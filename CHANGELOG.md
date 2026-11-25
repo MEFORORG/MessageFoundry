@@ -7,6 +7,12 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **A slow credential-reminder rescan is a named security loosening.** `[cert_monitor]` and
+  `[secret_rotation]` `check_interval_seconds` above the shipped default (`43200` and `86400`
+  seconds) are named as `cert_monitor.check_interval_seconds` and
+  `secret_rotation.check_interval_seconds` in the serve warning, `security show` and
+  `GET /security/posture`, while that reminder is on. Both settings now refuse NaN and infinity at
+  load as well as `0` or less. (`BACKLOG #2008`)
 - **The Windows service installer creates the secrets directory.** `install-service.ps1` makes
   `<DataDir>-secrets` (or `-SecretsDir`), restricted to SYSTEM, Administrators and the service
   account, and adds `MEFOR_SECRETS_DIRECTORY` to the service's NSSM environment, keeping the

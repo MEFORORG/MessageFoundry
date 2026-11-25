@@ -6731,8 +6731,14 @@ class RegistryRunner:
         called this respawns any that a STOP ended (:meth:`_ensure_inbound_workers`)."""
         self._log_halted.discard(name)
         if self._claim_mode != "pooled":
+            # Only a loopback inbound runs a RESPONSE worker (ADR 0013). Waking that lane for any
+            # other inbound left a stray Event in _lane_events (get-or-create) or set the shared
+            # RESPONSE singleton for every loopback worker (BACKLOG #5704).
+            ic = self.registry.inbound.get(name)
+            loopback = ic is not None and ic.spec.type is ConnectorType.LOOPBACK
             for stage in _INTERNAL_STAGES:
-                self._wake_lane(stage, name)
+                if stage is not Stage.RESPONSE or loopback:
+                    self._wake_lane(stage, name)
             return
         lanes = [
             (stage, d)

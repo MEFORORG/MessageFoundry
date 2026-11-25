@@ -9685,11 +9685,13 @@ class _ReopeningNoticeAudit:
 class _CountingNoticeAudit:
     """A :class:`NoticeAuditSink` that forwards to ``inner`` and counts the undelivered records the
     notifier asked for, so ``provision-admin`` can say that delivery of a notice it reported as
-    dispatched is unconfirmed (BACKLOG #5634). For a dispatched notice the notifier records only a
-    send that raised, so a count above zero is one, whether or not the forwarded write then
-    succeeded. A send can raise after the relay queued the mail, so it is not proof the notice
-    never left. A count of zero is not a delivery receipt: at least a drain ended by an interrupt
-    asks for no record."""
+    dispatched is unconfirmed (BACKLOG #5634). For a dispatched notice the notifier records a send
+    that raised, and, when its close is cut, the send it cut or the notice it left queued (BACKLOG
+    #6832); at least an interrupt cuts this command's close, and it ends the run before the count
+    is read. So a count above zero says delivery is unconfirmed, whether or not the forwarded write
+    then succeeded. A send can raise after the relay queued the mail, so it is not proof the notice
+    never left. A count of zero is not a delivery receipt: a send that returned says only that the
+    relay took the mail."""
 
     def __init__(self, inner: NoticeAuditSink) -> None:
         self._inner = inner
@@ -11600,7 +11602,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     # BACKLOG #5634: the notifier drained before run() returned, so its count is final here. None
     # unless a notice was dispatched. False is not a delivery receipt: it says only that the
-    # notifier recorded no undelivered notice, and at least a drain ended by an interrupt records none.
+    # notifier recorded no undelivered notice, and a send that returned says only the relay took it.
     holder_send_failed: bool | None = (
         bool(notice_audit) and notice_audit[0].undelivered > 0
         if outcome.holder_notice == HOLDER_NOTICE_DISPATCHED

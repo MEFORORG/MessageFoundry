@@ -111,8 +111,11 @@ class Fixture:
 
     def worktree(self, path: Path, branch: str) -> Path:
         _git(self.primary, "worktree", "add", "-q", "-b", branch, str(path))
-        # The untracked entry every real worktree carries. `git worktree remove` refuses on it
-        # without --force, so advice that omits --force would fail here -- which is the point.
+        # The entry every real worktree carries, gitignored as it is in this repository (the fixture
+        # ignores it in info/exclude). It was untracked and NOT ignored here until BACKLOG #2554
+        # finding 3, when remove.ps1 -Name began refusing such a file without -Force, which is
+        # right for real work and wrong for a stand-in for the .venv. Measured with git on Windows:
+        # plain `git worktree remove` does not refuse a tree whose only extra content is ignored.
         (path / ".venv").mkdir()
         (path / ".venv" / "marker.txt").write_text("untracked", encoding="utf-8")
         return path
@@ -127,6 +130,7 @@ def fx(tmp_path: Path) -> Fixture:
     _git(f.primary, "config", "user.name", "t")
     _git(f.primary, "add", "--", *REAL_SCRIPTS)
     _git(f.primary, "commit", "-qm", "seed")
+    (f.primary / ".git" / "info" / "exclude").write_text(".venv/\n", encoding="utf-8")
     _git(
         f.primary,
         "update-ref",
@@ -271,6 +275,9 @@ def test_new_ps1_NESTED_lands_under_dot_claude_worktrees_and_its_own_advice_remo
     assert "remove.ps1" not in made.stdout, "a nested tree has no scripted teardown to name"
     assert "--force" not in advice[0]
     assert "nothing checks whether a session is still in it" in made.stdout
+    # BACKLOG #2554 finding 1: the advice also names the guards plain git skips.
+    for guard in ("work claim", "ledger number", "detached HEAD"):
+        assert guard in made.stdout, f"the nested advice does not name the {guard} guard"
 
     wt = fx.primary / ".claude" / "worktrees" / "probe"
     assert wt.is_dir()

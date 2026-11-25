@@ -712,7 +712,9 @@ _UNSCANNABLE_RE_PATTERNS = {
     # character -- the linear-scan property BACKLOG #1437 bought, carried onto this path rather than
     # given back. ``tests/test_redaction.py`` times both against the scan budget, and reads both
     # with a clock-free character meter on at least the input shapes its arms name
-    # (``test_the_field_run_and_segment_patterns_read_each_character_once``, BACKLOG #2958).
+    # (``test_the_field_run_and_segment_patterns_read_each_character_once``, BACKLOG #2958), and reads
+    # both for a nested repetition from the compiled patterns
+    # (``test_the_field_run_and_segment_patterns_nest_no_repetition_as_shipped``).
     "messagefoundry/redaction.py": (
         "f'\\\\b([A-Z][A-Z0-9]{{2}})([{chars}])[^\\\\r\\\\n]*'",
         "f'(?<![^\\\\s{chars}])[^\\\\s{chars}]*+[{chars}][^\\\\s{chars}]*+(?:[{chars}][^\\\\s{chars}]*+)+'",
@@ -935,6 +937,19 @@ _UNSCANNABLE_RE_PATTERNS = {
     # ``.*`` with nothing after it. ``is_authorization_header_name`` uses ``fullmatch``, so there is
     # one start position.
     "messagefoundry/transports/http_auth.py": ("f'[^{_TCHARS}]*authorization(?:[^{_TCHARS}].*)?'",),
+    # BACKLOG #6637 item 10 -- the DICOM log line templates. Unresolvable BY CONSTRUCTION:
+    # ``compile_template`` builds each pattern from one ``TEMPLATES`` entry, so the line's wording and
+    # the slot grammar stay in one table the library census pins. Both are constants in that file, and
+    # no log line or peer value reaches a pattern: the text around each slot goes through
+    # ``re.escape``, and a slot's body comes from ``_SLOT_PATTERNS`` by its kind.
+    #
+    # Read on 2026-11-23 by running this file's own matchers over every built pattern:
+    # ``_has_nested_quantifier`` flagged none. The patterns are applied with ``fullmatch``, at
+    # ``_screened_line`` in ``transports/dicom.py``. They are safe only under ``fullmatch``: at least
+    # one is slow under ``.search``. A template has at most two unbounded runs. Where
+    # it has two, they cannot trade characters: ``quoted_uid`` stops at the quote that follows it,
+    # and ``{indent}{hex_dump}`` is spaces then a hex digit.
+    "messagefoundry/transports/_dicom_log_lines.py": ("''.join(parts)",),
     # BACKLOG #5062 -- the server schema check's EXEC-of-a-variable reading, in
     # ``_assigned_and_run``. Unresolvable because the code splices the variable name that
     # ``_ASSIGNED_LITERAL`` captured from the DDL text into an f-string. That is a choice, not a
@@ -956,13 +971,6 @@ _UNSCANNABLE_RE_PATTERNS = {
         "f'\\\\b(?:EXEC(?:UTE)?\\\\s*\\\\(\\\\s*@{var}\\\\s*\\\\)|sp_executesql\\\\s+@{var}\\\\b)'",
         "f'\\\\b(?:SET|SELECT)\\\\s+@{var}\\\\s*[-+*/|&^%]?=|@{var}\\\\s*[-+*/|&^%]='",
     ),
-    # BACKLOG #6637 -- the ignores for pydicom's UserWarning copies of a refused value. ``message``
-    # iterates ``reversed(_PYDICOM_VALUE_WARNINGS)``, which is derived from the ``warning`` field of
-    # each ``_REFUSALS`` shape that sets one, and this scanner reads neither. None has a nested
-    # quantifier. One, ``Value "(?s:.*)" ...``, has the many-starts shape; ``warnings`` applies it
-    # with ``.match``, from the start of the text, so it has one start. That was read in
-    # ``_py_warnings`` and measured through the C ``_warnings.warn`` on CPython 3.14.7.
-    "messagefoundry/transports/dicom.py": ("message",),
     # a wrapper's parameter. NOTE: register_ui_action's own re.compile(pattern) stays here BY
     # CONSTRUCTION — its argument is the function's parameter — but every one of its 25 call sites is
     # now resolved through _PATTERN_WRAPPERS, so no console route pattern is unscanned. consistency.py
@@ -970,6 +978,22 @@ _UNSCANNABLE_RE_PATTERNS = {
     "messagefoundry/parsing/consistency.py": ("pattern",),
     "messagefoundry_webconsole/_auth.py": ("pattern",),
 }
+
+
+def test_no_dicom_log_template_has_a_nested_quantifier(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The scan cannot read these patterns (see the entry above), so the built ones are read here.
+    from messagefoundry.transports import _dicom_log_lines as lines
+
+    def nested(patterns: list[re.Pattern[str]]) -> list[str]:
+        return [p.pattern for p in patterns if _has_nested_quantifier(p.pattern)]
+
+    built = [template.pattern for template in lines.compiled_templates()]
+    assert len(built) == len(lines.TEMPLATES)
+    assert nested(built) == []
+    # CONTROL: a nested quantifier in one slot's body is seen in each template that uses the slot.
+    monkeypatch.setitem(lines._SLOT_PATTERNS, "hex", r"(?:[0-9A-Fa-f]+)+")
+    mutated = [lines.compile_template(t).pattern for t in lines.TEMPLATES if "{hex}" in t]
+    assert mutated and len(nested(mutated)) == len(mutated)
 
 
 def test_no_catastrophic_regex_in_source() -> None:

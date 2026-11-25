@@ -5205,7 +5205,7 @@ slack.
 | Bind / exposure posture — refusing arms | `settings.api.host` loopback-ness, `tls_terminated_upstream`, `trusted_proxies`, `settings.api.public_origin`; derived `instance_exposed` (an off-loopback bind, a declared terminator, **or** a set `trusted_proxies`, vault BACKLOG #2251) and `admin_exposed`, plus `ui_exposed` for the `/ui` arms only; `[security].enforcement` | at least: `/ui` exposed without the required origin/TLS declarations; a non-loopback bind with no `[api].tls_cert_file` and no declared terminator, where `enforce` clamps both `--allow-insecure-bind` and `[security].require_encryption_for_remote = false` shut; `admin_exposed` + `enforcing` + `require_mfa` explicitly opted out; a declared terminator with no `[api].tls_cert_file`, as [Plaintext proxy hop](#plaintext-proxy-hop) states; a non-loopback `[api].tls_cert_file` bind without the attestation, as [API revocation gate](#api-revocation-gate) states. CORRECTED 2026-11-04 (BACKLOG #4636): this cell read "neither in-process TLS nor a declared terminator", which counted the minted placeholder as in-process TLS and read as if a terminator could stand in for a certificate off loopback. `serve` has no arm for sign-in off: the settings loader and the settings model refuse `[auth].enabled`, and nothing reads that key (vault BACKLOG #2719, #2825) | **DENY at startup** — `serve` prints an error and exits **2**. The refuse/warn dial is `[security].enforcement` (default `enforce`), **not** `production`: the `/ui`-exposure, plaintext-hop and API revocation arms refuse **unconditionally** (BACKLOG #4636: this read "plaintext-hop-acknowledgement arms" and named no revocation arm), and the `require_mfa` arm refuses on enforcement `enforce` alone — no data-class term narrows it, so `dev` and `staging` are gated exactly as `prod` is — and warns otherwise. `[security].allow_single_factor_admin_when_exposed = true` downgrades that one arm to permitted-but-audited. **`admin_exposed` is `instance_exposed`, and reads no console flag** (BACKLOG #326): the ADR 0143 degrade arms rewrite `settings.api.serve_ui` in place earlier in the same startup, so deriving an exposure decision from it made this arm and the dual-control arm below miss a declared-proxy instance whose console had been degraded or disabled — while the ASVS 11.7.1 arm called that same boot exposed. The same attributes force the session cookie's `Secure` flag + HSTS, and permit WebAuthn `rp_id` derivation from the request URL **only** on a loopback bind with no proxy declared or trusted (`trusted_proxies` empty, BACKLOG #2116) | loopback, nothing declared | `[security].local_access_only`, `listen_address`, `serve_web_console`, `web_console_public_address`, `require_mfa`, `require_encryption_for_remote`, `[api].tls_cert_file`, `tls_terminated_upstream`, `plaintext_upstream_hop_acknowledged`, `trusted_proxies`, `[security].enforcement`, `[security].allow_single_factor_admin_when_exposed`, the `MEFOR_TLS_REVOCATION_ATTESTED` environment variable (API revocation arm) |
 | Bind / exposure posture — dual-control arm | `admin_exposed` (= `instance_exposed`: an off-loopback bind, a declared TLS terminator, **or** a set `trusted_proxies` (vault BACKLOG #2251) — never the console flag, BACKLOG #326) × `[approvals].enabled` and `[approvals].operations` | `admin_exposed` **and** either `[approvals].enabled` off, or on with an `[approvals].operations` list that leaves out a default operation or holds none, which `_approvals_loosenings` reads (vault BACKLOG #3474) — high-value actions complete on one caller's authority | **LOG** — a startup **WARNING only, on every instance including production**; `serve` does **not** refuse. The refuse arm is an explicit unresolved owner fork recorded in `__main__.py`, not a shipped control | approvals off | `[approvals].enabled`, `[approvals].operations` |
 | Pending federated-login flows, per client IP | the `client_ip` recorded on each staged flow | ≥ **16** pending flows from this address (`DEFAULT_PER_IP_CAP`, no knob), or ≥ `oidc_flow_cache_max` (**512**) engine-wide; 300 s TTL; **reject-when-full, never evict** (evict-oldest would turn a start-leg flood into a login DoS) | **DENY** the start leg — `FlowCacheFullError` → **303** to `/ui/login?e=rate_limited` on the sign-in start, or a **429** that re-renders the step-up page on `POST /ui/reauth/oidc`, whose `begin_oidc_step_up` stages into the same cache; WARNING-logged, deliberately **never** audited so a flood cannot amplify into `audit_log` growth | 16 / 512 / 300 s | `[auth].oidc_flow_cache_max`, `oidc_flow_ttl_seconds` |
-| `Sec-Fetch-Mode` on the federated sign-in legs | the browser fetch-metadata header on `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when its interstitial is skipped, because that GET then runs the POST leg | header **present** and not `navigate` (absent = allowed by this check. On `POST /ui/oidc/start` the `Sec-Fetch-Site` row below runs first and refuses a POST with neither `Sec-Fetch-Site` nor `Origin`, with a 403 and no audit row, BACKLOG #1116, #1124. The skipped-interstitial GET runs that row too, but as a GET: a request with neither header is **not** refused there, under owner rulings R4 and R4b of 2026-09-28). Distinct from the `Sec-Fetch-Site` row below: a different header, a different surface, and `assert_same_origin` deliberately does **not** run on the callback leg, whose `Sec-Fetch-Site` is legitimately cross-site, or same-site when the identity provider is on the console's site, where the `/ui` fetch-metadata row's `Sec-Fetch-User: ?1` demand applies to it (`docs/BROWSER-SUPPORT.md`, *Federated sign-in and form-action*) | **DENY** — 303 → `/ui/login?e=sso_failed`\|`oidc_failed`, plus an **audited** `auth.login_failed` row carrying the closed-set slug `non_navigation_fetch`. Evaluated **after** each leg's limiter, so the audit write is itself rate-bounded: the login limiter, or on a step-up return to the callback the per-user ceremony key (BACKLOG #3374) and, for the row alone, the step-up return audit budget, kept per user with a backstop across all sources that pages when it stops a row (control 11 of the 6.1.1 protection set, BACKLOG #3965) | on | (no knob) |
+| `Sec-Fetch-Mode` on the federated sign-in legs | the browser fetch-metadata header on `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when its interstitial is skipped, because that GET then runs the POST leg | header **present** and not `navigate` (absent = allowed by this check. On `POST /ui/oidc/start` the `Sec-Fetch-Site` row below runs first and refuses a POST with neither `Sec-Fetch-Site` nor `Origin`, with a 403 and no audit row, BACKLOG #1116, #1124. The skipped-interstitial GET runs that row too, but as a GET: a request with neither header is **not** refused there, under owner rulings R4 and R4b of 2026-09-28). Distinct from the `Sec-Fetch-Site` row below: a different header, a different surface, and `assert_same_origin` deliberately does **not** run on the callback leg, whose `Sec-Fetch-Site` is legitimately cross-site, or same-site when the identity provider is on the console's site, where the `/ui` fetch-metadata row's `Sec-Fetch-User: ?1` demand applies to it (`docs/BROWSER-SUPPORT.md`, *Federated sign-in and form-action*) | **DENY** — 303 → `/ui/login?e=sso_failed`\|`oidc_failed`, plus an **audited** `auth.login_failed` row carrying the closed-set slug `non_navigation_fetch`. Evaluated **after** each leg's limiter, so the audit write is itself rate-bounded: the login limiter, or on a step-up return to the callback the per-user ceremony key (BACKLOG #3374) and, for the row alone, the step-up return audit budget, whose rules control 11 of the [6.1.1 protection set](#the-documented-protection-set-asvs-611) states (BACKLOG #3965) | on | (no knob) |
 | Instance environment posture × claimed AI data scope | `[ai].derived_posture()` (from `[ai].environment` and `[security].production_instance`; an unresolved posture defaults to the **strictest** ceiling) re-resolved server-side through `resolve_effective_policy` on every `POST /ai/chat` | the effective mode is not `managed_endpoint`, or the request's `data_scope` exceeds the server-enforced ceiling (the engine-broker MVP enforces `code_only` regardless of what the caller claims) | **DENY** — **409** on the mode mismatch, **403** on scope excess; each audited `ai.assist` with PHI-safe metadata only | `mode = byo`, `data_scope = code_only` | `[ai].mode`, `[ai].data_scope`, `[ai].environment`, `[security].production_instance` |
 | Gated operation × requester-vs-approver identity × hold age | the pending-approval record: the operation name, the requesting identity, and the hold's creation time | `[approvals].enabled` **and** the operation is in `[approvals].operations` and has no approved unexpired release; the approver is the requester; the hold is older than `expiry_hours`; the hold is younger than `min_dwell_seconds` | **DENY** the immediate execution — **202** hold + `approval.requested` audit; the same **202** and id + `approval.request_repeated` audit for the same requester's repeat of an open hold; **403** on self-approval; **409** once expired or already decided; **409** + `approval.too_early` audit while younger than the floor (the hold stays pending); **409** + `approval.no_longer_gated` audit once dual control no longer gates the operation (the hold stays pending); **503** + `approval.node_refused` audit for a config reload approved on a cluster node that lost its lease (the hold stays pending, for the leader) | off; `['connection_purge','dead_letter_replay']`; 72 h; 2 s | `[approvals].enabled`, `operations`, `expiry_hours`, `min_dwell_seconds` |
 | mTLS client-certificate subject | the subject DN of the loaded CA certificate whose key directly signed the peer certificate, and the peer's qualified subject-RDN / SAN names | exact match of the name under the map entry for that verifying CA's DN (BACKLOG #2237), in a deny-by-default map (empty map = feature off). The same subject from another CA matches nothing. A client-sent intermediate, and two loaded CAs sharing one DN with different keys, name no issuer | **ALLOW** — resolve the mapped account **id** (BACKLOG #2238; never a username, which a rename can hand to another account) to its Identity (RBAC then authorizes); an unknown or disabled account grants none. A directory account is also asked about in the directory on every request and fails closed: anything short of a present, enabled account grants none, and the Identity keeps only the stored roles and channels its current groups still map to. One exception: when none of its groups is in the scope map, a scope an administrator set stays as stored (BACKLOG #2316) | `{}` = off | `[api].tls_client_cert_identities` (requires `tls_client_ca_file`) |
@@ -7677,10 +7677,9 @@ the callback. Each such navigation spends that user's return key while the flow 
 refuse that user's IdP returns and none of their other ceremonies. That key has no global ceiling
 (`glob=0`). The refusals on a step-up return that consume nothing, and so repeat while the flow
 lives (a `state` mismatch, on the completion or the abandon leg, and a non-navigation fetch), write
-their audit rows only within control 11, the step-up return audit budget, which is kept per user
-(per client address for a flow that names no user) behind a backstop across all sources that
-pages when it stops a row and still lets each account write one row a window
-(BACKLOG #3965). Past it the refusal is the same and is logged instead.
+their audit rows only within control 11 of the
+[6.1.1 protection set](#the-documented-protection-set-asvs-611), the step-up return audit
+budget, whose row states its rules and what an over-budget refusal does (BACKLOG #3965).
 A refusal that consumes the flow writes at most one row per flow, so the start leg's per-user key
 bounds those, with no ceiling across users.
 
@@ -8225,18 +8224,21 @@ same drops give totals one apart by lane.
 when the notice is handed to the relay. It reads `mailed: true` only when the relay queued the
 notice: one its full queue dropped, or one it refused because it had begun to close, reads
 `mailed: false`, so the next lock of the kind mails again (vault BACKLOG #3120). When the relay's queue is full, the relay refuses the notice because it has
-begun to close, or the send fails, the engine writes one more row, with the notice's recipient as
-the actor. A lock
+begun to close, a cut close leaves the notice queued or cuts its send, or the send fails, the
+engine tries to write one more row, with the notice's recipient as the actor; when that write
+can fail is under *Still open* below. A lock
 notice writes `auth.lock_notice_undelivered`, hidden as above. Every other notice kind writes
 `auth.security_notice_undelivered`, which every `audit:read` reader sees. The detail names the
-notice kind and the `reason`, `queue_full`, `closing` or `send_failed`. An issuer's reminder also names the
+notice kind and the `reason`, at least `queue_full`, `closing`, `abandoned`, `interrupted` or
+`send_failed`. An issuer's reminder also names the
 holder. The row never carries the address, the rest of the notice's detail, or the error. The
 source of record is `SecurityEventNotifier._record_undelivered` in
 `messagefoundry/pipeline/security_notify.py`. At least the offline commands `provision-admin` and
 `admin-reset-totp` record it the same way (BACKLOG #5634). `provision-admin` writes it into the
 store it holds open, so a takeover notice whose `auth.first_administrator_provisioned` row reads
 `holder_notice: dispatched` and whose send failed gets its own undelivered row too, except in at
-least these cases: that write fails, or the run is interrupted mid-send. The command's own result
+least these cases: that write fails, or an interrupt ends the run before it lands. An interrupt
+mid-send can instead leave a `reason: interrupted` row (BACKLOG #6832). The command's own result
 says so as well: `holder_notice_send_failed` in `--json`, and a WARNING line in text. Both say
 the notifier requested to record the notice as undelivered, that is, its send raised, so delivery is
 unconfirmed; a send can raise after the relay has queued the mail. That row can
@@ -8245,9 +8247,23 @@ come before the provision row in the chain, because the notice is sent while the
 again for the row, and only when a send failed. **Still open, at least:**
 
 - At shutdown the notifier closes while the store is still open (BACKLOG #3191), so a send that
-  fails in its final drain is recorded. That close is one bounded step of the shutdown. When the
-  step is cut, a notice still queued is neither sent nor recorded, and a send already under way
-  may still go out or fail unrecorded. A lock notice among them keeps its `auth.lock_notice` row
+  fails in its final drain is recorded. That close is one bounded step of the shutdown, and it
+  sets no bound of its own, so the drain mails for the whole of the step's bound. When the step
+  is cut, the close cancels the drain and records the send it cut with `reason: interrupted` and
+  each notice still queued with `reason: abandoned` (BACKLOG #6832). A send still waiting for a
+  worker thread at the cut is skipped, so it never mails, and is recorded `abandoned` too. A send
+  that ended just before the cut reached the drain is read as it ended: a sent notice gets no
+  row, and a failed one gets `reason: send_failed`. A cut send whose thread began runs on to its
+  own timeout, so that notice may still go out. Those writes run one at a time and are not
+  bounded. The shutdown stops waiting for them at the step's bound plus its cut grace; the rest
+  go on beside `engine.stop()`, competing with its writes, until the store closes, and those still
+  to run then fail. Under a full queue that can be most of them. A cut logs at least the
+  teardown's ERROR line for the cut and, from the close, a WARNING line counting the queued
+  notices before their writes, only when a notice other than a lock notice is queued, and,
+  when any of those writes fail,
+  one counting them after; that one does not count the writes a cancel stopped before they ran.
+  Neither count includes a lock notice, and the first does not count the cut send. A lock
+  notice among them keeps its `auth.lock_notice` row
   reading `mailed: true`, so the throttle holds back that account's next lock notice of the kind
   for the rest of its 24 hours.
 - A notice that reaches the notifier once it has begun to close is refused and recorded with
@@ -8265,8 +8281,9 @@ again for the row, and only when a send failed. **Still open, at least:**
   on their own loop in a daemon thread, so the limit covers a synchronous key-provider hop inside
   the open too. A record still running at the time limit is not guaranteed either way: the process
   exit may wait for it, or it may be lost with no log line.
-- Under a long overload only 64 queue-full records are written at a time, and drops past that are
-  not recorded.
+- Under a long overload a queue-full drop, or a notice refused once the close has begun, is
+  recorded only while fewer than 64 record tasks are in flight, a failed send's record among them,
+  and drops past that are not recorded. A cut close's rows run as one such task.
 - A lock notice whose send fails still leaves its `auth.lock_notice` row reading `mailed: true`,
   because the send fails on the relay's own task after that row is written. So the throttle holds
   back the next lock notice of the kind for the rest of its 24 hours. The failure is on the
@@ -8702,9 +8719,15 @@ BACKLOG #190 bundled three integrity residuals; #190 closes with **one built** a
   trigger: [ADR 0139](adr/0139-ech-egress-sidecar-sni-hiding-for-asvs-12-1-5-demand-gated.md);
   operator contract: [`samples/ech-sidecar/`](../samples/ech-sidecar/README.md). The residual is
   metadata only — which partner, how often — with at least these compensating conditions: on-prem, a
-  trusted network segment, an operator-configured `[egress]`-allowlisted destination, and TLS still
-  protecting the payload. Re-open when a destination begins publishing an `ECHConfig`, or when CPython
-  ships a first-class ECH API.
+  trusted network segment, an operator-configured `[egress]`-allowlisted destination or, on the LDAPS
+  hop, the operator-configured `[auth].ad_server`, and TLS still protecting the payload. That LDAPS
+  host is not `[egress]`-gated. Since BACKLOG #6879, a bind to a hostname `ad_server` sends that
+  name as cleartext SNI. The form sent, and the hosts that send none, such as an IP literal, are
+  [`_sni_name`'s](../messagefoundry/auth/ldap_tls.py). Where the engine resolves the host through
+  unencrypted DNS, an observer on that path already sees the name. An observer only on the
+  engine-to-DC path learns it from SNI. On a TLS 1.2 handshake, whatever `ad_server` holds, the DC's
+  certificate travels in cleartext and names the DC to that observer too. Re-open when a
+  destination begins publishing an `ECHConfig`, or when CPython ships a first-class ECH API.
 
 ### In-use memory protection — best-effort partial + deployment requirement (13.3.3 / 11.7.1 / 11.7.2, #198)
 

@@ -829,6 +829,15 @@ def test_the_tls_sigalgs_leaf_imports_only_the_standard_library() -> None:
     assert sorted(m for m in modules if m.split(".")[0] not in sys.stdlib_module_names) == []
 
 
+def test_the_win32_sid_leaf_imports_only_the_standard_library() -> None:
+    # BACKLOG #6281: config/wiring.py and auth/anchor_path.py share it, so it sits outside auth/ and
+    # must reach no engine package, or the config-source readers would import the auth package.
+    path = _ENGINE_ROOT / "win32_sid.py"
+    modules = _imported_modules(path, path.parent)
+    assert "ctypes" in modules, "control: the walk did not read the module's imports"
+    assert sorted(m for m in modules if m.split(".")[0] not in sys.stdlib_module_names) == []
+
+
 def test_the_odbc_call_gate_leaf_imports_only_the_standard_library() -> None:
     # BACKLOG #2394: the SQL Server store and the DATABASE connector both import the gate. Neither
     # may import the other, so the gate must reach neither them nor a driver package.

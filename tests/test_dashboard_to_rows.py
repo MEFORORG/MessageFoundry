@@ -376,3 +376,170 @@ def test_asvs_provenance_row_quotes_the_tools_own_lines() -> None:
     row = _rows(snap)["asvs.provenance"]
     assert row["value"] is None
     assert row["error"] == "the snapshot holds no scorecard provenance lines"
+
+
+# -- Central time, the ledger history and the new metrics' facts ---------------------------------
+
+
+@pytest.mark.parametrize(
+    ("stamp", "shown"),
+    [
+        ("2026-11-24T13:01:32+00:00", "Tue Nov 24, 2026, 7:01 AM CST"),
+        ("2026-07-04T17:30:00Z", "Sat Jul 4, 2026, 12:30 PM CDT"),
+        # 2026's daylight time runs from Sun Mar 8 08:00 UTC to Sun Nov 1 07:00 UTC.
+        ("2026-03-08T07:59:00Z", "Sun Mar 8, 2026, 1:59 AM CST"),
+        ("2026-03-08T08:00:00Z", "Sun Mar 8, 2026, 3:00 AM CDT"),
+        ("2026-11-01T06:59:00Z", "Sun Nov 1, 2026, 1:59 AM CDT"),
+        ("2026-11-01T07:00:00Z", "Sun Nov 1, 2026, 1:00 AM CST"),
+        ("2026-12-31T23:30:00-05:00", "Thu Dec 31, 2026, 10:30 PM CST"),
+    ],
+)
+def test_central_time(stamp: str, shown: str) -> None:
+    assert tr.central(stamp) == shown
+
+
+@pytest.mark.parametrize("stamp", [None, "", "yesterday", 5])
+def test_central_time_of_junk_is_none(stamp: Any) -> None:
+    assert tr.central(stamp) is None
+    assert tr.utc_clock(stamp) is None
+
+
+def test_ledger_history_joins_the_open_series() -> None:
+    snap = tr.Snapshot(
+        {
+            "metrics": [
+                {
+                    "id": "backlog_burn",
+                    "detail": {
+                        "history": [{"week": "2026-W46", "filed": 4, "closed": 3}, "junk"],
+                        "open_series": [{"week": "2026-W46", "value": 13}],
+                    },
+                }
+            ]
+        }
+    )
+    assert tr.ledger_history(snap) == [{"week": "2026-W46", "filed": 4, "closed": 3, "open": 13}]
+    assert tr.ledger_history(tr.Snapshot({})) == []
+
+
+def _forecast_rows(detail: dict[str, Any]) -> dict[str, Any]:
+    data = {"metrics": [{"id": "backlog_forecast", "value": "x", "detail": detail}]}
+    return {r["id"]: r for r in tr.metric_rows(tr.Snapshot(data))}
+
+
+def test_forecast_facts_read_never_only_when_a_pace_was_read() -> None:
+    pace = {"net_closed_per_week": -5.0, "closed_per_week": 0.0, "filed_per_week": 5.0}
+    rows = _forecast_rows({"pace": pace, "short_pace": pace})
+    assert rows["backlog_forecast.short_finish"]["value"] == "never"
+    assert rows["backlog_forecast.no_filing_finish"]["value"] == "never"
+    assert rows["backlog_forecast.net_closed_per_week"]["value"] == -5.0
+    rows = _forecast_rows({})
+    assert rows["backlog_forecast.short_finish"]["value"] is None
+
+
+@pytest.mark.parametrize("net", [0.0, -0.0, 0])
+def test_forecast_line_says_filing_matched_closing_at_a_zero_net(net: float) -> None:
+    detail = {"pace": {"net_closed_per_week": net}, "finish": None}
+    data = {"metrics": [{"id": "backlog_forecast", "value": "x", "detail": detail}]}
+    line = tr.forecast_line(tr.Snapshot(data))
+    assert line is not None
+    assert "filing matched closing, so it never reaches zero" in line
+    assert "-0" not in line
+
+
+def test_batch_facts_count_every_state() -> None:
+    data = {
+        "metrics": [
+            {
+                "id": "batch_progress",
+                "value": 10.0,
+                "detail": {
+                    "batches_by_state": {"FREE": 3},
+                    "runbook_saved": "2026-11-24T13:00:00Z",
+                },
+            }
+        ]
+    }
+    rows = {r["id"]: r for r in tr.metric_rows(tr.Snapshot(data))}
+    assert rows["batch_progress.batches_free"]["value"] == 3
+    assert rows["batch_progress.batches_done"]["value"] == 0
+    assert "workbook saved Tue Nov 24, 2026, 7:00 AM CST" in rows["batch_progress"]["note"]
+
+
+def test_batch_facts_count_an_unlisted_state_as_other() -> None:
+    data = {
+        "metrics": [
+            {
+                "id": "batch_progress",
+                "value": 1.0,
+                "detail": {"batches_by_state": {"FREE": 1, "PARKED": 2}},
+            }
+        ]
+    }
+    rows = {r["id"]: r for r in tr.metric_rows(tr.Snapshot(data))}
+    assert rows["batch_progress.batches_other"]["value"] == 2
+
+
+def test_series_rows_carry_the_ledger_history() -> None:
+    data = {
+        "weeks": ["2026-W46", "2026-W47"],
+        "metrics": [
+            {
+                "id": "backlog_burn",
+                "detail": {
+                    "history": [{"week": "2026-W46", "filed": 4, "closed": 3}],
+                    "open_series": [{"week": "2026-W46", "value": 13}],
+                },
+            }
+        ],
+    }
+    rows = [r for r in tr.series_rows(tr.Snapshot(data)) if r["week"] == "2026-W46"]
+    got = {r["series"]: r["value"] for r in rows}
+    assert got == {"Filed, all weeks": 4, "Closed, all weeks": 3, "Open rows": 13}
+
+
+def test_priority_rows_order_and_fill_every_status() -> None:
+    by = {"unscored": {"open": 1}, "P2": {"closed": 4, "odd": 1}, "P1": {"open": 2}}
+    snap = tr.Snapshot({"metrics": [{"id": "backlog_burn", "detail": {"by_priority": by}}]})
+    rows = tr.priority_rows(snap)
+    assert list(dict.fromkeys(r["priority"] for r in rows)) == ["P1", "P2", "unscored"]
+    p2 = {r["status"]: r["value"] for r in rows if r["priority"] == "P2"}
+    assert p2 == {
+        "open": 0,
+        "partial": 0,
+        "in progress": 0,
+        "closed": 4,
+        "declined": 0,
+        "superseded": 0,
+        "odd": 1,
+    }
+    assert tr.priority_rows(tr.Snapshot({})) == []
+    # A status only P2 carries is a zero cell for P1 and unscored, not a missing one.
+    assert {"priority": "P1", "status": "odd", "value": 0} in rows
+
+
+def test_priority_rows_sort_two_digit_priorities_numerically() -> None:
+    by = {p: {"open": 1} for p in ("P10", "P2", "unscored", "P1")}
+    snap = tr.Snapshot({"metrics": [{"id": "backlog_burn", "detail": {"by_priority": by}}]})
+    order = list(dict.fromkeys(r["priority"] for r in tr.priority_rows(snap)))
+    assert order == ["P1", "P2", "P10", "unscored"]
+
+
+def test_main_writes_the_priority_file(tmp_path: Path) -> None:
+    snap = tmp_path / "metrics.json"
+    detail = {"by_priority": {"P1": {"open": 2}}}
+    snap.write_text(json.dumps({"metrics": [{"id": "backlog_burn", "detail": detail}]}), "utf-8")
+    out = tmp_path / "rows"
+    try:
+        code = tr.main([str(snap), str(out)])
+    except SystemExit as exc:  # pragma: no cover - argparse
+        code = int(exc.code or 0)
+    if code == 1:
+        pytest.skip("the temporary directory is inside a git work tree on this machine")
+    rows = json.loads((out / "priority.json").read_text(encoding="utf-8"))["rows"]
+    assert {"priority": "P1", "status": "open", "value": 2} in rows
+
+
+def test_unscored_label_matches_the_census_driver() -> None:
+    source = (_PATH.parent / "_vault_census.py").read_text(encoding="utf-8")
+    assert f'UNSCORED = "{tr.UNSCORED_LABEL}"' in source
