@@ -1883,7 +1883,7 @@ def test_the_residue_rules_leave_versions_and_plain_numbers_alone(sf, line: str)
         f"| {_REQ} | " + "__messagefoundry" * 5000 + " |",
         f"| {_REQ} | " + ("messagefoundry" + chr(0xE9)) * 5000 + " |",
         # Review round-23e833d96f: a long run of spaces, which the sentence split rescanned per space.
-        # The identifier lists that sat here are timed by a ratio, in
+        # The identifier lists that sat here are timed by a ratio, column list included, in
         # test_a_long_identifier_list_scans_in_linear_time below.
         _REQ + " " * 60000 + ": the row" + chr(0x200B) + chr(0x2028),
         # A cell that goes on past "never failing", over a markup run.
@@ -2071,6 +2071,37 @@ def test_the_column_list_takes_one_column_lookup_per_identifier(
     )
 
 
+class _FinditerCountingPattern:
+    """_PR_CELL_PIPE with its ``finditer`` calls counted; every other use passes through."""
+
+    def __init__(self, pattern: re.Pattern[str]) -> None:
+        self.pattern = pattern
+        self.finditers = 0
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.pattern, name)
+
+    def finditer(self, *args: Any, **kwargs: Any) -> Iterator[re.Match[str]]:
+        self.finditers += 1
+        return self.pattern.finditer(*args, **kwargs)
+
+
+def test_the_column_list_finds_its_pipes_once_per_row(sf, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The row's pipes are found once, however many identifiers the row holds, so the bisection
+    above searches a list built once. Rebuilding the list for each identifier still bisects once
+    per identifier, so the count above passes it, and fails here: 50 identifiers take 49 more
+    searches than one."""
+    counting = _FinditerCountingPattern(sf._PR_CELL_PIPE)
+    monkeypatch.setattr(sf, "_PR_CELL_PIPE", counting)
+    sf.scan_pr_body(_column_list(1))
+    one = counting.finditers
+    counting.finditers = 0
+    sf.scan_pr_body(_column_list(50))
+    assert counting.finditers == one, (
+        f"{counting.finditers} pipe searches for 50 identifiers, against {one} for one"
+    )
+
+
 class _SpanCountingPattern:
     """_PR_MARK_BEFORE with the span of every search recorded, so the window each identifier's mark
     search reads is a number of characters rather than a number of seconds."""
@@ -2106,13 +2137,15 @@ def test_an_and_list_searches_a_bounded_window_before_each_identifier(
 
 
 #: The scaling check's step and line: a body ``_GROWTH_STEP`` times as large must take under
-#: ``_GROWTH_LINE`` times as long, where linear gives about 8 and quadratic about 64. It is kept
-#: for the two "and" lists only, as an end-to-end guard on the whole sentence path: the searches
-#: the counts above reach are not the only ones it runs. Read on the thread CPU clock, 2026-11-24,
-#: on a 32-core Windows box, eight attempts per shape at 500 against 4000 identifiers. The shipped
-#: scanner read 7.3x to 8.6x. _PR_MARK_BEFORE searched from the start of the sentence, put back by
-#: hand in a copy of the scanner, read 26.1x to 35.3x and 28.7x to 31.4x. Its lowest reading is 1.9
-#: times the line. The count above stays that defect's guard; this ratio is the backstop.
+#: ``_GROWTH_LINE`` times as long, where linear gives about 8 and quadratic about 64. It is an
+#: end-to-end guard on the column list and the two "and" lists: the searches the counts above
+#: reach are not the only ones a row or a sentence runs. Read on the thread CPU clock, 2026-11-24,
+#: on a 32-core Windows box. The "and" lists, eight attempts at 500 against 4000 identifiers: the
+#: shipped scanner read 7.3x to 8.6x; _PR_MARK_BEFORE searched from the start of the sentence, put
+#: back by hand in a copy of the scanner, read 26.1x to 35.3x and 28.7x to 31.4x. The column list,
+#: 1000 against 8000: the shipped scanner read 6.2x to 8.0x; the row's pipe list
+#: rebuilt for each identifier read 40.2x to 50.1x. Each defect's lowest reading clears the line
+#: by at least 1.8 times. The counts above stay those defects' guards; this ratio is the backstop.
 _GROWTH_STEP, _GROWTH_LINE = 8, 14.0
 
 
@@ -2210,18 +2243,21 @@ def test_the_linear_check_passes_on_any_attempt_under_the_line(
 @pytest.mark.parametrize(
     ("make", "n"),
     [
+        # Identifiers split by a word, so each one takes the column lookup.
+        (_column_list, 1000),
         (_and_list, 500),
         # Review round-23e833d96f: an invisible character and a line separator.
         (lambda n: _and_list(n) + chr(0x200B) + chr(0x2028), 500),
     ],
-    ids=["and-list", "and-list-invisible"],
+    ids=["column-lookup", "and-list", "and-list-invisible"],
 )
 def test_a_long_identifier_list_scans_in_linear_time(
     sf, make: Callable[[int], str], n: int
 ) -> None:
-    """A sentence holding a long list of identifiers must scan in time linear in the list. These sat
-    in test_a_long_table_row_scans_in_linear_time under its 10 second bound at 8000 identifiers,
-    where they took about 1.4 s and 2.7 s locally, too close to it for a loaded runner.
+    """A row or a sentence holding a long list of identifiers must scan in time linear in the list.
+    These sat in test_a_long_table_row_scans_in_linear_time under its 10 second bound, where the
+    "and" lists took about 1.4 s and 2.7 s locally at 8000 identifiers, too close to it for a loaded
+    runner.
     :data:`_GROWTH_LINE` records the defects each fails. A ratio does not see a constant factor,
     such as the two whole extra readings the invisible character once added, and the former bound
     did not see it either at that size."""
