@@ -24,6 +24,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from pydantic import ValidationError
 
 from messagefoundry.config.settings import StoreBackend, StoreSettings
 from messagefoundry.store.sqlserver import _build_pool_executor
@@ -69,14 +70,13 @@ def test_the_default_loop_executor_would_be_too_narrow() -> None:
     assert default_width < 40, "the default executor would no longer be the constraint"
 
 
-def test_a_zero_or_negative_pool_size_still_yields_a_usable_executor() -> None:
-    """pool_size is clamped by max(1, ...) at the call site; the helper must not divide by it or return 0."""
-    for bad in (0, -1):
-        ex = _build_pool_executor(_settings(bad))
-        try:
-            assert ex._max_workers >= 1
-        finally:
-            ex.shutdown(wait=False)
+@pytest.mark.parametrize("bad", [0, -1])
+def test_a_zero_or_negative_pool_size_is_refused_before_the_helper(bad: int) -> None:
+    """A pool of 0 or less never reaches the helper: ``StoreSettings`` refuses it at load (BACKLOG
+    #5769), and every caller hands the helper either ``settings.pool_size`` or a literal 1."""
+    with pytest.raises(ValidationError) as info:
+        _settings(bad)
+    assert "pool_size" in str(info.value)
 
 
 def test_the_helper_needs_no_driver_and_no_server() -> None:
