@@ -1163,10 +1163,12 @@ class SandboxSession:
             thread.start()
         # Assign the Windows kill-on-close job BEFORE the boot frame. The boot frame triggers
         # ``load_snapshot()``, which runs top-level admin config — the earliest untrusted code and the
-        # first chance to spawn a grandchild. Until then the worker parks on its first stdin read, so
-        # assigning here is race-free: any process the worker later spawns is already in the job. The
-        # drains above do not disturb that argument, which turns on the CHILD's first stdin read and
-        # not on what the parent's threads are doing.
+        # first chance to spawn a grandchild. Until then the worker runs only its own code: it moves
+        # the request pipe off fd 0 (_detach_request_pipe, which starts no process) and parks on its
+        # first read of that pipe's private copy, so assigning here is race-free: any process the
+        # worker later spawns is already in the job. The drains above do not disturb that argument,
+        # which turns on the CHILD's first request-pipe read and not on what the parent's threads
+        # are doing.
         self._job = _assign_kill_on_close_job(proc)
         try:
             _write_frame(proc.stdin, boot)
@@ -1262,14 +1264,18 @@ class SandboxSession:
                 if body is _OVERSIZE:
                     return  # the stream is out of step, so nothing after the header is a frame
         except OSError as exc:
-            # Read as the peer being gone, as a clean EOF is. DEBUG, not WARNING: a read error on a
-            # pipe the reap has just broken is the ordinary end of a killed worker. The type name
-            # only, since an OSError's text can name a path.
+            # Read as the peer being gone, as a clean EOF is. Stamped before the log line, so a
+            # slow handler cannot delay the stamp _died_before_first_check reads. DEBUG, not
+            # WARNING: a read error on a pipe the reap has just broken is the ordinary end of a
+            # killed worker. The type name only, since an OSError's text can name a path.
+            eof_at.append(time.monotonic())
             log.debug(
                 "inbound %r: sandbox frame reader stopped on %s, read as EOF",
                 self._inbound,
                 type(exc).__name__,
             )
+            sink.put(_EOF)
+            return
         eof_at.append(time.monotonic())
         sink.put(_EOF)
 

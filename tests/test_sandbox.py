@@ -1346,7 +1346,16 @@ def test_a_detach_refusal_drains_the_boot_frame_and_reports_its_reason(
     from messagefoundry.config.snapshot import ConfigSnapshot
     from messagefoundry.pipeline import _sandbox_worker
 
-    stdin, stdout = io.BytesIO(), io.BytesIO()
+    class _Tracked(io.BytesIO):
+        # Where the reader stood when it was closed: a drain reads to the end of the boot frame.
+        closed_at = -1
+
+        def close(self) -> None:
+            if not self.closed:
+                self.closed_at = self.tell()
+            super().close()
+
+    stdin, stdout = _Tracked(), io.BytesIO()
     boot = codec.encode_boot(
         snapshot=ConfigSnapshot(directory=Path("."), files={}),
         forbidden=(),
@@ -1363,8 +1372,8 @@ def test_a_detach_refusal_drains_the_boot_frame_and_reports_its_reason(
     monkeypatch.setattr(_sandbox_worker, "_detach_request_pipe", _refuse)
     monkeypatch.setattr(sys, "stdout", SimpleNamespace(buffer=stdout))
     assert _sandbox_worker.main() == 1
-    assert stdin.closed  # drained, then closed
-    assert size > 0
+    assert stdin.closed
+    assert stdin.closed_at == size > 0  # read to the end of the boot frame before it was closed
     stdout.seek(0)
     reply = sandbox_mod._read_frame_bytes(stdout)
     assert reply is not None

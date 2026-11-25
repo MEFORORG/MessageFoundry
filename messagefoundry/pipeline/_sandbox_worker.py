@@ -144,9 +144,20 @@ def _detach_request_pipe() -> io.BufferedReader:
     except OSError as exc:
         try:
             reader = os.fdopen(private, "rb")
-        except OSError:
-            os.close(private)
-            raise exc from None
+        except OSError as fdopen_exc:
+            # No reader to hand back: close the copy and raise the detach's own failure, so the
+            # bootfail reply names it rather than this one.
+            log.error(
+                "sandbox worker could not reopen its request pipe: %s", type(fdopen_exc).__name__
+            )
+            try:
+                os.close(private)
+            except OSError as close_exc:
+                log.error(
+                    "sandbox worker could not close its request pipe copy: %s",
+                    type(close_exc).__name__,
+                )
+            raise exc  # noqa: B904 - the detach's failure is the one to report, chained to this
         raise _RequestPipeRefused(str(exc), reader=reader) from exc
 
 
