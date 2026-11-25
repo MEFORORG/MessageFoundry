@@ -422,7 +422,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "[pipeline].snapshot_on_send (copy-on-Send, ADR 0104) resolved best-effort from the service "
         "settings (--service-config, else ./messagefoundry.toml if present); when no settings load "
         "it falls back to the setting's own default (ON) — matching the default engine, never a "
-        "silent OFF (#230). A MEFOR_* variable that is a settings section's name alone can stop "
+        "silent OFF (#230), except under --env, where a settings load error stops the run. "
+        "A MEFOR_* variable that is a settings section's name alone can stop "
         "the run instead; SectionNameEnvError in messagefoundry.config.settings says when.",
     )
     dryrun.add_argument("--config", default="samples/config", help="config modules directory")

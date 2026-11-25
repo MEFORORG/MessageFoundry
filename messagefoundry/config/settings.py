@@ -8982,7 +8982,8 @@ class SectionNameEnvError(ValueError):
 
     Each reports it only when it reaches its settings load. At least these stop first: a load
     error raised before this refusal runs (a missing or malformed file, an unknown file key),
-    which is not this class and on which those callers still fall back; any error the command
+    which is not this class and on which those callers still fall back, except ``dryrun --env``,
+    which refuses such an error at its earlier load; any error the command
     reports before the load (a config graph or messages error in ``dryrun``; a dry-run leg that
     skips for no fixtures or no inbound). The ``check`` leg loads nothing when no settings source
     resolves, while ``dryrun`` with no file reads the environment alone and so refuses. Under
