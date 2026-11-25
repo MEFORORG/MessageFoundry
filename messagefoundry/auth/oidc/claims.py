@@ -24,7 +24,13 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
-from messagefoundry.auth.oidc.jwks import JwkAlgMismatch, JwksAmbiguousKid, JwksCache, JwksError
+from messagefoundry.auth.oidc.jwks import (
+    JwkAlgMismatch,
+    JwksAmbiguousKid,
+    JwksCache,
+    JwksError,
+    JwksRefreshBusy,
+)
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.domainshape import upn_suffix_key
 from messagefoundry.transports.signing import (
@@ -50,6 +56,9 @@ REASONS: frozenset[str] = frozenset(
         "unexpected_events_claim",
         "unknown_kid",
         "ambiguous_kid",
+        # BACKLOG #6905: the JWKS cache's wait for a refresh in progress ran out before the token's
+        # key was current. The IdP was slow or stalled; the token's kid was never judged.
+        "jwks_refresh_busy",
         "key_rejected",
         "bad_signature",
         "claim_iss",
@@ -219,6 +228,10 @@ def _select_key_and_alg(
         # it: a lookup inside the min-refetch floor after it is served a key the cache still holds
         # for its kid, or gets the throttled JwksError, recorded as unknown_kid below.
         raise ClaimsError("ambiguous_kid", str(exc)) from exc
+    except JwksRefreshBusy as exc:
+        # A refresh another sign-in started held the cache past this lookup's bounded wait (BACKLOG
+        # #6905). Not the token's fault, so not unknown_kid.
+        raise ClaimsError("jwks_refresh_busy", str(exc)) from exc
     except JwksError as exc:
         raise ClaimsError("unknown_kid", str(exc)) from exc
     try:

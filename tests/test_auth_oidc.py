@@ -27,6 +27,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
 from messagefoundry.auth import oidc
 from messagefoundry.auth.oidc import claims as claims_mod
+from messagefoundry.auth.oidc.jwks import JwksRefreshBusy
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.transports.signing import CompactJwtSigner
@@ -780,6 +781,29 @@ def test_any_other_jwks_fault_is_still_unknown_kid(rsa_key: rsa.RSAPrivateKey) -
     assert exc.value.reason == "unknown_kid"
 
 
+def test_a_jwks_wait_that_runs_out_is_recorded_as_jwks_refresh_busy(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #6905. A sign-in whose JWKS lookup waited out ``gate_wait_seconds`` behind a refresh
+    another sign-in holds is refused ``jwks_refresh_busy``: the IdP was slow, and the token's kid
+    was never judged, so ``unknown_kid`` would misstate the cause in the audit row. The test holds
+    the cache's gate to stand in for that refresh."""
+    fetch = _CountingFetch(_jwks_bytes(_rsa_jwk(rsa_key, "k1")))
+    cache = oidc.JwksCache(fetch, gate_wait_seconds=0.1)
+    jws = _mint(rsa_key, "k1", _good_claims())
+    assert cache._gate.acquire(timeout=10)
+    try:
+        with pytest.raises(oidc.ClaimsError) as exc:
+            oidc.validate_id_token(jws, _policy(), cache, clock=lambda: 1_000_100)
+    finally:
+        cache._gate.release()
+    assert exc.value.reason == "jwks_refresh_busy"
+    assert exc.value.reason != "unknown_kid"
+    assert fetch.calls == 0, "the busy lookup must not fetch"
+    # Once the gate is free the same token verifies, so nothing about the token was refused.
+    assert oidc.validate_id_token(jws, _policy(), cache, clock=lambda: 1_000_100) is not None
+
+
 def test_an_events_bearing_claim_set_is_refused_under_its_own_slug(
     rsa_key: rsa.RSAPrivateKey,
 ) -> None:
@@ -1506,7 +1530,7 @@ def test_a_lookup_waiting_on_a_stalled_refresh_fails_closed_when_its_wait_runs_o
         refreshing.join(timeout=10)
         waiter.join(timeout=10)
     refused = results["waiter"]
-    assert isinstance(refused, oidc.JwksError), f"the waiter was served: {refused!r}"
+    assert isinstance(refused, JwksRefreshBusy), f"the waiter was not refused busy: {refused!r}"
     assert "waited 0.2s for a JWKS refresh" in str(refused)
     assert not isinstance(results["refreshing"], BaseException), results["refreshing"]
     assert fetch.calls == 2

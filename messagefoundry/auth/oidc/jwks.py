@@ -89,6 +89,12 @@ class JwksAmbiguousKid(JwksError):
     lookup's refusal as ``ambiguous_kid``."""
 
 
+class JwksRefreshBusy(JwksError):
+    """A :class:`JwksCache` lookup waited the whole ``gate_wait_seconds`` for a refresh in progress
+    and its key was still not current (BACKLOG #6905). A slow or stalled IdP, not a fault in the
+    token; ``claims.py`` records the refusal as ``jwks_refresh_busy``, never ``unknown_kid``."""
+
+
 @dataclass(frozen=True, slots=True)
 class _BoundKey:
     """One JWKS key and the algorithm its JWK ``alg`` restricts it to, ``None`` when it names none
@@ -307,7 +313,7 @@ class JwksCache:
       simply raises :class:`JwksError` until the floor elapses. A miss that arrives while a fetch
       is in progress waits for the gate that fetch holds, at most ``gate_wait_seconds``. If it gets
       the gate it decides again against the keys it finds: the new ones, or on a failed fetch the
-      old ones. If its wait runs out first, it is refused with :class:`JwksError`, unless the keys
+      old ones. If its wait runs out first, it is refused with :class:`JwksRefreshBusy`, unless the keys
       published by then hold the ``kid`` within the TTL, and it is refused even if that fetch later
       fails and leaves the old keys in place. A key past the TTL is never served instead
       (BACKLOG #6905). The wait is bounded; the fetch is bounded only per socket operation;
@@ -386,8 +392,8 @@ class JwksCache:
         unknown ``kid`` or a cached one past its TTL, returns a body the cache refuses (too large,
         not JSON, no usable key), which is :class:`JwksAmbiguousKid` when the set gives two usable
         keys one ``kid``; or the wait for a refresh in progress runs out before the ``kid`` is
-        current. That last refusal can reach a cached key past its TTL, which the throttled path
-        would otherwise serve (BACKLOG #6905).
+        current, which is :class:`JwksRefreshBusy`. That last refusal can reach a cached key past
+        its TTL, which the throttled path would otherwise serve (BACKLOG #6905).
         """
         bound = self._lookup(kid)
         if bound.alg is not None and bound.alg != alg:
@@ -415,7 +421,7 @@ class JwksCache:
             bound = self._fresh(self._state, kid, self._clock())
             if bound is not None:
                 return bound
-            raise JwksError(
+            raise JwksRefreshBusy(
                 f"no key for kid {kid!r}; waited {self._gate_wait:g}s for a JWKS refresh in "
                 "progress to release the cache"
             )
