@@ -27,7 +27,7 @@ from messagefoundry.auth import (
     verify_password,
 )
 from messagefoundry.auth.permissions import BUILTIN_ROLE_PERMISSIONS
-from tests._content_free import escapes
+from tests._content_free import SECRET_CHAR, escapes
 
 
 def test_administrator_has_every_permission() -> None:
@@ -177,9 +177,9 @@ def _password_log_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogR
 @pytest.mark.parametrize(
     ("bad_char", "password"),
     [
-        ("é", "Str0ng!Passphrase"),
+        (SECRET_CHAR, "Str0ng!Passphrase"),
         ("\ud800", "Str0ng!Passphrase"),
-        ("é", "Str0ng!\ud800Passphrase"),  # both inputs bad: the hash encode fails first
+        (SECRET_CHAR, "Str0ng!\ud800Passphrase"),  # both inputs bad: the hash check wins
     ],
 )
 def test_verify_password_non_ascii_stored_hash_is_a_logged_non_match(
@@ -199,6 +199,12 @@ def test_verify_password_non_ascii_stored_hash_is_a_logged_non_match(
     assert h[:-1] not in text and "Str0ng!" not in text and "position" not in text
     for form in escapes(bad_char):
         assert form not in text
+    # Positive control: the same scan DOES fire on the encode error's own text, so a change that
+    # logged the exception would fail the loop above.
+    with pytest.raises(UnicodeEncodeError) as leaked:
+        corrupted.encode("ascii")
+    assert any(form in str(leaked.value) for form in escapes(bad_char))
+    assert "position" in str(leaked.value)
 
 
 def test_verify_password_unencodable_password_is_a_quiet_non_match(

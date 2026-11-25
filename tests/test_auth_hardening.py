@@ -33,7 +33,7 @@ from starlette.datastructures import Address, Headers
 
 from messagefoundry.api import create_app
 from messagefoundry.api.app import _session_reaper
-from messagefoundry.auth import Role, hash_password
+from messagefoundry.auth import Role, hash_password, verify_password
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator, LdapError
 from messagefoundry.auth.service import (
@@ -1476,7 +1476,16 @@ async def test_login_with_an_unencodable_password_is_refused_at_the_boundary(
     service = await _service(engine)
     await _add(service, "dave", Role.VIEWER)
     body = b'{"username": "dave", "password": "a-strong-\\ud800-passphrase", "provider": "local"}'
+    verified: list[str] = []
+
+    def _recording_verify(stored_hash: str, password: str) -> bool:
+        verified.append(password)
+        return verify_password(stored_hash, password)
+
+    monkeypatch.setattr("messagefoundry.auth.service.verify_password", _recording_verify)
     async with _client(engine, service) as c:
         r = await c.post("/auth/login", content=body, headers={"Content-Type": "application/json"})
         assert r.status_code == 422
+        assert verified == []  # refused before any verify ran
         assert (await _login(c, "dave")).status_code == 200  # the account still signs in
+        assert verified == [PW]  # the probe sees a real sign-in, so the empty read above is real

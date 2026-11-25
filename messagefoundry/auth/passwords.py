@@ -66,27 +66,29 @@ def hash_password(password: str) -> str:
 
 def verify_password(stored_hash: str, password: str) -> bool:
     """True iff ``password`` matches ``stored_hash``. Never raises on a bad password or malformed hash."""
+    # argon2-cffi encodes the hash as ASCII and the password as UTF-8 before argon2 sees either, and
+    # neither encode failure becomes one of its own exception types (BACKLOG #6880).
+    #
+    # ``hash_password`` only ever emits ASCII, so a non-ASCII stored hash, whether of a password or
+    # of a recovery code, is at least one of: corruption of an unsealed row, a defect in a path that
+    # writes the hash, or tampering. Where the users row is sealed, at-rest corruption fails the seal
+    # before this runs. Hence a WARNING that names no single cause. It is checked here, before the
+    # hasher runs, so the log call never sits inside an ``except`` whose exception would chain onto
+    # anything a failing handler prints: that exception carries the whole hash or password.
+    if not stored_hash.isascii():
+        _log.warning("stored argon2 hash is not ASCII; treating it as a non-match")
+        return False
     try:
         return _hasher.verify(stored_hash, password)
     except (VerificationError, InvalidHashError):
         return False
     except UnicodeEncodeError:
-        # argon2-cffi encodes the hash as ASCII before it reads the hash's type prefix, and encodes
-        # the password as UTF-8 after that read but before argon2 sees it. Neither encode failure
-        # becomes one of its own exception types (BACKLOG #6880). A non-ASCII hash, password or
-        # recovery code alike, can only be storage corruption, worth a WARNING. A password that will
-        # not encode (a lone surrogate) is caller input, and no stored hash can match it, because
-        # ``hash_password`` cannot hash it either, so it is an ordinary mismatch. The API's request
-        # models already refuse a lone surrogate with a 422, so that branch guards callers that skip
-        # them. The exception text quotes the offending character's escape and its position, so
-        # neither branch logs it.
-        if not stored_hash.isascii():
-            _log.warning(
-                "stored argon2 hash is not ASCII (storage corruption); treating it as a non-match"
-            )
-        else:
-            _log.debug("password does not encode as UTF-8; treating it as a non-match")
-        return False
+        # The password will not encode (a lone surrogate). It is caller input, and no stored hash can
+        # match it, because ``hash_password`` cannot hash it either. The API's request models refuse
+        # one with a 422, so this guards callers that skip them. Logged below, outside the handler.
+        pass
+    _log.debug("password does not encode as UTF-8; treating it as a non-match")
+    return False
 
 
 def needs_rehash(stored_hash: str) -> bool:
