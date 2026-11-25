@@ -262,8 +262,9 @@ def _positive(value: Any) -> int:
 
 def burndown_undated_note(snap: Snapshot) -> str | None:
     """What the rows with no readable date do to the worked-back open count, or ``None`` when
-    the census records none. Going back, an undated filing is never taken off, so early weeks
-    read high by up to that many; an undated closing is never put back, so they read low."""
+    the census records none. Going back, an undated filing is never taken off, so every week
+    before it reads high; an undated closing is never put back, so every week before it reads
+    low, the latest weeks included."""
     undated = _dict(snap.detail("backlog_burn").get("undated"))
     filed = _positive(undated.get("filed"))
     closed = sum(_positive(undated.get(k)) for k in cm.CLOSED_COLUMNS)
@@ -271,13 +272,13 @@ def burndown_undated_note(snap: Snapshot) -> str | None:
     if filed:
         parts.append(
             f"Rows with no readable filing date ({filed:,}) are never taken off going back, so "
-            "early weeks can overstate the open count by up to that many."
+            "any week before such a filing can overstate the open count, by up to that many."
         )
     if closed:
         parts.append(
             f"Closed rows with no readable closing date ({closed:,}) are never counted open again "
-            "going back, so "
-            "early weeks can understate the open count by up to that many."
+            "going back, so any week before such a closing, the latest included, can understate "
+            "the open count, by up to that many."
         )
     return " ".join(parts) or None
 

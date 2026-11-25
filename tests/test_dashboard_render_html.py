@@ -356,19 +356,26 @@ def test_the_asvs_tool_header_is_on_the_face_chosen_by_content() -> None:
     assert f'<p class="mono">{header}</p>' in face
     assert "# generated=x" not in face
     assert "# asvs-status" not in disclosure
-    assert "# generated=x" in disclosure
+    assert '<p class="mono"># generated=x</p>' in disclosure
     assert "Scorecard tool header, as printed" not in face  # no NO-GIT half to explain
 
 
-def test_a_no_git_asvs_tool_header_is_labelled_on_the_face() -> None:
-    # The shape every collector run writes: the tool read an archived scorecard copy.
-    header = "# asvs-status scorecard=NO-GIT engine=abc1234+archive"
+@pytest.mark.parametrize(
+    "header",
+    [
+        # The scheduled refresh: the tool runs from an archive and stamps neither half.
+        "# asvs-status scorecard=NO-GIT engine=NO-GIT",
+        # A run from a checkout: only the archived scorecard copy is unstamped.
+        "# asvs-status scorecard=NO-GIT engine=abc1234",
+    ],
+)
+def test_a_no_git_asvs_tool_header_is_labelled_on_the_face(header: str) -> None:
     face, disclosure = _asvs_face_and_disclosure([header, "# generated=x"])
     label = face.index("Scorecard tool header, as printed.")
-    assert "so its scorecard half says NO-GIT" in face
+    assert "quote the collector's ref pair under Measured at instead" in face
     assert label < face.index(f'<p class="mono">{header}</p>')
     assert "# asvs-status" not in disclosure
-    assert "# generated=x" in disclosure
+    assert '<p class="mono"># generated=x</p>' in disclosure
 
 
 def test_lines_without_an_engine_header_say_so_on_the_face() -> None:
@@ -381,7 +388,11 @@ def test_lines_without_an_engine_header_say_so_on_the_face() -> None:
     face, disclosure = tile.split('<details class="how">')
     assert '<p class="mono"># engine:' not in face
     assert "# engine: freshness=STALE" in disclosure
-    assert '<p class="err">the scorecard provenance lines hold no engine= header</p>' in tile
+    assert '<p class="err">scorecard provenance printed no engine= ref</p>' in tile
+    # With the collector's partial error already saying it, the fact is not said twice.
+    snap["metrics"][3]["error"] = "partial: scorecard provenance printed no engine= ref"
+    page = rh.render(snap)
+    assert page.count("printed no engine= ref") == 1
 
 
 def test_a_two_place_pace_prints_both_places() -> None:
@@ -417,12 +428,13 @@ def test_the_burndown_note_counts_the_undated_rows_both_ways() -> None:
     snap["metrics"][0]["detail"]["undated"] = {"filed": 879, "closed": 3, "declined": 2}
     card = _burndown_card(snap)
     assert (
-        "Rows with no readable filing date (879) are never taken off going back, so early weeks "
-        "can overstate the open count by up to that many." in card
+        "Rows with no readable filing date (879) are never taken off going back, so any week "
+        "before such a filing can overstate the open count, by up to that many." in card
     )
     assert (
         "Closed rows with no readable closing date (5) are never counted open again going back, "
-        "so early weeks can understate the open count by up to that many." in card
+        "so any week before such a closing, the latest included, can understate the open count, "
+        "by up to that many." in card
     )
 
 

@@ -468,8 +468,9 @@ def tile(
         # and beside any other error rather than hidden by it.
         # Its own words, not the provenance fact's error: that fact inherits the metric's error,
         # which says why the metric failed, not that the header is absent.
+        # The collector's own words for a header-less list, so its partial error is not repeated.
         reason = (
-            "the scorecard provenance lines hold no engine= header"
+            "scorecard provenance printed no engine= ref"
             if provenance_lines
             else "the snapshot holds no scorecard provenance lines"
         )
@@ -482,13 +483,14 @@ def tile(
     header = ""
     if row.get("ref"):
         if header_line:
-            # The collector hands the tool an archived copy of the scorecard, so the header's
-            # scorecard half reads NO-GIT; labelled, so the face shows one pair to quote.
+            # The tool reads an archived scorecard copy, and the scheduled refresh runs it from
+            # an archive, so either half can read NO-GIT; labelled, so the face says which pair
+            # to quote.
             label = (
-                '<p class="note">Scorecard tool header, as printed. The tool reads an archived '
-                "copy of the scorecard, so its scorecard half says NO-GIT; the ref pair under "
-                "Measured at names that copy's vault commit.</p>"
-                if "scorecard=NO-GIT" in header_line
+                '<p class="note">Scorecard tool header, as printed. A NO-GIT half is a ref the '
+                "tool could not stamp because it read an archive; quote the collector's ref pair "
+                "under Measured at instead.</p>"
+                if "NO-GIT" in header_line
                 else ""
             )
             header = f'{label}<p class="mono">{esc(header_line)}</p>'

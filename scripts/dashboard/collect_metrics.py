@@ -1461,7 +1461,8 @@ def xlsx_sheet_rows(data: bytes, sheet: str) -> list[list[str]]:
     ET = safe_xml()  # noqa: N806 - the module's conventional name
 
     def parse(xml: bytes) -> Any:
-        # Every part is read through here, so no new part can skip the DTD refusal.
+        # Every part this function reads today goes through here; a new part must too, since
+        # nothing else refuses a DTD and the test lists only these four parts.
         return ET.fromstring(xml, forbid_dtd=True)
 
     ns = _XLSX_NS
