@@ -189,6 +189,31 @@ def test_each_attestation_remedy_is_written_as_it_is_logged() -> None:
     assert "Set [ai].endpoint_revocation_attested = true with an " in str(info.value)
 
 
+def test_the_on_box_remedy_names_the_hosts_the_code_reads_as_loopback() -> None:
+    """The refusal's last remedy names the endpoint hosts ``is_loopback_hop_host`` reads as
+    loopback, and says no trailing dot, so following it crosses the refusal. Red before the fix:
+    it said "use an endpoint on this machine", which ``localhost.`` and ``127.0.0.1.`` are, yet
+    each is read as remote and still refused with that same remedy."""
+    named = ("localhost", "127.0.0.1", "[::1]")
+    for lever in (ai_broker_mod._AI_ATTESTATION_LEVER, ai_broker_mod._AI_CRL_LEVER):
+        assert "this machine" not in lever
+        assert "no trailing dot" in lever
+        for host in named:
+            assert host in lever
+    # Each host the remedy names builds under an enforcing posture, with no CRL or attestation.
+    for host in named:
+        _broker(
+            endpoint=f"https://{host}/v1/messages",
+            allowed=(host,),  # the allowlist matches the host as the URL writes it
+            posture=_ENFORCING,
+        )
+    # The same host with a trailing dot is on this machine to a resolver, but is still refused.
+    for host in ("localhost.", "127.0.0.1."):
+        with pytest.raises(ai_broker_mod.AiBrokerError) as info:
+            _broker(endpoint=f"https://{host}/v1/messages", allowed=(host,), posture=_ENFORCING)
+        assert ai_broker_mod._AI_ATTESTATION_LEVER in str(info.value)
+
+
 def test_each_caller_of_the_ai_opener_chooser_is_a_census_site() -> None:
     """Items 22 and 32: the revocation census treats ``_ai_endpoint_opener`` as a builder, so the
     function that calls it is the site, tied to its own guard call, and a new caller fails the

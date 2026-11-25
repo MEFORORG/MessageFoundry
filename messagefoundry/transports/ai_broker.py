@@ -122,16 +122,19 @@ _AI_HOP_CELL = "[ai] engine AI broker (verified TLS, no revocation check)"
 _AI_HOP_CELL_OTHER = "[ai] engine AI broker (verified TLS)"
 
 #: The ways across that refusal under an enforcing posture where no CRL can reach the hop: the
-#: attestation pair, or an endpoint on this machine. Each remedy is written out in full, with no
-#: text made from another, so a grep for its opening words finds it (BACKLOG #5527 item 13).
+#: attestation pair, or an endpoint whose host ``is_loopback_hop_host`` reads as loopback, which
+#: a host spelled ``localhost.`` or ``127.0.0.1.`` is not though a resolver may take it as this
+#: box, so the remedy names the spellings it reads that way. Each remedy is written out in full,
+#: with no text made from another, so a grep for its opening words finds it (BACKLOG #5527 item 13).
 _AI_ATTESTATION_LEVER = (
     "Set [ai].endpoint_revocation_attested = true with an "
     "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
-    "endpoint's certificate, or use an endpoint on this machine."
+    "endpoint's certificate, or use an endpoint URL whose host is read as loopback: localhost, or "
+    "a loopback address such as 127.0.0.1 or [::1], written with no trailing dot."
 )
 
 #: The ways across that refusal under an enforcing posture, on the terms below:
-#: ``[tls].crl_file``, the attestation pair, or an endpoint on this machine.
+#: ``[tls].crl_file``, the attestation pair, or an endpoint whose host reads as loopback.
 #: ``[tls].crl_file`` reaches this hop since BACKLOG #5527, the later CRL lever ADR 0173 section 12
 #: foresaw when the owner ruling of 2026-10-27 built the attestation pair alone. It is offered only
 #: to a broker that was handed a ``[tls]`` policy, on a context whose only reason for no CRL
@@ -144,7 +147,8 @@ _AI_CRL_LEVER = (
     "is instance-wide: every non-loopback hop it reaches then needs its issuer's CRL in that file, "
     "or its handshake fails), or set [ai].endpoint_revocation_attested = true with an "
     "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
-    "endpoint's certificate, or use an endpoint on this machine."
+    "endpoint's certificate, or use an endpoint URL whose host is read as loopback: localhost, or "
+    "a loopback address such as 127.0.0.1 or [::1], written with no trailing dot."
 )
 
 
