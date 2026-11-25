@@ -49,7 +49,10 @@ _BLANK_OR_COMMENT = re.compile(r"\A[ \t]*(#.*)?\Z")
 _LINE_BREAK = re.compile(r"\r\n|\n|\r")
 # A drive letter, colon and separator, a UNC \\server\share, or (off Windows) a leading slash.
 _ABSOLUTE = re.compile(r"\A(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+|/(?![\\/]))")
-_UNC = re.compile(r"\A[\\/]{2}([^\\/]+)[\\/]")
+# A \\server\share or \\?\UNC\server\share path's server. \\?\D:\x and \\.\D:\x are local: unc_host
+# refuses their '?' or '.', which is a namespace, not a server to probe on 445.
+_UNC = re.compile(r"\A[\\/]{2}(?:[?.][\\/][Uu][Nn][Cc][\\/])?([^\\/]+)[\\/]")
+_SEP = re.compile(r"[\\/]")
 
 
 @dataclass(frozen=True)
@@ -144,7 +147,16 @@ def _decode(raw: bytes) -> str:
 
 def unc_host(path: str) -> str | None:
     m = _UNC.match(path)
-    return m.group(1) if m else None
+    return m.group(1) if m and m.group(1) not in ("?", ".") else None
+
+
+def _root_key(path: str) -> str:
+    r"""One spelling of a UNC root for the down cache; ConvertTo-CoordRootKey builds the same one.
+
+    pathlib turns ``//srv/share/dir/`` into ``\\srv\share\dir`` and PowerShell keeps what it was
+    given, so without one spelling each twin missed, and overwrote, the verdict the other wrote.
+    """
+    return "\\\\" + "\\".join(s for s in _SEP.split(path[2:]) if s and s != ".")
 
 
 def probe_root(path: Path, local: Path | None) -> str | None:
@@ -152,13 +164,19 @@ def probe_root(path: Path, local: Path | None) -> str | None:
     server = unc_host(str(path))
     if server:
         down = local / DOWN_FILE if local else None
+        key = _root_key(str(path))
         # The verdict is about ONE root. A cache written for another root, or stamped in the future by a
         # skewed clock or a copied file, is ignored rather than trusted.
         try:
             if down is not None and down.is_file():
                 age = time.time() - down.stat().st_mtime
                 cached = json.loads(down.read_text(encoding="utf-8")).get("root")
-                if cached == str(path) and 0 <= age < DOWN_TTL_SECONDS:
+                if (
+                    isinstance(cached, str)
+                    and len(cached) >= 2
+                    and _root_key(cached) == key
+                    and 0 <= age < DOWN_TTL_SECONDS
+                ):
                     return f"shared root {path} was unreachable {int(age)} s ago (cached in {down})"
         except (OSError, ValueError, AttributeError):
             pass
@@ -169,7 +187,7 @@ def probe_root(path: Path, local: Path | None) -> str | None:
                     down.write_text(
                         json.dumps(
                             {
-                                "root": str(path),
+                                "root": key,
                                 "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                             }
                         ),

@@ -452,3 +452,74 @@ def test_a_form_feed_line_reads_the_same_on_both(repo: Path, tmp_path: Path) -> 
     (local / "root.toml").write_text(f"shared_root = '{shared}'\x0c\n", encoding="utf-8")
     ps, py = _both(repo, "claims")
     assert py.error is not None
+
+
+# BACKLOG #7569: pathlib respells a root (//srv/share/dir/ reads back as \\srv\share\dir) and
+# PowerShell keeps the configured text, so each twin missed the down verdict the other wrote, and
+# re-probed and overwrote it, whenever the root carried a forward or trailing slash.
+_DEAD_UNC_SLASHED = "//192.0.2.1/nothing/./mefor-coord/"
+
+
+def test_each_twin_reads_the_down_verdict_the_other_wrote(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MEFOR_COORD_ROOT", _DEAD_UNC_SLASHED)
+    down = _local(repo) / "coord-root-down.json"
+    py = coord_root.resolve("claims", repo)
+    assert py.error is not None and "cached" not in py.error
+    ps = _ps(repo, "claims")
+    assert ps["Error"] is not None and "cached" in str(ps["Error"]), ps
+    down.unlink()
+    ps = _ps(repo, "claims")
+    assert ps["Error"] is not None and "cached" not in str(ps["Error"]), ps
+    py = coord_root.resolve("claims", repo)
+    assert py.error is not None and "cached" in py.error, py
+
+
+def _ps_unc_hosts(paths: list[str]) -> list[object]:
+    quoted = ", ".join("'" + p.replace("'", "''") + "'" for p in paths)
+    script = (
+        f". '{PS}'; ConvertTo-Json -Compress -InputObject @(foreach ($p in @({quoted})) "
+        "{ $h = Get-CoordUncHost $p; if ($null -eq $h) { '' } else { $h } })"
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    out: list[object] = json.loads(proc.stdout)
+    return out
+
+
+def test_an_extended_length_path_names_no_server_on_either_side() -> None:
+    # BACKLOG #7569: \\?\D:\coord is local, yet its '?' was probed as a server on 445, so a root that
+    # exists failed as unreachable. \\?\UNC\srv\share names srv, not '?'.
+    cases = {
+        r"\\?\D:\coord": "",
+        r"\\.\D:\coord": "",
+        r"\\?\UNC\srv\share\x": "srv",
+        r"\\?\unc\srv\share": "srv",
+        r"\\srv\share\x": "srv",
+        "//srv/share/x": "srv",
+        r"C:\coord": "",
+    }
+    paths = list(cases)
+    assert _ps_unc_hosts(paths) == list(cases.values())
+    assert [coord_root.unc_host(p) or "" for p in paths] == list(cases.values())
+
+
+def test_an_extended_length_local_root_resolves_on_both(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    monkeypatch.setenv("MEFOR_COORD_ROOT", "\\\\?\\" + str(shared))
+    ps, py = _both(repo, "mail")
+    assert py.error is None and ps["Error"] is None, (ps, py)
+    assert _norm(py.path).endswith(_norm(shared / "mail"))
+    monkeypatch.setenv("MEFOR_COORD_ROOT", "\\\\?\\" + str(tmp_path / "absent"))
+    ps, py = _both(repo, "mail")
+    assert py.error is not None and "does not exist" in py.error, py
+    assert "does not exist" in str(ps["Error"]), ps

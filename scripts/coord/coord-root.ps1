@@ -173,10 +173,22 @@ function Test-CoordSharedKind {
 }
 
 function Get-CoordUncHost {
-    # The server name of a \\server\share path, or $null for anything else.
+    # The server name of a \\server\share or \\?\UNC\server\share path, or $null for anything else.
+    # \\?\D:\x and \\.\D:\x are local: their '?' or '.' is a namespace, not a server to probe on 445.
+    # The Python twin carries the same pattern.
     param([string]$Path)
-    if ($Path -match '\A[\\/]{2}([^\\/]+)[\\/]') { return $Matches[1] }
+    if ($Path -cmatch '\A[\\/]{2}(?:[?.][\\/][Uu][Nn][Cc][\\/])?([^\\/]+)[\\/]' -and
+        $Matches[1] -cne '?' -and $Matches[1] -cne '.') { return $Matches[1] }
     return $null
+}
+
+function ConvertTo-CoordRootKey {
+    # One spelling of a UNC root, for the down cache, so each twin reads the verdict the other wrote.
+    # Python's Path turns //srv/share/dir/ into \\srv\share\dir, and PowerShell keeps what it was
+    # given. Every separator becomes a backslash, and empty and '.' segments go, as pathlib drops them.
+    param([string]$Path)
+    $segments = @(($Path.Substring(2) -split '[\\/]') | Where-Object { $_ -and $_ -cne '.' })
+    return '\\' + ($segments -join '\')
 }
 
 function Test-CoordRoot {
@@ -186,13 +198,15 @@ function Test-CoordRoot {
     $server = Get-CoordUncHost -Path $Path
     if ($server) {
         $down = if ($LocalRoot) { Join-Path $LocalRoot $script:CoordDownFile } else { $null }
+        $key = ConvertTo-CoordRootKey $Path
         # The verdict is about ONE root. A cache written for another root, or stamped in the future by a
         # skewed clock or a copied file, is ignored rather than trusted.
         try {
             if ($down -and (Test-Path -LiteralPath $down -PathType Leaf)) {
                 $age = ([DateTime]::UtcNow - (Get-Item -LiteralPath $down).LastWriteTimeUtc).TotalSeconds
                 $cached = ([System.IO.File]::ReadAllText($down) | ConvertFrom-Json -ErrorAction Stop).root
-                if ($cached -ceq $Path -and $age -ge 0 -and $age -lt $script:CoordDownTtlSeconds) {
+                if ($cached -is [string] -and $cached.Length -ge 2 -and (ConvertTo-CoordRootKey $cached) -ceq $key -and
+                    $age -ge 0 -and $age -lt $script:CoordDownTtlSeconds) {
                     return @{ Ok = $false; Error = "shared root $Path was unreachable $([int]$age) s ago (cached in $down)" }
                 }
             }
@@ -206,7 +220,7 @@ function Test-CoordRoot {
             try {
                 if ($down) {
                     New-Item -ItemType Directory -Force -Path $LocalRoot | Out-Null
-                    [System.IO.File]::WriteAllText($down, (@{ root = $Path; at = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json -Compress))
+                    [System.IO.File]::WriteAllText($down, (@{ root = $key; at = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json -Compress))
                 }
             } catch { }
             return @{ Ok = $false; Error = "shared root $Path is unreachable: no answer from ${server}:445 within $($script:CoordProbeTimeoutMs) ms" }
