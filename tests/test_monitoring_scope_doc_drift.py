@@ -261,16 +261,6 @@ async def test_monitoring_plane_scope_is_measured_against_a_live_app(engine: Eng
         # ...and the scoped caller its own inbound only, with no shared-outbound series.
         assert 'connection="IB_A"' in smetrics
         assert "IB_B" not in smetrics and "OB_X" not in smetrics
-        assert _strip_volatile(smetrics) != _strip_volatile(umetrics)
-
-
-def _strip_volatile(exposition: str) -> list[str]:
-    """Metric LINES with the sampled values dropped, so a process gauge moving between two requests
-    cannot make an equality assertion flaky. The label sets — which is what scoping would change —
-    survive."""
-    return sorted(
-        line.split(" ")[0] for line in exposition.splitlines() if line and not line.startswith("#")
-    )
 
 
 # =====================================================================================================
@@ -307,6 +297,9 @@ def _monitoring_scope_problems(text: str) -> list[str]:
     for route in _GLOBAL_AGGREGATES:
         if route not in tokens:
             problems.append(f"{route} stays global and the blockquote omits it")
+    # The sentence GET /metrics carried before BACKLOG #4346 must not come back beside its token.
+    if "is **not** narrowed" in block:
+        problems.append("the blockquote says a monitoring read is not narrowed again")
     if "shared outbound" not in block.lower():
         problems.append("the shared-outbound suppression is the sharpest half and must be stated")
     return problems

@@ -45,6 +45,7 @@ from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.pipeline.sync_reply import SyncReplyMetrics
 from messagefoundry.store.store import LatencyHistogram
 from tests._admin_account import create_local_user_chosen
 
@@ -129,10 +130,13 @@ async def test_scoped_snapshot_keeps_the_aggregates_and_drops_every_destination(
         await gather_snapshot(engine),
         latency=[LatencyHistogram("IB_A", "OB_X", (1,) * len(DEFAULT_LATENCY_BUCKETS), 0.5, 1)],
     )
+    # And a synchronous-reply series on each inbound, which the fixture has none of either.
+    snap = replace(snap, sync_replies={n: SyncReplyMetrics(n) for n in ("IB_A", "IB_B")})
     assert snap.destinations
     assert 'destination="OB_X"' in _render_snapshot(snap).decode()
     narrowed = scoped_snapshot(snap, lambda name: name == "IB_A")
     assert set(narrowed.inbound) == {"IB_A"}
+    assert set(narrowed.sync_replies) == {"IB_A"}
     assert narrowed.destinations == {}
     assert list(narrowed.latency) == []
     assert narrowed.outbox_by_status == snap.outbox_by_status

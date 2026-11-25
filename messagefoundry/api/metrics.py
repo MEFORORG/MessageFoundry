@@ -674,9 +674,10 @@ def scoped_snapshot(snap: _Snapshot, in_scope: Callable[[str], bool]) -> _Snapsh
     """``snap`` as a channel-scoped caller may read it (BACKLOG #4346, the route build of #1152).
 
     It keeps the per-inbound series of each inbound ``in_scope`` admits, and drops every
-    per-destination series and the latency histogram outright. An outbound spans channels, so its
-    depth and latency can reflect another channel's traffic; the connections dashboard and
-    ``GET /graph/edges`` drop a shared outbound for such a caller the same way. The aggregates
+    per-destination series and the latency histogram outright, the caller's own inbound's
+    included. Those series count only their own inbound's rows, but their ``destination`` label
+    names an outbound, and the connections dashboard and ``GET /graph/edges`` show such a caller
+    no outbound at all. The aggregates
     that carry no connection or destination label stay, as they do on ``GET /stats``."""
     return replace(
         snap,

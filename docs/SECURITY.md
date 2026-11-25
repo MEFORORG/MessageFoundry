@@ -2332,18 +2332,21 @@ the same permission set on the same method reds CI until it is listed here.
 > `GET /stats`, `GET /metrics/history`, and the `outbox_by_status` field of the `/ws/stats` frame —
 > whose sibling `connections_html` field **is** scoped, so a single frame carries both rules.
 > `GET /metrics` is narrowed as well (BACKLOG #4346): a scoped caller reads the per-connection series
-> of its own inbounds only, and no per-destination or latency series, for the same shared-outbound
-> reason. Its aggregates that carry no connection or destination label stay global, like the
+> of its own inbounds only, and no per-destination or latency series, because their `destination`
+> label names an outbound, which a scoped caller is not shown. Its aggregates that carry no connection or destination label stay global, like the
 > counters above. A scraper that needs the whole
 > estate is given the all-channels grant. `GET /logs/tail`, `GET /audit` and `GET /audit/export`,
 > with the console's `/ui/audit` and `/ui/audit/export`, refuse a scoped caller 403 and write an
 > `auth.channel_denied` row: a log line names no single channel, and the owner's answer for the
 > audit trail was to narrow or refuse such a reader. So a built-in Auditor, or an Operator reading
 > the log, needs the all-channels grant. `tests/test_scoped_caller_metrics_logs_audit.py` executes
-> these refusals on the JSON routes; the two `/ui` routes call the same handlers.
-> This paragraph is derived, not asserted: `tests/test_monitoring_scope_doc_drift.py` executes each
-> route above against a scoped caller with an all-channels caller as the control, and reds if the
-> prose and the app disagree.
+> these refusals on the JSON routes. `/ui/audit/export` calls the `GET /audit/export` handler, and
+> `/ui/audit` calls the same core as `GET /audit` through the console seam; no test executes those
+> two refusals.
+> The monitoring half of this paragraph is derived, not asserted:
+> `tests/test_monitoring_scope_doc_drift.py` executes each narrowed and global monitoring read
+> above against a scoped caller with an all-channels caller as the control, and reds if the prose
+> and the app disagree. It does not check the refusal sentence.
 
 > **The per-name connection routes do not tell a scoped caller which names exist (BACKLOG #2551).**
 > This covers at least `GET /connections/{name}/metadata` and `POST /connections/{name}/test`,
@@ -6032,7 +6035,9 @@ on that session, for example) ends it as a revocation would.
   `users:manage`, would still receive the lock rows. A role change through the API revokes the
   session, so that loss stops the export with the reason `standing_changed`. Only when the session
   survives the loss, as after a direct store write or on a page checked before the revoke lands,
-  does it stop with the reason `scope_changed`. A stop records `audit.export.stopped` with the counted and streamed rows and
+  does it stop with the reason `scope_changed`. A caller that comes back channel-scoped on a
+  surviving session stops it with the reason `channel_scoped`, since such a caller may not read
+  the trail at all (BACKLOG #4346). A stop records `audit.export.stopped` with the counted and streamed rows and
   the reason, then raises to abort the transfer, which reaches the client as a failed download,
   as the bulk export bullet above says. The idle clock moves at most every quarter of the window,
   as the bulk export's does, but the quarter is counted from when the stream starts sending, not
@@ -8068,7 +8073,8 @@ notice: one its full queue dropped, or one it refused because it had begun to cl
 begun to close, or the send fails, the engine writes one more row, with the notice's recipient as
 the actor. A lock
 notice writes `auth.lock_notice_undelivered`, hidden as above. Every other notice kind writes
-`auth.security_notice_undelivered`, which every `audit:read` reader sees. The detail names the
+`auth.security_notice_undelivered`, which every all-channels `audit:read` reader sees; a
+channel-scoped one is refused the trail (BACKLOG #4346). The detail names the
 notice kind and the `reason`, `queue_full`, `closing` or `send_failed`. An issuer's reminder also names the
 holder. The row never carries the address, the rest of the notice's detail, or the error. The
 source of record is `SecurityEventNotifier._record_undelivered` in
