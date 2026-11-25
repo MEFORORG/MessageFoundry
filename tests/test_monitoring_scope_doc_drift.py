@@ -25,9 +25,8 @@ routes enforce the scope through a helper, so their bodies name no primitive) an
 per-property rule inside ``/ws/stats``. A scan that cannot see a rule it is checking for is not an
 instrument, so the executed request is the measurement here.
 
-NOT-DEPLOYED beta: ``GET /metrics`` is recorded below as the one monitoring read that is NOT
-narrowed. That is a gap a first deployment would carry, tracked as BACKLOG #1152 (the
-metrics-exposition scoping), not a live exposure.
+``GET /metrics`` was recorded here as the one monitoring read that was NOT narrowed. It narrows
+since BACKLOG #4346, the route build of #1152, and is measured below with the other narrowed reads.
 """
 
 from __future__ import annotations
@@ -79,16 +78,13 @@ _NARROWED_READS = (
     "GET /events",
     "GET /graph/edges",
     "GET /alerts/active",
+    "GET /metrics",
 )
 
 #: Monitoring reads that stay GLOBAL because they carry no connection identity at all — aggregate
 #: queue counters. These are the "both halves" the rule has to state: narrowing the topology reads
 #: while leaving these global is the actual shipped behaviour.
 _GLOBAL_AGGREGATES = ("GET /stats", "GET /metrics/history")
-
-#: The one monitoring read that is per-connection AND not narrowed. Stating it is what keeps the
-#: correction from trading one false sentence for another.
-_UNSCOPED_PER_CONNECTION = "GET /metrics"
 
 PW = "Sup3rSecret!!"
 
@@ -186,7 +182,7 @@ async def _login(c: httpx.AsyncClient, username: str) -> dict[str, str]:
 
 async def test_monitoring_plane_scope_is_measured_against_a_live_app(engine: Engine) -> None:
     """Every route in ``_NARROWED_READS`` narrows for a scoped caller; every route in
-    ``_GLOBAL_AGGREGATES`` does not; ``_UNSCOPED_PER_CONNECTION`` is per-connection and not narrowed.
+    ``_GLOBAL_AGGREGATES`` does not.
 
     The all-channels operator is the positive control, in the SAME run: if the fixture were
     mis-seeded, or a route 500'd, the control's assertions fail too rather than the scoped side
@@ -257,16 +253,15 @@ async def test_monitoring_plane_scope_is_measured_against_a_live_app(engine: Eng
             for name in ("IB_A", "IB_B", "OB_X"):
                 assert name not in str(scoped_body), f"{path} named {name} — it is not an aggregate"
 
-        # --- GET /metrics: per-connection AND NOT narrowed ----------------------------------------
+        # --- GET /metrics: NARROWED (BACKLOG #4346) -----------------------------------------------
         smetrics = (await c.get("/metrics", headers=s)).text
         umetrics = (await c.get("/metrics", headers=u)).text
-        # It is per-connection: the out-of-scope connection name appears in the exposition...
-        assert 'connection="IB_B"' in smetrics, (
-            "the exposition is keyed by connection name, so a scoped caller reads a connection "
-            "outside their scope — BACKLOG #1152 (metrics-exposition scoping)"
-        )
-        # ...and it is identical to what the all-channels caller reads, i.e. not narrowed at all.
-        assert _strip_volatile(smetrics) == _strip_volatile(umetrics)
+        # The control reads both inbounds and the shared outbound...
+        assert 'connection="IB_B"' in umetrics and 'destination="OB_X"' in umetrics
+        # ...and the scoped caller its own inbound only, with no shared-outbound series.
+        assert 'connection="IB_A"' in smetrics
+        assert "IB_B" not in smetrics and "OB_X" not in smetrics
+        assert _strip_volatile(smetrics) != _strip_volatile(umetrics)
 
 
 def _strip_volatile(exposition: str) -> list[str]:
@@ -312,11 +307,6 @@ def _monitoring_scope_problems(text: str) -> list[str]:
     for route in _GLOBAL_AGGREGATES:
         if route not in tokens:
             problems.append(f"{route} stays global and the blockquote omits it")
-    if _UNSCOPED_PER_CONNECTION not in tokens:
-        problems.append(
-            f"{_UNSCOPED_PER_CONNECTION} is per-connection and NOT narrowed; omitting it would "
-            "trade one false sentence for a quieter one"
-        )
     if "shared outbound" not in block.lower():
         problems.append("the shared-outbound suppression is the sharpest half and must be stated")
     return problems
@@ -342,7 +332,7 @@ def test_scope_guard_detects_the_retired_falsehood() -> None:
     assert any("retired falsehood" in p for p in _monitoring_scope_problems(planted))
 
 
-@pytest.mark.parametrize("route", (*_NARROWED_READS, *_GLOBAL_AGGREGATES, _UNSCOPED_PER_CONNECTION))
+@pytest.mark.parametrize("route", (*_NARROWED_READS, *_GLOBAL_AGGREGATES))
 def test_scope_guard_detects_a_planted_omission(route: str) -> None:
     """Deleting any single classified route from the blockquote must red the guard — the row-count
     floor in its per-row form. The walk's own docstring prescribes flooring because a refactor once

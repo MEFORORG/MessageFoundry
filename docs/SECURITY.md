@@ -2331,9 +2331,13 @@ the same permission set on the same method reds CI until it is listed here.
 > What stays global is the **aggregate queue counters**, which carry no connection identity to narrow:
 > `GET /stats`, `GET /metrics/history`, and the `outbox_by_status` field of the `/ws/stats` frame —
 > whose sibling `connections_html` field **is** scoped, so a single frame carries both rules.
-> `GET /metrics` is the exception in the other direction: the Prometheus exposition is keyed by
-> connection and destination and is **not** narrowed, so on a first deployment any `monitoring:read`
-> holder would read every connection's series regardless of scope (tracked as BACKLOG #1152).
+> `GET /metrics` is narrowed as well (BACKLOG #4346): a scoped caller reads the per-connection series
+> of its own inbounds only, and no per-destination or latency series, for the same shared-outbound
+> reason. Its label-less aggregates stay global, like the counters above. A scraper that needs the whole
+> estate is given the all-channels grant. `GET /logs/tail`, `GET /audit` and `GET /audit/export`,
+> with the console's `/ui/audit` and `/ui/audit/export`, refuse a scoped caller 403 and write an
+> `auth.channel_denied` row: a log line names no single channel, and the owner's answer for the
+> audit trail was to narrow or refuse such a reader.
 > This paragraph is derived, not asserted: `tests/test_monitoring_scope_doc_drift.py` executes each
 > route above against a scoped caller with an all-channels caller as the control, and reds if the
 > prose and the app disagree.

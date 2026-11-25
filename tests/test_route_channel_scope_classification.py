@@ -18,13 +18,14 @@ of it that can be measured without inventing anything:
 
 THE CLASSES.
 
-* ``scoped`` -- channel-bearing, and the route narrows or refuses per channel.
+* ``scoped`` -- channel-bearing, and the route narrows or refuses per channel. A route in
+  :data:`_REFUSES_A_SCOPED_CALLER` refuses a channel-scoped caller outright, and the probe checks
+  that it answers 403.
 * ``not_channel_bearing`` -- returns and changes nothing per channel: the caller's own account,
   aggregate counters, node-level state, or the caller's own objects.
 * ``administrator_only`` -- gated by a permission only the Administrator role holds, and an
   Administrator is always all-channels, so no caller of it is channel-scoped. Checked, not asserted:
   :func:`test_administrator_only_routes_admit_no_scoped_caller`.
-* ``known_unscoped_1152`` -- channel-bearing and NOT narrowed, tracked under BACKLOG #1152.
 * ``unscoped_unfiled`` -- channel-bearing and NOT narrowed, and on no backlog row this change could
   find. Listed so the gap is visible rather than silent. Filing them is not this test's job. EMPTY
   since BACKLOG #3189 classed its three routes, and kept so the next such route has an honest home.
@@ -75,10 +76,9 @@ from tests.test_monitoring_scope_doc_drift import (  # noqa: F401
 SCOPED = "scoped"
 NOT_CHANNEL_BEARING = "not_channel_bearing"
 ADMINISTRATOR_ONLY = "administrator_only"
-KNOWN_UNSCOPED_1152 = "known_unscoped_1152"
 UNSCOPED_UNFILED = "unscoped_unfiled"
 
-_CLASSES = {SCOPED, NOT_CHANNEL_BEARING, ADMINISTRATOR_ONLY, KNOWN_UNSCOPED_1152, UNSCOPED_UNFILED}
+_CLASSES = {SCOPED, NOT_CHANNEL_BEARING, ADMINISTRATOR_ONLY, UNSCOPED_UNFILED}
 
 #: Every route of the default app, keyed ``"METHOD /path"``, with its class and why. A dict key
 #: appears once, so a route cannot sit in two classes; the walk below checks it is in one.
@@ -139,8 +139,8 @@ ROUTES: dict[str, tuple[str, str]] = {
     "GET /ad-group-scope-map": (ADMINISTRATOR_ONLY, "users:manage"),
     "PUT /ad-group-scope-map": (ADMINISTRATOR_ONLY, "users:manage"),
     # --- audit ----------------------------------------------------------------------------------
-    "GET /audit": (KNOWN_UNSCOPED_1152, "#1152: the audit trail is not narrowed to the caller"),
-    "GET /audit/export": (KNOWN_UNSCOPED_1152, "#1152: same read as GET /audit, as a file"),
+    "GET /audit": (SCOPED, "#4346: a channel-scoped caller is refused the trail"),
+    "GET /audit/export": (SCOPED, "#4346: same refusal as GET /audit, as a file"),
     # --- health, AI, posture --------------------------------------------------------------------
     "GET /health": (NOT_CHANNEL_BEARING, "a liveness boolean"),
     "GET /ai/policy": (NOT_CHANNEL_BEARING, "the AI policy for this environment"),
@@ -223,7 +223,10 @@ ROUTES: dict[str, tuple[str, str]] = {
     "GET /search/layered": (SCOPED, "allowed_channels on the store read"),
     # --- monitoring -----------------------------------------------------------------------------
     "GET /stats": (NOT_CHANNEL_BEARING, "aggregate queue counters, measured global"),
-    "GET /metrics": (KNOWN_UNSCOPED_1152, "#1152: the metrics-exposition scoping"),
+    "GET /metrics": (
+        SCOPED,
+        "#4346: the caller's own inbounds' series; no destination or latency series",
+    ),
     "GET /metrics/history": (NOT_CHANNEL_BEARING, "aggregate queue counters, measured global"),
     "GET /graph/edges": (SCOPED, "the subgraph reachable from the caller's inbounds"),
     "GET /status": (SCOPED, "failed-inbound names narrowed; the counts are aggregates"),
@@ -231,7 +234,7 @@ ROUTES: dict[str, tuple[str, str]] = {
     # --- logging, service, cluster, DR ----------------------------------------------------------
     "GET /logging/level": (NOT_CHANNEL_BEARING, "a log level name"),
     "PATCH /logging/level": (NOT_CHANNEL_BEARING, "a log level name"),
-    "GET /logs/tail": (KNOWN_UNSCOPED_1152, "#1152: the log tail is not narrowed"),
+    "GET /logs/tail": (SCOPED, "#4346: a channel-scoped caller is refused the log"),
     "GET /service/identity": (NOT_CHANNEL_BEARING, "echoes the certificate's principal"),
     "GET /cluster/status": (NOT_CHANNEL_BEARING, "node-level state"),
     "GET /cluster/nodes": (NOT_CHANNEL_BEARING, "node-level state"),
@@ -275,12 +278,6 @@ def test_the_walk_sees_every_class_it_claims() -> None:
     # unscoped_unfiled is a gap list, empty since BACKLOG #3189; the other classes must be found.
     for cls in _CLASSES - {UNSCOPED_UNFILED}:
         assert any(ROUTES[key][0] == cls for key in app_routes if key in ROUTES), cls
-
-
-def test_known_unscoped_rows_cite_1152() -> None:
-    for key, (cls, reason) in ROUTES.items():
-        if cls == KNOWN_UNSCOPED_1152:
-            assert "#1152" in reason, key
 
 
 def test_administrator_only_routes_admit_no_scoped_caller() -> None:
@@ -328,6 +325,10 @@ _QUIET_HERE = {
     # tests/test_channel_scope_posture_users_reload.py measures it with declared deviations (#3189).
     "/security/posture": "no connection here declares a deviation or a static-credential hop",
 }
+
+#: Scoped GETs that refuse a channel-scoped caller rather than narrow its answer (BACKLOG #4346).
+#: The probe expects 403 from the scoped caller there and 200 from the all-channels control.
+_REFUSES_A_SCOPED_CALLER = {"/audit", "/audit/export", "/logs/tail"}
 
 #: What the scoped caller may legitimately see, and what it must never see. ``OB_X`` is the shared
 #: outbound both inbounds deliver to: docs/SECURITY.md says a scoped caller sees no shared outbound
@@ -466,6 +467,9 @@ async def test_scoped_routes_are_measured_against_a_live_app(engine: Engine) -> 
             rs = await c.get(path, headers=s, params=query(path, "scoped"))
             rw = await c.get(path, headers=w, params=query(path, "wide"))
             assert rw.status_code == 200, (path, rw.status_code, rw.text[:300])
+            if path in _REFUSES_A_SCOPED_CALLER:
+                assert rs.status_code == 403, (path, rs.status_code, rs.text[:300])
+                continue
             assert rs.status_code == 200, (path, rs.status_code, rs.text[:300])
             leaked = [m for m in out_of_scope if m in rs.text]
             assert not leaked, f"{path} showed a channel-scoped caller {leaked}"

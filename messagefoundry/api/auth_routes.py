@@ -2352,6 +2352,25 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
     # --- audit ---------------------------------------------------------------
 
+    async def _refuse_a_channel_scoped_reader(
+        service: AuthService, identity: Identity, client: str | None
+    ) -> None:
+        """Refuse a channel-scoped caller the audit trail, with an ``auth.channel_denied`` row
+        (BACKLOG #4346, the route build of #1152). The owner's answer of 2026-10-26 was to narrow
+        or refuse such a caller; an Auditor who needs the whole trail is given the all-channels
+        grant. ``GET /audit``, ``GET /audit/export`` and their ``/ui`` twins call this before they
+        read a row. ``client`` is ``None`` from the console seam, which has no request in hand."""
+        if identity.allowed_channels is None:
+            return
+        await service.store.record_audit(
+            "auth.channel_denied",
+            actor=identity.username,
+            channel_id=None,
+            detail=json.dumps({"channel": None}),
+            client=client,
+        )
+        raise HTTPException(403, "channel-scoped users cannot read the audit trail")
+
     async def _read_audit(
         service: AuthService,
         identity: Identity,
@@ -2435,8 +2454,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         action: str | None = None,
         since: float | None = None,
         until: float | None = None,
+        client: str | None = None,
     ) -> AuditList:
         """Plain-default core shared by the HTTP route below and the webconsole seam wrapper.
+
+        A channel-scoped caller is refused before any read (BACKLOG #4346):
+        :func:`_refuse_a_channel_scoped_reader`. ``client`` is the address for that refusal's row.
 
         The total is counted under the same exclusion as the page, so a reader without
         users:manage is told how many rows IT can page through, never how many the trail holds
@@ -2445,6 +2468,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         ``require(AUDIT_READ)`` writes before each read would push every row down one, so each
         page would repeat the last row of the one before it. The pin is a timestamp and never a
         row id: :mod:`messagefoundry.api.paging` says why an id would leak the lock rows."""
+
+        await _refuse_a_channel_scoped_reader(service, identity, client)
 
         def bound(pin: float | None) -> float | None:
             # The pin is one more ``until``, so the tighter of the two applies.
@@ -2487,6 +2512,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
     @app.get("/audit", response_model=AuditList)
     async def list_audit(
+        request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require(Permission.AUDIT_READ)),
         limit: int = Query(100, ge=1, le=1000),
@@ -2513,6 +2539,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             action=action,
             since=since,
             until=until,
+            client=client_ip(request),
         )
 
     async def _audit_ui_list(
@@ -2589,6 +2616,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # the audit.export row, so a wiring fault never reads as a revoked grant in the trail.
         if not isinstance(token, str):
             raise TypeError("export_audit needs the caller's session token")
+        # BACKLOG #4346: a channel-scoped caller is refused before the first page and before the
+        # audit.export row, so a refusal records no export.
+        await _refuse_a_channel_scoped_reader(service, identity, client_ip(request))
         page_size = min(limit, _AUDIT_EXPORT_PAGE)
 
         async def _page(size: int, before_id: int | None) -> Sequence[Any]:
@@ -2653,6 +2683,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
             if current is None:
                 return "standing_changed"
+            # A caller that is now channel-scoped may not read the trail at all (BACKLOG #4346).
+            # A scope edit ends the account's sessions, which the line above catches; this covers a
+            # standing that resolves narrowed with its session still live.
+            if current.allowed_channels is not None:
+                return "scope_changed"
             # The pages are read with the starting identity's exclusion. If the caller may now
             # read fewer rows, as after losing users:manage, the export stops. If it may read the
             # same rows or more, it goes on: the start already hid at least as much.
