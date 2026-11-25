@@ -32,6 +32,7 @@ from messagefoundry.transports.signing import (
     b64u_encode,
     unverified_jws_header,
     verify_compact_jws,
+    verify_detached_jws,
 )
 
 _RS256 = [SignatureAlgorithm.RS256]
@@ -265,8 +266,6 @@ def test_a_crit_header_is_refused_whatever_the_signature(
 def test_the_detached_verifier_refuses_a_crit_header_too(rsa_key: rsa.RSAPrivateKey) -> None:
     """``verify_detached_jws`` is the module's other public verifier, so the same rule holds there:
     a correctly signed detached JWS carrying ``crit`` is refused, and the same one without verifies."""
-    from messagefoundry.transports.signing import verify_detached_jws  # noqa: PLC0415
-
     body = b'{"sub": "jdoe"}'
 
     def detached(header: dict[str, Any]) -> str:
@@ -287,8 +286,6 @@ def test_the_detached_verifier_refuses_a_crit_header_too(rsa_key: rsa.RSAPrivate
 
 def test_the_detached_verifier_refuses_a_non_object_header(rsa_key: rsa.RSAPrivateKey) -> None:
     """A JSON header that is not an object is a SigningError, not an AttributeError on ``.get``."""
-    from messagefoundry.transports.signing import verify_detached_jws  # noqa: PLC0415
-
     jws = f"{b64u_encode(b'[1,2]')}..{b64u_encode(b'x')}"
     with pytest.raises(SigningError, match="must be a JSON object"):
         verify_detached_jws(jws, b"{}", rsa_key.public_key(), allowed_algorithms=_RS256)

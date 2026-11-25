@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 _RUNGS: tuple[tuple[str, str, frozenset[str]], ...] = (
     (
         "fed.replay.key",
-        "id_token type + key selection (typ -> crit -> kid -> alg pin -> JWKS)",
+        "id_token type + key selection (typ -> crit -> kid -> alg pin -> JWKS -> key fits alg)",
         frozenset(
             {
                 "malformed_token",

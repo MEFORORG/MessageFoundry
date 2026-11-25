@@ -12,8 +12,8 @@ Every rejection is a :class:`ClaimsError` carrying a **closed-set reason slug** 
 browser layer maps that slug to an allow-listed error code and audits it, never reflecting IdP text.
 The engine verifies what the IdP **asserts**, cryptographically; it does not and cannot prove the IdP
 *enforced* MFA. The success value is a :class:`FederatedPrincipal` carrying the claimed username
-(which selects no account), ``sub``, the evidence recorded in the audit, and the verified ``exp`` and ``auth_time`` the engine
-session is capped by.
+(which selects no account), ``sub``, the evidence recorded in the audit, and the verified ``exp``
+and ``auth_time`` the engine session is capped by.
 """
 
 from __future__ import annotations
@@ -120,11 +120,12 @@ class FederatedPrincipal:
     account, the claimed username, the evidence folded into the ``auth.login_success`` audit detail,
     and the verified ``exp`` and ``auth_time``.
 
-    ``username`` selects nothing. The relying party selects the account by the non-reassignable
+    ``username`` selects no account. The relying party selects the account by the non-reassignable
     ``(issuer, subject)`` pair alone (ADR 0184), refuses a pair no account is bound to (only the
-    administrative binding surface binds one), and keeps the claimed username only as a hint in that
-    refusal's audit row. A username is reassignable, so selecting by it would hand a reassigned name
-    the prior holder's account."""
+    administrative binding surface binds one), and carries the claimed username into that refusal's
+    audit row as a hint. The ladder still refuses a token whose username claim is missing or whose
+    suffix is off the allow-list (:func:`_resolve_username`). A username is reassignable, so
+    selecting by it would hand a reassigned name the prior holder's account."""
 
     username: str
     subject: str
@@ -207,9 +208,10 @@ def _select_key_and_alg(
         raise ClaimsError("key_rejected", str(exc)) from exc
     except JwksAmbiguousKid as exc:
         # The JWKS this lookup just fetched gives two usable keys one kid, whichever kid that is, so
-        # the whole set is refused: the IdP's key set is at fault, not necessarily this token's kid.
-        # Only the lookup that made the fetch sees it. A lookup inside the min-refetch floor after it
-        # gets the cache's plain throttled JwksError, recorded as unknown_kid below.
+        # that fetched set is refused and the cache keeps any keys it held before. The IdP's key set
+        # is at fault, not necessarily this token's kid. Only the lookup that made the fetch sees
+        # it: a lookup inside the min-refetch floor after it is served a key the cache still holds
+        # for its kid, or gets the throttled JwksError, recorded as unknown_kid below.
         raise ClaimsError("ambiguous_kid", str(exc)) from exc
     except JwksError as exc:
         raise ClaimsError("unknown_kid", str(exc)) from exc
