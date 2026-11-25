@@ -618,8 +618,8 @@ def redacted_log_field(
     ``tests/test_redacted_log_field_census.py`` pins the references to this function,
     :func:`redact_log_value` and :func:`~messagefoundry.controlchars.log_field_token` that its walk
     of the shipped packages finds by name, fails on a new one or on a ``before`` or ``after`` that
-    is not a literal or a module constant bound once, and names each pinned caller's
-    hides-no-less-than-main test. That test's docstring lists at least what the walk misses.
+    is not a literal or a module constant bound once, and names for each pinned caller a test
+    module with a test that calls it. That test's docstring lists at least what the walk misses.
 
     The reading is the one every later shipped handler leaves, not a fixed number of handler
     passes, so the field hides what the last sink of a logger with any number of handlers would
@@ -1791,17 +1791,19 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
 
     def _head_refused(self, entry: SpoolEntry) -> bool:
         """Whether the spooled ``entry``, whose send just failed, is dropped as undeliverable
-        (BACKLOG #5923): its stream send failed :data:`_SPOOL_HEAD_REFUSALS` times in a row because
-        the collector closed or reset a connection it had accepted (:data:`_COLLECTOR_REFUSALS`). Counted in :attr:`undeliverable` and reported, throttled and with no record
-        content. A failure before or in the connect, any datagram failure included, and any other
-        send error, a timeout included, starts the count over, since a collector that is down holds every entry alike and dropping would only
-        lose them. What this cannot tell apart is a collector that takes the connection and then
-        closes or resets it on every send for a reason of its own: the head is dropped then too, one entry per
+        (BACKLOG #5923): its stream send failed :data:`_SPOOL_HEAD_REFUSALS` times in a row
+        because the collector closed or reset a connection it had accepted
+        (:data:`_COLLECTOR_REFUSALS`). Counted in :attr:`undeliverable` and reported, throttled and
+        with no record content. A failure before or in the connect, any datagram failure included,
+        and any other send error, a timeout included, starts the count over, since a collector that
+        is down holds every entry alike and dropping would only lose them. What this cannot tell
+        apart is a collector that takes the connection and then closes or resets it on every send
+        for a reason of its own: the head is dropped then too, one entry per
         :data:`_SPOOL_HEAD_REFUSALS` tries."""
         if not getattr(self._target, "send_reached_collector", False):
             self._head_refusals = 0
             return False
-        if entry != self._head_entry:
+        if entry is not self._head_entry:  # peek() returns one object until advance()
             self._head_entry, self._head_refusals = entry, 0
         self._head_refusals += 1
         if self._head_refusals < _SPOOL_HEAD_REFUSALS:
@@ -1815,9 +1817,9 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
             cause = getattr(self._target, "send_error_cause", "") or "no exception recorded"
             _log.error(
                 "off-box log forwarding dropped a spooled record as undeliverable: its send failed "
-                "%d times in a row, each time the collector closed or reset a connection it had accepted (%s), so it would "
-                "hold every later record behind it; %d undeliverable so far. Record content is "
-                "not shown here.",
+                "%d times in a row, each time the collector closed or reset a connection it had "
+                "accepted (%s), so it would hold every later record behind it; %d undeliverable so "
+                "far. Record content is not shown here.",
                 _SPOOL_HEAD_REFUSALS,
                 cause,
                 self.undeliverable,

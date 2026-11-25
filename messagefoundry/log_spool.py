@@ -198,21 +198,20 @@ def count_segments(directory: str | Path) -> int:
 def _indexed_size(path: Path) -> int | None:
     """The size :meth:`LogSpool.open` counts for segment ``path`` against the cap, or ``None`` when
     the file is confirmed gone between the listing and this read, as :func:`_not_found_confirms`
-    reads it; the caller checks the directory after this. A symlink whose target cannot be read
-    just now, for any reason, a target on a mount that is down or stale for one, is indexed at size
-    0 rather than refusing the whole spool: the read passes over it and keeps the link, so a later
-    start replays it once its target is back, and the reader takes its real size when it opens it
-    (BACKLOG #5811). Any other ``OSError`` propagates."""
+    reads it; the caller checks the directory after this. A symlink whose target is not found
+    just now, a target on a mount that is down for one, is indexed at size 0 rather than refusing
+    the whole spool: the read passes over it and keeps the link, so a later start replays it once
+    its target is back, and the reader takes its real size when it opens it (BACKLOG #5811). Any
+    other ``OSError``, a link whose target errs some other way included, propagates, so open()
+    refuses the spool as it did before."""
     try:
         return path.stat().st_size
-    except OSError as exc:
+    except FileNotFoundError as exc:
         try:
             mode = path.lstat().st_mode
         except FileNotFoundError as gone:
-            if isinstance(exc, FileNotFoundError) and _not_found_confirms(gone):
+            if _not_found_confirms(gone):
                 return None
-            raise exc from None
-        except OSError:
             raise exc from None
         if stat.S_ISLNK(mode):
             return 0
@@ -605,12 +604,11 @@ class LogSpool:
         """Whether the spool directory can be reached, is a directory, and is the one :meth:`open`
         locked, read by ``stat``. Any ``OSError`` reads as not present.
 
-        A directory at the path with another ``(st_dev, st_ino)`` and no ``spool.lock`` in it is
-        not present either (BACKLOG #5811): an empty mountpoint a dropped mount leaves, or a
-        directory replaced under the spool, holds none of its segments, and reading it as this
-        spool would retire every one of them. Where the platform reports no inode, only the path
-        and the type are compared. A replaced directory that someone gave a ``spool.lock`` reads as
-        present."""
+        A directory at the path with another ``(st_dev, st_ino)`` is not present either (BACKLOG
+        #5811), unless the ``spool.lock`` in it has the identity of the lock file this spool holds
+        open: an empty mountpoint a dropped mount leaves, or a directory replaced under the spool,
+        holds none of its segments, and reading it as this spool would retire every one of them.
+        Where the platform reports no inode, only the path and the type are compared."""
         try:
             found = self.directory.stat()
         except OSError:
@@ -620,13 +618,17 @@ class LogSpool:
         identity = self._directory_identity
         if identity is None or (found.st_dev, found.st_ino) == identity:
             return True
-        # Another identity, but the lock file this spool holds is there: the same directory with
-        # unstable IDs, as a share remounted with client-made inode numbers can give.
+        # Another identity, but the lock file there is the one this spool holds open: the same
+        # directory with unstable IDs, as a share remounted with client-made inode numbers can
+        # give. A spool.lock some other spool left in a replaced directory is another file.
+        if self._lock_fd is None:
+            return False
         try:
-            os.lstat(self.directory / _LOCK_NAME)
+            there = os.lstat(self.directory / _LOCK_NAME)
+            held = os.fstat(self._lock_fd)
         except OSError:
             return False
-        return True
+        return held.st_ino != 0 and (there.st_dev, there.st_ino) == (held.st_dev, held.st_ino)
 
     def _close_reader(self) -> None:
         if self._reader is not None:

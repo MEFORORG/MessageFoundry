@@ -1125,6 +1125,32 @@ def test_a_directory_replaced_at_the_spool_path_retires_nothing(
         spool.close()
 
 
+def test_a_replaced_directory_holding_another_spools_lock_is_not_present(
+    spool_dir: Path, tmp_path: Path
+) -> None:
+    """A directory at the spool path with another identity and a ``spool.lock`` some other spool
+    left there is not this spool's, so nothing is retired. NEGATIVE CONTROL: with the lock file's
+    presence alone taken as proof, every segment was retired as gone."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    old = tmp_path / "old-spool"
+    old.mkdir()
+    (old / "spool.lock").write_bytes(b"")
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        segments = _segments(spool_dir)
+        spool.directory = old
+        assert spool.peek() is None
+        assert spool.unreadable == 0
+        spool.directory = spool_dir
+        assert _segments(spool_dir) == segments
+        assert _drain(spool) == [f"record {n:04d}" for n in range(6)]
+    finally:
+        spool.directory = spool_dir
+        spool.close()
+
+
 def test_the_same_directory_with_another_identity_still_reads_as_present(spool_dir: Path) -> None:
     """A directory whose IDs changed under the spool (a share remounted with client-made inode
     numbers) still holds the spool's lock file, so it reads as the spool's: a segment really gone
@@ -1190,21 +1216,24 @@ class _FakeSegmentPath:
         return os.stat_result((self.mode, 0, 0, 0, 0, 0, 0, 0, 0, 0))
 
 
+def test_a_link_segment_whose_target_is_not_found_is_indexed_not_refused() -> None:
+    """A kept link whose target is not found at the next start is indexed at size 0, so that start
+    keeps its spool and the read passes over the link."""
+    path: Any = _FakeSegmentPath(FileNotFoundError(errno.ENOENT, "target gone"), stat.S_IFLNK)
+    assert log_spool._indexed_size(path) == 0
+
+
 @pytest.mark.parametrize(
     "error",
-    [
-        FileNotFoundError(errno.ENOENT, "target gone"),
-        OSError(errno.ESTALE, "stale handle"),
-        OSError(errno.EACCES, "denied"),
-        _windows_error(64),
-    ],
+    [OSError(errno.ESTALE, "stale handle"), OSError(errno.EACCES, "denied"), _windows_error(64)],
 )
-def test_a_link_segment_whose_target_cannot_be_read_is_indexed_not_refused(error: OSError) -> None:
-    """A kept link whose target errs in any way at the next start is indexed at size 0, so that
-    start keeps its spool. NEGATIVE CONTROL: with only FileNotFoundError tolerated, a stale or
-    denied target made open() refuse the whole spool."""
-    path: Any = _FakeSegmentPath(error, stat.S_IFLNK | 0o777)
-    assert log_spool._indexed_size(path) == 0
+def test_a_link_segment_whose_target_errs_otherwise_still_refuses_the_spool(error: OSError) -> None:
+    """A link whose target errs other than by not being found is not passed over: indexed at 0,
+    every peek() faulted on it and held every later record behind it for the life of the run. So
+    open() refuses the spool, as it did before BACKLOG #5811."""
+    path: Any = _FakeSegmentPath(error, stat.S_IFLNK)
+    with pytest.raises(OSError):
+        log_spool._indexed_size(path)
 
 
 def test_a_regular_segment_whose_stat_fails_still_refuses_the_spool() -> None:

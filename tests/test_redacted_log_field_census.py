@@ -16,7 +16,9 @@ name to ``redacted_log_field``, to ``redact_log_value`` (which takes no ``checks
   one plain module-level assignment: a parameter, a local, a loop, ``with``, ``except`` or
   ``match`` target, a walrus, an import, a ``def``, a tuple target, an augmented assignment or a
   ``global`` declaration of that name anywhere in the file disqualifies it;
-- a pinned caller whose named test module does not name it.
+- a pinned caller whose named test module holds no ``test_`` function that calls it. That
+  proves a test exercises the caller, not that the test compares what it hides with main; the
+  reviewer of a new pin reads that.
 
 The walk reads names, so it misses at least a reference reached through ``getattr`` with a
 computed name, or through a module object passed around, and a constant rebound from another
@@ -252,7 +254,43 @@ def test_each_pinned_caller_has_its_own_hides_no_less_than_main_test(
         and reference.name == "redacted_log_field"
         for reference in _PINNED
     )
-    assert function in (_ROOT / test_module).read_text(encoding="utf-8")
+    source = (_ROOT / test_module).read_text(encoding="utf-8")
+    assert _test_functions_calling(source, function), (
+        f"{test_module} holds no test_ function that calls {function}"
+    )
+
+
+def _test_functions_calling(source: str, function: str) -> list[str]:
+    """The ``test_`` functions in ``source`` whose body calls ``function`` by name."""
+    found = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith(
+            "test_"
+        ):
+            for inner in ast.walk(node):
+                if (
+                    isinstance(inner, ast.Call)
+                    and isinstance(inner.func, ast.Name)
+                    and inner.func.id == function
+                ):
+                    found.append(node.name)
+                    break
+    return found
+
+
+def test_a_caller_test_module_that_only_imports_the_caller_is_refused() -> None:
+    """NEGATIVE CONTROL: a module that imports or mentions the caller, with no test calling it,
+    passed the check when it read the module's text for the name."""
+    source = (
+        "from messagefoundry.auth.service import _new_ip_path_field\n"
+        "# _new_ip_path_field is named here\n"
+        "def test_other():\n    assert True\n"
+        "def helper():\n    return _new_ip_path_field('/a')\n"
+    )
+    assert _test_functions_calling(source, "_new_ip_path_field") == []
+    assert _test_functions_calling(
+        source + "def test_it():\n    assert _new_ip_path_field('/a')\n", "_new_ip_path_field"
+    ) == ["test_it"]
 
 
 def test_every_caller_of_redacted_log_field_is_in_the_caller_test_map() -> None:
