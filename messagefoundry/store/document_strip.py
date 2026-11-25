@@ -492,6 +492,8 @@ def transform_strip_batch(
                 message_id,
                 exc,
             )
+            if _judged_an_outage(asked, no_verdict):
+                break  # the rest of the batch would wait on the same failing service
             continue
         assert raw is not None  # raw is NOT NULL
         try:
@@ -526,7 +528,16 @@ def transform_strip_batch(
                 message_id,
                 type(exc).__name__,
             )
+            if _judged_an_outage(asked, no_verdict):
+                break
             continue
         updates.append(StripUpdate(message_id, stored, new_cell, n_docs, n_bytes))
-    outage = asked >= OUTAGE_MIN_ROWS and no_verdict == asked
+    outage = _judged_an_outage(asked, no_verdict)
     return StripBatch(updates, failures, unwritable, outage=outage)
+
+
+def _judged_an_outage(asked: int, no_verdict: int) -> bool:
+    # Judged after each no-verdict row, so an unreachable key service is asked OUTAGE_MIN_ROWS
+    # times, not once per row of the batch, before the batch ends (BACKLOG #5651 step 2). Equal
+    # counts mean no row asked so far got a verdict, so the batch has nothing to write yet.
+    return asked >= OUTAGE_MIN_ROWS and no_verdict == asked

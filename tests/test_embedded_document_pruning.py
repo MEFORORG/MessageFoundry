@@ -1267,6 +1267,70 @@ def test_a_refused_cell_is_returned_with_its_traceback_cleared(
     assert failure.__traceback__ is None
 
 
+def test_an_unreachable_key_service_is_asked_only_until_the_outage_is_judged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5651 step 2: a batch stops asking the key service once ``OUTAGE_MIN_ROWS`` rows in
+    a row got no verdict, rather than waiting on it once per row of a 200-row batch."""
+    calls: list[str] = []
+
+    def unavailable(*_args: Any, message_id: str, **_kwargs: Any) -> str:
+        calls.append(message_id)
+        raise CipherUnavailableError("synthetic: the key service is unreachable")
+
+    monkeypatch.setattr(document_strip, "open_message_cell", unavailable)
+    rows = [
+        {"id": f"M-{i}", "channel_id": "IB", "raw": "sealed", "received_at": 0.0} for i in range(10)
+    ]
+
+    batch = document_strip.transform_strip_batch(
+        IdentityCipher(),
+        rows,
+        now=PRUNED_AT,
+        older_than=1.0,
+        connection_cutoffs=None,
+        min_bytes=0,
+        content_types={},
+    )
+
+    assert batch.outage
+    assert calls == [f"M-{i}" for i in range(document_strip.OUTAGE_MIN_ROWS)]
+
+
+def test_a_verdict_before_the_no_verdict_rows_keeps_the_batch_asking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Control for step 2: once one row got a verdict the batch is not an outage, so the rows
+    after it are all still tried."""
+    calls: list[str] = []
+
+    def first_refused_then_unavailable(
+        *_args: Any, message_id: str, channel_id: str, **_kwargs: Any
+    ) -> str:
+        calls.append(message_id)
+        if message_id == "M-0":
+            raise CellTagError("messages", "raw", message_id, channel_id)
+        raise CipherUnavailableError("synthetic: the key service is unreachable")
+
+    monkeypatch.setattr(document_strip, "open_message_cell", first_refused_then_unavailable)
+    rows = [
+        {"id": f"M-{i}", "channel_id": "IB", "raw": "sealed", "received_at": 0.0} for i in range(10)
+    ]
+
+    batch = document_strip.transform_strip_batch(
+        IdentityCipher(),
+        rows,
+        now=PRUNED_AT,
+        older_than=1.0,
+        connection_cutoffs=None,
+        min_bytes=0,
+        content_types={},
+    )
+
+    assert not batch.outage
+    assert len(calls) == 10
+
+
 # --- AC-5: one audit row per pass via the runner, recording counts -------------
 
 
