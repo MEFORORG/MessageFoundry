@@ -337,8 +337,11 @@ def _send(port: int, message: str, timeout: float) -> str | None:
                 for ack in decoder.feed(chunk):
                     try:
                         return Peek.parse(ack).field("MSA-1")
-                    except HL7PeekError:
-                        return None
+                    except HL7PeekError as exc:
+                        raise StepFailed(
+                            "mllp",
+                            f"the reply from port {port} did not parse: {type(exc).__name__}",
+                        ) from None
     except (OSError, MLLPFrameError) as exc:
         raise StepFailed("mllp", f"no ACK from port {port}: {type(exc).__name__}") from None
     raise StepFailed("mllp", f"no ACK from port {port} within {timeout:.0f}s")
@@ -360,8 +363,11 @@ def _poll_disposition(
         time.sleep(_POLL_S)
 
 
-def _stop(proc: subprocess.Popen[bytes], job: int | None) -> None:
-    """Stop the engine and everything it started. Never raises: it runs in a ``finally``.
+def _stop(proc: subprocess.Popen[bytes], job: int | None, *, never_ran: bool = False) -> None:
+    """Stop the engine and everything it started. It is not meant to raise: it runs in a
+    ``finally``, where :func:`run` reports an error it does raise as a ``WARNING`` when a step had
+    already failed. ``never_ran`` is for a child that was never resumed, whose job already ended
+    it, so no job holding it is no loss.
 
     On POSIX the engine's group outlives its leader. Once ``Popen`` has reaped the leader its pid
     may be reused, so the group is signalled through the reuse-safe
@@ -393,7 +399,7 @@ def _stop(proc: subprocess.Popen[bytes], job: int | None) -> None:
             file=sys.stderr,
             flush=True,
         )
-    elif sys.platform == "win32" and job is None:
+    elif sys.platform == "win32" and job is None and not never_ran:
         print(
             f"WARNING no kill-on-close job held the engine (pid {proc.pid}); a process it started"
             " may still run",
@@ -435,7 +441,7 @@ def _start(
         # this process by any route. Elsewhere this is a no-op and the child already runs.
         return proc, resume_into_job(proc.pid, who="e2e smoke engine")
     except OSError:
-        _stop(proc, None)
+        _stop(proc, None, never_ran=True)
         raise StepFailed("serve", "could not resume the engine process") from None
 
 
@@ -473,23 +479,26 @@ def run(
     proc: subprocess.Popen[bytes] | None = None
     job: int | None = None
     try:
-        _PROGRESS.step = "checkout"
-        from messagefoundry import pki  # pulls cryptography; only a run needs it
-
-        cert_pem, key_pem = pki.make_self_signed("127.0.0.1", ["127.0.0.1", "localhost"], 2)
         cert, key = work / "api-cert.pem", work / "api-key.pem"
-        cert.write_bytes(cert_pem)
-        key.touch(mode=0o600)  # owner-only before the key is in it, as the engine's key gate wants
-        key.write_bytes(key_pem)
         db = work / "store.db"
         env = _serve_env(cert, key)
+        _PROGRESS.step = "checkout"
         package = _check_checkout(env, work)
         print(f"step checkout: messagefoundry from {_shown(str(package))}", flush=True)
 
         _PROGRESS.step = "provision"
+        from messagefoundry import pki  # pulls cryptography; only a run needs it
+
+        cert_pem, key_pem = pki.make_self_signed("127.0.0.1", ["127.0.0.1", "localhost"], 2)
+        cert.write_bytes(cert_pem)
+        key.touch(mode=0o600)  # owner-only before the key is in it, as the engine's key gate wants
+        key.write_bytes(key_pem)
         print(f"step provision: rig Administrator in {db.name}", flush=True)
+        # The account is this run's own: a rig credential the caller's shell still carries
+        # (MEFOR_RIG_ADMIN_*) must not reach a smoke whose engine gets none of its settings.
+        admin = rigadmin.RigAdmin(rigadmin._DEFAULT_USERNAME, rigadmin._new_password())
         try:
-            created = rigadmin.provision(env=env, cwd=work, db=str(db))
+            created = rigadmin.provision(env=env, cwd=work, db=str(db), admin=admin)
         except rigadmin.RigAdminError as exc:
             raise StepFailed("provision", _shown(str(exc))) from None
         if not created:
@@ -526,8 +535,8 @@ def run(
                 _wait_api(client, proc, time.monotonic() + timeout)
                 _PROGRESS.step = "sign-in"
                 try:
-                    # rigadmin's sign-in, so a rig that supplies an authenticator key signs in too.
-                    client.set_token(rigadmin.sign_in(client.base_url, cacert=str(cert)))
+                    # rigadmin's sign-in, as the account provisioned above.
+                    client.set_token(rigadmin.sign_in(client.base_url, admin, cacert=str(cert)))
                 except (rigadmin.RigAdminError, ApiError) as exc:
                     raise StepFailed(
                         "sign-in", f"the rig sign-in failed: {_shown(str(exc))}"
@@ -542,10 +551,17 @@ def run(
                     deadline=time.monotonic() + timeout,
                 )
             except StepFailed as exc:
-                if exc.step == "sign-in":
+                if exc.step == "sign-in" and proc.poll() is None:
                     raise
+                died = (
+                    f"; the engine exited with code {proc.returncode}"
+                    if exc.step == "sign-in"
+                    else ""
+                )
                 tail = _log_tail(log)
-                raise StepFailed(exc.step, f"{exc}\n--- engine log tail ---\n{tail}") from None
+                raise StepFailed(
+                    exc.step, f"{exc}{died}\n--- engine log tail ---\n{tail}"
+                ) from None
             where = f"on {mllp_port}" if reported is not None else "(port not reported)"
             print(f"step ready: inbound {shown_inbound} running {where}", flush=True)
 
@@ -587,16 +603,27 @@ def run(
             print(f"step disposition: {status.upper()}", flush=True)
     finally:
         _SIGNALS.holding = True  # first, one store: a signal from here on waits for the teardown
-        # An error the teardown raises is the teardown's; one the steps raised keeps their name.
+        # A step's failure stays the run's failure: a teardown error then is only a WARNING. With
+        # no failure in flight, the teardown's own error ends the run as ``teardown``.
+        failing = sys.exc_info()[1]
         failed_step, _PROGRESS.step = _PROGRESS.step, "teardown"
         try:
-            if proc is not None:
-                _stop(proc, job)
-        finally:
             try:
-                _remove(work)
+                if proc is not None:
+                    _stop(proc, job)
             finally:
-                _SIGNALS.release()
+                try:
+                    _remove(work)
+                finally:
+                    _SIGNALS.release()
+        except Exception as exc:
+            if failing is None:
+                raise
+            print(
+                f"WARNING the teardown failed too: {type(exc).__name__}: {_shown(str(exc))}",
+                file=sys.stderr,
+                flush=True,
+            )
         _PROGRESS.step = failed_step
 
 
@@ -678,6 +705,8 @@ def main(argv: list[str] | None = None) -> int:
     previous: dict[signal.Signals, signal._HANDLER] = {}
     for sig in _HANDLED_SIGNALS:
         try:
+            if signal.getsignal(sig) == signal.SIG_IGN:
+                continue  # the caller ignores it on purpose, as nohup does SIGHUP
             previous[sig] = signal.signal(sig, _SIGNALS.handle)
         except ValueError:  # not the main thread, where no signal is delivered anyway
             break
@@ -709,7 +738,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     finally:
         for sig, handler in previous.items():
-            signal.signal(sig, handler)
+            # None: a handler not installed from Python, which signal.signal cannot put back.
+            signal.signal(sig, signal.SIG_DFL if handler is None else handler)
     print(f"PASS e2e smoke in {time.monotonic() - started:.1f}s", flush=True)
     return 0
 

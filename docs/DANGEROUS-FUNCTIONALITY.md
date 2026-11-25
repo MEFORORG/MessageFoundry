@@ -1196,8 +1196,9 @@ them. At least five things are open:
   `messagefoundry/childenv.py`.
 - No start takes its environment from `messagefoundry/childenv.py`'s builders, and
   `tests/test_child_process_environment.py` does not read the harness. So the check that holds
-  every engine start to that module does not reach a harness start. `e2e_smoke.py` uses only that
-  module's `outside_engine_namespace`, to drop the caller's engine variables before it adds its own. Some harness tests do check
+  every engine start to that module does not reach a harness start. For its engine's environment,
+  `e2e_smoke.py` uses only that module's `outside_engine_namespace`, to drop the caller's engine
+  variables before it adds its own. Some harness tests do check
   what one child is handed, at least `tests/test_rig_admin.py` for the provisioning child and the
   `rigadmin run` child.
 - `rigadmin run` signs in, then starts the command its caller names with `--token=<session>`
@@ -1213,8 +1214,8 @@ further. `load/multishard.py` and `load/shardcert.py` set `MEFOR_ALLOW_INSECURE_
 and `MEFOR_ALLOW_INSECURE_TLS=1` for their engines on every platform, whatever the run's own
 environment says. `e2e_smoke.py` sets the same three `MEFOR_SECURITY_*` relaxations,
 `MEFOR_SECURITY_REQUIRE_MFA=false`, and on Windows `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1`, for the
-engine it starts on the sample graph. It drops every `MEFOR_*` variable the caller set, so a run
-cannot keep the enforcing posture. These suit a synthetic load graph. An engine started this way would not protect
+engine it starts on whatever graph `--config` names, the sample graph by default. It drops every
+`MEFOR_*` variable the caller set, so a run cannot keep the enforcing posture. These suit a synthetic load graph. An engine started this way would not protect
 real messages, so never point one at them.
 
 **Import by name.** 2 harness modules import a module named at run time:

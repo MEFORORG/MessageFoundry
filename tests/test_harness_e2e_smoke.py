@@ -431,10 +431,15 @@ def test_stop_warns_when_the_engine_outlives_its_kill(
     assert "WARNING the engine (pid 424242) did not stop" in capsys.readouterr().err
 
 
-def test_a_failing_stop_still_removes_the_temp_directory(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_a_failing_stop_still_removes_the_temp_directory_and_keeps_the_step_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     removed: list[Path] = []
+    real_remove = e2e_smoke._remove
+
+    def remove(path: Path) -> None:
+        removed.append(path)
+        real_remove(path)
 
     def fail_stop(proc: object, job: object) -> None:
         raise OSError("stop failed")
@@ -450,9 +455,9 @@ def test_a_failing_stop_still_removes_the_temp_directory(
     monkeypatch.setattr(e2e_smoke, "_start", fake_start)
     monkeypatch.setattr(e2e_smoke, "_wait_api", refuse_api)
     monkeypatch.setattr(e2e_smoke, "_stop", fail_stop)
-    monkeypatch.setattr(e2e_smoke, "_remove", removed.append)
+    monkeypatch.setattr(e2e_smoke, "_remove", remove)
     config, port = _config(tmp_path, _DANGLING_ROUTER)
-    with pytest.raises(OSError, match="stop failed"):
+    with pytest.raises(e2e_smoke.StepFailed) as failed:
         e2e_smoke.run(
             config=config,
             message_file=e2e_smoke._DEFAULT_MESSAGE,
@@ -461,7 +466,11 @@ def test_a_failing_stop_still_removes_the_temp_directory(
             expect="processed",
             timeout=1.0,
         )
+    assert failed.value.step == "serve"
+    assert "planted" in str(failed.value)
+    assert "WARNING the teardown failed too: OSError: stop failed" in capsys.readouterr().err
     assert len(removed) == 1
+    assert not removed[0].exists()
 
 
 def test_an_unforeseen_error_ends_in_a_fail_line_naming_the_step(
@@ -496,3 +505,43 @@ def test_an_installed_harness_names_the_missing_defaults(
     assert "--message" in err
     assert "--project-root" in err
     assert "run from a MessageFoundry checkout" in err
+
+
+def test_a_reply_that_does_not_parse_says_so() -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen()
+        port = int(server.getsockname()[1])
+
+        def answer_garbage() -> None:
+            conn, _ = server.accept()
+            with conn:
+                received = b""
+                while not received.endswith(b"\x1c\r") and (chunk := conn.recv(4096)):
+                    received += chunk
+                conn.sendall(b"\x0bnot an ACK\x1c\r")
+
+        answerer = threading.Thread(target=answer_garbage)
+        answerer.start()
+        message = e2e_smoke._DEFAULT_MESSAGE.read_text(encoding="utf-8")
+        with pytest.raises(e2e_smoke.StepFailed) as failed:
+            e2e_smoke._send(port, message, timeout=10.0)
+        answerer.join()
+    assert failed.value.step == "mllp"
+    assert "did not parse: HL7PeekError" in str(failed.value)
+
+
+def test_main_leaves_an_ignored_signal_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    if threading.current_thread() is not threading.main_thread():
+        pytest.skip("signal handlers are installed only from the main thread")
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        e2e_smoke, "run", lambda **_: seen.update(handler=signal.getsignal(signal.SIGTERM))
+    )
+    before = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        assert e2e_smoke.main([]) == 0
+        assert signal.getsignal(signal.SIGTERM) == signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGTERM, before)
+    assert seen["handler"] == signal.SIG_IGN

@@ -18,7 +18,10 @@ on a fresh temp store and a free API port, sends `samples/messages/adt_a01.hl7` 
 on 2575, signs in as a per-run rig Administrator, and reads the message's disposition from
 `GET /messages`. Then it stops the engine and deletes the temp directory. About 20 s.
 
-- Exit 0 prints `PASS e2e smoke`. Exit 1 prints `FAIL <step>: <reason>` on stderr, the step one
+- Exit 0 prints `PASS e2e smoke`. A Ctrl+C exits 130 after `INTERRUPTED e2e smoke`; another
+  signal it handles (SIGTERM, SIGHUP, Ctrl+Break) exits 128 plus the signal number with no line of
+  its own. In both the engine is stopped and the temp directory deleted first.
+  Exit 1 prints `FAIL <step>: <reason>` on stderr, the step one
   of `message`, `ports`, `checkout`, `provision`, `serve`, `sign-in`, `ready`, `mllp`,
   `disposition`, or `teardown`. An unforeseen error prints its type and message after the step it
   escaped. A `serve` or `ready` failure also prints the engine log's tail. An installed harness, with
@@ -33,8 +36,9 @@ on 2575, signs in as a per-run rig Administrator, and reads the message's dispos
   move the sample inbound, whose port is fixed at 2575 in `samples/config/adt.py`; to run beside the
   holder, point the smoke at a graph whose inbound listens elsewhere:
   `--config <dir> --inbound <name> --mllp-port <port>`. Otherwise report the held port and stop.
-- `FAIL teardown` names an error while the engine was being stopped; check for a leftover engine
-  process and temp directory (`mefor-e2e-smoke-*`).
+- `FAIL teardown` names an error while the engine was being stopped after every step passed; a
+  `WARNING the teardown failed too` line is the same after a step failed. Either way, check for a
+  leftover engine process and temp directory (`mefor-e2e-smoke-*`).
 - `--expect unrouted|filtered|not_deployed|error` asserts another final disposition (`error`
   only after the ACK: a NAKed message fails `mllp`); `--message <file>` sends
   another file. Synthetic HL7 only.
