@@ -572,6 +572,7 @@ from messagefoundry.store.store import (
     OperatorAudit,
     ReingressOutcome,
     ResendOutcome,
+    is_origin_actor,
 )
 from messagefoundry.store.transit_attestation import (
     read_transit_bound_attestation,
@@ -10012,6 +10013,15 @@ def create_app(
         route is a two-step read of another operator's bodies — inject their message into an inbound you
         are authorized for, then read it as an ordinary message on your own channel."""
         us = _require_upload_store(request)
+        # BACKLOG #6589: the inject labels the message with this username, and the store refuses a
+        # blank or padded one. A directory name is not held to the local username rule, so refuse it
+        # here, before anything is read or written, as a 403 rather than the store's TypeError.
+        if not is_origin_actor(identity.username):
+            raise HTTPException(
+                403,
+                "this account's username has surrounding whitespace, so it cannot label an"
+                " injected message; correct the name in the directory",
+            )
         # Cross-channel authorization: the inbound name is treated as a channel for per-channel RBAC, so a
         # scoped operator cannot inject PHI into an inbound they can't reach. 403 (target denied).
         if not identity.can_access_channel(body.to):

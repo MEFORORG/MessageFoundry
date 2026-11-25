@@ -10838,6 +10838,14 @@ def require_mutation_audit[R](audit: OperatorAudit[R], mutation: str) -> Operato
 OPERATOR_ORIGINS: Final = frozenset({MessageOrigin.OPERATOR_EDIT, MessageOrigin.OPERATOR_UPLOAD})
 
 
+def is_origin_actor(value: object) -> TypeGuard[str]:
+    """Whether ``value`` can name the user behind an operator origin (BACKLOG #6589): a non-blank
+    string with no surrounding whitespace, so it matches the username it names. The rule
+    :func:`require_ingress_audit` applies, exposed so a caller can refuse first, as the upload
+    resend route does."""
+    return isinstance(value, str) and bool(value) and value == value.strip()
+
+
 def require_ingress_audit(
     audit: OperatorAudit[str] | None, origin: MessageOrigin, origin_actor: str | None
 ) -> InjectAudit | None:
@@ -10876,11 +10884,7 @@ def require_ingress_audit(
             f"enqueue_ingress with origin {str(origin)!r} needs an operator audit, a callable that"
             f" builds its audit row; got {type(audit).__name__} (BACKLOG #5071)"
         )
-    if (
-        not isinstance(origin_actor, str)
-        or not origin_actor
-        or origin_actor != origin_actor.strip()
-    ):
+    if not is_origin_actor(origin_actor):
         raise TypeError(
             f"enqueue_ingress with origin {str(origin)!r} needs the origin_actor that names its"
             f" user; got {origin_actor!r} (BACKLOG #6589)"

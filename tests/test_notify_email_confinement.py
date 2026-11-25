@@ -356,20 +356,30 @@ async def test_a_refused_birth_and_its_audit_row_roll_back_together() -> None:
     """BACKLOG #2100. The not-adopted row commits with the INSERT, so no crash can keep one and
     lose the other. Driven by refusing the audit append: before #2100 the account survived it.
     The birth's row comes first (BACKLOG #6589), so the second append, the not-adopted row's, is
-    the one refused."""
+    the one refused: the count below proves the refusal reached it, and the birth row the first
+    append wrote must have rolled back with the account."""
     store = await MessageStore.open(":memory:")
     try:
         service = _ad_service(store)
         await service.initialize()
         _refuse_audit_appends(store, after=1)
+        refusing = store._audit_append_mac
+        appends = [0]
+
+        def counted() -> Any:
+            appends[0] += 1
+            return refusing()
+
+        store._audit_append_mac = counted  # type: ignore[method-assign]
         with pytest.raises(RuntimeError, match="audit append refused"):
             await service._create_directory_row(
                 _directory_principal("torn", _UNADOPTABLE_DIRECTORY_MAIL[0][1]),
                 client=None,
                 birth=lambda _new_id: AuditAppend("auth.ad_user_created", actor="torn"),
             )
+        # Two appends: the birth's, allowed, then the not-adopted row's, refused.
+        assert appends[0] == 2
         assert await store.get_user_by_username("torn") is None
-        assert await store.list_audit(action="auth.ad_notify_email_not_adopted") == []
         assert await store.list_audit(action="auth.ad_user_created") == []
     finally:
         await store.close()

@@ -9694,27 +9694,33 @@ class AuthService:
                     " give one as notify_email, such as name@example.org"
                 )
             typed = address = _require_single_mailbox(notify_email)
-        # Committed with the INSERT, not after it (BACKLOG #2221).
-        created = AuditAppend(
-            "user.created",
-            actor=actor,
-            detail=_json(
-                {
-                    "username": principal.username,
-                    "roles": [],
-                    "provider": "ad",
-                    "notify_email_source": "directory" if typed is None else "administrator",
-                }
-            ),
-            client=client,
-        )
+
+        # Committed with the INSERT, not after it (BACKLOG #2221). It names the new row's id, as
+        # the sign-in's birth row does, because a directory may reissue the username (BACKLOG
+        # #6589); `_temporary_credential_issuer` keys on `username` and ignores the extra key.
+        def created(new_id: str) -> AuditAppend:
+            return AuditAppend(
+                "user.created",
+                actor=actor,
+                detail=_json(
+                    {
+                        "user_id": new_id,
+                        "username": principal.username,
+                        "roles": [],
+                        "provider": "ad",
+                        "notify_email_source": "directory" if typed is None else "administrator",
+                    }
+                ),
+                client=client,
+            )
+
         try:
             user_id = await self._create_directory_row(
                 principal,
                 client=client,
                 actor=actor,
                 typed_notify_email=typed,
-                birth=lambda _new_id: created,
+                birth=created,
             )
         except Exception as exc:
             if not _is_integrity_refusal(exc):
