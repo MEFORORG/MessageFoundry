@@ -378,8 +378,8 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   **How far it reaches.** A filter on each logger the libraries create, and a log record factory for any other
   logger under those names, so a logger created later, one that does not propagate, and a host with no
   `logging_setup` handler are all covered. A host that replaces the record factory without calling the one it
-  found leaves a logger outside the named list unscreened until the next SCP start, C-STORE or SCU association puts
-  the factory back. A record built by hand and given straight to a handler passes neither. Neither library sets
+  found leaves a logger outside the named list unscreened until the next SCP start, C-STORE, SCU association or
+  DICOMweb data set pre-read puts the factory back. A record built by hand and given straight to a handler passes neither. Neither library sets
   `propagate = False` on a logger of its own. An `Exception` raised while the screen reads a line withholds that line, and one raised while it
   renders the traceback withholds the traceback. Matching is linear in the line's length.
 

@@ -4068,10 +4068,14 @@ read as Explicit VR Little Endian, as PS3.10 requires, without `pydicom`, up to 
 outside group `0002`. The `(0002,0000)` Group Length is not read, as `pydicom` ignores a wrong one
 too. Both UIDs are read on every send **before the POST**, as the DICOM SCU parses before it
 associates, so the connection's build does not check `pydicom`. The data set read puts back the
-SCU's ignores for `pydicom` warnings that would name a value, and holds the lines `pydicom` logs
-while it reads. It writes them, redacted as the DICOM connectors' `pydicom` lines are, only with
-the first read-fault WARNING of the process (below); otherwise it writes none. `pydicom`'s own copy of such a line
-as a Python warning is not held, so it can still reach stderr. An object the codec cannot parse is read as no data set
+DICOM connectors' log screen, and the SCU's one warnings filter that ignores every warning
+attributed to a `pydicom` module, since `pydicom`'s `warn_and_log` raises a warning with the same
+text as its log line, value included. It holds the lines `pydicom` logs while it reads, and writes them only with the first
+read-fault WARNING of the process (below); otherwise it writes none. They are written through the
+same default-deny screen as the DICOM connectors' `pydicom` lines ([DICOM.md](DICOM.md), *The rule,
+stated once here*): a pinned line is written with a value the screen does not keep read as
+`[redacted]`, and a line nothing pins is written withheld. `pydicom`'s own copy of such a line as a
+Python warning is not held; that filter drops it where it is in force. An object the codec cannot parse is read as no data set
 UID, and the object is still sent. The codec takes at least the exception classes it lists for a
 malformed object as a parse failure, so one of those raised by a broken `pydicom` reads the same
 way: the object is sent, and a 202 that names only its data set UID is then refused after the

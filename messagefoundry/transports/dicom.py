@@ -766,8 +766,8 @@ class _ScreeningRecordFactory:
 def _install_record_screen() -> None:
     """Put the screening factory in force, over whatever factory is there now, unless it already is.
     A host that replaces the factory later and does not call this one takes it out of force, until
-    the next SCP start, C-STORE or SCU association puts it back; the named loggers keep their
-    filter through that gap."""
+    the next SCP start, C-STORE, SCU association or DICOMweb data set pre-read puts it back; the
+    named loggers keep their filter through that gap."""
     current = logging.getLogRecordFactory()
     if not isinstance(current, _ScreeningRecordFactory):
         logging.setLogRecordFactory(_ScreeningRecordFactory(current))
@@ -881,7 +881,11 @@ def _raised_at(exc: BaseException) -> str:
 
 
 def _write_held(held: list[logging.LogRecord]) -> None:
-    """Write records :func:`_logs_held` held, through the filter, which now redacts them."""
+    """Write records :func:`_logs_held` held, through each logger's filter, which now screens them
+    (:func:`_screen_record`) rather than holding them: a line :func:`_screened_line` keeps is
+    written as it returns it, any value it does not keep read as :data:`_REDACTED`, and any other
+    line is written withheld: its logger, its level, :data:`_LINE_WITHHELD` and any exception's
+    class, none of its message."""
     for record in held:
         logging.getLogger(record.name).handle(record)
 
@@ -889,8 +893,9 @@ def _write_held(held: list[logging.LogRecord]) -> None:
 @contextlib.contextmanager
 def _logs_held(*, write_on_error: bool = False) -> Iterator[list[logging.LogRecord]]:
     """Hold what the filtered loggers write on this thread, and only this one, for the block. With
-    ``write_on_error``, a block that raises has what it held written, redacted, before the raise
-    goes on. A hold inside another hands back to it on exit."""
+    ``write_on_error``, a block that raises has what it held written, screened as
+    :func:`_write_held` writes it, before the raise goes on. A hold inside another hands back to it
+    on exit."""
     held: list[logging.LogRecord] = []
     outer = getattr(_PRE_READ, "held", None)
     _PRE_READ.held = held
@@ -932,8 +937,9 @@ def _read_command_set(command_set: bytes) -> tuple[int, bool, bool] | None:
     association: when it returns ``None``, a command the SCP does not serve, or a request that is
     not valid. Otherwise pynetdicom writes its own as it reads the message, so one the association
     ends on later for another reason, such as a data set past its bound or the message deadline,
-    has none of them; the end's own line says why it ended. :class:`_PeerValueFilter` redacts the
-    peer's value from each line (vault BACKLOG #5081)."""
+    has none of them; the end's own line says why it ended. :class:`_PeerValueFilter` screens each
+    line as :func:`_write_held` says: a pinned line loses a peer's value it does not keep, and a
+    line nothing pins is written withheld (vault BACKLOG #5081, BACKLOG #6637)."""
     from pynetdicom.dimse_messages import _MESSAGE_TYPES, DIMSEMessage
     from pynetdicom.dsutils import decode
 

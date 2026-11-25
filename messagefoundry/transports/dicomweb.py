@@ -82,6 +82,7 @@ from messagefoundry.transports.bounded_read import (
 )
 from messagefoundry.transports.dicom import (
     _ignore_pydicom_value_warnings,
+    _install_record_screen,
     _logs_held,
     _write_held,
     recover_dicom_object_bytes,
@@ -527,8 +528,11 @@ def _warn_read_fault(fault: str, held: list[logging.LogRecord]) -> None:
     """Write, once per process, the WARNING that the codec's read of an object raised ``fault``, the
     class name of a fault it does not wrap, so that object's data set UID is not compared (BACKLOG
     #5914). The fault's own text can carry a value, so it is not written (PHI-safe). With the first
-    WARNING go the lines pydicom logged during that read, ``held``, through the redacting filter;
-    later reads' lines are dropped, as on a read that succeeds."""
+    WARNING go the lines pydicom logged during that read, ``held``, through the DICOM transport's
+    default-deny screen (:func:`~messagefoundry.transports.dicom._write_held`): a line a pinned
+    template or value-free line matches is written, any value in it the screen does not keep read as
+    ``[redacted]``, and a line nothing pins is written withheld, none of its message kept.
+    Later reads' lines are dropped, as on a read that succeeds."""
     if not _first_pre_read_warning("read"):
         return
     _write_held(held)
@@ -560,13 +564,20 @@ def _data_set_instance_uid(obj: bytes) -> tuple[str | None, bool]:
     Any other :class:`Exception` but a :class:`MemoryError` from the parse, a warning the filters
     turn into an error included, also reads as no UID, and :func:`_warn_read_fault` writes one
     WARNING per process naming its class, never its text; nothing is refused before the POST. The
-    SCU's ignores for pydicom's value warnings, which name a value, are put back first. pydicom's
+    screening log record factory is put back first
+    (:func:`~messagefoundry.transports.dicom._install_record_screen`), as the SCP start, each
+    C-STORE and each SCU association put it back. With the extra found, the SCU's ignore is put back
+    next: one ``warnings`` filter for every warning attributed to a pydicom module, since pydicom's
+    ``warn_and_log`` raises a warning with the same text as its log line, value included. pydicom's
     log lines from the parse are held, as the SCP holds its reads' lines
-    (:func:`~messagefoundry.transports.dicom._logs_held`), and written, through the same redacting
-    filter, only with that first WARNING; otherwise none is written, since the object is sent as
-    bytes and a line on how pydicom read it says nothing about the send.
-    pydicom's own copy of such a line as a Python warning is not held. A parse failure is logged by
-    exception class only, never the UID or the bytes (PHI-safe)."""
+    (:func:`~messagefoundry.transports.dicom._logs_held`), and written only with that first WARNING,
+    through the same default-deny screen as the SCP's: a pinned line is written with any value the
+    screen does not keep read as ``[redacted]``, and a line nothing pins is written withheld.
+    Otherwise none is written, since the object is sent as bytes and a line on how pydicom read it
+    says nothing about the send. pydicom's own copy of such a line as a Python warning is not held;
+    that ignore drops it, where it is in force. A parse failure is logged by exception class only,
+    never the UID or the bytes (PHI-safe)."""
+    _install_record_screen()  # a host may have replaced the record factory since the import
     if not _dicom_extra_installed():
         logger.debug(
             "DICOMweb: the [dicom] extra is absent, so no data set SOP Instance UID is read"

@@ -1376,6 +1376,36 @@ async def test_dicomweb_the_pre_read_drops_its_held_lines_on_the_other_exits(
     assert caplog.records == []
 
 
+async def test_dicomweb_the_pre_read_puts_a_replaced_record_factory_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A host that replaced the log record factory after the import has it put back before the
+    # DICOMweb read, as the SCP start, each C-STORE and each SCU association do, so a pydicom logger
+    # with no filter on it is screened during the read too (BACKLOG #6637).
+    pytest.importorskip("pydicom")
+    from messagefoundry.transports import dicom as dicom_module
+    from messagefoundry.transports import dicomweb
+
+    in_force: list[object] = []
+
+    def parse(data: bytes) -> object:
+        in_force.append(logging.getLogRecordFactory())
+        raise DicomPeekError("synthetic parse failure")
+
+    monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: True)
+    monkeypatch.setattr(DicomPeek, "parse", staticmethod(parse))
+    dest = _dest()
+    dest._opener = _FakeOpener(body=STORED_OK.encode(), status=200)  # type: ignore[assignment]
+    original = logging.getLogRecordFactory()
+    try:
+        logging.setLogRecordFactory(logging.LogRecord)
+        assert await dest.send(PAYLOAD) is None
+    finally:
+        logging.setLogRecordFactory(original)
+    assert len(in_force) == 1  # control: the read ran
+    assert isinstance(in_force[0], dicom_module._ScreeningRecordFactory)
+
+
 def test_dicomweb_the_pre_read_object_does_warn_through_pydicom(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
