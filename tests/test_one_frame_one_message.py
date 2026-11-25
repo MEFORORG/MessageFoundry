@@ -865,6 +865,35 @@ def test_an_isa_the_header_read_refuses_still_declares_its_offsets() -> None:
         framing_mod.encode_reply(reply, "ascii", connection="IB_X12_BAD_ISA")
 
 
+@pytest.mark.parametrize(
+    ("element", "component"), [("?", ":"), ("*", "?")], ids=["element-q", "component-q"]
+)
+def test_a_padded_isa_whose_data_holds_its_element_separator_declares_nothing(
+    element: str, component: str
+) -> None:
+    """Pins a residual the #5799 docstring and changelog name: a padded ISA whose element data
+    holds its own element separator (an ISA06 of ``AC*MER``) is not fixed-width, so it declares
+    nothing, and a ``?`` delimiter in it gets ``?`` written into its data, as on main. Mutation:
+    drop the element-data count from ``_isa_is_fixed_width`` and the call raises."""
+    header = _isa(element=element, component=component).replace("SENDER", f"AC{element}MER", 1)
+    assert len(header) == 106
+    reply = header + element.join(["TA1", "000000001", "260101", "1200", "A", "000中"]) + "~"
+    wire = framing_mod.encode_reply(reply, "ascii", connection="IB_X12_SEP_IN_DATA")
+    assert wire == reply.replace("中", "?").encode("ascii")
+
+
+def test_an_isa_whose_separators_are_off_their_offsets_declares_nothing() -> None:
+    """Pins the ``lined_up`` half of ``_isa_is_fixed_width``: ISA06 one short and ISA08 one long
+    keep 106 characters and 16 element separators before ISA16, but two separators sit off their
+    fixed offsets, so the ISA is not fixed-width and its ``?`` component separator is not read.
+    Mutation: drop ``lined_up`` and the call raises."""
+    header = _isa(component="?").replace("SENDER ", "SENDER", 1).replace("RECEIVER", "RECEIVER ", 1)
+    assert len(header) == 106 and header[104] == "?"
+    reply = header + "TA1*000000001*260101*1200*A*000中~"
+    wire = framing_mod.encode_reply(reply, "ascii", connection="IB_X12_OFF_OFFSET")
+    assert wire == reply.replace("中", "?").encode("ascii")
+
+
 @pytest.mark.parametrize("eol", [CR, "\n", "\r\n"], ids=["cr", "lf", "crlf"])
 def test_a_batch_members_own_msh_is_read_for_its_delimiters(eol: str) -> None:
     """Round-1 review: only the first header line was read, so a member ``MSH`` declaring ``?``

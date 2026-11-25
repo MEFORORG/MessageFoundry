@@ -348,15 +348,18 @@ def _reply_delimiters(reply: str) -> frozenset[str]:
     at the ISA's fixed delimiter offsets only when the ISA is fixed-width: all 106 characters are
     present, every element-separator offset holds the character at +3, and no element data before
     ISA16 holds it (:func:`_isa_is_fixed_width`). Those offsets are read
-    raw, without the distinctness and element-data checks ``discover_delimiters`` makes, so a
-    fixed-width ISA that read refuses still declares what its offsets hold; ISA11 counts only
-    from version 00501, as that read counts it. An ISA that is not fixed-width, such as one whose
-    elements are unpadded or one cut short, declares nothing, as every ``ISA``-led reply did
-    before this read: in an unpadded ISA, offsets 82, 104 and 105 can hold element data, and
-    reading them refused a reply whose data there the charset cannot hold. That leaves a residual:
-    +3 holds the element separator in any ISA, so an unpadded or short ISA whose separator is
-    ``?`` has ``?`` written into its data, as before. A reply with any other lead declares
-    nothing here.
+    raw, without the distinctness check ``discover_delimiters`` makes and without the terminator
+    half of its element-data check, so a fixed-width ISA that read refuses for one of those (ISA11
+    and ISA16 both ``?``, say) still declares what its offsets hold; ISA11 counts only from version
+    00501, as that read counts it. The element-separator half of that check is part of being
+    fixed-width, so an ISA that read refuses for it declares nothing. An ISA that is not
+    fixed-width declares nothing, as every ``ISA``-led reply did before this read: at least one
+    whose elements are unpadded, one cut short, and a padded one whose element data holds its own
+    element separator (an ISA06 of ``AC*ME``). In an unpadded ISA, offsets 82, 104 and 105 can
+    hold element data, and reading them refused a reply whose data there the charset cannot hold.
+    That leaves a residual: +3 holds the element separator in any ISA, so an ISA that is not
+    fixed-width and whose separator is ``?`` has ``?`` written into its data, as before. A reply
+    with any other lead declares nothing here.
 
     Leading whitespace and a BOM are skipped first, as the engine's one definition of tolerated
     leading noise (``sniff._LEADING_WS_STR``) skips them. A header line of ``MSH`` alone has no

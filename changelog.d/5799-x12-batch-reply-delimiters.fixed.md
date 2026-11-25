@@ -7,6 +7,7 @@
   with no CR. Before, only the first line of an `MSH`-led reply was read. Not covered, so a `?` can
   still be written into at least these: an HL7 reply whose header lines end at LF but which holds a
   CR elsewhere, a member header after an LF-only blank line in a CR reply, an X12 interchange after
-  the first `ISA`, an `ISA` that is not fixed-width (one with unpadded elements declares nothing,
-  as before, even where its element separator is `?`), and an HL7 v2.7 truncation character
-  declared as `?`. (`BACKLOG #5799`)
+  the first `ISA`, an `ISA` that is not fixed-width (one with unpadded elements, or a padded one
+  whose element data holds its own element separator, such as an ISA06 of `AC*ME`, declares
+  nothing, as before, even where its element separator is `?`), and an HL7 v2.7 truncation
+  character declared as `?`. (`BACKLOG #5799`)
