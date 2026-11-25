@@ -431,12 +431,12 @@ async def run_connscale(
     batch_comparison: FuseModeComparison | None = build_batch_comparison(
         records, profile.batch_modes, missing_detail=batch_missing_detail
     )
-    # A multi-arm run additionally fails on a throughput regression, a NO-collapse, or a missing pooled
-    # arm (comparison.ok folds those in). A single-arm run has no comparison and never swallows a miss
-    # (the loop re-raises), so its verdict is the SLOs alone. The fusion/batching A/Bs fold ONLY their
-    # correctness gate (.ok = every B1 arm held zero-loss + present, no B0 baseline missing, no cell
-    # unrun in both arms) — a NO-GO/INCONCLUSIVE throughput verdict is a legitimate measurement, not a
-    # red build.
+    # A multi-arm run additionally fails on at least a throughput regression, a NO-collapse, a missing
+    # pooled arm, or records from more than one sandbox arm (comparison.ok folds those in). A
+    # single-arm run has no comparison and never swallows a miss (the loop re-raises), so its verdict
+    # is the SLOs alone. The fusion/batching A/Bs fold ONLY their correctness gate (.ok, whose
+    # docstring lists what it folds) — a NO-GO/INCONCLUSIVE throughput verdict is a legitimate
+    # measurement, not a red build.
     #
     # A swallowed miss also fails the run on its own (BACKLOG #3132), because a comparison does not
     # fail every miss. A fusion or batching cell whose B0 and B1 both failed to start does fail .ok,

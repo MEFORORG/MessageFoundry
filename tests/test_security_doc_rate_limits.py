@@ -2067,24 +2067,33 @@ def test_the_sign_out_miss_row_budget_token_names_a_shipped_method() -> None:
 
 
 def _limiters_reached(service: ast.ClassDef, limiters: set[str], entry: str) -> set[str]:
-    """The limiter attributes ``entry`` reads, directly or through the service methods it calls."""
+    """The limiter attributes ``entry`` reads on ``self``, directly or through the ``self.<method>``
+    calls it makes. Only ``self`` receivers count, and a method is followed only where it is called,
+    so a same-named attribute of another object, or a method passed and not called, reaches nothing.
+    """
     methods = {
         n.name: n for n in service.body if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
     }
+
+    def on_self(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            return node.attr if node.value.id == "self" else None
+        return None
+
     reached: set[str] = set()
     seen: set[str] = set()
     todo = [entry]
     while todo:
         name = todo.pop()
-        if name in seen or name not in methods:
+        if name in seen:
             continue
         seen.add(name)
         for sub in ast.walk(methods[name]):
-            if isinstance(sub, ast.Attribute):
-                if sub.attr in limiters:
-                    reached.add(sub.attr)
-                elif sub.attr in methods:
-                    todo.append(sub.attr)
+            attr = on_self(sub)
+            if attr in limiters:
+                reached.add(attr)
+            elif isinstance(sub, ast.Call) and (called := on_self(sub.func)) in methods:
+                todo.append(called)
     return reached
 
 
@@ -2092,22 +2101,35 @@ def _census_reach(entries: set[str]) -> tuple[set[str], dict[str, set[str]]]:
     """Every limiter attribute in the service, and what each census entry reaches of them."""
     tree = ast.parse(_SERVICE.read_text(encoding="utf-8"))
     service = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AuthService")
+    methods = {
+        n.name for n in service.body if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    missing = sorted(entries - methods)
+    assert not missing, f"census entries that are no longer AuthService methods: {missing}"
     limiters = _limiter_attributes(tree)
     return limiters, {e: _limiters_reached(service, limiters, e) for e in sorted(entries)}
 
+
+#: Control 12's second method: the one count row a window its row says is begun for the misses past
+#: the bound. Pinned to that row by ``_CONTROL_12_COUNT_ROW_TOKEN``.
+_CONTROL_12_COUNT_ROW = "_count_unrecorded_logout_misses"
+_CONTROL_12_COUNT_ROW_TOKEN = "`unrecorded`"
 
 #: The census's entries: each limiter accessor, and the service methods of control 12, the one
 #: structural control built on limiters. A limiter none of them reaches is in no row of either table.
 _CENSUS_ENTRIES = (
     _AUTH_SURFACE_ACCESSORS
     | _BUSINESS_LIMIT_ACCESSORS
-    | {
-        # The token _STRUCTURAL_CONTROLS pins control 12 to: the per-source and all-sources bound.
-        "_admit_logout_miss_row",
-        # The one count row a window that control 12's row says is begun for the misses past it.
-        "_count_unrecorded_logout_misses",
-    }
+    | {_STRUCTURAL_CONTROLS["sign-out miss-row budget"], _CONTROL_12_COUNT_ROW}
 )
+
+
+def test_control_12_names_the_count_row_its_second_census_entry_writes() -> None:
+    """The census credits control 12 with the limiter of ``_count_unrecorded_logout_misses``, so the
+    row must still say that a count row is written (BACKLOG #5090)."""
+    token = _STRUCTURAL_CONTROLS["sign-out miss-row budget"]
+    (row,) = [r for r in _protection_rows()[1:] if token in "  ".join(r)]
+    assert _CONTROL_12_COUNT_ROW_TOKEN in "  ".join(row), row
 
 
 def test_every_sliding_window_limiter_is_reached_by_a_documented_control() -> None:

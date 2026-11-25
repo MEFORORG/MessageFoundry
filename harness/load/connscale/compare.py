@@ -60,15 +60,24 @@ COLLAPSE_INCONCLUSIVE = "INCONCLUSIVE"  # per_lane idle-poll below the noise flo
 COLLAPSE_MISSING = "MISSING"  # no pooled arm to compare
 
 
+def _sandbox_arm(r: ConnScaleRecord) -> str:
+    """The arm one record asked for, and what the engine parsed where that differs."""
+    sb = r.sandbox
+    if sb is None or sb.effective == sb.requested:
+        return r.sandbox_mode
+    return f"{sb.requested} (the engine parsed {sb.effective})"
+
+
 def _sandbox_arms(records: Iterable[ConnScaleRecord]) -> tuple[str, ...]:
     """The ``[sandbox]`` arms ``records`` ran under, sorted (BACKLOG #5090).
 
     No comparison here keys a cell on the sandbox arm: ``profile._validate`` refuses a sandbox A/B
     beside any other A/B, so one run's records carry one arm. Records from two arms would pool into
     one cell, so a comparison handed them fails rather than grade the mixture, and every comparison
-    names the arm it ran under, which its table did not.
+    names the arm it ran under, which its table did not. A step whose engine parsed another mode
+    than it asked for is its own arm here, so a fallback is named, and a partial one fails.
     """
-    return tuple(sorted({r.sandbox_mode for r in records}))
+    return tuple(sorted({_sandbox_arm(r) for r in records}))
 
 
 def _sandbox_line(arms: tuple[str, ...]) -> str:
@@ -971,8 +980,8 @@ class FuseModeComparison:
     in_pipeline_tolerance: float
     rows: list[FuseComparisonRow] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
-    # Axis labelling (defaulted to the fusion axis so a pre-existing fuse run's JSON/table is byte-
-    # identical). The statement-batching A/B (ADR 0075) reuses this SAME class + verdict path via
+    # Axis labelling (defaulted to the fusion axis so a pre-existing fuse run's labels are
+    # unchanged; BACKLOG #5090 added a sandbox line and key). The statement-batching A/B (ADR 0075) reuses this SAME class + verdict path via
     # build_batch_comparison(), only overriding these labels — there is no second comparator.
     axis_kind: str = FUSE_AXIS_KIND
     title: str = FUSE_TITLE
@@ -999,9 +1008,10 @@ class FuseModeComparison:
 
     @property
     def overall_verdict(self) -> str:
-        """GO only if EVERY present cell is GO and no cell went unrun; NO-GO if any cell is NO-GO, a
-        B0 baseline or B1 arm is missing, or a cell has no record in either arm; otherwise
-        INCONCLUSIVE (some cell could not clear the noise bar, none failed outright)."""
+        """GO only if EVERY present cell is GO and no cell went unrun; NO-GO at least if any cell is
+        NO-GO, a B0 baseline or B1 arm is missing, a cell has no record in either arm, or the records
+        span more than one sandbox arm; otherwise INCONCLUSIVE (some cell could not clear the noise
+        bar, none failed outright)."""
         verdicts = [row.verdict for row in self.rows]
         # A swallowed B0 baseline or an unrun cell is a run gap, never a GO. Checked before the
         # empty-rows branch, because every cell unrun is not INCONCLUSIVE.
@@ -1018,7 +1028,8 @@ class FuseModeComparison:
     @property
     def ok(self) -> bool:
         """The correctness fold for the run's exit code: every present B1 arm held zero-loss, none
-        is missing, and no cell went unrun in both arms. The GO/NO-GO throughput decision is
+        is missing, no cell went unrun in both arms, and the records ran under one sandbox arm. The
+        GO/NO-GO throughput decision is
         reported separately and does NOT fail the run (a null/negative fusion result banks nothing
         but is not an error, ADR 0071 §6.4b)."""
         return (

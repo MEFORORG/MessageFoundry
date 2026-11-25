@@ -96,7 +96,9 @@ def test_the_axis_parses_and_counts_toward_the_sweep() -> None:
             # sandbox refusal is the one that fires.
             _SANDBOX_AB.replace('claim_modes = ["pooled"]', 'claim_modes = ["per_lane"]')
             + "\n[connscale.slo]\nempty_claims_base_reading = true\n",
-            "would mix the two sandbox arms",
+            # Its lanes split by arm since BACKLOG #5090, so the reason is the missing per-arm
+            # bound, as for fd_monotonic below.
+            "graded each sandbox arm's base reading",
         ),
         (
             # Its lanes split by arm since BACKLOG #5570, so the reason is now the missing per-arm

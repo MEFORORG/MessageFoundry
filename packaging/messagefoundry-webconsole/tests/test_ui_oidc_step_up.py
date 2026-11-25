@@ -936,6 +936,37 @@ async def test_the_budget_spent_warning_escapes_the_client_address(
         assert "\r" not in line and "\n" not in line, line
 
 
+def test_every_client_bearing_log_line_in_the_oidc_routes_is_scrubbed() -> None:
+    """BACKLOG #5090. RED when: a log call in the console's OIDC routes passes the client address
+    without ``scrub_log_argument``. The test above drives one of these lines; this covers the rest,
+    which a flood or a full flow cache reaches."""
+    import ast
+
+    from messagefoundry_webconsole.routes import oidc as oidc_routes
+
+    tree = ast.parse(Path(oidc_routes.__file__).read_text(encoding="utf-8"))
+    sites = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "_log"
+    ]
+    bearing = 0
+    for call in sites:
+        for arg in call.args[1:]:
+            if not any(isinstance(n, ast.Name) and n.id == "client" for n in ast.walk(arg)):
+                continue
+            bearing += 1
+            assert (
+                isinstance(arg, ast.Call)
+                and isinstance(arg.func, ast.Name)
+                and arg.func.id == "scrub_log_argument"
+            ), f"line {call.lineno} logs the client unscrubbed"
+    assert bearing >= 6, bearing  # the control: the walk found the lines it exists to check
+
+
 async def test_spent_audit_and_sign_in_budgets_do_not_refuse_an_idp_step_up_return(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
