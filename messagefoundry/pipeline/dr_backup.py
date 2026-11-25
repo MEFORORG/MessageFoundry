@@ -424,7 +424,8 @@ class RestoreResult:
     archive_sha256: str
     archive_created_at: float | None = None
     last_audit_at: float | None = None
-    #: How many open sessions the restore ended in the store it placed (BACKLOG #2614).
+    #: How many unrevoked sessions the restore ended in the store it placed, expired ones never
+    #: purged included (BACKLOG #2614, #5095).
     sessions_revoked: int = 0
 
 
@@ -5384,9 +5385,9 @@ def restored_accounts_notice(sessions_revoked: int) -> str:
     already did. Worded from the count the restore's own revoke returned, so it never claims more
     than it ended."""
     return (
-        f"{RESTORE_ROLLBACK_NOTICE} The restore ended {sessions_revoked} open session(s) in the "
-        "store it placed, and the first engine start on this store ends every session again and "
-        "records the restore."
+        f"{RESTORE_ROLLBACK_NOTICE} The restore ended {sessions_revoked} unrevoked session(s), "
+        "expired ones included, in the store it placed, and the first engine start on this store "
+        "ends every session again and records the restore."
     )
 
 

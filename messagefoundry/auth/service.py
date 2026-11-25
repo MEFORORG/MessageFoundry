@@ -15262,8 +15262,9 @@ class AuthService:
         ``keep_token_hash`` names the caller's own session for the revoke to keep, so the
         administrator who ran it is not signed out mid-response where the revoke re-stamps it.
         Returns the count and whether that session was kept. Audited even when the count is zero,
-        because the act itself is the record an investigator looks for. The host command
-        ``admin-revoke-sessions`` keeps nothing and calls the store itself.
+        because the act itself is the record an investigator looks for; the row is appended after
+        the revoke commits, so a store that refuses it raises with the sessions already ended.
+        The host command ``admin-revoke-sessions`` keeps nothing and calls the store itself.
 
         A kept session whose seal fails makes the store write nothing. The caller's own session is
         then suspect, so it is ended with the rest, and the audit row's scope says so, as

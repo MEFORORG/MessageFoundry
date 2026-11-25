@@ -9227,7 +9227,8 @@ def write_restore_marker(
     The sessions are ended here too, in the same transaction as the marker, because a revoke
     needs no key: so no path that honours a session without consuming the marker, such as an
     older build started on the file, gets the archive's sessions back. The first start still
-    raises every account's session epoch, which needs the key, and adds this count to its own.
+    revokes as :meth:`MessageStore.revoke_all_sessions` does, raising the global session epoch
+    and each account's, the second of which needs the key, and adds this count to its own.
 
     It is proven in the main file as :func:`forget_store_salt`'s drop is, through
     :func:`_write_closed_store`: a non-empty ``-wal`` beside it, or a re-read that finds no row
@@ -22777,8 +22778,11 @@ class MessageStore:
     ) -> RevokeResult:
         """The body of :meth:`revoke_all_sessions`, inside the caller's writer transaction.
 
-        The store's global session epoch is raised first (BACKLOG #5091), then every account's
-        epoch, as :meth:`revoke_user_sessions` raises one, then one sweep ends the rows and the kept
+        The store's global session epoch is raised first (BACKLOG #5091), then the epoch of each
+        account its read of the account list returns, as :meth:`revoke_user_sessions` raises one;
+        an account whose
+        record the seal check refuses goes without its raise (:meth:`_bump_session_epoch`), and
+        the global epoch still ends its sessions. Then one sweep ends the rows and the kept
         row is re-sealed under its own account's new epoch and the new global one, when it carried
         both epochs those raises replaced (:class:`KeptSessionRestamp`, BACKLOG #4975), and is
         otherwise ended and counted (:meth:`_keep_or_end_session`).
