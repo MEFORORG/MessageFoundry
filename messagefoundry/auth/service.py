@@ -15351,8 +15351,9 @@ class AuthService:
         Returns the count and whether that session was kept. Audited even when the count is zero,
         because the act itself is the record an investigator looks for; the row is appended after
         the revoke commits, so a store that refuses it raises with the sessions already ended.
-        No row is written when the store's seal report fails after the revoke commits: the call
-        raises before the row is appended, with the sessions already ended.
+        No ``auth.session_revoked`` row is written when the store's seal report fails after the
+        revoke commits: the call raises before that row is appended, with the sessions already
+        ended.
         The host command ``admin-revoke-sessions`` keeps nothing and calls the store itself.
 
         A kept session whose seal fails makes the store write nothing. The caller's own session is
