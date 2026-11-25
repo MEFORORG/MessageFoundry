@@ -10666,14 +10666,20 @@ def _reminder_cadence(
     top of it."""
     if warn_days == 0 or interval <= default:
         return []
+    # Said only where it can happen, so a modest value does not read like one past the lead.
+    past_lead = (
+        f", which is longer than the {warn_days}-day warn_days lead, so that reminder can come "
+        "after the deadline itself"
+        if interval >= warn_days * 86_400
+        else ""
+    )
     return [
         (
             f"{section}.check_interval_seconds",
             # repr round-trips, so a value one step past the default never prints as it.
             f"[{section}].check_interval_seconds = {interval!r}, longer than the default of "
             f"{default:g} -- {what} that enters its warn window after start waits up to "
-            f"{interval!r} s for its first reminder, and an interval longer than the "
-            f"{warn_days}-day warn_days lead can put that reminder after the deadline itself{extra}",
+            f"{interval!r} s for its first reminder{past_lead}{extra}",
         )
     ]
 

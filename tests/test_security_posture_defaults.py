@@ -1802,6 +1802,11 @@ def test_a_reminder_interval_above_its_default_is_a_named_loosening() -> None:
         "check_interval_seconds = 86401.0, longer than the default of 86400"
         in named["secret_rotation.check_interval_seconds"]
     )
+    # The after-the-deadline clause only where the interval reaches the warn_days lead.
+    assert "after the deadline itself" in named["cert_monitor.check_interval_seconds"]
+    assert "after the deadline itself" not in named["secret_rotation.check_interval_seconds"]
+    # No "; " inside an entry: the serve warning joins whole entries with it.
+    assert not any("; " in named[k] for k in named if k.endswith("check_interval_seconds"))
     keys = ("cert_monitor.check_interval_seconds", "secret_rotation.check_interval_seconds")
     for cert, rotation in ((43_200.0, 86_400.0), (60.0, 3_600.0)):
         on = _names(
