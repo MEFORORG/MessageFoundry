@@ -89,7 +89,7 @@ refused, and so is a dropped bare defined ID with no field separator (a lone `OR
 `MFA` line is refused too, and so is a batch or file envelope line (`BHS`, `BTS`, `FHS`, `FTS`)
 with a non-envelope line after it. The run of envelope lines that ends a message is exempted like
 any other defined segment, because some intake paths still hand a message over with its batch's
-trailers on it (`_ENVELOPE` in `validate.py` names at least three). Every dropped segment is refused where MSH-9.3
+trailers, or the next batch's header, on it (`_ENVELOPE` in `validate.py` names at least three). Every dropped segment is refused where MSH-9.3
 borrows a slot-bearing structure under another message code (`ADT^A01^MFN_M01`). Under the same
 code, MSH-9.2 decides: a dropped segment in `MFN^M02^MFN_M01` is refused, because `MFN_M02` is a
 structure of its own, while some same-code borrows keep the exemption, at least `PGL^PC7^PGL_PC6`

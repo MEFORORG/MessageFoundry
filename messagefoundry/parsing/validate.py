@@ -419,9 +419,10 @@ _NEVER_EXEMPT = frozenset({"MSH", "DSC", "MSA", "ERR", "QAK", "MFA"})
 # The batch and file envelope. A dropped one is refused in such a structure too, unless it is in
 # the run of envelope lines that ends the message (BACKLOG #5920 step 2). That run is exempt
 # because some intake paths hand a message over with its batch's trailers or the next batch's
-# header still on it: at least a lone file message under an encoding the file split reads as
-# raw bytes, a member whose MSH-1 is not ASCII, and an MLLP, TCP or HTTP body, none of which
-# split_batch's trailer cut (BACKLOG #5806) reaches. An envelope line with a message line after
+# header still on it: at least a lone file message that one_message_bytes hands over as raw
+# bytes under an encoding that does not write ASCII as itself (utf-8-sig, UTF-16, cp932), a
+# member whose MSH-1 is not ASCII, and an MLLP, TCP or HTTP body, none of which split_batch's
+# trailer cut (BACKLOG #5806) reaches. An envelope line with any other kept or defined line after
 # it frames nothing and is refused.
 _ENVELOPE = frozenset({"BHS", "BTS", "FHS", "FTS"})
 
@@ -443,13 +444,6 @@ def _dropped_lines(lines: _Lines, message: Any) -> tuple[list[str], list[tuple[s
     """
     import hl7apy
 
-    # Where the run of envelope lines that ends the message starts: past every other line, Z
-    # lines included.
-    trailer_from = 1 + max(
-        (number for name, number in [*lines.segments, *lines.z_segments] if name not in _ENVELOPE),
-        default=0,
-    )
-
     kept = _segment_names(message)
     if not kept:
         # A message type hl7apy has no structure for (a site's ZZZ^Z01, say) builds an empty tree
@@ -460,6 +454,7 @@ def _dropped_lines(lines: _Lines, message: Any) -> tuple[list[str], list[tuple[s
         )
     defined = hl7apy.load_library(message.version).SEGMENTS
     exempts: bool | None = None  # read once, on the first dropped defined segment
+    trailer_from: int | None = None  # read once, on the first dropped envelope segment
     refusals: list[str] = []
     exempted: list[tuple[str, int]] = []
     for name, number in lines.segments:
@@ -470,7 +465,9 @@ def _dropped_lines(lines: _Lines, message: Any) -> tuple[list[str], list[tuple[s
         elif name in defined:
             if exempts is None:
                 exempts = _exempts_defined_segments(message)
-            misplaced = name in _ENVELOPE and number < trailer_from
+            if name in _ENVELOPE and trailer_from is None:
+                trailer_from = _trailer_from(lines, defined)
+            misplaced = trailer_from is not None and name in _ENVELOPE and number < trailer_from
             if exempts and number not in lines.bare and name not in _NEVER_EXEMPT and not misplaced:
                 exempted.append((name, number))
             else:
@@ -480,6 +477,23 @@ def _dropped_lines(lines: _Lines, message: Any) -> tuple[list[str], list[tuple[s
         else:
             refusals.append(f"unknown segment at line {number}")
     return refusals, exempted
+
+
+def _trailer_from(lines: _Lines, defined: Any) -> int:
+    """The position where the run of envelope lines that ends the message starts: past every
+    other line, Z lines included. A line refused whatever the structure (a bare line, an
+    unrecognised one, or an ID the version does not define) is left out, so it stays the first
+    refusal named rather than moving a correct trailer ahead of it."""
+    others = [
+        number
+        for name, number in lines.segments
+        if name not in _ENVELOPE
+        and number not in lines.bare
+        and _SEGMENT_ID.fullmatch(name) is not None
+        and name in defined
+    ]
+    others.extend(number for _name, number in lines.z_segments)
+    return 1 + max(others, default=0)
 
 
 @dataclass(frozen=True)

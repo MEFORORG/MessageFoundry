@@ -195,6 +195,20 @@ def test_the_envelope_run_that_ends_a_message_keeps_the_exemption() -> None:
     assert result.unvalidated_segments == (("BTS", 4), ("BHS", 5), ("FTS", 6), ("FHS", 7))
 
 
+@pytest.mark.parametrize(
+    ("tail", "first"), [("^Z", "unrecognised line 5"), ("ORC", "segment ORC at line 5")]
+)
+def test_a_line_refused_on_its_own_does_not_move_a_trailer_ahead_of_it(
+    tail: str, first: str
+) -> None:
+    """Review round-016ec5b937: a junk or bare line after a correct trailer stays the first refusal
+    named, as on origin/main. NEGATIVE CONTROL: on b15c4544f0 errors[0] named the BTS at line 4."""
+    result = validate(_MFN_M01 + "\rBTS|1\r" + tail)
+    assert not result.ok
+    assert result.errors[0].startswith(first), result.errors
+    assert not any("BTS" in error for error in result.errors)
+
+
 @pytest.mark.parametrize("extra", ["BHS|^~\\&", "BTS|2", "FHS|^~\\&", "FTS|1"], ids=lambda s: s[:3])
 @pytest.mark.parametrize("after", ["MFE|MAD|2||LOC2^Loc|CE", "ZLC|1"], ids=["MFE", "Z"])
 def test_an_envelope_line_inside_a_message_gets_no_exemption(extra: str, after: str) -> None:
