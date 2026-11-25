@@ -442,7 +442,94 @@ def test_multi_aud_with_matching_azp_accepted(rsa_key: rsa.RSAPrivateKey) -> Non
     assert principal.username == "jdoe"
 
 
-# --- claims: two malformed-IdP shapes reject as audited ClaimsErrors, not 500s (BACKLOG #1016) -----
+# --- claims: azp is checked whenever present, and a malformed aud array is refused (BACKLOG #5339) --
+#
+# What is refused, what is still accepted, and the spec items behind it: the comments above the aud
+# and azp checks in messagefoundry/auth/oidc/claims.py (_check_core_claims).
+
+_ABSENT = object()
+
+
+def _aud_azp_claims(aud: Any, azp: Any) -> dict[str, Any]:
+    """``_good_claims`` with this aud, and this azp unless it is ``_ABSENT``."""
+    return _good_claims(aud=aud) if azp is _ABSENT else _good_claims(aud=aud, azp=azp)
+
+
+@pytest.mark.parametrize(
+    ("aud", "azp"),
+    [
+        # The single-aud rows were accepted before BACKLOG #5339: azp was read only with 2+ auds.
+        ("mefor-console", "another-client"),
+        ("mefor-console", ""),
+        ("mefor-console", None),
+        ("mefor-console", 7),
+        ("mefor-console", ["mefor-console"]),
+        (["mefor-console"], "another-client"),
+        (["mefor-console", "another"], "another"),
+    ],
+)
+def test_an_azp_that_is_not_our_client_is_refused(
+    rsa_key: rsa.RSAPrivateKey, aud: Any, azp: Any
+) -> None:
+    jws = _mint(rsa_key, "k1", _aud_azp_claims(aud, azp))
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert exc.value.reason == "claim_azp"
+    assert exc.value.reason in oidc.REASONS
+
+
+@pytest.mark.parametrize(
+    ("aud", "azp"),
+    [
+        ("mefor-console", "mefor-console"),
+        (["mefor-console"], "mefor-console"),
+        ("mefor-console", _ABSENT),
+        (["mefor-console"], _ABSENT),
+        (["mefor-console", "mefor-console"], _ABSENT),
+    ],
+)
+def test_a_matching_or_absent_azp_is_accepted(
+    rsa_key: rsa.RSAPrivateKey, aud: Any, azp: Any
+) -> None:
+    jws = _mint(rsa_key, "k1", _aud_azp_claims(aud, azp))
+    principal = oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert principal.username == "jdoe"
+
+
+@pytest.mark.parametrize(
+    "aud",
+    [
+        ["mefor-console", 5],
+        ["mefor-console", None],
+        ["mefor-console", ""],
+        ["mefor-console", True],
+        ["mefor-console", 1.5],
+        ["mefor-console", ["x"]],
+        ["mefor-console", {"a": 1}],
+        "",
+    ],
+)
+def test_a_malformed_aud_is_refused_even_when_it_names_our_client(
+    rsa_key: rsa.RSAPrivateKey, aud: Any
+) -> None:
+    """Each array carries our client_id and a matching azp, so only the malformed element can refuse
+    it. Before BACKLOG #5339 the scalar-element cases were accepted; the unhashable ones (a nested
+    list, a dict) raised TypeError from ``set()`` and are refused by the same element check now. The
+    empty-string aud is refused under the same rule rather than by the membership check."""
+    jws = _mint(rsa_key, "k1", _good_claims(aud=aud, azp="mefor-console"))
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert exc.value.reason == "claim_aud"
+    assert exc.value.reason in oidc.REASONS
+    # The detail tells the shape check from the membership check, which also says claim_aud.
+    assert str(exc.value) == "aud is malformed"
+
+
+# --- claims: a malformed nonce rejects as an audited ClaimsError, not a 500 (BACKLOG #1016) ---------
+#
+# The malformed-aud half of #1016 is test_a_malformed_aud_is_refused_even_when_it_names_our_client
+# above; its negative control is test_a_matching_or_absent_azp_is_accepted, whose list-aud rows pass
+# the element check.
 
 
 def test_a_non_ascii_nonce_is_a_mismatch_not_a_crash(rsa_key: rsa.RSAPrivateKey) -> None:
@@ -457,29 +544,14 @@ def test_a_non_ascii_nonce_is_a_mismatch_not_a_crash(rsa_key: rsa.RSAPrivateKey)
     assert exc.value.reason in oidc.REASONS
 
 
-@pytest.mark.parametrize("aud", [[["mefor-console"]], [{"a": 1}]])
-def test_an_unhashable_aud_element_is_claim_aud_not_a_crash(
-    rsa_key: rsa.RSAPrivateKey, aud: Any
-) -> None:
-    """A ``list`` aud carrying an unhashable element (a nested list, or a dict) raises ``TypeError``
-    from ``set(aud)`` — the one malformed shape that escapes the fall-through to an empty set. It
-    must reject as an audited ``claim_aud``, not a 500. A top-level dict/int/None already falls
-    through cleanly, so reaching the guard proves it fired: pre-fix the path raises before the
-    membership check below it could run."""
-    jws = _mint(rsa_key, "k1", _good_claims(aud=aud))
-    with pytest.raises(oidc.ClaimsError) as exc:
-        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
-    assert exc.value.reason == "claim_aud"
-    assert exc.value.reason in oidc.REASONS
-
-
 def test_the_malformed_shape_guards_do_not_over_reject_a_valid_token(
     rsa_key: rsa.RSAPrivateKey,
 ) -> None:
-    """Negative control (guard-the-guard): the two malformed-shape guards must not reject an ordinary
-    valid token — an ASCII nonce equal to the policy nonce and a plain str aud validate byte-
-    identically. The existing ``{"nonce": "wrong"}`` rung already proves an ASCII wrong-nonce still
-    routes to ``nonce_mismatch``, so the encoding guard does not swallow real mismatches."""
+    """Negative control (guard-the-guard): the nonce-encoding guard and the aud shape check must not
+    reject an ordinary valid token — an ASCII nonce equal to the policy nonce and a plain str aud
+    validate byte-identically. The existing ``{"nonce": "wrong"}`` rung already proves an ASCII
+    wrong-nonce still routes to ``nonce_mismatch``, so the encoding guard does not swallow real
+    mismatches."""
     jws = _mint(rsa_key, "k1", _good_claims())
     principal = oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
     assert principal.username == "jdoe"

@@ -499,13 +499,14 @@ def test_the_credential_pass_reads_only_the_work_window(monkeypatch: pytest.Monk
     from messagefoundry.verify.model import safe_detail_text
 
     seen: list[int] = []
-    real = secretscrub.scrub_credentials
+    # verify_leaf reads the credential pass without the masked tails (BACKLOG #5546 to #5550).
+    real = secretscrub.scrub_credentials_without_tails
 
     def spy(text: str, **kwargs: str) -> str:
         seen.append(len(text))
         return real(text, **kwargs)
 
-    monkeypatch.setattr(secretscrub, "scrub_credentials", spy)
+    monkeypatch.setattr(secretscrub, "scrub_credentials_without_tails", spy)
     text = f"PWD={_PLANTED} " + "word " * (_REDACT_WINDOW // 2)
     assert len(text) > _REDACT_WINDOW
     detail = safe_detail_text(text)

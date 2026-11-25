@@ -653,7 +653,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/dicom.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     # ADR 0025 Phase 2: a per-request random multipart boundary (secrets.token_hex) for the DICOMweb
     # STOW-RS body, generated absent from the object bytes (RFC 2046 §5.1.1) — framing, not a secret.
-    "messagefoundry/transports/dicomweb.py": frozenset({"secrets"}),
+    # Vault BACKLOG #5511: tls_policy.refuse_chain_check_on_os_roots, a build-time refusal that
+    # decides nothing about the context; the anchored opener is still built by rest.py.
+    "messagefoundry/transports/dicomweb.py": frozenset(
+        {"messagefoundry.config.tls_policy", "secrets"}
+    ),
     # ADR 0085: DIRECT-HISP outbound S/MIME — cryptography.serialization.pkcs7 SIGN then ENCRYPT of the
     # Handler body + x509 recipient-cert / trust-anchor cross-validation at construction. No new dependency.
     # #323: ssl = the SMTP/HISP relay's TRANSPORT hop, a separate concern from the S/MIME message
@@ -1365,6 +1369,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # Vault BACKLOG #5627, #5511: harden_crl_check(chain=True), the whole-chain CRL of the
             # API listener and the MLLP, HTTP and DICOM inbound listeners.
             "tls_context:.verify_flags |= VERIFY_CRL_CHECK_CHAIN",
+            # Vault BACKLOG #5511: [tls].crl_check_chain makes an outbound chain end at a root.
+            "tls_context:.verify_flags &= ~int(VERIFY_X509_PARTIAL_CHAIN)",
             "tls_context:.verify_mode =",
             "tls_context:.verify_mode = CERT_NONE",
             "tls_context:ssl.SSLContext",

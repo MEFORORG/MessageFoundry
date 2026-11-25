@@ -1148,7 +1148,9 @@ async def test_the_sign_in_lock_notice_reads_the_totp_verdict_its_escalation_use
 
     store, service, _notifier, row = await _harness(threshold=2)
     try:
-        cell = await store.set_totp_secret(row.id, secret="JBSWY3DPEHPK3PXP", now=1.0)
+        cell = await store.set_totp_secret(
+            row.id, secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", now=1.0
+        )
         assert await store.enable_totp(
             row.id, expected_secret_cell=cell, recovery_code_hashes=[], now=1.0
         )

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Vendored from contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 (v2.6.1). See README.md in this directory.
+// Vendored from contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 (v2.6.1), with local modifications. See README.md in this directory.
 /******/ (() => { // webpackBootstrap
 /******/ 	var __webpack_modules__ = ({
 
@@ -41,7 +41,8 @@ function isUserNotInAllowList(committer) {
         pattern = pattern.trim();
         if (pattern.includes('*')) {
             const regex = _.escapeRegExp(pattern).split('\\*').join('.*');
-            return new RegExp(regex).test(committer);
+            // MessageFoundry patch (BACKLOG #5644): anchor the pattern to the whole name.
+            return new RegExp('^' + regex + '$').test(committer);
         }
         return pattern === committer;
     }).length > 0;
@@ -77,6 +78,11 @@ function getCommitters() {
         try {
             let committers = [];
             let filteredCommitters = [];
+            // MessageFoundry patch (BACKLOG #5645): read every page of commits.
+            let cursor = '';
+            let hasNextPage = true;
+            const seenCursors = new Set(['']);
+            while (hasNextPage) {
             let response = yield octokit_1.octokit.graphql(`
         query($owner:String! $name:String! $number:Int! $cursor:String!){
             repository(owner: $owner, name: $name) {
@@ -118,7 +124,7 @@ function getCommitters() {
                 owner: github_1.context.repo.owner,
                 name: github_1.context.repo.repo,
                 number: github_1.context.issue.number,
-                cursor: ''
+                cursor: cursor // MessageFoundry patch (BACKLOG #5645)
             });
             response.repository.pullRequest.commits.edges.forEach(edge => {
                 const committer = extractUserFromCommit(edge.node.commit);
@@ -133,6 +139,16 @@ function getCommitters() {
                     committers.push(user);
                 }
             });
+            // MessageFoundry patch (BACKLOG #5645): stop after the last page, and fail on a
+            // next page whose cursor is missing or already seen.
+            const commits = response.repository.pullRequest.commits;
+            hasNextPage = commits.pageInfo.hasNextPage === true;
+            if (hasNextPage && (typeof commits.pageInfo.endCursor !== 'string' || seenCursors.has(commits.pageInfo.endCursor))) {
+                throw new Error('pagination reported a next page with no new cursor');
+            }
+            cursor = commits.pageInfo.endCursor;
+            seenCursors.add(cursor);
+            }
             filteredCommitters = committers.filter((committer) => {
                 return committer.id !== 41898282;
             });

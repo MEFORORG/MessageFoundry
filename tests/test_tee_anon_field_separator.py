@@ -26,7 +26,7 @@ from messagefoundry.parsing.message import Message
 from tee.anon import hl7 as tee_hl7
 from tee.anon.keying import Keyer
 
-_SALT = "b214-5540-salt-0123456789abcdef"
+_SALT = "b214-5540-salt-0123456789abcdef-0123456789"
 #: A value in a field no rule rewrites, after the scrubbed one, so a shifted field would show.
 _MARK = "AFTERMARK"
 
@@ -126,7 +126,8 @@ def test_the_guard_passes_a_value_with_no_structure_character() -> None:
 @_SIDES
 def test_a_nul_kept_by_an_identifier_surrogate_is_refused(anon: ModuleType) -> None:
     """The identifier kinds keep every character that is not a letter or digit, NUL included. The
-    engine's ``Message.set`` refuses NUL in a whole-field write, so the tee must too."""
+    engine's ``Message.set`` refuses NUL in a whole-field write, so the tee must too. The shared
+    C0 refusal (BACKLOG #5533 item 14) now refuses it first, on both sides."""
     message = _message("|", "PID", {1: "1", 3: "A12\x0034^^^H^MR", 8: _MARK})
     with pytest.raises(anon.AnonError) as caught:
         anon.anonymize(message, salt=_SALT)
@@ -137,7 +138,7 @@ def test_a_nul_kept_by_an_identifier_surrogate_is_refused(anon: ModuleType) -> N
 @pytest.mark.parametrize(
     ("fields", "why"),
     [
-        ({1: "1", 3: "A12\x0734^^^H^MR"}, "a control byte the engine passes, in a ruled field"),
+        ({1: "1", 3: "A12\x7f34^^^H^MR"}, "DEL, which neither side refuses, in a ruled field"),
         ({1: "1", 8: "F\x00M"}, "NUL in a field no rule rewrites"),
     ],
 )

@@ -44,12 +44,16 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import re
 import sys
 import threading
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from messagefoundry.logging_setup import configure_stderr_logging
+
+if TYPE_CHECKING:
+    from messagefoundry.config.run_context import RunPhase
 
 # stdout is the IPC channel, so the root logger goes to stderr — a stray log line there cannot corrupt
 # a frame. It is `configure_stderr_logging` rather than a bare `basicConfig` because redaction is a
@@ -129,13 +133,21 @@ def _proc_status_kib(field: str) -> int | None:
 def _rlimit_data_counts_mmap() -> bool:
     """Whether this kernel counts private writable ``mmap`` memory against ``RLIMIT_DATA``. Linux
     4.7 and later do; earlier kernels count only the ``brk`` heap, which would leave most large
-    allocations outside the cap, so the caller falls back to ``RLIMIT_AS`` there."""
+    allocations outside the cap, so the caller falls back to ``RLIMIT_AS`` there. Only the leading
+    ``major.minor`` digits are read, so a suffix on the minor, as in ``6.12-rc4`` or ``5.15-aws``,
+    does not make a new kernel read as unknown (BACKLOG #6811)."""
     try:
-        release = os.uname().release  # type: ignore[attr-defined,unused-ignore]
-        major, minor = (int(part) for part in release.split(".")[:2])
-    except (AttributeError, ValueError):
+        uname = os.uname()  # type: ignore[attr-defined,unused-ignore]
+    except AttributeError:
         return False
-    return (major, minor) >= (4, 7)
+    if uname.sysname != "Linux":
+        return False  # another kernel's numbering says nothing about Linux 4.7 semantics
+    # Bounded ASCII digit runs, so int() never meets a string too long to convert; a longer run reads
+    # as unparseable rather than as its first nine digits.
+    match = re.match(r"([0-9]{1,9})\.([0-9]{1,9})(?![0-9])", uname.release)
+    if match is None:
+        return False
+    return (int(match[1]), int(match[2])) >= (4, 7)
 
 
 def _apply_resource_caps(mem_mb: int | None) -> str:
@@ -144,7 +156,8 @@ def _apply_resource_caps(mem_mb: int | None) -> str:
     platform. There is deliberately no ``RLIMIT_CPU``, so CPU spent outside a call has no bound (ADR
     0087, amendment of 2026-10-07).
 
-    Where ``/proc/self/status`` gives a ``VmData`` (Linux), ``mem_mb`` is HEADROOM above what the
+    Where ``/proc/self/status`` gives a ``VmData`` and ``uname`` reads Linux 4.7 or later,
+    ``mem_mb`` is HEADROOM above what the
     worker holds once its graph is loaded: the cap is ``RLIMIT_DATA`` at that ``VmData`` plus
     ``mem_mb`` (vault BACKLOG #3133 part 2, owner ruling 2026-10-11). Called right after
     ``load_snapshot``, so a graph larger than ``mem_mb`` does not start the worker over its cap.
@@ -154,7 +167,10 @@ def _apply_resource_caps(mem_mb: int | None) -> str:
     writable size does count after its threads exit, which is why the parent also starts this
     process with ``MALLOC_ARENA_MAX=2``. A live thread's stack counts too, and glibc keeps up to
     about 40 MiB of exited threads' stacks mapped for reuse.
-    Elsewhere on POSIX ``mem_mb`` stays an absolute ``RLIMIT_AS`` cap, and a log line says so."""
+    In at least these cases ``mem_mb`` stays an absolute ``RLIMIT_AS`` cap, and a log line says so:
+    a ``uname`` that does not name Linux, Linux before 4.7, a release with no readable
+    ``major.minor``, and no ``VmData``. A ``setrlimit`` that fails is logged and sets no cap of this
+    worker's own; a limit it inherited still applies."""
     try:
         import resource
     except ImportError:
@@ -174,7 +190,8 @@ def _apply_resource_caps(mem_mb: int | None) -> str:
         rlimit, name = resource.RLIMIT_AS, "RLIMIT_AS"  # type: ignore[attr-defined,unused-ignore]
         baseline = 0
         log.warning(
-            "sandbox worker: no VmData in /proc/self/status, or a kernel older than Linux 4.7, so "
+            "sandbox worker: no VmData in /proc/self/status, or no Linux 4.7 or later read from the "
+            "kernel release, so "
             "[sandbox].mem_mb is an absolute RLIMIT_AS cap of %d MiB here, not headroom above the "
             "loaded graph",
             mem_mb,
@@ -354,6 +371,7 @@ def _run_one(
         req.run_context, code_sets=registry.code_sets if code_sets is None else code_sets
     )
 
+    phase_key: RunPhase
     if phase == "router":
         fn = registry.routers.get(name)
         phase_key = "router"

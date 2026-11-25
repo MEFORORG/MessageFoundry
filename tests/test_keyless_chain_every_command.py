@@ -611,10 +611,9 @@ def test_a_key_that_does_not_resolve_exits_2(
     captured = capsys.readouterr()
     assert rc == 2, (captured.out, captured.err)
     text = _refusal_text(command, captured.out, captured.err)
-    from messagefoundry.store import base as store_base
-
-    # A fixed text since the eighth hold on engine PR 2818.
-    assert store_base._TRANSIT_BUILD_TEXTS[4] in text, text
+    # The engine built this refusal from the variable's name alone and recorded it, so the
+    # build's fixed-text replacement keeps it, naming what to set (BACKLOG #6010 item 3).
+    assert "MEFOR_STORE_TRANSIT_KEY is not set" in text, text
 
 
 @pytest.mark.parametrize("command", [*_KEY_REFUSING_COMMANDS, "admin-reset-totp", "rotate-key"])

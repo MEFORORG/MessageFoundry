@@ -57,7 +57,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, BinaryIO, NamedTuple, cast
+from typing import Any, BinaryIO, Literal, NamedTuple, Protocol, cast
 
 from messagefoundry import file_lock
 from messagefoundry.config import atomic_edit
@@ -74,6 +74,7 @@ from messagefoundry.store.backup_codec import (
     FORMAT_VERSION,
     BackupCodecError,
     BackupKeyMismatch,
+    _read_once,
     archive_key_id,
     decrypt_stream,
     encrypt_stream,
@@ -98,10 +99,11 @@ from messagefoundry.store.cipher_cells import (
 from messagefoundry.store.crypto import (
     StoreKeylessError,
     _decode_key,
+    gave_no_verdict,
     store_data_key_id,
 )
 from messagefoundry.store.gcm_bound import bounded_cipher
-from messagefoundry.store.schema_verify import SchemaMismatchError
+from messagefoundry.store.schema_verify import SchemaMismatchError, is_schema_step_error
 from messagefoundry.terminal_text import escape_for_terminal
 from messagefoundry.transports.file import (
     _FLAG_BACKUP_SEMANTICS,
@@ -207,9 +209,10 @@ _MAX_RESTORE_MEMBER_BYTES = 16 * 1024 * 1024 * 1024  # 16 GiB
 #: which the decrypt has already written to that same temp dir in full. So the member cap is reached
 #: only after the disk it protects is spent. This moves the bound to the first write — on the restore
 #: path, both limbs of it. :func:`_verify_archive_blocking`'s own plaintext limb is still uncounted,
-#: though since BACKLOG #1174 it too stages beside a SQLite store. Its copy is no larger than the
-#: archive file it reads, and giving it this bound means adding an escape arm to that function's
-#: ordered ``except`` block, which is a wider change than the one this constant documents.
+#: though since BACKLOG #1174 it too stages beside a SQLite store. That limb has no byte cap of its
+#: own: what it copies is whatever the archive path yields, which a device or a growing file does
+#: not bound. Nothing here gives it this bound yet; that is a change of its own, not one this
+#: constant documents.
 #:
 #: **Why twice the member cap, and why a multiple rather than a literal.** A conforming archive is one
 #: ``store.db`` — admitted up to :data:`_MAX_RESTORE_MEMBER_BYTES`, above which the verify FAILs at the
@@ -281,10 +284,13 @@ class VerifyResult:
     row_counts: dict[str, int] = field(default_factory=dict)
     manifest_counts: dict[str, int] = field(default_factory=dict)
     reason: str | None = None
-    #: How many cipher-covered cells the FULL verify decrypted AND authenticated in the snapshot. A
-    #: count, never a plaintext. ``0`` on a lightweight verify (it does not run the pass) and on an
-    #: unencrypted store (there is nothing sealed to open) — so it distinguishes "read the PHI" from
-    #: "opened the file", which is the whole difference a full verify is meant to prove.
+    #: How many cipher-covered cells the FULL verify decrypted AND authenticated in the snapshot as
+    #: the archive holds it, before its open. A count, never a plaintext. ``0`` on a lightweight
+    #: verify (it does not run the pass) and on an unencrypted store (there is nothing sealed to
+    #: open) — so it distinguishes "read the PHI" from "opened the file", which is the whole
+    #: difference a full verify is meant to prove. A cell only the walk after the open reads, one a
+    #: migration makes readable, is authenticated toward the verdict but not counted here
+    #: (:func:`_full_open_check`).
     decrypted_cells: int = 0
 
     @property
@@ -434,16 +440,72 @@ class _HashingReader:
         self._raw = raw
         self.digest = hashlib.sha256()
 
-    def read(self, size: int = -1) -> bytes:
+    def read(self, size: int = -1) -> bytes | None:
         data = self._raw.read(size)
         # A read that is not bytes-like (None from a non-blocking source with nothing ready, or a
         # str) passes through unhashed. On the keyed branch the codec's own refusal then names it,
         # rather than a TypeError from the digest escaping the BackupCodecError arm. The no-key
-        # copy loop has no such refusal, but its only source is the archive path opened 'rb', a
-        # blocking buffered reader whose reads return bytes.
+        # restore copy reads this class through `_read_chunks`, and the pass-through is what lets
+        # `_NoneRefusingReader` refuse such a read there rather than the digest (BACKLOG #6687).
         if isinstance(data, (bytes, bytearray, memoryview)):
             self.digest.update(data)
         return data
+
+
+class _ChunkSource(Protocol):
+    """What :func:`_read_chunks` reads from: a binary ``read(n)`` that may answer ``None``."""
+
+    def read(self, size: int, /) -> bytes | None: ...
+
+
+#: The read size of :func:`_read_chunks`, the 1 MiB the copy loops it replaced read.
+_COPY_CHUNK_BYTES = 1024 * 1024
+
+
+def _read_chunks(src: _ChunkSource, what: str) -> Iterator[bytes]:
+    """Yield ``src``'s bytes, one ``read`` of up to :data:`_COPY_CHUNK_BYTES` at a time, until an
+    empty read, which is the end of the stream.
+
+    Each read goes through :class:`_NoneRefusingReader`, which says what a single read is refused
+    for and how. It authenticates nothing and caps no total. ``what`` names the copy in the refusal.
+    A blocking binary file answers each read with at most ``n`` bytes and never ``None``, so for
+    one this yields the same reads the old loops wrote."""
+    reader = _NoneRefusingReader(src, what)
+    while buf := reader.read(_COPY_CHUNK_BYTES):
+        yield buf
+
+
+class _NoneRefusingReader:
+    """A ``read`` over ``src`` held to the codec's ``_read_once`` checks, at least the ones the keyed
+    copies apply to each read. :func:`_read_chunks` reads through it, and so can a reader such as
+    ``shutil.copyfileobj`` that drives its own loop. A ``None`` read, a read that is not bytes-like
+    and a read over the size asked for are refused (BACKLOG #6687); a ``bytearray`` or
+    ``memoryview`` read is returned as ``bytes``. A ``None`` read comes from a non-blocking source
+    with no data ready, and a bare ``if not buf: break`` loop, or ``copyfileobj``, reads it as the
+    end of the stream and finishes the copy short.
+
+    The refusal is raised as an ``OSError`` (``EIO``) with the codec's error chained to it, so each
+    caller handles it as it handles any ``OSError`` from that copy, which the callers' own ``except``
+    arms define. A ``BackupCodecError`` would instead be reported as an encrypt or decrypt failure,
+    and a no-key copy does neither.
+
+    ``size`` must be positive. A negative size, the io convention for "read all", including the
+    no-argument ``read()``, is refused as a ``ValueError`` before any read, so a caller that expects
+    the whole stream from one call fails loudly rather than getting one chunk."""
+
+    def __init__(self, src: _ChunkSource, what: str) -> None:
+        self._src = src
+        self._what = what
+        # Kept for a reader that names its source, as a test seam on `copyfileobj` does.
+        self.name: object = getattr(src, "name", "")
+
+    def read(self, size: int = -1, /) -> bytes:
+        if size < 0:
+            raise ValueError(f"the {self._what} is read in chunks: read(n) takes a positive n")
+        try:
+            return _read_once(cast(BinaryIO, self._src), size, self._what)
+        except BackupCodecError as exc:
+            raise OSError(errno.EIO, str(exc)) from exc
 
 
 def _manifest_time(manifest: dict[str, object]) -> float | None:
@@ -1281,10 +1343,7 @@ class BackupRunner:
             else:
                 # No key + allow_unencrypted: write the plaintext tar verbatim. It can hold PHI: no
                 # instance is synthetic since BACKLOG #1279 (ADR 0186).
-                while True:
-                    buf = src.read(1024 * 1024)
-                    if not buf:
-                        break
+                for buf in _read_chunks(src, "plaintext tar"):
                     dst.write(buf)
             dst.flush()
             os.fsync(dst.fileno())
@@ -2809,8 +2868,8 @@ def _discard_verify_staging(
 #
 # * A SQLite store stages in its own DATA DIRECTORY, beside the store, and applies the store's
 #   best-effort `_secure_file` to each staged tar and extracted store before its first byte, the way
-#   `mefor-restore-*` does. The snapshot file gets it from `snapshot_to` once its copy completes. What
-#   `_secure_file` leaves inside a temp directory's own DACL is not always owner-only (ADR 0163).
+#   `mefor-restore-*` does. The snapshot file gets it from `snapshot_to` once its copy completes.
+#   What `_secure_file` leaves on Windows is stated once, in its docstring (ADR 0163).
 # * A server-DB store has no data directory, so it stages in `.mefor-staging` under the backup
 #   destination, secured the same way: an owner-only per-run directory and `_secure_file` on each
 #   staged file. A share that will not keep the directory owner-only refuses the run (see
@@ -4409,10 +4468,7 @@ def _verify_in_staging(
             # teardown discards the partial tar on the way out.
             decrypt_stream(src, dst, match_key, max_plaintext_bytes=_MAX_RESTORE_PLAINTEXT_BYTES)
         else:
-            while True:
-                buf = src.read(1024 * 1024)
-                if not buf:
-                    break
+            for buf in _read_chunks(src, "plaintext archive"):
                 dst.write(buf)
     manifest = _read_manifest_from_tar(tar_path)
     if manifest.get("config_only"):
@@ -4780,9 +4836,16 @@ def _full_open_check(
         return "FAIL", "no live store settings were supplied for the full restore-verify", 0
     snap_settings = settings.model_copy(update={"path": str(snap), "backend": StoreBackend.SQLITE})
 
+    # Whether the last `_walk` returned `_decrypt_check`'s own verdict, rather than one for a raise.
+    walk_read: list[bool] = [False]
+    # The last walk's `WalkVerdict.kind`, or None for one that raised or carries no kind.
+    walk_kind: list[WalkKind | None] = [None]
+
     def _walk() -> tuple[str, str, int]:
+        walk_read[0] = False
+        walk_kind[0] = None
         try:
-            return _decrypt_check(snap, snap_settings, posture=posture)
+            result = _decrypt_check(snap, snap_settings, posture=posture)
         except (RuntimeError, ValueError, OSError, sqlite3.Error) as exc:
             # Its cipher build and its read-only connect are the open's own, so a failure there (a
             # key provider or DPAPI, a cipher config or a refused hop, a file the connect cannot
@@ -4790,14 +4853,17 @@ def _full_open_check(
             # open it is still behind an incompatible snapshot's verdict, so the open runs and the
             # order below decides; after the open it is the verdict.
             return "FAIL", safe_exc(exc), 0
+        walk_read[0] = True
+        walk_kind[0] = getattr(result, "kind", None)
+        return result
 
     # The cells are read FIRST, from the snapshot as the archive holds it (BACKLOG #1719). The open
     # below is a keyed open, and its at-open sweep seals what it reads as legacy plaintext: under
     # the opt-out, or on a surface no keyed open recorded, that includes a value whose marker is
     # damaged, which would then open cleanly and PASS. Read first, the walk judges that value as
-    # it was archived, and the verdict matches `cipher-audit`'s on the same store. A second walk
-    # after the open reads the cells a migration adds or renames, which this one cannot see.
+    # it was archived, and the verdict matches `cipher-audit`'s on the same store.
     walked = _walk()
+    walked_cells = walk_read[0]
     # ADR 0196 AC-8: the snapshot is a copy of the LIVE store and carries its salt. Opened as it is,
     # anything the open seals (the at-open sweep) would land under the live store's data sub-key and
     # be counted only in this throwaway copy's row. Dropping the salt makes the open mint a new one,
@@ -4835,7 +4901,40 @@ def _full_open_check(
     try:
         ok, msg = run_guarded(_open())
     except SchemaMismatchError as exc:
-        return "FAIL", _incompatible_snapshot(exc, engine_version), 0
+        # The walk's finding rides along, so it is not lost behind the remedy (BACKLOG #1719 item
+        # 3). `_walk` turns an exception that escapes `_decrypt_check` (its cipher build, its
+        # connect, or a RuntimeError, ValueError or OSError partway) into a FAIL of its own, which
+        # says nothing here. A sqlite3.Error or CipherWalkInterrupted partway is
+        # `_decrypt_check`'s own FAIL, and does ride along.
+        walk = None
+        if walked_cells:
+            # No count here: this arm reports none (`decrypted_cells` stays 0 on it).
+            if walked[0] != "PASS":
+                # Which findings get the misread reading, and what it does not claim, is
+                # `_MISREADABLE_KINDS`'s to say.
+                why = (
+                    " (the remedy leads because this build can misread another version's cells"
+                    " or schema)"
+                    if walk_kind[0] in _MISREADABLE_KINDS
+                    else ""
+                )
+                # Redacted by `_incompatible_snapshot` under `_WALK_REASON_LIMIT`, not safe_text's
+                # 200-character default, which the prefix and a reading's line together can pass.
+                walk = (
+                    f"Before the open, the walk of the cells this build knows reported {walked[0]}"
+                    f"{why}: {walked[1]}"
+                )
+            elif walked[2]:
+                walk = (
+                    "Before the open, the walk of the cells this build knows passed: every sealed"
+                    " value it read decrypted and authenticated."
+                )
+            else:
+                walk = (
+                    "Before the open, the walk of the cells this build knows passed, holding no"
+                    " sealed value to decrypt."
+                )
+        return "FAIL", _incompatible_snapshot(exc, engine_version, walk=walk), 0
     except StoreKeylessError as exc:
         # The store's own eager `state`/`reference` warm-ups fail closed on a keyless open of an
         # encrypted store. Same cause, same verdict — an absent keyring, not a bad archive — as
@@ -4860,13 +4959,36 @@ def _full_open_check(
 #: Longer than safe_exc's default, so the remedy and at least the first differences survive.
 _INCOMPATIBLE_REASON_LIMIT = 600
 
+#: The most characters of the walk's sentence the incompatible-snapshot refusal quotes. Its parts
+#: are bounded where they are made: at least a cell's locator values, at 64 characters and an
+#: elision mark each (`cipher_cells._shown`), and error text, cut at safe_text's 200 plus its
+#: notes. safe_exc's ordinary arm adds the class name and ": " outside that 200; the SQLite arm's
+#: text is bounded by safe_text in `_sqlite_error_reason`, with its class name inside the 200. A
+#: reading's line, the foreign-key note included, is then expected to stay well inside this,
+#: verdict and reason words included, so the cut is there to stop a defect from making the
+#: sentence unbounded.
+_WALK_REASON_LIMIT = 2000
 
-def _incompatible_snapshot(exc: SchemaMismatchError, engine_version: str) -> str:
+#: How :func:`_decrypt_check` opens the reason for a decrypt the key service gave no verdict on.
+_OUTAGE_LEAD = "the key service did not return a usable answer"
+
+
+def _error_classes(error: BaseException) -> str:
+    """The error's class, and its cause's when it has one, as a PHI-free label."""
+    cause = error.__cause__
+    named = type(error).__name__
+    return named if cause is None else f"{named} from {type(cause).__name__}"
+
+
+def _incompatible_snapshot(
+    exc: SchemaMismatchError, engine_version: str, *, walk: str | None = None
+) -> str:
     """The restore-verify refusal of a snapshot this build's schema cannot open (BACKLOG #2101).
 
     The store's own message tells an operator to move the store aside and recreate it, and for an
     encrypted store to change its key first. Neither applies to an archive, so this names the
-    version to restore it with instead. The remedy leads and the differences follow, so a short
+    version to restore it with instead. The remedy leads, the differences follow, and ``walk``,
+    the cell walk's sentence when one read the cells before the open, comes last, so a short
     display loses only the detail."""
     # The manifest is inside the authenticated archive, but it is still a string this build did not
     # write, so only a short, printable version label is quoted back.
@@ -4878,11 +5000,15 @@ def _incompatible_snapshot(exc: SchemaMismatchError, engine_version: str) -> str
         tail = f"The schema step failed: {exc.cause or ''}."
     # Redacted and bounded like every other arm's reason (safe_exc there): the tail is driver text
     # and a difference list with no length of its own. The remedy leads, so a cut loses only detail.
-    return safe_text(
+    head = safe_text(
         "the archive's store is from an incompatible version, so this build cannot open it: restore"
-        f" it with {wrote}. The archive opened and passed its integrity and row-count checks. {tail}",
+        f" it with {wrote}. The archive opened and passed its integrity and row-count checks."
+        f" {tail}",
         limit=_INCOMPATIBLE_REASON_LIMIT,
     )
+    # Redacted here, and appended after the head's cut, so a long differences list cannot cut it
+    # away.
+    return f"{head} {safe_text(walk, limit=_WALK_REASON_LIMIT)}" if walk else head
 
 
 def _sqlite_error_reason(exc: sqlite3.Error) -> str:
@@ -4893,11 +5019,85 @@ def _sqlite_error_reason(exc: sqlite3.Error) -> str:
     return safe_text(f"{type(exc).__name__}: {text}")
 
 
+#: What decided a :func:`_decrypt_check` verdict. ``cell`` is, under a key, at least a sealed value
+#: that did not open, other than one :func:`gave_no_verdict` reads as the key service's
+#: (``outage``). Which Transit replies give no verdict is for
+#: :meth:`~messagefoundry.store.crypto_transit.TransitCipher.decrypt` and
+#: :meth:`~messagefoundry.store.crypto_transit.TransitCipher.decrypt_many` to say, and the two do
+#: not always agree: at least a reply hvac returns unparsed (a 2xx other than 200, a 200 body that
+#: is not JSON, or one cut short where no length framed it) is ``cell`` for a value asked for alone
+#: and ``outage`` for a value asked for in a batch. ``cell`` is also a value that opened
+#: but its reader refuses (a ``QueueTagError``); a value whose AAD the open refused (an
+#: ``AADComponentError``); a marker in another ASCII case; and, on a surface the keyed store sealed
+#: and without ``allow_unmarked_ciphertext``, a value with no marker. ``damaged`` is a BLOB, or a
+#: TEXT value that is not UTF-8, for which Python's sqlite3 module raises a decode error; at least
+#: this build's own writer stores neither. ``sqlite_schema`` is a statement the snapshot's schema
+#: could not answer, by :func:`is_schema_step_error`, other than a virtual table's missing module;
+#: ``sqlite`` any other SQLite fault; ``interrupted`` a schema change mid-walk; ``outage`` a key
+#: service that gave no verdict; ``key_mismatch`` a keyed snapshot read with no key; ``pass`` none.
+WalkKind = Literal[
+    "pass",
+    "cell",
+    "damaged",
+    "sqlite_schema",
+    "sqlite",
+    "interrupted",
+    "outage",
+    "key_mismatch",
+]
+
+#: The kinds, by this set exactly, for which the incompatible-snapshot refusal offers the reading
+#: that a walk under this build read another version's cells or schema differently, as well as
+#: real damage. The reading is a possible cause there, never a finding that the cells are sound.
+#: They are not every kind a fault of that shape can reach, and a fault of any other kind gets no
+#: such framing. At least two such gaps are known, each a misread where another version wrote the
+#: snapshot. One is kind ``damaged`` (see :data:`WalkKind`), should another version's writer store
+#: what that kind names. The other is a keyed walk of a cipher column with an unregistered
+#: collation ("no such collation sequence"), kind ``sqlite`` where the collation's name holds no
+#: ``schema_verify._SHAPE_MESSAGES`` entry, or holds "no such module", which :func:`_sqlite_kind`
+#: excludes. :func:`is_schema_step_error` matches those entries as substrings of the whole
+#: message, so it rejects the first, and :func:`_sqlite_kind` falls through to ``sqlite`` for both.
+_MISREADABLE_KINDS: frozenset[WalkKind] = frozenset({"cell", "sqlite_schema"})
+
+
+class WalkVerdict(tuple[str, str, int]):
+    """A :func:`_decrypt_check` verdict: ``(status, reason, cells)``, as every caller unpacks it,
+    with the :data:`WalkKind` that decided it on ``kind``."""
+
+    kind: WalkKind
+
+    def __new__(cls, status: str, reason: str, cells: int, kind: WalkKind) -> WalkVerdict:
+        verdict = super().__new__(cls, (status, reason, cells))
+        verdict.kind = kind
+        return verdict
+
+    def __getnewargs__(self) -> tuple[str, str, int, WalkKind]:
+        # So copy and pickle rebuild it with its kind; tuple's own supplies only the three items.
+        return (self[0], self[1], self[2], self.kind)
+
+    def __repr__(self) -> str:
+        return f"WalkVerdict({self[0]!r}, {self[1]!r}, {self[2]!r}, kind={self.kind!r})"
+
+
+def _sqlite_kind(exc: sqlite3.Error) -> WalkKind:
+    """``sqlite_schema`` where the store's own schema classifier (:func:`is_schema_step_error`)
+    calls the fault a wrong shape, except a virtual table's missing module, which is an object
+    another tool left rather than another version's schema; ``damaged`` for a TEXT value Python's
+    sqlite3 module could not decode; else ``sqlite``."""
+    text = str(exc)
+    if is_schema_step_error(exc) and "no such module" not in text:
+        return "sqlite_schema"
+    if isinstance(exc, sqlite3.OperationalError) and text.startswith(_DECODE_ERROR_PREFIX):
+        return "damaged"
+    return "sqlite"
+
+
 def _decrypt_check(
     snap: Path, settings: StoreSettings, *, posture: HopPosture | None = None
-) -> tuple[str, str, int]:
+) -> WalkVerdict:
     """Decrypt AND authenticate every cipher-covered cell retained in the snapshot, under the store's own
-    cipher. Returns ``(status, message, cells)`` — a COUNT and a PHI-free reason, never a plaintext.
+    cipher. Returns a :class:`WalkVerdict`, ``(status, message, cells)`` with the :data:`WalkKind`
+    that decided it — a COUNT and a PHI-free reason, never a plaintext.
 
     Opening the store proves the file is a readable SQLite database. It does not prove the PHI inside it
     is readable, and those are the two different claims a disaster-recovery check gets confused about: a
@@ -4917,9 +5117,8 @@ def _decrypt_check(
     key opened, then a failure. Under a key no keyless reading can come, so this pass stops at the
     first value that does not open. With no key it reads on past a BLOB, which fails under any
     cipher, so a sealed value later in the walk still decides KEY_MISMATCH, as ``cipher-audit``
-    decides it, whichever row comes first. A full verify runs this pass before the store's own
-    open (:func:`_full_open_check`), so the open cannot decide first or change a cell this reads,
-    and again after it, over the migrated copy.
+    decides it, whichever row comes first. When a full verify runs this pass, and why, is
+    :func:`_full_open_check`'s to say.
 
     It also reads the non-blank values with no marker, as ``cipher-audit`` does: one on a surface
     the keyed store has sealed fails, unless ``allow_unmarked_ciphertext`` is set, because the
@@ -4935,7 +5134,7 @@ def _decrypt_check(
     try:
         mismatch = keyed_store_mismatch(conn, cipher, store_tables(conn), source="snapshot")
         if mismatch is not None:
-            return "KEY_MISMATCH", mismatch, cells
+            return WalkVerdict("KEY_MISMATCH", mismatch, cells, "key_mismatch")
         for reading in read_cipher_cells(conn, cipher, unmarked=True):
             if reading.kind == "unmarked":
                 # A non-blank value with no marker on a surface the keyed store sealed: the store
@@ -4944,12 +5143,13 @@ def _decrypt_check(
                 # plaintext, and so does this. Only a keyed walk yields one.
                 if settings.allow_unmarked_ciphertext:
                     continue
-                return (
+                return WalkVerdict(
                     "FAIL",
                     f"{reading.cell.table}.{reading.cell.column} {reading.where} carries no "
                     "at-rest marker on a surface this keyed store has sealed, so the store "
                     "refuses it at read: a damaged or stripped marker, or a planted row",
                     cells,
+                    "cell",
                 )
             if reading.kind == "legacy":
                 # Plaintext on a surface no keyed open recorded, which the next keyed open seals.
@@ -4960,29 +5160,41 @@ def _decrypt_check(
                 # unambiguously the cause. Keylessness is the CIPHER's, never a plaintext's: a
                 # decrypted value may itself begin with the marker. A BLOB never comes here.
                 mismatch = with_first_failure(reading.failure(source="snapshot"), first_blob)
-                return "KEY_MISMATCH", mismatch, cells
+                return WalkVerdict("KEY_MISMATCH", mismatch, cells, "key_mismatch")
             elif reading.kind == "blob":
                 # FAIL under any cipher, and never the keyring's: no key makes a BLOB readable.
                 if cipher.encrypts:
-                    return "FAIL", reading.failure(source="snapshot"), cells
+                    return WalkVerdict("FAIL", reading.failure(source="snapshot"), cells, "damaged")
                 first_blob = first_blob or reading.failure(source="snapshot")
             elif reading.kind == "failed":
+                if reading.error is not None and gave_no_verdict(reading.error):
+                    # The key service failed, not the value: the walk stops here, as
+                    # `cipher-audit` stops on an outage, and the reason says so rather than
+                    # calling the cell undecryptable (BACKLOG #1719 item 12). Still no PASS.
+                    return WalkVerdict(
+                        "FAIL",
+                        f"{_OUTAGE_LEAD} ({_error_classes(reading.error)}) while "
+                        f"{reading.cell.table}.{reading.cell.column} {reading.where} was read, so "
+                        f"the walk stopped without a verdict on it: {safe_exc(reading.error)}",
+                        cells,
+                        "outage",
+                    )
                 # Only under a key: a keyless walk never decrypts. FAIL, not KEY_MISMATCH:
                 # CipherError cannot separate a corrupted ciphertext from a key that was never
                 # supplied, so the softer verdict on a bit-flipped PHI cell is the reading that
                 # must not be talked down.
-                return "FAIL", reading.failure(source="snapshot"), cells
+                return WalkVerdict("FAIL", reading.failure(source="snapshot"), cells, "cell")
             elif reading.kind == "opened":
                 cells += 1
         if first_blob is not None:
-            return "FAIL", first_blob, cells
+            return WalkVerdict("FAIL", first_blob, cells, "damaged")
     except sqlite3.Error as exc:
-        return "FAIL", _sqlite_error_reason(exc), cells
+        return WalkVerdict("FAIL", _sqlite_error_reason(exc), cells, _sqlite_kind(exc))
     except CipherWalkInterrupted as exc:  # nothing else writes a snapshot, but never PASS a part
-        return "FAIL", str(exc), cells
+        return WalkVerdict("FAIL", str(exc), cells, "interrupted")
     finally:
         conn.close()
-    return "PASS", "ok", cells
+    return WalkVerdict("PASS", "ok", cells, "pass")
 
 
 def _read_manifest_from_tar(tar_path: Path) -> dict[str, object]:
@@ -5065,7 +5277,7 @@ def _extract_member(
     """Extract a single archive member to ``dest_dir`` and return its path, or ``None`` when absent.
 
     ``secure`` hands the output file to the store's own best-effort ``_secure_file`` the moment it
-    exists, BEFORE the first byte is streamed into it; what that leaves is not always owner-only on
+    exists, BEFORE the first byte is streamed into it; its docstring states what that leaves on
     Windows (ADR 0163). The restore path passes it: its staging directory sits on the destination
     volume, and the file is the whole decrypted store. Securing it after the stream, the way
     :func:`_place_restored_store` secures the file it publishes, would leave a multi-GB write of PHI
@@ -5109,10 +5321,10 @@ def _extract_member(
             # Reuse the store's own PHI-at-rest primitive, on the empty file, before any of the
             # member's bytes reach it.
             _secure_staged(out, secure)
-            while True:
-                buf = src.read(1024 * 1024)
-                if not buf:
-                    break
+            # `_read_chunks` refuses a None read as an OSError, which each caller reports as it
+            # reports any OSError from this copy, rather than reading it as the member's end and
+            # checking a truncated store (BACKLOG #6687).
+            for buf in _read_chunks(src, f"{name} member"):
                 streamed += len(buf)
                 if streamed > max_member_bytes:
                     raise tarfile.TarError(
@@ -5495,10 +5707,8 @@ def _restore_blocking(
         # moment it exists and before its first byte is written. Best-effort and non-fatal, per that
         # primitive's contract.
         # The file `_place_restored_store` PUBLISHES gets the store-trio rule instead (ADR 0183 Wave 0b).
-        # archive.tar and extracted_store.db keep what `_secure_file` leaves, which is NOT owner-only when
-        # a file carries the temp directory's entries explicitly (it removes inherited entries only;
-        # measured on the hosted runners, CI run 36039014999). A hard-linked placement then shares the
-        # published DACL. A follow-up recorded in ADR 0163.
+        # archive.tar and extracted_store.db keep what `_secure_file` leaves; its docstring states
+        # what that is on Windows (ADR 0163). A hard-linked placement then shares the published DACL. ADR 0163 records it.
         #
         # Staged under the backup's and verify's lock-and-sweep, not in a `TemporaryDirectory`
         # (BACKLOG #5617). That `__exit__` raised when one unlink was refused (on Windows, a scanner
@@ -5567,12 +5777,10 @@ def _restore_blocking(
                     # because it has no AEAD tag to fail on first -- a forged archive is simply copied.
                     # Counting the streamed bytes IS the enforcement (a file's size on disk is not a
                     # bound an attacker who supplies the file is subject to), so this cannot become
-                    # `copyfileobj`.
+                    # `copyfileobj`. `_read_chunks` refuses a None read as an OSError rather than
+                    # ending the copy short there (BACKLOG #6687).
                     streamed = 0
-                    while True:
-                        buf = src.read(1024 * 1024)
-                        if not buf:
-                            break
+                    for buf in _read_chunks(src, "plaintext archive"):
                         streamed += len(buf)
                         if streamed > _MAX_RESTORE_PLAINTEXT_BYTES:
                             raise BackupError(
@@ -6731,7 +6939,10 @@ def _place_restored_store(
         placed = False
         try:
             with out, open(src, "rb") as fh:
-                shutil.copyfileobj(fh, out, 1024 * 1024)
+                # `copyfileobj` reads a None read as the end and would place a truncated store as
+                # placed, so it reads through `_NoneRefusingReader`, which refuses one as an
+                # OSError that the cleanup below handles as it does any failed read (BACKLOG #6687).
+                shutil.copyfileobj(_NoneRefusingReader(fh, "staged store"), out, _COPY_CHUNK_BYTES)
                 out.flush()
                 os.fsync(out.fileno())
             placed = True
@@ -6961,10 +7172,7 @@ def _extract_config_members(
                 # secrets (connections.toml), and securing it after the stream would leave the write
                 # under the directory's inherited ACL on Windows for as long as the write takes.
                 _secure_file(out)
-                while True:
-                    buf = src.read(1024 * 1024)
-                    if not buf:
-                        break
+                for buf in _read_chunks(src, "config member"):
                     # Counting the streamed bytes IS the cap enforcement here (a lying header declares a
                     # small size and streams an unbounded one), so this loop cannot become copyfileobj.
                     streamed += len(buf)

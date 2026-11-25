@@ -67,8 +67,9 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.telemetry import TelemetryConfig
-from pydantic import PrivateAttr
+from pydantic import PrivateAttr, TypeAdapter, ValidationError
 from starlette.datastructures import MutableHeaders
+from starlette.requests import ClientDisconnect
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from messagefoundry import __version__
@@ -244,7 +245,7 @@ from messagefoundry.api.outlive import (
 )
 from messagefoundry.api.outlive import DRAIN_TIMEOUT_SECONDS as OUTLIVING_DRAIN_SECONDS
 from messagefoundry.api.paging import page_total
-from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
+from messagefoundry.api.request_timeout import BODY_REFUSED_KEY, RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     AUTH_NOT_CONFIGURED,
     DIRECTORY_GRANTED_BY,
@@ -268,11 +269,14 @@ from messagefoundry.api.security import (
     pending_credential_deadline,
     public_route,
     quiet_deliberate_export_stops,
+    raise_deferred_monitoring_refusal,
     recheck_standing,
     recheck_standing_or_refusal,
+    record_deferred_monitoring_refusal,
     refuse_from_new_address,
     refuse_undeclared_route,
     require,
+    require_monitoring_read,
     require_paced,
     require_phi_read,
     require_service_cert,
@@ -618,6 +622,22 @@ _MAX_PRESET_LAYERS = 8
 _CONNECTION_TEST_TIMEOUT = 35.0  # overall cap for a POST /connections/{name}/test probe (seconds)
 _MAX_WS_CONNECTIONS = 64  # cap concurrent /ws/stats sockets (API-WS)
 _WS_FRAME_SECONDS = 1.0  # one /ws/stats frame this often; the caller is re-resolved before each
+
+
+_CONNECTION_NAME_ADAPTER: TypeAdapter[str] = TypeAdapter(ConnectionName)
+
+
+def _valid_connection_name(value: str) -> bool:
+    """Whether ``value`` passes the ``ConnectionName`` rule the ``reveal`` query is validated by.
+    ``GET /connections`` defers its monitoring-read 429 only for a valid reveal, so a request that
+    will fail validation is refused, and recorded, at the gate (vault BACKLOG #1191)."""
+    try:
+        _CONNECTION_NAME_ADAPTER.validate_python(value)
+    except ValidationError:
+        return False
+    return True
+
+
 #: Path prefixes whose JSON responses are served ``Cache-Control: no-store`` (ASVS 14.2.2). These are
 #: the PHI-read route families — every route gated by ``require_phi_read`` and every step-up GET that
 #: charges the PHI-read hop/pacing budget lives under one of them, so a browser, a proxy or any other
@@ -4773,6 +4793,9 @@ def create_app(
     approvals: ApprovalsSettings | None = None,
     alerts_settings: AlertsSettings | None = None,
     service_settings: ServiceStatusSettings | None = None,
+    # The [tls] section POST /ai/chat and POST /alerts/test-email resolve their trust anchor and
+    # CRL from (BACKLOG #5527 item 8), stashed on app.state. None stashes no [tls] policy.
+    tls_settings: TlsSettings | None = None,
     expose_docs: bool = False,
     allow_no_auth: bool = False,
     # ON by default (BACKLOG #1277), matching [diagnostics].audit_all_authz. Two defaults for one
@@ -4870,6 +4893,10 @@ def create_app(
         app.state.auth = auth
     if ai_settings is not None:
         app.state.ai = ai_settings
+    # #323 layer 3, BACKLOG #5527 item 8: the [tls] policy the AI broker and the alerts test send
+    # read. On a direct create_app it is the embedder's to pass, and it should be the policy its
+    # engine's connections were built with. create_managed_app's lifespan stashes its own at start.
+    app.state.tls_settings = tls_settings
     # Store settings back the M5 GET /security/posture view (backend, key_provider source,
     # require_encryption / allow_unencrypted_phi). The managed-app lifespan sets the live value once the
     # store opens; here it supports the direct-construction (test) path.
@@ -5139,8 +5166,10 @@ def create_app(
 
             async def send_with_headers(message: Message) -> None:
                 # The response start is where the router has run, so the matched route the
-                # no-store arm reads is in the scope by now.
-                if message["type"] == "http.response.start":
+                # no-store arm reads is in the scope by now. After a counted 413 the body limit
+                # drops this response, and building its headers reads request.url, which raises on
+                # a query string that is not UTF-8.
+                if message["type"] == "http.response.start" and not scope.get(BODY_REFUSED_KEY):
                     _apply_security_headers(request, MutableHeaders(scope=message))
                 await send(message)
 
@@ -5192,20 +5221,115 @@ def create_app(
 
     def _limit_request_body(inner: ASGIApp) -> ASGIApp:
         async def middleware(scope: Scope, receive: Receive, send: Send) -> None:
-            refusal = _body_refusal(Request(scope)) if scope["type"] == "http" else None
-            if refusal is None:
+            if scope["type"] != "http":
                 await inner(scope, receive, send)
+                return
+            request = Request(scope)
+            refusal = _body_refusal(request)
+            if refusal is None:
+                await _run_counting_body(inner, request, receive, send)
             else:
                 await refusal(scope, receive, send)
 
         return middleware
 
+    async def _run_counting_body(
+        inner: ASGIApp, request: Request, receive: Receive, send: Send
+    ) -> None:
+        """Run ``inner`` on an admitted HTTP request, holding the body it delivers to the cap.
+
+        ``_body_refusal`` judges what the request declares, and a host need not deliver that, so
+        every chunk is counted as the route pulls it; docs/SECURITY.md control 5 says on which hosts
+        the count can fire. The body is not read ahead of the route: that would buffer a body for a
+        caller the route's own gate refuses before reading (AuthenticatedBeforeBodyRoute).
+
+        At the first chunk past the cap the route gets ``http.disconnect`` in place of that chunk,
+        so it never holds a partial body as if it were whole, and no later read pulls anything. The
+        413 goes out unless the route already started a response, which cannot then be replaced."""
+        seen = 0
+        over_cap = False
+        started = False
+
+        async def counted_receive() -> Message:
+            nonlocal seen, over_cap
+            if over_cap:
+                return {"type": "http.disconnect"}
+            message = await receive()
+            if over_cap:  # a concurrent read crossed the cap while this one waited
+                return {"type": "http.disconnect"}
+            if message["type"] != "http.request" or not message.get("body"):
+                return message
+            seen += len(message["body"])
+            # Read here, not up front: most requests through this path carry no body.
+            if seen <= _body_cap(request):
+                return message
+            over_cap = True  # before the first await, so no route response can interleave
+            if started:
+                _log.warning(
+                    "oversized request body on %s from %s after a response started: "
+                    "no 413 was sent, and the route's read got a disconnect",
+                    scrub_log_argument(request.scope["path"]),
+                    scrub_log_argument(client_ip(request) or "unknown"),
+                )
+            else:
+                # Before the 413's start: the request deadline must see that the route still runs.
+                request.scope[BODY_REFUSED_KEY] = True
+                refusal = _refuse_body(
+                    request, 413, "request body too large", "oversized request body"
+                )
+                try:
+                    await refusal(request.scope, receive, send)
+                except OSError as exc:  # the client went away; the route still gets its disconnect
+                    _log.warning(
+                        "could not send the 413 for an oversized request body on %s from %s: %s",
+                        scrub_log_argument(request.scope["path"]),
+                        scrub_log_argument(client_ip(request) or "unknown"),
+                        type(exc).__name__,
+                    )
+            return {"type": "http.disconnect"}
+
+        async def route_send(message: Message) -> None:
+            nonlocal started
+            # Past the cap with no response started, the 413 is the response.
+            if started or not over_cap:
+                started = started or message["type"] == "http.response.start"
+                await send(message)
+
+        try:
+            await inner(request.scope, counted_receive, route_send)
+        except ClientDisconnect:
+            # The route's read of the disconnect above, already answered or logged. A real client
+            # disconnect under the cap is not this refusal's to absorb. A response the route had
+            # started stays unfinished: uvicorn closes the connection on that return, and what
+            # another host does with it has not been measured.
+            if not over_cap:
+                raise
+
+    def _body_cap(request: Request) -> int:
+        # ADR 0134: the uploaded-logs upload routes admit up to [store].max_upload_bytes; all else 1 MiB.
+        # The scope's decoded path: request.url drops a TAB, CR or LF from it, and raises on a query
+        # string that is not UTF-8, which would stop the refusal.
+        upload_store = getattr(request.app.state, "upload_store", None)
+        if upload_store is not None and request.scope["path"] in _UPLOAD_BODY_PATHS:
+            return int(upload_store.max_bytes)
+        return _MAX_REQUEST_BODY_BYTES
+
     def _refuse_body(request: Request, status: int, detail: str, what: str) -> JSONResponse:
-        _log.warning("rejected %s on %s from %s", what, request.url.path, client_ip(request))
-        # `Connection: close` makes the server drop the connection after every refusal, so bytes
-        # it framed one way and a proxy another (RFC 9112 §6.1, §6.3), or a refused body the
-        # client never sent, are never read as a next request.
-        return JSONResponse({"detail": detail}, status_code=status, headers={"Connection": "close"})
+        _log.warning(
+            "rejected %s on %s from %s",
+            what,
+            scrub_log_argument(request.scope["path"]),
+            scrub_log_argument(client_ip(request) or "unknown"),
+        )
+        # On HTTP/1.x, `Connection: close` makes the server drop the connection after every refusal,
+        # so bytes it framed one way and a proxy another (RFC 9112 §6.1, §6.3), or a refused body
+        # the client never sent, are never read as a next request. HTTP/2 and HTTP/3 frame each
+        # stream and make a response with this field malformed (RFC 9113 §8.2.2, RFC 9114 §4.2).
+        # Exact ASGI tokens: llhttp takes an `HTTP/2.0` request line on HTTP/1 framing and reports
+        # `2.0`, so a prefix test would let any client turn this close off.
+        multiplexed = request.scope.get("http_version") in ("2", "3")
+        headers = None if multiplexed else {"Connection": "close"}
+        return JSONResponse({"detail": detail}, status_code=status, headers=headers)
 
     def _body_refusal(request: Request) -> JSONResponse | None:
         """The response refusing ``request``'s body before any route runs, or None to admit it."""
@@ -5215,8 +5339,8 @@ def create_app(
         # DoS probe) and were previously dropped silently. We log to the rotating general log rather
         # than the audit_log: it's pre-auth (no actor) and a flood must not grow the audit DB.
         lengths = request.headers.getlist("content-length")
-        # The API takes only Content-Length bodies, so ANY Transfer-Encoding is refused, by presence
-        # on any line and whatever its value, and the connection is closed. Beside a Content-Length
+        # A chunked body is not accepted: ANY Transfer-Encoding is refused, by presence on any line
+        # and whatever its value, and on HTTP/1.x the connection is closed. Beside a Content-Length
         # the request is ambiguously framed (RFC 9112 §6.1, the CL.TE smuggling vector, ASVS 4.2.1).
         # Under serve llhttp refuses most such pairs itself (BACKLOG #1125); h11, for one, passes
         # them on. Without a Content-Length, a coding list that does not end in `chunked` leaves the
@@ -5247,19 +5371,16 @@ def create_app(
                 "chunked request body",
             )
         if not lengths:
+            # Nothing declared to judge. A bodyless POST, PUT or DELETE looks like this, so it is
+            # not refused here: _run_counting_body holds whatever body does arrive to the cap.
             return None
         # One line holding `1*DIGIT` (RFC 9112 §6.2), not int(): int() takes `+2`, `-5` and `0_2`,
-        # and a repeated line is a second framing claim (an invalid length closes, §6.3 item 5).
+        # and a repeated line is a second framing claim (on HTTP/1.x an invalid length closes the
+        # connection, §6.3 item 5).
         value = lengths[0].strip(" \t")
         if len(lengths) > 1 or not (value.isascii() and value.isdigit()):
             return _refuse_body(request, 400, "invalid Content-Length", "invalid Content-Length")
-        # ADR 0134: the uploaded-logs upload routes admit up to [store].max_upload_bytes; all else 1 MiB.
-        upload_store = getattr(request.app.state, "upload_store", None)
-        cap = (
-            upload_store.max_bytes
-            if upload_store is not None and request.url.path in _UPLOAD_BODY_PATHS
-            else _MAX_REQUEST_BODY_BYTES
-        )
+        cap = _body_cap(request)
         # Digit count first: int() raises past 4300 digits, and a longer number is over any cap.
         digits = value.lstrip("0") or "0"
         if len(digits) > len(str(cap)) or int(digits) > cap:
@@ -5376,8 +5497,9 @@ def create_app(
         # http refusal takes no posture: it refuses in every one (vault BACKLOG #3533 item 5).
         # BACKLOG #5527: the [tls] policy too, the one the alerts test send reads, so the endpoint is
         # verified against [tls].internal_ca_file under augment or pinned and checked against
-        # [tls].crl_file as the other HTTP-family hops are. A direct create_app stashes none, so
-        # None goes down.
+        # [tls].crl_file as the other HTTP-family hops are. A direct create_app stashes its
+        # tls_settings argument, and its embedder may set the stash itself; create_managed_app's
+        # lifespan stashes its own argument at start. With none, None goes down.
         # Off the event loop: the constructor builds rest.py's shared opener on first use, a TLS
         # context that reads the system trust store, under a lock a worker thread may hold, or
         # builds the held anchored opener, which reads the [tls] CA and CRL files when it is built.
@@ -5695,7 +5817,13 @@ def create_app(
     async def list_connections(
         request: Request,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.MONITORING_READ)),
+        identity: Identity = Depends(
+            require_monitoring_read(
+                Permission.MONITORING_READ,
+                defer_when_query="reveal",
+                defer_value_valid=_valid_connection_name,
+            )
+        ),
         # Annotated rather than ``= Query(None)``, for the reason get_message gives: the web console
         # calls this handler in-process, and a call that leaves it out must get None.
         reveal: Annotated[ConnectionName | None, Query()] = None,
@@ -5713,10 +5841,21 @@ def create_app(
         # Per-channel RBAC, as on GET /connections/{name}/events: a reveal naming a connection
         # outside the caller's scope is refused and audited as a channel denial. Checked BEFORE the
         # reveal is admitted, so a refused name spends no PHI-read budget and cannot be hidden
-        # behind a 429. A scoped caller's dashboard carries no outbound rows at all.
+        # behind a 429. For that reason the gate holds a monitoring-read 429 on a valid reveal, and
+        # it is raised here, after this check and the reveal's own refusals (its permission, the
+        # serve hop and the new address), and each is answered as before pacing. With the budget
+        # spent none of them writes the monitoring:read grant row main wrote: the scope and
+        # permission refusals write only their denial row (owner ruling 2026-11-23). The hop and
+        # new-address refusals also record the held decision, through _refuse_reveal_phi_read,
+        # because the hop refusal writes no row of its own and a repeated new-address row is
+        # deduped (vault BACKLOG #1191). A scoped caller's dashboard carries no outbound rows at
+        # all.
         if reveal is not None:
             await _control_guard(engine, identity, reveal, client_ip(request))
-        await _admit_reveal(request, identity, reveal)
+            await _refuse_reveal(request, identity)
+        await raise_deferred_monitoring_refusal(request)
+        if reveal is not None:
+            _charge_reveal(request, identity)
         out = await _dashboard_rows(engine, identity, reveal=reveal)
         if reveal is not None:
             # The audit records what the response carried, not what was asked for: an in-scope
@@ -5772,7 +5911,8 @@ def create_app(
     ) -> list[ConnectionRow]:
         """The dashboard rows, channel-scoped, with ``error`` gated and masked on every row and
         lifted on the rows of the ONE connection ``reveal`` names (BACKLOG #2443). The caller has
-        already passed :func:`_admit_reveal` for any ``reveal``; the stats socket passes none."""
+        already passed :func:`_refuse_reveal` and :func:`_charge_reveal` for any ``reveal``; the
+        stats socket passes none."""
         rows = await _connection_rows(engine, identity)
         if reveal is None:  # the stats socket, every second, and every bare load
             return [redact_unauthorized(r, identity) for r in rows]
@@ -6753,23 +6893,9 @@ def create_app(
             reason=e.reason,
         )
 
-    async def _admit_reveal(request: Request, identity: Identity, reveal: int | str | None) -> None:
-        """The gate a ``reveal`` request adds on top of its list route's ``monitoring:*`` gate.
-
-        Called at ADMISSION, before the route reads the store, as ``require_phi_read`` would be.
-        A reveal hands out one reason or one connection's error whole, which is
-        ``messages:view_summary`` data (BACKLOG #2443). ``reveal`` is an event or alert id, or a
-        connection name on ``GET /connections`` and, for its ``reveal=true`` flag, on
-        ``GET /connections/{name}/metadata``. A caller without that permission is refused,
-        and the refusal is audited as
-        ``auth.permission_denied`` like every other one (ASVS 16.3.2). Over HTTP the reveal is
-        also a PHI read: it takes the serve-hop refusal, the new-address refusal (vault BACKLOG
-        #2620) and the per-actor PHI budget. The web console's reveal routes already took all three
-        through ``require_ui(..., phi=True)`` before
-        calling in-process, so a ``/ui`` route is not charged twice. That skip reads the matched
-        route, so a future ``/ui`` route passing ``reveal`` must carry ``phi=True`` itself."""
-        if reveal is None:
-            return
+    async def _refuse_reveal_without_view_summary(request: Request, identity: Identity) -> None:
+        """Refuse a reveal from a caller without ``messages:view_summary``, audited as
+        ``auth.permission_denied`` (the permission half of :func:`_admit_reveal`)."""
         if not identity.has(Permission.MESSAGES_VIEW_SUMMARY):
             auth = get_auth(request)
             if auth is not None:
@@ -6780,11 +6906,64 @@ def create_app(
                     client=client_ip(request),
                 )
             raise HTTPException(403, "a reveal needs messages:view_summary")
-        if not (_matched_route_path(request) or "").startswith("/ui/"):
+
+    async def _admit_reveal(request: Request, identity: Identity, reveal: int | str | None) -> None:
+        """The gate a ``reveal`` request adds on top of its list route's ``monitoring:*`` gate.
+
+        Called at ADMISSION, before the route reads the store, as ``require_phi_read`` would be.
+        A reveal hands out one reason or one connection's error whole, which is
+        ``messages:view_summary`` data (BACKLOG #2443). ``reveal`` is an event or alert id, or a
+        connection name on ``GET /connections`` and, for its ``reveal=true`` flag, on
+        ``GET /connections/{name}/metadata``. ``GET /connections`` does not call this: it calls
+        :func:`_refuse_reveal`, then raises any held monitoring-read 429, then
+        :func:`_charge_reveal`. A caller without that permission is refused,
+        and the refusal is audited as
+        ``auth.permission_denied`` like every other one (ASVS 16.3.2). Over HTTP the reveal is
+        also a PHI read: it takes the serve-hop refusal, the new-address refusal (vault BACKLOG
+        #2620) and the per-actor PHI budget. The web console's reveal routes already took all three
+        through ``require_ui(..., phi=True)`` before
+        calling in-process, so a ``/ui`` route is not charged twice. That skip reads the matched
+        route, so a future ``/ui`` route passing ``reveal`` must carry ``phi=True`` itself."""
+        if reveal is None:
+            return
+        await _refuse_reveal(request, identity)
+        _charge_reveal(request, identity)
+
+    def _reveal_over_http(request: Request) -> bool:
+        """Whether a reveal came over HTTP rather than from a ``/ui`` route calling in process,
+        which took the hop, new-address and budget checks in ``require_ui(..., phi=True)``."""
+        return not (_matched_route_path(request) or "").startswith("/ui/")
+
+    async def _refuse_reveal(request: Request, identity: Identity) -> None:
+        """The refusals of :func:`_admit_reveal`, without its PHI-read charge, so ``GET
+        /connections`` can answer them before a held monitoring-read 429."""
+        await _refuse_reveal_without_view_summary(request, identity)
+        await _refuse_reveal_phi_read(request)
+
+    async def _refuse_reveal_phi_read(request: Request) -> None:
+        """The PHI-read refusals of a reveal over HTTP: the serve hop and the new address.
+
+        Where a monitoring-read 429 is held for the request (``GET /connections``), each refusal
+        calls :func:`record_deferred_monitoring_refusal` before it propagates; that function says
+        what it records and when. Elsewhere the call is a no-op."""
+        if not _reveal_over_http(request):
+            return
+        try:
             enforce_phi_read_hop(request)
-            # Vault BACKLOG #2620: a PHI read, so it refuses a new address as require_phi_read
-            # does, before the budget. The /ui twins asked in require_ui's phi=True arm.
+        except HTTPException as refused:
+            await record_deferred_monitoring_refusal(request, refused, answered_reason="serve_hop")
+            raise
+        # Vault BACKLOG #2620: a PHI read, so it refuses a new address as require_phi_read
+        # does, before the budget. The /ui twins asked in require_ui's phi=True arm.
+        try:
             await refuse_from_new_address(request)
+        except HTTPException as refused:
+            await record_deferred_monitoring_refusal(request, refused)
+            raise
+
+    def _charge_reveal(request: Request, identity: Identity) -> None:
+        """The PHI-read charge of :func:`_admit_reveal`, run after :func:`_refuse_reveal`."""
+        if _reveal_over_http(request):
             enforce_phi_read_pacing(request, identity)
 
     async def _redact_reasons(
@@ -10406,7 +10585,7 @@ def create_app(
     @app.get("/stats", response_model=StatsResponse)
     async def stats(
         engine: Engine = Depends(_get_engine),
-        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+        _user: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
     ) -> StatsResponse:
         # B11 (read-only, additive): the runner's empty-claim counters (idle-poll vs wake-fanout herd)
         # for the connection-scale harness. Default-zero when no runner is attached (graph-less engine).
@@ -10444,7 +10623,7 @@ def create_app(
     @app.get("/metrics")
     async def metrics_endpoint(
         engine: Engine = Depends(_get_engine),
-        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+        _user: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
     ) -> Response:
         """Prometheus exposition (text/plain). Gated by monitoring:read like /stats — a scraper
         authenticates with a service token. Contains only aggregate counts/latency keyed by
@@ -10454,7 +10633,7 @@ def create_app(
     @app.get("/metrics/history", response_model=MetricsHistoryResponse)
     async def metrics_history(
         request: Request,
-        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+        _user: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
     ) -> MetricsHistoryResponse:
         """The in-memory metrics-history ring for the console trend charts (BACKLOG #76, ADR 0065
         amendment). Oldest-first samples of the outbound-row-by-status counts, fed by the ~1s /ws/stats
@@ -10474,7 +10653,7 @@ def create_app(
     @app.get("/graph/edges", response_model=GraphResponse)
     async def graph_edges(
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.MONITORING_READ)),
+        identity: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
     ) -> GraphResponse:
         """The by-name data-flow graph (BACKLOG #76, ADR 0065 amendment): the **static Registry edge
         set** (:func:`messagefoundry.config.graph.build_wiring_graph` — the same inbound → router →
@@ -10739,7 +10918,7 @@ def create_app(
     async def system_status(
         request: Request,
         engine: Engine = Depends(_get_engine),
-        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+        _user: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
     ) -> SystemStatus:
         now = time.time()
         total = running = 0
@@ -11921,7 +12100,8 @@ def create_app(
     # request rather than on the route function alone. It stays INSIDE ClientNetworkMiddleware
     # (registered after it, so further out): a refused address must be rejected before it can occupy
     # a deadline at all. The clock is cancelled at http.response.start, so a response that has begun
-    # streaming is never cut mid-body — see api/request_timeout.py.
+    # streaming is never cut mid-body; the body limit's counted 413 is the exception, because the
+    # route is still running behind it — see api/request_timeout.py.
     app.add_middleware(RequestTimeoutMiddleware)
 
     # [security].allowed_client_networks — registered so that only the response-header floor below is
@@ -13774,8 +13954,11 @@ def create_managed_app(
             # email_password_secret reference (fail-closed) exactly as notifier_from_settings does. None on
             # the embedded/test path — then only a plain env-sourced email_password can be tested.
             app.state.secret_provider = secret_provider
-            # #323 layer 3: expose the [tls] trust-anchor policy so POST /alerts/test-email builds its
-            # EmailTransport with the SAME anchors as the live notifier. None on the embedded/test path.
+            # #323 layer 3: the [tls] trust-anchor policy POST /alerts/test-email and POST /ai/chat
+            # read, stashed at start from the argument the live notifier and the connections read,
+            # so a stash written before start cannot split the two. create_app below is not
+            # handed it, so it writes None at build and this overwrites that at start (BACKLOG
+            # #5527 item 8).
             app.state.tls_settings = tls_settings
             app.state.service_settings = service_settings  # back GET /service/status (L6a)
             app.state.log_dir = log_dir  # back GET /status app-log metering (#50) + GET /logs/tail

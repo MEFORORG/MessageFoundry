@@ -1399,13 +1399,23 @@ def test_the_server_walk_reads_large_rows_in_small_chunks(
     tmp_path: Path, _template: tuple[Path, StoreSettings]
 ) -> None:
     """A server driver fetches a whole chunk at once, so ``attachment_chunk``, one 1 MiB slice a
-    row, is read at most its cap at a time whatever ``chunk_rows`` asks; other cells are not."""
+    row, and each cell that holds a whole body are read at most their cap at a time whatever
+    ``chunk_rows`` asks; a small cell is not (BACKLOG #1719 item 2)."""
     db, settings = _copy(_template, tmp_path)
     _audit_result, source = _server_audit(db, build_store_cipher(settings), chunk_rows=500)
-    cap = next(c.chunk_cap for c in POSTGRES_CIPHER_CELLS if c.table == "attachment_chunk")
-    assert cap is not None and cap < 500
-    assert set(source.limits["attachment_chunk.ciphertext"]) == {cap}
-    assert set(source.limits["messages.raw"]) == {500}
+    caps = {f"{c.table}.{c.column}": c.chunk_cap for c in POSTGRES_CIPHER_CELLS}
+    for name in (
+        "attachment_chunk.ciphertext",
+        "messages.raw",
+        "queue.payload",
+        "shared_body.body",
+        "response.body",
+    ):
+        cap = caps[name]
+        assert cap is not None and cap < 500, name
+        assert set(source.limits[name]) == {cap}, name
+    assert caps["messages.error"] is None
+    assert set(source.limits["messages.error"]) == {500}
 
 
 def test_an_unreachable_key_service_stops_the_server_audit(
@@ -1954,3 +1964,299 @@ def test_a_keyless_open_after_a_failed_walk_is_still_a_key_mismatch(
     assert (status, cells) == ("KEY_MISMATCH", 0), reason
     head, _, tail = reason.partition("; ")
     assert "no key resolved" in head and tail == "synthetic walk line", reason
+
+
+def test_a_key_service_outage_in_the_verify_walk_is_not_called_a_damaged_cell(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A decrypt the key service gave no usable answer to stops the walk as an outage, as cipher-audit
+    stops, and its FAIL says so rather than that the cell did not decrypt (BACKLOG #1719 item 12).
+    It is still no PASS."""
+    from messagefoundry.store.crypto import CipherUnavailableError
+
+    db, settings = _copy(_template, tmp_path)
+    calls: list[int] = []
+
+    def down(_cipher: Any, _stored: str, _aad: bytes) -> CipherError:
+        calls.append(1)
+        return CipherUnavailableError("synthetic: the key service did not answer")
+
+    monkeypatch.setattr(cipher_cells_module, "decrypt_or_error", down)
+    status, reason, cells = dr_backup._decrypt_check(db, settings)
+    assert (status, cells) == ("FAIL", 0), reason
+    assert reason.startswith(f"{dr_backup._OUTAGE_LEAD} (CipherUnavailableError)"), reason
+    assert "did not decrypt" not in reason, reason
+    assert len(calls) == 1, "the walk sent a value to the key service after its outage"
+    assert _SYNTH not in reason
+
+
+def test_an_incompatible_snapshot_keeps_the_walks_finding(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The remedy for a snapshot this build cannot open still leads, and the cell walk that ran
+    before the open is reported after it: what it found, or that it passed and whether it held a
+    sealed value to decrypt (BACKLOG #1719 item 3)."""
+    from messagefoundry.store.schema_verify import SchemaMismatchError
+
+    def incompatible(coro: Any) -> Any:
+        coro.close()
+        raise SchemaMismatchError("synthetic: schema written by another build")
+
+    monkeypatch.setattr(dr_backup, "run_guarded", incompatible)
+    db, settings = _copy(_template, tmp_path)
+    rowid, value = _first_sealed(db, "messages", "raw")
+    _set(db, "messages", "raw", rowid, "x" + value[1:])
+    status, reason, cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
+    assert (status, cells) == ("FAIL", 0), reason
+    remedy, _, walk = reason.partition("Before the open")
+    assert "0.0.1" in remedy and "messages.raw" not in remedy, reason
+    assert "messages.raw" in walk and "reported FAIL (the remedy leads" in walk, reason
+    assert _SYNTH not in reason
+
+    (tmp_path / "intact").mkdir()
+    db, settings = _copy(_template, tmp_path / "intact")
+    passed = dr_backup._decrypt_check(db, settings)
+    assert passed[0] == "PASS" and passed[2] > 0, passed
+    _status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
+    assert "passed: every sealed value it read decrypted and authenticated" in reason, reason
+    # Nor does it claim a decrypt that a walk with nothing sealed to read never made.
+    monkeypatch.setattr(dr_backup, "_decrypt_check", lambda *_a, **_kw: ("PASS", "ok", 0))
+    _status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
+    assert "holding no sealed value to decrypt" in reason and "authenticated" not in reason, reason
+    assert reason.index("The schema step failed") < reason.index("Before the open"), reason
+
+
+def test_the_second_walk_reads_the_cell_the_migration_made_readable(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Positive control for the intact-migration case (BACKLOG #1719 item 20): the walk before the
+    open opens no ``queue.payload`` value on the schema without ``body_ref``, and the walk after it
+    opens at least one."""
+    db, settings = _copy(_template, tmp_path)
+    _drop_queue_body_ref(db)
+    real = read_cipher_cells
+    opened: list[int] = []
+
+    def recorded(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        opened.append(0)
+        for reading in real(*args, **kwargs):
+            cell = (reading.cell.table, reading.cell.column)
+            if reading.kind == "opened" and cell == ("queue", "payload"):
+                opened[-1] += 1
+            yield reading
+
+    monkeypatch.setattr(dr_backup, "read_cipher_cells", recorded)
+    status, reason, _cells = dr_backup._full_open_check(db, settings)
+    assert status == "PASS", reason
+    assert len(opened) == 2 and opened[0] == 0 and opened[1] >= 1, opened
+
+
+def test_the_absence_predicates_the_live_server_tests_use_can_fire() -> None:
+    """Negative control for the live audit tests' ``absent`` check (BACKLOG #1719 item 23): a cell
+    whose table, value column or any paging, locator or AAD column the catalog lacks is absent."""
+    from messagefoundry.store.cipher_cells import server_cell_present
+
+    for cells in (POSTGRES_CIPHER_CELLS, SQLSERVER_CIPHER_CELLS):
+        for spec in cells:
+            needed = {spec.column, *spec.aad_columns, *spec.order, *spec.locator} - {POSITION}
+            assert server_cell_present(spec, {spec.table: frozenset(needed)}), spec
+            assert not server_cell_present(spec, {}), spec
+            for column in needed:
+                partial = {spec.table: frozenset(needed - {column})}
+                assert not server_cell_present(spec, partial), (spec, column)
+
+
+def test_the_walks_finding_survives_a_long_differences_list(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An archive many schema versions old lists many differences; the walk's finding is appended
+    after their cut, so the damaged cell's locator is still named (BACKLOG #1719 item 3)."""
+    from messagefoundry.store.schema_verify import SchemaMismatchError
+
+    differences = tuple(f"index ix_synthetic_{n:02d} lacks column c{n:02d}" for n in range(40))
+
+    def incompatible(coro: Any) -> Any:
+        coro.close()
+        raise SchemaMismatchError("synthetic: old schema", differences=differences)
+
+    monkeypatch.setattr(dr_backup, "run_guarded", incompatible)
+    db, settings = _copy(_template, tmp_path)
+    rowid, value = _first_sealed(db, "messages", "raw")
+    _set(db, "messages", "raw", rowid, "x" + value[1:])
+    status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
+    assert status == "FAIL" and "0.0.1" in reason and "ix_synthetic_00" in reason, reason
+    conn = sqlite3.connect(db)
+    try:
+        (message_id,) = conn.execute("SELECT id FROM messages WHERE rowid = ?", (rowid,)).fetchone()
+    finally:
+        conn.close()
+    assert f"messages.raw id={message_id} carries no at-rest marker" in reason, reason
+    assert reason.endswith("or a planted row"), reason
+    # Control: the differences were cut, so the walk line survived a cut.
+    assert "ix_synthetic_39" not in reason, reason
+
+
+def _incompatible_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    from messagefoundry.store.schema_verify import SchemaMismatchError
+
+    def incompatible(coro: Any) -> Any:
+        coro.close()
+        raise SchemaMismatchError("synthetic: schema written by another build")
+
+    monkeypatch.setattr(dr_backup, "run_guarded", incompatible)
+
+
+@pytest.mark.parametrize(
+    ("walked", "misread"),
+    [
+        (dr_backup.WalkVerdict("FAIL", "messages.raw id=1 did not decrypt: x", 0, "cell"), True),
+        (dr_backup.WalkVerdict("FAIL", "no such column: c", 0, "sqlite_schema"), True),
+        (dr_backup.WalkVerdict("FAIL", "the key service ... while", 0, "outage"), False),
+        (
+            dr_backup.WalkVerdict("KEY_MISMATCH", "messages.raw is encrypted", 0, "key_mismatch"),
+            False,
+        ),
+        (dr_backup.WalkVerdict("FAIL", "the store's schema changed", 0, "interrupted"), False),
+        (dr_backup.WalkVerdict("FAIL", "DatabaseError: malformed", 0, "sqlite"), False),
+        (dr_backup.WalkVerdict("FAIL", "messages.raw id=1 holds a BLOB", 0, "damaged"), False),
+    ],
+)
+def test_the_misread_rationale_follows_the_walks_kind(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    walked: dr_backup.WalkVerdict,
+    misread: bool,
+) -> None:
+    """Only a cell finding, or a statement the snapshot's schema could not answer, is offered the
+    misread rationale; the kind decides, never the reason's wording."""
+    _incompatible_open(monkeypatch)
+    monkeypatch.setattr(dr_backup, "_decrypt_check", lambda *_a, **_kw: walked)
+    db, settings = _copy(_template, tmp_path)
+    _status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
+    assert walked[1] in reason, reason
+    assert ("misread another version" in reason) is misread, reason
+
+
+def test_a_sqlite_fault_is_a_schema_kind_only_when_the_schema_could_not_answer() -> None:
+    """A fault the store's schema classifier calls a wrong shape is ``sqlite_schema``; a TEXT value
+    Python's sqlite3 module cannot decode is the cell's own content; a malformed image or a lock
+    is neither."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE t (a TEXT)")
+        conn.execute("INSERT INTO t VALUES (CAST(x'ff' AS TEXT))")
+        faults: dict[str, sqlite3.Error] = {}
+        for name, sql in (("column", "SELECT nope FROM t"), ("table", "SELECT 1 FROM nope")):
+            try:
+                conn.execute(sql)
+            except sqlite3.OperationalError as exc:
+                faults[name] = exc
+        try:
+            conn.execute("SELECT a FROM t").fetchall()
+        except sqlite3.OperationalError as exc:
+            faults["decode"] = exc
+    finally:
+        conn.close()
+    assert set(faults) == {"column", "table", "decode"}, faults
+    assert dr_backup._sqlite_kind(faults["column"]) == "sqlite_schema"
+    assert dr_backup._sqlite_kind(faults["table"]) == "sqlite_schema"
+    assert dr_backup._sqlite_kind(faults["decode"]) == "damaged"
+    malformed = sqlite3.DatabaseError("database disk image is malformed")
+    assert dr_backup._sqlite_kind(malformed) == "sqlite"
+    assert dr_backup._sqlite_kind(sqlite3.OperationalError("database is locked")) == "sqlite"
+
+
+def test_a_walk_verdict_keeps_its_kind_through_copy_and_pickle() -> None:
+    import copy
+    import pickle
+
+    verdict = dr_backup.WalkVerdict("FAIL", "messages.raw id=1 did not decrypt", 3, "cell")
+    for clone in (copy.copy(verdict), copy.deepcopy(verdict), pickle.loads(pickle.dumps(verdict))):
+        assert tuple(clone) == ("FAIL", "messages.raw id=1 did not decrypt", 3)
+        assert clone.kind == "cell"
+
+
+def test_a_shown_locator_is_bounded_and_cut_on_a_whole_escape() -> None:
+    """A locator value is shown at most 64 characters and the elision mark, escaped character by
+    character when its shown head holds a non-printable character, so no escape is split and a huge
+    value is never escaped whole."""
+    from messagefoundry.store.cipher_cells import _LOCATOR_LIMIT, _shown
+
+    for value in (chr(0xE0001) * 70, "\\" * 40 + "\x00", "a" * 65, chr(0xE0001) * 10**6):
+        shown = _shown(value)
+        assert len(shown) <= _LOCATOR_LIMIT + 3, (len(shown), shown[:80])
+        if not value[:_LOCATOR_LIMIT].isprintable():
+            # Whole escapes only, so the shown text decodes back without an error.
+            shown.removesuffix("...").encode("ascii").decode("unicode_escape")
+    assert _shown("short id") == "short id"
+    assert _shown("a" * 64) == "a" * 64
+    assert _shown(chr(0xE0001)) == "\\U000e0001"
+
+
+def test_a_real_outage_and_a_real_cell_finding_carry_their_kind(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through the real walk: an outage gets no misread framing under an incompatible
+    open, and a ``cell`` finding (an overwritten at-rest marker, read as an unmarked value on a
+    sealed surface) does."""
+    from messagefoundry.store.crypto import CipherUnavailableError
+
+    db, settings = _copy(_template, tmp_path)
+    rowid, value = _first_sealed(db, "messages", "raw")
+    _set(db, "messages", "raw", rowid, "x" + value[1:])
+    assert dr_backup._decrypt_check(db, settings).kind == "cell"
+    _incompatible_open(monkeypatch)
+    _status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
+    assert "misread another version" in reason, reason
+
+    (tmp_path / "down").mkdir()
+    db, settings = _copy(_template, tmp_path / "down")
+
+    def down(_cipher: Any, _stored: str, _aad: bytes) -> CipherError:
+        return CipherUnavailableError("synthetic: the key service did not answer")
+
+    monkeypatch.setattr(cipher_cells_module, "decrypt_or_error", down)
+    assert dr_backup._decrypt_check(db, settings).kind == "outage"
+    _status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
+    assert "did not return a usable answer" in reason and "misread another" not in reason, reason
+
+
+def test_the_incompatible_refusal_redacts_the_walk_line(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk's reason is redacted inside the refusal builder: an HL7-shaped run in it never
+    reaches the reason, whatever the walk handed back."""
+    _incompatible_open(monkeypatch)
+    phi = "PID|1||MRN123456^^^HOSP^MR||DOE^JOHN^Q||19700101|M"
+    walked = dr_backup.WalkVerdict("FAIL", f"messages.raw id=1 did not decrypt: {phi}", 0, "cell")
+    monkeypatch.setattr(dr_backup, "_decrypt_check", lambda *_a, **_kw: walked)
+    db, settings = _copy(_template, tmp_path)
+    _status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
+    assert "messages.raw id=1 did not decrypt" in reason, reason
+    assert "DOE^JOHN" not in reason and "MRN123456" not in reason, reason
+
+
+def test_a_long_escaped_locator_leaves_the_walk_lines_verdict_words(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A response row whose three locator values each hold 70 non-printable astral characters is
+    shown at most 64 escaped characters a value, so the refusal still says the cell did not
+    decrypt (BACKLOG #1719 item 3)."""
+    db, settings = _copy(_template, tmp_path)
+    tag = chr(0xE0001) * 70  # a format character: not printable, escaped as ten characters
+    conn = sqlite3.connect(db)
+    try:
+        (rowid,) = conn.execute("SELECT rowid FROM response ORDER BY rowid LIMIT 1").fetchone()
+        conn.execute(
+            "UPDATE response SET message_id = ?, destination_name = ?, response_seq = ?"
+            " WHERE rowid = ?",
+            (tag, tag, tag, rowid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    _incompatible_open(monkeypatch)
+    _status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
+    assert "response.body" in reason and "did not decrypt" in reason, reason
+    assert tag not in reason

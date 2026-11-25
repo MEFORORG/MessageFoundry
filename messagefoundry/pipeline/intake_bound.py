@@ -53,7 +53,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import queue
+import threading
 import time
+import weakref
+from collections.abc import Callable
+from typing import NamedTuple
 
 from messagefoundry.config.settings import StoreBackend
 from messagefoundry.pipeline.alerts import (
@@ -62,7 +67,11 @@ from messagefoundry.pipeline.alerts import (
     REMINDER_SECONDS,
     AlertSink,
 )
-from messagefoundry.pipeline.retention import read_disk_floor, sqlite_store_file
+from messagefoundry.pipeline.retention import (
+    DiskFloorReading,
+    read_disk_floor,
+    sqlite_store_file,
+)
 from messagefoundry.store import Store
 from messagefoundry.subject_checksum import (  # re-exported: its callers import it from here
     shorten_with_checksum as shorten_with_checksum,
@@ -98,6 +107,14 @@ DEFAULT_CHECK_SECONDS = 1.0
 
 #: How long one probe may take before it counts as failed. A hung read must not freeze the loop.
 PROBE_TIMEOUT_SECONDS = 10.0
+
+#: How long a disk probe may stay blocked before it is abandoned and a new one may start (BACKLOG
+#: #5767). Longer than the timeout, so a slow volume is not handed a second concurrent stat.
+PROBE_STUCK_SECONDS = 30.0
+
+#: The most abandoned disk-probe threads alive at once. A blocked thread cannot be killed, so this
+#: is what bounds the threads a volume that never answers can cost.
+MAX_ABANDONED_DISK_PROBES = 4
 
 #: While a pause holds, ``intake_paused`` fires again at most this often per bound: the reminder
 #: spacing ``queue_buildup`` uses too, from one shared constant. Without it a one-second measurement
@@ -185,6 +202,70 @@ def process_alert_subject(base: str, node: str | None = None) -> str:
     return f"{base}@{shorten_with_checksum(node, INTAKE_SUBJECT_MAX_LENGTH - len(base) - len('@'))}"
 
 
+#: A disk probe's reading, or the exception that stopped it.
+type _DiskOutcome = tuple[DiskFloorReading | None, BaseException | None]
+
+
+class _DiskProbeWorker:
+    """A long-lived daemon thread that runs one disk read at a time. Reused across ticks because
+    ``Thread.start`` blocks its caller until the thread runs, which under GIL contention would stall
+    the event loop on every tick. ``busy_since`` is read and written on the loop only."""
+
+    __slots__ = ("busy_since", "close", "inbox", "thread")
+
+    def __init__(self, owner: object) -> None:
+        self.inbox: queue.SimpleQueue[_DiskRequest | None] = queue.SimpleQueue()
+        self.busy_since: float | None = None
+        # Built before the thread starts, so no running thread can lack it. It holds the queue only,
+        # so an owner dropped without stop() still ends its idle thread.
+        closer = weakref.finalize(owner, self.inbox.put, None)
+        closer.atexit = False
+        self.close: Callable[[], object] = closer
+        self.thread = threading.Thread(
+            target=_serve_disk_probes,
+            args=(self.inbox,),
+            name="intake-disk-probe",
+            daemon=True,
+        )
+
+
+class _DiskRequest(NamedTuple):
+    path: str
+    floor_mb: int
+    loop: asyncio.AbstractEventLoop
+    waiter: asyncio.Future[_DiskOutcome]
+    worker: _DiskProbeWorker
+
+
+def _serve_disk_probes(inbox: queue.SimpleQueue[_DiskRequest | None]) -> None:
+    """The worker thread's body, until it reads ``None``. Module-level so a thread blocked for the
+    life of the process pins its queue and request only, never the monitor and its store."""
+    while (request := inbox.get()) is not None:
+        outcome: _DiskOutcome
+        try:
+            outcome = (read_disk_floor(request.path, request.floor_mb), None)
+        except Exception as exc:  # carried to the waiting tick, or dropped if it has gone
+            outcome = (None, exc)
+        try:
+            request.loop.call_soon_threadsafe(_finish_disk_probe, request, outcome)
+        except RuntimeError as exc:  # the loop closed while this call was blocked
+            log.debug(
+                "an intake disk probe could not reach its loop (%s); its outcome (%s) is dropped",
+                type(exc).__name__,
+                type(outcome[1]).__name__ if outcome[1] is not None else "a reading",
+            )
+
+
+def _finish_disk_probe(request: _DiskRequest, outcome: _DiskOutcome) -> None:
+    """On the loop: hand the waiting tick its outcome, or drop a late one. A failure travels inside
+    the result, so a dropped one can never be reported as an unretrieved future exception."""
+    request.worker.busy_since = None
+    if not request.waiter.done():
+        request.waiter.set_result(outcome)
+    elif outcome[1] is not None:
+        log.debug("a late intake disk probe failed; result dropped", exc_info=outcome[1])
+
+
 class IntakeBoundMonitor:
     """Measure the two intake bounds and hold or release the shared gate. See the module docstring.
 
@@ -248,6 +329,11 @@ class IntakeBoundMonitor:
         self._depth_failing = False
         self._disk_failing = False
         self._check_failing = False
+        # BACKLOG #5767: the current probe worker, the retired threads still alive, and whether the
+        # cap on those has been logged for this streak.
+        self._probe_worker: _DiskProbeWorker | None = None
+        self._abandoned_probes: list[threading.Thread] = []
+        self._probe_cap_logged = False
         # Whether check_once has run, so the loop does not repeat Engine.start's first measurement.
         self._measured = False
         # BACKLOG #3269, the expiry sweep: per instance id, the count it last saw and the monotonic
@@ -335,6 +421,7 @@ class IntakeBoundMonitor:
                 cancelled = cancelled or (me is not None and me.cancelling() > baseline)
                 # A task that died must not stop the stop: the gate below still opens.
                 log.warning("intake monitor task %s had failed", task.get_name(), exc_info=True)
+        self._retire_probe_worker()  # never waits: a blocked probe thread is a daemon
         held = set(self._gate.reasons)
         for reason in (DEPTH_REASON, DISK_REASON):
             self._gate.release(reason)
@@ -549,16 +636,7 @@ class IntakeBoundMonitor:
 
     async def _check_disk(self) -> None:
         assert self._floor_path is not None  # disk_floor_on
-        failure: BaseException | None = None
-        try:
-            # A hung stat leaves its worker thread behind; the loop moves on regardless.
-            reading = await asyncio.wait_for(
-                asyncio.to_thread(read_disk_floor, self._floor_path, self._floor_mb),
-                PROBE_TIMEOUT_SECONDS,
-            )
-        except Exception as exc:
-            # Broad on purpose, as in _check_depth; the cause is logged below, not swallowed.
-            reading, failure = None, exc
+        reading, failure = await self._probe_disk(self._floor_path)
         if reading is None or reading.free_bytes is None:
             if not self._disk_failing:
                 self._disk_failing = True
@@ -594,6 +672,69 @@ class IntakeBoundMonitor:
         free_mib = reading.free_mib
         assert free_mib is not None  # free_bytes was measured, checked above
         self._sync_alert(DISK_REASON, value=free_mib, limit=reading.floor_mib)
+
+    async def _probe_disk(self, path: str) -> tuple[DiskFloorReading | None, BaseException | None]:
+        """This tick's disk reading, or ``(None, cause)`` when it has none (BACKLOG #5767).
+
+        A thread blocked on a hung volume cannot be cancelled, so probes run on a dedicated daemon
+        worker and never hold a thread of the default executor that routing and transforms share.
+        At most one probe runs on the current worker. A worker stuck past
+        :data:`PROBE_STUCK_SECONDS` is abandoned and replaced, so one wedged call does not end
+        measuring, and at most :data:`MAX_ABANDONED_DISK_PROBES` abandoned threads may be alive. At
+        that cap no probe starts until one of them returns, so calls wedged for good leave the bound
+        unmeasured until a restart; ``[retention].min_free_disk_mb`` in ``docs/CONFIGURATION.md``
+        says when one can work. Only the tick that started a probe uses its result."""
+        self._abandoned_probes = [t for t in self._abandoned_probes if t.is_alive()]
+        worker = self._probe_worker
+        if worker is not None and not worker.thread.is_alive():
+            worker.close()  # a dead worker reads no sentinel; this drops its finalizer
+            worker = self._probe_worker = None
+        if worker is not None and worker.busy_since is not None:
+            if _monotonic() - worker.busy_since < PROBE_STUCK_SECONDS:
+                return None, None
+            self._retire_probe_worker()
+            worker = None
+        if len(self._abandoned_probes) >= MAX_ABANDONED_DISK_PROBES:
+            if not self._probe_cap_logged:
+                self._probe_cap_logged = True
+                log.warning(
+                    "intake pause: %d disk probes are stuck on the SQLite store's volume, so the "
+                    "engine stopped starting new ones. The disk pause state cannot change until "
+                    "one of them returns and a new probe succeeds. Before restarting the engine, "
+                    "read [retention].min_free_disk_mb in docs/CONFIGURATION.md: a restart can "
+                    "block or be refused",
+                    len(self._abandoned_probes),
+                )
+            return None, None
+        if worker is None:
+            new_worker: _DiskProbeWorker | None = None
+            try:
+                new_worker = _DiskProbeWorker(self)
+                new_worker.thread.start()
+            except Exception as exc:  # advisory: an unmeasured tick, never a dead monitor
+                if new_worker is not None:
+                    new_worker.close()  # never started: drop its finalizer
+                return None, exc
+            worker = self._probe_worker = new_worker
+        if self._probe_cap_logged:
+            self._probe_cap_logged = False
+            log.info("intake pause: a stuck disk probe returned; disk probes are running again")
+        loop = asyncio.get_running_loop()
+        waiter: asyncio.Future[_DiskOutcome] = loop.create_future()
+        worker.busy_since = _monotonic()
+        worker.inbox.put(_DiskRequest(path, self._floor_mb, loop, waiter, worker))
+        try:
+            return await asyncio.wait_for(waiter, PROBE_TIMEOUT_SECONDS)
+        except TimeoutError as exc:
+            return None, exc
+
+    def _retire_probe_worker(self) -> None:
+        """Give up on the current worker. It exits when its blocked call returns, or at once if it
+        is idle; until then it counts against the cap."""
+        worker, self._probe_worker = self._probe_worker, None
+        if worker is not None:
+            worker.close()  # sends the stop sentinel once and drops the finalizer
+            self._abandoned_probes.append(worker.thread)
 
     def _sync_alert(self, reason: str, *, value: int, limit: int) -> None:
         """Report ``reason``'s pause state to the sink: ``intake_paused`` when a pause starts and

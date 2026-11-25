@@ -545,6 +545,49 @@ def test_a_foreign_owners_file_can_be_edited_again_on_windows(
 
 
 @windows_only
+def test_both_failed_list_writes_leave_a_foreign_owned_file_its_candidate_list_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Both writes after the rename fail, but the candidate's list took: the file must keep it. The
+    # store's bare _secure_file grants the editing account alone, so running it here would take the
+    # owning account's entry (vault BACKLOG #5619). The kept icacls rewrite runs instead, as main's
+    # fallback did: it removes inherited entries and keeps the explicit ones, the owner's among
+    # them. RED before the fix: no call at all, so a file whose candidate write also failed kept
+    # its staging directory's inherited entries.
+    import messagefoundry.restricted_file as restricted_mod
+    import messagefoundry.store.store as store_mod
+
+    path = tmp_path / "connections.toml"
+    path.write_text(CONNECTIONS_TOML, encoding="utf-8")
+    owner = _real_owner(path)
+    monkeypatch.setattr(store_mod, "_current_user_sid", lambda: _EDITOR_SID)
+    monkeypatch.setattr(restricted_mod, "administrators_enabled", lambda: False)
+    monkeypatch.setattr(atomic_edit, "_restrict_to_owner_and_editor", lambda _path, _owner: False)
+    real_restrict = atomic_edit._restrict_to_editor
+
+    def _refused_after_the_rename(
+        target: Path, *, owner: str | None = None, editor_writes: bool = False
+    ) -> bool:
+        if target == path:
+            return False
+        return real_restrict(target, owner=owner, editor_writes=editor_writes)
+
+    monkeypatch.setattr(atomic_edit, "_restrict_to_editor", _refused_after_the_rename)
+    secured: list[tuple[Path, bool]] = []
+
+    def _secure(target: Path, *, keep_explicit_entries: bool = False) -> None:
+        secured.append((target, keep_explicit_entries))
+
+    monkeypatch.setattr(atomic_edit, "_secure_file", _secure)
+
+    atomic_edit.replace_validated(path, b"x = 1\n", _noop)
+
+    assert secured == [(path, True)]
+    assert protected_entries(path)[2] == [("A", "", "FA", owner), ("A", "", "FA", _EDITOR_SID)]
+    assert path.read_bytes() == b"x = 1\n"
+
+
+@windows_only
 def test_a_failed_owner_and_editor_list_write_keeps_the_foreign_owners_grant_on_windows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -714,7 +757,7 @@ def test_a_failed_list_write_still_restricts_the_file_on_windows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing: str
 ) -> None:
     # A candidate whose list could not be written still ends owner-only, because the replaced file
-    # gets the whole list again. Only when that write fails too does the icacls rewrite run.
+    # gets the whole list again. Only when that write fails too does the store's _secure_file run.
     import messagefoundry.store.store as store_mod
 
     path, owner = _an_own_file_in_a_folder_without_staging_entries(tmp_path, monkeypatch)

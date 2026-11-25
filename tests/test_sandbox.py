@@ -671,9 +671,30 @@ def test_on_github_actions_linux_both_thread_tests_run(
         ("6.8.0-1017-azure", True),
         ("5.15.0-91-generic", True),
         ("4.7.0", True),
+        ("4.7", True),
+        ("4.7-rc1", True),
+        # Numeric, not lexical: "10" and "14" sort below "4" and "7" as strings.
+        ("4.10", True),
+        ("4.14.0-1-generic", True),
+        ("10.0", True),
+        # Positive control for the off-Linux test below: its release passes here.
+        ("14.0-RELEASE", True),
+        ("6.1.0-13-amd64", True),
+        # A two-component release whose minor carries a suffix (BACKLOG #6811).
+        ("6.12-rc4", True),
+        ("5.15-aws", True),
+        ("5.15+", True),
+        ("4.6", False),
+        ("4.6-rc1", False),
         ("4.4.0-210-generic", False),
         ("3.10.0-1160.el7.x86_64", False),
         ("unparseable", False),
+        ("garbage", False),
+        ("6", False),
+        ("6-rc1", False),
+        ("4." + "9" * 5000, False),
+        ("\uff14.\uff17", False),  # fullwidth digits: a kernel release is ASCII
+        ("", False),
     ],
 )
 def test_rlimit_data_is_trusted_only_from_linux_4_7(
@@ -686,8 +707,36 @@ def test_rlimit_data_is_trusted_only_from_linux_4_7(
     from messagefoundry.pipeline import _sandbox_worker
 
     # The worker's own `os` is this module; raising=False because Windows has no os.uname.
-    monkeypatch.setattr(os, "uname", lambda: SimpleNamespace(release=release), raising=False)
+    monkeypatch.setattr(
+        os, "uname", lambda: SimpleNamespace(sysname="Linux", release=release), raising=False
+    )
     assert _sandbox_worker._rlimit_data_counts_mmap() is counts
+
+
+@pytest.mark.parametrize("sysname", ["FreeBSD", "Darwin"])
+def test_rlimit_data_is_not_trusted_off_linux(
+    sysname: str,
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_run_one: Any,  # noqa: F811 - imports the worker without keeping its root handler
+) -> None:
+    # "14.0-RELEASE" would pass the Linux 4.7 threshold, but another kernel's RLIMIT_DATA need not
+    # count mmap, so the worker keeps the absolute RLIMIT_AS cap there (BACKLOG #6811).
+    from messagefoundry.pipeline import _sandbox_worker
+
+    monkeypatch.setattr(
+        os, "uname", lambda: SimpleNamespace(sysname=sysname, release="14.0-RELEASE"), raising=False
+    )
+    assert _sandbox_worker._rlimit_data_counts_mmap() is False
+
+
+def test_rlimit_data_is_not_trusted_without_uname(
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_run_one: Any,  # noqa: F811 - imports the worker without keeping its root handler
+) -> None:
+    from messagefoundry.pipeline import _sandbox_worker
+
+    monkeypatch.delattr(os, "uname", raising=False)
+    assert _sandbox_worker._rlimit_data_counts_mmap() is False
 
 
 def test_a_memory_error_is_reported_as_the_memory_cap_and_recycles_the_worker(
@@ -1183,14 +1232,24 @@ def test_code_sets_reach_the_child_without_travelling_per_dispatch() -> None:
 
 def _codeset_graph(tmp_path: Path, mapped: str) -> Registry:
     (tmp_path / "codesets").mkdir(exist_ok=True)
-    (tmp_path / "codesets" / "cs.csv").write_text(f"key,value\nA,{mapped}\n", encoding="utf-8")
+    (tmp_path / "codesets" / "cs.csv").write_text(f"key,value\nA,{mapped}\nR,h\n", encoding="utf-8")
     (tmp_path / "graph.py").write_text(
         "from messagefoundry import inbound, outbound, router, handler, MLLP, Send, code_set\n"
         'inbound("IB_C", MLLP(port=19331), router="r")\n'
+        'inbound("IB_C_GEN", MLLP(port=19333), router="r_gen_cs")\n'
+        'inbound("IB_C_MISS", MLLP(port=19334), router="r_gen_missing")\n'
         'outbound("OB_C", MLLP(host="127.0.0.1", port=19332))\n'
         '@router("r")\n'
         "def r(msg):\n"
         '    return "h"\n'
+        '@router("r_gen_cs")\n'
+        "def r_gen_cs(msg):\n"
+        "    # A GENERATOR Router whose body reads a run-scoped provider (BACKLOG #5780).\n"
+        '    yield code_set("cs")["R"]\n'
+        '@router("r_gen_missing")\n'
+        "def r_gen_missing(msg):\n"
+        "    # A GENERATOR Router whose body raises a code_set error (BACKLOG #5780).\n"
+        '    yield code_set("no_such_set")["R"]\n'
         '@handler("h")\n'
         "def h(msg):\n"
         '    return Send("OB_C", code_set("cs")["A"])\n'
@@ -1243,6 +1302,44 @@ def test_a_generator_handlers_body_runs_inside_the_childs_run_context(tmp_path: 
     with run_contexts(rc, phase="transform"):
         off, _, _, _ = transform_one(registry, "h_gen_cs", RAW, run_context=rc)
     assert [(d.to, d.payload) for d in ds] == [(d.to, d.payload) for d in off]
+
+
+def test_a_generator_routers_body_runs_inside_the_childs_run_context(tmp_path: Path) -> None:
+    """BACKLOG #5780: a generator Router's body runs when something iterates it. The child must do
+    that inside ``with run_contexts(...)`` and inside its exception arms, as ``mode=off`` does.
+
+    Iterated anywhere else, a ``code_set(...)`` read in the body raises "called with no active code
+    sets" under ``mode=subprocess`` while it resolves under ``mode=off``, and a body error comes back
+    as an "unmarshallable result" instead of the Router's own error. So each half compares with
+    ``mode=off`` exactly. The worker survives either way, because ``_respond`` has caught every raise
+    since BACKLOG #5890; survival is checked here, but it is not what pins this fix."""
+    registry = _codeset_graph(tmp_path, "MAPPED")
+    gen_ic = registry.inbound["IB_C_GEN"]
+    miss_ic = registry.inbound["IB_C_MISS"]
+    rc = RunContext(code_sets=registry.code_sets)
+    with run_contexts(rc, phase="router"):
+        off = route_only(registry, gen_ic, RAW, run_context=rc)
+        with pytest.raises(Exception, match="no such code set 'no_such_set'") as off_err:
+            route_only(registry, miss_ic, RAW, run_context=rc)
+    assert off == ["h"]
+    off_text = f"{type(off_err.value).__name__}: {off_err.value}"
+
+    # One session per inbound, as production runs them.
+    gen_session = _session(str(tmp_path), inbound="IB_C_GEN", code_sets=registry.code_sets)
+    try:
+        assert route_only(registry, gen_ic, RAW, sandbox=gen_session, run_context=rc) == off
+    finally:
+        gen_session.close()
+    miss_session = _session(str(tmp_path), inbound="IB_C_MISS", code_sets=registry.code_sets)
+    try:
+        for _ in range(2):
+            with pytest.raises(SandboxError) as sub_err:
+                route_only(registry, miss_ic, RAW, sandbox=miss_session, run_context=rc)
+            assert str(sub_err.value) == f"sandbox failed router 'r_gen_missing': {off_text}"
+            proc = miss_session._proc
+            assert proc is not None and proc.poll() is None
+    finally:
+        miss_session.close()
 
 
 def test_an_unreloaded_codeset_edit_does_not_brick_the_inbound(tmp_path: Path) -> None:
