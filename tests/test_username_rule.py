@@ -211,6 +211,7 @@ def test_every_literal_audit_actor_is_a_reserved_form() -> None:
     for expected in ("system", "system:rotate-key", "<oidc>", "<kerberos>", "<reconciler>", "cli:"):
         assert expected in literals, (expected, sorted(literals))
     assert DIRECTORY_GRANTED_BY in literals
+    assert actors
     unreserved = [(where, lit) for where, lit in actors if not RESERVED_ACTOR_FORMS.fullmatch(lit)]
     assert not unreserved, unreserved
 
