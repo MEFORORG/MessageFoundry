@@ -79,6 +79,7 @@ __all__ = [
     "b64u_encode",
     "certificate_thumbprint",
     "client_assertion_claims",
+    "refuse_critical_extensions",
     "require_public_key_for_alg",
     "signer_from_destination",
     "unverified_jws_header",
@@ -551,6 +552,19 @@ class CompactJwtSigner:
         return f"{header_b64}.{claims_b64}.{_b64u_encode(signature)}"
 
 
+def refuse_critical_extensions(header: Mapping[str, Any]) -> None:
+    """Refuse a JWS protected header carrying any ``crit`` member (RFC 7515 section 4.1.11).
+
+    ``crit`` names extensions the recipient must process, and this module implements none, so no form
+    of ``crit``, well-formed or malformed, can be valid. Raises :class:`SigningError`.
+    """
+    if "crit" in header:
+        # The detail echoes nothing from the header: it is unverified, sender-chosen text.
+        raise SigningError(
+            "JWS carries a crit header, and this verifier implements no JWS header extension"
+        )
+
+
 def verify_detached_jws(
     jws: str,
     payload: bytes,
@@ -634,8 +648,9 @@ def verify_compact_jws(
     enum with **no** ``none`` and **no** ``HS*`` member, so ``{"alg":"none"}`` and an RS256→HS256
     confusion both fail to coerce before any key is touched.
 
-    Raises :class:`SigningError` on a malformed JWS, an unsupported/unpinned ``alg``, or a payload that
-    is not a JSON object; :class:`cryptography.exceptions.InvalidSignature` on a signature mismatch.
+    Raises :class:`SigningError` on a malformed JWS, a ``crit`` header (see
+    :func:`refuse_critical_extensions`), an unsupported/unpinned ``alg``, or a payload that is not a
+    JSON object; :class:`cryptography.exceptions.InvalidSignature` on a signature mismatch.
     Returns the decoded claims on success. **It verifies the SIGNATURE only** — ``iss``, ``aud``,
     ``exp``, ``nonce`` and friends are the caller's ladder.
     """
@@ -651,6 +666,9 @@ def verify_compact_jws(
         raise SigningError("compact JWS segments must all be non-empty")
 
     header = unverified_jws_header(jws)
+    # Before the signature: a crit naming an extension this verifier does not process makes the JWS
+    # invalid whatever its signature says (RFC 7515 section 4.1.11).
+    refuse_critical_extensions(header)
     try:
         alg = SignatureAlgorithm(header.get("alg"))
     except ValueError as exc:

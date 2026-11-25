@@ -66,6 +66,11 @@ class JwkAlgMismatch(JwksError):
     than the one the token names (BACKLOG #5517). A refusal of the key, not a missing ``kid``."""
 
 
+class JwksAmbiguousKid(JwksError):
+    """The JWKS document gives two usable keys the same ``kid``, so the set is refused whole. A fault
+    in the IdP's key set, not in the token, which ``claims.py`` records as ``ambiguous_kid``."""
+
+
 @dataclass(frozen=True, slots=True)
 class _BoundKey:
     """One JWKS key and the algorithm its JWK ``alg`` restricts it to, ``None`` when it names none
@@ -216,7 +221,7 @@ def _parse_bound(body: bytes) -> dict[str, _BoundKey]:
         # key order: a skipped key (an encryption key sharing a signing key's kid, say) is never a
         # second candidate, before or after the usable one (BACKLOG #5517).
         if kid in keys:
-            raise JwksError(f"JWKS contains two keys with kid {kid!r} (ambiguous; refused)")
+            raise JwksAmbiguousKid(f"JWKS contains two keys with kid {kid!r} (ambiguous; refused)")
         keys[kid] = bound
     if not keys:
         raise JwksError(f"JWKS yielded no usable signing keys ({skipped} skipped)")
