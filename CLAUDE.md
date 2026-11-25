@@ -852,7 +852,7 @@ Manager's watch reached the cloud session 29 seconds after its question.
   before the commit: `code-review <low|medium|high|xhigh|max|ultra>`, `verify`, `tests` or
   `none`. Name only a check that ran on this commit's own content. A review of an earlier head does
   not count for a later commit, so a fix commit made after a review says `tests`, or whatever ran
-  on it. Give one trailer per check that ran, for example `tests` and `code-review xhigh` on two
+  on it. An amend keeps the old message, so correct its trailer too. Give one trailer per check that ran, for example `tests` and `code-review xhigh` on two
   lines; `none` goes alone. `verify` means the project's `verify` skill (`.claude/skills/verify`)
   ran. The `commit-msg` hook (`scripts/hooks/claim_check.py`) only advises on this trailer: it
   prints one line, at least for a missing or malformed value, or `none` beside another value, and

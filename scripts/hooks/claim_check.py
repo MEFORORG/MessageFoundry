@@ -542,19 +542,15 @@ _GIT_REVERT_LINE = re.compile(r"This reverts commit [0-9a-f]{7,}")
 _SCISSORS_LINE = re.compile(r"# -+ >8 -+\s*$")
 
 
-def _trailer_lines(message_file: Path) -> list[str] | str:
-    """The message's trailers as git reads them, one per line, or why git could not answer.
+def _trailer_lines(message_file: Path) -> list[str]:
+    """The message's trailers as git reads them, one per line; raises when git cannot answer.
 
     `git interpret-trailers --parse` applies git's own rules: the last paragraph only, comment and
     scissors lines dropped, continuation lines folded into their trailer. `--no-divider` reads a
     `---` line as body text, as git does for a commit message, not as a patch divider. It runs
     outside a repository too, so the hook's tests need none.
     """
-    try:
-        out = _git("interpret-trailers", "--parse", "--no-divider", str(message_file))
-    except (GitReadError, OSError) as exc:
-        return _safe_for_message(exc, 160)
-    return out.split("\n")
+    return _git("interpret-trailers", "--parse", "--no-divider", str(message_file)).split("\n")
 
 
 def _git_generated(message: str, git_dir: Path) -> bool:
@@ -586,11 +582,12 @@ def _verified_by_advisory(message_file: Path) -> str | None:
     other value contradicts. OBSERVE MODE: main() prints this and carries on. Nothing here may
     refuse a commit.
     """
-    lines = _trailer_lines(message_file)
-    if isinstance(lines, str):
+    try:
+        lines = _trailer_lines(message_file)
+    except (GitReadError, OSError) as exc:
         return (
-            f"advisory: git could not read the trailers ({lines}), so 'Verified-by:' was not"
-            f" checked; {_NOT_REFUSED}\n"
+            f"advisory: git could not read the trailers ({_safe_for_message(exc, 160)}), so"
+            f" 'Verified-by:' was not checked; {_NOT_REFUSED}\n"
         )
     values = list(
         dict.fromkeys(
