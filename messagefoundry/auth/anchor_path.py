@@ -1077,15 +1077,15 @@ def dacl_entry_fields(entry: bytes) -> tuple[int, int, int] | str:
     """``(type, flags, mask)`` of one DACL entry, from as many bytes as its own AceSize gives, or
     what the entry is too short to hold.
 
-    Only a granting entry's mask is read, and the mask is 0 for any other type. The callers that
-    read :class:`WinSecurity` entries, :func:`evaluate_windows_object` and ``restricted_file.py``'s
-    link and holder checks, skip every type that grants nothing. An entry of a type Windows does
-    not define may be its 4-byte header alone, so reading a mask from it would read the next entry,
-    or past the DACL.
-    Every granting type carries its mask right after the header. An allow entry must also hold its
-    whole SID, which starts at offset 8 and is 8 bytes plus 4 per sub-authority; the SID's second
-    byte, at offset 9, counts them. The caller renders that SID once this answers. Kept free of
-    ctypes so every platform tests it."""
+    Only a granting entry's mask is read, and the mask is 0 for any other type. At least
+    :func:`evaluate_windows_object` and ``restricted_file.py``'s link and holder checks read
+    :class:`WinSecurity` entries, and each skips every type that grants nothing; a new reader that
+    needs a deny entry's rights cannot get them here. An entry of a type Windows does not define
+    may be its 4-byte header alone, so reading a mask from it would read the next entry, or past
+    the DACL. Every granting type carries its mask right after the header. An allow entry must also
+    hold its whole SID, which starts at offset 8 and is 8 bytes plus 4 per sub-authority; the SID's
+    second byte, at offset 9, counts them. The caller renders that SID once this answers. Kept free
+    of ctypes so every platform tests it."""
     if len(entry) < 4:
         return "too short to hold its header"
     ace_type, flags = entry[0], entry[1]
@@ -1098,44 +1098,67 @@ def dacl_entry_fields(entry: bytes) -> tuple[int, int, int] | str:
     return ace_type, flags, int.from_bytes(entry[4:8], "little")
 
 
+#: The ACL revisions Windows defines, ACL_REVISION (2) to ACL_REVISION_DS (4). ``GetAce`` refuses
+#: a DACL of any other revision, and so does :func:`dacl_entries`.
+_ACL_REVISIONS = frozenset({2, 3, 4})
+
+
 def dacl_entries(acl: bytes) -> tuple[tuple[tuple[int, int, int, int | None], ...], str | None]:
-    """Each entry of one DACL as ``(type, flags, mask, sid_offset)``, and why the walk stopped
-    early, or ``None`` when it read every entry.
+    """Each entry of one DACL as ``(type, flags, mask, sid_offset)``, and the first reason the read
+    is incomplete, or ``None`` when every entry was read.
 
     ``acl`` is the DACL's bytes from its start. The walk is bounded by the smaller of ``len(acl)``
     and the header's own AclSize, so bytes past the DACL are never read as an entry, whatever the
     caller copied. ``sid_offset`` is where an allow entry's SID starts in ``acl``, for the caller to
-    render, and ``None`` for any other type. The walk steps from entry to entry by each one's own
-    AceSize, as ``GetAce`` does. An entry shorter than its 4-byte header, or one that starts or runs
-    past the bound, stops the walk: an AceSize of 0 would make every later index read the same
-    entry again, and one of 1 to 3 would read the next entry from inside this one. The entries read
-    before the stop are returned with the reason, so a definite grant among them still counts.
-    Kept free of ctypes so every platform tests it."""
-    entries: list[tuple[int, int, int, int | None]] = []
+    render, and ``None`` for any other type. A revision Windows does not define reads no entry.
+
+    The walk steps from entry to entry by each one's own AceSize, as ``GetAce`` does. An entry
+    whose AceSize is at least 4 and inside the bound is skipped if its body is too short, and the
+    walk goes on. An AceSize that cannot be trusted stops the walk: one below 4 would make every
+    later index read the same entry again, or the next entry from inside this one, and one past the
+    bound gives no next entry. That entry is still read from the bytes up to the bound, as
+    ``GetAce`` read it. Every entry read is returned beside the reason, so a definite grant among
+    them still counts. Kept free of ctypes so every platform tests it."""
     if len(acl) < 8:
         return (), "its DACL is too short to hold its header"
     # ACL header: revision, sbz1 (bytes), AclSize, AceCount, sbz2 (words).
+    if acl[0] not in _ACL_REVISIONS:
+        return (), f"its DACL has revision {acl[0]}, which Windows does not define"
     bound = min(len(acl), int.from_bytes(acl[2:4], "little"))
     if bound < 8:
         return (), "its DACL is too short to hold its header"
     count = int.from_bytes(acl[4:6], "little")
+    entries: list[tuple[int, int, int, int | None]] = []
+    reason: str | None = None
+
+    def keep(index: int, entry: bytes, start: int) -> None:
+        nonlocal reason
+        fields = dacl_entry_fields(entry)
+        if isinstance(fields, str):
+            reason = reason or f"entry {index} of its DACL is {fields}"
+            return
+        ace_type, flags, mask = fields
+        entries.append(
+            (ace_type, flags, mask, start + 8 if ace_type == ACCESS_ALLOWED_ACE_TYPE else None)
+        )
+
     offset = 8
     for index in range(count):
         if offset + 4 > bound:
-            return tuple(entries), f"entry {index} of its DACL starts past the end of the DACL"
+            reason = reason or f"entry {index} of its DACL starts past the end of the DACL"
+            break
         size = int.from_bytes(acl[offset + 2 : offset + 4], "little")
-        if size < 4:
-            return tuple(entries), f"entry {index} of its DACL is shorter than an entry header"
-        if offset + size > bound:
-            return tuple(entries), f"entry {index} of its DACL runs past the end of the DACL"
-        fields = dacl_entry_fields(acl[offset : offset + size])
-        if isinstance(fields, str):
-            return tuple(entries), f"entry {index} of its DACL is {fields}"
-        ace_type, flags, mask = fields
-        sid_offset = offset + 8 if ace_type == ACCESS_ALLOWED_ACE_TYPE else None
-        entries.append((ace_type, flags, mask, sid_offset))
+        if size < 4 or offset + size > bound:
+            keep(index, acl[offset:bound], offset)
+            reason = reason or (
+                f"entry {index} of its DACL is shorter than an entry header"
+                if size < 4
+                else f"entry {index} of its DACL runs past the end of the DACL"
+            )
+            break
+        keep(index, acl[offset : offset + size], offset)
         offset += size
-    return tuple(entries), None
+    return tuple(entries), reason
 
 
 def windows_host_readers() -> WinHost:
@@ -1150,10 +1173,10 @@ def windows_host_readers() -> WinHost:
     import ctypes
     from ctypes import wintypes
 
-    from messagefoundry.auth import _win32_sid
+    from messagefoundry import win32_sid
 
     # The SID, entry, account and token prototypes are shared with config/wiring.py's reader.
-    advapi32, kernel32 = _win32_sid.sid_libraries()
+    advapi32, kernel32 = win32_sid.sid_libraries()
     pvoid_p = ctypes.POINTER(ctypes.c_void_p)
     kernel32.CreateFileW.restype = wintypes.HANDLE
     kernel32.CreateFileW.argtypes = [
@@ -1192,7 +1215,7 @@ def windows_host_readers() -> WinHost:
     invalid_handle = wintypes.HANDLE(-1).value
 
     def sid_text(sid_ptr: int | None) -> str | None:
-        return _win32_sid.sid_text(advapi32, kernel32, sid_ptr)
+        return win32_sid.sid_text(advapi32, kernel32, sid_ptr)
 
     def win_error(code: int) -> str:
         return f"Win32 error {code} ({ctypes.FormatError(code).strip()})"
@@ -1384,7 +1407,7 @@ def windows_host_readers() -> WinHost:
             return True  # a SID found in a partial read is still a member
         return False if complete else None
 
-    engine_sid = _win32_sid.process_user_sid(advapi32, kernel32)
+    engine_sid = win32_sid.process_user_sid(advapi32, kernel32)
     return WinHost(read_security, volume_cause, engine_sid, admin_member, query_drive_target)
 
 

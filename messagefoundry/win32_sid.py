@@ -11,7 +11,9 @@ here: the prototypes of the SID, entry, account and token calls, the text of a b
 SID of the account this process runs as. Other readers still declare their own, at least
 ``restricted_file.py``'s.
 
-ctypes stays behind the platform guard in each function, so mypy and lint pass on the Linux CI leg.
+It imports only the standard library and sits outside ``auth/``, so ``config/`` reaches it without
+loading the auth package. ctypes stays behind the platform guard in each function, so mypy and lint
+pass on the Linux CI leg.
 """
 
 from __future__ import annotations

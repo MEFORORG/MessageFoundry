@@ -11268,10 +11268,10 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
     import ctypes
     from ctypes import wintypes
 
-    from messagefoundry.auth import _win32_sid
+    from messagefoundry import win32_sid
 
     # The SID, entry, account and token prototypes are shared with auth/anchor_path.py's reader.
-    advapi32, kernel32 = _win32_sid.sid_libraries()
+    advapi32, kernel32 = win32_sid.sid_libraries()
 
     # Declare prototypes so 64-bit pointers aren't truncated to a default c_int arg (which raises an
     # OverflowError on a high address). PVOID = c_void_p; PSID/PACL/PSECURITY_DESCRIPTOR are pointers.
@@ -11318,7 +11318,7 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
         )
 
     def _sid_to_str(sid_ptr: int) -> str | None:
-        return _win32_sid.sid_text(advapi32, kernel32, sid_ptr)
+        return win32_sid.sid_text(advapi32, kernel32, sid_ptr)
 
     # LOCALGROUP_MEMBERS_INFO_0 — level 0 of NetLocalGroupGetMembers returns member SIDs only. Levels
     # 1..3 return NAMES, and translating a domain member's SID to a name is what reaches out to a domain
@@ -11542,7 +11542,7 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
 
     return _WinConfigSourceProbes(
         # The run-as account's SID, so a config dir the service account itself owns passes.
-        self_sid=_win32_sid.process_user_sid(advapi32, kernel32),
+        self_sid=win32_sid.process_user_sid(advapi32, kernel32),
         read_path=_read_path,
         owner_in_admins=_owner_in_admins,
     )
