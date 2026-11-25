@@ -1736,8 +1736,7 @@ async def refuse_from_new_address(request: Request) -> None:
     and started or stopped connections with no signal. Callers include at least
     :func:`require_phi_read`, :func:`require_paced`, :func:`step_up_status` and the HTTP reveal path
     in ``api/app.py`` (``_refuse_reveal_phi_read``, which ``_admit_reveal`` and ``GET /connections``
-    reach). It gives
-    them the step-up gates' refusal: 403 + ``X-Step-Up-Required: 1``, cleared by a
+    reach). It gives them the step-up gates' refusal: 403 + ``X-Step-Up-Required: 1``, cleared by a
     ``POST /me/reauth`` from the new address, which re-anchors the session. An ``oidc`` session is
     sent to the IdP step-up instead (:func:`_step_up_refusal`). A first sighting writes
     ``auth.new_address_reverify_required`` and a notice, deduped and capped per session as
