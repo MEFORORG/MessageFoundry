@@ -32,6 +32,8 @@ from messagefoundry.framing import (
 from messagefoundry.parsing._builtin_hl7 import _extract_separators
 from messagefoundry.parsing.sniff import _LEADING_WS_STR
 from messagefoundry.parsing.split import _sends_more_than_one_message
+from messagefoundry.parsing.x12.delimiters import discover_delimiters
+from messagefoundry.parsing.x12.errors import X12PeekError
 from messagefoundry.transports.base import NegativeAckError, encode_wire_body
 
 __all__ = [
@@ -272,13 +274,14 @@ def _encode_replacing(reply: str, encoding: str, connection: str) -> bytes:
     ``UnicodeError``, outside the handler, so neither error's text or ``object`` rides the chain.
     The warning names the connection, never the reply or the setting.
 
-    The ``replace`` handler writes ``?`` on encode. An ``MSH``-led reply declares its own
-    delimiters in MSH-1 and MSH-2, and HL7 lets a sender pick ``?`` as one, so where it is a
-    delimiter or the segment terminator a replaced data character would become structure (ADR
-    0206). That reply is refused with the same fixed error instead. So is one with a delimiter the
-    charset cannot hold: the delimiter itself would become ``?`` beside replaced data characters,
-    and both would read as one delimiter. A reply not led by ``MSH`` has no declared delimiters to
-    collide with."""
+    The ``replace`` handler writes ``?`` on encode. An HL7 reply declares its own delimiters in
+    MSH-1 and MSH-2 (or a ``BHS`` or ``FHS`` header's same fields), and an X12 reply in its ``ISA``;
+    both standards let a sender pick ``?`` as one, so where it is a delimiter or the segment
+    terminator a replaced data character would become structure (ADR 0206). That reply is refused
+    with the same fixed error instead. So is one with a delimiter the charset cannot hold: the
+    delimiter itself would become ``?`` beside replaced data characters, and both would read as
+    one delimiter. :func:`_reply_delimiters` says which headers are read; a reply led by none of
+    them declares no delimiters to collide with."""
     delimiters = _reply_delimiters(reply)
     if _REPLACEMENT in delimiters or not all(_encodes(d, encoding) for d in delimiters):
         raise UnicodeError(
@@ -324,14 +327,38 @@ def _encodes(delimiter: str, encoding: str) -> bool:
 
 
 def _reply_delimiters(reply: str) -> frozenset[str]:
-    """The delimiters an ``MSH``-led ``reply`` declares, read as the parser reads them, plus the
-    segment terminator; empty for any other reply. Read only: nothing here changes the reply.
+    """The delimiters a ``reply`` declares in its header, read as the parser reads them, plus its
+    segment terminator. Read only: nothing here changes the reply.
+
+    Three header shapes are read. An HL7 header led by ``MSH``, ``BHS`` or ``FHS`` declares its
+    delimiters in its first two fields, the layout ``_extract_separators`` reads for all three. An
+    X12 ``ISA`` declares them by fixed offset, read as
+    :func:`~messagefoundry.parsing.x12.delimiters.discover_delimiters` reads them; the X12
+    listener's reply is an interchange (BACKLOG #5799 item 2: before, only an ``MSH``-led reply was
+    read, so an X12 reply declaring ``?`` had ``?`` written into its data). A reply with any other
+    lead, or an ``ISA`` that header read refuses, declares nothing here.
 
     Leading whitespace and a BOM are skipped first, as the engine's one definition of tolerated
-    leading noise (``sniff._LEADING_WS_STR``) skips them. The first line is measured, not the whole
-    reply, so a first line of ``MSH`` alone has no field separator to read and declares nothing,
-    rather than indexing past its end."""
-    line = reply.lstrip(_LEADING_WS_STR).partition("\r")[0]
-    if not line.startswith("MSH") or len(line) < 4:
+    leading noise (``sniff._LEADING_WS_STR``) skips them. For an HL7 header the first line is
+    measured, not the whole reply, so a first line of ``MSH`` alone has no field separator to read
+    and declares nothing, rather than indexing past its end."""
+    body = reply.lstrip(_LEADING_WS_STR)
+    if body.startswith("ISA"):
+        try:
+            found = discover_delimiters(body, 0)
+        except X12PeekError:
+            return frozenset()
+        # A CR+LF terminator is two characters, and a `?` written for either would break it.
+        return frozenset(
+            (found.element, found.component, *found.segment)
+            + ((found.repetition,) if found.repetition is not None else ())
+        )
+    line = body.partition("\r")[0]
+    if not line.startswith(_HL7_HEADERS) or len(line) < 4:
         return frozenset()
     return frozenset((*_extract_separators(line), "\r"))
+
+
+#: The HL7 segments that open a message or a batch and declare its delimiters in MSH-1/MSH-2's
+#: layout, so a reply led by any of them is read for its delimiters.
+_HL7_HEADERS = ("MSH", "BHS", "FHS")

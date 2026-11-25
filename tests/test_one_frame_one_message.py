@@ -759,6 +759,65 @@ def test_frame_reply_reads_delimiters_past_a_leading_bom(lead: str) -> None:
         frame_reply(MLLP_CODEC, reply, "latin-1", connection="IB_BOM")
 
 
+def _isa(
+    *, element: str = "*", component: str = ":", repetition: str = "^", term: str = "~"
+) -> str:
+    """A 106-character synthetic ISA header (106 plus one for a CR+LF terminator)."""
+    fields = ["ISA", "00", " " * 10, "00", " " * 10, "ZZ", "SENDER".ljust(15), "ZZ"]
+    fields += ["RECEIVER".ljust(15), "260101", "1200", repetition, "00501", "000000001", "0", "P"]
+    return element.join([*fields, component]) + term
+
+
+@pytest.mark.parametrize(
+    ("header", "term"),
+    [
+        (_isa(component="?"), "~"),
+        (_isa(repetition="?"), "~"),
+        (_isa(element="?"), "~"),
+        (_isa(term="?"), "?"),
+    ],
+    ids=["isa-component", "isa-repetition", "isa-element", "isa-terminator"],
+)
+def test_encode_reply_refuses_a_replacement_that_is_an_x12_replys_delimiter(
+    header: str, term: str
+) -> None:
+    """BACKLOG #5799 item 2: the X12 listener's reply is an interchange, which declares its
+    delimiters in its ISA, and X12 lets a sender pick ``?`` as one. Only an ``MSH``-led reply was
+    read, so a ``?`` written for an unencodable character became structure. Red on the code
+    before: the call returns the replaced reply."""
+    element = header[3]
+    reply = header + element.join(["TA1", "000000001", "260101", "1200", "A", "000中"]) + term
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters") as ei:
+        framing_mod.encode_reply(reply, "ascii", connection="IB_X12_QDELIM")
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
+
+
+@pytest.mark.parametrize("term", ["~", "\r\n"], ids=["tilde", "crlf"])
+def test_control_an_x12_reply_with_ordinary_delimiters_is_replaced_and_sent(term: str) -> None:
+    """Control for the X12 refusal: with no ``?`` delimiter the data character is replaced, the
+    reply is sent, and a CR+LF terminator reads as the two characters it is."""
+    reply = _isa(term=term) + "TA1*000000001*260101*1200*A*000中" + term
+    body, replaced = framing_mod.encode_reply_reporting(reply, "ascii", connection="IB_X12_OK")
+    assert replaced and body == reply.replace("中", "?").encode("ascii")
+    # A truncated ISA is no header the X12 read accepts, so it declares nothing and is replaced.
+    short = "ISA*00*中" + "~"
+    assert framing_mod.encode_reply(short, "ascii") == b"ISA*00*?~"
+
+
+@pytest.mark.parametrize("head", ["BHS", "FHS"])
+def test_frame_reply_reads_a_batch_headers_delimiters_as_an_msh(head: str) -> None:
+    """BACKLOG #5799 item 2: a ``BHS`` or ``FHS`` header declares its delimiters in MSH-1 and MSH-2's
+    layout, so a batch-led reply declaring ``?`` is refused as an ``MSH``-led one is. Red on the
+    code before: the call returns a reply with ``?`` written into its data."""
+    reply = head + "|?~" + BS + "&|R|RF" + CR + "MSH|?~" + BS + "&|R" + CR + "MSA|AA|C|中" + CR
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
+        frame_reply(MLLP_CODEC, reply, "latin-1", connection="IB_BATCH_QDELIM")
+    # Control: ordinary delimiters, so only the data character is replaced and it answers.
+    plain = reply.replace("|?~", "|^~")
+    wire = frame_reply(MLLP_CODEC, plain, "latin-1", connection="IB_BATCH_QDELIM")
+    assert wire == MLLP_CODEC.frame(plain.replace("中", "?").encode("latin-1"))
+
+
 def test_frame_reply_refuses_leading_noise_the_charset_cannot_hold() -> None:
     """Round-four review of #5799: with ordinary delimiters, a BOM-led reply was replaced into
     "?MSH|...", which no parser reads as an ACK. Mutation: drop the leading-noise check in
