@@ -8017,9 +8017,9 @@ again for the row, and only when a send failed. **Still open, at least:**
   on their own loop in a daemon thread, so the limit covers a synchronous key-provider hop inside
   the open too. A record still running at the time limit is not guaranteed either way: the process
   exit may wait for it, or it may be lost with no log line.
-- Under a long overload a queue-full drop is recorded only while fewer than 64 records are in
-  flight, a failed send's record and a cut close's records among them, and drops past that are
-  not recorded.
+- Under a long overload a queue-full drop, or a notice refused once the close has begun, is
+  recorded only while fewer than 64 record tasks are in flight, a failed send's record among them,
+  and drops past that are not recorded. A cut close's rows run as one such task.
 - A lock notice whose send fails still leaves its `auth.lock_notice` row reading `mailed: true`,
   because the send fails on the relay's own task after that row is written. So the throttle holds
   back the next lock notice of the kind for the rest of its 24 hours. The failure is on the

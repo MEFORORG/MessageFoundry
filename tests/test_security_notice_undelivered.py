@@ -850,7 +850,12 @@ async def test_a_cut_close_with_no_audit_sink_still_logs_the_queued_count(
     assert [r.getMessage() for r in caplog.records if "still queued" in r.getMessage()] == [
         "SecurityEventNotifier closed with 1 security notice(s) still queued, never sent"
     ]
-    assert not [r for r in caplog.records if "could not be recorded" in r.getMessage()]
+    assert not [
+        r
+        for r in caplog.records
+        if r.name == "messagefoundry.pipeline.security_notify"
+        and "could not be recorded" in r.getMessage()
+    ]
 
 
 async def test_a_cut_of_the_close_while_it_records_stops_only_its_wait(
