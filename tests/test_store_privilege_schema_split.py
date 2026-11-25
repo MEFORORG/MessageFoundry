@@ -481,6 +481,8 @@ async def test_postgres_probe_with_no_current_schema_is_unobserved_under_externa
     report = await store.probe_principal_privileges()
     assert report.status is StorePrivilegeStatus.UNOBSERVABLE
     assert "not read" in report.detail
+    # BACKLOG #6015 item 2: the structured field names it as well.
+    assert report.unread == ("CREATE on the store's schema",)
 
 
 # --- the Postgres open path, through a fake connection -----------------------------------------
@@ -1246,6 +1248,11 @@ async def test_postgres_unread_audit_grants_never_soften_a_found_over_grant(
     assert report.status is StorePrivilegeStatus.OBSERVED
     assert report.excess == ("CREATE on schema mefor",)
     assert "audit-table grants read NULL" in report.detail
+    # BACKLOG #6015 item 5: probed_grant also leaves a non-boolean answer unread, and says so.
+    assert "or a value that is not true or false" in report.detail
+    # BACKLOG #6015 item 2: the unread grants reach the summary the log line and the alert carry.
+    assert "UPDATE on table audit_log" in report.unread
+    assert "not read: " in report.summary()
 
 
 def test_postgres_audit_probe_reads_every_assumable_role_and_column_updates() -> None:
@@ -1723,21 +1730,26 @@ async def test_live_sqlserver_external_refuses_then_provisions_then_runs_row_onl
         "grant view definition",
         admin.run_in(db, f"GRANT VIEW DEFINITION ON SCHEMA::[dbo] TO [{login}]"),
     )
-    store = await bounded(
-        sa,
-        "reopen with view definition",
-        SqlServerStore.open(runtime, cipher=cipher, audit_mac_key=cipher.audit_mac_key()),
-    )
+    # BACKLOG #6714 item 5: the REVOKE runs however the reopen or the probe ends.
     try:
-        viewer = await bounded(sa, "probe with view definition", store.probe_principal_privileges())
+        store = await bounded(
+            sa,
+            "reopen with view definition",
+            SqlServerStore.open(runtime, cipher=cipher, audit_mac_key=cipher.audit_mac_key()),
+        )
+        try:
+            viewer = await bounded(
+                sa, "probe with view definition", store.probe_principal_privileges()
+            )
+        finally:
+            await store.close()
     finally:
-        await store.close()
+        await bounded(
+            sa,
+            "revoke view definition",
+            admin.run_in(db, f"REVOKE VIEW DEFINITION ON SCHEMA::[dbo] FROM [{login}]"),
+        )
     assert viewer.excess == (view_definition_grant("dbo"),), viewer.excess
-    await bounded(
-        sa,
-        "revoke view definition",
-        admin.run_in(db, f"REVOKE VIEW DEFINITION ON SCHEMA::[dbo] FROM [{login}]"),
-    )
 
     await bounded(
         sa, "grant db_ddladmin", admin.run_in(db, f"ALTER ROLE db_ddladmin ADD MEMBER [{login}]")

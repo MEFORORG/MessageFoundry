@@ -1205,10 +1205,39 @@ async def test_webauthn_store_contract(store) -> None:
 
 
 async def test_a_session_for_a_missing_account_is_refused(store) -> None:
-    """BACKLOG #2733 on Postgres: the session's user foreign key, as on SQLite and SQL Server."""
+    """BACKLOG #2733 on Postgres: ``create_session``'s own missing-account refusal, as on SQLite and
+    SQL Server. It answers before the INSERT, so this does not reach the session's user foreign key
+    (vault BACKLOG #2733 item 10)."""
     from tests._webauthn_store_contract import assert_a_session_for_a_missing_account_is_refused
 
     await assert_a_session_for_a_missing_account_is_refused(store)
+
+
+async def test_the_sessions_user_key_refuses_an_orphan(store) -> None:
+    """Vault BACKLOG #2733 item 6: the test above no longer reaches the ``sessions.user_id``
+    foreign key, so this reaches it directly. A session row moved onto an account that does not
+    exist is refused."""
+    import asyncpg
+
+    user_id = f"fk-{uuid4().hex}"
+    token_hash = uuid4().hex * 2
+    await store.create_user(
+        user_id=user_id,
+        username=f"fk-{uuid4().hex}",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+        audits=(),
+    )
+    assert await store.create_session(token_hash=token_hash, user_id=user_id, expires_at=9e9)
+    async with store._pool.acquire() as conn:
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
+            await conn.execute(
+                "UPDATE sessions SET user_id=$1 WHERE token_hash=$2",
+                f"no-such-{uuid4().hex}",
+                token_hash,
+            )
 
 
 async def test_webauthn_conditional_bind_contract(store) -> None:

@@ -34,6 +34,8 @@ nobody can see fail is not a guard.
 from __future__ import annotations
 
 import importlib.util
+import io
+import json
 import re
 import subprocess
 import sys
@@ -1108,6 +1110,60 @@ def test_a_function_value_or_array_this_read_cannot_trace_is_a_floor(
     assert not mod.price_script(script).exact, label
 
 
+@pytest.mark.parametrize(
+    ("script", "agents", "flagged"),
+    [
+        pytest.param("const s = `${await agent(1)}`\n", 1, {1}, id="plain"),
+        pytest.param(
+            "const R = [1, 2, 3]\nconst s = `${await parallel(R.map(r => () => agent(r)))}`\n",
+            3,
+            {2},
+            id="parallel",
+        ),
+        pytest.param(
+            "const R = [1, 2, 3]\nconst s = `${Promise.all(R.map(r => agent(r)))}`\n",
+            3,
+            {2},
+            id="promise-all",
+        ),
+        pytest.param("const R = [1, 2]\nconst s = `${R.map(agent)}`\n", 2, {2}, id="hook-value"),
+        pytest.param("const s = `a ${`b ${await agent(1)}`}`\n", 1, {1}, id="nested-template"),
+        pytest.param("const s = `${(await agent(1)) + `${agent(2)}`}`\n", 2, {1}, id="two-agents"),
+        pytest.param("const s = `x${ /* c */ agent?.(1)}`\n", 1, {1}, id="comment-optional"),
+        pytest.param("const s = tag`${agent(1)}`\n", 1, {1}, id="tagged"),
+        pytest.param("const s = `${[...agent(1)]}`\n", 1, {1}, id="spread"),
+        pytest.param(
+            "function two() { return [agent(1), agent(2)] }\nawait Promise.all(two())\n"
+            "const s = `${(await Promise.all([...two()])).join()}`\n",
+            4,
+            {3},
+            id="spread-helper",
+        ),
+        pytest.param(
+            "const R = [1, 2, 3]\nconst f = r => `${agent(r)}`\n"
+            "await parallel(R.map(r => () => f(r)))\n",
+            3,
+            {2},
+            id="helper-fanned",
+        ),
+        pytest.param("const t = [...agent(1)]\n", 1, {1}, id="bare-spread"),
+    ],
+)
+def test_an_agent_inside_a_template_interpolation_is_never_an_exact_low_count(
+    mod: ModuleType, script: str, agents: int, flagged: set[int]
+) -> None:
+    """BACKLOG #7599: the mask blanks a template whole, ``${...}`` included, so no pricer sees a
+    call there. Before PR 2982 the plain cases priced 0 agents as EXACT, and before this change
+    the three spread cases still priced EXACT and low. Each case states its true agent count, so
+    a lexer that prices interpolation code exactly passes too; until one does, the unattributed
+    terms fall on exactly the lines in ``flagged``. At least these shapes are pinned; the
+    residue's guarantee is the reach of its word pattern, not this list."""
+    cost = mod.price_script(script)
+    assert cost.agents >= agents or not cost.exact, script
+    if not cost.exact:
+        assert flagged == {u.line for u in cost.unknowns if u.kind == "unattributed"}, script
+
+
 def test_a_helper_that_is_never_called_is_reported_not_priced(mod: ModuleType) -> None:
     """An agent in a body nobody calls by name may still run, passed as a value: say so."""
     script = "function review(r) { return agent(r) }\n"
@@ -1389,3 +1445,312 @@ def test_json_output_carries_the_floor_flag(mod: ModuleType, tmp_path: Path) -> 
     fuzzy = mod.to_json(mod.price_script(script), script, "<t>")
     assert fuzzy["exact"] is False
     assert [u["kind"] for u in fuzzy["unpriced"]] == ["dynamic-width"]
+
+
+# BACKLOG #7600: `_loop_head` read every `while` as a loop (a `do`'s tail included), missed the
+# head of `for await (...)`, and ended a brace-less body at the first `;` anywhere. Each shape
+# below priced EXACT and wrong before the fix.
+@pytest.mark.parametrize(
+    "source",
+    [
+        # the first `;` sat inside the `if` block: the agent priced once, outside the loop
+        "for (const x of rows) if (x) { y(); await agent('a') }\n",
+        # `for await` had no head, so its body ended at the block's inner `;`
+        "for await (const x of rows) { const r = 1; await agent('a') }\n",
+        # the `else` branch after the `;` was priced once, outside the loop
+        "for (const x of rows) if (x) y(); else await agent('a');\n",
+    ],
+)
+def test_a_loop_body_is_not_cut_short_into_an_exact_count(mod: ModuleType, source: str) -> None:
+    cost = mod.price_script(source)
+    assert not cost.exact, f"priced {cost.agents} EXACT for a loop of unknown length"
+    assert [u.kind for u in cost.unknowns] == ["loop"]
+    assert cost.unknowns[0].per_unit == 1
+
+
+@pytest.mark.parametrize(
+    ("source", "agents"),
+    [
+        # `for await` over a literal is a fan of known width like `for`
+        ("for await (const x of [1, 2, 3]) { const r = 1; await agent('a') }\n", 3),
+        # ASI ends the brace-less body at the line break: was 4 EXACT, the next line in the loop
+        ("for (const x of [1, 2])\n  await agent('a')\nawait agent('b')\n", 3),
+        ("for (const x of [1, 2]) for (const y of [1, 2, 3]) await agent('a');\n", 6),
+        # a `do`'s `while (...)` is its tail, not a loop swallowing the next statement
+        ("let i = 0\ndo { i++ } while (i < 3)\nawait agent('b')\n", 1),
+        ("do { i++ } while (i < 3)\nfor (const x of [1, 2]) await agent('b')\n", 2),
+        ("do i++; while (i < 3)\nawait agent('b')\n", 1),
+    ],
+)
+def test_a_loop_shape_prices_exactly(mod: ModuleType, source: str, agents: int) -> None:
+    cost = mod.price_script(source)
+    assert (cost.agents, cost.exact) == (agents, True), cost.unknowns
+
+
+def test_a_do_while_tail_is_not_a_second_loop(mod: ModuleType) -> None:
+    cost = mod.price_script("do {\n  await agent('a')\n} while (more())\nawait agent('b')\n")
+    assert [(u.kind, u.form) for u in cost.unknowns] == [("loop", "do loop, repetitions unknown")]
+    assert cost.agents == 1, "the agent after the loop runs once and belongs in the floor"
+
+
+@pytest.mark.parametrize(
+    ("source", "agents"),
+    [
+        # `if (c)`, a line break, then the branch: the next line after it runs once
+        ("for (const x of [1, 2])\n  if (c)\n    await agent('a')\nawait agent('b')\n", 3),
+        ("for (const r of [1, 2]) if (r) a(); else await agent('a');\nawait agent('b')\n", 3),
+        (
+            "for (const r of [1, 2, 3]) switch (r) { case 1: await agent('a'); break }\n"
+            "await agent('b')\nawait agent('c')\n",
+            5,
+        ),
+        ("for (const r of [1, 2]) try { await agent('a') } catch (e) {}\nawait agent('b')\n", 3),
+        (
+            "for (const x of [1, 2]) inner: for (const y of [1, 2, 3]) await agent('a')\n"
+            "await agent('b')\n",
+            7,
+        ),
+        # a `do` whose body is compound still ends at its own `while (...)`
+        ("do if (x) { a() } while (c)\nawait agent('b')\n", 1),
+        ("do try { a() } catch (e) {} while (c)\nawait agent('b')\n", 1),
+    ],
+)
+def test_a_compound_brace_less_body_is_read_to_its_end(
+    mod: ModuleType, source: str, agents: int
+) -> None:
+    """Each was a guess to the end of the file in round 1 of the fix; now each is read through."""
+    cost = mod.price_script(source)
+    assert (cost.agents, cost.exact) == (agents, True), cost.unknowns
+
+
+# BACKLOG #7601: `--stdin` decoded in the locale encoding while a path decoded UTF-8, and an
+# undecodable file escaped as a UnicodeDecodeError traceback.
+_UTF8_SCRIPT = "const q = rows.map(agent) // \u00c1\n".encode()
+
+
+def _stdin(monkeypatch: pytest.MonkeyPatch, data: bytes) -> None:
+    # The Windows default: a cp1252 text layer over the bytes, as a stock console gives.
+    wrapper = io.TextIOWrapper(io.BytesIO(data), encoding="cp1252", errors="surrogateescape")
+    monkeypatch.setattr(sys, "stdin", wrapper)
+
+
+def test_stdin_and_a_path_read_the_same_text(
+    mod: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "u8.js"
+    path.write_bytes(_UTF8_SCRIPT)
+    assert mod.main([str(path), "--json"]) == 0
+    from_path = json.loads(capsys.readouterr().out)
+    _stdin(monkeypatch, _UTF8_SCRIPT)
+    assert mod.main(["--stdin", "--json"]) == 0
+    from_stdin = json.loads(capsys.readouterr().out)
+    assert from_stdin["unpriced"] == from_path["unpriced"]
+    assert "\u00c1" in from_stdin["unpriced"][0]["form"]
+
+
+@pytest.mark.parametrize("route", ["path", "stdin"])
+def test_undecodable_input_is_reported_not_raised(
+    mod: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    route: str,
+) -> None:
+    bad = b"\xff\xfeawait agent('a')\n"
+    if route == "path":
+        path = tmp_path / "bad.js"
+        path.write_bytes(bad)
+        argv = [str(path)]
+    else:
+        _stdin(monkeypatch, bad)
+        argv = ["--stdin"]
+    assert mod.main(argv) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "cannot read" in captured.err and "utf-8" in captured.err
+
+
+@pytest.mark.parametrize(
+    ("source", "agents", "exact"),
+    [
+        # `while (k in R)` tests membership: it has no width, whatever R's length
+        ("const R = [1, 2, 3]\nwhile ('k' in R) await agent('a')\n", 0, False),
+        # a string statement is the body; the next line runs once
+        ("for (const r of [1, 2]) 'x'\nawait agent('b')\n", 1, True),
+        # `for$` is a name, not the keyword
+        ("const r = for$(await agent('a'))\n", 1, True),
+    ],
+)
+def test_a_loop_keyword_is_read_only_where_it_is_one(
+    mod: ModuleType, source: str, agents: int, exact: bool
+) -> None:
+    cost = mod.price_script(source)
+    assert (cost.agents, cost.exact) == (agents, exact), cost.unknowns
+
+
+def test_a_do_while_condition_is_priced_per_iteration(mod: ModuleType) -> None:
+    cost = mod.price_script("do { await agent('a') } while (await agent('c'))\n")
+    assert [(u.kind, u.per_unit) for u in cost.unknowns] == [("loop", 2)]
+
+
+def test_an_unsettled_body_says_why_it_has_no_width(mod: ModuleType) -> None:
+    cost = mod.price_script("for (const x of [1, 2]) if (x) { await agent('a')\n")
+    assert [u.form for u in cost.unknowns] == [
+        "for loop, body extent not read, so no width is trusted"
+    ]
+
+
+def test_a_bom_does_not_change_the_price(
+    mod: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    text = (
+        "function review(r) { return agent(r) }\nconst ROWS = [1, 2, 3]\n"
+        "await parallel(ROWS.map(r => () => review(r)))\n"
+    )
+    plain, bom = tmp_path / "plain.js", tmp_path / "bom.js"
+    plain.write_bytes(text.encode())
+    bom.write_bytes(b"\xef\xbb\xbf" + text.encode())
+    payloads = []
+    for path in (plain, bom):
+        assert mod.main([str(path), "--json"]) == 0
+        payloads.append(json.loads(capsys.readouterr().out))
+    assert [(p["agents"], p["exact"]) for p in payloads] == [(3, True), (3, True)]
+
+
+def test_a_text_stdin_without_a_buffer_still_reads(
+    mod: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "stdin", io.StringIO("await agent('a')\n"))
+    assert mod.main(["--stdin", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["agents"] == 1
+    monkeypatch.setattr(sys, "stdin", None)
+    assert mod.main(["--stdin"]) == 1
+    assert "cannot read <stdin>" in capsys.readouterr().err
+
+
+def test_a_snippet_the_console_cannot_encode_is_escaped(
+    mod: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "arrow.js"
+    path.write_bytes("const q = rows.map(agent) // \u2192 report\n".encode())
+    sink = io.BytesIO()
+    console = io.TextIOWrapper(sink, encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", console)
+    assert mod.main([str(path)]) == 0
+    console.flush()
+    assert b"\\u2192" in sink.getvalue()
+
+
+def test_a_byte_order_mark_anywhere_is_whitespace(mod: ModuleType) -> None:
+    body = (
+        "function review(r) { return agent(r) }\nconst ROWS = [1, 2, 3]\n"
+        "await parallel(ROWS.map(r => () => review(r)))\n"
+    )
+    for source in ("\ufeff" + body, "await agent('a')\n\ufeff" + body):
+        cost = mod.price_script(source)
+        assert cost.exact and cost.agents == 3 + source.count("agent('a')")
+
+
+# BACKLOG #7600, repair round 3. Each shape priced EXACT and wrong at 878a7bda.
+@pytest.mark.parametrize(
+    "source",
+    [
+        # a string subject: the mask blanks it, and blank read as an empty array of width 0
+        "for (const ch of 'abc') await agent('a')\n",
+        "for await (const ch of 'abc') await agent('a')\n",
+        "for (const ch of `abc`) { await agent('a') }\n",
+        # an unclosed bracket in a brace-less body: the rest of the file was a known extent
+        "for (const r of [1, 2]) x = f(\nawait agent('a')\nawait agent('b')\n",
+        "for (const r of [1, 2]) x = [1,\nawait agent('a')\n",
+        # the same unclosed `f(`, closed by an enclosing block's `}`
+        "{ for (const r of [1, 2]) x = f(\nawait agent('a') }\nawait agent('b')\n",
+    ],
+)
+def test_an_unread_loop_shape_is_a_floor_not_a_count(mod: ModuleType, source: str) -> None:
+    cost = mod.price_script(source)
+    assert not cost.exact, f"priced {cost.agents} EXACT"
+    assert [u.kind for u in cost.unknowns] == ["loop"]
+
+
+@pytest.mark.parametrize(
+    "then",
+    [
+        # the branch's `;` sits past the line break ASI was offered, then the `else`
+        "a()\n;",
+        # a do-while's `;` past its `)`
+        "do a(); while (c)\n;",
+        "do { a() } while (c) ;",
+    ],
+)
+def test_an_else_after_a_branch_ended_past_its_line_is_in_the_loop(
+    mod: ModuleType, then: str
+) -> None:
+    source = f"for (const r of [1, 2]) if (r) {then}\nelse await agent('a')\nawait agent('b')\n"
+    cost = mod.price_script(source)
+    assert (cost.agents, cost.exact) == (3, True), cost.unknowns
+
+
+def test_the_module_source_holds_no_invisible_byte_order_mark() -> None:
+    """A literal U+FEFF in the source is invisible in review: it is written as an escape."""
+    assert b"\xef\xbb\xbf" not in _SCRIPT.read_bytes()
+
+
+# BACKLOG #7600, repair round 5. Each shape below was misread at af3c3c51.
+def test_a_mismatched_closer_does_not_swallow_the_rest_of_the_file(mod: ModuleType) -> None:
+    """`read and opened.pop()` skipped the pop once read was False, so the next `(` never closed."""
+    cost = mod.price_script("const g = r => f(r }.y(1)\nawait agent('a')\n")
+    assert cost.agents == 1, "the next line was read into the arrow's body"
+    assert "unattributed" not in [u.kind for u in cost.unknowns]
+    loop = mod.price_script("for (const r of [1, 2]) x = f(r }.y(1)\nawait agent('a')\n")
+    assert not loop.exact
+    assert [(u.kind, u.per_unit) for u in loop.unknowns] == [("loop", 0)]
+    assert loop.agents == 1, "the line after the loop runs once and belongs in the floor"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # a `do` with no `while (...)` tail: its extent is a guess, so no agent count is exact
+        "do { i++ }\nawait agent('a')\n",
+        "do i++\n",
+    ],
+)
+def test_a_guessed_loop_extent_with_no_agent_is_still_a_floor(mod: ModuleType, source: str) -> None:
+    cost = mod.price_script(source)
+    assert not cost.exact, f"priced {cost.agents} EXACT for a loop whose extent was a guess"
+    assert [u.kind for u in cost.unknowns] == ["loop"]
+
+
+@pytest.mark.parametrize(
+    ("source", "agents"),
+    [
+        # a key named like a loop keyword is a name: an unsettled `do` here cost the exact label
+        ("for (const r of [1, 2]) { const o = { do: 1 }; await agent('a') }\n", 2),
+        ("const opts = { retries: 2, do: 'x' }\nfor (const r of [1, 2]) await agent('a')\n", 2),
+        ("const o = { while: agent('x') }\nawait agent('b')\n", 2),
+        ("x.do(1)\nawait agent('b')\n", 1),
+    ],
+)
+def test_a_loop_keyword_used_as_a_name_is_not_a_loop(
+    mod: ModuleType, source: str, agents: int
+) -> None:
+    cost = mod.price_script(source)
+    assert (cost.agents, cost.exact) == (agents, True), cost.unknowns
+
+
+@pytest.mark.parametrize(
+    "receiver",
+    ["rows?", "R!", "R !", ""],
+)
+def test_a_receiver_the_walk_cannot_read_is_not_an_empty_array(
+    mod: ModuleType, receiver: str
+) -> None:
+    source = f"const R = [1, 2]\nawait parallel({receiver}.map(r => () => agent(r)))\n"
+    cost = mod.price_script(source)
+    assert not cost.exact, f"priced {cost.agents} EXACT from an unread receiver"
+    assert [(u.kind, u.form, u.per_unit) for u in cost.unknowns] == [
+        ("dynamic-width", ".map(...): receiver not read", 1)
+    ]

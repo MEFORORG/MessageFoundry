@@ -129,7 +129,10 @@ async def test_the_store_pool_is_created_with_pooling_off(
 
     seen = _fake_aioodbc(monkeypatch, fake_pyodbc)
     monkeypatch.setattr(sqlserver, "connection_string", lambda *_a, **_k: "DSN=test")
-    settings = types.SimpleNamespace(pool_size=2, connect_timeout=5)
+    # sqlserver_pin_path: _build_pool_executor reads the pin spec (vault BACKLOG #3714 step 11).
+    settings = types.SimpleNamespace(
+        pool_size=2, connect_timeout=5, sqlserver_pin_path=lambda: None
+    )
     _pool, executor = await sqlserver.SqlServerStore._create_pool(
         settings,  # type: ignore[arg-type]
         maxsize=2,

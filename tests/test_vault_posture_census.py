@@ -519,7 +519,6 @@ _SERVE_DIAL = "(security_settings or SecuritySettings()).enforcement"
 _DERIVATIONS = sorted(
     [
         ("__main__.py", "_check_privileges", "settings.security.enforcement"),
-        ("__main__.py", "_cipher_audit", "settings.security.enforcement"),
         ("__main__.py", "_connection.validate", "settings.security.enforcement"),
         ("__main__.py", "_command_hop_posture", "settings.security.enforcement"),
         # The offline alert notifier's revocation guards and the offline security notifier's SMTP

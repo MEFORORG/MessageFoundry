@@ -411,35 +411,39 @@ _ROUTE_READS: dict[str, frozenset[str]] = {
     "create_user": frozenset({"get_user_by_username", "get_user"}),
     "create_directory_user": frozenset({"get_user"}),
     # The write routes the row left alone, each acting by id; the store's own write refuses a row
-    # that fails its seal. Their replies carry no field of the row, but ``set_user_roles`` decides
-    # its AD refusal on the unchecked ``auth_provider`` and names the unchecked ``username`` in its
-    # administrator-granted alert. Left for a later item, not covered by this row.
+    # that fails its seal. Their replies carry no field of the row. ``set_user_roles`` decided its
+    # AD refusal and its administrator-granted alert on a raw row until BACKLOG #5520 items 2 and
+    # 13, and now reads the account checked, so it is not listed.
     # The scan sees only ``<x>.store.<reader>`` chains in this one file: an alias, a ``getattr`` or
     # a read in another module is not seen.
     "delete_user": frozenset({"get_user"}),
     "admin_revoke_user_sessions": frozenset({"get_user"}),
-    "set_user_roles": frozenset({"get_user", "get_user_role_ids"}),
 }
 
 
 def _reader_calls(source: str, receiver: str) -> list[tuple[str, str]]:
-    """Every ``<x>.<receiver>.<reader>`` in ``source``, named by the innermost function holding it."""
-    tree = ast.parse(source)
-    found: dict[int, tuple[str, str]] = {}
-    # ast.walk is breadth-first, so an inner function is reached after the one holding it, and
-    # its name overwrites the outer one for the reads inside it.
-    for func in ast.walk(tree):
-        if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
-            continue
-        for node in ast.walk(func):
-            if (
-                isinstance(node, ast.Attribute)
-                and node.attr in _USER_READERS
-                and isinstance(node.value, ast.Attribute)
-                and node.value.attr == receiver
-            ):
-                found[id(node)] = (func.name, node.attr)
-    return list(found.values())
+    """Every ``<x>.<receiver>.<reader>`` in ``source``, named by the innermost function holding it.
+    A read outside every function is not collected."""
+    found: list[tuple[str, str]] = []
+
+    # The owner is carried down the tree, so the innermost function names each read whatever order
+    # a walk visits nodes in (BACKLOG #5520, filing review finding 1).
+    def visit(node: ast.AST, owner: str | None) -> None:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            owner = node.name
+        elif (
+            owner is not None
+            and isinstance(node, ast.Attribute)
+            and node.attr in _USER_READERS
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == receiver
+        ):
+            found.append((owner, node.attr))
+        for child in ast.iter_child_nodes(node):
+            visit(child, owner)
+
+    visit(ast.parse(source), None)
+    return found
 
 
 def _assert_reads_only_where_listed(

@@ -336,7 +336,12 @@ class _LeaseStore:
         self.members = [_node("A"), _node("B")]
 
     async def _fetchone_clamped(
-        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+        self,
+        sql: str,
+        params: tuple[object, ...],
+        *,
+        timeout_clamp: float,
+        share_deadline: bool = False,
     ) -> dict[str, object]:
         if "MERGE leader_lease" in sql:
             self.claims += 1

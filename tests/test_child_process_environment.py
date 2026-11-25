@@ -1255,7 +1255,7 @@ _MUST_CHOOSE = frozenset(
         ("tray/branding.py", "relaunch_branded", "subprocess.Popen"),
         # The fixed system tools, by their absolute System32 path (vault BACKLOG #2716).
         ("auth/trust_anchors.py", "dacl_is_owner_only", "subprocess.run"),
-        ("store/store.py", "_secure_file", "subprocess.run"),
+        ("store/store.py", "_icacls_grant_keeping_explicit_entries", "subprocess.run"),
         ("store/store.py", "_grant_read", "subprocess.run"),
         ("service.py", "service_state", "subprocess.run"),
         ("service_status.py", "_query", "subprocess.run"),

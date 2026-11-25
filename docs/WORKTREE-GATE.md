@@ -239,6 +239,20 @@ position, so a checkout many commits behind with an unchanged gate still passes.
 
 `-UpstreamRef` names a different yardstick.
 
+Every install leaves `worktree_gate.ps1.receipt.json` beside the installed gate, with the hash it wrote,
+and keeps the replaced gate as `worktree_gate.ps1.bak`. The installer **refuses to overwrite an
+installed gate that does not match its own receipt** (BACKLOG #1247): one whose content hash differs
+from the receipt's, one whose receipt cannot be read or records no hash, and one with no receipt at all.
+Each means something other than the installer may have written it. The refusal names the file and both
+hashes, and runs before any write, so it changes nothing. (The separate refusal for a gate that
+changed between that check and the copy throws later, after the allowlist write: the allowlist and its
+`.bak` are already written, the gate is not.) A missing receipt refuses too, because the receipt is not protected by
+the gate and deleting it must not silence the check; a box with no installed gate installs as before.
+Find out who wrote the gate, then pass `-OverwriteUnexplained`; the new receipt records the
+overwritten hash under `overwroteUnexplained`, and its bytes are kept as
+`worktree_gate.ps1.unexplained-<sha12>`. `-Status` reports the same check. The receipt is a
+convenience record, never attestation, and the gate does not protect it from an edit.
+
 Two structural choices worth understanding:
 
 - **Every config dir, not just `~/.claude`.** The hook is registered into `~/.claude/settings.json` **and**

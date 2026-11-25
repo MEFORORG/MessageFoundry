@@ -10,9 +10,12 @@ expected shapes are pinned by ``tests/test_sqlserver_postgres_schema_verify_1720
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from messagefoundry.store.server_schema_verify import (
+    Dialect,
     ServerSchemaMismatchError,
     declared_schema,
     refuse_short_schema,
@@ -762,3 +765,101 @@ def test_a_default_of_more_than_one_token_is_named_as_the_default() -> None:
         declared_schema(
             ("CREATE TABLE t (a TIMESTAMPTZ DEFAULT now() + interval '1 day')",), "postgres"
         )
+
+
+#: DDL a dynamic-SQL variable carries; ``NOT NULL`` so no rule about NULL refuses it first.
+_RUN_DDL = "DECLARE @sql nvarchar(max) = N'CREATE TABLE t (a INT NOT NULL)';"
+_DIALECTS: tuple[Dialect | None, ...] = (None, "sqlserver", "postgres")
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+@pytest.mark.parametrize(
+    "tail",
+    [
+        # Both servers nest block comments, so the EXEC is still inside the outer comment.
+        "/* /* */ EXEC(@sql) */",
+        "/* a /* b */ sp_executesql @sql */",
+        # Unterminated under nesting: the server's batch errors rather than running the EXEC.
+        "/* /* */ EXEC(@sql);",
+        # The inner opener shares its star with the first closer the old reader found.
+        "/* a /*/ EXEC(@sql);",
+        # Balanced, so the server runs the EXEC; refused by design rather than modelling depth.
+        "/* /* */ */ EXEC(@sql)",
+    ],
+)
+def test_a_nested_block_comment_raises(tail: str, dialect: Dialect | None) -> None:
+    """BACKLOG #5062 item 26: the comment reader closed a block comment at its first ``*/``, so an
+    ``EXEC`` a nesting server comments out was counted as running the literal's DDL. Any ``/*``
+    inside a block comment now raises, a balanced nesting too: fail closed, not a depth model."""
+    with pytest.raises(ValueError, match="a nested block comment in DDL"):
+        declared_schema((f"{_RUN_DDL} {tail}",), dialect)
+
+
+def test_a_nested_block_comment_in_plpgsql_raises() -> None:
+    statement = "DO $$ BEGIN /* /* */ EXECUTE 'CREATE TABLE v (c INT NOT NULL)'; */ END $$;"
+    with pytest.raises(ValueError, match="a nested block comment in DDL"):
+        declared_schema((statement,), "postgres")
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+@pytest.mark.parametrize("bad", ["\r", "\x00", "\x85", "\u2028"])
+def test_a_line_comment_holding_a_break_other_than_lf_raises(
+    bad: str, dialect: Dialect | None
+) -> None:
+    """Review of BACKLOG #5062 item 26: PostgreSQL ends a line comment at a CR and runs what
+    follows, where the reader read on to the LF and hid that DDL. The refusal names the character,
+    so a NUL is not called a line break."""
+    statement = f"CREATE TABLE v (c INT NOT NULL); -- note{bad}CREATE TABLE b (y INT NOT NULL);\n"
+    with pytest.raises(ValueError, match=re.escape(f"a DDL line comment holds {bad!r}")):
+        declared_schema((statement,), dialect)
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+@pytest.mark.parametrize("ending", ["\r\n", "\r", "\r\r\n"])
+def test_a_cr_that_ends_a_line_comment_is_accepted(ending: str, dialect: Dialect | None) -> None:
+    """A run of CRs reaching the LF, or the end of the entry, hides nothing: PostgreSQL may end the
+    comment at the first CR and the reader ends it at the LF, but only CRs lie between, so nothing
+    after the comment is hidden and the exemption refuses nothing main read."""
+    shape = declared_schema((f"CREATE TABLE v (c INT NOT NULL); -- note{ending}",), dialect)
+    assert shape.columns["v"] == frozenset({"c"})
+
+
+def test_a_cr_followed_by_more_text_before_the_lf_raises() -> None:
+    """The exemption is a run of CRs reaching the LF, not trailing whitespace."""
+    with pytest.raises(ValueError, match=re.escape("a DDL line comment holds '\\r'")):
+        declared_schema(("CREATE TABLE v (c INT NOT NULL); -- note\r  \n",), "postgres")
+
+
+@pytest.mark.parametrize("name", ["AS[x--y]", "AS [a[--b]"])
+def test_a_comment_marker_inside_a_bracket_name_still_reads_the_ddl_after_it(name: str) -> None:
+    """Review of BACKLOG #5062 item 26: reading ``]]`` and a subscript ``[`` in the comment reader
+    hid the ``CREATE`` after either name, which main reads. The comment reader's bracket handling
+    stays main's."""
+    statement = f"SELECT 1 {name}; CREATE TABLE v (a INT NOT NULL)"
+    assert set(declared_schema((statement,), "sqlserver").columns) == {"v"}
+
+
+@pytest.mark.xfail(
+    raises=AssertionError,
+    strict=True,
+    reason="known misread, as on main: the comment reader ends [ at its first ]",
+)
+@pytest.mark.parametrize("name", ["AS [x]]--y]", "AS [p]]/*q]"])
+def test_a_comment_marker_after_a_doubled_bracket_is_a_known_misread(name: str) -> None:
+    """SQL Server reads ``]]`` as a ``]`` inside the name, so it builds ``v``; the reader takes the
+    marker for a comment and hides it. Named in the module docstring; strict and bound to the
+    assertion, so a fix that reads the name, or one that raises instead, shows here."""
+    statement = f"SELECT 1 {name}; CREATE TABLE v (a INT NOT NULL); SELECT 1 AS [*/];"
+    assert set(declared_schema((statement,), "sqlserver").columns) == {"v"}
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+def test_an_exec_after_a_plain_block_comment_still_runs(dialect: Dialect | None) -> None:
+    shape = declared_schema((f"{_RUN_DDL} /* c */ EXEC(@sql)",), dialect)
+    assert shape.columns["t"] == frozenset({"a"})
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+def test_an_exec_in_a_line_comment_is_not_a_run(dialect: Dialect | None) -> None:
+    with pytest.raises(ValueError, match="sees no EXEC run"):
+        declared_schema((f"{_RUN_DDL} -- EXEC(@sql)\n",), dialect)

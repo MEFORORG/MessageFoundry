@@ -422,15 +422,19 @@ probe (item 3.r6). The sign-in path checks a user row past both caches, (e) says
 skips the audit row or the throttled page a refusal writes.
 
 **The probe rule differs from the audit chain's.** The audit chain reads a 400 as a version
-refusal only when the probe answers with a string that does not start with `vault:v<pinned>:`, so
-an empty answer or one naming no version passes too (`crypto_transit._refuses_only_version` on
-`main`). That 400 need not be Transit's own: a proxy can author it (corrected 2026-11-11, BACKLOG
-#6707). A row seal reads **any** 400 with a working probe as Unverifiable, whatever version the
-probe names. A planted seal naming the latest version, checked on a lagging node while the probe
-reaches a caught-up one, would otherwise read as an Outage: a 503 that ends nothing and writes no
+refusal when the probe answers a well-formed MAC naming a version other than the pinned one
+(`crypto_transit._refuses_only_version` on `main`). Corrected 2026-11-24, vault BACKLOG #6707 item
+73: a probe answer that is no well-formed MAC, at least an empty one or one naming no version,
+passed as such a refusal until then; it now gives the unconfirmed label, which is no evidence of
+a refused version but is still a break at that row. That 400 need not be Transit's own: a proxy can author it
+(corrected 2026-11-11, vault BACKLOG #6707). A row seal reads **any**
+400 with a working probe as Unverifiable, whatever version the probe names. A planted seal
+naming the latest version, checked on a lagging node while the probe reaches a caught-up one, would otherwise read as an Outage: a 503 that ends nothing and writes no
 integrity record, the loosening (a) rejects. Item 3.6's shared helper returns the probe's answer and
-each caller applies its own rule, so the audit chain's classification does not change. The cost is
-that a genuine row checked on a lagging node is denied and recorded as Unverifiable, which (a)
+each caller applies its own rule. Since 2026-11-24 the audit chain reads a probe answer that is
+no well-formed MAC as a break at the row under the unconfirmed label, and a well-formed one
+naming another version as a break under a label the reply's wording picks (vault BACKLOG #6707
+item 73). The cost is that a genuine row checked on a lagging node is denied and recorded as Unverifiable, which (a)
 already accepts. With the strict parse and the fixed-length input, no other 400 is known; the
 build lists any it finds.
 
@@ -898,10 +902,13 @@ it supersedes, and only where it disagrees; the earlier text is kept as it was.
   account's row still raises out of `_load_users`, and so out of the pass. At least two later
   reads still raise on an Unverifiable row: `_load_user`, in the re-read of each account its probe
   found present and in `_apply_reconcile_revocation`, and `_load_user_by_username` in the rename
-  step. The rename step runs after the revocations are applied, so a raise there ends a pass that
-  has already ended sessions, before the rest of its renames and its bookkeeping and alerts run.
+  step. The rename step runs after the revocations are applied, so a raise there ended a pass that
+  had already ended sessions, before the rest of its renames and its bookkeeping and alerts ran.
   The rename step's read and the dropped account's lost state are named here for filing on vault
-  #8202.
+  #8202. (Amended 2026-11-22, vault BACKLOG #3069 item 1: the rename step's reads still raise, and
+  the reconcile loop now catches the answer. An Unverifiable one skips that rename, logged at
+  ERROR. An Outage is paged once and stops the renames. Either way the pass returns its plan, so
+  its bookkeeping and alerts run.)
 - **The held `refused()` log.** `RevokeSealOutcome.refused` no longer logs at refusal time, inside
   the writer transaction. Its line is held and written once the outcome is known, with the
   committed or the failed wording, as the skipped-raise count is, which is logged after a commit

@@ -73,6 +73,8 @@ def _fresh_loaded_anchors(monkeypatch: pytest.MonkeyPatch) -> None:
     # raising=False: the negative controls run this file against a head without the memo.
     monkeypatch.setattr(ta, "_STORE_CONTENT_RECORDED", {}, raising=False)
     monkeypatch.setattr(ta, "_STORE_PIN_FIRST_CHECKED", {}, raising=False)
+    monkeypatch.setattr(ta, "_STORE_PIN_REFUSED", {}, raising=False)
+    monkeypatch.setattr(ta, "_STORE_PIN_RELEASE_REFUSED", set(), raising=False)
 
 
 def _settings_specs(auth: AuthSettings, api: ApiSettings | None = None) -> list[AnchorSpec]:
@@ -269,7 +271,7 @@ def test_dacl_read_pins_icacls_to_the_system_directory(monkeypatch: pytest.Monke
     # This call's OUTPUT decides whether a TLS trust anchor is owner-only, so it must name icacls by
     # absolute path: CreateProcess resolves an unqualified name through a search path that reaches the
     # caller's working directory, and a planted icacls.exe printing a clean DACL would turn a
-    # group-writable anchor into an accepted one (BACKLOG #1769). Same pin as store._secure_file,
+    # group-writable anchor into an accepted one (BACKLOG #1769). Same pin as store._grant_read,
     # which writes a DACL rather than reading one.
     from messagefoundry import service_status
 

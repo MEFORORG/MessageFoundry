@@ -94,10 +94,29 @@ function Get-DecisionIdDay([string]$Id) {
 }
 
 function Invoke-DecisionGh {
-    <# Runs gh, returning Code, Out and Err. Never throws: a missing gh is code 127. #>
+    <#
+      Runs gh, returning Code, Out and Err; a missing gh is code 127, and a gh failure is its own
+      code. A console whose UTF-8 switch fails with an IOException does not throw (BACKLOG #7555).
+      At least these still throw: a failure writing the --input file, any other console error, and
+      a gh that is found but cannot start.
+
+      GH_PROMPT_DISABLED and the console's UTF-8 output are both left set, deliberately, as before.
+      decision.ps1 and digest.ps1 set no UTF-8 output of their own and print records through this
+      switch, so restoring it would turn their non-ASCII output into the OEM code page. And
+      afk-kill.ps1 runs this body in a second runspace of the same process, so a restore of the
+      process-wide prompt variable there could unset it under a gh call running here.
+    #>
     param([string[]]$GhArgs, [string]$InputJson = '')
     $ErrorActionPreference = 'Continue'
     $tmp = $null
+    # PowerShell wraps a setter's exception (SetValueInvocationException), so the console-handle
+    # IOException is looked for along the inner chain. Local, because afk-kill.ps1 runs this
+    # function's body alone in another runspace.
+    $isConsoleIO = {
+        param([Exception]$Exception)
+        for ($e = $Exception; $null -ne $e; $e = $e.InnerException) { if ($e -is [System.IO.IOException]) { return $true } }
+        return $false
+    }
     try {
         if ($InputJson) {
             $tmp = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "mefor-decision-$PID-$([guid]::NewGuid().ToString('N')).json")
@@ -106,8 +125,21 @@ function Invoke-DecisionGh {
         }
         # A script must never wait on an auth prompt.
         $env:GH_PROMPT_DISABLED = '1'
-        # gh writes UTF-8; the console's code page would mangle a non-ASCII field.
-        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        # gh writes UTF-8; the console's code page would mangle a non-ASCII field. A host that
+        # refuses the setter with an IOException (lane-root.ps1 met one, BACKLOG #5486) still runs
+        # gh, and the refusal is reported unless the page was UTF-8 already.
+        $before = $null
+        try {
+            $before = [Console]::OutputEncoding
+            [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        } catch {
+            if (-not (& $isConsoleIO $_.Exception)) { throw }
+            if (-not $before -or $before.CodePage -ne 65001) {
+                $why = $_.Exception.Message
+                try { [Console]::Error.WriteLine("_decisionlog.ps1: WARNING -- gh's output could not be set to decode as UTF-8 ($why), so a non-ASCII field may come back mangled.") }
+                catch { if (-not (& $isConsoleIO $_.Exception)) { throw } }
+            }
+        }
         $all = & gh @GhArgs 2>&1
         $code = $LASTEXITCODE
         $out = @($all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n"

@@ -18,6 +18,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
+from tests.test_adr0157_sqlserver_fence import _force_nocount
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("MEFOR_TEST_SQLSERVER"),
@@ -168,6 +169,71 @@ async def test_concurrent_acquire_exactly_one_wins(store) -> None:
         await c._register()
     results = await asyncio.gather(*[c._claim_or_renew_lease() for c in coords])
     assert sum(1 for r in results if r) == 1
+
+
+async def test_concurrent_merges_on_every_cluster_table_do_not_deadlock(store) -> None:
+    """BACKLOG #6793 claims a shared-to-exclusive range-lock conversion deadlock (1205) when nodes
+    run MERGE ... WITH (HOLDLOCK) at once on ``cluster_config``, ``nodes`` or ``leader_lease``.
+    Each MERGE seeks its primary key and, by SQL Server's documented locking, reads the target
+    under update range locks, which conflict with each other, so racers should queue rather than
+    convert. Any 1205 escapes from gather. It races, with eight racers each: the empty-table seed
+    of the one ``cluster_config`` row once, then five rounds of bumps of that row; one insert each
+    of eight DISTINCT ``node_id`` keys once, then five rounds of one shared ``node_id`` registered
+    by every racer; and five rounds of take-over of one existing expired ``leader_lease`` row,
+    whose first insert is not raced. It is evidence, not proof: nothing here shows two statements
+    overlapped, and no arm makes a deadlock happen on purpose. The store itself treats a 1205 on a
+    one-key HOLDLOCK burst as possible and retries it (``_retry_idempotent_merge``), so a 1205 here
+    is a measurement for #6793, not a flake to re-run."""
+    coords = [_coord(store, f"node{i}:{i}:{i:04x}") for i in range(8)]
+    await coords[0]._ensure_tables()
+    # cluster_config: the empty-table seed race, then matched bumps of the single row.
+    assert set(await asyncio.gather(*[c.config_version() for c in coords])) == {0}
+    for round_no in range(5):
+        bumped = await asyncio.gather(*[c.bump_config_version(digest=None) for c in coords])
+        assert sorted(bumped) == list(range(8 * round_no + 1, 8 * round_no + 9))
+    # nodes: distinct inserts into an empty table, then the SAME node_id registered by every racer.
+    await asyncio.gather(*[c._register() for c in coords])
+    same = [_coord(store, "nodeS:9:ffff") for _ in range(8)]
+    for _ in range(5):
+        await asyncio.gather(*[c._register() for c in same])
+    assert len(await coords[0].cluster_members()) == 9
+    # leader_lease: standbys race the take-over of one EXISTING expired row, the failover case.
+    assert await coords[0]._claim_or_renew_lease() is True  # the row exists from here on
+    for _ in range(5):
+        await store._execute(
+            "UPDATE leader_lease SET lease_expires_at = 0 WHERE lease_key = ?",
+            (coords[0]._lease_key,),
+        )
+        held = await asyncio.gather(*[c._claim_or_renew_lease() for c in coords])
+        assert sum(1 for h in held if h) == 1
+
+
+async def test_the_release_reports_its_match_under_nocount_on(
+    store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6795 on the real driver, under a session-wide SET NOCOUNT ON: the release counts
+    its OUTPUT rows, so a release by a node the row does not name reports nothing released, and
+    the owner's reports a release. Read from ``cursor.rowcount`` the first would read ``-1``."""
+    _force_nocount(store, monkeypatch)
+    a = _coord(store, "nodeA:1:aaaa")
+    b = _coord(store, "nodeB:2:bbbb")
+    await a._ensure_tables()
+    await a._register()
+    await b._register()
+    assert await a._claim_or_renew_lease() is True
+    # Positive control: NOCOUNT reached the statement, so the driver's own count of this
+    # zero-match UPDATE is -1, the value the release no longer reads.
+    zero_match = await store._execute_clamped(
+        "UPDATE leader_lease SET owner = owner WHERE lease_key = ? AND owner = ?",
+        (b._lease_key, b.node_id),
+        timeout_clamp=5.0,
+    )
+    assert zero_match == -1, "NOCOUNT did not reach the statement; this test proves nothing"
+    _, _, wrote, released = await b._release_leadership(force_write=True)
+    assert (wrote, released) == (True, False), "the row names A, so B's release matched nothing"
+    a._is_leader = True
+    _, _, wrote, released = await a._release_leadership()
+    assert (wrote, released) == (True, True)
 
 
 async def test_config_version_seed_and_bump(store) -> None:

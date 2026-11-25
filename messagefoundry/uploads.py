@@ -58,7 +58,7 @@ from messagefoundry.controlchars import (
     strip_control_chars,
 )
 from messagefoundry.parsing.peek import HL7PeekError, Peek
-from messagefoundry.parsing.sniff import _looks_like_hl7, _lstrip_bom_ws, nontext_upload_reason
+from messagefoundry.parsing.sniff import _looks_like_hl7, _sniff_head, nontext_upload_reason
 from messagefoundry.parsing.split import split_batch
 from messagefoundry.path_reach import is_absent, is_name_absent, is_unreachable
 from messagefoundry.redaction import codec_safe_str, json_loads_or_refusal
@@ -255,6 +255,9 @@ _REPORT_INTERVAL_S = 3600.0
 _REPORTED_MAX = 4096
 #: How much of an upload id a tag-failure alert names, as ``store/cell_tag.py`` names a row.
 _TAG_REF_LEN = 12
+#: How much of a stored value the tag-failure checks read: more than any marker this build writes
+#: (version, algorithm, key id and v4 salt), so a multi-MiB body is not copied to read its key id.
+_TAG_MARKER_HEAD_CHARS = 256
 
 
 class _OncePerInterval:
@@ -287,9 +290,13 @@ class _OncePerInterval:
         return True
 
 
-#: Upload ids whose sidecar tag failure was reported (BACKLOG #5553). One memo for the process,
-#: whichever cipher instance reported.
+#: The ``"<part> <upload id>"`` keys of the sidecar and body tag failures reported (BACKLOG #5553,
+#: #5552 item 6 (a)), so one upload can hold two entries. One memo for the process, whichever
+#: cipher instance reported.
 _tag_reported = _OncePerInterval()
+
+#: The parts of an upload whose tag failure is reported, as the alert names them.
+_TaggedPart = Literal["sidecar", "body"]
 
 
 def _not_a_plain_file(path: Path) -> str | None:
@@ -301,6 +308,12 @@ def _not_a_plain_file(path: Path) -> str | None:
         info = path.lstat()
     except OSError:
         return None
+    return _plain_refusal(info)
+
+
+def _plain_refusal(info: os.stat_result) -> str | None:
+    """Why the file an ``lstat`` result describes must not be read, as :func:`_not_a_plain_file`
+    words it, or ``None`` when it is a regular file."""
     if _names_a_link(info):
         return "it is a link and was not followed"
     if not _is_regular(info):
@@ -383,6 +396,17 @@ class _NotPlainError(OSError):
     ``OSError``, so each reader treats it as it treats a file it could not read."""
 
 
+class _RefusedBeforeOpen(_NotPlainError):
+    """A :class:`_NotPlainError` raised by :func:`_open_plain`'s own ``lstat``, before any open:
+    ``reason`` is :func:`_plain_refusal`'s. The listing scan reads it rather than making that
+    ``lstat`` itself (BACKLOG #5552 item 8). ``reason`` defaults, and lives in the instance dict,
+    so a copy or unpickle, which calls the class with ``args`` alone, rebuilds it."""
+
+    def __init__(self, message: str, reason: str = "") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
     """The regular file ``path`` open for reading, without following a link, and its ``fstat``
     (BACKLOG #5387 added item 1). The caller closes it.
@@ -419,8 +443,9 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
         unreached = codec_safe_str(exc)
     if unreached is not None:
         raise _UnreachableError(errno.ENOENT, f"{path.name} could not be reached: {unreached}")
-    if _names_a_link(before) or not _is_regular(before):
-        raise _NotPlainError(f"{path.name} is not a plain file")
+    refused = _plain_refusal(before)
+    if refused is not None:
+        raise _RefusedBeforeOpen(f"{path.name} is not a plain file", refused)
     met: tuple[_Recheck, str] | None = None
     try:
         fd = os.open(path, _PLAIN_OPEN_FLAGS)
@@ -952,7 +977,7 @@ def _damaged(file_id: str, part: str, defect: str) -> UploadDamagedError:
 
 def _refuse_unplain(file_id: str, part: str, path: Path) -> None:
     """Raise the damaged refusal when ``path`` is not a plain file (:func:`_not_a_plain_file`),
-    the check the listing scan makes (BACKLOG #5552), so a by-id read does not open a directory,
+    the test the listing scan meets through :func:`_open_plain`'s own ``lstat`` (BACKLOG #5552), so a by-id read does not open a directory,
     which answered a server error, or a FIFO, which blocked a worker thread for good, that is in
     place when it looks. It guards against what is on disk then, not against a writer racing it.
     The reads that follow open through :func:`_open_plain`, which refuses a file swapped in after
@@ -1363,7 +1388,7 @@ def validate_upload_content(display: str, data: bytes) -> None:
         raise UploadContentError(
             display, "is not HL7 (no MSH/FHS/BHS header) despite its extension"
         )
-    if ctype == "xml" and not _lstrip_bom_ws(data).startswith(b"<"):
+    if ctype == "xml" and not _sniff_head(data).startswith(b"<"):
         raise UploadContentError(display, "is not XML (no leading '<') despite its extension")
 
 
@@ -1896,8 +1921,9 @@ class UploadStore:
         **A sidecar that is a link, or is not a regular file, is not read (BACKLOG #5552).** It is
         skipped, and its log line is rate-limited per upload: a followed link read a file outside
         the root, or another upload's sidecar, and a FIFO would block the scan, and the
-        ``_quota_lock`` a save holds over it, for good. One swapped in between that check and the
-        open is refused at the open (:func:`_read_plain_text`), and no read takes more than
+        ``_quota_lock`` a save holds over it, for good. The check is the open's own ``lstat``
+        (:class:`_RefusedBeforeOpen`); one swapped in between it and the open is refused at the
+        open (:func:`_read_plain_text`) and logged as unreadable, and no read takes more than
         :data:`_SIDECAR_LIMIT` bytes, so a planted oversized sidecar cannot exhaust memory under
         that lock either; it is refused as malformed (BACKLOG #5387 added item 1)."""
         out: list[UploadedFileMeta] = []
@@ -1906,17 +1932,20 @@ class UploadStore:
         for fid, entry in self._iter_sidecars():
             if sink is not None:
                 bodies.add(f"{fid}{_BLOB_SUFFIX}")
-            refused = _not_a_plain_file(entry)
-            if refused is not None:
-                if self._link_logged.first(f"scan {fid} {refused}"):
-                    _log.warning("uploaded-file sidecar %s: %s, so it was not read", fid, refused)
-                continue
             classify = False
             broken = False
             stored = ""
             try:
                 stored = _read_sidecar(entry)
                 out.append(self._decrypt_meta(stored, fid))
+            except _RefusedBeforeOpen as exc:
+                # The open's own lstat refused it, so the scan makes none of its own under
+                # _quota_lock (BACKLOG #5552 item 8).
+                if self._link_logged.first(f"scan {fid} {exc.reason}"):
+                    _log.warning(
+                        "uploaded-file sidecar %s: %s, so it was not read", fid, exc.reason
+                    )
+                continue
             except CipherError as exc:
                 if isinstance(exc, CipherUnavailableError):
                     # Its own line, so an outage never reads as the refusal logged below. Logged
@@ -1975,15 +2004,18 @@ class UploadStore:
                 self._body_checks.pop(name, None)
         return out
 
-    def _report_tag_failure(self, fid: str, stored: str, exc: CipherError) -> None:
-        """Raise the cipher's tag-failure alert for sidecar ``fid`` when ``exc`` is its AEAD tag
-        failing under a key the cipher holds, once per upload per :data:`_REPORT_INTERVAL_S`
-        and only while its hook is armed (BACKLOG #5553). The tests are ``store/cell_tag.py``'s
+    def _report_tag_failure(
+        self, fid: str, stored: str, exc: CipherError, part: _TaggedPart = "sidecar"
+    ) -> None:
+        """Raise the cipher's tag-failure alert for upload ``fid``'s ``part``, its sidecar or its
+        body, when ``exc`` is that part's AEAD tag failing under a key the cipher holds, once per
+        part per upload per :data:`_REPORT_INTERVAL_S` and only while its hook is armed (BACKLOG
+        #5553; the body by :meth:`read_bytes`, BACKLOG #5552 item 6 (a)). The tests are ``store/cell_tag.py``'s
         ``_tag_failure_kind``, inlined because that module imports beyond this leaf's set: a verdict was given, a cipher that names
         its keys holds the one the marker names, and one that cannot (Vault Transit) declares that
         its refusal is the value's own tag. The reason names a prefix of the upload id, as
-        ``cell_tag`` names a row: the id is random and carries no PHI, and the WARNING the scan logs
-        beside it names the whole id."""
+        ``cell_tag`` names a row: the id is random and carries no PHI. The WARNING the scan, or
+        :meth:`read_bytes` for a body, logs beside it names the whole id."""
         cipher = self._cipher
         report = getattr(cipher, "report_tag_failure", None)
         # A report with no hook armed goes nowhere, so it must not use up the upload's slot: a hook
@@ -1994,15 +2026,18 @@ class UploadStore:
             return
         if not isinstance(exc, UnauthenticatedCipherError) or gave_no_verdict(exc):
             return
-        if not cipher.is_encrypted(stored):
+        head = stored[:_TAG_MARKER_HEAD_CHARS]
+        if not cipher.is_encrypted(head):
             return
         holds = getattr(cipher, "holds_key_for", None)
-        held = holds(stored) if callable(holds) else getattr(cipher, "names_no_keys", False) is True
-        if not (held and _tag_reported.first(fid)):
+        held = holds(head) if callable(holds) else getattr(cipher, "names_no_keys", False) is True
+        if not (held and _tag_reported.first(f"{part} {fid}")):
             return
+        # The body under its own table name, so its alert has its own notifier subject and a
+        # sidecar page inside the cooldown cannot hold it back (BACKLOG #5552 item 6 (a)).
         report(
-            "uploaded_file",
-            f"an uploaded-file sidecar failed its integrity tag (upload {fid[:_TAG_REF_LEN]})",
+            "uploaded_file" if part == "sidecar" else "uploaded_file_body",
+            f"an uploaded-file {part} failed its integrity tag (upload {fid[:_TAG_REF_LEN]})",
         )
 
     def _unsealable_sync(self, fid: str, sidecar: Path) -> _UnsealableUpload | None:
@@ -3119,17 +3154,28 @@ class UploadStore:
             _refuse_unplain(file_id, "body", blob_path)
             kind: _ReadRefusal = "damaged"
             unreached: str | None = None
+            stored = ""
             try:
                 # No size cap: a sound body stored under a larger max_upload_bytes is still
                 # served, as the reseal pass keeps it too.
-                return self._decrypt_blob(_read_plain_text(blob_path), file_id)
+                stored = _read_plain_text(blob_path)
+                return self._decrypt_blob(stored, file_id)
             except _UnreachableError as exc:
                 unreached = codec_safe_str(exc)
             except FileNotFoundError as exc:
                 raise UploadNotFoundError(file_id) from exc
             except CipherUnavailableError as exc:
+                stored = ""
                 raise UploadUnavailableError(str(exc)) from exc
             except CipherError as exc:
+                # Logged with the whole id, as the scan logs a sidecar's, and a body under a held
+                # key whose tag fails is reported as a sidecar is (BACKLOG #5552 item 6 (a)). The
+                # cipher's message carries no decrypted value.
+                _log.warning("uploaded-file body %s: cipher declined it: %s", file_id, exc)
+                self._report_tag_failure(file_id, stored, exc, part="body")
+                # This frame's copy is let go; _decrypt_blob's frame on the cause's traceback
+                # still holds the stored text, as it did before this report.
+                stored = ""
                 raise UploadUnreadableError(str(exc)) from exc
             except OSError as exc:
                 # Refused on disk (BACKLOG #5388 added item 2). Its own arm, so the Unicode error
@@ -3142,6 +3188,9 @@ class UploadStore:
             except (UnicodeError, binascii.Error) as exc:
                 # Not UTF-8, not ASCII, or not the strict base64 the body is stored as.
                 defect = codec_safe_str(exc)
+            # The refusal raised below holds this frame on its traceback, so the stored body is
+            # let go first.
+            stored = ""
             if unreached is not None:
                 raise _unreachable(file_id, unreached)
             raise _refusal(file_id, "body", defect, kind)

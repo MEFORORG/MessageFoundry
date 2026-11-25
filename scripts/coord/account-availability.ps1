@@ -107,6 +107,22 @@ function Show-One([string]$Root) {
     }
 }
 
+function Assert-ConfigRoot([string]$Root) {
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
+        Write-Host "REFUSED -- no such config root: $Root" -ForegroundColor Red
+        Write-Host "  This script will not create one, and reads nothing from one. Check the path." -ForegroundColor DarkGray
+        exit 1
+    }
+}
+
+function Assert-MarkerNotDirectory([string]$MarkerPath) {
+    if (Test-Path -LiteralPath $MarkerPath -PathType Container) {
+        Write-Host "REFUSED -- the availability marker path is a directory: $MarkerPath" -ForegroundColor Red
+        Write-Host "  The reader treats this account as UNAVAILABLE (MALFORMED). Remove the directory by hand." -ForegroundColor DarkGray
+        exit 1
+    }
+}
+
 switch ($PSCmdlet.ParameterSetName) {
 
     'Mark' {
@@ -121,15 +137,34 @@ switch ($PSCmdlet.ParameterSetName) {
         # -Force builds every missing ancestor, so a typo'd -ConfigDir would have this command
         # MANUFACTURE a config root nothing can launch from and then declare it cancelled -- a wholly
         # fictional account, recorded as fact, with nothing anywhere reporting a problem.
-        if (-not (Test-Path -LiteralPath $ConfigDir -PathType Container)) {
-            Write-Host "REFUSED -- no such config root: $ConfigDir" -ForegroundColor Red
-            Write-Host "  This script will not create one. Check the path." -ForegroundColor DarkGray
-            exit 1
-        }
+        Assert-ConfigRoot $ConfigDir
+        $sd = Get-UsageStateDir $ConfigDir
+        $path = Join-Path $sd $script:UsageUnavailableMarker
+        Assert-MarkerNotDirectory $path
 
+        # THE INVARIANT CULTURE, BOTH WAYS, OR THE MARKER IS NOT THE ISO TEXT ITS READERS PARSE. Under
+        # th-TH the current culture's Thai Buddhist calendar wrote marked_at in year 2569, so an account
+        # marked dead NOW read PENDING for 543 years; under fi-FI the time separator became '.'; under
+        # ar-SA the Um Al Qura calendar refused '2026-10-01' outright. ConvertTo-UtcDateTime parses with
+        # the current culture, so -EffectiveFrom is parsed here instead, and ONLY as ISO-8601: a lenient
+        # parse took 'Jan 5' as a date already past and an en-GB '01/10/2026' as 10 January, marking a
+        # live account dead now. A form with no offset keeps its old meaning, the operator's LOCAL time.
+        $inv = [cultureinfo]::InvariantCulture
+        $iso = "yyyy-MM-dd'T'HH:mm:ss'Z'"
         $eff = $null
-        if ($EffectiveFrom) {
-            $eff = ConvertTo-UtcDateTime $EffectiveFrom
+        # BOUND, NOT TRUTHY: an explicit -EffectiveFrom '' (a wrapper passing an unset variable) must be
+        # refused, not read as omitted and so as "now".
+        if ($PSBoundParameters.ContainsKey('EffectiveFrom')) {
+            $parsed = [System.DateTimeOffset]::MinValue
+            $forms = [string[]]@(
+                'yyyy-MM-dd',
+                "yyyy-MM-dd'T'HH:mm", "yyyy-MM-dd'T'HH:mmK",
+                "yyyy-MM-dd'T'HH:mm:ss", "yyyy-MM-dd'T'HH:mm:ssK",
+                "yyyy-MM-dd'T'HH:mm:ss.FFFFFFF", "yyyy-MM-dd'T'HH:mm:ss.FFFFFFFK"
+            )
+            if ([System.DateTimeOffset]::TryParseExact([string]$EffectiveFrom, $forms, $inv, [System.Globalization.DateTimeStyles]::AssumeLocal, [ref]$parsed)) {
+                $eff = $parsed.UtcDateTime
+            }
             if ($null -eq $eff) {
                 Write-Host "REFUSED -- -EffectiveFrom is not a date I can read: $EffectiveFrom" -ForegroundColor Red
                 Write-Host "  Use an ISO-8601 date, for example 2026-10-01 or 2026-10-01T00:00:00Z." -ForegroundColor DarkGray
@@ -143,20 +178,25 @@ switch ($PSCmdlet.ParameterSetName) {
         $doc = [ordered]@{
             unavailable    = $true
             reason         = $Reason
-            marked_at      = $now.ToString('yyyy-MM-ddTHH:mm:ssZ')
+            marked_at      = $now.ToString($iso, $inv)
             marked_by      = $By
-            effective_from = $(if ($eff) { $eff.ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $now.ToString('yyyy-MM-ddTHH:mm:ssZ') })
+            effective_from = $(if ($eff) { $eff } else { $now }).ToString($iso, $inv)
         }
 
-        $sd = Get-UsageStateDir $ConfigDir
         New-Item -ItemType Directory -Force -Path $sd | Out-Null
-        $path = Join-Path $sd $script:UsageUnavailableMarker
         # Temp-then-rename, the same discipline the collector uses: a reader must never observe a
         # half-written marker, and a half-written marker reads as MALFORMED, which fails closed on a
         # live account.
+        # The finally removes the temp file a failed write or rename would otherwise leave beside the
+        # marker; after a successful rename it no longer exists, so it removes nothing.
         $tmp = "$path.$PID.tmp"
-        [System.IO.File]::WriteAllText($tmp, ($doc | ConvertTo-Json -Depth 4), [System.Text.Encoding]::UTF8)
-        [System.IO.File]::Move($tmp, $path, $true)
+        try {
+            [System.IO.File]::WriteAllText($tmp, ($doc | ConvertTo-Json -Depth 4), [System.Text.Encoding]::UTF8)
+            [System.IO.File]::Move($tmp, $path, $true)
+        }
+        finally {
+            if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        }
 
         $pending = $eff -and $eff -gt $now
         Write-Host ""
@@ -180,8 +220,14 @@ switch ($PSCmdlet.ParameterSetName) {
     }
 
     'Clear' {
+        # A typo'd root carries no marker, so without this a clear of a fictional account reported
+        # NOTHING TO CLEAR and exit 0, and the real marker stayed in force. BACKLOG #7558.
+        Assert-ConfigRoot $ConfigDir
         $sd = Get-UsageStateDir $ConfigDir
         $path = Join-Path $sd $script:UsageUnavailableMarker
+        # A directory at the marker path is not "no marker": the reader takes it as MALFORMED and the
+        # account as UNAVAILABLE, so NOTHING TO CLEAR there was false.
+        Assert-MarkerNotDirectory $path
         Write-Host ""
         if (Test-Path -LiteralPath $path -PathType Leaf) {
             Remove-Item -LiteralPath $path -Force
@@ -220,6 +266,9 @@ switch ($PSCmdlet.ParameterSetName) {
             }
         }
         else {
+            # A typo'd root has no marker and so read AVAILABLE, an all-clear for an account that
+            # does not exist. BACKLOG #7558.
+            Assert-ConfigRoot $ConfigDir
             Show-One $ConfigDir
         }
         Write-Host ""
