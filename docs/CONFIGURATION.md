@@ -854,8 +854,8 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `phi_read_rate_limit_global` | int | 0 | max PHI reads across all users per window (`0` = off; a negative value is refused at load) |
 | `phi_read_rate_limit_window_seconds` | float | 60 | sliding-window length (`0` disables the PHI-read limits; a negative value is refused at load) |
 | `monitoring_read_rate_limit_enabled` | bool | `true` | per-actor pace on six `monitoring:read` GETs, one budget per account per API process (vault BACKLOG #1191, ASVS 15.2.2), charged at admission by `require_monitoring_read`; the routes, the key and the basis of the default are in [SECURITY.md](SECURITY.md), *Monitoring-read pacing* |
-| `monitoring_read_rate_limit_per_actor` | int | 600 | max monitoring reads per user per window (`0` disables this dimension) |
-| `monitoring_read_rate_limit_global` | int | 0 | max monitoring reads across all users per window (`0` = off) |
+| `monitoring_read_rate_limit_per_actor` | int | 600 | max monitoring reads per user per window (`0` disables this dimension; a negative value is refused at load) |
+| `monitoring_read_rate_limit_global` | int | 0 | max monitoring reads across all users per window (`0` = off; a negative value is refused at load) |
 | `monitoring_read_rate_limit_window_seconds` | float | 60 | sliding-window length; must be above `0` |
 | `admin_write_rate_limit_enabled` | bool | `true` | per-actor anti-automation pacing on the **state-changing admin surface** (ASVS 2.4.2) — **NON-GET only**, charged from one per-actor bucket by `require_step_up`, `require_step_up_action` and `require_paced`, plus the one read `GET /me/step-up`. Charged on the `/ui` surface too, by `require_ui` -- the console reaches the handlers in-process, so it re-applies the floor rather than inheriting it ([BACKLOG #287](BACKLOG.md)) |
 | `admin_write_rate_limit_per_actor` | int | 12 | max state-changing admin writes per actor per window (`0` disables this dimension; a negative value is refused at load); there is deliberately **no global arm** — one operator's bulk work must never throttle another's |

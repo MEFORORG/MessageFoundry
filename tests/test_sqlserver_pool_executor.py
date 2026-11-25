@@ -72,8 +72,9 @@ def test_the_default_loop_executor_would_be_too_narrow() -> None:
 
 @pytest.mark.parametrize("bad", [0, -1])
 def test_a_zero_or_negative_pool_size_is_refused_before_the_helper(bad: int) -> None:
-    """A pool of 0 or less never reaches the helper: ``StoreSettings`` refuses it at load (BACKLOG
-    #5769), and every caller hands the helper either ``settings.pool_size`` or a literal 1."""
+    """A pool of 0 or less never reaches the helper: ``StoreSettings`` refuses it when it is built
+    (BACKLOG #5769), and every caller hands the helper either ``settings.pool_size`` or a literal 1.
+    This pins the construction refusal only; the load builds the same model."""
     with pytest.raises(ValidationError) as info:
         _settings(bad)
     assert "pool_size" in str(info.value)

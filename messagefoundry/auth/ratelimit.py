@@ -205,7 +205,8 @@ class SlidingWindowRateLimiter:
             # oldest hit is always the one holding the count at the budget. No [auth] setting can
             # now hand this class a negative count: the load refuses one for the sign-in keys,
             # which also feed the ceremony and audit-row limiters, and for the PHI-read keys
-            # (BACKLOG #5318), and for the admin-write count (BACKLOG #3293). The intake-auth
+            # (BACKLOG #5318), for the admin-write count (BACKLOG #3293), and for the
+            # monitoring-read counts (vault BACKLOG #1191). The intake-auth
             # budgets are refused separately, when their connection is built.
             wait = max(wait, bucket[0] - (now - self._window))
         return max(wait, 0.0)
