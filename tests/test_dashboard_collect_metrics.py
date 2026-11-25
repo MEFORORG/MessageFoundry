@@ -1589,21 +1589,40 @@ _CHECKER = type(
 )
 
 
-@pytest.mark.parametrize(
-    ("banners", "block", "status"),
-    [
-        (["O"], ["> O filed"], "open"),
-        (["I", "O"], ["> I working", "> O filed"], "in progress"),
-        (["I", "O"], ["> **PARTIAL 2026-10-01 built half**", "> O filed"], "partial"),
-        (["S", "I"], ["> S shipped", "> **PARTIAL x**"], "closed"),
-        (["D"], ["> D no"], "declined"),
-        (["R"], ["> R gone"], "superseded"),
-    ],
-)
+#: One case per return branch of ``row_status`` that names a status.
+_STATUS_CASES = [
+    (["O"], ["> O filed"], "open"),
+    (["I", "O"], ["> I working", "> O filed"], "in progress"),
+    (["I", "O"], ["> **PARTIAL 2026-10-01 built half**", "> O filed"], "partial"),
+    (["S", "I"], ["> S shipped", "> **PARTIAL x**"], "closed"),
+    (["D"], ["> D no"], "declined"),
+    (["R"], ["> R gone"], "superseded"),
+]
+
+
+@pytest.mark.parametrize(("banners", "block", "status"), _STATUS_CASES)
 def test_row_status_buckets_are_disjoint(banners: list[str], block: list[str], status: str) -> None:
     vc = _load_driver()
     lines = ["## 1. Title", *block, "body"]
     assert vc.row_status(_CHECKER, _Row(banners), lines) == status
+
+
+def test_priority_table_columns_are_exactly_the_driver_statuses() -> None:
+    # Both directions: a status the driver returns that the table has no column for, and a column
+    # the driver never fills, each fail here. The cases above cover every branch that names one.
+    spec = importlib.util.spec_from_file_location(
+        "dashboard_to_rows_status_pin", _PATH.parent / "to_rows.py"
+    )
+    assert spec is not None and spec.loader is not None
+    tr = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = tr
+    spec.loader.exec_module(tr)
+    vc = _load_driver()
+    returned = {
+        vc.row_status(_CHECKER, _Row(banners), ["## 1. Title", *block, "body"])
+        for banners, block, _ in _STATUS_CASES
+    }
+    assert returned == set(tr.PRIORITY_STATUSES)
 
 
 def test_row_priority_reads_the_rows_own_section_line() -> None:

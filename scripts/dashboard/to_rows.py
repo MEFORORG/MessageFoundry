@@ -492,9 +492,12 @@ UNSCORED_LABEL = "unscored"
 PRIORITY_STATUSES = (*cm.OPEN_STATUSES, "closed", "declined", "superseded")
 
 
-def _priority_key(priority: str) -> tuple[int, str]:
-    # P0, P1, ... in order, then anything else (the unscored bucket) after them.
-    return (0, priority) if priority[:1] == "P" and priority[1:].isdigit() else (1, priority)
+def _priority_key(priority: str) -> tuple[int, int, str]:
+    # P0, P1, ... in NUMERIC order, so P10 follows P9 rather than P1, then anything else (the
+    # unscored bucket) after them.
+    if priority[:1] == "P" and priority[1:].isascii() and priority[1:].isdigit():
+        return (0, int(priority[1:]), priority)
+    return (1, 0, priority)
 
 
 def priority_rows(snap: Snapshot) -> list[dict[str, Any]]:

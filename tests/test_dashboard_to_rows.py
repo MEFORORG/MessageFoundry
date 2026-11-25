@@ -508,10 +508,11 @@ def test_priority_rows_order_and_fill_every_status() -> None:
     assert {"priority": "P1", "status": "odd", "value": 0} in rows
 
 
-def test_priority_statuses_match_the_census_driver() -> None:
-    source = (_PATH.parent / "_vault_census.py").read_text(encoding="utf-8")
-    for status in tr.PRIORITY_STATUSES:
-        assert f'"{status}"' in source
+def test_priority_rows_sort_two_digit_priorities_numerically() -> None:
+    by = {p: {"open": 1} for p in ("P10", "P2", "unscored", "P1")}
+    snap = tr.Snapshot({"metrics": [{"id": "backlog_burn", "detail": {"by_priority": by}}]})
+    order = list(dict.fromkeys(r["priority"] for r in tr.priority_rows(snap)))
+    assert order == ["P1", "P2", "P10", "unscored"]
 
 
 def test_main_writes_the_priority_file(tmp_path: Path) -> None:
