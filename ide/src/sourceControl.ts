@@ -603,13 +603,56 @@ function logResult(label: string, res: { stdout: string; stderr: string }): void
 // right before each baseline commit: staging before the prompts would leave the whole tree in the
 // index after a Cancel, one stray `git commit` away from history (BACKLOG #5413). The pre-flight
 // check reads the files on disk, not the index, so it needs nothing staged. The `.` pathspec keeps a
-// workspace that is a subfolder of a larger repository from staging its parent's changes.
+// workspace that is a subfolder of a larger repository from staging its parent's changes. Staged
+// files the gitignore matches are then taken back out ({@link unstageIgnored}).
 async function stageBaseline(bin: string, ws: string): Promise<boolean> {
   const res = await git(bin, ["add", "-A", "--", "."], ws);
   if (res.code !== 0) {
     logResult(`--- staging the baseline failed: git exit code ${res.code} ---`, res);
     void vscode.window.showErrorMessage(`MessageFoundry: could not stage the baseline — ${res.stderr.trim()}`);
     return false;
+  }
+  return unstageIgnored(bin, ws);
+}
+
+// How many paths one `git rm --cached` call takes, so a long list stays under the OS argv limit.
+const UNSTAGE_BATCH = 100;
+
+// `git add -A` never removes a path that is already in the index, so a file the user staged before
+// setup wrote the gitignore, such as the minted TLS key, would still go into the baseline (BACKLOG
+// #5413, #8237 item 2). Only a repository with no commit gets a baseline, so taking an ignored path
+// out of the index here removes it from that first commit only; the file on disk is kept. Every path
+// the gitignore rules match is taken out, one the user force-added included, and each is named on the
+// Checks channel so it can be added back with `git add -f`. A failure refuses the commit.
+async function unstageIgnored(bin: string, ws: string): Promise<boolean> {
+  const listed = await git(bin, ["ls-files", "-z", "--cached", "--ignored", "--exclude-standard", "--", "."], ws);
+  if (listed.code !== 0) {
+    logResult(`--- listing ignored staged files failed: git exit code ${listed.code} ---`, listed);
+    void vscode.window.showErrorMessage(
+      `MessageFoundry: could not check the baseline for ignored files — ${listed.stderr.trim()}`,
+    );
+    return false;
+  }
+  const ignored = listed.stdout.split("\0").filter((p) => p !== "");
+  for (let i = 0; i < ignored.length; i += UNSTAGE_BATCH) {
+    // --literal-pathspecs, so a file name holding `*` or `:(` names only itself.
+    const batch = ignored.slice(i, i + UNSTAGE_BATCH);
+    const rm = await git(bin, ["--literal-pathspecs", "rm", "--cached", "-q", "--", ...batch], ws);
+    if (rm.code !== 0) {
+      logResult(`--- unstaging ignored files failed: git exit code ${rm.code} ---`, rm);
+      void vscode.window.showErrorMessage(
+        `MessageFoundry: could not take ignored files out of the baseline — ${rm.stderr.trim()}`,
+      );
+      return false;
+    }
+  }
+  if (ignored.length > 0) {
+    logChecks(
+      [
+        `Left out of the baseline: ${ignored.length} staged file(s) the .gitignore matches (kept on disk):`,
+        ...ignored.map((p) => `  ${p}`),
+      ].join("\n"),
+    );
   }
   return true;
 }

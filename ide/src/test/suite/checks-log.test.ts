@@ -207,6 +207,17 @@ if (NODE_SIDE) {
 
 const commandSuite = NODE_SIDE ? suite : suite.skip;
 
+/** A synchronous runner for the real git binary on PATH, or undefined where there is none. */
+function realExecFileSyncGit(): ((args: string[], cwd: string) => string) | undefined {
+  const { execFileSync } = require("node:child_process") as typeof import("node:child_process");
+  try {
+    execFileSync("git", ["--version"], { stdio: "ignore" });
+  } catch {
+    return undefined;
+  }
+  return (args, cwd) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+}
+
 commandSuite("Set Up Version Control & Checks: what reaches the Checks channel", () => {
   let ws: string;
 
@@ -310,8 +321,10 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
       await sc.setupSourceControl({} as never);
       const runs = launches();
       const commit = runs.findIndex((a) => a[0] === "commit");
-      assert.ok(commit > 0, `no commit ran: ${JSON.stringify(runs)}`);
-      assert.deepStrictEqual(runs[commit - 1], ["add", "-A", "--", "."]);
+      assert.ok(commit > 1, `no commit ran: ${JSON.stringify(runs)}`);
+      // The stub's ls-files lists nothing, so no `rm --cached` runs between the two.
+      assert.deepStrictEqual(runs[commit - 2], ["add", "-A", "--", "."]);
+      assert.deepStrictEqual(runs[commit - 1].slice(0, 5), ["ls-files", "-z", "--cached", "--ignored", "--exclude-standard"]);
       assert.strictEqual(runs.filter(isStageAll).length, 1, JSON.stringify(runs));
     }
   });
@@ -326,6 +339,46 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
     assert.ok(!runs.some(isStageAll), `the tree was staged: ${JSON.stringify(runs)}`);
     assert.ok(!runs.some((a) => a[0] === "commit"));
   });
+
+  // Real git, with only `messagefoundry check` stubbed: a file the user staged before setup wrote the
+  // gitignore, the minted TLS key here, must not reach the baseline (BACKLOG #5413, #8237 item 2).
+  const realGit = realExecFileSyncGit();
+  (realGit ? test : test.skip)("a secret staged before setup is left out of the baseline commit (BACKLOG #5413)", async () => {
+    const g = (...args: string[]): string => realGit!(args, ws);
+    g("init", "-q");
+    g("config", "user.name", "Synthetic Tester");
+    g("config", "user.email", "tester@example.invalid");
+    g("config", "commit.gpgsign", "false");
+    fs.writeFileSync(path.join(ws, "api-generated-key.pem"), "synthetic, not a key\n");
+    fs.mkdirSync(path.join(ws, "keys"));
+    fs.writeFileSync(path.join(ws, "keys", "handoff.key"), "synthetic\n");
+    fs.writeFileSync(path.join(ws, "route.py"), "# synthetic\n");
+    g("add", "-A");
+    childProcess.execFile = ((
+      file: string,
+      args: string[],
+      options: unknown,
+      done: (err: Error | null, stdout: string, stderr: string) => void,
+    ) => {
+      events.push({ kind: "launch", args });
+      if (args.includes("check")) {
+        done(Object.assign(new Error("stubbed"), { code: 1 }), CHECK_STDOUT, "");
+        return undefined;
+      }
+      return realExecFile(file, args, options as object, done);
+    }) as unknown as typeof childProcess.execFile;
+
+    await sc.setupSourceControl({} as never);
+
+    const committed = g("ls-tree", "-r", "--name-only", "HEAD").split("\n").filter((l) => l !== "");
+    // Control: the baseline ran and holds the ordinary file.
+    assert.ok(committed.includes("route.py"), JSON.stringify(committed));
+    assert.ok(!committed.includes("api-generated-key.pem"), `the key was committed: ${JSON.stringify(committed)}`);
+    assert.ok(!committed.includes("keys/handoff.key"), `the key was committed: ${JSON.stringify(committed)}`);
+    // The file stays on disk, and the channel names it.
+    assert.ok(fs.existsSync(path.join(ws, "api-generated-key.pem")));
+    assert.ok(lines().some((l) => l.endsWith("  api-generated-key.pem")), JSON.stringify(lines()));
+  }).timeout(30000); // real git, several launches: slow on a Windows runner
 
   test("a repository that already has a commit is offered no baseline and nothing is staged", async () => {
     hasHead = true;
