@@ -514,6 +514,30 @@ async def test_reauth_rp_migrated_credentials_render_legible_notice(engine: Engi
         assert "Complete the passkey prompt" not in r.text
 
 
+async def test_reauth_unreadable_credentials_render_their_own_notice(engine: Engine) -> None:
+    # BACKLOG #6886: a passkey-only user whose stored credential id cannot be decoded, under THIS
+    # origin, sees the unreadable-passkey notice at /ui/reauth, not the origin-migration one, whose
+    # cause would be false. The row is changed white-box, as a row written outside the store.
+    pytest.importorskip("webauthn")
+    service = await _service(engine)
+    async with _boss_client(engine, service) as c:
+        await _browser_enroll(c, label="old key")
+        await engine.store._db.execute(  # noqa: SLF001
+            "UPDATE webauthn_credentials SET credential_id='AAAAA'"
+        )
+        await engine.store._db.commit()  # noqa: SLF001
+
+        await _cookie_login(c, "boss")  # fresh MFA-pending session
+        boss_id = await _uid(service, "boss")
+        creds = await service.store.list_webauthn_credentials(boss_id)
+        delete_path = f"/ui/account/webauthn/{creds[0].credential_id_hash}/delete"
+        r = await c.get("/ui/reauth?next=" + quote(delete_path, safe=""))
+        assert r.status_code == 200
+        assert "Your passkeys could not be read" in r.text
+        assert "enrolled under a different origin" not in r.text
+        assert "data-mf-webauthn-get" not in r.text
+
+
 async def test_reauth_extra_less_with_credentials_renders_notice(
     engine: Engine, monkeypatch
 ) -> None:

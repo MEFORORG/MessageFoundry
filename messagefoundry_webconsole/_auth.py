@@ -2518,6 +2518,11 @@ WEBAUTHN_RP_CHANGED_NOTICE = (
     "Your passkeys were enrolled under a different origin and are unusable here — contact your "
     "administrator to reset your MFA so you can re-enroll."
 )
+#: BACKLOG #6886: the account's passkeys under this origin are stored in a form that cannot be read.
+WEBAUTHN_UNREADABLE_NOTICE = (
+    "Your passkeys could not be read and are unusable here. Contact your administrator to reset "
+    "your MFA so you can re-enroll."
+)
 
 
 def webauthn_rp(request: Request) -> tuple[str, str] | None:

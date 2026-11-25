@@ -1688,6 +1688,17 @@ class MfaStatus:
     totp_reenrolment_recommended: bool = False
 
 
+class StoredPasskeysUnreadable(Exception):
+    """Every passkey an account holds under the ceremony's ``rp_id`` has a stored credential id
+    that does not decode (BACKLOG #6886), so no assertion ceremony can be staged. Raised by
+    :meth:`AuthService.begin_webauthn_assertion` in place of its ``None``, which means the passkeys
+    were minted under another origin; the holder needs an MFA reset either way, for another
+    reason. The message names no passkey and no stored value."""
+
+    def __init__(self) -> None:
+        super().__init__("the account's passkeys could not be read")
+
+
 class FirstAdministratorRefused(RuntimeError):
     """:meth:`AuthService.provision_first_administrator` declined. The message is operator-facing."""
 
@@ -5205,9 +5216,9 @@ class AuthService:
             )
         if refused:
             _log.warning(
-                "%d passkey(s) were not moved to the current credential-id hash scheme (an unknown"
-                " scheme, a hash its own credential id does not give, or a move the store refused);"
-                " they cannot sign in",
+                "%d passkey(s) were not moved to the current credential-id hash scheme (at least: a"
+                " stored credential id that does not decode, an unknown scheme, a hash its own"
+                " credential id does not give, or a move the store refused); they cannot sign in",
                 refused,
             )
         return rehashed, refused
@@ -6958,10 +6969,13 @@ class AuthService:
           which of the two.
         * py_webauthn's own counter-regression rejection is a clone signal (ADR 0068 decision 4).
         * Any other refusal is audited ``auth.webauthn_failed`` only when ``audit_bad_signature``."""
-        refused_key: tuple[str, str | None] = (
-            "auth.webauthn_failed",
-            _json({"reason": "stored_key_refused", "label": cred.label}),
-        )
+
+        def refused_key() -> tuple[str, str | None]:
+            # Built only on a refusal, so a good assertion never encodes the label.
+            return "auth.webauthn_failed", _json(
+                {"reason": "stored_key_refused", "label": cred.label}
+            )
+
         try:
             # The id is decoded only to be checked: the begin legs leave out a passkey whose id
             # does not decode (:meth:`_split_stored_credential_ids`), and this refuses it too, so
@@ -6980,7 +6994,7 @@ class AuthService:
                 user.username,
                 cred.label,
             )
-            action, detail = refused_key
+            action, detail = refused_key()
         else:
             try:
                 return webauthn.verify_assertion(
@@ -6998,7 +7012,7 @@ class AuthService:
                     user.username,
                     cred.label,
                 )
-                action, detail = refused_key
+                action, detail = refused_key()
             except webauthn.WebAuthnVerificationError as exc:
                 if "sign count" in str(exc).lower():
                     action, detail = "auth.webauthn_clone_suspected", _json({"label": cred.label})
@@ -15492,25 +15506,53 @@ class AuthService:
         screen's THREAD ends, not until its caller stops waiting. So a corpus that appears is
         loaded once, not by every screen that missed the cache together, and a corpus on a path
         that stops answering blocks one worker thread in all, however many callers give up on it;
-        the others wait on the lock, which a caller may leave by being cancelled. The screen itself
-        is set lookups, so the queue costs nothing measurable."""
+        the others wait on the lock, which a caller may leave by being cancelled. The one way the
+        lock goes early is a cancel of the screen task itself, at loop teardown for example, which
+        releases it while the thread runs on. The screen itself is set lookups, so the queue costs
+        nothing measurable. A screen that fails after its caller left is logged at ERROR, as
+        :func:`_write_through_cancellation` logs a write, since nobody else reads it."""
         if self._screen_lock is None:
             self._screen_lock = asyncio.Lock()
         lock = self._screen_lock
         await lock.acquire()
-        screen = asyncio.ensure_future(
-            asyncio.to_thread(self._policy.violations, password, username=username)
-        )
+        caller_left = False
+        reported = False
+
+        def report(done: asyncio.Future[list[str]]) -> None:
+            nonlocal reported
+            if reported or done.cancelled() or done.exception() is None:
+                return
+            reported = True
+            _log.error(
+                "a password screen failed after its caller was cancelled",
+                exc_info=done.exception(),
+            )
 
         def finished(done: asyncio.Future[list[str]]) -> None:
             lock.release()
             if not done.cancelled():
-                done.exception()  # read, so a caller that left does not leave it unretrieved
+                done.exception()  # retrieved: the caller re-raises it below, or report() logs it
+            if caller_left:
+                report(done)
 
-        screen.add_done_callback(finished)
+        try:
+            screen = asyncio.ensure_future(
+                asyncio.to_thread(self._policy.violations, password, username=username)
+            )
+            screen.add_done_callback(finished)
+        except BaseException:
+            # Nothing was scheduled to release it, so a later screen would wait forever.
+            lock.release()
+            raise
         # ``wait``, not ``await screen``: a cancel of the caller then leaves the screen running,
         # and its callback, not the caller, releases the lock when the thread is done.
-        await asyncio.wait((screen,))
+        try:
+            await asyncio.wait((screen,))
+        except asyncio.CancelledError:
+            caller_left = True
+            if screen.done():  # finished already ran, before it could know the caller left
+                report(screen)
+            raise
         return screen.result()
 
     #: Serializes :meth:`_screened_violations`; made on first use, inside the running loop.
@@ -19735,28 +19777,33 @@ class AuthService:
     def _b64url_decode(value: str) -> bytes:
         return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
-    @classmethod
     def _split_stored_credential_ids(
-        cls, creds: Sequence[WebAuthnCredential], *, username: str
+        self, creds: Sequence[WebAuthnCredential], *, username: str
     ) -> tuple[list[bytes], list[WebAuthnCredential]]:
         """The raw ids of ``creds`` that decode, in order, and the passkeys whose stored id does
-        not (BACKLOG #6886). Such an id (not base64url, or not text at all) raised out of the
-        ceremony that listed it. Only a row written outside the store holds one: on a sealed store
-        the passkey digest refuses it first. Each is logged by label, never by its value."""
+        not (BACKLOG #6886): one ``base64.urlsafe_b64decode`` raises on, or one that is not text.
+        That decoder skips characters outside its alphabet, so not every malformed id is caught
+        here. Such an id raised out of the ceremony that listed it. Only a row written outside the
+        store holds one: on a sealed store the passkey digest refuses it first.
+
+        The second list holds only the passkeys due a report, at most once per passkey per
+        :class:`SealFailureThrottle` interval, since a begin leg runs on every page render. Each
+        reported one is logged by label, never by its value; the others are left out silently."""
         ids: list[bytes] = []
-        undecodable: list[WebAuthnCredential] = []
+        due: list[WebAuthnCredential] = []
         for cred in creds:
             try:
-                ids.append(cls._b64url_decode(cred.credential_id))
+                ids.append(self._b64url_decode(cred.credential_id))
             except (ValueError, TypeError):  # binascii.Error is a ValueError
-                _log.warning(
-                    "passkey %r of %s has a stored credential id that cannot be decoded and must "
-                    "be registered again",
-                    cred.label,
-                    username,
-                )
-                undecodable.append(cred)
-        return ids, undecodable
+                if self._seal_failures_reported.due(f"passkey-id:{cred.credential_id_hash}"):
+                    _log.warning(
+                        "passkey %r of %s has a stored credential id that cannot be decoded and "
+                        "must be registered again",
+                        cred.label,
+                        username,
+                    )
+                    due.append(cred)
+        return ids, due
 
     #: Ceremony-miss message — names the LB-stickiness caveat so a multi-node operator can
     #: self-diagnose intermittent failures (ADR 0068 §2).
@@ -20249,8 +20296,10 @@ class AuthService:
     async def begin_webauthn_assertion(self, token: str | None, *, rp_id: str) -> str | None:
         """Stage an assertion ceremony for the caller's session; returns the browser request-options
         JSON, or ``None`` when the user has no credentials minted under the CURRENT ``rp_id``
-        (an origin migration renders old credentials visibly unusable — ADR 0068 §7). Allowed for
-        MFA-pending sessions: the assertion is exactly what proves the second factor."""
+        (an origin migration renders old credentials visibly unusable — ADR 0068 §7). Raises
+        :class:`StoredPasskeysUnreadable` when it has some there but none whose stored id decodes
+        (BACKLOG #6886). Allowed for MFA-pending sessions: the assertion is exactly what proves the
+        second factor."""
         if not token:
             return None
         session = await self._load_session(hash_token(token))
@@ -20262,17 +20311,19 @@ class AuthService:
         creds = [c for c in held or () if c.rp_id == rp_id]
         if not creds or user is None:
             return None
-        allowed, undecodable = self._split_stored_credential_ids(creds, username=user.username)
-        for cred in undecodable:
+        allowed, due = self._split_stored_credential_ids(creds, username=user.username)
+        for cred in due:
             # BACKLOG #6886: a passkey whose stored id does not decode can never sign in, so it is
-            # refused here as a refused stored key is at the finish leg, row and all.
+            # refused here as a refused stored key is at the finish leg, row and all. The row is
+            # throttled with the WARNING, because the web console begins a ceremony on every render.
             await self._audit(
                 "auth.webauthn_failed",
                 actor=user.username,
                 detail=_json({"reason": "stored_key_refused", "label": cred.label}),
             )
         if not allowed:
-            return None
+            # Not ``None``: the console reads that as an origin migration, and none happened.
+            raise StoredPasskeysUnreadable
         challenge = webauthn.new_challenge()
         options = webauthn.assertion_options(
             rp_id=rp_id, challenge=challenge, allow_credential_ids=allowed

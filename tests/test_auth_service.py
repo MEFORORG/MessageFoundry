@@ -1678,3 +1678,74 @@ async def test_a_cancelled_screen_keeps_the_lock_until_its_thread_ends() -> None
     finally:
         gate.set()
         await store.close()
+
+
+class _ScreenFailed(Exception):
+    """The synthetic failure of a password screen."""
+
+
+async def test_a_screen_that_fails_after_its_caller_left_is_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #6881. RED when: a screen that fails after its caller was cancelled is dropped with
+    no log line. Nobody else reads it, so it is logged at ERROR, once, as
+    ``_write_through_cancellation`` logs a write that fails after its caller left."""
+    gate = threading.Event()
+    started = threading.Event()
+
+    class _FailingScreen:
+        def violations(self, password: str, *, username: str | None = None) -> list[str]:
+            started.set()
+            gate.wait(timeout=30)
+            raise _ScreenFailed("synthetic screen failure")
+
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        service._policy = _FailingScreen()  # type: ignore[assignment]
+        caller = asyncio.ensure_future(service._screened_violations("pw", username="u"))
+        for _ in range(500):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        with caplog.at_level(logging.ERROR, logger=_AUTH_LOGGER):
+            gate.set()
+            assert service._screen_lock is not None
+            for _ in range(500):  # the thread ends, then its callback releases the lock
+                if not service._screen_lock.locked():
+                    break
+                await asyncio.sleep(0.01)
+        lines = [r for r in caplog.records if "password screen failed" in r.getMessage()]
+        assert len(lines) == 1, [r.getMessage() for r in caplog.records]
+        assert lines[0].exc_info is not None and isinstance(lines[0].exc_info[1], _ScreenFailed)
+    finally:
+        gate.set()
+        await store.close()
+
+
+async def test_the_screen_lock_is_released_when_scheduling_the_screen_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6881. RED when: the screen lock stays held after the screen could not be
+    scheduled. Nothing would release it then, so every later password change would wait on it
+    forever. The next screen is the control that the lock works again."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(password_check_breached=False))
+        # The service module calls ``asyncio.to_thread`` through the one asyncio module.
+        real = asyncio.to_thread
+
+        def refuse(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("synthetic: the screen could not be scheduled")
+
+        monkeypatch.setattr(asyncio, "to_thread", refuse)
+        with pytest.raises(RuntimeError, match="could not be scheduled"):
+            await service._screened_violations(NEW_PASSWORD, username="u")
+        monkeypatch.setattr(asyncio, "to_thread", real)
+        assert service._screen_lock is not None and not service._screen_lock.locked()
+        assert await service._screened_violations(NEW_PASSWORD, username="u") == []
+    finally:
+        await store.close()
