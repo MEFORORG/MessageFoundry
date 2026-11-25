@@ -69,11 +69,15 @@ def local_root(start: str | os.PathLike[str] | None = None) -> Path | None:
     if start:
         args += ["-C", str(start)]
     args += ["rev-parse", "--path-format=absolute", "--git-common-dir"]
+    # Bytes, decoded here: text=True decodes with the ANSI code page on Windows, where git writes
+    # UTF-8, so a non-ASCII checkout path read as mojibake or killed the reader thread (BACKLOG #7571).
     try:
-        proc = subprocess.run(args, capture_output=True, text=True, check=False)  # nosec B603 B607 - fixed argv, no shell
-    except OSError:
+        proc = subprocess.run(args, capture_output=True, check=False)  # nosec B603 B607 - fixed argv, no shell
+        common = (
+            proc.stdout.decode("utf-8") if os.name == "nt" else os.fsdecode(proc.stdout)
+        ).strip()
+    except (OSError, UnicodeDecodeError):
         return None
-    common = proc.stdout.strip()
     if proc.returncode != 0 or not common:
         return None
     return Path(common) / "mefor-coord"

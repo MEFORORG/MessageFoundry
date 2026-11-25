@@ -523,3 +523,27 @@ def test_an_extended_length_local_root_resolves_on_both(
     ps, py = _both(repo, "mail")
     assert py.error is not None and "does not exist" in py.error, py
     assert "does not exist" in str(ps["Error"]), ps
+
+
+def test_a_non_ascii_checkout_path_reads_the_same_on_both(tmp_path: Path) -> None:
+    # BACKLOG #7571: git writes the common dir as UTF-8, and text=True decoded it with the ANSI code
+    # page. U+0101 is C4 81 in UTF-8, and cp1252 has no 0x81, so the decode failed outright.
+    r = tmp_path / "café-ā"
+    r.mkdir()
+    subprocess.run(["git", "-C", str(r), "init", "-q"], check=True, capture_output=True)
+    want = r / ".git" / "mefor-coord"
+    assert coord_root.local_root(r) == want
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f". '{PS}'; Get-CoordLocalRoot -From '{r}' | ConvertTo-Json",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        check=True,
+        timeout=60,
+    )
+    assert Path(json.loads(proc.stdout)) == want
