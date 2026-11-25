@@ -2963,17 +2963,14 @@ accept loop on a thread of its own. Work still queued behind a busy or hung pool
 is not run on the loop. Other worker-thread hops have no such fallback, at least the config load,
 which runs author code, the environment value read, the bundle fingerprint, which also reads the
 config directory, and a connector's own startup check, such as a remote-file listing. So a pool
-that stays broken still fails an operator reload at the first of these it meets. Some trust-anchor
-reads outside a reload have no such fallback either, at least the SMTP alert CA check at serve
-start and the SQL Server store's certificate pin checks at store open; a reload reads those anchors
-through the settings preflight, which has the fallback. A DR activation's reload instead records
-an outbound lane leaving the park whose startup check meets one as failed, and goes on, but an
-inbound whose start meets one still fails the activation. Nor does a rollback on such a pool bring every inbound back. It restarts, one
-at a time, the inbounds that were listening when the runner took its reload lock, which is after
-the engine has loaded and checked the new config, so an inbound stopped or started in between is
-not put back as it was when the reload was asked for. One whose start meets such a hop is
-recorded `failed`, with an alert, and stays down after the rollback, while the rollback still
-tries to restart the rest. The row does not claim the old graph is still serving: at least a
+that stays broken still fails an operator reload at the first of these it meets. A DR activation's
+reload instead records an outbound lane leaving the park whose startup check meets one as failed,
+and goes on, but an inbound whose start meets one still fails the activation. Nor does a rollback
+on such a pool bring every inbound back. It restarts, one at a time, the inbounds that were
+listening when the runner took its reload lock, which is after the engine has loaded and checked
+the new config, so an inbound stopped or started in between is not put back as it was when the
+reload was asked for. One whose start meets such a hop is recorded `failed`, with an alert, and
+stays down after the rollback, while the rollback still tries to restart the rest. The row does not claim the old graph is still serving: at least a
 fault raised after the swap committed leaves the new one live, and `GET /config/provenance` says
 which is. At least these write no such row: a DR activation's reload, and a row whose own write
 fails, which is logged. A cluster convergence reload records such a fault with reason

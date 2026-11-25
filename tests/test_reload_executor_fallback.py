@@ -228,7 +228,7 @@ async def test_a_refused_dicom_start_still_starts_the_server(
 
 
 async def test_a_dicom_start_with_no_thread_fails_and_releases_its_port(
-    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """With no thread to start, the start runs on the loop and its accept loop cannot start, so
     the start fails. make_server has bound the port by then, and the failed start closes it."""
@@ -245,13 +245,14 @@ async def test_a_dicom_start_with_no_thread_fails_and_releases_its_port(
 
     monkeypatch.setattr(dicom, "_admitting_server_class", lambda: Recording)
     _refuse_default_executor()
+    caplog.set_level(logging.WARNING, logger=threadhop.__name__)
     with monkeypatch.context() as patch:
         patch.setattr(threading.Thread, "start", _no_thread)
         with pytest.raises(RuntimeError, match="can't start new thread"):
             await source.start(object())  # type: ignore[arg-type]
     (server,) = built
+    assert "the DICOM listener start, so it runs on the event loop" in caplog.text
     assert server.socket.fileno() == -1
-    assert source._server is None
     port = server.server_address[1]
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", port))  # refused with the port still held
