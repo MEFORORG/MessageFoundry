@@ -187,37 +187,25 @@ def test_a_continuation_or_acknowledgment_segment_gets_no_exemption(extra: str) 
     assert result.unvalidated_segments == ()
 
 
+def test_the_envelope_run_that_ends_a_message_keeps_the_exemption() -> None:
+    """Some intake paths hand a message over with its batch's trailers or the next batch's header
+    still on it (``_ENVELOPE`` names at least three), so that run is not refused."""
+    result = validate(_MFN_M01 + "\rBTS|2\rBHS|^~\\&\rFTS|1\rFHS|^~\\&")
+    assert result.ok, result.errors
+    assert result.unvalidated_segments == (("BTS", 4), ("BHS", 5), ("FTS", 6), ("FHS", 7))
+
+
 @pytest.mark.parametrize("extra", ["BHS|^~\\&", "BTS|2", "FHS|^~\\&", "FTS|1"], ids=lambda s: s[:3])
-def test_a_batch_or_file_envelope_segment_gets_no_exemption(extra: str) -> None:
-    """The slot carries master-file or query data, not a batch or file header or trailer, so one
-    dropped from such a message is refused (BACKLOG #5920 step 2, its envelope half). NEGATIVE
-    CONTROL: on f1a1b4cad1 each passed, listed in unvalidated_segments."""
-    result = validate(_MFN_M01 + "\r" + extra)
+@pytest.mark.parametrize("after", ["MFE|MAD|2||LOC2^Loc|CE", "ZLC|1"], ids=["MFE", "Z"])
+def test_an_envelope_line_inside_a_message_gets_no_exemption(extra: str, after: str) -> None:
+    """A batch or file header or trailer with a message line after it frames nothing, and the slot
+    carries master-file or query data, so it is refused (BACKLOG #5920 step 2, its envelope half).
+    NEGATIVE CONTROL: on origin/main 33870a40944 each passed, listed in unvalidated_segments."""
+    result = validate(_MFN_M01 + "\r" + extra + "\r" + after)
     assert not result.ok
-    assert result.errors == [
-        f"segment {extra[:3]} at line 4 has no place in this message's structure"
-    ]
-    assert result.unvalidated_segments == ()
-
-
-def test_a_split_batch_member_carries_no_envelope_line_to_refuse() -> None:
-    """The reason the envelope was once exempt no longer holds: split_batch drops a member's
-    trailing envelope run (BACKLOG #5806), so each member of an enveloped batch still validates."""
-    from messagefoundry.parsing.split import split_batch
-
-    batch = (
-        "FHS|^~\\&|A\rBHS|^~\\&|A\r"
-        + _MFN_M01
-        + "\rBTS|2\rBHS|^~\\&|A\r"
-        + _MFN_M01.replace("|N1|", "|N2|")
-        + "\rBTS|1\rFTS|1\r"
+    assert f"segment {extra[:3]} at line 4 has no place in this message's structure" in (
+        result.errors
     )
-    members = split_batch(batch)
-    assert len(members) == 2
-    for member in members:
-        result = validate(member)
-        assert result.ok, result.errors
-        assert result.unvalidated_segments == ()
 
 
 @pytest.mark.parametrize(
