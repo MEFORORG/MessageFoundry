@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
 import secrets
 import time
 import urllib.error
@@ -36,6 +37,8 @@ from messagefoundry.redaction import json_loads_or_refusal
 
 if TYPE_CHECKING:  # the annotation only; this module takes no module-scope transports import
     from messagefoundry.auth.oidc.client_auth import ClientAuthentication
+
+_log = logging.getLogger(__name__)
 
 _VERIFIER_BYTES = 48  # 64 base64url chars — within RFC 7636's 43..128
 _STATE_BYTES = 32
@@ -484,6 +487,8 @@ def exchange_code(
     # its status or, for a header block that did not parse, with none.
     status: int | None = None
     body = b""
+    # The refused reply, kept past its arm only so it can be closed outside it (BACKLOG #6903).
+    refused_reply: urllib.error.HTTPError | None = None
     try:
         with opener.open(req, timeout=timeout) as resp:  # noqa: S310 — see above
             # The production opener refuses a redirect, so anything that reaches here is a 2xx.
@@ -494,9 +499,10 @@ def exchange_code(
                 resp, limit=_MAX_TOKEN_RESPONSE_BYTES, connector="OIDC token endpoint"
             )
     except urllib.error.HTTPError as exc:
-        # Read the RFC 6749 error code only; never the body verbatim (may echo request params).
-        # HTTPError is an OSError, so this arm must stay above the transport arm.
+        # Read the HTTP status only; never the body (may echo request params), which is closed
+        # unread below. HTTPError is an OSError, so this arm must stay above the transport arm.
         status = exc.code
+        refused_reply = exc
         refusal = f"token endpoint returned HTTP {exc.code}"
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         unreachable = True
@@ -515,6 +521,23 @@ def exchange_code(
     except EgressReplyError:
         # The family, so a refusal added to bounded_read later still lands on FlowError.
         refusal = "token endpoint response could not be read"
+    if refused_reply is not None:
+        # Close the unread reply, and its socket with it, now rather than when the last reference
+        # goes (BACKLOG #6903). CPython frees it once this function lets go today; the close keeps
+        # that true if a later edit holds it longer. Outside the arm, so a close that fails carries
+        # no HTTPError on its `__context__`. A close that fails with OSError or ValueError is
+        # logged by class alone, and the refusal below is still raised; any other exception from
+        # the close propagates in its place.
+        try:
+            refused_reply.close()
+        except (OSError, ValueError) as close_exc:
+            _log.warning(
+                "closing a refused token-endpoint reply failed: %s", type(close_exc).__name__
+            )
+        finally:
+            # The HTTPError's traceback holds this frame, so the local would keep the two in a
+            # cycle, and the frame would keep the unread reply reachable.
+            del refused_reply
     if refusal is not None:
         if unreachable:
             raise TokenEndpointUnreachableError(refusal)
