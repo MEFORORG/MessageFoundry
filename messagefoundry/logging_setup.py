@@ -2471,11 +2471,10 @@ def configure_logging(
                 # forwarder does not install says so through the arm above that it takes: at least
                 # a WARNING for a transient connect failure and an ERROR for a permanent one, both
                 # of which [logging].level can still filter, while a refused hop raises. A clean
-                # spool-off start was otherwise silent (vault BACKLOG #1199, ASVS 16.4.3 gap
-                # (iii)). Through Logger.handle, which skips the logger's level, so [logging].level
-                # does not filter this line. Unlike __main__._write_start_audit it does not check
-                # logging.disable() and records no caller location (at least the line number and
-                # function name).
+                # spool-off start was otherwise silent (vault BACKLOG #1199). Through Logger.handle,
+                # which skips the logger's level, so [logging].level does not filter this line.
+                # Unlike __main__._write_start_audit it does not check logging.disable() and records
+                # no caller location (at least the line number and function name).
                 _log.handle(
                     _log.makeRecord(
                         _log.name,
@@ -2578,7 +2577,8 @@ def ensure_logger_sink(logger: logging.Logger) -> None:
 
     **Not a forwarder.** This puts the record in front of an operator and into whatever the service
     manager captures; it does not transmit anything off the host. The durable off-box forwarder, and
-    the question of what ASVS 16.4.3 requires beyond it, stay open on BACKLOG #1199.
+    the question of what the ASVS off-box logging requirement asks beyond it, stay open on BACKLOG
+    #1199.
 
     Costs nothing on a configured process: it takes the ``hasHandlers`` branch and builds nothing, so
     no new work lands on the event-loop thread a caller may be running on.
