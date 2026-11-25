@@ -14271,13 +14271,16 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
             except AUDIT_WRITE_DEFECTS:
                 raise  # a bug, not a refused write
             except (*store_call_errors(), *store_connect_errors()) as exc:
-                # The defect first, in the transit-bound commands' order, so a defect whose
-                # context holds a lost link is not read as an unknown outcome.
-                if not isinstance(exc, store_call_errors()) and not _is_transient_driver_error(exc):
-                    # pyodbc's bare Error root on a SQLSTATE that is not transient, such as a
-                    # bind-count mismatch: a defect, as the transit-bound commands treat it, which
-                    # the dispatch floor reports by class and SQLSTATE only. Classes 08 and 40 are
-                    # transient, so a lost link or 40003 never lands here.
+                # pyodbc's bare Error root on a SQLSTATE that is not transient, such as a
+                # bind-count mismatch, is a defect, as the transit-bound commands treat it, which
+                # the dispatch floor reports by class and SQLSTATE only. Unless a lost link sits
+                # in its implicit context: a rollback on a dead connection after a COMMIT whose
+                # link failed raises such a root, and the sessions may have ended, so the outcome
+                # is unknown and the row must record it (BACKLOG #5093).
+                defect = not isinstance(exc, store_call_errors()) and not (
+                    _is_transient_driver_error(exc)
+                )
+                if defect and not _write_outcome_unknown(exc):
                     raise _StoreDefect(_store_error_text(exc)) from exc
                 if _write_outcome_unknown(exc):
                     # The link failed, possibly after the server applied the COMMIT, so nothing
@@ -15729,8 +15732,8 @@ def _write_outcome_unknown(exc: BaseException) -> bool:
         state = driver_sqlstate(link)
         if state is not None and (state.startswith("08") or state == "40003"):
             return True
-        explicit = link.__cause__ is not None or link.__suppress_context__
-        link = None if explicit else link.__context__
+        # Setting a cause, by `raise ... from` or by assignment, also suppresses the context.
+        link = None if link.__suppress_context__ else link.__context__
     return False
 
 

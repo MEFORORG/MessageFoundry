@@ -485,6 +485,75 @@ def test_a_pool_timeout_raised_from_a_timeout_error_stays_refused(
     assert asyncio.run(_state(db, tokens)) == ([False, False], [])
 
 
+def test_a_pyodbc_rollback_error_over_a_lost_commit_reads_as_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SQL Server's shape of the masked commit: the COMMIT's link fails with 08S01, and the
+    rollback on the dead connection raises pyodbc's bare ``Error`` root, HY000, carrying the 08S01
+    only as its context. The sessions ended, so the outcome is unknown and the row records it,
+    not the defect a bare root otherwise reports. pyodbc is not installed on every leg, so the
+    stand-ins the transit-bound tests use take its place."""
+    from tests.test_keyless_chain_every_command import _PyodbcError, _ServerDriverError
+    from tests.test_transit_bound_attestation import _stand_in_server_drivers
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+    _stand_in_server_drivers(monkeypatch)
+    revoke = MessageStore.revoke_all_sessions
+
+    async def masked(self: MessageStore, **kwargs: object) -> RevokeResult:
+        await revoke(self)
+        try:
+            raise _ServerDriverError("08S01", "[08S01] link failure (10054) (SQLEndTran)")
+        except _ServerDriverError:
+            raise _PyodbcError("HY000", "[HY000] connection is busy (0) (SQLEndTran)")  # noqa: B904
+
+    monkeypatch.setattr(MessageStore, "revoke_all_sessions", masked)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "whether it took effect is unknown" in error, error
+    assert "_StoreDefect" not in error, error
+    revoked, audits = asyncio.run(_state(db, tokens))
+    assert revoked == [True, True] and len(audits) == 1
+    assert json.loads(str(audits[0]["detail"]))["outcome"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("sqlstate", "defect"), [("07002", True), ("40001", False)], ids=["bind-count", "deadlock"]
+)
+def test_a_bare_pyodbc_root_is_a_defect_unless_its_state_is_transient(
+    sqlstate: str,
+    defect: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The pyodbc-root arm with no lost link: a bind-count mismatch is a defect the dispatch floor
+    reports by class and SQLSTATE, and a deadlock victim is a refusal that rolled back."""
+    from tests.test_keyless_chain_every_command import _PyodbcError
+    from tests.test_transit_bound_attestation import _stand_in_server_drivers
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+    _stand_in_server_drivers(monkeypatch)
+
+    async def refused(self: MessageStore, **kwargs: object) -> RevokeResult:
+        raise _PyodbcError(sqlstate, f"[{sqlstate}] refused (0) (SQLExecDirectW)")
+
+    monkeypatch.setattr(MessageStore, "revoke_all_sessions", refused)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    if defect:
+        assert error.startswith("_StoreDefect: ") and f"SQLSTATE {sqlstate}" in error, error
+    else:
+        assert error.startswith("nothing was revoked: ") and "unknown" not in error, error
+    assert asyncio.run(_state(db, tokens)) == ([False, False], [])
+
+
 def test_a_suppressed_context_is_not_read_as_a_lost_link(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
