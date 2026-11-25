@@ -1631,7 +1631,7 @@ import, which the worker's forbidden-import guard blocks; another error can come
 `ValueError` for a call with no trust anchor. The import fails closed: left uncaught, the error
 fails that message's call as an isolation denial. `SandboxError` is a `RuntimeError`, so a Handler
 that catches `RuntimeError` catches it too. `mode="off"`, the default, is unaffected, and is the
-only workaround today. It is engine-wide: it gives up the process boundary for every Router and
+only setting that avoids it today. It is engine-wide: it gives up the process boundary for every Router and
 Handler, not only the one that verifies. The fix is tracked in vault BACKLOG #6812.
 
 **What this boundary does NOT cover.** It confines the *address space*, not the machine: a sandboxed

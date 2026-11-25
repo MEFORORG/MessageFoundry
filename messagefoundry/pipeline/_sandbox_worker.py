@@ -694,8 +694,8 @@ def main() -> int:
         except OSError as exc:
             # Part of the frame may be on the pipe already, so another frame after it would put the
             # stream out of step with the parent. Exit without writing one (BACKLOG #6813). The parent
-            # then reads EOF, or the whole frame where the flush at interpreter exit completes it,
-            # and either way starts a fresh worker for the next message.
+            # then reads EOF, or takes the whole frame where the flush at interpreter exit completes
+            # it and finds the worker gone at a later message.
             log.error("sandbox worker: could not write a reply frame (%s)", type(exc).__name__)
             return 1
         except SandboxError as exc:
