@@ -10417,6 +10417,14 @@ row locks (and on SQLite the writer lock). It runs BEFORE the audit chain's lock
 not read chain state."""
 
 
+type InjectAudit = Callable[[str], AuditAppend]
+"""An operator inject's :data:`OperatorAudit`, built from the new message id (BACKLOG #6589).
+
+It returns a row every time: an inject always writes a message, so it always records one, and
+:func:`require_ingress_audit` refuses a ``None`` row at runtime. Typed apart from
+:data:`OperatorAudit` so mypy refuses, at a typed caller, an inject audit that may build none."""
+
+
 def no_audit_row(_result: object) -> None:
     """An :data:`OperatorAudit` that records nothing, for a write whose caller records it itself.
 
@@ -10905,35 +10913,54 @@ def require_mutation_audit[R](audit: OperatorAudit[R], mutation: str) -> Operato
 OPERATOR_ORIGINS: Final = frozenset({MessageOrigin.OPERATOR_EDIT, MessageOrigin.OPERATOR_UPLOAD})
 
 
-def require_ingress_audit(
-    audit: OperatorAudit[str] | None, origin: MessageOrigin
-) -> OperatorAudit[str] | None:
-    """``enqueue_ingress``'s refusal (BACKLOG #5071), and the audit it then runs.
+def is_origin_actor(value: object) -> TypeGuard[str]:
+    """Whether ``value`` can name the user behind an operator origin (BACKLOG #6589): a non-blank
+    string with no surrounding whitespace. The rule :func:`require_ingress_audit` applies, exposed
+    so a caller can refuse first, as the upload resend route does."""
+    return isinstance(value, str) and bool(value) and value == value.strip()
 
-    Before anything is written, an operator origin with no audit or with one that is not callable,
-    and an audit given with any other origin, raise :class:`TypeError`. The audit must also build
-    a row: an inject always writes a message, so a ``None`` row raises inside the transaction and
-    rolls the inject back. A live receipt keeps the default ``partner`` origin and passes none.
+
+def require_ingress_audit(
+    audit: OperatorAudit[str] | None, origin: MessageOrigin, origin_actor: str | None
+) -> InjectAudit | None:
+    """``enqueue_ingress``'s refusal (BACKLOG #5071, #6589), and the audit it then runs.
+
+    Before anything is written, :class:`TypeError` is raised for an operator origin (one in
+    :data:`OPERATOR_ORIGINS`) with no audit, with one that is not callable, or with no
+    ``origin_actor`` naming the user, which must be non-blank and carry no surrounding whitespace;
+    and for an audit or an ``origin_actor`` given with any other origin. The audit must also build a
+    row: an inject always writes a message, so a ``None`` row raises inside the transaction and
+    rolls the inject back. A live receipt keeps the default ``partner`` origin and passes neither.
 
     It keys on ``origin``, so it cannot see an operator's inject written with the default
-    ``partner`` origin: such a call writes neither the operator label nor an audit row. Nothing at
-    the type level holds a direct caller of the store either, since ``audit`` stays optional there.
-    The engine's inject, :meth:`~messagefoundry.pipeline.Engine.inject_message`, requires its
-    ``audit`` and always writes ``operator_upload``."""
+    ``partner`` origin and nothing else: such a call writes neither the operator label nor an audit
+    row. Nothing at the type level holds a direct caller of the store either, since ``audit`` stays
+    optional there. The engine's inject, :meth:`~messagefoundry.pipeline.Engine.inject_message`,
+    requires its ``audit`` and ``actor`` and always writes ``operator_upload``."""
     operator = origin in OPERATOR_ORIGINS
     if not operator:
+        # An audit or an actor is an operator's inject; with this origin the message would be
+        # labelled as a receipt, so the caller forgot the origin.
         if audit is not None:
-            # An audit is an operator's inject; with this origin the message would be labelled
-            # as a receipt, so the caller forgot the origin.
             raise TypeError(
                 f"enqueue_ingress was given an audit with origin {str(origin)!r}; an operator's"
                 " inject names its operator origin (BACKLOG #5071)"
+            )
+        if origin_actor is not None:
+            raise TypeError(
+                f"enqueue_ingress was given an origin_actor with origin {str(origin)!r}; only an"
+                " operator origin names its user (BACKLOG #6589)"
             )
         return None
     if not callable(audit):
         raise TypeError(
             f"enqueue_ingress with origin {str(origin)!r} needs an operator audit, a callable that"
             f" builds its audit row; got {type(audit).__name__} (BACKLOG #5071)"
+        )
+    if not is_origin_actor(origin_actor):
+        raise TypeError(
+            f"enqueue_ingress with origin {str(origin)!r} needs the origin_actor that names its"
+            f" user; got {origin_actor!r} (BACKLOG #6589)"
         )
     build = audit
 
@@ -10975,7 +11002,8 @@ def if_applied(audit: AuditAppend) -> OperatorAudit[bool]:
 
     Anything but an :class:`AuditAppend`, an explicit ``None`` included, raises :class:`TypeError`
     here, so an alert mutation given no row cannot change the alert and record nothing (BACKLOG
-    #5069)."""
+    #5069). Its callers take it as their first statement, so that refusal comes before any write
+    or lock (BACKLOG #6589)."""
     if not isinstance(audit, AuditAppend):
         raise TypeError(
             f"an operator alert mutation or connection flag needs an AuditAppend; got {type(audit).__name__}"
@@ -15036,7 +15064,7 @@ class MessageStore:
         metadata: str | None = None,
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
-        audit: OperatorAudit[str] | None = None,
+        audit: InjectAudit | None = None,
         origin: MessageOrigin = MessageOrigin.PARTNER,
         origin_actor: str | None = None,
     ) -> str:
@@ -15057,7 +15085,7 @@ class MessageStore:
         leaves the attachment at refcount 0 (no ACK → the sender resends; content-addressing dedups the
         resend and the startup ``sweep_orphan_attachments`` reclaims the orphan). Empty/None → the
         byte-identical no-detach path (no incref)."""
-        audit = require_ingress_audit(audit, origin)  # BACKLOG #5071
+        audit = require_ingress_audit(audit, origin, origin_actor)  # BACKLOG #5071, #6589
         now = time.time() if now is None else now
         mid = uuid4().hex
         # Distinct refs only: one skeleton holds a de-duplicated document (two identical OBX-5.5 values
@@ -19362,13 +19390,15 @@ class MessageStore:
         )
 
     async def _commit_alert_change(
-        self, written: AuditedWrite, audit: AuditAppend, applied: bool
+        self, written: AuditedWrite, audit_row: OperatorAudit[bool], applied: bool
     ) -> bool:
         """Append an operator alert mutation's row, when its UPDATE matched, and commit both in the
         one transaction (vault BACKLOG #3217), so a failed append changes nothing and a 404 writes
-        no row. Each caller spells its UPDATE at its own ``execute``, which the transaction-verb
-        guard reads (tests/test_writer_txn_is_the_only_begin.py)."""
-        await self._append_operator_audit(written, if_applied(audit), applied)
+        no row. ``audit_row`` is the caller's :func:`if_applied`, taken as its first statement, so a
+        missing row was refused before the UPDATE (BACKLOG #6589). Each caller spells its UPDATE at
+        its own ``execute``, which the transaction-verb guard reads
+        (tests/test_writer_txn_is_the_only_begin.py)."""
+        await self._append_operator_audit(written, audit_row, applied)
         await self._commit()
         return applied
 
@@ -19382,6 +19412,7 @@ class MessageStore:
         now: float | None = None,
     ) -> None:
         """See :meth:`messagefoundry.store.base.QueueStore.set_connection_flag`."""
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             if flagged:
@@ -19395,7 +19426,7 @@ class MessageStore:
                     "DELETE FROM connection_flag WHERE connection=? AND direction=?",
                     (connection, direction),
                 )
-            await self._append_operator_audit(written, if_applied(audit), True)
+            await self._append_operator_audit(written, audit_row, True)
             await self._commit()
 
     async def list_connection_flags(self) -> set[tuple[str, str]]:
@@ -19408,6 +19439,7 @@ class MessageStore:
     async def ack_alert_instance(
         self, alert_id: int, *, actor: str, audit: AuditAppend, now: float | None = None
     ) -> bool:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # Operator ack: open|acknowledged -> acknowledged, recording acked_by/acked_at. Idempotent (a
         # re-ack is a no-op update). Returns True iff a non-resolved instance with this id existed (so
         # the API can 404 a resolved/unknown id). Acking a resolved instance is refused (no-op, False).
@@ -19418,11 +19450,12 @@ class MessageStore:
                 " WHERE id=? AND status!='resolved'",
                 (actor, now, alert_id),
             )
-            return await self._commit_alert_change(written, audit, cur.rowcount > 0)
+            return await self._commit_alert_change(written, audit_row, cur.rowcount > 0)
 
     async def resolve_alert_instance(
         self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> bool:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # Operator resolve: open|acknowledged -> resolved, recording resolved_at. Returns True iff a
         # non-resolved instance with this id existed.
         now = time.time() if now is None else now
@@ -19432,7 +19465,7 @@ class MessageStore:
                 " WHERE id=? AND status!='resolved'",
                 (now, alert_id),
             )
-            return await self._commit_alert_change(written, audit, cur.rowcount > 0)
+            return await self._commit_alert_change(written, audit_row, cur.rowcount > 0)
 
     async def resolve_alert_instances_for(
         self, *, event_type: str, connection: str, now: float | None = None
@@ -19511,6 +19544,7 @@ class MessageStore:
     async def suspend_alert_instance(
         self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # #143 windowed suspend: mute NOTIFICATIONS for this instance's (event_type, connection) key until
         # `until` (an epoch). NOTIFICATION-only (ADR 0044 AC-3): the instance's status/count/visibility is
         # untouched; only `suspended_until` is set, so it stays open on the dashboard. Refuses a resolved
@@ -19522,7 +19556,7 @@ class MessageStore:
                 "UPDATE alert_instance SET suspended_until=? WHERE id=? AND status!='resolved'",
                 (until, alert_id),
             )
-            applied = await self._commit_alert_change(written, audit, cur.rowcount > 0)
+            applied = await self._commit_alert_change(written, audit_row, cur.rowcount > 0)
         if not applied:
             return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
@@ -19530,6 +19564,7 @@ class MessageStore:
     async def resume_alert_instance(
         self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # #143: clear a windowed suspend (re-alerts resume immediately). Idempotent (clearing an
         # un-suspended instance is a no-op UPDATE). Returns the row, or None if unknown/already resolved.
         now = time.time() if now is None else now
@@ -19538,7 +19573,7 @@ class MessageStore:
                 "UPDATE alert_instance SET suspended_until=NULL WHERE id=? AND status!='resolved'",
                 (alert_id,),
             )
-            applied = await self._commit_alert_change(written, audit, cur.rowcount > 0)
+            applied = await self._commit_alert_change(written, audit_row, cur.rowcount > 0)
         if not applied:
             return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)

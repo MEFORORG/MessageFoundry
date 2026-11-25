@@ -574,6 +574,7 @@ from messagefoundry.store.store import (
     OperatorAudit,
     ReingressOutcome,
     ResendOutcome,
+    is_origin_actor,
 )
 from messagefoundry.store.transit_attestation import (
     read_transit_bound_attestation,
@@ -4346,6 +4347,11 @@ def _plaintext_columns(backend: str, *, encryption_enabled: bool) -> list[str]:
         return list(_SQLSERVER_PLAINTEXT_RESIDUAL)  # () since H4 — full parity, no residual
     return []
 
+
+#: The ``X-Refusal-Code`` value of the upload resend's 403 for an acting username that cannot label
+#: an injected message (BACKLOG #6589). The channel denial's 403 carries none, so a client tells the
+#: two apart by it; the web console's ``uploaded_logs`` routes read the same value.
+RESEND_USERNAME_REFUSAL_CODE: Final = "username_unusable"
 
 #: The status a refused operator resubmission answers with, by the ingress guard that refused it
 #: (BACKLOG #1911). An oversize body is 413. A body that contradicts the inbound's declared type is 415,
@@ -10129,6 +10135,38 @@ def create_app(
         if not identity.can_access_channel(body.to):
             await _audit_channel_denied(engine, identity, body.to, client_ip(request))
             raise HTTPException(403, f"not authorized to inject into inbound {body.to!r}")
+        # BACKLOG #6589: the inject labels the message with this username, and the store refuses a
+        # blank or padded one. A directory name is not held to the local username rule, so refuse it
+        # here, after the channel check and before the upload is read or anything is injected, as a
+        # 403 rather than the store's TypeError. The step-up proof is already spent by then. The
+        # refusal writes an `upload.resend_reject` row, as the ingress guards' refusal does, so a
+        # resend that main would have audited as `upload.resend` is never refused unrecorded.
+        if not is_origin_actor(identity.username):
+            reason = (
+                "this account's username is blank or has surrounding whitespace, so it cannot"
+                " label an injected message"
+            )
+            await engine.store.record_audit(
+                "upload.resend_reject",
+                actor=identity.username,
+                channel_id=body.to,
+                detail=json.dumps(
+                    {
+                        "file_id": file_id,
+                        "index": body.index,
+                        "to": body.to,
+                        "phase": "origin_actor",
+                        "reason": reason,
+                    }
+                ),
+                client=client_ip(request),
+            )
+            _log.warning("upload.resend_reject: the acting username cannot label an inject")
+            # `X-Refusal-Code` tells this 403 apart from the channel denial above, for a JSON
+            # client and for the web console, which maps a bare 403 to that denial.
+            raise HTTPException(
+                403, reason, headers={"X-Refusal-Code": RESEND_USERNAME_REFUSAL_CODE}
+            )
         rr = engine.registry_runner
         if rr is None or body.to not in rr.registry.inbound:
             raise HTTPException(404, f"no such inbound connection: {body.to}")

@@ -9367,8 +9367,29 @@ class AuthService:
             if refusal is not None:
                 raise _DirectoryLoginRefused(refusal)
         if existing is None:
+            # BACKLOG #6589: the birth is recorded in the INSERT's transaction, as an
+            # administrator's create is, so no directory row commits without a row naming it. Its
+            # own action, not `user.created`: no administrator issued anything, and
+            # `_temporary_credential_issuer` reads `user.created` rows as credential issues,
+            # counting each in its window against its page. It names the new row's id, because a
+            # directory may reissue the username (BACKLOG #1471).
+            def born(new_id: str) -> AuditAppend:
+                return AuditAppend(
+                    "auth.ad_user_created",
+                    actor=principal.username,
+                    detail=_json(
+                        {
+                            "user_id": new_id,
+                            "username": principal.username,
+                            "provider": "ad",
+                            "federated": federated,
+                        }
+                    ),
+                    client=client,
+                )
+
             try:
-                user_id = await self._create_directory_row(principal, client=client)
+                user_id = await self._create_directory_row(principal, client=client, birth=born)
             except Exception as exc:
                 if not _is_integrity_refusal(exc):
                     raise
@@ -9545,7 +9566,7 @@ class AuthService:
         client: str | None,
         actor: str | None = None,
         typed_notify_email: str | None = None,
-        audits: Sequence[AuditAppend] = (),
+        birth: Callable[[str], AuditAppend],
     ) -> str:
         """Insert the mirror row for a directory principal the store does not hold, and return its id.
 
@@ -9558,10 +9579,19 @@ class AuthService:
         not adopted (#2021 only). It is bound in the same INSERT, so no crash leaves that row with
         no address. The profile mirror still gets the directory's ``mail``.
 
-        ``audits`` are the caller's own rows for this birth. They commit in the INSERT's
-        transaction, after any not-adopted row (BACKLOG #2221).
+        ``birth`` builds the caller's row recording this birth from the new row's id:
+        ``user.created`` for an administrator's create, ``auth.ad_user_created`` for a sign-in's.
+        Required with no default (BACKLOG #6589), and it must return an :class:`AuditAppend`, or
+        :class:`TypeError` is raised before anything is written. The row commits in the INSERT's
+        transaction (BACKLOG #2221), first, so any not-adopted row follows the birth it names.
         """
         user_id = uuid4().hex
+        born = birth(user_id)
+        if not isinstance(born, AuditAppend):
+            raise TypeError(
+                f"a directory account's birth needs its AuditAppend; got {type(born).__name__}"
+                " (BACKLOG #6589)"
+            )
         # BACKLOG #2014, ASVS 6.3.7. The birth seed is the one time the directory's `mail` can
         # become `notify_email`, where every later security notice goes. So it must pass the test
         # the address form applies before it suggests the same value; the form never sees an
@@ -9597,7 +9627,7 @@ class AuthService:
             directory_object_id=principal.directory_object_id,
             adopt_notify_email=adopt,
             notify_email=typed_notify_email,
-            audits=[*rows, *audits],
+            audits=[born, *rows],
             password_generated=False,
         )
         if not adopt:
@@ -9695,23 +9725,33 @@ class AuthService:
                     " give one as notify_email, such as name@example.org"
                 )
             typed = address = _require_single_mailbox(notify_email)
-        # Committed with the INSERT, not after it (BACKLOG #2221).
-        created = AuditAppend(
-            "user.created",
-            actor=actor,
-            detail=_json(
-                {
-                    "username": principal.username,
-                    "roles": [],
-                    "provider": "ad",
-                    "notify_email_source": "directory" if typed is None else "administrator",
-                }
-            ),
-            client=client,
-        )
+
+        # Committed with the INSERT, not after it (BACKLOG #2221). It names the new row's id, as
+        # the sign-in's birth row does, because a directory may reissue the username (BACKLOG
+        # #6589); `_temporary_credential_issuer` keys on `username` and ignores the extra key.
+        def created(new_id: str) -> AuditAppend:
+            return AuditAppend(
+                "user.created",
+                actor=actor,
+                detail=_json(
+                    {
+                        "user_id": new_id,
+                        "username": principal.username,
+                        "roles": [],
+                        "provider": "ad",
+                        "notify_email_source": "directory" if typed is None else "administrator",
+                    }
+                ),
+                client=client,
+            )
+
         try:
             user_id = await self._create_directory_row(
-                principal, client=client, actor=actor, typed_notify_email=typed, audits=(created,)
+                principal,
+                client=client,
+                actor=actor,
+                typed_notify_email=typed,
+                birth=created,
             )
         except Exception as exc:
             if not _is_integrity_refusal(exc):

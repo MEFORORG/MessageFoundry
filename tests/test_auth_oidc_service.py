@@ -940,6 +940,7 @@ async def test_an_administrator_created_directory_account_binds_and_signs_in_wit
         [row] = await _audit_rows(store, "user.created")
         assert row["actor"] == "admin" and row["client"] == "10.0.0.9"
         assert json.loads(row["detail"]) == {
+            "user_id": user_id,
             "username": "jdoe",
             "roles": [],
             "provider": "ad",

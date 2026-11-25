@@ -782,6 +782,53 @@ async def test_resend_injects_via_enqueue_ingress(engine: Engine, tmp_path: Path
     assert detail["origin"] == "operator_upload" and detail["body_digest"] is None
 
 
+async def test_resend_by_a_padded_username_is_refused_403_with_nothing_injected(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #6589. A directory may hand back a name with surrounding whitespace, which the
+    local username rule never sees, and the store refuses such an ``origin_actor``. The route
+    refuses first, as a 403, so the resend is not a 500 and nothing is injected. The name is
+    padded by a store write after sign-in, as a directory rename would do it. Control: the same
+    resend before the rename injects."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    service = await _make_user(engine, Role.OPERATOR, name="pad")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = reproving_transport(PW, app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "pad")
+        fid = (
+            await c.post("/uploads", files={"file": ("b.hl7", BATCH, "text/plain")}, headers=h)
+        ).json()["file_id"]
+        ok = await c.post(f"/uploads/{fid}/resend", json={"index": 0, "to": "in1"}, headers=h)
+        assert ok.status_code == 200, ok.text
+        user = await engine.store.get_user_by_username("pad")
+        assert user is not None
+        assert await engine.store.set_user_username(
+            user.id, "pad ", expected_username="pad", audits=()
+        )
+        before = int(await engine.store.count_messages(channel_id="in1", allowed_channels=None))
+        r = await c.post(f"/uploads/{fid}/resend", json={"index": 1, "to": "in1"}, headers=h)
+        assert r.status_code == 403, r.text
+        assert "surrounding whitespace" in r.json()["detail"]
+        # Told apart from the channel denial's 403, which carries no code.
+        assert r.headers["X-Refusal-Code"] == "username_unusable"
+    after = int(await engine.store.count_messages(channel_id="in1", allowed_channels=None))
+    assert after == before
+    # The refusal is audited, as main audits the resend it refuses (BACKLOG #6589): exactly one
+    # reject row naming the acting user and the reason, and no second resend row.
+    [reject] = await engine.store.list_audit(action="upload.resend_reject")
+    assert reject["actor"] == "pad "
+    assert reject["channel_id"] == "in1"
+    detail = json.loads(str(reject["detail"]))
+    assert (detail["phase"], detail["file_id"], detail["index"]) == ("origin_actor", fid, 1)
+    assert "surrounding whitespace" in detail["reason"]
+    assert len(await engine.store.list_audit(action="upload.resend")) == 1
+
+
 async def test_resend_unknown_and_not_running_inbound(engine: Engine, tmp_path: Path) -> None:
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
