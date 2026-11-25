@@ -3156,8 +3156,8 @@ _NON_DBAPI_DRIVERS = frozenset({"asyncpg"})
 #: inherits: ``store.schema_verify.SchemaMismatchError`` inherits ``sqlite3.DatabaseError`` so a
 #: store-open handler catches it, and its message is the engine's own (vault BACKLOG #8153, item
 #: 17). That message can quote the text SQLite gave a failed schema step, which can name a
-#: schema object another tool wrote, such as a trigger, and a traceback prints it in the engine's
-#: link while it withholds the driver link below.
+#: schema object another tool wrote, such as a trigger, so :func:`safe_exc` prints it, and a
+#: traceback withholds it as a driver's (:func:`_inherits_a_driver_class`).
 _ENGINE_PACKAGE = "messagefoundry"
 
 
@@ -3329,7 +3329,19 @@ def sqlite_errorname_of(exc: BaseException) -> str | None:
 UNDER_A_DRIVER_ERROR = "[message withheld under a driver error]"
 
 
-def _driver_line(exc: BaseException, *, under: bool) -> str | None:
+def _inherits_a_driver_class(exc: BaseException) -> bool:
+    """Whether any class in ``exc``'s chain is a driver's (:func:`_a_driver_class`), an engine
+    subclass of one included, which :func:`raised_by_a_driver` does not count. A traceback
+    withholds such an error's message, as before vault BACKLOG #8153 item 17: an engine subclass,
+    at least ``store.schema_verify.SchemaMismatchError``, can carry the driver's own text, such as
+    a failed schema step's. A class that raises when read answers ``True``."""
+    try:
+        return any(_a_driver_class(kind) for kind in type(exc).__mro__)
+    except Exception:  # noqa: BLE001 - fail closed, as raised_by_a_driver does
+        return True
+
+
+def _driver_line(exc: BaseException, *, under: bool, in_traceback: bool = False) -> str | None:
     """What a traceback prints after the class name for a database driver's error
     (:func:`raised_by_a_driver`), or for any link a traceback prints under one; None for any other
     link (vault BACKLOG #1661, added item 3). A driver's message can quote a value the statement
@@ -3342,8 +3354,10 @@ def _driver_line(exc: BaseException, *, under: bool) -> str | None:
     driver's own is labelled :data:`UNDER_A_DRIVER_ERROR`, not as a driver's message, since it may
     be an unrelated error the driver error was raised while handling (vault BACKLOG #8153, item
     21). An attribute that raises when read leaves the bare withheld line, since this runs on
-    every link of a logged traceback."""
-    if not raised_by_a_driver(exc):
+    every link of a logged traceback. With ``in_traceback``, an engine subclass of a driver class
+    counts as a driver's error too (:func:`_inherits_a_driver_class`), so a traceback withholds
+    the driver text it carries, while :func:`safe_exc` keeps the engine's message."""
+    if not (raised_by_a_driver(exc) or (in_traceback and _inherits_a_driver_class(exc))):
         return UNDER_A_DRIVER_ERROR if under else None
     try:
         code = _driver_code(exc)
@@ -3401,14 +3415,17 @@ def safe_traceback(ei: ExcInfo) -> str:
         node, exc, under = pending.pop()
         if node is None or exc is None:  # exc is None at the root of an empty exc_info
             continue
-        driver = _driver_line(exc, under=under)
+        driver = _driver_line(exc, under=under, in_traceback=True)
         line = driver if driver is not None else _codec_line(exc, share)
         below = driver is not None  # every link printed under a driver error is withheld too
         if line is not None:
             # The instance's own attribute, so a class-level default cannot pass; and getattr, so a
             # __slots__ class with no __dict__ fails closed rather than raising.
             if "_str" not in getattr(node, "__dict__", {}):  # renamed: fail closed, no traceback
-                return "" if value is None else safe_exc(value)
+                if value is None:
+                    return ""
+                root = _driver_line(value, under=False, in_traceback=True)
+                return f"{type(value).__name__}: {root}" if root is not None else safe_exc(value)
             node._str = line  # the stdlib's private name: see docstring
             if isinstance(exc, SyntaxError):  # printed from these four, never from _str
                 node.msg, node.text, node.filename, node.lineno = line, None, None, None

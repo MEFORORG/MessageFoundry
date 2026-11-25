@@ -447,3 +447,27 @@ def test_a_subclass_of_a_driver_error_outside_the_engine_is_still_a_drivers() ->
         pass
 
     assert raised_by_a_driver(_Elsewhere(f"UNIQUE constraint failed: MRN{_SYNTHETIC_ID}")) is True
+
+
+def test_a_traceback_still_withholds_the_driver_text_an_engine_subclass_carries() -> None:
+    """Vault BACKLOG #8153, item 17's regression. ``SchemaMismatchError`` subclasses
+    ``sqlite3.DatabaseError`` and quotes the failed schema step's SQLite text. main withheld its
+    message in a traceback, since the class walk counted it a driver's. Red on 5c90691ab26: item
+    17 made it the engine's everywhere, so ``safe_traceback`` printed the carried text. Its own
+    message still renders through ``safe_exc``."""
+    import sqlite3
+
+    from messagefoundry.store.schema_verify import SchemaMismatchError
+
+    carried = f"no such column: synthetic_MRN{_SYNTHETIC_ID}"
+    try:
+        try:
+            raise sqlite3.OperationalError(carried)
+        except sqlite3.OperationalError as step:
+            raise SchemaMismatchError(f"The schema step failed: {step}.", cause=str(step)) from step
+    except SchemaMismatchError as caught:
+        text = _rendered(caught)
+        own = safe_exc(caught)
+    assert _SYNTHETIC_ID not in text
+    assert "SchemaMismatchError: [driver message withheld]" in text
+    assert own.startswith("SchemaMismatchError: The schema step failed: ")  # the engine's own
