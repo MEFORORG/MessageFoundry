@@ -503,8 +503,13 @@ def test_an_extended_length_path_names_no_server_on_either_side() -> None:
     cases = {
         r"\\?\D:\coord": "",
         r"\\.\D:\coord": "",
+        r"\\?\D:": "",
         r"\\?\UNC\srv\share\x": "srv",
         r"\\?\unc\srv\share": "srv",
+        r"\\?\UNC\srv": "srv",
+        # Other device forms keep their '?', so they fail fast rather than reach a file call.
+        r"\\?\GLOBALROOT\Device\Mup\srv\share": "?",
+        r"\\?\Volume{0}\coord": "?",
         r"\\srv\share\x": "srv",
         "//srv/share/x": "srv",
         r"C:\coord": "",
@@ -537,4 +542,69 @@ def test_a_non_ascii_checkout_path_reads_the_same_on_both(tmp_path: Path) -> Non
     subprocess.run(["git", "-C", str(r), "init", "-q"], check=True, capture_output=True)
     want = r / ".git" / "mefor-coord"
     assert coord_root.local_root(r) == want
-    assert Path(_pwsh_json(f"Get-CoordLocalRoot -From '{r}' | ConvertTo-Json")) == want
+    # EscapeNonAscii keeps pwsh's stdout ASCII. Without it, a console code page that misread git's
+    # bytes re-encodes them back to the same UTF-8 on the way out, and the test reads the right path
+    # while PowerShell itself held mojibake.
+    # The OEM code page a stock Windows console starts in, set here so the reading does not depend
+    # on how this runner's console was set up.
+    got = _pwsh_json(
+        "[Console]::OutputEncoding = [System.Text.Encoding]::GetEncoding(437); "
+        f"Get-CoordLocalRoot -From '{r}' | ConvertTo-Json -EscapeHandling EscapeNonAscii"
+    )
+    assert Path(got) == want
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "//srv/share/./dir//",
+        r"\\srv\share\dir",
+        r"\\.\UNC\srv\share\x",
+        r"\\UNC\srv\share\x",
+        r"\\?\UNC\srv\share\.\x\\",
+    ],
+)
+def test_the_down_cache_key_is_one_spelling_on_both(path: str) -> None:
+    ps = _pwsh_json(f"ConvertTo-CoordRootKey '{path}' | ConvertTo-Json")
+    assert ps == coord_root._root_key(path)
+
+
+def test_the_down_cache_key_keeps_distinct_roots_apart() -> None:
+    # Dropping every '.' segment merged \\.\UNC\srv (server srv) with \\UNC\srv (server UNC).
+    assert coord_root._root_key(r"\\.\UNC\srv\share\x") != coord_root._root_key(
+        r"\\UNC\srv\share\x"
+    )
+    assert coord_root._root_key("//srv/share/./dir/") == coord_root._root_key(r"\\srv\share\dir")
+
+
+def test_decisions_network_check_reads_a_device_drive_as_its_drive() -> None:
+    # decision.ps1 relied on Get-CoordUncHost naming '?' for \\?\Z:\, which read as network. Now that
+    # names no host, the drive behind the prefix is judged as a bare Z:\ is, and a GLOBALROOT path,
+    # which still names '?', reads as network.
+    decision = ROOT / "scripts" / "coord" / "decision.ps1"
+    system = os.environ.get("SYSTEMDRIVE", "C:")
+    body = (
+        f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{decision}', [ref]$null, "
+        "[ref]$null); $fn = $ast.Find({ param($n) $n -is "
+        "[System.Management.Automation.Language.FunctionDefinitionAst] -and "
+        "$n.Name -eq 'Test-SeatRootIsNetwork' }, $true); . ([scriptblock]::Create($fn.Extent.Text)); "
+        f"ConvertTo-Json -Compress -InputObject @((Test-SeatRootIsNetwork '{system}\\coord'), "
+        f"(Test-SeatRootIsNetwork '\\\\?\\{system}\\coord'), "
+        "(Test-SeatRootIsNetwork '\\\\?\\GLOBALROOT\\Device\\Mup\\srv\\share'))"
+    )
+    bare, device, globalroot = _pwsh_json(body)
+    assert device == bare
+    assert globalroot is True
+
+
+def test_an_array_in_the_down_cache_is_ignored_on_both(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # PowerShell's -ceq filters an array instead of comparing it, so ["<root>"] read as a hit there
+    # and as a miss in Python.
+    down = _local(repo) / "coord-root-down.json"
+    down.parent.mkdir(parents=True)
+    down.write_text(json.dumps({"root": [_DEAD_UNC], "at": "now"}), encoding="utf-8")
+    monkeypatch.setenv("MEFOR_COORD_ROOT", _DEAD_UNC)
+    ps = _ps(repo, "claims")
+    assert ps["Error"] is not None and "cached" not in str(ps["Error"]), ps

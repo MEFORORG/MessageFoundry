@@ -49,9 +49,10 @@ _BLANK_OR_COMMENT = re.compile(r"\A[ \t]*(#.*)?\Z")
 _LINE_BREAK = re.compile(r"\r\n|\n|\r")
 # A drive letter, colon and separator, a UNC \\server\share, or (off Windows) a leading slash.
 _ABSOLUTE = re.compile(r"\A(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+|/(?![\\/]))")
-# A \\server\share or \\?\UNC\server\share path's server. \\?\D:\x and \\.\D:\x are local: the
-# lookahead refuses their '?' or '.', which is a namespace, not a server to probe on 445.
-_UNC = re.compile(r"\A[\\/]{2}(?:[?.][\\/][Uu][Nn][Cc][\\/])?(?![?.][\\/])([^\\/]+)[\\/]")
+# The three patterns Get-CoordUncHost carries; its comment says why each exists.
+_DEVICE_DRIVE = re.compile(r"\A[\\/]{2}[?.][\\/][A-Za-z]:(?:[\\/]|\Z)")
+_DEVICE_UNC = re.compile(r"\A[\\/]{2}[?.][\\/][Uu][Nn][Cc][\\/]([^\\/]+)")
+_UNC = re.compile(r"\A[\\/]{2}([^\\/]+)[\\/]")
 _SEP = re.compile(r"[\\/]")
 
 
@@ -71,13 +72,17 @@ def local_root(start: str | os.PathLike[str] | None = None) -> Path | None:
     args += ["rev-parse", "--path-format=absolute", "--git-common-dir"]
     # Bytes, decoded here: text=True decodes with the ANSI code page on Windows, where git writes
     # UTF-8, so a non-ASCII checkout path read as mojibake or killed the reader thread (BACKLOG #7571).
+    # Strict UTF-8 on Windows, as Get-CoordLocalRoot reads it.
     try:
         proc = subprocess.run(args, capture_output=True, check=False)  # nosec B603 B607 - fixed argv, no shell
-        common = (
-            proc.stdout.decode("utf-8") if os.name == "nt" else os.fsdecode(proc.stdout)
-        ).strip()
-    except (OSError, UnicodeDecodeError):
+    except OSError:
         return None
+    try:
+        out = proc.stdout.decode("utf-8") if os.name == "nt" else os.fsdecode(proc.stdout)
+    except UnicodeDecodeError as exc:
+        print(f"coord_root: git named a common dir that is not UTF-8 ({exc})", file=sys.stderr)
+        return None
+    common = out.strip(_WS)
     if proc.returncode != 0 or not common:
         return None
     return Path(common) / "mefor-coord"
@@ -150,7 +155,10 @@ def _decode(raw: bytes) -> str:
 
 
 def unc_host(path: str) -> str | None:
-    m = _UNC.match(path)
+    """The server a path reaches over SMB, or None for a local path, as Get-CoordUncHost answers."""
+    if _DEVICE_DRIVE.match(path):
+        return None
+    m = _DEVICE_UNC.match(path) or _UNC.match(path)
     return m.group(1) if m else None
 
 
@@ -159,8 +167,10 @@ def _root_key(path: str) -> str:
 
     pathlib turns ``//srv/share/dir/`` into ``\\srv\share\dir`` and PowerShell keeps what it was
     given, so without one spelling each twin missed, and overwrote, the verdict the other wrote.
+    The first two segments stay as written; past them, empty and '.' segments go.
     """
-    return "\\\\" + "\\".join(s for s in _SEP.split(path[2:]) if s and s != ".")
+    s = _SEP.split(path[2:])
+    return "\\\\" + "\\".join(s[:2] + [x for x in s[2:] if x and x != "."])
 
 
 def probe_root(path: Path, local: Path | None) -> str | None:

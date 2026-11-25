@@ -192,8 +192,10 @@ function Test-SeatRootIsNetwork([string]$Path) {
     try {
         $rootOf = [System.IO.Path]::GetPathRoot($Path)
         if (-not $rootOf) { return $true }
-        if ($rootOf -match '\A[A-Za-z]:') {
-            return ([System.IO.DriveInfo]::new($rootOf).DriveType -eq [System.IO.DriveType]::Network)
+        # \\?\Z:\ and \\.\Z:\ name drive Z: too; Get-CoordUncHost reads them as local, so a mapped
+        # network drive behind that prefix is told apart here, as a bare Z:\ is.
+        if ($rootOf -match '\A(?:[\\/]{2}[?.][\\/])?([A-Za-z]:)') {
+            return ([System.IO.DriveInfo]::new($Matches[1] + '\').DriveType -eq [System.IO.DriveType]::Network)
         }
         return $false
     } catch {

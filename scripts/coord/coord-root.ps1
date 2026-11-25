@@ -96,13 +96,28 @@ function ConvertFrom-CoordRootBytes {
 function Get-CoordLocalRoot {
     # <git-common-dir>/mefor-coord for the repository at $From, or $null when git cannot say.
     # --path-format=absolute is not optional: the bare form is relative to the caller's cwd.
+    # Git writes the path as UTF-8, and `& git` decodes it with [Console]::OutputEncoding, an OEM code
+    # page on a stock console, so a non-ASCII checkout read back as mojibake (BACKLOG #7571). Reading
+    # the process's own stream as strict UTF-8 matches local_root in the Python twin, and changes no
+    # process-wide encoding.
     param([string]$From)
     try {
-        $gitArgs = @()
-        if ($From) { $gitArgs = @('-C', $From) }
-        $common = & git @gitArgs rev-parse --path-format=absolute --git-common-dir 2>$null
-        if ($LASTEXITCODE -ne 0 -or -not $common) { return $null }
-        return (Join-Path ([string]$common).Trim() 'mefor-coord')
+        $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
+        if ($From) { $psi.ArgumentList.Add('-C'); $psi.ArgumentList.Add($From) }
+        foreach ($a in 'rev-parse', '--path-format=absolute', '--git-common-dir') { $psi.ArgumentList.Add($a) }
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false, $true)
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        try {
+            $stderr = $proc.StandardError.ReadToEndAsync()
+            $common = $proc.StandardOutput.ReadToEnd().Trim($script:CoordWs)
+            $proc.WaitForExit()
+            [void]$stderr.GetAwaiter().GetResult()
+            if ($proc.ExitCode -ne 0 -or -not $common) { return $null }
+        } finally { $proc.Dispose() }
+        return (Join-Path $common 'mefor-coord')
     } catch { return $null }
 }
 
@@ -173,21 +188,27 @@ function Test-CoordSharedKind {
 }
 
 function Get-CoordUncHost {
-    # The server name of a \\server\share or \\?\UNC\server\share path, or $null for anything else.
-    # \\?\D:\x and \\.\D:\x are local: their '?' or '.' is a namespace, not a server to probe on 445.
-    # The Python twin carries the same pattern.
+    # The server a path reaches over SMB, or $null for a local path. \\?\D:\x and \\.\D:\x are local,
+    # so nothing probes a '?' on 445; \\?\UNC\srv\share names srv. Any other \\?\ or \\.\ form, such as
+    # GLOBALROOT or a volume GUID, still names its '?' or '.', which no probe reaches: it fails fast
+    # rather than risk a file call that hangs. The Python twin carries the same three patterns.
     param([string]$Path)
-    if ($Path -cmatch '\A[\\/]{2}(?:[?.][\\/][Uu][Nn][Cc][\\/])?(?![?.][\\/])([^\\/]+)[\\/]') { return $Matches[1] }
+    if ($Path -cmatch '\A[\\/]{2}[?.][\\/][A-Za-z]:(?:[\\/]|\z)') { return $null }
+    if ($Path -cmatch '\A[\\/]{2}[?.][\\/][Uu][Nn][Cc][\\/]([^\\/]+)') { return $Matches[1] }
+    if ($Path -cmatch '\A[\\/]{2}([^\\/]+)[\\/]') { return $Matches[1] }
     return $null
 }
 
 function ConvertTo-CoordRootKey {
     # One spelling of a UNC root, for the down cache, so each twin reads the verdict the other wrote.
     # Python's Path turns //srv/share/dir/ into \\srv\share\dir, and PowerShell keeps what it was
-    # given. Every separator becomes a backslash, and empty and '.' segments go, as pathlib drops them.
+    # given. Every separator becomes a backslash; past the first two segments (the server and share,
+    # or a \\?\ or \\.\ prefix), empty and '.' segments go. The first two stay as written, so
+    # \\.\UNC\srv and \\UNC\srv keep two keys.
     param([string]$Path)
-    $segments = @(($Path.Substring(2) -split '[\\/]') | Where-Object { $_ -and $_ -cne '.' })
-    return '\\' + ($segments -join '\')
+    $s = @($Path.Substring(2) -split '[\\/]')
+    $rest = if ($s.Count -gt 2) { @(@($s[2..($s.Count - 1)]) -ne '' -cne '.') } else { @() }
+    return '\\' + ((@($s | Select-Object -First 2) + $rest) -join '\')
 }
 
 function Test-CoordRoot {
@@ -197,14 +218,16 @@ function Test-CoordRoot {
     $server = Get-CoordUncHost -Path $Path
     if ($server) {
         $down = if ($LocalRoot) { Join-Path $LocalRoot $script:CoordDownFile } else { $null }
-        $key = ConvertTo-CoordRootKey $Path
+        $key = if ($down) { ConvertTo-CoordRootKey $Path } else { $null }
         # The verdict is about ONE root. A cache written for another root, or stamped in the future by a
         # skewed clock or a copied file, is ignored rather than trusted.
         try {
             if ($down -and (Test-Path -LiteralPath $down -PathType Leaf)) {
                 $age = ([DateTime]::UtcNow - (Get-Item -LiteralPath $down).LastWriteTimeUtc).TotalSeconds
                 $cached = ([System.IO.File]::ReadAllText($down) | ConvertFrom-Json -ErrorAction Stop).root
-                if ($cached -ceq $key -and $age -ge 0 -and $age -lt $script:CoordDownTtlSeconds) {
+                # -is [string] first: on an array, -ceq filters rather than compares, and Python's ==
+                # rejects one.
+                if ($cached -is [string] -and $cached -ceq $key -and $age -ge 0 -and $age -lt $script:CoordDownTtlSeconds) {
                     return @{ Ok = $false; Error = "shared root $Path was unreachable $([int]$age) s ago (cached in $down)" }
                 }
             }
@@ -407,6 +430,8 @@ function Read-CoordText {
             try { $reader.ReadToEnd() } finally { $reader.Dispose() }
         } finally { $stream.Dispose() }
     }
-    if ($text.Length -eq 0) { return }
+    # The null test first: a silenced caller's $text is AutomationNull, and under strict mode its
+    # .Length raises PropertyNotFoundException, which that caller's SilentlyContinue only hides.
+    if ($null -eq $text -or $text.Length -eq 0) { return }
     return $text
 }

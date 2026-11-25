@@ -236,10 +236,11 @@ $x = Read-CoordText '{tmp_path / "gone.json"}'
 
 
 def test_a_silenced_caller_gets_nothing_not_a_null_even_under_strict_mode(tmp_path: Path) -> None:
-    """BACKLOG #7570 claimed `return $text` emits one $null here, and that strict mode throws on
-    `$text.Length`. It does neither: the helper's bare `return` leaves $text AutomationNull, which
-    `return` emits as nothing, and under SilentlyContinue strict mode's error is suppressed too.
-    The control shows the claim's shape is real for a true $null, so the count is not vacuous."""
+    """BACKLOG #7570 claimed `return $text` emits one $null here. It does not: the helper's bare
+    `return` leaves $text AutomationNull, which `return` emits as nothing. The control shows the
+    claim's shape is real for a true $null, so the zero is not vacuous. Its other claim held in
+    part: under strict mode `$text.Length` raised PropertyNotFoundException, which the caller's
+    SilentlyContinue only hid in $Error. The null test now runs first, so none is raised."""
     out = _ps(
         f"""
 function Plain {{ $ErrorActionPreference = 'SilentlyContinue'; Read-CoordText '{tmp_path / "gone.json"}' }}
@@ -251,11 +252,16 @@ function Control {{
     Set-StrictMode -Version Latest; $ErrorActionPreference = 'SilentlyContinue'
     $text = $null; if ($text.Length -eq 0) {{ return }}; return $text
 }}
-[ordered]@{{ plain = @(Plain).Count; strict = @(Strict).Count; control = @(Control).Count }} |
-    ConvertTo-Json -Compress
+$r = [ordered]@{{ plain = @(Plain).Count }}
+$Error.Clear()
+$r.strict = @(Strict).Count
+$r.strictPropertyErrors = @($Error | Where-Object {{
+    $_.Exception -is [System.Management.Automation.PropertyNotFoundException] }}).Count
+$r.control = @(Control).Count
+$r | ConvertTo-Json -Compress
 """
     )
-    assert out == {"plain": 0, "strict": 0, "control": 1}, out
+    assert out == {"plain": 0, "strict": 0, "strictPropertyErrors": 0, "control": 1}, out
 
 
 def test_a_reader_shares_with_a_writer(tmp_path: Path) -> None:
