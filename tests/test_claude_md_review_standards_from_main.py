@@ -41,8 +41,10 @@ _NO_FETCH = (
 
 
 def _example_arguments(text: str) -> list[str]:
-    """Every backticked code-review argument example: a level, a round nonce, then the prompt."""
-    return re.findall(r"`(xhigh round-<hex> [^`]*REVIEW-STANDARDS\.md[^`]*)`", text)
+    """Every backticked code-review argument example: a level first, then a prompt naming the file."""
+    return re.findall(
+        r"`((?:low|medium|high|xhigh|max|ultra) [^`]*REVIEW-STANDARDS\.md[^`]*)`", text
+    )
 
 
 def _reads_standard_from_main(argument: str) -> bool:
@@ -58,7 +60,8 @@ def test_the_example_reads_the_standard_from_origin_main() -> None:
 
 def test_the_check_rejects_the_worktree_copy_a_mention_and_a_missing_fetch() -> None:
     """Positive controls: each wrong form must be found as an example and then fail the check."""
-    for wrong in (_OLD_EXAMPLE, _MENTION_ONLY, _NO_FETCH):
+    other_level = "high Review this diff; read docs/REVIEW-STANDARDS.md and apply its rules."
+    for wrong in (_OLD_EXAMPLE, _MENTION_ONLY, _NO_FETCH, other_level):
         examples = _example_arguments(f"`{wrong}`")
         assert examples == [wrong]
         assert not _reads_standard_from_main(examples[0]), wrong

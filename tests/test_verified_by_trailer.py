@@ -5,12 +5,13 @@
 A missing, unrecognised or contradictory trailer prints one advisory line to stderr; a valid one
 prints nothing, and a merge or a git-generated squash or revert message prints nothing either. No
 case may refuse the commit. Each case runs the real hook as a subprocess on a message file, the way
-git invokes it. These messages cite no ledger number, so the hook exits before any git read and no
-repository is needed.
+git invokes it. These messages cite no ledger number, so the hook's only git call is
+`git interpret-trailers --parse`, which runs outside a repository, and no repository is needed.
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -128,15 +129,56 @@ def test_a_trailer_outside_the_trailer_block_does_not_count(tmp_path: Path, mess
 
 
 @pytest.mark.parametrize(
+    "message",
+    [
+        # A wrapped value: git folds the continuation line into the trailer.
+        "docs: a plain subject\n\nBody.\n\nVerified-by: code-review\n  xhigh\n",
+        # The comment block an editor commit leaves below the message.
+        "docs: a plain subject\n\nBody.\n\nVerified-by: tests\n# Please enter the message.\n#\n",
+    ],
+)
+def test_a_trailer_git_reads_is_counted(tmp_path: Path, message: str) -> None:
+    proc = _run(tmp_path, message)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr == ""
+
+
+@pytest.mark.parametrize("body", ["", "Body.\n\n"])
+def test_a_hash_digit_subject_does_not_hide_the_trailer(tmp_path: Path, body: str) -> None:
+    """A `#1134:` subject, which a -m or -F commit keeps, leaves the trailer block readable.
+
+    The bare-citation check refuses this subject; the advisory must not add a false line above it.
+    """
+    proc = _run(tmp_path, f"#1134: retire the old reader\n\n{body}Verified-by: tests\n")
+    assert proc.returncode == 1, proc.stderr
+    assert "MessageFoundry claim gate" in proc.stderr
+    assert "advisory:" not in proc.stderr
+
+
+def test_git_that_cannot_answer_prints_one_advisory_line(tmp_path: Path) -> None:
+    """No git on PATH: the advisory says the trailer went unchecked, and still refuses nothing."""
+    msg = tmp_path / "COMMIT_EDITMSG"
+    msg.write_bytes(b"docs: a plain subject\n\nBody.\n\nVerified-by: tests\n")
+    proc = subprocess.run(
+        [sys.executable, str(_CHECK), str(msg)],
+        cwd=tmp_path,
+        capture_output=True,
+        encoding="utf-8",
+        errors="backslashreplace",
+        timeout=60,
+        env={**os.environ, "PATH": str(tmp_path)},
+    )
+    line = _one_advisory(proc)
+    assert "git could not read the trailers" in line
+
+
+@pytest.mark.parametrize(
     ("message", "state"),
     [
-        ("Merge branch 'main' into topic\n", ()),
-        ("Merge remote-tracking branch 'origin/main'\n", ()),
+        ("Merge branch 'main' into topic\n", ("MERGE_HEAD",)),
         ("Resolve the conflict by hand\n", ("MERGE_HEAD",)),
         ("Squashed commit of the following:\n\ncommit 0123456789abcdef\n", ()),
-        ("Fold the topic in\n", ("SQUASH_MSG",)),
         ('Revert "docs: a plain subject"\n\nThis reverts commit 0123456789abcdef.\n', ()),
-        ("Back the change out\n", ("REVERT_HEAD",)),
     ],
 )
 def test_a_merge_or_git_generated_message_is_skipped(
@@ -147,9 +189,30 @@ def test_a_merge_or_git_generated_message_is_skipped(
     assert proc.stderr == ""
 
 
-def test_a_merge_shaped_word_in_an_ordinary_subject_still_advises(tmp_path: Path) -> None:
-    """Negative control for the skip: only git's own merge subjects are skipped."""
-    line = _one_advisory(_run(tmp_path, "Merge the two readers into one helper\n\nBody.\n"))
+@pytest.mark.parametrize(
+    ("message", "state"),
+    [
+        ("Merge the two readers into one helper\n\nBody.\n", ()),
+        # A human subject in git's merge shape, with no merge in progress.
+        ("Merge branch handling into the router\n\nBody.\n", ()),
+        # The author's own message while a squash or revert state file lingers.
+        ("Fold the topic in\n\nBody.\n", ("SQUASH_MSG",)),
+        ("Back the change out\n\nBody.\n", ("REVERT_HEAD",)),
+        # The revert sentence in an ordinary commit's body.
+        ("Reland the router\n\nThis reverts commit 0123456789abcdef, which broke X.\n", ()),
+        # The revert sentence only in the diff `git commit -v` appends below the scissors.
+        (
+            'Revert "docs: a plain subject"\n\nBody.\n'
+            "# ------------------------ >8 ------------------------\n"
+            "+This reverts commit 0123456789abcdef.\n"
+            "This reverts commit 0123456789abcdef.\n",
+            (),
+        ),
+    ],
+)
+def test_only_git_shapes_are_skipped(tmp_path: Path, message: str, state: tuple[str, ...]) -> None:
+    """Negative controls for the skip: a look-alike still gets the advisory."""
+    line = _one_advisory(_run(tmp_path, message, state))
     assert line.startswith("advisory: no 'Verified-by:' trailer")
 
 

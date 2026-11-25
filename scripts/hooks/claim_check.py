@@ -36,17 +36,17 @@ not start with one of them, such as an indented or backticked quote, passes. It 
 A fourth check is ADVISORY ONLY (observe mode) and never refuses a commit:
 
     A `Verified-by:` trailer is the author's own statement of what ran on this commit's content
-    before the commit: `code-review <low|medium|high|xhigh|max>`, `verify`, `tests` or `none`.
-    A missing, unrecognised or contradictory one prints one line to stderr, and the commit goes
-    ahead. Only the trailer block counts, the message's last paragraph as git reads trailers.
+    before the commit, one of ``_VERIFIED_BY_ALLOWED``. A missing, unrecognised or contradictory
+    one prints one line to stderr, and the commit goes ahead. Only a trailer that
+    `git interpret-trailers --parse` reads from the message counts.
 
 Nothing checks the statement and nothing records the advisory, so the trailer is never proof that a
 review ran (CLAUDE.md section 5 says what is). It only makes the convention visible before anything
 enforces it. It fires wherever this hook is installed, the vault clone included. At least these
 never print it: `--no-verify`; a box whose ``.git/hooks`` copy predates it; a message the
-attribution check refuses, since that check exits first; a merge commit, or a squash or revert
-message git generated (``_git_generated``); and any commit git writes without running the
-commit-msg hook, such as a squash merge on GitHub.
+attribution check refuses, since that check exits first; a merge commit (MERGE_HEAD present); a
+squash or revert message in the shape git generates (``_git_generated``); and any commit git
+writes without running the commit-msg hook, such as a squash merge on GitHub.
 
 Three scoping decisions for the claim rule, each load-bearing:
 
@@ -524,78 +524,77 @@ def _refuse_trailers(hits: list[tuple[int, str]]) -> int:
     return 1
 
 
-_VERIFIED_BY_LINE = re.compile(r"Verified-by\s*:(?P<value>.*)", re.IGNORECASE)
-_VERIFIED_BY_VALID = re.compile(r"(?:code-review (?:low|medium|high|xhigh|max)|verify|tests|none)")
-_VERIFIED_BY_ALLOWED = "code-review <low|medium|high|xhigh|max>, verify, tests, none"
-_NOT_REFUSED = "this advisory does not refuse the commit"
-# A trailer line as git's trailer parser accepts one: a token of letters, digits and hyphens, then a
-# colon. A line starting with whitespace continues the trailer above it.
-_TRAILER_LINE = re.compile(r"[A-Za-z0-9-]+\s*:")
-_SCISSORS_LINE = re.compile(r"# -+ >8 -+\s*$")
-# The messages git writes itself for a merge, a `merge --squash` and a revert.
-_GIT_MERGE_SUBJECT = re.compile(
-    r"Merge (?:branch|branches|remote-tracking branch|remote-tracking branches|tag|tags|commit|commits) "
+_CODE_REVIEW_LEVELS = ("low", "medium", "high", "xhigh", "max")
+_PLAIN_VALUES = ("verify", "tests", "none")
+_VERIFIED_BY_VALUES = frozenset(
+    (*(f"code-review {level}" for level in _CODE_REVIEW_LEVELS), *_PLAIN_VALUES)
 )
-_GIT_REVERT_BODY = re.compile(r"This reverts commit [0-9a-f]{7,}", re.MULTILINE)
+_VERIFIED_BY_ALLOWED = f"code-review <{'|'.join(_CODE_REVIEW_LEVELS)}>, {', '.join(_PLAIN_VALUES)}"
+_VERIFIED_BY_LINE = re.compile(r"Verified-by\s*:(?P<value>.*)", re.IGNORECASE)
+_NOT_REFUSED = "this advisory does not refuse the commit"
+# The squash and revert messages git writes itself. A merge is read from MERGE_HEAD instead, so a
+# human subject that starts "Merge branch" is not skipped.
 _GIT_SQUASH_SUBJECT = "Squashed commit of the following:"
-# Per-worktree state files present while git is completing a merge, a squash merge or a revert.
-_GIT_STATE_FILES = ("MERGE_HEAD", "SQUASH_MSG", "REVERT_HEAD")
+_GIT_REVERT_SUBJECT = 'Revert "'
+_GIT_REVERT_LINE = re.compile(r"This reverts commit [0-9a-f]{7,}")
+_SCISSORS_LINE = re.compile(r"# -+ >8 -+\s*$")
 
 
-def _trailer_block(message: str) -> list[str]:
-    """The trailer lines of *message*: its last paragraph, if every line of it is trailer-shaped.
+def _trailer_lines(message_file: Path) -> list[str] | None:
+    """The message's trailers as git reads them, one per line, or None when git cannot answer.
 
-    Git's own rule also accepts a last paragraph that is only 25 percent trailers when one of them
-    is git-generated; this stricter reading may then miss a trailer, which costs one spurious
-    advisory line and never a refusal. Comment lines and everything below a scissors line are
-    dropped, as git drops them. The subject paragraph is never a trailer block.
+    `git interpret-trailers --parse` applies git's own rules: the last paragraph only, comment and
+    scissors lines dropped, continuation lines folded into their trailer. It runs outside a
+    repository too, so the hook's tests need none.
     """
-    lines: list[str] = []
-    for line in message.split("\n"):
-        if _SCISSORS_LINE.match(line):
-            break
-        if not line.startswith("#"):
-            lines.append(line)
-    while lines and not lines[-1].strip():
-        lines.pop()
-    while lines and not lines[0].strip():
-        lines.pop(0)
-    blanks = [i for i, line in enumerate(lines) if not line.strip()]
-    if not blanks:
-        return []  # only a subject paragraph
-    block = lines[blanks[-1] + 1 :]
-    if not _TRAILER_LINE.match(block[0]):
-        return []
-    if not all(_TRAILER_LINE.match(ln) or ln[:1] in (" ", "\t") for ln in block):
-        return []
-    return [ln for ln in block if _TRAILER_LINE.match(ln)]
+    try:
+        proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell, no caller-supplied executable
+            ["git", "interpret-trailers", "--parse", str(message_file)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout.split("\n") if proc.returncode == 0 else None
 
 
 def _git_generated(message: str, git_dir: Path) -> bool:
-    """True for a merge commit, or a squash or revert message git wrote itself.
+    """True for a merge commit, or a squash or revert message in the shape git generates.
 
     *git_dir* is the directory of the message file git hands the hook, which is the per-worktree
-    git directory where git keeps MERGE_HEAD and its siblings.
+    git directory where git keeps MERGE_HEAD. Only the text above a scissors line is read, and
+    comment lines are skipped, so a diff that `git commit -v` appends cannot trigger the skip.
     """
-    if any((git_dir / name).exists() for name in _GIT_STATE_FILES):
+    if (git_dir / "MERGE_HEAD").exists():
         return True
     subject = _subject(message)
-    return bool(
-        _GIT_MERGE_SUBJECT.match(subject)
-        or subject == _GIT_SQUASH_SUBJECT
-        or _GIT_REVERT_BODY.search(message)
-    )
+    if subject == _GIT_SQUASH_SUBJECT:
+        return True
+    if not subject.startswith(_GIT_REVERT_SUBJECT):
+        return False
+    for line in message.split("\n"):
+        if _SCISSORS_LINE.match(line):
+            return False
+        if not _COMMENT_LINE.match(line) and _GIT_REVERT_LINE.match(line):
+            return True
+    return False
 
 
-def _verified_by_advisory(message: str) -> str | None:
+def _verified_by_advisory(message_file: Path) -> str | None:
     """The one advisory line for a missing, unrecognised or contradictory trailer, else None.
 
     OBSERVE MODE: main() prints this and carries on. Nothing here may refuse a commit.
     """
+    lines = _trailer_lines(message_file)
+    if lines is None:
+        return f"advisory: git could not read the trailers, so 'Verified-by:' was not checked; {_NOT_REFUSED}\n"
     values = list(
         dict.fromkeys(
             " ".join(m.group("value").split()).lower()
-            for line in _trailer_block(message)
+            for line in lines
             if (m := _VERIFIED_BY_LINE.match(line))
         )
     )
@@ -604,7 +603,7 @@ def _verified_by_advisory(message: str) -> str | None:
     if len(values) > 1:
         shown = _safe_for_message(" / ".join(values), 120)
         return f"advisory: 'Verified-by:' trailers disagree ({shown}); give one value; {_NOT_REFUSED}\n"
-    if _VERIFIED_BY_VALID.fullmatch(values[0]):
+    if values[0] in _VERIFIED_BY_VALUES:
         return None
     shown = _safe_for_message(values[0], 80)
     return (
@@ -628,7 +627,7 @@ def main() -> int:
         return _refuse_trailers(trailers)
 
     if not _git_generated(message, Path(sys.argv[1]).parent):
-        advisory = _verified_by_advisory(message)
+        advisory = _verified_by_advisory(Path(sys.argv[1]))
         if advisory is not None:
             sys.stderr.write(advisory)
 
