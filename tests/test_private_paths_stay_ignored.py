@@ -71,8 +71,8 @@ _PRIVATE_PATHS: list[tuple[str, str]] = [
 # the guard a control: whether a matcher names it is asserted in
 # tests/test_claude_settings_contract.py, not here.
 #
-# This is an exact SET, not a floor. Adding a second negation to the block -- `.claude/rules/`,
-# `.claude/skills/`, an agent definition, anything -- fails here until someone writes it down, and
+# This is an exact SET, not a floor. Re-including another file in the block -- `.claude/rules/`,
+# another skill, an agent definition, anything -- fails here until someone writes it down, and
 # `.claude/worktrees/` reaching this set would publish full nested checkouts.
 _TRACKED_EXCEPTIONS: dict[str, frozenset[str]] = {
     # .claude/skills/verify/SKILL.md is the second: the shared end-to-end smoke skill. An untracked
@@ -126,7 +126,7 @@ def test_nothing_under_a_private_path_is_tracked(rule: str, probe: str) -> None:
     not-publishing are different properties; this asserts the second one.
 
     Asserted as an exact SET against `_TRACKED_EXCEPTIONS`, which is empty for every rule but the
-    `.claude/` one. A floor ("at least these are absent") would pass while a new negation quietly
+    `.claude/` and `docs/testing/` ones. A floor ("at least these are absent") would pass while a new negation quietly
     published a second file; the set makes each addition a deliberate, reviewed edit.
     """
     pathspec = rule.rstrip("*").lstrip("/")
@@ -163,7 +163,9 @@ def test_the_negations_re_include_exactly_their_files() -> None:
     Written as `/.claude/` the directory itself would be excluded, and git cannot re-include a file
     whose parent directory is excluded — the negation would parse fine, apply to nothing, and leave
     `settings.json` untracked with no error anywhere. The contents form `/.claude/*` is what makes it
-    work, so the asymmetry is asserted rather than assumed: one path un-ignored, its siblings not.
+    work, so the asymmetry is asserted rather than assumed: the two files un-ignored, their siblings
+    not. `skills/verify/SKILL.md` needs its two directories re-included and their contents
+    re-ignored, so a sibling inside each re-included directory is probed too.
 
     The siblings matter beyond hygiene. `rules/`, `skills/` and `agents/` are the directories a
     future session is most likely to reach for, and each would reach exactly one checkout while
@@ -192,8 +194,9 @@ def test_the_negations_re_include_exactly_their_files() -> None:
     ):
         res = _git("check-ignore", "-q", "--no-index", sibling)
         assert res.returncode == 0, (
-            f"{sibling!r} is NOT ignored. The negation is meant to cover `settings.json` alone; a "
-            "second `!` line publishes session state or machine-local config. If this path is now "
+            f"{sibling!r} is NOT ignored. The negations are meant to cover `settings.json` and "
+            "`skills/verify/SKILL.md` alone; a wider one publishes session state or machine-local "
+            "config. If this path is now "
             "meant to travel, pin it in _TRACKED_EXCEPTIONS and say why in .gitignore."
         )
 

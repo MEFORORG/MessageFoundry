@@ -117,8 +117,8 @@ builder
 ```
 
 It is git-ignored. Measured with `git check-ignore`: `/.claude/*` is ignored and the `.gitignore`
-permits negating only `settings.json`, so a marker **at the worktree root** can never dirty a tree
-or ride into a commit. `CLAUDE.local.md`, `ROLE.md` and `docs/ROLE.md` were all tested and would
+permits negating only `settings.json` and `skills/verify/SKILL.md`, so a marker **at the worktree
+root** can never dirty a tree or ride into a commit. `CLAUDE.local.md`, `ROLE.md` and `docs/ROLE.md` were all tested and would
 show as untracked, which is why none of them is used.
 
 **The ignore rule is root-anchored, so that guarantee does not travel.** A nested spelling such as

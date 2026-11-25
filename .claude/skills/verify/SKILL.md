@@ -19,8 +19,10 @@ on 2575, signs in as a per-run rig Administrator, and reads the message's dispos
 `GET /messages`. Then it stops the engine and deletes the temp directory. About 20 s.
 
 - Exit 0 prints `PASS e2e smoke`. Exit 1 prints `FAIL <step>: <reason>` on stderr, the step one
-  of `message`, `ports`, `provision`, `serve`, `sign-in`, `ready`, `mllp`, `disposition`. A
-  `serve` or `ready` failure also prints the engine log's tail.
+  of `message`, `ports`, `checkout`, `provision`, `serve`, `sign-in`, `ready`, `mllp`,
+  `disposition`. A `serve` or `ready` failure also prints the engine log's tail.
+- `FAIL checkout` means the venv imports `messagefoundry` from another checkout, so the engine
+  would not run your change. Run `scripts\worktree\ensure-venv.ps1` in this worktree.
 - `FAIL ports` means something already holds 2575, often another engine. Stop it, or point the
   run at your own graph: `--config <dir> --inbound <name> --mllp-port <port>`.
 - `--expect unrouted|filtered|not_deployed|error` asserts another final disposition (`error`

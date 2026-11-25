@@ -2,7 +2,8 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A Codex session in a linked worktree resolves repo skills from the primary checkout.
 
-.gitignore keeps .claude/skills out of git, so a linked worktree carries none of its own.
+.gitignore keeps .claude/skills out of git but for verify/SKILL.md, so a linked worktree carries
+almost none of its own.
 Disposable repositories only; plumbing commands, so no hook in any git config runs.
 """
 

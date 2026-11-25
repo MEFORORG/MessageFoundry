@@ -165,7 +165,7 @@ scripts/security/scan-tokens.local.txt
 # `.claude/` is ignored by CONTENTS (`/.claude/*`), NOT as a directory, so `settings.json` can be
 # re-included on the next line. Ignoring the directory itself would make that negation a silent
 # no-op: git cannot re-include a file whose parent directory is excluded. Everything else under
-# `.claude/` stays ignored by the same star rule -- `settings.local.json` (machine-local, also
+# `.claude/` but `skills/verify/SKILL.md` (re-included below) stays ignored by the same star rule -- `settings.local.json` (machine-local, also
 # named at line 85), `worktrees/` (session state, not configuration), and anything Claude Code
 # adds there later, which is ignored by DEFAULT rather than by enumeration.
 #
@@ -193,8 +193,10 @@ scripts/security/scan-tokens.local.txt
 # protection for the session tree was that wildcard -- `.git/info/exclude` carries it too, but that
 # file is per-clone and reaches nobody else. A later edit that narrows the wildcard or adds a second
 # negation would expose full nested checkouts carrying `.venv`, `messagefoundry.db` and the caches.
-# NOTHING under `.claude/` may be negated except `settings.json` and `skills/verify/SKILL.md`; tests/test_private_paths_stay_ignored.py
-# pins the tracked set so widening it fails a required check instead of shipping.
+# NOTHING under `.claude/` may be negated except `settings.json` and `skills/verify/SKILL.md`, and
+# the two directory negations that reach the latter, whose contents are re-ignored on the next line;
+# tests/test_private_paths_stay_ignored.py pins the tracked set so widening it fails a required
+# check instead of shipping.
 /.claude/worktrees/
 
 # Codex transport is tracked; session state and migration backups are local.
