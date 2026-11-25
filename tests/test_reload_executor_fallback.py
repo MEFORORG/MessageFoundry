@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A reload's worker-thread hops run on the loop when the default executor refuses them (BACKLOG
-#5755, items 3 to 5).
+"""A reload's worker-thread hops still run when the default executor refuses them: on a thread of
+their own, or on the loop only when no thread can start (BACKLOG #5755, items 3 to 5).
 
 Each test shuts the loop's default executor down first, the realistic refusal: ``run_in_executor``
 then raises ``RuntimeError`` at submit, as ``asyncio.to_thread`` did at every one of these hops
@@ -97,7 +97,7 @@ async def test_a_working_executor_runs_the_hop_off_the_loop() -> None:
     assert ran_on and ran_on[0] is not threading.current_thread()
 
 
-async def test_work_the_executor_cancels_while_queued_runs_on_the_loop() -> None:
+async def test_work_the_executor_cancels_while_queued_runs_on_a_thread_of_its_own() -> None:
     """``shutdown(cancel_futures=True)`` cancels queued work; it runs on its own thread instead."""
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     asyncio.get_running_loop().set_default_executor(pool)

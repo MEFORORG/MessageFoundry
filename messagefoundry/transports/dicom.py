@@ -7,10 +7,10 @@
 *send* image and SR objects to MessageFoundry. ``pynetdicom``'s AE server is **blocking/threaded, not
 asyncio-native**, and its C-STORE callback runs on a foreign (acceptor) thread — so the SCP:
 
-* starts/stops the AE server **off the event loop** (``asyncio.to_thread``), so binding/shutdown does
-  not stall other listeners/workers/API calls; a hop the default executor refuses runs on a thread
-  of its own, and on the loop only when no thread can start
-  (:func:`~messagefoundry.threadhop.to_thread_or_loop`);
+* starts/stops the AE server **off the event loop**, in the default executor
+  (:func:`~messagefoundry.threadhop.to_thread_or_loop`), so binding/shutdown does not stall other
+  listeners/workers/API calls; a hop the default executor refuses runs on a thread of its own, and
+  on the loop only when no thread can start;
 * in the C-STORE callback (the foreign thread) re-encodes the received object to its **Part-10 bytes**
   and bridges them back onto the loop-owned ingress via ``asyncio.run_coroutine_threadsafe`` — the same
   loop-bridge pattern as ``db_lookup`` (ADR 0010) — blocking the **worker thread** (never the loop) on

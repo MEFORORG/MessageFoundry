@@ -2951,18 +2951,21 @@ at least when a worker-thread hop with no fallback meets it. The row never
 carries the error's text. A connector build or build check that the executor refused at submit,
 before a worker took it, or cancelled or failed before it began, runs on the event loop instead,
 with a WARNING in the engine log, so that hop does not fail; a bad config is still refused. So do
-at least the trust-anchor reads (a lane's anchor check and the settings preflight), a reload's
-target check, its reads of the config directory and its approval check, a DICOM listener's start
-and stop, and the sandbox session closes (BACKLOG #5755), except that each of these runs on a
-thread of its own rather than on the loop. Only when no thread can be started does it run on the
-event loop, which then blocks while it runs: an anchor on a stalled share for as long as the read
-takes, and a DICOM stop or sandbox close that waits on the loop itself until that wait times out,
-failing an in-flight C-STORE or brokered lookup. Work still queued behind a busy or hung pool waits for it and is not run on the loop. Other
-worker-thread hops have no such fallback, at least the config load and the environment value read,
-which run author or embedder code, the bundle fingerprint, and a connector's own startup check,
-such as a remote-file listing, so a pool that stays broken still fails the reload. The row does
-not claim
-the old graph is still serving: at least a
+at least these hops (BACKLOG #5755), except that each runs on a thread of its own rather than on
+the loop: the trust-anchor reads (a lane's anchor check and the settings preflight), a reload's
+target check, its two snapshots of the config directory (the content snapshot and the reload
+snapshot), its approval check, a DICOM listener's start and stop, and the sandbox session closes.
+Only when no thread can be started does it run on the event loop, which then blocks while it runs:
+an anchor on a stalled share for as long as the read takes, and a DICOM stop or sandbox close that
+waits on the loop itself until that wait times out, failing an in-flight C-STORE or brokered
+lookup. Work still queued behind a busy or hung pool waits for it and is not run on the loop.
+Other worker-thread hops have no such fallback, at least the config load and the environment value
+read, which run author or embedder code, the bundle fingerprint, which also reads the config
+directory, and a connector's own startup check, such as a remote-file listing. So a pool that stays
+broken still fails the reload at the first of these it meets. Nor does a rollback on such a pool
+bring every inbound back: it restarts each of the previous graph's inbounds on its own, so one
+whose start meets such a hop is logged as not restarted and stays down after the rollback, while
+the rollback still tries to restart the rest. The row does not claim the old graph is still serving: at least a
 fault raised after the swap committed leaves the new one live, and `GET /config/provenance` says
 which is. At least these write no such row: a DR activation's reload, and a row whose own write
 fails, which is logged. A cluster convergence reload records such a fault with reason

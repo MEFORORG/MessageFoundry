@@ -865,6 +865,17 @@ def test_the_path_reach_leaf_imports_only_the_standard_library() -> None:
     assert sorted(m for m in modules if m.split(".")[0] not in sys.stdlib_module_names) == []
 
 
+def test_the_threadhop_leaf_imports_only_the_standard_library_and_redaction() -> None:
+    # BACKLOG #5755: transports/, auth/ and pipeline/ all take their refused-executor fallback
+    # through it, so an engine import here beyond the redaction leaf would reach every one of them.
+    path = _ENGINE_ROOT / "threadhop.py"
+    modules = _imported_modules(path, path.parent)
+    assert "concurrent.futures" in modules, "control: the walk did not read the module's imports"
+    assert sorted(m for m in modules if m.split(".")[0] not in sys.stdlib_module_names) == [
+        "messagefoundry.redaction"
+    ]
+
+
 def test_the_leaf_check_fires_on_a_root_import_and_a_third_party_one(tmp_path: Path) -> None:
     planted = tmp_path / "messagefoundry" / "leaf.py"
     planted.parent.mkdir()
