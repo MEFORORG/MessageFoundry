@@ -1,7 +1,9 @@
 # Sandbox A/B (ADR 0087, BACKLOG #3132): [sandbox].mode off versus subprocess at 750 and 1500 inbound
-# MLLP connections, against a real engine the harness OWNS per step. Its readings are evidence for
-# ADR 0052 AC-2 with the subprocess sandbox on. 1500 is the AC-2 target read as inbound connections; 750 is the inbound
-# count if AC-2 counts inbound plus outbound, since a sandbox worker exists per inbound only.
+# MLLP connections, against a real engine the harness OWNS per step. Its readings bear on ADR 0052
+# AC-2 with the subprocess sandbox on, but a passing subprocess step is not on its own AC-2 evidence
+# that every inbound had a worker (the `sandbox_workers` paragraph below says why). 1500 is the AC-2
+# target read as inbound connections; 750 is the inbound count if AC-2 counts inbound plus
+# outbound, since a sandbox worker exists per inbound only.
 #
 # This is an OPERATOR sweep (multi-minute, large port budget, SERVER-DB store) -- never CI:
 #
