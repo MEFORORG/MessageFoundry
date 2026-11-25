@@ -7716,6 +7716,9 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         StoreNotFoundError,
         _UnauditableWrite,
         _StoreOpenRefused,  # the OPEN only: a refused hop (#2532), a key, a short schema (#1720)
+        # Not reached from the open, which _open_store_or_refuse turns into _StoreOpenRefused.
+        # Kept so a key error raised after the open, which no trace here rules out, is still
+        # exit 2 rather than the dispatch floor's 1 (BACKLOG #5633 item 11).
         *_key_unresolved(),
     )
     # A refused store call on every backend (BACKLOG #1983, store_call_errors), and what a store
