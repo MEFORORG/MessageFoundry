@@ -155,14 +155,13 @@ function Get-SkillInstructionSource {
     if (-not $ours) {
         # A marker that cannot NAME the seat may still VETO the instruction: one naming Special, or
         # an alias of it in either roster, prints nothing, as the cwd's marker did before the
-        # repository check. The cwd's roster only adds vetoes here, so a fault reading it is noted
-        # and skipped; this script's roster, or the marker itself, failing to read still throws.
+        # repository check. The cwd's roster only adds vetoes here, so a fault reading it, like one
+        # reading this script's roster or the marker, throws, and no instruction is printed.
         # Like the marker it vetoes as, it outranks $env:KORUS_SEAT. The cost is accepted: a stale
         # Special marker in a shared foreign checkout silences a non-Special seat there too.
         $extra = @()
         if (-not [string]::IsNullOrWhiteSpace($raw) -and (Test-Path -LiteralPath $theirSeats -PathType Leaf)) {
-            try { $extra = @(Get-SeatAliasMap $theirSeats) }
-            catch { [Console]::Error.WriteLine("afk-kill.ps1: the roster $theirSeats could not be read for a veto, so only this script's is used: $($_.Exception.Message)") }
+            $extra = @(Get-SeatAliasMap $theirSeats)
         }
         if (Test-SpecialSeatLabel $raw @($ownSeats) $extra) {
             [Console]::Error.WriteLine("afk-kill.ps1: the hook input's cwd $($p.Cwd) is in $root, which is not shown to be a checkout of this repository, and its seat marker names a Special seat, so no instruction")

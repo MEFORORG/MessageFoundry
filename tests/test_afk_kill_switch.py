@@ -413,13 +413,15 @@ def test_an_alias_only_the_foreign_roster_maps_still_vetoes(sb: Sandbox) -> None
     _veto(_seat_run(sb, "off", "builder", cwd=foreign / "src"))
 
 
-def test_an_unreadable_foreign_roster_is_noted_and_skipped(sb: Sandbox) -> None:
-    # It could only add a veto, so a fault reading it must not silence a non-Special seat.
+def test_an_unreadable_foreign_roster_gives_no_instruction(sb: Sandbox) -> None:
+    # A Special alias only that roster maps would be lost if the fault were skipped, so it throws
+    # and prints no instruction, as a fault reading this script's roster or the marker does.
+    # Every marker here is non-Special, so only the fault can silence the hook.
     foreign = _foreign_repo(sb, "builder")
     (foreign / "docs" / "roles" / "seats.json").write_text("not json", encoding="utf-8")
-    proc = _seat_run(sb, "off", "special", cwd=foreign / "src")
-    _undeclared(proc)
-    assert "could not be read for a veto" in proc.stderr, proc.stderr
+    proc = _seat_run(sb, "off", "builder", cwd=foreign / "src")
+    assert proc.stdout == "" and "no skill instruction" in proc.stderr, (proc.stdout, proc.stderr)
+    assert VETO not in proc.stderr, proc.stderr
 
 
 def test_a_foreign_special_marker_outranks_korus_seat(sb: Sandbox) -> None:
