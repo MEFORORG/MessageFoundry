@@ -2,8 +2,8 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The commit-msg hook reads an optional `Verified-by:` trailer, in OBSERVE MODE only.
 
-A missing, unrecognised or contradictory trailer prints one advisory line to stderr; a valid one
-prints nothing, and a merge or a git-generated squash or revert message prints nothing either. No
+A missing or malformed trailer, or `none` beside another value, prints one advisory line to stderr;
+valid ones print nothing, several different valid values included, and a merge or a git-generated squash or revert message prints nothing either. No
 case may refuse the commit. Each case runs the real hook as a subprocess on a message file, the way
 git invokes it. These messages cite no ledger number, so the hook's only git call is
 `git interpret-trailers --parse`, which runs outside a repository, and no repository is needed.
@@ -57,12 +57,17 @@ def _one_advisory(proc: subprocess.CompletedProcess[str]) -> str:
         "Verified-by: code-review high",
         "Verified-by: code-review xhigh",
         "Verified-by: code-review max",
+        "Verified-by: code-review ultra",
         "Verified-by: verify",
         "Verified-by: tests",
         "Verified-by: none",
         "verified-by:   Code-Review   XHIGH",
         "Verified-by: tests\r",
         "Verified-by: tests\nVerified-by: Tests",
+        # Several valid values, each naming one check that ran. The pre-fix hook flagged these as
+        # disagreeing, so they are the negative control for the "none beside a check" rule below.
+        "Verified-by: tests\nVerified-by: code-review xhigh",
+        "Verified-by: verify\nVerified-by: tests\nVerified-by: code-review ultra",
         "Signed-off-by: A Person <a@example.invalid>\n  continued\nVerified-by: tests",
     ],
 )
@@ -81,10 +86,12 @@ def test_an_absent_trailer_prints_one_advisory_line_and_passes(tmp_path: Path) -
     "trailer",
     [
         "Verified-by: code-review",
-        "Verified-by: code-review ultra",
+        "Verified-by: code-review extreme",
         "Verified-by: ",
         "Verified-by: looked at it",
         "Verified-by: tests and a review",
+        # One malformed value among valid ones is still malformed.
+        "Verified-by: tests\nVerified-by: looked at it",
     ],
 )
 def test_a_malformed_trailer_prints_one_advisory_line_and_passes(
@@ -97,12 +104,12 @@ def test_a_malformed_trailer_prints_one_advisory_line_and_passes(
 @pytest.mark.parametrize(
     "trailers",
     [
-        "Verified-by: tests\nVerified-by: code-review xhigh",
-        "Verified-by: tests\nVerified-by: looked at it",
+        "Verified-by: none\nVerified-by: tests",
+        "Verified-by: code-review xhigh\nVerified-by: none",
     ],
 )
 def test_contradictory_trailers_print_one_advisory_line(tmp_path: Path, trailers: str) -> None:
-    """Two values that differ say nothing about what ran, even when each is valid on its own."""
+    """`none` beside a check that ran contradicts itself; two different checks do not."""
     line = _one_advisory(_run(tmp_path, f"docs: a plain subject\n\nSome body.\n\n{trailers}\n"))
     assert "disagree" in line
 
@@ -173,7 +180,10 @@ def test_git_that_cannot_answer_prints_one_advisory_line(tmp_path: Path) -> None
         env={**os.environ, "PATH": str(tmp_path)},
     )
     line = _one_advisory(proc)
-    assert "git could not read the trailers" in line
+    assert "git could not read the trailers (" in line
+    # The failure's own detail is kept, so the line says why git could not answer.
+    detail = line.split("git could not read the trailers (", 1)[1].split("), so", 1)[0]
+    assert detail.strip(), line
 
 
 @pytest.mark.parametrize(

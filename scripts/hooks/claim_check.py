@@ -36,8 +36,9 @@ not start with one of them, such as an indented or backticked quote, passes. It 
 A fourth check is ADVISORY ONLY (observe mode) and never refuses a commit:
 
     A `Verified-by:` trailer is the author's own statement of what ran on this commit's content
-    before the commit, one of ``_VERIFIED_BY_ALLOWED``. A missing, unrecognised or contradictory
-    one prints one line to stderr, and the commit goes ahead. Only a trailer that
+    before the commit, one of ``_VERIFIED_BY_ALLOWED``. Several trailers may each name one check
+    that ran, such as `tests` and `code-review xhigh`. A missing or malformed one, or `none` beside
+    any other value, prints one line to stderr, and the commit goes ahead. Only a trailer that
     `git interpret-trailers --parse` reads from the message counts.
 
 Nothing checks the statement and nothing records the advisory, so the trailer is never proof that a
@@ -524,7 +525,7 @@ def _refuse_trailers(hits: list[tuple[int, str]]) -> int:
     return 1
 
 
-_CODE_REVIEW_LEVELS = ("low", "medium", "high", "xhigh", "max")
+_CODE_REVIEW_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
 _PLAIN_VALUES = ("verify", "tests", "none")
 _VERIFIED_BY_VALUES = frozenset(
     (*(f"code-review {level}" for level in _CODE_REVIEW_LEVELS), *_PLAIN_VALUES)
@@ -541,8 +542,8 @@ _GIT_REVERT_LINE = re.compile(r"This reverts commit [0-9a-f]{7,}")
 _SCISSORS_LINE = re.compile(r"# -+ >8 -+\s*$")
 
 
-def _trailer_lines(message_file: Path) -> list[str] | None:
-    """The message's trailers as git reads them, one per line, or None when git cannot answer.
+def _trailer_lines(message_file: Path) -> list[str] | str:
+    """The message's trailers as git reads them, one per line, or why git could not answer.
 
     `git interpret-trailers --parse` applies git's own rules: the last paragraph only, comment and
     scissors lines dropped, continuation lines folded into their trailer. `--no-divider` reads a
@@ -551,8 +552,8 @@ def _trailer_lines(message_file: Path) -> list[str] | None:
     """
     try:
         out = _git("interpret-trailers", "--parse", "--no-divider", str(message_file))
-    except (GitReadError, OSError):
-        return None
+    except (GitReadError, OSError) as exc:
+        return _safe_for_message(exc, 160)
     return out.split("\n")
 
 
@@ -579,13 +580,18 @@ def _git_generated(message: str, git_dir: Path) -> bool:
 
 
 def _verified_by_advisory(message_file: Path) -> str | None:
-    """The one advisory line for a missing, unrecognised or contradictory trailer, else None.
+    """The one advisory line for a missing, malformed or contradictory trailer, else None.
 
-    OBSERVE MODE: main() prints this and carries on. Nothing here may refuse a commit.
+    Several valid values are allowed, since each names one check that ran. Only `none` beside any
+    other value contradicts. OBSERVE MODE: main() prints this and carries on. Nothing here may
+    refuse a commit.
     """
     lines = _trailer_lines(message_file)
-    if lines is None:
-        return f"advisory: git could not read the trailers, so 'Verified-by:' was not checked; {_NOT_REFUSED}\n"
+    if isinstance(lines, str):
+        return (
+            f"advisory: git could not read the trailers ({lines}), so 'Verified-by:' was not"
+            f" checked; {_NOT_REFUSED}\n"
+        )
     values = list(
         dict.fromkeys(
             " ".join(m.group("value").split()).lower()
@@ -595,15 +601,14 @@ def _verified_by_advisory(message_file: Path) -> str | None:
     )
     if not values:
         return f"advisory: no 'Verified-by:' trailer ({_VERIFIED_BY_ALLOWED}); {_NOT_REFUSED}\n"
-    if len(values) > 1:
+    bad = [value for value in values if value not in _VERIFIED_BY_VALUES]
+    if bad:
+        shown = _safe_for_message(" / ".join(bad), 80)
+        return f"advisory: 'Verified-by: {shown}' is not one of: {_VERIFIED_BY_ALLOWED}; {_NOT_REFUSED}\n"
+    if "none" in values and len(values) > 1:
         shown = _safe_for_message(" / ".join(values), 120)
-        return f"advisory: 'Verified-by:' trailers disagree ({shown}); give one value; {_NOT_REFUSED}\n"
-    if values[0] in _VERIFIED_BY_VALUES:
-        return None
-    shown = _safe_for_message(values[0], 80)
-    return (
-        f"advisory: 'Verified-by: {shown}' is not one of: {_VERIFIED_BY_ALLOWED}; {_NOT_REFUSED}\n"
-    )
+        return f"advisory: 'Verified-by:' trailers disagree, none beside a check ({shown}); {_NOT_REFUSED}\n"
+    return None
 
 
 def main() -> int:

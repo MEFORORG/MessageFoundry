@@ -849,12 +849,14 @@ Manager's watch reached the cloud session 29 seconds after its question.
 - `pre-commit` does not run mypy. Run it by hand before you commit, or strict typing first fails in
   CI, after your process is gone.
 - End each commit message with a `Verified-by:` trailer naming what ran on that commit's content
-  before the commit: `code-review <low|medium|high|xhigh|max>`, `verify`, `tests` or `none`. A
-  first commit usually says `tests`; a fix commit made after a review may name the review, as
-  `code-review xhigh`. `verify` means the project's `verify` skill (`.claude/skills/verify`) ran.
-  The `commit-msg` hook (`scripts/hooks/claim_check.py`) only advises on this trailer: it prints
-  one line, at least for a missing, unknown or contradictory value, and that advice never refuses
-  the commit. The trailer is the author's own word, so it is **not** proof of code review for the
+  before the commit: `code-review <low|medium|high|xhigh|max|ultra>`, `verify`, `tests` or
+  `none`. Name only a check that ran on this commit's own content. A review of an earlier head does
+  not count for a later commit, so a fix commit made after a review says `tests`, or whatever ran
+  on it. Give one trailer per check that ran, for example `tests` and `code-review xhigh` on two
+  lines; `none` goes alone. `verify` means the project's `verify` skill (`.claude/skills/verify`)
+  ran. The `commit-msg` hook (`scripts/hooks/claim_check.py`) only advises on this trailer: it
+  prints one line, at least for a missing or malformed value, or `none` beside another value, and
+  that advice never refuses the commit. The trailer is the author's own word, so it is **not** proof of code review for the
   Lander; what counts as proof is in the merge bullet under *Branch, commit one layer, open the PR*.
 - If the full suite will not finish inside your turn, run the tests covering your change and push.
   Record in your exit report which checks you ran and which you skipped, for the Manager to carry
