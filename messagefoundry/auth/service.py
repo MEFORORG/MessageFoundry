@@ -2535,15 +2535,22 @@ async def _write_through_cancellation(
 ) -> None:
     """Run ``writes`` to completion even if the caller is cancelled, then re-raise the cancel.
 
-    Shielded, and awaited again after each cancel, so a repeated cancellation neither abandons the
-    writes nor lets the caller leave (and release the account's queue) before they finish. A write
-    that fails raises as it did when the rows were written inline. ``what`` names the writes in
-    the ERROR line logged when one fails while the caller is cancelled."""
+    Waited on, and waited on again after each cancel, so a repeated cancellation neither abandons
+    the writes nor lets the caller leave (and release the account's queue) before they finish. A
+    write that fails raises as it did when the rows were written inline. ``what`` names the writes
+    in the ERROR line logged when one fails while the caller is cancelled.
+
+    BACKLOG #6884: :func:`asyncio.wait`, not :func:`asyncio.shield`. A cancel of the caller cancels
+    neither, but an awaited shield raises the write's own error, so a write that failed after an
+    earlier cancel left the loop with that error, skipping the branch below: the caller left with
+    the write's error and its cancel unconsumed. ``wait`` raises only the caller's cancel, so every
+    outcome is read from ``task`` below. It also leaves no shield behind to log the same failure a
+    second time on asyncio's own logger."""
     task = asyncio.ensure_future(_run_in_order(writes))
     cancelled = False
     while not task.done():
         try:
-            await asyncio.shield(task)
+            await asyncio.wait((task,))
         except asyncio.CancelledError:
             # Recorded before anything else, so a cancel that lands in the turn the writes finish
             # is still re-raised rather than swallowed.
@@ -4517,8 +4524,8 @@ class AuthService:
         # (_step_up_return_audit_floor, charged only past the backstop), so the ceiling never
         # silences a named user outright; a source with no account gets no such row, because
         # client addresses are the caller's to multiply and accounts are not. A row it stops pages
-        # (_page_step_up_return_audit_backstop). Neither is built for a window of 0 or less, which
-        # removes the whole budget (a negative global would otherwise refuse every row there).
+        # (_page_step_up_return_audit_backstop). Neither is built for a window of 0, which removes
+        # the whole budget. The load refuses a negative window or global (BACKLOG #5318).
         backstop_on = (
             settings.login_rate_limit_enabled and settings.login_rate_limit_window_seconds > 0
         )
@@ -5432,7 +5439,7 @@ class AuthService:
         # Before every account write, the repair branch's clears included (R3-F1).
         if await self._unverifiable_account_held():
             raise FirstAdministratorRefused(_UNVERIFIABLE_ACCOUNT_REFUSAL)
-        violations = self._policy.violations(password, username=username)
+        violations = await self._screened_violations(password, username=username)
         if violations:
             raise FirstAdministratorRefused("; ".join(violations))
         # ADR 0197 Amendment A (N-A): the code is proved in memory, before any write.
@@ -7293,7 +7300,6 @@ class AuthService:
             self._oidc_flows,
             return_to="/ui",
             client_ip=client or "",
-            ttl_seconds=self._settings.oidc_flow_ttl_seconds,
             prior_session_hash=_superseded_hash(prior_session),
         )
         challenge = oidc.pkce_challenge(flow.code_verifier)
@@ -7861,7 +7867,6 @@ class AuthService:
             self._oidc_flows,
             return_to=return_to,
             client_ip=client or "",
-            ttl_seconds=self._settings.oidc_flow_ttl_seconds,
             step_up_session_hash=token_hash,
             step_up_user_id=session.user_id,
             step_up_purpose=purpose,
@@ -8650,6 +8655,11 @@ class AuthService:
             # required no pair, so it could sign in an account bound to another identity. No
             # production caller did.
             raise ValueError("a federated login (mech='oidc') needs the verified federated_subject")
+        if federated_subject is not None and mech != "oidc":
+            # BACKLOG #4977, the other direction. A pair with ``mech`` None (or any other value)
+            # minted an OIDC session whose success row, which names ``mech`` only when it is set,
+            # did not say ``"mech": "oidc"``. The pair and the mechanism name travel together.
+            raise ValueError("a federated login (one carrying federated_subject) needs mech='oidc'")
         federated = federated_subject is not None
         if federated != (session_mechanism is SessionMechanism.OIDC):
             # A programming error, not a login outcome: a verified federated pair minted under any
@@ -9370,8 +9380,29 @@ class AuthService:
             if refusal is not None:
                 raise _DirectoryLoginRefused(refusal)
         if existing is None:
+            # BACKLOG #6589: the birth is recorded in the INSERT's transaction, as an
+            # administrator's create is, so no directory row commits without a row naming it. Its
+            # own action, not `user.created`: no administrator issued anything, and
+            # `_temporary_credential_issuer` reads `user.created` rows as credential issues,
+            # counting each in its window against its page. It names the new row's id, because a
+            # directory may reissue the username (BACKLOG #1471).
+            def born(new_id: str) -> AuditAppend:
+                return AuditAppend(
+                    "auth.ad_user_created",
+                    actor=principal.username,
+                    detail=_json(
+                        {
+                            "user_id": new_id,
+                            "username": principal.username,
+                            "provider": "ad",
+                            "federated": federated,
+                        }
+                    ),
+                    client=client,
+                )
+
             try:
-                user_id = await self._create_directory_row(principal, client=client)
+                user_id = await self._create_directory_row(principal, client=client, birth=born)
             except Exception as exc:
                 if not _is_integrity_refusal(exc):
                     raise
@@ -9548,7 +9579,7 @@ class AuthService:
         client: str | None,
         actor: str | None = None,
         typed_notify_email: str | None = None,
-        audits: Sequence[AuditAppend] = (),
+        birth: Callable[[str], AuditAppend],
     ) -> str:
         """Insert the mirror row for a directory principal the store does not hold, and return its id.
 
@@ -9561,10 +9592,19 @@ class AuthService:
         not adopted (#2021 only). It is bound in the same INSERT, so no crash leaves that row with
         no address. The profile mirror still gets the directory's ``mail``.
 
-        ``audits`` are the caller's own rows for this birth. They commit in the INSERT's
-        transaction, after any not-adopted row (BACKLOG #2221).
+        ``birth`` builds the caller's row recording this birth from the new row's id:
+        ``user.created`` for an administrator's create, ``auth.ad_user_created`` for a sign-in's.
+        Required with no default (BACKLOG #6589), and it must return an :class:`AuditAppend`, or
+        :class:`TypeError` is raised before anything is written. The row commits in the INSERT's
+        transaction (BACKLOG #2221), first, so any not-adopted row follows the birth it names.
         """
         user_id = uuid4().hex
+        born = birth(user_id)
+        if not isinstance(born, AuditAppend):
+            raise TypeError(
+                f"a directory account's birth needs its AuditAppend; got {type(born).__name__}"
+                " (BACKLOG #6589)"
+            )
         # BACKLOG #2014, ASVS 6.3.7. The birth seed is the one time the directory's `mail` can
         # become `notify_email`, where every later security notice goes. So it must pass the test
         # the address form applies before it suggests the same value; the form never sees an
@@ -9600,7 +9640,7 @@ class AuthService:
             directory_object_id=principal.directory_object_id,
             adopt_notify_email=adopt,
             notify_email=typed_notify_email,
-            audits=[*rows, *audits],
+            audits=[born, *rows],
             password_generated=False,
         )
         if not adopt:
@@ -9698,23 +9738,33 @@ class AuthService:
                     " give one as notify_email, such as name@example.org"
                 )
             typed = address = _require_single_mailbox(notify_email)
-        # Committed with the INSERT, not after it (BACKLOG #2221).
-        created = AuditAppend(
-            "user.created",
-            actor=actor,
-            detail=_json(
-                {
-                    "username": principal.username,
-                    "roles": [],
-                    "provider": "ad",
-                    "notify_email_source": "directory" if typed is None else "administrator",
-                }
-            ),
-            client=client,
-        )
+
+        # Committed with the INSERT, not after it (BACKLOG #2221). It names the new row's id, as
+        # the sign-in's birth row does, because a directory may reissue the username (BACKLOG
+        # #6589); `_temporary_credential_issuer` keys on `username` and ignores the extra key.
+        def created(new_id: str) -> AuditAppend:
+            return AuditAppend(
+                "user.created",
+                actor=actor,
+                detail=_json(
+                    {
+                        "user_id": new_id,
+                        "username": principal.username,
+                        "roles": [],
+                        "provider": "ad",
+                        "notify_email_source": "directory" if typed is None else "administrator",
+                    }
+                ),
+                client=client,
+            )
+
         try:
             user_id = await self._create_directory_row(
-                principal, client=client, actor=actor, typed_notify_email=typed, audits=(created,)
+                principal,
+                client=client,
+                actor=actor,
+                typed_notify_email=typed,
+                birth=created,
             )
         except Exception as exc:
             if not _is_integrity_refusal(exc):
@@ -12865,8 +12915,9 @@ class AuthService:
         multi-session revocations record it. The count includes lapsed rows the cap ended, which
         the validator already refused; the store returns one count for both.
         """
+        # 0 = unlimited; the load refuses a negative cap (BACKLOG #5318).
         cap = self._settings.max_sessions_per_user
-        if not cap or cap <= 0:
+        if not cap:
             return
         user = await self._load_user(user_id)
         # A user row that has gone owes nothing more; splitting is then the closed choice, since it
@@ -15544,6 +15595,75 @@ class AuthService:
     def password_violations(self, password: str, *, username: str | None = None) -> list[str]:
         return self._policy.violations(password, username=username)
 
+    async def _screened_violations(self, password: str, *, username: str) -> list[str]:
+        """:meth:`PasswordPolicy.violations`, run off the event loop (BACKLOG #6881).
+
+        The screen can read a file. ``lru_cache`` caches no exception, so a missing or unreadable
+        operator corpus is opened again on every call, and a file placed after startup is read
+        whole by the first call; a broken bundled corpus is re-read the same way. Run on a worker
+        thread, none of that blocks the loop. The answer, and any exception, is unchanged.
+
+        One screen at a time per service instance, as the loop used to run them, and the lock is
+        held until the screen's THREAD ends, not until its caller stops waiting. The lock is this
+        instance's while the corpus cache is the module's, so the claims that follow hold within
+        one instance; two instances can each load a corpus, or each block a thread, at once. Within
+        one, a corpus that appears is loaded once, not by every screen that missed the cache
+        together, and a corpus on a path that stops answering blocks one worker thread in all,
+        however many callers give up on it;
+        the others wait on the lock, which a caller may leave by being cancelled. The one way the
+        lock goes early is a cancel of the screen task itself, at loop teardown for example, which
+        releases it while the thread runs on. The screen itself is set lookups, so the queue costs
+        nothing measurable. A screen that fails after its caller left is logged at ERROR, as
+        :func:`_write_through_cancellation` logs a write, since nobody else reads it."""
+        if self._screen_lock is None:
+            self._screen_lock = asyncio.Lock()
+        lock = self._screen_lock
+        await lock.acquire()
+        caller_left = False
+        reported = False
+
+        def report(done: asyncio.Future[list[str]]) -> None:
+            nonlocal reported
+            if reported or done.cancelled() or done.exception() is None:
+                return
+            reported = True
+            _log.error(
+                "a password screen failed after its caller was cancelled",
+                exc_info=done.exception(),
+            )
+
+        def finished(done: asyncio.Future[list[str]]) -> None:
+            lock.release()
+            if not done.cancelled():
+                done.exception()  # retrieved: the caller re-raises it below, or report() logs it
+            if caller_left:
+                report(done)
+
+        try:
+            screen = asyncio.ensure_future(
+                asyncio.to_thread(self._policy.violations, password, username=username)
+            )
+            screen.add_done_callback(finished)
+        except BaseException:
+            # Nothing was scheduled to release it, so a later screen would wait forever.
+            lock.release()
+            raise
+        # ``wait``, not ``await screen``: a cancel of the caller then leaves the screen running,
+        # and its callback, not the caller, releases the lock when the thread is done.
+        try:
+            await asyncio.wait((screen,))
+        except asyncio.CancelledError:
+            caller_left = True
+            if screen.done():
+                # ``finished`` may already have run, before it could know the caller left; report
+                # here, and ``reported`` keeps it to one line if ``finished`` runs after this.
+                report(screen)
+            raise
+        return screen.result()
+
+    #: Serializes :meth:`_screened_violations`; made on first use, inside the running loop.
+    _screen_lock: asyncio.Lock | None = None
+
     async def verify_current_password(
         self,
         identity: Identity,
@@ -17413,7 +17533,7 @@ class AuthService:
             # before the policy, so the answer does not depend on the password typed, and before the
             # hash, so no password_changed row is written for an absent account.
             raise ValueError("no such user")
-        violations = self._policy.violations(new_password, username=identity.username)
+        violations = await self._screened_violations(new_password, username=identity.username)
         if violations:
             return violations
         covered = self._covered_by_requirement(user, identity.roles)

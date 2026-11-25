@@ -14,8 +14,9 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -367,3 +368,508 @@ def test_the_cli_command_refuses_a_missing_store(
     assert main(["admin-revoke-sessions", "--db", str(missing), "--json"]) == 2
     assert "refusing to create one" in json.loads(capsys.readouterr().out)["error"]
     assert not missing.exists()
+
+
+# --- BACKLOG #5093: a revoke whose link to the store failed is reported as unknown ---------------
+
+
+def _on_a_server_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Read the SQLite store under test as a server store, the only kind whose link the revoke
+    reads as lost (``_revoke_link_lost``); the store itself is unchanged."""
+    import messagefoundry.__main__ as cli
+
+    monkeypatch.setattr(cli, "_store_on_network", lambda _settings: True)
+
+
+class _LinkLost(RuntimeError):
+    """A stand-in for a server driver's lost-connection error: asyncpg's carry a ``sqlstate``
+    attribute, and class 08 is a connection exception. A ``RuntimeError``, so it is one of
+    ``store_call_errors()`` with no server driver installed."""
+
+    sqlstate = "08006"
+
+
+@pytest.mark.parametrize(
+    "lost",
+    [lambda: OSError("connection reset by peer"), TimeoutError, _LinkLost],
+    ids=["OSError", "TimeoutError", "sqlstate-08"],
+)
+@pytest.mark.parametrize("committed", [True, False], ids=["after-commit", "before-commit"])
+def test_a_link_lost_during_the_revoke_reads_as_unknown_and_is_recorded(
+    lost: Callable[[], Exception],
+    committed: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A link that fails during the revoke may fail after the server applied the COMMIT, so the
+    command says the outcome is unknown, never "nothing was revoked", and its row records the
+    attempt. The after-commit arm is the case the old text misreported: the sessions ended. A
+    TimeoutError is one of these: a driver's command timeout covers the COMMIT, so it can fire
+    after the server committed."""
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    _on_a_server_store(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+    revoke = MessageStore.revoke_all_sessions
+
+    async def losing(self: MessageStore, **kwargs: object) -> RevokeResult:
+        if committed:
+            await revoke(self)
+        raise lost()  # a fresh instance per case, so no traceback is shared between them
+
+    monkeypatch.setattr(MessageStore, "revoke_all_sessions", losing)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "whether it took effect is unknown" in error, error
+    assert "nothing was revoked" not in error, error
+    assert "records the attempt" in error and "Re-run the command" in error, error
+    revoked, audits = asyncio.run(_state(db, tokens))
+    assert revoked == [committed, committed]
+    assert len(audits) == 1
+    assert json.loads(str(audits[0]["detail"])) == {
+        "scope": "all",
+        "count": None,
+        "outcome": "unknown",
+    }
+    assert str(audits[0]["actor"]).startswith("cli:")
+
+
+def test_a_rollback_error_that_masks_a_lost_commit_reads_as_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A backend that rolls back in an ``except`` block and re-raises loses the COMMIT's lost
+    link to the rollback's own error on the dead connection, which carries it only as its
+    implicit context. That is still an unknown outcome, never "nothing was revoked"; the sessions did end here."""
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    _on_a_server_store(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+    revoke = MessageStore.revoke_all_sessions
+
+    async def masked(self: MessageStore, **kwargs: object) -> RevokeResult:
+        await revoke(self)
+        try:
+            raise _LinkLost()  # the COMMIT's lost link
+        except _LinkLost:
+            # The implicit context is the case under test.
+            raise sqlite3.OperationalError("cannot rollback: the connection is closed")  # noqa: B904
+
+    monkeypatch.setattr(MessageStore, "revoke_all_sessions", masked)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "whether it took effect is unknown" in error, error
+    assert "nothing was revoked" not in error, error
+    revoked, audits = asyncio.run(_state(db, tokens))
+    assert revoked == [True, True] and len(audits) == 1
+
+
+def test_a_pool_timeout_raised_from_a_timeout_error_stays_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The pool's ``StoreAcquireTimeout`` is raised ``from`` a ``TimeoutError``, an OSError, before
+    any transaction began. An explicit cause is not followed, so it stays "nothing was revoked"
+    and writes no row."""
+    from messagefoundry.store.base import StoreAcquireTimeout
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    _on_a_server_store(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+
+    async def borrow_timed_out(self: MessageStore, **kwargs: object) -> RevokeResult:
+        try:
+            raise TimeoutError
+        except TimeoutError as exc:
+            raise StoreAcquireTimeout("store pool acquire timed out after 5s") from exc
+
+    monkeypatch.setattr(MessageStore, "revoke_all_sessions", borrow_timed_out)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error.startswith("nothing was revoked: ") and "unknown" not in error, error
+    assert asyncio.run(_state(db, tokens)) == ([False, False], [])
+
+
+def test_a_pyodbc_rollback_error_over_a_lost_commit_reads_as_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SQL Server's shape of the masked commit: the COMMIT's link fails with 08S01, and the
+    rollback on the dead connection raises pyodbc's bare ``Error`` root, HY000, carrying the 08S01
+    only as its context. The sessions ended, so the outcome is unknown and the row records it,
+    not the defect a bare root otherwise reports. pyodbc is not installed on every leg, so the
+    stand-ins the transit-bound tests use take its place."""
+    from messagefoundry.store.base import store_call_errors
+    from tests.test_keyless_chain_every_command import _PyodbcError, _ServerDriverError
+    from tests.test_transit_bound_attestation import _stand_in_server_drivers
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    _on_a_server_store(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+    # Warmed before the stand-ins: the tuple is cached, and a first call under them would
+    # keep the stand-in in it for every later test on this worker.
+    store_call_errors()
+    _stand_in_server_drivers(monkeypatch)
+    revoke = MessageStore.revoke_all_sessions
+
+    async def masked(self: MessageStore, **kwargs: object) -> RevokeResult:
+        await revoke(self)
+        try:
+            raise _ServerDriverError("08S01", "[08S01] link failure (10054) (SQLEndTran)")
+        except _ServerDriverError:
+            raise _PyodbcError("HY000", "[HY000] connection is busy (0) (SQLEndTran)")  # noqa: B904
+
+    monkeypatch.setattr(MessageStore, "revoke_all_sessions", masked)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "whether it took effect is unknown" in error, error
+    assert "_StoreDefect" not in error, error
+    revoked, audits = asyncio.run(_state(db, tokens))
+    assert revoked == [True, True] and len(audits) == 1
+    assert json.loads(str(audits[0]["detail"]))["outcome"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("sqlstate", "defect"), [("07002", True), ("40001", False)], ids=["bind-count", "deadlock"]
+)
+def test_a_bare_pyodbc_root_is_a_defect_unless_its_state_is_transient(
+    sqlstate: str,
+    defect: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The pyodbc-root arm with no lost link: a bind-count mismatch is a defect the dispatch floor
+    reports by class and SQLSTATE, and a deadlock victim is a refusal that rolled back."""
+    from messagefoundry.store.base import store_call_errors
+    from tests.test_keyless_chain_every_command import _PyodbcError
+    from tests.test_transit_bound_attestation import _stand_in_server_drivers
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+    # Warmed before the stand-ins: the tuple is cached, and a first call under them would
+    # keep the stand-in in it for every later test on this worker.
+    store_call_errors()
+    _stand_in_server_drivers(monkeypatch)
+
+    async def refused(self: MessageStore, **kwargs: object) -> RevokeResult:
+        raise _PyodbcError(sqlstate, f"[{sqlstate}] refused (0) (SQLExecDirectW)")
+
+    monkeypatch.setattr(MessageStore, "revoke_all_sessions", refused)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    if defect:
+        assert error.startswith("_StoreDefect: ") and f"SQLSTATE {sqlstate}" in error, error
+    else:
+        assert error.startswith("nothing was revoked: ") and "unknown" not in error, error
+    assert asyncio.run(_state(db, tokens)) == ([False, False], [])
+
+
+def test_a_suppressed_context_is_not_read_as_a_lost_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control: a refusal raised ``from None`` names its context irrelevant, so a lost link
+    there does not make the outcome unknown."""
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    _on_a_server_store(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+
+    async def suppressed(self: MessageStore, **kwargs: object) -> RevokeResult:
+        try:
+            raise _LinkLost()
+        except _LinkLost:
+            raise sqlite3.OperationalError("database is locked") from None
+
+    monkeypatch.setattr(MessageStore, "revoke_all_sessions", suppressed)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error.startswith("nothing was revoked: "), error
+    assert asyncio.run(_state(db, tokens)) == ([False, False], [])
+
+
+def test_an_os_error_on_a_sqlite_store_is_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A SQLite file has no link to lose, and a revoke that raised there rolled back, so an
+    OSError is "nothing was revoked" and writes no row."""
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+
+    async def failing(self: MessageStore, **kwargs: object) -> RevokeResult:
+        raise OSError("disk I/O error")
+
+    monkeypatch.setattr(MessageStore, "revoke_all_sessions", failing)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error.startswith("nothing was revoked: ") and "unknown" not in error, error
+    assert asyncio.run(_state(db, tokens)) == ([False, False], [])
+
+
+def test_a_server_store_failure_that_names_no_lost_commit_is_a_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """On a server store, a refusal raised while an OSError was being handled names no lost
+    COMMIT: "nothing was revoked", no row."""
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    _on_a_server_store(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+
+    async def failing(self: MessageStore, **kwargs: object) -> RevokeResult:
+        try:
+            raise ConnectionResetError("reset while reading a setting")
+        except OSError:
+            raise sqlite3.OperationalError("the statement was refused")  # noqa: B904
+
+    monkeypatch.setattr(MessageStore, "revoke_all_sessions", failing)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error.startswith("nothing was revoked: ") and "unknown" not in error, error
+    assert asyncio.run(_state(db, tokens)) == ([False, False], [])
+
+
+def test_a_report_that_fails_after_the_commit_is_a_revoke_that_landed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The store's revoke commits, then the seal report ``RevokeSealOutcome.committing`` runs
+    after it raises. The sessions are ended, so the command says so, with no count, and writes
+    the row, never "nothing was revoked". The real revoke runs; only the report is made to
+    fail."""
+    from messagefoundry.store.store import RevokeSealOutcome
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+    report = RevokeSealOutcome._report
+
+    async def failing(self: RevokeSealOutcome, record_audit: Any, *, end: Any) -> None:
+        if end == "committed":
+            raise RuntimeError("the report failed")
+        await report(self, record_audit, end=end)
+
+    monkeypatch.setattr(RevokeSealOutcome, "_report", failing)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error.startswith("the revoke committed, so the sessions it found are ended"), error
+    assert "nothing was revoked" not in error and "records it" in error, error
+    revoked, audits = asyncio.run(_state(db, tokens))
+    assert revoked == [True, True] and len(audits) == 1
+    assert json.loads(str(audits[0]["detail"])) == {
+        "scope": "all",
+        "count": None,
+        "outcome": "committed",
+    }
+
+
+def test_a_defect_in_the_audit_append_is_raised_not_reported_as_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An audit-write defect after the revoke is a bug, so it reaches the dispatch floor as it
+    did on main, rather than reading as a store that refused the row."""
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "cli.db"
+    asyncio.run(_seed(db))
+    record = MessageStore.record_audit
+
+    async def defective(self: MessageStore, action: str, **kwargs: Any) -> Any:
+        if action == "auth.session_revoked":
+            raise NotImplementedError("record_audit")
+        return await record(self, action, **kwargs)
+
+    monkeypatch.setattr(MessageStore, "record_audit", defective)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "NotImplementedError" in error and "could not be written" not in error, error
+
+
+def test_an_unknown_outcome_whose_row_is_refused_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """When the row that would record an unknown outcome is refused too, the command says to
+    record the attempt by hand rather than claim a row it did not write."""
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    _on_a_server_store(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+    record = MessageStore.record_audit
+
+    async def losing(self: MessageStore, **kwargs: object) -> RevokeResult:
+        raise OSError("connection reset by peer")
+
+    async def refusing(self: MessageStore, action: str, **kwargs: Any) -> Any:
+        if action == "auth.session_revoked":
+            raise OSError("connection reset by peer")
+        return await record(self, action, **kwargs)
+
+    monkeypatch.setattr(MessageStore, "revoke_all_sessions", losing)
+    monkeypatch.setattr(MessageStore, "record_audit", refusing)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "whether it took effect is unknown" in error, error
+    assert "could not be written either" in error and "record the attempt by hand" in error
+    assert "records the attempt" not in error, error
+    assert asyncio.run(_state(db, tokens)) == ([False, False], [])
+
+
+def test_a_refused_revoke_still_says_nothing_was_revoked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control: a refusal that is not a lost link rolled the revoke back, so the command says
+    nothing was revoked and writes no row."""
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+
+    async def busy(self: MessageStore, **kwargs: object) -> RevokeResult:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(MessageStore, "revoke_all_sessions", busy)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error.startswith("nothing was revoked: ") and "unknown" not in error, error
+    assert error.endswith(
+        "Retry; if the engine is running on this SQLite store, stop it and re-run"
+    )
+    assert asyncio.run(_state(db, tokens)) == ([False, False], [])
+
+
+def test_a_refusal_that_is_not_a_lock_gets_no_stop_the_engine_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control for the hint: only a lock is fixed by stopping a SQLite engine."""
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "cli.db"
+    asyncio.run(_seed(db))
+
+    async def refused(self: MessageStore, **kwargs: object) -> RevokeResult:
+        raise sqlite3.OperationalError("disk is full")
+
+    monkeypatch.setattr(MessageStore, "revoke_all_sessions", refused)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error.startswith("nothing was revoked: ") and error.endswith("Retry"), error
+
+
+def test_an_os_user_that_cannot_be_named_revokes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The OS user is named before the store opens, as admin-unlock names it, so a shell that
+    cannot name it ends no session it would then fail to record."""
+    import getpass
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+
+    def nobody() -> str:
+        raise OSError("no such user")
+
+    monkeypatch.setattr(getpass, "getuser", nobody)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error.startswith("cannot name the OS user") and "nothing was revoked" in error, error
+    assert asyncio.run(_state(db, tokens)) == ([False, False], [])
+
+
+def test_a_close_that_fails_after_the_revoke_still_reports_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A close that fails once the revoke and its row have committed warns, and the command still
+    reports the revoke it made."""
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+    close = MessageStore.close
+
+    async def failing_close(self: MessageStore) -> None:
+        await close(self)
+        raise OSError("close failed")
+
+    monkeypatch.setattr(MessageStore, "close", failing_close)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"ok": True, "revoked": 2}
+    assert "closing the store failed (OSError)" in captured.err
+    monkeypatch.setattr(MessageStore, "close", close)
+    revoked, audits = asyncio.run(_state(db, tokens))
+    assert revoked == [True, True] and len(audits) == 1
+
+
+def test_a_transit_refusal_of_the_row_after_the_revoke_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A row refused after the revoke committed by an error outside ``store_call_errors()``, here
+    the ``CipherError`` a vault_transit store raises when it cannot compute the chain's MAC, is
+    still reported as the command's own refusal: the sessions are ended, record the act by hand."""
+    from messagefoundry.store.crypto import CipherError
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+    record = MessageStore.record_audit
+
+    async def refusing(self: MessageStore, action: str, **kwargs: Any) -> Any:
+        if action == "auth.session_revoked":
+            raise CipherError("transit unreachable")
+        return await record(self, action, **kwargs)
+
+    monkeypatch.setattr(MessageStore, "record_audit", refusing)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error.startswith("ended 2 unrevoked session row(s), but the audit row could not be")
+    assert "record the act by hand" in error, error
+    assert asyncio.run(_state(db, tokens)) == ([True, True], [])
+
+
+def test_the_cli_text_says_what_the_count_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5095 step 2: the count is the unrevoked rows the sweep ended, an expired one never
+    purged among them, so the text says so; the global epoch is what ends every other session."""
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "cli.db"
+    asyncio.run(_seed(db))
+
+    async def expired_row() -> None:
+        store = await MessageStore.open(db)
+        try:
+            await store.create_session(
+                token_hash=hash_token(mint_token()),
+                user_id="cli-a",
+                expires_at=1.0,  # long expired, and never purged
+                client="192.0.2.10",
+                auth_mechanism="password",
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(expired_row())
+    assert main(["admin-revoke-sessions", "--db", str(db)]) == 0
+    out = capsys.readouterr().out
+    # Two live sessions and the expired row: the count is every unrevoked row the sweep ended.
+    assert out.startswith("OK: ended 3 unrevoked session row(s), expired ones included"), out
+    assert "raised the global session epoch" in out, out

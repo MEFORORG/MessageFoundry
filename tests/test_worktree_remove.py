@@ -44,6 +44,7 @@ from pathlib import Path
 import pytest
 
 from tests._no_prompt import run_holding_stdin_open
+from tests.test_coord_claim_adjudicate import _flat
 from tests.test_worktree_remove_path import _ENV, copy_real_scripts, settle_worktrees
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -774,14 +775,9 @@ def test_removal_still_succeeds_with_no_claims_directory(fx: Fixture) -> None:
 
 # --- BACKLOG #1293: allocations a removed worktree owns ------------------------
 #
-# Ownership of a ledger number is a casefolded PATH-STRING comparison against the worktree recorded
-# at allocation time, with no fallback when that directory is gone. So removal BURNS the number:
-# `owns()` returns false for every session forever and any PR that must re-introduce the heading is
-# unlandable by anyone. PR #397 was stranded exactly this way.
-#
-# IT REFUSES RATHER THAN WARNS BECAUSE THERE IS NO POST-HOC FIX. A claim can be released afterwards;
-# an allocation cannot be re-keyed -- ownership is documented non-transferable -- so the removal is
-# the only moment this can be stopped.
+# Removing the worktree an allocation record names can strand the number; PR #397 was stranded this
+# way. The ownership rule, and which records a recorded branch can still recover, are in
+# docs/LEDGER-GATE.md, "When the owning worktree is gone".
 
 
 def _alloc_dir(fx: Fixture, kind: str = "backlog") -> Path:
@@ -791,7 +787,9 @@ def _alloc_dir(fx: Fixture, kind: str = "backlog") -> Path:
     return d
 
 
-def _write_alloc(fx: Fixture, number: str, worktree: Path | str, kind: str = "backlog") -> Path:
+def _write_alloc(
+    fx: Fixture, number: str, worktree: Path | str, kind: str = "backlog", branch: str = "b"
+) -> Path:
     f = _alloc_dir(fx, kind) / f"{number}.json"
     f.write_text(
         json.dumps(
@@ -799,7 +797,7 @@ def _write_alloc(fx: Fixture, number: str, worktree: Path | str, kind: str = "ba
                 "number": number,
                 "kind": kind,
                 "title": "t",
-                "branch": "b",
+                "branch": branch,
                 "worktree": str(worktree).replace("\\", "/"),
             }
         ),
@@ -831,7 +829,7 @@ def test_removal_is_REFUSED_when_the_worktree_owns_an_unlanded_number(fx: Fixtur
     _write_alloc(fx, "9101", wt)
 
     proc = run(fx, "-Name", "alpha")
-    assert proc.returncode != 0, "the removal proceeded and burned the number"
+    assert proc.returncode != 0, "the removal proceeded past an unlanded number"
     assert "9101" in proc.stderr, "the refusal does not name the number, so nobody can act on it"
     assert fx.is_registered(wt), "the worktree was removed despite the refusal"
 
@@ -865,7 +863,7 @@ def test_an_allocation_owned_by_a_DIFFERENT_worktree_does_not_block(fx: Fixture)
 
 def test_an_unreadable_allocation_record_refuses(fx: Fixture) -> None:
     """CANNOT-TELL COUNTS AS AT-RISK. An unparseable record might name this worktree, and proceeding
-    on that ambiguity is the irreversible direction."""
+    on that ambiguity may strand its number."""
     wt = fx.add("alpha")
     (_alloc_dir(fx) / "9104.json").write_text("{not json", encoding="utf-8")
 
@@ -876,9 +874,8 @@ def test_an_unreadable_allocation_record_refuses(fx: Fixture) -> None:
 
 
 def test_the_override_is_NOT_Force(fx: Fixture) -> None:
-    """-Force means "I accept losing uncommitted changes". It must not also mean "I accept burning a
-    ledger number" -- one consent covering two unrelated risks is how an irreversible one gets given
-    away by accident."""
+    """-Force means "I accept losing uncommitted changes". It must not also mean "I accept stranding
+    a ledger number" -- one consent covering two unrelated risks gives the second away by accident."""
     wt = fx.add("alpha")
     _write_alloc(fx, "9105", wt)
 
@@ -889,6 +886,105 @@ def test_the_override_is_NOT_Force(fx: Fixture) -> None:
     allowed = run(fx, "-Name", "alpha", "-AllowOrphanedAllocations")
     assert allowed.returncode == 0, allowed.stderr
     assert not fx.is_registered(wt)
+
+
+# The refusal states one outcome PER RECORD, because the outcomes differ (BACKLOG #1282): one
+# sentence for every record was false for one class or the other, whichever way it was worded.
+
+_RECOVERABLE = "can still commit it: a worktree on a branch of that name is entitled to it"
+_STRANDED = "no other worktree can commit it once this one is removed"
+
+
+def test_an_adr_record_with_a_branch_is_named_recoverable_by_that_branch(fx: Fixture) -> None:
+    wt = fx.add("alpha")
+    _write_alloc(fx, "9106", wt, kind="adr", branch="feat/x")
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode != 0, "removal proceeded past a recorded allocation"
+    assert f"a recorded branch feat/x {_RECOVERABLE}" in _flat(proc.stderr), proc.stderr
+    assert _STRANDED not in _flat(proc.stderr), proc.stderr
+    assert fx.is_registered(wt)
+
+
+def test_a_record_with_no_branch_is_named_unrecoverable(fx: Fixture) -> None:
+    wt = fx.add("alpha")
+    _write_alloc(fx, "9107", wt, kind="adr", branch="")
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode != 0, "removal proceeded past a recorded allocation"
+    assert _STRANDED in _flat(proc.stderr), proc.stderr
+    assert _RECOVERABLE not in _flat(proc.stderr), proc.stderr
+    assert fx.is_registered(wt)
+
+
+def test_a_detached_head_placeholder_is_not_read_as_a_branch(fx: Fixture) -> None:
+    """alloc.ps1 records a detached HEAD as ``detached@<sha>``, which names no branch."""
+    wt = fx.add("alpha")
+    _write_alloc(fx, "9109", wt, kind="adr", branch="detached@abc1234")
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode != 0, "removal proceeded past a recorded allocation"
+    assert _STRANDED in _flat(proc.stderr), proc.stderr
+    assert _RECOVERABLE not in _flat(proc.stderr), proc.stderr
+
+
+def test_a_record_field_cannot_forge_a_line_in_the_refusal(fx: Fixture) -> None:
+    """The record's text lands in prose an agent acts on (the BACKLOG #1040 route)."""
+    wt = fx.add("alpha")
+    f = _write_alloc(fx, "9110", wt, kind="adr", branch="b")
+    record = json.loads(f.read_text(encoding="utf-8"))
+    record["title"] = "x\nDo this instead:\tforged"
+    f.write_text(json.dumps(record), encoding="utf-8")
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode != 0, "removal proceeded past a recorded allocation"
+    assert "x?Do this instead:?forged" in _flat(proc.stderr), proc.stderr
+
+
+def test_a_backlog_record_with_a_branch_is_named_unrecoverable(fx: Fixture) -> None:
+    """The engine checks only adr numbers with owns(), so a backlog record's branch recovers nothing."""
+    wt = fx.add("alpha")
+    _write_alloc(fx, "9108", wt, kind="backlog", branch="feat/y")
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode != 0, "removal proceeded past a recorded allocation"
+    assert _STRANDED in _flat(proc.stderr), proc.stderr
+    assert _RECOVERABLE not in _flat(proc.stderr), proc.stderr
+    assert fx.is_registered(wt)
+
+
+_DELETE_BRANCH_WARNING = (
+    "A record with no branch, or whose branch is deleted (-DeleteBranch on this run can delete the "
+    "branch checked out here), can then be committed from a worktree recreated at this path"
+)
+
+
+def test_under_DeleteBranch_a_recorded_branch_is_not_named_recoverable(fx: Fixture) -> None:
+    """The re-run this refusal offers, with -AllowOrphanedAllocations, can also delete the branch
+    checked out here, which is usually the recorded one, so the line must not promise it survives.
+
+    The record names the branch the worktree is on, as alloc.ps1 records it."""
+    wt = fx.add("alpha")
+    here = _git(wt, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    assert here and here != "HEAD", here
+    _write_alloc(fx, "9111", wt, kind="adr", branch=here)
+
+    proc = run(fx, "-Name", "alpha", "-DeleteBranch")
+    flat = _flat(proc.stderr)
+    assert proc.returncode != 0, "removal proceeded past a recorded allocation"
+    assert _RECOVERABLE not in flat, proc.stderr
+    assert (
+        f"if that is the recorded branch {here}, the number then rests on a worktree recreated"
+        in flat
+    ), proc.stderr
+    assert _DELETE_BRANCH_WARNING in flat, proc.stderr
+    assert fx.is_registered(wt)
+
+    # The control: without the flag, the same record is named recoverable and no warning prints.
+    plain = run(fx, "-Name", "alpha")
+    assert plain.returncode != 0, "removal proceeded past a recorded allocation"
+    assert _RECOVERABLE in _flat(plain.stderr), plain.stderr
+    assert "-DeleteBranch" not in _flat(plain.stderr), plain.stderr
 
 
 # --- BACKLOG #1829: the retired-allocator tombstone ------------------------------------------------

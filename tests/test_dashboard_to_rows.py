@@ -167,7 +167,7 @@ def test_metric_rows_contract() -> None:
     assert rows["release_distance.uploaded"]["value"] is None
     assert rows["release_distance.pypi_version"]["value"] is None
     # A metric absent from the snapshot contributes no fact rows.
-    assert "flow_health.oldest_open_days" not in rows
+    assert "batch_progress.rows_closed" not in rows
 
 
 @pytest.mark.parametrize("raw", [None, "", "nan", "inf", "n/a"])
@@ -543,3 +543,25 @@ def test_main_writes_the_priority_file(tmp_path: Path) -> None:
 def test_unscored_label_matches_the_census_driver() -> None:
     source = (_PATH.parent / "_vault_census.py").read_text(encoding="utf-8")
     assert f'UNSCORED = "{tr.UNSCORED_LABEL}"' in source
+
+
+def test_estimate_and_demand_gate_labels_match_the_census_driver() -> None:
+    spec = importlib.util.spec_from_file_location(
+        "dashboard_vault_census_labels", _PATH.parent / "_vault_census.py"
+    )
+    assert spec is not None and spec.loader is not None
+    vc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(vc)
+    assert vc.ESTIMATE == tr.ESTIMATE_LABEL
+    # What the driver returns for a DEMAND-GATE row, not a substring of its source.
+    item = type("Item", (), {"line": 1, "body_line": 3, "section_lines": []})()
+    lines = ["## 1. Title", "> **Re-scored 2026-11-25 -> DEMAND-GATE.** Value **5/10**", "body"]
+    assert vc.row_priority(item, lines) == tr.DEMAND_GATE
+
+
+def test_priority_rows_order_tiers_then_demand_gate_estimates_and_unscored() -> None:
+    names = ("unscored", "scored, no tier", "DEMAND-GATE", "P10", "P2", "P1")
+    by = {p: {"open": 1} for p in names}
+    snap = tr.Snapshot({"metrics": [{"id": "backlog_burn", "detail": {"by_priority": by}}]})
+    order = list(dict.fromkeys(r["priority"] for r in tr.priority_rows(snap)))
+    assert order == ["P1", "P2", "P10", "DEMAND-GATE", "scored, no tier", "unscored"]

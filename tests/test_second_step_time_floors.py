@@ -749,7 +749,7 @@ async def _floored_federated_service(
     store: MessageStore, rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[AuthService, list[float]]:
     service = await _service(store, rsa_key, oidc_callback_min_elapsed_seconds=OIDC_FLOOR)
-    # Starts at the real reading: start_flow sets each deadline on the real clock.
+    # FlowCache.put stamps each deadline on this patched clock; it starts at the real reading.
     clock = [time.monotonic()]
     assert service._oidc_flows is not None
     monkeypatch.setattr(service._oidc_flows, "_clock", lambda: clock[0])

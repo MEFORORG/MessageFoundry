@@ -312,6 +312,11 @@ this line.**
   accepted. An `oidc` session that met its factor, on an account with TOTP enrolled, does not get
   the notice for a code within the form's length bound: that code is refused unread
   (`idp_step_up_required`, ADR 0142 Amendment F) and still lands on a bare `/ui`.
+- **An uploaded-log resend refused for the operator's own username names that cause.** The engine
+  refuses a resend whose acting username is blank or has spaces around it with a 403 carrying
+  `X-Refusal-Code: username_unusable`. The console now shows its own notice for it, not the
+  channel-denial text, which would send the operator after a scope that is not the problem. No seam
+  changes. (BACKLOG #6589)
 - **The High Availability pages degrade when the store does not answer.** The page, its live
   fragment and both step-down confirm pages read the cluster membership and lease rows with no error
   handling, so a store timeout or outage answered with an error body in place of the page. The page
