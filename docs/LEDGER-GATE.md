@@ -279,19 +279,31 @@ same key and the check was a no-op between them. [WORKTREE-GATE.md](WORKTREE-GAT
 session into its own worktree, which is what makes worktree-keyed ownership meaningful. The two gates are
 a pair.
 
-### When the owning worktree is gone — recreate it (BACKLOG #1293)
+### When the owning worktree is gone — check out the branch, or recreate it (BACKLOG #1293, #1282)
 
 `Checker.owns` compares the recorded worktree path to the committing one by **casefolded string
-equality**, with no fallback. So removing a worktree that holds an unlanded allocation strands the
-number: `owns()` returns false for **every** session from then on, and any PR that must re-introduce
-that heading is unlandable **by anyone**. PR #397 was stranded exactly this way.
+equality** first. When the path misses, it falls back to the **recorded branch**: a commit from any
+worktree standing on the branch the allocation recorded is entitled to the number (BACKLOG #1282).
+The path is mortal and the branch is not, so removing a worktree no longer strands its number on that
+alone. Before the fallback, removing a worktree that held an unlanded allocation stranded the number:
+`owns()` returned false for **every** session from then on, and any PR that had to re-introduce that
+heading was unlandable **by anyone**. PR #397 was stranded exactly this way.
+
+**The fallback is as exclusive as git's single-checkout default, and no more.** Git refuses an
+ordinary second checkout of one branch, so two worktrees do not both hold it; `git worktree add
+--force` and `git checkout --ignore-other-worktrees` defeat that default (BACKLOG #1039), and the
+`Checker.owns` docstring states the residual. **A number still strands once both keys are gone**: the
+recorded worktree removed and the recorded branch deleted, or an allocation recorded before the
+branch field existed. Then the recovery below is the one that works.
 
 **Prevention is enforced.** `scripts/worktree/remove.ps1` refuses a removal while this worktree owns a
 number whose item is not yet on `origin/main`, and a cannot-tell reads as at-risk. The override is
 `-AllowOrphanedAllocations` and deliberately **not** `-Force`: that one already means *"I accept losing
 uncommitted changes"*, and one consent must not silently cover a second, irreversible risk.
 
-**Recovery, for a number already stranded: RECREATE A WORKTREE AT THE RECORDED PATH.** Owner ruling,
+**Recovery, for a number the fallback cannot reach: check out the recorded branch in any worktree if it
+still exists, which is the `orphan-branch-free` row of the table below; otherwise RECREATE A WORKTREE AT
+THE RECORDED PATH.** Owner ruling for the recreate,
 2026-08-21. Its closeness to the rename workaround [`CLAUDE.md`](../CLAUDE.md) §5 forbids was put to the
 owner explicitly and ruled acceptable **for this case only**.
 

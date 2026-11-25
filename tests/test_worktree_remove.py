@@ -747,13 +747,16 @@ def test_removal_still_succeeds_with_no_claims_directory(fx: Fixture) -> None:
 # --- BACKLOG #1293: allocations a removed worktree owns ------------------------
 #
 # Ownership of a ledger number is a casefolded PATH-STRING comparison against the worktree recorded
-# at allocation time, with no fallback when that directory is gone. So removal BURNS the number:
-# `owns()` returns false for every session forever and any PR that must re-introduce the heading is
-# unlandable by anyone. PR #397 was stranded exactly this way.
+# at allocation time. When that directory is gone, `owns()` falls back to the recorded BRANCH
+# (BACKLOG #1282), but only while that branch still exists and was recorded at all. Without it,
+# removal BURNS the number: `owns()` returns false for every session forever and any PR that must
+# re-introduce the heading is unlandable by anyone. PR #397 was stranded exactly this way, before
+# the fallback.
 #
-# IT REFUSES RATHER THAN WARNS BECAUSE THERE IS NO POST-HOC FIX. A claim can be released afterwards;
-# an allocation cannot be re-keyed -- ownership is documented non-transferable -- so the removal is
-# the only moment this can be stopped.
+# IT REFUSES RATHER THAN WARNS BECAUSE THE FALLBACK IS NOT A GUARANTEE. A claim can be released
+# afterwards; an allocation cannot be re-keyed -- ownership is documented non-transferable -- and a
+# branch deleted after the removal strands the number again, so the removal is the moment this is
+# stopped.
 
 
 def _alloc_dir(fx: Fixture, kind: str = "backlog") -> Path:
