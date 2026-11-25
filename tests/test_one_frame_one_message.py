@@ -813,9 +813,9 @@ _UNPADDED_ISA = "ISA*00**00**ZZ*SENDER*ZZ*RECEIVER*260101*1200*^*00501*000000001
 def test_an_unpadded_isa_declares_nothing_so_its_data_is_replaced_and_sent(offset: int) -> None:
     """Review of the #5799 X12 read: the ISA offsets were read raw even when the ISA was unpadded,
     so an unencodable data character at offset 82, 104 or 105 read as a delimiter the charset
-    cannot hold and the reply was refused, where main replaced it and sent it (the X12 listener
-    closes on a refusal, and the sender resends). An ISA that is not fixed-width declares nothing,
-    as on main. Green on main, red on 1f27b49: the call raised."""
+    cannot hold and the reply was refused, where main replaced it and sent it (where a reply is
+    owed, the X12 listener closes on that refusal). An ISA that is not fixed-width declares
+    nothing, as on main. Green on main, red on 1f27b49: the call raised."""
     filler = list((_UNPADDED_ISA + "TA1*000000001*260101*1200*A*000").ljust(120, "0"))
     filler[offset] = "中"
     reply = "".join(filler) + "~"
@@ -832,6 +832,18 @@ def test_a_pre_00501_isa11_is_data_so_the_reply_is_replaced_and_sent(isa11: str)
     header = _isa(repetition=isa11).replace("*00501*", "*00401*")
     reply = header + "TA1*000000001*260101*1200*A*000中~"
     wire = framing_mod.encode_reply(reply, "ascii", connection="IB_X12_00401")
+    assert wire == reply.encode("ascii", errors="replace")
+
+
+@pytest.mark.parametrize(
+    "run", ["中" * 110, "?" * 110 + "中"], ids=["unencodable", "question-mark"]
+)
+def test_isa_followed_by_a_run_of_one_character_is_not_fixed_width(run: str) -> None:
+    """Round-2 review: ``ISA`` and a run of one character lined up at every element-separator
+    offset, so it read as a fixed-width ISA and was refused, where main replaced it and sent it.
+    X12 keeps the element separator out of element data, so a run is not read as an ISA."""
+    reply = "ISA" + run
+    wire = framing_mod.encode_reply(reply, "ascii", connection="IB_X12_RUN")
     assert wire == reply.encode("ascii", errors="replace")
 
 

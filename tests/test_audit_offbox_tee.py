@@ -889,17 +889,18 @@ def test_a_value_over_the_window_ends_with_its_bound_note_and_hides_the_name(cap
     """Open finding 3 of engine PR 2864: a field over the 64 KiB window holding a control shipped
     cut with no note saying so, and a ``detail``'s ``(+N chars)`` count was taken over a shorter
     head than ``safe_text`` reads. Synthetic values."""
-    from messagefoundry.redaction import clamp_untrusted, safe_text, safe_text_bound
+    from messagefoundry.redaction import clamp_untrusted, safe_text_bound
 
     value = f"{chr(0x01)}DOE JANE " + "word " * 14000
     clamped = clamp_untrusted(value)
     scrubbed = audit_tee._scrub_field(value)
     assert scrubbed.endswith(clamped[clamped.rfind("\n") :]) and "DOE" not in scrubbed
-    # A detail's note is the one safe_text gives the value, so its counts are safe_text's own. The
-    # tee builds safe_text(head) + note, not safe_text(value), which since BACKLOG #5925 reads the
-    # head knowing a note follows it, so only the note is compared.
+    # A detail's note is the one safe_text_bound gives the value, so its counts are that bound's
+    # own, and the shipped detail ends with it (below). The tee builds safe_text(head) + note, not
+    # safe_text(value), which since BACKLOG #5925 reads the head knowing a note follows it, so the
+    # two are not compared whole.
     _head, note = safe_text_bound(value)
-    assert note and safe_text(value).endswith(note)
+    assert note
     (line,) = _tee_lines([{"detail": value}], capsys)
     detail = _shipped_detail(line)
     assert detail.endswith(note) and "DOE" not in detail

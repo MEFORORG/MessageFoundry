@@ -346,7 +346,8 @@ def _reply_delimiters(reply: str) -> frozenset[str]:
     holds one, so an LF inside a field is data, and at LF only in a reply with no CR; that
     terminator, and the LF of a CR+LF end, are declared too. An X12 reply led by ``ISA`` is read
     at the ISA's fixed delimiter offsets only when the ISA is fixed-width: all 106 characters are
-    present and every element-separator offset holds the character at +3. Those offsets are read
+    present, every element-separator offset holds the character at +3, and no element data before
+    ISA16 holds it (:func:`_isa_is_fixed_width`). Those offsets are read
     raw, without the distinctness and element-data checks ``discover_delimiters`` makes, so a
     fixed-width ISA that read refuses still declares what its offsets hold; ISA11 counts only
     from version 00501, as that read counts it. An ISA that is not fixed-width, such as one whose
@@ -392,8 +393,11 @@ _ISA_DELIMITER_OFFSETS = (ELEMENT_SEP_OFFSETS[0], _COMPONENT_SEP_OFFSET, _SEGMEN
 def _isa_is_fixed_width(body: str) -> bool:
     """Whether the ``ISA`` that opens ``body`` is laid out at its fixed widths: all
     ``ISA_SEGMENT_LEN`` characters are present and every element-separator offset holds the
-    character at +3, so its delimiter offsets hold delimiters rather than element data."""
+    character at +3, and no other offset before ISA16 holds it, as X12 keeps the element separator
+    out of element data. So its delimiter offsets hold delimiters rather than element data, and
+    ``ISA`` followed by a run of one character is not read as one."""
     if len(body) < ISA_SEGMENT_LEN:
         return False
     element = body[ELEMENT_SEP_OFFSETS[0]]
-    return all(body[i] == element for i in ELEMENT_SEP_OFFSETS)
+    lined_up = all(body[i] == element for i in ELEMENT_SEP_OFFSETS)
+    return lined_up and body.count(element, 0, _COMPONENT_SEP_OFFSET) == len(ELEMENT_SEP_OFFSETS)
