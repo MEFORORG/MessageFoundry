@@ -498,8 +498,8 @@ than a path is not checked
   name, the mount at `/`, any type on a host with no mount table, such as macOS, a mount an
   automounter has not made yet, a network file system beneath an overlay mount, or a file in the
   secrets directory that is a mount of its own. Keep key files on a local file system. It reads no
-  access list itself, so it can pass a key that a file system of a type it does not judge
-  system, or an access list such as an NFSv4 or macOS one, lets another account reach. Check
+  access list itself, so it can pass a key that a file system of a type it does not judge, or an
+  access list such as an NFSv4 or macOS one, lets another account reach. Check
   those yourself. A directory a group or other account may write is accepted
   when it has the sticky bit, since that bit keeps them from deleting or renaming a file they do
   not own. The engine
