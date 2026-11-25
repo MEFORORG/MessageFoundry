@@ -2378,9 +2378,11 @@ the same permission set on the same method reds CI until it is listed here.
 > engine shards: `GET /connections/{name}/events` does not use that resolver. It checks the scope
 > only, through `_control_guard`, on any deployment, so it answers an in-scope name the graph does
 > not hold, and on the wrong engine shard an in-scope inbound, from the shared store, with no 403
-> and no denial row. `GET /events?connection=<name>` and the web console's event reads check the
-> scope only too, through `_admit_event_read`, and refuse a name outside it with their own 403
-> body, `connection is outside your channel scope`.
+> and no denial row. `GET /events?connection=<name>` and the web console's `/ui/events` page and
+> its reason view check the scope only too, through `_admit_event_read`, and refuse a name outside
+> it with their own 403 body, `connection is outside your channel scope`. The console's connection
+> detail page answers 404 `connection not found`, with no denial row, for a name its scoped
+> connection list lacks.
 > A row naming an in-scope inbound has at least one more cause, on any deployment: a
 > flag request refused for its direction. Such a row's detail carries
 > `"flag_direction_not_inbound": true`, so a row without that marker was not refused for its
