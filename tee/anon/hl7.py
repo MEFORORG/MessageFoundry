@@ -90,7 +90,9 @@ def anonymize_message(
             raise AnonError("message MSH-2 repeats an encoding character — refusing to emit")
         raise AnonError("message has no parseable MSH / encoding characters — refusing to emit")
     seps, field_sep = parsed
-    found: list[str] = []
+    # Held apart from the caller's list until the message is written (BACKLOG #5540); None when the
+    # caller asked for no record, so the date check is not run for nothing.
+    found: list[str] | None = [] if blanked is not None else None
     segments = [seg.split(field_sep) for seg in text.split("\r")]
     # The header may be spelled ``Msh``: the separators are read from it in any case and the
     # leak-check skips it in any case, so an MSH rule must reach it in any case too. Only the
@@ -117,7 +119,7 @@ def anonymize_message(
                 fields[index] = _whole_field(rule.path, value, field_sep)
     encoded = "\r".join(field_sep.join(fields) for fields in segments)
     output = scrub_message_site_codes(encoded, keyer, rules)
-    if blanked is not None:
+    if blanked is not None and found:
         blanked.extend(found)
     return output
 

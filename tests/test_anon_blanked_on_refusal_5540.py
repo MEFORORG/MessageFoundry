@@ -44,6 +44,7 @@ _DOT_ENCODING = r"^~\."
 class _Side(NamedTuple):
     anon: ModuleType
     hl7: ModuleType
+    surrogates: ModuleType
     keyer: Any
     rule: Any
     kind: Any
@@ -56,13 +57,20 @@ _SIDES = pytest.mark.parametrize(
         _Side(
             engine_anon,
             engine_hl7,
+            engine_surrogates,
             EngineKeyer,
             EngineRule,
             EngineKind,
             engine_surrogates.SurrogateSeparatorRefused,
         ),
         _Side(
-            tee_anon, tee_hl7, TeeKeyer, TeeRule, TeeKind, tee_surrogates.SurrogateSeparatorRefused
+            tee_anon,
+            tee_hl7,
+            tee_surrogates,
+            TeeKeyer,
+            TeeRule,
+            TeeKind,
+            tee_surrogates.SurrogateSeparatorRefused,
         ),
     ],
     ids=["engine", "tee"],
@@ -125,3 +133,41 @@ def test_a_refusal_in_the_emptied_field_itself_records_nothing(side: _Side) -> N
             raw, side.keyer(_SALT), (side.rule("EVN-2", side.kind.DATE),), blanked
         )
     assert blanked == []
+
+
+@_SIDES
+def test_a_refusal_in_the_site_code_pass_records_nothing(
+    side: _Side, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The site-code pass runs after every rule, so the list is handed over only once it returns.
+    It refuses only under a configured site-code prefix, so a refusal from it is stood in for."""
+
+    def _refuse(*_args: object) -> str:
+        raise side.anon.AnonError("site-code pass refused")
+
+    monkeypatch.setattr(side.hl7, "scrub_message_site_codes", _refuse)
+    blanked: list[str] = []
+    with pytest.raises(side.anon.AnonError, match="site-code pass refused"):
+        side.anon.anonymize(
+            _message("Q7734^^^H^MR"), salt=_SALT, rules=_rules(side), blanked=blanked
+        )
+    assert blanked == []
+
+
+@_SIDES
+def test_the_shared_helper_records_a_field_only_once_it_is_written(side: _Side) -> None:
+    """``surrogate_field_recorded`` called directly: a date field it refuses is not recorded, and
+    the same field it writes is."""
+    module = side.surrogates
+    refused_seps = module.read_message_seps(_message("Q7734", encoding=_DOT_ENCODING))[0]
+    plain_seps = module.read_message_seps(_message("Q7734"))[0]
+    keyer = side.keyer(_SALT)
+    value = f"{_NOT_A_DATE}~20260315142233.12"
+    blanked: list[str] = []
+    with pytest.raises(side.refused, match="EVN-2"):
+        module.surrogate_field_recorded(
+            "EVN-2", side.kind.DATE, value, keyer, refused_seps, blanked
+        )
+    assert blanked == []
+    module.surrogate_field_recorded("EVN-2", side.kind.DATE, value, keyer, plain_seps, blanked)
+    assert blanked == ["EVN-2"]

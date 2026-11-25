@@ -658,25 +658,27 @@ def surrogate_field_recorded(
     """:func:`surrogate_field`, and a record of the one case where a rule destroys a value without
     anyone having decided that: the ``DATE`` kind scrubbing a repetition that is not a valid
     timestamp to empty (BACKLOG #2330). ``path`` is appended to ``blanked`` once per field it
-    happens in. The address only, never the value, so the list is safe to log.
+    happens in, and only once the field has been written: a field this refuses is not recorded
+    (BACKLOG #5540). The address only, never the value, so the list is safe to log.
 
     A ``DROP`` is not recorded: the rule map already says that field is blanked. Both adapters call
     this, each with the value it read, so they agree wherever they read the same value.
     """
     # Asked of each INPUT repetition. The output is not split again: a filled ``+0000`` holds a
     # ``+``, which a message may declare as its repetition separator.
-    if (
+    emptied = (
         blanked is not None
         and kind == SurrogateKind.DATE
         and any(rep and not _filled_date(rep, seps) for rep in value.split(seps.repetition))
-    ):
-        blanked.append(path)
+    )
     try:
         written = surrogate_field(kind, value, keyer, seps)
         # A keep leaves the value as read, so the C0 check is skipped for it. ``anonymize`` drops
         # keep rules first; a direct adapter call may not, and the adapter writes the value back.
         if kind != SurrogateKind.KEEP:
             _no_control(written, seps)
+        if blanked is not None and emptied:
+            blanked.append(path)
         return written
     except _HeldDelimiter as held:
         cause = held.cause
