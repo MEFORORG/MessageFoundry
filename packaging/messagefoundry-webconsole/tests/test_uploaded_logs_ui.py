@@ -683,7 +683,8 @@ async def test_a_padded_username_refusal_is_not_shown_as_a_channel_denial(
         assert refused.headers["location"] == "/ui/uploaded-logs?e=resend_username_refused"
         landed = await c.get(refused.headers["location"], follow_redirects=False)
         assert landed.status_code == 200, landed.text
-        assert "username is blank or has spaces" in landed.text
+        assert "username is blank or has whitespace before or after it" in landed.text
+        assert "correct the username in the directory" in landed.text
         assert "not authorized to inject" not in landed.text
     [reject] = await engine.store.list_audit(action="upload.resend_reject")
     assert reject["actor"] == "pad "

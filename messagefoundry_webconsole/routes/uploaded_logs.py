@@ -188,8 +188,9 @@ RESEND_DENIED_NOTICE = (
 #: same 403 status otherwise means here.
 RESEND_USERNAME_NOTICE = (
     "That resend did not run, and nothing was injected. Your account's username is blank or has "
-    "spaces before or after it, so it cannot be recorded as the user who injected the message. "
-    "The username comes from your directory or identity provider, so it must be corrected there."
+    "whitespace before or after it, so it cannot be recorded as the user who injected the message. "
+    "Ask your administrator to correct the username in the directory; the change takes effect at "
+    "your next sign-in."
 )
 RESEND_STOPPED_NOTICE = (
     "That resend did not run — nothing was injected. The target inbound connection is registered but "
