@@ -9,8 +9,9 @@ asyncio-native**, and its C-STORE callback runs on a foreign (acceptor) thread �
 
 * starts/stops the AE server **off the event loop**, in the default executor
   (:func:`~messagefoundry.threadhop.to_thread_or_loop`), so binding/shutdown does not stall other
-  listeners/workers/API calls; a hop the default executor refuses runs on a thread of its own
-  (docs/SECURITY.md says what happens when no thread can start: a start then fails);
+  listeners/workers/API calls; a hop the default executor refuses runs on a thread of its own, and
+  on the loop only when no thread can start, where a start fails, since its accept loop needs a
+  thread, and a stop blocks the loop until its wait on the connection threads times out;
 * in the C-STORE callback (the foreign thread) re-encodes the received object to its **Part-10 bytes**
   and bridges them back onto the loop-owned ingress via ``asyncio.run_coroutine_threadsafe`` — the same
   loop-bridge pattern as ``db_lookup`` (ADR 0010) — blocking the **worker thread** (never the loop) on
@@ -1281,11 +1282,18 @@ def _admitting_server_class() -> type[Any]:
             """What ``AE.start_server(block=False)`` does once it has built its server: run the
             accept loop on a daemon thread and record the server on the AE. The base ``shutdown()``
             removes the server from that list, and raises if it is not there."""
-            threading.Thread(
-                target=make_target(self.serve_forever),
-                name=f"AcceptorServer@{self.ae_title}",
-                daemon=True,
-            ).start()
+            try:
+                threading.Thread(
+                    target=make_target(self.serve_forever),
+                    name=f"AcceptorServer@{self.ae_title}",
+                    daemon=True,
+                ).start()
+            except BaseException:
+                # make_server has bound the port, and nothing else holds this server to close
+                # it, so an accept loop with no thread to run on would leave the port held.
+                with contextlib.suppress(OSError):
+                    self.server_close()
+                raise
             self.ae._servers.append(self)
 
         def get_request(self) -> tuple[socket.socket, Any]:
@@ -2292,13 +2300,7 @@ class DicomScpSource(SourceConnector):
             max_object_bytes=self._max_object_bytes,
             min_message_bytes_per_second=self._min_message_bytes_per_second,
         )
-        try:
-            server.start_serving()
-        except BaseException:
-            # make_server has bound the port, and nothing else holds this server to close it,
-            # so a start whose accept loop cannot start (no thread) would keep the port held.
-            server.server_close()
-            raise
+        server.start_serving()
         self._ae = ae
         self._server = server
 

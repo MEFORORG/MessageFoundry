@@ -47,6 +47,10 @@ def _refuse_default_executor() -> None:
     asyncio.get_running_loop().set_default_executor(pool)
 
 
+def _no_thread(self: threading.Thread) -> None:
+    raise RuntimeError("can't start new thread")
+
+
 # --- the helper ----------------------------------------------------------------------------------
 
 
@@ -72,11 +76,7 @@ async def test_a_refused_hop_runs_on_the_loop_when_no_thread_can_start(
 ) -> None:
     _refuse_default_executor()
     caplog.set_level(logging.WARNING, logger=threadhop.__name__)
-
-    def no_thread(self: threading.Thread) -> None:
-        raise RuntimeError("can't start new thread")
-
-    monkeypatch.setattr(threading.Thread, "start", no_thread)
+    monkeypatch.setattr(threading.Thread, "start", _no_thread)
     total, ran_on = await to_thread_or_loop("probe hop", _add, 2, b=3)
     assert (total, ran_on) == (5, threading.current_thread())
     assert "runs on the event loop, since no thread could start" in caplog.text
@@ -245,12 +245,8 @@ async def test_a_dicom_start_with_no_thread_fails_and_releases_its_port(
 
     monkeypatch.setattr(dicom, "_admitting_server_class", lambda: Recording)
     _refuse_default_executor()
-
-    def no_thread(self: threading.Thread) -> None:
-        raise RuntimeError("can't start new thread")
-
     with monkeypatch.context() as patch:
-        patch.setattr(threading.Thread, "start", no_thread)
+        patch.setattr(threading.Thread, "start", _no_thread)
         with pytest.raises(RuntimeError, match="can't start new thread"):
             await source.start(object())  # type: ignore[arg-type]
     (server,) = built

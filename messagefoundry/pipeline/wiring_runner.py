@@ -8170,9 +8170,10 @@ class RegistryRunner:
         self._fusion_active = False
         # ADR 0087 (#197): stop the per-inbound sandbox worker children (kills + reaps each subprocess).
         # Run OFF the loop (each close() waits on a process) so a draining child can't wedge the loop;
-        # what a refused hop does instead is stated on _close_sandbox_sessions. With fusion active, a
-        # refused executor still stops this teardown at the fusing shutdown above, which has no
-        # such fallback, before it gets here.
+        # what a refused hop does instead is stated on _close_sandbox_sessions. The fusing shutdown
+        # above has no such fallback, so with fusion active a refused executor stops this teardown
+        # there, skipping the rest of it; fusion never runs with a sandbox mode on, so no session
+        # is left unclosed by that.
         # No-op unless [sandbox].mode=subprocess actually spawned any.
         await self._close_sandbox_sessions()
         # THE LOOKUP-EXECUTOR CLOSE, stated here once. The live executor retires like a reload's:
