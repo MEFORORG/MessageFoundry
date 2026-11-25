@@ -8719,9 +8719,15 @@ BACKLOG #190 bundled three integrity residuals; #190 closes with **one built** a
   trigger: [ADR 0139](adr/0139-ech-egress-sidecar-sni-hiding-for-asvs-12-1-5-demand-gated.md);
   operator contract: [`samples/ech-sidecar/`](../samples/ech-sidecar/README.md). The residual is
   metadata only — which partner, how often — with at least these compensating conditions: on-prem, a
-  trusted network segment, an operator-configured `[egress]`-allowlisted destination, and TLS still
-  protecting the payload. Re-open when a destination begins publishing an `ECHConfig`, or when CPython
-  ships a first-class ECH API.
+  trusted network segment, an operator-configured `[egress]`-allowlisted destination or, on the LDAPS
+  hop, the operator-configured `[auth].ad_server`, and TLS still protecting the payload. That LDAPS
+  host is not `[egress]`-gated. Since BACKLOG #6879, a bind to a hostname `ad_server` sends that
+  name as cleartext SNI. The form sent, and the hosts that send none, such as an IP literal, are
+  [`_sni_name`'s](../messagefoundry/auth/ldap_tls.py). Where the engine resolves the host through
+  unencrypted DNS, an observer on that path already sees the name. An observer only on the
+  engine-to-DC path learns it from SNI. On a TLS 1.2 handshake, whatever `ad_server` holds, the DC's
+  certificate travels in cleartext and names the DC to that observer too. Re-open when a
+  destination begins publishing an `ECHConfig`, or when CPython ships a first-class ECH API.
 
 ### In-use memory protection — best-effort partial + deployment requirement (13.3.3 / 11.7.1 / 11.7.2, #198)
 
