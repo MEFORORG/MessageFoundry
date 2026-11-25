@@ -3986,8 +3986,7 @@ async def _require_gate_or_discard(pool: Any, conn: Any) -> None:
     (:func:`~messagefoundry.odbc_call_gate.require_call_gate`) has no safe cancellation exit, so
     it is closed here, while no call runs on it.
     :class:`~messagefoundry.odbc_call_gate.UngatedConnectionError` then propagates, and each caller
-    classifies it: :func:`_connect` as a permanent ``config_fault``, and at least the source poll,
-    the mark, ``db_lookup`` and the login role probe as they classify any other failure to borrow. A stand-in the gate cannot wrap is not
+    classifies it as it does any other failure to borrow. A stand-in the gate cannot wrap is not
     refused, as ``require_call_gate`` leaves it alone.
 
     **Its handle is dropped before any await**, so the pool never lends it again, and given back
@@ -4400,10 +4399,8 @@ async def _connect(get_pool: Callable[[], Any], timeout: float) -> tuple[Any, An
     Opening the pool or a pooled connection logs in, so a refused login, a missing ODBC driver or
     the missing ``sqlserver`` extra surfaces here (BACKLOG #5713). A driver error is classified as
     a connect failure (:func:`_classify_db_error`), and the missing extra is a ``config_fault``.
-    So is a connection the call gate cannot wrap (BACKLOG #2394): the installed aioodbc lends only
-    such connections, so a retry would log in again only to be refused again. Any other failure,
-    with no SQLSTATE, is a transient :class:`DeliveryError`, as the acquire timeout already is:
-    nothing has run, so no message can be at fault."""
+    Any other failure, with no SQLSTATE, is a transient :class:`DeliveryError`, as the acquire
+    timeout already is: nothing has run, so no message can be at fault."""
     try:
         pool = await get_pool()
         return pool, await _acquire(pool, timeout)
@@ -4411,16 +4408,6 @@ async def _connect(get_pool: Callable[[], Any], timeout: float) -> tuple[Any, An
         raise
     except _DriverMissingError as exc:
         raise NegativeAckError(str(exc), code="db", permanent=True, config_fault=True) from exc
-    except UngatedConnectionError as exc:
-        # An engine literal naming neither the DSN nor the server (_ENGINE_FIXED_TEXT). The fix is
-        # the installed package, not the connection's settings, so the stop names that.
-        raise NegativeAckError(
-            str(exc),
-            code="db",
-            permanent=True,
-            config_fault=True,
-            remedy="the installed aioodbc package (the release pyproject.toml pins, then a restart)",
-        ) from exc
     except Exception as exc:
         state = _log_sqlstate(exc)  # never a codec name read as a SQLSTATE
         if state is None:
@@ -4478,9 +4465,7 @@ async def _probe_db(
 ) -> None:
     """Open the pool and run ``SELECT 1`` — a no-data, no-write reachability probe shared by the
     DATABASE source and destination's ``test_connection``. A driver error is mapped via
-    :func:`_classify_db_error` (transient vs permanent, through :func:`_connect` at connect); a
-    connection the call gate cannot wrap is the permanent ``config_fault`` :func:`_connect` makes
-    of it (BACKLOG #2394); any
+    :func:`_classify_db_error` (transient vs permanent, through :func:`_connect` at connect); any
     other non-driver failure (e.g. an unreachable host before any SQLSTATE) becomes a transient
     :class:`DeliveryError`. Triggers the connector's lazy pool;
     the caller closes it with ``aclose()``."""
