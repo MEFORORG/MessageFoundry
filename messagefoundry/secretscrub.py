@@ -1951,9 +1951,13 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # an ``origin/main`` tree, where it does not print there. On its last run, seeds 101 to 110 and
 # 201 to 210, 3,000,000 random lines of which 1,215,761 hold a ";" and 807,717 a marker shape, it
 # printed no line on any path, against the member pass off and against an ``origin/main`` tree
-# alike. That run was BEFORE BACKLOG #5030 added item 1 took ``key``, ``sig``, ``auth`` and ``jwt``
-# off :data:`_MEMBER_KEEP_WORDS` and put the key-label words on it, and was not repeated after;
-# the seeded sample in the test passes on the change. The word mask before it, ``redacted`` for every word, printed 1 line on a chain line the
+# alike. That run PREDATES two changes under BACKLOG #5030 and was not repeated: added item 1,
+# which took the URL query-credential words off :data:`_MEMBER_KEEP_WORDS` and put the key-label
+# words on it, and added item 3, which keeps a hex escape before a segment ID. What covers those
+# two is the fixed cases and the seeded sample in ``tests/test_connection_string_member_scrub.py``,
+# a far smaller corpus: it holds ``key=``, ``auth=`` and two compound key-label lines, but no
+# ``sig`` or ``jwt`` word, and only three fixed cases of a hex escape before a segment ID. The
+# word mask before it, ``redacted`` for every word, printed 1 line on a chain line the
 # bundle read back on the first ten seeds, and the "#" rule before its fix printed on five later
 # paths.
 #
@@ -2045,8 +2049,8 @@ _CONNECTION_STRING_MEMBER = re.compile(
 #: ``given``, ``birthDate``, ``identifier``, ``telecom`` beside ``name`` and ``address``) and the
 #: DICOM label words.
 #:
-#: NOT :data:`_QUERY_CREDENTIAL_WORDS` (``key``, ``sig``, ``auth``, ``jwt``), which this list held
-#: until BACKLOG #5030 added item 1: :func:`credential_query_params` reads them in a configured
+#: NOT the words of :data:`_QUERY_CREDENTIAL_WORDS`, at least ``key``, ``sig``, ``auth`` and ``jwt``,
+#: which this list held until BACKLOG #5030 added item 1: :func:`credential_query_params` reads them in a configured
 #: URL's parameter names. A log pass reads ``key`` and ``auth`` only inside a longer label this
 #: list keeps, at least the key-label words above. Kept alone, they kept a password word that held
 #: one before a ":" or "=", so ``;sslpassword=Monkey:Banana42;`` printed ``Monkey``.

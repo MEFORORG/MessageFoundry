@@ -750,9 +750,11 @@ def _field_run_reads(field_run: re.Pattern[str], delimiters: frozenset[str], cha
     **One-character words.** The guard admits a start after each white space character, which is
     correct; what keeps it cheap is that the run class stops at the next one. Each start is charged
     what it matched, so a run class widened over whitespace, which matches from every word to the
-    end, is charged that. The words are read once per white space character, each line separated by
-    one of them alone, so a run class narrowed from ``\\s`` to a literal space crosses the tabs or line
-    breaks of a line and is charged that too (BACKLOG #2958 step 6 item b).
+    end, is charged that. The words are read once per ASCII white space character, each line
+    separated by one of them alone, so a run class narrowed from ``\\s`` to a literal space crosses
+    the tabs or line breaks of a line and is charged that too (BACKLOG #2958 step 6 item b). The
+    non-ASCII white space characters share ONE line (:data:`_NON_ASCII_WHITESPACE`), so a class
+    that crosses only one of them is not seen.
 
     The charge per start is the model. A start that re-reads its token more than once, the nested
     shape, is not seen; :func:`test_the_field_run_and_segment_patterns_nest_no_repetition_as_shipped`
@@ -1000,10 +1002,10 @@ _LEAF_OPCODES = frozenset(
 
 
 def _nested_repetitions(pattern: str) -> list[str]:
-    """The repetitions in ``pattern`` that can repeat more than once with no fixed count, sit inside
-    another such repetition, and can give characters back: anything but a possessive one. That is
-    the shape that lets one start re-read its token many times, whether either repetition is greedy
-    or lazy. Read from the parsed pattern, through groups, atomic groups, both arms of a conditional
+    """The repetitions in ``pattern`` with no fixed count that sit inside an outer repetition that
+    can repeat more than once with no fixed count, and can give characters back: anything but a
+    possessive one. The inner one may be an optional (``(?:a?b?)*``). That is the shape that lets
+    one start re-read its token many times, whether either repetition is greedy or lazy. Read from the parsed pattern, through groups, atomic groups, both arms of a conditional
     group, lookarounds and alternations (BACKLOG #2958 step 6 item c).
 
     **Stricter than ``tests/test_security_static.py``'s ``_has_nested_quantifier``, on purpose.**
@@ -1092,7 +1094,8 @@ def test_the_field_run_and_segment_patterns_nest_no_repetition(case: str, nestin
     run = rf"[^\s{spelling}]"
     nested = pair.field_run.pattern.replace(run + "*+", nesting.format(run), 1)
     assert nested != pair.field_run.pattern and _nested_repetitions(nested), (
-        f"the {nesting} control did not regress the field run, so the assertion above measures nothing"
+        f"the {nesting} control did not regress the field run, so "
+        f"test_the_field_run_and_segment_patterns_nest_no_repetition_as_shipped measures nothing"
     )
 
 

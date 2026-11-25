@@ -889,7 +889,8 @@ def test_the_member_mask_keeps_a_replaced_marker_head(monkeypatch: pytest.Monkey
     assert _printed_where_the_baseline_hid([line], [_every_redaction_path(line)], baseline)
 
 
-#: A password word that holds a URL query-credential word (``key``, ``sig``, ``auth``, ``jwt``) before
+#: A password word that holds a URL query-credential word (at least ``key``, ``sig``, ``auth`` and
+#: ``jwt``; ``secretscrub._QUERY_CREDENTIAL_WORDS`` holds them) before
 #: a ":" or "=". Those words were kept whole there, so the first word printed (BACKLOG #5030 added
 #: item 1). Each fragment is synthetic.
 _QUERY_WORD_PASSWORDS = (
