@@ -116,9 +116,11 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # /approvals/{approval_id}/interrupt, approvals:approve, the operator's way out for a release
 # stranded in 'executing'.
 # BACKLOG #5559 added one /ui route and no JSON route: GET /ui/users/{user_id}/delete-confirm.
-_ROUTES_DEFAULT = 121
-_ROUTES_WITH_DOCS = 125
-_ROUTES_WITH_UI = 252
+# BACKLOG #2603 (ADR 0215 slice 2) added 31 JSON routes and no /ui route: the gate-only
+# GET /auth/check, one GET /auth/check/<permission> per permission (29), and GET /me/step-up.
+_ROUTES_DEFAULT = 152
+_ROUTES_WITH_DOCS = 156
+_ROUTES_WITH_UI = 283
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in (with its passkey begin leg),
 #: re-auth and second-factor entry points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -236,6 +238,8 @@ _PERMISSIONLESS_ROUTES = frozenset(
         ("GET", "/me/security-events"),
         ("DELETE", "/me/sessions/{session_id}"),
         ("DELETE", "/me/sessions"),
+        ("GET", "/auth/check"),
+        ("GET", "/me/step-up"),
     }
 )
 
@@ -683,8 +687,9 @@ _CONTEXTUAL_PROSE_ONLY = frozenset(
 # -1 BACKLOG #1136 (ADR 0183 Amendment A, Wave 4): the first-run account's claim-state row went with
 # that account; +2 BACKLOG #288: the first-seen sign-in address, split by outcome; +1 BACKLOG #1957
 # (ADR 0198): the reconciler's scope re-diff; +2 BACKLOG #2301: the two second-step time floors;
-# +1 BACKLOG #2298: a session whose temporary credential lapsed is ended.
-_CONTEXT_TABLE_A_ROWS = 43
+# +1 BACKLOG #2298: a session whose temporary credential lapsed is ended; +1 vault BACKLOG #1191:
+# the monitoring-read volume per actor.
+_CONTEXT_TABLE_A_ROWS = 44
 # +1 BACKLOG #4907 (Table B): the MLLP listener's expected-sender allowlist, tls_client_subjects.
 _CONTEXT_TABLE_B_ROWS = 14
 
@@ -837,6 +842,10 @@ def test_permission_catalogue_heading_states_the_real_size() -> None:
     )
 
 
+#: The gate-only check routes' prefix (ADR 0215 section 2). The catalogue counts them apart.
+_CHECK_PREFIX = "/auth/check/"
+
+
 def test_catalogue_route_counts_match_the_live_route_walk() -> None:
     """The per-permission route count in the catalogue equals what the app actually gates.
 
@@ -851,9 +860,18 @@ def test_catalogue_route_counts_match_the_live_route_walk() -> None:
         documented[value] = int(row[3])
 
     derived: dict[str, int] = {p.value: 0 for p in Permission}
-    for _method, _path, perms, _gate in _route_rows():
+    checks: dict[str, list[tuple[tuple[str, ...], str | None]]] = {}
+    for method, path, perms, gate in _route_rows():
+        if method == "GET" and path.startswith(_CHECK_PREFIX):
+            # Counted apart, as the catalogue's preamble says: one gate-only route per permission.
+            checks.setdefault(path.removeprefix(_CHECK_PREFIX), []).append((perms, gate))
+            continue
         for perm in perms:
             derived[perm] += 1
+    assert checks == {p.value: [((p.value,), "require")] for p in Permission}, (
+        "each permission must have exactly one GET /auth/check/<permission> route, gated "
+        f"require(<that permission>) (ADR 0215 section 2); the walk read {checks}"
+    )
 
     assert documented == derived, (
         "the catalogue's route counts drifted from the live app. Differences (permission: doc -> "
@@ -1384,6 +1402,7 @@ _STEP_UP_GATES = frozenset(
 _NOT_STEP_UP_GATES = frozenset(
     {
         "require",
+        "require_monitoring_read",
         "require_paced",
         "require_phi_read",
         "require_ui",
@@ -2203,8 +2222,9 @@ def test_ungated_routes_are_exactly_the_reviewed_allowlist() -> None:
     # 98 -> 100: ADR 0207's POST and DELETE /users/{user_id}/enrolment-code, users:manage.
     # 100 -> 102: BACKLOG #1562's GET /approvals/executing and POST /approvals/{approval_id}/interrupt,
     # approvals:approve.
-    assert len(gated) == 102, (
-        f"{len(gated)} permission-gated routes, not 102 — update the doc's totals."
+    # 102 -> 131: BACKLOG #2603's 29 gate-only GET /auth/check/<permission> routes (ADR 0215).
+    assert len(gated) == 131, (
+        f"{len(gated)} permission-gated routes, not 131 — update the doc's totals."
     )
 
 
@@ -2319,9 +2339,9 @@ def test_gate_wrapper_preamble_matches_the_table_it_introduces() -> None:
     block = _section(_doc_text(), _H_DESIGN)
     table = _table_with_header(block, "Gate wrapper")
     rows = len(table) - 1
-    assert rows == 7, f"the gate-wrapper table now has {rows} rows; restate the preamble"
+    assert rows == 8, f"the gate-wrapper table now has {rows} rows; restate the preamble"
     assert (
-        f"The table below has **{['', 'one', 'two', 'three', 'four', 'five', 'six', 'seven'][rows]}** rows"
+        f"The table below has **{['', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight'][rows]}** rows"
         in block
     ), f"the gate-wrapper preamble must state the real row count ({rows})"
     assert "deliberately\n**bypasses**" in block or "deliberately **bypasses**" in block, (

@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from urllib.parse import parse_qsl
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
@@ -32,6 +32,11 @@ from .._auth import (
 )
 from ._common import CONNECTION_RULE, refuse
 
+if TYPE_CHECKING:
+    # Typing only, so a console on an engine without it still mounts (the seam note on
+    # ENGINE_UI_SEAM says what such a pairing does).
+    from messagefoundry.api.message_scope import DeniedOperation
+
 _log = logging.getLogger(__name__)
 
 #: What a bulk outcome row says for a selection that is not a name this console could have rendered.
@@ -56,7 +61,18 @@ _log = logging.getLogger(__name__)
 _NOT_A_CONNECTION_NAME = "not applied: not a valid connection name"
 
 
-async def _audit_refused_name(core: Any, engine: Any, identity: Identity, request: Request) -> None:
+#: What ``_audit_refused_name`` hands the engine for a refused name: empty, which the
+#: connection-name rule refuses, so the row is marked malformed and carries no caller text.
+_REFUSED_NAME = ""
+
+
+async def _audit_refused_name(
+    core: Any,
+    engine: Any,
+    identity: Identity,
+    request: Request,
+    operation: DeniedOperation,
+) -> None:
     """Audit a channel-scoped actor's bulk selection that failed the connection-name rule.
 
     A channel-scoped actor's attempt on a name it may not reach is a security event. MEASURED when
@@ -66,15 +82,24 @@ async def _audit_refused_name(core: Any, engine: Any, identity: Identity, reques
     malformed name is never in scope, and the refusal is audited here instead.
 
     The row carries no channel (BACKLOG #3031). The name is caller-chosen text that failed the rule,
-    bounded only by the request body, and ``audit_log.channel_id`` would otherwise hold it whole. The
-    actor and the host still identify the attempt, as on the purge confirm page's refusal.
+    bounded only by the request body, so this audit call does not pass it on: the helper is handed
+    :data:`_REFUSED_NAME`, an empty name the engine's rule refuses, so it writes no channel and
+    marks the row ``"malformed_name": true``; that check is what marks this row, so it is not
+    redundant here. This console's control routes check the rule before they call the engine, and
+    that check is their bound; the engine helper's own rule check is defence in depth behind it, so
+    do not drop the console's check on the strength of the engine's. The actor and the host still
+    identify the attempt. The row's ``operation`` says which
+    bulk route refused it (vault BACKLOG #3748 item 7), and the marker tells it from the purge
+    confirm page's refusal, which names no channel by design.
 
     A failed write is logged and the batch goes on, as it does for a failed target, so the
     operator still sees which targets were applied."""
     if identity.allowed_channels is None:
         return
     try:
-        await core.audit_channel_denied(engine, identity, None, client_ip(request))
+        await core.audit_channel_denied(
+            engine, identity, _REFUSED_NAME, client_ip(request), operation=operation
+        )
     except Exception:  # noqa: BLE001 - capture-and-continue; one bad selection never aborts the batch
         _log.exception("could not audit a channel-scoped actor's malformed bulk selection")
 
@@ -165,7 +190,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # The rule's own sentence is discarded here on purpose -- see _NOT_A_CONNECTION_NAME.
             # A channel-scoped actor's refusal is still audited; _audit_refused_name says why.
             if refuse(CONNECTION_RULE, name) is not None:
-                await _audit_refused_name(core, engine, identity, request)
+                await _audit_refused_name(core, engine, identity, request, "connection_control")
                 outcomes.append((None, _NOT_A_CONNECTION_NAME))
                 continue
             try:
@@ -268,7 +293,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # ADR 0150: a console RBAC denial is a security event from a specific host, so it
             # carries the browser's address exactly as the JSON API's denials do. `request` here is
             # the browser's — the console mounts in-process on the engine's own app.
-            await core.audit_channel_denied(engine, identity, None, client_ip(request))
+            await core.audit_channel_denied(
+                engine, identity, None, client_ip(request), operation="connection_purge"
+            )
             raise HTTPException(
                 403, "channel-scoped users cannot purge a shared outbound connection"
             )
@@ -325,7 +352,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # value reaching the result table, which the raw append below used to put there.
             # Same shape and the same channel-scope audit as ui_bulk_control above.
             if refuse(CONNECTION_RULE, value) is not None:
-                await _audit_refused_name(core, engine, identity, request)
+                await _audit_refused_name(core, engine, identity, request, "connection_purge")
                 outcomes.append((None, _NOT_A_CONNECTION_NAME))
                 continue
             try:

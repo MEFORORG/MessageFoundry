@@ -153,6 +153,29 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
 
 ## Amendments
 
+- **2026-11-22, the host key provider's files get a custody directory of their own (vault
+  BACKLOG #3411).** Under `[store].key_provider = 'host'` the service's first start writes its own
+  key file, `master.key`, beside the `handoff.key` an administrator's `provision-admin
+  --service-account` left. Neither the installer nor the engine guarantees the service read only
+  on this directory ([SERVICE.md, The custody directory under the host key
+  provider](../SERVICE.md#the-custody-directory-under-the-host-key-provider) says which grants
+  survive a rerun); decision 4's check passes a directory one named account may write. A service right to add a
+  file here would let it supply a secret-class setting. So those two files move to a directory of their own when
+  `MEFOR_CUSTODY_DIRECTORY` names one, an absolute path, which wins over `MEFOR_SECRETS_DIRECTORY`
+  for them; unset, they stay where they were, in this directory or beside a SQLite store. Before
+  a read or a mint, the engine applies decision 4's check to the directory that variable names,
+  `broad_access_problem` with `directory`, at every enforcement setting; like decision 4's check,
+  it reads known broad groups only, so it refuses no entry for one account, the service's add-file
+  right included. While the variable is set and neither file is in that directory, a host file or
+  handoff in this directory or beside a SQLite store refuses a read and a mint, so one made
+  without the variable is not taken for no key; and the check that refuses another key provider
+  beside a host file or handoff looks in at least the custody directory, this directory and the
+  place beside a SQLite store, whatever is set. Its refusal deletes no file it finds and moves
+  none, and points at the one procedure in docs/SERVICE.md that says when a key file may move.
+  `install-service.ps1` makes the custody directory only when it reads that provider, and names
+  it to the service as `MEFOR_CUSTODY_DIRECTORY`. docs/SERVICE.md, *The custody directory under
+  the host key provider*, states its location, its access list and the rest, and is the record
+  of them.
 - **2026-11-17, the Windows holder is read where the path resolves to (vault BACKLOG #5657).**
   This replaces parts of the 2026-11-13 amendment below. `_windows_surroundings_problem` still
   walks `full.parent`, except for a drive root such as `S:\`, whose own path it walks, so a
@@ -214,9 +237,12 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   on Windows" now reads "a link": `broad_access_problem` reads the named path without following a
   link on POSIX too, so a secrets directory, or a file in it, that is itself a link is refused
   there as well. A Kubernetes Secret volume serves each file as a link, so it cannot be this
-  directory. On POSIX the same check also refuses a directory or file another account owns, and
-  one held in a directory that another account owns or that a group or other may write without
-  the sticky bit; `docs/CONFIGURATION.md` states the rule.
+  directory. On POSIX the same check also judges the owner of a directory or file and the
+  directory that holds it; `docs/CONFIGURATION.md` states the rule. *(Corrected 2026-11-22, vault
+  BACKLOG #5657 step 14: this sentence said the check refuses a directory or file another account
+  owns, and one held in a directory that another account owns or that a group or other may write
+  without the sticky bit. Root may own either as well, so the rule now lives in
+  `docs/CONFIGURATION.md` alone.)*
 - **2026-11-11, half of slice B built: the NSSM reading refuses every secret-class name.** A
   name from `DIRECTORY_SETTING_NAMES` in the service's own environment lists now refuses `serve`
   and `supervise`, under every enforcement setting, as a store key there already did, and the
@@ -227,7 +253,16 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   secret found in the environment elsewhere, is not built: one reaching the engine from the
   machine-wide environment, or from its own environment when the service's lists could not be
   read, is neither refused nor named, since only a store key's names are read there (vault
-  BACKLOG #2595).
+  BACKLOG #2595). **UPDATED 2026-11-24: that other half is now built for these names (vault
+  BACKLOG #2595).** Where the engine reads its service's lists and such a secret is in its own
+  environment but not in them, it is named as `secret_from_outside_service_lists`, and where
+  the machine-wide environment's registry key sets it, `serve`, `supervise` and both API app
+  factories refuse under `enforce`. Where the service is known and its lists could not be read,
+  such a secret refuses under every setting, as a store key there already did. Not refused, at
+  least: such a secret from elsewhere, such as a `python.exe` wrapper between NSSM and the engine, which is named; a store
+  key from outside the lists, which is named; and a `MEFOR_VALUE_*` variable from outside the
+  lists, which is neither refused nor named. An engine that does not find its service reads none
+  of this. `messagefoundry/serviceenv.py`'s module docstring states the rule.
 - **2026-11-05, slice D built.** `[store].key_provider` no longer accepts the four external names
   ADR 0019 declared and nobody built, `aws_kms`, `azure_kv`, `gcp_kms` and `pkcs11`; each is now
   refused as an unknown name. Question 12 of the maintainer-internal decisions index answered yes

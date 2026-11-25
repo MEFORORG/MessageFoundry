@@ -398,34 +398,48 @@ class RetentionRunner:
         # Default to the logging sink so an over-limit store is at least visible without a notifier.
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
         self._clock = clock
-        # A monotonic clock for the #121 between-phase duration cap — SEPARATE from `clock` (which is the
-        # wall clock feeding the retention *window* cutoffs and is often frozen in tests). Measuring
-        # elapsed pass time against a frozen window clock would never advance; monotonic can't go backwards.
+        # A monotonic clock for the #121 between-phase duration cap and the WAL truncate cadence
+        # (BACKLOG #6526) — SEPARATE from `clock` (which is the wall clock feeding the retention
+        # *window* cutoffs and is often frozen in tests). Elapsed time measured on a frozen window
+        # clock never advances, and on a wall clock stepped backward it goes negative and holds the
+        # truncate past its cadence; monotonic can't go backwards.
         self._monotonic = monotonic
         # Retention is a leader-only WRITE singleton (it purges PHI bodies + writes audit rows), so in
         # a cluster it must run on exactly one node. Default NullCoordinator → always leader → always
         # runs, so an existing caller/test that passes no coordinator is byte-identical (Track B Step 4).
         self._coordinator: ClusterCoordinator = coordinator or NullCoordinator()
         self._stop = asyncio.Event()
+        # Ends the current between-pass sleep early: set by stop(), and by wake() after a config
+        # reload. wake() sets it only while the loop is idle, so a window a reload sets is enforced at
+        # once only when the loop was idle; on an active loop it waits for the next scheduled pass.
+        self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
-        # Maintenance cadence state (loop-driven; only read/written on the single task).
-        self._last_wal = 0.0
+        # Whether the last check of `enabled` found something to do; the loop logs when it flips.
+        self._active = False
+        # Maintenance cadence state (loop-driven; only read/written on the single task). The WAL
+        # marker is a `monotonic` reading. It starts as None, not 0.0, so the first pass truncates
+        # whatever the monotonic clock reads, which can be under the cadence just after boot.
+        self._last_wal: float | None = None
         self._last_vacuum_day: str | None = None
 
     @property
     def enabled(self) -> bool:
-        """True when any window/threshold/maintenance knob is configured. When False, :meth:`start`
-        spawns no task. Every purge window is off by default, but the low-disk floor
-        (``min_free_disk_mb``, BACKLOG #290) and the hourly WAL truncate (``wal_checkpoint_seconds``,
-        vault BACKLOG #2619) ship ON, so on a file-backed SQLite store the runner starts on stock
-        settings to run those two. The audit-log growth warning (``audit_log_warn_rows``, BACKLOG
-        #1421) ships ON as well and applies to every backend, so stock settings start the runner on
-        SQL Server and Postgres too. It purges nothing unless a window is set.
+        """True when any window/threshold/maintenance knob is configured. When False, a pass does
+        nothing worth running, so the loop skips it (and :meth:`start` spawns no loop at all when no
+        registry is wired, since nothing can change the answer then). Every purge window is off by
+        default, but the low-disk floor (``min_free_disk_mb``, BACKLOG #290) and the hourly WAL
+        truncate (``wal_checkpoint_seconds``, vault BACKLOG #2619) ship ON, so on a file-backed
+        SQLite store stock settings give the runner passes to run for those two. The audit-log
+        growth warning (``audit_log_warn_rows``, BACKLOG #1421) ships ON as well and applies to every
+        backend, so stock settings give it passes on SQL Server and Postgres too. It purges nothing
+        unless a window is set.
 
         Embedded-document pruning (#47, ADR 0042) has no ``[retention]`` setting — it is a purely
-        per-connection knob — so the runner must also start when any inbound sets ``prune_documents_after``
-        even if no global window is configured. The registry is consulted via ``_registry_source`` (None
-        when no registry is wired)."""
+        per-connection knob — so this is also True when any inbound sets ``prune_documents_after``
+        even if no global window is configured. So must a per-connection ``messages_days`` or
+        ``dead_letter_days`` window above 0 (0 keeps forever, which no pass acts on). The registry is
+        consulted via ``_registry_source`` (None when no registry is wired) and read live, because a
+        config reload can set or clear these (BACKLOG #6804)."""
         s = self._settings
         if (
             s.messages_days
@@ -443,28 +457,46 @@ class RetentionRunner:
         ):
             return True
         # Application log-file retention (#120 delete, #119 compress) needs BOTH a window and a log_dir
-        # to do anything, so only start the runner for it when both are present (avoids a no-op task for
-        # a configured window on a stdout-only deployment).
+        # to do anything, so it counts only when both are present (avoids a no-op pass for a configured
+        # window on a stdout-only deployment).
         if (s.app_log_days > 0 or s.app_log_compress_days > 0) and self._log_dir:
             return True
         registry = self._registry_source() if self._registry_source is not None else None
-        if registry is not None and any(  # noqa: SIM103
-            ic.prune_documents_after is not None for ic in registry.inbound.values()
-        ):
-            return True
-        return False
+        if registry is None:
+            return False
+        # A connection's own window gives a pass something to do even with every global knob off.
+        return any(
+            ic.prune_documents_after is not None or (ic.messages_days or 0) > 0
+            for ic in registry.inbound.values()
+        ) or any((oc.dead_letter_days or 0) > 0 for oc in registry.outbound.values())
 
     # --- lifecycle -----------------------------------------------------------
 
     def start(self) -> None:
-        """Spawn the supervised purge/maintenance loop (no-op when nothing is configured)."""
+        """Spawn the supervised purge/maintenance loop (idempotent).
+
+        With a registry wired the loop is spawned even when nothing is configured yet, and idles:
+        each interval it re-reads :attr:`enabled` and runs a pass only when that is True. A config
+        reload can set a per-connection window on a graph that started with none, and a loop decided
+        once here would leave that window unenforced until a restart (BACKLOG #6804). With no
+        registry nothing can change :attr:`enabled`, so a disabled runner spawns no loop."""
         if self._task is not None:
             return
-        if not self.enabled:
-            log.debug("retention disabled (no [retention] windows configured); not starting")
+        active = self.enabled
+        if not active and self._registry_source is None:
+            log.debug("retention disabled (nothing configured); not starting")
             return
         self._stop.clear()
+        self._wake.clear()
+        self._active = active
         self._task = asyncio.create_task(self._run())
+        if not active:
+            log.debug(
+                "retention idle: nothing configured yet; re-checked every %gs, so a config reload "
+                "that sets a per-connection window takes effect without a restart",
+                self._settings.purge_interval_seconds,
+            )
+            return
         log.info(
             "retention enabled: messages_days=%d dead_letter_days=%d max_db_mb=%d "
             "min_free_disk_mb=%d audit_log_warn_rows=%d wal_checkpoint_seconds=%g vacuum_at=%r "
@@ -484,9 +516,18 @@ class RetentionRunner:
             self._settings.purge_interval_seconds,
         )
 
+    def wake(self) -> None:
+        """End an IDLE loop's sleep, so it re-reads :attr:`enabled` now and runs a pass if a config
+        reload just gave it something to do (BACKLOG #6804). The engine calls this after every
+        reload. An active loop keeps its interval: waking it would add a pass per reload, each with
+        its own alerts and audit row, for a change that it picks up on its next pass anyway."""
+        if not self._active:
+            self._wake.set()
+
     async def stop(self) -> None:
         """Signal the loop and await its exit (idempotent)."""
         self._stop.set()
+        self._wake.set()
         task = self._task
         self._task = None
         if task is not None:
@@ -500,18 +541,47 @@ class RetentionRunner:
         # One isolated pass per interval; an error in a pass is logged and the loop continues (a
         # retention hiccup must never take the engine down). Cooperatively cancellable via _stop.
         while not self._stop.is_set():
+            # Cleared here, before this iteration reads `enabled`, so a wake() that landed before
+            # this read (say between start() and the first iteration) is answered by this pass and
+            # cannot also cut the sleep after it short into a second, back-to-back pass.
+            self._wake.clear()
             try:
-                await self.run_once()
+                active = self._refresh_active()
+            except Exception:
+                log.exception(
+                    "retention could not read its configuration; will retry next interval"
+                )
+                active = False
+            try:
+                if active:
+                    await self.run_once()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("retention pass failed; will retry next interval")
             await self._sleep(self._settings.purge_interval_seconds)
 
+    def _refresh_active(self) -> bool:
+        """Re-read :attr:`enabled` for this interval and log a change, so an operator can see a
+        reload turn retention on or off (BACKLOG #6804)."""
+        active = self.enabled
+        if active != self._active:
+            self._active = active
+            if active:
+                log.info(
+                    "retention active: the configuration now sets something for it to do "
+                    "(a pass every %gs)",
+                    self._settings.purge_interval_seconds,
+                )
+            else:
+                log.info("retention idle: the configuration no longer sets anything for it to do")
+        return active
+
     async def _sleep(self, delay: float) -> None:
-        """Sleep up to ``delay``, waking immediately on stop (so shutdown isn't held by the interval)."""
+        """Sleep up to ``delay``, waking immediately on stop (so shutdown isn't held by the interval)
+        or on :meth:`wake`."""
         try:  # noqa: SIM105
-            await asyncio.wait_for(self._stop.wait(), delay)
+            await asyncio.wait_for(self._wake.wait(), delay)
         except TimeoutError:
             pass
 
@@ -521,6 +591,8 @@ class RetentionRunner:
         """Run a full retention pass for ``now`` (default: the injected clock): purge bodies past the
         configured windows, checkpoint the WAL / VACUUM if due, check the size threshold, and write a
         single ``audit_log`` entry when the pass did real work. Returns a :class:`RetentionPass`.
+        ``now`` does not decide whether the WAL truncate is due: that cadence reads the injected
+        ``monotonic`` clock (BACKLOG #6526).
 
         Leader-gated (Track B Step 4): a non-leader node returns a did-nothing pass without touching the
         store, so in a cluster exactly one node purges. The loop keeps ticking on followers
@@ -777,29 +849,29 @@ class RetentionRunner:
         # running VACUUM is non-interruptible: the deadline is checked only BEFORE it is dispatched.
         wal_checkpointed = False
         wal_left_untruncated = False
-        if (
-            not _deadline_hit()
-            and self._wal_truncate_applies()
-            and now - self._last_wal >= s.wal_checkpoint_seconds
-        ):
-            # `is False`: None is a backend with no -wal file, which `_wal_truncate_applies` skips.
-            wal_left_untruncated = await self._store.wal_checkpoint() is False
-            # The marker advances either way, so a reader that pins the WAL costs writers one busy
-            # timeout per cadence rather than one per pass.
-            self._last_wal = now
-            wal_checkpointed = True
-            if wal_left_untruncated:
-                # Vault BACKLOG #2619: a purged body can still sit in the -wal frames. Names the file
-                # and the cause only; no message content reaches this line.
-                log.warning(
-                    "retention: the WAL truncate did not finish -- another connection (one of the "
-                    "engine's own reads, a DR snapshot copy, or another process on this store) "
-                    "still held %s-wal, so frames written before this pass, purged bodies among "
-                    "them, stay in that file until a later truncate (the first retention pass at "
-                    "least %gs from now)",
-                    self._floor_path,
-                    s.wal_checkpoint_seconds,
-                )
+        # The cadence reads `self._monotonic`, not `now` (see __init__).
+        if not _deadline_hit() and self._wal_truncate_applies():
+            wal_at = self._monotonic()
+            if self._last_wal is None or wal_at - self._last_wal >= s.wal_checkpoint_seconds:
+                # `is False`: None is a backend with no -wal file, which `_wal_truncate_applies`
+                # skips.
+                wal_left_untruncated = await self._store.wal_checkpoint() is False
+                # The marker advances either way, so a reader that pins the WAL costs writers one
+                # busy timeout per cadence rather than one per pass.
+                self._last_wal = wal_at
+                wal_checkpointed = True
+                if wal_left_untruncated:
+                    # Vault BACKLOG #2619: a purged body can still sit in the -wal frames. Names the
+                    # file and the cause only; no message content reaches this line.
+                    log.warning(
+                        "retention: the WAL truncate did not finish -- another connection (one of "
+                        "the engine's own reads, a DR snapshot copy, or another process on this "
+                        "store) still held %s-wal, so frames written before this pass, purged "
+                        "bodies among them, stay in that file until a later truncate (the first "
+                        "retention pass at least %gs from now)",
+                        self._floor_path,
+                        s.wal_checkpoint_seconds,
+                    )
 
         vacuumed = False
         if not _deadline_hit() and self._vacuum_due(now):

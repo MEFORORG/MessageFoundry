@@ -21,12 +21,13 @@ if str(_REPO_ROOT) not in sys.path:  # runnable as a bare script, like its sibli
     sys.path.insert(0, str(_REPO_ROOT))
 
 from messagefoundry.security.audit_all_platforms import (  # noqa: E402
+    cli,
     main,
     requirement_lines,
     strip_markers,
 )
 
-__all__ = ["main", "requirement_lines", "strip_markers"]
+__all__ = ["cli", "main", "requirement_lines", "strip_markers"]
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(cli())

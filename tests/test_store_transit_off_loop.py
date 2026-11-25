@@ -351,3 +351,144 @@ async def test_converge_keeps_a_newer_own_sync_made_during_the_read(backend: str
     assert await store.converge_reference_cache() == []
     assert store._reference_versions == {"codes": "v2"}
     assert store._reference_cache["codes"] is own
+
+
+class _RangeHost:
+    """The parts of an :class:`~messagefoundry.store.store.AuditRangeHost` that
+    :func:`~messagefoundry.store.store.settle_audit_ranges` reads, over fixed range rows."""
+
+    def __init__(self, mac_fn: Any, rows: list[dict[str, Any]]) -> None:
+        self._audit_mac_keys: dict[str, bytes] = {}
+        self._audit_mac_key = None
+        self._audit_mac_fn = mac_fn
+        self._audit_range_key_id: str | None = None
+        self._audit_range_from: int | None = None
+        self._audit_range_keys: list[str] = []
+        self._audit_ranges_trusted = True
+        self._rows = rows
+
+    async def _audit_range_rows(self) -> list[dict[str, Any]]:
+        return self._rows
+
+
+def _closes(key_id: str, from_seq: int, to_seq: int) -> dict[str, Any]:
+    return {
+        "key_id": key_id,
+        "from_seq": from_seq,
+        "to_seq": to_seq,
+        "rows": to_seq - from_seq + 1,
+        "digest": "0" * 64,
+        "prev_hash": "",
+    }
+
+
+def _range_rows(transit_tag: tuple[bytes | None, Any]) -> list[dict[str, Any]]:
+    """Two range rows after a genesis under a key the host does not hold: the first opens the
+    Transit range (its outgoing key is not held, so its tag is not checked), the second closes the
+    Transit range, so its tag, made with ``transit_tag``, is checked under the Transit MAC."""
+    transit_id = store_module.AUDIT_TRANSIT_KEY_ID
+    return [
+        {
+            "seq": 3,
+            "detail": store_module.audit_epoch_detail(
+                transit_id, _closes("k-unheld", 1, 2), (b"\x01" * 32, None)
+            ),
+        },
+        {
+            "seq": 6,
+            "detail": store_module.audit_epoch_detail(
+                "k-local", _closes(transit_id, 3, 5), transit_tag
+            ),
+        },
+    ]
+
+
+async def test_the_open_checks_a_transit_handover_tag_off_the_loop() -> None:
+    """``settle_audit_ranges`` checks a range row's handover tag under the outgoing key. When that
+    key is the Transit one the check is a Transit MAC call, which ran on the loop at the open."""
+    transit = _RecordingTransit()
+    mac_fn = TransitCipher(_FakeClient(transit), _KEY).audit_mac_fn()
+    transit_id = store_module.AUDIT_TRANSIT_KEY_ID
+    host = _RangeHost(mac_fn, _range_rows((None, mac_fn)))
+    transit.threads.clear()
+    await store_module.settle_audit_ranges(host, {}, "k-unheld", None, transit_id)  # type: ignore[arg-type]
+    # The tag verified, so the range it opens was accepted: the check ran, and it passed.
+    assert host._audit_range_keys == ["k-unheld", transit_id, "k-local"]
+    assert host._audit_ranges_trusted
+    assert transit.threads, "the open made no Transit call, so this test measured nothing"
+    assert threading.get_ident() not in transit.threads
+
+
+async def test_a_transit_handover_tag_that_does_not_verify_is_read_as_a_break() -> None:
+    """The control: a tag the outgoing key did not make is read as a break; the store opens."""
+    mac_fn = TransitCipher(_FakeClient(_RecordingTransit()), _KEY).audit_mac_fn()
+    transit_id = store_module.AUDIT_TRANSIT_KEY_ID
+    host = _RangeHost(mac_fn, _range_rows((b"\x02" * 32, None)))
+    await store_module.settle_audit_ranges(host, {}, "k-unheld", None, transit_id)  # type: ignore[arg-type]
+    assert not host._audit_ranges_trusted
+    assert host._audit_range_keys == ["k-unheld", transit_id]
+
+
+class _HmacThreadsTransit(_RecordingTransit):
+    """Records the thread of each ``generate_hmac`` alone: at the open the genesis check is a
+    ``verify_signed_data``, and a range row's handover-tag check is a ``generate_hmac``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hmac_threads: list[int] = []
+
+    def generate_hmac(self, **kw: Any) -> dict[str, Any]:
+        self.hmac_threads.append(threading.get_ident())
+        return super().generate_hmac(**kw)
+
+
+async def test_a_real_open_checks_a_planted_transit_handover_tag_off_the_loop(
+    tmp_path: Path,
+) -> None:
+    """The store open itself, over a range row planted to close the Transit range (no roll writes
+    one), makes its handover-tag ``generate_hmac`` off the loop."""
+    import sqlite3
+
+    from messagefoundry.store.crypto import audit_key_id
+
+    transit = _HmacThreadsTransit()
+    cipher = TransitCipher(_FakeClient(transit), _KEY)
+    db = tmp_path / "t.db"
+    store = await MessageStore.open(db, cipher=cipher, audit_mac_fn=cipher.audit_mac_fn())
+    try:
+        await store.record_audit("probe", actor="tester", detail="synthetic")
+    finally:
+        await store.close()
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = [dict(r) for r in con.execute("SELECT * FROM audit_log ORDER BY seq")]
+        transit_id = store_module.AUDIT_TRANSIT_KEY_ID
+        closes = store_module.audit_range_closing(rows, key_id=transit_id, from_seq=1, prev_hash="")
+        local_id = audit_key_id(b"\x03" * 32)
+        detail = store_module.audit_epoch_detail(local_id, closes, (None, cipher.audit_mac_fn()))
+        con.execute(
+            "INSERT INTO audit_log (seq, ts, actor, action, detail, row_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                len(rows) + 1,
+                time.time(),
+                "tester",
+                store_module.AUDIT_KEY_EPOCH_ACTION,
+                detail,
+                "0" * 64,
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+    transit.hmac_threads.clear()
+    store = await MessageStore.open(db, cipher=cipher, audit_mac_fn=cipher.audit_mac_fn())
+    try:
+        # The tag verified, so the open accepted the range the planted row opens.
+        assert store._audit_range_keys == [transit_id, local_id]
+        assert store._audit_ranges_trusted
+    finally:
+        await store.close()
+    assert transit.hmac_threads, "the open made no generate_hmac, so this test measured nothing"
+    assert threading.get_ident() not in transit.hmac_threads

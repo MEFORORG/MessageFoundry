@@ -4815,10 +4815,10 @@ class _RoleDefault:
         return "<each role's default>"
 
 
-#: ``DICOM(max_object_bytes=...)`` left unset. One factory builds both roles and each has its own
-#: default (``transports/dicom.py``; vault BACKLOG #4908), so the factory writes no value it was not
-#: given. Typed ``Any`` so that the parameter's annotation stays ``int | None``, which is what an
-#: author may pass. DICOM is not a connections.toml transport today, so no file reads this default.
+#: ``DICOM(max_object_bytes=...)`` or ``min_message_bytes_per_second`` left unset. One factory builds
+#: both roles and the transport holds each default (``transports/dicom.py``; vault BACKLOG #4908,
+#: #6637), so the factory writes no value it was not given. Typed ``Any`` so that the parameter's
+#: annotation stays what an author may pass. DICOM is not a connections.toml transport today, so no file reads this default.
 #: Not ``_UNSET``, which is ``env()``'s.
 _ROLE_DEFAULT: Any = _RoleDefault()
 
@@ -4869,6 +4869,9 @@ def DICOM(
     max_pdu_size: int = 16384,  # largest PDU offered; the SCP aborts a longer one (SCP: 4096 to 1 MiB)
     timeout_seconds: float = 30.0,  # ACSE/DIMSE/network timeout; SCP: deadline per read and send, >= 1 s
     connect_timeout: float = 10.0,  # outbound SCU: association-request timeout (Phase 2)
+    min_message_bytes_per_second: int = _ROLE_DEFAULT,  # SCP: the rate in each message's deadline;
+    # unset = 64 KiB a second. Lower it for a slower link. At least 16 KiB a second: it cannot be
+    # off. Refused on an outbound.
 ) -> ConnectionSpec:
     """A **DICOM DIMSE** endpoint (ADR 0025). **Phase 1 (built): the inbound C-STORE SCP** — pair it
     with ``content_type="dicom"`` on ``inbound(...)`` so a received object is base64-carried (ADR 0028)
@@ -4956,6 +4959,8 @@ def DICOM(
     }
     if max_object_bytes is not _ROLE_DEFAULT:
         settings["max_object_bytes"] = max_object_bytes
+    if min_message_bytes_per_second is not _ROLE_DEFAULT:
+        settings["min_message_bytes_per_second"] = min_message_bytes_per_second
     return ConnectionSpec(ConnectorType.DIMSE, settings)
 
 
@@ -12121,13 +12126,18 @@ _CONFIG_MODULE_SUFFIX_LEN: Final = 13
 #: Why the loader's diagnostic for author code carries no exception text.
 _WITHHELD: Final = "its message is withheld: it can carry a value the module held"
 
+#: What :func:`_failure_detail` adds when a folder :func:`_in_dir` could not resolve may make the
+#: location short; its docstring says when.
+_FOLDER_UNRESOLVED: Final = ", and the folder of at least one source file could not be resolved"
+
 
 def _module_failure(
     path: Path, exc: BaseException, source_of: Callable[[str], bytes | None]
 ) -> str:
     """The loader's diagnostic for author code that failed: the exception TYPE, the config-directory
-    file and line it was raised from, and each identifier :func:`_failure_detail` can vouch for, but
-    never the exception's text (vault BACKLOG #3249).
+    file and line it was raised from, each identifier :func:`_failure_detail` can vouch for, and
+    its fixed note when a folder it could not resolve may make that location short, but never the
+    exception's text (vault BACKLOG #3249).
 
     The text is author code's, or a library's quoting author data, and can carry any value the module
     held -- an inline credential, a row it read. It reached ``messagefoundry validate`` and ``check``
@@ -12186,7 +12196,8 @@ def _is_a_signal(exc: BaseException, path: Path) -> bool:
 
 def _raised_in_the_config_dir(exc: BaseException, path: Path) -> bool:
     file = raise_statement_file(exc)
-    return file is not None and _in_dir(file, path.parent.resolve())
+    # A raise in a folder that could not be resolved cannot prove a config file raised it.
+    return file is not None and _in_dir(file, path.parent.resolve()) is True
 
 
 def _read_fault(path: Path, fault: BaseException) -> None:
@@ -12238,25 +12249,40 @@ def _failure_detail(
     is not ``own_file``), and each identifier the exception claims that the source line spells.
 
     The file is the deepest frame in the config directory, so a failing helper is named rather than
-    the config module's import of it. A file name and a line number are layout, not data."""
+    the config module's import of it. A file name and a line number are layout, not data.
+
+    A file whose folder could not be resolved (:func:`_in_dir`) is not named. When one is a frame
+    deeper than the last config-directory frame, is any frame when no frame is in the config
+    directory, or is the file a SyntaxError names, the detail ends with :data:`_FOLDER_UNRESOLVED`,
+    because the location may then be short (vault BACKLOG #3765, LF10)."""
     located: tuple[str, int] | None = None
     filename = getattr(exc, "filename", None) if isinstance(exc, SyntaxError) else None
     lineno = getattr(exc, "lineno", None)
-    if isinstance(filename, str) and isinstance(lineno, int) and _in_dir(filename, config_dir):
-        located = (filename, lineno)
-    else:
+    # A SyntaxError's own file is not a frame, so no config-directory frame outweighs it.
+    syntax_file_unresolved = False
+    if isinstance(filename, str):
+        in_dir = _in_dir(filename, config_dir)
+        syntax_file_unresolved = in_dir is None
+        if in_dir is True and isinstance(lineno, int):
+            located = (filename, lineno)
+    deeper_unresolved = False
+    if located is None:
         # One resolve per distinct file: a RecursionError walks about a thousand frames of one file.
-        seen: dict[str, bool] = {}
+        seen: dict[str, bool | None] = {}
         for frame, frame_line in traceback.walk_tb(exc.__traceback__):
             name = frame.f_code.co_filename
             if name not in seen:
                 seen[name] = _in_dir(name, config_dir)
-            if seen[name]:
+            if seen[name] is True:
                 located = (name, frame_line)
+                deeper_unresolved = False
+            elif seen[name] is None:
+                deeper_unresolved = True
+    note = _FOLDER_UNRESOLVED if syntax_file_unresolved or deeper_unresolved else ""
     detail = _type_name(exc)
     # A frame's line can be None (a code object with no line table): no line, and nothing vouched.
     if located is None or not isinstance(located[1], int):
-        return detail
+        return detail + note
     source_file, line = located
     if Path(source_file).name != own_file:
         detail += f" in {Path(source_file).name}"
@@ -12272,7 +12298,7 @@ def _failure_detail(
         ]
         if idents:
             detail += " naming " + ", ".join(repr(ident) for ident in idents)
-    return detail
+    return detail + note
 
 
 def _claimed_identifiers(exc: BaseException) -> tuple[object, ...]:
@@ -12347,9 +12373,14 @@ def _source_name(name: object) -> str | None:
     return name
 
 
-def _in_dir(filename: str, directory: Path) -> bool:
+def _in_dir(filename: str, directory: Path) -> bool | None:
     """Whether ``filename`` sits directly in ``directory`` -- config modules and their helpers are
-    siblings -- compared resolved.
+    siblings -- compared resolved, or ``None`` when its folder could not be resolved.
+
+    ``None`` is not a match, and the names are not compared as text in its place. Nothing is logged
+    here: this runs while an interrupt is judged (:func:`_is_a_signal`), where a log call would run
+    a handler a module added. :func:`_failure_detail` says it in its diagnostic when it may make the
+    location short; the interrupt verdict records nothing of it.
 
     Only an absolute filename counts. The loader's modules record one (the import machinery makes the
     spec's path absolute, even for a config directory given as a relative path), while ``<string>``,
@@ -12363,7 +12394,7 @@ def _in_dir(filename: str, directory: Path) -> bool:
         # (the Kubernetes ConfigMap layout, or one shared helper), and still sits in this one.
         return candidate.parent.resolve() == directory
     except (OSError, ValueError):
-        return False
+        return None
 
 
 def _textless_import_error(exc: ImportError) -> ImportError:

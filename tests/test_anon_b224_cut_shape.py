@@ -23,7 +23,7 @@ from messagefoundry_toolkit.anon import leak as engine_leak
 from tee.anon import leak as tee_leak
 from tests.test_anon_core import _NO_SCANNER
 
-_SALT = "b224-cut-salt-0123456789abcdef"
+_SALT = "b224-cut-salt-0123456789abcdef-0123456789"
 _DASH_HEAD = "MSH-^~\\&-A-B-C-D-20260101--ORU^R01-M1-P-2.5.1\rPID-1--1^^^H^MR--X^Y"
 _SIDES = pytest.mark.parametrize("anon", [engine_anon, tee_anon], ids=["engine", "tee"])
 _LEAKS = pytest.mark.parametrize("leak", [engine_leak, tee_leak], ids=["engine", "tee"])

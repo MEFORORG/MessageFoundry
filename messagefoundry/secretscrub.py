@@ -180,6 +180,7 @@ __all__ = [
     "CREDENTIAL_PLACEHOLDER",
     "credential_query_params",
     "has_credential_like_segment",
+    "mask_private_key_blocks",
     "scrub_credentials",
 ]
 
@@ -726,6 +727,70 @@ _GUARDED_BRACED_VALUE = r"\{(?:[^}'\"\r\n]|\}\})*+\}(?!\})"
 #: The same, holding no whitespace at all: the one braced shape the old plain class took whole.
 _GUARDED_BRACED_NO_SPACE = r"\{(?:[^}'\"\s]|\}\})*+\}(?!\})"
 
+# A BRACED VALUE HOLDING WHITE SPACE, WITH TEXT GLUED AFTER ITS CLOSER (BACKLOG #2966 step 1).
+# The guard above refuses a closer that does not end the value, and the plain class then stopped at the
+# first white space inside the braces, so ``MEFOR_X={pp ww}x rest`` printed " ww}x rest".
+# ``_MEFOR_SECRET`` now takes such a value, closer and glued text, in one narrow shape
+# (:data:`_MEFOR_GLUED_BRANCH`). Every other shape falls back to the plain class and prints as before.
+# ``_KEY_MATERIAL`` takes no such branch: one ending its glued text at ";" or "&" deleted the space
+# that ended the token before it, so the support bundle's HL7 field-run pass read one longer token
+# and printed a name or a password tail ``origin/main`` hid (``a|b|private_key={pp ww}x;Smith
+# Jones`` printed "Jones"). Found by the third review round; #2966 step 2 stays open.
+#
+# WHAT THE OLD CLASS LEFT, from the space in the braces to the end of the glued text, was still read by
+# every later pass, here and in the support bundle's PHI pass. A pass that starts there, or before the
+# label, and reads on, across the next space or to the end of the line, hid text that this branch
+# would take its anchor or its token end away from. So the shape is an ALLOWLIST, as :data:`_SPACED_BRACED_TAIL` is, and each condition is a
+# measured or reviewed reason:
+#
+# * Before the braces' first plain space, any character except white space, a quote, ";", "&", "{"
+#   and "}" (a doubled "}}" is allowed). The old class took that head too, so no later pass read it
+#   either way. ";", "&" and "{" are refused as a precaution carried from an earlier form of this
+#   branch, whose differential against ``origin/main`` printed five values with ";" allowed anywhere
+#   in the braces; the third review round measured no newly printed value with ";" or "&" allowed in
+#   the head alone, so the head refusal may cost coverage only.
+# * The first white space is a plain space, U+0020; any other white space before it, at least a tab,
+#   U+00A0 and a line separator such as U+2028, refuses the branch. Deleting a line separator would
+#   join two lines of a multi-line record.
+# * After it, up to the closer, and in the glued text after the closer, only lower case ASCII letters,
+#   with spaces in the braces and ";", "," and "&" in the glued text, which the plain class runs over
+#   too. That refuses at least a
+#   capital, a digit, "|", "(", ":", "=", "-", "." and "/": an HL7 segment ID, a DICOM tag, a
+#   ``PatientName=`` label, a name run or a date the PHI pass reads to the end of the line or across
+#   the next space, a ``://`` or a ``-----BEGIN`` marker. Found by code review on this change, with
+#   ``MEFOR_X={pp PID|x}x rest vq9`` printing "rest vq9" in the bundle.
+# * No word of :data:`_GLUED_REFUSED_WORDS`, a fixed list of words later passes read, anywhere in
+#   those letters; at least ``mrn``, ``nonnumeric`` and the scheme words are on it. ``MEFOR_X={pp ww}mrn 12345`` printed
+#   "12345" in the bundle without it, and ``nonnumeric port: 'pw@host'`` after the glued text printed
+#   the password, found by the first and second review rounds.
+# * The glued text ends at white space or the end of the text, so the token after it ends where it
+#   did. A quote right after it refuses the branch, as do at least white space and a ":", "=" or
+#   quote, and white space, a scheme word and white space, which is :data:`_NO_QUOTED_LABEL_AFTER`:
+#   ``;password = v`` keeps its label.
+#
+# These are the readings found so far, not a proof that no later pass reads anything else in such
+# text. ``tests/test_secretscrub_braced_glued.py`` compares both surfaces with and without the
+# branch over a seeded corpus that holds the conditions above after the braces' first space, with a
+# widened branch as its positive control; the conditions before that space are tested only by the
+# refused-shape cases.
+#: Words a later pass reads, as lower case ASCII letters spell them, at least: :data:`_MEMBER_KEEP_WORDS`
+#: and the PHI pass's anchor and unbounded words (``redaction._ANCHOR_PREFIXES``' sources and
+#: ``redaction._UNBOUNDED_WORDS``, ``nonnumeric`` among them), reduced by subsumption, with entries
+#: holding "_", "-" or a digit left out, since no such text holds one. Refusing a short word such as
+#: ``id`` refuses every glued word holding it; that costs coverage only.
+#: ``tests/test_secretscrub_braced_glued.py`` holds it to those sources, which can grow, so a
+#: word a later pass reads and no source lists is not refused.
+_GLUED_REFUSED_WORDS = (
+    r"(?:pass|pwd|secret|credential|auth|bearer|token|session|key|sig|jwt|code|state|basic|digest"
+    r"|mrn|name|address|family|given|birthdate|identifier|telecom|patient|medicalrecordlocator"
+    r"|responsibleperson|access|api|bhs|enc|false|fhs|fs|id|intake|mefor|mfb|msh|next|none"
+    r"|nonnumeric|null|port|private|redacted|retired|true|za)"
+)
+#: One lower case letter that does not start a refused word. The one-character gate in front skips
+#: the alternation for a letter no refused word starts with.
+_GLUED_LOWER = r"(?-i:(?![abcdefgijkmnprstz])[a-z]|(?!" + _GLUED_REFUSED_WORDS + r")[a-z])"
+_SPACED_GUARDED_BRACED = r"\{(?:[^{}'\"\s;&]|\}\})*+ (?: |" + _GLUED_LOWER + r")*+\}(?!\})"
+
 #: One unit of a value walk: a run of letters and digits, SPLIT AT EVERY CAMELCASE BOUNDARY, a capital
 #: after a lower-case letter or a digit (BACKLOG #5545). The walks below check for a later label in
 #: front of each unit, and a label may start at such a boundary since :data:`_CAMEL_START`, so a walk
@@ -1013,6 +1078,17 @@ _PLAIN_SCHEME_VALUE = (
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 
+#: The branch :data:`_SPACED_GUARDED_BRACED` says why: a braced value holding a space, then glued
+#: text up to where ``_MEFOR_SECRET``'s plain class stops, with no label after it.
+_MEFOR_GLUED_BRANCH = (
+    _SPACED_GUARDED_BRACED
+    + r"(?:[;,&]|"
+    + _GLUED_LOWER
+    + r")++"
+    + rf"(?![^{_PLAIN_TERMINATORS}])"
+    + _NO_QUOTED_LABEL_AFTER
+)
+
 
 def _narrowed_value(
     value: str, terminators: str, group: str, extra: str
@@ -1055,6 +1131,222 @@ _CAMEL_PLAIN_KEY_VALUE, _CAMEL_KEY_VALUE_CLASSES = _narrowed_value(
     _PLAIN_KEY_VALUE, _KEY_TERMINATORS, "compound", ","
 )
 
+# --- THE MASKED TAILS (BACKLOG #5546, #5547, #5548, #5550) ----------------------------------------
+#
+# Three shapes printed their value after a label pattern had matched, because the match ended early:
+#
+#   {"Authorization": "Basic dXNl=="}  ->  {"Authorization=<redacted> dXNl=="}     (#5546)
+#   password=b'v w'                    ->  password=<redacted>'v w'                 (#5547)
+#   Authorization: Digest username="u", nonce="n", response="r"
+#                                      ->  Authorization=<redacted>"u", nonce=...   (#5548)
+#
+# THE MATCH ITSELF IS NOT CHANGED, which is what three earlier designs got wrong (engine PR 2956). A
+# widened value took a later label's head while its value stayed outside; a pass after the scrub
+# shortened the line, so a cut surface showed text the old cut dropped; and writing spaces split HL7
+# field runs below the PHI pass's threshold. Here each pattern keeps the match it had, and an
+# optional possessive TAIL group after it takes what the old match left printing. The tail is
+# written back masked, one character for one, by :func:`_mask_tail`: every character becomes "x",
+# except whitespace, the quotes and the HL7 delimiters ``|^~\&``. So the line keeps its length, its
+# whitespace, its quotes and its HL7 delimiters, and nothing else of a scheme, bytes or Digest tail:
+# its other separators, at least "=", ":", ".", "-" and "/", become "x" too, and a masked word no
+# longer reads as a label or a name. A key body keeps more, its escaped line breaks and its
+# ``Proc-Type:`` and ``DEK-Info:`` header lines (:func:`_mask_key_body`). A pass after this one can therefore read the line differently from the line
+# before the tails, which is why the control below is a comparison.
+#
+# WHAT THE TAIL GRAMMAR AIMS AT, each item a reason one of those designs regressed. These are aims
+# of the grammar, and a review found shapes each missed; the control is the next paragraph.
+#
+# * No "{", no line break, no "://" and no quote other than the tail's own inside a scheme, bytes
+#   or Digest tail. A key body holds line breaks by design; its pattern says what else.
+# * No label head inside a tail unless the label's whole value is inside too. A bytes literal or a
+#   token68 body holds no ":" or "=", except token68's trailing padding, and that padding is refused
+#   when a label word ends right before it (:data:`_NO_LABEL_BEFORE`): ``Basic abc.password==``
+#   would otherwise mask a label ``_CREDENTIAL_KV`` reads. A Digest parameter whose name ends in a
+#   label word is refused the same way.
+# * A tail ends right before whitespace not followed by ":" or "=", before a quote not followed by
+#   them, or at the end of the text (:data:`_TAIL_END`). A closer followed by them is a later
+#   label's quote, as in ``token=b'x+pwd'='v'``, and a spaced ``abc.password = 'v'`` is a label.
+# * A shape the tail grammar refuses matches exactly as it did before: the tail group is optional
+#   and possessive, after the whole old match, so a refused tail leaves the old match whole.
+#
+# THE CONTROL IS A COMPARISON, NOT THE GRAMMAR. Each surface computes the line twice where a tail
+# could fire, with the tails and without them (:func:`_without_tails`, which is the reading before
+# them), and keeps the tailed output only where it has the other's length and differs from it only
+# at an "x" (:func:`_mask_only`); otherwise it keeps the output without the tails, which is what the
+# code before them printed. :func:`scrub_credentials` does it on its own output,
+# ``support.redact.redact_log_line`` on its output before the long-base64 sweep, the query filter in
+# ``logging_setup`` on the credential pass's reading of its output, and the key-block mask on the PHI
+# pass's (:func:`mask_private_key_blocks_then`), read through the credential passes after it on the
+# installed chain and the tray. So where a comparison runs, a shape the grammar gets wrong costs
+# coverage rather than a value the code before it hid. At least these places are not covered:
+#
+# * a record that two handlers filter, where the second pass reads the first's output;
+# * the line across filters on the installed chain, where only the query filter's step and the
+#   key-block mask are compared;
+# * the filter-less ``JsonFormatter``'s ``exc_info`` branch, whose key-block mask is compared
+#   through the PHI pass alone, since no credential pass runs after it there;
+# * the support bundle read over a line the chain already masked: ``redact_log_line`` compares its
+#   own two readings of that line, not a reading of the line the chain would have written without
+#   the tails, and its long-base64 sweep can join the chain's "x" runs, so the line comes out
+#   shorter;
+# * the audit tee, whose field scrub reads without the tails and the key-block mask
+#   (``logging_setup.scrub_log_text``), so its fields are the reading before them, while the chain
+#   reads its encoded line with them as it reads any other line.
+#
+# RESIDUALS, at least: a bytes literal whose value holds ":" or "=" prints as before, and so does a
+# quoted scheme token whose padding follows a label word, a token68 followed by anything but
+# whitespace, a quote or the end, a Digest header in a dict repr or JSON, with an unquoted first
+# parameter, an absolute uri or trailing punctuation, and every shape the comparison falls back on.
+# A quoted scheme token after an EARLIER label's plain value, as in
+# ``MEFOR_X=a;authorization:"Basic x=="``, prints too: the earlier value runs on over the label and
+# no tail follows it. ``_BEARER`` still takes no braced value (BACKLOG #2966 step 3). A tail or a
+# key body prints as before in a text the camelCase union returns its reading before for, whole: a
+# text where the shipped reading hid a member key's ";", as in ``userPwd='a;PWD=b' password=b'v w'``,
+# and an untraceable one. :func:`_pre_camel` leaves the tails and the key-block pass out of that
+# reading, so in such a text none of them runs. The fallback covers the whole text, not one line:
+# through :func:`scrub_credentials` alone, a line where the camelCase reading hides a member key's
+# ";" (``userPwd='a;PWD=b'``) leaves at least a PEM body on another line of that text unmasked,
+# before that line or after it. A plain member key (``Server=x;PWD=b``) does not trigger it.
+# :func:`mask_private_key_blocks_then` over :func:`scrub_credentials` masked the body on both
+# orders when measured, since its key-block mask runs before this pass. Not so
+# ``support.redact.redact_log_text``: it splits the text at line breaks first, so the key-block
+# mask cannot match a block with real line breaks there, and a body line too short for its
+# long-base64 sweep prints, with or without the member key.
+
+#: The label words a padded token68 may not end in: every family's, and the query keys
+#: ``logging_setup``'s query filter reads. Case-insensitive, one fixed-width lookbehind per word.
+_NO_LABEL_BEFORE = "".join(
+    rf"(?<!(?i:{re.escape(word)}))"
+    for word in sorted(set(_CAMEL_WORDS + _CREDENTIAL_QUERY_KEYS), key=lambda w: (-len(w), w))
+)
+#: Where every tail ends: right before whitespace or a quote that no ":" or "=" follows, or at the
+#: end of the text.
+_TAIL_END = r"(?=\s++(?![:=])|['\"](?!\s*+[:=])|\Z)"
+#: A bytes literal's closers, each one no ":" or "=" follows, so it is not a later label's quote.
+_SQ_CLOSER = r"(?='(?!\s*+[:=]))"
+_DQ_CLOSER = r"(?=\"(?!\s*+[:=]))"
+#: A token68 credential (RFC 9110 section 11.2) and its padding.
+_TOKEN68 = r"[A-Za-z0-9._~+/-]++(?:" + _NO_LABEL_BEFORE + r"=++)?+" + _TAIL_END
+
+#: BACKLOG #5546. After ``_BEARER``'s value, only when that value was a quote and ``basic`` or
+#: ``bearer``: the ``"Basic`` of ``{"Authorization": "Basic dXNl=="}``, where the guarded quoted value
+#: refused the padding before the closer and the plain class stopped at the space.
+_SCHEME_TOKEN_TAIL = (
+    r"(?:(?<=['\"](?i:basic))|(?<=['\"](?i:bearer)))(?P<scheme_tail>[ ]++" + _TOKEN68 + r")"
+)
+
+#: BACKLOG #5547. A Python bytes literal, ``password=b'v w'``: the plain classes took the ``b`` and
+#: stopped at the quote. :data:`_BYTES_PROBE` sits where a value starts and records, without taking
+#: anything, that the value is exactly a ``b`` and a quote; :data:`_BYTES_TAIL` then takes the
+#: literal's body up to its closer, which stays. ``_MEFOR_SECRET``'s plain value takes the opening
+#: quote as well, so its tail, :data:`_MEFOR_BYTES_TAIL`, starts after it.
+#: What a bytes literal's body may hold: printable ASCII and the space, without the quotes, "{",
+#: ":", "=", "%", "\", the brackets "[" "]" and "<" ">" of a placeholder, and "}". So a tail holds no
+#: control character, which the control-character filter after it would escape to another length,
+#: no escape, no placeholder, and no ``mfb64:`` carriage marker in any spelling (found by code
+#: review). A literal holding one prints as before.
+_TAIL_TEXT = r"[ !#$&(-9;?-Z^-z|~]"
+_BYTES_CHARS = _TAIL_TEXT
+_BYTES_PROBE = r"(?:(?=(?P<bytes_open>)b['\"]))?"
+_BYTES_TAIL = (
+    r"(?(bytes_open)|(?!))(?<=b)(?P<bytes_tail>'"
+    + _BYTES_CHARS
+    + r"*+"
+    + _SQ_CLOSER
+    + r"|\""
+    + _BYTES_CHARS
+    + r"*+"
+    + _DQ_CLOSER
+    + r")"
+)
+_MEFOR_BYTES_TAIL = (
+    r"(?(bytes_open)|(?!))(?P<bytes_tail>(?<=b')"
+    + _BYTES_CHARS
+    + r"*+"
+    + _SQ_CLOSER
+    + r"|(?<=b\")"
+    + _BYTES_CHARS
+    + r"*+"
+    + _DQ_CLOSER
+    + r")"
+)
+
+#: BACKLOG #5548. ``_BEARER``'s scheme words as they shipped, and the same with a marker on
+#: ``digest``, which :data:`_DIGEST_TAIL` reads. The marker changes no match.
+_SCHEME_WORDS = r"(?:(?:bearer|basic|digest)\s+)?"
+_MARKED_SCHEME_WORDS = r"(?:(?:bearer|basic|(?P<digest>digest))\s+)?"
+#: A quoted Digest parameter value: ":" and "=" are allowed inside, and "'", "{" and "://" are not.
+_DIGEST_QUOTED = r"\"(?:" + _TAIL_TEXT[:-1] + r"=]|(?<!mfb64):(?!//))*+\""
+#: After ``digest`` and the value ``_BEARER`` took, which stops before the first parameter's quote:
+#: the rest of that parameter, then every later ``, name=value`` on the line, to :data:`_TAIL_END`.
+_DIGEST_TAIL = (
+    r"(?(digest)|(?!))(?P<digest_tail>(?:(?<=[:=])"
+    + _DIGEST_QUOTED
+    + r")?+(?:[^\S\r\n]*+,[^\S\r\n]*+[A-Za-z]++"
+    + _NO_LABEL_BEFORE
+    + r"=(?:"
+    + _DIGEST_QUOTED
+    + r"|[A-Za-z0-9._~+/-]++))*+)"
+    + _TAIL_END
+)
+
+#: Each pattern's tails, spliced after its whole old value.
+_BEARER_TAILS = r"(?:" + _SCHEME_TOKEN_TAIL + r"|" + _BYTES_TAIL + r"|" + _DIGEST_TAIL + r")?+"
+_KV_TAILS = r"(?:" + _BYTES_TAIL + r")?+"
+_MEFOR_TAILS = r"(?:" + _MEFOR_BYTES_TAIL + r")?+"
+
+#: Every tail fragment, with what the pattern before the tails held in its place, for
+#: :func:`_strip_tails`. The composites come first, so no later entry sits inside an earlier one.
+_TAIL_FRAGMENTS = (
+    (_BEARER_TAILS, ""),
+    (_MEFOR_TAILS, ""),
+    (_KV_TAILS, ""),
+    (_BYTES_PROBE, ""),
+    (_MARKED_SCHEME_WORDS, _SCHEME_WORDS),
+)
+
+
+def _strip_tails(source: str) -> str:
+    """``source`` without the masked tails: each of :data:`_TAIL_FRAGMENTS` swapped back."""
+    for fragment, before in _TAIL_FRAGMENTS:
+        source = source.replace(fragment, before)
+    return source
+
+
+# BACKLOG #5550. A PEM or OpenSSH PRIVATE KEY block, its body masked as a tail is. No label pattern
+# reads one: the body is base64 lines between two markers, and ``_ANY_HINT`` held no word in it, so
+# :func:`scrub_credentials` returned the text at its gate. On the installed chain the PHI pass ran
+# first and rewrote the markers as a name run, so nothing after it could find the block either.
+#
+# Group 1 is the BEGIN marker, kept. ``key_body`` is every whole line after it that is a base64 run
+# not ending in a label word (:data:`_NO_LABEL_BEFORE`), with its padding, a ``Proc-Type:`` or ``DEK-Info:``
+# header or an empty line, each line separated by a real or an escaped line break, with spaces or
+# tabs allowed at its end. A line is taken
+# only where it ends where a line ends, so a block cut off mid-line by a driver or a clamp is masked
+# only to its last line boundary, and a block with its END marker is masked to that marker. The line
+# breaks are kept, escaped ones too (:func:`_mask_key_body`), so the masked block keeps its layout.
+#
+# LINEAR: a match starts only at ``-----BEGIN``, every repetition is possessive, and each line ends
+# at the next line break, so walks from two markers cannot overlap. Out of scope, and left as they
+# are: a PGP block (its marker ends ``PRIVATE KEY BLOCK``), a certificate and a public key.
+_KEY_SEPARATOR = r"(?:\r\n|\n|\r|\\r\\n|\\n)"
+_KEY_LINE = (
+    r"(?:[A-Za-z0-9+/]++"
+    + _NO_LABEL_BEFORE
+    + r"(?:={1,2})?+|Proc-Type:[ ]*+[0-9]++,[A-Z]++|DEK-Info:[ ]*+[A-Za-z0-9-]++,[0-9A-Fa-f]++|)"
+)
+_PRIVATE_KEY_BLOCK = re.compile(
+    r"(?i)(-----BEGIN (?:(?!PRIVATE )[A-Z0-9]++ )*+PRIVATE KEY-----)(?P<key_body>(?:[ \t]*+"
+    + _KEY_SEPARATOR
+    + _KEY_LINE
+    + r"[ \t]*+(?="
+    + _KEY_SEPARATOR
+    + r"|\Z))++)"
+)
+#: The fold of the BEGIN marker's tail, for the admission gate. Not ``-----begin``, which a
+#: certificate holds too.
+_KEY_BLOCK_HINT = ("private key-----",)
+
 # A bearer/authorization token or an opaque session token in a header-ish or "token=" shape.
 #
 # The ``(?:bearer|basic|digest)\s+`` group is load-bearing, not decoration: without it the value class
@@ -1077,8 +1369,15 @@ _CAMEL_PLAIN_KEY_VALUE, _CAMEL_KEY_VALUE_CLASSES = _narrowed_value(
 # loses only its "{", exactly as ``session={"u": 1}`` does.
 _BEARER = re.compile(
     r"(?i)(" + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + r"(?:" + _alternation(_TOKEN_WORDS) + r"))\b"
-    r"(?:['\"]\s*:|\s*[:=])\s*(?:(?:bearer|basic|digest)\s+)?"
-    r"(?:" + _GUARDED_QUOTED_VALUE + r"|" + _CAMEL_PLAIN_VALUE + r")"
+    r"(?:['\"]\s*:|\s*[:=])\s*"
+    + _MARKED_SCHEME_WORDS
+    + _BYTES_PROBE
+    + r"(?:"
+    + _GUARDED_QUOTED_VALUE
+    + r"|"
+    + _CAMEL_PLAIN_VALUE
+    + r")"
+    + _BEARER_TAILS
 )
 
 # A bare auth scheme carrying its credential with no preceding header label -- "Bearer <tok>" as it
@@ -1110,7 +1409,8 @@ _AUTH_SCHEME = re.compile(
 # -- which an unquoted form misses entirely.
 #
 # A quoted value is taken whole, and so is a braced one when its closer ends the value; the guard is
-# on ``_CREDENTIAL_KV``'s residuals.
+# on ``_CREDENTIAL_KV``'s residuals. A braced value holding a space is also taken with lower case
+# text glued after its closer, in the one shape :data:`_SPACED_GUARDED_BRACED` states.
 #
 # A BRACED VALUE WITH NO SPACE IN IT TAKES ONE QUOTE AFTER ITS CLOSER, as the old plain class's
 # trailing ``['\"]?`` did. Without it ``password='vq0 MEFOR_X={vq1}' vq2'`` printed " vq2'": the old
@@ -1120,13 +1420,17 @@ _AUTH_SCHEME = re.compile(
 # there made ``password="hunter;two MEFOR_DB={x y}" mode`` print ";two", found by the second review
 # round of 2026-10-05.
 _MEFOR_SECRET = re.compile(
-    r"\b(" + re.escape(_ENV_PREFIX) + r"[A-Z0-9_]+)\b['\"]?\s*[:=]\s*"
-    r"(?:"
+    r"\b("
+    + re.escape(_ENV_PREFIX)
+    + r"[A-Z0-9_]+)\b['\"]?\s*[:=]\s*"
+    + _BYTES_PROBE
+    + r"(?:"
     + _GUARDED_BRACED_NO_SPACE
     + rf"(?![^{_PLAIN_TERMINATORS}])"
     + r"['\"]?|"
     + _GUARDED_BRACED_VALUE
-    + rf"(?![^{_PLAIN_TERMINATORS}])"
+    + rf"(?![^{_PLAIN_TERMINATORS}])|"
+    + _MEFOR_GLUED_BRANCH
     # A quoted value with no space in it and at least one character, closer and all. With the braced
     # branch above, it takes exactly the span the old plain class and its trailing quote took, so later
     # passes see the same text they always did, wherever the old pattern matched this label at all.
@@ -1138,6 +1442,7 @@ _MEFOR_SECRET = re.compile(
     + r"|"
     + _PLAIN_VALUE
     + r"['\"]?)"
+    + _MEFOR_TAILS
 )
 
 # A credential in a "<label>=<value>" pair: an ODBC "PWD=", a "password=" in a connection error, a
@@ -1155,7 +1460,10 @@ _MEFOR_SECRET = re.compile(
 #   closing "}" ENDS the value -- that is, when the next character is one their plain class stops at.
 #   Without that guard, ``MEFOR_X={a}bc`` would redact ``{a}`` and print "bc", which the plain class
 #   used to hide. Both forms are the GUARDED ones. A value either refuses falls back to the plain
-#   class, which now carries the stop before a quoted label and is otherwise the old class.
+#   class, which now carries the stop before a quoted label and is otherwise the old class. Since
+#   BACKLOG #2966 step 1, ``_MEFOR_SECRET`` also takes a braced value holding a space with text glued
+#   after its closer, in the one shape :data:`_SPACED_GUARDED_BRACED` states; every other shape, and
+#   every such value under ``_KEY_MATERIAL``, still prints the braced tail as before.
 # * ``_BEARER`` takes a quoted value and NOT a braced one. ``session=`` and ``token=`` legitimately
 #   carry a "{"-opening dict or JSON repr in this engine's log text, and taking braces would change
 #   those lines for no credential.
@@ -1195,7 +1503,8 @@ _CREDENTIAL_KV = re.compile(
     + _alternation(_CREDENTIAL_WORDS)
     + r"))\b"
     r"['\"]?\s*[:=]\s*"
-    r"(?:"
+    + _BYTES_PROBE
+    + r"(?:"
     + _ODBC_BRACED
     + r"|"
     + _KV_QUOTED_VALUE
@@ -1204,6 +1513,7 @@ _CREDENTIAL_KV = re.compile(
     + r"|"
     + _PLAIN_KV_VALUE
     + r")"
+    + _KV_TAILS
 )
 
 # Key MATERIAL in a "<label>=<value>" pair, where the label ends in a credential word neither pattern
@@ -1237,13 +1547,15 @@ _KEY_LABEL_ALTERNATION = (
 _KEY_MATERIAL = re.compile(
     r"(?i)(" + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + r"(?:" + _KEY_LABEL_ALTERNATION + r"))\b"
     r"['\"]?\s*[:=]\s*"
-    r"(?:"
+    + _BYTES_PROBE
+    + r"(?:"
     + _GUARDED_BRACED_VALUE
     + rf"(?![^{_KEY_TERMINATORS}])|"
     + _GUARDED_QUOTED_VALUE
     + r"|"
     + _CAMEL_PLAIN_KEY_VALUE
     + r")"
+    + _KV_TAILS
 )
 
 # An inline password in a URL-shaped DSN: "postgres://user:<pw>@host/db". The scheme and the user
@@ -1349,8 +1661,8 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # starts after, nor any of ``| ^ ~ { } < > [ ] %``: a review measured ``|dbPassword=Tail@Sec`` print
 # its tail, an HL7 run after the host, literal or percent-encoded, lose the separators the PHI pass
 # reads it by, and ``:587|cc=admin@corp`` name the wrong host, each where the run reached a later
-# "@". A ";" that opens no ``key=`` member was tried too (BACKLOG #5386, added item 4) and declined:
-# a ";" this pass hides is one a LATER reading no longer ends a camelCase value at, so in
+# "@". A ";" that opens no ``key=`` member was tried too (BACKLOG #5386, added item 4) and declined in
+# this run, though a narrower rule after a user's placeholder now reads one (below): a ";" this pass hides is one a LATER reading no longer ends a camelCase value at, so in
 # ``accessToken=redis://:Kv9;w@cache,userPwd='Sec;PWD='`` the support bundle, reading the log line,
 # printed ``Sec``, and ``smtp://ops:pw@mail:587;alerts@corp`` named the wrong host. With a user,
 # the old pattern runs first on both callers, :func:`_run` and
@@ -1368,6 +1680,29 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # ``smtp://:587%2Ccc=admin@corp`` as a password and named the wrong host (code review). It
 # stops at a "[" that opens a bracketed word of letters, the shape of ``[redacted]`` and
 # ``[REDACTED]``; any other "[", and a "]", it takes (wave 3).
+#
+# A ";"-SPLIT TAIL AFTER A USER'S PLACEHOLDER IS READ BY ITS OWN NARROWER RULE (BACKLOG #5386, added
+# item 4). In ``postgres://svc:Kv9x@Zq7;w@db`` the narrow pass writes ``svc:<placeholder>@`` and the
+# run after it stops at the ";", so ``Zq7;w`` printed. Where the user's first segment is a
+# placeholder (the named group ``dsn_placeholder``), after the run the match goes on over every
+# following group that ends at an "@" and is one of two kinds: a group the run itself would read,
+# holding no ";", or a group holding ";" and only characters outside the run's stops and ".", ":",
+# "=" and "@", where a ";" may lead, end or repeat. All such groups are taken at once, and the
+# text after the last is a group of neither kind, which is also the only text the run could start
+# on in a second run, so a second run of this pattern over its own output takes nothing more. That
+# says nothing of a whole redaction, whose other passes can still change a line a second time: on
+# a DSN a camelCase label's value takes, such as ``dbPassword=postgres://svc:Kv9x@Zq7;w@db``, the
+# union writes ``dbPassword=<placeholder>db``, and a second redaction hides the host too. It hides
+# more, never prints the tail (:func:`_pre_camel` says why the tail stays in both readings). A
+# group holding a ";" and a ".", a ":" or a ``key=`` member is not taken, so
+# ``smtp://ops:pw@mail.local:587;alerts@corp`` keeps its host, which the declined ";" reading named
+# wrongly. The rule sits on the plain user's alternative only, so an empty user's match, a user
+# holding an "@" and a password's leading "@" signs never take it, and the declined camelCase lines
+# above, each with an empty user, read as before. The cost: a host
+# with no "." or ":" before a later "@", as in ``smtp://ops:pw@mail;alerts@corp``, is hidden with
+# the password, and the output then names what follows that "@", here ``corp``, as the host, the
+# wrong-host shape the declined reading had for a host with a port. What it leaves, at least: a
+# group holding ";" and ".", ":" or "=", and every group after it, prints, as it did before.
 # Without the user the pattern reads ``ws://:8765?accessToken=Tail@Tok`` as a password-only DSN, and
 # a review measured the token's tail print where the old pattern, matching nothing, left the query
 # label to the member pass. And a "|" it took, as in ``redis://:Tk|mrn@h``, was a separator the PHI
@@ -1399,7 +1734,9 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # nothing back, so the run after it is the only walk and backs off to its last "@". Written flat,
 # not as a repeated "@"-led group. One quantifier nests under another, inside a lookahead; the
 # comment on the static gate's entry for this pattern says which, and why it stays linear. The
-# static ReDoS gate in
+# tail after a user's placeholder nests too: there each repeat is an "@", then a possessive run
+# that refuses "@", ending where the next "@" is, so the repeats tile the text and none can split
+# another. The static ReDoS gate in
 # ``tests/test_security_static.py`` DOES NOT SCAN this pattern: it splices ``_DSN_RUN_STOP`` below,
 # so that gate lists it among the patterns it cannot resolve, and the shape is held by inspection,
 # stated there. The growth is held by a stopwatch, against a backtracking control, in
@@ -1439,7 +1776,28 @@ _DSN_RUN_STOP = (
     + re.escape(_ENV_PREFIX)
     + r"))"
 )
-_DSN_USER_FIRST_SEGMENT = r"(?>\[[a-z]+\]|<[a-z]+>|(?:" + _DSN_RUN_STOP + r"[^\s/@<>\[\]])++)"
+# The placeholder alternatives are a named group, which the tail after the run tests for.
+_DSN_USER_FIRST_SEGMENT = (
+    r"(?>(?P<dsn_placeholder>\[[a-z]+\]|<[a-z]+>)|(?:" + _DSN_RUN_STOP + r"[^\s/@<>\[\]])++)"
+)
+#: What the run after the first segment stops at, one class body, shared with the tail's class so
+#: the two stop sets cannot drift apart.
+_DSN_RUN_STOPS = r"\s/;?#&,()|^~{}<>\[\]%\x27\x22"
+#: The run, less the "@" it ends at: the pattern takes that "@" once, last, after the tail
+#: (:data:`_DSN_TAIL`).
+_DSN_RUN = r"(?:" + _DSN_RUN_STOP + r"[^" + _DSN_RUN_STOPS + r"])*"
+# One character of a tail group after a user's placeholder (BACKLOG #5386, the
+# ``svc:Kv9x@Zq7;w@db`` shape): a ";", or a character of the run's class but ".", ":", "=" or "@",
+# so a group holding a host's dot, a port or a ``key=`` member is not taken. The comment above says
+# why.
+_DSN_TAIL_CHAR = r"(?:;|" + _DSN_RUN_STOP + r"[^" + _DSN_RUN_STOPS + r".:=@])"
+# One character of a tail group with no ";": the run's own class, less "@".
+_DSN_GROUP_CHAR = r"(?:" + _DSN_RUN_STOP + r"[^" + _DSN_RUN_STOPS + r"@])"
+#: The tail after a user's placeholder: each group opens with the "@" before it and ends before
+#: the next. Both of :func:`_union`'s readings hold it (:func:`_pre_camel` says why).
+_DSN_TAIL = (
+    r"(?(dsn_placeholder)(?:@" + _DSN_GROUP_CHAR + r"*+(?=@)|@" + _DSN_TAIL_CHAR + r"++(?=@))*+)"
+)
 # AN EMPTY USER'S FIRST SEGMENT, THE SEGMENT AFTER A USER HOLDING AN "@", AND THE SEGMENT AFTER A
 # PASSWORD'S LEADING "@" SIGNS (BACKLOG #5386, wave 3). One character is a class, a "%" the class
 # excludes behind a fixed-width lookahead, a "[" that does not open a bracketed word of letters, or
@@ -1488,9 +1846,10 @@ _WIDE_DSN_PASSWORD = re.compile(
     + _DSN_WIDE_SEGMENT
     + r"|"
     + _DSN_USER_FIRST_SEGMENT
-    + r")))(?:"
-    + _DSN_RUN_STOP
-    + r"[^\s/;?#&,()|^~{}<>\[\]%\x27\x22])*@"
+    + r")))"
+    + _DSN_RUN
+    + _DSN_TAIL
+    + r"@"
 )
 
 
@@ -1848,19 +2207,123 @@ def _keep_label(m: re.Match[str], placeholder: str) -> str:
 
 
 def _braced_tail(m: re.Match[str]) -> str:
-    """The ``braced_tail`` of a match that took a braced label after its value, each letter masked
-    to "x", or "" when it took none. :data:`_BRACED_RUN_ON` says why the tail is written back masked
-    rather than dropped, and why every letter. A pattern without the group gets "", so a rebuilt
-    pattern without the run-on still works here; the tests that rebuild one are the positive
-    controls, and a test holds every shipped stopped pattern of both copies to having the group."""
-    if "braced_tail" not in m.re.groupindex:
-        return ""
-    tail = m.group("braced_tail")
-    return "" if tail is None else tail.translate(_BRACED_TAIL_MASK)
+    """Every tail a match took after its old value, each written back masked one character for one,
+    in the order they sit in the line, or "" when it took none. The ``braced_tail`` of a match that
+    took a braced label has each letter masked to "x"; :data:`_BRACED_RUN_ON` says why the tail is
+    written back masked rather than dropped, and why every letter. A ``key_body`` is masked by
+    :func:`_mask_key_body`, and every other tail by :func:`_mask_tail` (the comment above
+    :data:`_NO_LABEL_BEFORE` says why). A pattern without a group gets "" for it, so a rebuilt
+    pattern without the run-on or the tails still works here; the tests that rebuild one are the
+    positive controls, and a test holds every shipped stopped pattern of both copies to having the
+    braced group."""
+    return "".join(_TAIL_MASKS[name](m.group(name)) for name in _taken_tails(m))
+
+
+def _taken_tails(m: re.Match[str]) -> list[str]:
+    """The tail groups ``m`` took text in, in the order they sit in the line."""
+    names = [name for name in _TAIL_MASKS if name in m.re.groupindex and m.group(name)]
+    return sorted(names, key=m.start)
 
 
 #: What :func:`_braced_tail` writes for each letter its tail can hold.
 _BRACED_TAIL_MASK = _MEMBER_ALNUM_MASK
+
+#: The characters a masked tail keeps: whitespace, both quotes and the HL7 delimiters.
+_TAIL_MASKED = re.compile(r"[^\s'\"|^~\\&]")
+#: The same for a key body, which also keeps an escaped line break whole, and a ``Proc-Type:`` or
+#: ``DEK-Info:`` header line as it was. A header names a cipher and an IV, not key material, and
+#: masking one changed what the PHI pass after it reads: on the line before the tails it rewrote
+#: ``ENCRYPTED`` and the next line's ``DEK`` as a name run, and the masked line kept its length.
+_KEY_BODY_MASKED = re.compile(r"(\\[rn]|(?i:Proc-Type|DEK-Info):[^\r\n\\]*+)|[^\s'\"|^~\\&]++")
+
+
+def _mask_tail(text: str) -> str:
+    """``text`` with every character but whitespace, the quotes and ``|^~\\&`` written as "x"."""
+    return _TAIL_MASKED.sub("x", text)
+
+
+def _mask_key_body(text: str) -> str:
+    """:func:`_mask_tail` over a key body, keeping each escaped ``\\n`` and ``\\r``."""
+    return _KEY_BODY_MASKED.sub(lambda m: m.group(1) or "x" * (m.end() - m.start()), text)
+
+
+#: Every tail group a pattern may hold, and how each is written back.
+_TAIL_MASKS: dict[str, Callable[[str], str]] = {
+    "braced_tail": lambda text: text.translate(_BRACED_TAIL_MASK),
+    "scheme_tail": _mask_tail,
+    "bytes_tail": _mask_tail,
+    "digest_tail": _mask_tail,
+    "key_body": _mask_key_body,
+}
+
+
+def _tail_span(m: re.Match[str]) -> tuple[int, int]:
+    """Where the tails :func:`_braced_tail` writes back sit in the line, or ``(0, 0)``."""
+    names = _taken_tails(m)
+    return (m.start(names[0]), m.end(names[-1])) if names else (0, 0)
+
+
+def _keep_key_marker(m: re.Match[str]) -> str:
+    """A :data:`_PRIVATE_KEY_BLOCK` match: its BEGIN marker, and its body masked."""
+    return m.group(1) + _braced_tail(m)
+
+
+def mask_private_key_blocks(text: str) -> str:
+    """``text`` with the body of every PRIVATE KEY block masked, one character for one (BACKLOG
+    #5550). Where it runs, it runs first: :func:`scrub_credentials` runs it as its first pass, and
+    ``support/redact.py``, ``logging_setup`` and the tray chain run it before the PHI pass, which
+    would rewrite the markers. At least :func:`scrub_credentials_without_tails`, and so the verify
+    details (``verify_leaf.safe_detail_text``) and the audit tee's field scrub
+    (``logging_setup.scrub_log_text``), do not run it, by design: they read as the code before it.
+    Text holding no ``-----`` returns as the same object."""
+    if "-----" not in text:
+        return text
+    return _PRIVATE_KEY_BLOCK.sub(_keep_key_marker, text)
+
+
+def _mask_only(before: str, after: str) -> bool:
+    """Whether ``after`` is ``before`` with some characters written as "x": the same length, and
+    every character that differs is an "x". The comparison the comment above
+    :data:`_NO_LABEL_BEFORE` calls the control. It compares the text between the "x" runs of
+    ``after``, so it costs one slice per run rather than a step per character."""
+    if len(before) != len(after):
+        return False
+    if before == after:
+        return True
+    pos = 0
+    for run in _X_RUN.finditer(after):
+        if before[pos : run.start()] != after[pos : run.start()]:
+            return False
+        pos = run.end()
+    return before[pos:] == after[pos:]
+
+
+_X_RUN = re.compile("x+")
+
+
+def mask_private_key_blocks_then(
+    text: str, then: Callable[[str], str], after: Callable[[str], str] | None = None
+) -> str:
+    """``then`` over ``text`` with its PRIVATE KEY block bodies masked, where that output is
+    ``then(text)`` with characters written as "x"; ``then(text)`` otherwise (BACKLOG #5550).
+
+    For a caller that runs the PHI pass, which reads a block's markers as a name run and rewrites
+    them, so the mask must run before it. The PHI pass may read the masked body differently from
+    the body, as it read the ``ENCRYPTED`` header against the next line's ``DEK``, and the comparison
+    keeps that from printing anything ``then(text)`` hid. A caller clamps ``text`` first, so the mask
+    scans no more than the PHI pass does.
+
+    ``after`` is what the caller runs over the result next, at least its credential passes: the two
+    outputs are compared through it, because a masked body line can take away a label those passes
+    read (found by code review: a body line ``token`` before a line opening ``: v``)."""
+    masked = mask_private_key_blocks(text)
+    plain = then(text)
+    if masked is text or masked == text:
+        return plain
+    tailed = then(masked)
+    if after is None:
+        return tailed if _mask_only(plain, tailed) else plain
+    return tailed if _mask_only(after(plain), after(tailed)) else plain
 
 
 # --- ADMISSION GATING: what makes a per-record credential pass affordable --------------------------
@@ -1976,6 +2439,7 @@ _ANY_HINT = tuple(
                 *_KEY_MATERIAL_HINT,
                 *_ENV_HINT,
                 *_DSN_HINT,
+                *_KEY_BLOCK_HINT,
             }
             if not any(
                 other != word and other in word
@@ -1986,6 +2450,7 @@ _ANY_HINT = tuple(
                     *_KEY_MATERIAL_HINT,
                     *_ENV_HINT,
                     *_DSN_HINT,
+                    *_KEY_BLOCK_HINT,
                 }
             )
         }
@@ -2000,11 +2465,14 @@ def _admits(folded: str | None, words: tuple[str, ...]) -> bool:
 
 
 def scrub_credentials(text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER) -> str:
-    """Return ``text`` with credential VALUES replaced by ``placeholder``, keeping every label.
+    """Return ``text`` with credential VALUES replaced by ``placeholder``, keeping the label of
+    each match.
 
     The label survives on purpose: an operator reading a scrubbed line must still be able to tell WHICH
-    credential the failing code was handling. Nothing else about the line is touched -- this is a
-    credential pass, not a PHI pass (:mod:`messagefoundry.redaction` owns that) and not a control-char
+    credential the failing code was handling. Some text after a match is written back masked rather
+    than replaced, one character for one, at least a braced run-on, the masked tails and a PRIVATE
+    KEY block body (BACKLOG #5546 to #5550); a Digest tail masks the names of the parameters after
+    the first, which are labels too. This is a credential pass, not a PHI pass (:mod:`messagefoundry.redaction` owns that) and not a control-char
     pass (:func:`messagefoundry.controlchars.scrub_control_chars` owns that).
 
     Idempotent on ordinary lines, which matters because a record dispatched to stdout *and* the off-box
@@ -2025,9 +2493,47 @@ def scrub_credentials(text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER) -
     folded = _gate_fold(text)
     if not _admits(folded, _ANY_HINT):
         return text
+    return _scrub_credentials(text, placeholder, folded)
+
+
+def scrub_credentials_without_tails(text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER) -> str:
+    """:func:`scrub_credentials` as it read before the masked tails and the key-block pass, for a
+    caller that compares the two readings itself (``support/redact.py``)."""
+    folded = _gate_fold(text)
+    if not _admits(folded, _ANY_HINT):
+        return text
+    return _scrub_credentials(text, placeholder, folded, tails=False)
+
+
+def _scrub_credentials(
+    text: str, placeholder: str, folded: str | None, *, tails: bool = True
+) -> str:
+    """:func:`scrub_credentials` after its gate. With ``tails`` False, the reading without the masked
+    tails and the key-block pass (BACKLOG #5546 to #5550), which is what the code before them
+    printed. With it True, that reading's output wherever the tailed one is not that output with
+    characters written as "x" (:func:`_mask_only`), and the tailed one otherwise; a line no tail
+    could fire on takes one reading, which the two share there."""
+    if not tails:
+        return _one_reading(text, placeholder, folded, _without_tails, _without_tails_sub)
+    tailed = _one_reading(text, placeholder, folded, _same, None)
+    if not _could_take_a_tail(folded):
+        return tailed
+    before = _one_reading(text, placeholder, folded, _without_tails, _without_tails_sub)
+    return tailed if _mask_only(before, tailed) else before
+
+
+def _one_reading(
+    text: str,
+    placeholder: str,
+    folded: str | None,
+    read: Callable[[re.Pattern[str]], re.Pattern[str]],
+    sub: _Sub | None,
+) -> str:
+    """One reading of ``text``: each pattern through ``read``, applied by ``sub``, and through
+    :func:`_union` on a line the camelCase reading could change."""
     if _reads_camel(text, folded, placeholder):
-        return _union(text, placeholder, folded)
-    return _run(text, placeholder, folded)
+        return _union(text, placeholder, folded, read, sub)
+    return _run(text, placeholder, folded, sub)
 
 
 #: Query-parameter NAMES that carry a credential in a URL and in nothing else here. Each is too
@@ -2316,13 +2822,18 @@ def _run(
     :func:`scrub_credentials`'s own run, on a line it sends to no union, takes it too. So the pass
     also runs where the union returns its reading before whole: on a line where the shipped
     reading would hide a member key's ";", and on an untraceable one.
-    The widened pattern holds no camelCase fragment, so :func:`_pre_camel` leaves it as it is and
-    both readings apply the same pattern. Its run does not cross a camelCase label only the shipped
+    The widened pattern holds no camelCase fragment, so :func:`_pre_camel` leaves it as it is,
+    the tail after a user's placeholder (:data:`_DSN_TAIL`) included, and both readings apply the
+    same pattern. So a line the union returns its reading before for, whole, on either branch
+    above, still takes the tail. Its run does not cross a camelCase label only the shipped
     reading reads, because every segment of the widened match stops at a label word
     (``_DSN_RUN_STOP``): on ``redis://:pw@h?accessToken=Tail@Sec`` and
     ``redis://:pw@h;userPassword=Tail@Sec`` the reading before, widened or not, differs only in
     ``pw``, which the pass hides."""
     apply = _plain_sub if sub is None else sub
+    # FIRST, so no label pass reads a key body (BACKLOG #5550; see the pattern).
+    if _admits(folded, _KEY_BLOCK_HINT):
+        text = apply(_PRIVATE_KEY_BLOCK, _keep_key_marker, text, _BRACED)
     if _admits(folded, _ENV_HINT):
         text = apply(_MEFOR_SECRET, lambda m: _keep_label(m, placeholder), text, _BRACED)
     if _admits(folded, _TOKEN_HINT):
@@ -2360,7 +2871,8 @@ def _run(
 # newly read value could take a later label that hid something, and that something printed (the
 # comment on :data:`_CAMEL_START` gives the measurement). So on a line where they can read anything,
 # :func:`scrub_credentials` runs :func:`_run` twice, once with the shipped patterns and once with
-# :func:`_pre_camel` of each, which is exactly the pattern without them, and keeps a character of the
+# :func:`_pre_camel` of each, which is the pattern without them and without the masked tails, with
+# the key-block pass as a pattern that never matches, and keeps a character of the
 # first output only where the second kept it too. Before those two runs :func:`_union` probes the
 # second reading with a search per pattern, stopping at the first match (BACKLOG #5386); a line
 # where none matches takes the shipped run alone. So a union line costs that probe and two runs, or
@@ -2428,6 +2940,14 @@ _CAMEL_FRAGMENTS = (
     ),
 )
 
+#: The tail fragments each shipped pattern holds, by its id, for :func:`_pre_camel`'s check.
+_SHIPPED_TAILS: dict[int, tuple[str, ...]] = {
+    id(_BEARER): (_BEARER_TAILS, _BYTES_PROBE, _MARKED_SCHEME_WORDS),
+    id(_MEFOR_SECRET): (_MEFOR_TAILS, _BYTES_PROBE),
+    id(_CREDENTIAL_KV): (_KV_TAILS, _BYTES_PROBE),
+    id(_KEY_MATERIAL): (_KV_TAILS, _BYTES_PROBE),
+}
+
 #: :func:`_pre_camel`'s compiled readings, by the id of the pattern each was derived from, beside
 #: that pattern, so a recycled id is told apart. Keyed by id because hashing a compiled pattern
 #: hashes its whole program on every call.
@@ -2435,8 +2955,9 @@ _PRE_CAMEL: dict[int, tuple[re.Pattern[str], re.Pattern[str]]] = {}
 
 
 def _pre_camel(pattern: re.Pattern[str]) -> re.Pattern[str]:
-    """``pattern`` without the camelCase reading: each of :data:`_CAMEL_FRAGMENTS` swapped back.
-    Derived from the live pattern, not held beside it, so a test that patches a pattern patches both
+    """``pattern`` without the camelCase reading: each of :data:`_CAMEL_FRAGMENTS` swapped back,
+    and the masked tails stripped, with the key-block pass as a pattern that never matches (the
+    comment in the body says why). Derived from the live pattern, not held beside it, so a test that patches a pattern patches both
     readings, and a pattern change cannot leave this one behind. Compiled once per pattern."""
     found = _PRE_CAMEL.get(id(pattern))
     if found is not None and found[0] is pattern:
@@ -2444,6 +2965,26 @@ def _pre_camel(pattern: re.Pattern[str]) -> re.Pattern[str]:
     source = pattern.pattern
     for fragment, before in _CAMEL_FRAGMENTS:
         source = source.replace(fragment, before)
+    # The widened DSN pass's tail after a user's placeholder (:data:`_DSN_TAIL`) is not a camelCase
+    # fragment, so it stays in. Left out, a line the union returns this reading for whole (a
+    # member key's ";", an untraceable replacement) printed the tail, and on
+    # ``dbPassword=postgres://svc:Kv9x@Zq7;w@db`` the union printed the ``;w`` of the password
+    # (BACKLOG #5386, code review). Kept, that line reads ``dbPassword=<placeholder>db``, and a
+    # second redaction's label pass hides the host too: it hides more, never prints a secret.
+    # The masked tails (BACKLOG #5546, #5547, #5548) and the key-block pass (#5550) are left out,
+    # since the reading before does not run them, so that reading stays the code before them; the
+    # control on the tails is :func:`_scrub_credentials`' comparison, not the union. A shipped
+    # pattern that should hold a tail and does not raises,
+    # as :func:`_narrowed_value` does, so a strip cannot silently change nothing.
+    # One expression, not a bare ``source = "..."`` in an ``if``: the ReDoS scanner in
+    # ``tests/test_security_static.py`` reads a name bound to one literal anywhere in the file as
+    # that literal, so the bare form made it read both ``re.compile(source, ...)`` calls here as
+    # compiling the never-matching pattern, and hid the blind spot it pins.
+    source = r"(?!x)x" if pattern is _PRIVATE_KEY_BLOCK else source
+    for fragment in _SHIPPED_TAILS.get(id(pattern), ()):
+        if fragment not in source:
+            raise ValueError(f"no {fragment[:40]} to strip")
+    source = _strip_tails(source)
     if len(_PRE_CAMEL) >= 64:  # only patched test patterns get here
         _PRE_CAMEL.clear()
     compiled = re.compile(source, pattern.flags)
@@ -2453,6 +2994,37 @@ def _pre_camel(pattern: re.Pattern[str]) -> re.Pattern[str]:
 
 def _plain_sub(pattern: re.Pattern[str], repl: _Repl, text: str, _tail: str | int | None) -> str:
     return pattern.sub(repl, text)
+
+
+def _same(pattern: re.Pattern[str]) -> re.Pattern[str]:
+    return pattern
+
+
+#: :func:`_without_tails`' compiled readings, keyed as :data:`_PRE_CAMEL` is.
+_WITHOUT_TAILS: dict[int, tuple[re.Pattern[str], re.Pattern[str]]] = {}
+
+
+def _without_tails(pattern: re.Pattern[str]) -> re.Pattern[str]:
+    """``pattern`` without the masked tails, and the key-block pass as a pattern that never
+    matches: the reading the code before BACKLOG #5546 to #5550 ran. Compiled once per pattern."""
+    found = _WITHOUT_TAILS.get(id(pattern))
+    if found is not None and found[0] is pattern:
+        return found[1]
+    for fragment in _SHIPPED_TAILS.get(id(pattern), ()):
+        if fragment not in pattern.pattern:
+            raise ValueError(f"no {fragment[:40]} to strip")
+    source = r"(?!x)x" if pattern is _PRIVATE_KEY_BLOCK else _strip_tails(pattern.pattern)
+    if len(_WITHOUT_TAILS) >= 64:  # only patched test patterns get here
+        _WITHOUT_TAILS.clear()
+    compiled = re.compile(source, pattern.flags)
+    _WITHOUT_TAILS[id(pattern)] = (pattern, compiled)
+    return compiled
+
+
+def _without_tails_sub(
+    pattern: re.Pattern[str], repl: _Repl, text: str, _tail: str | int | None
+) -> str:
+    return _without_tails(pattern).sub(repl, text)
 
 
 def _pre_camel_sub(
@@ -2488,8 +3060,7 @@ class _Trace:
 
     def sub(self, pattern: re.Pattern[str], repl: _Repl, text: str, tail: str | int | None) -> str:
         pattern = self.read(pattern)
-        if tail == _BRACED and _BRACED not in pattern.groupindex:
-            tail = None
+        tails = tail == _BRACED
         out: list[str] = []
         runs: list[tuple[int, int, int, bool]] = []
         cursor = pos = length = 0
@@ -2499,7 +3070,10 @@ class _Trace:
             head_end = m.end(1)
             if m.start(1) != start or not replacement.startswith(m.group(1)):
                 raise _Untraceable(pattern.pattern[:40])
-            tail_start, tail_end = m.span(tail) if tail is not None else (0, 0)
+            if tails:
+                tail_start, tail_end = _tail_span(m)
+            else:
+                tail_start, tail_end = m.span(tail) if tail is not None else (0, 0)
             if tail_start < 0:  # the group took no part
                 tail_start = tail_end = 0
             if len(replacement) < head_end - start + tail_end - tail_start:
@@ -2547,6 +3121,18 @@ class _Trace:
         return cursor
 
 
+#: What a line must hold for a masked tail or the key-block pass to fire, folded: each tail's
+#: lookbehind or marker, and the BEGIN marker's tail.
+_TAIL_TRIGGERS = (*_KEY_BLOCK_HINT, "'basic", '"basic', "'bearer", '"bearer')
+#: Where :data:`_DIGEST_TAIL` can fire: ``digest`` as a scheme word after a label's ":" or "=",
+#: not the word anywhere, which a hash mismatch message holds.
+_DIGEST_TRIGGER = re.compile(r"[:=]\s*+digest\s")
+#: Where :data:`_BYTES_PROBE` can fire: a ``b`` and a quote at a value's start, which follows a
+#: ":", an "=" or white space. Searched for rather than a bare ``b'`` substring, which ``'job'``
+#: and ``"db":`` hold too.
+_BYTES_TRIGGER = re.compile(r"[:=\s]b['\"]")
+
+
 def _reads_camel(text: str, folded: str | None, placeholder: str) -> bool:
     """Whether the camelCase reading could change anything on ``text``: the comment above says why
     these tests are enough."""
@@ -2556,13 +3142,34 @@ def _reads_camel(text: str, folded: str | None, placeholder: str) -> bool:
     return folded is None or ("key" in folded and _admits(folded, _COMPOUND_HINT))
 
 
-def _union(text: str, placeholder: str, folded: str | None) -> str:
+def could_take_a_tail(text: str) -> bool:
+    """Whether a masked tail or the key-block pass could fire on ``text`` (BACKLOG #5546 to
+    #5550), so a caller must compare the readings with and without them."""
+    return _could_take_a_tail(_gate_fold(text))
+
+
+def _could_take_a_tail(folded: str | None) -> bool:
+    if folded is None or any(trigger in folded for trigger in _TAIL_TRIGGERS):
+        return True
+    if "digest" in folded and _DIGEST_TRIGGER.search(folded) is not None:
+        return True
+    return _BYTES_TRIGGER.search(folded) is not None
+
+
+def _union(
+    text: str,
+    placeholder: str,
+    folded: str | None,
+    read: Callable[[re.Pattern[str]], re.Pattern[str]] | None = None,
+    sub: _Sub | None = None,
+) -> str:
     """``text`` scrubbed with the shipped patterns, keeping a character of the line only where
     :func:`_pre_camel` of them printed it too: where that reading masked it, its mask, and where it
     hid it, one ``placeholder`` for the run. That reading's own output instead where the shipped one
-    would hide a ";" it printed."""
+    would hide a ";" it printed. ``read`` and ``sub`` give the shipped reading, the patterns as
+    they are by default; :func:`_scrub_credentials` passes the reading without the tails."""
     before = _Trace(len(text), _pre_camel)
-    shipped = _Trace(len(text), lambda pattern: pattern)
+    shipped = _Trace(len(text), _same if read is None else read)
     try:
         # The shortcut is decided on the reading before WITHOUT the widened DSN pass, as it was
         # before BACKLOG #5386 widened that reading. Decided on the widened one, a line where that
@@ -2577,7 +3184,7 @@ def _union(text: str, placeholder: str, folded: str | None) -> str:
         except _Changed:
             pass
         else:
-            return _run(text, placeholder, folded)
+            return _run(text, placeholder, folded, sub)
         old = _run(text, placeholder, folded, before.sub)
         new = _run(text, placeholder, folded, shipped.sub)
     except _Untraceable:

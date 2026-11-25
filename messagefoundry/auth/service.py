@@ -42,9 +42,9 @@ from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from functools import cache, partial
+from functools import cache, partial, wraps
 from types import MappingProxyType
-from typing import Any, Final, Literal, NamedTuple, NoReturn, TypeVar
+from typing import Any, Concatenate, Final, Literal, NamedTuple, NoReturn, TypeVar
 from uuid import uuid4
 
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
@@ -217,6 +217,7 @@ from messagefoundry.store.store import (
     PendingFactorAnchor,
     RevokeResult,
     RoleRow,
+    SessionMintContended,
     SessionRecord,
     TotpState,
     UnknownRoleError,
@@ -1193,6 +1194,14 @@ DIRECTORY_OBJECT_ID_MISSING = "directory_object_id_missing"
 #: during the role sync, can be refused there first, as ``account_refused``.
 ACCOUNT_DELETED = "account_deleted"
 
+#: The closed-set reason a directory sign-in is refused with when the store refused its session
+#: insert and the read after that refusal cannot name why (BACKLOG #5653): the row then reads
+#: enabled, unlocked and bound as the insert required, or could not be read. The account changed
+#: between the check and the insert (a lock that lapsed by the read, or a binding moved and moved
+#: back), and nothing read afterwards says how, so neither a lock nor a binding change is claimed.
+#: Absent from the browser layer's code map, so it shows as generic there.
+ACCOUNT_STATE_CHANGED_AT_INSERT = "account_state_changed_at_insert"
+
 #: The closed-set reason a directory answer is refused with when it names another directory object
 #: than the row's own (BACKLOG #1471 at sign-in, #2027 at the step-up re-bind).
 DIRECTORY_IDENTITY_CONFLICT = "directory_identity_conflict"
@@ -1213,6 +1222,18 @@ DIRECTORY_LOCKED = "locked"
 #: this sign-in's directory-derived one (vault BACKLOG #3085). The sign-in is refused, not the role
 #: write: whatever the other writer left stands, and nothing is written over it.
 ROLE_SYNC_CONTENDED = "role_sync_contended"
+
+#: The closed-set reason a sign-in fails with when its session insert met contention on every
+#: bounded attempt, a busy SQLite database or a session epoch a revoke kept raising, and wrote
+#: nothing (BACKLOG #5653; :class:`~messagefoundry.store.SessionMintContended`). The account did
+#: not refuse it, so it is neither an invalid credential nor a binding or eligibility refusal:
+#: the credential was proved, and the caller may try again. The row's ``contention`` field names
+#: which cause. Absent from the browser layer's code map, so it shows as generic there.
+SESSION_MINT_CONTENDED = "session_mint_contended"
+
+#: ``LoginOutcome.error`` for a sign-in that failed on :data:`SESSION_MINT_CONTENDED`: a temporary
+#: server-side failure, never ``invalid credentials``.
+_SIGN_IN_UNAVAILABLE = "sign-in temporarily unavailable"
 
 #: The code that opens :class:`FederatedBindingChanged`'s message (BACKLOG #2026), so a caller can
 #: tell that refusal from the other 409 on the federated-identity routes without matching prose.
@@ -1675,11 +1696,16 @@ class FirstAdministratorGrantedSessionsLive(FirstAdministratorRefused):
     """The run granted the Administrator role to ``username``, then gave up on the revoke that
     ends the account's earlier sessions (vault BACKLOG #3023 residual (4)). Not a decline: the
     grant stands, so the command still raises the ``administrator_granted`` alert before it exits
-    non-zero with this operator-facing message."""
+    non-zero with this operator-facing message. ``administrators_at_check`` is the other enabled
+    Administrators the run's check found, as on :class:`ProvisionedAdministrator`, so the command
+    can name them when the page was not delivered (vault BACKLOG #3023 items 11 and 30)."""
 
-    def __init__(self, message: str, *, username: str) -> None:
+    def __init__(
+        self, message: str, *, username: str, administrators_at_check: tuple[str, ...] = ()
+    ) -> None:
         super().__init__(message)
         self.username = username
+        self.administrators_at_check = administrators_at_check
 
 
 class LastAdministratorRefused(RuntimeError):
@@ -1987,7 +2013,10 @@ class _BindingChangedMidLogin(Exception):
     "returns the token". The store's one ``False`` does not say which cause it was, so
     :meth:`AuthService._issue_session` reads the account once more to tell them apart. An id that
     names no row then was deleted: no later write brings it back. An id that names a row was refused
-    for its binding, because the guarded insert refuses a present row only on its pair.
+    for its binding, or, on an insert that also passed ``require_sign_in_eligible`` (the directory
+    leg, BACKLOG #5653), because the row was disabled or locked at the insert. ``account_deleted``
+    is ``False`` for both; :meth:`AuthService._complete_ad_login` reads the row once more to name
+    which.
     """
 
     def __init__(self, account_deleted: bool = False) -> None:
@@ -2285,13 +2314,14 @@ class UserSealRefused(RuntimeError):
     seal (BACKLOG #5520). :meth:`AuthService.change_password` raises it too, from that read or
     from the store write's own seal refusal, each reported the same way, and ``POST /me/password``
     answers it 423 (BACKLOG #5902). The failure was handed to the seal-failure report, which
-    writes the audit row and raises the alert only for the first failure of the account in each report interval
-    (:data:`~messagefoundry.store.row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS`) of this
-    service's process, so a refusal inside that interval adds no row. Not "no such user": the row is there, and an administrator
-    may still delete it. ``auth_routes._checked_user``, and so the JSON admin routes that read an
-    account through it, answer it 423; docs/SECURITY.md, *What an admin user read reports*, states
-    what at least some web console pages answer. A record Vault transit cannot verify is
-    refused the same way, reported under ``integrity.authority_seal_unverifiable`` (ADR 0217)."""
+    writes the audit row and raises the alert only for the first failure of the account in each
+    report interval (:data:`~messagefoundry.store.row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS`)
+    of this service's process, so a refusal inside that interval adds no row. Not "no such user":
+    the row is there, and an administrator may still delete it. ``auth_routes._checked_user``, and
+    so the JSON admin routes that read an account through it, answer it 423; docs/SECURITY.md,
+    *What an admin user read reports*, states what at least some web console pages answer. A
+    record Vault transit cannot verify is refused the same way, reported under
+    ``integrity.authority_seal_unverifiable`` (ADR 0217)."""
 
 
 async def read_user_or_unreadable(read: Awaitable[UserRecord | None]) -> UserRecord | None:
@@ -2526,12 +2556,15 @@ async def _write_through_cancellation(
     task.result()
 
 
-def _local_refusal_detail(reason: str, *, combined: bool) -> str:
+def _local_refusal_detail(
+    reason: str, *, combined: bool, extra: Mapping[str, object] | None = None
+) -> str:
     """The ``auth.login_failed`` detail of a refused local credential sign-in (BACKLOG #1131).
 
     The one builder for both the verified refusal and the refusal by a lock, so the row a reader
-    without ``users:manage`` sees cannot differ between them by a key, a value or their order."""
-    detail: dict[str, Any] = {"provider": "local", "reason": reason}
+    without ``users:manage`` sees cannot differ between them by a key, a value or their order.
+    ``extra`` adds fields only a contended insert writes (BACKLOG #5653); the others pass none."""
+    detail: dict[str, Any] = {**(extra or {}), "provider": "local", "reason": reason}
     if combined:
         detail["combined"] = True
     return _json(detail)
@@ -2724,6 +2757,52 @@ def _directory_login_refusal(user: UserRecord, now: float, *, federated: bool) -
     if not federated and _holds_federated_binding(user):
         return FEDERATED_SIGN_IN_REQUIRED
     return None
+
+
+def _in_directory_sign_in_queue[**P](
+    method: Callable[Concatenate[AuthService, AdPrincipal, P], Awaitable[LoginOutcome]],
+) -> Callable[Concatenate[AuthService, AdPrincipal, P], Awaitable[LoginOutcome]]:
+    """Run a directory sign-in's completion inside a per-account queue (BACKLOG #5653).
+
+    **ONE DIRECTORY SIGN-IN PER ACCOUNT AT A TIME.** The completion reads the row, writes its
+    roles, scope and profile, revokes the other sessions on a role change, mints, and clears the
+    failure counters. Without the queue two sign-ins of one account could each read the roles
+    before either wrote them; the second then found its target already written, counted the change
+    as its own, and revoked every session of the account, the first sign-in's new one included. In
+    the queue the second reads the roles the first wrote and revokes nothing.
+
+    **ITS OWN QUEUE, NOT THE PASSWORD LEG'S.** :meth:`AuthService.login` holds the credential queue
+    across each attempt's padded failure window, so a directory sign-in waiting in it could be
+    stalled by anyone sending passwords for that name. That queue orders only concurrent sign-in
+    attempts (``login`` and ``verify_mfa``); an administrator's disable never takes it. Here the
+    disable and lock states are held by the store guard alone: the mint is refused for an account
+    disabled or locked when it inserts (``require_sign_in_eligible``), and the counter clear is a
+    compare-and-set on the row read before the mint, so it never clears a lock that landed after
+    that read.
+
+    **WHAT THE QUEUE DOES NOT ORDER.** At least an administrator's disable or role change, a lock a
+    re-proof or a second-step check sets, a directory reconciler pass, and a sign-in on another
+    engine shard take no part in it: it is per API process, keyed by the account's directory
+    object id (by name only for a principal that carries none). A reconciler pass or a
+    sign-in on another shard that moves the roles can still end this sign-in's new session.
+
+    The key is the account's directory object id. A decorator rather than a wrapper method so
+    the completion keeps its one name for every caller; ``__wrapped__`` is the body outside the
+    queue, for a test that drives the cross-process race."""
+
+    @wraps(method)
+    async def queued(
+        self: AuthService, principal: AdPrincipal, /, *args: P.args, **kwargs: P.kwargs
+    ) -> LoginOutcome:
+        # The directory's immutable id where the principal carries one, so a sign-in under an
+        # old name and one under a renamed one queue together; the name only where it does not,
+        # which the completion refuses anyway (BACKLOG #2027).
+        oid = principal.directory_object_id
+        key = f"id\x00{oid}" if oid else f"name\x00{_credential_lock_key(principal.username)}"
+        async with _hold_keyed_lock(self._directory_sign_in_locks, key):
+            return await method(self, principal, *args, **kwargs)
+
+    return queued
 
 
 @dataclass(frozen=True)
@@ -3049,8 +3128,11 @@ class LockableAccountCensus:
     no_way_past: tuple[str, ...] = ()
     undecryptable_totp: tuple[str, ...] = ()
     #: The accounts in ``undecryptable_totp`` whose TOTP could not be JUDGED (the cell did not open,
-    #: or the value would not compute), as opposed to a KNOWN refusal. Every gate counts such a TOTP
-    #: as the plain enabled-TOTP rule does; this names them as unknown (BACKLOG #3422).
+    #: or the opened value is not base32), as opposed to a KNOWN refusal: a refused enrolment
+    #: marker (a value holding a colon reads as a refused marker, a known refusal), a key too short
+    #: to compute with (BACKLOG #5340) or an empty secret is a known refusal and is not named here.
+    #: Every gate counts such a TOTP as the plain enabled-TOTP rule does; this names them as
+    #: unknown (BACKLOG #3422).
     unknown_totp: tuple[str, ...] = ()
     passkey_only: tuple[str, ...] = ()
     #: The covered accounts in ``unknown_totp`` that also hold a discoverable passkey, which a
@@ -3159,11 +3241,24 @@ def _log_totp_undecryptable(username: str) -> None:
 
 
 def _log_totp_refused(username: str) -> None:
-    """Log an account whose TOTP cell opens but names parameters this release does not compile in
-    (BACKLOG #3422). No code matches it, so the cure is a fresh enrolment, not the store key."""
+    """Log an account whose TOTP cell opens to an enrolment this release refuses
+    (:class:`totp.RefusedEnrolment` raised directly, BACKLOG #3422, #5340): a malformed marker, one
+    naming parameters it does not compile in, or an accepted marker followed by an empty secret. No
+    code matches it, so the cure is a fresh enrolment, not the store key."""
     _log.warning(
-        "the TOTP enrolment of account %r names parameters this release does not compute with; no "
-        "code matches it until the account enrols again",
+        "the TOTP enrolment of account %r is refused by this release (a malformed marker, "
+        "parameters it does not compute with, or no secret after the marker); no code matches it "
+        "until the account enrols again",
+        username,
+    )
+
+
+def _log_totp_short_key(username: str) -> None:
+    """Log an account whose TOTP cell opens to a key shorter than this release computes with
+    (BACKLOG #5340). No code matches it, so the cure is a fresh enrolment, not the store key."""
+    _log.warning(
+        "the TOTP secret of account %r is shorter than this release computes with; no code matches "
+        "it until the account enrols again",
         username,
     )
 
@@ -3261,14 +3356,17 @@ class CensusNeedsTheStoreKey(RuntimeError):
 async def _totp_secret_state(store: AdminStore, user: UserRecord) -> TotpState:
     """What ``user``'s enabled TOTP secret is (:data:`~messagefoundry.store.store.TotpState`):
     ``"usable"``, ``"refused"`` (a KNOWN no: its enrolment marker names parameters this release
-    refuses, or the row holds no secret) or ``"unknown"`` (it could not be judged: the cell did not
-    open, or the value could not be computed with).
+    refuses, its key is too short to compute with, or the row holds no secret) or ``"unknown"``
+    (it could not be judged: the cell did not open, or the value is not base32; a value holding a colon reads as a refused marker, a known refusal).
 
     At least these ways to fail. The cipher refuses the cell (:class:`CipherError`), which is logged, naming
-    the account and never the value. A keyless open hands the stored ciphertext through unchanged,
-    which is not base32, so computing a code from it fails. Or the cell opens but its enrolment
-    marker is refused (:class:`totp.RefusedEnrolment`, BACKLOG #3422), logged with its own cause
-    since the store key is healthy and the cure is a re-enrolment. Any other store error propagates: it
+    the account and never the value. A keyless open hands the stored ciphertext through
+    unchanged; the census does not judge that cell but raises :class:`CensusNeedsTheStoreKey`,
+    reading the fault as the shell's key. Or the cell opens but its enrolment marker is refused
+    (:class:`totp.RefusedEnrolment`, BACKLOG #3422), its key is short
+    (:class:`totp.RefusedTotpSecret`, BACKLOG #5340) or it is not base32
+    (:class:`totp.UndecodableTotpSecret`), each logged with its own cause since the store key is
+    healthy. Any other store error propagates: it
     says nothing about this secret, and filing it as "undecryptable" would send an operator to reset
     a healthy account."""
     try:
@@ -3284,45 +3382,68 @@ async def _totp_secret_state(store: AdminStore, user: UserRecord) -> TotpState:
             "written under. Set the service's store key here and run again."
         )
     reason = _totp_unusable_reason(secret)
-    if reason == "refused":
-        _log_totp_refused(user.username)
-        return "refused"
-    if reason == "malformed":
-        _log_totp_malformed(user.username)
-        return "unknown"
-    return "usable"
+    if reason is not None:
+        _log_totp_unusable(user.username, reason)
+    return _totp_state_for(reason)
 
 
-def _totp_unusable_reason(secret: str) -> Literal["refused", "malformed"] | None:
+_TotpUnusable = Literal["refused", "short_key", "malformed"]
+
+
+def _totp_state_for(reason: _TotpUnusable | None) -> TotpState:
+    """The :data:`TotpState` of an opened secret whose :func:`_totp_unusable_reason` is ``reason``:
+    the one mapping the census and the gates share. A refused marker or a short key is a KNOWN
+    refusal; a value that is not base32 cannot be judged."""
+    if reason is None:
+        return "usable"
+    return "unknown" if reason == "malformed" else "refused"
+
+
+def _totp_unusable_reason(secret: str) -> _TotpUnusable | None:
     """Why an OPENED TOTP secret is no key the engine can compute codes with, or ``None`` when it
     is one. ``"refused"``: its enrolment marker names parameters this release refuses
-    (:class:`totp.RefusedEnrolment`, BACKLOG #3422). ``"malformed"``: not base32, so no key. The one
+    (:class:`totp.RefusedEnrolment`, BACKLOG #3422). ``"short_key"``: its key is too short to
+    compute with (:class:`totp.RefusedTotpSecret`, BACKLOG #5340). Both are a KNOWN refusal.
+    ``"malformed"``: not base32 (:class:`totp.UndecodableTotpSecret`), so no key to judge. The one
     statement of the rule: :func:`_totp_secret_state` (the census) and :func:`_opened_totp_state`
     (every way-past gate) both ask it, so they cannot disagree about one account."""
     try:
         totp.totp(secret)
+    except totp.UndecodableTotpSecret:
+        return "malformed"
+    except totp.RefusedTotpSecret:
+        return "short_key"
     except totp.RefusedEnrolment:
         return "refused"
-    except ValueError:  # binascii.Error is a ValueError: not base32, so no key
+    except ValueError:  # no other is raised today; one that is cannot be judged, never a 500
         return "malformed"
     return None
+
+
+def _log_totp_unusable(username: str, reason: _TotpUnusable) -> None:
+    """Log ``reason`` (:func:`_totp_unusable_reason`) for ``username``'s opened TOTP secret, by its
+    own cause and never the value."""
+    if reason == "refused":
+        _log_totp_refused(username)
+    elif reason == "short_key":
+        _log_totp_short_key(username)
+    else:
+        _log_totp_malformed(username)
 
 
 def _opened_totp_state(secret: str | None) -> TotpState:
     """What an OPENED TOTP secret is (BACKLOG #3422): ``"usable"`` when the engine can compute
     codes with it (:func:`_totp_unusable_reason`), ``"refused"`` when it KNOWS it cannot (an
-    enrolment marker this release refuses, or no secret at all), and ``"unknown"`` when it cannot
-    tell (ciphertext a keyless open passed through, or a value that will not compute). The service's
+    enrolment marker this release refuses, a key too short to compute with, or no secret at all),
+    and ``"unknown"`` when it cannot tell (ciphertext a keyless open passed through, or a value
+    that is not base32). The service's
     gates ask it, and pass it to the store's writes as their TOTP rule. Only ``"refused"`` moves any
     decision away from the plain ``totp_enabled`` rule."""
     if not secret:
         return "refused"
     if secret.startswith(MARKER_PREFIX):
         return "unknown"
-    reason = _totp_unusable_reason(secret)
-    if reason == "refused":
-        return "refused"
-    return "usable" if reason is None else "unknown"
+    return _totp_state_for(_totp_unusable_reason(secret))
 
 
 def _passkey_counts_nothing(cred: WebAuthnCredential) -> bool:
@@ -3682,8 +3803,12 @@ _PROVISION_REVOKE_RETRY: Final = _RevokeRetry(
 )
 
 
-#: How long ``provision-admin``'s revoke re-ran before it was given up on, for its texts.
-_PROVISION_REVOKE_GAVE_UP: Final = f"on every attempt, re-running for up to {_PROVISION_REVOKE_RETRY.budget_seconds / 60:g} minutes"
+#: How ``provision-admin``'s revoke was re-run before it was given up on, for its texts. It names
+#: the budget, not a duration: an attempt itself is unbounded, and a re-run may start up to one
+#: pause past the budget (vault BACKLOG #3023 items 16, 31 and 39).
+_PROVISION_REVOKE_GAVE_UP: Final = (
+    f"on every attempt, re-run on a {_PROVISION_REVOKE_RETRY.budget_seconds / 60:g}-minute budget"
+)
 
 
 #: What ``provision-admin`` tells the operator to do when a revoke after a grant that may have
@@ -3692,8 +3817,8 @@ _PROVISION_REVOKE_GAVE_UP: Final = f"on every attempt, re-running for up to {_PR
 _PROVISION_REVOKE_RECOVERY: Final = (
     "Running provision-admin again does not help: it refuses an account that holds the role. Once "
     "the store answers again, run 'messagefoundry admin-revoke-sessions' on this host, with the "
-    "--service-config or --db this command used: it ends every account's sessions, that one's "
-    "included"
+    "--service-config or --db this command used: it ends the sessions it finds, of any account. "
+    "docs/SECURITY.md, Limits of the session sweep, says what it may miss"
 )
 #: Said after :data:`_PROVISION_REVOKE_RECOVERY` where the give-up wrote its miss row.
 _PROVISION_REVOKE_MISS_ROW: Final = (
@@ -3729,6 +3854,8 @@ _SESSION_ID_SHAPE: Final = re.compile(r"[0-9a-f]{1,64}")
 #: Vault BACKLOG #3260: the row an admin route writes when it refuses the caller's own account.
 #: Its detail's ``op`` names the route, one of :data:`SelfTargetOp`.
 SELF_TARGET_REFUSED_ACTION: Final = "auth.self_target_refused"
+#: The row ``GET /me/step-up`` writes for each answered read (ADR 0215 section 2, BACKLOG #2603).
+STEP_UP_STATUS_READ_ACTION: Final = "auth.step_up_status_read"
 SelfTargetOp = Literal[
     "password_reset",
     "mfa_reset",
@@ -4296,6 +4423,18 @@ class AuthService:
             if settings.phi_read_rate_limit_enabled
             else None
         )
+        # Per-actor pacing for six monitoring:read GETs (vault BACKLOG #1191, ASVS
+        # 15.2.2), consulted by require_monitoring_read. Its own bucket, so dashboard polling never
+        # spends the PHI-read budget.
+        self._monitoring_read_limiter: SlidingWindowRateLimiter | None = (
+            SlidingWindowRateLimiter(
+                per_key=settings.monitoring_read_rate_limit_per_actor,
+                glob=settings.monitoring_read_rate_limit_global,
+                window_seconds=settings.monitoring_read_rate_limit_window_seconds,
+            )
+            if settings.monitoring_read_rate_limit_enabled
+            else None
+        )
         # Per-actor anti-automation pacing for the state-changing admin surface (BACKLOG #193, ASVS
         # 2.4.2). Built like _phi_read_limiter but consulted from the step-up gate for NON-GET sensitive
         # ops. glob=0 (no cross-actor dimension): one operator's write burst must never throttle
@@ -4444,6 +4583,12 @@ class AuthService:
         # same caveat as the re-proof table above: engine shards serving their own API ports each
         # keep their own table, so the bound holds per process, not across them.
         self._credential_locks: dict[str, _KeyedLock] = {}
+        # BACKLOG #5653: one directory sign-in per account at a time, keyed by its directory
+        # object id, by name only where the principal carries none
+        # (:func:`_in_directory_sign_in_queue`). Its own table, not the credential queue above:
+        # a password attempt holds that one across its padded failure window, so sharing it would
+        # let anyone who knows a directory name stall that user's Windows SSO and OIDC sign-ins.
+        self._directory_sign_in_locks: dict[str, _KeyedLock] = {}
         # BACKLOG #2216: one in-flight ACCOUNT_LOCKED notice per (user id, lock kind), so two locks of
         # one kind landing together read the throttle one after the other and mail once. Its own table:
         # the credential queue above is held across a sign-in's pad, and the notice runs off it. Per
@@ -4579,7 +4724,8 @@ class AuthService:
         #: `_advance_hold_standing` moves it.
         self._reconcile_hold_standing: _HoldStanding = "fresh"
         #: user_ids of bound id-less rows the reconciler has already reported as skipped (BACKLOG
-        #: #2027), so each is logged and audited once per process rather than once per pass.
+        #: #2027), so a marked row is not reported on every pass. When a mark is set and dropped is
+        #: stated in `_report_unkeyed_bindings`.
         self._reconcile_unkeyed_reported: set[str] = set()
         #: user_ids whose skip report the store refused, in the order of their latest refusal, oldest
         #: first: a dict used as an ordered set (BACKLOG #2137). Refused accounts go last, the
@@ -4785,6 +4931,18 @@ class AuthService:
         depends on other accounts' reads (:meth:`SlidingWindowRateLimiter.retry_after`). The JSON
         API and the ``/ui`` console both send it."""
         return _retry_after_seconds(self._phi_read_limiter, actor)
+
+    def allow_monitoring_read(self, actor: str) -> bool:
+        """Per-actor pacing for six monitoring:read GETs (vault BACKLOG #1191, ASVS
+        15.2.2). True = proceed; False = throttle. Always True when the limiter is disabled."""
+        if self._monitoring_read_limiter is None:
+            return True
+        return self._monitoring_read_limiter.allow(actor)
+
+    def monitoring_read_retry_after(self, actor: str) -> int:
+        """The ``Retry-After`` value for a monitoring read just refused for ``actor``, rounded as
+        :meth:`phi_read_retry_after` rounds it, on the monitoring-read limiter."""
+        return _retry_after_seconds(self._monitoring_read_limiter, actor)
 
     def login_retry_after(self) -> int:
         """The ``Retry-After`` value for a sign-in attempt refused by :meth:`allow_login_attempt`:
@@ -5161,8 +5319,15 @@ class AuthService:
         totp_secret: str | None = None,
         totp_code: str | None = None,
         totp_code_read_at: float | None = None,
+        on_first_write: Callable[[], None] | None = None,
     ) -> ProvisionedAdministrator:
         """Create the first administrator from an operator-supplied name and credential (#1136).
+
+        ``on_first_write`` is called once, at the first account write that may have landed: right
+        after a fresh row's INSERT returns, or on a repair right before the clear of the earlier
+        holder's factors (BACKLOG #5067). A caller uses it to tell a refusal raised before any
+        account write from one that may follow one. A read before it can still write an audit row
+        of its own, such as a seal failure's.
 
         **IT ENROLS TOTP FROM BIRTH (ADR 0197 Amendment A, N-A, AC-A5).** ``totp_secret`` is the
         secret the command generated and showed at the terminal, and ``totp_code`` the code the
@@ -5314,6 +5479,8 @@ class AuthService:
             # or a session of theirs, onto the new Administrator. Cleared BEFORE anything is
             # written for the new holder, and before the role that would make a kept session an
             # Administrator session.
+            if on_first_write is not None:
+                on_first_write()
             await self._store.disable_totp(user_id)
             await self._store.delete_all_webauthn_credentials(user_id)
             # The command's longer budget here too (vault BACKLOG #3023 residual (4)): no request
@@ -5365,6 +5532,10 @@ class AuthService:
                     "provision-admin run is in progress, let it finish. Then run the command again: "
                     "it reads that account and either completes it or says why it cannot"
                 ) from exc
+            # After the INSERT, not before it: a refused INSERT wrote no row, so a refusal from it
+            # is still one raised before any account write (BACKLOG #5067).
+            if on_first_write is not None:
+                on_first_write()
         await self._seed_roles()
         # ADR 0197 Amendment A (N-A): the step is consumed FIRST, before the credential or the
         # secret is written, so a code this row already spent (an interrupted earlier run in the
@@ -5644,6 +5815,7 @@ class AuthService:
         raise FirstAdministratorGrantedSessionsLive(
             _provision_revoke_missed_text(username, enrolled=totp_secret is not None),
             username=username,
+            administrators_at_check=standing_admins,
         ) from missed
 
     async def _unexpected_grant_refusal(
@@ -6482,9 +6654,48 @@ class AuthService:
             )
         except _BindingChangedMidLogin:
             # BACKLOG #2733: the account was deleted after the load above, so no session was
-            # minted. The answer, and its deferred row, are an unknown account's.
+            # minted. The answer, and its deferred row, are an unknown account's. The log line
+            # says what happened, which that row does not (vault BACKLOG #2733 item 7).
+            _log.info(
+                "a local sign-in for account id %s was refused because the account was deleted "
+                "before its session was minted; it is answered and audited as an unknown account "
+                "(vault BACKLOG #2733)",
+                user.id,
+            )
             await later(unknown_row)
             return LoginOutcome(ok=False, error="invalid credentials")
+        except SessionMintContended as contended:
+            # BACKLOG #5653: the insert met contention on every attempt and wrote nothing. The
+            # password was right and the account is there, so this is neither an unknown account
+            # nor a wrong credential, and nothing is charged to the lockout.
+            cause = contended.cause
+
+            # As for a refusal by a lock (owner ruling 2026-09-28, BACKLOG #1131): first the row
+            # every reader sees, byte-identical to a wrong credential's, then the true row only
+            # ``users:manage`` reads. Only a right password reaches this insert, so without the
+            # first a reader without ``users:manage`` would see a missing row where a wrong
+            # password leaves one. The first is exactly the row a wrong password for an existing account
+            # writes (:data:`_LOCAL_REFUSAL_REASON`), which is the case a correct-password
+            # contention must be indistinguishable from; the administrator reads the row naming
+            # the cause beside it.
+            async def contended_rows() -> None:
+                await self._audit(
+                    "auth.login_failed",
+                    actor=username,
+                    detail=_local_refusal_detail(_LOCAL_REFUSAL_REASON, combined=combined),
+                    client=client,
+                )
+                await self._audit(
+                    "auth.login_failed",
+                    actor=username,
+                    detail=_local_refusal_detail(
+                        SESSION_MINT_CONTENDED, combined=combined, extra={"contention": cause}
+                    ),
+                    client=client,
+                )
+
+            await later(contended_rows)
+            return LoginOutcome(ok=False, error=_SIGN_IN_UNAVAILABLE, reason=SESSION_MINT_CONTENDED)
         await self._record_login_address(
             address, user, client=client, provider="local", mechanism=None
         )
@@ -6593,9 +6804,10 @@ class AuthService:
         # name the account as enrolled to anyone who knows the username. The secret comes from the
         # checked record, so no driver runs here since BACKLOG #3510, and the open runs off the
         # loop (:meth:`_open_totp_cell`, BACKLOG #3929). At least the shipped ciphers, Transit
-        # included, refuse a cell as ``CipherError``, and a value that opens but is not base32
-        # raises ``ValueError`` from the verify; each is logged by the census's own one-line logger
-        # (BACKLOG #5335). Anything else is a defect, but raising it would be that unpadded 500, so
+        # included, refuse a cell as ``CipherError``, logged by the census's own one-line logger
+        # (BACKLOG #5335). A value that opens but no code is computed from, short or not base32,
+        # matches no code in the verify, and :meth:`_totp_secret` logged its cause (BACKLOG
+        # #5340). Anything else is a defect, but raising it would be that unpadded 500, so
         # it too is a wrong code, logged at ERROR by its type name and the account id alone, with
         # no traceback. Every arm fails CLOSED. ``consume_totp_step`` below is outside the catch,
         # reached only once a code matched.
@@ -6616,8 +6828,6 @@ class AuthService:
                     window=self._settings.totp_skew_steps,
                     now=arrived,
                 )
-            except ValueError:  # binascii.Error is a ValueError: opened, but not base32
-                _log_totp_malformed(user.username)
             except Exception as exc:  # noqa: BLE001 -- as above
                 _log_combined_totp_defect(user.id, exc)
         # The store is asked only once the code matched a step (ASVS 11.2.4, BACKLOG #1167: kept on
@@ -8389,6 +8599,7 @@ class AuthService:
             return None
         return set(stored.user.role_ids) == set(role_ids)
 
+    @_in_directory_sign_in_queue
     async def _complete_ad_login(
         self,
         principal: AdPrincipal,
@@ -8740,6 +8951,36 @@ class AuthService:
         # already mints with seed_reauth=False below, so a NEW verdict is challenged by construction
         # and this leg adds the audit row and the notice.
         address = await self._classify_login_address(user, client)
+        # BACKLOG #5653. THE ROW IS READ AGAIN, AND JUDGED, RIGHT BEFORE THE MINT. The checks above
+        # ran on reads taken before the role, scope and profile writes, and a disable or a lock can
+        # commit during them. ``decided`` is also what the counter clear below compares against,
+        # so a lock that lands after this read is never cleared by it.
+        settled = await self._lookup_user_settled(user.id)
+        decided = settled.user
+        if decided is None:
+            # A row gone is named as the insert's refusal names it (BACKLOG #5624); a row still
+            # there that fails its seal is refused as everywhere else in this method.
+            ineligible: str | None = ACCOUNT_REFUSED if settled.held else ACCOUNT_DELETED
+        else:
+            ineligible = _directory_login_refusal(decided, time.time(), federated=federated)
+        if federated and ineligible == ACCOUNT_DELETED:
+            await self._directory_reject_audit(
+                principal.username, "oidc", ACCOUNT_DELETED, client=client, extra=outcome_extra
+            )
+            return LoginOutcome(
+                ok=False,
+                error="federated sign-in failed",
+                reason=ACCOUNT_DELETED,
+                roles_gained=roles_gained,
+            )
+        if ineligible is not None or decided is None:
+            refused = await self._refuse_directory_row(
+                principal.username,
+                ineligible or ACCOUNT_REFUSED,
+                client=client,
+                extra=outcome_extra,
+            )
+            return replace(refused, roles_gained=roles_gained)
         # ASVS 6.3.4 / 6.8.4: the second-factor grant is the CALLER's per-mechanism decision, not a
         # blanket literal. Kerberos passes False -- a ticket asserts nothing about directory-side
         # strength, so the engine assumes the minimum (BACKLOG #1144); the federated leg passes the
@@ -8770,17 +9011,25 @@ class AuthService:
                 # BACKLOG #1474. THE UNBIND'S SESSION SWEEP CANNOT SEE A SESSION THAT DOES NOT EXIST
                 # YET, which is the race this closes: an admin unbinding this account mid-login
                 # revokes what is live at that instant, and without the guard this login's own
-                # INSERT lands just after it. The password leg passes no guard, so it skips the
-                # binding comparison; its account read still runs, for the session epoch.
+                # INSERT lands just after it. The local password sign-in (`_login_local`), which
+                # does not reach this mint, passes no guard, so it skips the binding comparison;
+                # its account read still runs, for the session epoch.
                 #
-                # vault BACKLOG #2609. THE WINDOWS SSO LEG NOW PASSES THE MIRROR GUARD, so the
-                # sentence above holds for the password leg only. The refusal further up read
-                # the row before this mint, and a bind can commit between the two: its sweep
-                # runs in the bind's own transaction and cannot see a session inserted after
-                # it. So the insert itself requires an unbound row, under the lock the bind
+                # vault BACKLOG #2609. THE WINDOWS SSO LEG NOW PASSES THE MIRROR GUARD, so both
+                # legs that reach this mint pass one (vault BACKLOG #2733 item 9). The refusal
+                # further up read the row before this mint, and a bind can commit between the two:
+                # its sweep runs in the bind's own transaction and cannot see a session inserted
+                # after it. So the insert itself requires an unbound row, under the lock the bind
                 # takes. That also covers a rebind's gap, where the row is unbound between the
                 # clear and the write.
                 require_federated_subject=federated_subject if federated else _UNBOUND,
+                # BACKLOG #5653: the insert also requires the row enabled and unlocked, judged by
+                # the insert's own read under the lock a disable or a lockout takes. Either can
+                # still commit between the re-read above and that read; the insert's read then
+                # sees it and refuses. What the lock closes is the window from that read to the
+                # INSERT: a disable or lockout arriving there waits until the INSERT commits. A
+                # disable's session sweep cannot see a session that does not exist yet.
+                require_sign_in_eligible=True,
                 idp_auth_time=idp_auth_time,
                 supersedes_hash=supersedes_hash,
             )
@@ -8795,13 +9044,51 @@ class AuthService:
             # set, and the set this sign-in first read was a different one, those sessions were
             # ended too, with no role write and no ``auth.ad_roles_resynced`` row of this
             # sign-in's own (``_SignInRoleSync``, vault BACKLOG #3085).
+            # BACKLOG #5653: the store also refuses a row disabled or locked at the insert. The
+            # account is read once more to name that cause. A binding reason is written only when
+            # that read shows the binding moved off what the insert required; a row that reads
+            # eligible and bound as required (a lock that lapsed by the read, say), or that could
+            # not be read, gets the neutral reason, so no binding change is claimed that the read
+            # does not show.
+            now_ineligible: str | None = None
+            binding_moved = False
+            if not changed.account_deleted:
+                try:
+                    again = await self._load_user(user.id)
+                except (*store_call_errors(), *store_connect_errors()) as exc:
+                    if isinstance(exc, AUDIT_WRITE_DEFECTS):
+                        raise
+                    # Only the reason depends on this read; the refusal stands without it.
+                    _log.warning(
+                        "a directory sign-in of account id %r was refused at its session insert, "
+                        "and the account could not be read again to name why (%s)",
+                        user.id,
+                        type(exc).__name__,
+                    )
+                    again = None
+                if again is not None:
+                    # ``federated=True`` here is NOT a claim that this sign-in is federated (on the
+                    # Windows SSO leg it is not). It is passed only because that value skips
+                    # ``_directory_login_refusal``'s one binding check, its last, so the result
+                    # names the disabled and lock states alone; a binding change keeps the reason
+                    # chosen below, and the insert's own guard already judged the binding.
+                    now_ineligible = _directory_login_refusal(again, time.time(), federated=True)
+                    binding_moved = (
+                        (again.oidc_issuer, again.oidc_subject) != federated_subject
+                        if federated
+                        else _holds_federated_binding(again)
+                    )
             if changed.account_deleted:
                 reason = ACCOUNT_DELETED
+            elif now_ineligible is not None:
+                reason = now_ineligible
+            elif not binding_moved:
+                reason = ACCOUNT_STATE_CHANGED_AT_INSERT
             elif federated:
                 reason = "federated_subject_unbound"
             else:
                 reason = FEDERATED_SIGN_IN_REQUIRED
-            if not federated:
+            if not federated or now_ineligible is not None:
                 refused = await self._refuse_directory_row(
                     principal.username, reason, client=client, extra=outcome_extra
                 )
@@ -8815,6 +9102,29 @@ class AuthService:
                 reason=reason,
                 roles_gained=roles_gained,
             )
+        except SessionMintContended as contended:
+            # BACKLOG #5653: the insert met contention on every attempt (a busy SQLite database, or
+            # a session epoch a revoke kept raising) and wrote nothing. That says nothing about the
+            # account or its binding, so it is audited under its own reason, never as a binding or
+            # eligibility refusal. The role and profile sync above already ran, as on a refusal.
+            contended_extra = {**(outcome_extra or {}), "contention": contended.cause}
+            if federated:
+                await self._directory_reject_audit(
+                    principal.username,
+                    "oidc",
+                    SESSION_MINT_CONTENDED,
+                    client=client,
+                    extra=contended_extra,
+                )
+                refused = LoginOutcome(ok=False, reason=SESSION_MINT_CONTENDED)
+            else:
+                refused = await self._refuse_directory_row(
+                    principal.username,
+                    SESSION_MINT_CONTENDED,
+                    client=client,
+                    extra=contended_extra,
+                )
+            return replace(refused, error=_SIGN_IN_UNAVAILABLE, roles_gained=roles_gained)
         # The password-AD and Kerberos paths must keep emitting EXACTLY {"provider","roles"}: _json is
         # json.dumps(sort_keys=True), so a null-valued key is a different stored string, not a no-op.
         # Only the federated path passes mech/evidence/outcome_extra, so it alone grows the row.
@@ -8848,14 +9158,28 @@ class AuthService:
             #
             # ``verify_mfa`` and ``finish_webauthn_assertion`` are the two legs that finish the job,
             # and both clear the counter themselves.
-            await self._store.record_login_success(user.id, audits=())
+            #
+            # BACKLOG #5653: a compare-and-set on ``decided``, the row judged eligible before the
+            # mint, as the re-auth leg's clear is (BACKLOG #5900). A lock, a failure or a disable
+            # that commits after that read leaves the counters as that writer left them.
+            cleared = await self._store.record_login_success(
+                user.id, expected=full_authentication_snapshot(decided), audits=()
+            )
+            if cleared != "written":
+                _log.info(
+                    "a directory sign-in of account id %r found the account %s since its check "
+                    "before the mint, so it cleared no lockout state",
+                    user.id,
+                    "missing" if cleared == "gone" else "changed",
+                )
             # vault BACKLOG #2145, closing the #2156 review's R1-1: only a directory sign-in that owes
             # nothing more marks its address known. The audit baseline this replaced counted a
             # directory row that still owed a factor, because that row carries no marker of it.
             # NEW is written too: no directory session is ever seeded, so withholding the write
             # would challenge nothing and would only repeat the notice at every sign-in from an
             # address its owner keeps using. A failed read is no evidence, so it writes nothing.
-            if address is not _LoginAddress.UNEVALUATED_READ_FAILED:
+            # A clear refused above (BACKLOG #5653) is no full authentication either.
+            if cleared == "written" and address is not _LoginAddress.UNEVALUATED_READ_FAILED:
                 await self._mark_login_address_known(user.id, client)
         return LoginOutcome(
             ok=True,
@@ -9129,9 +9453,14 @@ class AuthService:
                         client=client,
                     )
                 )
-            await self._store.update_user_profile(
-                user_id, display_name=display_name, email=email, audits=repoint
-            )
+            # BACKLOG #5653 item 1 (S11-33): a returning sign-in whose directory profile matches the
+            # row writes nothing, rather than re-seal the row with the same two values on every
+            # sign-in. ``existing`` is the row this sign-in read, so a value another writer moved
+            # since is written back on the next sign-in, as the unconditional write would have.
+            if email_changed or display_name != existing.display_name:
+                await self._store.update_user_profile(
+                    user_id, display_name=display_name, email=email, audits=repoint
+                )
             if email_changed:
                 # ADDRESSED TO THE ENGINE-OWNED ``notify_email`` FIRST (BACKLOG #1139, ADR 0182).
                 # This read used to start at ``existing.email``, the profile mirror, which is the one
@@ -9942,8 +10271,9 @@ class AuthService:
             is_unkeyed = _holds_unkeyed_federated_binding(user)
             if is_unkeyed:
                 # Recorded BEFORE the session filter, so an account whose sessions lapse between
-                # passes keeps its "already reported" mark and is not reported again on its next
-                # sign-in.
+                # passes keeps its "already reported" mark and is not reported again if a session
+                # of its is listed again later. Such a row cannot sign in, but a session can come
+                # back into the listing, for example after a backward clock step (BACKLOG #2283).
                 still_unkeyed.add(user.id)
             # Deliberately WITHOUT the idle timeout (BACKLOG #2283). An idle row can come back: a
             # backward clock step or a raised idle setting makes the validator accept it again. So
@@ -10198,7 +10528,7 @@ class AuthService:
                 applied.append(revocation)
             if outcome == "reported":
                 reported.append(revocation)
-        for refresh in plan.renames:
+        for i, refresh in enumerate(plan.renames):
             # BACKLOG #1532. Applied only on a pass that was NOT aborted, with every other write the
             # plan carries: the reconciler's invariant is that an aborted pass leaves the store
             # byte-identical, and a rename is a store write like any other.
@@ -10208,15 +10538,45 @@ class AuthService:
             # row, so renaming first would put two different names on one account's records for one
             # pass -- reachable whenever an account is renamed and role-demoted in the same pass.
             # Both reads see the pre-rename name this way, and the rename still lands on this pass.
-            await self._refresh_cached_username(
-                user_id=refresh.user_id,
-                old_username=refresh.old_username,
-                new_username=refresh.new_username,
-                held=await self._load_user_by_username(refresh.new_username),
-                from_plan=True,
-                # BACKLOG #3018: a refused audit write here must not skip the renames after it.
-                audit_soft=True,
-            )
+            #
+            # Vault BACKLOG #3069 item 1: one catch around the held read here and the refresh. An
+            # Unverifiable answer at a checked read in either is about one record, so it skips
+            # this rename and the pass goes on (see _rename_read_seal_answer). An Outage, at a
+            # read or at the rename's write, is the key service being down, which every later
+            # rename would meet again, so it is paged once and the rename loop stops; the
+            # recorders below still run and the plan is returned, so the revocations already
+            # applied keep their alerts (Manager decisions, 2026-11-22). Before this catch an
+            # Outage at a read raised out of the pass, unpaged, and those alerts were lost; one at
+            # the write was paged and the renames went on.
+            try:
+                await self._refresh_cached_username(
+                    user_id=refresh.user_id,
+                    old_username=refresh.old_username,
+                    new_username=refresh.new_username,
+                    held=await self._load_user_by_username(refresh.new_username),
+                    from_plan=True,
+                    # BACKLOG #3018: a refused audit write here must not skip the renames after it.
+                    audit_soft=True,
+                )
+            except TransitSealUnverifiableError as exc:
+                self._rename_read_seal_answer(
+                    exc, user_id=refresh.user_id, new_username=refresh.new_username
+                )
+            except TransitSealUnavailableError as exc:
+                _log.error(
+                    "directory reconcile: account %s (renaming to %s): Vault transit did not "
+                    "answer for a record one of the rename's reads or its write checked, so this "
+                    "rename and the %d after it were not applied on this pass; the rest of the "
+                    "pass goes on (vault BACKLOG #3069)",
+                    refresh.user_id,
+                    scrub_log_argument(refresh.new_username),
+                    len(plan.renames) - i - 1,
+                    exc_info=exc,
+                )
+                # Paged here alone: the write's seal arm raises its Outage to this arm too, and
+                # the break means one page per pass.
+                self._user_seal_outage("rename")
+                break
         # BACKLOG #2538. After the revocations, like the hold below: the referred accounts were left
         # unjudged, and every other account's revocation above has already been applied.
         await self._record_reconcile_referral(plan, first=referral)
@@ -10231,7 +10591,8 @@ class AuthService:
         # logged rather than raised (BACKLOG #2137), so the pass still returns its plan and the
         # lifespan task still raises an alert for each revocation above and for the hold.
         await self._record_reconcile_hold(plan)
-        # BACKLOG #2027. Reported LAST, on every exit, so an audit write that keeps failing costs
+        # BACKLOG #2027. Reported LAST, on every exit that returns after the users are loaded (an
+        # exception raised above skips it for that pass), so an audit write that keeps failing costs
         # only this report and never stops the probes and revocations above from running. A
         # failed write is logged, not raised (BACKLOG #2137), for the same reason as the hold's.
         await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
@@ -10614,6 +10975,35 @@ class AuthService:
         elif event == "settled" and current in _HOLD_RELEASABLE:
             self._reconcile_hold_standing = "settled"
 
+    def _rename_read_seal_answer(
+        self,
+        exc: TransitSealUnverifiableError,
+        *,
+        user_id: str,
+        new_username: str,
+    ) -> None:
+        """Answer an Unverifiable answer that one of a reconciler rename's checked reads raised:
+        Vault transit could not verify the record it read (vault BACKLOG #3069 item 1). The loop
+        then skips that one rename and goes on, as the write's seal arm in
+        :meth:`_refresh_cached_username` does (note T2), though unlike that arm it pages and audits
+        nothing (below): a raise would end the pass and every rename after it. The checked reads it was written for run before the
+        rename's write lands, or after a write that wrote nothing, which is why the line says the
+        rename was not applied. A record that fails its seal is mostly not raised by these reads:
+        it comes back refused, for the refresh to handle as it already does. A row whose id cannot
+        be read is still raised (:func:`read_user_or_unreadable`) and is not caught here.
+
+        Logged at ERROR. It is not reported under an account here: the answer does not say which
+        record raised it, and the rename reads more than one, so this line names the account being
+        renamed and no other."""
+        _log.error(
+            "directory reconcile: account %s (renaming to %s): Vault transit could not verify the "
+            "integrity seal of a record one of the rename's reads checked, so the rename was not "
+            "applied; the pass goes on (vault BACKLOG #3069)",
+            user_id,
+            scrub_log_argument(new_username),
+            exc_info=exc,
+        )
+
     async def _refresh_cached_username(
         self,
         *,
@@ -10638,8 +11028,12 @@ class AuthService:
         commits with the write (step 7), rolls the rename back and is logged rather than raised.
         The login path leaves it off, so there a refused write still fails the sign-in, as it always
         has. It also lets a store fault on the ``held`` re-read skip the rename rather than raise
-        (BACKLOG #3070; the reason is at that read), and a seal refusal at the write be logged and
-        reported rather than raised (vault BACKLOG #3069 note T2; the reason is at that arm).
+        (BACKLOG #3070; the reason is at that read), and a Forged or Unverifiable seal refusal at the
+        write be logged and reported rather than raised (vault BACKLOG #3069 note T2; the reason
+        is at that arm); an Outage there is raised to the reconcile loop, as at the reads. A
+        Vault transit answer at one of its checked reads still raises out of it; the reconcile loop
+        absorbs an Unverifiable one (:meth:`_rename_read_seal_answer`, item 1) and stops its
+        renames on an Outage.
 
         **ONE implementation for two callers, deliberately.** The login path
         (:meth:`_upsert_ad_user`) and the ADR 0079 reconciler pass both reach a renamed account and
@@ -10957,16 +11351,17 @@ class AuthService:
             # or did not answer (Outage). A sign-in raises it. On the reconciler a raise would
             # cost the pass what the refused row below says it costs, so it logs and goes on, and
             # the answer is reported as an admin read reports the same answer for a record: the
-            # seal-failure report, which pages ``integrity_drift``, the store's Unverifiable page,
-            # or its Outage page. Which accounts a later pass reads is ``_load_users``'s.
-            if not audit_soft:
+            # seal-failure report, which pages ``integrity_drift``, or the store's Unverifiable
+            # page. Which accounts a later pass reads is ``_load_users``'s. An Outage is raised to
+            # the reconcile loop instead, which pages it once and stops the renames, as it does
+            # for an Outage at a read (vault BACKLOG #3069 item 1).
+            if not audit_soft or isinstance(exc, TransitSealUnavailableError):
                 raise
-            if isinstance(exc, RowSealError):
-                what = "its record failed its integrity check"
-            elif isinstance(exc, RowSealUnverifiableError):
-                what = "Vault transit could not verify its record's integrity seal"
-            else:
-                what = "Vault transit did not answer for its record's integrity seal"
+            what = (
+                "its record failed its integrity check"
+                if isinstance(exc, RowSealError)
+                else "Vault transit could not verify its record's integrity seal"
+            )
             _log.error(
                 "directory reconcile: account %s (%s, renaming to %s): %s at the rename's write, "
                 "so the rename was not applied; the pass goes on, and the seal answer is reported "
@@ -10979,10 +11374,8 @@ class AuthService:
             )
             if isinstance(exc, RowSealError):
                 await self._user_seal_failed(user_id)
-            elif isinstance(exc, RowSealUnverifiableError):
-                await self._user_seal_unverifiable(user_id, exc)
             else:
-                self._user_seal_outage("rename")
+                await self._user_seal_unverifiable(user_id, exc)
             return
         except Exception as exc:
             # THE RESIDUAL RACE, absorbed here because the store's in-statement guard cannot close it
@@ -11147,9 +11540,15 @@ class AuthService:
     async def _report_unkeyed_bindings(
         self, unkeyed: Sequence[UserRecord], *, still_unkeyed: set[str]
     ) -> None:
-        """Log and audit, once per account per process, each bound id-less row a pass skipped
-        (BACKLOG #2027). ``still_unkeyed`` is every such row, signed in or not; a mark is dropped
-        only when its row stops being one (unbound, disabled or removed).
+        """Log and audit each bound id-less row a pass skipped (BACKLOG #2027).
+
+        A row is marked once its audit row is written, and is not reported again while it stays
+        marked. ``still_unkeyed`` is every enabled bound id-less row the pass loaded, signed in or
+        not. A row missing from it loses its mark, so it can be reported again in this process; at
+        least an unbound, locally disabled or removed row goes missing, and so does one the load
+        leaves out. The loop stops at the first refused write, so the refused row and any behind it
+        stay unmarked. A later pass logs them and tries the audit again only if it finds them
+        signed in and reaches them.
 
         **Its own audit action, ``auth.ad_reconcile_binding_unkeyed``, not the outage row.**
         ``auth.ad_reconcile_skipped`` means the directory was unreachable and the accounts are fine.
@@ -11200,7 +11599,7 @@ class AuthService:
                     }
                 ),
             )
-            # Marked only once the audit row is written, so a failed write is retried next pass.
+            # Marked only once the audit row is written, so a later pass can retry a failed write.
             if not written:
                 # Stop at the first refusal: one ERROR and one WARNING per pass, and no second
                 # acquire timeout behind a store that is refusing every write.
@@ -12333,9 +12732,13 @@ class AuthService:
         max_expires_at: float | None = None,
         require_federated_subject: tuple[str | None, str | None] | None = None,
         supersedes_hash: str | None = None,
+        require_sign_in_eligible: bool = False,
     ) -> str:
         """Mint a session token and persist the row. Every caller must handle
-        :class:`_BindingChangedMidLogin`, raised for an account deleted under the sign-in too.
+        :class:`_BindingChangedMidLogin`, raised for an account deleted under the sign-in too, and
+        :class:`~messagefoundry.store.SessionMintContended`, which the store raises when its insert
+        met contention on every attempt (BACKLOG #5653). That one is not a refusal: the caller
+        fails the sign-in as a temporary failure under :data:`SESSION_MINT_CONTENDED`.
 
         ``supersedes_hash`` names the session this sign-in REPLACES in the caller's browser (ASVS
         7.2.4, login side). It is ended after the new
@@ -12394,14 +12797,20 @@ class AuthService:
             # seal ended the row, yet this method went on to supersede the caller's prior session
             # and hand back a dead token as a success.
             mfa_verified=mfa_verified,
+            # BACKLOG #5653: the directory leg also requires the row enabled and unlocked.
+            require_sign_in_eligible=require_sign_in_eligible,
         )
         if not issued:
             # An unbind or a bind revoked this account's sessions while this login was in flight,
-            # so issuing now would hand back a token the revocation could never have seen; or the
-            # account was deleted under it (BACKLOG #2733). Nothing was written, so there is
-            # nothing to undo. One more read tells the two apart (BACKLOG #5624).
-            # An unguarded insert is refused only for a missing row, so it needs no read.
-            deleted = require_federated_subject is None or not await self._user_id_held(user_id)
+            # so issuing now would hand back a token the revocation could never have seen; or,
+            # under ``require_sign_in_eligible``, the row was disabled or locked at the insert
+            # (BACKLOG #5653); or the account was deleted under it (BACKLOG #2733). Nothing was
+            # written, so there is nothing to undo. One more read tells a deleted row from a
+            # present one (BACKLOG #5624); a present row's cause is the caller's to name.
+            # An insert with neither guard is refused only for a missing row, so it needs no read.
+            deleted = (
+                require_federated_subject is None and not require_sign_in_eligible
+            ) or not await self._user_id_held(user_id)
             raise _BindingChangedMidLogin(account_deleted=deleted)
         if supersedes_hash is not None:
             await self._supersede_session_hash(supersedes_hash, client=client)
@@ -13468,8 +13877,12 @@ class AuthService:
     async def checked_user(self, user_id: str) -> VerifiedUser | None:
         """The account ``user_id`` names, its whole record checked against its seal, for a caller
         outside this service that SHOWS it (BACKLOG #5520), and for :meth:`change_password`, which
-        decides on it (BACKLOG #5902), so its raise-or-``None`` contract binds that control too. ``None`` when no row is there. Raises
-        :class:`UserSealRefused` only when :meth:`_verified` established that the record fails,
+        decides on it (BACKLOG #5902), so its raise-or-``None`` contract binds that control too, as
+        it binds at least the admin role, channel-scope and password-reset routes, which answer
+        404 or 423 on it and, for the role write, decide the directory refusal and the
+        administrator-granted alert on what it returns (BACKLOG #5520 items 2 and 13).
+        ``None`` when no row is there. Raises :class:`UserSealRefused` only when
+        :meth:`_verified` established that the record fails,
         or :meth:`_checked_by_id` failed closed, and handed that to the seal-failure report, so
         the caller can say so rather than answer "no such user". A record Vault transit cannot
         verify raises it too, reported under its own cause (ADR 0217 (a)). A Vault transit Outage
@@ -13695,17 +14108,16 @@ class AuthService:
     async def _totp_secret(self, user: VerifiedUser) -> str | None:
         """``user``'s TOTP secret, decrypted from the record its seal covered (BACKLOG #3510), or
         ``None``. Never a second read of the store: a secret swapped in after the checked load would
-        be checked against no seal, and its codes would sign in. A secret whose enrolment marker
-        is refused is logged here (BACKLOG #3422): every code check then reads it as a wrong code,
-        so this line is what names the cause."""
+        be checked against no seal, and its codes would sign in. A secret no code is computed from,
+        a refused enrolment marker (BACKLOG #3422) or a key that is short or not base32 (BACKLOG
+        #5340), is logged here by its cause: every code check then reads it as a wrong code, so this
+        line is what names the cause."""
         secret = await self._open_totp_cell(user)
         # A keyless open hands ciphertext through; that is a store-key fault, not a refused marker.
-        if (
-            secret is not None
-            and not secret.startswith(MARKER_PREFIX)
-            and _totp_unusable_reason(secret) == "refused"
-        ):
-            _log_totp_refused(user.username)
+        if secret is not None and not secret.startswith(MARKER_PREFIX):
+            reason = _totp_unusable_reason(secret)
+            if reason is not None:
+                _log_totp_unusable(user.username, reason)
         return secret
 
     async def _opened_totp_enrolment(self, user: VerifiedUser) -> _OpenedTotp | None:
@@ -16796,8 +17208,10 @@ class AuthService:
         reads, the console's ``phi=True`` arm) and the paced writes (``require_paced``, the
         console's write gate), which refuse on ``True``. Not every caller refuses: the console's
         reauth-only action gate records the signal on a request it is refusing for another reason.
-        The JSON plane's base gate (``require``) never calls it, so the monitoring polls are not
-        refused. The console's base gate (``require_ui``) calls it for a PHI read or a write, and,
+        The JSON plane's base gate (``require``) and its monitoring-read gate
+        (``require_monitoring_read``) never call it, so the JSON monitoring polls are not refused;
+        a monitoring ``reveal`` read is, through the HTTP reveal path above. The console's base
+        gate (``require_ui``) calls it for a PHI read or a write, and,
         since BACKLOG #5646, on every request a step-up gate serves, GET included, because the
         step-up factories hand it their question; the console's plain monitoring polls ride none
         of those, so they are not refused either.
@@ -17124,8 +17538,9 @@ class AuthService:
     async def _totp_state(self, user: VerifiedUser) -> TotpState | None:
         """What ``user``'s TOTP is (:func:`_opened_totp_state`, the census rule), or ``None`` when
         it is not enabled. The engine judges it ``"usable"`` when it can compute codes with it. An
-        enrolment whose marker this release refuses matches no code, so its combined sign-in can
-        never pass a lock, and it is no way past (BACKLOG #3422). The cell is the one the checked
+        enrolment whose marker this release refuses (BACKLOG #3422), or whose key is too short to
+        compute with (BACKLOG #5340), matches no code, so its combined sign-in can never pass a
+        lock, and it is no way past. The cell is the one the checked
         record's seal covered, judged by the store's :func:`judge_totp_cell`, off the event loop:
         the same judgement the store's conditional writes and the lock escalation make on the cell
         they lock (BACKLOG #3948 finding 17). The service's way-past decisions ask this: at least
@@ -17339,11 +17754,12 @@ class AuthService:
         if census.unknown_totp:
             _log.warning(
                 "ADR 0197: %d of those could not be checked at all (the cell did not open, or the "
-                "value would not compute): %s. Until they can be, every gate treats each as an "
-                "enabled TOTP, and its holder cannot remove it while no discoverable passkey "
+                "value it holds is not base32, where a value holding a colon reads as a refused marker "
+                "and is not counted here): %s. Until they can be, every gate treats each as "
+                "an enabled TOTP, and its holder cannot remove it while no discoverable passkey "
                 "remains. For a cell that does not open, check the store key and the cipher "
                 "service before resetting anything, since a reset destroys a healthy enrolment; a "
-                "value that opens and will not compute is cleared by an administrator's factor "
+                "value that opens and is not base32 is cleared by an administrator's factor "
                 "reset (POST /users/{id}/reset-mfa).",
                 len(census.unknown_totp),
                 ", ".join(census.unknown_totp),
@@ -19297,8 +19713,9 @@ class AuthService:
         reenrol = False
         # The cell is opened only when this release compiles in a set other than its default, the
         # only way an ACCEPTED enrolment can differ from it, so a status read costs no decrypt
-        # otherwise. A refused marker is not reported here: the census names it at startup and in
-        # verify, and _totp_secret logs it at every code check.
+        # otherwise. A refused marker, or a secret no code is computed from, sets the flag here only
+        # then (totp.needs_reenrolment); the census names it at startup and in verify, and
+        # _totp_secret logs it at every open.
         if user.totp_enabled and totp.reenrolment_possible():
             try:
                 secret = await self._totp_secret(user)
@@ -19861,8 +20278,9 @@ class AuthService:
         authenticator reported user verification, clearing it otherwise. A session that had already
         met its factor when that write ran, and any ``oidc`` session, is neither re-anchored nor
         stamped (vault BACKLOG #2964 item 14, owner rulings 2026-11-14, ADR 0068 amendment of that
-        date). Returns a not-``ok`` :class:`Elevation` (never raises) for any invalid input, always
-        audited.
+        date). Returns a not-``ok`` :class:`Elevation` for invalid input rather than raising, but an
+        exception can still raise, at least from the passkey re-read as the last paragraph says. A
+        missing token, session or account, or a disabled account, returns one with no ``auth.*`` row.
 
         For a passkey-only account this is the ONLY leg of ``POST /ui/mfa``, so the rotation here is
         what keeps the 7.2.4 claim honest rather than TOTP-shaped. **Deliberate divergence from
@@ -22125,6 +22543,35 @@ class AuthService:
             client=client,
         )
 
+    async def audit_step_up_status_read(
+        self,
+        identity: Identity,
+        path: str,
+        *,
+        action: str | None,
+        window_live: bool,
+        action_proof_live: bool | None,
+        client: str | None,
+    ) -> None:
+        """Audit one answered ``GET /me/step-up`` read (ADR 0215 section 2, BACKLOG #2603).
+
+        The read tells its caller whether a proof is live, so each answer leaves a row naming who
+        asked, about which action, and what it was told. ``client`` is required, as for
+        :meth:`audit_self_target_refused`."""
+        await self._audit(
+            STEP_UP_STATUS_READ_ACTION,
+            actor=identity.username,
+            detail=_json(
+                {
+                    "path": path,
+                    "action": action,
+                    "window_live": window_live,
+                    "action_proof_live": action_proof_live,
+                }
+            ),
+            client=client,
+        )
+
     async def audit_gate_refused(
         self,
         identity: Identity,
@@ -22133,20 +22580,36 @@ class AuthService:
         *,
         reason: str,
         client: str | None,
+        answered_status: int | None = None,
+        answered_reason: str | None = None,
     ) -> None:
         """Audit a request refused by a check its gate makes AFTER the permission check passed
         (BACKLOG #1197, ASVS 16.3.2), such as a stale step-up (``reason`` ``step_up``) or the
         per-actor pacing (``throttled``).
 
+        Where ``answered_status`` is given, the row also records it and ``answered_reason`` (null
+        if that is not given): a different refusal the caller was actually answered with, as when
+        a held monitoring-read 429 is recorded but a route's own refusal is returned in its place
+        (vault BACKLOG #1191). Without ``answered_status``, ``answered_reason`` is not recorded.
+
         The caller holds ``permission``, so this is not :meth:`audit_permission_denied`: that row
         says the permission was missing, and the denial-burst detector counts it.
-        ``_recorded_decision`` in ``api/security.py`` decides when this row is written for a gate's
-        own refusals, and ``_record_route_refusal`` for the step-up refusals a ``proof_in_route``
-        route body makes. ``client`` is required, as for :meth:`audit_self_target_refused`."""
+        Its writers in ``api/security.py`` include at least ``_recorded_decision`` for a gate's own
+        refusals, ``_record_route_refusal`` for the step-up refusals a ``proof_in_route`` route
+        body makes, and ``raise_deferred_monitoring_refusal`` and
+        ``record_deferred_monitoring_refusal`` for a monitoring-read 429 a gate held for its
+        route body. ``client`` is required, as for :meth:`audit_self_target_refused`."""
         await self._audit(
             "auth.gate_refused",
             actor=identity.username,
-            detail=_json({"permission": permission.value, "path": path, "reason": reason}),
+            detail=_json(
+                {"permission": permission.value, "path": path, "reason": reason}
+                | (
+                    {}
+                    if answered_status is None
+                    else {"answered_status": answered_status, "answered_reason": answered_reason}
+                )
+            ),
             client=client,
         )
 

@@ -29,7 +29,7 @@ from tee.anon import leak as tee_leak
 from tee.anon import rules as tee_rules
 from tee.anon import surrogates as tee_surrogates
 
-_SALT = "b193-salt-0123456789abcdef"
+_SALT = "b193-salt-0123456789abcdef-0123456789"
 _HEADER = r"MSH|^~\&|SAPP|SFAC|RAPP|RFAC|20260315142233||ADT^A01|MSGCTRL|P|2.5.1"
 _ADAPTERS = (engine_anonymize, tee_anonymize)
 _EACH_ADAPTER = pytest.mark.parametrize("adapter", _ADAPTERS, ids=("engine", "tee"))

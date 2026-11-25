@@ -34,12 +34,17 @@ from __future__ import annotations
 import base64
 import binascii
 import ntpath
+import re
 
 from messagefoundry.content_type import ContentType
 from messagefoundry.controlchars import has_control_char
 
 # Segment ids a valid HL7 v2 payload (single message or batch file) may start with.
 _HL7_LEADING_SEGMENTS = (b"MSH", b"FHS", b"BHS")
+
+#: The first byte past the leading noise :func:`_looks_like_hl7` tolerates (the MLLP start byte,
+#: CR, LF, space and tab), found in C without copying the body.
+_PAST_HL7_LEADING_WS = re.compile(rb"[^\x0b\r\n \t]")
 
 
 def _looks_like_hl7(raw: bytes) -> bool:
@@ -50,10 +55,7 @@ def _looks_like_hl7(raw: bytes) -> bool:
     (file) or BHS (batch). This rejects a binary or non-HL7 file that merely carries the ``.hl7``
     extension before its bytes enter the pipeline, without rejecting a structurally-odd-but-textual
     HL7 message (which still flows through and is recorded as ``ERROR`` by the parser)."""
-    head = raw.lstrip(b"\x0b\r\n \t")
-    if head.startswith(b"\xef\xbb\xbf"):  # UTF-8 BOM
-        head = head[3:].lstrip(b"\x0b\r\n \t")
-    return head[:3] in _HL7_LEADING_SEGMENTS
+    return _sniff_head(raw, _PAST_HL7_LEADING_WS)[:3] in _HL7_LEADING_SEGMENTS
 
 
 # Leading noise tolerated before a JSON/XML/X12 magic byte: ASCII whitespace incl. the MLLP start byte
@@ -65,21 +67,44 @@ def _looks_like_hl7(raw: bytes) -> bool:
 _LEADING_WS = b" \t\r\n\x0b\x0c"
 
 
-def _lstrip_bom_ws(raw: bytes) -> bytes:
-    head = raw.lstrip(_LEADING_WS)
-    if head.startswith(b"\xef\xbb\xbf"):  # UTF-8 BOM
-        head = head[3:].lstrip(_LEADING_WS)
-    return head
+#: The first byte that is not :data:`_LEADING_WS`, found in C without copying the body. Written out
+#: as a literal so the static regex scan in tests/test_security_static.py can read it; a test in
+#: tests/test_sniff_head_copy.py pins its class to :data:`_LEADING_WS`.
+_PAST_LEADING_WS = re.compile(rb"[^ \t\r\n\x0b\x0c]")
+
+#: How much of the body past the leading noise :func:`_sniff_head` returns: more than the longest
+#: signature any caller compares (the 8-byte PNG magic).
+_SNIFF_HEAD_BYTES = 16
+
+
+def _sniff_head(raw: bytes, past_noise: re.Pattern[bytes] = _PAST_LEADING_WS) -> bytes:
+    """At most the first :data:`_SNIFF_HEAD_BYTES` of ``raw`` past its leading noise (the bytes
+    ``past_noise`` does not match) and one UTF-8 BOM, with noise either side of it. A head for a
+    signature check, never the body: only the head is copied, so a large body with leading noise
+    is not copied whole (BACKLOG #5520, filing review finding 3)."""
+    found = past_noise.search(raw)
+    at = len(raw) if found is None else found.start()
+    if raw.startswith(b"\xef\xbb\xbf", at):  # UTF-8 BOM
+        found = past_noise.search(raw, at + 3)
+        at = len(raw) if found is None else found.start()
+    return raw[at : at + _SNIFF_HEAD_BYTES]
 
 
 #: The str-domain twin of :data:`_LEADING_WS`, plus U+FEFF (what a UTF-8/UTF-16 BOM decodes to). Derived
-#: from the byte set rather than retyped, so the tolerated leading noise has ONE definition.
+#: from the byte set rather than retyped. The two skip patterns below restate both sets as regex
+#: literals, and tests/test_sniff_head_copy.py holds each literal equal to its set.
 _LEADING_WS_STR = _LEADING_WS.decode("ascii") + "\ufeff"
 
 #: Characters of a decoded body that :func:`text_sniff_head` encodes. The longest text magic is three
 #: bytes (``ISA`` / ``MSH``); eight characters leave headroom for a multi-byte first character while
 #: keeping the work O(1) instead of re-encoding a whole 16 MiB body.
 _TEXT_SNIFF_HEAD_CHARS = 8
+
+#: The first character that is not :data:`_LEADING_WS_STR`, found without copying the text, so a
+#: large decoded body with leading noise is not copied whole (BACKLOG #5520, filing review
+#: finding 3). A literal for the same reason as :data:`_PAST_LEADING_WS`, and pinned to
+#: :data:`_LEADING_WS_STR` by the same test file.
+_PAST_LEADING_WS_STR = re.compile(r"[^ \t\r\n\x0b\x0c\ufeff]")
 
 
 def text_sniff_head(text: str) -> bytes:
@@ -96,7 +121,9 @@ def text_sniff_head(text: str) -> bytes:
     Leading whitespace/BOM is stripped in str space first, so the head starts at the first significant
     character however much whitespace preceded it; :func:`_content_matches_declared` strips again in
     byte space, which is idempotent."""
-    return text.lstrip(_LEADING_WS_STR)[:_TEXT_SNIFF_HEAD_CHARS].encode("utf-8")
+    found = _PAST_LEADING_WS_STR.search(text)
+    at = len(text) if found is None else found.start()
+    return text[at : at + _TEXT_SNIFF_HEAD_CHARS].encode("utf-8")
 
 
 def _content_matches_declared(content_type: ContentType | None, raw: bytes) -> bool:
@@ -116,7 +143,7 @@ def _content_matches_declared(content_type: ContentType | None, raw: bytes) -> b
         case ContentType.HL7V2 | None:
             return _looks_like_hl7(raw)
         case ContentType.X12:
-            return _lstrip_bom_ws(raw).startswith(b"ISA")
+            return _sniff_head(raw).startswith(b"ISA")
         case ContentType.DICOM:
             # DICOM Part-10: 128-byte preamble + the "DICM" magic. Every DICOM object the engine produces
             # (C-STORE SCP save_as enforce_file_format=True, dicom.py) or parses (dcmread force=False,
@@ -127,9 +154,9 @@ def _content_matches_declared(content_type: ContentType | None, raw: bytes) -> b
             # FHIR is HL7 FHIR JSON, so it shares the JSON magic (leading { or [ after BOM/ws). Accepting a
             # top-level [ for FHIR is superset-permissive by design (a single resource is {…}, a bundle is
             # too) — the accept-gate can only ADMIT more; parsing/fhir stays the real validator.
-            return _lstrip_bom_ws(raw)[:1] in (b"{", b"[")
+            return _sniff_head(raw)[:1] in (b"{", b"[")
         case ContentType.XML:
-            return _lstrip_bom_ws(raw).startswith(b"<")
+            return _sniff_head(raw).startswith(b"<")
         case _:  # BINARY / TEXT — opaque bytes / arbitrary text, no reliable signature → accept unchecked
             return True
 
@@ -169,9 +196,9 @@ def attachment_mime_agrees(content_type: str | None, head: bytes) -> bool:
     if exact is not None:
         return head.startswith(exact)
     if mime in _XML_MIMES or mime.endswith("+xml"):
-        return _lstrip_bom_ws(head).startswith(b"<")
+        return _sniff_head(head).startswith(b"<")
     if mime == "application/json" or mime.endswith("+json"):
-        return _lstrip_bom_ws(head)[:1] in (b"{", b"[")
+        return _sniff_head(head)[:1] in (b"{", b"[")
     return True  # no reliable signature for this MIME → accept the declared label unchecked
 
 
@@ -217,7 +244,7 @@ def nontext_upload_reason(data: bytes) -> str | None:
     begins with a container's signature never reaches the store. This is a stricter, binary-shaped
     gate than the 5.2.2 extension/content sniff (which maps a text-but-mismatched body to 400); a container carrying a permitted text extension is
     caught here first (415), so the 5.2.2 400 path handles the remaining text-vs-extension mismatches."""
-    head = _lstrip_bom_ws(data)
+    head = _sniff_head(data)
     for mime, prefixes in _MAGIC_PREFIXES.items():
         if head.startswith(prefixes):
             return f"body is a {mime} container; the uploaded-logs feature accepts only plain-text logs"

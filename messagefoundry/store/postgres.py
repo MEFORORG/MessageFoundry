@@ -110,11 +110,13 @@ from messagefoundry.store.base import (
     SchemaLockTimeout,
     SchemaNotProvisionedError,
     SchemaProvisionResult,
+    ServerCipherWalk,
     StoreGrantsMissingError,
     StoreNotFoundError,
     _codec_chain_reading,
     _flush_unjudged,
     acquire_pooled,
+    check_walk_identifiers,
     driver_sqlstate,
     seed_filter_clause,
     warm_pool_connections,
@@ -217,6 +219,7 @@ from messagefoundry.store.row_seal import (
     cipher_call,
     classify_unrotated,
     row_sealer_for_cipher,
+    seal_chunks,
 )
 from messagefoundry.store.schema_verify import IndexShape
 from messagefoundry.store.sealed_cache import (
@@ -254,6 +257,8 @@ from messagefoundry.store.store import (
     REINGRESS_TAG_FAILURE_OUTCOME,
     REINGRESS_TARGET_PREFIX,
     REINGRESS_TOKEN_TAG_FAILED,
+    SESSION_MINT_ATTEMPTS,
+    SESSION_MINT_EPOCH_RAISED,
     TRANSIT_ATTESTATION_COLUMNS,
     USER_READ_SQL,
     VIEWED_EVENT,
@@ -319,6 +324,7 @@ from messagefoundry.store.store import (
     RoleGrant,
     RoleRow,
     SecretRotationMetaRow,
+    SessionMintContended,
     SessionRecord,
     SignCountAnswer,
     Stage,
@@ -423,6 +429,7 @@ from messagefoundry.store.store import (
     seal_role_async,
     seal_session_async,
     seal_user_async,
+    session_epochs_current,
     session_insert_params,
     session_owes_unproven_factor_async,
     session_reseal_params,
@@ -430,6 +437,7 @@ from messagefoundry.store.store import (
     settle_newest_keyed_audit_row,
     settle_transit_bound_attestation,
     should_record_event,
+    sign_in_state_refused,
     stamped_connection_event,
     tee_audits,
     totp_enable,
@@ -471,14 +479,6 @@ _PG_EPOCH_NOW = "EXTRACT(EPOCH FROM statement_timestamp())::double precision"
 # which is the memory budget the 500-row passes actually spend; 500 here would be ~650 MiB held in a
 # single transaction while the store is still opening.
 _ATTACHMENT_CHUNK_BATCH = 16
-
-
-def _check_walk_identifiers(*names: str) -> None:
-    """Refuse a cipher-walk identifier that is not a plain ASCII name. The walk's names are declared
-    constants (BACKLOG #1719), so this only stops a caller that passed something else."""
-    for name in names:
-        if not (name.isascii() and name.isidentifier()):
-            raise ValueError(f"not a plain identifier for the cipher walk: {name!r}")
 
 
 # BACKLOG #3383: write a surface's `keyed_surface` marker unless it exists. RETURNING yields a row
@@ -2078,7 +2078,7 @@ def _refuse_store_revocation(
     ).enforce_construction()
 
 
-class PostgresStore:
+class PostgresStore(ServerCipherWalk):
     """PostgreSQL-backed durable queue (the :class:`Store` protocol). Open with :meth:`open`."""
 
     # Postgres implements the full staged ingress pipeline (enqueue_ingress/route_handoff/
@@ -2302,8 +2302,8 @@ class PostgresStore:
             # Don't leak the pool if first-open initialization fails (M-6), a cancel included
             # (BACKLOG #5720). The cleanup settles nothing, as before: a failed open forfeits the
             # AES-GCM invocation block it reserved, and each forfeited block counts toward the
-            # key's fail-closed invocation ceiling. A cleanup that fails is logged by class, so it never replaces the open's own error (vault
-            # BACKLOG #3054).
+            # key's fail-closed invocation ceiling. A cleanup that fails is logged by class, so it
+            # never replaces the open's own error (vault BACKLOG #3054).
             async def _release() -> None:
                 try:
                     await pool.close()
@@ -3028,6 +3028,8 @@ class PostgresStore:
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
+        # KNOWN GAP (BACKLOG #5720): a cancel in the settle, a write on a keyed store, skips every
+        # close step after it, so the pool stays open; this close is not cancel-safe.
         try:
             if not self._read_only:  # #1780: a read-only handle reserved nothing to settle
                 await self.checkpoint_cipher_invocations(settle=True)
@@ -3137,6 +3139,7 @@ class PostgresStore:
                 status=StorePrivilegeStatus.UNOBSERVABLE,
                 principal=str(scalar["principal"] or ""),
                 database=database,
+                unread=("CREATE on the store's schema",),
                 detail=(
                     "current_schema() resolved to NULL, so CREATE on the store's schema was not read; "
                     "[store].schema_management is 'external', which requires the runtime role to hold "
@@ -3163,7 +3166,8 @@ class PostgresStore:
             # read unobserved rather than clean. With an over-grant already found it stays OBSERVED,
             # so the start still refuses on what WAS read: a partial read only understates.
             unread_note = (
-                f"the audit-table grants read NULL for {', '.join(audit_unread)}, so whether this "
+                "the audit-table grants read NULL, or a value that is not true or false, for "
+                f"{', '.join(audit_unread)}, so whether this "
                 "role can change audit rows was not read; [store].schema_management is "
                 "'external', which requires INSERT and SELECT only on audit_log"
             )
@@ -3173,6 +3177,7 @@ class PostgresStore:
                     status=StorePrivilegeStatus.UNOBSERVABLE,
                     principal=str(scalar["principal"] or ""),
                     database=database,
+                    unread=audit_unread,
                     detail=unread_note,
                 )
             unread_note = "; " + unread_note
@@ -3187,6 +3192,8 @@ class PostgresStore:
             server_roles=(),
             database_roles=tuple(f.name for f in facts if not f.is_self),
             excess=excess,
+            # #6015 item 2: an unread audit grant beside a read over-grant reaches the summary.
+            unread=audit_unread if external else (),
             detail=(
                 "roles are every role this principal may assume (pg_has_role MEMBER, so roles reached by "
                 "inheritance and by the set-role command alike); role ATTRIBUTES (SUPERUSER/CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS) "
@@ -3970,21 +3977,21 @@ class PostgresStore:
                 )
                 if not rows:
                     break
-                for r in rows:
-                    await conn.execute(
-                        f"UPDATE {table} SET {column}=$1 WHERE {where_keys}",
-                        (
-                            await self._aencrypt(
-                                r["v"],
-                                aad=(
-                                    aad_of(r)
-                                    if aad_of is not None
-                                    else cell_aad(table, column, *(r[c] for c in aad_cols))
-                                ),
-                            )
-                        ),
-                        *(r[c] for c in keys),
-                    )
+                async for chunk, sealed_values in seal_chunks(
+                    self._cipher,
+                    table,
+                    column,
+                    rows,
+                    aad_cols=aad_cols,
+                    aad_of=aad_of,
+                    local_whole_page=False,
+                ):
+                    for value, r in zip(sealed_values, chunk, strict=True):
+                        await conn.execute(
+                            f"UPDATE {table} SET {column}=$1 WHERE {where_keys}",
+                            value,
+                            *(r[c] for c in keys),
+                        )
                 sealed += len(rows)
         # Top the reserve back up for whatever follows; the burst itself was reserved above.
         await self._charge_bound_batch()
@@ -4007,9 +4014,8 @@ class PostgresStore:
         return row is not None
 
     # --- the read-only cipher-cell walk (BACKLOG #1719) ----------------------
-    # The source `cipher_cells.read_server_cipher_cells` reads, for `messagefoundry cipher-audit`.
-    # Each call is one SELECT on its own bounded borrow, so no read transaction spans chunks. Every
-    # identifier is a declared constant from `cipher_cells`; only values are parameters.
+    # This dialect's reads; `store/base.py` says what the walk's reads share, and holds the one
+    # read that is not dialect, `cipher_walk_surface_sealed`.
 
     async def cipher_walk_columns(self, tables: Sequence[str]) -> dict[str, frozenset[str]]:
         """The columns of each of ``tables`` this store's schema holds; an absent table is left out."""
@@ -4030,14 +4036,6 @@ class PostgresStore:
         )
         return None if row is None else (str(row[0]), str(row[1]))
 
-    async def cipher_walk_surface_sealed(self, table: str, column: str, *, keyed: bool) -> bool:
-        """Whether the store has sealed ``table.column``, by the rule its at-open sweep applies
-        (BACKLOG #3383); ``keyed`` says the ``keyed_surface`` table exists to be asked."""
-        _check_walk_identifiers(table, column)
-        if keyed and await self._surface_keyed(table, column):
-            return True
-        return await self._surface_holds_ciphertext(table, column, f"{_ENC_MARKER_PREFIX}%")
-
     async def cipher_walk_chunk(
         self,
         table: str,
@@ -4053,7 +4051,7 @@ class PostgresStore:
         ``after`` (``None`` for the first chunk), in ``order``. Each row is the ``select`` values,
         then ``column``'s. ``sealed_only`` keeps a value only when it starts with the marker in any
         ASCII case, as ``cipher_cells._sealed_test`` reads one."""
-        _check_walk_identifiers(table, column, *select, *order)
+        check_walk_identifiers(table, column, *select, *order)
         params: list[Any] = []
 
         def bind(value: Any) -> str:
@@ -11169,8 +11167,8 @@ class PostgresStore:
         audits: Sequence[AuditAppend],
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
-        calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
-        #1139). Adding that column to this SET list would hand the directory the notification target
+        calls it on an AD/OIDC login whose profile changed — so it deliberately does NOT name
+        ``notify_email`` (BACKLOG #1139). Adding that column to this SET list would hand the directory the notification target
         back and restore the defect the split removes. ``audits``: see
         ``AuthStore.update_user_profile``."""
         now = time.time() if now is None else now
@@ -12011,8 +12009,68 @@ class PostgresStore:
         auth_mechanism: str | None = None,
         idp_auth_time: float | None = None,
         mfa_verified: bool = False,
+        require_sign_in_eligible: bool = False,
     ) -> bool:
-        now = time.time() if now is None else now
+        # BACKLOG #5653: the seal is made BEFORE the locked transaction opens, as SQLite's
+        # create_session does. Under a Vault Transit sealer it is an HTTP call, and holding the
+        # account's row lock and a pooled connection across it would stall that account's writers
+        # behind Vault. The seal covers the session epochs, so they are read first, unlocked, and
+        # read again under the lock: if a revoke raised either in between, nothing is written and
+        # the record is sealed again over the new values.
+        for _ in range(SESSION_MINT_ATTEMPTS):
+            # Unlocked, so the subquery's snapshot is fine here; the locked read below takes the
+            # global epoch in its own statement (BACKLOG #5091).
+            pre = await self._fetchone(
+                f"SELECT session_epoch, {GLOBAL_SESSION_EPOCH_SQL} AS global_epoch"
+                " FROM users WHERE id=$1",
+                user_id,
+            )
+            if pre is None:
+                # A deleted account is refused, guarded or not (BACKLOG #2733); the locked read
+                # below refuses one deleted after this read.
+                return False
+            record = await seal_session_async(
+                self._row_sealer,
+                new_session_record(
+                    token_hash=token_hash,
+                    user_id=user_id,
+                    now=time.time() if now is None else now,
+                    expires_at=expires_at,
+                    client=client,
+                    seed_reauth=seed_reauth,
+                    auth_mechanism=auth_mechanism,
+                    idp_auth_time=idp_auth_time,
+                    mfa_verified=mfa_verified,
+                    user_epoch=int(pre["session_epoch"]),
+                    global_epoch=global_epoch_or_refuse(pre["global_epoch"]),
+                ),
+            )
+            inserted = await self._insert_sealed_session(
+                record,
+                now=now,
+                require_federated_subject=require_federated_subject,
+                require_sign_in_eligible=require_sign_in_eligible,
+            )
+            if inserted is not None:
+                return inserted
+        log.warning(
+            "postgres: a session insert found the session epochs raised %d times; giving up",
+            SESSION_MINT_ATTEMPTS,
+        )
+        raise SessionMintContended(SESSION_MINT_EPOCH_RAISED, SESSION_MINT_ATTEMPTS)
+
+    async def _insert_sealed_session(
+        self,
+        record: SessionRecord,
+        *,
+        now: float | None,
+        require_federated_subject: tuple[str | None, str | None] | None,
+        require_sign_in_eligible: bool,
+    ) -> bool | None:
+        """``create_session``'s locked transaction: insert ``record``, already sealed, if the
+        account's row still allows it. ``False`` is a refusal. ``None`` means a revoke raised an
+        epoch the seal covers after the seal was made, so nothing was written and the caller seals
+        again. Nothing here seals (BACKLOG #5653)."""
         # BACKLOG #1474 and #2592. FOR UPDATE, not a plain read: the row lock is the guard. Either a
         # concurrent unbind or whole-account revoke committed first, and this read sees the cleared
         # pair (so the insert is refused) and the raised session epoch; or this transaction holds
@@ -12026,43 +12084,53 @@ class PostgresStore:
         # An unguarded sign-in takes FOR SHARE: it still waits behind a revoke's users UPDATE, and
         # parallel sign-ins of one account do not wait on each other.
         async with self._timed_acquire(record=False) as conn, conn.transaction():
+            # BACKLOG #5653: the eligibility columns are read under the same row lock. A disable or
+            # a lockout is an UPDATE, which conflicts with FOR SHARE too, so either committed first
+            # and refuses this insert, or waits behind it.
             if require_federated_subject is None:
                 row = await conn.fetchrow(
-                    "SELECT oidc_issuer, oidc_subject, session_epoch FROM users WHERE id=$1"
-                    " FOR SHARE",
-                    user_id,
+                    "SELECT oidc_issuer, oidc_subject, session_epoch, disabled, locked_until,"
+                    " second_step_locked_until FROM users WHERE id=$1 FOR SHARE",
+                    record.user_id,
                 )
             else:
                 row = await conn.fetchrow(
-                    "SELECT oidc_issuer, oidc_subject, session_epoch FROM users WHERE id=$1"
-                    " FOR UPDATE",
-                    user_id,
+                    "SELECT oidc_issuer, oidc_subject, session_epoch, disabled, locked_until,"
+                    " second_step_locked_until FROM users WHERE id=$1 FOR UPDATE",
+                    record.user_id,
                 )
+            # Read once the row lock is held, so a read that waited behind a writer judges a lock's
+            # expiry at the time of the read, not when this sign-in began to wait.
+            judged_at = time.time() if now is None else now
             # A deleted account is refused, guarded or not (BACKLOG #2733), not left to the
             # INSERT's foreign-key error.
-            if row is None or (
-                require_federated_subject is not None
-                and (row["oidc_issuer"], row["oidc_subject"]) != require_federated_subject
+            if (
+                row is None
+                or (
+                    require_federated_subject is not None
+                    and (row["oidc_issuer"], row["oidc_subject"]) != require_federated_subject
+                )
+                or (
+                    require_sign_in_eligible
+                    and sign_in_state_refused(
+                        row["disabled"],
+                        row["locked_until"],
+                        row["second_step_locked_until"],
+                        judged_at,
+                    )
+                )
             ):
                 return False
-            record = new_session_record(
-                token_hash=token_hash,
-                user_id=user_id,
-                now=now,
-                expires_at=expires_at,
-                client=client,
-                seed_reauth=seed_reauth,
-                auth_mechanism=auth_mechanism,
-                idp_auth_time=idp_auth_time,
-                mfa_verified=mfa_verified,
+            if not session_epochs_current(
+                record,
                 user_epoch=int(row["session_epoch"]),
                 # BACKLOG #5091: its own statement, after the row lock, so a sign-in that waited
                 # behind a revoke reads that revoke's global epoch beside its account epoch. A
                 # subquery in the locked read would keep its pre-wait snapshot, and the session
                 # would be minted dead. revoke_all_sessions says why this read never waits.
                 global_epoch=await self._global_session_epoch(conn),
-            )
-            record = await seal_session_async(self._row_sealer, record)
+            ):
+                return None
             await conn.execute(_PG_SESSION_INSERT, *session_insert_params(record))
         return True
 

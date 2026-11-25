@@ -554,7 +554,8 @@ class PendingApprovalInfo(BaseModel):
     ``operation_unavailable`` (no such operation is registered), ``not_gated`` (dual control no
     longer gates the operation: ``[approvals].enabled`` is off, or the operation has left
     ``[approvals].operations``, read from the settings at listing time; the approve's 409 writes
-    ``approval.no_longer_gated``), ``params_unreadable``, ``params_no_requester`` (the operation's
+    ``approval.no_longer_gated``), ``params_unreadable`` (the stored parameters cannot be read; the
+    approve's 409 writes ``approval.params_unreadable``), ``params_no_requester`` (the operation's
     executor needs the requester's name, as at least a held purge's and reload's do, and these
     parameters carry none; vault BACKLOG #3217), ``params_no_fingerprint`` (the operation binds
     its release to a config digest the hold captured, as a held reload does, and these parameters

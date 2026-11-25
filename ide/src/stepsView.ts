@@ -690,6 +690,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       (m: {
         command?: string;
         line?: number;
+        lines?: unknown; // noteLineCount (BACKLOG #5841), validated where it is read
         handler?: string;
         lineStart?: number;
         lineEnd?: number;
@@ -944,6 +945,19 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           // Copy/Cut feedback — the block source lives in the webview clipboard (vscode.setState); the
           // provider only surfaces the toast. Validate the text (inbound webview data is untrusted).
           void vscode.window.showInformationMessage(m.text);
+        } else if (
+          m?.command === "noteLineCount" &&
+          typeof m.lines === "number" &&
+          Number.isSafeInteger(m.lines) &&
+          m.lines > 1
+        ) {
+          // A multi-line Comment edit whose line count changed, which the page did not post because
+          // the engine's set_note refuses it (BACKLOG #5841). The text is the provider's own; only the
+          // validated count comes from the webview.
+          void vscode.window.showErrorMessage(
+            `MessageFoundry: this comment spans ${m.lines} lines, so its text must keep ${m.lines} ` +
+              "lines; nothing was written. To change the count, edit the file as code.",
+          );
         } else if (m?.command === "stepsDiag" && typeof m.text === "string") {
           // Steps webview self-diagnostic. The `ping` is the handshake — the script started, so it did NOT
           // die at load; record it and stay silent. An `error` (uncaught script error) or `info` (load-state
@@ -1225,14 +1239,18 @@ function pageHtml(
     .params { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 6px; }
     .params .field { display: flex; flex-direction: column; gap: 2px; min-width: 120px; }
     .params .field label { font-size: 11px; color: var(--vscode-descriptionForeground); }
-    .params .field input { font-family: var(--vscode-editor-font-family, monospace); font-size: 12px;
+    .params .field input, .params .field textarea { font-family: var(--vscode-editor-font-family, monospace); font-size: 12px;
                            color: var(--vscode-foreground); background: var(--vscode-input-background);
                            border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 2px;
                            padding: 2px 6px; }
     /* An editable (recognized-row) field is focusable; a read-only field (code/control, or an argument
        the lens can't round-trip) is visibly muted. */
-    .params .field input:disabled { opacity: 0.6; cursor: default; }
-    .params .field input.edit:focus { outline: 1px solid var(--vscode-focusBorder); }
+    .params .field input:disabled, .params .field textarea:disabled { opacity: 0.6; cursor: default; }
+    .params .field input.edit:focus, .params .field textarea.edit:focus { outline: 1px solid var(--vscode-focusBorder); }
+    /* A multi-line Comment (BACKLOG #5841) edits in a textarea whose row count is its line count. */
+    .params .field:has(> textarea) { flex: 1 1 100%; min-width: 0; }
+    .params .field textarea { resize: none; width: 100%; box-sizing: border-box; overflow-x: auto; }
+    .params .field textarea.invalid { outline: 1px solid var(--vscode-inputValidation-errorBorder, red); }
     /* ADR 0104 §2.3 field picker: the ⋮ button sits beside its input (the input keeps flexing, so free-text
        stays first-class). Only a pickable path/segment slot gets the .edit-row wrapper. */
     .params .field .edit-row { display: flex; align-items: stretch; gap: 3px; }

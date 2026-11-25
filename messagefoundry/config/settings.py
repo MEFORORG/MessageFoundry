@@ -21,7 +21,9 @@ refused the same way and for the same reason: a misspelt ``[integrty]`` drops ev
 
 The **env** layer has a refusal of its own, narrower than the file's
 (:func:`_reject_unknown_env_keys`, vault BACKLOG #2600): a ``MEFOR_<SECTION>_<KEY>`` variable whose
-section has an env layer and whose key that section does not define. It is narrower because some
+section has an env layer and whose key that section does not define, and a variable that is a
+modelled section's name alone, with or without trailing ``_`` (``MEFOR_STORE``,
+``MEFOR_UPDATE_CHECK``), whatever the section. It is narrower because some
 documented ``MEFOR_*`` variables are read straight from ``os.environ`` by their consuming module
 and are not fields on any section (``MEFOR_STORE_VAULT_ADDR``, ``MEFOR_TLS_REVOCATION_ATTESTED``
 and siblings); those are spared by name. A variable whose SECTION part matches no section with
@@ -174,6 +176,7 @@ __all__ = [
     "DrActivationMode",
     "ServiceSettings",
     "load_settings",
+    "SectionNameEnvError",
     "store_path_refusal",
     "settings_file_path",
     "settings_error_detail",
@@ -291,6 +294,11 @@ class StorePrivilegePosture:
     excess: tuple[str, ...] = ()
     #: Why the probe could not observe (``UNOBSERVABLE``), or what it observed against (otherwise).
     detail: str = ""
+    #: Grants the probe named as not read (BACKLOG #6015). Beside an ``OBSERVED`` excess the
+    #: over-grant entry names them, so it does not read as a complete observation. Empty does not
+    #: mean every grant was read: at least a failed SQL Server user-defined role enumeration is
+    #: noted in ``detail`` and not here.
+    unread: tuple[str, ...] = ()
 
 
 class SchemaManagement(str, Enum):  # noqa: UP042
@@ -2269,7 +2277,8 @@ class TlsSettings(_Section):
     # secret -- a path, the same status as internal_ca_file. Empty (default) = no outbound
     # revocation checking, which is exactly the gap the #201 RevocationHopGuard refuses on an
     # enforcing hop. Set it and every hop that resolves a trust anchor loads the CRL onto its OWN
-    # context and sets VERIFY_CRL_CHECK_LEAF.
+    # context and sets VERIFY_CRL_CHECK_LEAF, or with crl_check_chain the whole-chain check
+    # (vault BACKLOG #5511; build_verifying_client_context says what that refuses).
     #
     # WARNING, and it is the operational half of this setting: VERIFY_CRL_CHECK_LEAF refuses a peer whose
     # issuer has NO CRL in the store, not only a revoked one. So the file must cover every issuer the
@@ -2280,6 +2289,12 @@ class TlsSettings(_Section):
     # local PKI the org CRL does not cover, and the revocation guard already ALLOWs a loopback hop, so
     # applying a CRL there would break on-box traffic to close a gap the gate does not consider open.
     crl_file: str | None = None
+    # Opt-in (vault BACKLOG #5511): check revocation for every certificate in the peer's chain on
+    # the outbound hops crl_file reaches, not only the leaf, so a revoked intermediate CA refuses
+    # the servers under it. Default False keeps the leaf check. It needs crl_file. A hop on the OS
+    # trust store refuses it at build, for the reason tls_policy.OS_ROOTS_CHAIN_CHECK_REASON gives;
+    # docs/CONFIGURATION.md says what each hop refuses with it on.
+    crl_check_chain: bool = False
 
     @field_validator("crl_file")
     @classmethod
@@ -2304,6 +2319,17 @@ class TlsSettings(_Section):
             )
         return self
 
+    @model_validator(mode="after")
+    def _check_chain_requires_crl_file(self) -> TlsSettings:
+        # With no CRL file the chain check has nothing to check against, so the flag would read as a
+        # control that is on while every hop keeps no revocation check at all.
+        if self.crl_check_chain and not self.crl_file:
+            raise ValueError(
+                "[tls].crl_check_chain = true requires [tls].crl_file: the whole-chain check reads "
+                "the CRLs in that file, and with none set no hop would check revocation"
+            )
+        return self
+
     def policy(self) -> TrustAnchorPolicy:
         """The resolved :class:`~messagefoundry.config.tls_policy.TrustAnchorPolicy` threaded onto each
         outbound, and onto each inbound ``Source`` for the FTPS poll (vault BACKLOG #2370), so a
@@ -2316,6 +2342,7 @@ class TlsSettings(_Section):
             internal_ca_file=self.internal_ca_file,
             mode=self.trust_anchor_mode,
             crl_file=self.crl_file,
+            crl_check_chain=self.crl_check_chain,
         )
 
 
@@ -3927,7 +3954,9 @@ class AuthSettings(_Section):
     # (_issuer_fits_the_column): a bind stores it, and the narrowest issuer column is SQL Server
     # NVARCHAR(256), so a longer one could be configured and never bound (BACKLOG #2331).
     oidc_issuer: str | None = None
-    oidc_client_id: str | None = None  # also the required `aud`/`azp`
+    # The id_token aud/azp rule this feeds, and its known limit: docs/CONFIGURATION.md, the
+    # oidc_client_id row, and _check_core_claims in auth/oidc/claims.py.
+    oidc_client_id: str | None = None
     # The confidential-client secret. ENV ONLY (MEFOR_AUTH_OIDC_CLIENT_SECRET) — never the config file
     # (_FILE_SECRET_KEYS warns) — or via a [secrets].provider reference in oidc_client_secret_ref. The
     # `_ref` suffix (not the house `_secret`) avoids the absurd `oidc_client_secret_secret`; ADR 0142.
@@ -4086,6 +4115,19 @@ class AuthSettings(_Section):
     # and then refuse every PHI read until a restart. Capped for the same reason.
     phi_read_rate_limit_window_seconds: float = Field(
         default=60.0, ge=0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
+    )
+
+    # Per-actor pacing on six monitoring:read GETs (vault BACKLOG #1191, ASVS 15.2.2):
+    # /graph/edges, /status, /stats, /metrics, /metrics/history and /connections, charged at
+    # admission by require_monitoring_read. The default's basis and multiplier are written
+    # once, in docs/SECURITY.md, "Monitoring-read pacing". In-process only, like the PHI-read
+    # throttle. 0 disables that dimension.
+    monitoring_read_rate_limit_enabled: bool = True
+    monitoring_read_rate_limit_per_actor: int = Field(default=600, ge=0)
+    monitoring_read_rate_limit_global: int = Field(default=0, ge=0)  # 0 = off
+    # No nan/inf and capped, for the reason login_rate_limit_window_seconds gives.
+    monitoring_read_rate_limit_window_seconds: float = Field(
+        default=60.0, gt=0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
     )
 
     # Anti-automation on the state-changing admin surface (BACKLOG #193, ASVS 2.4.2): a per-actor
@@ -6750,11 +6792,11 @@ _RENEW_CLAMP_CEILING_SECONDS = 5.0
 #:
 #: **That holds on Postgres only**, where the renew's borrow and statement share one deadline
 #: (``pipeline.cluster._call_within``), so a renew lands within the clamp of being issued. On SQL
-#: Server the borrow and the statement each get the full clamp (``SqlServerStore._fetchone_clamped``),
-#: plus a COMMIT the clamp does not bound, so the derived default is NOT safe by construction there.
-#: At the shipped 10/20/30 the clamp is 4.5, which runs as a 4.5 s borrow plus a 4 s statement: about
-#: 8.5 s of the 9.0 s margin. At fence 4.0 / TTL 6.0 (margin 1.2 s) the floor makes the clamp 1.0,
-#: which runs as about 2 s, past the margin.
+#: Server the claim's borrow and statement share the clamp's deadline only from a 2 s clamp up
+#: (``SqlServerStore._fetchone_clamped``, BACKLOG #5064), and a COMMIT the clamp does not bound
+#: follows the statement, so the derived default is NOT safe by construction there. At fence 4.0 /
+#: TTL 6.0 (margin 1.2 s) the floor makes the clamp 1.0, which runs as a 1 s borrow plus a 1 s
+#: statement, about 2 s, past the margin.
 #: ``ServiceSettings._sqlserver_renew_bounds`` checks the borrow and statement windows together
 #: (:func:`_sqlserver_renew_reach_seconds`) against the margin: it steps a derived clamp down to a
 #: whole second that fits, and refuses a set clamp, or a pair no clamp fits, such as 4.0 / 6.0
@@ -6796,16 +6838,54 @@ def _clamped_statement_timeout(clamp_seconds: float, command_timeout: int) -> in
     return min(whole, command_timeout) if command_timeout > 0 else whole
 
 
+#: The smallest floored SQL Server clamp under which the lease claim's borrow and statement share
+#: one deadline: the statement timeout counts whole seconds and never drops below 1, so under 2 s no
+#: borrow window fits in front of it (BACKLOG #5064).
+_SQLSERVER_SHARED_DEADLINE_MIN_SECONDS = 2.0
+
+
+def _sqlserver_shared_borrow_limit(clamp_seconds: float) -> float:
+    """The pooled-connection wait of a SQL Server lease claim, whose borrow and statement share the
+    clamp's deadline (``store.sqlserver.SqlServerStore._clamp_bounds``, BACKLOG #5064): the clamp
+    floored at 1 s, less the 1 s a statement needs, and never under 1 s. ``[store].acquire_timeout``
+    caps it further, applied by ``SqlServerStore._acquire_clamped`` so it can tell which limit cut
+    a borrow. The 1 s floor keeps the wait from shrinking as the clamp rises toward 2 s."""
+    return max(1.0, clamp_seconds - 1.0)
+
+
+def _sqlserver_statement_timeout_left(
+    clamp_seconds: float, elapsed_seconds: float, statement_cap: int
+) -> int | None:
+    """The whole-second statement timeout a SQL Server lease claim gets once its borrow took
+    ``elapsed_seconds``, or ``None`` when the borrow left less than the 1 s a statement needs and
+    the statement must not be issued (BACKLOG #5064). ``statement_cap`` is
+    :func:`_clamped_statement_timeout`.
+
+    Rounded DOWN, so the statement timeout ends by the deadline, the clamp floored at 1 s from
+    before the borrow; a whole-number clamp therefore runs its statement at least 1 s short of it.
+    Under :data:`_SQLSERVER_SHARED_DEADLINE_MIN_SECONDS` it is ``statement_cap``, 1 s, whatever the
+    borrow took: refusing whenever the borrow left under 1 s would refuse every claim at a 1 s
+    clamp. So there the claim can overrun the clamp by up to that second less the clamp's
+    fraction."""
+    floored = max(1.0, clamp_seconds)
+    if floored < _SQLSERVER_SHARED_DEADLINE_MIN_SECONDS:
+        return statement_cap
+    left = math.floor(floored - elapsed_seconds)
+    return min(statement_cap, left) if left >= 1 else None
+
+
 def _sqlserver_renew_reach_seconds(
     clamp_seconds: float, acquire_timeout: float, command_timeout: int
 ) -> float:
-    """The two windows of a SQL Server lease claim that config bounds: the pooled-connection wait
-    plus the statement timeout, which there do not share one deadline (BACKLOG #5979).
+    """The two windows of a SQL Server lease claim that config bounds, counted as if they did not
+    share one deadline: the pooled-connection wait plus the statement timeout (BACKLOG #5979).
 
-    The wait is the smaller of the clamp floored at 1 s and ``[store].acquire_timeout``, as
-    ``store.sqlserver.SqlServerStore._clamp_bounds`` borrows; the statement timeout is
-    :func:`_clamped_statement_timeout`, the function the store applies.
-    ``tests/test_adr0157_b1497_sqlserver_renew_clamp.py`` pins this against ``_clamp_bounds``.
+    The wait is the smaller of the clamp floored at 1 s and ``[store].acquire_timeout``; the
+    statement timeout is :func:`_clamped_statement_timeout`. Since BACKLOG #5064 the claim's borrow
+    and statement share the clamp's deadline from 2 s up (:func:`_sqlserver_shared_borrow_limit`),
+    so this OVER-counts them there; it was left as the load check's formula so that no config that
+    check refused loads, because the steps outside both windows are not bounded by it either.
+    ``tests/test_adr0157_b1497_sqlserver_renew_clamp.py`` pins it against what the store applies.
 
     It is a LOWER bound on a late renew, not the whole of one. At least two steps are outside both
     windows: the cursor's creation between them (``SqlServerStore._cursor``, an executor dispatch)
@@ -6922,8 +7002,9 @@ class ClusterSettings(_Section):
     # it bounds every maintenance-loop statement with its borrow (BACKLOG #2523); on SQL SERVER the
     # heartbeat, the claim/renew, the config-version refresh and a stepdown's release (BACKLOG #5064),
     # and the paused tick's owner read at the smaller of this and half its own budget, at least,
-    # each borrow and statement separately, as SqlServerStore._fetchone_clamped describes, and a value
-    # under 1 s is refused there (ServiceSettings._sqlserver_renew_bounds).
+    # each borrow and statement separately except the claim's, which share it from 2 s up, as
+    # SqlServerStore._fetchone_clamped describes, and a value under 1 s is refused there
+    # (ServiceSettings._sqlserver_renew_bounds).
     #
     # UNSET (the default) means DERIVED from the detection margin, not a fixed number: half the margin,
     # capped at 5.0 s and floored at 1.0 s. The floor is a LIVENESS bound the margin cannot express --
@@ -6935,9 +7016,9 @@ class ClusterSettings(_Section):
     # (fence 4.0 / ttl 6.0, margin 1.2 s) at config load. Deriving it gives a tight pair a
     # proportionally tight clamp instead of a refusal. It is still not safe by construction: the 1.0 s
     # floor can exceed half a small margin, or the margin itself, so the derived value is checked like
-    # an explicit one; and on SQL Server the renew can land up to about twice the clamp after it is
-    # issued (the comment on _RENEW_CLAMP_MARGIN_FRACTION says why). At the shipped 10/20/30 the
-    # margin is 9.0 s and this resolves to 4.5.
+    # an explicit one; and on SQL Server the renew's COMMIT is outside the clamp, and under a 2 s
+    # clamp so is its statement's last second (the comment on _RENEW_CLAMP_MARGIN_FRACTION says
+    # why). At the shipped 10/20/30 the margin is 9.0 s and this resolves to 4.5.
     #
     # Set it EXPLICITLY and it is checked, not clamped: a value that does not fit the margin is
     # REFUSED at config load (_renew_fits_the_margin below). Silently shrinking an operator's number to
@@ -7086,8 +7167,8 @@ class ClusterSettings(_Section):
         **Backend scope.** The comparison is with the clamp alone, which is the renew's whole bound
         on Postgres only, where its borrow and statement share one deadline. **On SQL Server a green
         load does not prove the renew lands inside the margin:** there the borrow and the statement
-        each get the full clamp, so a renew can land up to about twice the clamp after it is issued,
-        plus a COMMIT the clamp does not bound (``SqlServerStore._fetchone_clamped``).
+        share the clamp's deadline only from a 2 s clamp up, and a COMMIT the clamp does not bound
+        follows the statement (``SqlServerStore._fetchone_clamped``).
         :meth:`ServiceSettings._sqlserver_renew_bounds` refuses a config whose borrow and
         statement windows together reach this margin (BACKLOG #5979), and
         :meth:`ServiceSettings.sqlserver_renew_bound_warning` is the start-up warning, not a refusal,
@@ -8414,8 +8495,9 @@ class ServiceSettings(_InputHidingModel):
            quietly widened. The derived clamp is floored at 1 s and never trips this.
         2. **A claim that can still be running past the margin before its statement returns**
            (BACKLOG #5979). The margin check compares the clamp alone with the margin, which is the
-           renew's bound on Postgres only. On SQL Server the pooled-connection wait and the
-           statement each get their own window (:func:`_sqlserver_renew_reach_seconds`), so a clamp
+           renew's bound on Postgres only. On SQL Server this check counts the pooled-connection
+           wait and the statement as two windows (:func:`_sqlserver_renew_reach_seconds`, which says
+           why it still does from 2 s up, where the claim shares one deadline), so a clamp
            that passed that check could still let a renew issued just before this node self-fences
            land and re-extend the lease it is standing down from. Both windows are known from
            config, so a clamp whose two windows reach the margin is refused, not warned about.
@@ -8473,8 +8555,8 @@ class ServiceSettings(_InputHidingModel):
             remedy = f"Widen {_FENCE_TTL_GAP}{shorter_wait}"
         else:
             cause = (
-                f"lease_renew_timeout_seconds = {clamp:g} runs the lease claim's pool wait and its"
-                f" statement for up to {reach:g} s"
+                f"lease_renew_timeout_seconds = {clamp:g} gives the lease claim's pool wait and its"
+                f" statement {reach:g} s counted as two windows"
             )
             remedy = (
                 "Lower lease_renew_timeout_seconds or unset it to derive one that fits, or widen"
@@ -8485,9 +8567,12 @@ class ServiceSettings(_InputHidingModel):
             )
         raise ValueError(
             f"[cluster] on [store].backend = 'sqlserver': {cause}, which reaches the demotion"
-            f" detection margin ({margin:g} s). On SQL Server the two do not share one deadline, so"
-            " a renew issued just before this node self-fences could still land and re-extend the"
-            f" lease it is standing down from. {remedy}"
+            f" detection margin ({margin:g} s). From a 2 s clamp up the claim's pool wait and"
+            " statement share one deadline, so this count over-states them, but it is kept as the"
+            " headroom for what that deadline does not cover: under 2 s the statement can overrun"
+            " the clamp by up to 1 s, and at least the claim's cursor creation and its COMMIT run"
+            " outside that deadline, with nothing known to bound them. A renew issued just before"
+            f" this node self-fences can still commit late. {remedy}"
         )
 
     def sqlserver_renew_bound_warning(self) -> str | None:
@@ -8495,9 +8580,11 @@ class ServiceSettings(_InputHidingModel):
         or ``None``.
 
         ``ClusterSettings._renew_fits_the_margin`` compares the clamp alone with the margin. On SQL
-        Server the claim's borrow and its statement each get the full clamp, so a renew can land up
-        to about twice the clamp after it is issued, plus a COMMIT the clamp does not bound
-        (``store.sqlserver.SqlServerStore._fetchone_clamped``). :meth:`_sqlserver_renew_bounds`
+        Server a COMMIT the clamp does not bound follows the claim's statement, and under a 2 s
+        clamp the borrow and statement cannot share its deadline
+        (``store.sqlserver.SqlServerStore._fetchone_clamped``). The predicate below predates the
+        shared deadline of BACKLOG #5064 and was kept unchanged; it does not measure the COMMIT's
+        cost, which no config bounds, and whether it still earns its place is open. :meth:`_sqlserver_renew_bounds`
         refuses a config whose two windows reach the margin; this names one that passed that but
         where twice the clamp reaches the same margin. A warning, not a refusal: the bound is
         approximate (Manager decision d20261030T213636115-0af931). Spans two sections, so it lives
@@ -8538,9 +8625,9 @@ class ServiceSettings(_InputHidingModel):
             )
         return (
             f"[cluster] on SQL Server: {cause} reaches the demotion detection margin"
-            f" ({margin:g} s). There the lease claim's pool wait and its statement each get the full"
-            " clamp, and its COMMIT is not bounded by it, so a renew issued just before this node"
-            f" self-fences can still land and re-extend the lease. {remedy}"
+            f" ({margin:g} s). There the lease claim's COMMIT is not bounded by the clamp, so a renew"
+            " issued just before this node self-fences may still land and re-extend the lease."
+            f" {remedy}"
         )
 
     @model_validator(mode="after")
@@ -9024,9 +9111,57 @@ def _near_env_name(section: str, key: str, model: type[BaseModel]) -> str | None
     return f"{prefix}{near[0].upper()}?"
 
 
+def _section_named_alone(rest: str, models: Mapping[str, object]) -> str | None:
+    """The modelled section ``rest`` names and nothing else, or ``None``. ``rest`` is a ``MEFOR_*``
+    name after the prefix, in lower case; any trailing ``_`` is ignored, so ``store``, ``store_``
+    and ``store__`` all name ``[store]``. :func:`_reject_unknown_env_keys` refuses such a name and
+    :func:`_unread_env_notes` notes it, both through this, so the two cannot disagree on it."""
+    bare = rest.rstrip("_")
+    return bare if bare in models else None
+
+
+def _how_to_set_in(section: str) -> str:
+    """How a setting in ``section`` is set, so the obvious fix to a section's name alone is not a
+    name the refusal then stops."""
+    if section in _SECTIONS:
+        return f"a setting in it is {_ENV_PREFIX}{section.upper()}_<KEY>"
+    return "that section has no environment layer; set it in the file"
+
+
+class SectionNameEnvError(ValueError):
+    """The refusal :func:`_reject_unknown_env_keys` raises when at least one variable it refuses is
+    a modelled section's name alone (:func:`_section_named_alone`, vault BACKLOG #2600).
+
+    A ``ValueError``, so a caller that reports a load error reports this one too. Its own class so
+    a caller that falls back to a default on a load error can tell this refusal apart and report
+    it instead. Before this refusal the exact ``MEFOR_<SECTION>`` name did not stop the load, so
+    those callers read the settings; falling back on it would drop the file's settings with only
+    the WARNING :func:`load_settings` logs first. Some trailing-``_`` forms
+    (``MEFOR_UPDATE_CHECK_``, ``MEFOR_STORE__``) were refused before as a plain ``ValueError`` and
+    those callers fell back on them; they are this class now, so those callers report them too.
+    At least these report it: ``dryrun``'s and ``check``'s ``[pipeline].snapshot_on_send``
+    resolution, and ``alert add``'s transport and recipient-override checks.
+
+    Each reports it only when it reaches its settings load. At least these stop first: a load
+    error raised before this refusal runs (a missing or malformed file, an unknown file key),
+    which is not this class and on which those callers still fall back, except ``dryrun --env``,
+    which refuses such an error at its earlier load; any error the command
+    reports before the load (a config graph or messages error in ``dryrun``; a dry-run leg that
+    skips for no fixtures or no inbound). The ``check`` leg loads nothing when no settings source
+    resolves, while ``dryrun`` with no file reads the environment alone and so refuses. Under
+    ``--env``, ``dryrun`` loads the settings earlier and prints a fixed line that does not name
+    the variable.
+
+    The class is chosen per refusal, not per variable: a refusal that also names an unknown
+    ``MEFOR_<SECTION>_<KEY>`` is this class when at least one name is a section's name alone, and
+    a plain ``ValueError`` otherwise."""
+
+
 def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]) -> None:
     """Raise ``ValueError`` if the environment sets a ``MEFOR_<SECTION>_<KEY>`` variable that names a
-    modelled section and no setting in it (vault BACKLOG #2600).
+    modelled section and no setting in it, or a variable that is a modelled section's name alone
+    (vault BACKLOG #2600). A refusal that names at least one section's name alone is raised as
+    :class:`SectionNameEnvError`, a ``ValueError``, whatever else it names.
 
     The same failure :func:`_reject_unknown_file_keys` refuses in the file: a mistyped
     ``MEFOR_STORE_REQUIRE_ENCRYPTON`` used to be scraped into ``[store]``, ignored by the model, and
@@ -9036,8 +9171,19 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
     and environment layers, before the model is built, so a typo that is also the cause of a
     cross-field validation error is named here first.
 
-    Two cases refuse:
+    Three cases refuse:
 
+    * the name is a modelled section's name and nothing else, ``MEFOR_<SECTION>`` with or without
+      trailing ``_`` (``MEFOR_STORE``, ``MEFOR_STORE_``, ``MEFOR_UPDATE_CHECK``), for every
+      modelled section, ``[security]`` included (:func:`_section_named_alone`). No setting has
+      that name. ``MEFOR_*`` names are the engine's namespace, so a bare section name is refused
+      even though a tool outside the engine could choose one. Two census tests in
+      ``tests/test_settings_env_keys.py`` read the names spelled out as whole string constants in
+      some of this repository's code trees and in its shipped deployment files; they miss a name
+      built at run time and files outside those trees, and no test checks in general the names a
+      tool outside the repository sets. The exact ``MEFOR_<SECTION>`` shape was decided under the
+      owner's delegation of 2026-11-23 (Manager decision d20261123T172418598-d8ffd6, option (c));
+      the trailing ``_`` forms and the every-section scope are this change's reading of it;
     * the section part is in :data:`_SECTIONS`, the list :func:`_env_overrides` reads, and the key
       is not a field of that section;
     * the name starts ``MEFOR_<SECTION>_`` for a modelled section that has NO env layer
@@ -9047,14 +9193,17 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
 
     At least these names are spared:
 
-    * one that names no modelled section either way (``MEFOR_ALLOW_INSECURE_TLS``, the escape
-      honoured only at ``[security].enforcement = warn``; a harness variable; another tool's).
-      So a typo in the SECTION part of a name is not refused.
+    * one that none of the three cases above matches because it names no modelled section
+      (``MEFOR_ALLOW_INSECURE_TLS``, the escape honoured only at
+      ``[security].enforcement = warn``; a harness variable; another tool's).
+      So a typo in the SECTION part of a name that leaves it naming no modelled section is not
+      refused; a typo that makes its leading parts another section's name (``MEFOR_AI_HOST`` for
+      ``MEFOR_API_HOST``) is read as that section and refused by the cases above.
       :func:`_unread_env_notes` writes a note, which :func:`load_settings` logs as a WARNING,
       for at least some of those, and the rest are dropped with no message;
-    * one with no key part, which gets the same note when it is a section's name;
     * one in :data:`_OUT_OF_BAND_ENV`, spelled exactly;
-    * a ``[security]`` name, which :func:`_desugar_security` refuses with its own message, and the
+    * a ``[security]`` name with a key, which :func:`_desugar_security` refuses with its own
+      message when the key is unknown, and the
       renamed ``[logging]`` keys in :data:`_RENAMED_LOGGING_KEYS`, which the model refuses naming
       the replacement;
     * under ``[secrets].provider = "env"`` only, a variable that one of the
@@ -9069,7 +9218,16 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
     no_env_layer = sorted(set(models) - set(_SECTIONS), key=len, reverse=True)
     referenced = _env_secret_reference_names(data)
     offenders: list[str] = []
+    named_alone = False
     for name, rest in _unspared_env_names(environ, referenced):
+        alone = _section_named_alone(rest, models)
+        if alone is not None:
+            named_alone = True
+            offenders.append(
+                f"{_printable(name)} (names the [{alone}] section and no setting; "
+                f"{_how_to_set_in(alone)})"
+            )
+            continue
         unread = next((s for s in no_env_layer if rest.startswith(f"{s}_")), None)
         if unread is not None:
             offenders.append(
@@ -9078,7 +9236,8 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
             continue
         section, _, key = rest.partition("_")
         model = models.get(section)
-        if section not in _SECTIONS or section == "security" or not key or model is None:
+        # An empty key cannot reach here: the section-name case above took it.
+        if section not in _SECTIONS or section == "security" or model is None:
             continue
         if key in model.model_fields:
             continue
@@ -9087,7 +9246,8 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
         near = _near_env_name(section, key, model)
         offenders.append(_printable(name) + (f" (did you mean {near})" if near else ""))
     if offenders:
-        raise ValueError(
+        refusal = SectionNameEnvError if named_alone else ValueError
+        raise refusal(
             f"unrecognized environment variable(s): {', '.join(offenders)}. Each names a config "
             "section and no setting the environment can give it. It is REFUSED, not ignored — a "
             "dropped one leaves the setting it was meant to apply silently un-applied. Check the "
@@ -9150,18 +9310,22 @@ def _env_can_hold(model: type[BaseModel], key: str) -> bool:
 
 
 def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> list[str]:
-    """One note per ``MEFOR_*`` variable that :func:`_reject_unknown_env_keys` lets through and
-    that LOOKS like a setting nothing will read (vault BACKLOG #2600). Never quotes a value.
+    """One note per ``MEFOR_*`` variable that LOOKS like a setting nothing will read (vault
+    BACKLOG #2600). Never quotes a value. Every such variable but a section's name alone is one
+    :func:`_reject_unknown_env_keys` lets through; that one it refuses too (the first shape below).
 
-    A WARNING and not a refusal, on purpose. A name the refusal passes names no section the
+    For the rest, a WARNING and not a refusal, on purpose. A name the refusal passes names no section the
     environment can set, and the engine cannot list every such name: harnesses, scripts and an
     operator's own tooling use ``MEFOR_*`` names this module has never seen. A wrong guess here
     costs a log line; a wrong refusal would stop the start.
 
     At least two shapes are noted:
 
-    * the name is ``MEFOR_<SECTION>`` exactly, a modelled section and no key
-      (``MEFOR_UPDATE_CHECK=false``, ``MEFOR_STORE``). No setting has that name;
+    * the name is a modelled section's name alone (:func:`_section_named_alone`), which
+      :func:`_reject_unknown_env_keys` then refuses. It is noted as well, because
+      :func:`load_settings` logs the notes before its key and variable refusals, so a refused file
+      key does not hide it until the next start. A file that cannot be read or parsed is refused
+      before any note is logged;
     * the name splits as ``MEFOR_<NEAR>_<KEY>`` where ``NEAR`` is no section, is close to one, and
       ``KEY`` is a real setting of that section or the rest of a :data:`_OUT_OF_BAND_ENV` name
       (``MEFOR_STOER_PATH``). ``NEAR`` is compared only with sections of as many ``_``-parts as it
@@ -9180,16 +9344,11 @@ def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> li
     gone = set(_RELOCATED_TO_SECURITY) | set(_REMOVED_KEYS)
     notes: list[str] = []
     for name, rest in _unspared_env_names(environ, referenced):
-        if rest in models:
-            # Say how to set one, so the obvious fix is not a name the refusal then stops.
-            how = (
-                f"a setting in it is {_ENV_PREFIX}{rest.upper()}_<KEY>"
-                if rest in _SECTIONS
-                else "that section has no environment layer; set it in the file"
-            )
+        alone = _section_named_alone(rest, models)
+        if alone is not None:
             notes.append(
-                f"{_printable(name)} names the [{rest}] section and no setting in it, so "
-                f"nothing reads it ({how})"
+                f"{_printable(name)} names the [{alone}] section and no setting in it, so "
+                f"nothing reads it ({_how_to_set_in(alone)})"
             )
             continue
         tokens = rest.split("_")
@@ -9665,7 +9824,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     """The ``[auth]`` anti-automation limits, and the other numeric ``[auth]`` knobs that weaken a
     control (vault BACKLOG #2600 step 4), set LOOSER THAN THEIR SHIPPED DEFAULT, as
     ``(switch, risk)`` entries for :func:`security_loosenings`, which always calls this, since sign-in
-    is always on (BACKLOG #1131; ASVS 6.1.1, 6.3.1, 2.3.2, and the 2.4.1, 2.4.2 and 7.1.2 each field cites).
+    is always on (BACKLOG #1131; ASVS 6.1.1, 6.3.1, 2.3.2, and the 2.4.1, 2.4.2, 7.1.2 and 15.2.2 each
+    field cites).
 
     **Why the default is the cutoff.** The first pass named only the values the code reads as OFF,
     and a vault re-read then measured near-off values that were just as off in effect and silent: a
@@ -9676,11 +9836,13 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
 
     **The direction is read from each consumer, not from the name.**
 
-    * ``SlidingWindowRateLimiter`` (the sign-in, ceremony, PHI-read and admin-write limiters) treats a
+    * ``SlidingWindowRateLimiter`` (at least the sign-in, ceremony, PHI-read, monitoring-read and
+      admin-write limiters) treats a
       falsy count as "no limit on that dimension" and admits more as a count rises. It prunes every hit
       older than the window, so a SHORTER window admits more, and one of 0 or less prunes each hit
       before it is counted. The load refuses a negative count or window (BACKLOG #3293 for the
-      admin-write count, #5318 for the sign-in and PHI-read ones), so none reaches here. A NaN or infinite
+      admin-write count, #5318 for the sign-in and PHI-read ones, vault BACKLOG #1191 for the
+      monitoring-read ones), so none reaches here. A NaN or infinite
       window never reaches this function: the load refuses it (vault BACKLOG #2466), since a NaN or
       ``+inf`` one never prunes. A ``min_interval_seconds`` of 0 turns the gap off, and a shorter gap
       admits a faster burst.
@@ -9984,6 +10146,41 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
             off=(
                 "there is no per-account PHI-read limit, so one signed-in account may read PHI "
                 "as fast as the engine answers (only an all-users limit, if one is set, holds)"
+            ),
+        )
+
+    # --- the monitoring-read limiter (vault BACKLOG #1191, ASVS 15.2.2): per actor, on the six
+    # paced monitoring:read GETs. Its window cannot be 0 or less (gt=0 at load), and the
+    # all-users count ships OFF (0), so neither has an off value to name.
+    if not auth.monitoring_read_rate_limit_enabled:
+        out.append(
+            (
+                "monitoring_read_rate_limit_enabled",
+                "the six paced monitoring reads (the wiring graph, status, stats, metrics, "
+                "metrics history and the connections dashboard) have NO pace on the JSON API -- "
+                "one signed-in account may make the engine rebuild the graph and scan the store "
+                "through them as fast as it answers",
+            )
+        )
+    elif _window(
+        "monitoring_read_rate_limit_window_seconds",
+        auth.monitoring_read_rate_limit_window_seconds,
+        what="the monitoring-read rate-limit window",
+        off=None,
+        counts=(auth.monitoring_read_rate_limit_per_actor, auth.monitoring_read_rate_limit_global),
+    ):
+        _count(
+            "monitoring_read_rate_limit_per_actor",
+            auth.monitoring_read_rate_limit_per_actor,
+            what="the per-account monitoring-read limit",
+            so=(
+                "one signed-in account may make that many paced monitoring reads per "
+                "window before it is refused"
+            ),
+            off=(
+                "there is no per-account monitoring-read limit, so one signed-in account may "
+                "drive the graph rebuild and the store scans through the six JSON routes as fast "
+                "as the engine answers (only an all-users limit, if one is set, holds)"
             ),
         )
 
@@ -10955,7 +11152,10 @@ def security_loosenings(
     start of ``serve`` and ``supervise``, and the build of ``create_app`` and
     ``create_managed_app``, which never reach this registry then; a caller that reads it with no
     refusal of its own gets what they refuse as ``secret_in_service_environment``, where the
-    engine finds its service. ``None`` has the meaning it has for ``remote_debug``.
+    engine finds its service. Another engine secret that reaches the service from outside those
+    lists is named here as ``secret_from_outside_service_lists``; one the machine-wide
+    environment sets refuses them under ``enforce``. ``None`` has the meaning it has for
+    ``remote_debug``.
 
     The sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
@@ -11440,10 +11640,10 @@ def security_loosenings(
     # is dialled. The reason is in the entry for the same reason as the Vault pairs above.
     # BACKLOG #5527: the CRL clause states the three conditions a CRL check needs, and names the
     # paths that check none, and stays static. Whether the [tls] section reached the app is a fact
-    # of the app (app.state.tls_settings, which create_managed_app stashes from its tls_settings
-    # argument, None unless passed, and an embedder of a direct create_app may set), not of these
-    # arguments. Loopback could be read off ai.endpoint, but the
-    # app half would still be static, so both stay named.
+    # of the app (app.state.tls_settings: create_app stashes its tls_settings argument, None unless
+    # passed, and create_managed_app's lifespan stashes its own at start), not of these arguments.
+    # Loopback could be read off ai.endpoint, but the app half would still be static, so both stay
+    # named.
     if ai.endpoint_revocation_attested:
         out.append(
             (
@@ -11452,8 +11652,10 @@ def security_loosenings(
                 f"the engine (reason: {ai.endpoint_revocation_attested_reason}) -- the AI broker "
                 "verifies that certificate but its own handshake checks no OCSP, and checks no CRL "
                 "unless all three hold: [tls].crl_file is set, the [tls] section reaches the app "
-                "serving POST /ai/chat (`messagefoundry serve` hands it; a direct create_app holds "
-                "none unless the embedder sets it), and the endpoint is not loopback. So at least "
+                "serving POST /ai/chat (messagefoundry serve hands it; an embedder's "
+                "create_managed_app holds none unless it passes tls_settings, and a direct "
+                "create_app none unless it passes tls_settings or sets app.state.tls_settings), "
+                "and the endpoint is not loopback. So at least "
                 "a loopback endpoint, and an app the [tls] section never reached, check no CRL "
                 "whatever [tls].crl_file says. The "
                 "attestation adds no check. Where no CRL is checked, the revocation refusal is "
@@ -11717,13 +11919,19 @@ def security_loosenings(
             )
         elif store_privilege.excess:
             named = ", ".join(store_privilege.excess)
+            not_read = (
+                "; these grants were not read, so the list may be incomplete: "
+                f"{', '.join(store_privilege.unread)}"
+                if store_privilege.unread
+                else ""
+            )
             out.append(
                 (
                     "store_principal_over_granted",
                     f"the store principal holds {len(store_privilege.excess)} privilege(s) BEYOND the "
                     f"least-privilege grant docs/DEPLOY-SERVER-DB.md prescribes ({named}) — the "
                     "engine's own database credential can reach data and administrative operations "
-                    "its runbook says it must not",
+                    f"its runbook says it must not{not_read}",
                 )
             )
     # --- the AUDIT CHAIN's observed keying (BACKLOG #1905). An observation, like the entry above: no

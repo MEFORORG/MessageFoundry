@@ -21,6 +21,8 @@ import functools
 import io
 import logging
 import socket
+import struct
+import sys
 import threading
 import time
 import traceback
@@ -716,9 +718,15 @@ def _formatted(records: list[logging.LogRecord]) -> list[str]:
     return [formatter.format(r) for r in records]
 
 
-def _associate_against(ac: bytes, caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+def _associate_against(
+    ac: bytes,
+    caplog: pytest.LogCaptureFixture,
+    then: Callable[[Any], None] | None = None,
+    reply: bytes | None = None,
+) -> list[logging.LogRecord]:
     """A pynetdicom SCU, as the engine's DICOM destination uses, asks a peer for an association and
-    gets ``ac`` back. Every record logged meanwhile is returned."""
+    gets ``ac`` back, and does ``then`` on it if it is established. With ``reply``, the peer answers
+    the next PDU with that command set. Every record logged meanwhile is returned."""
     from pynetdicom import AE
     from pynetdicom.sop_class import Verification  # type: ignore[attr-defined]
 
@@ -726,24 +734,34 @@ def _associate_against(ac: bytes, caplog: pytest.LogCaptureFixture) -> list[logg
 
         def answer() -> None:
             conn, _ = listener.accept()
-            with conn:
+            with conn, contextlib.suppress(OSError):
                 conn.settimeout(5.0)
                 _read_pdu(conn)
                 conn.sendall(ac)
-                with contextlib.suppress(OSError):
-                    while conn.recv(4096):
-                        pass
+                if reply is not None:
+                    _read_pdu(conn)
+                    conn.sendall(_p_data(0x03, reply))
+                while conn.recv(4096):
+                    pass
 
         peer = threading.Thread(target=answer)
         peer.start()
         ae = AE(ae_title="MODALITY1")
         ae.acse_timeout = 5
+        ae.dimse_timeout = 5
         ae.add_requested_context(Verification)
-        with caplog.at_level(logging.DEBUG):
-            assoc = ae.associate("127.0.0.1", listener.getsockname()[1], ae_title="PLAINSCP")
-            if assoc.is_established:
-                assoc.abort()
-        peer.join(10.0)
+        try:
+            with caplog.at_level(logging.DEBUG):
+                assoc = ae.associate("127.0.0.1", listener.getsockname()[1], ae_title="PLAINSCP")
+                if assoc.is_established:
+                    try:
+                        if then is not None:
+                            then(assoc)
+                    finally:
+                        if assoc.is_established:  # a refused reply has already ended it
+                            assoc.abort()
+        finally:
+            peer.join(10.0)
     return list(caplog.records)
 
 
@@ -940,3 +958,1104 @@ def test_pynetdicoms_dump_of_a_flagged_value_is_redacted(
     filtered = dumped()
     lines = [line for line in filtered if line.startswith(line_start)]
     assert lines and all(line.endswith(_REDACTED_MARK) for line in lines), filtered
+
+
+# --- A peer's credentials in the association dumps (vault BACKLOG #6637, item 6) -------------------
+
+_PLANTED_USERNAME = "planted-user-6637"
+_PLANTED_PASSWORD = "planted-pass-6637"
+
+
+def _a_request_with_credentials() -> Any:
+    """An A-ASSOCIATE-RQ whose user identity item is a username and password, decoded from bytes."""
+    from pynetdicom.pdu import A_ASSOCIATE_RQ
+    from pynetdicom.pdu_items import UserIdentitySubItemRQ
+
+    pdu = A_ASSOCIATE_RQ()
+    pdu.decode(_captured_request())
+    item = UserIdentitySubItemRQ()
+    item.user_identity_type = 2
+    item.positive_response_requested = 0
+    item.primary_field = _PLANTED_USERNAME.encode("ascii")
+    item.secondary_field = _PLANTED_PASSWORD.encode("ascii")
+    user_information = pdu.user_information
+    assert user_information is not None
+    user_information.user_data.append(item)
+    decoded = A_ASSOCIATE_RQ()
+    decoded.decode(pdu.encode())
+    return decoded
+
+
+@pytest.mark.parametrize("dump", ["_receive_associate_rq", "_send_associate_rq"])
+def test_the_association_dump_never_writes_a_username_or_password(
+    dump: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    from pynetdicom import _handlers
+
+    pdu = _a_request_with_credentials()
+
+    def dumped() -> list[str]:
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            getattr(_handlers, dump)(cast("Event", SimpleNamespace(pdu=pdu)))
+        return _formatted(list(caplog.records))
+
+    with _filter_removed():  # CONTROL: the dump names both, in cleartext
+        unfiltered = dumped()
+    assert [line for line in unfiltered if f"Username: [{_PLANTED_USERNAME}]" in line]
+    assert [line for line in unfiltered if f"Password: [{_PLANTED_PASSWORD}]" in line]
+    filtered = dumped()
+    assert filtered
+    assert not [line for line in filtered if _PLANTED_USERNAME in line], filtered
+    assert not [line for line in filtered if _PLANTED_PASSWORD in line], filtered
+    # The lines stay, so a reader can still see that an identity was negotiated, and of which kind.
+    assert "pynetdicom._handlers:   Username: [redacted]" in filtered
+    assert "pynetdicom._handlers:   Password: [redacted]" in filtered
+    assert [line for line in filtered if "Authentication Mode: 2" in line]
+
+
+async def test_a_peers_credentials_never_reach_the_scp_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from tests.test_dicom_scp_pre_association import _ASSOCIATE_AC, _stall
+
+    request = _a_request_with_credentials().encode()
+
+    async def associate() -> list[str]:
+        async with _running_scp({"timeout_seconds": 30.0}) as scp:
+            with caplog.at_level(logging.DEBUG):
+                sock = await asyncio.to_thread(_stall, scp.sockport, request)
+                try:
+                    sock.settimeout(5.0)
+                    assert await asyncio.to_thread(sock.recv, 1) == _ASSOCIATE_AC
+                finally:
+                    sock.close()
+        return _formatted(list(caplog.records))
+
+    with _filter_removed():  # CONTROL: the same capture sees the password on the SCP's own path
+        unfiltered = await associate()
+    assert [line for line in unfiltered if _PLANTED_PASSWORD in line]
+    caplog.clear()
+    filtered = await associate()
+    assert filtered
+    leaked = [line for line in filtered if _PLANTED_PASSWORD in line or _PLANTED_USERNAME in line]
+    assert leaked == []
+    assert "pynetdicom._handlers:   Password: [redacted]" in filtered
+
+
+def test_the_credential_lines_the_filter_reads_are_still_pynetdicoms() -> None:
+    import inspect
+
+    from pynetdicom import _handlers
+
+    for dump in (_handlers._receive_associate_rq, _handlers._send_associate_rq):
+        source = inspect.getsource(dump)
+        assert "f\"  Username: [{primary.decode('utf-8')}]\"" in source
+        assert "f\"  Password: [{secondary.decode('utf-8')}]\"" in source
+
+
+# --- A refusal inside an exception, on any logger that logs one (vault BACKLOG #6637, item 5) ------
+
+_REFUSAL = f"Invalid 'Affected SOP Instance UID' value '{_PLANTED}' - must not exceed 64 characters"
+_PYDICOM_REFUSAL = (
+    f"Invalid value for VR UI: '{_PLANTED}'. Please see <https://dicom.nema.org/x> for allowed "
+    "values for each VR."
+)
+
+
+def _raised_from(inner: str) -> BaseException:
+    """A plain error raised from a refusal, so only the traceback's chain names the value."""
+    try:
+        try:
+            raise ValueError(inner)
+        except ValueError as refusal:
+            raise RuntimeError("the handler failed") from refusal
+    except RuntimeError as exc:
+        return exc
+
+
+def _raised_during(inner: str) -> BaseException:
+    try:
+        try:
+            raise ValueError(inner)
+        except ValueError:
+            raise RuntimeError("the handler failed")  # noqa: B904 - the implicit context is the case
+    except RuntimeError as exc:
+        return exc
+
+
+def _raised_through_pydicoms_wrapper(inner: str) -> BaseException:
+    """pydicom's ``tag_in_exception``, which builds a new message around the refusal and a copy of
+    its traceback, the shape an encode failure has when ``pynetdicom.dsutils`` logs it."""
+    from pydicom.tag import Tag, tag_in_exception
+
+    try:
+        with tag_in_exception(Tag(0x0000, 0x1000)):
+            raise ValueError(inner)
+    except ValueError as exc:
+        return exc
+    raise AssertionError("the refusal was not raised")
+
+
+def _logged(name: str, exc: BaseException, caplog: pytest.LogCaptureFixture) -> list[str]:
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        # As pynetdicom's own `LOGGER.exception(exc)`, from inside the except block that caught it.
+        logging.getLogger(name).exception(exc, exc_info=exc)
+    return _formatted(list(caplog.records))
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "pynetdicom.acse",
+        "pynetdicom.association",
+        "pynetdicom.dimse",
+        "pynetdicom.dsutils",
+        "pynetdicom.dul",
+        "pynetdicom.events",
+        "pynetdicom.fsm",
+        "pynetdicom.service_class",
+        "pynetdicom.transport",
+        "pynetdicom.utils",
+    ],
+)
+@pytest.mark.parametrize("inner", [_REFUSAL, _PYDICOM_REFUSAL], ids=["pynetdicom", "pydicom"])
+@pytest.mark.parametrize(
+    "raising",
+    [_raised_from, _raised_during, _raised_through_pydicoms_wrapper],
+    ids=["cause", "context", "wrapped"],
+)
+def test_a_refusal_in_a_logged_exception_is_redacted_on_every_logger(
+    name: str,
+    inner: str,
+    raising: Callable[[str], BaseException],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    exc = raising(inner)
+    with _filter_removed():  # CONTROL: the handler's output names the value
+        assert [line for line in _logged(name, exc, caplog) if _PLANTED in line]
+    lines = _logged(name, exc, caplog)
+    assert lines
+    assert not [line for line in lines if _PLANTED in line], lines
+    assert [line for line in lines if _REDACTED_MARK in line], lines
+
+
+def test_every_pynetdicom_module_that_logs_an_exception_is_filtered() -> None:
+    """A module that logs one and is not on the filter would write a chained refusal whole."""
+    import pkgutil
+
+    import pynetdicom
+
+    logging_exceptions = {
+        f"pynetdicom.{module.name}"
+        for module in pkgutil.iter_modules(pynetdicom.__path__)
+        if not module.ispkg
+        and "LOGGER.exception("
+        in (Path(pynetdicom.__path__[0]) / f"{module.name}.py").read_text(encoding="utf-8")
+    }
+    assert "pynetdicom.events" in logging_exceptions  # CONTROL: the scan finds a known one
+    assert logging_exceptions <= set(dicom_module._FILTERED_LOGGERS)
+
+
+def test_a_value_ahead_of_another_shape_in_one_message_is_redacted() -> None:
+    # The first head in the text decides, whichever order the shapes are listed in.
+    message = f"Unable to decode '{_PLANTED}' using the ascii codec(s): {_REFUSAL}"
+    assert _PLANTED not in _filtered("pynetdicom.events", message)
+
+
+# --- pydicom's character set and IS/DS lines, and "No presentation context" (#6637, item 7) --------
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            f"Incorrect value for Specific Character Set '{_PLANTED}' - assuming 'ISO_IR {_PLANTED}'",
+            "Incorrect value for Specific Character Set '[redacted]",
+        ),
+        (
+            f"Unknown encoding '{_PLANTED}' - using default encoding instead",
+            "Unknown encoding '[redacted]' - using default encoding instead",
+        ),
+        (f"Unknown encoding '{_PLANTED}'", "Unknown encoding '[redacted]"),
+        (
+            f"Value 'ISO_IR 192' for Specific Character Set does not allow code extensions, "
+            f"ignoring: {_PLANTED}, {_PLANTED}",
+            "Value 'ISO_IR 192' for Specific Character Set does not allow code extensions, "
+            "ignoring: [redacted]",
+        ),
+        (
+            f'Value "{_PLANTED}" is not valid for elements with a VR of DS',
+            'Value "[redacted]" is not valid for elements with a VR of DS',
+        ),
+        (
+            f'Value "{_PLANTED}" is not valid for elements with a VR of IS\n'
+            "Set reading_validation_mode to WARN or IGNORE to bypass",
+            'Value "[redacted]" is not valid for elements with a VR of IS\n'
+            "Set reading_validation_mode to WARN or IGNORE to bypass",
+        ),
+        (
+            # A value can hold the line's own fixed text: none of it survives.
+            f'Value "x" is not valid for elements with a VR of DS {_PLANTED}" is not valid for '
+            "elements with a VR of DS",
+            'Value "[redacted]" is not valid for elements with a VR of DS',
+        ),
+    ],
+    ids=["incorrect", "unknown", "unknown-raised", "code-extension", "ds", "is-raised", "quoted"],
+)
+def test_pydicoms_character_set_and_number_lines_lose_the_value(
+    message: str, expected: str
+) -> None:
+    assert _filtered("pydicom", message) == expected
+
+
+def _pydicom_flags_planted_values() -> None:
+    """pydicom's own calls for each line, each with the planted value or one carrying it."""
+    from pydicom import charset, config
+    from pydicom.valuerep import DSdecimal
+
+    charset._warn_about_invalid_encoding(_PLANTED, "ISO_IR 192")
+    charset._warn_about_invalid_encoding(_PLANTED)
+    charset._handle_illegal_standalone_encodings(["ISO_IR 192", _PLANTED], ["utf8", "ascii"])
+    DSdecimal(_PLANTED_NAN, validation_mode=config.WARN)
+
+
+#: A DS the decimal parser takes and the DS check refuses: the case that reaches pydicom's own line.
+_PLANTED_NAN = "NaN"
+
+
+def test_pydicoms_character_set_lines_never_reach_the_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with _filter_removed(), caplog.at_level(logging.DEBUG):  # CONTROL
+            _pydicom_flags_planted_values()
+        unfiltered = _formatted(list(caplog.records))
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            _pydicom_flags_planted_values()
+        filtered = _formatted(list(caplog.records))
+    assert len([line for line in unfiltered if _PLANTED in line]) == 3, unfiltered
+    assert [line for line in unfiltered if f'Value "{_PLANTED_NAN}"' in line], unfiltered
+    assert len(filtered) == len(unfiltered)
+    assert not [line for line in filtered if _PLANTED in line], filtered
+    assert not [line for line in filtered if f'Value "{_PLANTED_NAN}"' in line], filtered
+    assert 'pydicom: Value "[redacted]" is not valid for elements with a VR of DS' in filtered
+
+
+def test_pydicoms_warning_copies_of_those_lines_are_ignored() -> None:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")  # so only the filters installed next can ignore them
+        dicom_module._redact_flagged_peer_values()
+        _pydicom_flags_planted_values()
+    assert not [w for w in caught if _PLANTED in str(w.message)], [str(w.message) for w in caught]
+    assert not [w for w in caught if "is not valid for elements" in str(w.message)]
+    with warnings.catch_warnings(record=True) as caught:  # CONTROL: unignored, they carry the value
+        warnings.simplefilter("always")
+        _pydicom_flags_planted_values()
+    assert len([w for w in caught if _PLANTED in str(w.message)]) == 3
+
+
+def test_the_character_set_and_number_lines_are_still_pydicoms() -> None:
+    import inspect
+
+    from pydicom import charset, valuerep
+
+    source = inspect.getsource(charset)
+    assert "f\"Incorrect value for Specific Character Set '{encoding}' - \"" in source
+    assert "msg = f\"Unknown encoding '{encoding}' - using default encoding instead\"" in source
+    assert "f\"Value '{encodings[0]}' for Specific Character Set does not \"" in source
+    assert 'f"allow code extensions, ignoring: {' in source
+    number = inspect.getsource(valuerep)
+    assert "msg = f'Value \"{self}\" is not valid for elements with a VR of DS'" in number
+    assert "msg = f'Value \"{self}\" is not valid for elements with a VR of IS'" in number
+    assert 'msg += "\\nSet reading_validation_mode to WARN or IGNORE to bypass"' in number
+
+
+def _no_context_store(sop_class: str) -> Callable[[Any], None]:
+    """A C-STORE of a ``sop_class`` object on an association that accepted only Verification."""
+
+    def send(assoc: Any) -> None:
+        from pydicom import Dataset
+        from pydicom.dataset import FileMetaDataset
+        from pydicom.uid import ImplicitVRLittleEndian
+
+        ds = Dataset()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # pydicom flags the planted UID as it is set
+            ds.SOPClassUID = sop_class
+            ds.SOPInstanceUID = "1.2.826.0.1.3680043.2.1"
+        ds.file_meta = FileMetaDataset()
+        ds.file_meta.TransferSyntaxUID = ImplicitVRLittleEndian
+        with pytest.raises(ValueError, match="No presentation context"):
+            assoc.send_c_store(ds)
+
+    return send
+
+
+def test_the_no_presentation_context_line_loses_a_flagged_sop_class(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with _filter_removed():  # CONTROL: the line names the planted class
+        unfiltered = _formatted(
+            _associate_against(_captured_ac(), caplog, _no_context_store(_PLANTED))
+        )
+    assert [line for line in unfiltered if f"No presentation context for '{_PLANTED}'" in line]
+    caplog.clear()
+    filtered = _formatted(_associate_against(_captured_ac(), caplog, _no_context_store(_PLANTED)))
+    assert filtered
+    assert not [line for line in filtered if _PLANTED in line], filtered
+    assert "pynetdicom.association: No presentation context for '[redacted]" in filtered
+
+
+def test_the_no_presentation_context_line_keeps_a_real_sop_class(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The CONTROL for the redaction: a conformant class is what an operator needs from this line.
+    lines = _formatted(
+        _associate_against(_captured_ac(), caplog, _no_context_store("1.2.840.10008.5.1.4.1.1.2"))
+    )
+    assert (
+        "pynetdicom.association: No presentation context for 'CT Image Storage' has been accepted "
+        "by the peer with 'Implicit VR Little Endian' transfer syntax for the SCU role"
+    ) in lines
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        f"No presentation context for 'CT Image Storage' has been accepted by the peer with "
+        f"'{_PLANTED}' transfer syntax for the SCU role",
+        f"No presentation context for '{_PLANTED}' has been accepted by the peer for the SCU role",
+        f"No presentation context for 'x' has been accepted by the peer {_PLANTED}",
+        f"No presentation context for 'it's {_PLANTED}' has been accepted by the peer for the "
+        "SCU role",
+    ],
+    ids=["syntax", "class", "unknown-end", "quote"],
+)
+def test_a_no_presentation_context_line_with_any_flagged_part_loses_it(message: str) -> None:
+    assert _filtered("pynetdicom.association", message) == (
+        "No presentation context for '[redacted]"
+    )
+
+
+def test_the_no_presentation_context_line_is_still_pynetdicoms() -> None:
+    import inspect
+
+    from pynetdicom import association
+
+    source = inspect.getsource(association.Association._get_valid_context)
+    assert "f\"No presentation context for '{ab_syntax.name}' has been \"" in source
+    assert 'f"accepted by the peer"' in source
+    assert "msg += f\" with '{tr_syntax.name}' transfer syntax\"" in source
+    assert 'msg += f" for the {role.upper()} role"' in source
+
+
+# --- A codec error on a filtered logger, on a host with no engine log chain (#6637, item 15) -------
+
+
+def test_a_codec_errors_byte_never_reaches_a_stock_handler(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # decode_bytes logs each UnicodeDecodeError it hits, and its str() names the byte.
+    from pynetdicom import utils
+
+    def decoded() -> list[str]:
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG), pytest.raises(ValueError):
+            utils.decode_bytes(b"\xc3\x28")
+        return _formatted(list(caplog.records))
+
+    with _filter_removed():  # CONTROL: a stock formatter writes the byte, in the line and traceback
+        assert [line for line in decoded() if line.count("0xc3") >= 2]
+    lines = decoded()
+    assert lines
+    assert not [line for line in lines if "0xc3" in line], lines
+    assert [line for line in lines if "UnicodeDecodeError" in line], lines
+
+
+def test_a_codec_error_in_a_records_args_is_rendered_safely() -> None:
+    try:
+        b"\xc3\x28".decode("ascii")
+    except UnicodeDecodeError as exc:
+        record = logging.LogRecord(
+            "pynetdicom.events", logging.ERROR, __file__, 1, "failed: %s", (exc,), None
+        )
+    assert dicom_module._PEER_VALUE_FILTER.filter(record) is True
+    assert "0xc3" not in record.getMessage()
+
+
+# --- The SCU's warnings filter, and the engine's own error text (#6637, items 11 and 14) -----------
+
+
+def test_the_scu_puts_the_warnings_filter_back_on_a_host_that_reset_it() -> None:
+    from tests.test_dicom_scu import _scu
+
+    with warnings.catch_warnings(record=True) as caught:  # CONTROL: reset, the copy names the value
+        warnings.simplefilter("always")
+        dicom_module._read_command_set(_planted_command())
+    assert [w for w in caught if _PLANTED in str(w.message)]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _scu(1)._build_ae()
+        dicom_module._read_command_set(_planted_command())
+    assert not [w for w in caught if _PLANTED in str(w.message)]
+
+
+_CONTEXT_AWARE = bool(getattr(sys.flags, "context_aware_warnings", 0))
+
+
+@pytest.mark.skipif(_CONTEXT_AWARE, reason="warnings.filters is not the list in force there")
+def test_the_warnings_filters_are_not_reinstalled_while_they_are_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Each filterwarnings call resets every module's once-per-location record, so a reinstall per
+    # send would repeat any other library's warning on stderr once per message.
+    calls: list[str] = []
+    original = warnings.filterwarnings
+
+    def counted(*args: Any, **kwargs: Any) -> None:
+        calls.append(str(kwargs.get("message")))
+        original(*args, **kwargs)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("always")
+        monkeypatch.setattr(warnings, "filterwarnings", counted)
+        dicom_module._ignore_pydicom_value_warnings()
+        assert len(calls) == len(dicom_module._PYDICOM_VALUE_WARNINGS)  # CONTROL: it installs them
+        calls.clear()
+        dicom_module._ignore_pydicom_value_warnings()
+        assert calls == []
+        warnings.simplefilter("always")  # now ahead of them, so they must go back in front
+        dicom_module._ignore_pydicom_value_warnings()
+        assert len(calls) == len(dicom_module._PYDICOM_VALUE_WARNINGS)
+        monkeypatch.undo()
+
+
+def test_no_warning_filter_nests_an_unbounded_scan_inside_a_leading_one() -> None:
+    # Every UserWarning meets these filters, on text a peer can fill with a pattern's own opening
+    # words, up to the 64 KiB command set cap. A leading `.*` with a second unbounded scan after it
+    # is quadratic there. Read from the patterns, so a loaded machine cannot fail it.
+    def nested(pattern: str) -> bool:
+        return pattern.startswith(".*") and "*" in pattern[2:]
+
+    assert nested(r'.*Value ".*" is not valid for elements with a VR of ')  # CONTROL
+    assert dicom_module._PYDICOM_VALUE_WARNINGS
+    assert not [p for p in dicom_module._PYDICOM_VALUE_WARNINGS if nested(p)]
+
+
+def test_the_scu_ignores_pydicoms_copies_before_it_reads_the_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from messagefoundry.parsing.dicom import DicomPeek
+    from tests._dicom_sample import make_sr_part10
+    from tests.test_dicom_scu import _scu
+
+    class Reached(Exception):
+        """The read is over; the association is not under test."""
+
+    def stop() -> Any:
+        raise Reached
+
+    data = make_sr_part10()
+    uid = DicomPeek.parse(data).sop_instance_uid
+    assert uid
+    planted = ("1.02." + "7" * len(uid))[: len(uid)]
+    scu = _scu(1)
+    monkeypatch.setattr(scu, "_build_ae", stop)
+
+    def warned() -> list[str]:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with pytest.raises(Reached):
+                scu._store_object(data.replace(uid.encode(), planted.encode()))
+        return [str(w.message) for w in caught if planted in str(w.message)]
+
+    install = dicom_module._ignore_pydicom_value_warnings
+    monkeypatch.setattr(dicom_module, "_ignore_pydicom_value_warnings", lambda: None)
+    assert warned()  # CONTROL: uninstalled, the read warns with the value
+    monkeypatch.setattr(dicom_module, "_ignore_pydicom_value_warnings", install)
+    assert warned() == []
+
+
+@pytest.mark.skipif(_CONTEXT_AWARE, reason="its control needs the flag off")
+def test_context_aware_warnings_always_reinstall(monkeypatch: pytest.MonkeyPatch) -> None:
+    # There, warnings.filters is not the list in force, so it cannot say the ignores are in place.
+    calls: list[str] = []
+    original = warnings.filterwarnings
+
+    def counted(*args: Any, **kwargs: Any) -> None:
+        calls.append(str(kwargs.get("message")))
+        original(*args, **kwargs)
+
+    with warnings.catch_warnings():
+        dicom_module._ignore_pydicom_value_warnings()
+        monkeypatch.setattr(warnings, "filterwarnings", counted)
+        dicom_module._ignore_pydicom_value_warnings()
+        assert calls == []  # CONTROL: without the flag, in place means no call
+        flags = SimpleNamespace(context_aware_warnings=1)
+        monkeypatch.setattr(dicom_module, "sys", SimpleNamespace(flags=flags))
+        dicom_module._ignore_pydicom_value_warnings()
+        assert len(calls) == len(dicom_module._PYDICOM_VALUE_WARNINGS)
+        monkeypatch.undo()
+
+
+@pytest.mark.parametrize("vr", ["UI", "CS", "IS", "DS"])
+def test_the_engines_error_text_redacts_pydicoms_own_refusal(vr: str) -> None:
+    # redact() rewrites this refusal's head, so the shapes must read the message before it does.
+    from pydicom import config
+    from pydicom.valuerep import validate_value
+
+    value = "1.02.7777777^PLANTED"
+    with pytest.raises(ValueError) as raised:
+        validate_value(vr, value, config.RAISE)
+    assert value in str(raised.value)  # CONTROL
+    assert value not in dicom_module._safe_library_exc(raised.value)
+    assert _REDACTED_MARK in dicom_module._safe_library_exc(raised.value)
+
+
+def test_the_engines_error_text_keeps_a_codec_errors_byte_out() -> None:
+    with pytest.raises(UnicodeDecodeError) as raised:
+        b"\xc3\x28".decode("ascii")
+    assert "0xc3" in str(raised.value)  # CONTROL
+    assert "0xc3" not in dicom_module._safe_library_exc(raised.value)
+
+
+def test_a_numeric_elements_raw_bytes_never_reach_the_log_or_the_error_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from pydicom.errors import BytesLengthException
+    from pydicom.values import convert_numbers
+
+    planted = b"S3CRETVAL"
+    with pytest.raises(BytesLengthException) as raised:
+        convert_numbers(planted, True, "H")
+    exc = raised.value
+    assert planted.decode() in str(exc)  # CONTROL
+    text = dicom_module._safe_library_exc(exc)
+    assert planted.decode() not in text
+    assert "Instead received [redacted] with length 9 and struct format 'H'" in text
+    lines = _logged("pynetdicom.dsutils", exc, caplog)
+    assert lines
+    assert not [line for line in lines if planted.decode() in line], lines
+
+
+def test_a_message_that_holds_another_is_replaced_whole() -> None:
+    # The outer message is short and sits inside its cause's, which also names a second value.
+    outer = "Invalid 'A' value 'FIRSTVAL' - must not exceed 16 characters"
+    inner = f"With tag (0000,1000): {outer}\nInvalid value for VR UI: 'SECONDVAL'."
+    try:
+        try:
+            raise ValueError(inner)
+        except ValueError as cause:
+            raise ValueError(outer) from cause
+    except ValueError as exc:
+        info = (ValueError, exc, exc.__traceback__)
+        record = logging.LogRecord("pynetdicom.dimse", logging.ERROR, __file__, 1, exc, (), info)
+    assert dicom_module._PEER_VALUE_FILTER.filter(record) is True
+    written = logging.Formatter("%(message)s").format(record)
+    assert "FIRSTVAL" not in written and "SECONDVAL" not in written, written
+    assert _REDACTED_MARK in written
+
+
+@pytest.mark.parametrize("dump", ["_receive_associate_rq", "_send_associate_rq"])
+def test_the_dump_of_extended_negotiation_writes_no_application_information(
+    dump: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    from pynetdicom import _handlers
+    from pynetdicom.pdu import A_ASSOCIATE_RQ
+    from pynetdicom.pdu_items import SOPClassExtendedNegotiationSubItem
+
+    pdu = A_ASSOCIATE_RQ()
+    pdu.decode(_captured_request())
+    item = SOPClassExtendedNegotiationSubItem()
+    item.sop_class_uid = "1.2.840.10008.1.1"
+    item.service_class_application_information = b"S3CRETVAL"
+    user_information = pdu.user_information
+    assert user_information is not None
+    user_information.user_data.append(item)
+    hexed = "  ".join(format(byte, "02x") for byte in b"S3CRETVAL")
+
+    def dumped() -> list[str]:
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            getattr(_handlers, dump)(cast("Event", SimpleNamespace(pdu=pdu)))
+        return [r.getMessage() for r in caplog.records]
+
+    with _filter_removed():  # CONTROL: the dump writes the bytes as hex
+        assert [line for line in dumped() if hexed in line]
+    lines = dumped()
+    assert lines
+    assert not [line for line in lines if hexed in line], lines
+    assert "    [redacted]" in lines
+
+
+async def test_the_scp_puts_the_warning_ignores_back_at_each_c_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests._dicom_sample import make_sr_part10
+    from tests.test_dicom_scp import _scu_cstore
+
+    calls: list[str] = []
+    install = dicom_module._ignore_pydicom_value_warnings
+
+    def counted() -> None:
+        calls.append(threading.current_thread().name)
+        install()
+
+    async with _running_scp({"timeout_seconds": 5.0}) as scp:
+        monkeypatch.setattr(dicom_module, "_ignore_pydicom_value_warnings", counted)
+        established, status = await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10())
+    assert established and status == 0x0000
+    assert calls, "the C-STORE callback did not put the ignores back"
+
+
+def _with_a_note() -> BaseException:
+    exc = RuntimeError("the handler failed")
+    exc.add_note(f"while reading {_PLANTED}")
+    return exc
+
+
+@pytest.mark.parametrize(
+    "build",
+    [_with_a_note, lambda: ExceptionGroup("failed", [ValueError(_REFUSAL)])],
+    ids=["note", "group-member"],
+)
+def test_a_traceback_with_a_note_or_group_member_is_withheld(
+    build: Callable[[], BaseException], caplog: pytest.LogCaptureFixture
+) -> None:
+    exc = build()
+    with _filter_removed():  # CONTROL: a stock formatter prints both
+        assert [line for line in _logged("pynetdicom.dimse", exc, caplog) if _PLANTED in line]
+    lines = _logged("pynetdicom.dimse", exc, caplog)
+    assert lines
+    assert not [line for line in lines if _PLANTED in line], lines
+    assert [line for line in lines if "traceback withheld" in line], lines
+
+
+async def test_the_scus_delivery_error_names_no_refused_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pynetdicom.association import Association
+
+    from messagefoundry.transports.base import DeliveryError
+    from tests._dicom_sample import make_sr_part10
+    from tests.test_dicom_scu import _carry, _scu, _storage_scp
+
+    def refuse(self: Any, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(_REFUSAL)
+
+    monkeypatch.setattr(Association, "send_c_store", refuse)
+    with _storage_scp() as port, pytest.raises(DeliveryError) as raised:
+        await _scu(port).send(_carry(make_sr_part10()))
+    assert _PLANTED not in str(raised.value)
+    assert "value '[redacted]' - must not exceed 64 characters" in str(raised.value)
+
+
+async def test_the_scps_decode_error_line_names_no_refused_value(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from pydicom.dataset import Dataset
+
+    from tests._dicom_sample import make_sr_part10
+    from tests.test_dicom_scp import _scu_cstore
+
+    def refuse(self: Any, *args: Any, **kwargs: Any) -> None:
+        raise ValueError(_REFUSAL)
+
+    data = make_sr_part10()
+    async with _running_scp({"timeout_seconds": 5.0}) as scp:
+        monkeypatch.setattr(Dataset, "save_as", refuse)
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.dicom"):
+            await asyncio.to_thread(_scu_cstore, scp.sockport, data)
+    lines = [
+        r.getMessage() for r in caplog.records if "could not be decoded/encoded" in r.getMessage()
+    ]
+    assert lines, caplog.text
+    assert not [line for line in lines if _PLANTED in line], lines
+    assert [line for line in lines if "value '[redacted]'" in line], lines
+
+
+# --- A peer's DIMSE response that does not convert (vault BACKLOG #6637, item 4) -------------------
+
+_PLANTED_REFUSED = "1.02." + "9" * 70  # over 64 characters, so set_uid raises rather than warns
+
+
+def _c_echo_rsp_command(class_uid: str) -> bytes:
+    """A whole C-ECHO-RSP command set, implicit VR little endian, naming ``class_uid``."""
+
+    def element(tag: tuple[int, int], value: bytes) -> bytes:
+        return struct.pack("<HHI", *tag, len(value)) + value
+
+    uid = class_uid.encode("ascii")
+    rest = (
+        element((0x0000, 0x0002), uid + b"\x00" * (len(uid) % 2))
+        + element((0x0000, 0x0100), struct.pack("<H", 0x8030))
+        + element((0x0000, 0x0120), struct.pack("<H", 1))
+        + element((0x0000, 0x0800), struct.pack("<H", 0x0101))
+        + element((0x0000, 0x0900), struct.pack("<H", 0x0000))
+    )
+    return element((0x0000, 0x0000), struct.pack("<I", len(rest))) + rest
+
+
+def _scu_echo_answered_with(command: bytes, caplog: pytest.LogCaptureFixture) -> list[str]:
+    """A pynetdicom SCU sends a C-ECHO to a peer that answers with ``command``. Every record logged
+    meanwhile is returned as a handler would write it, its traceback included."""
+    records = _associate_against(
+        _captured_ac(), caplog, then=lambda assoc: assoc.send_c_echo(), reply=command
+    )
+    return _formatted(records)
+
+
+def test_a_refused_value_in_a_peers_dimse_response_never_reaches_the_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    command = _c_echo_rsp_command(_PLANTED_REFUSED)
+    with (
+        _filter_removed()
+    ):  # CONTROL: pynetdicom.dimse logs the refusal, and its traceback repeats it
+        unfiltered = _scu_echo_answered_with(command, caplog)
+    assert [
+        line
+        for line in unfiltered
+        if line.startswith("pynetdicom.dimse: Invalid 'Affected SOP Class UID' value ")
+        and line.count(_PLANTED_REFUSED) >= 2
+    ], unfiltered
+    caplog.clear()
+    filtered = _scu_echo_answered_with(command, caplog)
+    assert filtered
+    assert not [line for line in filtered if _PLANTED_REFUSED in line], filtered
+    assert [
+        line
+        for line in filtered
+        if line.startswith("pynetdicom.dimse: Invalid 'Affected SOP Class UID' value '[redacted]'")
+        and "Traceback" in line
+    ], filtered
+
+
+# --- The no-service-class and private creator lines (vault BACKLOG #6637) --------------------------
+
+_NO_SERVICE_TAIL = (
+    "', please see the pynetdicom.sop_class.register_uid() function if you need to add support "
+    "for a private, retired or otherwise unknown SOP Class UID"
+)
+#: The length of the class UID in ``_c_store_command``, so a replace keeps the command set's lengths.
+_PLANTED_CLASS = (_PLANTED + ".9" * 7)[:30]
+
+
+def _no_service_line(value: str) -> str:
+    return f"No supported service class available for the SOP Class UID '{value}{_NO_SERVICE_TAIL}"
+
+
+def test_the_no_service_class_line_keeps_only_a_conformant_class() -> None:
+    assert _filtered("pynetdicom.association", _no_service_line(_PLANTED)) == (
+        "No supported service class available for the SOP Class UID '[redacted]"
+    )
+    # The CONTROL: a real private class is what an operator needs from this line.
+    real = _no_service_line("1.2.826.0.1.3680043.2.1")
+    assert _filtered("pynetdicom.association", real) == real
+
+
+def test_the_no_service_class_line_is_still_pynetdicoms() -> None:
+    import inspect
+
+    from pynetdicom import association
+
+    source = inspect.getsource(association.Association._serve_request)
+    assert '"No supported service class available for the SOP "' in source
+    assert "f\"Class UID '{class_uid}', please see the \"" in source
+    assert '"pynetdicom.sop_class.register_uid() function if you need to add "' in source
+    assert '"support for a private, retired or otherwise unknown SOP Class UID"' in source
+
+
+async def _store_of_a_class_no_service_serves(
+    caplog: pytest.LogCaptureFixture,
+) -> list[str]:
+    """A C-STORE on an accepted context whose command names a class pynetdicom has no service for."""
+    command = _c_store_command().replace(
+        b"1.2.840.10008.5.1.4.1.1.88.11\x00", _PLANTED_CLASS.encode("ascii")
+    )
+    async with _running_scp({"timeout_seconds": 30.0}) as scp:
+        sock = await _a_held_association(scp.sockport)
+        try:
+            with caplog.at_level(logging.DEBUG):
+                sock.sendall(_p_data(0x03, command) + _p_data(0x02, b"\x00" * 16))
+                assert await asyncio.to_thread(_first_bytes, sock, 1), "the SCP did not end it"
+        finally:
+            sock.close()
+    return _formatted(list(caplog.records))
+
+
+async def test_a_peers_class_with_no_service_never_reaches_the_scp_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with _filter_removed():  # CONTROL: a peer's command reaches the line, with its value whole
+        unfiltered = await _store_of_a_class_no_service_serves(caplog)
+    assert [line for line in unfiltered if "No supported service" in line and _PLANTED in line]
+    caplog.clear()
+    filtered = await _store_of_a_class_no_service_serves(caplog)
+    assert [line for line in filtered if "No supported service" in line], filtered
+    assert not [line for line in filtered if _PLANTED in line], filtered
+
+
+def _read_a_bad_private_creator() -> KeyError:
+    """pydicom's own lookup of a private element whose creator has more than one value, and the
+    error it raises."""
+    from pydicom.datadict import get_private_entry
+    from pydicom.multival import MultiValue
+    from pydicom.tag import Tag
+
+    with pytest.raises(KeyError) as raised:
+        get_private_entry(Tag(0x0009, 0x1001), MultiValue(str, ["A", _PLANTED]))  # type: ignore[arg-type]
+    return raised.value
+
+
+def test_a_bad_private_creator_never_reaches_the_log(caplog: pytest.LogCaptureFixture) -> None:
+    def lines() -> list[str]:
+        caplog.clear()
+        with warnings.catch_warnings(), caplog.at_level(logging.DEBUG):
+            warnings.simplefilter("ignore")
+            _read_a_bad_private_creator()
+        return _formatted(list(caplog.records))
+
+    with _filter_removed():  # CONTROL
+        assert [line for line in lines() if _PLANTED in line]
+    filtered = lines()
+    assert filtered
+    assert not [line for line in filtered if _PLANTED in line], filtered
+    assert "pydicom: (0009,0010) '[redacted]' is not a valid private creator" in filtered
+
+
+def test_a_bad_private_creators_warning_copy_is_ignored() -> None:
+    with warnings.catch_warnings(record=True) as caught:  # CONTROL: unignored, it carries the value
+        warnings.simplefilter("always")
+        _read_a_bad_private_creator()
+    assert [w for w in caught if _PLANTED in str(w.message)]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        dicom_module._redact_flagged_peer_values()
+        _read_a_bad_private_creator()
+    assert not [w for w in caught if _PLANTED in str(w.message)]
+
+
+def test_a_bad_private_creator_in_a_raised_error_is_redacted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        error = _read_a_bad_private_creator()
+    assert _PLANTED in str(error)  # CONTROL
+    assert _PLANTED not in dicom_module._safe_library_exc(error)
+    lines = _logged("pynetdicom.events", error, caplog)
+    assert lines
+    assert not [line for line in lines if _PLANTED in line], lines
+
+
+def test_a_tag_and_quote_on_any_other_line_stay_as_they_are() -> None:
+    # The CONTROL on the shape's width: the head alone is not enough to redact a line.
+    line = "Element (0009,0010) 'LO' has no value"
+    assert _filtered("pydicom", line) == line
+
+
+def test_a_private_creator_holding_a_double_quote_is_redacted() -> None:
+    # repr() of the KeyError's line then escapes each single quote, which moves the shape's head.
+    creator = f"['{_PLANTED}\"X', 'B']"
+    error = KeyError(f"(0009,0010) '{creator}' is not a valid private creator")
+    assert _PLANTED in str(error)  # CONTROL
+    assert _PLANTED not in dicom_module._safe_library_exc(error)
+
+
+@pytest.mark.parametrize(
+    "convert",
+    ["DS", "IS", "DSfloat"],
+)
+def test_pythons_number_error_on_a_peers_text_loses_the_value(convert: str) -> None:
+    from pydicom import valuerep
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(ValueError) as raised:
+            getattr(valuerep, convert)("DOE^JANE")
+    assert "DOE^JANE" in str(raised.value)  # CONTROL
+    assert "DOE^JANE" not in dicom_module._safe_library_exc(raised.value)
+    assert "DOE^JANE" not in _filtered("pynetdicom.events", str(raised.value))
+
+
+def test_pydicoms_wrong_length_warning_copy_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pydicom import config
+    from pydicom.dataelem import RawDataElement, convert_raw_data_element
+    from pydicom.tag import Tag
+
+    monkeypatch.setattr(config, "convert_wrong_length_to_UN", True)
+    element = RawDataElement(Tag(0x0028, 0x0010), "US", 3, b"SEC", 0, False, True)
+
+    with warnings.catch_warnings(record=True) as caught:  # CONTROL: unignored, it quotes the bytes
+        warnings.simplefilter("always")
+        convert_raw_data_element(element)
+    assert [w for w in caught if "b'SEC'" in str(w.message)]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        dicom_module._redact_flagged_peer_values()
+        convert_raw_data_element(element)
+    assert not [w for w in caught if "b'SEC'" in str(w.message)]
+
+
+def test_the_private_creator_line_is_still_pydicoms() -> None:
+    import inspect
+
+    from pydicom import datadict
+
+    source = inspect.getsource(datadict.get_private_entry)
+    assert "f\"{tag.private_creator} '{private_creator}' \"" in source
+    assert 'f"is not a valid private creator"' in source
+    assert "warn_and_log(msg)" in source
+
+
+# --- What the SCU refuses in an object before it associates (vault BACKLOG #6637) ------------------
+
+
+def _object_with_class(sop_class: Any) -> bytes:
+    from pydicom import dcmread
+
+    from tests._dicom_sample import make_sr_part10
+
+    dataset = dcmread(io.BytesIO(make_sr_part10()))
+    buffer = io.BytesIO()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        dataset["SOPClassUID"].value = sop_class
+        dataset.save_as(buffer, enforce_file_format=True)
+    return buffer.getvalue()
+
+
+def _object_whose_instance_uid_will_not_read() -> bytes:
+    """Its SOP Instance UID is declared US with three bytes, which pydicom raises on when read."""
+    from pydicom import dcmread
+
+    from tests._dicom_sample import make_sr_part10
+
+    data = make_sr_part10()
+    found = data.find(b"\x08\x00\x18\x00UI")
+    assert found > 0
+    length = int.from_bytes(data[found + 6 : found + 8], "little")
+    broken = (
+        data[: found + 4]
+        + b"US"
+        + (3).to_bytes(2, "little")
+        + b"\xff\xfe\xfd"
+        + data[found + 8 + length :]
+    )
+    with pytest.raises(Exception, match="bytes per value"):  # CONTROL: this is what the SCU meets
+        _ = dcmread(io.BytesIO(broken)).SOPInstanceUID
+    return broken
+
+
+def _object_with_instance(value: Any) -> bytes:
+    """A synthetic object whose SOP Instance UID is ``value``, or absent where that is ``None``."""
+    from pydicom import dcmread
+
+    from tests._dicom_sample import make_sr_part10
+
+    dataset = dcmread(io.BytesIO(make_sr_part10()))
+    if value is None:
+        del dataset.SOPInstanceUID
+    else:
+        dataset.SOPInstanceUID = value
+    buffer = io.BytesIO()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        dataset.save_as(buffer)
+    return buffer.getvalue()
+
+
+def _object_with_two_transfer_syntaxes() -> bytes:
+    """A synthetic object whose file meta names two transfer syntaxes, by editing its bytes, since
+    pydicom will not write one. The group length moves with it."""
+    from tests._dicom_sample import make_sr_part10
+
+    data = make_sr_part10()
+    found = data.find(b"\x02\x00\x10\x00UI")
+    assert found > 0
+    length = int.from_bytes(data[found + 6 : found + 8], "little")
+    first = data[found + 8 : found + 8 + length].rstrip(b"\x00")
+    value = first + b"\\1.2.840.10008.1.2"
+    value += b"\x00" * (len(value) % 2)
+    grown = len(value) - length
+    broken = (
+        data[: found + 6] + len(value).to_bytes(2, "little") + value + data[found + 8 + length :]
+    )
+    meta_length_at = broken.find(b"\x02\x00\x00\x00UL") + 8
+    meta_length = int.from_bytes(broken[meta_length_at : meta_length_at + 4], "little")
+    return (
+        broken[:meta_length_at]
+        + (meta_length + grown).to_bytes(4, "little")
+        + broken[meta_length_at + 4 :]
+    )
+
+
+def _object_with_transfer_syntax_as_lo() -> bytes:
+    """A synthetic object whose (0002,0010) is encoded as LO, so it reads as a plain string."""
+    from tests._dicom_sample import make_sr_part10
+
+    data = make_sr_part10()
+    found = data.find(b"\x02\x00\x10\x00UI")
+    assert found > 0
+    return data[: found + 4] + b"LO" + data[found + 6 :]
+
+
+def _object_with_instance_as_us() -> bytes:
+    """A synthetic object whose (0008,0018) is encoded as US, so it reads as an int."""
+    from tests._dicom_sample import make_sr_part10
+
+    data = make_sr_part10()
+    found = data.find(b"\x08\x00\x18\x00UI")
+    assert found > 0
+    length = int.from_bytes(data[found + 6 : found + 8], "little")
+    return (
+        data[: found + 4]
+        + b"US"
+        + (2).to_bytes(2, "little")
+        + b"\x05\x00"
+        + data[found + 8 + length :]
+    )
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: _object_with_class(_PLANTED_REFUSED),
+        lambda: _object_with_class(["1.2", "1.3"]),
+        _object_with_transfer_syntax_as_lo,
+        _object_with_instance_as_us,
+        _object_whose_instance_uid_will_not_read,
+        lambda: _object_with_instance(None),
+        lambda: _object_with_instance(""),
+        lambda: _object_with_instance(["1.2.3", "1.2.4"]),
+        _object_with_two_transfer_syntaxes,
+    ],
+    ids=[
+        "refused-sop-class",
+        "two-sop-classes",
+        "transfer-syntax-as-lo",
+        "instance-uid-as-us",
+        "instance-uid-does-not-read",
+        "no-instance-uid",
+        "empty-instance-uid",
+        "two-instance-uids",
+        "two-transfer-syntaxes",
+    ],
+)
+async def test_an_object_the_scu_cannot_propose_is_a_bad_object(
+    build: Callable[[], bytes],
+) -> None:
+    from messagefoundry.transports.base import NegativeAckError
+    from tests.test_dicom_scu import _carry, _scu, _storage_scp
+
+    with _storage_scp() as port, pytest.raises(NegativeAckError) as raised:
+        await _scu(port).send(_carry(build()))
+    assert raised.value.code == "bad-object"
+    assert raised.value.permanent is True
+    assert _PLANTED_REFUSED not in str(raised.value)
+    assert "xff" not in str(raised.value)

@@ -566,7 +566,7 @@ SITES: dict[str, Site] = {
         1, REVIEWED, "The guard itself: it resolves the candidate to check its parent."
     ),
     "messagefoundry/config/codeset_edit.py::rename_code_set": Site(
-        1,
+        3,
         GUARDED,
         _CODESET_NAME,
         "messagefoundry/config/codeset_edit.py::_validate_name",
@@ -723,6 +723,15 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/log_spool.py::LogSpool.open": Site(
         1, INTERNAL, "A fixed lock name in the spool directory."
+    ),
+    "messagefoundry/parsing/x12/_deps.py::_read_map_segment_ids": Site(
+        2,
+        INTERNAL,
+        "The fixed index name, and map names read from that index inside the installed pyx12 "
+        "package, each refused unless a bare file name; no interchange value reaches either.",
+    ),
+    "messagefoundry/parsing/x12/_deps.py::load_x12_map_segment_ids": Site(
+        1, INTERNAL, "The fixed name map under the installed pyx12 package."
     ),
     "messagefoundry/parsing/xml/schema.py::_bundled_root": Site(
         1, INTERNAL, "A fixed name, schemas, beside the installed xmlschema package's own file."
@@ -955,8 +964,8 @@ SITES: dict[str, Site] = {
     "messagefoundry/store/custody_host.py::_custody_paths": Site(
         2,
         OPERATOR,
-        "The two fixed custody file names under the directory MEFOR_SECRETS_DIRECTORY names, or "
-        "the operator's [store].path directory.",
+        "The two fixed custody file names under the directory MEFOR_CUSTODY_DIRECTORY or "
+        "MEFOR_SECRETS_DIRECTORY names, or the operator's [store].path directory.",
     ),
     "messagefoundry/store/store.py::MessageStore._db_size_bytes": Site(
         1, OPERATOR, _SQLITE_SIDECARS
@@ -1055,18 +1064,18 @@ SITES: dict[str, Site] = {
     "messagefoundry/transports/remotefile.py::RemoteFileSource._after_processing": Site(
         1, GUARDED, _LISTING, "messagefoundry/transports/remotefile.py::_is_contained_name"
     ),
-    "messagefoundry/transports/remotefile.py::RemoteFileSource._file_key_forms": Site(
-        1, GUARDED, _LISTING, "messagefoundry/transports/remotefile.py::_is_contained_name"
-    ),
-    "messagefoundry/transports/remotefile.py::RemoteFileSource._move": Site(
-        1, GUARDED, _LISTING, "messagefoundry/transports/remotefile.py::_is_contained_name"
-    ),
-    "messagefoundry/transports/remotefile.py::RemoteFileSource._poll_once": Site(
+    "messagefoundry/transports/remotefile.py::RemoteFileSource._examine": Site(
         1,
         GUARDED,
         _LISTING,
         "messagefoundry/transports/remotefile.py::_is_contained_name",
         called=True,
+    ),
+    "messagefoundry/transports/remotefile.py::RemoteFileSource._file_key_forms": Site(
+        1, GUARDED, _LISTING, "messagefoundry/transports/remotefile.py::_is_contained_name"
+    ),
+    "messagefoundry/transports/remotefile.py::RemoteFileSource._move": Site(
+        1, GUARDED, _LISTING, "messagefoundry/transports/remotefile.py::_is_contained_name"
     ),
     "messagefoundry/transports/remotefile.py::_FtpClient._list": Site(
         1,
@@ -1286,7 +1295,7 @@ SCRIPT_SITES: dict[str, Site] = {
         7, OPERATOR, "Fixed names under the repo root, the helper source and the install directory."
     ),
     "scripts/service/install-service.ps1": Site(
-        44,
+        45,
         OPERATOR,
         "Fixed names, and a folder named from a fresh GUID under the Windows temp folder, under "
         "paths the operator passes or the script derives (repo root, install "
@@ -1294,7 +1303,8 @@ SCRIPT_SITES: dict[str, Site] = {
         "wheel's folder, "
         "the base interpreter's folder and the one above it, "
         "project root, data directory and the folder above it, ProgramData, NSSM directory, temp), "
-        "the data directory's own leaf name with -secrets after it, the leaf name of the engine wheel "
+        "the data directory's own leaf name with -secrets or -custody after it, the leaf name of "
+        "the engine wheel "
         "the operator passes, which must match messagefoundry-<version>-*.whl, plus registry keys "
         "named after the service's own images, and the fixed Parameters key under each key the "
         "registry lists below Services.",
@@ -1310,10 +1320,11 @@ SCRIPT_SITES: dict[str, Site] = {
         1, OPERATOR, "A fixed name under the install directory."
     ),
     "scripts/service/uninstall-service.ps1": Site(
-        7,
+        8,
         OPERATOR,
         "Fixed names, and a folder named from a fresh GUID, under the Windows temp folder or a "
-        "parent the tests pass, and registry keys named after the service's images.",
+        "parent the tests pass, registry keys named after the service's images, and the two "
+        "fixed custody file names under the custody directory the registration names.",
     ),
 }
 

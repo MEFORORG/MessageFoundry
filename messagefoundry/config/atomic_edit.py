@@ -15,10 +15,14 @@ On Windows those modes do not restrict the file, so the candidate is given a pro
 granting the editing account, and the live file's owner when that is another account, before its
 first byte is written. An own-account replaced file is then given the editing account's list
 alone; a foreign-owned one gets the list the next paragraph describes. ``_restrict_to_editor``
-says why that is one whole-list write and not ``store._secure_file``, which is only the fallback
-when the write fails. The caller's ``validate`` runs against that candidate. Only a candidate that
-validates replaces the live file, so a refused edit never touches the live file at all: its bytes
-and its permission bits stay exactly as they were, and there is no rollback write to get wrong.
+writes that one whole list. When that write fails, ``store._secure_file``, which writes the
+editing account's entry and the entries its docstring says it carries over, is the fallback for
+a file no other account owns. On Windows, a file another account owns takes its kept icacls
+rewrite instead, which removes inherited entries and keeps the explicit ones, the owner's entry
+among them where the candidate's write took. The caller's ``validate`` runs against that
+candidate. Only a candidate that validates replaces the live file, so a refused edit never
+touches the live file at all: its bytes and its permission bits stay exactly as they were, and
+there is no rollback write to get wrong.
 
 The replaced file keeps its OWNER (vault BACKLOG #5619). An edit restricts it to its owner, and an
 edit run as another account, such as root or an elevated administrator editing a file the service
@@ -43,7 +47,10 @@ elevated administrator of a file Administrators owns, makes the owner-only rewri
 the editing account, not SYSTEM, Administrators or another reader. That holds only when this
 process's account can be read from its token and the list can be written. When the token cannot be
 read, no list is written, the edit logs it, and the file keeps what its staging directory gave it.
-When only the write fails, the ``store._secure_file`` fallback can leave more entries than one.
+When only the write fails, ``store._secure_file`` runs; its docstring states what it leaves,
+including the entries it carries over and the cases where it runs the kept icacls rewrite, which
+keeps every explicit entry. Where it fails too, the file keeps the candidate's or staging
+directory's list, which can hold more entries.
 A config file that is itself a link is refused rather than replaced: the rename would put a detached
 regular file where the link was and leave its target unedited.
 
@@ -441,6 +448,13 @@ def replace_validated(
     # written never gets here.
     if sys.platform == "win32" and _restrict_to_editor(path, owner=live.windows_owner):
         return
+    if sys.platform == "win32" and live.windows_owner is not None:
+        # The bare store._secure_file writes a list granting the editing account alone, which would
+        # take the owning account's entry the candidate gave the file (vault BACKLOG #5619). The
+        # kept icacls rewrite removes inherited entries, such as the staging directory's, and keeps
+        # every explicit one, the owner's among them where the candidate's write took.
+        _secure_file(path, keep_explicit_entries=True)
+        return
     _secure_file(path)
 
 
@@ -627,11 +641,13 @@ def _restrict_to_editor(
     the write failed. Windows only. The candidate takes ``editor_writes`` (the module docstring says
     why).
 
-    The whole list in one write, never ``store._secure_file``'s ``icacls /inheritance:r``. The
-    private directory ``mkdtemp`` makes on Python 3.13+ grants SYSTEM, Administrators and OWNER
-    RIGHTS, and an own-account edit whose replaced file went through that icacls rewrite was
-    measured granting all four rather than its owner alone; that rewrite does not remove every
-    entry a file carries. :func:`replace_validated` calls this on the candidate before its first
+    The whole list in one write, never an ``icacls /inheritance:r`` rewrite. The private directory
+    ``mkdtemp`` makes on Python 3.13+ grants SYSTEM, Administrators and OWNER RIGHTS, and an
+    own-account edit whose replaced file went through that icacls rewrite, which
+    ``store._secure_file`` made until it too wrote one whole list (it still makes it on the
+    fallbacks its docstring names), was measured granting all four
+    rather than its owner alone; that rewrite does not remove an entry a file carries explicitly.
+    :func:`replace_validated` calls this on the candidate before its first
     byte, with the live file's owner when that is another account so it can still read the file
     once it is renamed into place, and again on an own-account replaced file."""
     from messagefoundry.store.store import _current_user_sid, _set_security_from_sddl
@@ -856,9 +872,10 @@ def _remove_private_dir(private: Path) -> None:
     shutil.rmtree(private, onexc=_report)
 
 
-def _secure_file(path: Path) -> None:
-    # Owner-only permissions (defence in depth). Reuse the store's primitive, imported here rather than
-    # at module top so the config layer does not pull the store package in at import time.
+def _secure_file(path: Path, *, keep_explicit_entries: bool = False) -> None:
+    # The store's primitive (defence in depth; its docstring says what each mode grants), imported
+    # here rather than at module top so the config layer does not pull the store package in at
+    # import time.
     from messagefoundry.store.store import _secure_file as _secure
 
-    _secure(path)
+    _secure(path, keep_explicit_entries=keep_explicit_entries)

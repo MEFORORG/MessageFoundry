@@ -94,10 +94,29 @@ function Get-DecisionIdDay([string]$Id) {
 }
 
 function Invoke-DecisionGh {
-    <# Runs gh, returning Code, Out and Err. Never throws: a missing gh is code 127. #>
+    <#
+      Runs gh, returning Code, Out and Err; a missing gh is code 127, and a gh failure is its own
+      code. A console whose UTF-8 switch fails with an IOException does not throw (BACKLOG #7555).
+      At least these still throw: a failure writing the --input file, any other console error, and
+      a gh that is found but cannot start.
+
+      GH_PROMPT_DISABLED and the console's UTF-8 output are both left set, deliberately, as before.
+      decision.ps1 and digest.ps1 set no UTF-8 output of their own and print records through this
+      switch, so restoring it would turn their non-ASCII output into the OEM code page. And
+      afk-kill.ps1 runs this body in a second runspace of the same process, so a restore of the
+      process-wide prompt variable there could unset it under a gh call running here.
+    #>
     param([string[]]$GhArgs, [string]$InputJson = '')
     $ErrorActionPreference = 'Continue'
     $tmp = $null
+    # PowerShell wraps a setter's exception (SetValueInvocationException), so the console-handle
+    # IOException is looked for along the inner chain. Local, because afk-kill.ps1 runs this
+    # function's body alone in another runspace.
+    $isConsoleIO = {
+        param([Exception]$Exception)
+        for ($e = $Exception; $null -ne $e; $e = $e.InnerException) { if ($e -is [System.IO.IOException]) { return $true } }
+        return $false
+    }
     try {
         if ($InputJson) {
             $tmp = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "mefor-decision-$PID-$([guid]::NewGuid().ToString('N')).json")
@@ -106,8 +125,21 @@ function Invoke-DecisionGh {
         }
         # A script must never wait on an auth prompt.
         $env:GH_PROMPT_DISABLED = '1'
-        # gh writes UTF-8; the console's code page would mangle a non-ASCII field.
-        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        # gh writes UTF-8; the console's code page would mangle a non-ASCII field. A host that
+        # refuses the setter with an IOException (lane-root.ps1 met one, BACKLOG #5486) still runs
+        # gh, and the refusal is reported unless the page was UTF-8 already.
+        $before = $null
+        try {
+            $before = [Console]::OutputEncoding
+            [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        } catch {
+            if (-not (& $isConsoleIO $_.Exception)) { throw }
+            if (-not $before -or $before.CodePage -ne 65001) {
+                $why = $_.Exception.Message
+                try { [Console]::Error.WriteLine("_decisionlog.ps1: WARNING -- gh's output could not be set to decode as UTF-8 ($why), so a non-ASCII field may come back mangled.") }
+                catch { if (-not (& $isConsoleIO $_.Exception)) { throw } }
+            }
+        }
         $all = & gh @GhArgs 2>&1
         $code = $LASTEXITCODE
         $out = @($all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n"
@@ -945,7 +977,11 @@ function Get-DecisionCostRung {
       numbers). RATE GOVERNS (korus roles/COMMON.md, The three usage states; the record is
       roles/retired/STEWARD.md 9.6a, owner-ratified 2026-08-14): with a burn rate, the rung is hit
       when the window is projected to run out within HoldMin minutes and before it resets, whatever
-      the level. Only with no rate is the level the backstop. A rate of zero or below counts as no
+      the level. Only with no rate, or a rate usage.ps1 refused on a fresh reading (rate_refused,
+      BACKLOG #5494), is the level the backstop. A refused rate still HITS when the fallback rate
+      usage.ps1 projects from, unguarded or guarded (rate_fallback), runs out within HoldMin and before
+      the reset, and short of a hit it answers UNKNOWN below the level, never OK. Both are stricter
+      than the pre-guard code where it had no rate or graded OK. A rate of zero or below counts as no
       rate, because usage inside one reset period does not fall, and such a rate must not lift
       the backstop. In the Steward's watch.py the rate helper likewise returns nothing unless the rate
       is positive. Its _burn projects again since the owner lifted its suppression on 2026-11-02, from
@@ -1038,6 +1074,26 @@ function Get-DecisionCostRung {
         }
         return (New-DecisionRung 'HIT' "weekly at least $floor%, a stale reading whose reset is still ahead, so that level stands; rung $($lv.HoldAt)% with no rate, from $($lv.Source)")
     }
+    # A FRESH READING WHOSE RATE usage.ps1 REFUSED IS UNKNOWN THERE, AND THE LEVEL STILL BACKS IT HERE
+    # (BACKLOG #5494). The refusal means the rows show a move nothing could measure, so it cannot clear;
+    # but at the rung it must still hit, as with no rate. usage.ps1 sets rate_refused on a fresh reading
+    # only, so this does not grade a stale number.
+    # With no reset, usage.ps1 keeps the fallback rate's run-out on such a window, whichever its kind, and
+    # the rung hits on it inside HoldMin, since a missing reset must not loosen the rung. On an unguarded
+    # fallback that is where the pre-guard rate hit; on a guarded one the pre-guard code had no rate, so
+    # the hit is stricter than before.
+    if ($weekState -eq 'UNKNOWN' -and $null -ne $pct -and (Get-DecisionJsonValue $week 'rate_refused')) {
+        $uRate = Get-DecisionJsonValue $week 'rate_pct_per_hr'
+        $uEmpty = Get-DecisionJsonValue $week 'minutes_to_empty'
+        $uKind = [string](Get-DecisionJsonValue $week 'rate_fallback')
+        if ($uKind -notin @('guarded', 'unguarded')) { $uKind = 'unguarded' }
+        if ($null -ne $uRate -and [double]$uRate -gt 0 -and $null -ne $uEmpty -and [double]$uEmpty -le $lv.HoldMin -and ($null -eq $toReset -or [double]$uEmpty -lt [double]$toReset)) {
+            return (New-DecisionRung 'HIT' "weekly at $pct%; rung $($lv.HoldMin) min to cutoff, from $($lv.Source). usage.ps1 refused the burn rate, but the history's $uKind rate projects a run-out in about $uEmpty min")
+        }
+        if ([double]$pct -ge $lv.HoldAt) {
+            return (New-DecisionRung 'HIT' "weekly at $pct%; rung $($lv.HoldAt)% with no rate, from $($lv.Source). usage.ps1 refused the burn rate, so the level is the backstop, and it is reached")
+        }
+    }
     if ($null -eq $week -or $null -eq $pct -or $weekState -notin @('OK', 'WARN', 'CRITICAL')) {
         $why = [string](Get-DecisionJsonValue $week 'reason')
         if (-not $why) { $why = [string](Get-DecisionJsonValue $j 'reason') }
@@ -1061,6 +1117,20 @@ function Get-DecisionCostRung {
         New-DecisionRung 'HIT' "$at. No burn rate, so the level is the backstop, and it is reached"
     } else {
         New-DecisionRung 'OK' "$at. No burn rate; below the level backstop"
+    }
+    # A RATE usage.ps1 REFUSED CAN HIT AND CANNOT CLEAR (BACKLOG #5494). Its window reads CRITICAL only on
+    # its fallback rate, unguarded or guarded, so a run-out inside HoldMin hits: where the pre-guard rate
+    # hit, on an unguarded fallback, and where the pre-guard code had no rate, on a guarded one, which is
+    # stricter than before. Short of that the level backs it as with no rate, and below the level the
+    # answer is UNKNOWN (REVIEW), never OK, where the pre-guard code could answer OK.
+    $refused = [string](Get-DecisionJsonValue $week 'rate_refused')
+    if ($refused -and $rung.State -ne 'HIT') {
+        if ($pct -ge $lv.HoldAt) {
+            $rung = New-DecisionRung 'HIT' "$at. usage.ps1 refused the burn rate, so the level is the backstop, and it is reached"
+        }
+        else {
+            return (New-DecisionRung 'UNKNOWN' "$($rung.Reason); but usage.ps1 refused the burn rate on this reading: $refused")
+        }
     }
     # A HIT stands whatever the overall state: halting on a reading that may be another root's
     # costs a deferral, while dropping it to UNKNOWN would let a session at the ceiling act.

@@ -465,6 +465,26 @@ async def test_the_413_closes_so_a_reused_connection_is_never_read_as_body(engin
     assert statuses == [413] and closed, raw
 
 
+@pytest.mark.parametrize(
+    ("framing", "status"),
+    [(b"Content-Length: 2000000\r\n", 413), (b"Transfer-Encoding: chunked\r\n", 411)],
+    ids=["declared-413", "chunked-411"],
+)
+async def test_an_http_2_request_line_cannot_turn_off_the_close(
+    engine: Engine, framing: bytes, status: int
+) -> None:
+    """llhttp accepts an ``HTTP/2.0`` request line on HTTP/1 framing and reports ``2.0``, so a
+    client writing it must not be treated as a real HTTP/2 stream and keep its connection."""
+    head = (
+        b"POST /health HTTP/2.0\r\nHost: localhost\r\nConnection: keep-alive\r\n"
+        b"Content-Type: application/json\r\n" + framing + b"\r\n"
+    )
+    async with _served(create_app(engine), http=floored_http_protocol_class()) as port:
+        statuses, raw, closed = await _split(port, head, _SMUGGLED)
+    assert statuses == [status] and closed, raw
+    assert b"connection: close" in raw.split(b"\r\n\r\n", 1)[0].lower(), raw
+
+
 async def test_the_api_frames_unambiguous_requests_exactly(engine: Engine) -> None:
     misses = []
     async with _served(create_app(engine), http=floored_http_protocol_class()) as port:
