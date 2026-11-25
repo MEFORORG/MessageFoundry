@@ -766,10 +766,9 @@ def test_flow_expires() -> None:
 
 
 def test_the_caches_own_ttl_and_clock_set_a_flows_deadline() -> None:
-    """BACKLOG #6902. RED when: ``start_flow`` stamps the deadline from a TTL and a clock of its
-    own, so a cache built with ``ttl_seconds`` or ``clock`` keeps flows for the module default on
-    ``time.monotonic`` instead. The clock here starts far from ``time.monotonic``, so a deadline
-    read on the wrong clock is unmistakable, and the TTL is far from the 300 s default."""
+    """BACKLOG #6902. RED when: the deadline comes from a TTL or a clock other than the cache's
+    own, such as ``start_flow``'s old defaults of 300 s on ``time.monotonic``. This clock starts far
+    from ``time.monotonic`` and the TTL is far from 300 s, so either mistake moves the deadline."""
     clock = [1e9]
     cache = oidc.FlowCache(ttl_seconds=7.0, clock=lambda: clock[0])
     flow_id, flow = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1")
@@ -799,6 +798,15 @@ def test_put_replaces_a_deadline_set_before_staging() -> None:
     assert staged.deadline == 60.0 and staged.started == 50.0
     clock[0] = 60.0
     assert cache.peek("flow-1") is None
+
+
+@pytest.mark.parametrize("ttl", [0.0, -5.0, float("nan"), float("inf"), float("-inf")])
+def test_a_flow_cache_refuses_a_ttl_that_is_not_finite_and_positive(ttl: float) -> None:
+    """BACKLOG #6902. The cache's TTL alone sets every deadline, so NaN or infinity would keep each
+    flow, holding its cap slot for good, and 0 or below would expire each flow as it is staged."""
+    oidc.FlowCache(ttl_seconds=0.001)  # the control: a small positive TTL is accepted
+    with pytest.raises(ValueError, match="finite and positive"):
+        oidc.FlowCache(ttl_seconds=ttl)
 
 
 def test_flow_cache_rejects_when_full_never_evicts() -> None:

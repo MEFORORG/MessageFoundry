@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import math
 import secrets
 import time
 import urllib.error
@@ -124,9 +125,8 @@ class PendingFlow:
     code_verifier: str
     return_to: str
     client_ip: str
-    #: Stamped by :meth:`FlowCache.put` as the cache's clock plus the cache's TTL, so the cache that
-    #: checks expiry is the only source of both (BACKLOG #6902): a value set before staging is
-    #: replaced. ``0.0`` on a flow never staged, which reads as already expired.
+    #: Stamped by :meth:`FlowCache.put`, which says how (BACKLOG #6902). ``0.0`` on a flow never
+    #: staged.
     deadline: float = 0.0
     #: The hash of the session the browser presented at the START leg, if any (ASVS 7.2.4). The
     #: callback cannot read it for itself: the session cookie is SameSite=Strict and the IdP's
@@ -188,6 +188,12 @@ class FlowCache:
         per_ip_cap: int = DEFAULT_PER_IP_CAP,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        # The TTL alone sets every deadline, so a bad one would never expire a flow (NaN, inf) or
+        # expire each one as it is staged (0 or below).
+        if not math.isfinite(ttl_seconds) or ttl_seconds <= 0:
+            raise ValueError(
+                f"FlowCache ttl_seconds must be finite and positive, got {ttl_seconds!r}"
+            )
         self._ttl = ttl_seconds
         self._global_cap = global_cap
         self._per_ip_cap = per_ip_cap
@@ -207,11 +213,12 @@ class FlowCache:
 
     def put(self, flow_id: str, flow: PendingFlow) -> PendingFlow:
         """Stage ``flow`` under ``sha256(flow_id)``, enforcing the global and per-IP caps, and return
-        the staged copy, stamped with the instant it was staged and the deadline this cache's TTL
-        sets from it.
+        the staged copy, stamped with the instant it was staged and a deadline of that instant
+        plus this cache's TTL. Both read this cache's clock, and any deadline ``flow`` carried is
+        replaced, so no caller can set one on another clock.
 
-        A cap of ``0`` or below refuses every flow, an empty cache included. That is deliberate: no
-        cap value switches the bound off."""
+        A cap of ``0`` or below refuses every flow, an empty cache included: ``0`` does not mean
+        unlimited."""
         now = self._clock()
         self._prune(now)
         if len(self._entries) >= self._global_cap:
@@ -291,8 +298,7 @@ def start_flow(
     """Mint a flow (state/nonce/PKCE), stage it, and return ``(flow_id, flow)``.
 
     ``flow_id`` goes in the browser cookie; ``flow`` carries the values the callback re-checks. Its
-    expiry is ``cache``'s TTL on ``cache``'s clock, stamped by :meth:`FlowCache.put`; nothing here
-    takes a TTL or a clock, so no caller can stage a deadline the cache then reads on another clock.
+    deadline is set by :meth:`FlowCache.put`.
     """
     flow_id = new_flow_id()
     verifier, _challenge = generate_pkce()
