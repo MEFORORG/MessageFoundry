@@ -491,11 +491,13 @@ than a path is not checked
   whoever is in the group, and one held in a directory that such an account owns or that a group or
   other may write without the sticky bit (vault BACKLOG #5636). Where it can read the host's
   mount table, as on Linux, its walk of the key file's path also refuses a path on at least an
-  NFS, CIFS or SMB, 9p, Ceph, AFS, Lustre or FUSE mount, where a server or a user-space program,
-  not the owner and mode bits, decides who reaches the file (vault BACKLOG #5657). It does not
-  judge any other type, any type where no mount table can be read, such as on macOS, a network
-  file system beneath an overlay mount, or the mount of a file in the secrets directory beyond the
-  directory's own path. It reads no access list itself, so it can pass a key that such a file
+  NFS, CIFS or SMB, 9p, FUSE or automount (`autofs`) mount, where something other than the owner
+  and mode bits decides who reaches the file (vault BACKLOG #5657). The secrets directory's own
+  check refuses such a mount on its path too, under either enforcement setting. The list of types
+  is open: it does not judge at least a type it does not name, any type where no mount table can
+  be read, such as on macOS, a network file system beneath an overlay mount, or the mount of a
+  file in the secrets directory beyond the directory's own path. Keep key files on a local file
+  system. It reads no access list itself, so it can pass a key that such a file
   system, or an access list such as an NFSv4 or macOS one, lets another account reach. Check
   those yourself. A directory a group or other account may write is accepted
   when it has the sticky bit, since that bit keeps them from deleting or renaming a file they do

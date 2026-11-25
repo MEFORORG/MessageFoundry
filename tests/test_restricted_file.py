@@ -1050,7 +1050,14 @@ def _typed_link_problem(path: str, mounts: list[tuple[str, str]]) -> str | None:
     )
 
 
-@pytest.mark.parametrize("fstype", ["nfs4", "nfs", "cifs", "smb3", "9p", "fuse.sshfs", "fuseblk"])
+@pytest.mark.parametrize(
+    "fstype",
+    [
+        *sorted(restricted_file._POSIX_DELEGATED_FILE_SYSTEMS),
+        "fuse.sshfs",
+        "fuseblk.ntfs-3g",
+    ],
+)
 def test_a_posix_key_on_a_delegated_file_system_is_refused(fstype: str) -> None:
     """Vault BACKLOG #5657 step 6 (f), #5636: the owner and mode bits of an NFS, CIFS, 9p or FUSE
     mount are not what decides who may reach the file, so a clean 0600 key under clean folders on
@@ -1069,6 +1076,15 @@ def test_a_posix_key_on_a_type_not_named_is_not_judged_by_its_type(fstype: str) 
     assert _typed_link_problem("/private/tmp/keys/k.key", mounts) is None
 
 
+def test_a_posix_mount_type_the_refusal_cannot_print_is_not_quoted() -> None:
+    """A FUSE subtype is chosen by whoever mounts it, so one with characters outside a type name's
+    is replaced in the refusal rather than copied into the start error and the log."""
+    mounts = [("/", "ext4"), ("/private/tmp", "fuse.\x1b[2Jodd")]
+    problem = _typed_link_problem("/private/tmp/keys/k.key", mounts)
+    assert problem is not None and "its path is on a network or FUSE mount" in problem
+    assert "\x1b" not in problem
+
+
 def test_a_posix_mount_table_that_could_not_be_read_judges_no_type() -> None:
     """With no mount table (``fstype_fn`` answers ``None``, as off Linux) nothing is refused for
     its type, and the walk is otherwise unchanged."""
@@ -1085,9 +1101,8 @@ def test_broad_access_problem_refuses_a_key_the_mount_table_puts_on_nfs(
     key = tmp_path / "k.key"
     key.write_bytes(b"synthetic")
     os.chmod(key, 0o600)
-    clean = restricted_file.broad_access_problem(key)
-    if clean is not None:
-        pytest.skip(f"this host's temporary folder is refused already: {clean}")
+    # The control: a CI runner's temporary folder is on a local file system.
+    assert restricted_file.broad_access_problem(key) is None
     monkeypatch.setattr(
         restricted_file,
         "read_mounts",

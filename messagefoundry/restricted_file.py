@@ -52,6 +52,7 @@ import functools
 import ipaddress
 import ntpath
 import os
+import re
 import stat
 import sys
 import time
@@ -1093,19 +1094,51 @@ def _posix_parent(path: Path) -> Path:
     return path / ".." if path.name in {"", ".."} else path.parent
 
 
-#: At least these Linux file system types, and every ``fuse.*`` subtype, leave who may read or
-#: replace a file to a server or a user-space program, so the owner and mode bits they report
-#: can look clean while another account can still reach the file (vault BACKLOG #5657 step 6 (f)).
-#: A type not named here is not judged by this rule.
+#: At least these Linux file system types, and every ``fuse.*`` and ``fuseblk.*`` subtype, leave who
+#: may read or replace a file to a server, another host, a user-space program or the mount's own
+#: options, so the owner and mode bits they report can look clean while another account can still
+#: reach the file (vault BACKLOG #5657 step 6 (f)). ``autofs`` is a mount trigger: what it mounts
+#: is often a network file system, and the mount table read before the walk shows only the
+#: trigger. A type not named here is not judged by this rule. Unlike the closed lists elsewhere in
+#: this module, this list is open, so a type it misses passes.
 _POSIX_DELEGATED_FILE_SYSTEMS = frozenset(
-    {"nfs", "nfs4", "cifs", "smb3", "smbfs", "9p", "fuse", "fuseblk", "ceph", "afs", "lustre"}
+    {
+        "nfs",
+        "nfs4",
+        "cifs",
+        "smb3",
+        "smbfs",
+        "9p",
+        "fuse",
+        "fuseblk",
+        "autofs",
+        "ceph",
+        "afs",
+        "coda",
+        "lustre",
+        "gpfs",
+        "beegfs",
+        "orangefs",
+        "pvfs2",
+        "glusterfs",
+        "ocfs2",
+        "gfs2",
+        "virtiofs",
+        "vboxsf",
+        "drvfs",
+        "fakeowner",
+    }
 )
+#: The characters a type name the refusal quotes may hold. A FUSE subtype is chosen by whoever
+#: mounts it, so any other name is not quoted.
+_PRINTABLE_FILE_SYSTEM_TYPE = re.compile(r"[A-Za-z0-9._+-]{1,64}")
 
 
 def _posix_delegated_file_system(fstype: str) -> bool:
     """Whether ``fstype``, as ``/proc/self/mountinfo`` names it, is a type in
-    :data:`_POSIX_DELEGATED_FILE_SYSTEMS` or a ``fuse.*`` subtype."""
-    return fstype in _POSIX_DELEGATED_FILE_SYSTEMS or fstype.startswith("fuse.")
+    :data:`_POSIX_DELEGATED_FILE_SYSTEMS`, or a subtype of one, such as ``fuse.sshfs`` or
+    ``fuseblk.ntfs-3g``."""
+    return fstype.split(".", 1)[0] in _POSIX_DELEGATED_FILE_SYSTEMS
 
 
 def _posix_link_problem(
@@ -1166,10 +1199,12 @@ def _posix_link_problem(
     for finding in verdict.findings:
         if finding.kind == DIRECTORY and not finding.insecure and finding.path in delegated:
             # Its path is the mount point; this text names none.
+            fstype = delegated[finding.path]
+            shown = fstype if _PRINTABLE_FILE_SYSTEM_TYPE.fullmatch(fstype) else "network or FUSE"
             return (
-                f"its path is on a {delegated[finding.path]} mount, where a server or a "
-                "user-space program, not the owner and mode bits this check reads, decides who may "
-                "read or replace it"
+                f"its path is on a {shown} mount, where something other than the owner and mode "
+                "bits this check reads decides who may read or replace it; keep it on a local "
+                "file system"
             )
         about_holder = finding.kind == DIRECTORY and above_a_link(finding.path)
         # A folder that could not be read, ``/`` included: the walk stopped there, so no link
