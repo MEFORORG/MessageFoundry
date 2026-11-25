@@ -27,6 +27,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from cryptography import x509
@@ -193,6 +194,9 @@ def _tls_endpoint(
         yield f"https://127.0.0.1:{port}/token", str(anchor), seen
     finally:
         thread.join(timeout=wait + 15)
+    # A server that failed or never finished is not a reading about the client's socket.
+    assert not thread.is_alive(), "the test server did not finish"
+    assert len(seen) == 1 and seen[0] in {"open", "closed", "sent more"}, seen
 
 
 def _exchange(url: str, opener: urllib.request.OpenerDirector) -> None:
@@ -206,6 +210,23 @@ def _exchange(url: str, opener: urllib.request.OpenerDirector) -> None:
         opener=opener,
         timeout=10.0,
     )
+
+
+class _KeepingOpener(urllib.request.OpenerDirector):
+    """Opens through ``inner`` and keeps every ``HTTPError`` it raises, as an edit that held the
+    error past ``exchange_code``'s arm would."""
+
+    def __init__(self, inner: urllib.request.OpenerDirector) -> None:
+        super().__init__()
+        self._inner = inner
+        self.kept: list[urllib.error.HTTPError] = []
+
+    def open(self, fullurl: Any, data: Any = None, timeout: Any = None) -> Any:
+        try:
+            return self._inner.open(fullurl, data, timeout)
+        except urllib.error.HTTPError as exc:
+            self.kept.append(exc)
+            raise
 
 
 @contextlib.contextmanager
@@ -237,6 +258,18 @@ def test_a_refused_token_exchange_closes_its_tls_socket_without_a_collection(
                 _exchange(url, opener)
         assert raised.value.status == status
         assert seen == ["closed"], "the client's TLS socket outlived exchange_code"
+
+
+def test_exchange_code_closes_the_reply_even_when_the_error_is_held(tmp_path: Path) -> None:
+    """RED when: ``exchange_code`` stops closing the refused reply itself. The opener keeps the
+    ``HTTPError``, so reference counting cannot close it; only the explicit close can."""
+    with _collector_off():
+        with _tls_endpoint(tmp_path, _REFUSED_400, wait=_CLOSE_WAIT_SECONDS) as (url, anchor, seen):
+            opener = _KeepingOpener(build_idp_opener(anchor, enforcing=False))
+            with pytest.raises(oidc.TokenRefusedError):
+                _exchange(url, opener)
+        assert len(opener.kept) == 1, "the opener must have held the error, or this proves nothing"
+        assert seen == ["closed"], "exchange_code left a held error reply's socket open"
 
 
 def test_the_instrument_reads_a_held_error_reply_as_open(tmp_path: Path) -> None:

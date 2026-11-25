@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
 import secrets
 import time
 import urllib.error
@@ -36,6 +37,8 @@ from messagefoundry.redaction import json_loads_or_refusal
 
 if TYPE_CHECKING:  # the annotation only; this module takes no module-scope transports import
     from messagefoundry.auth.oidc.client_auth import ClientAuthentication
+
+_log = logging.getLogger(__name__)
 
 _VERIFIER_BYTES = 48  # 64 base64url chars — within RFC 7636's 43..128
 _STATE_BYTES = 32
@@ -197,10 +200,16 @@ class FlowCache:
         # The TTL alone sets every deadline, so a bad one would never expire a flow or expire each
         # one as it is staged. It is read by the rule ``transports.base.float_setting`` holds, which
         # also keeps the value out of the message; imported lazily, as ``exchange_code`` imports
-        # transports, so this package takes no module-scope transports import.
-        from messagefoundry.transports.base import positive_seconds  # noqa: PLC0415
+        # transports, so this package takes no module-scope transports import. Text is refused
+        # first: that rule reads text because settings can arrive as text, and this cache's only
+        # caller passes a validated number.
+        from messagefoundry.transports.base import float_setting  # noqa: PLC0415
 
-        ttl = positive_seconds(ttl_seconds, knob="ttl_seconds", transport="FlowCache")
+        if isinstance(ttl_seconds, str):
+            raise ValueError(
+                "FlowCache ttl_seconds is a number of seconds, not text (value withheld)"
+            )
+        ttl = float_setting(ttl_seconds, knob="ttl_seconds", transport="FlowCache")
         if not _MIN_FLOW_TTL_SECONDS <= ttl <= _MAX_FLOW_TTL_SECONDS:
             raise ValueError(
                 f"FlowCache ttl_seconds must be between {_MIN_FLOW_TTL_SECONDS:g} and "
@@ -509,6 +518,8 @@ def exchange_code(
     # its status or, for a header block that did not parse, with none.
     status: int | None = None
     body = b""
+    # The refused reply, kept past its arm only so it can be closed outside it (BACKLOG #6903).
+    refused_reply: urllib.error.HTTPError | None = None
     try:
         with opener.open(req, timeout=timeout) as resp:  # noqa: S310 — see above
             # The production opener refuses a redirect, so anything that reaches here is a 2xx.
@@ -519,13 +530,10 @@ def exchange_code(
                 resp, limit=_MAX_TOKEN_RESPONSE_BYTES, connector="OIDC token endpoint"
             )
     except urllib.error.HTTPError as exc:
-        # Read the RFC 6749 error code only; never the body verbatim (may echo request params).
-        # HTTPError is an OSError, so this arm must stay above the transport arm.
-        # Close the unread reply, and its socket with it, here rather than when the last reference
-        # goes (BACKLOG #6903). CPython frees it at this arm's end today; the close keeps that true
-        # if a later edit holds the error past the arm.
-        exc.close()
+        # Read the HTTP status only; never the body (may echo request params), which is closed
+        # unread below. HTTPError is an OSError, so this arm must stay above the transport arm.
         status = exc.code
+        refused_reply = exc
         refusal = f"token endpoint returned HTTP {exc.code}"
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         unreachable = True
@@ -544,6 +552,20 @@ def exchange_code(
     except EgressReplyError:
         # The family, so a refusal added to bounded_read later still lands on FlowError.
         refusal = "token endpoint response could not be read"
+    if refused_reply is not None:
+        # Close the unread reply, and its socket with it, now rather than when the last reference
+        # goes (BACKLOG #6903). CPython frees it once this function lets go today; the close keeps
+        # that true if a later edit holds it longer. Outside the arm, so a close that fails carries
+        # no HTTPError on its `__context__`. A failure is logged by class alone, and the refusal
+        # below is raised either way.
+        try:
+            refused_reply.close()
+        except OSError as close_exc:
+            _log.debug(
+                "closing a refused token-endpoint reply failed: %s", type(close_exc).__name__
+            )
+        # The HTTPError's traceback holds this frame, so the local would keep the two in a cycle.
+        del refused_reply
     if refusal is not None:
         if unreachable:
             raise TokenEndpointUnreachableError(refusal)

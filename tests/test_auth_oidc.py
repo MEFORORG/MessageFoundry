@@ -826,6 +826,8 @@ _BAD_FLOW_TTLS: dict[str, object] = {
     "decimal-signalling-nan": Decimal("sNaN"),
     "decimal-that-rounds-to-zero": Decimal("1e-400"),
     "not-a-number": [300],
+    # The shared rule reads text, as a setting can arrive; this cache's caller passes a number.
+    "text": "300",
 }
 
 
@@ -851,6 +853,7 @@ def test_a_flow_cache_reads_a_ttl_inside_its_bounds_as_a_float(ttl: Any) -> None
     )
     staged = cache.put("flow-1", flow)
     assert staged.deadline == 1e9 + float(ttl) and staged.deadline > staged.started
+    assert type(cache._ttl) is float
 
 
 @pytest.mark.parametrize("ttl", [86_400.5 + 0.123456789, 0.987654321, 1e300])
