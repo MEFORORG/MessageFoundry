@@ -45,6 +45,7 @@ import time
 import httpx
 
 from messagefoundry.api import create_app
+from messagefoundry.api.message_scope import SCOPED_READER_REFUSALS
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import (
@@ -260,7 +261,19 @@ _CHECK_ROUTES = {
         "a gate-only answer about the caller's own permission, naming no channel",
     )
     for permission in Permission
+    if permission not in SCOPED_READER_REFUSALS
 }
+# The check routes whose permission's real routes refuse a channel-scoped holder refuse it too
+# (BACKLOG #4346), so they carry a per-channel rule.
+_CHECK_ROUTES.update(
+    {
+        f"GET /auth/check/{permission.value}": (
+            SCOPED,
+            "#4346: refuses a channel-scoped holder, as its permission's routes do",
+        )
+        for permission in SCOPED_READER_REFUSALS
+    }
+)
 assert not _CHECK_ROUTES.keys() & ROUTES.keys()
 ROUTES.update(_CHECK_ROUTES)
 
@@ -346,7 +359,9 @@ _QUIET_HERE = {
 
 #: Scoped GETs that refuse a channel-scoped caller rather than narrow its answer (BACKLOG #4346).
 #: The probe expects 403 from the scoped caller there and 200 from the all-channels control.
-_REFUSES_A_SCOPED_CALLER = {"/audit", "/audit/export", "/logs/tail"}
+_REFUSES_A_SCOPED_CALLER = {"/audit", "/audit/export", "/logs/tail"} | {
+    f"/auth/check/{permission.value}" for permission in SCOPED_READER_REFUSALS
+}
 
 #: What the scoped caller may legitimately see, and what it must never see. ``OB_X`` is the shared
 #: outbound both inbounds deliver to: docs/SECURITY.md says a scoped caller sees no shared outbound

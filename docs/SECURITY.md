@@ -1697,12 +1697,14 @@ tuple: they act only on the caller's own account.
 
 One `GET /auth/check/<permission>` per permission, registered in a loop over `Permission`, each
 gated `require(<that permission>)` (ADR 0215 section 2). Each answers 200 once the ladder admits
-the caller and reads nothing else, except where its permission's routes refuse a channel-scoped
-holder. `/auth/check/audit:read`, `/auth/check/audit:export` and `/auth/check/logs:view` refuse
-such a caller 403 as `GET /audit`, `GET /audit/export` and `GET /logs/tail` do, with the same
-`auth.channel_denied` row, before the check route's own grant row (`SCOPED_READER_REFUSALS` in
-`messagefoundry/api/message_scope.py`, BACKLOG #4346). The gate's own grant row, where the gate
-writes one, is written before the refusal, as on the real route. They are built for the web console's later ADR 0215 slices to
+the caller and reads nothing else, except these three. `/auth/check/audit:read`,
+`/auth/check/audit:export` and `/auth/check/logs:view` refuse a channel-scoped caller 403, as
+`GET /audit`, `GET /audit/export` and `GET /logs/tail` refuse every such caller, and write the
+rows those routes write for it: the gate's grant row where the gate writes one, then the same
+`auth.channel_denied` row (`SCOPED_READER_REFUSALS` in `messagefoundry/api/message_scope.py`,
+BACKLOG #4346). They match those routes on channel scope only: `/auth/check/logs:view` does not
+run the PHI-read gate `GET /logs/tail` runs. A check route whose permission's routes refuse a
+scoped caller only for some names, or for other reasons, still answers it 200. They are built for the web console's later ADR 0215 slices to
 sub-request before a page that shows no engine data of its own renders; no console page calls one
 yet. A caller learns nothing it cannot read from its own `GET /auth/me`. Each writes an
 `auth.permission_granted` row naming its permission wherever a grant of that permission is
@@ -2450,8 +2452,8 @@ the same permission set on the same method reds CI until it is listed here.
 > GET /events, GET /graph/edges, GET /alerts/active and GET /metrics as narrowed reads, and
 > GET /stats and GET /metrics/history as global ones, against a scoped caller with an
 > all-channels caller as the control. It does not measure at least the `/ws/stats` fields, the
-> per-name 403s, outbound names in GET /alerts/active, the control half of the GET /connections
-> shared-outbound suppression, or the GET /metrics latency-series drop. On the prose side it checks, among other things, that each of those route tokens appears
+> per-name 403s, an outbound the scope lists in GET /alerts/active, the control half of the
+> GET /connections shared-outbound suppression, or the GET /metrics latency-series drop. On the prose side it checks, among other things, that each of those route tokens appears
 > somewhere in this DLQ-SCOPE blockquote; it does not check which paragraph holds a token or which
 > side of the rule it is on. It does not check the refusal sentence.
 

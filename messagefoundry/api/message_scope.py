@@ -71,10 +71,12 @@ DeniedOperation = Literal[
 ]
 _DENIED_OPERATIONS: Final[frozenset[str]] = frozenset(get_args(DeniedOperation))
 
-#: The permissions whose routes refuse a channel-scoped holder outright, because what they read is
-#: not attributable to one channel, so there is nothing to narrow it by (BACKLOG #4346). Each maps
-#: to the operation its refusal row names and the refusal's 403 detail. The real routes and the
-#: gate-only ``GET /auth/check/<permission>`` routes both read this map, so the two answer alike.
+#: Permissions whose routes refuse every channel-scoped holder, whatever it asks for, because what
+#: they read is not attributable to one channel, so there is nothing to narrow it by (BACKLOG
+#: #4346). A permission whose routes refuse a scoped holder only for some names is not here.
+#: Each maps to the operation its refusal row names and the refusal's 403 detail. The real routes
+#: and the gate-only ``GET /auth/check/<permission>`` routes both read this map, so the two answer
+#: alike on channel scope.
 SCOPED_READER_REFUSALS: Final[Mapping[Permission, tuple[DeniedOperation, str]]] = MappingProxyType(
     {
         Permission.AUDIT_READ: (
@@ -101,9 +103,11 @@ async def refuse_a_channel_scoped_reader(
     all-channels caller. ``client`` is ``None`` from the console seam, which has no request in
     hand. Takes the store rather than the engine because the audit routes hold only the auth
     service's."""
+    # Looked up first, so a permission missing from the map fails for every caller, not only
+    # for a scoped one after the all-channels callers have passed.
+    operation, detail = SCOPED_READER_REFUSALS[permission]
     if identity.allowed_channels is None:
         return
-    operation, detail = SCOPED_READER_REFUSALS[permission]
     await record_channel_denied(store, identity, None, client, operation=operation)
     raise HTTPException(403, detail)
 
@@ -140,9 +144,10 @@ async def record_channel_denied(
     """Audit a per-channel RBAC denial (mirrors auth.permission_denied).
 
     ``client`` (ADR 0150) is the caller's address — a denial is exactly the record an investigator
-    wants a host for. It is OPTIONAL because :func:`audit_channel_denied` is handed to the console seam as a bare
-    callback (``audit_channel_denied=``). The console's callers pass the browser's address; a caller
-    that passes none leaves it NULL rather than inheriting some other caller's address.
+    wants a host for. It is OPTIONAL because :func:`audit_channel_denied` is handed to the console
+    seam as a bare callback (``audit_channel_denied=``). The console's callers pass the browser's
+    address; a caller that passes none leaves it NULL rather than inheriting some other caller's
+    address.
 
     A ``channel`` that fails the connection-name rule is recorded as no channel (BACKLOG #3031).
     Some callers pass a caller-chosen name, and at least the core handlers the console seam calls

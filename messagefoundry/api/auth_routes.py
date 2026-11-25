@@ -858,15 +858,17 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     def _add_permission_check(permission: Permission) -> None:
         async def auth_check_permission(
             request: Request,
-            service: AuthService = Depends(_service),
             identity: Identity = Depends(require(permission)),
         ) -> SimpleMessage:
-            # A permission whose routes refuse a channel-scoped holder is refused here too, with
-            # the same row and before the check's own grant row, so this route does not admit a
-            # caller those routes refuse (BACKLOG #4346).
-            if permission in SCOPED_READER_REFUSALS:
+            # A permission whose routes refuse every channel-scoped holder is refused here too,
+            # with the same auth.channel_denied row, so on channel scope this route does not admit
+            # a caller those routes refuse (BACKLOG #4346). The other gates those routes add, such
+            # as require_phi_read's on GET /logs/tail, are not run here. With no auth service
+            # attached the caller is the open-mode identity, which no scope narrows.
+            auth = get_auth(request)
+            if permission in SCOPED_READER_REFUSALS and auth is not None:
                 await refuse_a_channel_scoped_reader(
-                    service.store, identity, permission, client_ip(request)
+                    auth.store, identity, permission, client_ip(request)
                 )
             await record_check_grant(request, identity, permission)
             return SimpleMessage(detail="authorized")
@@ -2410,18 +2412,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
     # --- audit ---------------------------------------------------------------
 
-    async def _refuse_a_channel_scoped_reader(
-        service: AuthService, identity: Identity, permission: Permission, client: str | None
-    ) -> None:
-        """Refuse a channel-scoped caller the audit trail, with an ``auth.channel_denied`` row
-        naming the operation (BACKLOG #4346, the route build of #1152). The owner's answer of
-        2026-10-26 was to narrow or refuse such a caller; an Auditor who needs the whole trail is
-        given the all-channels grant. ``GET /audit``, ``GET /audit/export`` and their ``/ui`` twins
-        call this before they read a row. ``client`` is ``None`` from the console seam, which has
-        no request in hand. :func:`refuse_a_channel_scoped_reader` writes the row through
-        :func:`record_channel_denied`, as ``audit_channel_denied`` does."""
-        await refuse_a_channel_scoped_reader(service.store, identity, permission, client)
-
     async def _read_audit(
         service: AuthService,
         identity: Identity,
@@ -2510,7 +2500,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         """Plain-default core shared by the HTTP route below and the webconsole seam wrapper.
 
         A channel-scoped caller is refused before any read (BACKLOG #4346):
-        :func:`_refuse_a_channel_scoped_reader`. ``client`` is the address for that refusal's row.
+        :func:`refuse_a_channel_scoped_reader`. ``client`` is the address for that refusal's row.
 
         The total is counted under the same exclusion as the page, so a reader without
         users:manage is told how many rows IT can page through, never how many the trail holds
@@ -2520,7 +2510,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         page would repeat the last row of the one before it. The pin is a timestamp and never a
         row id: :mod:`messagefoundry.api.paging` says why an id would leak the lock rows."""
 
-        await _refuse_a_channel_scoped_reader(service, identity, Permission.AUDIT_READ, client)
+        await refuse_a_channel_scoped_reader(service.store, identity, Permission.AUDIT_READ, client)
 
         def bound(pin: float | None) -> float | None:
             # The pin is one more ``until``, so the tighter of the two applies.
@@ -2669,8 +2659,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise TypeError("export_audit needs the caller's session token")
         # BACKLOG #4346: a channel-scoped caller is refused before the first page and before the
         # audit.export row, so a refusal records no export.
-        await _refuse_a_channel_scoped_reader(
-            service, identity, Permission.AUDIT_EXPORT, client_ip(request)
+        await refuse_a_channel_scoped_reader(
+            service.store, identity, Permission.AUDIT_EXPORT, client_ip(request)
         )
         page_size = min(limit, _AUDIT_EXPORT_PAGE)
 

@@ -33,6 +33,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import auth_routes, create_app
+from messagefoundry.api.message_scope import SCOPED_READER_REFUSALS
 from messagefoundry.api.metrics import (
     DEFAULT_LATENCY_BUCKETS,
     _render_snapshot,
@@ -239,8 +240,21 @@ _REFUSING_CHECKS = [
 ]
 
 
+def test_refusing_checks_cover_the_refusal_map() -> None:
+    """The list the probe below walks is the map the routes read, so a permission added to
+    ``SCOPED_READER_REFUSALS`` without a probe here reds this test."""
+    assert {check for check, _real, _op in _REFUSING_CHECKS} == {
+        f"/auth/check/{p.value}" for p in SCOPED_READER_REFUSALS
+    }
+    assert {op for _c, _r, op in _REFUSING_CHECKS} == {
+        op for op, _detail in SCOPED_READER_REFUSALS.values()
+    }
+
+
 async def _rows(eng: Engine, actor: str) -> list[dict[str, Any]]:
-    return [dict(r) for r in await eng.store.list_audit(limit=1000, actor=actor)]
+    """The actor's rows, oldest first, so a comparison sees their order."""
+    rows = [dict(r) for r in await eng.store.list_audit(limit=1000, actor=actor)]
+    return sorted(rows, key=lambda r: r["id"])
 
 
 def _added(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -248,8 +262,16 @@ def _added(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> list[di
     return [r for r in after if r["id"] not in seen]
 
 
-def _actions(rows: list[dict[str, Any]]) -> list[str]:
-    return sorted(r["action"] for r in rows)
+def _shape(rows: list[dict[str, Any]]) -> list[tuple[str, Any]]:
+    """Each row's action and detail in write order, with the path a grant row records left out,
+    since the check route and the real route have different paths."""
+    out: list[tuple[str, Any]] = []
+    for r in rows:
+        detail = json.loads(r["detail"]) if r["detail"] else None
+        if isinstance(detail, dict):
+            detail = {k: v for k, v in detail.items() if k != "path"}
+        out.append((r["action"], detail))
+    return out
 
 
 def _log_dir(tmp_path: Path) -> Path:
@@ -268,9 +290,9 @@ async def test_check_route_answers_a_scoped_holder_as_its_real_route_does(
     operation: str,
 ) -> None:
     """``GET /auth/check/<permission>`` stands in for a page its permission's routes serve (ADR
-    0215 section 2). Where those routes refuse a channel-scoped holder, the check route refuses
-    that holder too, and writes the rows the real route writes for the refusal: no grant row of
-    its own (``record_check_grant``), and one ``auth.channel_denied`` row naming the operation."""
+    0215 section 2). Where those routes refuse every channel-scoped holder, the check route refuses
+    that holder too, and writes the rows the real route writes for the refusal, in the same order.
+    Each refusal row names no channel and names the operation (vault BACKLOG #3748 item 7)."""
     _service, c = await _setup(engine, _log_dir(tmp_path))
     async with c:
         s = await _login(c, "scoped")
@@ -285,28 +307,20 @@ async def test_check_route_answers_a_scoped_holder_as_its_real_route_does(
         r2 = await _rows(engine, "scoped")
     assert real_r.status_code == 403, real_r.text
     assert check_r.status_code == 403, check_r.text
-    # The check route writes the same rows as the real route it stands in for.
-    assert _actions(_added(r1, r2)) == _actions(_added(r0, r1))
-    denied = [r for r in _added(r1, r2) if r["action"] == "auth.channel_denied"]
-    assert [json.loads(r["detail"]) for r in denied] == [{"channel": None, "operation": operation}]
+    assert check_r.json() == real_r.json()
+    assert _shape(_added(r1, r2)) == _shape(_added(r0, r1))
+    for rows in (_added(r0, r1), _added(r1, r2)):
+        denied = [r for r in rows if r["action"] == "auth.channel_denied"]
+        assert [json.loads(r["detail"]) for r in denied] == [
+            {"channel": None, "operation": operation}
+        ]
 
 
-@pytest.mark.parametrize(("check", "real", "operation"), _REFUSING_CHECKS)
-async def test_a_scoped_reader_refusal_row_names_its_operation(
-    engine: Engine,  # noqa: F811
-    tmp_path: Path,
-    check: str,
-    real: str,
-    operation: str,
-) -> None:
-    """A refusal row that names no channel names the operation it refused (vault BACKLOG #3748
-    item 7)."""
-    del check
-    _service, c = await _setup(engine, _log_dir(tmp_path))
-    async with c:
-        s = await _login(c, "scoped")
-        r0 = await _rows(engine, "scoped")
-        assert (await c.get(real, headers=s)).status_code == 403
-        r1 = await _rows(engine, "scoped")
-    denied = [r for r in _added(r0, r1) if r["action"] == "auth.channel_denied"]
-    assert [json.loads(r["detail"]) for r in denied] == [{"channel": None, "operation": operation}]
+async def test_check_routes_answer_in_open_mode(engine: Engine) -> None:  # noqa: F811
+    """With no auth service attached the check routes admit the open-mode caller, as before the
+    scope refusal was added: the refusal reads the auth service only where one is attached."""
+    app = create_app(engine, allow_no_auth=True)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        for path in ("/auth/check/monitoring:read", "/auth/check/logs:view"):
+            r = await c.get(path)
+            assert r.status_code == 200, (path, r.text)

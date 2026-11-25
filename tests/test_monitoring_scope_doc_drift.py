@@ -149,11 +149,6 @@ async def _service(engine: Engine) -> AuthService:
     return service
 
 
-def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
-    return httpx.AsyncClient(transport=transport, base_url="http://t")
-
-
 async def _operator(service: AuthService, username: str) -> str:
     user_id = await create_local_user_chosen(
         service,
