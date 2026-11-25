@@ -2812,6 +2812,50 @@ def _in_directory_sign_in_queue[**P](
     return queued
 
 
+#: How many times a directory sign-in tries its compare-and-set scope write before it fails
+#: (BACKLOG #6887). A miss on a row still there means another writer committed in between; what
+#: counts as a change differs per backend, and ``AuthStore.set_ad_channel_scope_if_unchanged``
+#: states it. A bound this small is reached only by a row other writers keep moving.
+_AD_SCOPE_WRITE_ATTEMPTS: Final = 3
+
+#: The closed-set reason a directory sign-in is refused with when its scope write's compare-and-set
+#: missed on every one of :data:`_AD_SCOPE_WRITE_ATTEMPTS` attempts (BACKLOG #6887). Contention
+#: says nothing about the account, so it is answered as a temporary failure, like
+#: :data:`SESSION_MINT_CONTENDED`.
+SCOPE_SYNC_CONTENDED = "scope_sync_contended"
+
+
+class _AdChannelScopeNotWritten(Exception):
+    """A directory sign-in's scope write was not made, so the sign-in is refused (BACKLOG #6887).
+
+    Raised by :meth:`AuthService._sync_ad_channel_scope` with nothing written, and caught at its
+    one call site in :meth:`AuthService._complete_ad_login`, which audits and answers it as the
+    pre-mint refusals there are answered, so no session is minted. ``reason`` is the closed-set
+    slug the refusal row carries. The message is that slug, which is PHI-free."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class _AdChannelScopeContended(_AdChannelScopeNotWritten):
+    """The scope write met a concurrent writer on every attempt: :data:`SCOPE_SYNC_CONTENDED`.
+    Not a refusal of the account, so the caller answers it as a temporary failure."""
+
+    def __init__(self, attempts: int) -> None:
+        super().__init__(SCOPE_SYNC_CONTENDED)
+        self.attempts = attempts
+
+
+class _AdChannelScopeRefused(_AdChannelScopeNotWritten):
+    """The scope write missed, and the row read again refuses the sign-in. ``reason`` names the
+    row as the caller's pre-mint read would: :data:`ACCOUNT_DELETED` for a row gone (BACKLOG
+    #5624), :data:`ACCOUNT_REFUSED` for one failing its seal, or the reason
+    :func:`_directory_login_refusal` gives for the sign-in's leg (disabled, locked or, off the
+    federated leg, ``FEDERATED_SIGN_IN_REQUIRED``), as the role write's re-read judges it. The role
+    write names a gone row :data:`ACCOUNT_REFUSED`; this one does not."""
+
+
 @dataclass(frozen=True)
 class _Reproof:
     """The outcome of one post-session credential re-proof, checked under the login leg's lockout.
@@ -8946,7 +8990,29 @@ class AuthService:
             raise held
         ad_roles = _roles_from_ids(role_ids)
         ad_custom_permissions = await self._custom_permissions_for_ids(role_ids)
-        user = await self._sync_ad_channel_scope(user, ad_roles, principal.groups, client=client)
+        try:
+            user = await self._sync_ad_channel_scope(
+                user, ad_roles, principal.groups, client=client, federated=federated
+            )
+        except _AdChannelScopeNotWritten as unwritten:
+            # BACKLOG #6887: the scope write was not made, so no session is minted. Answered as the
+            # refusals below are: a row gone on the federated leg as there, contention as the
+            # session insert's, and everything else through the directory row refusal.
+            contended = isinstance(unwritten, _AdChannelScopeContended)
+            if federated and (contended or unwritten.reason == ACCOUNT_DELETED):
+                await self._directory_reject_audit(
+                    principal.username, "oidc", unwritten.reason, client=client, extra=outcome_extra
+                )
+                scope_refused = LoginOutcome(
+                    ok=False, error="federated sign-in failed", reason=unwritten.reason
+                )
+            else:
+                scope_refused = await self._refuse_directory_row(
+                    principal.username, unwritten.reason, client=client, extra=outcome_extra
+                )
+            if contended:
+                scope_refused = replace(scope_refused, error=_SIGN_IN_UNAVAILABLE)
+            return replace(scope_refused, roles_gained=roles_gained)
         identity = Identity.build(
             user_id=user.id,
             username=user.username,
@@ -9206,9 +9272,13 @@ class AuthService:
         groups: Iterable[str],
         *,
         client: str | None = None,
+        federated: bool = False,
     ) -> VerifiedUser:
         """Persist a user's AD-group-derived per-channel scope (C3) so it's durable for later
         requests (mirrors role sync). Returns the (possibly refreshed) user record.
+
+        ``federated`` is the sign-in's leg, passed to the eligibility check on a re-read as the
+        role write passes it. Its default is the Kerberos shape, for direct test callers.
 
         **The rule is** :func:`~messagefoundry.auth.channel_scope.decide_ad_channel_scope` **and is
         stated there once**; this method applies what it decides. The directory reconciler plans its
@@ -9218,42 +9288,126 @@ class AuthService:
 
         History worth keeping: before BACKLOG #1927 this path returned early for every no-match
         login, so a user removed from their last scope-mapped group kept the directory's channels
-        for as long as the account existed."""
+        for as long as the account existed.
+
+        **BOTH WRITES ARE COMPARE-AND-SETS ON WHAT THE DECISION READ**: the withdrawal on the scope,
+        the grant on the scope and its source. How far the compare holds against another process
+        differs per backend, and ``AuthStore.set_ad_channel_scope_if_unchanged`` states it; on a
+        keyless SQLite store it does not. ``user`` was read several awaits earlier, and the
+        per-process sign-in queue orders neither a sign-in on another engine shard nor an
+        administrator's write. Before BACKLOG #6887 the grant was written unconditionally, so a
+        sign-in that read the scope before a concurrent one replaced it judged ``changes`` against
+        the replaced value: it revoked the other sign-in's brand-new session and audited the resync
+        a second time. On a miss, of the grant or of the withdrawal, the scope is NOT taken from
+        the row the other writer left, since that writer may have read older group memberships: a
+        sign-in whose groups map to no channel would otherwise mint on another writer's grant.
+        Nothing tells which read is newer, though: when this sign-in's groups are the older ones,
+        its write replaces the newer scope and revokes, as the role write's compare cannot tell
+        either. The row is read again and decided again from this sign-in's own groups, at most
+        :data:`_AD_SCOPE_WRITE_ATTEMPTS` times, and past that the sign-in fails
+        (:class:`_AdChannelScopeContended`). A re-read that finds this sign-in's target already
+        written revokes, as the role write does on finding its roles already written, and writes
+        no row. A re-read that finds the row gone, failing its seal, or ineligible to sign in
+        (disabled, locked or, off the federated leg, bound) fails the sign-in too, with nothing
+        written (:class:`_AdChannelScopeRefused`); the reasons are the role write's except that a
+        gone row is ``account_deleted``, as the caller's pre-mint read names it. Both are raised,
+        and the caller audits and answers them as refusals.
+
+        **WHAT THE COMPARE-AND-SET DOES NOT CLOSE.** A concurrent sign-in's new session can still
+        be ended, at least three ways. The revoke after a write is a separate transaction, so a
+        sign-in that misses, reads the new scope and mints in the gap between this write and this
+        revoke loses that session to the revoke. A sign-in that finds its target already written
+        revokes deliberately, as above, and so ends a session the other writer minted. And the
+        role write earlier in the same sign-in does the same when it finds its target roles already
+        written (``_SignInRoleSync``). Where the compare holds against another process (not on a
+        keyless SQLite store), what it does stop is a second write and a second
+        ``auth.ad_scope_resynced`` row for a scope already stored."""
         administrator = Role.ADMINISTRATOR in roles
-        decision = channel_scope.decide_ad_channel_scope(
-            channel_scope.ScopeInput(
-                stored_scope=user.channel_scope,
-                stored_source=user.channel_scope_source,
-                # An administrator's groups are not read: the decision ignores them.
-                mapped=frozenset() if administrator else await self._ad_channels_for_groups(groups),
-                administrator=administrator,
+        # An administrator's groups are not read: the decision ignores them. Read once: a retry
+        # re-reads the ROW, never the groups, so every attempt decides from this sign-in's answer.
+        mapped = frozenset() if administrator else await self._ad_channels_for_groups(groups)
+
+        def decide(stored: VerifiedUser) -> channel_scope.ScopeDecision:
+            return channel_scope.decide_ad_channel_scope(
+                channel_scope.ScopeInput(
+                    stored_scope=stored.channel_scope,
+                    stored_source=stored.channel_scope_source,
+                    mapped=mapped,
+                    administrator=administrator,
+                )
             )
-        )
+
+        decision = decide(user)
         if not decision.write:
             return user
-        if decision.scope_json is None:
-            if user.channel_scope is None:
-                # The decision never withdraws a NULL scope, which already denies. This narrows
-                # the type for the compare-and-set below, which needs a stored value to compare.
+        # Whether the scope this sign-in FIRST read differs from its target. It is the revoke
+        # trigger when another writer is found to have written that target already, as the role
+        # write's ``previous`` is the set it first read, so a failed revoke by that writer cannot
+        # leave stale-scope sessions live.
+        first_changes = decision.changes
+        # ``mapped`` is the same on every pass, so every pass decides the same kind of write: a
+        # withdrawal when it is empty, a grant otherwise.
+        attempt = 1
+        while True:
+            if decision.scope_json is None:
+                if user.channel_scope is None:
+                    # The decision never withdraws a NULL scope, which already denies. This narrows
+                    # the type for the compare-and-set below, which needs a stored value to compare.
+                    return user
+                written = await self._store.withdraw_ad_channel_scope(user.id, user.channel_scope)
+            else:
+                written = await self._store.set_ad_channel_scope_if_unchanged(
+                    user.id,
+                    decision.scope_json,
+                    expected_scope=user.channel_scope,
+                    expected_source=user.channel_scope_source,
+                )
+            if written:
+                break
+            # Settled, as the role write's re-read is: a single read can report a row a concurrent
+            # write is moving as refused, and that must not end the loop with nothing written.
+            settled = await self._lookup_user_settled(user.id)
+            fresh = settled.user
+            if fresh is None:
+                # Refused here, not returned: the caller's own re-read before the mint can find the
+                # row readable again, and would then mint on a scope this sign-in neither wrote nor
+                # checked. Nothing was written. The role write names a gone row ACCOUNT_REFUSED;
+                # this names it ACCOUNT_DELETED, as the caller's pre-mint read does (BACKLOG
+                # #5624), and keeps ACCOUNT_REFUSED for a row failing its seal.
+                reason = ACCOUNT_REFUSED if settled.held else ACCOUNT_DELETED
+                _log.error(
+                    "auth: the record of %s is gone or fails its seal, read after the sign-in's "
+                    "scope write found it moved; nothing was written and the sign-in is refused",
+                    scrub_log_argument(user.username),
+                )
+                raise _AdChannelScopeRefused(reason)
+            # The re-read decides eligibility too, as the role write's does, with the same
+            # ``federated``: the account may have been disabled, locked or bound since the read the
+            # sign-in's own gate ran on. Unlogged, as the role write's is; the caller audits it.
+            ineligible = _directory_login_refusal(fresh, time.time(), federated=federated)
+            if ineligible is not None:
+                raise _AdChannelScopeRefused(ineligible)
+            user = fresh
+            decision = decide(user)
+            if not decision.write:
+                # Kept: either this sign-in's target, already written by another writer, or (for a
+                # withdrawal) a scope an administrator set, which a withdrawal never overrides.
+                # Judged before the bound, so a last miss onto either is not contention. At the
+                # target, revoke as the role write does when it finds its roles already written.
+                if first_changes and user.channel_scope_source != SCOPE_SOURCE_MANUAL:
+                    await self._revoke_after_commit(
+                        user.id, change="ad_scope_resynced", actor=user.username, client=client
+                    )
                 return user
-            # Compare-and-set against the value read: an administrator or a concurrent login may
-            # have written the scope since ``user`` was read.
-            if not await self._store.withdraw_ad_channel_scope(user.id, user.channel_scope):
-                return await self._load_user(user.id) or user
-            await self._revoke_after_commit(
-                user.id, change="ad_scope_resynced", actor=user.username, client=client
-            )
-            # ``withdrawn`` keeps the removed grant, which the row itself no longer holds.
-            await self._audit(
-                AD_SCOPE_RESYNCED_ACTION,
-                actor=user.username,
-                detail=_json({"channels": None, "withdrawn": user.channel_scope}),
-                client=client,
-            )
-            return await self._load_user(user.id) or user
-        await self._store.set_user_channel_scope(
-            user.id, decision.scope_json, source=SCOPE_SOURCE_AD
-        )
+            if attempt >= _AD_SCOPE_WRITE_ATTEMPTS:
+                _log.warning(
+                    "auth: the directory scope write for account id %r met a concurrent writer on "
+                    "each of %d attempts; the sign-in fails",
+                    user.id,
+                    attempt,
+                )
+                raise _AdChannelScopeContended(attempt)
+            attempt += 1
         # Drop stale-scope tokens; the new one is issued after. Skipped when only the provenance
         # moved -- the directory taking over an identical manual scope changes no decision, so
         # there is nothing stale to drop -- but that write is still audited below.
@@ -9261,14 +9415,23 @@ class AuthService:
             await self._revoke_after_commit(
                 user.id, change="ad_scope_resynced", actor=user.username, client=client
             )
-        await self._audit(
-            AD_SCOPE_RESYNCED_ACTION,
-            actor=user.username,
-            detail=_json(
-                {"channels": ALL_CHANNELS if decision.wildcard else list(decision.channels)}
-            ),
-            client=client,
-        )
+        if decision.scope_json is None:
+            # ``withdrawn`` keeps the removed grant, which the row itself no longer holds.
+            await self._audit(
+                AD_SCOPE_RESYNCED_ACTION,
+                actor=user.username,
+                detail=_json({"channels": None, "withdrawn": user.channel_scope}),
+                client=client,
+            )
+        else:
+            await self._audit(
+                AD_SCOPE_RESYNCED_ACTION,
+                actor=user.username,
+                detail=_json(
+                    {"channels": ALL_CHANNELS if decision.wildcard else list(decision.channels)}
+                ),
+                client=client,
+            )
         return await self._load_user(user.id) or user
 
     async def _upsert_ad_user(
