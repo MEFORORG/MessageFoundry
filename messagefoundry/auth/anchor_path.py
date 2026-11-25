@@ -226,7 +226,7 @@ class WinSecurity:
     ``aces`` holds ``(type, flags, mask, sid)`` per entry, with ``sid`` empty for an entry type the
     reader does not parse, and ``mask`` 0 for a type outside ``_GRANTING_ACE_TYPES``
     (:func:`dacl_entry_fields`). ``aces is None`` is a NULL DACL. ``error`` is set when the read
-    failed, and ``aces`` then holds the entries read before the failure."""
+    failed, and ``aces`` then holds every entry the reader could still read."""
 
     owner: str | None
     aces: tuple[tuple[int, int, int, str], ...] | None
@@ -314,7 +314,7 @@ def evaluate_windows_object(
 
     The entries are scanned before the owner, and past any entry the reader cannot judge, so a
     definite insecure entry is never hidden behind an indeterminate one. That holds for a read that
-    failed part way too: the entries read before the failure are scanned first. Deny entries are
+    failed part way too: every entry the reader could still read is scanned first. Deny entries are
     ignored: that can only make the rule refuse more, never less."""
     if sec.aces is None and sec.error is None:
         return [ChainFinding(path, kind, True, "it has a null DACL, so everyone has full control")]
@@ -1131,12 +1131,17 @@ def dacl_entries(acl: bytes) -> tuple[tuple[tuple[int, int, int, int | None], ..
     entries: list[tuple[int, int, int, int | None]] = []
     reason: str | None = None
 
-    def keep(index: int, entry: bytes, start: int) -> None:
+    def keep(index: int, start: int, end: int) -> None:
         nonlocal reason
-        fields = dacl_entry_fields(entry)
+        fields = dacl_entry_fields(acl[start:end])
         if isinstance(fields, str):
             reason = reason or f"entry {index} of its DACL is {fields}"
-            return
+            # GetAce handed the entry over whatever its size, and its rights and SID were read
+            # from the bytes after it. Read it the same way, up to the bound and no further, so a
+            # grant origin/main judged is still judged.
+            fields = dacl_entry_fields(acl[start:bound])
+            if isinstance(fields, str):
+                return
         ace_type, flags, mask = fields
         entries.append(
             (ace_type, flags, mask, start + 8 if ace_type == ACCESS_ALLOWED_ACE_TYPE else None)
@@ -1149,14 +1154,14 @@ def dacl_entries(acl: bytes) -> tuple[tuple[tuple[int, int, int, int | None], ..
             break
         size = int.from_bytes(acl[offset + 2 : offset + 4], "little")
         if size < 4 or offset + size > bound:
-            keep(index, acl[offset:bound], offset)
+            keep(index, offset, bound)
             reason = reason or (
                 f"entry {index} of its DACL is shorter than an entry header"
                 if size < 4
                 else f"entry {index} of its DACL runs past the end of the DACL"
             )
             break
-        keep(index, acl[offset : offset + size], offset)
+        keep(index, offset, offset + size)
         offset += size
     return tuple(entries), reason
 
@@ -1259,16 +1264,18 @@ def windows_host_readers() -> WinHost:
             acl_size = ctypes.cast(dacl_ptr.value + 2, ctypes.POINTER(wintypes.WORD))[0]
             acl = ctypes.create_string_buffer(ctypes.string_at(dacl_ptr.value, acl_size), acl_size)
             walked, stopped = dacl_entries(acl.raw)
-            # The entries read before a failure go back with it, so a definite grant among them
-            # is still judged (evaluate_windows_object).
+            # Every entry the walk could read goes back with its reason, so a definite grant among
+            # them is still judged (evaluate_windows_object).
             aces: list[tuple[int, int, int, str]] = []
-            for index, (ace_type, ace_flags, ace_mask, sid_offset) in enumerate(walked):
+            for ace_type, ace_flags, ace_mask, sid_offset in walked:
                 sid = ""
                 if sid_offset is not None:
                     parsed = sid_text(ctypes.addressof(acl) + sid_offset)
                     if parsed is None:
                         return WinSecurity(
-                            owner, tuple(aces), f"the SID in entry {index} could not be read"
+                            owner,
+                            tuple(aces),
+                            "the SID of one of its allow entries could not be read",
                         )
                     sid = parsed
                 aces.append((ace_type, ace_flags, ace_mask, sid))

@@ -1684,11 +1684,28 @@ _OVERRUNNING_EVERYONE = (
             id="acesize-past-aclsize",
         ),
         # A granting entry too short for its rights, inside the bound: skipped, and the walk goes on.
+        # Its rights are read from the bytes after it, as GetAce read them on origin/main: here the
+        # next entry's header, 0x00140000.
         pytest.param(
             _acl([_SHORT_CALLBACK, _allow_everyone()]),
-            ((0x00, 0, 0x1F01FF, 8 + 4 + 8),),
+            ((0x09, 0, 0x00140000, None), (0x00, 0, 0x1F01FF, 8 + 4 + 8)),
             "too short to hold its rights",
             id="short-callback-then-grant",
+        ),
+        # An allow entry whose SID needs 20 bytes but whose AceSize is 16: the SID's last 4 bytes
+        # are read from the next entry, as on origin/main, and the walk goes on by AceSize.
+        pytest.param(
+            _acl(
+                [
+                    bytes([0x00, 0, 16, 0])
+                    + (0x1F01FF).to_bytes(4, "little")
+                    + _EVERYONE_SID_BYTES[:8],
+                    _allow_everyone(),
+                ]
+            ),
+            ((0x00, 0, 0x1F01FF, 16), (0x00, 0, 0x1F01FF, 8 + 16 + 8)),
+            "too short to hold its SID",
+            id="allow-sid-past-acesize",
         ),
         pytest.param(
             _acl([_ace(0x00, (0x1F01FF).to_bytes(4, "little"))]),
