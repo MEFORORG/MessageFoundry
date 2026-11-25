@@ -503,8 +503,10 @@ async def test_a_slow_close_of_an_overtaken_session_does_not_hold_the_dispatch(
             # Tracked, so the stop teardown waits for them: one per discarded session, the first
             # and the one its immediate retry made, since the registry is still the one served.
             assert len(pending) == 2
-            # A reload's session close returns without waiting on it.
+            # A reload's session close returns without waiting on it, with a session to close.
+            assert runner._sandbox_for("IB_X") is not None
             await asyncio.wait_for(runner._close_sandbox_sessions(), 5)
+            assert "IB_X" not in runner._sandbox_sessions
             assert not closed.is_set()
             release.set()
             await asyncio.wait_for(asyncio.wait(pending), 10)
@@ -584,7 +586,7 @@ async def test_an_overtaken_refusal_re_pends_with_no_error_traceback(
     if overtaken:
         assert errors == [], [r.getMessage() for r in errors]
         assert any(
-            r.levelno == logging.INFO and "'IB'" in r.getMessage() and "overtook" in r.getMessage()
+            r.levelno == logging.INFO and "'IB'" in r.getMessage() and "overtaken" in r.getMessage()
             for r in records
         ), [r.getMessage() for r in records]
     else:
@@ -628,7 +630,8 @@ def test_the_pooled_dispatcher_re_pends_an_overtaken_refusal_as_a_hand_back(
 async def _detached_closes(runner: RegistryRunner) -> None:
     """Wait for the detached closes the runner tracks for its stop teardown."""
     if runner._lookup_close_tasks:
-        await asyncio.wait(set(runner._lookup_close_tasks))
+        _done, pending = await asyncio.wait(set(runner._lookup_close_tasks), timeout=30)
+        assert not pending, "a detached close never ended"
 
 
 async def test_a_refusal_straddling_a_reload_under_stop_re_pends_and_alerts_on_its_rerun(

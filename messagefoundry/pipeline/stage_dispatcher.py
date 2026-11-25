@@ -421,7 +421,9 @@ class _LaneOutcome:
     # (i > 0): the prefix made forward progress (>=1 item RESOLVED) before the fault, so this is NOT a
     # head-of-line-blocked zero-progress fault — it resets the streak rather than accruing it.
     made_progress: bool = False
-    # LaneItemResult.hand_back, carried to _apply_retry (BACKLOG #5704).
+    # LaneItemResult.hand_back, carried to _apply_retry (BACKLOG #5704), or set by
+    # _infra_fault_outcome for a RependWithoutFault (BACKLOG #6830): either way a head that
+    # says nothing about the lane's health, so the infra streak is left as it was.
     hand_back: bool = False
 
 

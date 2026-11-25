@@ -704,8 +704,8 @@ def _log_overtaken_repend(worker: str, name: str) -> None:
     the back-off bounds how fast a run of reloads can make the lane spawn and refuse workers. A
     hand-back that does not land is logged by the arm's own re-pend path."""
     log.info(
-        "%s worker %r: a reload, a stop or a graph change overtook a sandbox worker's refusal; "
-        "handing the message back to be compared again",
+        "%s worker %r: a sandbox worker's refusal was overtaken (at least a reload, a rollback, a "
+        "stop or a graph change does that); handing the message back to be compared again",
         worker,
         name,
     )
@@ -7386,8 +7386,8 @@ class RegistryRunner:
         tracked as the lookup executors' detached closes are (:meth:`_track_detached_close`), so the
         teardown of :meth:`stop` waits for it, on the same terms, and a reload does not: a reload
         holds ``_reload_lock`` with every listener unbound, and must not wait on a close queued
-        behind a sibling worker's dispatch. Until it ends, that inbound can briefly run two worker
-        processes, the one being reaped and the one its retry starts."""
+        behind a sibling worker's dispatch. The task starts in an empty context, so it holds none
+        of the dispatching message's run-context views or lookup activation."""
 
         async def close() -> None:
             try:
@@ -7401,7 +7401,7 @@ class RegistryRunner:
                     type(exc).__name__,
                 )
 
-        self._track_detached_close(asyncio.create_task(close()))
+        self._track_detached_close(asyncio.create_task(close(), context=contextvars.Context()))
 
     async def _close_sandbox_sessions(self) -> None:
         """Drop every sandbox session and close its worker, off the loop: each ``close()`` waits on
@@ -8057,13 +8057,15 @@ class RegistryRunner:
                 self._abandoned_lookup_closes |= still
                 self._lookup_close_tasks -= still
                 log.warning(
-                    "teardown: %d lookup executor close(s) still pending after %.2fs; left running",
+                    "teardown: %d detached close(s) (lookup executors, sandbox sessions) still pending "
+                    "after %.2fs; left running",
                     len(still),
                     budget,
                 )
         if not demote and self._abandoned_lookup_closes:
             log.warning(
-                "teardown: cancelling %d lookup executor close(s) a demotion abandoned",
+                "teardown: cancelling %d detached close(s) a demotion abandoned; a sandbox session's "
+                "close thread runs on regardless",
                 len(self._abandoned_lookup_closes),
             )
             for _close_task in list(self._abandoned_lookup_closes):
@@ -12647,7 +12649,7 @@ class RegistryRunner:
                 # A store error in the loop itself (claim/handoff failing — DB locked, disk full) must
                 # never kill the worker: that would stall routing while the listener keeps ACKing. Log,
                 # back off, and keep going (mirrors the delivery worker). #1844: with a backoff.
-                if isinstance(exc, SandboxRefusalOvertaken):
+                if isinstance(exc, RependWithoutFault):
                     _log_overtaken_repend("router", name)
                 else:
                     faults.failed(
@@ -13243,7 +13245,7 @@ class RegistryRunner:
             except Exception as exc:
                 # A store error in the loop itself must never kill the worker (mirrors the others).
                 # #1844: logged with a backoff, not a traceback per pass (see _WorkerFaultLog).
-                if isinstance(exc, SandboxRefusalOvertaken):
+                if isinstance(exc, RependWithoutFault):
                     _log_overtaken_repend("transform", name)
                 else:
                     faults.failed(
