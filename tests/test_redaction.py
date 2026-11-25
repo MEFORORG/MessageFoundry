@@ -668,8 +668,9 @@ def test_the_separator_sniff_stays_inside_the_scan_budget() -> None:
 # ``redact`` on two inputs, and no input it carries puts the separator-aware field run on a long
 # delimiter-free token. The arms below read the compiled patterns themselves, for real declared
 # delimiter sets and for the hardcoded pair, with a character meter and no clock, plus two structural
-# reads of the parsed patterns: the nesting the meters cannot see, and the invariants their
-# linearity argument rests on.
+# reads of the parsed patterns: the nesting the meters cannot see, and a stated shape of each
+# pattern. Neither structural read covers every shape that would make a scan super-linear; each
+# names at least the shapes it misses.
 
 #: Headers whose declared delimiters reach outside the defaults, so ``redact`` runs the
 #: separator-aware pass on them, keyed by test id. The dash and backslash headers declare a class
@@ -1005,7 +1006,8 @@ def test_a_segment_pattern_that_needs_more_after_its_run_is_read_red(case: str, 
 
 _REPEATS = (sre_constants.MAX_REPEAT, sre_constants.MIN_REPEAT, sre_constants.POSSESSIVE_REPEAT)
 
-#: Parsed opcodes that hold no sub-pattern, which :func:`_nested_repetitions` steps over. An opcode
+#: Parsed opcodes that hold no sub-pattern, which :func:`_nested_repetitions` and
+#: :func:`_open_repetitions` both step over, so a change here changes both. An opcode
 #: on neither this list nor its own raises, so a new one is read before it is trusted.
 _LEAF_OPCODES = frozenset(
     {
@@ -1135,24 +1137,28 @@ def test_the_field_run_and_segment_patterns_nest_no_repetition(case: str, nestin
 # --- the shape the linearity argument states (BACKLOG #2958 step 8) -------------------------------
 #
 # The meters above read cost on inputs they build, so a regression is seen only on an input someone
-# thought to build. The argument at ``_delimiter_patterns`` instead rests on the shape of the
-# patterns, and the arm below asserts that shape on the parsed pattern, for each case, with no
+# thought to build. The argument at ``_delimiter_patterns`` rests on the shape of the field run:
+# its guard is the exact complement of the class after it, and its runs are possessive. That
+# docstring states nothing about the segment pattern; the segment shape below is this file's own
+# statement. The arm below asserts both shapes on the parsed pattern, for each case, with no
 # input. The field run: its guard and every open repetition over one item in it match one
 # character set, so each such item is one class and not a repetition, an alternation or a group of
 # them, and each of those runs is possessive. The segment pattern: no open repetition before its
-# tail, and a tail of an open ``[^\r\n]*`` with nothing after it. The linearity argument rests on
-# the guard, the nesting and the segment's tail, but this arm does not read every shape that would
-# break it, so a green here is not proof the scans are linear: the shapes it is known to miss are
-# named in the arm's docstring. Possessive runs and the segment's fixed head are
-# pinned because the patterns state them, so a red that names only one of those is not always a
-# linearity red: possessive runs save about half (the comment on ``_HL7_FIELD_RUN``), and an open
-# segment-ID run (``[A-Z0-9]*``) is still linear behind ``\b``, though a repeated group there
-# (``(?:[A-Z]\.)*``) is not. It reads at least the regressions its controls build, and does not
-# replace the meters or the nesting arm.
+# tail, and a tail of an open ``[^\r\n]*`` with nothing after it. This arm does not read every
+# shape that would make a scan super-linear, so a green here is not proof the scans are linear;
+# the arm's docstring names at least the shapes it is known to miss. Some of what it pins is
+# pinned because the patterns state it, so a red is not always a linearity red. At least these
+# read red here and linear on the meters: a run that is not possessive (possessive runs save about
+# half, the comment on ``_HL7_FIELD_RUN``), a run over something other than one class
+# (``(?:R{2})*``, ``(?:R*+)*``, an appended ``.*``), an open segment-ID run (``[A-Z0-9]*``,
+# still linear behind ``\b``, though a repeated group there, ``(?:[A-Z]\.)*``, is not), and a
+# segment tail that is bounded, stops at a tab, or crosses a carriage return. It reads at least
+# the regressions its controls build, and does not replace the meters or the nesting arm.
 
 #: The characters two classes are compared over: every one up to U+3000, past which ``\s``
-#: matches none (:data:`_NON_ASCII_WHITESPACE`), and a case's own delimiters. Two classes that
-#: differ only past U+3000 are not told apart.
+#: matches none (:data:`_NON_ASCII_WHITESPACE`), and a case's own delimiters. That bound holds for
+#: ``\s`` only, not for a literal or range member: two classes that differ only past U+3000, such
+#: as a guard that also names U+FF5C, are not told apart.
 _CLASS_UNIVERSE = "".join(map(chr, range(0x3001)))
 
 
@@ -1210,7 +1216,8 @@ def _ungroup(body: Any) -> list[Any]:
 def _sole_repetition(op: Any, arg: Any) -> Any:
     """The repetition an atomic group holds alone, or None. For a greedy repetition such a group
     matches what the repetition made possessive does (``(?>[^|]*)`` is ``[^|]*+``). A lazy one is
-    returned the same way and read as possessive too, which it is not (``(?>[^|]*?)``)."""
+    returned the same way, and :func:`_open_repetitions` reads it as possessive, which it is not
+    (``(?>[^|]*?)``). The segment half reads the opcode it returns, so it refuses one."""
     if op != sre_constants.ATOMIC_GROUP:
         return None
     inner = _ungroup(arg)
@@ -1315,14 +1322,18 @@ def test_the_field_run_and_segment_patterns_keep_the_shape_their_linearity_argum
     """The structural half of the linearity pin: the shape the comment above names, read from the
     shipped patterns as compiled, for each case.
 
-    It reads the class of an open repetition over ONE item only. An open repetition over more than
-    one item is skipped, and so are a group's scoped flags and a lazy run's laziness. It does not
-    see, at least: a repeated sequence (``(?:RR)*``, read green while ``(?:R{2})*`` reads red),
-    a repeated overlapping alternation spliced into the run (``(?:R(?:R|RR))*``, read green and
-    measured at 4.9 s on a 64-character token), an atomic lazy run (``(?>R*?)``, read as
-    possessive), and a run under scoped flags (``(?a:R)*+``, its class read with no flags). Here
-    ``R`` is the run class. Whether the meters or the nesting arm read any of these is not recorded
-    here."""
+    In the field run it reads the class of an open repetition over ONE item only: one over more
+    than one item is skipped (the segment half refuses any open repetition before its tail, so
+    there it is read), and a group's scoped flags are dropped unread. In the field run it does not
+    see, at least, with ``R`` the run class: a repeated sequence (``(?:RR)*``, read green while
+    ``(?:R{2})*`` reads red); a repeated overlapping alternation spliced into the run
+    (``(?:R(?:R|RR))*``, about 3 s on a 64-character token on one Windows box, 2026-11-25); an
+    atomic lazy run (``(?>R*?)``, read as possessive); a run under scoped flags (``(?a:R)*+``, its
+    class read with no flags); and a guard or run class that differs from the other only past
+    U+3000 (:data:`_CLASS_UNIVERSE`). Measured on 2026-11-25 for all four cases, the field-run
+    meter reds ``(?>R*?)`` on its precondition and ``(?a:R)*+`` as quadratic, and neither the meter
+    nor :func:`_nested_repetitions` reads ``(?:RR)*`` or ``(?:R(?:R|RR))*``, so none of the three
+    reads those two."""
     pair = _linearity_case(case)
     violations = _field_run_violations(pair.field_run.pattern, pair.delimiters)
     violations += _segment_violations(pair.segment.pattern, pair.delimiters)
@@ -1330,7 +1341,8 @@ def test_the_field_run_and_segment_patterns_keep_the_shape_their_linearity_argum
 
 
 def _unique(*tables: dict[str, Callable[[str], str]]) -> dict[str, Callable[[str], str]]:
-    """``tables`` merged, refusing a name two of them share, so no control is dropped silently."""
+    """``tables`` merged, refusing a name two of them share. A table built with a ``**`` spread has
+    already resolved its own shared names last-wins before it reaches this, so that is not seen."""
     merged: dict[str, Callable[[str], str]] = {}
     for table in tables:
         shared = merged.keys() & table.keys()
@@ -1341,7 +1353,8 @@ def _unique(*tables: dict[str, Callable[[str], str]]) -> dict[str, Callable[[str
 
 
 #: Every field run the structural control builds, by test id: the meter and nesting controls'
-#: regressions, and edits the meters read as linear. A greedy run still gives back only its own
+#: regressions, and edits the field-run meter reads as linear, except ``runs-removed``, which it
+#: refuses on its precondition (measured 2026-11-25). A greedy run still gives back only its own
 #: token, and an appended ``.*`` reads to the end of the line once, since the scan resumes after
 #: its match.
 _FIELD_RUN_SHAPE_BREAKS = _unique(
@@ -1402,7 +1415,7 @@ def _segment_with_tail(case: str, tail: str) -> str:
 
 #: Every segment pattern the structural control builds from the shipped one, by test id: each
 #: tail the segment meter's controls require, an open head, a tail that crosses a carriage return,
-#: and a bounded tail.
+#: a bounded tail, a tail that stops at a tab, and a repeated group in the head.
 _SEGMENT_SHAPE_BREAKS = _unique(
     {
         name: functools.partial(_segment_with_tail, tail=tail)
@@ -1427,7 +1440,9 @@ _SEGMENT_SHAPE_BREAKS = _unique(
 
 
 def test_an_atomic_segment_tail_reads_as_the_possessive_tail_it_is() -> None:
-    """The segment half reads an atomic tail as the field-run half reads an atomic run."""
+    """The segment half reads an atomic greedy tail as the field-run half reads an atomic greedy
+    run. The two halves differ on an atomic lazy one, which the segment half refuses and the
+    field-run half reads as possessive (:func:`_sole_repetition`)."""
     pair = _linearity_case("hardcoded")
     segment = pair.segment.pattern.replace(r"[^\r\n]*", r"(?>[^\r\n]*)")
     assert segment != pair.segment.pattern
