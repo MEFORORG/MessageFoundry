@@ -76,7 +76,8 @@ def anonymize_message(
     delimiter in a value it wrote itself (``surrogates._written``).
 
     ``blanked``, when given, collects the address of every field the ``DATE`` kind scrubbed to empty
-    (``surrogate_field_recorded``), as the engine adapter does.
+    (``surrogate_field_recorded``), as the engine adapter does. Those addresses are added only once
+    the message has been written, so a refused message adds none (BACKLOG #5540).
     """
     _refuse_unwritable_rules(rules)
     # A keep rewrites nothing, so it never makes a line reachable (BACKLOG #3001).
@@ -89,6 +90,7 @@ def anonymize_message(
             raise AnonError("message MSH-2 repeats an encoding character — refusing to emit")
         raise AnonError("message has no parseable MSH / encoding characters — refusing to emit")
     seps, field_sep = parsed
+    found: list[str] = []
     segments = [seg.split(field_sep) for seg in text.split("\r")]
     # The header may be spelled ``Msh``: the separators are read from it in any case and the
     # leak-check skips it in any case, so an MSH rule must reach it in any case too. Only the
@@ -110,11 +112,14 @@ def anonymize_message(
                 continue
             if index < len(fields):
                 value = surrogate_field_recorded(
-                    rule.path, _kind_for(rule, fields), fields[index], keyer, seps, blanked
+                    rule.path, _kind_for(rule, fields), fields[index], keyer, seps, found
                 )
                 fields[index] = _whole_field(rule.path, value, field_sep)
     encoded = "\r".join(field_sep.join(fields) for fields in segments)
-    return scrub_message_site_codes(encoded, keyer, rules)
+    output = scrub_message_site_codes(encoded, keyer, rules)
+    if blanked is not None:
+        blanked.extend(found)
+    return output
 
 
 #: Beside the field separator, what the engine's whole-field ``Message.set`` refuses: CR, LF, then
