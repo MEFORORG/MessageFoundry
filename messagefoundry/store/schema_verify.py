@@ -155,11 +155,12 @@ def _schema_step_text(exc: BaseException) -> object:
 
 
 # Its message is the engine's remedy, which a renderer must keep, and it quotes the SQLite text of
-# a failed schema step, its `cause`, which can name an object another tool wrote. safe_exc and
-# safe_traceback withhold that part (vault BACKLOG #8153). The DR restore-verify reasons still
-# print SQLite's text, as before #8153: `_incompatible_snapshot` quotes `cause`, and
-# `_sqlite_error_reason` prints a SQLite error's message, each redacted by pattern only. The
-# differences are the engine's reading of the live schema, printed as before.
+# a failed schema step, its `cause`. safe_exc and safe_traceback withhold that part (vault BACKLOG
+# #8153). At least these still print it, as before #8153: the CLI's store-open handler
+# (`_store_error_text` prints a sqlite3.DatabaseError's text whole) and the `backup` subcommand's
+# refusal, neither redacted; and the DR restore-verify reasons, `_incompatible_snapshot` quoting
+# `cause` and `_sqlite_error_reason` printing a SQLite error's message, redacted by pattern only.
+# The differences are the engine's reading of the live schema, printed as before.
 engine_text_only(SchemaMismatchError, driver_text=_schema_step_text)
 
 
