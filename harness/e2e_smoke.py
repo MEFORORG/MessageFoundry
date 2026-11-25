@@ -9,11 +9,11 @@ Unit tests can pass while the running engine is broken, so this starts one and d
 
 Each run gets a fresh temp directory holding the store, the engine's working directory (so a
 ``File`` outbound's relative path lands there) and a throwaway loopback TLS pair. The API port is a
-free one. The MLLP port is the inbound's own, from its config: ``--mllp-port``, 2575 for the
+free one unless ``--api-port`` names it. The MLLP port is the inbound's own, from its config: ``--mllp-port``, 2575 for the
 sample's ``IB_Test_ADT``. A port already taken fails the ``ports`` step rather than sending to
 whatever holds it.
 
-The steps, in order: ``ports``, ``provision``, ``serve``, ``ready``, ``mllp``, ``sign-in``,
+The steps, in order: ``message``, ``ports``, ``provision``, ``serve``, ``ready``, ``mllp``, ``sign-in``,
 ``disposition``. Exit 0 when every step passes; otherwise exit 1 with ``FAIL <step>: <reason>``
 on stderr. The engine is stopped and the temp directory deleted either way.
 
@@ -165,6 +165,7 @@ def run(
     mllp_port: int,
     expect: str,
     timeout: float,
+    api_port: int | None = None,
 ) -> None:
     """Run every step. Returns on a pass; raises :class:`StepFailed` naming the step otherwise."""
     try:
@@ -176,7 +177,8 @@ def run(
         raise StepFailed("message", f"{message_file} has no MSH-10 control id")
     if _port_taken(mllp_port):
         raise StepFailed("ports", f"MLLP port {mllp_port} is already in use on 127.0.0.1")
-    api_port = _free_port()
+    if api_port is None:
+        api_port = _free_port()
 
     work = Path(tempfile.mkdtemp(prefix="mefor-e2e-smoke-"))
     proc: subprocess.Popen[bytes] | None = None
@@ -249,10 +251,10 @@ def run(
                 raise StepFailed("mllp", ack.detail)
             print(f"step mllp: AA for control id {control_id}", flush=True)
 
-            admin = rigadmin.rig_admin()
             try:
-                client.login(admin.username, admin.password)
-            except ApiError as exc:
+                # rigadmin's sign-in, so a rig that supplies an authenticator key signs in too.
+                client.set_token(rigadmin.sign_in(client.base_url, cacert=str(cert)))
+            except (rigadmin.RigAdminError, ApiError) as exc:
                 raise StepFailed("sign-in", f"the engine refused the rig sign-in: {exc}") from None
             print("step sign-in: rig Administrator", flush=True)
 
@@ -289,7 +291,7 @@ def run(
 
 def _remove(path: Path) -> None:
     """Delete the temp dir. Windows may hold the store file briefly after the engine dies."""
-    for _ in range(20):
+    for _ in range(8):
         try:
             shutil.rmtree(path)
             return
@@ -306,6 +308,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--message", type=Path, default=_DEFAULT_MESSAGE)
     parser.add_argument("--inbound", default=_DEFAULT_INBOUND)
     parser.add_argument("--mllp-port", type=int, default=_DEFAULT_MLLP_PORT)
+    parser.add_argument("--api-port", type=int, default=None, help="default: a free port")
     parser.add_argument("--expect", default="processed", choices=sorted(_TERMINAL))
     parser.add_argument("--timeout", type=float, default=60.0, help="seconds per waiting step")
     args = parser.parse_args(argv)
@@ -318,6 +321,7 @@ def main(argv: list[str] | None = None) -> int:
             mllp_port=args.mllp_port,
             expect=args.expect,
             timeout=args.timeout,
+            api_port=args.api_port,
         )
     except StepFailed as exc:
         print(f"FAIL {exc.step}: {exc}", file=sys.stderr, flush=True)

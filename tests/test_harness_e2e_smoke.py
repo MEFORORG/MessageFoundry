@@ -25,6 +25,9 @@ from pathlib import Path
 
 import pytest
 
+from harness import e2e_smoke
+from tests._harness_engine import free_port
+
 #: Above the subprocess cap below, so a hung engine fails as that timeout, with its output.
 pytestmark = pytest.mark.timeout(300)
 
@@ -54,12 +57,6 @@ inbound("IB_E2E_ADT", MLLP(port={port}), router="no_such_router")
 """
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 def _smoke(config: Path, port: int) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
@@ -72,8 +69,8 @@ def _smoke(config: Path, port: int) -> subprocess.CompletedProcess[str]:
             "IB_E2E_ADT",
             "--mllp-port",
             str(port),
-            "--timeout",
-            "60",
+            "--api-port",
+            str(free_port()),
         ],
         cwd=_REPO,
         capture_output=True,
@@ -86,7 +83,7 @@ def _smoke(config: Path, port: int) -> subprocess.CompletedProcess[str]:
 
 
 def _config(tmp_path: Path, template: str, **values: object) -> tuple[Path, int]:
-    port = _free_port()
+    port = free_port()
     config = tmp_path / "config"
     config.mkdir()
     (config / "e2e_graph.py").write_text(template.format(port=port, **values), encoding="utf-8")
@@ -119,25 +116,22 @@ def test_a_router_nothing_registers_fails_the_serve_step(tmp_path: Path) -> None
     assert "step mllp" not in done.stdout
 
 
-def test_a_taken_mllp_port_fails_before_any_engine_starts(tmp_path: Path) -> None:
+def test_a_taken_mllp_port_fails_before_any_engine_starts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     config, port = _config(tmp_path, _DANGLING_ROUTER)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
         holder.bind(("127.0.0.1", port))
         holder.listen()
-        done = _smoke(config, port)
-    assert done.returncode == 1, done.stderr + done.stdout
-    assert f"FAIL ports: MLLP port {port} is already in use" in done.stderr
-    assert "step serve" not in done.stdout
+        code = e2e_smoke.main(["--config", str(config), "--mllp-port", str(port)])
+    out = capsys.readouterr()
+    assert code == 1, out.err + out.out
+    assert f"FAIL ports: MLLP port {port} is already in use" in out.err
+    assert "step serve" not in out.out
 
 
-def test_the_command_line_parses() -> None:
-    done = subprocess.run(
-        [sys.executable, "-m", "harness.e2e_smoke", "--help"],
-        cwd=_REPO,
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    assert done.returncode == 0, done.stderr
-    assert "--mllp-port" in done.stdout
+def test_the_command_line_parses(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exited:
+        e2e_smoke.main(["--help"])
+    assert exited.value.code == 0
+    assert "--mllp-port" in capsys.readouterr().out
