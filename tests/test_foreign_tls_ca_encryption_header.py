@@ -690,7 +690,8 @@ def test_a_missing_pwd_module_is_a_valueerror_from_the_build(
     monkeypatch.setitem(sys.modules, "pwd", None)
     with pytest.raises(OSError, match="password file could not be read"):
         database._libpq_homes()
-    with pytest.raises(ValueError, match="set PGSSLROOTCERT to a local path"):
+    remedy = f"DATABASE: libpq's home is unknown; {database._LIBPQ_REMEDY}"
+    with pytest.raises(ValueError, match=re.escape(remedy)):
         _build_psql()
 
 
@@ -1179,8 +1180,8 @@ def test_the_cause_and_remedy_survive_a_40_character_connection_name(
 ) -> None:
     """Vault BACKLOG #8153, review round 2, finding 2. Red on the previous head: the setting came
     first, so a name of about 19 characters or more pushed the remedy past ``safe_exc``'s cut.
-    The walk-unread shape is the review of 525c7df's finding 1: what survives is the cause and
-    :data:`~database._LIBPQ_REMEDY`, and the raised error keeps the second remedy, which
+    The walk-unread shape pins what ``_LIBPQ_REMEDY``'s comment claims: what survives is the
+    cause and :data:`~database._LIBPQ_REMEDY`, and the raised error keeps the second remedy, which
     ``_LIBPQ_REMEDY``'s comment says a stored failure can lose."""
     assert len(_LONG_CONNECTION) == 40
     named = {"sslmode": "verify-full"}

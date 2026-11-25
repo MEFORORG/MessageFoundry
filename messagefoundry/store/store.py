@@ -9145,7 +9145,8 @@ class _ClosedStoreWriteError(sqlite3.OperationalError):
     """:func:`_write_closed_store`'s own refusal, whose text the engine wrote: the store's path,
     the journal mode SQLite reported and a fixed sentence, never a row's value or SQLite's message.
     Marked :func:`~messagefoundry.redaction.engine_text_only`, so a renderer that withholds a
-    database driver's message keeps it, under the name ``OperationalError`` (vault BACKLOG #8153).
+    database driver's message keeps it (vault BACKLOG #8153). ``safe_exc`` and the DR reasons show
+    it as ``OperationalError``; a traceback names this class itself.
     Still a ``sqlite3.OperationalError``, so every handler that caught one catches it."""
 
 

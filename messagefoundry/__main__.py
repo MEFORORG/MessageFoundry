@@ -15660,8 +15660,10 @@ def _emit_store_open_error(
     a job keeps in its log (vault BACKLOG #3054, item 10). The column name stays. A server driver's
     error that carries a SQLSTATE renders as its class, SQLSTATE and native error number, never its
     text: a server message can quote a stored value, such as SQL Server's "The duplicate key value
-    is (...)", and ``safe_exc``'s pattern redaction keeps that (measured in BACKLOG #1661). An
-    error with no SQLSTATE goes through ``safe_exc``. A driver's own error class, at least one of
+    is (...)", and ``safe_exc``'s pattern redaction keeps that (measured in BACKLOG #1661). A
+    SQLite error (a ``sqlite3.DatabaseError``) prints its own text, apart from that decode tail,
+    and never goes through ``safe_exc``, as before vault BACKLOG #8153. Any other error with no
+    SQLSTATE goes through ``safe_exc``: another driver's own error class, at least one of
     asyncpg's client errors, renders as its class and a withheld message (vault BACKLOG #8153);
     any other, at least asyncpg's refused connection and an OSError, keeps its text, redacted by
     pattern only.

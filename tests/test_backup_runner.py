@@ -1691,9 +1691,9 @@ async def test_start_spawns_loop_and_stop_cancels_cleanly(tmp_path, key_b64) -> 
 
 
 async def test_a_snapshot_sqlite_failure_keeps_sqlites_text(tmp_path, key_b64) -> None:
-    """Vault BACKLOG #8153, review of 525c7df, finding 3. The snapshot arm rendered a SQLite error
-    through ``safe_exc``, which withholds a driver's message, so a locked store's snapshot failure
-    read ``[driver message withheld]``. Red on 525c7df. SQLite's text is kept, as before #8153."""
+    """Vault BACKLOG #8153. Red while the snapshot arm rendered a SQLite error through
+    ``safe_exc``, which withholds a driver's message, so a locked store's snapshot failure read
+    ``[driver message withheld]``. SQLite's text is kept, as before #8153."""
     import sqlite3
 
     store = await _store_with_rows(tmp_path / "msg.db", key_b64)

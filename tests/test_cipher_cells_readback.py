@@ -1824,8 +1824,8 @@ def test_a_cipher_build_failure_in_the_full_walk_is_a_fail_verdict(
 def test_a_sqlite_failure_in_the_full_walk_keeps_sqlites_text(
     tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Vault BACKLOG #8153, review of 525c7df, finding 3. The walk arm rendered a SQLite error
-    through ``safe_exc``, which withholds a driver's message. Red on 525c7df."""
+    """Vault BACKLOG #8153. Red while the walk arm rendered a SQLite error through
+    ``safe_exc``, which withholds a driver's message."""
     db, settings = _copy(_template, tmp_path)
 
     def locked(*_a: Any, **_kw: Any) -> tuple[str, str, int]:
@@ -1839,7 +1839,7 @@ def test_a_sqlite_failure_in_the_full_walk_keeps_sqlites_text(
 def test_a_sqlite_failure_in_the_full_open_keeps_sqlites_text(
     tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Review of 525c7df, finding 3: the open's catch-all arm, the same way. Red on 525c7df."""
+    """Vault BACKLOG #8153: the open's catch-all arm, the same way, red while it used safe_exc."""
     import messagefoundry.store.base as store_base
 
     db, settings = _copy(_template, tmp_path)

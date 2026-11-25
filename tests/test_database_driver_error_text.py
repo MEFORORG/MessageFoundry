@@ -443,10 +443,9 @@ _WITHHELD_STEP = "SchemaMismatchError: The schema step failed: [driver message w
 
 
 def test_an_engine_subclass_withholds_the_driver_text_it_quotes() -> None:
-    """Vault BACKLOG #8153, review of 525c7df, finding 2. ``SchemaMismatchError`` subclasses
-    ``sqlite3.DatabaseError`` and quotes the failed schema step's SQLite text. Red on 525c7df:
-    every class from the engine's package counted as the engine's, so ``safe_exc`` printed that
-    text. It is marked ``engine_text_only`` with that text named, so its own words, the store's
+    """Vault BACKLOG #8153. ``SchemaMismatchError`` subclasses ``sqlite3.DatabaseError`` and
+    quotes the failed schema step's SQLite text. Red while every class from the engine's
+    package counted as the engine's, so ``safe_exc`` printed that text. It is marked ``engine_text_only`` with that text named, so its own words, the store's
     remedy among them, still print, and the quoted text does not."""
     caught = _schema_mismatch_carrying_sqlite_text()
     assert raised_by_a_driver(caught) is False
@@ -456,17 +455,17 @@ def test_an_engine_subclass_withholds_the_driver_text_it_quotes() -> None:
 
 
 def test_a_traceback_withholds_the_driver_text_an_engine_subclass_carries() -> None:
-    """Vault BACKLOG #8153, item 17's regression, red on 5c90691ab26: a traceback printed the
-    text ``SchemaMismatchError`` carries, where main withheld it."""
+    """Vault BACKLOG #8153, item 17's regression: red while a traceback printed the text
+    ``SchemaMismatchError`` carries, where main withheld it."""
     text = _rendered(_schema_mismatch_carrying_sqlite_text())
     assert _SYNTHETIC_ID not in text
     assert _WITHHELD_STEP in text
 
 
 def test_an_engine_subclass_that_is_not_marked_is_a_drivers() -> None:
-    """Review of 525c7df, finding 2: only a class marked by its exact type keeps its message. A
-    subclass of a marked class, or an unmarked engine class, can carry other text, so its whole
-    message is withheld. Red on 525c7df, which counted every engine class as the engine's."""
+    """Vault BACKLOG #8153: only a class marked by its exact type keeps its message. A subclass
+    of a marked class, or an unmarked engine class, can carry other text, so its whole message
+    is withheld. Red while every engine class counted as the engine's."""
     from messagefoundry.store.schema_verify import SchemaMismatchError
 
     class _Narrower(SchemaMismatchError):
@@ -493,10 +492,9 @@ def test_a_marked_message_that_does_not_hold_its_named_text_is_withheld_whole() 
 
 
 def test_a_marked_class_keeps_its_text_under_its_driver_class_name() -> None:
-    """Review of 525c7df, findings 2 and 8. A class marked ``engine_text_only`` with
-    ``named_as_driver`` prints its message under the driver class it stands in for, in
-    ``safe_exc``; a traceback prints the message too. Red on 525c7df for the name: it printed the
-    engine's private class name. A subclass of a marked class is not marked."""
+    """Vault BACKLOG #8153. A class marked ``engine_text_only`` with ``named_as_driver`` prints
+    its message under the driver class it stands in for, in ``safe_exc``; a traceback prints the
+    message too. Red for the name while ``safe_exc`` printed the engine's private class name. A subclass of a marked class is not marked."""
     import sqlite3
 
     from messagefoundry.redaction import engine_text_only, shown_class_name
@@ -559,8 +557,8 @@ def _sqlite_error(statement: str, *args: Any, closed: bool = False) -> BaseExcep
     ],
 )
 def test_sqlite_texts_that_carry_no_value_keep_their_reason(shape: str, expected: str) -> None:
-    """Review of 525c7df, finding 7. ``sqlite3`` raises these with no ``sqlite_errorname``, so
-    item 23 reduced each to ``[driver message withheld]`` and lost its reason. Red on 525c7df.
+    """Vault BACKLOG #8153. ``sqlite3`` raises these with no ``sqlite_errorname``, so item 23
+    reduced each to ``[driver message withheld]`` and lost its reason; red while it did.
     Each is raised by ``sqlite3`` itself, not built by hand, so a change to its wording shows."""
     exc = {
         "closed": lambda: _sqlite_error("SELECT 1", closed=True),
