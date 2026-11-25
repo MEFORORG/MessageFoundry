@@ -4,10 +4,13 @@
 #6903).
 
 An HTTP error status, or a 3xx the no-redirect handler declines, reaches ``exchange_code`` as a
-``urllib.error.HTTPError`` that holds the unread reply and, through it, the socket. These tests
-drive the production opener, ``build_idp_opener``, over real TLS on loopback, with the garbage
-collector off, and ask the SERVER whether the client's side of the connection closed. A socket
-that only a collection would release reads as still open.
+``urllib.error.HTTPError`` that holds the unread reply and, through it, the socket. Every test but
+one drives the production opener, ``build_idp_opener`` (one of them through a wrapper that keeps
+the error), over real TLS on loopback, with the garbage collector off, and asks the SERVER whether
+the client's side of the connection closed. A socket that only a collection would release reads as
+still open. The exception, ``test_a_close_that_fails_still_refuses_with_nothing_chained``, uses a
+stand-in opener and no socket: it pins what ``exchange_code`` raises and logs when the close itself
+fails.
 
 The positive control holds the ``HTTPError`` the way a leak would, and the same instrument must
 then read the connection as open. Without it, a server that saw every connection close, whatever
