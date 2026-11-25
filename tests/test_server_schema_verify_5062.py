@@ -817,8 +817,9 @@ def test_a_line_comment_holding_a_break_other_than_lf_raises(
 @pytest.mark.parametrize("dialect", _DIALECTS)
 @pytest.mark.parametrize("ending", ["\r\n", "\r", "\r\r\n"])
 def test_a_cr_that_ends_a_line_comment_is_accepted(ending: str, dialect: Dialect | None) -> None:
-    """A run of CRs reaching the LF or the end of the batch ends the comment where the server does
-    too, so nothing after it is hidden and the exemption refuses nothing main read."""
+    """A run of CRs reaching the LF, or the end of the entry, hides nothing: PostgreSQL may end the
+    comment at the first CR and the reader ends it at the LF, but only CRs lie between, so nothing
+    after the comment is hidden and the exemption refuses nothing main read."""
     shape = declared_schema((f"CREATE TABLE v (c INT NOT NULL); -- note{ending}",), dialect)
     assert shape.columns["v"] == frozenset({"c"})
 

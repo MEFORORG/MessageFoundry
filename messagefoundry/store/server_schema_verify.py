@@ -51,10 +51,11 @@ that opens with a ``::`` or ``CAST`` cast of a column, a key built ``USING INDEX
 inline ``INDEX``, a ``NOT NULL`` table constraint, a column type or clause it does not know, a SQL
 Server column that leaves its nullability to the session, ``COLLATE CATALOG_DEFAULT``, and a ``--``
 or ``/*`` inside a quoted string, which may be dynamic SQL's comment or a literal's text, any
-``/*`` inside a block comment, even a balanced one, since both servers nest them, and a line
-comment holding a NUL, or a CR or other line break that is not part of a run of CRs reaching the
-LF that closes the comment or the end of the comment's entry in the batch. A unit test reads each
-shipped batch, so a new form fails there before it reaches an open.
+``/*`` inside a block comment the reader finds, even a balanced one, since both servers nest them,
+and a line comment it finds holding a NUL, or a CR or other line break that is not part of a run
+of CRs reaching the LF that closes the comment or the end of the comment's entry in the batch.
+(the misreads below name where it finds none) A unit test reads each shipped batch, so a new form
+fails there before it reaches an open.
 
 An ``ALTER COLUMN`` or added ``PRIMARY KEY`` that opens its entry in the batch, with nothing
 before it, is read as reaching every store, and one with anything before it, even a statement a
@@ -240,9 +241,10 @@ _DATA_STATEMENT = frozenset({"insert", "update", "delete", "merge", "select", "t
 _DDL_OBJECT = re.compile(
     r"\s+(?:TABLE|INDEX|VIEW|PROC|PROCEDURE|TRIGGER|FUNCTION|SEQUENCE|SCHEMA|TYPE|DATABASE)\b", re.I
 )
-#: Characters a ``--`` comment may not hold, because the reader ends one at LF alone and a server
-#: may end it sooner. PostgreSQL ends one at CR as well, and SQL Server's reading of a CR is not
-#: relied on; the rest are refused for the same reason ``transports/database.py`` refuses them.
+#: Characters that raise inside a ``--`` comment the reader finds, except CRs in a run that
+#: reaches the LF closing the comment or the end of the entry: the reader ends a comment at LF
+#: alone, and a server may end it sooner. PostgreSQL ends one at CR as well, and SQL Server's
+#: reading of a CR is not relied on; the rest are refused for the same reason ``transports/database.py`` refuses them.
 #: They are refused only inside a ``--`` comment, not elsewhere in the batch.
 _OTHER_LINE_BREAKS: Final = frozenset("\x00\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
 _TOKEN = re.compile(r"""N?'(?:[^']|'')*'|"[^"]*"|\[[^\]]*\]|\w+|\S""")
@@ -317,13 +319,16 @@ def _strip_comments(raw: str) -> str:
     """``raw`` with its ``--`` and ``/* */`` comments blanked, read left to right so a quote inside a
     comment opens nothing and a comment marker inside a quoted name is not one. A marker inside a
     string literal raises: in an ``EXEC`` string it is dynamic SQL's comment, in any other a
-    literal's text, and the reader cannot tell which. Any ``/*`` inside a block comment raises,
-    even a balanced one, because both servers nest them and the first ``*/`` would not end it
-    (BACKLOG #5062 item 26). A line comment holding a NUL or a line break other than LF raises,
-    because a server may end the comment there and run what follows: PostgreSQL ends one at a CR,
-    and the reader does not rely on SQL Server reading a CR otherwise. CRs that run up to the LF
-    ending it, or to the end of ``raw``, are allowed: nothing follows them on the line for a
-    server to run."""
+    literal's text, and the reader cannot tell which. Any ``/*`` inside a block comment the reader
+    finds raises, even a balanced one, because both servers nest them and the first ``*/`` would
+    not end it (BACKLOG #5062 item 26). A line comment the reader finds that holds a NUL or a line
+    break other than LF raises, because a server may end the comment there and run what follows:
+    PostgreSQL ends one at a CR, and the reader does not rely on SQL Server reading a CR otherwise.
+    CRs that run up to the LF ending it, or to the end of ``raw``, are allowed: nothing follows
+    them on the line for a server to run. The reader finds no comment inside a ``[...]``, which it
+    ends at its first ``]`` on both servers, so on PostgreSQL a comment inside an ``ARRAY[...]`` or
+    subscript is neither refused nor blanked, and a ``]]`` misread can hide one, as the module
+    docstring says."""
     out: list[str] = []
     i, n = 0, len(raw)
     while i < n:
