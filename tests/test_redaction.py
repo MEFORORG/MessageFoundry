@@ -704,7 +704,6 @@ class _LinearityCase(NamedTuple):
     field_run: re.Pattern[str]
 
 
-@functools.cache
 def _linearity_case(case: str) -> _LinearityCase:
     """A header's separator-aware pair, read through the same sniff and union ``redact`` uses, or
     ``"hardcoded"`` for the default-delimiter pair every ``redact`` call runs first."""
@@ -1104,14 +1103,17 @@ _NESTINGS = {
 }
 
 
-def _nested_field_run(case: str, nesting: str) -> str:
-    """The case's shipped field run with its first repetition rewritten into ``nesting``."""
+def _rewritten_field_run(case: str, template: str) -> str:
+    """The case's shipped field run with its first run rewritten into ``template``, in which ``{}``
+    is the run class."""
     pair = _linearity_case(case)
     _guard, spelling = _field_run_guard(pair.field_run)
     run = rf"[^\s{spelling}]"
-    nested = pair.field_run.pattern.replace(run + "*+", nesting.format(run), 1)
-    assert nested != pair.field_run.pattern, f"the {nesting} control did not regress the field run"
-    return nested
+    rewritten = pair.field_run.pattern.replace(run + "*+", template.format(run), 1)
+    assert rewritten != pair.field_run.pattern, (
+        f"the {template} control did not regress the field run"
+    )
+    return rewritten
 
 
 @pytest.mark.parametrize("case", _LINEARITY_CASES)
@@ -1122,23 +1124,27 @@ def test_the_field_run_and_segment_patterns_nest_no_repetition(case: str, nestin
     rewritten into each nesting shape must be found, so
     :func:`test_the_field_run_and_segment_patterns_nest_no_repetition_as_shipped`, which reads the
     shipped patterns as compiled since the ReDoS scanner cannot reach them statically, can see it."""
-    nested = _nested_field_run(case, nesting)
+    nested = _rewritten_field_run(case, nesting)
     assert _nested_repetitions(nested), (
         f"the {nesting} control was not read as nested, so "
         f"test_the_field_run_and_segment_patterns_nest_no_repetition_as_shipped measures nothing"
     )
 
 
-# --- the structural invariants the linearity argument rests on (BACKLOG #2958 step 8) -------------
+# --- the shape the linearity argument states (BACKLOG #2958 step 8) -------------------------------
 #
 # The meters above read cost on inputs they build, so a regression is seen only on an input someone
-# thought to build. The argument at ``_delimiter_patterns`` instead rests on properties of the
-# patterns themselves, and the arm below asserts three of them on the parsed pattern, for each case,
-# with no input: the field run's guard and every single-class run in it match one character set,
-# each of those runs is possessive, and the segment pattern ends in its open ``[^\r\n]*`` with
-# nothing after it. It reads at least the regressions the meters' controls build. It does not
-# replace the meters: a change that keeps all three properties, such as a repetition nested around
-# a possessive run, is read by the nesting arm above, not here.
+# thought to build. The argument at ``_delimiter_patterns`` instead rests on the shape of the
+# patterns, and the arm below asserts that shape on the parsed pattern, for each case, with no
+# input. The field run: its guard and every open run over one item in it match one character set,
+# and each of those runs is possessive. The segment pattern: no open repetition before its tail, and
+# a tail of an open ``[^\r\n]*`` with nothing after it. The guard and the segment's shape are what
+# make the scans linear; possessive runs are pinned because ``_delimiter_patterns`` states them, and
+# the comment on ``_HL7_FIELD_RUN`` says what they save, so a red that names only possessiveness is
+# not a linearity red. It reads at least the regressions its controls build. It does not replace
+# the meters or the nesting arm: a repetition nested around a repetition over several items
+# (``(?:(?:XY)*)*``) is read by the nesting arm and not here, and one nested around a possessive
+# run (``(?:[^|]*+)*``) is read by neither.
 
 #: The characters two classes are compared over: every one up to U+3000, past which ``\s``
 #: matches none (:data:`_NON_ASCII_WHITESPACE`), and a case's own delimiters. Two classes that
@@ -1187,26 +1193,39 @@ def _class_set(item: Any, universe: str) -> frozenset[str]:
     return frozenset(universe) - hit if negated else frozenset(universe) & hit
 
 
+def _ungroup(body: Any) -> list[Any]:
+    """``body`` with each group around a single item, plain or atomic, taken off."""
+    body = list(body)
+    while len(body) == 1 and body[0][0] in (sre_constants.SUBPATTERN, sre_constants.ATOMIC_GROUP):
+        op, arg = body[0]
+        body = list(arg[3] if op == sre_constants.SUBPATTERN else arg)
+    return body
+
+
 def _open_runs(items: Any) -> Iterator[tuple[Any, Any]]:
     """``(repeat opcode, item)`` for each repetition in ``items``, at any depth, with no fixed count
     over one leaf item, a group around one included (``([^|])*``). A repetition over more than one
-    item is read into rather than yielded. Read through the same group kinds as
+    item is read into rather than yielded. An atomic group around a sole repetition is read as the
+    possessive repetition it is (``(?>[^|]*)`` is ``[^|]*+``). Read through the same group kinds as
     :func:`_nested_repetitions`, and an opcode neither reads raises, so it is read before it is
     trusted."""
     for op, arg in items:
-        if op in _REPEATS:
+        if op == sre_constants.ATOMIC_GROUP:
+            inner = _ungroup(arg)
+            if len(inner) == 1 and inner[0][0] in _REPEATS:
+                for _op, item in _open_runs(inner):
+                    yield sre_constants.POSSESSIVE_REPEAT, item
+            else:
+                yield from _open_runs(inner)
+        elif op in _REPEATS:
             low, high, body = arg
-            body = list(body)
-            while len(body) == 1 and body[0][0] == sre_constants.SUBPATTERN:
-                body = list(body[0][1][3])
+            body = _ungroup(body)
             if low != high and len(body) == 1 and body[0][0] in _LEAF_OPCODES:
                 yield op, body[0]
             else:
                 yield from _open_runs(body)
         elif op == sre_constants.SUBPATTERN:
             yield from _open_runs(arg[3])
-        elif op == sre_constants.ATOMIC_GROUP:
-            yield from _open_runs(arg)
         elif op == sre_constants.GROUPREF_EXISTS:
             for option in arg[1:]:
                 if option is not None:
@@ -1221,7 +1240,7 @@ def _open_runs(items: Any) -> Iterator[tuple[Any, Any]]:
 
 
 def _field_run_violations(field_run: str, delimiters: frozenset[str]) -> list[str]:
-    """What in ``field_run`` breaks the guard and run invariants the comment above names."""
+    """What in ``field_run`` breaks the field-run shape the comment above names."""
     universe = _class_universe(delimiters)
     items = list(sre_parser.parse(field_run))
     first = items[0] if items else None
@@ -1235,7 +1254,7 @@ def _field_run_violations(field_run: str, delimiters: frozenset[str]) -> list[st
         return [f"the field run does not open with a one-class negative lookbehind: {field_run!r}"]
     guard = _class_set(first[1][1][0], universe)
     runs = list(_open_runs(items[1:]))
-    violations = [] if runs else [f"the field run repeats no single class: {field_run!r}"]
+    violations = [] if runs else [f"the field run has no open run: {field_run!r}"]
     for op, item in runs:
         if item[0] != sre_constants.IN:
             violations.append(f"a run over {item!r} is not over a class")
@@ -1247,11 +1266,15 @@ def _field_run_violations(field_run: str, delimiters: frozenset[str]) -> list[st
 
 
 def _segment_violations(segment: str, delimiters: frozenset[str]) -> list[str]:
-    """What in ``segment`` breaks the open-tail invariant the comment above names."""
+    """What in ``segment`` breaks the segment shape the comment above names."""
     universe = _class_universe(delimiters)
     items = list(sre_parser.parse(segment))
+    violations = [
+        f"an open repetition over {item!r} comes before the tail: {segment!r}"
+        for _op, item in _open_runs(items[:-1])
+    ]
     last = items[-1] if items else None
-    if (
+    if not (
         last is not None
         and last[0] in (sre_constants.MAX_REPEAT, sre_constants.POSSESSIVE_REPEAT)
         and last[1][:2] == (0, sre_constants.MAXREPEAT)
@@ -1259,79 +1282,120 @@ def _segment_violations(segment: str, delimiters: frozenset[str]) -> list[str]:
         and last[1][2][0][0] == sre_constants.IN
         and _class_set(last[1][2][0], universe) == frozenset(universe) - {"\r", "\n"}
     ):
-        return []
-    return [f"the segment pattern does not end in an open [^\\r\\n]* alone: {segment!r}"]
+        violations.append(
+            f"the segment pattern does not end in an open [^\\r\\n]* alone: {segment!r}"
+        )
+    return violations
 
 
 @pytest.mark.parametrize("case", _LINEARITY_CASES)
-def test_the_field_run_and_segment_patterns_keep_the_invariants_their_linearity_rests_on(
+def test_the_field_run_and_segment_patterns_keep_the_shape_their_linearity_argument_states(
     case: str,
 ) -> None:
-    """The structural half of the linearity pin: the three properties the comment above names,
-    read from the shipped patterns as compiled, for each case."""
+    """The structural half of the linearity pin: the shape the comment above names, read from the
+    shipped patterns as compiled, for each case."""
     pair = _linearity_case(case)
     violations = _field_run_violations(pair.field_run.pattern, pair.delimiters)
     violations += _segment_violations(pair.segment.pattern, pair.delimiters)
     assert not violations, "; ".join(violations)
 
 
-def _greedy_run(case: str) -> str:
-    """The case's field run with its first run made greedy rather than possessive."""
-    shipped = _linearity_case(case).field_run.pattern
-    regressed = shipped.replace("]*+", "]*", 1)
-    assert regressed != shipped
-    return regressed
-
-
-def _grouped_greedy_run(case: str) -> str:
-    """The case's field run with its first run made a greedy repetition of a capturing group."""
-    pair = _linearity_case(case)
-    _guard, spelling = _field_run_guard(pair.field_run)
-    run = rf"[^\s{spelling}]"
-    regressed = pair.field_run.pattern.replace(run + "*+", f"({run})*", 1)
-    assert regressed != pair.field_run.pattern
-    return regressed
+def _unique(*tables: dict[str, Callable[[str], str]]) -> dict[str, Callable[[str], str]]:
+    """``tables`` merged, refusing a name two of them share, so no control is dropped silently."""
+    merged: dict[str, Callable[[str], str]] = {}
+    for table in tables:
+        shared = merged.keys() & table.keys()
+        if shared:
+            raise AssertionError(f"two structural controls share the names {sorted(shared)}")
+        merged |= table
+    return merged
 
 
 #: Every field run the structural control builds, by test id: the meter and nesting controls'
-#: regressions, and three the meters read as linear, because one start still reads its token once.
-_FIELD_RUN_INVARIANT_BREAKS: dict[str, Callable[[str], str]] = {
-    **{
+#: regressions, and edits the meters read as linear. A greedy run still gives back only its own
+#: token, and an appended ``.*`` reads to the end of the line once, since the scan resumes after
+#: its match.
+_FIELD_RUN_SHAPE_BREAKS = _unique(
+    {
         name: functools.partial(_regressed_field_run, regression=name)
         for name in _FIELD_RUN_REGRESSIONS
     },
-    **{
-        name: functools.partial(_nested_field_run, nesting=shape)
-        for name, shape in _NESTINGS.items()
+    {
+        name: functools.partial(_rewritten_field_run, template=template)
+        for name, template in {
+            **_NESTINGS,
+            "run-not-possessive": "{}*",
+            "grouped-run-not-possessive": "({})*",
+            "atomic-group-run-not-possessive": "(?>{})*",
+        }.items()
     },
-    "run-not-possessive": _greedy_run,
-    "grouped-run-not-possessive": _grouped_greedy_run,
-    "any-character-run-added": lambda case: _linearity_case(case).field_run.pattern + ".*",
-}
-assert len(_FIELD_RUN_INVARIANT_BREAKS) == len(_FIELD_RUN_REGRESSIONS) + len(_NESTINGS) + 3
+    {
+        "runs-removed": lambda case: _field_run_guard(_linearity_case(case).field_run)[0] + "x",
+        "any-character-run-added": lambda case: _linearity_case(case).field_run.pattern + ".*",
+    },
+)
 
 
 @pytest.mark.parametrize("case", _LINEARITY_CASES)
-@pytest.mark.parametrize(
-    "build", _FIELD_RUN_INVARIANT_BREAKS.values(), ids=_FIELD_RUN_INVARIANT_BREAKS
-)
-def test_a_field_run_that_breaks_an_invariant_is_read_red(
+@pytest.mark.parametrize("build", _FIELD_RUN_SHAPE_BREAKS.values(), ids=_FIELD_RUN_SHAPE_BREAKS)
+def test_a_field_run_that_breaks_its_shape_is_read_red(
     case: str, build: Callable[[str], str]
 ) -> None:
     """Live positive control for the structural arm's field-run half: each field run in
-    :data:`_FIELD_RUN_INVARIANT_BREAKS` must break an invariant the arm asserts."""
+    :data:`_FIELD_RUN_SHAPE_BREAKS` must break the shape the arm asserts."""
     field_run = build(case)
     assert _field_run_violations(field_run, _linearity_case(case).delimiters), field_run
 
 
+@pytest.mark.parametrize(
+    "template",
+    [r"(?>{}*)", r"(?>(?>{})*)"],
+    ids=["atomic-around-the-run", "atomic-around-an-atomic-run"],
+)
+def test_an_atomic_group_around_a_run_reads_as_the_possessive_run_it_is(template: str) -> None:
+    """A run spelled atomically matches what a possessive one does, so the structural arm reads it
+    as one rather than reporting a refactor to it as a broken shape."""
+    field_run = _rewritten_field_run("hardcoded", template)
+    assert _field_run_violations(field_run, _linearity_case("hardcoded").delimiters) == [], (
+        field_run
+    )
+
+
+def _segment_with_tail(case: str, tail: str) -> str:
+    """The case's shipped segment pattern with ``tail`` required after it."""
+    return _linearity_case(case).segment.pattern + tail
+
+
+#: Every segment pattern the structural control builds from the shipped one, by test id: each
+#: tail the segment meter's controls require, an open head, a tail that crosses a carriage return,
+#: and a bounded tail.
+_SEGMENT_SHAPE_BREAKS = _unique(
+    {
+        name: functools.partial(_segment_with_tail, tail=tail)
+        for name, tail in _SEGMENT_TAILS.items()
+    },
+    {
+        "head-opened": lambda case: _linearity_case(case).segment.pattern.replace("{2}", "*", 1),
+        "tail-crosses-a-carriage-return": lambda case: _linearity_case(
+            case
+        ).segment.pattern.replace(r"[^\r\n]*", r"[^\n]*"),
+        "tail-bounded": lambda case: _linearity_case(case).segment.pattern.replace(
+            r"[^\r\n]*", r"[^\r\n]{0,64}"
+        ),
+    },
+)
+
+
 @pytest.mark.parametrize("case", _LINEARITY_CASES)
-@pytest.mark.parametrize("tail", _SEGMENT_TAILS.values(), ids=_SEGMENT_TAILS)
-def test_a_segment_pattern_that_breaks_its_invariant_is_read_red(case: str, tail: str) -> None:
-    """Live positive control for the structural arm's segment half: each tail the segment meter's
-    controls require after the shipped ``[^\\r\\n]*`` must break the open-tail invariant."""
-    pair = _linearity_case(case)
-    segment = pair.segment.pattern + tail
-    assert _segment_violations(segment, pair.delimiters), segment
+@pytest.mark.parametrize("build", _SEGMENT_SHAPE_BREAKS.values(), ids=_SEGMENT_SHAPE_BREAKS)
+def test_a_segment_pattern_that_breaks_its_shape_is_read_red(
+    case: str, build: Callable[[str], str]
+) -> None:
+    """Live positive control for the structural arm's segment half: each segment pattern in
+    :data:`_SEGMENT_SHAPE_BREAKS` must break the shape the arm asserts."""
+    segment = build(case)
+    assert segment != _linearity_case(case).segment.pattern
+    assert _segment_violations(segment, _linearity_case(case).delimiters), segment
 
 
 def test_a_headerless_custom_delimiter_fragment_is_an_accepted_residual() -> None:
@@ -2466,7 +2530,7 @@ def _name_token_wall(window: int, tail: int | None = None) -> str:
     4.00. **That catches a search per STEP, not one per clamp:** a single scan of the whole text
     still doubles with the window. ``tail`` sets the run behind on its own, for
     ``test_the_walk_charges_nothing_for_the_text_behind_the_window``, which reads that case."""
-    return ("AA " * (window // 3 + 1))[:window] + "Q" * (3 * window if tail is None else tail)
+    return _tile("AA ", window) + "Q" * (3 * window if tail is None else tail)
 
 
 def _walk_cost(window: int, tail: int | None = None) -> int:
@@ -4142,7 +4206,7 @@ def test_a_single_token_longer_than_the_bound_is_dropped_whole() -> None:
 def _plain_words(length: int) -> str:
     """``length`` characters of lowercase ten-letter tokens that ``redact`` leaves alone, ending on a
     whole token."""
-    return ("abcdefghi " * (length // 10 + 1))[: length - 1] + "j"
+    return _tile("abcdefghi ", length - 1) + "j"
 
 
 @pytest.mark.parametrize(
