@@ -684,11 +684,14 @@ roots and pyodbc's `Error` root where those drivers are installed, and `StoreAcq
 connection raises `ValueError`. These classes do not tell a store fault from a bug, so a bug that
 raises one of them is refused as `store_error` too. Every other exception that reaches the catch
 raises out of the ceremony, `sqlite3.InterfaceError` among them: it is a `sqlite3.Error` but not a
-`DatabaseError`. Since 2026-11-25 such a raise, the `AUDIT_WRITE_DEFECTS` classes included, is
-first logged by type and audited `auth.webauthn_failed` with `reason=read_raised` (BACKLOG #3775
-added item 9), because until then a raise after the sign-count write left the attempt with no audit
-row. That row is soft: a store that refuses it, or whose audit write raises anything, leaves no row,
-and the read's exception still raises. `MemoryError`, `RecursionError` and a cancel write no row. The session, account and lock re-read, which since 2026-11-05 follows that set read
+`DatabaseError`. Since 2026-11-25 such a raise from this read is first logged by type and
+audited `auth.webauthn_failed` with `reason=read_raised` (BACKLOG #3775 added item 9), because
+until then it left the attempt with no audit row. At least `sqlite3.InterfaceError`, `CipherError`
+and the `AUDIT_WRITE_DEFECTS` classes other than `RecursionError` take that path; a
+`MemoryError`, a `RecursionError` and a cancel from the read write no row. That row is soft: a
+store that refuses it, or whose audit write raises another `Exception`, leaves no row and the
+read's exception raises, but a `MemoryError`, `RecursionError` or cancel during the write raises
+in its place. `AuthService._passkey_standing` holds the rule. The session, account and lock re-read, which since 2026-11-05 follows that set read
 rather than preceding it (BACKLOG #3068), is outside this catch, so an exception there raises.
 
 **Why a gone passkey still raises the signal.** A self-service passkey delete takes no account

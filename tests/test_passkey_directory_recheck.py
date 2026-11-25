@@ -1475,7 +1475,7 @@ async def test_a_pyodbc_root_read_fault_takes_the_connect_class_path(
     adds. RED when: the catch drops ``store_connect_errors()`` and the fault raises. CONTROL: the
     call set alone really misses it."""
     assert not isinstance(_PyodbcError(), store_call_errors())
-    # pyodbc puts the SQLSTATE first and the driver message second; the message is not logged.
+    # pyodbc puts the SQLSTATE first and the driver message second; neither message is logged.
     await _assert_the_read_fault_refuses(
         _PyodbcError("40001", "synthetic: chosen as the deadlock victim"), monkeypatch, caplog
     )
@@ -1487,6 +1487,7 @@ _RAISED_FAULTS: dict[str, Callable[[], Exception]] = {
     "sqlite-interface": lambda: sqlite3.InterfaceError("synthetic: SQLITE_MISUSE"),
     "cipher": lambda: CipherError("synthetic: the passkey row did not decrypt"),
     "type-error": lambda: TypeError("synthetic: a code defect"),
+    "not-implemented": lambda: NotImplementedError("synthetic: an AUDIT_WRITE_DEFECTS class"),
 }
 
 
@@ -1510,6 +1511,29 @@ async def test_a_fault_outside_the_refusal_set_raises_after_an_audit_row(
             for line in error_lines
         )
         assert not any(str(fault) in line for line in error_lines)
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    "fault_factory",
+    [
+        lambda: RecursionError("synthetic: out of stack"),
+        lambda: MemoryError("synthetic: out of memory"),
+    ],
+    ids=["recursion", "memory"],
+)
+async def test_resource_exhaustion_in_the_passkey_re_read_raises_with_no_row(
+    fault_factory: Callable[[], Exception], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3775 added item 9. A ``RecursionError`` or ``MemoryError`` from the read raises at
+    once, with no audit row: nothing more is asked of a process out of stack or memory. RED when:
+    either is audited ``read_raised`` or refused as ``store_error``."""
+    store, token = await _raise_with_the_set_read_failing(monkeypatch, fault_factory())
+    try:
+        assert await _audited_assertion_failures(store) == []
+        session = await store.get_session(hash_token(token))
+        assert session is not None and session.mfa_verified_at is None
     finally:
         await store.close()
 
@@ -1543,34 +1567,5 @@ async def test_a_raise_whose_audit_row_is_refused_still_raises_the_read_fault(
         assert await _audited_assertion_failures(store) == []
         session = await store.get_session(hash_token(token))
         assert session is not None and session.mfa_verified_at is None
-    finally:
-        await store.close()
-
-
-async def test_a_server_driver_sqlstate_is_named_on_the_refusal_line(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """BACKLOG #3775 added item 14. A refused re-read's ERROR line names the SQLSTATE a server
-    driver's error carries, read with ``driver_sqlstate``, and still not the message. RED when: the
-    SQLSTATE is dropped from the ERROR line."""
-
-    class _AsyncpgLike(RuntimeError):
-        sqlstate = "40P01"
-
-    # The SQLSTATE is read only for an error from a server driver's own module.
-    _AsyncpgLike.__module__ = "asyncpg.exceptions"
-
-    store, _token, refused = await _assert_with_the_set_read_failing(
-        monkeypatch, _AsyncpgLike("synthetic: deadlock detected")
-    )
-    try:
-        assert refused.ok is False
-        error_lines = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
-        assert any(
-            "(sqlstate 40P01)" in line and "refused as a store error" in line
-            for line in error_lines
-        )
-        assert not any("deadlock detected" in line for line in error_lines)
-        assert {"reason": "store_error"} in await _audited_assertion_failures(store)
     finally:
         await store.close()
