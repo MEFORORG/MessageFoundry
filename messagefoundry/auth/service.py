@@ -139,7 +139,6 @@ from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.tokens import (
     CREDENTIAL_ID_HASH_SCHEME,
     ENROLMENT_CODE_MAX,
-    credential_id_hash_is_current,
     credential_id_hash_scheme,
     decode_stored_b64url,
     enrolment_code_digest,
@@ -147,6 +146,7 @@ from messagefoundry.auth.tokens import (
     hash_token,
     mint_enrolment_code,
     mint_token,
+    stored_passkey_is_readable,
 )
 from messagefoundry.auth.tokens import (
     credential_id_hash as _credential_id_hash,  # locals and parameters here use the bare name
@@ -1693,8 +1693,9 @@ class StoredPasskeysUnreadable(Exception):
     """Every passkey an account holds under the ceremony's ``rp_id`` has a stored credential id
     that does not decode (BACKLOG #6886), so no assertion ceremony can be staged. Raised by
     :meth:`AuthService.begin_webauthn_assertion` in place of its ``None``, which means the passkeys
-    were minted under another origin; the holder needs an MFA reset either way, for another
-    reason. The message names no passkey and no stored value."""
+    were minted under another origin. The holder signs in with another factor where it has one and
+    removes the unreadable passkey, or asks an administrator for an MFA reset where it has none.
+    The message names no passkey and no stored value."""
 
     def __init__(self) -> None:
         super().__init__("the account's passkeys could not be read")
@@ -3513,12 +3514,18 @@ async def lockable_account_census(
 
     def second_factor_counts(cred: WebAuthnCredential) -> bool:
         # A directory account's passkey second factor: offered only under the request's rp_id,
-        # and found at the finish only by a credential-id hash in today's scheme. The rp_id rule
-        # is ``sign_in_counts``'s; the discoverable record is not asked, since the second-factor
-        # ceremony names the credential itself.
-        return (
-            way_past_rp_id is None or cred.rp_id == way_past_rp_id
-        ) and credential_id_hash_is_current(cred.credential_id_hash)
+        # found at the finish only by a credential-id hash in today's scheme, and verified only
+        # where its stored id and key decode (BACKLOG #6886). The rp_id rule is
+        # ``sign_in_counts``'s, and the stored-cell rule is ``passkey_is_way_past``'s; the
+        # discoverable record is not asked, since the second-factor ceremony names the credential
+        # itself.
+        return (way_past_rp_id is None or cred.rp_id == way_past_rp_id) and (
+            stored_passkey_is_readable(
+                credential_id_hash=cred.credential_id_hash,
+                credential_id=cred.credential_id,
+                public_key=cred.public_key,
+            )
+        )
 
     integrity_failed: list[str] = []
     for user in await store.list_users():
@@ -3628,6 +3635,25 @@ async def lockable_account_census(
 
 def _json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True)
+
+
+def _passkey_label(label: object) -> str | None:
+    """A stored passkey label as an audit detail carries it, rendered so that encoding the detail
+    cannot raise (BACKLOG #6886): text as it is, bytes (a BLOB in the TEXT column reads back as
+    bytes) decoded with replacement, and anything else as no label. A raise there would turn a
+    refusal into a server error, which a caller can tell from the refusal."""
+    if isinstance(label, str):
+        return label
+    if isinstance(label, (bytes, bytearray)):
+        return bytes(label).decode("utf-8", "replace")
+    return None
+
+
+def _stored_key_refused_detail(cred: WebAuthnCredential) -> str:
+    """The one audit detail for a passkey whose stored cells will never sign in (BACKLOG #1963,
+    #6886), written by both the assertion begin leg and the verify: a fixed slug and the label,
+    never the refusal text, which can quote the key."""
+    return _json({"reason": "stored_key_refused", "label": _passkey_label(cred.label)})
 
 
 def _is_idp_transport_failure(exc: BaseException) -> bool:
@@ -5217,9 +5243,11 @@ class AuthService:
             )
         if refused:
             _log.warning(
-                "%d passkey(s) were not moved to the current credential-id hash scheme (at least: a"
-                " stored credential id that does not decode, an unknown scheme, a hash its own"
-                " credential id does not give, or a move the store refused); they cannot sign in",
+                "%d passkey(s) were left as stored, and no sign-in can use them: each has a"
+                " credential-id hash in a scheme this release does not know or of a malformed"
+                " shape, a stored credential id that does not decode, or today's scheme tag over a"
+                " digest its own credential id does not give, or the store refused its move to"
+                " today's scheme",
                 refused,
             )
         return rehashed, refused
@@ -6973,15 +7001,15 @@ class AuthService:
 
         def refused_key() -> tuple[str, str | None]:
             # Built only on a refusal, so a good assertion never encodes the label.
-            return "auth.webauthn_failed", _json(
-                {"reason": "stored_key_refused", "label": cred.label}
-            )
+            return "auth.webauthn_failed", _stored_key_refused_detail(cred)
 
         try:
             # The id is decoded only to be checked. The second-factor begin leg and the registration
             # options leave out a passkey whose id does not decode
-            # (:meth:`_split_stored_credential_ids`), but the usernameless begin leg names no
-            # credential, so a combined sign-in reaches here with one, and this refuses it.
+            # (:meth:`_split_stored_credential_ids`), and the combined sign-in is taken only where
+            # some passkey of the account is a way past (``passkey_is_way_past``). A browser can
+            # still answer either ceremony with another of the account's passkeys, found by its
+            # hash, so this refuses one whose stored id or key does not decode.
             self._b64url_decode(cred.credential_id)
             public_key = self._b64url_decode(cred.public_key)
         except (ValueError, TypeError):
@@ -7017,7 +7045,8 @@ class AuthService:
                 action, detail = refused_key()
             except webauthn.WebAuthnVerificationError as exc:
                 if "sign count" in str(exc).lower():
-                    action, detail = "auth.webauthn_clone_suspected", _json({"label": cred.label})
+                    action = "auth.webauthn_clone_suspected"
+                    detail = _json({"label": _passkey_label(cred.label)})
                 elif audit_bad_signature:
                     action, detail = "auth.webauthn_failed", None
                 else:
@@ -20327,7 +20356,7 @@ class AuthService:
             await self._audit(
                 "auth.webauthn_failed",
                 actor=user.username,
-                detail=_json({"reason": "stored_key_refused", "label": cred.label}),
+                detail=_stored_key_refused_detail(cred),
             )
         if not allowed:
             # Not ``None``: the console reads that as an origin migration, and none happened.

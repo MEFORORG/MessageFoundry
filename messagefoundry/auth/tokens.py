@@ -136,9 +136,10 @@ def decode_stored_b64url(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
-def stored_credential_id_decodes(stored: str) -> bool:
-    """Whether a stored ``credential_id`` decodes with :func:`decode_stored_b64url` (BACKLOG
-    #6886). The verify refuses a passkey whose id does not, so no sign-in can use it."""
+def stored_b64url_decodes(stored: str) -> bool:
+    """Whether a stored passkey column (``credential_id``, ``public_key``) decodes with
+    :func:`decode_stored_b64url` (BACKLOG #6886). The verify refuses a passkey where either does
+    not, so no sign-in can use it."""
     try:
         decode_stored_b64url(stored)
     except (ValueError, TypeError):
@@ -149,8 +150,26 @@ def stored_credential_id_decodes(stored: str) -> bool:
 def credential_id_hash_is_current(stored: str) -> bool:
     """Whether a stored ``credential_id_hash`` is under today's scheme, the only key the sign-in
     looks a passkey up by (BACKLOG #3423). A bare digest the start-up rehash has not moved, an
-    unknown tag and a malformed value are all ``False``: no sign-in can find that passkey."""
+    unknown tag, a malformed value and a value that is not text (a BLOB in the TEXT column reads
+    back as bytes) are all ``False``: no sign-in can find that passkey."""
+    if not isinstance(stored, str):
+        return False
     try:
         return credential_id_hash_scheme(stored) == CREDENTIAL_ID_HASH_SCHEME
     except CredentialHashSchemeError:
         return False
+
+
+def stored_passkey_is_readable(
+    *, credential_id_hash: str, credential_id: str, public_key: str
+) -> bool:
+    """Whether every stored cell a passkey sign-in reads before the signature check reads back:
+    the hash under today's scheme (:func:`credential_id_hash_is_current`), and the id and the key
+    decoding (:func:`stored_b64url_decodes`; BACKLOG #6886). A passkey that fails any of them can
+    never sign in. One that passes may still be refused by the verify, at least for a key the
+    registration rule refuses, so this is a necessary condition and not a sufficient one."""
+    return (
+        credential_id_hash_is_current(credential_id_hash)
+        and stored_b64url_decodes(credential_id)
+        and stored_b64url_decodes(public_key)
+    )

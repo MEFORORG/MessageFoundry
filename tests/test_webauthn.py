@@ -697,6 +697,81 @@ async def test_the_finish_leg_refuses_a_passkey_whose_stored_id_does_not_decode(
         await store.close()
 
 
+#: A label as a BLOB in the TEXT column reads back: bytes, which ``json.dumps`` refuses. Synthetic.
+_BYTES_LABEL = b"bytes key"
+
+
+async def _refusal_details(service: AuthService, username: str, action: str) -> list[Any]:
+    events = await service.security_events_for(username)
+    return [json.loads(e["detail"]) for e in events if e["action"] == action]
+
+
+async def test_a_bytes_label_does_not_break_the_finish_legs_stored_key_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6886. RED when: a stored label that reads back as bytes makes the
+    ``stored_key_refused`` detail raise ``TypeError`` from ``json.dumps``, so a refusal of an
+    undecodable stored key becomes a server error, which a caller can tell from the refusal. The
+    detail renders the label so that it cannot raise: the caller sees the one refusal, and the row
+    carries the label as text."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        auth, token = await _enroll(service, identity, token)
+        _with_stored(monkeypatch, store, label=_BYTES_LABEL, public_key="AAAAA")
+        refused = await _finish_assertion(service, token, auth)
+        assert refused == Elevation(), "the caller must see the same refusal as a bad signature"
+        failed = await _refusal_details(service, identity.username, "auth.webauthn_failed")
+        assert failed == [{"reason": "stored_key_refused", "label": "bytes key"}]
+    finally:
+        await store.close()
+
+
+async def test_a_bytes_label_does_not_break_the_begin_legs_stored_key_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6886. RED when: the begin leg's ``stored_key_refused`` row for a passkey whose
+    stored id does not decode raises ``TypeError`` on a label that reads back as bytes, a server
+    error in place of :class:`StoredPasskeysUnreadable`. The row is the same one the finish leg
+    writes, built by one builder."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        _, token = await _enroll(service, identity, token)
+        _with_stored(monkeypatch, store, label=_BYTES_LABEL, credential_id="AAAAA")
+        with pytest.raises(StoredPasskeysUnreadable):
+            await service.begin_webauthn_assertion(token, rp_id=RP)
+        failed = await _refusal_details(service, identity.username, "auth.webauthn_failed")
+        assert failed == [{"reason": "stored_key_refused", "label": "bytes key"}]
+    finally:
+        await store.close()
+
+
+async def test_a_bytes_label_does_not_break_the_clone_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6886. RED when: the clone signal's detail raises ``TypeError`` on a label that
+    reads back as bytes, so a replayed counter becomes a server error and writes no
+    ``auth.webauthn_clone_suspected`` row. The control is the advancing assertion before it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        auth = SoftAuthenticator(rp_id=RP, origin=ORIGIN, sign_count=5)
+        _, token = await _enroll(service, identity, token, auth=auth)
+        _with_stored(monkeypatch, store, label=_BYTES_LABEL)
+        ok, token = await _assert_once(service, token, auth, sign_count=6)
+        assert ok is True
+        ok, token = await _assert_once(service, token, auth, sign_count=6)
+        assert ok is False
+        cloned = await _refusal_details(service, identity.username, "auth.webauthn_clone_suspected")
+        assert cloned == [{"label": "bytes key"}]
+    finally:
+        await store.close()
+
+
 async def test_a_good_assertion_never_encodes_the_stored_label(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

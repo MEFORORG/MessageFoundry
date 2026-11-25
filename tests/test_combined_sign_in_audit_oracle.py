@@ -1388,8 +1388,9 @@ async def test_a_cancel_then_a_failing_write_ends_in_the_cancel_and_logs_the_err
         for _ in range(3):  # let the cancel land on the caller's wait before the write fails
             await asyncio.sleep(0)
         assert not task.done(), "the caller left before its write finished"
-        # Every logger, at ERROR: the failure is logged once, by the service, and asyncio adds no
-        # second record of it (a cancelled shield used to add "exception in shielded future").
+        # The failure is logged once, by the service, and asyncio adds no second record of THIS
+        # write's error (a cancelled shield used to add "exception in shielded future"). Only those
+        # are counted, so an unrelated ERROR from elsewhere in the run cannot fail the test.
         with caplog.at_level(logging.ERROR):
             release.set()
             with pytest.raises(asyncio.CancelledError):
@@ -1402,9 +1403,20 @@ async def test_a_cancel_then_a_failing_write_ends_in_the_cancel_and_logs_the_err
             with contextlib.suppress(asyncio.CancelledError, _WriteFailed):
                 await task
     assert task.cancelled()
-    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
-    assert len(errors) == 1, [(r.name, r.getMessage()) for r in errors]
-    assert errors[0].name == "messagefoundry.auth.service"
+    errors = [
+        r
+        for r in caplog.records
+        if r.name == "messagefoundry.auth.service" and r.levelno >= logging.ERROR
+    ]
+    assert len(errors) == 1, [r.getMessage() for r in errors]
+    echoed = [
+        r
+        for r in caplog.records
+        if r.name == "asyncio"
+        and r.exc_info is not None
+        and isinstance(r.exc_info[1], _WriteFailed)
+    ]
+    assert echoed == [], [r.getMessage() for r in echoed]
     assert "the test's write failed while the request was cancelled" in errors[0].getMessage()
     assert errors[0].exc_info is not None and isinstance(errors[0].exc_info[1], _WriteFailed)
 
