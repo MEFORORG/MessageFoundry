@@ -456,15 +456,27 @@ def _validate(profile: ConnScaleProfile, where: str) -> None:
         "empty_claims_herd_floor_legs": bool(profile.slo.empty_claims_herd_floor_legs),
     }
     # The floor once graded only the FIRST record at the base count of each (sweep_mode, claim_mode),
-    # so a repeat trial was recorded and never graded. Since BACKLOG #5090 `herd_floor_readings`
-    # groups on `monotonic_lane`, so each trial is graded in its own lane, labelled `.../trial=<n>`;
-    # the harvest behind the arming never read a lane so named, so the pairing stays refused.
-    if profile.slo.empty_claims_herd_floor_legs and profile.trials > 1:
-        raise ConnScaleProfileError(
-            f"{where}: slo.empty_claims_herd_floor_legs cannot be armed with trials = "
-            f"{profile.trials}: each trial grades in a lane of its own, named '.../trial=<n>', "
-            f"which the harvest behind the arming never read"
-        )
+    # so a repeat trial or a second arm was recorded and never graded. Since BACKLOG #5090
+    # `herd_floor_readings` groups on `monotonic_lane`, so each trial and each fusion or batching arm
+    # is graded in its own lane, labelled `.../trial=<n>`, `.../fuse=<on|off>` or
+    # `.../batch=<on|off>`; the harvest behind the arming never read a lane so named, so the pairing
+    # is refused. A sandbox A/B is refused with it in `_validate_sandbox`.
+    if profile.slo.empty_claims_herd_floor_legs:
+        splits = [
+            f"{name} = {value}"
+            for name, value, split in (
+                ("trials", profile.trials, profile.trials > 1),
+                ("fuse_modes", list(profile.fuse_modes), len(profile.fuse_modes) > 1),
+                ("batch_modes", list(profile.batch_modes), len(profile.batch_modes) > 1),
+            )
+            if split
+        ]
+        if splits:
+            raise ConnScaleProfileError(
+                f"{where}: slo.empty_claims_herd_floor_legs cannot be armed with "
+                f"{' and '.join(splits)}: each trial or arm grades in a lane of its own, named "
+                f"'.../<axis>=<value>', which the harvest behind the arming never read"
+            )
     for key, armed in per_lane_only.items():
         if armed and PER_LANE not in profile.claim_modes:
             raise ConnScaleProfileError(

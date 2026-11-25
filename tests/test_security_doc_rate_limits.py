@@ -2008,7 +2008,9 @@ def test_every_sliding_window_limiter_is_filed_under_the_right_requirement() -> 
     for accessor in sorted(_AUTH_SURFACE_ACCESSORS):
         assert accessor in protection, f"{accessor} has no row in the 6.1.1 protection set"
     for accessor in sorted(_BUSINESS_LIMIT_ACCESSORS):
-        field = "phi_read" if "phi" in accessor else "admin_write"
+        # Each accessor's own settings: the monitoring read was checked against admin_write's
+        # row before BACKLOG #5090, so its own row could go unseen.
+        field = next(f for f in ("phi_read", "monitoring_read", "admin_write") if f in accessor)
         assert f"{field}_rate_limit_enabled" in limits, (
             f"{accessor}'s settings have no row in the 2.1.3 business-logic-limits table"
         )
@@ -2115,13 +2117,18 @@ def _census_reach(entries: set[str]) -> tuple[set[str], dict[str, set[str]]]:
 _CONTROL_12_COUNT_ROW = "_count_unrecorded_logout_misses"
 _CONTROL_12_COUNT_ROW_TOKEN = "`unrecorded`"
 
-#: The census's entries: each limiter accessor, and the service methods of control 12, the one
-#: structural control built on limiters. A limiter none of them reaches is in no row of either table.
-_CENSUS_ENTRIES = (
-    _AUTH_SURFACE_ACCESSORS
-    | _BUSINESS_LIMIT_ACCESSORS
-    | {_STRUCTURAL_CONTROLS["sign-out miss-row budget"], _CONTROL_12_COUNT_ROW}
-)
+
+#: The census's entries (:func:`_census_entries`): each limiter accessor, and the service methods
+#: of control 12, the one structural control built on limiters. A limiter none of them reaches is
+#: in no row of either table.
+def _census_entries() -> set[str]:
+    # A function, not a module constant: a renamed _STRUCTURAL_CONTROLS key then fails these
+    # tests one at a time instead of failing this module's collection.
+    return set(
+        _AUTH_SURFACE_ACCESSORS
+        | _BUSINESS_LIMIT_ACCESSORS
+        | {_STRUCTURAL_CONTROLS["sign-out miss-row budget"], _CONTROL_12_COUNT_ROW}
+    )
 
 
 def test_control_12_names_the_count_row_its_second_census_entry_writes() -> None:
@@ -2138,7 +2145,7 @@ def test_every_sliding_window_limiter_is_reached_by_a_documented_control() -> No
     control on the ONE limiter its accessor reads, so a second limiter behind the same control was
     invisible to it: control 11's backstop and per-account floor, read through
     ``_step_up_return_audit_backstop_admits``, and control 12's count-row limiter."""
-    limiters, reach = _census_reach(set(_CENSUS_ENTRIES))
+    limiters, reach = _census_reach(_census_entries())
     unseen = limiters - set().union(*reach.values())
     assert not unseen, (
         f"sliding-window limiters no documented control reaches: {sorted(unseen)}. Put each behind "
@@ -2154,7 +2161,7 @@ def test_every_sliding_window_limiter_is_reached_by_a_documented_control() -> No
 def test_the_limiter_reach_census_can_fail() -> None:
     """The control for the census above: without control 11's accessor, its three limiters are
     reported unseen, so the walk is not vacuously complete."""
-    entries = set(_CENSUS_ENTRIES) - {"allow_step_up_return_audit"}
+    entries = _census_entries() - {"allow_step_up_return_audit"}
     limiters, reach = _census_reach(entries)
     unseen = limiters - set().union(*reach.values())
     assert {

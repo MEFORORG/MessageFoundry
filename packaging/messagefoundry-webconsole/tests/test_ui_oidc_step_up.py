@@ -939,7 +939,9 @@ async def test_the_budget_spent_warning_escapes_the_client_address(
 def test_every_client_bearing_log_line_in_the_oidc_routes_is_scrubbed() -> None:
     """BACKLOG #5090. RED when: a log call in the console's OIDC routes passes the client address
     without ``scrub_log_argument``. The test above drives one of these lines; this covers the rest,
-    which a flood or a full flow cache reaches."""
+    which a flood or a full flow cache reaches. Every argument is read, the format string and the
+    keywords included, so an f-string naming ``client`` fails too. A copy of the address under
+    another name is not followed."""
     import ast
 
     from messagefoundry_webconsole.routes import oidc as oidc_routes
@@ -955,7 +957,7 @@ def test_every_client_bearing_log_line_in_the_oidc_routes_is_scrubbed() -> None:
     ]
     bearing = 0
     for call in sites:
-        for arg in call.args[1:]:
+        for arg in [*call.args, *(kw.value for kw in call.keywords)]:
             if not any(isinstance(n, ast.Name) and n.id == "client" for n in ast.walk(arg)):
                 continue
             bearing += 1

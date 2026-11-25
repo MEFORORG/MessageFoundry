@@ -1381,6 +1381,18 @@ def test_a_second_arm_or_trial_is_its_own_lane(second: dict[str, object]) -> Non
 
 
 @pytest.mark.parametrize("second", _SECOND_RUN)
+def test_the_herd_floor_grades_each_arm_or_trial_in_its_own_lane(second: dict[str, object]) -> None:
+    """BACKLOG #5090: the herd floor grouped on (sweep_mode, claim_mode) and graded only the first
+    record at the base count, so the second run's reading was recorded and never graded."""
+    records = _two_runs(second)
+    readings = herd_floor_readings(records, _KEY, base_count=12)
+    assert sorted(r.value for r in readings if r.value is not None) == [10.0, 100.0], readings
+    assert all(r.ok is not None for r in readings), readings
+    pair_labels = {p.label for p in monotonic_pairs(records, _KEY, tolerance=_MONOTONIC_TOLERANCE)}
+    assert {r.label for r in readings} == pair_labels
+
+
+@pytest.mark.parametrize("second", _SECOND_RUN)
 def test_the_readings_table_has_one_row_per_record_with_its_own_prior(
     second: dict[str, object],
 ) -> None:
