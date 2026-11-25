@@ -36,7 +36,7 @@ import os
 import shutil
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -279,7 +279,7 @@ def test_an_unreadable_cache_stamp_is_a_miss_that_says_so(tmp_path: Path) -> Non
     assert json.loads(cache.read_text(encoding="utf-8"))["at"] != "not a date", (
         "an unreadable stamp must miss and re-walk, which rewrites the cache"
     )
-    assert "FormatException" in proc.stderr, f"the miss was silent: {proc.stderr!r}"
+    assert "re-walking" in proc.stderr, f"the miss was silent: {proc.stderr!r}"
     assert "not a date" not in proc.stderr, "the raw stamp, foreign text, reached the terminal"
 
 
@@ -296,11 +296,13 @@ def test_a_string_stamp_is_parsed_invariantly(tmp_path: Path, culture: str) -> N
     _run(repo, tmp_path, "-Refresh", "-Json")
     cache = _cache_path(repo)
     body = json.loads(cache.read_text(encoding="utf-8"))
-    body["at"] = datetime.now().strftime("%m/%d/%Y %H:%M:%S")
+    # Two hours back with a day-long window: a DST shift of an hour either way still leaves the
+    # stamp in the past and inside the window, so the test has no fall-back-night flake.
+    body["at"] = (datetime.now() - timedelta(hours=2)).strftime("%m/%d/%Y %H:%M:%S")
     cache.write_text(json.dumps(body), encoding="utf-8")
     before = cache.read_bytes()
 
-    proc = _run(repo, tmp_path, "-CacheSeconds", "3600", "-Json", culture=culture)
+    proc = _run(repo, tmp_path, "-CacheSeconds", "86400", "-Json", culture=culture)
     assert cache.read_bytes() == before, (
         f"under {culture} a fresh invariant string stamp missed: {proc.stderr!r}"
     )

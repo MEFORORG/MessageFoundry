@@ -172,9 +172,10 @@ def test_an_untouched_file_is_not_reported(
 
 
 # A ``-File`` spelled the way a shell tab-completes it (``.\docs\gamma.txt``) or with a ``.`` or ``..``
-# segment names the same file git reports as ``docs/gamma.txt``, and must match it. ConvertTo-Norm once
-# only flipped slashes, trimmed and lowercased, so every dotted spelling below missed, and the gate read
-# a real collision as an all-clear.
+# segment names the same file git reports as ``docs/gamma.txt``, and must match it. The -File query once
+# only went through ConvertTo-Norm (slash flip, trim, lowercase), so every dotted spelling below missed,
+# and the gate read a real collision as an all-clear. The query now resolves through GetFullPath against
+# the repo root first; ConvertTo-Norm itself is unchanged and still does not canonicalize.
 def test_a_dotted_or_tab_completed_spelling_matches_gits_path(
     peer_worktree: tuple[Path, Path], tmp_path: Path
 ) -> None:
