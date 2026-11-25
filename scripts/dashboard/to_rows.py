@@ -286,7 +286,11 @@ def _other_batches(d: dict[str, Any]) -> Any:
     by = d.get("batches_by_state")
     if not isinstance(by, dict):
         return None
-    return sum(int(n) for s, n in by.items() if s not in BATCH_STATES)
+    try:
+        return sum(int(n) for s, n in by.items() if s not in BATCH_STATES)
+    except (TypeError, ValueError):
+        # A malformed count is no measurement; the page shows no data rather than raising.
+        return None
 
 
 def _batches(state: str) -> Callable[[dict[str, Any]], Any]:

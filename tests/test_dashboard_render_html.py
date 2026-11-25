@@ -374,3 +374,23 @@ def test_provenance_lines_keep_their_own_semicolons() -> None:
     snap["metrics"][3]["detail"]["provenance"] = ["# engine: freshness=STALE; behind=3"]
     page = rh.render(snap)
     assert "# engine: freshness=STALE; behind=3</p>" in page
+
+
+def test_missing_asvs_provenance_is_said_on_the_tile() -> None:
+    snap = _snapshot()
+    snap["metrics"][3]["error"] = None
+    page = rh.render(snap)
+    tile = page[page.index("<h3>asvs") :]
+    tile = tile[: tile.index("</section>")]
+    assert '<p class="err">the snapshot holds no scorecard provenance lines</p>' in tile
+    snap["metrics"][3]["detail"]["provenance"] = ["# asvs-status scorecard=x engine=y"]
+    tile = rh.render(snap)
+    assert "holds no scorecard provenance lines" not in tile
+
+
+def test_a_malformed_batch_count_renders_no_data() -> None:
+    snap = _snapshot()
+    snap["metrics"].append(
+        _metric("batch_progress", value=1.0, detail={"batches_by_state": {"X": "many"}})
+    )
+    assert "Other state" in rh.render(snap)

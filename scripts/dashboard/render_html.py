@@ -449,6 +449,16 @@ def tile(
     shown = [f for f in facts if not str(f.get("id", "")).endswith(".provenance")]
     dl = "".join(f"<dt>{esc(f.get('label', ''))}</dt><dd>{fmt(f.get('value'))}</dd>" for f in shown)
     error = row.get("error")
+    if row.get("ref") and not provenance_lines and not error:
+        # A missing tool header is said on the tile's face, never only inside the disclosure.
+        error = next(
+            (
+                f.get("error")
+                for f in facts
+                if str(f.get("id", "")).endswith(".provenance") and f.get("error")
+            ),
+            "the snapshot holds no scorecard provenance lines",
+        )
     note = f'<p class="note">{esc(row["note"])}</p>' if row.get("note") else ""
     how = ""
     if row.get("ref"):
@@ -494,11 +504,12 @@ def _points(series: Sequence[Mapping[str, Any]], name: str) -> dict[str, Any]:
 
 def ledger_charts(snap: tr.Snapshot, series: Sequence[Mapping[str, Any]]) -> tuple[str, str]:
     """The ranged filed-and-closed chart (log axis) and the burndown, with the range controls."""
-    names = [name for name, _ in tr.HISTORY_SERIES]
-    hist = [r for r in series if r.get("series") in names]
+    hist = [r for r in series if r.get("series") in {name for name, _ in tr.HISTORY_SERIES}]
     weeks = sorted({str(r["week"]) for r in hist})
     if weeks:
-        filed, closed, opened = (_points(hist, name) for name in names)
+        # By ledger_history key, never by position, so reordering HISTORY_SERIES swaps nothing.
+        by_key = {key: _points(hist, name) for name, key in tr.HISTORY_SERIES}
+        filed, closed, opened = by_key["filed"], by_key["closed"], by_key["open"]
         partial = {str(r["week"]) for r in hist if r.get("partial")}
     else:
         # A snapshot from before the history was collected: its window alone, as before.

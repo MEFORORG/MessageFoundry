@@ -1485,7 +1485,8 @@ def xlsx_sheet_rows(data: bytes, sheet: str) -> list[list[str]]:
                     try:
                         text = shared[int(text)]
                     except (ValueError, IndexError):
-                        raise CollectError(f"cell {c.get('r')} names no shared string") from None
+                        where = ref or f"in column {col + 1} of its row"
+                        raise CollectError(f"cell {where} names no shared string") from None
             cells[col] = text
         rows.append([cells.get(i, "") for i in range(max(cells, default=-1) + 1)])
     return rows
