@@ -1074,10 +1074,10 @@ _CONTROL_ACTION_SIDE: Final = {"restart_inbound": "inbound", "restart_outbound":
 
 #: Which side of the graph raises each alert event type (BACKLOG #3378). ``"outbound"`` marks a type
 #: whose emitters, read on 2026-11-22, raise it only for an outbound lane. ``GET /alerts/rules``
-#: reads only that value: it withholds a rule of an ``"outbound"`` type, or of a type missing here,
-#: from a channel-scoped caller. The other values are notes, not checked per emitter: ``"inbound"``
-#: and ``"both"`` for the side or sides read, ``"none"`` for a type whose settings comment keys it
-#: on something other than a connection name. A test pins the keys to
+#: withholds from a channel-scoped caller a rule of an ``"outbound"`` type, or of a type missing
+#: here, and a ``"*"`` rule of a ``"both"`` type, which it treats ``"any"`` as too. The other values
+#: are notes, not checked per emitter: ``"inbound"`` for the side read, ``"none"`` for a type whose
+#: settings comment keys it on something other than a connection name. A test pins the keys to
 #: ``config.settings._ALERT_EVENT_TYPES``, so a new type has to be classified.
 _ALERT_EVENT_SIDE: Final[Mapping[str, str]] = MappingProxyType(
     {
@@ -10950,10 +10950,15 @@ def create_app(
             ):
                 return False
             # An event type only an outbound raises makes the rule an outbound rule, a "*" one
-            # included. "any" matches every side, as connection_stopped does, so it shows.
-            return rule.event_type == "any" or (
-                _ALERT_EVENT_SIDE.get(rule.event_type, "outbound") != "outbound"
+            # included. A "*" rule fires for every connection, so one of a type both sides raise,
+            # or of "any", matches outbound events too, and is withheld (BACKLOG #3378, #8390). On
+            # a reachable inbound such a rule matches only that inbound's events, so it shows.
+            side = (
+                "both"
+                if rule.event_type == "any"
+                else _ALERT_EVENT_SIDE.get(rule.event_type, "outbound")
             )
+            return side != "outbound" and not (rule.connection == "*" and side == "both")
 
         rules = [r for r in alerts.rules if visible(r)]
         show_ids = not scoped

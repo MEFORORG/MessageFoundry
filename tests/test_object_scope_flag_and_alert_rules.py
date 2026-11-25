@@ -168,9 +168,11 @@ async def test_flag_with_no_graph_checks_the_scope_first(engine: Engine) -> None
         assert not [a for a in audit if a[0] == "auth.channel_denied"], audit
 
 
+#: The ``"*"`` rule is of an inbound-only type, so a scoped caller sees it; a ``"*"`` rule of a type
+#: an outbound can raise is withheld (BACKLOG #3378, #8390 item 14).
 _RULES = AlertsSettings(
     rules=[
-        AlertRule(id="all", connection="*"),
+        AlertRule(id="all", event_type="sandbox_worker_refused", connection="*"),
         AlertRule(id="mine", connection="IB_A"),
         AlertRule(id="theirs", connection="IB_B"),
         AlertRule(id="glob", connection="IB_*"),
@@ -395,17 +397,17 @@ async def test_alert_rules_withhold_an_outbound_only_event_type(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """BACKLOG #3378 item 4: a rule whose event type only an outbound raises is an outbound rule, so
-    a scoped caller does not see it, a ``"*"`` rule or one on its own inbound alike. The control: a
-    ``"*"`` rule of a type both sides raise, and an ``"any"`` rule, show; an all-channels caller
-    reads every rule."""
+    a scoped caller does not see it, a ``"*"`` rule or one on its own inbound alike. The controls: a
+    ``"*"`` rule of an inbound-only type, and a rule of a type both sides raise on its own inbound,
+    show; an all-channels caller reads every rule."""
     _attach_graph(engine, monkeypatch)
     rules = AlertsSettings(
         rules=[
             AlertRule(id="stall", event_type="message_stall", connection="*"),
             AlertRule(id="error", event_type="connection_error", connection="*"),
             AlertRule(id="mine-stall", event_type="message_stall", connection="IB_A"),
-            AlertRule(id="buildup", event_type="queue_buildup", connection="*"),
-            AlertRule(id="any", connection="*"),
+            AlertRule(id="sandbox", event_type="sandbox_worker_refused", connection="*"),
+            AlertRule(id="mine-buildup", event_type="queue_buildup", connection="IB_A"),
         ]
     )
     service = await _service(engine)
@@ -414,7 +416,52 @@ async def test_alert_rules_withhold_an_outbound_only_event_type(
     app = create_app(engine, auth=service, alerts_settings=rules)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
         for username, expected in (
-            ("scoped", [("queue_buildup", "*"), ("any", "*")]),
+            ("scoped", [("sandbox_worker_refused", "*"), ("queue_buildup", "IB_A")]),
+            ("wide", [(r.event_type, r.connection) for r in rules.rules]),
+        ):
+            r = await c.get("/alerts/rules", headers=await _login(c, username))
+            assert r.status_code == 200, r.text
+            got = [(x["event_type"], x["connection"]) for x in r.json()["rules"]]
+            assert got == expected, username
+
+
+async def test_alert_rules_withhold_a_star_rule_an_outbound_can_raise(
+    engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3378 item 4, the ``"*"`` rule (#8390 item 14): a ``"*"`` rule fires for every
+    connection, outbounds included, so one of a type both sides raise, or of ``"any"``, matches
+    outbound events and is withheld from a scoped caller. The controls: a ``"*"`` rule of an
+    inbound-only type, or of a type keyed on no connection, shows, and so does a rule of a type
+    both sides raise, or ``"any"``, on the caller's own inbound; an all-channels caller reads every
+    rule."""
+    _attach_graph(engine, monkeypatch)
+    rules = AlertsSettings(
+        rules=[
+            AlertRule(id="stopped", event_type="connection_stopped", connection="*"),
+            AlertRule(id="cert", event_type="cert_expiry", connection="*"),
+            AlertRule(id="any", connection="*"),
+            AlertRule(id="sandbox", event_type="sandbox_worker_refused", connection="*"),
+            AlertRule(id="storage", event_type="storage_threshold", connection="*"),
+            AlertRule(id="mine-stopped", event_type="connection_stopped", connection="IB_A"),
+            AlertRule(id="mine-any", connection="IB_A"),
+        ]
+    )
+    service = await _service(engine)
+    await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
+    await _user(service, "wide", Role.OPERATOR, [ALL_CHANNELS])
+    app = create_app(engine, auth=service, alerts_settings=rules)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        for username, expected in (
+            (
+                "scoped",
+                [
+                    ("sandbox_worker_refused", "*"),
+                    ("storage_threshold", "*"),
+                    ("connection_stopped", "IB_A"),
+                    ("any", "IB_A"),
+                ],
+            ),
             ("wide", [(r.event_type, r.connection) for r in rules.rules]),
         ):
             r = await c.get("/alerts/rules", headers=await _login(c, username))
@@ -468,7 +515,7 @@ async def test_alert_rules_with_no_graph_show_a_scoped_caller_no_named_rule(
     assert engine.registry_runner is None
     rules = AlertsSettings(
         rules=[
-            AlertRule(id="all", connection="*"),
+            AlertRule(id="all", event_type="sandbox_worker_refused", connection="*"),
             AlertRule(id="mine", connection="IB_A"),
             AlertRule(id="ob", connection="OB_X"),
         ]
@@ -533,7 +580,10 @@ async def test_alert_rules_read_that_withholds_writes_one_count_only_audit_row(
         engine,
         auth=service,
         alerts_settings=AlertsSettings(
-            rules=[AlertRule(id="all", connection="*"), AlertRule(id="mine", connection="IB_A")]
+            rules=[
+                AlertRule(id="all", event_type="sandbox_worker_refused", connection="*"),
+                AlertRule(id="mine", connection="IB_A"),
+            ]
         ),
     )
     async with (
