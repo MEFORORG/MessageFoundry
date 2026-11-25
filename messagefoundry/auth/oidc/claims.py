@@ -500,9 +500,11 @@ def validate_id_token(
     """Verify an ``id_token`` end to end and return the :class:`FederatedPrincipal`, or raise
     :class:`ClaimsError` with a closed-set ``reason``.
 
-    Order is deliberate: signature first (nothing downstream trusts an unverified claim), then the
-    core OIDC claims, then the MFA gate, then the username claim. ``clock`` is wall-clock ``time.time``
-    (token lifetimes are wall-clock, unlike the monotonic caches) and injectable for tests.
+    Order is deliberate: key selection first, whose ``typ`` and ``crit`` refusals read the
+    unverified protected header before the signature is checked, and can only refuse, never accept;
+    then the signature (nothing downstream trusts an unverified claim), then the core OIDC claims,
+    then the MFA gate, then the username claim. ``clock`` is wall-clock ``time.time`` (token
+    lifetimes are wall-clock, unlike the monotonic caches) and injectable for tests.
     """
     key, _alg = _select_key_and_alg(id_token, policy, jwks)
     claims = _verify_signature(id_token, key, policy)

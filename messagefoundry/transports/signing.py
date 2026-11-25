@@ -615,8 +615,10 @@ def unverified_jws_header(jws: str) -> dict[str, Any]:
     """The protected header of a compact JWS, **without verifying anything** (RFC 7515 §4).
 
     Named for the danger. A relying party must read ``kid`` *before* it can select a key, so this step
-    is unavoidable — but nothing it returns is trustworthy. Use it to pick a key and for nothing else;
-    every value that matters (``alg`` included) is re-read from the verified header inside
+    is unavoidable — but nothing it returns is trustworthy. Use it to pick a key, and to refuse a
+    JWS before its signature is checked, as :func:`refuse_critical_extensions` and the ``id_token``
+    ``typ`` assertion do: a value read here may refuse the JWS, never accept it. Use it for nothing
+    else; every value that matters (``alg`` included) is re-read from the verified header inside
     :func:`verify_compact_jws`."""
     parts = jws.split(".")
     if len(parts) != 3:
