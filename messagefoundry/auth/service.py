@@ -5422,7 +5422,7 @@ class AuthService:
         # Before every account write, the repair branch's clears included (R3-F1).
         if await self._unverifiable_account_held():
             raise FirstAdministratorRefused(_UNVERIFIABLE_ACCOUNT_REFUSAL)
-        violations = self._policy.violations(password, username=username)
+        violations = await self._screened_violations(password, username=username)
         if violations:
             raise FirstAdministratorRefused("; ".join(violations))
         # ADR 0197 Amendment A (N-A): the code is proved in memory, before any write.
@@ -15466,6 +15466,15 @@ class AuthService:
     def password_violations(self, password: str, *, username: str | None = None) -> list[str]:
         return self._policy.violations(password, username=username)
 
+    async def _screened_violations(self, password: str, *, username: str) -> list[str]:
+        """:meth:`PasswordPolicy.violations`, run off the event loop (BACKLOG #6881).
+
+        The screen can read a file. ``lru_cache`` caches no exception, so a missing or unreadable
+        operator corpus is opened again on every call, and a file placed after startup is read
+        whole by the first call; a broken bundled corpus is re-read the same way. Run on a worker
+        thread, none of that blocks the loop. The answer, and any exception, is unchanged."""
+        return await asyncio.to_thread(self._policy.violations, password, username=username)
+
     async def verify_current_password(
         self,
         identity: Identity,
@@ -17303,7 +17312,7 @@ class AuthService:
             # before the policy, so the answer does not depend on the password typed, and before the
             # hash, so no password_changed row is written for an absent account.
             raise ValueError("no such user")
-        violations = self._policy.violations(new_password, username=identity.username)
+        violations = await self._screened_violations(new_password, username=identity.username)
         if violations:
             return violations
         covered = self._covered_by_requirement(user, identity.roles)

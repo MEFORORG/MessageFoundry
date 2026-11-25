@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -34,7 +35,14 @@ from messagefoundry.auth.notifications import (
 from messagefoundry.auth.service import AuthService, IssuedCredential, UsernameTaken
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
-from tests._admin_account import ADMIN_USERNAME, create_admin, create_local_user_chosen
+from tests._admin_account import (
+    ADMIN_USERNAME,
+    PROVISION_EMAIL,
+    create_admin,
+    create_local_user_chosen,
+    login_admin,
+    provision_totp,
+)
 from tests._log_absence import assert_capture_sees
 
 GOOD_PASSWORD = "Sup3rSecret!!"
@@ -1560,5 +1568,64 @@ async def test_an_integrity_refusal_with_no_holder_is_not_called_a_username_conf
                 roles=[],
                 actor="admin",
             )
+    finally:
+        await store.close()
+
+
+async def test_the_breach_screen_runs_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #6881. RED when: ``change_password`` or ``provision_first_administrator`` runs the
+    password screen on the event loop again. An operator corpus that cannot be read is opened on
+    every call, since ``lru_cache`` caches no exception, so the screen is file I/O. The corpus
+    loader is replaced by one that records its thread and refuses, as a missing file does; the
+    direct call first is the control that the recorder sees the loop's own thread."""
+    from messagefoundry.auth import policy as policy_module
+
+    loop_thread = threading.get_ident()
+    seen: list[int] = []
+
+    def unreadable(path: str) -> tuple[frozenset[str], bool]:
+        seen.append(threading.get_ident())
+        raise OSError("synthetic: the corpus file cannot be read")
+
+    monkeypatch.setattr(policy_module, "_operator_corpus", unreadable)
+    settings = AuthSettings(password_breach_corpus_file=str(tmp_path / "absent-corpus.txt"))
+
+    store = await _store()
+    try:
+        service = AuthService(store, settings)
+        await service.initialize()
+        assert service.policy.violations(NEW_PASSWORD) == []
+        assert seen == [loop_thread], "the control: the recorder did not see a direct call"
+        seen.clear()
+
+        await service.provision_first_administrator(
+            username="site-admin",
+            password=GOOD_PASSWORD + "-long-enough",
+            notify_email=PROVISION_EMAIL,
+            actor="test",
+            **provision_totp(),
+        )
+        assert seen and loop_thread not in seen, "provisioning screened on the event loop"
+    finally:
+        await store.close()
+
+    seen.clear()
+    store = await _store()
+    try:
+        # Off here, so a covered account needs no factor to rotate; provisioning above ran under
+        # the shipped default, which enrols one.
+        service = AuthService(
+            store,
+            AuthSettings(
+                password_breach_corpus_file=settings.password_breach_corpus_file, require_mfa=False
+            ),
+        )
+        await service.initialize()
+        identity, _token, _password = await login_admin(service)
+        seen.clear()
+        assert await service.change_password(identity, NEW_PASSWORD + "-long-enough") == []
+        assert seen and loop_thread not in seen, "change_password screened on the event loop"
     finally:
         await store.close()
