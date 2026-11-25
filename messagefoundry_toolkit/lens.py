@@ -6922,8 +6922,10 @@ def _is_leaf_literal(value: Any) -> bool:
 def _copy_write_method(src: Any) -> str:
     """The ``Message`` write a native Copy Field from ``src`` uses (ADR 0206 rule 1): ``set_data`` for
     a literal component or subcomponent path, whose read is decoded, as ``actions.copy_field`` does;
-    ``set`` otherwise. A ``src`` given as an expression cannot be classified and keeps ``set``; the
-    handler-security lint cannot see that one either. An insert of a literal whole-field ``src``
+    ``set`` otherwise. An ``{"expr": ...}`` holding only a string literal classifies as that string
+    does (:func:`_constant_text`). Any other expression ``src``, a module name included, cannot be
+    classified and keeps ``set``; the handler-security lint cannot see that one either. An insert of
+    a literal whole-field ``src``
     into a literal component or subcomponent ``dst`` with no other parameter writes no native form
     at all (:func:`_copy_needs_wrapper`)."""
     return "set_data" if _is_leaf_literal(_constant_text(src)) else "set"
