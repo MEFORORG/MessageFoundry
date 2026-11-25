@@ -816,6 +816,35 @@ def test_a_block_the_load_stops_at_refuses_as_cafile_does(
     assert anchor_cadata(good.pem, _SPEC)
 
 
+def test_a_read_to_end_load_that_raises_refuses_naming_the_error(
+    monkeypatch: pytest.MonkeyPatch, cas: tuple[_Ca, _Ca]
+) -> None:
+    """Where the load with the probe appended raises, the refusal says so and carries OpenSSL's
+    reason, rather than saying the load stopped without an error. The load is forced to raise, so
+    no input shape is needed. The control: the same file loads without the forced error."""
+    good, _ = cas
+    assert anchor_cadata(good.pem, _SPEC)  # the control
+    real = ssl.SSLContext.load_verify_locations
+
+    def load(
+        self: ssl.SSLContext,
+        cafile: str | None = None,
+        capath: str | None = None,
+        cadata: str | bytes | None = None,
+    ) -> None:
+        if isinstance(cadata, str) and cadata.endswith(ta._READ_TO_END_PROBE):
+            raise ssl.SSLError(1, "forced probe failure")
+        real(self, cafile, capath, cadata)
+
+    monkeypatch.setattr(ssl.SSLContext, "load_verify_locations", load)
+    with pytest.raises(
+        TrustAnchorError, match=r"raised an error \(.*forced probe failure\)"
+    ) as refused:
+        anchor_cadata(good.pem, _SPEC)
+    assert "without an error" not in str(refused.value)
+    assert refused.value.scope == "unloadable"
+
+
 def test_a_file_holding_the_read_to_end_probe_refuses(cas: tuple[_Ca, _Ca]) -> None:
     """The check appends a throwaway certificate and looks for it after the load. In a file that
     already holds that certificate, the certificate shows whether or not the load reached the end,

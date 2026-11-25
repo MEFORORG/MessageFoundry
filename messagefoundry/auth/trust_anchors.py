@@ -1032,7 +1032,18 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             "certificate is never trusted, so remove it",
             scope="holds_probe",
         )
-    if not _reads_to_the_end(text, len(loaded)):
+    try:
+        reaches_the_end = _reads_to_the_end(text, len(loaded))
+    except ssl.SSLError as exc:
+        why = _SSL_WHERE.sub("", str(exc))
+        raise TrustAnchorError(
+            f"{spec.setting}: the TLS library loads the trust anchor {spec.path!r} on its own, but "
+            f"raised an error ({why}) when the engine appended a test certificate to check that it "
+            "reads the file to its end, so the engine cannot tell what it would trust. Check that "
+            "each PEM block in it is well-formed",
+            scope="unloadable",
+        ) from exc
+    if not reaches_the_end:
         raise TrustAnchorError(
             f"{spec.setting}: the TLS library stops reading the trust anchor {spec.path!r} at a PEM "
             "block it cannot use, without an error, so it would trust only the certificates before "
@@ -1068,7 +1079,8 @@ def _reads_to_the_end(text: str, loaded: int) -> bool:
     OpenSSL cannot use, the ``cadata=`` load stops reading without an error and keeps the
     certificates before that block, while ``cafile=`` refuses the whole file with ``PEM lib``. So
     this loads ``text`` with :data:`_READ_TO_END_PROBE` after it into a throwaway context: a load
-    that stopped early never reaches the probe. A load that raises here counts as not reaching it.
+    that stopped early never reaches the probe. A load that raises here raises its
+    :class:`ssl.SSLError` to the caller, which refuses with OpenSSL's reason.
     ``loaded`` is how many CA certificates the load of ``text`` alone holds, and the load with the
     probe must hold exactly one more and hold the probe. OpenSSL does not always drop a
     certificate it is given twice (:func:`messagefoundry.pki._refuse_unless_openssl_loads` records
@@ -1078,10 +1090,7 @@ def _reads_to_the_end(text: str, loaded: int) -> bool:
     It does not judge a block's contents once decoded: at least a ``X509 CRL`` block whose base64
     decodes to bytes that are no CRL loads here and refuses under ``cafile=``."""
     probe = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    try:
-        probe.load_verify_locations(cadata=text + "\n" + _READ_TO_END_PROBE)
-    except ssl.SSLError:
-        return False
+    probe.load_verify_locations(cadata=text + "\n" + _READ_TO_END_PROBE)
     reached = probe.get_ca_certs(binary_form=True)
     return len(reached) == loaded + 1 and _READ_TO_END_PROBE_DER in reached
 
