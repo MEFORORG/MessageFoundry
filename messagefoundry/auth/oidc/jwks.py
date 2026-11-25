@@ -298,7 +298,8 @@ class JwksCache:
         the caller still checks that it fits ``alg``.
 
         Raises :class:`JwksError` if the key is unknown and the min-refetch floor has not elapsed, or
-        if a forced refetch still does not yield the ``kid``.
+        if a forced refetch still does not yield the ``kid``; :class:`JwksAmbiguousKid` if that refetch
+        returns a set giving two usable keys one ``kid``.
         """
         bound = self._lookup(kid)
         if bound.alg is not None and bound.alg != alg:

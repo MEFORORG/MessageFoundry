@@ -692,6 +692,30 @@ def test_a_crit_header_is_refused_at_key_selection(rsa_key: rsa.RSAPrivateKey, c
     assert fetch.calls == 0
 
 
+@pytest.mark.parametrize(
+    ("header", "other_reason"),
+    [
+        ({"kid": ""}, "unknown_kid"),  # crit before the kid guard
+        ({"alg": "ES256"}, "key_rejected"),  # crit before the alg pin (policy pins RS256 only)
+    ],
+)
+def test_crit_is_checked_before_the_kid_guard_and_the_alg_pin(
+    rsa_key: rsa.RSAPrivateKey, header: dict[str, Any], other_reason: str
+) -> None:
+    """The rung order the federation verifier's title states: typ, then crit, then kid, then the alg
+    pin. A token failing both crit and a later rung is refused as unsupported_crit, and the same token
+    without crit fails that later rung, so each case would catch crit moving below it."""
+    claims = _good_claims()
+    with pytest.raises(oidc.ClaimsError) as exc:
+        jws = _mint_with_typ(rsa_key, "k1", claims, extra_header={"crit": ["exp"], **header})
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert exc.value.reason == "unsupported_crit"
+    with pytest.raises(oidc.ClaimsError) as control:
+        jws = _mint_with_typ(rsa_key, "k1", claims, extra_header=header)
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert control.value.reason == other_reason
+
+
 def test_the_crit_positive_control_validates(rsa_key: rsa.RSAPrivateKey) -> None:
     """Guard-the-guard for the crit cases: the same extension members WITHOUT ``crit`` validate, so
     those refusals come from ``crit`` and not from the other members the helper adds."""
