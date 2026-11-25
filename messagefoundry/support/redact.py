@@ -843,9 +843,10 @@ def key_body_mask_from(lines: list[str], start: int) -> int:
     where it reads a line break, and the mask writes each line from that line alone.
 
     The equivalence holds for ``lines`` as :func:`split_log_lines` returns them, where no element
-    holds a "\\n". An element before the returned index that holds one breaks it: over the whole
-    list :func:`mask_key_body_lines` then returns every line unchanged, while from the returned
-    index it may still mask a block, so the cut list errs toward masking more, not less."""
+    holds a "\\n". An element outside the span masked, before the returned index or after an end
+    cut, that holds one breaks it: over the whole list :func:`mask_key_body_lines` then returns
+    every line unchanged, while over the span it may still mask a block, so the span errs toward
+    masking more, not less."""
     index = min(start, len(lines))
     while index > 0 and _WHOLE_KEY_BODY_LINE.fullmatch(lines[index - 1]):
         index -= 1
@@ -857,7 +858,7 @@ def mask_key_body_lines(lines: list[str]) -> list[str]:
     written as secretscrub's key-block mask writes it, one character for one (BACKLOG #5550).
 
     ``lines`` is what :func:`split_log_lines` returns: no element holds a "\\n" (one that does is
-    returned unchanged, with every other line). :func:`redact_log_line` masks a block inside one
+    returned unchanged, with every other line). :func:`redact_log_line` can mask a block inside one
     line, and so one whose line breaks are escaped, but a block with real line breaks reaches it one
     line at a time, where no line holds its BEGIN marker and its body together. A body line of 24 or
     more base64 characters fell to the long-base64 sweep, and a shorter one, such as a block's padded
@@ -886,7 +887,7 @@ def mask_key_body_lines(lines: list[str]) -> list[str]:
         start = block.start("key_body")
         body = block.group("key_body")
         if "\n" not in body:
-            continue  # every line break in it is escaped, so it sits on one line, masked there
+            continue  # every line break in it is escaped, so it sits on one line, left to that line's pass
         masked = _braced_tail(block)  # the body masked, one character for one
         # The first real line break in the body ends the BEGIN line, which the line pass masks
         # itself; every later piece starts a line, and is that whole line unless it is the last

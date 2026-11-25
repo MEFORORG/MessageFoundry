@@ -12,8 +12,10 @@
   is configured (the viewer degrades to "no file", never raises).
 - **Related:** [ADR 0092](0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
   (the PHI-read hop guard the viewer inherits), [ADR 0065](0065-web-ops-dashboard.md)
-  (the console that renders it), `support/redact.redact_log_text` (#49 — the shared redactor the viewer
-  reuses), BACKLOG #171. Companion: [ADR 0131](0131-bulk-raw-message-body-export-from-a-search-result-step-up-audited-phi-egress.md)
+  (the console that renders it), `support/redact.redact_log_record` (#49 — the per-line redactor the viewer
+  shares with the support bundle's `redact_log_text`; corrected 2026-11-25, this read
+  "`support/redact.redact_log_text` (#49 — the shared redactor the viewer reuses)", and the viewer
+  never calls `redact_log_text`), BACKLOG #171. Companion: [ADR 0131](0131-bulk-raw-message-body-export-from-a-search-result-step-up-audited-phi-egress.md)
   (the S7b bulk-export item).
 
 ## Context
@@ -61,14 +63,10 @@ serve's Gate #1 refuses to start at it. *(Corrected 2026-10-06. This sentence re
 
 `GET /logs/tail` reads the **newest** file under `[logging].log_dir` (one level, `.log`/`.txt`), pages
 back from the end (`offset`/`limit`, newest page first), and returns each line **through
-`support.redact.redact_log_record`**, which runs `support.redact.redact_log_line` over each piece of
-the line between the code points `str.splitlines` would also break at. The support bundle passes each
-line through the same `redact_log_record`, from `redact_log_text`. Since BACKLOG
+`support.redact.redact_log_record`**, the per-line pass the support bundle's `redact_log_text` also
+runs; its docstring says how it wraps `redact_log_line`. Since BACKLOG
 #5550 both also mask PRIVATE KEY body lines across lines first, over different spans of text, so the
-two need not mask a line the same way; the `_read_log_tail` docstring says how they differ.
-*(Corrected 2026-11-25. This sentence read "returns each line through `support.redact.redact_log_line`
-— the same per-line redactor the support bundle uses"; `_read_log_tail` calls `redact_log_record`,
-which wraps `redact_log_line`.)* It is gated by a **new `logs:view` permission** via `require_phi_read`,
+two need not mask a line the same way; the `_read_log_tail` docstring says how they differ. The route is gated by a **new `logs:view` permission** via `require_phi_read`,
 which folds in the [ADR 0092] `enforce_phi_read_hop` data-path guard (a production-PHI instance on an
 unproven-secure serve hop refuses to emit) and the per-actor anti-automation throttle — exactly like the
 message-detail read. Each page served writes a `logs_view` audit row (actor + how many lines exposed —
@@ -76,7 +74,10 @@ message-detail read. Each page served writes a `logs_view` audit row (actor + ho
 NSSM) or the file is unreadable, the route returns an empty, `available=false` page — it **degrades
 gracefully and never raises**. Redaction is best-effort (a residual single-token identifier can survive),
 which is why the surface is RBAC-gated + audited rather than open: the control is defence-in-depth over
-the redactor, mirroring the "never put PHI in a log line" convention.
+the redactor, mirroring the "never put PHI in a log line" convention. *(Corrected 2026-11-25. The
+paragraph read that the route returns each line "through `support.redact.redact_log_line` — the same
+per-line redactor the support bundle uses"; `_read_log_tail` calls `redact_log_record`, which wraps
+`redact_log_line`.)*
 
 ### §3 — `set_runtime_level` lands CLEAN for the S7a file-handler work to build on
 
