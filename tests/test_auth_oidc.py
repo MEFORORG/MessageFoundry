@@ -717,6 +717,20 @@ def test_a_jwks_with_a_duplicate_kid_is_refused_as_ambiguous_kid(
     assert exc.value.reason == "ambiguous_kid"
 
 
+def test_only_the_fetching_lookup_sees_ambiguous_kid(rsa_key: rsa.RSAPrivateKey) -> None:
+    """Pins the limit the claims.py comment states: a sign-in inside the min-refetch floor after the
+    refused fetch gets the cache's throttled refusal, so it is recorded as unknown_kid."""
+    body = _jwks_bytes(_rsa_jwk(rsa_key, "k1"), _rsa_jwk(rsa_key, "k1"))
+    cache = oidc.JwksCache(_CountingFetch(body), clock=lambda: 0.0)
+    jws = _mint(rsa_key, "k1", _good_claims())
+    reasons = []
+    for _ in range(2):
+        with pytest.raises(oidc.ClaimsError) as exc:
+            oidc.validate_id_token(jws, _policy(), cache, clock=lambda: 1_000_100)
+        reasons.append(exc.value.reason)
+    assert reasons == ["ambiguous_kid", "unknown_kid"]
+
+
 def test_any_other_jwks_fault_is_still_unknown_kid(rsa_key: rsa.RSAPrivateKey) -> None:
     """The ambiguous_kid arm is narrow: a JWKS with no usable key still reads as unknown_kid."""
     jws = _mint(rsa_key, "k1", _good_claims())

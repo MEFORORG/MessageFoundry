@@ -68,7 +68,8 @@ class JwkAlgMismatch(JwksError):
 
 class JwksAmbiguousKid(JwksError):
     """The JWKS document gives two usable keys the same ``kid``, so the set is refused whole. A fault
-    in the IdP's key set, not in the token, which ``claims.py`` records as ``ambiguous_kid``."""
+    in the IdP's key set, not in the token. Raised only by the parse of a fetch, so only the lookup
+    that made the fetch sees it; ``claims.py`` records that refusal as ``ambiguous_kid``."""
 
 
 @dataclass(frozen=True, slots=True)

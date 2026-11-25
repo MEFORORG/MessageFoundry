@@ -577,7 +577,8 @@ def verify_detached_jws(
     This is the **verify counterpart** of the signer — what a receiver (or a test) runs. ``payload`` is
     the exact body bytes the message arrived as. Returns ``None`` on success; raises
     :class:`cryptography.exceptions.InvalidSignature` if the signature does not match, or
-    :class:`SigningError` if the JWS is malformed / its ``alg`` is unsupported or not in
+    :class:`SigningError` if the JWS is malformed / carries ``crit`` (see
+    :func:`refuse_critical_extensions`) / its ``alg`` is unsupported or not in
     ``allowed_algorithms`` (pass the algorithms you expect to pin against an ``alg`` downgrade)."""
     parts = jws.split(".")
     if len(parts) != 3:
@@ -590,6 +591,9 @@ def verify_detached_jws(
     header = _b64u_json_or_refusal(
         protected_b64, "detached JWS protected header is not valid base64url JSON"
     )
+    if not isinstance(header, dict):
+        raise SigningError("detached JWS protected header must be a JSON object")
+    refuse_critical_extensions(header)
     try:
         alg = SignatureAlgorithm(header.get("alg"))
     except ValueError as exc:

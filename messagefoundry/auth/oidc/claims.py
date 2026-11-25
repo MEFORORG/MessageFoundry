@@ -11,8 +11,8 @@ gate (``amr``/``acr``), which is BACKLOG #99(g)'s real control.
 Every rejection is a :class:`ClaimsError` carrying a **closed-set reason slug** (:data:`REASONS`) — the
 browser layer maps that slug to an allow-listed error code and audits it, never reflecting IdP text.
 The engine verifies what the IdP **asserts**, cryptographically; it does not and cannot prove the IdP
-*enforced* MFA. The success value is a :class:`FederatedPrincipal` carrying the resolved username,
-``sub``, the evidence recorded in the audit, and the verified ``exp`` and ``auth_time`` the engine
+*enforced* MFA. The success value is a :class:`FederatedPrincipal` carrying the claimed username
+(which selects no account), ``sub``, the evidence recorded in the audit, and the verified ``exp`` and ``auth_time`` the engine
 session is capped by.
 """
 
@@ -206,8 +206,10 @@ def _select_key_and_alg(
         # The kid names a key, but its JWK restricts it to another alg (BACKLOG #5517).
         raise ClaimsError("key_rejected", str(exc)) from exc
     except JwksAmbiguousKid as exc:
-        # The fetched JWKS gives two usable keys one kid, so the whole set is refused. That is the
-        # IdP's key set at fault, not this token's kid, so it is not recorded as unknown_kid.
+        # The JWKS this lookup just fetched gives two usable keys one kid, whichever kid that is, so
+        # the whole set is refused: the IdP's key set is at fault, not necessarily this token's kid.
+        # Only the lookup that made the fetch sees it. A lookup inside the min-refetch floor after it
+        # gets the cache's plain throttled JwksError, recorded as unknown_kid below.
         raise ClaimsError("ambiguous_kid", str(exc)) from exc
     except JwksError as exc:
         raise ClaimsError("unknown_kid", str(exc)) from exc
@@ -491,7 +493,7 @@ def validate_id_token(
     :class:`ClaimsError` with a closed-set ``reason``.
 
     Order is deliberate: signature first (nothing downstream trusts an unverified claim), then the
-    core OIDC claims, then the MFA gate, then username resolution. ``clock`` is wall-clock ``time.time``
+    core OIDC claims, then the MFA gate, then the username claim. ``clock`` is wall-clock ``time.time``
     (token lifetimes are wall-clock, unlike the monotonic caches) and injectable for tests.
     """
     key, _alg = _select_key_and_alg(id_token, policy, jwks)
