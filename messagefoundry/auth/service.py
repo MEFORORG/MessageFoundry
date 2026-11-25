@@ -7296,7 +7296,6 @@ class AuthService:
             self._oidc_flows,
             return_to="/ui",
             client_ip=client or "",
-            ttl_seconds=self._settings.oidc_flow_ttl_seconds,
             prior_session_hash=_superseded_hash(prior_session),
         )
         challenge = oidc.pkce_challenge(flow.code_verifier)
@@ -7864,7 +7863,6 @@ class AuthService:
             self._oidc_flows,
             return_to=return_to,
             client_ip=client or "",
-            ttl_seconds=self._settings.oidc_flow_ttl_seconds,
             step_up_session_hash=token_hash,
             step_up_user_id=session.user_id,
             step_up_purpose=purpose,

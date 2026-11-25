@@ -46,6 +46,13 @@ _NONCE_BYTES = 32
 _FLOW_ID_BYTES = 32
 
 DEFAULT_FLOW_TTL_SECONDS = 300.0
+#: The bounds :class:`FlowCache` holds its TTL to (BACKLOG #6902). They guard the mechanism, not
+#: the operator's choice, which ``[auth].oidc_flow_ttl_seconds`` bounds more tightly. The floor is
+#: far above the float spacing of any clock reading this engine will see, so every deadline moves
+#: past the instant it is stamped at. The ceiling is a judgment: past a day, one abandoned flow
+#: holds its cap slot for as good as forever.
+_MIN_FLOW_TTL_SECONDS = 1.0
+_MAX_FLOW_TTL_SECONDS = 86_400.0
 DEFAULT_FLOW_CACHE_MAX = 512
 DEFAULT_PER_IP_CAP = 16
 # The token-endpoint response is small; a larger body is refused unread.
@@ -127,7 +134,9 @@ class PendingFlow:
     code_verifier: str
     return_to: str
     client_ip: str
-    deadline: float
+    #: Stamped by :meth:`FlowCache.put`, which says how (BACKLOG #6902). ``0.0`` on a flow never
+    #: staged.
+    deadline: float = 0.0
     #: The hash of the session the browser presented at the START leg, if any (ASVS 7.2.4). The
     #: callback cannot read it for itself: the session cookie is SameSite=Strict and the IdP's
     #: redirect back is a cross-site navigation, so the browser withholds it there. Staged as a hash,
@@ -174,7 +183,8 @@ class FlowCache:
     Keyed on ``sha256(flow_id)`` — the raw ``flow_id`` lives only in the browser cookie, so a cache
     dump never yields a usable flow id. ``put`` **rejects** at the global or per-IP cap rather than
     evicting (eviction = a login DoS). :meth:`pop_if_state_matches` is the only way to consume a
-    flow: single-use, TTL-checked on ``time.monotonic``, and only for the flow's own ``state``.
+    flow: single-use, TTL-checked on the cache's own clock (``time.monotonic`` by default), and only
+    for the flow's own ``state``.
     There is deliberately no plain ``pop``, because consuming before comparing let a forged callback
     spend a sign-in in flight (BACKLOG #3198).
     """
@@ -187,7 +197,25 @@ class FlowCache:
         per_ip_cap: int = DEFAULT_PER_IP_CAP,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._ttl = ttl_seconds
+        # The TTL alone sets every deadline, so a bad one would never expire a flow or expire each
+        # one as it is staged. It is read by the rule ``transports.base.float_setting`` holds, which
+        # also keeps the value out of the message; imported lazily, as ``exchange_code`` imports
+        # transports, so this package takes no module-scope transports import. Text is refused
+        # first: that rule reads text because settings can arrive as text, and ``AuthService``
+        # passes the validated ``[auth].oidc_flow_ttl_seconds`` int.
+        from messagefoundry.transports.base import float_setting  # noqa: PLC0415
+
+        if isinstance(ttl_seconds, str):
+            raise ValueError(
+                "FlowCache ttl_seconds is a number of seconds, not text (value withheld)"
+            )
+        ttl = float_setting(ttl_seconds, knob="ttl_seconds", transport="FlowCache")
+        if not _MIN_FLOW_TTL_SECONDS <= ttl <= _MAX_FLOW_TTL_SECONDS:
+            raise ValueError(
+                f"FlowCache ttl_seconds must be between {_MIN_FLOW_TTL_SECONDS:g} and "
+                f"{_MAX_FLOW_TTL_SECONDS:g} seconds (value withheld)"
+            )
+        self._ttl = ttl
         self._global_cap = global_cap
         self._per_ip_cap = per_ip_cap
         self._clock = clock
@@ -206,7 +234,12 @@ class FlowCache:
 
     def put(self, flow_id: str, flow: PendingFlow) -> PendingFlow:
         """Stage ``flow`` under ``sha256(flow_id)``, enforcing the global and per-IP caps, and return
-        the staged copy, stamped with the instant it was staged."""
+        the staged copy, stamped with the instant it was staged and a deadline of that instant
+        plus this cache's TTL. Both read this cache's clock, and any deadline ``flow`` carried is
+        replaced, so no caller can set one on another clock.
+
+        A cap of ``0`` or below refuses every flow, an empty cache included: ``0`` does not mean
+        unlimited."""
         now = self._clock()
         self._prune(now)
         if len(self._entries) >= self._global_cap:
@@ -220,7 +253,7 @@ class FlowCache:
                 f"OIDC login refused: too many pending flows from {flow.client_ip} "
                 f"({self._per_ip_cap})."
             )
-        staged = replace(flow, started=now)
+        staged = replace(flow, started=now, deadline=now + self._ttl)
         self._entries[self._key(flow_id)] = staged
         return staged
 
@@ -277,8 +310,6 @@ def start_flow(
     *,
     return_to: str,
     client_ip: str,
-    ttl_seconds: float = DEFAULT_FLOW_TTL_SECONDS,
-    clock: Callable[[], float] = time.monotonic,
     prior_session_hash: str | None = None,
     step_up_session_hash: str | None = None,
     step_up_user_id: str | None = None,
@@ -287,7 +318,8 @@ def start_flow(
 ) -> tuple[str, PendingFlow]:
     """Mint a flow (state/nonce/PKCE), stage it, and return ``(flow_id, flow)``.
 
-    ``flow_id`` goes in the browser cookie; ``flow`` carries the values the callback re-checks.
+    ``flow_id`` goes in the browser cookie; ``flow`` carries the values the callback re-checks. Its
+    deadline is set by :meth:`FlowCache.put`.
     """
     flow_id = new_flow_id()
     verifier, _challenge = generate_pkce()
@@ -297,7 +329,6 @@ def start_flow(
         code_verifier=verifier,
         return_to=return_to,
         client_ip=client_ip,
-        deadline=clock() + ttl_seconds,
         prior_session_hash=prior_session_hash,
         step_up_session_hash=step_up_session_hash,
         step_up_user_id=step_up_user_id,
