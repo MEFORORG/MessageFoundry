@@ -218,11 +218,13 @@ the worktree in place and untouched either way, so the next session can see what
 
 ### The harness guards refuse the tool call, not the commit
 
-These are user-scope PreToolUse hooks, not git hooks, so a refusal from one arrives at the tool
-call rather than at commit time. What each refuses, and what it does not intercept, is stated in
+`collision_gate.ps1` and `worktree_gate.ps1` are user-scope PreToolUse hooks, not git hooks, so a
+refusal from one arrives at the tool call rather than at commit time. Which tools each sees, and
+what it does not intercept, is stated in
 [*A Builder gets one turn, items 2, 5 and 6, from section 5*](#a-builder-gets-one-turn-items-2-5-and-6-from-section-5),
-item 2, and in the hook sources, [`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1)
-and [`collision_gate.ps1`](../scripts/hooks/collision_gate.ps1); where a description and a hook
+item 2. What each refuses is in the hook sources,
+[`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1) and
+[`collision_gate.ps1`](../scripts/hooks/collision_gate.ps1); where a description and a hook
 disagree, the hook wins.
 
 ### Stage explicit paths; a guard catches only the common blanket spellings
