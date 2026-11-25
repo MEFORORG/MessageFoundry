@@ -1697,16 +1697,19 @@ tuple: they act only on the caller's own account.
 
 One `GET /auth/check/<permission>` per permission, registered in a loop over `Permission`, each
 gated `require(<that permission>)` (ADR 0215 section 2). Each answers 200 once the ladder admits
-the caller and reads nothing else, except these three. `/auth/check/audit:read`,
-`/auth/check/audit:export` and `/auth/check/logs:view` refuse a channel-scoped caller 403, as
+the caller and reads nothing else, except the check routes for the permissions in
+`SCOPED_READER_REFUSALS`. At the time of writing those are `/auth/check/audit:read`,
+`/auth/check/audit:export` and `/auth/check/logs:view`, which refuse a channel-scoped caller 403, as
 `GET /audit`, `GET /audit/export` and `GET /logs/tail` refuse every such caller, and write the
 rows those routes write for it: the gate's grant row where the gate writes one, then the same
 `auth.channel_denied` row (`SCOPED_READER_REFUSALS` in `messagefoundry/api/message_scope.py`,
 BACKLOG #4346). They match those routes on channel scope only: `/auth/check/logs:view` does not
 run the PHI-read gate `GET /logs/tail` runs. A check route whose permission's routes refuse a
-scoped caller only for some names, or for other reasons, still answers it 200. They are built for the web console's later ADR 0215 slices to
+scoped caller for another reason still answers it 200: at least `/auth/check/messages:purge`
+does, although every purge route refuses a channel-scoped caller. They are built for the web console's later ADR 0215 slices to
 sub-request before a page that shows no engine data of its own renders; no console page calls one
-yet. A caller learns nothing it cannot read from its own `GET /auth/me`. Each writes an
+yet. Apart from those refusals, which tell a channel-scoped caller what the real route's 403
+tells it, a caller learns nothing it cannot read from its own `GET /auth/me`. Each writes an
 `auth.permission_granted` row naming its permission wherever a grant of that permission is
 audited (`record_check_grant`). Under `[security].audit_all_authorization_decisions`, on by default, that is every
 permission, the two PHI views `messages:view_raw` and `messages:view_summary` included: their own

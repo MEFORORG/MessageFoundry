@@ -263,8 +263,8 @@ _CHECK_ROUTES = {
     for permission in Permission
     if permission not in SCOPED_READER_REFUSALS
 }
-# The check routes whose permission's real routes refuse a channel-scoped holder refuse it too
-# (BACKLOG #4346), so they carry a per-channel rule.
+# The check routes for the permissions in SCOPED_READER_REFUSALS refuse a channel-scoped holder,
+# as those permissions' real routes do (BACKLOG #4346), so they carry a per-channel rule.
 _CHECK_ROUTES.update(
     {
         f"GET /auth/check/{permission.value}": (
@@ -483,6 +483,8 @@ async def test_scoped_routes_are_measured_against_a_live_app(engine: Engine) -> 
             return httpx.QueryParams(_QUERY.get(path, ()))
 
         paths = _scoped_get_paths()
+        # Every refusing route is walked, so none drops out of the 403 probe unnoticed.
+        assert set(paths) >= _REFUSES_A_SCOPED_CALLER, _REFUSES_A_SCOPED_CALLER - set(paths)
         assert "/messages" in paths and "/channels" in paths, paths  # the walk found the reads
         quiet: set[str] = set()
 

@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The one by-id message read under ``messagefoundry/api/`` (BACKLOG #2627).
+"""The one by-id message read under ``messagefoundry/api/`` (BACKLOG #2627), and the
+``auth.channel_denied`` row every channel refusal writes (:func:`record_channel_denied`), with the
+refusal of a channel-scoped caller from the audit trail and the application log
+(:data:`SCOPED_READER_REFUSALS`, BACKLOG #4346).
 
 Every route that opens a message by its id used to repeat the same four lines: fetch the row, test
 the caller's channel scope, audit a refusal, and answer 404. Eight routes and the export stream did
@@ -73,7 +76,8 @@ _DENIED_OPERATIONS: Final[frozenset[str]] = frozenset(get_args(DeniedOperation))
 
 #: Permissions whose routes refuse every channel-scoped holder, whatever it asks for, because what
 #: they read is not attributable to one channel, so there is nothing to narrow it by (BACKLOG
-#: #4346). A permission whose routes refuse a scoped holder only for some names is not here.
+#: #4346). Not every permission whose routes refuse such a holder is here: at least
+#: ``messages:purge`` is not, since its routes refuse through their own scope checks.
 #: Each maps to the operation its refusal row names and the refusal's 403 detail. The real routes
 #: and the gate-only ``GET /auth/check/<permission>`` routes both read this map, so the two answer
 #: alike on channel scope.

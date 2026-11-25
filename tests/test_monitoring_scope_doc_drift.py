@@ -195,9 +195,10 @@ async def test_monitoring_plane_scope_is_measured_against_a_live_app(engine: Eng
     await service.set_channel_scope(wide_id, [ALL_CHANNELS], actor="admin")
 
     app = create_app(engine, auth=service)
-    # One planted history sample counting both inbounds' deliveries, so a history read that
-    # narrowed, or answered an empty ring, would differ from it. The ring is otherwise fed only by
-    # the /ws/stats sampler, which this test does not run.
+    # One planted history sample, so a history read that answered the scoped caller an empty or
+    # rewritten ring would differ from it. The sample carries no channel identity, so this does not
+    # tell a narrowing that kept channel-free samples from a global read. The ring is otherwise fed
+    # only by the /ws/stats sampler, which this test does not run.
     planted = {"pending": 2}
     app.state.metrics_history.record(time.time(), planted)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:

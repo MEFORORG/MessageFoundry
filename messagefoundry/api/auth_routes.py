@@ -856,20 +856,25 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         return SimpleMessage(detail="authorized")
 
     def _add_permission_check(permission: Permission) -> None:
+        # A permission in SCOPED_READER_REFUSALS is refused to a channel-scoped holder here too,
+        # with the same auth.channel_denied row its real routes write (BACKLOG #4346). Not every
+        # permission whose routes refuse such a holder is in that map: at least messages:purge
+        # is not, so its check route still admits one. The other gates the real routes add, such
+        # as require_phi_read's on GET /logs/tail, are not run here.
+        refuses_scoped = permission in SCOPED_READER_REFUSALS
+
         async def auth_check_permission(
             request: Request,
             identity: Identity = Depends(require(permission)),
         ) -> SimpleMessage:
-            # A permission whose routes refuse every channel-scoped holder is refused here too,
-            # with the same auth.channel_denied row, so on channel scope this route does not admit
-            # a caller those routes refuse (BACKLOG #4346). The other gates those routes add, such
-            # as require_phi_read's on GET /logs/tail, are not run here. With no auth service
-            # attached the caller is the open-mode identity, which no scope narrows.
-            auth = get_auth(request)
-            if permission in SCOPED_READER_REFUSALS and auth is not None:
-                await refuse_a_channel_scoped_reader(
-                    auth.store, identity, permission, client_ip(request)
-                )
+            if refuses_scoped:
+                # With no auth service attached the caller is the open-mode identity, which no
+                # scope narrows, and there is no store to read through it.
+                auth = get_auth(request)
+                if auth is not None:
+                    await refuse_a_channel_scoped_reader(
+                        auth.store, identity, permission, client_ip(request)
+                    )
             await record_check_grant(request, identity, permission)
             return SimpleMessage(detail="authorized")
 
