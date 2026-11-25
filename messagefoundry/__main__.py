@@ -422,7 +422,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "[pipeline].snapshot_on_send (copy-on-Send, ADR 0104) resolved best-effort from the service "
         "settings (--service-config, else ./messagefoundry.toml if present); when no settings load "
         "it falls back to the setting's own default (ON) — matching the default engine, never a "
-        "silent OFF (#230).",
+        "silent OFF (#230), except under --env, where a settings load error stops the run. "
+        "A MEFOR_* variable that is a settings section's name alone can stop "
+        "the run instead; SectionNameEnvError in messagefoundry.config.settings says when.",
     )
     dryrun.add_argument("--config", default="samples/config", help="config modules directory")
     _add_anchor_flags(
@@ -461,7 +463,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "best-effort from the settings the posture check reads: this instance's "
         "messagefoundry.toml, or with no file, the MEFOR_* environment when --env or "
         "MEFOR_AI_ENVIRONMENT names the instance. When no settings load, the preview falls back to the "
-        "setting's own default (ON) — matching the default engine, never a silent OFF (#230). "
+        "setting's own default (ON) — matching the default engine, never a silent OFF (#230). A MEFOR_* "
+        "variable that is a settings section's name alone can fail the dryrun check instead; "
+        "SectionNameEnvError in messagefoundry.config.settings says when. "
         "Under --project-root with no --service-config, check reads the project root's "
         "messagefoundry.toml, else the config dir's, while serve with the same flags reads the "
         "one in its own working directory; when they differ, each settings check's line names "
@@ -6496,13 +6500,21 @@ def _snapshot_on_send_setting(service_config: str | None) -> bool:
     top) and returns the loaded flag. When no settings load (no file, or one that won't
     parse/validate), fall back to the **Settings-model default (True)** — the posture of exactly the
     default, un-overridden engine — never a hardcoded ``False``, which would make the preview diverge
-    from the engine this command exists to mirror (ADR 0104 §8.1)."""
+    from the engine this command exists to mirror (ADR 0104 §8.1). The exception is
+    :class:`~messagefoundry.config.settings.SectionNameEnvError`, which is raised for the caller to
+    report rather than fall back on."""
     from pydantic import ValidationError
 
-    from messagefoundry.config.settings import PipelineSettings, load_settings
+    from messagefoundry.config.settings import (
+        PipelineSettings,
+        SectionNameEnvError,
+        load_settings,
+    )
 
     try:
         return load_settings(config_path=service_config).pipeline.snapshot_on_send
+    except SectionNameEnvError:
+        raise  # why: SectionNameEnvError's docstring
     except (FileNotFoundError, ValueError, ValidationError, OSError):
         return PipelineSettings().snapshot_on_send
 
@@ -6530,6 +6542,7 @@ def _dryrun_loop_error(exc: ValueError | KeyError) -> str:
 
 
 def _dryrun(args: argparse.Namespace) -> int:
+    from messagefoundry.config.settings import SectionNameEnvError
     from messagefoundry.config.wiring import WiringError, load_config
     from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_messages
     from messagefoundry.redaction import safe_error
@@ -6559,7 +6572,10 @@ def _dryrun(args: argparse.Namespace) -> int:
     # #230 P4 (ADR 0104): preview under the engine's copy-on-Send posture, resolved from the service
     # settings serve would load, so a site's [pipeline] value reaches the preview; the library default,
     # True, is the PipelineSettings default and applies only where nothing is passed (BACKLOG #5794).
-    snapshot_on_send = _snapshot_on_send_setting(service_config)
+    try:
+        snapshot_on_send = _snapshot_on_send_setting(service_config)
+    except SectionNameEnvError as exc:
+        return _emit_error(str(exc), as_json=args.json)
 
     show_phi: bool = args.show_phi
     if not show_phi:
@@ -14945,7 +14961,7 @@ def _alert(args: argparse.Namespace) -> int:
     from pydantic import ValidationError
 
     from messagefoundry.config import alerts_edit
-    from messagefoundry.config.settings import AlertRule, load_settings
+    from messagefoundry.config.settings import AlertRule, SectionNameEnvError, load_settings
     from messagefoundry.pipeline.alert_sinks import (
         check_rule_recipients,
         configured_alert_transport_names,
@@ -14988,6 +15004,8 @@ def _alert(args: argparse.Namespace) -> int:
                     configured = configured_alert_transport_names(
                         load_settings(config_path=path).alerts
                     )
+                except SectionNameEnvError:
+                    raise  # to the handler below; why: SectionNameEnvError's docstring
                 except (OSError, ValueError):
                     configured = (
                         set()
@@ -15006,6 +15024,8 @@ def _alert(args: argparse.Namespace) -> int:
             if new_rule.recipients or any(step.recipients for step in new_rule.escalate):
                 try:
                     alerts = load_settings(config_path=path).alerts
+                except SectionNameEnvError:
+                    raise  # to the handler below; why: SectionNameEnvError's docstring
                 except (OSError, ValueError):
                     alerts = None  # no settings yet, so no email transport sends the override
                 if (
