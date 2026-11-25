@@ -2441,7 +2441,9 @@ Two limits follow from this:
   file and a share Windows could not reach, saying the file must be a plain local path, not a
   share, a network drive, a link to one, or a path the check cannot read. A denial or fault on the
   file's own name can pass the walk, since Windows answers it from the folder's listing; the
-  read then refuses it as a file that could not be read. A missing name, which Windows reports as
+  file's own `stat` and read then judge it. A `stat` failure that libpq could not get past either,
+  at least a denial (code 5) or a missing name, is left to libpq; any other refusal there says its
+  `stat` failed or that it could not be read. A missing name, which Windows reports as
   code 2 or 3, ends the walk and is left to libpq. Another code Windows raises as not found is not
   read as a missing name: a share it could not reach is refused as above, and at least codes 161
   and 206 stop the walk, and the build is refused.
@@ -2450,7 +2452,8 @@ Two limits follow from this:
   application-data folder, which the engine asks the shell for as libpq does, through the ANSI
   call. Where that call returns a `?` past the drive, which it writes for a character the code
   page cannot hold, the engine cannot say which file libpq reads, so it refuses the build; set
-  `PGSSLROOTCERT` to a local path. Best-fit maps other such characters to other characters, and
+  `PGSSLROOTCERT` to a copy in a local folder only administrators and the service account can
+  write. Best-fit maps other such characters to other characters, and
   the engine checks that path like any other; one mapped to a character no Windows name holds,
   at least `*` for a fullwidth asterisk, refuses the build. Elsewhere it is under `.postgresql`
   in `HOME`, which libpq 15 and later read (or the password-file home when `HOME` is unset or
@@ -4068,10 +4071,14 @@ read as Explicit VR Little Endian, as PS3.10 requires, without `pydicom`, up to 
 outside group `0002`. The `(0002,0000)` Group Length is not read, as `pydicom` ignores a wrong one
 too. Both UIDs are read on every send **before the POST**, as the DICOM SCU parses before it
 associates, so the connection's build does not check `pydicom`. The data set read puts back the
-SCU's ignores for `pydicom` warnings that would name a value, and holds the lines `pydicom` logs
-while it reads. It writes them, redacted as the DICOM connectors' `pydicom` lines are, only with
-the first read-fault WARNING of the process (below); otherwise it writes none. `pydicom`'s own copy of such a line
-as a Python warning is not held, so it can still reach stderr. An object the codec cannot parse is read as no data set
+DICOM connectors' screening log record factory, and the warnings filter the DICOM connectors
+install, which ignores every warning attributed to a `pydicom` module. It holds the lines `pydicom`
+logs while it reads on the loggers the DICOM connectors' filter is on, and writes them only with
+the first read-fault WARNING of the process (below); otherwise it writes none. A line on another
+`pydicom` logger is not held and is written as it is logged. Such lines pass the DICOM connectors'
+default-deny screen, within its limits ([DICOM.md](DICOM.md), *The rule, stated once here* and *How
+far it reaches*), so a line no template pins is written withheld, not redacted. `pydicom`'s own
+copy of such a line as a Python warning is not held; that filter drops it where it is in force. An object the codec cannot parse is read as no data set
 UID, and the object is still sent. The codec takes at least the exception classes it lists for a
 malformed object as a parse failure, so one of those raised by a broken `pydicom` reads the same
 way: the object is sent, and a 202 that names only its data set UID is then refused after the

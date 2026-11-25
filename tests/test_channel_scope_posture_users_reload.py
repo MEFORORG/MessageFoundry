@@ -348,8 +348,11 @@ async def test_a_scope_change_row_withholds_its_channels_from_a_reader_without_u
     channels to any ``audit:read`` holder. A reader without ``users:manage`` now reads the row with
     its list withheld, on ``GET /audit`` and the CSV export; an administrator reads it whole."""
     service = await _service(engine)
-    await _user(service, "other", [Role.OPERATOR.value], [THEIRS])  # writes the row
-    await _user(service, "auditor", [Role.AUDITOR.value], None)
+    other = await _user(service, "other", [Role.OPERATOR.value], [THEIRS])  # writes the row
+    # The Auditor's own all-channels grant writes a second scope row, so the reads below pick
+    # out the other account's row.
+    # The audit trail refuses a channel-scoped reader (BACKLOG #4346), so the Auditor is wide.
+    await _user(service, "auditor", [Role.AUDITOR.value], [ALL_CHANNELS])
     await _user(service, "boss", [Role.ADMINISTRATOR.value], None)
     query = {"action": "user.channel_scope_changed"}
     async with _client(engine, service) as c:
@@ -359,13 +362,17 @@ async def test_a_scope_change_row_withholds_its_channels_from_a_reader_without_u
         by_boss = await c.get("/audit", params=query, headers=await _login(c, "boss"))
     for r in (by_auditor, exported, by_boss):
         assert r.status_code == 200, r.text
-    (seen,) = by_auditor.json()["entries"]
+
+    def of_other(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [e for e in entries if json.loads(e["detail"]).get("user_id") == other]
+
+    (seen,) = of_other(by_auditor.json()["entries"])
     assert json.loads(seen["detail"])["channels"] == "withheld"
     assert "user_id" in json.loads(seen["detail"]), "the row itself stays readable"
     assert THEIRS not in by_auditor.text and THEIRS not in exported.text
     assert "user.channel_scope_changed" in exported.text, "control: the export holds the row"
     # The control: users:manage reads the list.
-    (whole,) = by_boss.json()["entries"]
+    (whole,) = of_other(by_boss.json()["entries"])
     assert json.loads(whole["detail"])["channels"] == [THEIRS]
 
 
@@ -436,7 +443,8 @@ async def test_a_refused_scope_save_withholds_the_scope_owner(engine: Engine) ->
 
     service = await _service(engine)
     target = await _user(service, "other", [Role.OPERATOR.value], [THEIRS])
-    await _user(service, "auditor", [Role.AUDITOR.value], None)
+    # The audit trail refuses a channel-scoped reader (BACKLOG #4346), so the Auditor is wide.
+    await _user(service, "auditor", [Role.AUDITOR.value], [ALL_CHANNELS])
     await _user(service, "boss", [Role.ADMINISTRATOR.value], None)
     with pytest.raises(ChannelScopeSourceConflict):
         await service.set_channel_scope(target, [THEIRS], actor="boss", expected_source="ad")

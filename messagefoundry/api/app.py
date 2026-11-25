@@ -113,6 +113,7 @@ from messagefoundry.api.message_scope import (
     MessageKeyServiceUnavailableError,
     get_scoped_message,
     read_scoped_message,
+    refuse_a_channel_scoped_reader,
 )
 from messagefoundry.api.message_scope import audit_channel_denied as _audit_channel_denied
 from messagefoundry.api.metrics import (
@@ -2509,10 +2510,11 @@ def _posture_loosenings(
             # BACKLOG #2489, vault #3123: the dual-control dwell, expiry and held list, read off the
             # gate that enforces them.
             approvals=gate.settings if gate is not None else ApprovalsSettings(),
-            # BACKLOG #2227: a short or zero warn_days is named. The managed lifespan stashes the
-            # live section. An app built without it (an embedding, or a test) is read at the
-            # shipped default, the stash-or-default rule [secret_rotation] follows above. KNOWN
-            # GAP: such an engine may run no cert monitor at all, and this then reads it as on.
+            # BACKLOG #2227, #2008: a short or zero warn_days is named, and so is a long interval.
+            # The managed lifespan stashes the live section. An app built without it (an
+            # embedding, or a test) is read at the shipped default, the stash-or-default rule
+            # [secret_rotation] follows above. KNOWN GAP: such an engine may run no cert monitor at
+            # all, and this then reads it as on.
             cert_monitor=getattr(state, "cert_monitor_settings", None) or CertMonitorSettings(),
             # Vault BACKLOG #2302: the cleartext-archive escape, off the [backup] section the
             # managed lifespan stashed. The same stash-or-default rule: an app built without it
@@ -7568,9 +7570,12 @@ def create_app(
             )
             success = True
         except Exception as exc:  # noqa: BLE001 — any SMTP/config failure is a test FAILURE, not a 500
-            # safe_exc scrubs + bounds the message so no SMTP server banner / internal detail (possible
-            # host/credential hints) escapes to the caller. A hop refusal from the build is the
-            # exception: the build dials nothing, so it is the engine's own text, the operator's
+            # safe_exc keeps the exception type, redacts PHI and credential shapes in the message and
+            # cuts it at 200 characters, adding short notes of what it cut, so the detail can run a
+            # little past 200. A banner or host name is not one of those shapes, so most of what the
+            # relay or the socket said, up to that cut, can reach the caller, who holds
+            # service:configure. A hop refusal from the build gets a
+            # longer bound: the build dials nothing, so it is the engine's own text, the operator's
             # host and the remedy. A send's refusal can quote what the relay advertised.
             if building and isinstance(exc, InsecureHopRefused):
                 detail = safe_exc(exc, limit=_TEST_SEND_BUILD_REFUSAL_LIMIT)
@@ -10734,12 +10739,21 @@ def create_app(
     @app.get("/metrics")
     async def metrics_endpoint(
         engine: Engine = Depends(_get_engine),
-        _user: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
+        identity: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
     ) -> Response:
         """Prometheus exposition (text/plain). Gated by monitoring:read like /stats — a scraper
         authenticates with a service token. Contains only aggregate counts/latency keyed by
-        connection name + status — no PHI."""
-        return Response(content=await render_metrics(engine), media_type=METRICS_CONTENT_TYPE)
+        connection name + status — no PHI.
+
+        A channel-scoped caller reads only its own inbounds' series, and no per-destination or
+        latency series at all (BACKLOG #4346, the route build of #1152):
+        :func:`~messagefoundry.api.metrics.scoped_snapshot` says why. A scraper that needs the
+        whole estate is given the all-channels grant."""
+        in_scope = identity.can_access_channel if identity.allowed_channels is not None else None
+        return Response(
+            content=await render_metrics(engine, in_scope=in_scope),
+            media_type=METRICS_CONTENT_TYPE,
+        )
 
     @app.get("/metrics/history", response_model=MetricsHistoryResponse)
     async def metrics_history(
@@ -11359,7 +11373,14 @@ def create_app(
         refuses to emit) + the per-actor anti-automation throttle — under the new ``logs:view`` permission,
         exactly like a message-detail read. Each served page writes a ``logs_view`` audit row counting how
         many lines were exposed (**metadata only, never the content**). Degrades gracefully to an empty,
-        ``available=false`` page when no ``[logging].log_dir`` is configured or the file is unreadable."""
+        ``available=false`` page when no ``[logging].log_dir`` is configured or the file is unreadable.
+
+        A channel-scoped caller is refused 403, with an ``auth.channel_denied`` row (BACKLOG #4346,
+        the route build of #1152). A log line is not attributable to one channel, so there is
+        nothing to narrow the page by; a reader who needs the log is given the all-channels grant."""
+        await refuse_a_channel_scoped_reader(
+            engine.store, identity, Permission.LOGS_VIEW, client_ip(request)
+        )
         log_dir = getattr(request.app.state, "log_dir", None)
         # Blocking file read + redaction pass — off the event loop, like /status app-log metering.
         lines, total, available = await asyncio.to_thread(

@@ -30,6 +30,7 @@ from __future__ import annotations
 import datetime as dt
 import importlib
 import json
+import re
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -73,11 +74,85 @@ def clipped_census(report: Any, sources: Any, through: dt.date) -> tuple[Any, in
     return census, calls
 
 
+#: A row's priority, as its section marker line writes it: ``**Cluster:** X. **Priority:** P3.``
+_PRIORITY = re.compile(r"\*\*Priority:\*\*\s*(P[0-9]+)\b")
+#: A banner-block score, ``Value **6/10**``: a copy of the vault ``backlog_status_check._SCORE``,
+#: so the FIRST banner-block line it matches is the line ``parse_items`` takes its score from.
+_SCORE = re.compile(r"[Vv]alue\s*\**\s*(?P<value>\d+)\s*/\s*10", re.I)
+#: The tier a scoring pass writes in that line's lead-in, before the score:
+#: ``**Re-scored 2026-11-25 -> P2.** Value **6/10**``. Some rows write the arrow as U+2192.
+_TIER = re.compile(r"(?:->|\u2192)\s*(P[0-9]+|DEMAND-GATE)\.")
+#: The priority bucket of a row whose first score line carries no tier, and whose section marker
+#: names no priority. Most are filing estimates; a tierless score with a Cluster priority is not here.
+ESTIMATE = "scored, no tier"
+#: The priority bucket of a row with no tier, no section-marker priority and no score.
+UNSCORED = "unscored"
+
+
+def row_status(checker: Any, item: Any, lines: Sequence[str]) -> str | None:
+    """One status per row, the buckets disjoint: an open row is ``partial`` when its banner block
+    holds a PARTIAL line, else ``in progress`` under an in-progress banner, else ``open``; a closed
+    row is ``closed``, ``declined`` or ``superseded`` by its newest closed banner, as the weekly
+    census reads it. ``None`` for a row with no status banner, which the census counts nowhere."""
+    closing = {
+        checker.SHIPPED_BANNER: "closed",
+        checker.DECLINED_BANNER: "declined",
+        checker.RETIRED_BANNER: "superseded",
+    }
+    if not item.is_open:
+        newest = next((b for _, b in item.banner_lines if b in closing), None)
+        return None if newest is None else closing[newest]
+    block = lines[item.line : item.body_line - 1]
+    if any(checker.PARTIAL_LINE.match(line) for line in block):
+        return "partial"
+    newest = next((b for _, b in item.banner_lines), None)
+    return "in progress" if newest == checker.IN_PROGRESS_BANNER else "open"
+
+
+def row_priority(item: Any, lines: Sequence[str]) -> str:
+    """The row's priority bucket, read only from its OWN lines, never from one its prose quotes.
+
+    First, the tier in the lead-in of the FIRST banner-block line holding a ``Value **N/10**``
+    score, the line a scoring pass writes (it never rewrites the Cluster line); else the priority
+    on the row's section marker line; else :data:`ESTIMATE` when that score line carries no tier;
+    else :data:`UNSCORED`. A tier after the score is prose on that line, not the row's tier."""
+    block = lines[item.line : item.body_line - 1]
+    found = next(((ln, s) for ln in block if (s := _SCORE.search(ln)) is not None), None)
+    if found is not None:
+        line, score = found
+        # The tier nearest the score is the one written with it; an earlier one on the same
+        # line belongs to an older banner sharing it.
+        tiers = list(_TIER.finditer(line, 0, score.start()))
+        if tiers:
+            return tiers[-1][1]
+    for n in item.section_lines[:1]:
+        m = _PRIORITY.search(lines[n - 1])
+        if m:
+            return m[1]
+    return UNSCORED if found is None else ESTIMATE
+
+
+def priority_census(checker: Any, sources: Sequence[tuple[str, str]]) -> dict[str, dict[str, int]]:
+    """Rows per priority per status, over the same sources the weekly census reads."""
+    out: dict[str, dict[str, int]] = {}
+    for _label, text in sources:
+        lines = text.splitlines()
+        for item in checker.parse_items(text):
+            status = row_status(checker, item, lines)
+            if status is None:
+                continue
+            bucket = out.setdefault(row_priority(item, lines), {})
+            bucket[status] = bucket.get(status, 0) + 1
+    return out
+
+
 def census_json(report: Any, root: Path, through: dt.date) -> dict[str, Any]:
     paths = [root / p for p in report.DEFAULT_SOURCES]
     sources = report.read_sources(paths, root, explicit=True)
     census, calls = clipped_census(report, sources, through)
+    checker = _import(root, "backlog_status_check")
     return {
+        "by_priority": priority_census(checker, sources),
         "rows": int(census.rows),
         "per_source": [[str(label), int(n)] for label, n in census.per_source],
         "weeks": {str(w): {str(k): int(v) for k, v in c.items()} for w, c in census.weeks.items()},

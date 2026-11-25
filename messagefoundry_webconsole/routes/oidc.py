@@ -70,6 +70,7 @@ from messagefoundry.api.security import (
 )
 from messagefoundry.auth.oidc import FlowCacheFullError, FlowError
 from messagefoundry.auth.service import AuthService, LoginOutcome, OidcStepUp, OidcStepUpFlow
+from messagefoundry.controlchars import scrub_log_argument
 
 from .. import pages
 from .._auth import (
@@ -399,7 +400,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         client = client_ip(request)
         if not auth.allow_login_attempt(client):
             # A _log.warning, never an audit — parity with sso.py, so exhaustion writes zero DB rows.
-            _log.warning("federated sign-in rate limit exceeded for %s", client or "<unknown>")
+            _log.warning(
+                "federated sign-in rate limit exceeded for %s",
+                scrub_log_argument(client or "<unknown>"),
+            )
             return RedirectResponse("/ui/login?e=rate_limited", status_code=303)
         mode = request.headers.get("Sec-Fetch-Mode")
         if mode is not None and mode != "navigate":
@@ -431,7 +435,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         except FlowCacheFullError:
             # The bounded flow cache REJECTS rather than evicts (evict-oldest would make a start-leg
             # flood a login DoS). That is a flood signal, so it is logged, not audited per request.
-            _log.warning("federated flow cache is full; refusing new sign-in for %s", client or "?")
+            _log.warning(
+                "federated flow cache is full; refusing new sign-in for %s",
+                scrub_log_argument(client or "?"),
+            )
             return RedirectResponse("/ui/login?e=rate_limited", status_code=303)
         except FlowError:
             await auth.audit_oidc_reject("start_failed", client=client)
@@ -510,7 +517,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             )
         except FlowCacheFullError:
             claim.restore()
-            _log.warning("federated flow cache is full; refusing step-up for %s", client or "?")
+            _log.warning(
+                "federated flow cache is full; refusing step-up for %s",
+                scrub_log_argument(client or "?"),
+            )
             return reauth_idp_response(
                 deps,
                 auth,
@@ -563,14 +573,18 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 # nothing: a reload of this return retries it once the budget refills, if the IdP's
                 # code still redeems, and the page's own button starts a fresh flow.
                 _log.warning(
-                    "federated step-up return rate limit exceeded for %s", client or "<unknown>"
+                    "federated step-up return rate limit exceeded for %s",
+                    scrub_log_argument(client or "<unknown>"),
                 )
                 return _step_up_refusal(
                     deps, auth, staged.return_to, error=_TOO_MANY_ATTEMPTS, status_code=429
                 )
         elif not auth.allow_login_attempt(client):
             # The limiter runs on BOTH legs (ADR 0142): the callback is equally unauthenticated.
-            _log.warning("federated callback rate limit exceeded for %s", client or "<unknown>")
+            _log.warning(
+                "federated callback rate limit exceeded for %s",
+                scrub_log_argument(client or "<unknown>"),
+            )
             return RedirectResponse("/ui/login?e=rate_limited", status_code=303)
         mode = request.headers.get("Sec-Fetch-Mode")
         if mode is not None and mode != "navigate":
@@ -585,7 +599,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 _log.warning(
                     "federated step-up return refused (non_navigation_fetch) for %s; its audit "
                     "budget is spent, so no row is written",
-                    client or "<unknown>",
+                    scrub_log_argument(client or "<unknown>"),
                 )
             # Consumed nothing, so the cookie stays for the real IdP return (BACKLOG #3198).
             return _fail(request, "oidc_failed", keep_flow=True)

@@ -108,7 +108,7 @@
     THE SIX-HOUR FENCE STILL HOLDS: a tree a session has just finished cannot be discarded for six
     hours, because its git state, its working tree or its uncommitted work is too recent.
     What it parks is every tracked change and untracked file older than that, the ones -Force would
-    otherwise discard, and on -Name the untracked files that route lets go, at any size: whatever
+    otherwise discard, at any size: whatever
     the tree's .gitignore does not ignore lands in the object store and stays there while the ref
     does. A temporary index file, a copy of the tree's own index set on the snapshot's own git calls
     only and never left set, takes `add -A` and `write-tree`; the shared stash is never touched.
@@ -148,9 +148,10 @@
 
     -Name KEEPS ITS OLD RULES OTHERWISE. It shares at least the detached HEAD, nested worktree and
     reflog-only refusals above; docs/WORKTREES.md lists what -Name refuses. Tracked changes refuse
-    without -Force, and so do files flagged skip-worktree or
-    assume-unchanged (BACKLOG #5648), which git status does not read. -Force overrides both, and the
-    run names the flagged files it lets go. Untracked files older than six hours and ignored
+    without -Force, and so do untracked files no exclude rule covers (BACKLOG #2554 finding 3)
+    and files flagged skip-worktree or
+    assume-unchanged (BACKLOG #5648), which git status does not read. -Force overrides all three, and the
+    run names the flagged files it lets go. Ignored
     files other than the repositories named above go with the worktree, and there is no occupancy
     check. NEITHER ROUTE RUNS A BLANKET `git worktree prune` (-Name ran one until BACKLOG #5648 and
     #7619): `git worktree remove` already drops the target's own registration, and a prune also drops
@@ -184,7 +185,7 @@
 .EXAMPLE
     .\remove.ps1 -Name alerts
     .\remove.ps1 -Name alerts -DeleteBranch
-    .\remove.ps1 -Name alerts -Force        # discard uncommitted tracked changes older than six hours too
+    .\remove.ps1 -Name alerts -Force        # discard uncommitted tracked changes and untracked files older than six hours too
     .\remove.ps1 -Name alerts -Discard      # park them on refs/attic/<date>-alerts instead
     .\remove.ps1 -List
     .\remove.ps1 -Path C:\Users\me\AppData\Local\Temp\claude\x\y\scratchpad\wt
@@ -230,9 +231,9 @@ param(
 
     # Remove even when this worktree OWNS a ledger number whose item is not yet on origin/main
     # (BACKLOG #1293). DELIBERATELY NOT -Force: that one means "I accept losing uncommitted changes",
-    # and one consent must not silently cover an unrelated, IRREVERSIBLE risk. A stranded allocation
-    # cannot be re-keyed -- ownership is non-transferable -- so the number is burned and the PR
-    # carrying it is unlandable BY ANYONE.
+    # and one consent must not silently cover an unrelated risk. Ownership is non-transferable, so a
+    # number this removal strands may be one nothing can commit again; the refusal says, per record,
+    # which. docs/LEDGER-GATE.md, "When the owning worktree is gone", has the rule and the recovery.
     [Parameter(ParameterSetName = 'ByName')]
     [Parameter(ParameterSetName = 'ByPath')]
     [switch]$AllowOrphanedAllocations,
@@ -1159,30 +1160,45 @@ if ($byPath) {
     }
 }
 else {
-    # Guard against losing UNCOMMITTED tracked work. Note this does NOT see committed-but-unpushed
+    # Guard against losing UNCOMMITTED work. Note this does NOT see committed-but-unpushed
     # commits -- `status --porcelain` is empty for a clean worktree holding them; -DeleteBranch's own
-    # containment check below is what covers those. Untracked entries (??) -- the .venv, node_modules,
-    # dev db -- are expected and don't block removal, once they are older than the quiet period.
+    # containment check below is what covers those.
+    # UNTRACKED FILES REFUSE TOO, WITHOUT -Force (BACKLOG #2554 finding 3). This filter used to drop
+    # every `??` line, on the reasoning that the .venv and node_modules are expected; but this
+    # repository ignores a .venv directory and ide/node_modules, and this read does not pass
+    # --ignored, so those do not print here. A .venv that is a link, or a node_modules no rule
+    # ignores, does print, and now refuses without -Force. What a `??` line
+    # names is untracked work no exclude rule covers (.gitignore, .git/info/exclude or
+    # core.excludesFile), and `worktree remove --force` deleted it. The untracked mode is named,
+    # because status.showUntrackedFiles=no in any config would otherwise hide every `??` line.
+    # Ignored files still go with the tree. -Force overrides, as it does for tracked changes, and
+    # -Discard parks them instead.
     # The exit code is read BEFORE the filter: a git that cannot read this worktree (a corrupt index, say)
     # prints nothing, and nothing read as "no changes" here would hand `worktree remove --force` the very
     # edits this guard exists for. -Force does not override it (BACKLOG #1038).
-    $status = @(& git -C $WorktreePath status --porcelain 2>$null)
+    $status = @(& git -C $WorktreePath status --porcelain --untracked-files=normal 2>$null)
     if ($LASTEXITCODE -ne 0) {
         throw "git status failed in '$WorktreePath' (exit $LASTEXITCODE), so its changes are unknown. Nothing was removed."
     }
     $tracked = $status | Where-Object { $_ -notmatch '^\?\?' }
+    $untracked = $status | Where-Object { $_ -match '^\?\?' }
     # FILES FLAGGED skip-worktree (S) OR assume-unchanged (lower case), BACKLOG #5648. git status does
     # not look at one, so an edit to it is invisible to the guard above, and `worktree remove --force`
     # deletes it. Nothing here can tell an edited one from an untouched one without reading it, so
     # every flagged file refuses. -Force overrides, as it does for tracked changes, and the run names
     # each file it let go so the override leaves a record in the caller's output. -Discard refuses
     # them whatever -Force says, in its own block below.
-    # ONE REFUSAL NAMES BOTH KINDS, so an operator told to re-run with -Force for a tracked change has
-    # also been shown every flagged file that -Force would take with it.
+    # ONE REFUSAL NAMES EVERY KIND, so an operator told to re-run with -Force for a tracked change has
+    # also been shown every untracked and flagged file that -Force would take with it.
     $refuseFlagged = $flagged.Count -gt 0 -and -not $Discard -and -not $Force
-    if (($tracked -and -not $Force -and -not $Discard) -or $refuseFlagged) {
+    if ((($tracked -or $untracked) -and -not $Force -and -not $Discard) -or $refuseFlagged) {
         $why = @()
         if ($tracked -and -not $Discard) { Write-Host ($tracked -join "`n"); $why += 'uncommitted tracked changes' }
+        if ($untracked -and -not $Discard) {
+            $untracked | Select-Object -First 20 | ForEach-Object { Write-Host $_ }
+            if (@($untracked).Count -gt 20) { Write-Host "... and $(@($untracked).Count - 20) more" }
+            $why += 'untracked files that no exclude rule covers'
+        }
         if ($flagged.Count -gt 0 -and -not $Discard) {
             $flagged | Select-Object -First 20 | ForEach-Object { Write-Host "flagged $($_.Substring(2))" }
             if ($flagged.Count -gt 20) { Write-Host "... and $($flagged.Count - 20) more" }
@@ -1203,20 +1219,13 @@ else {
 
 # --- BACKLOG #1293: refuse to strand a ledger number ---------------------------
 #
-# `Checker.owns` (scripts/hooks/ledger_check.py) decides ownership by CASEFOLDED PATH-STRING
-# EQUALITY against the worktree recorded at allocation time. There is no fallback for a recorded
-# worktree that no longer exists, so once this directory is gone `owns()` returns false for EVERY
-# session, forever. The number is burned and any PR that must re-introduce its heading is
-# unlandable by anybody. PR #397 was stranded exactly this way.
+# Removing the worktree an allocation record names can strand that number; PR #397 was stranded this
+# way. Whether anything else can still commit it depends on the record, so the refusal says so per
+# record. The ownership rule and the recoveries are in docs/LEDGER-GATE.md, "When the owning worktree
+# is gone"; this guard does not restate them.
 #
-# THE GATE IS NOT WRONG AND THIS DOES NOT WIDEN IT. It fails closed and is behaving correctly; the
-# defect is that there is no route back. Recovery for ALREADY-stranded numbers is an open route
-# decision (three candidates, none obviously right -- see the item). PREVENTION needs no such
-# decision, which is why it is here and the recovery is not.
-#
-# WHY IT REFUSES RATHER THAN WARNS. A claim can be released after the fact; an allocation CANNOT be
-# re-keyed, because ownership is documented non-transferable. There is no post-hoc fix, so the only
-# moment this can be stopped is before the removal.
+# WHY IT REFUSES RATHER THAN WARNS. A claim can be released after the fact; an allocation cannot be
+# re-keyed, because ownership is documented non-transferable.
 #
 # CANNOT-TELL COUNTS AS AT-RISK. An unreadable allocation record might name this worktree, and an
 # unreadable ledger read might hide a heading. Both refuse.
@@ -1225,6 +1234,15 @@ else {
 # are read) and on an alloc directory that cannot be listed. -Name used to read both as "no records
 # found" (vault BACKLOG #2985, item 11, and #2988).
 $allocDirRoot = Join-Path $ownShared.Path 'alloc'
+
+function Format-RecordText($Value) {
+    # A record field lands in prose an operator or agent acts on, so a line break or other invisible
+    # character in it must not be able to forge a line (the BACKLOG #1040 route). \p{C} includes the
+    # surrogate halves .NET sees for an astral format character; the cap matches _safe_for_message.
+    $t = ([string]$Value).Trim() -replace '[\p{C}\p{Zl}\p{Zp}]', '?'
+    if ($t.Length -gt 400) { $t = $t.Substring(0, 400) + '...' }
+    $t
+}
 
 function Test-LedgerNumberOnMain([string]$Kind, [string]$Number) {
     <# $true on origin/main, $false absent, $null CANNOT TELL (which the caller treats as at-risk).
@@ -1258,13 +1276,27 @@ if (Test-RegistryDirPresent $allocDirRoot 'the allocation directory') {
         $r = Read-RecordFile $f
         # The retired-allocator tombstone names no worktree on purpose, so it can strand nothing.
         if ($r.Tombstone) { continue }
-        if ($r.Problem) { $allocUnreadable += "$($f.Name) ($($r.Problem))"; continue }
+        if ($r.Problem) { $allocUnreadable += "$(Format-RecordText $f.Name) ($($r.Problem))"; continue }
         if ($r.Elsewhere -or $targetNorms -notcontains $r.Holder) { continue }
         $a = $r.Record
         $onMain = Test-LedgerNumberOnMain ([string]$a.kind) ([string]$a.number)
         if ($onMain -ne $true) {
             $why = if ($null -eq $onMain) { 'COULD NOT CHECK origin/main' } else { 'not on origin/main' }
-            $atRisk += "$([string]$a.kind) #$([string]$a.number) -- $why -- $([string]$a.title)"
+            # The engine's gate checks only adr numbers with owns(), so only an adr record's branch is a
+            # second key. alloc.ps1 records a detached HEAD as `detached@<sha>`, which names no branch.
+            $recBranch = if ($a.branch -is [string]) { Format-RecordText $a.branch } else { '' }
+            if ($recBranch -like 'detached@*') { $recBranch = '' }
+            # Under -DeleteBranch the re-run this refusal offers can delete the branch checked out here,
+            # which is usually the recorded one, so the line must not promise that branch survives.
+            $outcome = if ([string]$a.kind -eq 'adr' -and $recBranch -and $DeleteBranch) {
+                "-DeleteBranch on this run can delete the branch checked out here, and if that is the recorded branch $recBranch, the number then rests on a worktree recreated at this path (docs/LEDGER-GATE.md)"
+            } elseif ([string]$a.kind -eq 'adr' -and $recBranch) {
+                "a recorded branch $recBranch can still commit it: a worktree on a branch of that name is entitled to it"
+            } else {
+                'no other worktree can commit it once this one is removed, short of one recreated at this path'
+            }
+            # The outcome before the title, so a title cannot put a forged outcome ahead of the real one.
+            $atRisk += "$(Format-RecordText $a.kind) #$(Format-RecordText $a.number) -- $why -- $outcome -- title: $(Format-RecordText $a.title)"
         }
     }
     if (($atRisk.Count -gt 0 -or $allocUnreadable.Count -gt 0) -and -not $AllowOrphanedAllocations) {
@@ -1275,14 +1307,17 @@ if (Test-RegistryDirPresent $allocDirRoot 'the allocation directory') {
             $lines += "  record MIGHT name this worktree: $($allocUnreadable -join ', ')"
         }
         $lines += ""
-        $lines += "Removing it BURNS those numbers. Ownership is a path-string comparison against this"
-        $lines += "directory and is NON-TRANSFERABLE, so once it is gone ledger_check.owns() returns"
-        $lines += "false for every session forever and any PR that must re-introduce the heading is"
-        $lines += "unlandable BY ANYONE. This is not recoverable after the fact."
+        if ($DeleteBranch) {
+            $lines += "A record with no branch, or whose branch is deleted (-DeleteBranch on this run can delete the"
+            $lines += "branch checked out here), can then be committed from a worktree recreated at this path"
+            $lines += "(docs/LEDGER-GATE.md)."
+            $lines += ""
+        }
+        $lines += "Recovery for a stranded number: docs/LEDGER-GATE.md, `"When the owning worktree is gone`"."
         $lines += ""
         $lines += "Do this instead:"
         $lines += "  land the item(s) first, so the heading is on origin/main and ownership stops mattering;"
-        $lines += "  or, if you accept burning them, re-run with -AllowOrphanedAllocations."
+        $lines += "  or, if the operator accepts each line above, they may re-run with -AllowOrphanedAllocations."
         throw ($lines -join "`n")
     }
 }
@@ -1414,8 +1449,9 @@ if ($Discard) {
     }
 }
 
-# -Name passes --force regardless: an untracked .venv makes git consider the worktree non-empty, and
-# that route lets untracked files go.
+# -Name passes --force regardless. The reason this comment gave, that -Name lets untracked files
+# go, stopped holding at BACKLOG #2554 finding 3, which refuses them without -Force; whether -Name
+# should drop the unconditional --force as -Path does is left open on that row.
 # -Path WITHOUT -Force PASSES NO --force, so git makes its own check at the moment it deletes: it
 # refuses a tree with modified or untracked files. That closes the gap between the status read above
 # and the removal, for those two kinds. Git's check does not list ignored files, so the tolerated

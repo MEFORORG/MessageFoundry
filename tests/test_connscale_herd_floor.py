@@ -247,12 +247,21 @@ def test_a_malformed_leg_list_is_refused(bad: str) -> None:
         load_connscale_profile_text(text, where="<unit>")
 
 
-def test_a_floor_cannot_be_armed_over_repeat_trials() -> None:
-    # The floor grades the first base record per lane, so trials 2..N would go ungraded.
+@pytest.mark.parametrize(
+    ("line", "match"),
+    [
+        ("trials = 3", "trials = 3"),
+        ("fuse_modes = [false, true]", r"fuse_modes = \[False, True\]"),
+        ("batch_modes = [false, true]", r"batch_modes = \[False, True\]"),
+    ],
+)
+def test_a_floor_cannot_be_armed_over_repeat_trials_or_arms(line: str, match: str) -> None:
+    # Each trial or arm grades in a lane of its own since BACKLOG #5090, named '.../<axis>=<value>',
+    # and the harvest behind the arming never read a lane so named.
     text = _profile_text_with(f"empty_claims_herd_floor_legs = ['{_ARMED}']").replace(
-        "corpus_count_per_trigger = 5", "corpus_count_per_trigger = 5\ntrials = 3"
+        "corpus_count_per_trigger = 5", f"corpus_count_per_trigger = 5\n{line}"
     )
-    with pytest.raises(ConnScaleProfileError, match="trials = 3"):
+    with pytest.raises(ConnScaleProfileError, match=match):
         load_connscale_profile_text(text, where="<unit>")
 
 

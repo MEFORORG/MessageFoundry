@@ -79,7 +79,8 @@ def test_a_recent_edit_two_folders_deep_refuses_even_with_force(rig: Rig, route:
 
 
 def test_a_recent_untracked_file_refuses_name_without_force(rig: Rig) -> None:
-    """-Name lets untracked files go without -Force. Red before the fix: a fresh one did too."""
+    """A fresh untracked file refuses -Name. Red before the fix: it went. An older one refuses
+    without -Force since BACKLOG #2554 finding 3, so the control passes -Force."""
     wt = _sibling(rig, "fresh")
     (wt / "pkg" / "sub").mkdir(parents=True)
     settle_worktrees(rig.primary)
@@ -93,7 +94,7 @@ def test_a_recent_untracked_file_refuses_name_without_force(rig: Rig) -> None:
     assert "pkg/sub/new.py" in _out(proc), _out(proc)
     assert new.is_file()
 
-    proc = rig.run("-Name", "fresh")
+    proc = rig.run("-Name", "fresh", "-Force")
     assert proc.returncode == 0, _out(proc)
     assert not wt.exists()
 

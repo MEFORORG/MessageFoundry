@@ -1,0 +1,547 @@
+pydicom DEBUG %04x: Expected 0x00000000 after delimiter, found 0x%x
+pydicom DEBUG %04x: Found Delimiter '%s'
+pydicom DEBUG %04x: Item, length 0x%x
+pydicom DEBUG %04x: Read 0 bytes after delimiter
+pydicom DEBUG %04x: Sequence Delimiter, length 0x%x
+pydicom DEBUG <'-' * 80>
+pydicom DEBUG <msg.format(fp.tell() - 4)>
+pydicom DEBUG Call to dcmread()
+pydicom DEBUG Caller passed file name
+pydicom DEBUG Caller passed file object
+pydicom DEBUG Could not convert value for tag {} with any VR in the 'convert_retry_VR_order' list
+pydicom DEBUG Decoding {} encoded Pixel Data using {}
+pydicom DEBUG End of input encountered while parsing undefined length value as encapsulated pixel data. Unable to find length for tag %s at position 0x%x. Falling back to byte by byte scan.
+pydicom DEBUG End of input encountered while parsing undefined length value as encapsulated pixel data. Unable to find tag at position 0x%x. Falling back to byte by byte scan.
+pydicom DEBUG Exception raised by pixel data handler
+pydicom DEBUG Reading File Meta Information preamble...
+pydicom DEBUG Reading File Meta Information prefix...
+pydicom DEBUG Reading deferred element {}
+pydicom DEBUG Reading file '{}'
+pydicom DEBUG Setting private tag {}
+pydicom DEBUG Successfully read {} pixel bytes
+pydicom DEBUG Too-long length %04x for tag %s at position 0x%x found while parsing undefined length value as encapsulated pixel data. Falling back to byte-by-byte scan.
+pydicom DEBUG Unable to convert tag {} with VR {} using the standard value converter
+pydicom DEBUG Unknown tag bytes %s at position 0x%x found while parsing undefined length value as encapsulated pixel data. Falling back to byte-by-byte scan.
+pydicom DEBUG \n<'-' * 80>
+pydicom DEBUG filename: {}, defer_size={}, stop_before_pixels={}, force={}, specific_tags={}
+pydicom DEBUG {}: 'DICM' prefix found
+pydicom DEBUG {}: End of Sequence
+pydicom DEBUG {}: Finished sequence item
+pydicom DEBUG {}: {}
+pydicom DEBUG {}: {}  Found Item tag (start of item)
+pydicom ERROR <details>
+pydicom ERROR <msg.format(fp.tell() - 4)>
+pydicom ERROR Error while processing tag {}
+pydicom INFO <'Unable to decode the pixel data using the following handlers: {}.Please see the list of supported Transfer Syntaxes in the pydicom documentation for alternative packages that might be able to decode the data'.format(', '.join([str(hh) for hh in available_handlers]))>
+pydicom INFO File is not conformant with the DICOM File Format: 'DICM' prefix is missing from the File Meta Information header or the header itself is missing. Assuming no header and continuing.
+pydicom INFO _read_file_meta_info: (0002,0000) 'File Meta Information Group Length' value doesn't match the actual File Meta Information length ({} vs {} bytes)
+pydicom INFO encode bulk data element '{}' inline
+pydicom WARNING 'datetime.datetime' doesn't allow a value of '60' for the seconds component, changing to '59'
+pydicom WARNING 'datetime.time' doesn't allow a value of '60' for the seconds component, changing to '59'
+pydicom WARNING 'dtype_corrected_for_endianness' is deprecated and will be removed in v4.0
+pydicom WARNING 'pydicom.dataelem.DataElement_from_raw' is deprecated and will be removed in v4.0, please use 'pydicom.dataelem.convert_raw_data_element' instead
+pydicom WARNING 'write_like_original' is deprecated and will be removed in v4.0, please use 'enforce_file_format' instead
+pydicom WARNING '{}.is_implicit_VR' will be removed in v4.0, set the Transfer Syntax UID or use the 'implicit_vr' argument with {}.save_as() or dcmwrite() instead
+pydicom WARNING '{}.is_little_endian' will be removed in v4.0, set the Transfer Syntax UID or use the 'little_endian' argument with {}.save_as() or dcmwrite() instead
+pydicom WARNING '{}.read_encoding' will be removed in v4.0, use '{}.original_character_set' instead
+pydicom WARNING '{}.read_implicit_vr' will be removed in v4.0, use '{}.original_encoding[0]' instead
+pydicom WARNING '{}.read_little_endian' will be removed in v4.0, use '{}.original_encoding[1]' instead
+pydicom WARNING <+=   {}>
+pydicom WARNING <+= \nSet reading_validation_mode to WARN or IGNORE to bypass>
+pydicom WARNING <msg>
+pydicom WARNING <str(details)> in file <getattr(fp, 'name', '<no filename>')>
+pydicom WARNING A download failure occurred while attempting to retrieve {}
+pydicom WARNING A value of '{}' for (0028,0008) 'Number of Frames' is invalid, assuming 1 frame
+pydicom WARNING Applying a VOI LUT on a float input array may give incorrect results
+pydicom WARNING Camel case attribute '{}' used which is not in the element keyword data dictionary
+pydicom WARNING Deferred read warning -- file modification time has changed
+pydicom WARNING Did not find expected delimiter '{}', instead found {} at file position 0x{}
+pydicom WARNING Error while processing tag {}: {}
+pydicom WARNING Expected 0x00000000 after delimiter, found 0x%x, at data position 0x%x
+pydicom WARNING Expected 0x00000000 after delimiter, found 0x{}, at position 0x{}
+pydicom WARNING Expected Item with tag %s at data position 0x%x
+pydicom WARNING Expected length between 2 and 16, got length {}
+pydicom WARNING Expected length between 4 and 26, got length {}
+pydicom WARNING Expected length to be multiple of 4 for VR 'AT', got length {}
+pydicom WARNING Expected sequence item with tag {} at file position 0x{}
+pydicom WARNING Failed to decode byte string with encoding '{}' - using replacement characters in decoded string
+pydicom WARNING Failed to decode byte string with encodings: {} - using replacement characters in decoded string
+pydicom WARNING Failed to encode value with encodings: {} - using replacement characters in encoded string
+pydicom WARNING Hash not found in hashes.json. File will be updated.
+pydicom WARNING Incorrect value for Specific Character Set '{}' - assuming '{}'
+pydicom WARNING Invalid element tag value used with the 'in' operator: tags have a maximum value of (0xFFFF, 0xFFFF)
+pydicom WARNING Invalid value '{}' for AT element - ignoring it
+pydicom WARNING Invalid value '{}' used with the 'in' operator: must be an element tag as a 2-tuple or int, or an element keyword
+pydicom WARNING No bulk data URI handler provided for retrieval of value of data element "{}"
+pydicom WARNING None of the records in the DICOMDIR dataset contain all the query elements, consider using the 'load' parameter to expand the search to the corresponding SOP instances
+pydicom WARNING None of the records in the DICOMDIR dataset contain {}, consider using the 'load' parameter to expand the search to the corresponding SOP instances
+pydicom WARNING One or more download failures occurred, the list of matching file paths may be incomplete
+pydicom WARNING The 'pydicom.encoders' module will be removed in v4.0, please use 'from pydicom.pixels import {}' instead
+pydicom WARNING The 'pydicom.pixel_data_handlers' module will be removed in v4.0, please use 'from pydicom.pixels import {}' instead
+pydicom WARNING The 'pydicom.pixel_data_handlers' module will be removed in v4.0, please use 'from pydicom.pixels.utils import {}' instead
+pydicom WARNING The (0028,0101) 'Bits Stored' value ({}-bit) doesn't match the JPEG 2000 data ({}-bit). It's recommended that you change the 'Bits Stored' value
+pydicom WARNING The DICOMDIR dataset uses an invalid transfer syntax '{}' and will be updated to use 'Explicit VR Little Endian'
+pydicom WARNING The DICOMDIR has {} orphaned directory records that reference an instance that will not be included in the File-set
+pydicom WARNING The Photometric Interpretation of the dataset is YBR_FULL_422, however the length of the pixel data ({} bytes) is a third larger than expected ({} bytes) which indicates that this may be incorrect. You may need to change the Photometric Interpretation to the correct value.
+pydicom WARNING The decoded RLE segment contains non-conformant padding - {} vs. {} bytes expected
+pydicom WARNING The end of the encapsulated pixel data has been reached but fewer frames than expected have been found
+pydicom WARNING The end of the encapsulated pixel data has been reached but fewer frames than expected have been found. Please confirm that the generated frame data is correct
+pydicom WARNING The end of the encapsulated pixel data has been reached but no JPEG EOI/EOC marker was found, the final frame may be be invalid
+pydicom WARNING The end of the encapsulated pixel data has been reached but no JPEG EOI/EOC marker was found, the returned frame data may be invalid
+pydicom WARNING The length of the overlay data in the dataset ({} bytes) indicates it contains excess padding. {} bytes will be removed from the end of the data
+pydicom WARNING The length of the pixel data in the dataset ({} bytes) indicates it contains excess padding. {} bytes will be removed from the end of the data
+pydicom WARNING The odd length pixel data is missing a trailing padding byte
+pydicom WARNING The overlay data length is odd and misses a padding byte.
+pydicom WARNING The referenced SOP Instance for the directory record at offset {} does not exist: {}
+pydicom WARNING The value for the data element {} exceeds the size of 64 kByte and cannot be written in an explicit transfer syntax. The data element VR is changed from '{}' to 'UN' to allow saving the data.
+pydicom WARNING The {} exception '{}' occurred trying to deepcopy the buffer-like the dataset was read from, the 'buffer' attribute will be set to 'None' in the copied object
+pydicom WARNING Unknown DICOM tag {} - setting VR to 'UN'
+pydicom WARNING Unknown VR '0x{}{}' assuming implicit VR encoding
+pydicom WARNING Unknown VR '{}' assuming explicit VR encoding with 2-byte length
+pydicom WARNING Unknown encoding '{}' - using default encoding instead
+pydicom WARNING Value "{}" is not valid for elements with a VR of DS
+pydicom WARNING Value "{}" is not valid for elements with a VR of IS
+pydicom WARNING Value '{}' cannot be used as code extension, ignoring it
+pydicom WARNING Value '{}' for Specific Character Set does not allow code extensions, ignoring: {}
+pydicom WARNING Value of data element '{}' with VR Person Name (PN) is not formatted correctly
+pydicom WARNING Values for elements with a VR of 'DS' values must be <= 16 characters long. Use a smaller string, set 'config.settings.reading_validation_mode' to 'WARN' to override the length check, use 'Decimal.quantize()' and initialize with a 'Decimal' instance, or explicitly construct a DS instance with 'auto_format' set to True
+pydicom WARNING {} '{}' is not a valid private creator
+pydicom WARNING {} - setting VR to 'UN'
+pydicom WARNING {} - using encoding {}
+pydicom WARNING {} - using {} VR for reading
+pydicom WARNING {} Setting VR to 'UN'.
+pydicom WARNING {} is deprecated and will be removed in v4.0
+pydicom WARNING {}: retrying in {} seconds...
+pydicom.pixels.decoders.base DEBUG <runner>
+pydicom.pixels.decoders.base DEBUG Padding frame {} from {} to {}-bit
+pydicom.pixels.decoders.base ERROR <exc>
+pydicom.pixels.decoders.base WARNING The (0028,0004) 'Photometric Interpretation' value is '{}' however the encoded image's codestream contains a JFIF APP marker which indicates it should be '{}'
+pydicom.pixels.decoders.base WARNING The (0028,0004) 'Photometric Interpretation' value is '{}' however the encoded image's codestream uses component IDs that indicate it should be 'RGB'
+pydicom.pixels.decoders.base WARNING The decoding plugin '{}' failed to decode the frame at index {}
+pydicom.pixels.decoders.base WARNING The decoding plugin has changed from '{}' to '{}' during the decoding process - you may get inconsistent inter-frame results, consider passing 'decoding_plugin="{}"' instead
+pydicom.pixels.decoders.base WARNING The number of bytes of compressed pixel data matches the expected number for uncompressed data - check that the transfer syntax has been set correctly
+pydicom.pixels.decoders.base WARNING The number of bytes of pixel data is sufficient to contain {} frames which is larger than the given (0028,0008) 'Number of Frames' value of {}. The returned data will include these extra frames and if it's correct then you should update 'Number of Frames' accordingly, otherwise pass 'allow_excess_frames=False' to return only the first {} frames.
+pydicom.pixels.decoders.base WARNING The number of items in (7FE0,0001) 'Extended Offset Table' and (7FE0,0002) 'Extended Offset Table Lengths' don't match - the extended offset table will be ignored
+pydicom.pixels.decoders.base WARNING The pixel data is {} bytes long, which indicates it contains {} bytes of excess padding to be removed
+pydicom.pixels.decoders.base WARNING Unable to return an ndarray that's a view on the original buffer for 8-bit pixel data encoded as OW with 'Explicit VR Big Endian'
+pydicom.pixels.decoders.base WARNING Unable to return an ndarray that's a view on the original buffer for bit-packed pixel data
+pydicom.pixels.decoders.base WARNING Unable to return an ndarray that's a view on the original buffer for uncompressed pixel data with a photometric interpretation of 'YBR_FULL_422'
+pydicom.pixels.decoders.base WARNING Unable to return an ndarray that's a view on the original buffer if applying a color space conversion
+pydicom.pixels.decoders.base WARNING Unable to return an ndarray that's a view on the original buffer when (0028,0101) 'Bits Stored' doesn't equal (0028,0100) 'Bits Allocated' and 'correct_unused_bits=True'. In most cases you can pass 'correct_unused_bits=False' instead to get a view if the uncorrected array is equivalent to the corrected one.
+pydicom.pixels.decoders.base WARNING {} frames have been found in the encapsulated pixel data, which is larger than the given (0028,0008) 'Number of Frames' value of {}. The returned data will include these extra frames and if it's correct then you should update 'Number of Frames' accordingly, otherwise pass 'allow_excess_frames=False' to return only the first {} frames.
+pydicom.pixels.encoders.base DEBUG <runner>
+pydicom.pixels.encoders.base ERROR <exc>
+pydicom.pixels.utils DEBUG <exc>
+pydicom.pixels.utils WARNING A value of '{}' for (0028,0008) 'Number of Frames' is invalid, assuming 1 frame
+pydicom.pixels.utils WARNING A value of {} for (0028,0008) 'Number of Frames' is non-conformant. It's recommended that this value be changed to 1
+pynetdicom._handlers DEBUG       ={}
+pynetdicom._handlers DEBUG     Abstract Syntax: ={}
+pynetdicom._handlers DEBUG     Accepted SCP/SCU Role: {}
+pynetdicom._handlers DEBUG     Accepted Transfer Syntax: ={}
+pynetdicom._handlers DEBUG     Proposed SCP/SCU Role: {}
+pynetdicom._handlers DEBUG     Proposed Transfer Syntax:
+pynetdicom._handlers DEBUG     Proposed Transfer Syntaxes:
+pynetdicom._handlers DEBUG     Related General SOP Class(es):
+pynetdicom._handlers DEBUG     Related General SOP Classes: None
+pynetdicom._handlers DEBUG     Service Class: ={}
+pynetdicom._handlers DEBUG   Authentication Mode: {} - {}
+pynetdicom._handlers DEBUG   Context ID:        {} (Proposed)
+pynetdicom._handlers DEBUG   Context ID:        {} ({})
+pynetdicom._handlers DEBUG   JSON Web Token (not dumped) length: {}
+pynetdicom._handlers DEBUG   Kerberos Service Ticket (not dumped) length: {}
+pynetdicom._handlers DEBUG   Maximum Invoked Operations:     {}
+pynetdicom._handlers DEBUG   Maximum Performed Operations:   {}
+pynetdicom._handlers DEBUG   Password: [{}]
+pynetdicom._handlers DEBUG   Positive Response Requested: No
+pynetdicom._handlers DEBUG   Positive Response Requested: None
+pynetdicom._handlers DEBUG   Positive Response Requested: Yes
+pynetdicom._handlers DEBUG   SAML Assertion (not dumped) length: {}
+pynetdicom._handlers DEBUG   SOP Class: ={}
+pynetdicom._handlers DEBUG   Username: [{}]
+pynetdicom._handlers DEBUG   {}
+pynetdicom._handlers DEBUG  {}:        PDV - context ID {}, length {}
+pynetdicom._handlers DEBUG  {}: 0x{} - {} ({} bytes)
+pynetdicom._handlers DEBUG <'{}: {} + {} -> {} -> {}'.format(event.assoc.mode[0].upper(), event.current_state, event.fsm_event, event.action, event.next_state)>
+pynetdicom._handlers DEBUG <+=  - Result {}, Source {}, Reason {}>
+pynetdicom._handlers DEBUG <+=  - Source {}, Reason {}>
+pynetdicom._handlers DEBUG <+=  - {}, SCU {}, SCP {}>
+pynetdicom._handlers DEBUG <+=  - {}>
+pynetdicom._handlers DEBUG <line>
+pynetdicom._handlers DEBUG <s>
+pynetdicom._handlers DEBUG ======================= INCOMING A-ASSOCIATE-AC PDU ========================
+pynetdicom._handlers DEBUG ======================= INCOMING A-ASSOCIATE-RJ PDU ========================
+pynetdicom._handlers DEBUG ======================= INCOMING A-ASSOCIATE-RQ PDU ========================
+pynetdicom._handlers DEBUG ======================= OUTGOING A-ASSOCIATE-AC PDU ========================
+pynetdicom._handlers DEBUG ======================= OUTGOING A-ASSOCIATE-RJ PDU ========================
+pynetdicom._handlers DEBUG ======================= OUTGOING A-ASSOCIATE-RQ PDU ========================
+pynetdicom._handlers DEBUG ========================== END A-ASSOCIATE-AC PDU ==========================
+pynetdicom._handlers DEBUG ========================== END A-ASSOCIATE-RJ PDU ==========================
+pynetdicom._handlers DEBUG ========================== END A-ASSOCIATE-RQ PDU ==========================
+pynetdicom._handlers DEBUG ========================== INCOMING DIMSE MESSAGE ==========================
+pynetdicom._handlers DEBUG ========================== OUTGOING DIMSE MESSAGE ==========================
+pynetdicom._handlers DEBUG =========================== DEBUG - ENCODED PDU ============================
+pynetdicom._handlers DEBUG =========================== DEBUG - PDU SUMMARY ============================
+pynetdicom._handlers DEBUG =========================== INCOMING A-ABORT PDU ===========================
+pynetdicom._handlers DEBUG =========================== OUTGOING A-ABORT PDU ===========================
+pynetdicom._handlers DEBUG ============================ END DIMSE MESSAGE =============================
+pynetdicom._handlers DEBUG ============================= END A-ABORT PDU ==============================
+pynetdicom._handlers DEBUG ============================= END ENCODED PDU ==============================
+pynetdicom._handlers DEBUG ============================= END PDU SUMMARY ==============================
+pynetdicom._handlers DEBUG Abort Parameters:
+pynetdicom._handlers DEBUG Abort Reason: {}
+pynetdicom._handlers DEBUG Abort Source: {}
+pynetdicom._handlers DEBUG Accept Parameters:
+pynetdicom._handlers DEBUG Accepted Asynchronous Operations Window Negotiation:
+pynetdicom._handlers DEBUG Accepted Asynchronous Operations Window Negotiation: None
+pynetdicom._handlers DEBUG Accepted Extended Negotiation:
+pynetdicom._handlers DEBUG Accepted Extended Negotiation: None
+pynetdicom._handlers DEBUG Action Information            : {}
+pynetdicom._handlers DEBUG Action Reply                  : {}
+pynetdicom._handlers DEBUG Action Type ID                : {}
+pynetdicom._handlers DEBUG Affected SOP Class UID        : {}
+pynetdicom._handlers DEBUG Affected SOP Class UID     : {}
+pynetdicom._handlers DEBUG Affected SOP Instance UID     : {}
+pynetdicom._handlers DEBUG Application Context Name:    {}
+pynetdicom._handlers DEBUG Attribute Identifier List     : {}
+pynetdicom._handlers DEBUG Attribute List                : {}
+pynetdicom._handlers DEBUG Called Application Name:     {}
+pynetdicom._handlers DEBUG Calling Application Name:    {}
+pynetdicom._handlers DEBUG Completed Sub-operations      : {}
+pynetdicom._handlers DEBUG Data Set                      : None
+pynetdicom._handlers DEBUG Data Set                      : {}
+pynetdicom._handlers DEBUG Event Information             : {}
+pynetdicom._handlers DEBUG Event Reply                   : {}
+pynetdicom._handlers DEBUG Event Type ID                 : {}
+pynetdicom._handlers DEBUG Failed Sub-operations         : {}
+pynetdicom._handlers DEBUG Identifier                    : {}
+pynetdicom._handlers DEBUG Message ID                    : {}
+pynetdicom._handlers DEBUG Message ID Being Responded To : {}
+pynetdicom._handlers DEBUG Message Type                  : C-CANCEL RQ
+pynetdicom._handlers DEBUG Message Type                  : C-ECHO RQ
+pynetdicom._handlers DEBUG Message Type                  : C-FIND RQ
+pynetdicom._handlers DEBUG Message Type                  : C-FIND RSP
+pynetdicom._handlers DEBUG Message Type                  : C-GET RQ
+pynetdicom._handlers DEBUG Message Type                  : C-GET RSP
+pynetdicom._handlers DEBUG Message Type                  : C-MOVE RQ
+pynetdicom._handlers DEBUG Message Type                  : C-MOVE RSP
+pynetdicom._handlers DEBUG Message Type                  : C-STORE RQ
+pynetdicom._handlers DEBUG Message Type                  : C-STORE RSP
+pynetdicom._handlers DEBUG Message Type                  : N-ACTION RQ
+pynetdicom._handlers DEBUG Message Type                  : N-ACTION RSP
+pynetdicom._handlers DEBUG Message Type                  : N-CREATE RQ
+pynetdicom._handlers DEBUG Message Type                  : N-CREATE RSP
+pynetdicom._handlers DEBUG Message Type                  : N-DELETE RQ
+pynetdicom._handlers DEBUG Message Type                  : N-DELETE RSP
+pynetdicom._handlers DEBUG Message Type                  : N-EVENT-REPORT RQ
+pynetdicom._handlers DEBUG Message Type                  : N-EVENT-REPORT RSP
+pynetdicom._handlers DEBUG Message Type                  : N-GET RQ
+pynetdicom._handlers DEBUG Message Type                  : N-GET RSP
+pynetdicom._handlers DEBUG Message Type                  : N-SET RQ
+pynetdicom._handlers DEBUG Message Type                  : N-SET RSP
+pynetdicom._handlers DEBUG Modification List             : {}
+pynetdicom._handlers DEBUG Move Destination              : {}
+pynetdicom._handlers DEBUG Move Originator               : {}
+pynetdicom._handlers DEBUG Our Implementation Class UID:      {}
+pynetdicom._handlers DEBUG Our Implementation Version Name:   {}
+pynetdicom._handlers DEBUG Our Max PDU Receive Size:    {}
+pynetdicom._handlers DEBUG Presentation Context ID       : {}
+pynetdicom._handlers DEBUG Presentation Context:
+pynetdicom._handlers DEBUG Presentation Contexts:
+pynetdicom._handlers DEBUG Presentation Contexts: None
+pynetdicom._handlers DEBUG Priority                      : {}
+pynetdicom._handlers DEBUG Reason:    {}
+pynetdicom._handlers DEBUG Received Echo Response (Status: {})
+pynetdicom._handlers DEBUG Reject Parameters:
+pynetdicom._handlers DEBUG Remaining Sub-operations      : {}
+pynetdicom._handlers DEBUG Request Parameters:
+pynetdicom._handlers DEBUG Requested Asynchronous Operations Window Negotiation:
+pynetdicom._handlers DEBUG Requested Asynchronous Operations Window Negotiation: None
+pynetdicom._handlers DEBUG Requested Common Extended Negotiation:
+pynetdicom._handlers DEBUG Requested Common Extended Negotiation: None
+pynetdicom._handlers DEBUG Requested Extended Negotiation:
+pynetdicom._handlers DEBUG Requested Extended Negotiation: None
+pynetdicom._handlers DEBUG Requested SOP Class UID       : {}
+pynetdicom._handlers DEBUG Requested SOP Instance UID    : {}
+pynetdicom._handlers DEBUG Requested User Identity Negotiation:
+pynetdicom._handlers DEBUG Requested User Identity Negotiation: None
+pynetdicom._handlers DEBUG Responding Application Name: {}
+pynetdicom._handlers DEBUG Result:    {}
+pynetdicom._handlers DEBUG Source:    {}
+pynetdicom._handlers DEBUG Status                        : 0x{}
+pynetdicom._handlers DEBUG Status                        : {}
+pynetdicom._handlers DEBUG Their Implementation Class UID:      {}
+pynetdicom._handlers DEBUG Their Implementation Class UID:    {}
+pynetdicom._handlers DEBUG Their Implementation Version Name:   {}
+pynetdicom._handlers DEBUG Their Implementation Version Name: {}
+pynetdicom._handlers DEBUG Their Max PDU Receive Size:  {}
+pynetdicom._handlers DEBUG User Identity Negotiation Response: {}
+pynetdicom._handlers DEBUG Warning Sub-operations        : {}
+pynetdicom._handlers INFO <line>
+pynetdicom._handlers INFO Received Echo Request (MsgID {})
+pynetdicom._handlers INFO Received Get Response
+pynetdicom._handlers INFO Received Store Request
+pynetdicom._handlers INFO Received Store Response (Status: {})
+pynetdicom._handlers INFO Sending Store Request: MsgID {}{}
+pynetdicom.acse DEBUG An A-RELEASE collision has occurred
+pynetdicom.acse ERROR <exc>
+pynetdicom.acse ERROR ACSE timeout reached while waiting for response to association request
+pynetdicom.acse ERROR Aborting Association
+pynetdicom.acse ERROR Association Aborted
+pynetdicom.acse ERROR Association Rejected
+pynetdicom.acse ERROR Exception in handler bound to 'evt.EVT_USER_ID'
+pynetdicom.acse ERROR Exception raised in handler bound to 'evt.EVT_ASYNC_OPS'
+pynetdicom.acse ERROR Exception raised in handler bound to 'evt.EVT_SOP_COMMON'
+pynetdicom.acse ERROR Exception raised in handler bound to 'evt.EVT_SOP_EXTENDED'
+pynetdicom.acse ERROR Invalid type returned by handler bound to 'evt.EVT_SOP_COMMON'
+pynetdicom.acse ERROR Invalid type returned by handler bound to 'evt.EVT_SOP_EXTENDED'
+pynetdicom.acse ERROR No accepted presentation contexts
+pynetdicom.acse ERROR One or more requested presentation contexts must be set prior to association negotiation
+pynetdicom.acse ERROR Reason: {}
+pynetdicom.acse ERROR Received an invalid A-ASSOCIATE response from the peer
+pynetdicom.acse ERROR Result: {}, Source: {}
+pynetdicom.acse ERROR Unable to set the SOP Class Extended Negotiation response values for the SOP Class UID {}
+pynetdicom.acse ERROR Unable to set the User Identity Negotiation's 'server_response'
+pynetdicom.acse INFO Aborting Association
+pynetdicom.acse INFO Accepting Association
+pynetdicom.acse INFO Association Aborted
+pynetdicom.acse INFO Association Accepted
+pynetdicom.acse INFO Rejecting Association
+pynetdicom.acse INFO User identity failed verification
+pynetdicom.ae ERROR <msg>
+pynetdicom.ae ERROR No supported Presentation Contexts have been defined
+pynetdicom.ae ERROR The following presentation contexts have inconsistent scu_role/scp_role values (if one is None, both must be):\n  
+pynetdicom.ae WARNING ACSE timeout set to 30 seconds
+pynetdicom.ae WARNING connection_timeout set to None
+pynetdicom.ae WARNING dimse_timeout set to 30 s
+pynetdicom.ae WARNING maximum_associations set to 1
+pynetdicom.ae WARNING maximum_pdu_size set to {}
+pynetdicom.ae WARNING network_timeout set to 60 s
+pynetdicom.association DEBUG 
+pynetdicom.association DEBUG <str(msg)>
+pynetdicom.association ERROR <+=  for the {} role>
+pynetdicom.association ERROR <+=  with '{}' transfer syntax>
+pynetdicom.association ERROR <ex>
+pynetdicom.association ERROR <exc>
+pynetdicom.association ERROR <msg>
+pynetdicom.association ERROR Connection closed while waiting for DIMSE message
+pynetdicom.association ERROR DIMSE timeout reached while waiting for message response
+pynetdicom.association ERROR Exception in the handler bound to 'evt.EVT_C_STORE'
+pynetdicom.association ERROR Failed to decode the received Identifier dataset
+pynetdicom.association ERROR Failed to encode the supplied 'Action Information' dataset
+pynetdicom.association ERROR Failed to encode the supplied 'Attribute List' dataset
+pynetdicom.association ERROR Failed to encode the supplied 'Modification List' dataset
+pynetdicom.association ERROR Failed to encode the supplied Dataset
+pynetdicom.association ERROR Failed to encode the supplied Identifier dataset
+pynetdicom.association ERROR Failed to encode the supplied dataset
+pynetdicom.association ERROR Invalid status returned by the EVT_C_STORE handler
+pynetdicom.association ERROR Network timeout reached
+pynetdicom.association ERROR No presentation context for '{}' has been accepted by the peer
+pynetdicom.association ERROR No supported service class available for the SOP Class UID '{}', please see the pynetdicom.sop_class.register_uid() function if you need to add support for a private, retired or otherwise unknown SOP Class UID
+pynetdicom.association ERROR Received an invalid C-FIND response from the peer
+pynetdicom.association ERROR Received an invalid {} response from the peer
+pynetdicom.association ERROR Received an unexpected {} message from the peer
+pynetdicom.association ERROR The EVT_C_STORE handler returned a Dataset without a 'Status' element
+pynetdicom.association ERROR Unable to decode the received 'Action Reply' dataset
+pynetdicom.association ERROR Unable to decode the received 'Attribute List' dataset
+pynetdicom.association ERROR Unable to decode the received 'Event Reply' dataset
+pynetdicom.association ERROR Unable to encode the supplied 'Event Information' dataset
+pynetdicom.association INFO 
+pynetdicom.association INFO   Abstract Syntax:   ={}
+pynetdicom.association INFO   Context ID:        {}
+pynetdicom.association INFO # Request Identifier
+pynetdicom.association INFO # Response Identifier
+pynetdicom.association INFO <+=  (A-P-ABORT)>
+pynetdicom.association INFO <elem>
+pynetdicom.association INFO <line>
+pynetdicom.association INFO <log_msg>
+pynetdicom.association INFO Aborting Association
+pynetdicom.association INFO Association Aborted
+pynetdicom.association INFO Association Released
+pynetdicom.association INFO Find SCP Response: {} - 0xB001 (Warning - Matching reached response limit, subsequent request may return additional matches)
+pynetdicom.association INFO Find SCP Response: {} - 0x{} (Pending)
+pynetdicom.association INFO Find SCP Result: 0x{} ({})
+pynetdicom.association INFO No exact matching context found for 'Unified Procedure Step - Push SOP Class', checking accepted contexts for other UPS SOP classes
+pynetdicom.association INFO Received DIMSE message with invalid or rejected context ID: {}
+pynetdicom.association INFO Releasing Association
+pynetdicom.association INFO Requesting Association
+pynetdicom.association INFO Sending Action Request: MsgID {}
+pynetdicom.association INFO Sending C-CANCEL request
+pynetdicom.association INFO Sending Create Request: MsgID {}
+pynetdicom.association INFO Sending Delete Request: MsgID {}
+pynetdicom.association INFO Sending Echo Request: MsgID {}
+pynetdicom.association INFO Sending Event Report Request: MsgID {}
+pynetdicom.association INFO Sending Find Request: MsgID {}
+pynetdicom.association INFO Sending Get Request: MsgID {}
+pynetdicom.association INFO Sending Move Request: MsgID {}
+pynetdicom.association INFO Sending Set Request: MsgID {}
+pynetdicom.association INFO Sub-Operations Remaining: %s, Completed: %s, Failed: %s, Warning: %s
+pynetdicom.association INFO Using Presentation Context:
+pynetdicom.association INFO {} SCP Response: {} - 0x{} (Pending)
+pynetdicom.association INFO {} SCP Result: 0x{} ({})
+pynetdicom.association WARNING Received unexpected {} service message
+pynetdicom.association WARNING Status dataset returned from the EVT_C_STORE handler contained an unsupported element '{}'
+pynetdicom.association WARNING Unknown status value returned by the EVT_C_STORE handler: 0x{}
+pynetdicom.association WARNING {} - using 'Explicit VR Big Endian' instead
+pynetdicom.association WARNING {} - using 'Implicit VR Little Endian' instead
+pynetdicom.association WARNING {} message received during association release, ignoring
+pynetdicom.dimse ERROR <exc>
+pynetdicom.dimse ERROR Received an invalid DIMSE message
+pynetdicom.dimse_messages WARNING Non-conformant VM {} for '{}', taking the first value
+pynetdicom.dimse_primitives ERROR Invalid 'Move Originator AE Title' in C-STORE request
+pynetdicom.dimse_primitives WARNING Attempted to set Priority parameter to an invalid value
+pynetdicom.dsutils DEBUG pydicom.read_dataset() TransferSyntax="%s"
+pynetdicom.dsutils ERROR <exc>
+pynetdicom.dsutils ERROR pydicom.write_dataset() failed:
+pynetdicom.dul ERROR <exc>
+pynetdicom.dul ERROR Connection closed before the entire PDU was received
+pynetdicom.dul ERROR Exception in DUL.run(), aborting association
+pynetdicom.dul ERROR The received PDU is shorter than expected ({} of {} bytes received)
+pynetdicom.dul ERROR Unable to decode the received PDU data
+pynetdicom.dul ERROR Unknown PDU type received '0x{}'
+pynetdicom.dul WARNING Attempted to send data over closed connection
+pynetdicom.events ERROR <exc>
+pynetdicom.events ERROR Exception raised in user's 'evt.{}' event handler '{}'
+pynetdicom.fsm ERROR <exc>
+pynetdicom.fsm ERROR <msg>
+pynetdicom.fsm ERROR A-ASSOCIATE-RQ: Unsupported protocol version '0x{}'
+pynetdicom.fsm ERROR Invalid state '{}' for State Machine
+pynetdicom.fsm ERROR State Machine received an exception attempting to perform the action '%s' while in state '%s'
+pynetdicom.pdu ERROR <msg>
+pynetdicom.pdu ERROR Invalid value in Reason field in A-ASSOCIATE-RJ PDU
+pynetdicom.pdu ERROR Invalid value in Result field in A-ASSOCIATE-RJ PDU
+pynetdicom.pdu ERROR Invalid value in Source field in A-ASSOCIATE-RJ PDU
+pynetdicom.pdu WARNING Invalid A-ABORT-RQ 'Reason/Diagnostic' {}
+pynetdicom.pdu WARNING Invalid A-ABORT-RQ 'Source' {}
+pynetdicom.pdu_items ERROR <msg>
+pynetdicom.pdu_items ERROR Invalid 'User Identity Type' {}
+pynetdicom.pdu_items ERROR Invalid Presentation Context Item 'Result' {}
+pynetdicom.pdu_items ERROR Related General SOP Class Identification contains an invalid UID
+pynetdicom.pdu_primitives ERROR 'A_ASSOCIATE.called_presentation_address' must be an AddressInformation instance or None
+pynetdicom.pdu_primitives ERROR 'A_ASSOCIATE.calling_presentation_address' must be an AddressInformation instance or None, not {}
+pynetdicom.pdu_primitives ERROR 'sop_class_uid' must be set prior to Association
+pynetdicom.pdu_primitives ERROR <msg>
+pynetdicom.pdu_primitives ERROR A_ABORT.abort_source value not set
+pynetdicom.pdu_primitives ERROR A_ABORT.provider_reason parameter not set
+pynetdicom.pdu_primitives ERROR A_ASSOCIATE.diagnostic set to an unknown value
+pynetdicom.pdu_primitives ERROR A_ASSOCIATE.presentation_context_definition_list must be a list
+pynetdicom.pdu_primitives ERROR A_ASSOCIATE.presentation_context_definition_results_list must be a list
+pynetdicom.pdu_primitives ERROR A_ASSOCIATE.result set to an unknown value
+pynetdicom.pdu_primitives ERROR A_ASSOCIATE.result_source set to an unknown value
+pynetdicom.pdu_primitives ERROR A_ASSOCIATE.user_information must be a list
+pynetdicom.pdu_primitives ERROR A_RELEASE.result must be None or 'affirmative'
+pynetdicom.pdu_primitives ERROR Attempted to set A_P_ABORT.provider_reason to an invalid value
+pynetdicom.pdu_primitives ERROR Implementation Class UID has not been set
+pynetdicom.pdu_primitives ERROR Invalid A-ABORT 'Source' value '{}'
+pynetdicom.pdu_primitives ERROR Maximum Length Received must be greater than 0
+pynetdicom.pdu_primitives ERROR Maximum Length Received must be numerical
+pynetdicom.pdu_primitives ERROR Maximum Number Operations Invoked must be an int
+pynetdicom.pdu_primitives ERROR Maximum Number Operations Performed must be an int
+pynetdicom.pdu_primitives ERROR Positive Response Requested must be boolean
+pynetdicom.pdu_primitives ERROR Primary Field must be bytes if requesting Association, None otherwise
+pynetdicom.pdu_primitives ERROR Related General SOP Class Identification contains an invalid UID
+pynetdicom.pdu_primitives ERROR Related General SOP Class Identification must be a list of pydicom.uid.UID, str or bytes
+pynetdicom.pdu_primitives ERROR SCP Role must be boolean
+pynetdicom.pdu_primitives ERROR SCU Role must be boolean
+pynetdicom.pdu_primitives ERROR SCU and SCP Roles cannot both be unsupported for '{}'
+pynetdicom.pdu_primitives ERROR SOP Class UID and Service Class Application Information must be set prior to Association negotiation
+pynetdicom.pdu_primitives ERROR SOP Class UID and Service Class UID must be set prior to Association negotiation
+pynetdicom.pdu_primitives ERROR Secondary Field must be bytes if requesting Association with User Identity Type equal to 2, None otherwise
+pynetdicom.pdu_primitives ERROR Secondary Field must be set when User Identity is 2
+pynetdicom.pdu_primitives ERROR Server Response must be bytes or None
+pynetdicom.pdu_primitives ERROR Service Class Application Information should be a bytes object
+pynetdicom.pdu_primitives ERROR The Implementation Class UID must be set prior to requesting Association
+pynetdicom.pdu_primitives ERROR User Identity Type and Primary Field must be set prior to Association negotiation
+pynetdicom.pdu_primitives ERROR User Identity Type must be 1, 2, 3, 4 or 5 if requesting Association, None otherwise
+pynetdicom.pdu_primitives ERROR User Identity Type must be an int or None
+pynetdicom.pdu_primitives INFO Attempted to set A_ASSOCIATE.user_information to a list which includes an unsupported item
+pynetdicom.pdu_primitives WARNING Attempted to set A_ASSOCIATE.presentation_context_definition_list to a list which includes an invalid items
+pynetdicom.pdu_primitives WARNING Attempted to set A_ASSOCIATE.presentation_context_definition_results_list to a list which includes one or more invalid items
+pynetdicom.pdu_primitives WARNING Invalid A-ASSOCIATE 'Result Source' {}
+pynetdicom.pdu_primitives WARNING Invalid A-ASSOCIATE 'Result Source' {} and/or 'Diagnostic' {} values
+pynetdicom.pdu_primitives WARNING Invalid A-ASSOCIATE 'Result' {}
+pynetdicom.pdu_primitives WARNING The Related General SOP Class UID '{}' is non-conformant
+pynetdicom.presentation ERROR 'transfer_syntax' contains an invalid UID
+pynetdicom.presentation ERROR Attempted to add an invalid transfer syntax
+pynetdicom.presentation WARNING A UID has been added to 'transfer_syntax' that is not a transfer syntax: '{}'
+pynetdicom.presentation WARNING A non-conformant UID has been added to 'transfer_syntax'
+pynetdicom.presentation WARNING The Transfer Syntax Name '{}' is non-conformant
+pynetdicom.service_class DEBUG 
+pynetdicom.service_class DEBUG # DICOM Dataset
+pynetdicom.service_class DEBUG <line>
+pynetdicom.service_class DEBUG A-ABORT or A-RELEASE-RQ received during Q/R sub-operations
+pynetdicom.service_class DEBUG Find SCP Response Identifier:
+pynetdicom.service_class ERROR <ex>
+pynetdicom.service_class ERROR <exc_val>
+pynetdicom.service_class ERROR <self.error_msg>
+pynetdicom.service_class ERROR <str(exc)>
+pynetdicom.service_class ERROR Exception in handler bound to 'evt.EVT_C_FIND'
+pynetdicom.service_class ERROR Exception in handler bound to 'evt.EVT_C_GET'
+pynetdicom.service_class ERROR Exception in handler bound to 'evt.EVT_C_MOVE'
+pynetdicom.service_class ERROR Exception in the handler bound to 'evt.EVT_C_ECHO', responding with a default 'Status' value of 0x0000 (Success)
+pynetdicom.service_class ERROR Failed encoding the response 'Action Reply' dataset
+pynetdicom.service_class ERROR Failed encoding the response 'Attribute List' dataset
+pynetdicom.service_class ERROR Failed encoding the response 'Event Reply' dataset
+pynetdicom.service_class ERROR Failed encoding the response 'Identifier' dataset
+pynetdicom.service_class ERROR Invalid status returned by callback
+pynetdicom.service_class ERROR Move SCP: Unable to associate with destination AE
+pynetdicom.service_class ERROR Received invalid dataset from callback
+pynetdicom.service_class ERROR The C-GET request handler yielded more than 65535 matches
+pynetdicom.service_class ERROR The C-MOVE request handler yielded more than 65535 matches
+pynetdicom.service_class ERROR The N-CREATE-RQ has no 'Affected SOP Instance UID' value and the 'evt.EVT_N_CREATE' handler doesn't include one in the 'Attribute List' dataset
+pynetdicom.service_class ERROR Unknown Move Destination: {}
+pynetdicom.service_class ERROR User callback returned a `Dataset` without a Status element
+pynetdicom.service_class ERROR \nTraceback (most recent call last):\n<''.join(traceback.format_tb(exc[2]))>{}: {}
+pynetdicom.service_class INFO 
+pynetdicom.service_class INFO # DICOM Dataset
+pynetdicom.service_class INFO <line>
+pynetdicom.service_class INFO <msg>
+pynetdicom.service_class INFO Find SCP Request Identifier:
+pynetdicom.service_class INFO Find SCP Response {}: 0x0000 (Success)
+pynetdicom.service_class INFO Find SCP Response {}: 0x{} (Cancel)
+pynetdicom.service_class INFO Find SCP Response {}: 0x{} (Failure - {})
+pynetdicom.service_class INFO Find SCP Response {}: 0x{} (Pending)
+pynetdicom.service_class INFO Find SCP Response {}: 0x{} (Warning - {})
+pynetdicom.service_class INFO Find SCP Response:  0x{} (Pending)
+pynetdicom.service_class INFO Find SCP Response: 0x0000 (Success)
+pynetdicom.service_class INFO Find SCP Response: 0x{} (Cancel)
+pynetdicom.service_class INFO Find SCP Response: 0x{} (Failure)
+pynetdicom.service_class INFO Get SCP Request Identifier:
+pynetdicom.service_class INFO Get SCP Response {}: 0x0000 (Success)
+pynetdicom.service_class INFO Get SCP Response {}: 0xA702 (Failure)
+pynetdicom.service_class INFO Get SCP Response {}: 0xB000 (Warning)
+pynetdicom.service_class INFO Get SCP Response {}: 0x{} (Cancel)
+pynetdicom.service_class INFO Get SCP Response {}: 0x{} (Pending)
+pynetdicom.service_class INFO Get SCP Result {}: 0x{} ({} - {})
+pynetdicom.service_class INFO Get SCP: Received Store SCP response ({})
+pynetdicom.service_class INFO Get SCP: Received Store SCP response 0x{} ({})
+pynetdicom.service_class INFO Move SCP Request Identifier:
+pynetdicom.service_class INFO Move SCP Response {}: 0x0000 (Success)
+pynetdicom.service_class INFO Move SCP Response {}: 0xA702 (Failure)
+pynetdicom.service_class INFO Move SCP Response {}: 0xB000 (Warning)
+pynetdicom.service_class INFO Move SCP Response {}: 0x{} (Cancel)
+pynetdicom.service_class INFO Move SCP Response {}: 0x{} (Pending)
+pynetdicom.service_class INFO Move SCP Response {}: 0x{} ({} - {})
+pynetdicom.service_class INFO Move SCP: Received Store SCP response ({})
+pynetdicom.service_class INFO Move SCP: Received Store SCP response 0x{} ({})
+pynetdicom.service_class INFO Received C-CANCEL-FIND RQ from peer
+pynetdicom.service_class INFO Received C-CANCEL-GET RQ from peer
+pynetdicom.service_class INFO Received C-CANCEL-MOVE RQ from peer
+pynetdicom.service_class WARNING C-STORE sub-operation failed.
+pynetdicom.service_class WARNING Handler bound to 'evt.EVT_C_MOVE' yielded further (status, dataset) results but these will be ignored as the sub-operations are complete
+pynetdicom.service_class WARNING Status dataset returned by callback contained an unsupported Element '{}'
+pynetdicom.service_class WARNING The 'status' dataset returned by the handler bound to 'evt.EVT_C_ECHO' contained an unsupported Element '{}'
+pynetdicom.service_class WARNING The Query/Retrieve - Composite Instance Retrieve Without Bulk Data service is requested but a yielded dataset contains the following (to be removed) bulk data elements: {}
+pynetdicom.service_class WARNING Unknown 'status' value returned by the handler bound to 'evt.EVT_C_ECHO' - 0x{}
+pynetdicom.service_class WARNING Unknown status value returned by callback - 0x{}
+pynetdicom.service_class WARNING User's C-GET generator yielded further (status, dataset) results but these will be ignored as the sub-operations are complete
+pynetdicom.transport ERROR <exc>
+pynetdicom.transport ERROR Association request failed: unable to connect to remote
+pynetdicom.transport ERROR TCP Initialisation Error: {}
+pynetdicom.transport WARNING AssociationSocket instantiated with both a 'client_socket' and bind 'address'. The original socket will not be rebound
+pynetdicom.utils ERROR <+= must not be an empty str>
+pynetdicom.utils ERROR <+= must not consist entirely of spaces>
+pynetdicom.utils ERROR <exc>
+pynetdicom.utils ERROR <msg>
+pynetdicom.utils ERROR Invalid '{}' value '{}' - {}
+pynetdicom.utils ERROR Invalid '{}' value - 
+pynetdicom.utils WARNING Non-conformant '{}' value '{}'
