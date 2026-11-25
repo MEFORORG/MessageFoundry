@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A credential the generic ODBC dialect sends WITHOUT braces is hidden whole on every log surface
-(BACKLOG #5030).
+"""No fragment of a credential the generic ODBC dialect sends WITHOUT braces reaches the log surfaces
+below: each word of its value is masked character for character (BACKLOG #5030).
 
 ``transports/database.py`` sends every ``odbc_params`` value plain, ``sslpassword`` among them. Such
 a value may hold a space, ",", "&" and, for a password, "=". The plain value class of the log
@@ -248,10 +248,10 @@ _SHAPES_A_SECOND_PASS_PRINTED = (
 #: line break the control-character filter wrote as text; and the PHI pass's userinfo opener with a
 #: word glued on before it, which a review measured on six paths.
 _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED = (
-    "connect failed;xpass=mfb64:v1:a1qkey= tail",
-    "connect failed;xpass=amfb64:v1:b2qkey= tail",
-    "%26;sslpassword=mfb64:v1:c3qkey=\t{password=ABC|",
-    ";xpass=mfb64:v1:x_mfb64:v1:d4qkey= tail",
+    "connect failed;xpass=mfb64:v1:a1qpwd= tail",
+    "connect failed;xpass=amfb64:v1:b2qpwd= tail",
+    "%26;sslpassword=mfb64:v1:c3qpwd=\t{password=ABC|",
+    ";xpass=mfb64:v1:x_mfb64:v1:d4qpwd= tail",
     ';xpass="family": \ne5q',
     "&<redacted>19800505;xpass=xnonnumeric port: '\nc3q%5E.@hpassword=MEFOR_X=",
 )
@@ -267,7 +267,7 @@ _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED = (
 #: to a letter, which under a JSON ``name`` the PHI pass no longer read as an operator's value.
 _SHAPES_THE_WORD_MASK_PRINTED = (
     ";xpass=Patient%7CBearer #=\nc3qd4qBasic ",
-    "MRN: %26PID\x0ba1qkey=;KeyStorepwd={%41MSHstate=Jane Doemfb64:v1:mfb64:v1:ABC|Basic ",
+    "MRN: %26PID\x0ba1qpwd=;KeyStorepwd={%41MSHstate=Jane Doemfb64:v1:mfb64:v1:ABC|Basic ",
     "Digest {~\x0cb2qe5q;xpass=%41%41MEFOR_X=[%5E05/05/1980/",
     "mfb64:v1:==mfb64:v1:;sslpassword=givenmfb64:v1:mfb64:v1:auth=;Accesstoken=-birthDate\x0c"
     "Zm9vYmFy+/Zm9vd4qstate=",
@@ -446,7 +446,7 @@ _DIFFERENTIAL_PIECES = (
 _MEMBER_LED_KEYS = (";PWD=", ";sslpassword=", ";xpass=", ";Accesstoken=")
 _MEMBER_LED_OPENERS = ("", "", "", '"family": ')
 _MEMBER_LED_PIECES = (
-    "mfb64:v1:", "amfb64:v1:", "x_mfb64:v1:", "a1qkey=", "b2qtoken=", "c3q", "_", ".", "+", "/",
+    "mfb64:v1:", "amfb64:v1:", "x_mfb64:v1:", "a1qpwd=", "b2qtoken=", "c3q", "_", ".", "+", "/",
     "=", " ", "\n", '"family": ', "\x0c", "d4q",
 )  # fmt: skip
 
@@ -664,8 +664,6 @@ def test_the_kept_words_and_shapes_cover_what_later_passes_read() -> None:
         "secretscrub credential words": secretscrub._CREDENTIAL_WORDS,
         "secretscrub token words": secretscrub._TOKEN_WORDS,
         "secretscrub key-material words": secretscrub._KEY_MATERIAL_WORDS,
-        "secretscrub query-credential words": secretscrub._QUERY_CREDENTIAL_WORDS,
-        "secretscrub query-credential compounds": secretscrub._QUERY_CREDENTIAL_COMPOUNDS,
         "secretscrub env prefix": (secretscrub._ENV_PREFIX,),
         "logging_setup query keys": logging_setup._CREDENTIAL_QUERY_KEYS,
         "logging_setup query stop words": logging_setup._QUERY_STOP_WORDS,
@@ -851,7 +849,7 @@ def test_the_member_mask_keeps_a_replaced_marker_head(monkeypatch: pytest.Monkey
     which the log chain's carriage pass still reads. A mask that took that ``v1`` printed the body
     on the chain where the baseline hid it; the fuzz differential found the line below. With the
     unit's alternative removed, it prints again."""
-    line = ';PWD="family": .=amfb64:v1:a1qkey=/"family": '
+    line = ';PWD="family": .=amfb64:v1:a1qpwd=/"family": '
     unit = secretscrub._MEMBER_VALUE_UNIT.pattern
     with monkeypatch.context() as patched:
         _without_member_pass(patched)
@@ -861,3 +859,49 @@ def test_the_member_mask_keeps_a_replaced_marker_head(monkeypatch: pytest.Monkey
     assert stripped != unit
     monkeypatch.setattr(secretscrub, "_MEMBER_VALUE_UNIT", re.compile(stripped))
     assert _printed_where_the_baseline_hid([line], [_every_redaction_path(line)], baseline)
+
+
+#: A password word that holds a URL query-credential word (``key``, ``sig``, ``auth``, ``jwt``) before
+#: a ":" or "=". Those words were kept whole there, so the first word printed (BACKLOG #5030 added
+#: item 1). Each fragment is synthetic.
+_QUERY_WORD_PASSWORDS = (
+    ("Monkey", ";sslpassword=Monkey:Banana42;"),
+    ("Sigma7", ";sslpassword=Sigma7=Banana42;"),
+    ("Author", ";sslpassword=Author:Banana42;"),
+    ("Jwtz9", ";sslpassword=Jwtz9:Banana42;"),
+)
+
+
+@pytest.mark.parametrize(("fragment", "member"), _QUERY_WORD_PASSWORDS)
+@pytest.mark.parametrize(("surface", "apply"), _SURFACES, ids=[name for name, _ in _SURFACES])
+def test_a_password_word_holding_a_query_credential_word_is_masked(
+    surface: str, apply: Callable[[str], str], fragment: str, member: str
+) -> None:
+    line = "DRIVER={Acme};SERVER=db1.example" + member
+    assert fragment in line
+    out = apply(line)
+    assert fragment not in out, f"{surface}: {fragment!r} printed -- {out!r}"
+    assert "Banana42" not in out, f"{surface}: the second word printed -- {out!r}"
+
+
+def test_the_query_credential_words_are_not_kept_words() -> None:
+    """No log pass reads them: ``credential_query_params`` reads them in a configured URL's parameter
+    names. The pass that reads ``key=`` in log text reads it under a longer word this list keeps."""
+    for word in secretscrub._QUERY_CREDENTIAL_WORDS:
+        assert secretscrub._MEMBER_KEEP.search(word) is None, word
+        assert word.casefold() not in {w.casefold() for w in secretscrub._MEMBER_KEEP_WORDS}
+
+
+@pytest.mark.parametrize(
+    ("line", "masked"),
+    [
+        (";xpass=%3B.PID|x;", ";xpass=%0A.PID|x;"),
+        (";xpass=%3b-OBX|1;", ";xpass=%0A-OBX|0;"),
+        (";xpass=%7Z.PID|x;", ";xpass=%0x.PID|x;"),
+    ],
+)
+def test_a_hex_escape_before_a_segment_prefix_stays_a_hex_escape(line: str, masked: str) -> None:
+    """Right after a "%", the two characters of a hex escape stay hex in the segment-ID branch too,
+    as they do for any other word (BACKLOG #5030 added item 3): ``%3B.PID|`` was ``%0x.PID|``. A pair
+    that is not a hex escape (``7Z``) is masked like any other word."""
+    assert scrub_credentials(line) == masked
