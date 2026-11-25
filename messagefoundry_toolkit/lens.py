@@ -3950,6 +3950,14 @@ def _repick_write(source: str, line_start: int, line_end: int, before: ast.AST) 
             )
     else:
         src = getattr(field_call.args[0], "value", None)
+        if _copies_whole_field_into_leaf(call, field_call):
+            # No native write copies a whole field's raw text into a component the way
+            # ``copy_field`` does: both escape its escape sequences a second time (BACKLOG #5821).
+            raise LensRewriteError(
+                "this edit would copy a whole field into a component or subcomponent, which a "
+                "native msg.set escapes a second time - delete the row and insert a Copy Field "
+                "(it is written as the copy_field call), or edit it as text"
+            )
         if not isinstance(src, str) or _is_leaf_literal(getattr(dst, "value", None)):
             return source
         want = _copy_write_method(src)
@@ -3958,6 +3966,22 @@ def _repick_write(source: str, line_start: int, line_end: int, before: ast.AST) 
     data = source.encode("utf-8")
     end = _line_byte_starts(data)[(func.end_lineno or func.lineno) - 1] + func.end_col_offset
     return (data[: end - len(func.attr)] + want.encode("ascii") + data[end:]).decode("utf-8")
+
+
+def _copies_whole_field_into_leaf(call: ast.Call, field_call: ast.Call) -> bool:
+    """Whether a native copy ``call`` writes the read ``field_call`` of a literal whole field into a
+    literal component or subcomponent, with no other argument on either: the copy
+    :func:`_copy_needs_wrapper` inserts as the ``copy_field`` call. Another argument keeps the
+    native form, as an insert carrying one does."""
+    src = getattr(field_call.args[0], "value", None)
+    return (
+        not call.keywords
+        and not field_call.keywords
+        and len(field_call.args) == 1
+        and isinstance(src, str)
+        and _WHOLE_FIELD_PATH_RE.match(src) is not None
+        and _is_leaf_literal(getattr(call.args[0], "value", None))
+    )
 
 
 def _moves_data_off_a_leaf(before: ast.AST, dst: ast.expr, value: ast.expr) -> bool:
@@ -6909,13 +6933,26 @@ def _copy_needs_wrapper(params: dict[str, Any]) -> bool:
     (BACKLOG #5821): ``set`` would escape the field's escape sequences a second time. The call takes
     no other argument, so an insert carrying any other key (``occurrence``, ``repetition``, or one
     neither form reads) keeps the native form, as before the wrapper existed."""
-    src = params.get("src")
+    src = _constant_text(params.get("src"))
     return (
         set(params) <= {"src", "dst"}
         and isinstance(src, str)
         and _WHOLE_FIELD_PATH_RE.match(src) is not None
-        and _is_leaf_literal(params.get("dst"))
+        and _is_leaf_literal(_constant_text(params.get("dst")))
     )
+
+
+def _constant_text(value: Any) -> Any:
+    """``value``, or the string an ``{"expr": ...}`` holding only a string literal spells, so
+    ``{"expr": '"PID-5"'}`` classifies as ``"PID-5"`` does (BACKLOG #5821, PR 3036 finding 3)."""
+    if isinstance(value, dict) and set(value) == {"expr"} and isinstance(value["expr"], str):
+        try:
+            node = ast.parse(value["expr"].strip(), mode="eval").body
+        except SyntaxError:
+            return value
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+    return value
 
 
 #: The characters that template text carries as structure the author meant: the HL7 component,
