@@ -10021,13 +10021,31 @@ def create_app(
         # BACKLOG #6589: the inject labels the message with this username, and the store refuses a
         # blank or padded one. A directory name is not held to the local username rule, so refuse it
         # here, after the channel check and before the upload is read or anything is injected, as a
-        # 403 rather than the store's TypeError. The step-up proof is already spent by then.
+        # 403 rather than the store's TypeError. The step-up proof is already spent by then. The
+        # refusal writes an `upload.resend_reject` row, as the ingress guards' refusal does, so a
+        # resend that main would have audited as `upload.resend` is never refused unrecorded.
         if not is_origin_actor(identity.username):
-            raise HTTPException(
-                403,
+            reason = (
                 "this account's username is blank or has surrounding whitespace, so it cannot"
-                " label an injected message",
+                " label an injected message"
             )
+            await engine.store.record_audit(
+                "upload.resend_reject",
+                actor=identity.username,
+                channel_id=body.to,
+                detail=json.dumps(
+                    {
+                        "file_id": file_id,
+                        "index": body.index,
+                        "to": body.to,
+                        "phase": "origin_actor",
+                        "reason": reason,
+                    }
+                ),
+                client=client_ip(request),
+            )
+            _log.warning("upload.resend_reject: the acting username cannot label an inject")
+            raise HTTPException(403, reason)
         rr = engine.registry_runner
         if rr is None or body.to not in rr.registry.inbound:
             raise HTTPException(404, f"no such inbound connection: {body.to}")

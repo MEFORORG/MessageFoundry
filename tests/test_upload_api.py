@@ -816,6 +816,15 @@ async def test_resend_by_a_padded_username_is_refused_403_with_nothing_injected(
         assert "surrounding whitespace" in r.json()["detail"]
     after = int(await engine.store.count_messages(channel_id="in1", allowed_channels=None))
     assert after == before
+    # The refusal is audited, as main audits the resend it refuses (BACKLOG #6589): exactly one
+    # reject row naming the acting user and the reason, and no second resend row.
+    [reject] = await engine.store.list_audit(action="upload.resend_reject")
+    assert reject["actor"] == "pad "
+    assert reject["channel_id"] == "in1"
+    detail = json.loads(str(reject["detail"]))
+    assert (detail["phase"], detail["file_id"], detail["index"]) == ("origin_actor", fid, 1)
+    assert "surrounding whitespace" in detail["reason"]
+    assert len(await engine.store.list_audit(action="upload.resend")) == 1
 
 
 async def test_resend_unknown_and_not_running_inbound(engine: Engine, tmp_path: Path) -> None:
