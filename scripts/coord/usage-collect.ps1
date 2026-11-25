@@ -110,6 +110,21 @@ function Test-OwnStamp([string]$Stamp, [string]$Root) {
     return (Get-RootLabel $Stamp) -ieq (Get-RootLabel $Root)
 }
 
+# THE NUMBER usage.ps1 WOULD GRADE THIS WINDOW BY NOW, or $null. The window has a number, its reset is
+# absent or still ahead, and its age is at most 20 minutes, usage.ps1's default -MaxAgeMinutes, which
+# the gate's reader runs with. A window dated after now counts, because usage.ps1 keeps a level_floor
+# at its number. The caller has tested that the window is this root's own. Without config-roots.ps1
+# the age cannot be read the reader's way, so the answer is $null.
+function Get-GradedPercentage($w, [long]$NowEpoch) {
+    if (-not $w -or -not $HaveConfigRoots) { return $null }
+    $pct = Get-Percentage $w.used_percentage
+    $reset = $w.resets_at_epoch -as [long]
+    if ($null -eq $pct -or ($reset -and $reset -le $NowEpoch)) { return $null }
+    $at = ConvertTo-UtcDateTime $w.captured_at
+    if ($null -eq $at -or ([datetime]::UtcNow - $at).TotalMinutes -gt 20) { return $null }
+    return $pct
+}
+
 $ConfigRootEnv = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { $null }
 if (-not $StateDir) {
     $root = $null
@@ -336,42 +351,48 @@ try {
     # An idle session keeps reporting its cached number on a timer and every session publishes here, so
     # without the rule a stale 60 replaces a live 99 and reads as freshly observed.
     #
-    # A refused reading leaves the published window whole, so the staleness guard keeps counting from
+    # A refused reading leaves the window it keeps whole, so the staleness guard keeps counting from
     # the last real observation. $confirmed is the one exception: a live session's refused equal reading
     # for the same running reset refreshes the age and nothing else.
     #
-    # $guard is the live-session rule. $ownPct is the number it holds a reading to: the published one,
-    # or over a window stamped with another root, this root's own last number, which own_used_percentage
-    # carries across that stamp. With none carried there is no number, so the rule is as on main there.
-    # The per-reset tests ($perReset) hold for this root's own window only, by the reader's own test.
+    # $perReset is the per-reset rule, over this root's own published window only. $guard is the
+    # live-session rule. It holds an idle reading of this root's to $ownWin, this root's own last
+    # window, and only while usage.ps1 would grade that window by its number (Get-GradedPercentage), so the
+    # window it keeps reads at least as high as the reading it refuses. Over a window stamped with
+    # another root, $ownWin is the own_window that window carries, and a refusal publishes it again.
     #
     # THE READ AND THE WRITE ARE NOT LOCKED. Every session publishes here, so a reading can pass this
     # check and then land over a higher one written in between. The next live fire corrects it.
     $keepPublished = -not $seven
     $calledApi = Test-SessionCalledApi $StateDir $p
     $confirmed = $false
-    $ownPct = $null
-    $publishedRoot = if ($published) { [string]$published.config_root_env } else { "" }
+    $holdWin = $null
+    $ownWin = $null
     $ownRoot = Get-RootLabel (Split-Path $StateDir -Parent)
     $stampOwn = Test-OwnStamp $stampEnv $ownRoot
+    if ($published) {
+        $publishedOwn = Test-OwnStamp ([string]$published.config_root_env) $ownRoot
+        $ownWin = if ($publishedOwn) { $published } else { $published.own_window }
+    }
     if ($seven -and $published) {
         $nowEpoch = [System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
         $seenEpoch = $seven.resets_at_epoch -as [long]
         $publishedEpoch = $published.resets_at_epoch -as [long]
-        $publishedOwn = Test-OwnStamp $publishedRoot $ownRoot
         # A window with no number in it holds no level to keep, so it is not a 0 this reading can equal.
         $publishedPct = Get-Percentage $published.used_percentage
-        $ownPct = if ($publishedOwn) { $publishedPct } else { Get-Percentage $published.own_used_percentage }
-        $notHigher = $null -ne $ownPct -and $seven.used_percentage -le $ownPct
+        $notHigher = $null -ne $publishedPct -and $seven.used_percentage -le $publishedPct
         $live = $calledApi -and $stampOwn
-        $guard = $notHigher -and -not $live
         $perReset = if (-not $publishedOwn) { $false }
         elseif ($seenEpoch -and $publishedEpoch) {
             ($notHigher -and $seenEpoch -eq $publishedEpoch) -or
             ($seenEpoch -lt $publishedEpoch -and $seenEpoch -le $nowEpoch)
         }
         else { $publishedEpoch -gt $nowEpoch }
-        $keepPublished = $guard -or $perReset
+        $ownPct = if ($stampOwn -and -not $live) { Get-GradedPercentage $ownWin $nowEpoch }
+        $guard = $null -ne $ownPct -and $seven.used_percentage -le $ownPct
+        if ($guard) { $holdWin = $ownWin }
+        elseif ($perReset) { $holdWin = $published }
+        $keepPublished = $null -ne $holdWin
         $confirmed = $live -and $publishedOwn -and
             $seenEpoch -and $seenEpoch -eq $publishedEpoch -and $seenEpoch -gt $nowEpoch -and
             $seven.used_percentage -eq $publishedPct
@@ -382,16 +403,18 @@ try {
     # in a tool built to warn about consumption. A refused lower one would also read as a falling rate.
     $freshSeven = $null
     if ($keepPublished) {
-        $seven = $published
+        $seven = if ($holdWin) { $holdWin } else { $published }
         if ($confirmed) { $seven | Add-Member -NotePropertyName captured_at -NotePropertyValue $now -Force }
     }
     else {
         $freshSeven = $seven.used_percentage
         $seven.captured_at = $now
         $seven.config_root_env = $stampEnv
-        # A reading of another root's carries this root's own last number with it, so the rule above
-        # still has it to hold the next reading of this root's to.
-        if (-not $stampOwn -and $null -ne $ownPct) { $seven.own_used_percentage = $ownPct }
+        # A reading of another root's carries this root's own last window with it, so the live-session
+        # rule above still has that window to hold the next reading of this root's to.
+        if (-not $stampOwn -and $ownWin) {
+            $seven.own_window = $ownWin | Select-Object used_percentage, resets_at_epoch, resets_at, captured_at, config_root_env
+        }
     }
 
     # Nothing observed and nothing remembered: publish NOTHING rather than a document full of nulls.

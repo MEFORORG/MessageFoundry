@@ -1094,30 +1094,67 @@ def test_a_numeric_string_from_a_fire_halts_at_the_ceiling(sb: Sandbox, tmp_path
     assert code == HALT and "At the ceiling" in why(doc), why(doc)
 
 
+def _wired_root(sb: Sandbox, tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    root = tmp_path / "config-root"
+    root.mkdir()
+    env = {"CLAUDE_CONFIG_DIR": str(root)}
+    _wire(sb, root, tmp_path, env)
+    return root / "mefor-usage", env
+
+
 def test_a_bare_reading_after_a_gone_window_cannot_clear_through_the_real_scripts(
     sb: Sandbox, tmp_path: Path
 ) -> None:
-    """The collector takes a lower bare reading over a gone window only from a live session (ADR
-    0211, the live-session rule). It used to clear the rung: a 40 that cannot say which window it
-    belongs to, on a pool that may be spent."""
-    root = tmp_path / "config-root"
-    root.mkdir()
-    state = root / "mefor-usage"
-    env = {"CLAUDE_CONFIG_DIR": str(root)}
-    _wire(sb, root, tmp_path, env)
+    """A bare 40 over a gone window is taken from any session (ADR 0211: the live-session rule holds
+    nothing to a gone window), and the gate answers REVIEW on it. It used to clear the rung: a 40
+    that cannot say which window it belongs to, on a pool that may be spent."""
+    state, env = _wired_root(sb, tmp_path)
     gone = {"used_percentage": 95, "resets_at": int(ago().timestamp()) - 300}
     assert _fire(sb, state, gone, env, api_ms=1000).returncode == 0
     seed_vault(sb, calibrated("manager"))
-
-    # An idle bare 40 is refused, so the gone window stands and the gate still answers REVIEW.
     assert _fire(sb, state, {"used_percentage": 40}, env, api_ms=1000).returncode == 0
     code, doc = _real_gate(sb, env)
-    assert code == REVIEW and "no reset time" not in why(doc), why(doc)
-
-    # A live session's bare 40 is taken, and the gate answers REVIEW on it rather than clearing.
-    assert _fire(sb, state, {"used_percentage": 40}, env, api_ms=2000).returncode == 0
-    code, doc = _real_gate(sb, env)
     assert code == REVIEW and "no reset time" in why(doc), why(doc)
+
+
+def test_past_a_gone_reset_an_idle_reading_at_the_rung_halts_through_the_real_scripts(
+    sb: Sandbox, tmp_path: Path
+) -> None:
+    """BACKLOG #5178. A gone 99, then an idle 93 on the new reset. Keeping the gone window answered
+    REVIEW; the collector on origin/main takes the 93 and the gate halts on it at the default rung of
+    90. The collector now takes it too, so the answer is that HALT."""
+    state, env = _wired_root(sb, tmp_path)
+    now = int(ago().timestamp())
+    assert (
+        _fire(sb, state, {"used_percentage": 99, "resets_at": now - 300}, env, 1000).returncode == 0
+    )
+    seed_vault(sb, calibrated("manager"))
+    assert _real_gate(sb, env)[0] == REVIEW, "control: the gone window reviews"
+    idle = {"used_percentage": 93, "resets_at": now + 500000}
+    assert _fire(sb, state, idle, env, api_ms=1000).returncode == 0
+    code, doc = _real_gate(sb, env)
+    assert code == HALT, why(doc)
+
+
+def test_a_foreign_reading_then_an_idle_one_still_halts_through_the_real_scripts(
+    sb: Sandbox, tmp_path: Path
+) -> None:
+    """BACKLOG #5178. This root's 99 halts; another root's 100 replaces it; then an idle 99 of this
+    root's. The collector on origin/main takes that 99 and the gate halts. Holding it under the
+    foreign window answered REVIEW, because the reader refuses another root's window. The collector
+    now publishes this root's own 99 again, so the answer is that HALT."""
+    state, env = _wired_root(sb, tmp_path)
+    reset = int(ago().timestamp()) + 500000
+    own = {"used_percentage": 99, "resets_at": reset}
+    assert _fire(sb, state, own, env, api_ms=1000).returncode == 0
+    seed_vault(sb, calibrated("manager"))
+    assert _real_gate(sb, env)[0] == HALT, "control: this root's 99 halts"
+    foreign_env = {"CLAUDE_CONFIG_DIR": str(tmp_path / "other-root")}
+    foreign = {"used_percentage": 100, "resets_at": reset}
+    assert _fire(sb, state, foreign, foreign_env, api_ms=2000).returncode == 0
+    assert _fire(sb, state, own, env, api_ms=2000).returncode == 0
+    code, doc = _real_gate(sb, env)
+    assert code == HALT, why(doc)
 
 
 def test_the_real_reader_sends_a_passed_reset_to_review_not_halt(

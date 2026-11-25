@@ -401,33 +401,24 @@ def test_a_higher_number_on_a_moved_reset_still_replaces_from_an_idle_session(
     assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(80.0)
 
 
-def test_after_a_real_reset_an_idle_lower_reading_keeps_the_gone_window(tmp_path: Path) -> None:
-    """BACKLOG #5178, past the published reset. The gone window reads UNKNOWN, so keeping it costs a
-    REVIEW; an idle session's frozen number for the new window could read OK on a pool since spent."""
+def test_after_a_real_reset_an_idle_reading_replaces_the_gone_window(tmp_path: Path) -> None:
+    """BACKLOG #5178, past the published reset. usage.ps1 reads a gone window UNKNOWN, so keeping it
+    would answer REVIEW where the reading it refused could halt: a gone 99 kept over an idle 93 did.
+    So the live-session rule holds nothing to a gone window, and the per-reset rule decides: a reading
+    on a later reset replaces it from any session, lower or not. The gate halts on the 93 (ADR 0211)."""
     now = int(time.time())
-    _session_fire(tmp_path, {"used_percentage": 91.0, "resets_at": now - 300}, "live", 1000)
-    new = {"used_percentage": 2.0, "resets_at": now + 500000}
-    _session_fire(tmp_path, new, "idle", 1000)
-    _session_fire(tmp_path, new, "idle", 1000)
-    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(91.0)
-    assert read(tmp_path)[0] == UNKNOWN
-
-    # An equal number is refused too: it is no rise, so it is no evidence of a new window.
-    _session_fire(tmp_path, {**new, "used_percentage": 91.0}, "other", 1000)
-    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(91.0)
-    assert len(history(tmp_path)) == 1
-
-    # CONTROL. A live session's reading of the new window replaces the gone one.
-    _session_fire(tmp_path, new, "idle", 2000)
-    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(2.0)
-    assert read(tmp_path)[0] == OK
+    _session_fire(tmp_path, {"used_percentage": 99.0, "resets_at": now - 300}, "live", 1000)
+    assert read(tmp_path)[0] == UNKNOWN, "control: the gone window reads UNKNOWN"
+    _session_fire(tmp_path, {"used_percentage": 93.0, "resets_at": now + 500000}, "idle", 1000)
+    _session_fire(tmp_path, {"used_percentage": 93.0, "resets_at": now + 500000}, "idle", 1000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(93.0)
+    assert [r["seven_day"] for r in history(tmp_path)] == [99.0, 93.0]
+    assert read(tmp_path)[0] == WARN
 
 
 def test_after_a_real_reset_an_idle_higher_reading_replaces_the_gone_window(tmp_path: Path) -> None:
-    """BACKLOG #5178, past the published reset. Only a lower or equal idle reading is refused there. A
-    higher one replaces the gone window from any session, as on main: a gone 50 and an idle session's
-    99 for the new window publish 99, which reads at the ceiling, so the gate halts rather than
-    answering REVIEW on the gone window."""
+    """BACKLOG #5178, past the published reset: a gone 50 and an idle session's 99 for the new window
+    publish 99, which reads at the ceiling, so the gate halts rather than answering REVIEW."""
     now = int(time.time())
     _session_fire(tmp_path, {"used_percentage": 50.0, "resets_at": now - 300}, "live", 1000)
     assert read(tmp_path)[0] == UNKNOWN, "control: the gone window reads UNKNOWN"
@@ -437,34 +428,31 @@ def test_after_a_real_reset_an_idle_higher_reading_replaces_the_gone_window(tmp_
     assert read(tmp_path)[0] == CRITICAL
 
 
-def test_after_a_real_reset_a_no_reset_reading_cannot_open_a_path_past_the_rule(
-    tmp_path: Path,
-) -> None:
-    """BACKLOG #5178. Before this fix the live-session rule held only where both windows had a reset:
-    past a gone published reset, an idle reading with no reset was taken and dropped the reset, and
-    the next idle reading, a frozen low number on a new reset, was then taken too, so the rung read OK
-    on a pool since spent. The rule now binds on that path: an idle reading at or below the published
-    number is refused there too, and a higher one is still taken from any session, as on main."""
+def test_a_stale_own_window_holds_no_idle_reading(tmp_path: Path) -> None:
+    """BACKLOG #5178. Past usage.ps1's default age of 20 minutes the published window reads UNKNOWN,
+    so keeping it could answer REVIEW where the refused reading halts. The live-session rule then holds
+    nothing, and the per-reset rule decides: an idle lower reading on another reset replaces it."""
+    now = int(time.time())
+    _session_fire(tmp_path, {"used_percentage": 95.0, "resets_at": now + 500000}, "live", 1000)
+    frozen = {"used_percentage": 93.0, "resets_at": now + 100000}
+    _session_fire(tmp_path, frozen, "idle", 1000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(95.0), (
+        "control: a fresh own window holds the idle reading"
+    )
+    _age_window(tmp_path, 25)
+    _session_fire(tmp_path, frozen, "idle", 1000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(93.0)
+
+
+def test_a_no_reset_window_holds_an_idle_frozen_number_to_its_own(tmp_path: Path) -> None:
+    """BACKLOG #5178. usage.ps1 grades a fresh window with no reset by its number, so the live-session
+    rule holds an idle reading to it: past a gone reset an idle bare 95 is taken by the per-reset rule,
+    and an idle frozen 5 on a new reset then cannot replace it."""
     now = int(time.time())
     _session_fire(tmp_path, {"used_percentage": 90.0, "resets_at": now - 300}, "live", 1000)
-    assert read(tmp_path)[0] == UNKNOWN, "control: the gone window reads UNKNOWN"
-
-    # CONTROL. Straight from the gone window, the idle frozen number is refused.
-    frozen = {"used_percentage": 5.0, "resets_at": now + 500000}
-    _session_fire(tmp_path, frozen, "idle", 1000)
-    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(90.0)
-
-    # An idle equal reading with no reset is refused, so the reset stays and the frozen number with it.
-    _session_fire(tmp_path, {"used_percentage": 90.0}, "bare", 1000)
-    assert latest(tmp_path)["seven_day"].get("resets_at_epoch") == now - 300
-    _session_fire(tmp_path, frozen, "idle", 1000)
-    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(90.0)
-    assert read(tmp_path)[0] == UNKNOWN
-
-    # CONTROL. A higher reading with no reset is still taken from an idle session and drops the reset,
-    # and the idle frozen number still cannot follow it in.
-    _session_fire(tmp_path, {"used_percentage": 95.0}, "bare2", 1000)
+    _session_fire(tmp_path, {"used_percentage": 95.0}, "bare", 1000)
     assert latest(tmp_path)["seven_day"].get("resets_at_epoch") is None
+    frozen = {"used_percentage": 5.0, "resets_at": now + 500000}
     _session_fire(tmp_path, frozen, "idle", 1000)
     assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(95.0)
 
@@ -474,66 +462,100 @@ def test_after_a_real_reset_a_no_reset_reading_cannot_open_a_path_past_the_rule(
     assert read(tmp_path)[0] == OK
 
 
-def test_a_foreign_stamp_cannot_open_a_path_past_this_roots_rule(tmp_path: Path) -> None:
-    """BACKLOG #5178. A session pinned to another root posts a higher reading, which is taken and
-    stamped with that root. Before this fix, as on main, no rule held over the window, so an idle
-    session's frozen 5 on another reset was taken next and the rung read OK on it. The live-session
-    rule now binds over a foreign window too."""
+def _foreign_state(tmp_path: Path) -> tuple[Path, Path]:
     root = tmp_path / "this-root"
     state = root / "mefor-usage"
     state.mkdir(parents=True)
-    now = int(time.time())
-    reset = now + 500000
+    return state, tmp_path / "other"
+
+
+def test_over_a_foreign_window_an_idle_reading_is_held_to_this_roots_carried_window(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #5178. A reading of another root's replaces this root's window by the per-reset rule
+    and carries this root's own window with it as own_window. An idle reading of this root's at or
+    below that window, while usage.ps1 would grade it, publishes it again, so this root's number never
+    moves because of another root; a higher or live one replaces as the per-reset rule says."""
+    state, other = _foreign_state(tmp_path)
+    reset = int(time.time()) + 500000
     _session_fire(state, {"used_percentage": 90.0, "resets_at": reset}, "live", 1000)
     foreign = {"used_percentage": 95.0, "resets_at": reset}
-    _session_fire(state, foreign, "F", 1000, pin=tmp_path / "other")
+    _session_fire(state, foreign, "F", 1000, pin=other)
     kept = latest(state)["seven_day"]
     assert kept["used_percentage"] == pytest.approx(95.0), (
         "control: the foreign higher one is taken"
     )
-    assert kept["config_root_env"] == str(tmp_path / "other"), kept
+    assert kept["config_root_env"] == str(other), kept
+    assert kept["own_window"]["used_percentage"] == pytest.approx(90.0), kept
 
-    frozen = {"used_percentage": 5.0, "resets_at": now + 100000}
+    frozen = {"used_percentage": 5.0, "resets_at": reset - 400000}
     _session_fire(state, frozen, "idle", 1000)
-    assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(95.0)
+    back = latest(state)["seven_day"]
+    assert back["used_percentage"] == pytest.approx(90.0), back
+    assert back["config_root_env"] == "unset" and "own_window" not in back, back
     assert len(history(state)) == 2
 
     # CONTROL. Not frozen: the lower reading from a session of this root that has just called the API
     # replaces the foreign window.
+    _session_fire(state, foreign, "F", 2000, pin=other)
     _session_fire(state, frozen, "idle", 2000)
     assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(5.0)
     assert read(state)[0] == OK
 
-    # CONTROL. A higher reading of this root's still lands over a foreign window from an idle session.
-    _session_fire(state, {**foreign, "used_percentage": 96.0}, "F", 2000, pin=tmp_path / "other")
-    assert latest(state)["seven_day"]["config_root_env"] == str(tmp_path / "other")
+    # CONTROL. A higher reading of this root's lands over a foreign window from an idle session.
+    _session_fire(state, {**foreign, "used_percentage": 96.0}, "F", 3000, pin=other)
     _session_fire(state, {"used_percentage": 97.0, "resets_at": reset}, "hi", 1000)
     assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(97.0)
 
-    # CONTROL. The number to beat is this root's own last one, not the foreign one: an idle 98 lands
-    # under a foreign 99, as on main, so the gate can still halt on it.
-    _session_fire(state, {**foreign, "used_percentage": 99.0}, "F", 3000, pin=tmp_path / "other")
-    _session_fire(state, {"used_percentage": 98.0, "resets_at": reset}, "hi2", 1000)
-    assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(98.0)
+
+def test_foreign_then_foreign_then_idle_still_holds_to_this_roots_window(tmp_path: Path) -> None:
+    """BACKLOG #5178. A second reading of another root's carries the first one's own_window forward,
+    so an idle frozen 5 after two foreign readings still publishes this root's 90 again, which reads
+    stricter than the OK the 5 reads when it is taken."""
+    state, other = _foreign_state(tmp_path)
+    reset = int(time.time()) + 500000
+    _session_fire(state, {"used_percentage": 90.0, "resets_at": reset}, "live", 1000)
+    _session_fire(state, {"used_percentage": 95.0, "resets_at": reset}, "F", 1000, pin=other)
+    _session_fire(state, {"used_percentage": 3.0, "resets_at": reset - 9000}, "F", 2000, pin=other)
+    kept = latest(state)["seven_day"]
+    assert kept["used_percentage"] == pytest.approx(3.0), "control: the second foreign one is taken"
+    assert kept["own_window"]["used_percentage"] == pytest.approx(90.0), kept
+    _session_fire(state, {"used_percentage": 5.0, "resets_at": reset - 400000}, "idle", 1000)
+    assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(90.0)
+    assert read(state)[0] in (WARN, CRITICAL)
 
 
-def test_a_live_session_of_another_root_cannot_lower_this_roots_window(tmp_path: Path) -> None:
-    """BACKLOG #5178: as for a confirmation, the live-session exception needs this root's stamp, or a
-    mis-wired session's 5 replaces this root's 100 and the reader refuses the foreign window."""
-    root = tmp_path / "this-root"
-    state = root / "mefor-usage"
-    state.mkdir(parents=True)
+def test_a_stale_carried_window_holds_no_idle_reading(tmp_path: Path) -> None:
+    """BACKLOG #5178. A carried own_window past usage.ps1's default age would read UNKNOWN if
+    published again, so it holds nothing: the per-reset rule takes the idle reading."""
+    state, other = _foreign_state(tmp_path)
+    reset = int(time.time()) + 500000
+    _session_fire(state, {"used_percentage": 90.0, "resets_at": reset}, "live", 1000)
+    _session_fire(state, {"used_percentage": 95.0, "resets_at": reset}, "F", 1000, pin=other)
+    doc = latest(state)
+    doc["seven_day"]["own_window"]["captured_at"] = _minutes_ago(25)
+    (state / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    _session_fire(state, {"used_percentage": 5.0, "resets_at": reset - 400000}, "idle", 1000)
+    assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(5.0)
+
+
+def test_a_reading_of_another_root_replaces_by_the_per_reset_rule_alone(tmp_path: Path) -> None:
+    """BACKLOG #5178. The live-session rule holds only readings of this root's. Refusing another
+    root's lower reading would keep this root's window graded where the reader refuses the foreign
+    one, so a low own number could read OK where taking the reading answers UNKNOWN. A live or idle
+    session of another root's replaces as the per-reset rule says, and this root's 100 travels on as
+    own_window, which the next idle reading of this root's is held to."""
+    state, other = _foreign_state(tmp_path)
     now = int(time.time())
     _session_fire(state, {"used_percentage": 100.0, "resets_at": now + 500000}, "live", 1000)
     low = {"used_percentage": 5.0, "resets_at": now + 100000}
-    for api_ms in (1000, 2000):
-        _session_fire(state, low, "S", api_ms, pin=tmp_path / "other-root")
-    assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(100.0)
-
-    # CONTROL. The same live reading from an unpinned session of this root is taken.
+    _session_fire(state, low, "S", 1000, pin=other)
+    kept = latest(state)["seven_day"]
+    assert kept["used_percentage"] == pytest.approx(5.0) and kept["config_root_env"] == str(other)
+    assert read(state)[0] == UNKNOWN
     _session_fire(state, low, "T", 1000)
-    _session_fire(state, low, "T", 2000)
-    assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(5.0)
+    assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(100.0)
+    assert read(state)[0] == CRITICAL
 
 
 def test_a_higher_reading_with_no_reset_is_refused_and_the_floor_stays_armed(
@@ -684,28 +706,28 @@ def test_the_status_line_shows_no_number_for_a_gone_window(tmp_path: Path) -> No
     assert line == "7d reset passed, no current reading", line
 
 
-def test_a_window_carried_from_another_root_holds_only_the_live_session_rule(
-    tmp_path: Path,
-) -> None:
-    """A window stamped with another root is no per-reset floor, and its own number is another pool's,
-    so the live-session rule holds a reading of this root's only to this root's own last number, which
-    the window carries (BACKLOG #5178). A window that carries none, as from a hand copy, holds no
-    number, as on main: an idle lower reading replaces it."""
+def test_a_window_carried_from_another_root_holds_only_its_own_window(tmp_path: Path) -> None:
+    """A window stamped with another root is no per-reset floor, and its number is another pool's, so
+    the live-session rule holds a reading of this root's only to the own_window it carries (BACKLOG
+    #5178). A window that carries none, as from a hand copy, holds nothing: an idle lower reading
+    replaces it, as the per-reset rule says."""
     seven = window(88.0, 280000)
     collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": seven}})
     doc = latest(tmp_path)
+    own = dict(doc["seven_day"], used_percentage=40.0)
     doc["seven_day"]["config_root_env"] = str(tmp_path / "another-account")
     (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
-    doc["seven_day"]["own_used_percentage"] = 40.0
+    doc["seven_day"]["own_window"] = own
     carried = json.dumps(doc)
 
     _session_fire(tmp_path, {**seven, "used_percentage": 12.0}, "B", 1000)
     assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(12.0)
 
-    # With this root's own 40 carried, an idle 12 is refused, and a live one replaces.
+    # With this root's own 40 carried, an idle 12 publishes the 40 again, and a live one replaces.
     (tmp_path / "latest.json").write_text(carried, encoding="utf-8")
     _session_fire(tmp_path, {**seven, "used_percentage": 12.0}, "C", 1000)
-    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(88.0)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(40.0)
+    (tmp_path / "latest.json").write_text(carried, encoding="utf-8")
     _session_fire(tmp_path, {**seven, "used_percentage": 12.0}, "C", 2000)
     assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(12.0)
 

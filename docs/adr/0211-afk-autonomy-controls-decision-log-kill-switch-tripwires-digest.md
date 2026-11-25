@@ -440,16 +440,30 @@ roster alias of the Lander.
 > confirmation the per-reset tests name.
 >
 > **The live-session rule, stated once here (BACKLOG #5178); the collector's comments and the limits
-> below point to it.** A reading at or below this root's number is refused unless it comes from a live
-> session. Over a published window of this root's, that number is the published one. Over a window
-> stamped with another root, it is this root's own last number, which the collector carries on the
-> window as `own_used_percentage` when a reading of another root's replaces it. A window of another
-> root's that carries none, such as a hand copy, holds no number, and a reading of any value replaces
-> it, as on main. Where there is a number, the rule holds on the same reset or another, before or after
-> the published reset, and with no readable reset on either side. A higher reading passes it from any
-> session. `tests/test_coord_usage.py` pins the no-reset and the foreign-stamp paths:
-> `test_after_a_real_reset_a_no_reset_reading_cannot_open_a_path_past_the_rule` and
-> `test_a_foreign_stamp_cannot_open_a_path_past_this_roots_rule`.
+> below point to it.** It refuses a reading when all of these hold: the reading's stamp is this root's,
+> unset or absent, by the reader's own test; the fire is not live; the reading is at or below the
+> number in this root's own window; and that window is one `usage.ps1` grades by its number at the fire.
+> That last condition means the window holds a number, its reset is absent or still ahead, and its
+> `captured_at` reads as at most 20 minutes old, `usage.ps1`'s default `-MaxAgeMinutes`, or as dated
+> after now. Without `config-roots.ps1` the collector cannot read that age, and the rule refuses nothing.
+>
+> This root's own window is the published window when that window's stamp is this root's. When it is
+> another root's, it is the `own_window` the published window carries. A reading of another root's that
+> replaces the published window carries this root's own window on as `own_window`: the published window
+> itself when that is this root's, otherwise the published window's own `own_window`, so it survives any
+> number of readings of other roots. A refusal over a window of another root's publishes the
+> `own_window` again, whole and with its own age, so this root's number never moves because of another
+> root. Everywhere else a refusal leaves the published window as it was.
+>
+> The rule holds only to a window the reader grades because the gate then answers on the window kept.
+> A graded window of this root's at or above the reading answers at least as strictly, at the level, as
+> the reading would at that fire. A gone, stale, numberless or foreign window answers REVIEW, where the
+> refused reading could halt: a gone 99 kept over an idle 93 answered REVIEW, and taking the 93 halts at
+> the 90 percent level. For the same reason a reading of another root's is held by the per-reset tests
+> alone: keeping this root's window over it could answer OK where the reader refuses the foreign window
+> and the gate answers REVIEW. `tests/test_afk_gate.py` pins both cases through the real scripts:
+> `test_past_a_gone_reset_an_idle_reading_at_the_rung_halts_through_the_real_scripts` and
+> `test_a_foreign_reading_then_an_idle_one_still_halts_through_the_real_scripts`.
 >
 > A fire is live when all of these hold: its session id is a plain name, 1 to 128 letters, digits, `_`
 > or `-`; its `cost.total_api_duration_ms` is a finite number above the counter in that session's mark
@@ -466,22 +480,21 @@ roster alias of the Lander.
 > passed; and a reading with no readable reset while the published reset is ahead, higher or not,
 > because it cannot prove which window it belongs to. A live session's equal reading on the same reset,
 > while that reset is ahead, is still refused, and refreshes the age and nothing else. A published window
-> stamped with another root has no per-reset test, so a live session of this root replaces it on any
-> reset, lower or not.
+> stamped with another root has no per-reset test, so a reading the live-session rule passes replaces
+> it on any reset, lower or not.
 >
-> A higher reading passes the live-session rule from any session because refusing it can weaken a stop.
-> For a reading of this root's: while the published reset is ahead, the lower published number could
-> clear the gate, and past it the gone window reads UNKNOWN, so the gate would answer REVIEW where the
-> higher number halts it. A higher reading from a session pinned to another root passes too, as on main,
-> though the reader refuses the window it publishes, so the gate answers REVIEW on it rather than
-> halting.
+> A higher reading passes the live-session rule from any session because refusing it can weaken a stop:
+> the lower number kept could clear the gate where the higher one halts it.
 >
-> **The rule can turn a HALT into a REVIEW where main halted.** It refuses an idle reading at or below
-> this root's number even when that reading is at or above the rung, and the window it keeps may not
-> halt the gate. At least this case does: a published 99 whose reset has passed reads UNKNOWN, and an
-> idle session's 93 for the new window is refused, so the gate answers REVIEW. Main took that 93 and
-> halted on it at the 90 percent level. This is the price of refusing an idle session's frozen 5 there,
-> which main took and cleared on. It lasts until a live session or a higher reading replaces the window.
+> **The live-session rule compares the gate's answer at the fire, and only at the level.** At least
+> these can still make it answer less strictly than taking the reading would. The window kept ages from
+> its own last observation, so it can go stale or past its reset while the refused reading would still
+> be fresh and current; the gate then answers REVIEW where the reading could halt, until a later fire's
+> reading replaces it. The window kept can also outlast a refused reading with an earlier reset:
+> once that reset passes, the kept window can still grade OK where the refused reading's gone window
+> would answer REVIEW, and an idle repeat of that reading is then refused by the per-reset tests. A
+> burn rate projected from the history rows is not compared, and a refused reading adds no row. A
+> reader run with a `-MaxAgeMinutes` below 20 can call stale a window the collector graded.
 >
 > **A reading below the rung with no reset time answers UNKNOWN**, so the gate answers REVIEW. It cannot
 > prove which window it belongs to, so it may be last week's number. At the rung it still hits, because a
@@ -558,10 +571,10 @@ roster alias of the Lander.
 >
 > - It needs a published window to compare with. At least these gone readings are published and reach
 >   the history: one on an empty directory or over a `latest.json` that does not read, one over a
->   published window that holds no number for the live-session rule above, and one that rule passes,
->   unless a per-reset test refuses it. `usage.ps1` reports any window past its reset as UNKNOWN with no
->   percentage, so its level is not graded. With no current reset the rate cannot filter its rows by
->   reset, so rows that change reset or fall refuse it, under the 2026-11-23 amendment above.
+>   published window the live-session rule holds nothing to, unless a per-reset test refuses it.
+>   `usage.ps1` reports any window past its reset as UNKNOWN with no percentage, so its level is not
+>   graded. With no current reset the rate cannot filter its rows by reset, so rows that change reset or
+>   fall refuse it, under the 2026-11-23 amendment above.
 > - With no published reset ahead, no per-reset test refuses a reading with no reset, so one that the
 >   live-session rule above passes is taken and drops the published reset. Below the rung the gate answers REVIEW for a reading with no reset, unless a burn is
 >   projected. A reading dated after now still sets the reader's own `level_floor`.
@@ -588,15 +601,13 @@ roster alias of the Lander.
 >   before this amendment did this too, and more widely: measured 2026-11-01, its `five_hour` window read
 >   OK at 5 after a spent 100, with the same or an earlier reset. The same-reset case is what this
 >   amendment closes.
->   **Narrowed 2026-11-24 (BACKLOG #5178)** by the live-session rule above. From a published 80, two idle sessions' 80, 5, 80, 5 now
->   leaves one history row, and an idle session's frozen 5 no longer replaces a published 100. A higher
->   reading is still taken from any session, before or after the published reset: past it, refusing an
->   idle 99 of this root's over a gone 50 would turn the gate's HALT into a REVIEW. So a live lower session and an idle
->   higher one can still trade the window. Whether a failed call moves the API-duration counter is not
->   measured, so a frozen number from a session whose calls fail may still pass as live. After a real
->   reset, a session that never reads as live cannot open the new window at or below the gone window's
->   number, short of the unlocked write below and an unreadable `latest.json`. The gate answers REVIEW
->   on the gone one until a live session or a higher reading opens it.
+>   **Narrowed 2026-11-24 (BACKLOG #5178)** by the live-session rule above. From a fresh published 80,
+>   two idle sessions' 80, 5, 80, 5 leaves one history row, and an idle session's frozen 5 no longer
+>   replaces a fresh published 100. A higher reading is still taken from any session. A live lower
+>   session and an idle higher one can still trade the window. Whether a failed call moves the
+>   API-duration counter is not measured, so a frozen number from a session whose calls fail may still
+>   pass as live. Past the published reset, or once the published window is stale, the rule holds
+>   nothing, so an idle frozen 5 on a new reset opens the new window and the gate can clear on it.
 > - The per-reset tests apply only against this root's own window, as the paragraph on them above says.
 > - The read and the write are not locked, so a concurrent publisher can still land a lower number, and
 >   the gate can clear on it. The next live reading corrects it.
