@@ -1862,9 +1862,8 @@ def test_doc_presents_the_two_limiters_as_one_conditional_pair() -> None:
     )
 
 
-def _limiter_accessors() -> dict[str, str]:
-    """``{accessor_name: limiter_attribute}`` for every ``SlidingWindowRateLimiter`` in the service."""
-    tree = ast.parse(_SERVICE.read_text(encoding="utf-8"))
+def _limiter_attributes(tree: ast.Module) -> set[str]:
+    """Every attribute the service assigns a ``SlidingWindowRateLimiter`` to."""
     attrs: set[str] = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Assign | ast.AnnAssign):
@@ -1875,6 +1874,13 @@ def _limiter_accessors() -> dict[str, str]:
                 attr = getattr(target, "attr", None)
                 if attr:
                     attrs.add(attr)
+    return attrs
+
+
+def _limiter_accessors() -> dict[str, str]:
+    """``{accessor_name: limiter_attribute}`` for every ``SlidingWindowRateLimiter`` in the service."""
+    tree = ast.parse(_SERVICE.read_text(encoding="utf-8"))
+    attrs = _limiter_attributes(tree)
     out: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name.startswith(
@@ -1986,7 +1992,8 @@ def test_every_sliding_window_limiter_is_filed_under_the_right_requirement() -> 
 
     ``allow_login_attempt``/``allow_reauth_attempt``/``allow_repeated_credential_audit``/
     ``allow_step_up_return_audit`` defend the AUTHENTICATION surface (6.1.1);
-    ``allow_phi_read``/``allow_admin_write`` are post-authentication business-logic limits (2.1.3).
+    ``allow_phi_read``/``allow_admin_write``/``allow_monitoring_read`` are post-authentication
+    business-logic limits (2.1.3).
     The split is asserted, so a new accessor forces an explicit decision rather than silently
     inheriting one table's coverage claim.
     """
@@ -2002,7 +2009,15 @@ def test_every_sliding_window_limiter_is_filed_under_the_right_requirement() -> 
     for accessor in sorted(_AUTH_SURFACE_ACCESSORS):
         assert accessor in protection, f"{accessor} has no row in the 6.1.1 protection set"
     for accessor in sorted(_BUSINESS_LIMIT_ACCESSORS):
-        field = "phi_read" if "phi" in accessor else "admin_write"
+        # Each accessor's own settings: the monitoring read was checked against admin_write's
+        # row before BACKLOG #5090, so its own row could go unseen.
+        field = next(
+            (f for f in ("phi_read", "monitoring_read", "admin_write") if f in accessor), None
+        )
+        assert field is not None, (
+            f"{accessor} names none of phi_read, monitoring_read or admin_write; map it to the "
+            "settings prefix of its 2.1.3 business-logic-limits row here"
+        )
         assert f"{field}_rate_limit_enabled" in limits, (
             f"{accessor}'s settings have no row in the 2.1.3 business-logic-limits table"
         )
@@ -2058,6 +2073,109 @@ def test_the_sign_out_miss_row_budget_token_names_a_shipped_method() -> None:
     assert method is not None, f"{token} is no longer a method of AuthService"
     attrs = {s.attr for s in ast.walk(method) if isinstance(s, ast.Attribute)}
     assert "_logout_miss_rows" in attrs, f"{token} no longer reads the _logout_miss_rows limiter"
+
+
+def _limiters_reached(service: ast.ClassDef, limiters: set[str], entry: str) -> set[str]:
+    """The limiter attributes ``entry`` reads on ``self``, directly or through the ``self.<method>``
+    calls it makes. Only ``self`` receivers count, and a method is followed only where it is called,
+    so a same-named attribute of another object, or a method passed and not called, reaches nothing.
+    """
+    methods = {
+        n.name: n for n in service.body if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+
+    def on_self(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            return node.attr if node.value.id == "self" else None
+        return None
+
+    reached: set[str] = set()
+    seen: set[str] = set()
+    todo = [entry]
+    while todo:
+        name = todo.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        for sub in ast.walk(methods[name]):
+            attr = on_self(sub)
+            if attr in limiters:
+                reached.add(attr)
+            elif isinstance(sub, ast.Call) and (called := on_self(sub.func)) in methods:
+                todo.append(called)
+    return reached
+
+
+def _census_reach(entries: set[str]) -> tuple[set[str], dict[str, set[str]]]:
+    """Every limiter attribute in the service, and what each census entry reaches of them."""
+    tree = ast.parse(_SERVICE.read_text(encoding="utf-8"))
+    service = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AuthService")
+    methods = {
+        n.name for n in service.body if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    missing = sorted(entries - methods)
+    assert not missing, f"census entries that are no longer AuthService methods: {missing}"
+    limiters = _limiter_attributes(tree)
+    return limiters, {e: _limiters_reached(service, limiters, e) for e in sorted(entries)}
+
+
+#: Control 12's second method: the one count row a window its row says is begun for the misses past
+#: the bound. Pinned to that row by ``_CONTROL_12_COUNT_ROW_TOKEN``.
+_CONTROL_12_COUNT_ROW = "_count_unrecorded_logout_misses"
+_CONTROL_12_COUNT_ROW_TOKEN = "`unrecorded`"
+
+
+#: The census's entries (:func:`_census_entries`): each limiter accessor, and the service methods
+#: of control 12, the one structural control built on limiters. A limiter none of them reaches is
+#: in no row of either table.
+def _census_entries() -> set[str]:
+    # A function, not a module constant: a renamed _STRUCTURAL_CONTROLS key then fails these
+    # tests one at a time instead of failing this module's collection.
+    return set(
+        _AUTH_SURFACE_ACCESSORS
+        | _BUSINESS_LIMIT_ACCESSORS
+        | {_STRUCTURAL_CONTROLS["sign-out miss-row budget"], _CONTROL_12_COUNT_ROW}
+    )
+
+
+def test_control_12_names_the_count_row_its_second_census_entry_writes() -> None:
+    """The census credits control 12 with the limiter of ``_count_unrecorded_logout_misses``, so the
+    row must still say that a count row is written (BACKLOG #5090)."""
+    token = _STRUCTURAL_CONTROLS["sign-out miss-row budget"]
+    (row,) = [r for r in _protection_rows()[1:] if token in "  ".join(r)]
+    assert _CONTROL_12_COUNT_ROW_TOKEN in "  ".join(row), row
+
+
+def test_every_sliding_window_limiter_is_reached_by_a_documented_control() -> None:
+    """BACKLOG #5090. RED when: the service builds a ``SlidingWindowRateLimiter`` that no 6.1.1 or
+    2.1.3 row's accessor, or structural control's method, reads. The ``allow_`` derivation keys a
+    control on the ONE limiter its accessor reads, so a second limiter behind the same control was
+    invisible to it: control 11's backstop and per-account floor, read through
+    ``_step_up_return_audit_backstop_admits``, and control 12's count-row limiter."""
+    limiters, reach = _census_reach(_census_entries())
+    unseen = limiters - set().union(*reach.values())
+    assert not unseen, (
+        f"sliding-window limiters no documented control reaches: {sorted(unseen)}. Put each behind "
+        "the accessor or structural control whose row states it, or give it a row of its own."
+    )
+    assert {
+        "_step_up_return_audit_limiter",
+        "_step_up_return_audit_backstop",
+        "_step_up_return_audit_floor",
+    } <= reach["allow_step_up_return_audit"], reach["allow_step_up_return_audit"]
+
+
+def test_the_limiter_reach_census_can_fail() -> None:
+    """The control for the census above: without control 11's accessor, its three limiters are
+    reported unseen, so the walk is not vacuously complete."""
+    entries = _census_entries() - {"allow_step_up_return_audit"}
+    limiters, reach = _census_reach(entries)
+    unseen = limiters - set().union(*reach.values())
+    assert {
+        "_step_up_return_audit_limiter",
+        "_step_up_return_audit_backstop",
+        "_step_up_return_audit_floor",
+    } <= unseen, unseen
 
 
 def test_protection_set_count_word_matches_the_table() -> None:

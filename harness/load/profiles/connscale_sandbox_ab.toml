@@ -1,7 +1,9 @@
 # Sandbox A/B (ADR 0087, BACKLOG #3132): [sandbox].mode off versus subprocess at 750 and 1500 inbound
-# MLLP connections, against a real engine the harness OWNS per step. Its readings are evidence for
-# ADR 0052 AC-2 with the subprocess sandbox on. 1500 is the AC-2 target read as inbound connections; 750 is the inbound
-# count if AC-2 counts inbound plus outbound, since a sandbox worker exists per inbound only.
+# MLLP connections, against a real engine the harness OWNS per step. Its readings bear on ADR 0052
+# AC-2 with the subprocess sandbox on, but a passing subprocess step is not on its own AC-2 evidence
+# that every inbound had a worker (the `sandbox_workers` paragraph below says why). 1500 is the AC-2
+# target read as inbound connections; 750 is the inbound count if AC-2 counts inbound plus
+# outbound, since a sandbox worker exists per inbound only.
 #
 # This is an OPERATOR sweep (multi-minute, large port budget, SERVER-DB store) -- never CI:
 #
@@ -18,7 +20,10 @@
 # route, which must fail) is a separate step. Each step writes its graph into a generated config directory, so the worker builds the
 # engine's graph; the warm-up brings every worker up before the hold and records the first-delivery
 # latency beside [sandbox].startup_seconds; the `sandbox_workers` SLO fails a subprocess step that
-# did not start a process per driven inbound. A subprocess arm that cannot reach the top count is a
+# started fewer processes than driven inbounds. That SLO is a FLOOR, not a per-inbound proof: on a
+# Windows venv a worker tree is two processes, so workers on half the inbounds clear it. A passing
+# subprocess step is not, on its own, AC-2 evidence that every inbound had a worker; that proof is
+# deferred to ADR 0187's pool (BACKLOG #5090). A subprocess arm that cannot reach the top count is a
 # valid result: its records and SLOs say where it stopped.
 #
 # All values synthetic + generic. See docs/LOAD-TESTING.md.
@@ -55,7 +60,7 @@ corpus_count_per_trigger = 20
 
 [connscale.slo]
 # Correctness gate only. The walls are recorded per arm, not graded: their values are host-variable.
-# The vs-N checks are not armed, and the profile loader refuses them beside a sandbox A/B: the
-# empty-claims checks group records without the sandbox arm, and fd_monotonic has no per-arm bound
-# that it compared each arm at least once.
+# The vs-N checks are not armed, and the profile loader refuses them beside a sandbox A/B: each
+# keeps each arm in its own lane, but none has a per-arm bound that it graded or compared each
+# arm at least once.
 zero_loss = true

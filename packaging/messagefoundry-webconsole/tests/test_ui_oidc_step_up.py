@@ -909,6 +909,88 @@ async def test_a_non_navigation_step_up_return_writes_its_row_within_the_audit_b
         assert service.oidc_step_up_flow(flow_id) is not None and _flow_id(c) == flow_id
 
 
+async def test_the_budget_spent_warning_escapes_the_client_address(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5090. RED when: the console's budget-spent WARNING logs the client address raw, as
+    the service's twin does not. caplog's handler has no scrub filter, so a raw CR LF here is what a
+    handler without that filter would write: a second, forged log line."""
+    from messagefoundry_webconsole.routes import oidc as oidc_routes
+
+    caplog.set_level(logging.WARNING, logger="messagefoundry_webconsole")
+    service = await _service(engine, _FakeLdap())
+    async with _client(engine, service) as c:
+        identity = await service.identity_for_token(
+            await _federated_sign_in(service, c, monkeypatch), activity=False
+        )
+        assert identity is not None
+        start = await _start_step_up(c)
+        _drain_own_step_up_return_audit_budget(service, identity.user_id)
+        monkeypatch.setattr(oidc_routes, "client_ip", lambda _r: "10.0.0.9\r\nFORGED line")
+
+        r = await _fetch_return(c, idp_url(start))
+
+        assert r.status_code == 303
+        (line,) = [m for m in caplog.messages if "refused (non_navigation_fetch)" in m]
+        assert "10.0.0.9\\r\\nFORGED line" in line, line
+        assert "\r" not in line and "\n" not in line, line
+
+
+def _client_log_census(source: str) -> tuple[int, list[int]]:
+    """``(client-bearing log arguments, lines that log one unscrubbed)`` for ``_log.*`` calls in
+    ``source``. Every argument is read, the format string and the keywords included, so an f-string
+    naming ``client`` counts too. A copy of the address under another name is not followed."""
+    import ast
+
+    bearing = 0
+    unscrubbed: list[int] = []
+    for call in ast.walk(ast.parse(source)):
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "_log"
+        ):
+            continue
+        for arg in [*call.args, *(kw.value for kw in call.keywords)]:
+            if not any(isinstance(n, ast.Name) and n.id == "client" for n in ast.walk(arg)):
+                continue
+            bearing += 1
+            if not (
+                isinstance(arg, ast.Call)
+                and isinstance(arg.func, ast.Name)
+                and arg.func.id == "scrub_log_argument"
+            ):
+                unscrubbed.append(call.lineno)
+    return bearing, unscrubbed
+
+
+def test_every_client_bearing_log_line_in_the_oidc_routes_is_scrubbed() -> None:
+    """BACKLOG #5090. RED when: a log call in the console's OIDC routes passes the client address
+    without ``scrub_log_argument``. The test above drives one of these lines; this covers the rest,
+    which a flood or a full flow cache reaches."""
+    from messagefoundry_webconsole.routes import oidc as oidc_routes
+
+    bearing, unscrubbed = _client_log_census(Path(oidc_routes.__file__).read_text(encoding="utf-8"))
+    assert not unscrubbed, f"lines that log the client unscrubbed: {unscrubbed}"
+    assert bearing >= 6, bearing  # the control: the walk found the lines it exists to check
+
+
+def test_the_client_log_census_flags_an_unscrubbed_line() -> None:
+    """The negative control for the census above: a raw argument, an f-string and a keyword each
+    fail it, and a scrubbed argument and a line with no client do not."""
+    source = "\n".join(
+        [
+            '_log.warning("raw %s", client)',
+            '_log.warning(f"fstring {client}")',
+            '_log.warning("kw %(c)s", extra=client)',
+            '_log.warning("ok %s", scrub_log_argument(client or "?"))',
+            '_log.warning("no client here %s", other)',
+        ]
+    )
+    assert _client_log_census(source) == (4, [1, 2, 3])
+
+
 async def test_spent_audit_and_sign_in_budgets_do_not_refuse_an_idp_step_up_return(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:

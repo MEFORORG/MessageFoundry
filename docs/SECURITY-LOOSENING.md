@@ -1110,8 +1110,8 @@ count is above `0` (vault BACKLOG #2613).
 > Each value above also loosens, the same way, the two audit-row budgets built on these keys:
 > the repeated-credential budget and the IdP step-up return's (controls 10 and 11 of the
 > [6.1.1 protection set](SECURITY.md#the-documented-protection-set-asvs-611), BACKLOG #2454,
-> #3965). On the step-up return's budget, `login_rate_limit_global = 0` also removes the page its
-> backstop raises when it stops a row. The report names only the limits in the table.
+> #3965). Control 11's row states what each value does to the step-up return's budget, its
+> backstop and page included. The report names only the limits in the table.
 >
 > The **credential ceremonies** are re-auth, password change, MFA enrolment, and the console's
 > second-factor step at sign-in (`POST /ui/mfa`); [SECURITY.md](SECURITY.md) lists the routes. With the
