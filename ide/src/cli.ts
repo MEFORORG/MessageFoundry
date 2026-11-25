@@ -146,16 +146,30 @@ function writerSetting(key: PathSettingKey): ContainedPathSetting | undefined {
     void vscode.window.showErrorMessage(writerRefusal(key, s.dropped));
     return undefined;
   }
+  const escape = pathSettingLinkEscape(key, s);
+  if (escape !== undefined) {
+    void vscode.window.showErrorMessage(escape);
+    return undefined;
+  }
+  return s;
+}
+
+/**
+ * The refusal text when the file or folder `s` names leaves the workspace through a link
+ * ({@link escapesByLink}), else undefined. Run only in a trusted window, for the reason
+ * {@link writerSetting} gives. Exported for the readers that hand the path to the CLI too, the
+ * alert list and engine trust's `cert inventory` (BACKLOG #5411, #8237 item 24).
+ */
+export function pathSettingLinkEscape(key: PathSettingKey, s: ContainedPathSetting): string | undefined {
   // A blank serviceConfig sends no --service-config (connectionServiceConfig), so the CLI opens its
   // own fallback, `./messagefoundry.toml` in the workspace folder, at least serve does. That file is
   // checked in its place, since the blank value names the folder itself.
   const blank = key === "serviceConfig" && s.value.trim() === "";
   const checked = blank ? PATH_FALLBACK.serviceConfig : s.value;
   if (!isExecGated() && escapesByLink(workspaceDir(), checked)) {
-    void vscode.window.showErrorMessage(linkEscapeRefusal(key, blank ? checked : undefined));
-    return undefined;
+    return linkEscapeRefusal(key, blank ? checked : undefined);
   }
-  return s;
+  return undefined;
 }
 
 /**

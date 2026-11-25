@@ -271,6 +271,30 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, undefined);
   });
 
+  test("a workspace serviceConfig that leaves the folder through a link runs no `cert inventory` (BACKLOG #5411)", async () => {
+    // The control is the test below: a plain folder at the same spelling IS read.
+    stubInventory = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "mf-engine-trust-out-"));
+    try {
+      // A junction on Windows, which needs no symlink privilege; a directory symlink elsewhere.
+      fs.symlinkSync(outside, path.join(ws, "conf"), "junction");
+      stubWorkspaceValues.serviceConfig = path.join("conf", "svc.toml");
+
+      await trust.refreshEngineTrust();
+      assert.deepStrictEqual(invocations, []);
+      assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, undefined);
+      assert.ok(logged.some((l) => l.includes("`cert inventory` was not run")), logged.join("\n"));
+    } finally {
+      // Removes the link itself, never what it points at.
+      try {
+        fs.unlinkSync(path.join(ws, "conf"));
+      } catch {
+        fs.rmdirSync(path.join(ws, "conf"));
+      }
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   test("a contained workspace serviceConfig is used, and passed to `cert inventory` as written", async () => {
     stubInventory = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
     stubWorkspaceValues.serviceConfig = path.join("conf", "svc.toml");
@@ -278,7 +302,8 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     assert.strictEqual(await trust.refreshEngineTrust(), true);
     assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
     const args = invocations[0]?.args ?? [];
-    assert.strictEqual(args[args.indexOf("--service-config") + 1], path.join("conf", "svc.toml"), JSON.stringify(args));
+    // Bound with `=` (BACKLOG #5411, #8237 item 24), so the value is one element with its flag.
+    assert.ok(args.includes(`--service-config=${path.join("conf", "svc.toml")}`), JSON.stringify(args));
   });
 
   test("a LOCAL certificate is never anchored for a REMOTE engine", async () => {
@@ -1138,7 +1163,7 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     await settle();
 
     assert.strictEqual(invocations.length, 3, "the child's exit queued no refresh");
-    assert.ok(invocations[2].args.includes("other.toml"), JSON.stringify(invocations[2].args));
+    assert.ok(invocations[2].args.includes("--service-config=other.toml"), JSON.stringify(invocations[2].args));
     assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, RENEWED);
   });
 

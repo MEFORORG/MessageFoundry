@@ -7,7 +7,15 @@ import * as fs from "node:fs";
 
 import * as vscode from "vscode";
 
-import { engineUrl, environments, isExecGated, runJson, workspaceDir, writerCheckSetting } from "./cli";
+import {
+  engineUrl,
+  environments,
+  isExecGated,
+  pathSettingLinkEscape,
+  runJson,
+  workspaceDir,
+  writerCheckSetting,
+} from "./cli";
 import {
   clearEngineTrustAnchors,
   setEngineTrustAnchor,
@@ -522,6 +530,16 @@ async function askCli(
     );
     return;
   }
+  // A value that leaves the workspace through a link is refused the same way, before the CLI reads
+  // its `[api].tls_cert_file` (BACKLOG #5411, #8237 item 24).
+  const escape = pathSettingLinkEscape("serviceConfig", setting);
+  if (escape !== undefined) {
+    engineLog().warn(
+      `${escape}. \`cert inventory\` was not run and no certificate it would name is trusted for ${url} ` +
+        "(a caFile pin in messagefoundry.environments still applies)",
+    );
+    return;
+  }
   if (cliRun !== undefined) {
     cliWanted = true;
     engineLog().warn("an earlier `cert inventory` run has not exited; not starting another");
@@ -534,7 +552,7 @@ async function askCli(
     // The path is workspace-relative (like every other messagefoundry.* path setting), so it runs
     // from the workspace the same way alertEditor.ts runs `alert list`.
     const call = runJson<unknown>(
-      ["cert", "inventory", "--service-config", setting.value],
+      ["cert", "inventory", `--service-config=${setting.value}`],
       workspace,
       { timeoutMs: CERT_INVENTORY_TIMEOUT_MS },
     );

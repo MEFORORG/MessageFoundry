@@ -10,7 +10,7 @@
 // a rule is remove + re-add. A change lands in the file immediately but the engine reads `[alerts]`
 // at startup, so it takes effect on the next engine restart (not via Promote/reload) — the UI says so.
 import * as vscode from "vscode";
-import { runJson, serviceConfig, workspaceDir, writerPathSetting } from "./cli";
+import { pathSettingLinkEscape, runJson, serviceConfigSetting, workspaceDir, writerPathSetting } from "./cli";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { ALERT_COOLDOWN_MAX_DAYS, ALERT_COOLDOWN_MAX_SECONDS, alertEditorScript } from "./alertEditorWebview";
 
@@ -91,8 +91,17 @@ async function refresh(current: vscode.WebviewPanel): Promise<void> {
   if (!ws) {
     return;
   }
+  // The file is handed to the CLI, so a value that leaves the workspace through a link is refused
+  // here as the writers below refuse it (BACKLOG #5411, #8237 item 24).
+  const setting = serviceConfigSetting();
+  const escape = pathSettingLinkEscape("serviceConfig", setting);
+  if (escape !== undefined) {
+    postToWebview(current.webview, { command: "error", message: escape });
+    return;
+  }
   try {
-    const rules = await runJson<Rule[]>(["alert", "list", "--service-config", serviceConfig()], ws);
+    // Bound with `=`, so a value that starts with `-` stays the flag's value.
+    const rules = await runJson<Rule[]>(["alert", "list", `--service-config=${setting.value}`], ws);
     postToWebview(current.webview, { command: "rules", rules });
   } catch (e) {
     postToWebview(current.webview, { command: "error", message: String(e) });
@@ -112,7 +121,7 @@ async function add(rule: NewRule, current: vscode.WebviewPanel): Promise<void> {
   }
   try {
     await runJson(
-      ["alert", "add", "--service-config", file, "--data", JSON.stringify(rule)],
+      ["alert", "add", `--service-config=${file}`, `--data=${JSON.stringify(rule)}`],
       ws,
     );
   } catch (e) {
@@ -145,7 +154,7 @@ async function remove(index: number, current: vscode.WebviewPanel): Promise<void
   }
   try {
     await runJson(
-      ["alert", "remove", "--service-config", file, "--index", String(index)],
+      ["alert", "remove", `--service-config=${file}`, `--index=${index}`],
       ws,
     );
   } catch (e) {
