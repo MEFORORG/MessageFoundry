@@ -6736,9 +6736,12 @@ revoked" when the id no longer matches, rather than reporting a revoke that did 
 
 A store restored from a backup brings back the whole store as it was when the backup was taken,
 accounts and sessions included. **The engine records a restore only when `messagefoundry restore`
-placed a SQLite store** (BACKLOG #2614). That command ends every session in the store it places
-and writes a marker into it, and the first `serve` on that store ends every session again, writes
-one `store_restored` audit row and raises a `store_restored` alert. The
+placed a SQLite store** (BACKLOG #2614). That command ends the unrevoked sessions it finds in the
+store it places, expired ones included, and writes a marker into it. The first `serve` on that
+store revokes again the sessions it finds and raises the global session epoch, writes one
+`store_restored` audit row and raises a `store_restored` alert. What both revokes may miss:
+*Limits of the session sweep* under
+[Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142). The
 [early-adopter guide](EARLY-ADOPTER-GUIDE.md#10-backup-restore--disaster-recovery) says what an
 operator sees, and what a restore rolls back.
 
