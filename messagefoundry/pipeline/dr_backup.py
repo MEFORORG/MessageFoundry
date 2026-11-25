@@ -445,8 +445,8 @@ class _HashingReader:
         # A read that is not bytes-like (None from a non-blocking source with nothing ready, or a
         # str) passes through unhashed. On the keyed branch the codec's own refusal then names it,
         # rather than a TypeError from the digest escaping the BackupCodecError arm. The no-key
-        # copies do not read through this class; they read through `_read_chunks`, which refuses
-        # such a read itself (BACKLOG #6687).
+        # restore copy reads this class through `_read_chunks`, and the pass-through is what lets
+        # `_NoneRefusingReader` refuse such a read there rather than the digest (BACKLOG #6687).
         if isinstance(data, (bytes, bytearray, memoryview)):
             self.digest.update(data)
         return data
@@ -466,30 +466,32 @@ def _read_chunks(src: _ChunkSource, what: str) -> Iterator[bytes]:
     """Yield ``src``'s bytes, one ``read`` of up to :data:`_COPY_CHUNK_BYTES` at a time, until an
     empty read, which is the end of the stream.
 
-    Each read goes through the codec's own ``_read_once``, so a single read is held to at least the
-    checks the keyed copies apply to each read: a ``None`` read, a read that is not bytes, and a
-    read over the size asked for are refused. It authenticates nothing and caps no total. A ``None``
-    read comes from a non-blocking source with no data ready, and a bare ``if not buf: break`` loop
-    reads it as the end of the stream and finishes the copy short (BACKLOG #6687). ``what`` names
-    the copy in the refusal. A blocking binary file answers each read with at most ``n`` bytes and
-    never ``None``, so for one this yields the same reads the old loops wrote.
-
-    The refusal is raised as an ``OSError`` (``EIO``) with the codec's error chained to it, so each
-    caller handles it as it handles any ``OSError`` from that copy, which the callers' own ``except``
-    arms define. A ``BackupCodecError`` would instead be reported as an encrypt or decrypt failure,
-    and a no-key copy does neither."""
+    Each read goes through :class:`_NoneRefusingReader`, which says what a single read is refused
+    for and how. It authenticates nothing and caps no total. ``what`` names the copy in the refusal.
+    A blocking binary file answers each read with at most ``n`` bytes and never ``None``, so for
+    one this yields the same reads the old loops wrote."""
     reader = _NoneRefusingReader(src, what)
     while buf := reader.read(_COPY_CHUNK_BYTES):
         yield buf
 
 
 class _NoneRefusingReader:
-    """A ``read`` over ``src`` held to the codec's ``_read_once`` checks. :func:`_read_chunks` reads
-    through it, and so does a reader such as ``shutil.copyfileobj`` that drives its own loop: a
-    ``None`` read, a read that is not bytes-like and a read over the size asked for are raised as
-    ``OSError`` (``EIO``) (BACKLOG #6687). A ``bytearray`` or ``memoryview`` read is returned as
-    ``bytes``. ``size`` must be positive: the io convention of a negative size for "read all" is
-    not supported."""
+    """A ``read`` over ``src`` held to the codec's ``_read_once`` checks, at least the ones the keyed
+    copies apply to each read. :func:`_read_chunks` reads through it, and so can a reader such as
+    ``shutil.copyfileobj`` that drives its own loop. A ``None`` read, a read that is not bytes-like
+    and a read over the size asked for are refused (BACKLOG #6687); a ``bytearray`` or
+    ``memoryview`` read is returned as ``bytes``. A ``None`` read comes from a non-blocking source
+    with no data ready, and a bare ``if not buf: break`` loop, or ``copyfileobj``, reads it as the
+    end of the stream and finishes the copy short.
+
+    The refusal is raised as an ``OSError`` (``EIO``) with the codec's error chained to it, so each
+    caller handles it as it handles any ``OSError`` from that copy, which the callers' own ``except``
+    arms define. A ``BackupCodecError`` would instead be reported as an encrypt or decrypt failure,
+    and a no-key copy does neither.
+
+    ``size`` must be positive. A negative size, the io convention for "read all", including the
+    no-argument ``read()``, is refused as a ``ValueError`` before any read, so a caller that expects
+    the whole stream from one call fails loudly rather than getting one chunk."""
 
     def __init__(self, src: _ChunkSource, what: str) -> None:
         self._src = src
@@ -497,7 +499,9 @@ class _NoneRefusingReader:
         # Kept for a reader that names its source, as a test seam on `copyfileobj` does.
         self.name: object = getattr(src, "name", "")
 
-    def read(self, size: int = _COPY_CHUNK_BYTES, /) -> bytes:
+    def read(self, size: int = -1, /) -> bytes:
+        if size < 0:
+            raise ValueError(f"the {self._what} is read in chunks: read(n) takes a positive n")
         try:
             return _read_once(cast(BinaryIO, self._src), size, self._what)
         except BackupCodecError as exc:

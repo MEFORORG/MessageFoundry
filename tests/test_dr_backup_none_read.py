@@ -3,15 +3,16 @@
 """BACKLOG #6687: a DR copy loop refuses a ``None`` read rather than reading it as end of stream.
 
 A non-blocking source answers ``None`` when it has nothing ready. A copy loop that stops on
-``if not buf: break`` ends the copy short there, and so does ``shutil.copyfileobj``. Six copies in
-``pipeline/dr_backup.py`` now read through :class:`dr_backup._NoneRefusingReader`, which reads
-through the codec's ``_read_once`` and so refuses a ``None`` read, as the keyed branch does. Five
-do so by way of :func:`dr_backup._read_chunks`: the no-key build, the plaintext verify, the
-config-member restore, ``_extract_member`` and the plaintext branch of ``_restore_blocking``. The
-sixth, the copy fallback of ``_place_restored_store``, hands the reader to ``shutil.copyfileobj``.
-The refusal is raised as an ``OSError``, so each site reports it the way it reports any ``OSError``
-in that copy; these tests drive each site and check that report, the last three against an
-``OSError`` read as the control. Reads in that module this branch does not change include at least
+``if not buf: break`` ends the copy short there, and so does ``shutil.copyfileobj``. The copies in
+``pipeline/dr_backup.py`` that read through :class:`dr_backup._NoneRefusingReader`, which reads
+through the codec's ``_read_once`` and so refuses a ``None`` read as the keyed branch does,
+include at least these. By way of :func:`dr_backup._read_chunks`: the no-key build, the plaintext
+verify, the config-member restore, ``_extract_member`` and the plaintext branch of
+``_restore_blocking``. Handed to ``shutil.copyfileobj``: the copy fallback of
+``_place_restored_store``. The refusal is raised as an ``OSError``, so each site reports it the way
+it reports any ``OSError`` in that copy. These tests drive each of those sites, the last four
+against an ``OSError`` read as the control; for the placement copy they check the ``OSError``
+``_place_restored_store`` raises, not the restore's report of it. Reads in that module this branch does not change include at least
 ``_sha256_file``, where a ``None`` read raises a ``TypeError`` from the hash rather than ending the
 read short, ``_looks_encrypted`` and ``_read_manifest_from_tar``. The sources are synthetic: a
 store with one made-up row, and a tar of made-up config bytes."""
@@ -418,8 +419,9 @@ def test_restore_reports_a_none_read_of_a_plaintext_archive_as_it_reports_an_ose
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
 ) -> None:
     """The plaintext branch of ``_restore_blocking`` copies the archive into the staged tar. A
-    ``None`` read there used to end the copy short, here at zero bytes, and the restore failed
-    later on an empty tar. It is now the ``restore`` refusal an ``OSError`` at that read is."""
+    ``None`` read there used to end the copy short: at zero bytes for ``none-read``, after the first
+    1 MiB for ``none-read-midway``, and the restore failed later on a short tar. It is now the
+    ``restore`` refusal an ``OSError`` at that read is."""
     archive = _plaintext_archive(tmp_path / "plain.mfbak")
     cls, text = _FAULTS[fault]
     wrapped = _wrap_open(monkeypatch, cls, Path(archive))
@@ -470,3 +472,29 @@ def test_the_placement_copy_still_copies_whole_from_a_blocking_reader(
     _refuse_links(monkeypatch)
     assert dr._place_restored_store(src, dest) == (len(payload), False)
     assert dest.read_bytes() == payload
+
+
+@pytest.mark.parametrize("script", [["not bytes"], [b"x" * 9]], ids=["str-read", "oversize-read"])
+def test_the_refusing_reader_refuses_a_read_that_is_not_bytes_or_over_the_size(
+    script: list[Any],
+) -> None:
+    """The reader's other per-read checks, which the placement copy also leans on."""
+    reader = dr._NoneRefusingReader(_Scripted(script), "staged store")
+    with pytest.raises(OSError) as caught:
+        reader.read(8)
+    assert caught.value.errno == errno.EIO
+    assert isinstance(caught.value.__cause__, BackupCodecError)
+
+
+@pytest.mark.parametrize("call", ["no-argument", "negative"])
+def test_the_refusing_reader_refuses_a_read_all_before_reading(call: str) -> None:
+    """A ``read()`` or ``read(-1)`` is refused with no read, rather than answered with one chunk or
+    with the whole source pulled into memory."""
+    src = _Scripted([b"synthetic"])
+    reader = dr._NoneRefusingReader(src, "staged store")
+    with pytest.raises(ValueError, match="positive"):
+        if call == "no-argument":
+            reader.read()
+        else:
+            reader.read(-1)
+    assert src.reads == 0
