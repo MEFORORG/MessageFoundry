@@ -65,10 +65,13 @@ def _sandbox_arm(r: ConnScaleRecord) -> str:
 
     Both come from the record's :class:`SandboxReading`: the mode the profile asked for, and the
     mode the engine's settings parser reads from the env the harness gave the step. Neither is
-    reported by the running engine.
+    reported by the running engine. A record with no reading, a batch-box record at least, reads as
+    ``not recorded``: its arm was never read, so no arm is named for it.
     """
     sb = r.sandbox
-    if sb is None or sb.effective == sb.requested:
+    if sb is None:
+        return "not recorded"
+    if sb.effective == sb.requested:
         return r.sandbox_mode
     if sb.effective is None:
         return f"{sb.requested} (its env did not parse)"

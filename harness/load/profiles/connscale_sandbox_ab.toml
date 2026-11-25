@@ -18,7 +18,7 @@
 # route, which must fail) is a separate step. Each step writes its graph into a generated config directory, so the worker builds the
 # engine's graph; the warm-up brings every worker up before the hold and records the first-delivery
 # latency beside [sandbox].startup_seconds; the `sandbox_workers` SLO fails a subprocess step that
-# did not start a process per driven inbound. That SLO is a FLOOR, not a per-inbound proof: on a
+# started fewer processes than driven inbounds. That SLO is a FLOOR, not a per-inbound proof: on a
 # Windows venv a worker tree is two processes, so workers on half the inbounds clear it. A passing
 # subprocess step is not, on its own, AC-2 evidence that every inbound had a worker; that proof is
 # deferred to ADR 0187's pool (BACKLOG #5090). A subprocess arm that cannot reach the top count is a
@@ -58,7 +58,7 @@ corpus_count_per_trigger = 20
 
 [connscale.slo]
 # Correctness gate only. The walls are recorded per arm, not graded: their values are host-variable.
-# The vs-N checks are not armed, and the profile loader refuses them beside a sandbox A/B: the
-# empty-claims checks group records without the sandbox arm, and fd_monotonic has no per-arm bound
-# that it compared each arm at least once.
+# The vs-N checks are not armed, and the profile loader refuses them beside a sandbox A/B: each
+# keeps each arm in its own lane, but none has a per-arm bound that it graded or compared each
+# arm at least once.
 zero_loss = true

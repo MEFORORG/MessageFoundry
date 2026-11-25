@@ -485,12 +485,35 @@ def test_the_ab_table_names_its_sandbox_arm_bug_5090() -> None:
     assert cmp.to_json_dict()["sandbox_arms"] == ["subprocess"]
 
 
+def test_a_record_with_no_sandbox_reading_names_no_arm_bug_5090() -> None:
+    # A record with no SandboxReading (a batch-box record) once read as "sandbox: off", an arm nobody
+    # read. It reads as not recorded.
+    recs = [
+        _record(claim_mode="per_lane", count=500, achieved_read=400.0, idle_poll=100.0),
+        _record(claim_mode="pooled", count=500, achieved_read=400.0, idle_poll=0.0),
+    ]
+    cmp = build_comparison(recs, ("per_lane", "pooled"))
+    assert cmp is not None
+    assert cmp.sandbox_arms == ("not recorded",)
+    assert "\nsandbox: not recorded\n" in cmp.render_table()
+    assert "sandbox: off" not in cmp.render_table()
+
+
+_OFF = SandboxReading(requested="off", effective="off", startup_seconds=None)
+
+
 def test_records_from_two_sandbox_arms_fail_the_ab_rather_than_pool_bug_5090() -> None:
     # No cell is keyed on the sandbox arm, so two arms' records would pool into one cell. A profile
     # cannot produce this (a sandbox A/B composes with no other), so the comparison refuses it.
     recs = [
-        _record(claim_mode="per_lane", count=500, achieved_read=400.0, idle_poll=100.0),
-        _record(claim_mode="pooled", count=500, achieved_read=400.0, idle_poll=0.0),
+        dataclasses.replace(
+            _record(claim_mode="per_lane", count=500, achieved_read=400.0, idle_poll=100.0),
+            sandbox=_OFF,
+        ),
+        dataclasses.replace(
+            _record(claim_mode="pooled", count=500, achieved_read=400.0, idle_poll=0.0),
+            sandbox=_OFF,
+        ),
         dataclasses.replace(
             _record(claim_mode="per_lane", count=500, achieved_read=400.0, idle_poll=100.0),
             sandbox=_SUBPROCESS,

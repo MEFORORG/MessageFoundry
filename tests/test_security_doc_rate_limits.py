@@ -1992,7 +1992,8 @@ def test_every_sliding_window_limiter_is_filed_under_the_right_requirement() -> 
 
     ``allow_login_attempt``/``allow_reauth_attempt``/``allow_repeated_credential_audit``/
     ``allow_step_up_return_audit`` defend the AUTHENTICATION surface (6.1.1);
-    ``allow_phi_read``/``allow_admin_write`` are post-authentication business-logic limits (2.1.3).
+    ``allow_phi_read``/``allow_admin_write``/``allow_monitoring_read`` are post-authentication
+    business-logic limits (2.1.3).
     The split is asserted, so a new accessor forces an explicit decision rather than silently
     inheriting one table's coverage claim.
     """

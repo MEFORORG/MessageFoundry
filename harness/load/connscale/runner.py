@@ -2969,7 +2969,7 @@ def _sandbox_workers_slo(records: list[ConnScaleRecord]) -> SloCheck:
     observed = "; ".join(problems) if problems else f"ok ({graded} subprocess step(s) graded)"
     return SloCheck(
         "sandbox_workers",
-        "the asked-for mode runs; subprocess starts >= 1 process per driven inbound "
+        "the asked-for mode runs; subprocess starts no fewer processes than driven inbounds "
         "(a floor, not a per-inbound proof: deferred to ADR 0187)",
         observed,
         not problems,
