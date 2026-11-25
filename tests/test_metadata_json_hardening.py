@@ -25,7 +25,6 @@ from messagefoundry.store import OutboxStatus, Stage
 from messagefoundry.store import metadata as metadata_module
 from messagefoundry.store.cell_tag import message_cell_aad
 from messagefoundry.store.metadata import (
-    MetadataNotJsonError,
     MetadataTooDeepError,
     decode_response_headers,
     encode_reference_value,
@@ -280,19 +279,15 @@ async def test_a_dynamic_headers_read_faults_rather_than_proceeding_without_head
     ],
     ids=["default-continue", "stop"],
 )
-@pytest.mark.parametrize(
-    "cell", [_DEEP_CELL, '{"user": {"k": NaN}}'], ids=["too-deep", "non-finite"]
-)
-async def test_the_delivery_worker_takes_an_unreadable_bag_on_its_internal_error_arm(
+async def test_the_delivery_worker_takes_a_too_deep_bag_on_its_internal_error_arm(
     tmp_path: Path,
-    cell: str,
     policy: InternalErrorPolicy | None,
     outcome: _ItemOutcome,
     status: OutboxStatus,
 ) -> None:
-    """BACKLOG #6712 item 17: the worker's handling of the refusal, pinned. Nothing is sent; the
-    default policy dead-letters the row and ``stop`` halts the lane with the row kept pending.
-    Control: an intact cell on the same runner delivers its headers."""
+    """BACKLOG #6712 item 17: the worker's handling of ``MetadataTooDeepError``, pinned as main
+    behaves. Nothing is sent; the default policy dead-letters the row and ``stop`` halts the lane
+    with the row kept pending. Control: an intact cell on the same runner delivers its headers."""
     store = await MessageStore.open(tmp_path / "worker.db")
     try:
         sender = _Sender(consumes_metadata=True)
@@ -311,7 +306,7 @@ async def test_the_delivery_worker_takes_an_unreadable_bag_on_its_internal_error
         assert sender.metadata == [{"X-Synth": "v1"}]
 
         mid = await store.enqueue_message(
-            channel_id="IB", raw=raw, deliveries=[(DEST, raw)], metadata=cell, now=101.0
+            channel_id="IB", raw=raw, deliveries=[(DEST, raw)], metadata=_DEEP_CELL, now=101.0
         )
         item = await store.claim_next_fifo(DEST)
         assert item is not None and item.message_id == mid
@@ -333,34 +328,6 @@ def test_merge_user_metadata_refuses_when_existing_will_not_re_encode(
     with pytest.raises(MetadataTooDeepError, match="re-encode") as info:
         merge_user_metadata(stored, [("k", "v")])
     assert info.value.__context__ is None
-
-
-@pytest.mark.parametrize("token", ["NaN", "Infinity", "-Infinity"])
-def test_user_metadata_refuses_a_bag_holding_a_non_finite_number(token: str) -> None:
-    """BACKLOG #6711 item 5: json.loads accepts the bare token, and re-encoding with json's default
-    wrote it back, so the API's metadata field carried text that is not JSON. Refused, unchained,
-    content-free, and not a ValueError, as a too-deep bag is."""
-    stored = '{"correlation_id": "c", "user": {"k": ' + token + ', "j": "SYNTHETIC-5550199"}}'
-    with pytest.raises(MetadataNotJsonError) as info:
-        user_metadata(stored)
-    assert info.value.__cause__ is None and info.value.__context__ is None
-    assert "SYNTHETIC" not in str(info.value) and token not in str(info.value)
-    assert not isinstance(info.value, ValueError)
-
-
-def test_a_finite_user_bag_still_reads_as_strict_json() -> None:
-    """Control: an ordinary bag reads byte-identical, and a strict reader accepts it."""
-    stored = json.dumps({"correlation_id": "c", "user": {"k": "v", "n": 1.5}})
-    out = user_metadata(stored)
-    assert out == json.dumps({"k": "v", "n": 1.5})
-    assert _strict_loads(out) == {"k": "v", "n": 1.5}
-
-
-def test_merge_user_metadata_still_writes_a_non_finite_bag_back() -> None:
-    """The merge keeps the stored cell's other keys; refusing here would fault the handoff."""
-    stored = '{"correlation_id": "c", "user": {"k": NaN}}'
-    merged = merge_user_metadata(stored, [("j", "v")])
-    assert merged == '{"correlation_id": "c", "user": {"k": NaN, "j": "v"}}'
 
 
 def test_a_non_text_cell_reads_as_empty_and_is_logged(caplog: pytest.LogCaptureFixture) -> None:

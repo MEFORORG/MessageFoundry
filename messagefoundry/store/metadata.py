@@ -211,30 +211,16 @@ def _load_object(
     return value if isinstance(value, dict) else {}
 
 
-class MetadataNotJsonError(RuntimeError):
-    """A stored user bag that decodes but holds a non-finite float (a ``NaN`` or ``Infinity``
-    token), which strict JSON cannot carry (BACKLOG #6711). A ``RuntimeError`` for the reason
-    :class:`MetadataTooDeepError` is one. Carries no content."""
-
-
-def _dumps_or_raise(value: Any, *, strict: bool = False) -> str:
+def _dumps_or_raise(value: Any) -> str:
     """``json.dumps(value)``, or :class:`MetadataTooDeepError` when json's encoder hits its depth
     limit, raised outside the handler so nothing is chained.
 
     The encoder's limit sits below the decoder's, so an object :func:`_load_object` read can still
-    be too deep to write back (BACKLOG #6712). With ``strict``, a non-finite float raises
-    :class:`MetadataNotJsonError` instead of being written as a bare ``NaN`` token, the same way."""
-    not_json = False
+    be too deep to write back (BACKLOG #6712)."""
     try:
-        return json.dumps(value, allow_nan=not strict)
+        return json.dumps(value)
     except RecursionError:
         pass
-    except ValueError:
-        # Only allow_nan=False makes json raise ValueError for a decoded bag: json.loads already
-        # refused an oversized int, and a decoded value cannot be circular.
-        not_json = True
-    if not_json:
-        raise MetadataNotJsonError("a stored user metadata bag holds a non-finite number")
     raise MetadataTooDeepError("a stored metadata cell is too deeply nested to re-encode")
 
 
@@ -316,12 +302,8 @@ def user_metadata(metadata_json: StoredJson, *, row_id: object = None) -> str | 
     worker takes it on its internal-error arm (``InternalErrorPolicy``). The API's message summary
     takes it too, so one such cell fails the whole response it is on, as json's ``RecursionError``
     did before: at least ``GET /messages``, ``GET`` and ``POST /messages/search``,
-    ``GET /search/layered`` and ``GET /messages/{message_id}``.
-
-    A bag holding a ``NaN`` or ``Infinity`` raises :class:`MetadataNotJsonError` at the same
-    callers, rather than returning text that is not JSON (BACKLOG #6711). ``SetMeta`` writes string
-    values, so no engine write produces such a bag."""
+    ``GET /search/layered`` and ``GET /messages/{message_id}``."""
     user = _load_object(metadata_json, row_id=row_id).get("user")
     if not isinstance(user, dict) or not user:
         return None
-    return _dumps_or_raise(user, strict=True)
+    return _dumps_or_raise(user)
