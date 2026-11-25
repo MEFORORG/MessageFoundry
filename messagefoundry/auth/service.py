@@ -2800,9 +2800,9 @@ def _in_directory_sign_in_queue[**P](
 
 
 #: How many times a directory sign-in tries its compare-and-set scope write before it fails
-#: (BACKLOG #6887). A miss on a row still there means another writer committed in between: a
-#: different scope or source, or, on SQLite, whose guard is the seal compare, a change to any column.
-#: A bound this small is reached only by a row other writers keep moving.
+#: (BACKLOG #6887). A miss on a row still there means another writer committed in between; what
+#: counts as a change differs per backend, and ``AuthStore.set_ad_channel_scope_if_unchanged``
+#: states it. A bound this small is reached only by a row other writers keep moving.
 _AD_SCOPE_WRITE_ATTEMPTS: Final = 3
 
 
@@ -2828,7 +2828,9 @@ class _AdChannelScopeRefused(Exception):
 
     Raised by :meth:`AuthService._sync_ad_channel_scope` and left to propagate, so the sign-in
     fails and mints no session, as :class:`_AdChannelScopeContended` does. ``reason`` is the
-    closed-set slug the role write's refusal would carry for the same row."""
+    closed-set slug the role write's refusal carries for a gone, sealed-out, disabled or locked
+    row. Unlike the role write's re-read, this one does not judge the federated binding, so it
+    never carries ``FEDERATED_SIGN_IN_REQUIRED``; the session insert's guard judges that."""
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -9226,7 +9228,9 @@ class AuthService:
         for as long as the account existed.
 
         **BOTH WRITES ARE COMPARE-AND-SETS ON WHAT THE DECISION READ**: the withdrawal on the scope,
-        the grant on the scope and its source. ``user`` was read several awaits earlier, and the
+        the grant on the scope and its source. How far the compare holds against another process
+        differs per backend, and ``AuthStore.set_ad_channel_scope_if_unchanged`` states it; on a
+        keyless SQLite store it does not. ``user`` was read several awaits earlier, and the
         per-process sign-in queue orders neither a sign-in on another engine shard nor an
         administrator's write. Before BACKLOG #6887 the grant was written unconditionally, so a
         sign-in that read the scope before a concurrent one replaced it judged ``changes`` against

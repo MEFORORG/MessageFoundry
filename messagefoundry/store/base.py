@@ -3274,9 +3274,13 @@ class AuthStore(Protocol):
         reads the row, compares in Python, and writes with a compare on the seal it read, so a row
         changed after the read writes nothing and this returns ``False``. Postgres and SQL Server
         also read the row under a lock held to the write (``FOR UPDATE``, ``UPDLOCK, ROWLOCK``), so
-        there the seal compare is a second guard. SQLite's read takes no lock against another
-        process, so there the seal compare in the ``UPDATE`` is the guard; a row changed in ANY
-        column after the read loses it too, and the caller reads that as a miss."""
+        there the seal compare is a second guard. On SQLite the writer lock holds the read and the
+        write together within one process, but the read takes no lock against ANOTHER process
+        writing the same file. Across processes the only guard there is the seal compare in the
+        ``UPDATE``, and only under a row sealer: with one, a row changed in any column after the
+        read loses the compare, and the caller reads that as a miss. A keyless store writes an
+        empty seal on every row, so the compare always matches and nothing stops another
+        process's write landing between this read and this write."""
         ...
 
     async def set_user_federated_subject(
