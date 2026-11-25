@@ -454,3 +454,35 @@ def test_batch_facts_count_every_state() -> None:
     assert rows["batch_progress.batches_free"]["value"] == 3
     assert rows["batch_progress.batches_done"]["value"] == 0
     assert "workbook saved Tue Nov 24, 2026, 7:00 AM CST" in rows["batch_progress"]["note"]
+
+
+def test_batch_facts_count_an_unlisted_state_as_other() -> None:
+    data = {
+        "metrics": [
+            {
+                "id": "batch_progress",
+                "value": 1.0,
+                "detail": {"batches_by_state": {"FREE": 1, "PARKED": 2}},
+            }
+        ]
+    }
+    rows = {r["id"]: r for r in tr.metric_rows(tr.Snapshot(data))}
+    assert rows["batch_progress.batches_other"]["value"] == 2
+
+
+def test_series_rows_carry_the_ledger_history() -> None:
+    data = {
+        "weeks": ["2026-W46", "2026-W47"],
+        "metrics": [
+            {
+                "id": "backlog_burn",
+                "detail": {
+                    "history": [{"week": "2026-W46", "filed": 4, "closed": 3}],
+                    "open_series": [{"week": "2026-W46", "value": 13}],
+                },
+            }
+        ],
+    }
+    rows = [r for r in tr.series_rows(tr.Snapshot(data)) if r["week"] == "2026-W46"]
+    got = {r["series"]: r["value"] for r in rows}
+    assert got == {"Filed, all weeks": 4, "Closed, all weeks": 3, "Open rows": 13}

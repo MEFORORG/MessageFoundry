@@ -1511,3 +1511,24 @@ def test_the_vendored_defusedxml_is_where_the_refresh_archives_it() -> None:
     refresh = (_PATH.parent / "scheduled-refresh.ps1").read_text(encoding="utf-8")
     rel = cm.DEFUSEDXML_DIR.relative_to(cm.ENGINE_ROOT).as_posix()
     assert f"'{rel}'" in refresh
+
+
+def test_burn_history_is_capped_at_its_maximum() -> None:
+    # One mistyped year must not stretch the history across decades.
+    weeks = {"0026-W45": {"filed": 1}, "2026-W47": {"filed": 2}}
+    hist = cm.burn_history(weeks, "2026-W47")
+    assert hist[0]["week"] == "2026-W47" and len(hist) == 1
+    oldest = cm.iso_week(dt.date(2026, 11, 16) - dt.timedelta(weeks=cm.HISTORY_MAX_WEEKS - 1))
+    weeks = {oldest: {"filed": 1}, "2026-W47": {"filed": 2}}
+    hist = cm.burn_history(weeks, "2026-W47")
+    assert len(hist) == cm.HISTORY_MAX_WEEKS and hist[0]["week"] == oldest
+
+
+def test_xlsx_cells_without_a_reference_follow_the_previous_cell() -> None:
+    rows = cm.xlsx_sheet_rows(
+        _xlsx(
+            '<row><c t="inlineStr"><is><t>a</t></is></c><c r="C1"><v>3</v></c><c><v>4</v></c></row>'
+        ),
+        "Batch queue",
+    )
+    assert rows == [["a", "", "3", "4"]]

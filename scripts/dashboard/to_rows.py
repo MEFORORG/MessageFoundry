@@ -281,6 +281,14 @@ def ledger_history(snap: Snapshot) -> list[dict[str, Any]]:
 BATCH_STATES = ("FREE", "IN PROGRESS", "QUIET", "NO BUILDER", "BUILT", "MERGED", "DONE")
 
 
+def _other_batches(d: dict[str, Any]) -> Any:
+    """Batches in a state the list above does not name, so the breakdown always sums."""
+    by = d.get("batches_by_state")
+    if not isinstance(by, dict):
+        return None
+    return sum(int(n) for s, n in by.items() if s not in BATCH_STATES)
+
+
 def _batches(state: str) -> Callable[[dict[str, Any]], Any]:
     def read(d: dict[str, Any]) -> Any:
         by = d.get("batches_by_state")
@@ -394,6 +402,7 @@ def facts(weeks: int) -> list[Fact]:
             )
             for s in BATCH_STATES
         ],
+        ("batch_progress", "batches_other", "Other state", _other_batches),
     ]
 
 
@@ -495,7 +504,20 @@ def series_rows(snap: Snapshot) -> list[dict[str, Any]]:
     for repo, name in repo_series():
         add(name, per_repo.get(repo))
     add("CI pass %", snap.by_id.get("ci_main", {}).get("series"))
+    # The whole ledger history the page's ranged charts and burndown draw, so the row files carry
+    # everything the page shows.
+    hist = ledger_history(snap)
+    for name, key in HISTORY_SERIES:
+        add(name, [{"week": p["week"], "value": p[key]} for p in hist])
     return rows
+
+
+#: ``(series name, ledger_history key)`` for the history series rows.
+HISTORY_SERIES = (
+    ("Filed, all weeks", "filed"),
+    ("Closed, all weeks", "closed"),
+    ("Open rows", "open"),
+)
 
 
 def meta(src: Path, snap: Snapshot) -> list[dict[str, Any]]:

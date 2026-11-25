@@ -361,3 +361,16 @@ def test_an_info_status_is_a_progress_pill() -> None:
     page = rh.render(snap)
     assert '<span class="pill info">info</span>' in page
     assert "1 progress only" in page
+
+
+def test_a_burndown_with_no_open_series_says_no_data() -> None:
+    page = rh.render(_snapshot())
+    card = page[page.index("<h2>Backlog burndown</h2>") :]
+    assert '<p class="nodata">no data</p>' in card[: card.index("</section>")]
+
+
+def test_provenance_lines_keep_their_own_semicolons() -> None:
+    snap = _snapshot()
+    snap["metrics"][3]["detail"]["provenance"] = ["# engine: freshness=STALE; behind=3"]
+    page = rh.render(snap)
+    assert "# engine: freshness=STALE; behind=3</p>" in page

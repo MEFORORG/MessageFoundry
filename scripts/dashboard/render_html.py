@@ -436,14 +436,17 @@ def short_pair(pair: str) -> str:
     return _SHA.sub(r"\1", pair)
 
 
-def tile(row: Mapping[str, Any], facts: Sequence[Mapping[str, Any]]) -> str:
+def tile(
+    row: Mapping[str, Any],
+    facts: Sequence[Mapping[str, Any]],
+    provenance_lines: Sequence[str] = (),
+) -> str:
     status = _status(row.get("status"))
     unit = str(row.get("unit") or "")
     shown_unit = "" if unit == "percent" else unit
     # The scorecard tool's provenance lines say where it ran, not what it measured: they go in the
     # disclosure with the full ref pair, never in the facts list.
     shown = [f for f in facts if not str(f.get("id", "")).endswith(".provenance")]
-    provenance = [f for f in facts if str(f.get("id", "")).endswith(".provenance")]
     dl = "".join(f"<dt>{esc(f.get('label', ''))}</dt><dd>{fmt(f.get('value'))}</dd>" for f in shown)
     error = row.get("error")
     note = f'<p class="note">{esc(row["note"])}</p>' if row.get("note") else ""
@@ -452,12 +455,12 @@ def tile(row: Mapping[str, Any], facts: Sequence[Mapping[str, Any]]) -> str:
         # The ASVS ref pair sits beside the value it qualifies, never only in a footnote.
         lines = [
             f'<p>Collector ref pair:</p><p class="mono">{esc(row["ref"])}</p>',
-            *(
+            (
                 '<p>Scorecard tool provenance:</p><p class="mono">'
-                + "<br>".join(esc(ln) for ln in str(f.get("value") or "").split("; ") if ln)
+                + "<br>".join(esc(ln) for ln in provenance_lines)
                 + "</p>"
-                for f in provenance
-                if f.get("value")
+                if provenance_lines
+                else ""
             ),
             f"<p>{esc(row['note'])}</p>" if row.get("note") else "",
         ]
@@ -491,14 +494,12 @@ def _points(series: Sequence[Mapping[str, Any]], name: str) -> dict[str, Any]:
 
 def ledger_charts(snap: tr.Snapshot, series: Sequence[Mapping[str, Any]]) -> tuple[str, str]:
     """The ranged filed-and-closed chart (log axis) and the burndown, with the range controls."""
-    hist = tr.ledger_history(snap)
-    weeks = [str(p["week"]) for p in hist]
+    names = [name for name, _ in tr.HISTORY_SERIES]
+    hist = [r for r in series if r.get("series") in names]
+    weeks = sorted({str(r["week"]) for r in hist})
     if weeks:
-        filed = {str(p["week"]): p.get("filed") for p in hist}
-        closed = {str(p["week"]): p.get("closed") for p in hist}
-        opened = {str(p["week"]): p.get("open") for p in hist}
-        last_full = snap.last_full_week or (weeks[-2] if len(weeks) >= 2 else "")
-        partial = {w for w in weeks if w > last_full}
+        filed, closed, opened = (_points(hist, name) for name in names)
+        partial = {str(r["week"]) for r in hist if r.get("partial")}
     else:
         # A snapshot from before the history was collected: its window alone, as before.
         weeks = list(snap.weeks)
@@ -534,6 +535,7 @@ def ledger_charts(snap: tr.Snapshot, series: Sequence[Mapping[str, Any]]) -> tup
         '<section class="chart"><h2>Backlog burndown</h2>'
         + ranged(options, down)
         + legend([("Open rows", "s3")])
+        + ("" if any(_number(v) for v in opened.values()) else '<p class="nodata">no data</p>')
         + '<p class="note">Open rows at the end of each week, worked back from the count at run '
         "time through each week's filed and closed rows."
         + (f" {esc(forecast)}" if forecast else "")
@@ -576,7 +578,12 @@ def render(data: dict[str, Any]) -> str:
         reference=ci_bar,
         unit="%",
     )
-    tiles = "".join(tile(r, by_metric.get(str(r["id"]), [])) for r in headline)
+    raw_lines = snap.detail("asvs").get("provenance")
+    lines = [str(ln) for ln in raw_lines if str(ln).strip()] if isinstance(raw_lines, list) else []
+    tiles = "".join(
+        tile(r, by_metric.get(str(r["id"]), []), lines if r["id"] == "asvs" else ())
+        for r in headline
+    )
     if not tiles:
         tiles = '<p class="nodata">no data: the snapshot holds no metrics</p>'
     generated = data.get("generated_at")
@@ -601,7 +608,7 @@ def render(data: dict[str, Any]) -> str:
 <main>
 <h1>Project progress</h1>
 <p class="stamp">{stamp_html}</p>
-<p class="lede">{lede(headline)} Window {esc(window)}, through {esc(data.get("through") or "unknown")}.</p>
+<p class="lede">{lede(headline)} Window {esc(window)}, through {esc(data.get("through") or "unknown")} (UTC).</p>
 <div class="tiles">{tiles}</div>
 {ledger}
 <section class="chart"><h2>Pull requests merged per week</h2>{merged}

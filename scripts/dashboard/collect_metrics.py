@@ -185,6 +185,10 @@ THRESHOLDS: dict[str, dict[str, float]] = {
     "backlog_forecast": {"good_weeks": 13, "warn_weeks": 52},
 }
 
+#: The most weeks of ledger history kept: a mistyped year on one ledger date must not stretch the
+#: history, and the page's charts, across decades.
+HISTORY_MAX_WEEKS = 104
+
 #: The full weeks the backlog forecast averages over, and a shorter, more recent read beside it.
 FORECAST_WEEKS = 4
 FORECAST_SHORT_WEEKS = 2
@@ -287,9 +291,16 @@ def week_after(label: str) -> str:
 
 def burn_history(weeks: Mapping[str, Mapping[str, int]], last: str) -> list[dict[str, Any]]:
     """Filed and closed rows for every ISO week from the census's first dated week through
-    ``last``, oldest first, a week with no activity zero-filled. A key that is no week label (the
-    after-through bucket) is left out."""
-    dated = sorted(w for w in weeks if _ISO_WEEK.fullmatch(w) and w <= last)
+    ``last``, oldest first, a week with no activity zero-filled, and at most
+    :data:`HISTORY_MAX_WEEKS` weeks. A key that is no week label (the after-through bucket) is left
+    out."""
+    m = _ISO_WEEK.fullmatch(last)
+    if m is None:
+        raise CollectError(f"{last!r} is not an ISO week label")
+    floor = iso_week(
+        dt.date.fromisocalendar(int(m[1]), int(m[2]), 1) - dt.timedelta(weeks=HISTORY_MAX_WEEKS - 1)
+    )
+    dated = sorted(w for w in weeks if _ISO_WEEK.fullmatch(w) and floor <= w <= last)
     out: list[dict[str, Any]] = []
     week = dated[0] if dated else last
     while week <= last:
@@ -1459,7 +1470,11 @@ def xlsx_sheet_rows(data: bytes, sheet: str) -> list[list[str]]:
     rows: list[list[str]] = []
     for row in root.iterfind("m:sheetData/m:row", ns):
         cells: dict[int, str] = {}
+        col = -1
         for c in row.iterfind("m:c", ns):
+            # OOXML makes a cell's reference optional; one without it follows the previous cell.
+            ref = c.get("r")
+            col = _col_index(ref) if ref else col + 1
             kind = c.get("t")
             if kind == "inlineStr":
                 text = "".join(t.text or "" for t in c.iter(text_tag))
@@ -1471,7 +1486,7 @@ def xlsx_sheet_rows(data: bytes, sheet: str) -> list[list[str]]:
                         text = shared[int(text)]
                     except (ValueError, IndexError):
                         raise CollectError(f"cell {c.get('r')} names no shared string") from None
-            cells[_col_index(c.get("r") or "")] = text
+            cells[col] = text
         rows.append([cells.get(i, "") for i in range(max(cells, default=-1) + 1)])
     return rows
 
