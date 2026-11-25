@@ -1205,6 +1205,10 @@ _REFINED_ONLY_WALK = 'echo "$((find /proc) )"'
 #: The line in the guard that lets `Add-RefinedBounds` build the refined view.
 _REFINED_VIEW_GATE = "        if (-not $refinedPending.Value) { return $false }"
 
+#: The line in the guard that lets `Add-SiteBounds` read the per-site texts, which run after the
+#: refined view and would otherwise deny the timed shape once that view is switched off.
+_SITE_PASS_GATE = "        if (-not $sitePending.Value) { return $false }"
+
 
 def _arithmetic_command(sites: int) -> str:
     return 'echo "find"; ' + "(( 1 )); " * sites + _REFINED_ONLY_WALK
@@ -1575,10 +1579,14 @@ def test_the_timing_driver_reads_a_command_as_the_hook_does(
     payloads = [json.dumps(bash(row)) for row in rows]
     source = GUARD.read_text(encoding="utf-8")
     assert source.count(_REFINED_VIEW_GATE) == 1, "the refined view's gate moved; re-anchor it"
+    assert source.count(_SITE_PASS_GATE) == 1, "the per-site pass's gate moved; re-anchor it"
     with tempfile.TemporaryDirectory() as tmp:
         unrefined = Path(tmp) / "unrefined.ps1"
         unrefined.write_text(
-            source.replace(_REFINED_VIEW_GATE, "        return $false"), encoding="utf-8"
+            source.replace(_REFINED_VIEW_GATE, "        return $false").replace(
+                _SITE_PASS_GATE, "        return $false"
+            ),
+            encoding="utf-8",
         )
         real = timing_driver.run(GUARD, payloads, [0, 1], warm=(), floor=0)
         without = timing_driver.run(unrefined, payloads[:1], [0], warm=(), floor=0)
