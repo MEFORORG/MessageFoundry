@@ -20,11 +20,21 @@ on 2575, signs in as a per-run rig Administrator, and reads the message's dispos
 
 - Exit 0 prints `PASS e2e smoke`. Exit 1 prints `FAIL <step>: <reason>` on stderr, the step one
   of `message`, `ports`, `checkout`, `provision`, `serve`, `sign-in`, `ready`, `mllp`,
-  `disposition`. A `serve` or `ready` failure also prints the engine log's tail.
+  `disposition`, or `teardown`. An unforeseen error prints its type and message after the step it
+  escaped. A `serve` or `ready` failure also prints the engine log's tail. An installed harness, with
+  no checkout around it, fails `message` at once unless `--config`, `--message` and
+  `--project-root` are passed.
 - `FAIL checkout` means the venv imports `messagefoundry` from another checkout, so the engine
   would not run your change. Run `scripts\worktree\ensure-venv.ps1` in this worktree.
-- `FAIL ports` means something already holds 2575, often another engine. Stop it, or point the
-  run at your own graph: `--config <dir> --inbound <name> --mllp-port <port>`.
+- `FAIL ports` means something already holds 2575, often another session's engine. Find out
+  whose process it is first (PowerShell: `Get-NetTCPConnection -LocalPort 2575 -State Listen`,
+  then `Get-Process -Id <OwningProcess>`; POSIX: `lsof -iTCP:2575 -sTCP:LISTEN`). Stop it only if
+  your own session started it: never kill another session's engine. `--mllp-port` alone does not
+  move the sample inbound, whose port is fixed at 2575 in `samples/config/adt.py`; to run beside the
+  holder, point the smoke at a graph whose inbound listens elsewhere:
+  `--config <dir> --inbound <name> --mllp-port <port>`. Otherwise report the held port and stop.
+- `FAIL teardown` names an error while the engine was being stopped; check for a leftover engine
+  process and temp directory (`mefor-e2e-smoke-*`).
 - `--expect unrouted|filtered|not_deployed|error` asserts another final disposition (`error`
   only after the ACK: a NAKed message fails `mllp`); `--message <file>` sends
   another file. Synthetic HL7 only.

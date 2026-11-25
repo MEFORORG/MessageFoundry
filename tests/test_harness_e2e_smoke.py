@@ -386,3 +386,113 @@ def test_a_ctrl_c_during_teardown_is_held_until_it_finishes(
     assert len(removed) == 1
     assert not removed[0].exists()
     assert signal.getsignal(signal.SIGINT) is before
+
+
+def test_a_running_inbound_that_reports_no_port_is_ready_on_its_name() -> None:
+    """An inbound whose port comes from ``env()`` reports none; its name and status are the word."""
+    client: Any = SimpleNamespace(
+        connections=lambda: [
+            SimpleNamespace(role="source", channel_id="IB_E2E_ADT", status="running", port=None)
+        ]
+    )
+    reported = e2e_smoke._wait_inbound(
+        client,
+        _Proc(),  # type: ignore[arg-type]
+        inbound="IB_E2E_ADT",
+        mllp_port=2575,
+        deadline=time.monotonic() + 30,
+    )
+    assert reported is None
+
+
+def test_a_signal_held_by_a_block_that_raises_still_ends_the_run() -> None:
+    state = e2e_smoke._SignalState()
+    with pytest.raises(SystemExit) as exited, state.held():
+        state.handle(signal.SIGTERM, None)
+        raise RuntimeError("the block failed")
+    assert exited.value.code == 128 + signal.SIGTERM
+    assert state.pending is None
+    assert not state.holding
+
+
+def test_stop_warns_when_the_engine_outlives_its_kill(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(e2e_smoke, "ADOPT_NEW_SESSION", False)
+
+    class _Refusing(_Proc):
+        def terminate(self) -> None:
+            raise PermissionError("refused")
+
+        def kill(self) -> None:
+            raise PermissionError("refused")
+
+    e2e_smoke._stop(_Refusing(), None)  # type: ignore[arg-type]
+    assert "WARNING the engine (pid 424242) did not stop" in capsys.readouterr().err
+
+
+def test_a_failing_stop_still_removes_the_temp_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    removed: list[Path] = []
+
+    def fail_stop(proc: object, job: object) -> None:
+        raise OSError("stop failed")
+
+    def fake_start(argv: object, **_: object) -> tuple[_Proc, None]:
+        return _Proc(), None
+
+    def refuse_api(*_: object) -> None:
+        raise e2e_smoke.StepFailed("serve", "planted")
+
+    monkeypatch.setattr(e2e_smoke, "_check_checkout", lambda env, work: work)
+    monkeypatch.setattr(rigadmin, "provision", lambda **_: True)
+    monkeypatch.setattr(e2e_smoke, "_start", fake_start)
+    monkeypatch.setattr(e2e_smoke, "_wait_api", refuse_api)
+    monkeypatch.setattr(e2e_smoke, "_stop", fail_stop)
+    monkeypatch.setattr(e2e_smoke, "_remove", removed.append)
+    config, port = _config(tmp_path, _DANGLING_ROUTER)
+    with pytest.raises(OSError, match="stop failed"):
+        e2e_smoke.run(
+            config=config,
+            message_file=e2e_smoke._DEFAULT_MESSAGE,
+            inbound="IB_E2E_ADT",
+            mllp_port=port,
+            expect="processed",
+            timeout=1.0,
+        )
+    assert len(removed) == 1
+
+
+def test_an_unforeseen_error_ends_in_a_fail_line_naming_the_step(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    def broken_check(env: object, work: object) -> Path:
+        raise ValueError("bad\x1b[2Jvalue")
+
+    monkeypatch.setattr(e2e_smoke, "_check_checkout", broken_check)
+    config, port = _config(tmp_path, _DANGLING_ROUTER)
+    code = e2e_smoke.main(["--config", str(config), "--mllp-port", str(port)])
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "FAIL checkout: ValueError: bad" in err
+    assert "\x1b" not in err
+
+
+def test_an_installed_harness_names_the_missing_defaults(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """Installed, the repo-relative defaults point into site-packages, where samples/ is not."""
+    site = tmp_path / "site-packages"
+    monkeypatch.setattr(e2e_smoke, "_REPO", site)
+    monkeypatch.setattr(e2e_smoke, "_DEFAULT_CONFIG", site / "samples" / "config")
+    monkeypatch.setattr(e2e_smoke, "_DEFAULT_MESSAGE", site / "samples" / "messages" / "a.hl7")
+    monkeypatch.setattr(e2e_smoke, "_DEFAULT_ENVIRONMENTS", site / "environments")
+    monkeypatch.setattr(e2e_smoke, "run", lambda **_: pytest.fail("ran without a checkout"))
+    code = e2e_smoke.main([])
+    err = capsys.readouterr().err
+    assert code == 1
+    assert err.startswith("FAIL message: not found for the default --config")
+    assert "--message" in err
+    assert "--project-root" in err
+    assert "run from a MessageFoundry checkout" in err

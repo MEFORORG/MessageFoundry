@@ -12,14 +12,19 @@ Each run gets a fresh temp directory holding the store, the engine's working dir
 free one unless ``--api-port`` names it. The MLLP port is the inbound's own, from its config:
 ``--mllp-port``, 2575 for the sample's ``IB_Test_ADT``. A port already held fails the ``ports``
 step, and the ``ready`` step waits for the API to report this engine's inbound running on that
-port, so the message never goes to another process that holds it.
+port, so the message does not go to another process that took it in between. An inbound whose port
+comes from ``env()`` reports none, so for it ``ready`` rests on the name and status alone, and only
+the ``ports`` step's earlier check says the port was this engine's to take.
 
 The steps, in order: ``message``, ``ports``, ``checkout``, ``provision``, ``serve``, ``sign-in``,
 ``ready``, ``mllp``, ``disposition``. ``checkout`` asks the engine's interpreter, started as
 ``serve`` is, where it imports ``messagefoundry`` from, and fails unless that is the package this
 script imports: the engine runs with ``-P`` from the temp directory, so it imports whatever the
 environment installed, which can be another checkout. Exit 0 when every step passes; otherwise
-exit 1 with ``FAIL <step>: <reason>`` on stderr.
+exit 1 with ``FAIL <step>: <reason>`` on stderr, where an unforeseen error gives its type as the
+reason's first word and an error while stopping the engine names the step ``teardown``. An
+installed harness has no checkout around it, so it fails ``message`` unless ``--config``,
+``--message`` and ``--project-root`` name real paths.
 
 The engine is stopped and the temp directory deleted on either exit, and on SIGINT, SIGTERM,
 SIGHUP (POSIX) or SIGBREAK (Windows), when :func:`main` runs the smoke. Such a signal during that
@@ -33,8 +38,7 @@ process's SIGHUP handler.
 
 It signs in as the rig Administrator :mod:`harness.load.rigadmin` provisions with a password drawn
 per run, which is never printed. The engine gets none of the caller's ``MEFOR_*`` settings, only
-the per-gate relaxations ``harness.load.failover.EngineNode`` takes, because it serves a synthetic
-graph.
+the ones :func:`_serve_env` names, which loosen checks because it serves a synthetic graph.
 
 It prints step names, the control id and the disposition, never a message body (CLAUDE.md
 section 9). On a ``serve`` or ``ready`` failure it prints the tail of the engine's own log.
@@ -84,12 +88,11 @@ from messagefoundry.verify_leaf import port_state
 _REPO = Path(__file__).resolve().parents[1]
 _DEFAULT_CONFIG = _REPO / "samples" / "config"
 _DEFAULT_MESSAGE = _REPO / "samples" / "messages" / "adt_a01.hl7"
+#: What ``serve --env dev`` reads under the default ``--project-root``.
+_DEFAULT_ENVIRONMENTS = _REPO / "environments"
 _DEFAULT_INBOUND = "IB_Test_ADT"
 _DEFAULT_MLLP_PORT = 2575
 _DEFAULT_MLLP_TIMEOUT = 10.0
-
-#: The interpreter options the engine starts under, as CLAUDE.md section 7 runs ``serve``.
-SERVE_PYTHON_OPTIONS = CHILD_INTERPRETER_FLAGS
 
 #: The final dispositions, by ``MessageStatus`` value. Polling stops at the first of these.
 #: ``error`` is reachable only after the ACK (a router or transform failure): a message the
@@ -150,15 +153,25 @@ class _SignalState:
 
     @contextlib.contextmanager
     def held(self) -> Iterator[None]:
+        """Hold signals for the block, then act on one that arrived, however the block exits."""
         self.holding = True
         try:
             yield
         finally:
-            self.holding = False
-        self.release()
+            self.release()
 
 
 _SIGNALS = _SignalState()
+
+
+class _Progress:
+    """The step :func:`run` is on, so :func:`main` can name it when something unforeseen escapes."""
+
+    def __init__(self) -> None:
+        self.step = "message"
+
+
+_PROGRESS = _Progress()
 
 
 class StepFailed(Exception):
@@ -183,7 +196,10 @@ def _free_port() -> int:
 def _serve_env(cert: Path, key: Path) -> dict[str, str]:
     """The engine's environment: this one, less the engine's namespace (every ``MEFOR_*`` and the
     secrets outside it; a developer's own store backend or bind host must not redirect the smoke),
-    plus the rig's relaxations."""
+    plus :data:`harness.load.rigadmin.SERVE_ENV`, this run's TLS pair, and three per-gate
+    relaxations (and, on Windows, the config-source escape) that
+    :class:`harness.load.failover.EngineNode` also sets. Unlike that node it leaves the
+    monitoring-read pace on, which the once-a-second poll stays under."""
     env = {k: v for k, v in os.environ.items() if outside_engine_namespace(k)}
     env.update(rigadmin.SERVE_ENV)
     env.update(
@@ -220,7 +236,7 @@ def _check_checkout(env: dict[str, str], work: Path) -> Path:
     probe = "import sys, messagefoundry; sys.stdout.write(messagefoundry.__file__ or '')"
     try:
         done = subprocess.run(  # noqa: S603 -- our own interpreter and a fixed probe
-            [sys.executable, *SERVE_PYTHON_OPTIONS, "-c", probe],
+            [sys.executable, *CHILD_INTERPRETER_FLAGS, "-c", probe],
             cwd=str(work),
             env=env,
             capture_output=True,
@@ -266,8 +282,10 @@ def _wait_inbound(
     inbound: str,
     mllp_port: int,
     deadline: float,
-) -> None:
-    """Wait until the API reports THIS engine's inbound running on ``mllp_port``.
+) -> int | None:
+    """Wait until the API reports THIS engine's inbound running on ``mllp_port``, and return the
+    port it reported. A running inbound that reports no port (one whose port comes from ``env()``)
+    passes on its name, and returns ``None``.
 
     A bare connect would accept any process holding the port, and a failed inbound bind leaves the
     engine up (ADR 0031), so only the engine's own word that its listener runs is evidence. An
@@ -288,8 +306,8 @@ def _wait_inbound(
             raise StepFailed("ready", f"inbound {_shown(inbound)} is not in the engine's graph")
         for row in mine:
             seen = f"status {row.status}, port {row.port}"
-            if row.status == "running" and row.port == mllp_port:
-                return
+            if row.status == "running" and row.port in (mllp_port, None):
+                return row.port
             if row.status in ("failed", "not_deployed", "filtered", "running"):
                 raise StepFailed(
                     "ready", f"inbound {_shown(inbound)}: {_shown(seen)}, expected port {mllp_port}"
@@ -348,9 +366,13 @@ def _stop(proc: subprocess.Popen[bytes], job: int | None) -> None:
     On POSIX the engine's group outlives its leader. Once ``Popen`` has reaped the leader its pid
     may be reused, so the group is signalled through the reuse-safe
     :func:`~messagefoundry.proctree.kill_reaped_leader_group`; only a leader still unreaped, whose
-    pid nothing else can hold, takes :func:`~messagefoundry.proctree.kill_process_group`."""
+    pid nothing else can hold, takes :func:`~messagefoundry.proctree.kill_process_group`.
+
+    A refused or failed kill is not swallowed: an engine still running afterwards, or a Windows
+    engine no kill-on-close job held, prints a ``WARNING`` line."""
     if proc.poll() is None:
         # PermissionError: Windows refuses TerminateProcess on a root its job is already ending.
+        # Suppressed only because the check below reports an engine that outlived the refusal.
         with contextlib.suppress(ProcessLookupError, PermissionError):
             proc.terminate()
         try:
@@ -362,6 +384,22 @@ def _stop(proc: subprocess.Popen[bytes], job: int | None) -> None:
                 proc.wait(timeout=15)
     if job is not None:
         terminate_job(job)
+        if proc.poll() is None:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=5)
+    if proc.poll() is None:
+        print(
+            f"WARNING the engine (pid {proc.pid}) did not stop; stop it by hand",
+            file=sys.stderr,
+            flush=True,
+        )
+    elif sys.platform == "win32" and job is None:
+        print(
+            f"WARNING no kill-on-close job held the engine (pid {proc.pid}); a process it started"
+            " may still run",
+            file=sys.stderr,
+            flush=True,
+        )
     if ADOPT_NEW_SESSION:
         if proc.returncode is None:
             reached = kill_process_group(proc.pid, started_as_leader=True) is not GroupKill.NOT_SENT
@@ -414,6 +452,7 @@ def run(
     mllp_timeout: float = _DEFAULT_MLLP_TIMEOUT,
 ) -> None:
     """Run every step. Returns on a pass; raises :class:`StepFailed` naming the step otherwise."""
+    _PROGRESS.step = "message"
     try:
         message = normalize(message_file.read_bytes())
         control_id = Peek.parse(message).control_id
@@ -425,6 +464,7 @@ def run(
         raise StepFailed("message", f"{_shown(str(message_file))} has no MSH-10 control id")
     shown_id = _shown(control_id)
     shown_inbound = _shown(inbound)
+    _PROGRESS.step = "ports"
     for what, port in (("MLLP", mllp_port), ("API", api_port)):
         if port is not None and (state := port_state(port)) != "free":
             raise StepFailed("ports", f"{what} port {port} is {state}")
@@ -433,6 +473,7 @@ def run(
     proc: subprocess.Popen[bytes] | None = None
     job: int | None = None
     try:
+        _PROGRESS.step = "checkout"
         from messagefoundry import pki  # pulls cryptography; only a run needs it
 
         cert_pem, key_pem = pki.make_self_signed("127.0.0.1", ["127.0.0.1", "localhost"], 2)
@@ -445,6 +486,7 @@ def run(
         package = _check_checkout(env, work)
         print(f"step checkout: messagefoundry from {_shown(str(package))}", flush=True)
 
+        _PROGRESS.step = "provision"
         print(f"step provision: rig Administrator in {db.name}", flush=True)
         try:
             created = rigadmin.provision(env=env, cwd=work, db=str(db))
@@ -457,7 +499,7 @@ def run(
 
         argv = [
             sys.executable,
-            *SERVE_PYTHON_OPTIONS,
+            *CHILD_INTERPRETER_FLAGS,
             "-m",
             "messagefoundry",
             "serve",
@@ -472,6 +514,7 @@ def run(
             "--project-root",
             str(project_root),
         ]
+        _PROGRESS.step = "serve"
         print(f"step serve: API on {api_port}, inbound {shown_inbound} on {mllp_port}", flush=True)
         log = work / "engine.log"
         with _SIGNALS.held():  # a signal here must not lose the engine before ``proc`` holds it
@@ -481,6 +524,7 @@ def run(
         with client:
             try:
                 _wait_api(client, proc, time.monotonic() + timeout)
+                _PROGRESS.step = "sign-in"
                 try:
                     # rigadmin's sign-in, so a rig that supplies an authenticator key signs in too.
                     client.set_token(rigadmin.sign_in(client.base_url, cacert=str(cert)))
@@ -489,7 +533,8 @@ def run(
                         "sign-in", f"the rig sign-in failed: {_shown(str(exc))}"
                     ) from None
                 print("step sign-in: rig Administrator", flush=True)
-                _wait_inbound(
+                _PROGRESS.step = "ready"
+                reported = _wait_inbound(
                     client,
                     proc,
                     inbound=inbound,
@@ -501,14 +546,17 @@ def run(
                     raise
                 tail = _log_tail(log)
                 raise StepFailed(exc.step, f"{exc}\n--- engine log tail ---\n{tail}") from None
-            print(f"step ready: inbound {shown_inbound} running on {mllp_port}", flush=True)
+            where = f"on {mllp_port}" if reported is not None else "(port not reported)"
+            print(f"step ready: inbound {shown_inbound} running {where}", flush=True)
 
             try:
+                _PROGRESS.step = "mllp"
                 code = _send(mllp_port, message, timeout=mllp_timeout)
                 # CA is the enhanced-mode commit accept: an inbound with ack_mode="enhanced" says it.
                 if code not in ("AA", "CA"):
                     raise StepFailed("mllp", f"MSA-1 was {_shown(str(code))}, expected AA")
                 print(f"step mllp: {code} for control id {shown_id}", flush=True)
+                _PROGRESS.step = "disposition"
 
                 try:
                     status = _poll_disposition(
@@ -539,12 +587,17 @@ def run(
             print(f"step disposition: {status.upper()}", flush=True)
     finally:
         _SIGNALS.holding = True  # first, one store: a signal from here on waits for the teardown
+        # An error the teardown raises is the teardown's; one the steps raised keeps their name.
+        failed_step, _PROGRESS.step = _PROGRESS.step, "teardown"
         try:
             if proc is not None:
                 _stop(proc, job)
-            _remove(work)
         finally:
-            _SIGNALS.release()
+            try:
+                _remove(work)
+            finally:
+                _SIGNALS.release()
+        _PROGRESS.step = failed_step
 
 
 def _remove(path: Path) -> None:
@@ -599,6 +652,26 @@ def main(argv: list[str] | None = None) -> int:
         help=f"seconds to wait for the ACK (default {_DEFAULT_MLLP_TIMEOUT:.0f})",
     )
     args = parser.parse_args(argv)
+    # An installed harness has no checkout around it, so a default left in place names a path
+    # under site-packages that does not exist. Say so, rather than fail later on a missing file.
+    absent = [
+        f"--{flag} ({_shown(str(needed))})"
+        for flag, path, default, needed in (
+            ("config", args.config, _DEFAULT_CONFIG, _DEFAULT_CONFIG),
+            ("message", args.message, _DEFAULT_MESSAGE, _DEFAULT_MESSAGE),
+            ("project-root", args.project_root, _REPO, _DEFAULT_ENVIRONMENTS),
+        )
+        if path == default and not needed.exists()
+    ]
+    if absent:
+        print(
+            f"FAIL message: not found for the default {', '.join(absent)}, so this harness has"
+            " no checkout around it; pass --config, --message and --project-root, or run from a"
+            " MessageFoundry checkout",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
     # A Ctrl+C, a SIGTERM (a CI cancel, a POSIX caller's terminate()), a hangup or a Ctrl+Break
     # unwinds through run()'s finally, so the engine is stopped and the temp directory deleted. On
     # Windows terminate() is TerminateProcess, which no handler sees.
@@ -627,6 +700,13 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("INTERRUPTED e2e smoke", file=sys.stderr, flush=True)
         return 128 + signal.SIGINT
+    except Exception as exc:  # noqa: BLE001 -- the last word: every failure ends in a FAIL line
+        print(
+            f"FAIL {_PROGRESS.step}: {type(exc).__name__}: {_shown(str(exc))}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
