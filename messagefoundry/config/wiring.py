@@ -11268,8 +11268,10 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
     import ctypes
     from ctypes import wintypes
 
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    from messagefoundry.auth import _win32_sid
+
+    # The SID, entry, account and token prototypes are shared with auth/anchor_path.py's reader.
+    advapi32, kernel32 = _win32_sid.sid_libraries()
 
     # Declare prototypes so 64-bit pointers aren't truncated to a default c_int arg (which raises an
     # OverflowError on a high address). PVOID = c_void_p; PSID/PACL/PSECURITY_DESCRIPTOR are pointers.
@@ -11284,45 +11286,6 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
         ctypes.POINTER(ctypes.c_void_p),  # ppSacl
         ctypes.POINTER(ctypes.c_void_p),  # ppSecurityDescriptor
     ]
-    advapi32.GetAce.restype = wintypes.BOOL
-    advapi32.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
-    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
-    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
-    advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
-    advapi32.ConvertStringSidToSidW.argtypes = [
-        wintypes.LPCWSTR,
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    advapi32.LookupAccountSidW.restype = wintypes.BOOL
-    advapi32.LookupAccountSidW.argtypes = [
-        wintypes.LPCWSTR,  # lpSystemName (NULL = this machine)
-        ctypes.c_void_p,  # Sid
-        wintypes.LPWSTR,  # Name
-        ctypes.POINTER(wintypes.DWORD),  # cchName
-        wintypes.LPWSTR,  # ReferencedDomainName
-        ctypes.POINTER(wintypes.DWORD),  # cchReferencedDomainName
-        ctypes.POINTER(ctypes.c_int),  # peUse (SID_NAME_USE)
-    ]
-    advapi32.OpenProcessToken.restype = wintypes.BOOL
-    advapi32.OpenProcessToken.argtypes = [
-        wintypes.HANDLE,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.HANDLE),
-    ]
-    advapi32.GetTokenInformation.restype = wintypes.BOOL
-    advapi32.GetTokenInformation.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_int,  # TOKEN_INFORMATION_CLASS
-        ctypes.c_void_p,  # TokenInformation (buffer)
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD),
-    ]
-    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-    kernel32.LocalFree.restype = ctypes.c_void_p
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-
     # GetNamedSecurityInfoW(pObjectName, SE_FILE_OBJECT=1, SecurityInfo, ppOwner, ppGroup, ppDacl,
     # ppSacl, ppSecurityDescriptor). We request OWNER (0x1) | DACL (0x4). The SD is allocated by the
     # API and must be LocalFree'd; the owner/DACL pointers point INTO that buffer (do not free them).
@@ -11355,40 +11318,7 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
         )
 
     def _sid_to_str(sid_ptr: int) -> str | None:
-        out = wintypes.LPWSTR()
-        if not advapi32.ConvertSidToStringSidW(sid_ptr, ctypes.byref(out)):
-            return None
-        try:
-            return out.value
-        finally:
-            # ConvertSidToStringSidW allocates the string with LocalAlloc; free its address.
-            if out:
-                kernel32.LocalFree(ctypes.cast(out, ctypes.c_void_p))
-
-    def _self_sid() -> str | None:
-        # Current process user SID, so a config dir the service account itself owns/controls passes.
-        token = wintypes.HANDLE()
-        _TOKEN_QUERY = 0x0008
-        _TokenUser = 1
-        if not advapi32.OpenProcessToken(
-            kernel32.GetCurrentProcess(), _TOKEN_QUERY, ctypes.byref(token)
-        ):
-            return None
-        try:
-            size = wintypes.DWORD(0)
-            advapi32.GetTokenInformation(token, _TokenUser, None, 0, ctypes.byref(size))
-            if size.value == 0:
-                return None
-            buf = ctypes.create_string_buffer(size.value)
-            if not advapi32.GetTokenInformation(
-                token, _TokenUser, buf, size.value, ctypes.byref(size)
-            ):
-                return None
-            # TOKEN_USER = SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes; }; Sid is the first pointer.
-            sid_ptr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
-            return _sid_to_str(sid_ptr) if sid_ptr else None
-        finally:
-            kernel32.CloseHandle(token)
+        return _win32_sid.sid_text(advapi32, kernel32, sid_ptr)
 
     # LOCALGROUP_MEMBERS_INFO_0 — level 0 of NetLocalGroupGetMembers returns member SIDs only. Levels
     # 1..3 return NAMES, and translating a domain member's SID to a name is what reaches out to a domain
@@ -11609,7 +11539,10 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
                 kernel32.LocalFree(sd_ptr)
 
     return _WinConfigSourceProbes(
-        self_sid=_self_sid(), read_path=_read_path, owner_in_admins=_owner_in_admins
+        # The run-as account's SID, so a config dir the service account itself owns passes.
+        self_sid=_win32_sid.process_user_sid(advapi32, kernel32),
+        read_path=_read_path,
+        owner_in_admins=_owner_in_admins,
     )
 
 

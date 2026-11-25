@@ -1483,6 +1483,38 @@ def test_s12_15_an_entry_of_an_undefined_type_has_no_mask_read_past_its_end(
 
 
 @_windows_only
+def test_s12_52_both_windows_readers_read_the_run_as_sid_through_the_shared_helper() -> None:
+    """The anchor reader and the config-source reader share one token read (BACKLOG #6281, member
+    S12-52). Both answer the SID ``whoami`` reports for this process's account, an instrument
+    outside either reader."""
+    from messagefoundry.auth import _win32_sid
+    from messagefoundry.config.wiring import _win32_config_source_probes
+
+    row = subprocess.run(
+        ["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True, check=True
+    ).stdout
+    expected = row.strip().rsplit(",", 1)[1].strip('"')
+    assert expected.startswith("S-1-")
+    advapi32, kernel32 = _win32_sid.sid_libraries()
+    assert _win32_sid.process_user_sid(advapi32, kernel32) == expected
+    assert ap.windows_host_readers().engine_sid == expected
+    assert _win32_config_source_probes().self_sid == expected
+    assert _win32_sid.sid_text(advapi32, kernel32, None) is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the refusal is the non-Windows branch")
+def test_s12_52_the_shared_sid_helpers_refuse_off_windows() -> None:
+    from messagefoundry.auth import _win32_sid
+
+    with pytest.raises(OSError, match="only on Windows"):
+        _win32_sid.sid_libraries()
+    with pytest.raises(OSError, match="only on Windows"):
+        _win32_sid.sid_text(None, None, None)
+    with pytest.raises(OSError, match="only on Windows"):
+        _win32_sid.process_user_sid(None, None)
+
+
+@_windows_only
 def test_s12_15_the_reader_still_reads_a_well_formed_allow_entry(tmp_path: Path) -> None:
     """The control: a well-formed allow entry reads with its mask and SID as before. The deny entry
     beside it now records no rights. It recorded ``0x2`` before, and no caller reads the rights of

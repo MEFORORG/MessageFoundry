@@ -1075,8 +1075,10 @@ def windows_host_readers() -> WinHost:
     import ctypes
     from ctypes import wintypes
 
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    from messagefoundry.auth import _win32_sid
+
+    # The SID, entry, account and token prototypes are shared with config/wiring.py's reader.
+    advapi32, kernel32 = _win32_sid.sid_libraries()
     pvoid_p = ctypes.POINTER(ctypes.c_void_p)
     kernel32.CreateFileW.restype = wintypes.HANDLE
     kernel32.CreateFileW.argtypes = [
@@ -1088,11 +1090,6 @@ def windows_host_readers() -> WinHost:
         wintypes.DWORD,
         wintypes.HANDLE,
     ]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.LocalFree.restype = ctypes.c_void_p
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
     kernel32.GetDriveTypeW.restype = wintypes.UINT
     kernel32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
     kernel32.GetVolumeInformationW.restype = wintypes.BOOL
@@ -1117,50 +1114,10 @@ def windows_host_readers() -> WinHost:
         pvoid_p,
         pvoid_p,
     ]
-    advapi32.GetAce.restype = wintypes.BOOL
-    advapi32.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, pvoid_p]
-    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
-    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
-    advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
-    advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, pvoid_p]
-    advapi32.LookupAccountSidW.restype = wintypes.BOOL
-    advapi32.LookupAccountSidW.argtypes = [
-        wintypes.LPCWSTR,
-        ctypes.c_void_p,
-        wintypes.LPWSTR,
-        ctypes.POINTER(wintypes.DWORD),
-        wintypes.LPWSTR,
-        ctypes.POINTER(wintypes.DWORD),
-        ctypes.POINTER(ctypes.c_int),
-    ]
-    advapi32.OpenProcessToken.restype = wintypes.BOOL
-    advapi32.OpenProcessToken.argtypes = [
-        wintypes.HANDLE,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.HANDLE),
-    ]
-    advapi32.GetTokenInformation.restype = wintypes.BOOL
-    advapi32.GetTokenInformation.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD),
-    ]
-
     invalid_handle = wintypes.HANDLE(-1).value
 
     def sid_text(sid_ptr: int | None) -> str | None:
-        if not sid_ptr:
-            return None
-        out = wintypes.LPWSTR()
-        if not advapi32.ConvertSidToStringSidW(sid_ptr, ctypes.byref(out)):
-            return None
-        try:
-            return out.value
-        finally:
-            if out:
-                kernel32.LocalFree(ctypes.cast(out, ctypes.c_void_p))
+        return _win32_sid.sid_text(advapi32, kernel32, sid_ptr)
 
     def win_error(code: int) -> str:
         return f"Win32 error {code} ({ctypes.FormatError(code).strip()})"
@@ -1257,27 +1214,6 @@ def windows_host_readers() -> WinHost:
         if fs_name.value.upper() not in ("NTFS", "REFS"):
             return f"it is a {fs_name.value} volume, whose permissions this check does not read"
         return None
-
-    def engine_sid() -> str | None:
-        token = wintypes.HANDLE()
-        if not advapi32.OpenProcessToken(
-            kernel32.GetCurrentProcess(),
-            0x0008,
-            ctypes.byref(token),  # TOKEN_QUERY
-        ):
-            return None
-        try:
-            size = wintypes.DWORD(0)
-            advapi32.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))  # TokenUser
-            if size.value == 0:
-                return None
-            buf = ctypes.create_string_buffer(size.value)
-            if not advapi32.GetTokenInformation(token, 1, buf, size.value, ctypes.byref(size)):
-                return None
-            # TOKEN_USER is SID_AND_ATTRIBUTES; the SID pointer comes first.
-            return sid_text(ctypes.cast(buf, pvoid_p)[0])
-        finally:
-            kernel32.CloseHandle(token)
 
     def administrators_name() -> str | None:
         # NetLocalGroupGetMembers takes a NAME, and the group's name is localized.
@@ -1396,7 +1332,8 @@ def windows_host_readers() -> WinHost:
             return True  # a SID found in a partial read is still a member
         return False if complete else None
 
-    return WinHost(read_security, volume_cause, engine_sid(), admin_member, query_drive_target)
+    engine_sid = _win32_sid.process_user_sid(advapi32, kernel32)
+    return WinHost(read_security, volume_cause, engine_sid, admin_member, query_drive_target)
 
 
 def _windows_host_verdict(path: str) -> PathVerdict:
