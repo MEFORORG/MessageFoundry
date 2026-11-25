@@ -8557,13 +8557,18 @@ class AuthService:
         return synced.result, held
 
     async def _lookup_user_settled(self, user_id: str) -> _UserLookup:
-        """:meth:`_lookup_user`, read once more when the first read is refused: ``_lookup_user``
-        also reads a row deleted or re-keyed between its row and role reads as refused, so the
-        second read decides."""
-        stored = await self._lookup_user(user_id)
-        if stored.refused:
-            stored = await self._lookup_user(user_id)
-        return stored
+        """The account ``user_id`` names, read through :meth:`_checked_by_id`, as a
+        :class:`_UserLookup`: ``held`` without ``user`` is a record that fails its seal, and a row
+        gone is not ``held``.
+
+        Vault BACKLOG #3085 item 7: this read ``_lookup_user`` at most twice, and ``_lookup_user``
+        reads a check that raced a delete or a re-key as refused, so two raced checks refused the
+        sign-in as a seal failure for contention alone. :meth:`_checked_by_id` checks up to
+        :data:`_CHECKED_READ_PASSES` times and fails closed, reported, only once every pass
+        raced. A record Vault transit cannot verify is answered as :meth:`_checked_by_id` answers
+        it."""
+        found = await self._checked_by_id(user_id)
+        return _UserLookup(found.user, found.settled)
 
     async def _roles_read_back(
         self, user_id: str, username: str, role_ids: Iterable[str], *, where: str

@@ -67,6 +67,7 @@ from messagefoundry.auth.service import (
     DirectoryObjectIdMissing,
     _AuditWatermark,
     _RevocationApplied,
+    _SealCheck,
     _UserLookup,
 )
 from messagefoundry.auth.tokens import hash_token
@@ -8594,8 +8595,9 @@ async def test_a_read_back_that_finds_the_account_gone_counts_as_not_written(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """BACKLOG #3018 step 4. A retried compare-and-set finds the roles moved, and the read-back
-    finds the account deleted after its row read, which ``_lookup_user`` reads as a seal failure.
-    It counts as not written, so the row is not written on its own either."""
+    finds the account deleted, which ``_checked_by_id`` answers as gone, not as a seal failure
+    (vault BACKLOG #3085 item 7). It counts as not written, so the row is not written on its own
+    either."""
     store, _, service, _ = await _scoped_service(_GRP_A)
     try:
         _notifier, revocation, target = await _role_revocation(store, service)
@@ -8609,16 +8611,16 @@ async def test_a_read_back_that_finds_the_account_gone_counts_as_not_written(
 
         lookups: list[int] = []
 
-        async def refused_then_gone(_user_id: str) -> _UserLookup:
-            # The row was read, then deleted before its role read; read again, it is gone.
+        async def gone(_user_id: str, _listed: Any = None) -> _SealCheck:
+            # The row was deleted after the write: no account, nothing reported.
             lookups.append(1)
-            return _UserLookup(None, len(lookups) == 1)
+            return _SealCheck()
 
         rows_before = len(await store.list_audit(action="auth.ad_roles_resynced"))
         monkeypatch.setattr(store, "set_user_roles_if_held", moved)
-        monkeypatch.setattr(service, "_lookup_user", refused_then_gone)
+        monkeypatch.setattr(service, "_checked_by_id", gone)
         roles = await service._write_reconciled_roles(revocation, target, ("viewer",))
-        assert calls == [1, 1] and lookups == [1, 1]
+        assert calls == [1, 1] and lookups == [1]
         assert roles.result is False and not roles.written and roles.retried
         monkeypatch.undo()
         assert len(await store.list_audit(action="auth.ad_roles_resynced")) == rows_before
