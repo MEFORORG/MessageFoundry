@@ -816,13 +816,12 @@ async def test_AC3_restore_refuses_rather_than_place_a_store_it_could_not_resalt
     await store.close()
 
     def _cannot(path: Path) -> bool:
-        raise sqlite3.OperationalError("simulated: the WAL could not be checkpointed")
+        # The class forget_store_salt's own refusals raise (vault BACKLOG #8153).
+        raise store_module._ClosedStoreWriteError("simulated: the WAL could not be checkpointed")
 
     monkeypatch.setattr(store_module, "forget_store_salt", _cannot)
     dest = tmp_path / "restored" / "store.db"
-    # The driver's own message is withheld from the stored reason, SQLite's text included (vault
-    # BACKLOG #8153, item 23); a raised sqlite3 error would keep its result-code name too.
-    with pytest.raises(BackupError, match=r"OperationalError: \[driver message withheld\]"):
+    with pytest.raises(BackupError, match="WAL could not be checkpointed"):
         await run_restore(
             result.archive_path, dest_store_path=dest, store_settings=_store_settings(dest, key)
         )
@@ -936,3 +935,24 @@ def test_the_archive_frame_sub_key_is_wiped_after_use(monkeypatch: pytest.Monkey
     assert back.getvalue() == b"payload"
     assert len(handed_out) == 2  # one derivation to seal, one to open
     assert all(sub == bytearray(len(sub)) for sub in handed_out)
+
+
+def test_a_closed_store_write_refusal_keeps_its_text_through_safe_exc(tmp_path: Path) -> None:
+    """Vault BACKLOG #8153, round-2 finding 1: ``safe_exc`` withholds a database driver's message,
+    and ``_write_closed_store`` raised plain ``sqlite3.OperationalError`` with the engine's own
+    remedy, so a restore refusal lost it. Red while the refusal was the driver's class."""
+    from messagefoundry.redaction import safe_exc
+    from messagefoundry.store import store as store_module
+
+    db = tmp_path / "closed.db"
+    sqlite3.connect(str(db)).close()
+    with pytest.raises(sqlite3.OperationalError) as refused:
+        store_module._write_closed_store(
+            db,
+            lambda conn: None,
+            lambda conn: False,
+            what="synthetic",
+            proof_failed="was not proven",
+        )
+    assert isinstance(refused.value, store_module._ClosedStoreWriteError)
+    assert "was not proven" in safe_exc(refused.value)

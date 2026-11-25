@@ -9141,6 +9141,12 @@ def forget_store_salt(path: Path) -> bool:
     )
 
 
+class _ClosedStoreWriteError(sqlite3.OperationalError):
+    """:func:`_write_closed_store`'s own refusal, whose text the engine wrote, so a renderer that
+    withholds a database driver's message keeps it (``redaction.raised_by_a_driver``, vault BACKLOG
+    #8153). Still a ``sqlite3.OperationalError``, so every handler that caught one catches it."""
+
+
 def _write_closed_store[T](
     path: Path,
     write: Callable[[sqlite3.Connection], T],
@@ -9162,7 +9168,7 @@ def _write_closed_store[T](
     try:
         mode = str(conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]).lower()
         if mode != "delete":
-            raise sqlite3.OperationalError(
+            raise _ClosedStoreWriteError(
                 f"could not take {path} out of WAL mode (it is still {mode!r}); another "
                 f"connection holds it, so {what}"
             )
@@ -9170,14 +9176,14 @@ def _write_closed_store[T](
     finally:
         conn.close()
     if wal.exists() and wal.stat().st_size:
-        raise sqlite3.OperationalError(f"{wal} still holds changes after leaving WAL mode")
+        raise _ClosedStoreWriteError(f"{wal} still holds changes after leaving WAL mode")
     proof = sqlite3.connect(_sqlite_readonly_uri(str(path.absolute())), uri=True)
     try:
         proven = prove(proof)
     finally:
         proof.close()
     if not proven:
-        raise sqlite3.OperationalError(f"{path} {proof_failed}")
+        raise _ClosedStoreWriteError(f"{path} {proof_failed}")
     return result
 
 

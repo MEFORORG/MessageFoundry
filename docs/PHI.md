@@ -307,8 +307,9 @@ out, the trust-anchor refusal, or a store that stopped that check) or with a wir
 error passed through `safe_text()` or
 `safe_exc()`. The connector errors name the endpoint, an HTTP status, or a socket or driver error.
 No probe echoes a reply body. At least the REST, FHIR and DATABASE probes are a `HEAD`, a
-`GET /metadata` and a `SELECT 1`. A peer can still choose some of the text, such as a database
-server's error string or a socket error reason. That text is bounded and holds nothing from the
+`GET /metadata` and a `SELECT 1`. A peer can still choose some of the text, such as a socket
+error reason, or a server's error text a connector's own error quotes; `safe_exc()` withholds a
+database driver's own message (vault BACKLOG #8153). That text is bounded and holds nothing from the
 engine's messages. **So the field carries operational metadata, and no `no-store` is stamped on
 either route.** Both routes need `connections:test`. The rating leans on the rule that a connector's
 exception never interpolates a credential value: `safe_*` scrubs PHI shapes and bounds the length,

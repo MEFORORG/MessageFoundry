@@ -4993,8 +4993,9 @@ def _incompatible_snapshot(
 
 def _sqlite_error_reason(exc: sqlite3.Error) -> str:
     """A SQLite error as a FAIL reason that quotes no row. Its decode error quotes the column's
-    bytes (``... with text '...'``), which are a row's content and which ``safe_exc`` keeps, so
-    that tail is cut, as ``cipher-audit``'s report cuts it."""
+    bytes (``... with text '...'``), which are a row's content and which ``safe_text`` keeps, so
+    that tail is cut, as ``cipher-audit``'s report cuts it. ``safe_exc`` would withhold the whole
+    message (vault BACKLOG #8153, item 23); this keeps the rest of SQLite's text."""
     text = re.sub(r" with text '.*\Z", " (its text is not shown)", str(exc), flags=re.DOTALL)
     return safe_text(f"{type(exc).__name__}: {text}")
 

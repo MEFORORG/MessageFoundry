@@ -463,7 +463,7 @@ def test_a_root_certificate_the_walk_stops_in_without_a_read_failure_is_not_clea
     text = str(refused.value)
     assert _NOT_CLEARED_REMEDY in text
     assert "could not be read to check" not in text  # not the unread refusal
-    assert text.split(": ", 2)[1].startswith("not a plain local path; ")  # its short cause
+    assert ": not cleared as a local path; " in text  # its short cause, which claims no host
 
 
 @pytest.mark.parametrize("source", ["default", "PGSSLROOTCERT"])
@@ -847,7 +847,7 @@ def test_a_refused_stat_failure_takes_no_second_look(
     monkeypatch.setattr(os, "stat", faulting)
     monkeypatch.setattr(os.path, "isdir", no_second_look)
     with pytest.raises(ValueError, match="could not be stat'ed to check it"):
-        database._refuse_libpq_root_cert_file("setting", target)
+        database._refuse_libpq_root_cert_file(None, "setting", target)
 
 
 def test_a_directory_swapped_in_after_a_passing_stat_is_still_left(
@@ -863,7 +863,7 @@ def test_a_directory_swapped_in_after_a_passing_stat_is_still_left(
 
     monkeypatch.setattr(database, "names_another_host", lambda value, verdicts=None: False)
     monkeypatch.setattr(database, "read_if_regular", swapped)
-    database._refuse_libpq_root_cert_file("setting", target)  # left, not refused
+    database._refuse_libpq_root_cert_file(None, "setting", target)  # left, not refused
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="libpq reads the password file off Windows")
@@ -910,7 +910,7 @@ def test_a_libpq_home_the_engine_cannot_name_refuses_the_build(
         raise OSError("synthetic: shell32 did not load")
 
     monkeypatch.setattr(database, "_libpq_homes", unnamed)
-    remedy = f"root certificate: libpq's home is unknown; {database._LIBPQ_REMEDY}"
+    remedy = f"DATABASE: libpq's home is unknown; {database._LIBPQ_REMEDY}"
     with pytest.raises(ValueError, match=re.escape(remedy)):
         _build_psql()
 
@@ -1025,7 +1025,7 @@ def test_each_libpq_refusal_keeps_its_remedy_in_a_stored_failure(
     # Round-1 review: the remedy first left every shape's stored text alike. A short cause
     # before it keeps them apart.
     cause = {
-        "another host": "not a plain local path; ",
+        "another host": "not cleared as a local path; ",
         "home not named": "libpq's home is unknown; ",
         "stat fault": "its stat failed; ",
         "walk unread": "could not be read; ",
@@ -1156,3 +1156,44 @@ def test_a_shell_folder_that_does_not_decode_refuses_the_build(
     monkeypatch.delenv("PGSSLROOTCERT", raising=False)
     with pytest.raises(ValueError, match=re.escape(database._LIBPQ_REMEDY)):
         _build_psql()
+
+
+#: A connection name of 40 characters, the length round-2 finding 2 asks the remedy to survive.
+_LONG_CONNECTION = "OB_ACME_REGIONAL_LABORATORY_RESULTS_FEED"
+
+
+@pytest.mark.parametrize("shape", ["another host", "home not named", "stat fault"])
+def test_the_cause_and_remedy_survive_a_40_character_connection_name(
+    _no_libpq_root: Path, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    """Vault BACKLOG #8153, review round 2, finding 2. Red on the previous head: the setting came
+    first, so a name of about 19 characters or more pushed the remedy past ``safe_exc``'s cut."""
+    assert len(_LONG_CONNECTION) == 40
+    named = {"sslmode": "verify-full"}
+    if shape == "another host":
+        monkeypatch.setenv("PGSSLROOTCERT", "//db.synthetic.test/share/root.crt")
+    elif shape == "home not named":
+
+        def unnamed() -> list[tuple[str, str]]:
+            raise OSError("synthetic: the home could not be named")
+
+        monkeypatch.setattr(database, "_libpq_homes", unnamed)
+    else:
+        root = _write(_no_libpq_root, _certificate(), "root.crt")
+        monkeypatch.setenv("PGSSLROOTCERT", root)
+        real_stat = os.stat
+        fault = _windows_stat_failure(32) if sys.platform == "win32" else OSError(errno.EIO, "I/O")
+
+        def faulting(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            if str(path) == root:
+                raise copy.copy(fault)
+            return real_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "stat", faulting)
+    with pytest.raises(ValueError) as refused:
+        database._refuse_encrypted_libpq_root_cert(
+            named, family="psqlodbc", connection=_LONG_CONNECTION
+        )
+    rendered = safe_exc(refused.value)
+    assert _LONG_CONNECTION in rendered
+    assert database._LIBPQ_REMEDY in rendered, rendered

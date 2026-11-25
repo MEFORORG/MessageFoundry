@@ -1585,10 +1585,13 @@ _LIBPQ_COPY_FOLDER = (
     if sys.platform == "win32"
     else "a local folder only root and the service account can write"
 )
-#: The remedy every libpq root-certificate refusal gives right after its setting and a cause of a
-#: few words, so a stored failure, which keeps about the first 200 characters
-#: (``redaction.safe_exc``), keeps both for a connection name of ordinary length (vault BACKLOG
-#: #8153, items 6, 24 and 31). The full cause follows them.
+#: The remedy the refusals worded in :func:`_refuse_encrypted_libpq_root_cert` and
+#: :func:`_refuse_libpq_root_cert_file` give, after the connection, ``DATABASE:`` and a cause of a
+#: few words, and before the setting and the full cause, so a stored failure, which keeps about the
+#: first 200 characters (``redaction.safe_exc``), keeps the cause and the remedy for a connection
+#: name of 40 characters (vault BACKLOG #8153, items 6, 24 and 31). The refusals the file's read
+#: and content checks give (:func:`_read_driver_file`, :func:`_refuse_ca_content`) name the
+#: setting first and carry no such remedy.
 _LIBPQ_REMEDY = f"set PGSSLROOTCERT to a copy in {_LIBPQ_COPY_FOLDER}"
 #: The host refusal's second remedy, where the walk read the folders (:data:`_WALKS_BEYOND_SPELLING`).
 _LIBPQ_CHECK_FOLDERS = (
@@ -1768,7 +1771,8 @@ def _refuse_encrypted_libpq_root_cert(
     fails (read, not measured). On Windows, libpq's ``stat`` opens the file and CPython's needs
     only its attributes, so libpq may skip a file whose read is denied rather than fail on it, which
     was not measured; the refusal errs on the side of refusing there (vault BACKLOG #8153, items 5
-    and 29). Each refusal opens with a short cause and its remedy (:data:`_LIBPQ_REMEDY`).
+    and 29). The refusals worded here and in :func:`_refuse_libpq_root_cert_file` open with a
+    short cause and the remedy (:data:`_LIBPQ_REMEDY`).
 
     **It reads the environment of the process that builds the connection**, so ``messagefoundry
     check`` and a dry run judge their own machine's file, not the service's. **It runs when the
@@ -1785,25 +1789,37 @@ def _refuse_encrypted_libpq_root_cert(
         found = _libpq_root_certs()
     except OSError as exc:
         raise ValueError(
-            f"{hop_name_prefix(connection)}DATABASE libpq's default root certificate: libpq's "
-            f"home is unknown; {_LIBPQ_REMEDY}; the folder libpq reads it from could not be "
-            f"named, so it was not read to check {_CA_CHECKED_FOR}"
+            f"{_libpq_lead(connection, _LIBPQ_HOME_UNKNOWN)}; libpq's default "
+            "root certificate: the folder libpq reads it from could not be named, so it was not "
+            f"read to check {_CA_CHECKED_FOR}"
         ) from exc
     except _UnholdableShellFolder as exc:
         raise ValueError(
-            f"{hop_name_prefix(connection)}DATABASE libpq's default root certificate: libpq's "
-            f"home is unknown; {_LIBPQ_REMEDY}; {exc}"
+            f"{_libpq_lead(connection, _LIBPQ_HOME_UNKNOWN)}; libpq's default "
+            f"root certificate: {exc}"
         ) from exc
     for source, path in found:
-        _refuse_libpq_root_cert_file(f"{hop_name_prefix(connection)}DATABASE {source}", path)
+        _refuse_libpq_root_cert_file(connection, source, path)
 
 
-def _refuse_libpq_root_cert_file(setting: str, path: str) -> None:
-    """:func:`_refuse_encrypted_libpq_root_cert`'s judgement of one file libpq could load: the
-    host check, then the file's own ``stat``, left or refused as :func:`_libpq_cannot_stat_either`
-    says, then :func:`_read_driver_file`'s read. The ``stat`` is made here, where libpq's rule is
-    known, and :func:`~messagefoundry.auth.trust_anchors.read_if_regular` makes its own again,
-    since it takes none from its caller."""
+#: The short cause of a refusal that could not name the folder libpq reads.
+_LIBPQ_HOME_UNKNOWN = "libpq's home is unknown"
+
+
+def _libpq_lead(connection: str | None, cause: str) -> str:
+    """The head of a libpq root-certificate refusal: the connection, ``DATABASE:``, a ``cause`` of
+    a few words, then :data:`_LIBPQ_REMEDY`, ahead of the setting, which can be long."""
+    return f"{hop_name_prefix(connection)}DATABASE: {cause}; {_LIBPQ_REMEDY}"
+
+
+def _refuse_libpq_root_cert_file(connection: str | None, source: str, path: str) -> None:
+    """:func:`_refuse_encrypted_libpq_root_cert`'s judgement of one file libpq could load, named
+    ``source``: the host check, then the file's own ``stat``, left or refused as
+    :func:`_libpq_cannot_stat_either` says, then :func:`_read_driver_file`'s read. The ``stat`` is
+    made here, where libpq's rule is known, and
+    :func:`~messagefoundry.auth.trust_anchors.read_if_regular` makes its own again, since it takes
+    none from its caller."""
+    setting = f"{hop_name_prefix(connection)}DATABASE {source}"
     what = "root certificate file"
     unread: dict[str, str] = {}
     with judging_file_keyword(setting):
@@ -1815,15 +1831,17 @@ def _refuse_libpq_root_cert_file(setting: str, path: str) -> None:
             # path leads off the host, so this refusal names the walk's cause, which the general
             # one below does not.
             raise ValueError(
-                f"{setting}: could not be read; {_LIBPQ_REMEDY}, or check the path and the "
-                f"folders above it; the {what} could not be read to check {_CA_CHECKED_FOR}: "
-                f"{cause}"
+                f"{_libpq_lead(connection, 'could not be read')}, or check the path and the "
+                f"folders above it; {source}: the {what} could not be read to check "
+                f"{_CA_CHECKED_FOR}: {cause}"
             )
         # Where the walk ran, it may have stopped on a local path it could not finish, so the
-        # remedy cannot be only to name a local path.
+        # cause says only that the check did not clear it, and the remedy cannot be only to name a
+        # local path (round-2 review, finding 5).
         raise ValueError(
-            f"{setting}: not a plain local path; {_LIBPQ_REMEDY}{_LIBPQ_CHECK_FOLDERS}; the "
-            f"{what} {REMOTE_PATH_RULE}, so it was not read to check {_CA_CHECKED_FOR}"
+            f"{_libpq_lead(connection, 'not cleared as a local path')}{_LIBPQ_CHECK_FOLDERS}; "
+            f"{source}: the {what} {REMOTE_PATH_RULE}, so it was not read to check "
+            f"{_CA_CHECKED_FOR}"
         )
     try:
         os.stat(path)
@@ -1834,12 +1852,15 @@ def _refuse_libpq_root_cert_file(setting: str, path: str) -> None:
     except OSError as exc:
         if not _libpq_cannot_stat_either(exc):
             raise ValueError(
-                f"{setting}: its stat failed; {_LIBPQ_REMEDY}, or retry once the fault clears; "
-                f"the {what} could not be stat'ed to check {_CA_CHECKED_FOR}: {_why(exc)}"
+                f"{_libpq_lead(connection, 'its stat failed')}, or retry once the fault clears; "
+                f"{source}: the {what} could not be stat'ed to check {_CA_CHECKED_FOR}: "
+                f"{_why(exc)}"
             ) from exc
-        # The class and codes, never the path, which can name the account. A missing file is the
-        # ordinary case; anything else left is worth an operator's look.
-        missing = isinstance(exc, (FileNotFoundError, NotADirectoryError))
+        # The class and codes, never the path, which can name the account. A missing name
+        # (_names_no_file) is the ordinary case; anything else left is worth an operator's look.
+        missing = isinstance(exc, NotADirectoryError) or (
+            isinstance(exc, FileNotFoundError) and _names_no_file(exc)
+        )
         logger.log(
             logging.DEBUG if missing else logging.INFO,
             "%s: left to libpq, which loads no file it cannot stat: %s (errno %s, winerror %s)",
@@ -2988,11 +3009,13 @@ def _safe_db_error(
     :func:`_classify_db_error` (BACKLOG #1661).
 
     A driver error renders as its type, SQLSTATE and native error number — the message is read, never
-    quoted. ``safe_exc`` is NOT enough on its own here and the difference is measured: fed the SQL
-    Server 2627 text, it keeps ``Cannot insert duplicate key ... The duplicate key value is (4242``
-    because ``redact`` sees no HL7 delimiters and no name run, and the 200-character bound cuts the
-    identifier in the middle rather than removing it. asyncpg's errors, from a PostgreSQL store,
-    count too: their ``str()`` appends a ``DETAIL`` that quotes the key. A driver error with no
+    quoted. ``safe_exc``'s patterns alone were NOT enough, and the difference was measured: fed the
+    SQL Server 2627 text, they kept ``Cannot insert duplicate key ... The duplicate key value is
+    (4242`` because ``redact`` sees no HL7 delimiters and no name run, and the 200-character bound
+    cuts the identifier in the middle rather than removing it. ``safe_exc`` now withholds a driver
+    error's message too (vault BACKLOG #8153, item 23), but names no native error number. asyncpg's
+    errors, from a PostgreSQL store, count too: their ``str()`` appends a ``DETAIL`` that quotes
+    the key. A driver error with no
     SQLSTATE (:func:`_raised_by_a_driver`), such as asyncpg's client-side ``DataError``, which quotes
     the argument it could not encode, renders as ``<type> [driver message withheld]``, with SQLite's
     result-code name inside the brackets when it has one (:func:`_withheld`; engine PR 2658, finding
