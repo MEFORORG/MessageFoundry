@@ -1626,7 +1626,9 @@ count is above `0` (vault BACKLOG #2613).
   URL can carry its path token. **Setting the flag adds no check on the wire.**
 - **What the attestation can truthfully rest on:** for the SMTP relay, `[tls].crl_file` reaches
   that hop and adds a real check, where you hold the relay issuer's CRL, the `[tls]` policy reaches
-  the caller that builds the sink, and the relay is not loopback; the `alerts.email_tls_revocation_attested`
+  the caller that builds the sink, and the relay's host is not loopback as `is_loopback_hop_host`
+  in `config/tls_policy.py` reads it, under which at least `localhost.` reads as remote; the
+  `alerts.email_tls_revocation_attested`
   entry `security_loosenings()` prints names which callers hand that policy over. It is instance-wide:
   every non-loopback hop the `[tls]` policy reaches then needs its issuer's CRL in that file, or
   its handshake fails. For the webhook no CRL can reach the hop, so the

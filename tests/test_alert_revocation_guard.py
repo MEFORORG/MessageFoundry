@@ -144,6 +144,29 @@ def test_an_off_box_smtp_login_is_refused_when_it_checks_no_revocation() -> None
     assert "synthetic-not-a-secret" not in text
 
 
+def test_a_login_built_with_no_tls_policy_is_not_offered_the_crl_as_its_remedy() -> None:
+    """BACKLOG #5527: with no ``[tls]`` policy handed to the caller, ``[tls].crl_file`` cannot
+    reach the hop's context, so the refusal must not tell the operator that setting it is enough."""
+    for build in (_email, _notifier):
+        with pytest.raises(InsecureHopRefused, match="revocation") as exc:
+            build(ENFORCING)
+        text = str(exc.value)
+        assert "Configure [tls].crl_file so the engine checks a CRL on this hop" not in text
+        assert "No [tls] policy was handed to the caller that built this sink" in text
+        assert "[alerts].email_tls_revocation_attested" in text
+
+
+def test_a_login_built_with_a_tls_policy_is_offered_the_crl_as_its_remedy() -> None:
+    """The other arm: a ``[tls]`` policy with no ``crl_file`` reaches the hop, so setting the file
+    is a remedy the operator can perform."""
+    for build in (_email, _notifier):
+        with pytest.raises(InsecureHopRefused, match="revocation") as exc:
+            build(ENFORCING, trust_anchor_policy=TrustAnchorPolicy())
+        text = str(exc.value)
+        assert "Configure [tls].crl_file so the engine checks a CRL on this hop" in text
+        assert "No [tls] policy was handed" not in text
+
+
 def test_the_security_notifier_takes_the_same_guard() -> None:
     with pytest.raises(InsecureHopRefused, match="revocation") as exc:
         _notifier(ENFORCING)

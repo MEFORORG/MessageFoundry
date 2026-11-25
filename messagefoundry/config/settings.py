@@ -5045,7 +5045,8 @@ class AiSettings(_Section):
     # Attest that revocation of the AI endpoint's server certificate is covered outside the engine
     # (BACKLOG #2193 slice (e), on the ADR 0173 section 12 pattern). The broker verifies that
     # certificate and checks no OCSP, and no CRL unless [tls].crl_file is set, the [tls] section
-    # reaches the app serving POST /ai/chat, and the endpoint is not loopback (BACKLOG #5527;
+    # reaches the app serving POST /ai/chat, and the endpoint host is not loopback as
+    # config.tls_policy.is_loopback_hop_host reads it (BACKLOG #5527;
     # docs/SECURITY-LOOSENING.md states it in full). So without that CRL an
     # off-box endpoint is REFUSED under [security].enforcement = enforce unless this is set. What
     # the refusal keys on is stated once, on transports.ai_broker._refuse_an_unrevoked_ai_hop.
@@ -5169,8 +5170,8 @@ def alert_revocation_attestations(
             "the [alerts] SMTP relay, for a login (email_username) over verified STARTTLS",
             "and no CRL unless all three hold: [tls].crl_file is set, the [tls] policy reaches "
             "the caller that builds the sink (messagefoundry serve, provision-admin and admin "
-            "reset-totp hand it; the alerts test send reads the app's [tls] section, as POST "
-            "/ai/chat does; at least an embedder's notifier_from_settings or "
+            "reset-totp hand it, the alerts test send reads the app's [tls] section as POST "
+            "/ai/chat does, and at least an embedder's notifier_from_settings or "
             "security_notifier_from_settings call, or app, holds none unless it is passed one), "
             "and the relay host is not loopback as config.tls_policy.is_loopback_hop_host reads "
             "it. So "
@@ -11523,7 +11524,7 @@ def security_loosenings(
             switch,
             f"revocation of the certificate of {hop} is attested as covered outside the engine "
             f"(reason: {reason}) -- the engine verifies that certificate but its own handshake "
-            f"checks no OCSP, {crl}; the attestation adds no check. "
+            f"checks no OCSP, {crl}. The attestation adds no check. "
             "Wherever the revocation refusal would apply to that hop it is lifted, so a revoked "
             "certificate is caught only if what the reason names really covers it. It never lifts "
             "a cleartext or verify-off refusal",
@@ -11551,7 +11552,9 @@ def security_loosenings(
                 "create_managed_app holds none unless it passes tls_settings, and a direct "
                 "create_app none unless it passes tls_settings or sets app.state.tls_settings), "
                 "and the endpoint host is not loopback as config.tls_policy.is_loopback_hop_host "
-                "reads it (at least localhost. reads remote and gets the CRL). So at least "
+                "reads it, under which at least the name localhost with a trailing dot reads as "
+                "remote and gets the CRL, though the bare name localhost reads as loopback. So "
+                "at least "
                 "a loopback endpoint, and an app the [tls] section never reached, check no CRL "
                 "whatever [tls].crl_file says. The "
                 "attestation adds no check. Where no CRL is checked, the revocation refusal is "

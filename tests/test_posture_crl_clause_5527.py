@@ -16,6 +16,8 @@ and none pins which callers hand the ``[tls]`` policy over. No message body is i
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from messagefoundry.config.settings import (
     AiSettings,
     AlertsSettings,
@@ -45,14 +47,24 @@ def _smtp_clause() -> str:
     return entries["alerts.email_tls_revocation_attested"]
 
 
+_ROOT = Path(__file__).resolve().parent.parent
+_SMTP_ALERTS = AlertsSettings(
+    email_tls_revocation_attested=True, email_tls_revocation_attested_reason=_REASON
+)
+
+
 def _ai_entry() -> str:
     ai = AiSettings(endpoint_revocation_attested=True, endpoint_revocation_attested_reason=_REASON)
+    return _entries(AlertsSettings(), ai=ai)["ai.endpoint_revocation_attested"]
+
+
+def _entries(alerts: AlertsSettings, *, ai: AiSettings | None = None) -> dict[str, str]:
     return dict(
         security_loosenings(
             SecuritySettings(),
             StoreSettings(),
             AuthSettings(),
-            AlertsSettings(),
+            alerts,
             SecretRotationSettings(),
             cleartext_hops=(),
             expiry_relaxed_hops=(),
@@ -69,14 +81,14 @@ def _ai_entry() -> str:
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
             secrets=SecretsSettings(),
-            ai=ai,
+            ai=ai if ai is not None else AiSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
             startup=None,
             service_env=None,
         )
-    )["ai.endpoint_revocation_attested"]
+    )
 
 
 def test_the_smtp_clause_names_all_three_conditions() -> None:
@@ -93,7 +105,41 @@ def test_the_smtp_clause_names_the_loopback_relay_as_checking_no_crl() -> None:
 def test_the_ai_entry_says_how_loopback_is_read() -> None:
     entry = _ai_entry()
     assert "the endpoint host is not loopback as config.tls_policy.is_loopback_hop_host" in entry
-    assert "(at least localhost. reads remote and gets the CRL)" in entry
+    assert (
+        "at least the name localhost with a trailing dot reads as remote and gets the CRL, though "
+        "the bare name localhost reads as loopback" in entry
+    )
+    # The old parenthesis ended on "localhost." and so read as the plain name localhost.
+    assert "localhost." not in entry
+
+
+def test_the_smtp_entry_holds_no_serve_warning_joiner() -> None:
+    """The serve-start warning joins entries with "; ", so a "; " inside an entry splits it there
+    for a reader. The reason is the operator's own text; this one holds no "; "."""
+    entry = _entries(_SMTP_ALERTS)["alerts.email_tls_revocation_attested"]
+    assert "; " not in entry
+
+
+def test_the_smtp_loosening_doc_bullet_names_the_loopback_reading() -> None:
+    doc = (_ROOT / "docs" / "SECURITY-LOOSENING.md").read_text(encoding="utf-8")
+    start = doc.index("- **What the attestation can truthfully rest on:** for the SMTP relay")
+    bullet = doc[start : doc.index("\n- **", start + 1)]
+    assert "is_loopback_hop_host" in bullet
+    assert "`localhost.` reads as remote" in bullet
+
+
+def test_the_ai_source_text_reads_loopback_as_the_code_does() -> None:
+    """``transports/ai_broker.py``'s module docstring and the ``AiSettings`` comment said "not
+    loopback" with no reading; the code reads loopback with ``is_loopback_hop_host``."""
+    broker = (_ROOT / "messagefoundry" / "transports" / "ai_broker.py").read_text(encoding="utf-8")
+    assert "and the endpoint is not loopback" not in broker
+    assert "endpoint that is not loopback" not in broker
+    assert broker.count("``tls_policy.is_loopback_hop_host`` reads it") >= 2
+    settings = (_ROOT / "messagefoundry" / "config" / "settings.py").read_text(encoding="utf-8")
+    start = settings.index("# Attest that revocation of the AI endpoint's server certificate")
+    comment = settings[start : settings.index("endpoint_revocation_attested:", start)]
+    assert "the endpoint is not loopback" not in comment
+    assert "config.tls_policy.is_loopback_hop_host reads it" in comment
 
 
 def test_a_loopback_relay_resolves_no_crl_whatever_the_file_says() -> None:
