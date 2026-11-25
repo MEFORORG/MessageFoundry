@@ -379,9 +379,9 @@ def _restore(archive: str, dest: Path) -> None:
 def test_verify_reports_a_none_read_of_the_store_member_as_it_reports_an_oserror(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
 ) -> None:
-    """``_extract_member`` on the verify path: a ``None`` read used to end the member short, so the
-    verify went on to check a truncated store. It is now a ``FAIL`` at the read, as an ``OSError``
-    there is, and not worded as a decrypt."""
+    """``_extract_member`` on the verify path: given a ``None`` read, which only this test's wrapper
+    produces, the old loop ended the member short and the verify went on to check a truncated store.
+    It is now a ``FAIL`` at the read, as an ``OSError`` there is, and not worded as a decrypt."""
     archive = _plaintext_archive(tmp_path / "plain.mfbak")
     cls, text = _FAULTS[fault]
     wrapped = _wrap_store_member(monkeypatch, cls)
@@ -448,9 +448,10 @@ def _refuse_links(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_the_placement_copy_reports_a_none_read_as_it_reports_an_oserror(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
 ) -> None:
-    """``_place_restored_store``'s copy fallback, taken where a hard link is refused. A ``None``
-    read used to end ``copyfileobj`` short, and a truncated store was placed and reported placed.
-    It now raises at the read, as an ``OSError`` there does, and the partial file is removed."""
+    """``_place_restored_store``'s copy fallback, taken where a hard link is refused. Given a
+    ``None`` read, which only this test's wrapper produces over the blocking staged file, the old
+    ``copyfileobj`` ended short and placed a truncated store as placed. It now raises at the read,
+    as an ``OSError`` there does, and the partial file is removed."""
     src = tmp_path / "staged.db"
     src.write_bytes(b"synthetic store bytes " * 100_000)  # over 2 MiB: several reads
     dest = tmp_path / "placed.db"
