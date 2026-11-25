@@ -10,6 +10,7 @@ whole batch when one item fails. Synthetic data only."""
 
 from __future__ import annotations
 
+import argparse
 import base64
 import collections
 import json
@@ -749,3 +750,161 @@ def test_a_none_key_is_refused_before_any_transit_request() -> None:
     assert isinstance(opened[4], AADComponentError)
     assert transit.decrypt_requests == 1  # one batch for the four; the refusal sent nothing
     assert cipher._batch_alone is False
+
+
+# --- vault BACKLOG #6706 added items 1, 2, 7, 14 and 15 ------------------------------------------
+
+
+def _chain(error: CipherError, links: int) -> CipherError:
+    """``error`` with ``links`` raised exceptions chained under it as contexts, each holding a
+    traceback whose frame reaches a synthetic local."""
+    secret = "value 0"  # a local the links' frames reach until they are cleared
+    tail: BaseException | None = None
+    for i in range(links):
+        try:
+            raise ValueError(f"link {i} {secret[:0]}") from None
+        except ValueError as caught:
+            caught.__context__ = tail
+            tail = caught
+    error.__context__ = tail
+    return error
+
+
+def test_detached_past_its_limit_returns_a_fresh_error_with_no_links(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Item 1: past _DETACH_LIMIT the error was returned with the rest of its tracebacks attached.
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 3)
+    caplog.set_level(logging.WARNING)
+    error = _chain(CipherError("synthetic outer text zz0451"), 5)
+    assert _frames_reach(error, "value 0")
+    fresh = detached(error)
+    assert fresh is not error and type(fresh) is CipherError
+    assert fresh.__cause__ is None and fresh.__context__ is None and fresh.__traceback__ is None
+    assert "zz0451" not in str(fresh)
+    assert not _frames_reach(fresh, "value 0")
+    assert any(
+        r.name == "messagefoundry.store.crypto"
+        and "returned as a fresh CipherError" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_detached_past_its_limit_keeps_an_outage_an_outage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 3)
+    error = _chain(CipherError("synthetic"), 5)
+    error.__cause__ = requests.ConnectionError("synthetic unreachable")
+    assert crypto.gave_no_verdict(error)
+    fresh = detached(error)
+    assert isinstance(fresh, CipherUnavailableError) and crypto.gave_no_verdict(fresh)
+    assert fresh.__cause__ is None and fresh.__context__ is None
+
+
+def test_detached_under_its_limit_returns_the_same_error() -> None:
+    error = _chain(CipherError("synthetic"), 3)
+    assert detached(error) is error and not _frames_reach(error, "value 0")
+
+
+def _switch_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "messagefoundry.store.crypto_transit"
+        and "sending each value alone" in r.getMessage()
+    ]
+
+
+def test_the_decrypt_switch_to_sending_alone_warns_once_naming_the_failure_type(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Items 2 and 15: the WARNING named no failure type, and no test asserted it.
+    caplog.set_level(logging.WARNING)
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    items = _sealed(cipher, 3)
+    real = transit.decrypt_data
+
+    def too_large(**kw: Any) -> dict[str, Any]:
+        if kw.get("batch_input") is not None:
+            raise UnexpectedError("413 Request Entity Too Large")
+        return real(**kw)
+
+    transit.decrypt_data = too_large  # type: ignore[method-assign]
+    assert cipher.decrypt_many(items) == ["value 0", "value 1", "value 2"]
+    assert cipher.decrypt_many(items) == ["value 0", "value 1", "value 2"]
+    (message,) = _switch_warnings(caplog)
+    assert "refused a batch decrypt (UnexpectedError)" in message
+    assert "413" not in message
+
+
+def test_the_encrypt_switch_to_sending_alone_warns_naming_the_failure_type(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING)
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    real = transit.encrypt_data
+
+    def too_large(**kw: Any) -> dict[str, Any]:
+        if kw.get("batch_input") is not None:
+            raise UnexpectedError("413 Request Entity Too Large")
+        return real(**kw)
+
+    transit.encrypt_data = too_large  # type: ignore[method-assign]
+    encrypt_many(cipher, [(f"plain {i}", cell_aad("t", "c", i)) for i in range(3)])
+    (message,) = _switch_warnings(caplog)
+    assert "refused a batch encrypt (UnexpectedError)" in message
+
+
+def test_an_unechoed_reply_switch_warns_with_no_failure_type(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING)
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    items = _sealed(cipher, 3)
+    transit.tamper = _without_reference
+    cipher.decrypt_many(items)
+    (message,) = _switch_warnings(caplog)
+    assert "did not echo the reference of a batch decrypt (key=" in message
+
+
+def test_a_faulting_400_check_does_not_discard_an_outage(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Item 7: a fault in is_vault_bad_request discarded True from is_vault_unavailable, so an
+    # outage was handled as a 400 and every value asked for alone.
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    items = _sealed(cipher, 4)
+    real = transit.decrypt_data
+    singles = 0
+
+    def down(**kw: Any) -> dict[str, Any]:
+        nonlocal singles
+        if kw.get("batch_input") is not None:
+            raise requests.ConnectionError("synthetic unreachable")
+        singles += 1
+        return real(**kw)
+
+    def broken(exc: BaseException) -> bool:
+        raise RuntimeError("synthetic classifier fault")
+
+    transit.decrypt_data = down  # type: ignore[method-assign]
+    monkeypatch.setattr(crypto_transit, "is_vault_bad_request", broken)
+    results = cipher.decrypt_many(items)
+    assert all(isinstance(r, CipherUnavailableError) for r in results)
+    assert singles == 0
+    assert cipher._batch_alone is False
+
+
+def test_the_cipher_audit_help_states_the_batch_bound_as_a_number() -> None:
+    # Item 14: the help named BATCH_MAX_ITEMS and a file path rather than the number.
+    from messagefoundry.__main__ import _build_parser
+
+    parser, _ = _build_parser()
+    sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    help_text = next(c.help for c in sub._choices_actions if c.dest == "cipher-audit")
+    assert help_text is not None
+    assert f"batches of up to {crypto.BATCH_MAX_ITEMS} values" in help_text
+    assert "BATCH_MAX_ITEMS" not in help_text and "store/crypto.py" not in help_text

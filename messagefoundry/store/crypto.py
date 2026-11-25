@@ -1065,8 +1065,9 @@ def detached(error: CipherError) -> CipherError:
     ``__cause__``, ``__context__`` and an exception group's ``exceptions``, each visited once,
     for an error that is returned rather than raised (BACKLOG #6706). A traceback's frames,
     through ``f_back``, reach the batch path's locals, which hold the other values' plaintext;
-    the errors' types, texts and links are kept. Past :data:`_DETACH_LIMIT` exceptions it stops
-    and logs a WARNING."""
+    the errors' types, texts and links are kept. Past :data:`_DETACH_LIMIT` exceptions it stops,
+    logs a WARNING and returns a fresh error in ``error``'s place, carrying no link and no
+    traceback, so nothing it could not clear is returned (vault BACKLOG #6706 item 1)."""
     seen: set[int] = set()
     pending: list[BaseException] = [error]
     while pending:
@@ -1075,16 +1076,33 @@ def detached(error: CipherError) -> CipherError:
             continue
         if len(seen) >= _DETACH_LIMIT:
             _log.warning(
-                "an error's exception graph has more than %d links; the rest keep their tracebacks",
+                "an error's exception graph has more than %d links; returned as a fresh %s",
                 _DETACH_LIMIT,
+                type(error).__name__,
             )
-            break
+            return _fresh_in_place_of(error)
         seen.add(id(link))
         link.__traceback__ = None
         pending.extend(e for e in (link.__cause__, link.__context__) if e is not None)
         if isinstance(link, BaseExceptionGroup):
             pending.extend(link.exceptions)
     return error
+
+
+def _fresh_in_place_of(error: CipherError) -> CipherError:
+    """A new error standing for ``error`` with no cause, context or traceback (vault BACKLOG #6706
+    item 1). One that gave no verdict (:func:`gave_no_verdict`) is a
+    :class:`CipherUnavailableError`, since its cause, which that reading needs, is dropped. Any
+    other keeps ``error``'s class where that class builds and words itself as
+    :class:`CipherError` does, else is a :class:`CipherError`. Its text names the class only:
+    ``error``'s own text is not repeated."""
+    kind = type(error)
+    text = f"{kind.__name__} (its exception graph was too large to return)"
+    if gave_no_verdict(error):
+        return CipherUnavailableError(text)
+    if kind.__init__ is CipherError.__init__ and kind.__str__ is CipherError.__str__:
+        return kind(text)
+    return CipherError(text)
 
 
 def decrypt_or_error(cipher: Cipher, stored: str, aad: bytes | None) -> str | CipherError:
