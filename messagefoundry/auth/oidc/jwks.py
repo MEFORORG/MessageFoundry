@@ -62,7 +62,8 @@ IDP_TIMEOUT_SECONDS = 10.0
 #: How long a lookup waits for the gate a refresh holds across its fetch before it is refused
 #: (BACKLOG #6905): the IdP timeout, so a hung IdP degrades the login rather than pinning each
 #: waiting lookup for as long as the fetch runs. It bounds the WAIT, not the refresh. A waiter whose
-#: wait runs out is refused even if that refresh later fails and leaves the old keys in place. It
+#: wait runs out reads the published keys once more and is refused, as JwksRefreshBusy, only if
+#: that read serves no key, even if the refresh later fails and leaves the old keys in place. It
 #: also bounds how long a key within its TTL is served past the start of a refresh in flight.
 DEFAULT_JWKS_GATE_WAIT_SECONDS = IDP_TIMEOUT_SECONDS
 # A JWKS document larger than this is refused unread — a defensive bound on a remote body the engine
