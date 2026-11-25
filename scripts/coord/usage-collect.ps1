@@ -129,6 +129,39 @@ function Get-GradedPercentage($w, [long]$NowEpoch) {
     return $pct
 }
 
+# COULD usage.ps1 PROJECT A BURN RATE FOR EITHER WINDOW? With a rate the gate grades a window by its
+# run-out, not its level, so a kept higher window with a slow rate can clear where the refused reading,
+# graded by its level, halts. usage.ps1 takes a rate from two or more history rows of the window's reset
+# (any reset, for a window with none) in its last -RateWindowMinutes, counting rows of any stamp in its
+# unguarded read. So this is true only when the kept window's reset has at most one such row and the
+# reading's has none, since taking the reading adds one. Rows are counted from the last
+# $RateMaxTailLines lines, the most usage.ps1 reads, and a row whose time does not read counts. A
+# history that exists and does not read answers false.
+#
+# usage.ps1's default -RateWindowMinutes and its $RateMaxTailLines; tests/test_coord_usage.py pins them.
+$RateWindowMinutesDefault = 90
+$RateMaxTailLines = 6400
+function Test-NoRateForEither([string]$Dir, $Kept, $Reading) {
+    $histPath = Join-Path $Dir "history.jsonl"
+    if (-not [System.IO.File]::Exists($histPath)) { return $true }
+    $keptReset = $Kept.resets_at_epoch -as [long]
+    $readingReset = $Reading.resets_at_epoch -as [long]
+    $nKept = 0
+    $now = [datetime]::UtcNow
+    try {
+        foreach ($line in (Get-Content -LiteralPath $histPath -Tail $RateMaxTailLines -ErrorAction Stop)) {
+            try { $r = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+            if (-not $r) { continue }
+            $at = if ($HaveConfigRoots) { ConvertTo-UtcDateTime $r.at } else { $null }
+            if ($at -and [math]::Round(($now - $at).TotalMinutes, 1) -gt $RateWindowMinutesDefault) { continue }
+            $rowReset = $r.seven_reset -as [long]
+            if (-not $keptReset -or $rowReset -eq $keptReset) { if (++$nKept -ge 2) { return $false } }
+            if (-not $readingReset -or $rowReset -eq $readingReset) { return $false }
+        }
+    } catch { return $false }
+    return $true
+}
+
 $ConfigRootEnv = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { $null }
 if (-not $StateDir) {
     $root = $null
@@ -361,8 +394,8 @@ try {
     #
     # $perReset is the per-reset rule. $guard is the live-session rule, and it holds a reading only to
     # $ownWin, this root's own last window, which over a window of another root's is the own_window that
-    # window carries. ADR 0211 says why each refuses only where the window it keeps answers at least
-    # as strictly as the reading would.
+    # window carries. ADR 0211 states both and the cases where each can still answer less strictly than
+    # taking the reading would.
     #
     # THE READ AND THE WRITE ARE NOT LOCKED. Every session publishes here, so a reading can pass this
     # check and then land over a higher one written in between. The next live fire corrects it.
@@ -403,7 +436,8 @@ try {
         $ownPct = if ($stampOwn -and -not $live -and ($seenEpoch -gt $nowEpoch -or -not ($ownWin.resets_at_epoch -as [long]))) {
             Get-GradedPercentage $ownWin $nowEpoch
         }
-        $guard = $null -ne $ownPct -and $seven.used_percentage -le $ownPct
+        $guard = $null -ne $ownPct -and $seven.used_percentage -le $ownPct -and
+            (Test-NoRateForEither $StateDir $ownWin $seven)
         if ($guard) { $holdWin = $ownWin }
         elseif ($perReset) { $holdWin = $published }
         $keepPublished = $null -ne $holdWin

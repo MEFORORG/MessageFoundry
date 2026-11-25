@@ -443,12 +443,17 @@ roster alias of the Lander.
 > **The live-session rule, stated once here (BACKLOG #5178); the collector's comments and the limits
 > below point to it.** It refuses a reading when all of these hold: the reading's stamp is this root's,
 > unset or absent, by the reader's own test; the fire is not live; the reading is at or below the
-> number in this root's own window; the reading's reset is ahead, or that window has no reset; and that
-> window is one `usage.ps1` grades by its number at the fire. That last condition means the window holds
-> a number, its reset is absent or still ahead, and its `captured_at` reads as at most 20 minutes old,
-> rounded to a tenth as the reader rounds it, or as dated after now. The 20 is `usage.ps1`'s default
-> `-MaxAgeMinutes`, which the gate runs it with, and `tests/test_coord_usage.py` pins the two equal.
-> Without `config-roots.ps1` the collector cannot read that age, and the rule refuses nothing.
+> number in this root's own window; the reading's reset is ahead, or that window has no reset; that
+> window is one `usage.ps1` grades by its number at the fire; and neither could take a burn rate. A
+> graded window holds a number, its reset is absent or still ahead, and its `captured_at` reads as at
+> most 20 minutes old, rounded to a tenth as the reader rounds it, or as dated after now. Neither could
+> take a rate when, in the last 6400 lines of the history and its last 90 minutes, the window's reset has
+> at most one row and the reading's has none, counting rows of any stamp, every row for a side with no
+> reset, and every row whose time does not read; a history that does not read counts as a rate. The
+> 20, the 90 and the 6400 are `usage.ps1`'s `-MaxAgeMinutes`, `-RateWindowMinutes` and
+> `$RateMaxTailLines`, the first two at the defaults the gate runs it with, and
+> `tests/test_coord_usage.py` pins the copies equal. Without `config-roots.ps1` the collector cannot
+> read an age, and the rule refuses nothing.
 >
 > This root's own window is the published window when that window's stamp is this root's. When it is
 > another root's, it is the `own_window` the published window carries, if that window's own stamp is
@@ -456,12 +461,14 @@ roster alias of the Lander.
 > replaces the published window carries this root's own window on as `own_window`: the published window
 > itself when that is this root's, otherwise the published window's own `own_window`, so it survives any
 > number of readings of other roots. A refusal over a window of another root's publishes the
-> `own_window` again, whole and with its own age, so this root's number never moves because of another
-> root.
+> `own_window` again, whole and with its own age. The per-reset tests do not hold to an `own_window`,
+> so a reading the live-session rule passes replaces it on any reset.
 >
 > The rule holds only to a window the reader grades because the gate then answers on the window kept.
-> A graded window of this root's at or above the reading answers at least as strictly, at the level, as
-> the reading would at that fire. A gone, numberless or foreign window answers REVIEW, and so can a
+> A graded window of this root's at or above the reading, with no rate on either side, answers at least
+> as strictly as the reading would at that fire, because the gate then grades both by their level. With
+> a rate it grades by the run-out instead, so a kept window with a slow rate could clear where the
+> reading halts at its level. A gone, numberless or foreign window answers REVIEW, and so can a
 > stale one, where the refused reading could halt: a gone 99 kept over an idle 93 answered REVIEW, and
 > taking the 93 halts at the 90 percent level. A reading with no reset, or one already passed, is held
 > only to a window with no reset: at a number at least as high, that window answers REVIEW below the
@@ -497,15 +504,16 @@ roster alias of the Lander.
 > A higher reading passes the live-session rule from any session because refusing it can weaken a stop:
 > the lower number kept could clear the gate where the higher one halts it.
 >
-> **The live-session rule compares the gate's answer at the fire, and only at the level.** At least
-> these can still make it answer less strictly than taking the reading would. The window kept ages from
+> **The live-session rule's limits.** At least
+> these can still make it answer less strictly than taking the reading would; the first two below are
+> accepted by owner ruling 2026-11-24 (*"Ship with edge cases"*). The window kept ages from
 > its own last observation, so it can go stale or past its reset while the refused reading would still
 > be fresh and current; the gate then answers REVIEW where the reading could halt, until a later fire's
 > reading replaces it. The window kept can also outlast a refused reading with an earlier reset:
 > once that reset passes, the kept window can still grade OK where the refused reading's gone window
-> would answer REVIEW, and an idle repeat of that reading is then refused by the per-reset tests. A
-> burn rate projected from the history rows is not compared, and a refused reading adds no row. A
-> reader run with a `-MaxAgeMinutes` below 20 can call stale a window the collector graded. A window
+> would answer REVIEW, and an idle repeat of that reading is then refused by the per-reset tests. Rows
+> written after the fire can give the kept window a rate. A reader run with a `-MaxAgeMinutes` below 20,
+> or a `-RateWindowMinutes` above 90, can grade differently from the collector. A window
 > dated after now stays graded until the clock passes its stamp, with no other bound, so it holds every
 > idle reading at or below it until then or until a live fire; that fails closed.
 >
@@ -615,8 +623,7 @@ roster alias of the Lander.
 >   OK at 5 after a spent 100, with the same or an earlier reset. The same-reset case is what this
 >   amendment closes.
 >   **Narrowed 2026-11-24 (BACKLOG #5178)** by the live-session rule above. From a fresh published 80,
->   two idle sessions' 80, 5, 80, 5 leaves one history row, and an idle session's frozen 5 no longer
->   replaces a fresh published 100. A higher reading is still taken from any session. A live lower
+>   two idle sessions' 80, 5, 80, 5 leaves one history row. A higher reading is still taken from any session. A live lower
 >   session and an idle higher one can still trade the window. Whether a failed call moves the
 >   API-duration counter is not measured, so a frozen number from a session whose calls fail may still
 >   pass as live. Past the published reset, or once the published window is stale, the rule holds

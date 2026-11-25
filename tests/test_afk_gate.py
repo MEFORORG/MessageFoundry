@@ -1167,7 +1167,7 @@ def test_over_a_foreign_window_an_idle_frozen_number_cannot_clear_through_the_re
     reset = int(ago().timestamp()) + 500000
     assert _fire(sb, state, {"used_percentage": 90, "resets_at": reset}, env, 1000).returncode == 0
     foreign_env = {"CLAUDE_CONFIG_DIR": str(tmp_path / "other-root")}
-    foreign = {"used_percentage": 95, "resets_at": reset}
+    foreign = {"used_percentage": 95, "resets_at": reset + 7200}
     assert _fire(sb, state, foreign, foreign_env, api_ms=2000).returncode == 0
     frozen = {"used_percentage": 5, "resets_at": reset - 400000}
     assert _fire(sb, state, frozen, env, api_ms=2000).returncode == 0
