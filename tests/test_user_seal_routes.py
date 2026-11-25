@@ -180,6 +180,51 @@ async def test_patch_answers_423_for_a_failing_record(keyed: tuple[Engine, Path]
     assert await _seal_failures(engine, victim) >= 1
 
 
+#: The admin writes that decide on the account's record before they write (#5520 items 2 and 13):
+#: (method, path suffix, JSON body, step-up action or None for the session window).
+_CHECKED_WRITES = {
+    "roles": ("PUT", "roles", {"roles": [Role.VIEWER.value]}, None),
+    "channel-scope": ("PUT", "channel-scope", {"channels": ["*"]}, None),
+    "reset-password": ("POST", "reset-password", None, "admin_reset_password"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_CHECKED_WRITES))
+async def test_an_admin_write_answers_423_for_a_failing_record(
+    keyed: tuple[Engine, Path], name: str
+) -> None:
+    """#5520 items 2 and 13: ``PUT /users/{id}/roles``, ``PUT /users/{id}/channel-scope`` and
+    ``POST /users/{id}/reset-password`` read the account through the checked read, so a record
+    that fails its seal answers the 423 the reads answer, reported, rather than a 409 from the
+    write's own seal check or a 404 from the service's loader. Controls: an unknown id is still a
+    404, and an intact account is written."""
+    method, suffix, body, action = _CHECKED_WRITES[name]
+    engine, path = keyed
+    service, alerts, intact, victim = await _setup(engine)
+    await _tamper(path, victim)
+
+    async with _client(engine, service) as c:
+        token = (await _login(c, "root")).json()["token"]
+
+        async def send(user_id: str) -> httpx.Response:
+            nonlocal token
+            _, token = await _reauth(c, token, purpose=action)
+            return await c.request(
+                method, f"/users/{user_id}/{suffix}", json=body, headers=_auth(token)
+            )
+
+        refused = await send(victim)
+        absent = await send(ABSENT_USER_ID)
+        served = await send(intact)
+    assert refused.status_code == 423, refused.text
+    assert refused.json()["detail"] == USER_SEAL_REFUSED
+    assert _PLANTED not in refused.text
+    assert await _seal_failures(engine, victim) >= 1
+    assert any(victim in alert for alert in alerts)
+    assert absent.status_code == 404, absent.text
+    assert served.status_code == 200, served.text
+
+
 async def test_checked_user_tells_a_failing_record_from_a_missing_one(
     keyed: tuple[Engine, Path],
 ) -> None:
@@ -479,11 +524,12 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
         "Each engine process sharing the store keeps its own interval",
         "Where `[auth].require_action_step_up` is on, the default",
         "the single-use `admin_user_update` grant, so its 423 and its 404 cost that proof",
+        "the single-use `admin_reset_password` grant, so its 423, its 404 and the 503",
         "Where it is off, the gate checks the step-up session window instead and spends nothing",
     ):
         assert fact in body, fact
     rows = [line for line in text.splitlines() if line.startswith("|") and "#5520" in line]
-    assert len(rows) == 5, rows
+    assert len(rows) == 8, rows
     for row in rows:
         assert "*What an admin user read reports* below this table" in row, row
         assert "audit row and alert" not in row and "audited and alerted" not in row, row
