@@ -2339,7 +2339,9 @@ def test_a_gone_upstream_is_not_a_merge_signal_when_the_pr_probe_answered_no(
     else:
         assert d["Reason"] == "PR #6 merged at this exact tip"
 
-    # Control: with no probe at all the gone upstream still reads as merged, as before.
+    if payload != "[]":
+        return
+    # Control, once: with no probe at all the gone upstream still reads as merged, as before.
     skipped = by_leaf(run(fx), "gone")
     assert skipped["Decision"] == "PRUNE", skipped
     assert "is gone" in skipped["Reason"]

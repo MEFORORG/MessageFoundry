@@ -528,12 +528,14 @@ function Test-Merged {
     #    while) while the receipt still claimed a PR probe was scoped. Keep the commas tight.
     #    `--head` also matches a PR into ANY base and a fork's PR from a branch of the same name, so only
     #    a PR into $mainBase from this repository counts (BACKLOG #7615). A row that does not say fails
-    #    closed.
-    #    $answeredNo: the probe ran, parsed, and found no such PR. Step 3 reads it.
+    #    closed. `--base` keeps PRs into other bases from filling `--limit`; the filter below still
+    #    checks the field, since an answer that ignored it must not count.
+    #    $answeredNo: the probe ran, parsed, and found no such PR (it is set before the early return of
+    #    a match, which never reaches step 3). Step 3 reads it.
     $answeredNo = $false
     if ($hasGh) {
         $script:ghAttempts++
-        $raw = & gh pr list --repo $ghSlug --head $Branch --state merged --json number,headRefOid,baseRefName,isCrossRepository --limit 20 2>&1
+        $raw = & gh pr list --repo $ghSlug --head $Branch --base $mainBase --state merged --json number,headRefOid,baseRefName,isCrossRepository --limit 20 2>&1
         $ghExit = $LASTEXITCODE
         # 2>&1 folds stderr in as ErrorRecords; keep them out of the JSON but keep them as the reason.
         $ghText = (@($raw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n").Trim()
@@ -545,8 +547,7 @@ function Test-Merged {
         }
         if ($ghExit -eq 0 -and $ghText) {
             $prs = $null
-            $parsed = $true
-            try { $prs = @($ghText | ConvertFrom-Json) } catch { $prs = @(); $parsed = $false }
+            try { $prs = @($ghText | ConvertFrom-Json); $answeredNo = $true } catch { $prs = @() }
             $atTip = @($prs | Where-Object { $_.headRefOid -eq $tip })
             $exact = @($atTip | Where-Object { $_.baseRefName -ceq $mainBase -and $_.isCrossRepository -eq $false })
             if ($exact.Count -gt 0) {
@@ -558,7 +559,6 @@ function Test-Merged {
                 else { "it merged into '$($pr.baseRefName)', not '$mainBase'" }
                 $notes += "PR #$($pr.number) merged at this exact tip, but $why -- not a merge signal"
             }
-            $answeredNo = $parsed
             if ($prs.Count -gt 0 -and $atTip.Count -eq 0) {
                 $notes += "a merged PR (#$($prs[0].number)) exists for the branch NAME '$Branch', but its head was $($prs[0].headRefOid.Substring(0,8)) and this branch is at $($tip.Substring(0,8)) -- the branch moved on after that merge"
             }
@@ -590,15 +590,15 @@ function Test-Merged {
             # A gone upstream is no proof once the probe ANSWERED that no PR merged into $mainBase at
             # this tip: a closed PR, or a branch that moved on after its merge, leaves the same shape
             # (BACKLOG #7615). With no answer (-SkipGh, no gh, a failed probe) it still reads as merged.
-            if ($upShort -eq "$upRemote/$Branch" -and $answeredNo) {
-                $notes += "upstream $upShort is gone, but the merged-PR probe found no PR merged into '$mainBase' at this tip, and a closed PR or a deleted remote branch leaves the same shape -- not a merge signal"
-            }
-            elseif ($upShort -eq "$upRemote/$Branch") {
-                return @{
-                    Merged = $true
-                    Reason = "upstream $upShort is gone (squash-merged + remote-deleted); the branch is KEPT because $uniq commit(s) are not on $MainRef"
-                    Unique = $uniq; Notes = $notes; NeverUsed = $false
+            if ($upShort -eq "$upRemote/$Branch") {
+                if (-not $answeredNo) {
+                    return @{
+                        Merged = $true
+                        Reason = "upstream $upShort is gone (squash-merged + remote-deleted); the branch is KEPT because $uniq commit(s) are not on $MainRef"
+                        Unique = $uniq; Notes = $notes; NeverUsed = $false
+                    }
                 }
+                $notes += "upstream $upShort is gone, but the merged-PR probe found no PR merged into '$mainBase' at this tip, and a closed PR or a deleted remote branch leaves the same shape -- not a merge signal"
             }
             $notes += "upstream $upShort is gone, but it belongs to ANOTHER branch (this worktree was branched off it) -- not a merge signal"
         }
