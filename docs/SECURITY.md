@@ -6904,9 +6904,10 @@ under running engines skips that moment, so stop every engine process and cluste
 store before the restore):
 
 - run `messagefoundry admin-revoke-sessions` against the restored store. It ends the sessions it
-  finds, of any account, and writes one `auth.session_revoked` audit row; *Limits of the session
-  sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) says what it
-  may miss;
+  finds, of any account, then writes one `auth.session_revoked` audit row, and says so when the
+  store refuses that row or when the outcome of the revoke itself is unknown; *Limits of the
+  session sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) says
+  what it may miss;
 - re-apply the changes the restore undid. `messagefoundry restore --help` prints the statement of
   what a restore rolls back, and the guide lists its classes; it applies to these restores too.
   The source's audit log, or its off-host copy, lists the changes themselves.
