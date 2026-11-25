@@ -355,7 +355,7 @@ def test_libpqs_root_certificate_controls_still_build(
 #: it, escaped for ``match=`` (vault BACKLOG #8153, item 26), and its remedy, which names who may
 #: write the copy's folder.
 _NOT_CLEARED = re.escape(f"root certificate file {database.REMOTE_PATH_RULE}")
-_NOT_CLEARED_REMEDY = f"{database._LIBPQ_REMEDY}, or check the path and the folders above it"
+_NOT_CLEARED_REMEDY = f"{database._LIBPQ_REMEDY}{database._LIBPQ_CHECK_FOLDERS}"
 
 
 @pytest.mark.usefixtures("_no_libpq_root")
@@ -463,7 +463,7 @@ def test_a_root_certificate_the_walk_stops_in_without_a_read_failure_is_not_clea
     text = str(refused.value)
     assert _NOT_CLEARED_REMEDY in text
     assert "could not be read to check" not in text  # not the unread refusal
-    assert "set PGSSLROOTCERT to a local path" not in text
+    assert text.split(": ", 2)[1].startswith("not a plain local path; ")  # its short cause
 
 
 @pytest.mark.parametrize("source", ["default", "PGSSLROOTCERT"])
@@ -853,16 +853,17 @@ def test_a_refused_stat_failure_takes_no_second_look(
 def test_a_directory_swapped_in_after_a_passing_stat_is_still_left(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The control for the test above: when the stat passes and the open then fails with a
-    ``PermissionError`` on what is now a directory, the read's directory look still runs and leaves
-    it. Red when a passing stat also skipped that look."""
+    """The control for the test above, through the same check: when the stat passes and the open
+    then fails with a ``PermissionError`` on what is now a directory, the read's directory look
+    still runs and leaves it. Red when a passing stat also skipped that look."""
     target = str(tmp_path)
 
     def swapped(path: Any, limit: int) -> bytes | None:
         raise PermissionError(errno.EACCES, "Permission denied")
 
+    monkeypatch.setattr(database, "names_another_host", lambda value, verdicts=None: False)
     monkeypatch.setattr(database, "read_if_regular", swapped)
-    assert database._read_driver_file(target, "setting", "file", "it") is None
+    database._refuse_libpq_root_cert_file("setting", target)  # left, not refused
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="libpq reads the password file off Windows")
@@ -909,7 +910,8 @@ def test_a_libpq_home_the_engine_cannot_name_refuses_the_build(
         raise OSError("synthetic: shell32 did not load")
 
     monkeypatch.setattr(database, "_libpq_homes", unnamed)
-    with pytest.raises(ValueError, match=re.escape(f"root certificate: {database._LIBPQ_REMEDY}")):
+    remedy = f"root certificate: libpq's home is unknown; {database._LIBPQ_REMEDY}"
+    with pytest.raises(ValueError, match=re.escape(remedy)):
         _build_psql()
 
 
@@ -1020,6 +1022,15 @@ def test_each_libpq_refusal_keeps_its_remedy_in_a_stored_failure(
     rendered = safe_exc(_refused(monkeypatch, _no_libpq_root, shape))
     assert _CONNECTION in rendered
     assert database._LIBPQ_REMEDY in rendered, rendered
+    # Round-1 review: the remedy first left every shape's stored text alike. A short cause
+    # before it keeps them apart.
+    cause = {
+        "another host": "not a plain local path; ",
+        "home not named": "libpq's home is unknown; ",
+        "stat fault": "its stat failed; ",
+        "walk unread": "could not be read; ",
+    }[shape]
+    assert f": {cause}{database._LIBPQ_REMEDY}" in rendered, rendered
 
 
 def test_the_remedy_names_who_may_write_the_folder_for_this_platform() -> None:

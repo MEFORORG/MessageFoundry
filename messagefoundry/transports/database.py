@@ -1227,18 +1227,22 @@ def _refuse_remote_paths(
     return verdicts
 
 
+#: Whether the remote-path check reads anything beyond the spelling: on Windows only, the one gate
+#: for :func:`_path_verdict` and for listing an ``sslcapath`` folder.
+_WALKS_BEYOND_SPELLING = sys.platform == "win32"
 #: What a refused driver file value must be, after the setting's name, for the build and the lane
 #: check alike (:func:`driver_file_rule`). Neither names a path.
 #: Kept short: a stored failure keeps about the first 200 characters, and the build's prefix and
 #: the connection name come first.
-#: Off Windows only the spelling is checked (:data:`_WALKS_BEYOND_SPELLING`), so the rule names
-#: what that refuses, a path that starts with two separators or a device prefix
+#: Where only the spelling is checked (:data:`_WALKS_BEYOND_SPELLING`), the rule names what that
+#: refuses, a path that starts with two separators or a device prefix
 #: (:func:`~messagefoundry.transports.db_endpoint.is_remote_spelling`), and no network drive
-#: (vault BACKLOG #8153, item 25).
+#: (vault BACKLOG #8153, item 25). Read once, at import: a test that flips the gate keeps the
+#: platform's wording.
 REMOTE_PATH_RULE = (
     "must be a plain local path on this host: not a share, a network drive, a link to one, or a "
     "path the check cannot read"
-    if sys.platform == "win32"
+    if _WALKS_BEYOND_SPELLING
     else "must be a plain local path on this host: not a network path or a device path"
 )
 #: The entry rule covers a folder that cannot be listed or is past the entry cap too, so it points
@@ -1263,9 +1267,6 @@ def driver_file_rule(keyword: str, value: object, verdicts: FileVerdicts) -> str
     return None
 
 
-#: Whether the remote-path check reads anything beyond the spelling: on Windows only, the one gate
-#: for :func:`_path_verdict` and for listing an ``sslcapath`` folder.
-_WALKS_BEYOND_SPELLING = sys.platform == "win32"
 #: How many entries of an ``sslcapath`` folder :func:`_capath_entries_leave_host` judges. A folder
 #: holding more is refused rather than judged in part, which bounds the time a build or a lane
 #: check spends listing it. A serving engine builds a connector, and runs the lane check, in a
@@ -1584,10 +1585,15 @@ _LIBPQ_COPY_FOLDER = (
     if sys.platform == "win32"
     else "a local folder only root and the service account can write"
 )
-#: The remedy every libpq root-certificate refusal opens with, right after its setting, so a
-#: stored failure, which keeps about the first 200 characters (``redaction.safe_exc``), keeps it
-#: for a connection name of ordinary length (vault BACKLOG #8153, items 6, 24 and 31).
+#: The remedy every libpq root-certificate refusal gives right after its setting and a cause of a
+#: few words, so a stored failure, which keeps about the first 200 characters
+#: (``redaction.safe_exc``), keeps both for a connection name of ordinary length (vault BACKLOG
+#: #8153, items 6, 24 and 31). The full cause follows them.
 _LIBPQ_REMEDY = f"set PGSSLROOTCERT to a copy in {_LIBPQ_COPY_FOLDER}"
+#: The host refusal's second remedy, where the walk read the folders (:data:`_WALKS_BEYOND_SPELLING`).
+_LIBPQ_CHECK_FOLDERS = (
+    ", or check the path and the folders above it" if _WALKS_BEYOND_SPELLING else ""
+)
 
 
 def _libpq_root_certs() -> list[tuple[str, str]]:
@@ -1762,7 +1768,7 @@ def _refuse_encrypted_libpq_root_cert(
     fails (read, not measured). On Windows, libpq's ``stat`` opens the file and CPython's needs
     only its attributes, so libpq may skip a file whose read is denied rather than fail on it, which
     was not measured; the refusal errs on the side of refusing there (vault BACKLOG #8153, items 5
-    and 29). Each refusal opens with its remedy (:data:`_LIBPQ_REMEDY`).
+    and 29). Each refusal opens with a short cause and its remedy (:data:`_LIBPQ_REMEDY`).
 
     **It reads the environment of the process that builds the connection**, so ``messagefoundry
     check`` and a dry run judge their own machine's file, not the service's. **It runs when the
@@ -1779,14 +1785,14 @@ def _refuse_encrypted_libpq_root_cert(
         found = _libpq_root_certs()
     except OSError as exc:
         raise ValueError(
-            f"{hop_name_prefix(connection)}DATABASE libpq's default root certificate: "
-            f"{_LIBPQ_REMEDY}; the folder libpq reads it from could not be named, so it was not "
-            f"read to check {_CA_CHECKED_FOR}"
+            f"{hop_name_prefix(connection)}DATABASE libpq's default root certificate: libpq's "
+            f"home is unknown; {_LIBPQ_REMEDY}; the folder libpq reads it from could not be "
+            f"named, so it was not read to check {_CA_CHECKED_FOR}"
         ) from exc
     except _UnholdableShellFolder as exc:
         raise ValueError(
-            f"{hop_name_prefix(connection)}DATABASE libpq's default root certificate: "
-            f"{_LIBPQ_REMEDY}; {exc}"
+            f"{hop_name_prefix(connection)}DATABASE libpq's default root certificate: libpq's "
+            f"home is unknown; {_LIBPQ_REMEDY}; {exc}"
         ) from exc
     for source, path in found:
         _refuse_libpq_root_cert_file(f"{hop_name_prefix(connection)}DATABASE {source}", path)
@@ -1809,14 +1815,15 @@ def _refuse_libpq_root_cert_file(setting: str, path: str) -> None:
             # path leads off the host, so this refusal names the walk's cause, which the general
             # one below does not.
             raise ValueError(
-                f"{setting}: {_LIBPQ_REMEDY}, or check the path and the folders above it; the "
-                f"{what} could not be read to check {_CA_CHECKED_FOR}: {cause}"
+                f"{setting}: could not be read; {_LIBPQ_REMEDY}, or check the path and the "
+                f"folders above it; the {what} could not be read to check {_CA_CHECKED_FOR}: "
+                f"{cause}"
             )
-        # The walk may have stopped on a local path it could not finish, so the remedy cannot be
-        # only to name a local path.
+        # Where the walk ran, it may have stopped on a local path it could not finish, so the
+        # remedy cannot be only to name a local path.
         raise ValueError(
-            f"{setting}: {_LIBPQ_REMEDY}, or check the path and the folders above it; the {what} "
-            f"{REMOTE_PATH_RULE}, so it was not read to check {_CA_CHECKED_FOR}"
+            f"{setting}: not a plain local path; {_LIBPQ_REMEDY}{_LIBPQ_CHECK_FOLDERS}; the "
+            f"{what} {REMOTE_PATH_RULE}, so it was not read to check {_CA_CHECKED_FOR}"
         )
     try:
         os.stat(path)
@@ -1827,8 +1834,8 @@ def _refuse_libpq_root_cert_file(setting: str, path: str) -> None:
     except OSError as exc:
         if not _libpq_cannot_stat_either(exc):
             raise ValueError(
-                f"{setting}: {_LIBPQ_REMEDY}, or retry once the fault clears; the {what} could "
-                f"not be stat'ed to check {_CA_CHECKED_FOR}: {_why(exc)}"
+                f"{setting}: its stat failed; {_LIBPQ_REMEDY}, or retry once the fault clears; "
+                f"the {what} could not be stat'ed to check {_CA_CHECKED_FOR}: {_why(exc)}"
             ) from exc
         # The class and codes, never the path, which can name the account. A missing file is the
         # ordinary case; anything else left is worth an operator's look.

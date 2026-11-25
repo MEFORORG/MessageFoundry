@@ -97,6 +97,7 @@ from types import (
 from typing import Any, Final, TypeGuard
 
 __all__ = [
+    "UNDER_A_DRIVER_ERROR",
     "RepeatedKeyError",
     "args_hold_a_message",
     "clamp_untrusted",
@@ -3152,8 +3153,9 @@ _NON_DBAPI_DRIVERS = frozenset({"asyncpg"})
 
 #: The package whose own error classes are the engine's, not a driver's, whatever driver class one
 #: inherits: ``store.schema_verify.SchemaMismatchError`` inherits ``sqlite3.DatabaseError`` so a
-#: store-open handler catches it, and its message is the engine's own remedy (vault BACKLOG #8153,
-#: item 17).
+#: store-open handler catches it, and its message is the engine's own (vault BACKLOG #8153, item
+#: 17). That message can quote the text SQLite gave a failed schema step, the engine's own DDL,
+#: which a traceback then prints in the engine's link while it withholds the driver link below.
 _ENGINE_PACKAGE = "messagefoundry"
 
 
