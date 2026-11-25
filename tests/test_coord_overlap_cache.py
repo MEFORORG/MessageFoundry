@@ -229,6 +229,66 @@ def test_the_cache_is_keyed_on_the_querying_head_and_not_only_its_root(tmp_path:
     )
 
 
+def _run_in_culture(repo: Path, sandbox: Path, culture: str, *args: str) -> str:
+    """Run overlap.ps1 with ``CurrentCulture`` set first, and return its stderr.
+
+    The culture is set in the same runspace the script runs in, and printed to stderr before the call,
+    so a test can prove the setting took rather than assume it.
+    """
+    # A quoted '-Refresh' binds as a positional STRING, not the switch, so parameter names stay bare.
+    quoted = " ".join(a if a.startswith("-") else "'" + a.replace("'", "''") + "'" for a in args)
+    command = (
+        f"[System.Globalization.CultureInfo]::CurrentCulture = '{culture}'; "
+        "[Console]::Error.WriteLine('culture=' + [System.Globalization.CultureInfo]::CurrentCulture.Name); "
+        f"& '{OVERLAP}' -Repo '{repo}' -ConfigRoot '{sandbox / 'no-such-config'}' "
+        f"-TasksDir '{sandbox / 'no-such-tasks'}' {quoted}; exit $LASTEXITCODE"
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, f"overlap exited {proc.returncode}: {proc.stderr}\n{proc.stdout}"
+    assert f"culture={culture}" in proc.stderr, f"the culture did not take: {proc.stderr!r}"
+    return proc.stderr
+
+
+@pytest.mark.parametrize("culture", ["en-US", "th-TH", "fi-FI", "ar-SA"])
+def test_a_fresh_cache_is_a_hit_under_any_culture(tmp_path: Path, culture: str) -> None:
+    """The cache stamp is ISO-8601 and must be read back as ISO-8601 whatever the current culture.
+
+    ``ConvertFrom-Json`` hands the stamp back as a ``[datetime]``; the old reader passed that to
+    ``[datetime]::Parse``, which turned it into an invariant-culture string and re-parsed it under the
+    CURRENT culture. Under th-TH, fi-FI and ar-SA that threw, a catch-all turned the throw into a
+    miss, and the cache never hit. en-US is the control that passes either way.
+    """
+    repo = _repo(tmp_path, "culture")
+    _run_in_culture(repo, tmp_path, culture, "-Refresh", "-Json")
+    before = _cache_path(repo).read_bytes()
+    _run_in_culture(repo, tmp_path, culture, "-CacheSeconds", "3600", "-Json")
+    assert _cache_path(repo).read_bytes() == before, (
+        f"under {culture} a cache written seconds ago was not a hit: the run re-walked and rewrote it"
+    )
+
+
+def test_an_unreadable_cache_stamp_is_a_miss_that_says_so(tmp_path: Path) -> None:
+    """A stamp nobody can read misses and re-walks, and stderr names why rather than staying silent."""
+    repo = _repo(tmp_path, "badstamp")
+    _run(repo, tmp_path, "-Refresh", "-Json")
+    cache = _cache_path(repo)
+    body = json.loads(cache.read_text(encoding="utf-8"))
+    body["at"] = "not a date"
+    cache.write_text(json.dumps(body), encoding="utf-8")
+
+    proc = _run(repo, tmp_path, "-CacheSeconds", "3600", "-Json")
+    assert json.loads(cache.read_text(encoding="utf-8"))["at"] != "not a date", (
+        "an unreadable stamp must miss and re-walk, which rewrites the cache"
+    )
+    assert "cache timestamp" in proc.stderr, f"the miss was silent: {proc.stderr!r}"
+
+
 def test_a_write_sweeps_cache_files_a_day_old_and_keeps_fresh_ones(tmp_path: Path) -> None:
     """One cache file per querying root, so files for removed worktrees must not pile up forever."""
     repo = _repo(tmp_path, "sweep")

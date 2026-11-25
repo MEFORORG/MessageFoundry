@@ -976,9 +976,26 @@ function Build-Map {
 # --- cache -------------------------------------------------------------------------------------
 $map = $null
 if (-not $Refresh -and (Test-Path -LiteralPath $cacheFile)) {
-    try {
-        $c = Get-Content $cacheFile -Raw -EA Stop | ConvertFrom-Json -EA Stop
-        $age = ((Get-Date) - [datetime]::Parse($c.at)).TotalSeconds
+    # The catch covers only the read: a cache file that is missing, locked or not JSON is a miss.
+    $c = try { Get-Content $cacheFile -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { $null }
+    # THE STAMP IS ISO-8601 AND IS READ AS ISO-8601. ConvertFrom-Json hands it back as a [datetime];
+    # `[datetime]::Parse` once took that, rendered it as an invariant-culture string, and re-parsed it
+    # under the CURRENT culture, which threw under th-TH, fi-FI and ar-SA (and can misdate elsewhere),
+    # and a catch-all turned the throw into a cache that silently never hit. Both shapes are accepted,
+    # the string one parsed invariantly; an unreadable stamp is a miss that says so on stderr.
+    $stamp = $null
+    if ($c) {
+        if ($c.at -is [datetime]) { $stamp = $c.at }
+        else {
+            $parsed = [datetime]::MinValue
+            if ([datetime]::TryParse([string]$c.at, [System.Globalization.CultureInfo]::InvariantCulture,
+                    [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) { $stamp = $parsed }
+            else { [Console]::Error.WriteLine("overlap.ps1: cache timestamp '$($c.at)' is unreadable; re-walking.") }
+        }
+    }
+    if ($stamp) {
+        # Both sides in UTC, so a stamp read back as Local, Utc or Unspecified ages the same way.
+        $age = ([datetime]::UtcNow - $stamp.ToUniversalTime()).TotalSeconds
         # Bound BOTH ways: a cache stamped in the future (clock skew, or a file copied between boxes)
         # would otherwise look eternally fresh and pin a stale map forever.
         #
@@ -1000,7 +1017,7 @@ if (-not $Refresh -and (Test-Path -LiteralPath $cacheFile)) {
             # A cache written before this field existed reads back null and the census says so.
             if ($c.census) { foreach ($k in @($script:Census.Keys)) { if ($null -ne $c.census.$k) { $script:Census[$k] = $c.census.$k } } }
         }
-    } catch { $map = $null }
+    }
 }
 if ($null -eq $map) {
     # @() for the SAME reason Write-JsonArray filters nulls, at the other end of the same round trip.
