@@ -155,7 +155,8 @@ def env_setting(environ: Mapping[str, str], name: str) -> str | None:
 
 def _rate_limiter_off(environ: Mapping[str, str]) -> bool:
     """Whether ``environ`` turns the engine's sign-in rate limiter off: switched off, or a window
-    of 0 or less. A ``messagefoundry.toml`` the engine also reads is not consulted."""
+    of 0 (the engine's loader refuses a negative one). A ``messagefoundry.toml`` the engine also
+    reads is not consulted."""
     if (env_setting(environ, _RATE_LIMIT_ENABLED_ENV) or "").lower() in _FALSE_WORDS:
         return True
     try:
@@ -179,9 +180,9 @@ def check_operator_sign_in_limits(procs: int, environ: Mapping[str, str]) -> Non
       silently ends another process's oldest session, and that one's renewal ends the next. So a
       second session a process takes (a step-up re-proof signs in to one of its own) must fit too.
 
-    No limit passes: 0 for any of the three, below 0 for the session cap, and either rate count
-    while ``environ`` turns the rate limiter off. A value that is not a number is left for the
-    engine's loader to refuse. One the loader reads as a whole number, such as ``3.0``, is read
+    No limit passes: 0 for any of the three, and either rate count while ``environ`` turns the
+    rate limiter off. A session cap below 0 passes too, and the engine's loader refuses it. A
+    value that is not a number is left for the engine's loader to refuse. One the loader reads as a whole number, such as ``3.0``, is read
     here as a number too.
     """
     limiter_off = _rate_limiter_off(environ)

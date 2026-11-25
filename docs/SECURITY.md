@@ -7803,12 +7803,12 @@ Read the two together: the table above is the operator-surface half, and that se
 picture including the ingest plane. That document is maintainer-internal;
 [SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md) explains what is withheld and what you can request.
 
-**Almost no limiter has a validator floor.** None of the fifteen `*_rate_limit_*` fields carries a
-lower-bound validator except `admin_write_rate_limit_window_seconds` and
-`monitoring_read_rate_limit_window_seconds`, which must be above `0`, and
-`admin_write_rate_limit_per_actor` (BACKLOG #3293), `monitoring_read_rate_limit_per_actor` and
-`monitoring_read_rate_limit_global` (vault BACKLOG #1191), which must be `0` or more; the windows' other
-validators refuse NaN, infinity and a very long window, not a small one. And
+**The limiters' floors refuse a negative value, not a weak one.**
+Every count among the fifteen `*_rate_limit_*` fields must be `0` or more: the sign-in and PHI-read
+counts (BACKLOG #5318), `admin_write_rate_limit_per_actor` (BACKLOG #3293) and the two
+monitoring-read counts (vault BACKLOG #1191). The sign-in and PHI-read windows must be `0` or more,
+and `admin_write_rate_limit_window_seconds` and `monitoring_read_rate_limit_window_seconds` above
+`0`; the windows' other validators refuse NaN, infinity and a very long window, not a small one. And
 neither `lockout_threshold` nor `lockout_minutes` carries one. So a `per_key` or `glob` of `0` disables that
 dimension, and a sign-in or PHI-read `*_window_seconds` of `0` ages every recorded hit out
 immediately — disabling enforcement while the limiter still reports as "enabled". Treat these as

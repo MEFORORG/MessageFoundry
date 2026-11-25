@@ -327,7 +327,7 @@ def test_every_rate_limit_setting_has_a_documented_row() -> None:
     # limiter setting lands (it read "twelve" against eleven shipped fields).
     word = _COUNT_WORDS.get(len(fields))
     assert word is not None, f"add {len(fields)} to _COUNT_WORDS"
-    assert f"None of the {word.lower()} `*_rate_limit_*` fields" in _doc_text(), (
+    assert f"Every count among the {word.lower()} `*_rate_limit_*` fields" in _doc_text(), (
         f"AuthSettings has {len(fields)} *_rate_limit_* fields; the validator-floor note must say "
         f"{word.lower()!r}."
     )

@@ -24,9 +24,10 @@ from messagefoundry.config.settings import (
 
 # --- [auth] (BACKLOG #5318) ----------------------------------------------------------------------
 
-#: (field, value the load must refuse). A negative count reads as "refuse every attempt after the
-#: first" in RateLimiter, a negative session cap ends every federated session at once, and a cap of
-#: 0 pending flows refuses every federated sign-in.
+#: (field, value the load must refuse). In SlidingWindowRateLimiter a negative per-key count refuses
+#: every attempt after a key's first and a negative global count refuses every attempt, a negative
+#: session cap ends every federated session at once, and a cap of 0 pending flows refuses every
+#: federated sign-in.
 _AUTH_REFUSED: list[tuple[str, Any]] = [
     ("password_min_length", -1),
     ("max_sessions_per_user", -1),
