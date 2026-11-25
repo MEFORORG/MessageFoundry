@@ -38,6 +38,7 @@ cycles, which is how these tests were checked for discrimination.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -551,6 +552,86 @@ def test_an_annotated_tag_reports_its_COMMIT_not_the_tag_object(tmp_path: Path) 
     assert rows["refs/tags/rescue/annotated"]["commit"] == commit, (
         "reported the tag object instead of the commit"
     )
+
+
+def _run_with_failing_git(
+    repo: Path, shim_dir: Path, *fail_when_all_present: str
+) -> subprocess.CompletedProcess[str]:
+    """Run ``-Check`` with a ``git`` that fails for ONE call shape and passes every other through.
+
+    BACKLOG #7591. A PATH shim rather than a corrupted repository, because the three reads it
+    covers need separate faults, and a fault that breaks ``git remote`` (a bad config) also breaks
+    the ``rev-parse`` the script resolves its repository with, so it never reaches the read.
+    ``pwsh`` resolves ``& git`` to the first ``git.*`` it finds on PATH, a ``.ps1`` included.
+    """
+    real_git = shutil.which("git")
+    assert real_git, "git not on PATH"
+    shim_dir.mkdir()
+
+    def quote(s: str) -> str:  # a PowerShell single-quoted literal doubles an apostrophe
+        return "'" + s.replace("'", "''") + "'"
+
+    wanted = ", ".join(quote(a) for a in fail_when_all_present)
+    (shim_dir / "git.ps1").write_text(
+        # $argv, not $args, inside the filter: a script block has its own empty $args. Flattened,
+        # because an array the caller passes to a .ps1 arrives as ONE argument, not spread out.
+        "$argv = @($args | ForEach-Object { $_ })\n"
+        f"$missing = @({wanted}) | Where-Object {{ $argv -notcontains $_ }}\n"
+        "if (-not $missing) { [Console]::Error.WriteLine('shim: injected git failure'); exit 128 }\n"
+        f"& {quote(real_git)} @args\n"
+        "exit $LASTEXITCODE\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["PATH"] = str(shim_dir) + os.pathsep + env.get("PATH", "")
+    return subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(repo / "scripts" / "coord" / "rescue.ps1"),
+            "-Check",
+            "-Json",
+        ],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=env,
+    )
+
+
+@pytest.mark.parametrize(
+    ("fault", "named"),
+    [
+        (("remote",), "git remote"),
+        (("for-each-ref", "refs/rescue"), "rescue refs"),
+        (("for-each-ref", "refs/heads"), "branch tips"),
+    ],
+)
+def test_a_git_failure_is_REFUSED_never_read_as_an_empty_answer(
+    tmp_path: Path, fault: tuple[str, ...], named: str
+) -> None:
+    """BACKLOG #7591: a failed read must not pass as "no remotes", "no refs" or "no branches".
+
+    Before the fix each of the three reads below ignored ``$LASTEXITCODE``, so a git failure
+    returned empty output and the audit went on. A failed ``remote`` drops every push-updated
+    namespace from the coverage; a failed ref read reports zero refs examined; a failed branch read
+    sends every self-describing ref down the branch-gone arm. Each exits 0 with a clean-looking
+    report. The positive control is the same repository passing with the shim on PATH but aimed at
+    a call that never happens, so the shim itself is shown not to be what fails.
+    """
+    repo = _repo_with_a_remote(tmp_path / "r", tmp_path / "priv.git")
+    assert _run(repo, "-Anchor", "kept").returncode == 0
+
+    control = _run_with_failing_git(repo, tmp_path / "control", "no-such-subcommand")
+    assert control.returncode == 0, control.stderr or control.stdout
+    assert "refs/tags/rescue/kept" in control.stdout
+
+    proc = _run_with_failing_git(repo, tmp_path / "shim", *fault)
+    assert proc.returncode != 0, f"a git failure read as an answer:\n{proc.stdout}"
+    assert named in (proc.stderr + proc.stdout), proc.stderr
 
 
 def test_sha_without_anchor_refuses_instead_of_prompting(tmp_path: Path) -> None:

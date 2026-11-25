@@ -7,6 +7,8 @@
   left open. In the same sitting the owner answered two more, on grant rows for timer-driven reads
   and on the grant row's form; *To resolve on acceptance* records each question and its answer. The
   last, on extra session reads, was not put to the owner and stays open to slice 5. No code yet.
+  Amended 2026-11-24 by the dated section at the end of this ADR (check routes and the audited
+  grant row, slice 2a).
   > **Superseded status text, kept as a record.** Until 2026-10-30 this line read: *"Proposed"*.
 - **Date:** 2026-10-29
 - **Related:** vault BACKLOG #2603 (this ADR is its research step); #1197 (console grant rows),
@@ -520,3 +522,21 @@ AskUserQuestion. The fourth stays open after acceptance, as open items did on AD
       measurement points to memoising, the choice changes when a console sub-request re-resolves
       the session, which a bearer request would not share, so it goes to the owner as a gate
       question rather than being taken inside the slice.
+
+## Amendment 2026-11-24: check routes write the grant row of an audited permission (BACKLOG #2603, slice 2a)
+
+Section 2 says a gate-only check route runs what `require` runs, in its order, ending with the
+grant row on a route that names a permission. Slice 2a adds one rule to that sentence and changes
+nothing else in section 2: a check route also writes the grant row where its own gate would not,
+for any permission whose grant is audited on its own routes. That covers the PHI views and, with
+`audit_all_authz` off, the sensitive set and `files:browse` on a GET. Section 3's rules about which
+grants get a row govern every other route. docs/SECURITY.md (Gate-only check routes) states the
+check-route rule.
+
+Provenance. This amendment rests on a Lander ruling recorded with `scripts/coord/decision.ps1` as
+decision `d20261124T135809520-03bdbe`, decided by the Lander under the owner's delegation of
+2026-11-24. The Lander put the amendment's provenance to the owner in its owner table on engine
+PR 3248, and the owner answered *"/driver for all"* in the Lander's chat; an adversarial review
+subagent affirmed the decision. The ruling accepts this amendment: grant rows are added for audited
+check routes and none are removed, so access is unchanged. CORRECTED 2026-11-24: this paragraph
+first cited class B decision `d20261124T092116115-d8b2a5`, whose record is pending and unreviewed.

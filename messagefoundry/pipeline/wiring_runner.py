@@ -248,6 +248,7 @@ from messagefoundry.pipeline.stage_dispatcher import (
     LaneItemResult,
     LaneResultKind,
     RependFence,
+    RependWithoutFault,
     StageDispatcher,
     _capped_backoff,
     wait_to_retry,
@@ -274,7 +275,7 @@ from messagefoundry.store.crypto import (
     StoreKeylessError,
     gave_no_verdict,
 )
-from messagefoundry.store.metadata import user_metadata
+from messagefoundry.store.metadata import intake_metadata_json, user_metadata
 from messagefoundry.store.queue_tag import QueueTagError
 from messagefoundry.store.sealed_cache import point_in_time
 from messagefoundry.store.store import (
@@ -313,6 +314,7 @@ from messagefoundry.transports.egress import warn_url_query_credentials_before_b
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.framing import FRAMING_CODE, MULTIPLE_MESSAGES_CODE
 from messagefoundry.transports.http_listener import DEFAULT_BIND_HOST, reply_seconds
+from messagefoundry.transports.intake import IntakeContext, intake_handler
 from messagefoundry.transports.mllp import build_ack
 from messagefoundry.transports.receipt import IngressReceipt, RefusalKind, receipt_handler
 
@@ -682,9 +684,33 @@ class _SendGated(Exception):
     does."""
 
 
+class SandboxRefusalOvertaken(SandboxSessionClosed, RependWithoutFault):
+    """A sandbox refusal a reload, a rollback, a stop or a graph swap overtook, raised as a close
+    (BACKLOG #6830; :meth:`RegistryRunner._sandboxed_dispatch` says when). It is retried or
+    re-pended as any close is, but a per-lane worker's fault arm, and the pooled dispatcher
+    (:class:`~messagefoundry.pipeline.stage_dispatcher.RependWithoutFault`), log its re-pend at INFO
+    with no traceback, since what overtook it is not a fault. The pooled dispatcher still counts
+    and backs it off as an infra fault, so its STOP bound holds. The message's rerun compares again, and a
+    refusal there alerts and dead-letters as before."""
+
+
 # A delivery worker backs off this long after an *unexpected* error (e.g. the store being briefly
 # unavailable) before retrying, so a transient failure logs once and recovers instead of hot-looping.
 _WORKER_ERROR_BACKOFF_SECONDS = 1.0
+
+
+def _log_overtaken_repend(worker: str, name: str) -> None:
+    """The fault arm's line for a :class:`SandboxRefusalOvertaken` (BACKLOG #6830): INFO, with no
+    traceback and outside the worker's fault run, as the retry line in
+    :meth:`RegistryRunner._off_loop_sandboxed` is. The arm still hands the row back and backs off:
+    the back-off bounds how fast a run of reloads can make the lane spawn and refuse workers. A
+    hand-back that does not land is logged by the arm's own re-pend path."""
+    log.info(
+        "%s worker %r: a sandbox worker's refusal was overtaken (at least a reload, a rollback, a "
+        "stop or a graph change does that); handing the message back to be compared again",
+        worker,
+        name,
+    )
 
 
 # A per-lane worker's run of faults closes on the first healthy pass or empty claim at least this
@@ -2060,6 +2086,12 @@ class RegistryRunner:
         sandbox_config_source: tuple[str | None, str | None] | None = None,
     ) -> None:
         self.registry = registry
+        # BACKLOG #5892: replaced only at a commit; see committed_graph.
+        self._committed: tuple[int, Registry, dict[str, Any] | None] = (
+            RegistryRunner._take_graph_generation(),
+            registry,
+            None,
+        )
         self.store = store
         #: ADR 0154 D3. One rendezvous per runner: the waiter and the capturing worker are the same
         #: process by construction (under HA the graph runs on the leader only), so process-local is
@@ -2102,8 +2134,9 @@ class RegistryRunner:
         self._outbound_plan: _OutboundPlan | None = None
         self._sandbox_graph_shape: tuple[Registry, GraphShape] | None = None
         # Sessions read that cache from their worker threads. Two building it at once would each
-        # get their own object, and a session matches its cached refusal by identity, so it would
-        # start a worker and alert again for the same refusal (vault BACKLOG #2724).
+        # get their own object. Both the sessions' refusal cache and ``_sandboxed_dispatch``
+        # compare by value (BACKLOG #6830), so this is no longer what keeps an alert; it keeps one
+        # shape per registry, not one per session (vault BACKLOG #2724).
         self._sandbox_graph_shape_lock = threading.Lock()
         # ADR 0013 Increment 2: the loop-prevention cap for re-ingress. A re-ingressed message at this
         # correlation depth still routes; the next hop (depth+1) dead-letters its work-row and ERRORs the
@@ -2879,6 +2912,111 @@ class RegistryRunner:
     def notify_work(self) -> None:
         """Wake every stage worker now (e.g. after a replay re-queues rows at an unknown stage)."""
         self._wake_all(Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
+
+    #: The longest injected summary stored, in characters (BACKLOG #5707). ``\.inN\`` escapes can
+    #: expand a summary far past its body, and a longer one is stored as ``None``, never cut. Also
+    #: the most escape growth an inject will unescape while building a summary.
+    _INJECT_SUMMARY_MAX_CHARS = 4096
+
+    #: The most raw characters, across the fields a summary is built from, that an inject will
+    #: unescape (BACKLOG #5707). Unescaping costs many times a leaf's length in memory before any
+    #: cap can see the result, so a message over this is stored with no summary.
+    _INJECT_SUMMARY_MAX_SOURCE_CHARS = 16 * 1024
+
+    async def ingress_fields_for(
+        self, channel_id: str, raw: str
+    ) -> tuple[str | None, str | None, str | None]:
+        """``(control_id, message_type, summary)`` for an operator-injected ``raw`` on ``channel_id``
+        (BACKLOG #5707): an HL7 inbound through its own :func:`peek_max_bytes` ceiling, reading the
+        three values :func:`_read_ingress_fields` reads but each behind its own bound, which that
+        helper's eager read could not honour; any other inbound as its content type with no control
+        id or summary.
+
+        This only labels a row and never refuses one, because the API's resubmission guard has
+        already admitted the body. An unknown channel or an ``Exception`` raised here is three
+        ``None`` values. Only the exception's type is logged: its text can carry the body. The peek
+        runs off the event loop, as that guard's does, because the body can be upload-sized.
+
+        What this bounds is the label values, and nothing about the store write that follows, which
+        can still fail for its own reasons. A value is dropped to ``None`` when it is wider than
+        SQL Server's ``NVARCHAR(256)`` control id or ``NVARCHAR(64)`` type, counted in UTF-16 units
+        as it counts them; when it holds a NUL, which a hex escape can decode into a summary after
+        the guard's NUL check and Postgres refuses; or when a summary is over
+        :attr:`_INJECT_SUMMARY_MAX_CHARS`. The widths apply on every backend, so an inject can store
+        ``None`` where a listener on SQLite or Postgres would keep a longer value.
+
+        Those checks see a summary only after it is built, so its memory bound is taken first, from
+        the raw text of the fields it can be built from for any message type. It is not built when
+        a PID, ORC or OBR line is over :attr:`_INJECT_SUMMARY_MAX_SOURCE_CHARS` characters, when
+        those fields total more, or when their counted escapes could add more than
+        :attr:`_INJECT_SUMMARY_MAX_CHARS`. The measure takes whole fields and counts the order
+        fields on every type, so a value the summary would not read can still cost a row its
+        summary."""
+        from messagefoundry.parsing._builtin_hl7 import escape_expansion_estimate
+
+        cap = self._INJECT_SUMMARY_MAX_CHARS
+
+        def storable(value: str | None, limit: int, *, utf16: bool = False) -> str | None:
+            # The plain length first: an oversized value is dropped with no scan or encode.
+            if value is None or len(value) > limit or "\x00" in value:
+                return None
+            # Strict on purpose: a lone surrogate raises here and stores no labels.
+            if utf16 and len(value.encode("utf-16-le")) // 2 > limit:
+                return None
+            return value
+
+        try:
+            ic = self.registry.inbound.get(channel_id)
+            if ic is None:
+                return None, None, None
+            if ic.content_type is not ContentType.HL7V2:
+                return None, ic.content_type.value, None
+            ceiling = peek_max_bytes(ic)
+
+            def read() -> tuple[str | None, str | None, str | None]:
+                peek = Peek.parse(raw, max_bytes=ceiling)
+                # A whole-field read returns the raw text and unescapes nothing, so measuring the
+                # fields summarize() reads costs no expansion. The control id and type are such
+                # reads too, which is why only the summary needs this bound.
+                # Any field read splits its whole segment, at a cost set by the segment's field
+                # count, so a long segment is refused from its unsplit line before that read.
+                limit = self._INJECT_SUMMARY_MAX_SOURCE_CHARS
+                unsplit = peek.message["_lazy"]
+                read_summary = all(
+                    len(unsplit.get(index, "")) <= limit
+                    for index, segment in enumerate(peek.message["segments"])
+                    if segment["id"] in ("PID", "ORC", "OBR")
+                )
+                sources = (
+                    [
+                        value
+                        for path in ("MSH-9", "PID-3", "PID-5", "ORC-2", "ORC-3", "OBR-2", "OBR-3")
+                        if (value := peek.field(path))
+                    ]
+                    if read_summary
+                    else []
+                )
+                read_summary = read_summary and sum(map(len, sources)) <= limit
+                if read_summary:
+                    # The estimate takes the escape character from its text's first line, so the
+                    # probe opens with the message's own MSH encoding characters.
+                    start = peek.raw.find("MSH")
+                    probe = "\r".join([peek.raw[start : start + 8], *sources])
+                    read_summary = escape_expansion_estimate(probe, limit=cap) <= cap
+                return (
+                    storable(peek.control_id, 256, utf16=True),
+                    storable(peek.message_type, 64, utf16=True),
+                    storable(summarize(peek) or None, cap) if read_summary else None,
+                )
+
+            return await asyncio.to_thread(read)
+        except Exception as exc:  # CancelledError is a BaseException, so a cancel still propagates
+            log.warning(
+                "inject on %r: reading the stored fields raised %s; storing none",
+                channel_id,
+                type(exc).__name__,
+            )
+            return None, None, None
 
     @property
     def env_values(self) -> dict[str, Any]:
@@ -6593,8 +6731,14 @@ class RegistryRunner:
         called this respawns any that a STOP ended (:meth:`_ensure_inbound_workers`)."""
         self._log_halted.discard(name)
         if self._claim_mode != "pooled":
+            # Only a loopback inbound runs a RESPONSE worker (ADR 0013). Waking that lane for any
+            # other inbound left a stray Event in _lane_events (get-or-create) or set the shared
+            # RESPONSE singleton for every loopback worker (BACKLOG #5704).
+            ic = self.registry.inbound.get(name)
+            loopback = ic is not None and ic.spec.type is ConnectorType.LOOPBACK
             for stage in _INTERNAL_STAGES:
-                self._wake_lane(stage, name)
+                if stage is not Stage.RESPONSE or loopback:
+                    self._wake_lane(stage, name)
             return
         lanes = [
             (stage, d)
@@ -7354,6 +7498,30 @@ class RegistryRunner:
                 cached = self._sandbox_graph_shape = (registry, graph_shape(registry))
             return cached[1]
 
+    def _close_sandbox_session_later(self, name: str, session: SandboxSession) -> None:
+        """Close ``session``, already dropped from ``_sandbox_sessions``, in a detached task, so
+        the inbound's worker does not wait on it (BACKLOG #6830): a close waits on a process and
+        joins its drains, and the worker would stall routing or transform for as long. The task is
+        tracked as the lookup executors' detached closes are (:meth:`_track_detached_close`), so the
+        teardown of :meth:`stop` waits for it, on the same terms, and a reload does not: a reload
+        holds ``_reload_lock`` with every listener unbound, and must not wait on a close queued
+        behind a sibling worker's dispatch. The task starts in an empty context, so it holds none
+        of the dispatching message's run-context views or lookup activation."""
+
+        async def close() -> None:
+            try:
+                await asyncio.to_thread(session.close)
+            except Exception as exc:  # noqa: BLE001 - logged by type; the session is already dropped
+                # A failed close leaves at most a worker for the collector. It is not the
+                # message's fault, and the dispatch that dropped the session raised it as a close.
+                log.warning(
+                    "inbound %r: could not close the sandbox session a graph change overtook (%s)",
+                    name,
+                    type(exc).__name__,
+                )
+
+        self._track_detached_close(asyncio.create_task(close(), context=contextvars.Context()))
+
     async def _close_sandbox_sessions(self) -> None:
         """Drop every sandbox session and close its worker, off the loop: each ``close()`` waits on
         a process. A no-op unless a worker sandbox mode spawned any. The next dispatch on an
@@ -7463,28 +7631,31 @@ class RegistryRunner:
         A worker refused for a graph mismatch raises the ``sandbox_worker_refused`` alert here, on
         the loop, before the exception goes on to the internal-error policy unchanged (vault BACKLOG
         #2724, owner ruling 2026-10-16: alert, keep dead-letter). Only the refusal that compared the
-        graphs raises it; the session's cached refusals for later messages do not."""
+        graphs raises it; the session's cached refusals for later messages do not.
+
+        **An overtaken refusal is a close, not a refusal** (BACKLOG #6830):
+        :meth:`_sandboxed_dispatch` says which refusals are overtaken, and raises each as
+        :class:`SandboxRefusalOvertaken`, a :class:`SandboxSessionClosed`, so it is retried or
+        re-pended exactly as above, raises no alert and is not dead-lettered. Both claim modes log
+        that re-pend at INFO with no traceback, and still back off. The message's next run
+        compares again, and that refusal, if the cause still stands, is the one that alerts and
+        dead-letters, whether or not any further message arrives."""
         try:
             try:
-                return await asyncio.to_thread(
-                    fn, registry, *args, sandbox=self._sandbox_for(name), **kwargs
-                )
+                return await self._sandboxed_dispatch(name, fn, registry, *args, **kwargs)
             except SandboxSessionClosed:
                 if self._stop.is_set() or self.registry is not registry:
                     raise
                 log.info(
-                    "inbound %r: its sandbox worker was recycled mid-dispatch; retrying",
+                    "inbound %r: its sandbox worker was recycled mid-dispatch, or a reload "
+                    "overtook its refusal; retrying",
                     name,
                 )
-                return await asyncio.to_thread(
-                    fn, registry, *args, sandbox=self._sandbox_for(name), **kwargs
-                )
+                return await self._sandboxed_dispatch(name, fn, registry, *args, **kwargs)
         except SandboxWorkerRefused as exc:
-            # Not for a refusal computed against a graph a reload has since replaced: the reload
-            # is the remedy, so the alert would stay open with nothing left to fix. The graph the
-            # worker was compared with is checked, not ``registry``: a reload that swapped and
-            # then rolled back leaves ``registry`` served though the comparison used the other.
-            if exc.first and (exc.graph is None or exc.graph is self._engine_graph_shape()):
+            # Only a refusal from a session still serving, against the graph still served, gets
+            # here: :meth:`_sandboxed_dispatch` turns any other into a close.
+            if exc.first:
                 # The whole refusal, once: what differs and both digests. A dead-lettered message
                 # keeps only the first 200 characters of it. Config names and digests, no message.
                 log.warning("inbound %r: %s", name, exc)
@@ -7500,6 +7671,42 @@ class RegistryRunner:
             # SystemExit, whose code may be the author's text, is on neither chain.
             exited = UserCodeCalledSysExit.from_exit(exc)
         raise exited
+
+    async def _sandboxed_dispatch[T](
+        self, name: str, fn: Callable[..., T], registry: Registry, /, *args: Any, **kwargs: Any
+    ) -> T:
+        """One dispatch of :meth:`_off_loop_sandboxed`, on the session resolved for it now.
+
+        An overtaken :class:`SandboxWorkerRefused` is raised as :class:`SandboxRefusalOvertaken`
+        (BACKLOG #6830). It is overtaken when the session that raised it is no longer the one
+        serving ``name``, which at least a reload, a rollback and a stop cause by discarding every
+        session, or when the graph its worker was compared with is not equal to the one served now.
+        Neither the alert nor the dead-letter belongs to it: what overtook it may have cleared the
+        cause, and if not, the message's next run compares again and alerts once. That run is on a
+        fresh session: a session still serving when only the graph changed is discarded here, since
+        its refusal cache holds the overtaken refusal, and an equal graph served again later would
+        be refused from that cache with no alert. Its close runs in a task of its own
+        (:meth:`_close_sandbox_session_later`), so this dispatch does not wait on it. The graph is
+        compared by value, as the session's
+        refusal cache is, so a swap of ``self.registry`` to an equal graph does not overtake a
+        refusal. Checked on the loop with no await before the caller's alert, so a reload cannot
+        discard the session between this check and that alert."""
+        session = self._sandbox_for(name)
+        try:
+            return await asyncio.to_thread(fn, registry, *args, sandbox=session, **kwargs)
+        except SandboxWorkerRefused as exc:
+            if session is None:
+                raise
+            serving = self._sandbox_sessions.get(name) is session
+            if serving and (exc.graph is None or exc.graph == self._engine_graph_shape()):
+                raise
+            if serving:
+                del self._sandbox_sessions[name]
+                self._close_sandbox_session_later(name, session)
+            raise SandboxRefusalOvertaken(
+                f"inbound {name!r}: its sandbox worker's refusal was overtaken: its session was "
+                "discarded or the graph it was compared with is no longer served"
+            ) from exc
 
     async def stop(
         self,
@@ -7969,13 +8176,15 @@ class RegistryRunner:
                 self._abandoned_lookup_closes |= still
                 self._lookup_close_tasks -= still
                 log.warning(
-                    "teardown: %d lookup executor close(s) still pending after %.2fs; left running",
+                    "teardown: %d detached close(s) (lookup executors, sandbox sessions) still pending "
+                    "after %.2fs; left running",
                     len(still),
                     budget,
                 )
         if not demote and self._abandoned_lookup_closes:
             log.warning(
-                "teardown: cancelling %d lookup executor close(s) a demotion abandoned",
+                "teardown: cancelling %d detached close(s) a demotion abandoned; a sandbox session "
+                "close already running runs on, and one not yet started never runs",
                 len(self._abandoned_lookup_closes),
             )
             for _close_task in list(self._abandoned_lookup_closes):
@@ -9576,6 +9785,35 @@ class RegistryRunner:
             )
         return stranded
 
+    # Process-wide, so a runner that replaces another never reissues a generation a load still holds.
+    _last_graph_generation = 0
+
+    @staticmethod
+    def _take_graph_generation() -> int:
+        RegistryRunner._last_graph_generation += 1
+        return RegistryRunner._last_graph_generation
+
+    def committed_graph(self) -> tuple[int, Registry, dict[str, Any] | None]:
+        """The last committed graph's generation, graph and reload values (BACKLOG #5892).
+
+        The values are ``None`` until a reload commits some, so the holder of the start's values
+        keeps answering until then.
+
+        :attr:`registry` holds a reload's new graph from its swap on, while that reload can still
+        be refused. This answers with the graph it replaced until the reload commits, and the
+        generation advances only at that commit, never during the swap or a rollback."""
+        return self._committed
+
+    def _commit_graph(self, new_values: dict[str, Any] | None) -> None:
+        _, registry, values = self._committed
+        if self.registry is registry and new_values is None:
+            return  # a re-apply of the same graph and values: a load under it is still valid
+        self._committed = (
+            RegistryRunner._take_graph_generation(),
+            self.registry,
+            values if new_values is None else new_values,
+        )
+
     async def reload(
         self,
         new_registry: Registry | None = None,
@@ -9702,6 +9940,7 @@ class RegistryRunner:
                     self._park_outbounds_while_passive()
             if not self._running:
                 self.registry = new_registry
+                self._commit_graph(new_env_values)  # BACKLOG #5892: nothing below can refuse it
                 self._forget_removed_anchor_lanes()
                 return ()
 
@@ -9964,6 +10203,8 @@ class RegistryRunner:
                         log.exception("rollback: could not restart inbound %r", name)
                 raise
 
+            # BACKLOG #5892: the commit point. No await since step 3 returned.
+            self._commit_graph(new_env_values)
             # BACKLOG #5755: the closes of what step 3 retired run on every exit from here. A raise
             # or a cancellation anywhere in the commit tail, synchronous or awaited, hands the ones
             # not yet begun to a detached close rather than leaving them open with nothing holding
@@ -10032,11 +10273,13 @@ class RegistryRunner:
         # before ACKing (ACK-on-receipt) — it no longer routes, so it needs no registry snapshot.
         # Routing happens later in the router worker against the LIVE registry, so a message ingested
         # before a reload is routed under the new graph (the staged model decouples intake from
-        # routing). The inbound name is fixed for this source.
-        async def on_message(raw: bytes) -> str | None:
-            return await self._handle_inbound(ic, raw)
+        # routing). The inbound name is fixed for this source. A source that knows its peer hands
+        # the intake context over with the body (vault BACKLOG #2607, transports/intake.py); one
+        # that does not calls this with the body alone.
+        async def on_message(raw: bytes, intake: IntakeContext | None = None) -> str | None:
+            return await self._handle_inbound(ic, raw, intake)
 
-        return on_message
+        return intake_handler(on_message)
 
     def _make_unlisted_sender_refusal(self, ic: InboundConnection) -> InboundHandler:
         # BACKLOG #4907: the source's `refuse_unlisted_sender` seam, bound to this inbound.
@@ -10480,8 +10723,17 @@ class RegistryRunner:
         finally:
             self._stream_inflight_bytes -= size
 
-    async def _handle_inbound(self, ic: InboundConnection, raw: bytes) -> str | None:
+    async def _handle_inbound(
+        self, ic: InboundConnection, raw: bytes, intake: IntakeContext | None = None
+    ) -> str | None:
+        """Decode, guard and parse one body, commit it to the ingress stage, and return the wire
+        reply. ``intake`` is the source's intake context, written into the message's metadata in
+        the ingress transaction (vault BACKLOG #2607). The MLLP, raw-TCP and File sources pass one,
+        so a message they received records how its sender was admitted, or its path; a source that passes none, and a
+        refusal recorded before ingress, store no context."""
         ack_mode = ic.ack_mode
+        # Built once, before any commit, so every ingress path below writes the same cell.
+        metadata = intake_metadata_json(intake.fields() if intake is not None else None)
         reply = ack_mode is not AckMode.NONE
         src = ic.spec.type.value
         hl7v2 = ic.content_type is ContentType.HL7V2
@@ -10515,6 +10767,7 @@ class RegistryRunner:
                 message_type=ic.content_type.value,
                 source_type=src,
                 summary=None,
+                metadata=metadata,
             )
             self._wake_lane(Stage.INGRESS, ic.name)  # B12: wake only this inbound's router lane
             return None
@@ -10628,6 +10881,7 @@ class RegistryRunner:
                 message_type=ic.content_type.value,
                 source_type=src,
                 summary=None,
+                metadata=metadata,
             )
             self._wake_lane(Stage.INGRESS, ic.name)  # B12: wake only this inbound's router lane
             return None
@@ -10848,6 +11102,7 @@ class RegistryRunner:
             message_type=fields.message_type,
             source_type=src,
             summary=fields.summary,
+            metadata=metadata,
             attachment_refs=attachment_refs or None,
         )
         self._wake_lane(
@@ -12559,7 +12814,12 @@ class RegistryRunner:
                 # A store error in the loop itself (claim/handoff failing — DB locked, disk full) must
                 # never kill the worker: that would stall routing while the listener keeps ACKing. Log,
                 # back off, and keep going (mirrors the delivery worker). #1844: with a backoff.
-                faults.failed(exc, "router worker %r: unexpected error; backing off and retrying")
+                if isinstance(exc, RependWithoutFault):
+                    _log_overtaken_repend("router", name)
+                else:
+                    faults.failed(
+                        exc, "router worker %r: unexpected error; backing off and retrying"
+                    )
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
                 held = await self._repend_claimed_on_fault(
                     "router", name, claimed, faults=faults, fence=fence
@@ -12644,9 +12904,44 @@ class RegistryRunner:
         await self.store.dead_letter_now(item.id, f"handler error: {safe_exc(exc)}")
         return _ItemOutcome.PROCESSED, None
 
+    #: How many times one ingress row may start again because a reload replaced the graph during its
+    #: Router (BACKLOG #5707). Past this the row finishes on the served graph without a recheck, so
+    #: a run of reloads cannot hold it, or the lane behind it, indefinitely.
+    _INGRESS_RELOAD_REPASSES = 3
+
+    def _ingress_row_restarts(
+        self, name: str, item: OutboxItem, read: Registry, repass: int
+    ) -> bool:
+        """Whether an inline row whose Router selected one handler must start again, because a reload
+        replaced ``read``, the graph its inline gates describe (BACKLOG #5707). The restart follows
+        with no await, so the next pass finds the inbound this saw.
+
+        Not when the reload removed this inbound: a restart would reach the missing-inbound STOP, and
+        nothing re-arms a worker that stops while a later reload restores the inbound. That row
+        continues on the served graph, whose ``transform_one`` refuses a handler or an outbound that
+        graph no longer has. A reload landing during that transform is not covered.
+
+        Nor when the engine is stopping or this inbound's log gate has closed: both are checked before
+        a claim, and a restart would otherwise run the Router again past them."""
+        if self.registry is read or name not in self.registry.inbound:
+            return False
+        if self._stop.is_set() or self._inbound_log_halted(name):
+            return False
+        if repass >= self._INGRESS_RELOAD_REPASSES:
+            log.warning(
+                "router worker %r: %s met a reload on %d Router passes; finishing on the served "
+                "graph",
+                name,
+                item.id,
+                repass + 1,
+            )
+            return False
+        log.info("router worker %r: a reload replaced the graph; re-running %s", name, item.id)
+        return True
+
     @_records_worker_death("router")
     async def _process_ingress_item(
-        self, name: str, item: OutboxItem
+        self, name: str, item: OutboxItem, *, repass: int = 0
     ) -> tuple[_ItemOutcome, float | None]:
         """Route one claimed ingress row — the per-item body of :meth:`_router_worker`, extracted
         verbatim (ADR 0066, pure code motion) so the loop and the pooled dispatcher share it. Returns
@@ -12654,8 +12949,9 @@ class RegistryRunner:
         always ``None`` (``(PROCESSED, None)`` where the loop advanced, ``(STOPPED, None)`` on a missing
         inbound or the STOP internal-error policy — the body already ``mark_failed``'d / dead-lettered
         the head per policy). The per_lane loop reads only ``outcome[0]``. Store errors propagate to the
-        caller's backoff."""
-        ic = self.registry.inbound.get(name)
+        caller's backoff. ``repass`` counts restarts after a reload (:meth:`_ingress_row_restarts`)."""
+        registry = self.registry  # the graph `inline` below describes (BACKLOG #5707)
+        ic = registry.inbound.get(name)
         if ic is None:
             # The inbound was removed from the registry but residual ingress rows remain.
             # Revert this just-claimed row to pending and EXIT the worker — there is nothing to
@@ -12714,6 +13010,7 @@ class RegistryRunner:
         # route_only and transform_one have both returned and every per-message gate held. The
         # handoff that commits them runs AFTER the try (ADR 0057 G1 as amended 2026-10-07).
         fused: list[tuple[str, str]] | None = None
+        restart = False
         try:
             # Publish the live graph's run-scoped views (code sets / reference snapshots /
             # active environment) so a call-time code_set(...)/reference(...)/
@@ -12755,7 +13052,11 @@ class RegistryRunner:
             # and as the fused path's handoff_exc does (ADR 0071). Eligible iff the inbound opted in
             # AND the graph has no live lookup AND ack_after=ingest AND not LOOPBACK
             # (graph-level gates, cached in self._inline_ok) — plus the per-message gates here.
-            if inline and len(names) == 1:
+            # BACKLOG #5707: those gates describe `registry`, and a reload may have replaced it
+            # during the Router, so such a row commits nothing here and starts again below.
+            single_inline = inline and len(names) == 1
+            restart = single_inline and self._ingress_row_restarts(name, item, registry, repass)
+            if single_inline and not restart:
                 # M-single held. Run the single handler's transform OFF the loop (G4: keep the
                 # to_thread hop — SEC-013), mirroring _transform_worker. No lookup ExitStack:
                 # self._inline_ok already guaranteed no live lookup runner (INV-7), so a
@@ -12833,6 +13134,12 @@ class RegistryRunner:
             # policy decides (factored into _apply_router_internal_error, the single source of
             # truth shared with the fused route branch; byte-identical).
             return await self._apply_router_internal_error(name, item, exc)
+        if restart:
+            # Outside the try, so a store fault in the next pass reaches the caller's fault arm and
+            # is not read as a Router error. The undecorated body, so a worker death counts once.
+            body: Callable[..., Awaitable[tuple[_ItemOutcome, float | None]]]
+            body = RegistryRunner._process_ingress_item.__wrapped__  # type: ignore[attr-defined]
+            return await body(self, name, item, repass=repass + 1)
         # `inline and` is redundant with how `fused` is set; it keeps the fused commit visibly
         # gated on the inline cache (tests/test_crit2_inline_doc_drift.py reads that link).
         if inline and fused is not None:
@@ -13150,9 +13457,12 @@ class RegistryRunner:
             except Exception as exc:
                 # A store error in the loop itself must never kill the worker (mirrors the others).
                 # #1844: logged with a backoff, not a traceback per pass (see _WorkerFaultLog).
-                faults.failed(
-                    exc, "transform worker %r: unexpected error; backing off and retrying"
-                )
+                if isinstance(exc, RependWithoutFault):
+                    _log_overtaken_repend("transform", name)
+                else:
+                    faults.failed(
+                        exc, "transform worker %r: unexpected error; backing off and retrying"
+                    )
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
                 held = await self._repend_claimed_on_fault(
                     "transform", name, claimed, faults=faults, fence=fence

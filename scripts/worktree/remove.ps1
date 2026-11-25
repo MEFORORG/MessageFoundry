@@ -108,7 +108,7 @@
     THE SIX-HOUR FENCE STILL HOLDS: a tree a session has just finished cannot be discarded for six
     hours, because its git state, its working tree or its uncommitted work is too recent.
     What it parks is every tracked change and untracked file older than that, the ones -Force would
-    otherwise discard, and on -Name the untracked files that route lets go, at any size: whatever
+    otherwise discard, at any size: whatever
     the tree's .gitignore does not ignore lands in the object store and stays there while the ref
     does. A temporary index file, a copy of the tree's own index set on the snapshot's own git calls
     only and never left set, takes `add -A` and `write-tree`; the shared stash is never touched.
@@ -148,9 +148,10 @@
 
     -Name KEEPS ITS OLD RULES OTHERWISE. It shares at least the detached HEAD, nested worktree and
     reflog-only refusals above; docs/WORKTREES.md lists what -Name refuses. Tracked changes refuse
-    without -Force, and so do files flagged skip-worktree or
-    assume-unchanged (BACKLOG #5648), which git status does not read. -Force overrides both, and the
-    run names the flagged files it lets go. Untracked files older than six hours and ignored
+    without -Force, and so do untracked files no exclude rule covers (BACKLOG #2554 finding 3)
+    and files flagged skip-worktree or
+    assume-unchanged (BACKLOG #5648), which git status does not read. -Force overrides all three, and the
+    run names the flagged files it lets go. Ignored
     files other than the repositories named above go with the worktree, and there is no occupancy
     check. NEITHER ROUTE RUNS A BLANKET `git worktree prune` (-Name ran one until BACKLOG #5648 and
     #7619): `git worktree remove` already drops the target's own registration, and a prune also drops
@@ -184,7 +185,7 @@
 .EXAMPLE
     .\remove.ps1 -Name alerts
     .\remove.ps1 -Name alerts -DeleteBranch
-    .\remove.ps1 -Name alerts -Force        # discard uncommitted tracked changes older than six hours too
+    .\remove.ps1 -Name alerts -Force        # discard uncommitted tracked changes and untracked files older than six hours too
     .\remove.ps1 -Name alerts -Discard      # park them on refs/attic/<date>-alerts instead
     .\remove.ps1 -List
     .\remove.ps1 -Path C:\Users\me\AppData\Local\Temp\claude\x\y\scratchpad\wt
@@ -1159,30 +1160,45 @@ if ($byPath) {
     }
 }
 else {
-    # Guard against losing UNCOMMITTED tracked work. Note this does NOT see committed-but-unpushed
+    # Guard against losing UNCOMMITTED work. Note this does NOT see committed-but-unpushed
     # commits -- `status --porcelain` is empty for a clean worktree holding them; -DeleteBranch's own
-    # containment check below is what covers those. Untracked entries (??) -- the .venv, node_modules,
-    # dev db -- are expected and don't block removal, once they are older than the quiet period.
+    # containment check below is what covers those.
+    # UNTRACKED FILES REFUSE TOO, WITHOUT -Force (BACKLOG #2554 finding 3). This filter used to drop
+    # every `??` line, on the reasoning that the .venv and node_modules are expected; but this
+    # repository ignores a .venv directory and ide/node_modules, and this read does not pass
+    # --ignored, so those do not print here. A .venv that is a link, or a node_modules no rule
+    # ignores, does print, and now refuses without -Force. What a `??` line
+    # names is untracked work no exclude rule covers (.gitignore, .git/info/exclude or
+    # core.excludesFile), and `worktree remove --force` deleted it. The untracked mode is named,
+    # because status.showUntrackedFiles=no in any config would otherwise hide every `??` line.
+    # Ignored files still go with the tree. -Force overrides, as it does for tracked changes, and
+    # -Discard parks them instead.
     # The exit code is read BEFORE the filter: a git that cannot read this worktree (a corrupt index, say)
     # prints nothing, and nothing read as "no changes" here would hand `worktree remove --force` the very
     # edits this guard exists for. -Force does not override it (BACKLOG #1038).
-    $status = @(& git -C $WorktreePath status --porcelain 2>$null)
+    $status = @(& git -C $WorktreePath status --porcelain --untracked-files=normal 2>$null)
     if ($LASTEXITCODE -ne 0) {
         throw "git status failed in '$WorktreePath' (exit $LASTEXITCODE), so its changes are unknown. Nothing was removed."
     }
     $tracked = $status | Where-Object { $_ -notmatch '^\?\?' }
+    $untracked = $status | Where-Object { $_ -match '^\?\?' }
     # FILES FLAGGED skip-worktree (S) OR assume-unchanged (lower case), BACKLOG #5648. git status does
     # not look at one, so an edit to it is invisible to the guard above, and `worktree remove --force`
     # deletes it. Nothing here can tell an edited one from an untouched one without reading it, so
     # every flagged file refuses. -Force overrides, as it does for tracked changes, and the run names
     # each file it let go so the override leaves a record in the caller's output. -Discard refuses
     # them whatever -Force says, in its own block below.
-    # ONE REFUSAL NAMES BOTH KINDS, so an operator told to re-run with -Force for a tracked change has
-    # also been shown every flagged file that -Force would take with it.
+    # ONE REFUSAL NAMES EVERY KIND, so an operator told to re-run with -Force for a tracked change has
+    # also been shown every untracked and flagged file that -Force would take with it.
     $refuseFlagged = $flagged.Count -gt 0 -and -not $Discard -and -not $Force
-    if (($tracked -and -not $Force -and -not $Discard) -or $refuseFlagged) {
+    if ((($tracked -or $untracked) -and -not $Force -and -not $Discard) -or $refuseFlagged) {
         $why = @()
         if ($tracked -and -not $Discard) { Write-Host ($tracked -join "`n"); $why += 'uncommitted tracked changes' }
+        if ($untracked -and -not $Discard) {
+            $untracked | Select-Object -First 20 | ForEach-Object { Write-Host $_ }
+            if (@($untracked).Count -gt 20) { Write-Host "... and $(@($untracked).Count - 20) more" }
+            $why += 'untracked files that no exclude rule covers'
+        }
         if ($flagged.Count -gt 0 -and -not $Discard) {
             $flagged | Select-Object -First 20 | ForEach-Object { Write-Host "flagged $($_.Substring(2))" }
             if ($flagged.Count -gt 20) { Write-Host "... and $($flagged.Count - 20) more" }
@@ -1414,8 +1430,9 @@ if ($Discard) {
     }
 }
 
-# -Name passes --force regardless: an untracked .venv makes git consider the worktree non-empty, and
-# that route lets untracked files go.
+# -Name passes --force regardless. The reason this comment gave, that -Name lets untracked files
+# go, stopped holding at BACKLOG #2554 finding 3, which refuses them without -Force; whether -Name
+# should drop the unconditional --force as -Path does is left open on that row.
 # -Path WITHOUT -Force PASSES NO --force, so git makes its own check at the moment it deletes: it
 # refuses a tree with modified or untracked files. That closes the gap between the status read above
 # and the removal, for those two kinds. Git's check does not list ignored files, so the tolerated

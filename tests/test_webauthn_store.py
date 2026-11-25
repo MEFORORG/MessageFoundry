@@ -44,6 +44,35 @@ async def test_a_session_for_a_missing_account_is_refused_sqlite(tmp_path: Path)
         await store.close()
 
 
+async def test_the_sessions_user_key_refuses_an_orphan_sqlite(tmp_path: Path) -> None:
+    """Vault BACKLOG #2733 item 6. ``create_session`` now refuses a missing account before its
+    INSERT, so the contract above no longer reaches the ``sessions.user_id`` foreign key. This
+    reaches it directly: a session row moved onto an account that does not exist is refused. RED
+    when: the key is dropped, or SQLite runs with foreign keys off."""
+    import sqlite3
+
+    import pytest
+
+    store = await MessageStore.open(tmp_path / "fk.db")
+    try:
+        await store.create_user(
+            user_id="fk-u1",
+            username="fk-alice",
+            auth_provider="local",
+            password_hash="h",
+            now=1.0,
+            password_generated=False,
+            audits=(),
+        )
+        assert await store.create_session(token_hash="k" * 64, user_id="fk-u1", expires_at=9e9)
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+            await store._db.execute(
+                "UPDATE sessions SET user_id=? WHERE token_hash=?", ("no-such-account", "k" * 64)
+            )
+    finally:
+        await store.close()
+
+
 async def test_webauthn_rehash_contract_sqlite(tmp_path: Path) -> None:
     store = await MessageStore.open(tmp_path / "rehash.db")
     try:

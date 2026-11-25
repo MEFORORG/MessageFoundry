@@ -212,11 +212,11 @@ class KillCause(str, enum.Enum):  # noqa: UP042
     #: The worker answered that it ran out of memory and exits, so it is reaped (vault BACKLOG #3133).
     MEMORY_CAP = "memory_cap"
     #: The worker loaded a graph that differs from the engine's. No WARNING here: the runner logs
-    #: and raises the ``sandbox_worker_refused`` alert for a refusal against the graph it serves. A
-    #: refusal against a graph a reload has since replaced gets neither, and this record does not
-    #: outlast it: the reload discards this session. That kill then writes no line of its own,
-    #: though its reap can (see :func:`_reap_process_tree`); only the refused dispatch's own error
-    #: reaches the runner's internal-error policy.
+    #: and raises the ``sandbox_worker_refused`` alert for this refusal, unless it finds the refusal
+    #: overtaken (``RegistryRunner._sandboxed_dispatch`` says when, BACKLOG #6830), in which case it
+    #: does neither and runs the message again. That kill writes no line of its own, though its
+    #: reap can (see :meth:`SandboxSession._reap`); only the refused dispatch's own error, when it
+    #: is not overtaken, reaches the runner's internal-error policy.
     GRAPH_MISMATCH = "graph_mismatch"
     #: The boot frame could not be written to the new worker.
     BOOT_WRITE = "boot_write"
@@ -522,6 +522,18 @@ _STDERR_NOTICE_SECONDS: Final = 60.0
 #: grandchild can hold the pipes open indefinitely, and this runs under the session lock.
 _STDERR_JOIN_SECONDS: Final = 1.0
 
+#: How long a reap waits for the killed worker to exit before it logs that it has not.
+_REAP_WAIT_SECONDS: Final = 5.0
+
+
+def _close_quietly(stream: Any) -> None:
+    """Close a pipe end this side owns and no longer uses. A failed close changes nothing for the
+    worker, so it is logged at DEBUG, by exception type only."""
+    try:
+        stream.close()
+    except OSError as exc:
+        log.debug("could not close a sandbox worker pipe (%s)", type(exc).__name__)
+
 
 class _StderrRelay:
     """One worker GENERATION's stderr, turned into log records (BACKLOG #343, ADR 0176).
@@ -573,7 +585,12 @@ class _StderrRelay:
         except OSError:
             pass  # the pipe died with the worker; the kill path reports that, this thread does not
         finally:
-            self.close()
+            try:
+                self.close()
+            finally:
+                # This thread is the stream's only reader, so it closes it once the drain ends,
+                # rather than leave the descriptor to the collector (BACKLOG #6831).
+                _close_quietly(stream)
 
     def feed(self, chunk: bytes) -> None:
         """Accumulate ``chunk`` and emit every complete line (or cap-length run) it completes."""
@@ -927,7 +944,8 @@ class SandboxWorkerRefused(SandboxError):
     BACKLOG #2724, owner ruling 2026-10-16). ``content_only`` is True when the config modules'
     bytes are the only difference: the worker ran other bytes than the engine loaded, which a
     session sent the engine's snapshot cannot do (vault BACKLOG #2596). ``graph`` is
-    the engine graph the worker was compared with, so the runner can tell a refusal against a
+    the engine graph object the worker was compared with, a cached refusal's included (BACKLOG
+    #6830: a hit matches by value), so the runner can tell a refusal against a
     graph it no longer serves. The defaults exist only so that a copy or an unpickle, which
     passes the message alone, still builds."""
 
@@ -1006,6 +1024,9 @@ class SandboxSession:
         # The current generation's drain threads (frames on fd 1, stderr on fd 2), joined ONLY on the
         # shutdown path -- see :meth:`close`.
         self._threads: list[threading.Thread] = []
+        # Workers whose request pipe a lookup helper its dispatch gave up on still holds; that
+        # helper closes it, not :meth:`_reap` (BACKLOG #6831).
+        self._stdin_held: set[subprocess.Popen[bytes]] = set()
         # Monotonic per-session worker counter. Part of a relayed line's identity because a pid is NOT
         # a unique generation id: an OS recycles pids (aggressively on Windows), and a stale relay can
         # still be draining a killed child while the next one runs -- two generations' records would
@@ -1048,9 +1069,15 @@ class SandboxSession:
         # survive. A no-op on the first spawn and whenever there is no proc.
         self._reap(self._proc)
         engine_graph = self._graph() if self._graph is not None else None
-        if self._refused is not None and self._refused[0] is engine_graph:
+        # Compared by value: the cache means "the same graph", and a graph callable need not return
+        # one object per graph (BACKLOG #6830). A hit only ever refuses, so it cannot let a
+        # mismatched worker up. ``graph`` stays the object the worker was compared with.
+        if self._refused is not None and self._refused[0] == engine_graph:
             raise SandboxWorkerRefused(
-                self._refused[1], first=False, content_only=self._refused[2], graph=engine_graph
+                self._refused[1],
+                first=False,
+                content_only=self._refused[2],
+                graph=self._refused[0],
             )
         # NAMED, not inherited: an allowlist, so the engine's secrets are not in the child's
         # environment (vault BACKLOG #2587). No engine variable crosses. The config-source escape
@@ -1239,6 +1266,10 @@ class SandboxSession:
                     return  # the stream is out of step, so nothing after the header is a frame
         except OSError:
             sink.put(_EOF)
+        finally:
+            # This thread is the stream's only reader, so it closes it on the way out rather than
+            # leave the descriptor to the collector (BACKLOG #6831).
+            _close_quietly(stdout)
 
     def _kill(self, proc: subprocess.Popen[bytes] | None, cause: KillCause, phase: str) -> None:
         """Kill ``proc`` for ``cause``: record the cause, write its WARNING, and reap the tree.
@@ -1285,7 +1316,8 @@ class SandboxSession:
 
     def _reap(self, proc: subprocess.Popen[bytes] | None) -> None:
         """Reap ``proc``'s whole tree, recording no kill and writing no kill line (see
-        :class:`KillCause`). The tree reap itself can still log (see :func:`_reap_process_tree`)."""
+        :class:`KillCause`). The tree reap itself can still log (see :func:`_reap_process_tree`),
+        and so can the wait for the worker to exit that follows it."""
         if proc is None:
             return
         # Reap the WHOLE tree, not just ``proc``: a grandchild the Handler spawned inherited fd 1 (the
@@ -1295,16 +1327,40 @@ class SandboxSession:
         #
         # The same reap EOFs fd 2, so the stderr relay thread ends on its own here exactly as the frame
         # reader does. Neither thread is joined on THIS path (a respawn must not wait on a grandchild
-        # that holds a pipe open, and this runs under the session lock), and neither pipe is closed:
-        # closing a file object under a mid-read thread raises ``ValueError``, which is not what either
-        # drain's ``except OSError`` catches, so it would escape into ``threading.excepthook``. The
+        # that holds a pipe open, and this runs under the session lock), and neither of their pipes
+        # is closed here: closing a file object under a mid-read thread raises ``ValueError``, which
+        # is not what either drain's ``except OSError`` catches, so it would escape into
+        # ``threading.excepthook``. Each drain closes its own stream as it ends (BACKLOG #6831). The
         # shutdown-only bounded join lives in :meth:`close`.
         _reap_process_tree(proc, self._job, self._inbound)
         self._job = None
-        try:  # noqa: SIM105
-            proc.wait(timeout=5)
-        except (subprocess.TimeoutExpired, OSError):
-            pass
+        try:
+            proc.wait(timeout=_REAP_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            # Not swallowed (BACKLOG #6831): this engine stops waiting on a worker the tree reap
+            # did not end in time. Identity only, no content.
+            log.warning(
+                "inbound %r: sandbox worker pid %d had not exited %.0fs after its process tree was "
+                "reaped, and is not waited on further",
+                self._inbound,
+                proc.pid,
+                _REAP_WAIT_SECONDS,
+            )
+        except OSError as exc:
+            log.warning(
+                "inbound %r: could not wait on sandbox worker pid %d (%s)",
+                self._inbound,
+                proc.pid,
+                type(exc).__name__,
+            )
+        # The engine's end of the request pipe, closed here rather than left to the collector
+        # (BACKLOG #6831). The thread holding the session lock writes it, and so does a lookup
+        # helper while that thread waits on it. A helper its dispatch gave up on may still be inside
+        # a write: that helper closes the pipe itself when it ends, because a close under another
+        # thread's write can free the descriptor number for reuse before that write reaches the
+        # kernel. Any other helper has ended before the reap.
+        if proc.stdin is not None and proc not in self._stdin_held:
+            _close_quietly(proc.stdin)
         if proc is self._proc:
             self._proc = None
 
@@ -1600,17 +1656,36 @@ class SandboxSession:
             except Exception as exc:  # noqa: BLE001 — logged by type, failed by the dispatch thread
                 report(exc)
 
+        # Who closes the request pipe is decided under this lock (see :meth:`_reap`): the helper
+        # if its dispatch gave up on it before it ended, and the reap otherwise.
+        handoff = threading.Lock()
+        ended = False
+
+        def serve_then_release() -> None:
+            nonlocal ended
+            try:
+                serve()
+            finally:
+                with handoff:
+                    ended = True
+                    if abandoned.is_set():
+                        _close_quietly(stdin)
+                        self._stdin_held.discard(proc)
+
         context = contextvars.copy_context()
         helper = threading.Thread(
             target=context.run,
-            args=(serve,),
+            args=(serve_then_release,),
             name=f"mf-sandbox-lookup-{self._inbound}",
             daemon=True,
         )
         helper.start()
         helper.join(max(0.0, deadline - time.monotonic()))
         if helper.is_alive():
-            abandoned.set()
+            with handoff:
+                if not ended:
+                    self._stdin_held.add(proc)
+                abandoned.set()
             return False
         if fault:
             self._kill(proc, KillCause.LOOKUP_FAULT, phase)

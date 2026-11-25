@@ -175,8 +175,10 @@ def test_removes_a_clean_worktree(fx: Fixture) -> None:
     assert fx.branch_exists("clean")
 
 
-def test_untracked_files_do_not_block_removal(fx: Fixture) -> None:
-    """The `.venv` case the header calls expected -- and it is why `--force` is unconditional."""
+def test_ignored_venv_does_not_block_removal(fx: Fixture) -> None:
+    """The `.venv` case the header calls expected. It is gitignored, as it is in this repository, so
+    `git status --porcelain` does not list it and -Name does not refuse it."""
+    (fx.primary / ".git" / "info" / "exclude").write_text(".venv/\n", encoding="utf-8")
     wt = fx.add("venv")
     (wt / ".venv").mkdir()
     (wt / ".venv" / "marker.txt").write_text("not tracked anywhere", encoding="utf-8")
@@ -184,6 +186,32 @@ def test_untracked_files_do_not_block_removal(fx: Fixture) -> None:
     proc = run(fx, "-Name", "venv")
 
     assert proc.returncode == 0, proc.stderr
+    assert not wt.exists()
+
+
+@pytest.mark.parametrize("hide_untracked", [False, True], ids=["default", "showUntrackedFiles-no"])
+def test_name_refuses_untracked_files_and_force_overrides(
+    fx: Fixture, hide_untracked: bool
+) -> None:
+    """Red before the fix (BACKLOG #2554 finding 3): -Name dropped every `??` line, so an untracked
+    file older than the quiet period went with `worktree remove --force` without -Force. A config
+    that hides untracked files from `git status` must not hide them from the refusal."""
+    if hide_untracked:
+        _git(fx.primary, "config", "status.showUntrackedFiles", "no")
+    wt = fx.add("untracked")
+    (wt / "deep").mkdir()
+    (wt / "deep" / "notes.txt").write_text("untracked work\n", encoding="utf-8")
+
+    refused = run(fx, "-Name", "untracked")
+
+    assert refused.returncode != 0
+    assert "untracked files" in refused.stderr, refused.stdout + refused.stderr
+    assert "deep/" in refused.stdout
+    assert (wt / "deep" / "notes.txt").is_file()
+    assert fx.is_registered(wt)
+
+    control = run(fx, "-Name", "untracked", "-Force")
+    assert control.returncode == 0, control.stdout + control.stderr
     assert not wt.exists()
 
 

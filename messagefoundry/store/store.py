@@ -139,6 +139,7 @@ from messagefoundry.store.crypto import (
     AADComponentError,
     AesGcmCipher,
     AuditKeyVersionRefusedError,
+    AuditKeyVersionUnverifiedError,
     AuditMacFn,
     AuditMacMalformedError,
     AuditMacVerifier,
@@ -213,6 +214,7 @@ from messagefoundry.store.row_seal import (
     SESSION_KIND,
     USER_KIND,
     AnyRowSealer,
+    NonFiniteSealValueError,
     ResealOutcome,
     RevokedRowSealError,
     RowSealer,
@@ -1691,7 +1693,9 @@ def session_reseal_params(new: SessionRecord, old: SessionRecord) -> tuple[objec
         new.global_epoch,
         new.seal,
         old.token_hash,
-        old.seal,
+        # The seal cell as read, so a non-empty BLOB cell still matches and an empty one does not,
+        # each as on main (SessionRecord.from_mapping).
+        getattr(old, "_seal_cell", old.seal),
     )
 
 
@@ -1712,6 +1716,35 @@ def session_insert_params(record: SessionRecord) -> tuple[object, ...]:
         record.global_epoch,
         record.seal,
     )
+
+
+def _non_finite_kind(value: object) -> str | None:
+    """``"nan"``, ``"inf"`` or ``"-inf"`` for a float that is not finite, else ``None``."""
+    if not isinstance(value, float) or math.isfinite(value):
+        return None
+    return "nan" if math.isnan(value) else repr(value)
+
+
+def _refuse_new_non_finite(
+    sealer: AnyRowSealer | None,
+    fields: Iterable[tuple[str, object]],
+    prior: Iterable[tuple[str, object]] = (),
+) -> None:
+    """On a store with no sealer, raise :class:`NonFiniteSealValueError`, the type
+    :meth:`RowSealer.seal` raises, for a NaN or an infinity in ``fields`` that ``prior``, the row
+    as it was read, does not already hold under that name (BACKLOG #6717). No seal is made here:
+    SQLite stores a NaN as ``NULL``, so a nullable column would change silently and a ``NOT NULL``
+    one would refuse the write, and no sealed field means anything by an infinity, as that class
+    says. A value carried forward from the stored row is
+    written as before, so only a new value is refused. A name may repeat (a user's role grants),
+    so a value counts as held when any field of that name in ``prior`` holds the same kind."""
+    if sealer is not None:
+        return
+    held = {(n, k) for n, v in prior if (k := _non_finite_kind(v)) is not None}
+    for name, value in fields:
+        kind = _non_finite_kind(value)
+        if kind is not None and (name, kind) not in held:
+            raise NonFiniteSealValueError("a row write refuses a float that is not finite")
 
 
 def seal_session(sealer: RowSealer | None, record: SessionRecord) -> SessionRecord:
@@ -3643,7 +3676,14 @@ class SessionRecord:
     def from_mapping(cls, d: Mapping[str, Any]) -> SessionRecord:
         """The session ``d`` holds; a cell that does not parse raises :class:`RowSealError`, as
         :func:`decode_or_refuse` says, and a missing column still raises ``KeyError``."""
-        return decode_or_refuse(SESSION_KIND, _cell_text(d, "token_hash"), lambda: cls._decode(d))
+        record = decode_or_refuse(SESSION_KIND, _cell_text(d, "token_hash"), lambda: cls._decode(d))
+        if isinstance(d["seal"], bytes) and d["seal"]:
+            # ``seal`` reads a non-empty BLOB as text, which fails a seal check as malformed; the
+            # compare-and-set binds the cell itself (:func:`session_reseal_params`), so a keyless
+            # write still matches the row it read, as on main. An empty BLOB reads as ``""`` and
+            # binds as text, which does not match it, as on main (BACKLOG #6718).
+            object.__setattr__(record, "_seal_cell", d["seal"])
+        return record
 
     @classmethod
     def _decode(cls, d: Mapping[str, Any]) -> SessionRecord:
@@ -3662,7 +3702,7 @@ class SessionRecord:
             # Hard subscripts: every reader is a SELECT *, so a mapping without them is a defect.
             user_epoch=int(d["user_epoch"]),
             global_epoch=int(d["global_epoch"]),
-            seal=d["seal"] or "",
+            seal=str(d["seal"] or ""),
         )
 
     def seal_fields(self) -> tuple[tuple[str, object], ...]:
@@ -4941,10 +4981,10 @@ async def way_past_passkeys(
     Where the write keeps the TOTP (not ``drop_totp``) and ``totp_counts`` counts it on ``record``,
     the rule passes on the TOTP alone, so no passkey is read for it: a set that cannot be read
     must not refuse a write the TOTP already allows. A write that reads the set for its own sake
-    still does (the passkey delete re-seals over the new set). A TOTP judged before the lock that no longer counts
-    under it (:meth:`TotpJudgement.moved`) falls back to the read. Where the write removes the TOTP
-    (``drop_totp``) it is the other way round: the passkeys matter only while that TOTP counts
-    (:func:`totp_removal`), so only then are they read. A set that cannot be read
+    still does (the passkey delete re-seals over the new set). A TOTP judged before the lock that
+    no longer counts under it (:meth:`TotpJudgement.moved`) falls back to the read. Where the write
+    removes the TOTP (``drop_totp``) it is the other way round: the passkeys matter only while that
+    TOTP counts (:func:`totp_removal`), so only then are they read. A set that cannot be read
     (:func:`passkeys_or_none`) is empty here, so it counts as no way past, whatever the seal."""
     if record is None or bool(_totp_is_way_past(record, totp_counts)) != bool(drop_totp):
         return []
@@ -10536,19 +10576,31 @@ async def settle_transit_bound_attestation(
     ``None`` when no row is recorded. The check reuses the chain's own pieces: the row MAC
     (:func:`_audit_row_mac`, under the key of the row's range, by Transit's own ``verify`` for a
     Transit MAC) and the constant-time compare. It walks no chain, so it costs one MAC. A MAC
-    provider runs off the event loop, because it is a blocking Vault call. A Transit refusal of
-    that call, such as a key version a forged hash names that does not exist, reads as a gap, not
-    an error, so a row anyone with DML wrote cannot stop a ``warn`` start."""
+    provider runs off the event loop, because it is a blocking Vault call. A cipher failure of
+    that call reads as a gap, not an error, so a row anyone with DML wrote cannot stop a ``warn``
+    start. A 400 whose reply's wording reads as a version refusal, while the probe under the
+    latest version answers a well-formed MAC naming another version, such as one for a version a
+    forged hash names, says
+    Transit refused the check; the code reads only that wording, which a proxy can imitate. At
+    least a 400 not read as a version refusal, a 400 whose probe answers no well-formed MAC, and
+    an outage that raises :class:`CipherError` say the MAC could not be checked (vault BACKLOG
+    #6707 items 24 and 73). A timeout
+    on both asks is not raised here: :func:`_audit_row_mac` reads it as a MAC that does not
+    verify."""
     attestation = read.attestation
     if attestation is None or read.mac_check is None:
         return attestation
     seq = read.mac_check[0]["seq"]
     try:
         verified = await _audit_row_mac_verifies(*read.mac_check)
-    except CipherError as exc:
+    except AuditKeyVersionUnverifiedError as exc:  # no verdict on the MAC, so not "does not verify"
+        return replace(attestation, audit_gap=f"audit row {seq}'s MAC could not be checked: {exc}")
+    except AuditKeyVersionRefusedError as exc:  # the reply's wording read as a version refusal
         return replace(
             attestation, audit_gap=f"Transit refused to check audit row {seq}'s MAC: {exc}"
         )
+    except CipherError as exc:
+        return replace(attestation, audit_gap=f"audit row {seq}'s MAC could not be checked: {exc}")
     if not verified:
         return replace(
             attestation, audit_gap=f"audit row {seq}'s MAC does not verify under the audit key"
@@ -19918,6 +19970,9 @@ class MessageStore:
         ``current`` that fails its seal, writing nothing, and the UPDATE lands only while the row
         is still in ``current``'s status and carries its seal."""
         sealer = self._row_sealer
+        _refuse_new_non_finite(
+            sealer, new.seal_fields(), () if current is None else current.seal_fields()
+        )
         if current is not None:
             cur = await self._db.execute(
                 _SQLITE_APPROVAL_UPDATE,
@@ -20582,6 +20637,7 @@ class MessageStore:
         )
         # Sealed before the writer lock: the seal depends on the record alone, and under a Transit
         # sealer it is a Vault round trip that ingress would otherwise wait behind.
+        _refuse_new_non_finite(self._row_sealer, record.seal_fields())
         sealed = await seal_user_async(self._row_sealer, record)
         async with _writer_guard(self._db, self._lock):
             # BACKLOG #2592: the whole row, sealed, in one INSERT.
@@ -20640,6 +20696,7 @@ class MessageStore:
             return None
         if changed.roles != current.roles:
             raise ValueError("a presealed user write may not change the account's role rows")
+        _refuse_new_non_finite(self._row_sealer, changed.seal_fields(), current.seal_fields())
         return _PresealedUserWrite(current, await seal_user_async(self._row_sealer, changed))
 
     async def _write_user(
@@ -20688,6 +20745,7 @@ class MessageStore:
                 changed = existing_roles_only(
                     current, changed, [str(r["id"]) for r in await cur.fetchall()]
                 )
+            _refuse_new_non_finite(self._row_sealer, changed.seal_fields(), current.seal_fields())
             updated = await seal_user_async(self._row_sealer, changed)
         cur = await self._db.execute(_USER_RESEAL, user_reseal_params(updated, current))
         if cur.rowcount != 1:
@@ -22331,22 +22389,21 @@ class MessageStore:
                 # A deleted account is refused, guarded or not (BACKLOG #2733), not left to the
                 # INSERT's foreign-key error. The locked read refuses one deleted after this read.
                 return False
-            record = await seal_session_async(
-                self._row_sealer,
-                new_session_record(
-                    token_hash=token_hash,
-                    user_id=user_id,
-                    now=time.time() if now is None else now,
-                    expires_at=expires_at,
-                    client=client,
-                    seed_reauth=seed_reauth,
-                    auth_mechanism=auth_mechanism,
-                    idp_auth_time=idp_auth_time,
-                    mfa_verified=mfa_verified,
-                    user_epoch=epochs[0],
-                    global_epoch=epochs[1],
-                ),
+            minted = new_session_record(
+                token_hash=token_hash,
+                user_id=user_id,
+                now=time.time() if now is None else now,
+                expires_at=expires_at,
+                client=client,
+                seed_reauth=seed_reauth,
+                auth_mechanism=auth_mechanism,
+                idp_auth_time=idp_auth_time,
+                mfa_verified=mfa_verified,
+                user_epoch=epochs[0],
+                global_epoch=epochs[1],
             )
+            _refuse_new_non_finite(self._row_sealer, minted.seal_fields())
+            record = await seal_session_async(self._row_sealer, minted)
             try:
                 inserted = await self._insert_sealed_session(
                     record,
@@ -22504,7 +22561,9 @@ class MessageStore:
         if current.revoked_at is not None:
             return None
         await session_writer_seal_check(self._row_sealer, current)
-        updated = await seal_session_async(self._row_sealer, change(current))
+        changed = change(current)
+        _refuse_new_non_finite(self._row_sealer, changed.seal_fields(), current.seal_fields())
+        updated = await seal_session_async(self._row_sealer, changed)
         cur = await self._db.execute(_SESSION_RESEAL, session_reseal_params(updated, current))
         return updated if cur.rowcount == 1 else None
 

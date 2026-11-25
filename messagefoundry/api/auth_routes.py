@@ -29,6 +29,7 @@ from fastapi.responses import StreamingResponse
 from messagefoundry.api._ui_seam import AdminHandlers
 from messagefoundry.api.auth_models import (
     _GROUP_MAX,
+    STEP_UP_ACTION_MAX,
     STEP_UP_VIA_HEADER,
     STEP_UP_VIA_IDP,
     AdGroupMap,
@@ -70,6 +71,7 @@ from messagefoundry.api.auth_models import (
     SessionInfo,
     SessionList,
     SimpleMessage,
+    StepUpStatusReply,
     UserCreatedResponse,
     UserCreateRequest,
     UserListEntry,
@@ -98,6 +100,7 @@ from messagefoundry.api.security import (
     pending_credential_deadline_for,
     public_route,
     recheck_standing,
+    record_check_grant,
     record_repeated_credential,
     refuse_unless_step_up_window_live,
     require,
@@ -106,6 +109,7 @@ from messagefoundry.api.security import (
     require_step_up,
     require_step_up_action,
     spend_step_up_action,
+    step_up_status,
 )
 from messagefoundry.api.validation import (
     AUDIT_EXPORT_DEFAULT_LIMIT,
@@ -837,6 +841,44 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def me(identity: Identity = Depends(require())) -> CurrentUser:
         return _current_user(identity)
 
+    # ADR 0215 section 2: gate-only routes, for the web console's later slices to sub-request before
+    # a page that shows no engine data of its own renders. No console code calls them yet. Each is a
+    # static gate, require(p) for one permission, registered in a loop over Permission so the route
+    # walk and the route map read it; the permission never comes from the request. Each writes the
+    # grant row its permission's own routes audit (record_check_grant). docs/SECURITY.md (Gate-only
+    # check routes) states what they answer and which rows they write.
+    @app.get("/auth/check", response_model=SimpleMessage)
+    async def auth_check(_: Identity = Depends(require())) -> SimpleMessage:
+        return SimpleMessage(detail="authorized")
+
+    def _add_permission_check(permission: Permission) -> None:
+        async def auth_check_permission(
+            request: Request,
+            identity: Identity = Depends(require(permission)),
+        ) -> SimpleMessage:
+            await record_check_grant(request, identity, permission)
+            return SimpleMessage(detail="authorized")
+
+        app.add_api_route(
+            f"/auth/check/{permission.value}",
+            auth_check_permission,
+            methods=["GET"],
+            response_model=SimpleMessage,
+            name=f"auth_check_{permission.name.lower()}",
+        )
+
+    for check_permission in Permission:
+        _add_permission_check(check_permission)
+
+    @app.get("/me/step-up", response_model=StepUpStatusReply)
+    async def my_step_up_status(
+        request: Request,
+        action: Annotated[str | None, Query(max_length=STEP_UP_ACTION_MAX)] = None,
+        identity: Identity = Depends(require()),
+    ) -> StepUpStatusReply:
+        """:func:`step_up_status`, for the caller's own session (ADR 0215 section 2)."""
+        return await step_up_status(request, identity, action)
+
     @app.post("/me/password", response_model=SimpleMessage)
     async def change_password(
         body: PasswordChangeRequest,
@@ -1279,8 +1321,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         # 7.5.2 (ASVS): terminating a session needs a fresh PASSWORD re-proof BOUND TO THIS ACTION
         # (BACKLOG #1149) — single-use, so the login-seeded window no longer satisfies it. Still the
-        # reauth-only family and NOT the MFA gate: a no-factor user must remain able to revoke; a
-        # pending session on an account WITH a factor is refused (#1951). The gate runs before the
+        # reauth-only family and NOT the MFA gate, but no pending session passes it: one on an
+        # account WITH a factor is refused (#1951), and so is one with NO factor that require_mfa
+        # covers, which is told to enrol (#1149). The gate runs before the
         # body and 403s identically for owned AND foreign ids, so it leaks no ownership.
         identity: Identity = Depends(require_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE)),
     ) -> SimpleMessage:
@@ -1807,19 +1850,18 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # the body model. A body that fails ``RolesUpdateRequest`` is answered first, with no audit
         # row: FastAPI answers 422 on the JSON plane, and the console route that builds the model
         # renders "invalid input" with a 400.
-        user = await service.store.get_user(user_id)
         await _refuse_if_self(
             request,
             service,
             identity,
             user_id,
-            user,
             op="set_roles",
             detail="another administrator must change your own roles",
         )
         await _validate_roles(service, body.roles)
-        if user is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+        # BACKLOG #5520 items 2 and 13: the route decides on the record, so it reads it checked: a
+        # record that fails its seal answers the reads' 423, not the write's own 409.
+        user = await _checked_user(service, user_id)
         if _externally_managed(user.auth_provider):
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "AD users get roles from the AD-group map"
@@ -1827,8 +1869,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # BACKLOG #315: promotion mints an approver exactly as creation does, so it pages too. Only a
         # GRANT pages: re-saving an existing Administrator's roles changes nothing.
         granted = (
-            Role.ADMINISTRATOR.value in body.roles
-            and Role.ADMINISTRATOR.value not in await service.store.get_user_role_ids(user_id)
+            Role.ADMINISTRATOR.value in body.roles and Role.ADMINISTRATOR.value not in user.role_ids
         )
         try:
             # The last-administrator guard is inside, in one store transaction with the role write
@@ -1877,6 +1918,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             op="password_reset",
             detail="use change-password for your own account",
         )
+        # BACKLOG #5520 items 2 and 13: a record that fails its seal answers the reads' 423, not
+        # the service loader's 404. The service reads the account again before it writes.
+        await _checked_user(service, user_id)
         try:
             issued = await service.admin_reset_password(user_id, actor=identity.username)
         except ValueError as exc:
@@ -2222,6 +2266,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         ``ChannelScope`` is answered 422 by FastAPI before the guard runs, with no audit row; the
         console route runs the guard before its own checks (BACKLOG #3393)."""
         await _refuse_own_channel_scope(request, service, identity, user_id)
+        # BACKLOG #5520 items 2 and 13: as on the role write, a record that fails its seal answers
+        # the reads' 423, not the service loader's 404. The service reads it again to decide.
+        await _checked_user(service, user_id)
         try:
             await service.set_channel_scope(
                 user_id,

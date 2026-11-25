@@ -2615,8 +2615,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         was never started. A close cancelled while its sentinel waits on a full queue cancels the
         delivery task too and waits for it (BACKLOG #5907), so the startup unwind's cut does not
         leave the drain running after the store closed; a send that outlives the drain's grace is
-        still left running (:meth:`_cut_sends`). Only this sink does that: an undelivered alert is
-        counted by :attr:`undelivered`, while a security notice's loss must reach its audit row."""
+        still left running (:meth:`_cut_sends`). A cut close of the security notifier cancels
+        its drain too, and then starts recording, where it has an audit sink, each notice the cut
+        left unsent (BACKLOG #6832); a write that meets the closed store is lost."""
         drain = self._task
         try:
             await super().aclose()
