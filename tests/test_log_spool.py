@@ -2086,8 +2086,8 @@ def test_a_failed_udp_send_keeps_a_young_socket_or_one_a_lookup_failed(
         handler.close()
 
 
-#: How many replay retries the head-holding tests below drive: well past any small count a change
-#: that dropped a failing head after a few tries would use.
+#: How many replay retries the head-holding test below drives. Each retry clears the backoff, so
+#: the test rules out a head drop keyed to fewer failed retries than this, and nothing keyed to time.
 _HEAD_RETRIES = 15
 
 
@@ -2120,9 +2120,6 @@ class _FailingStream:
     def sendall(self, data: bytes) -> None:
         raise self.make()
 
-    def settimeout(self, _timeout: float | None) -> None:
-        pass
-
     def close(self) -> None:
         pass
 
@@ -2145,11 +2142,12 @@ def test_a_failing_collector_keeps_the_spool_head_in_place(
     spool_dir: Path, monkeypatch: pytest.MonkeyPatch, on_connect: bool, make: Callable[[], OSError]
 ) -> None:
     """Controls for the spool head (BACKLOG #5923). A collector that is down, or a send on a
-    connection that was up but timed out, could not route or was reset, fails every retry, and
-    the head stays first with the entry behind it still waiting: nothing is dropped and each
-    failed retry is counted. The reset case measures the hold ADR 0200 Amendment B states for a
-    collector that resets the connection on one frame. NEGATIVE CONTROL: on 2026-11-25 a test
-    plugin that advanced the spool past the head after five failed retries turned every case red."""
+    connection that was up but timed out, could not route or was reset on every frame, fails every
+    retry: the head stays first, nothing is dropped, each failed retry is counted, and both entries
+    are still there in order. The reset case resets every frame, so it is a down collector, not
+    the one-frame reset ADR 0200 Amendment B leaves unmeasured. NEGATIVE CONTROL: on 2026-11-25 a
+    test plugin that advanced the spool past the head after five failed retries turned every case
+    red."""
 
     def connect(self: Any) -> None:
         if on_connect:
@@ -2158,17 +2156,18 @@ def test_a_failing_collector_keeps_the_spool_head_in_place(
 
     spool = LogSpool(spool_dir, max_bytes=1_000_000)
     spool.open()
-    listener, handler = _stream_listener(spool, monkeypatch, connect)
     try:
-        assert spool.append(SpoolEntry(level="WARNING", line="head"))
-        assert spool.append(SpoolEntry(level="WARNING", line="behind"))
-        _replay_retries(listener, _HEAD_RETRIES)
-        head = spool.peek()
-        assert head is not None and head.line == "head"
-        assert listener.undeliverable == 0
-        assert listener.send_failures == _HEAD_RETRIES
+        listener, handler = _stream_listener(spool, monkeypatch, connect)
+        try:
+            assert spool.append(SpoolEntry(level="WARNING", line="head"))
+            assert spool.append(SpoolEntry(level="WARNING", line="behind"))
+            _replay_retries(listener, _HEAD_RETRIES)
+            assert listener.undeliverable == 0
+            assert listener.send_failures == _HEAD_RETRIES
+            assert _drain(spool) == ["head", "behind"]
+        finally:
+            handler.close()
     finally:
-        handler.close()
         spool.close()
 
 
