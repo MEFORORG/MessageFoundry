@@ -1847,8 +1847,8 @@ def test_a_reminder_interval_above_its_default_is_a_named_loosening() -> None:
 def test_a_reminder_interval_that_is_not_a_finite_positive_number_is_refused(
     section: type[CertMonitorSettings] | type[SecretRotationSettings], value: float
 ) -> None:
-    """BACKLOG #2008: NaN passed the old ``v <= 0`` check and would be named as a longer interval
-    while the runner rescanned almost continuously; infinity would sleep forever."""
+    """BACKLOG #2008: see the check_interval_seconds validator in settings.py for why NaN is
+    refused; infinity would sleep forever."""
     with pytest.raises(ValueError, match="finite number > 0"):
         section(check_interval_seconds=value)
 

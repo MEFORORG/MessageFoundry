@@ -7178,9 +7178,10 @@ class CertMonitorSettings(_Section):
     @field_validator("check_interval_seconds")
     @classmethod
     def _check_interval(cls, v: float) -> float:
-        # Finite as well as positive (BACKLOG #2008): NaN passed ``v <= 0``, and a NaN sleep wakes
-        # at the loop's next timer, so the monitor rescanned almost continuously and the handshake
-        # re-alert throttle in api/security.py never held.
+        # Finite as well as positive (BACKLOG #2008): NaN passed ``v <= 0``. A NaN timer breaks
+        # asyncio's timer-heap order, delaying the monitor and unrelated timers, and can raise
+        # ValueError from the event loop whether or not other timers are pending;
+        # ``now - last < NaN`` is never true, so the handshake re-alert throttle would never hold.
         if not (v > 0 and math.isfinite(v)):
             raise ValueError("cert_monitor.check_interval_seconds must be a finite number > 0")
         return v
