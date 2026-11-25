@@ -418,10 +418,15 @@ def test_an_unreadable_foreign_roster_gives_no_instruction(sb: Sandbox) -> None:
     # and prints no instruction, as a fault reading this script's roster or the marker does.
     # Every marker here is non-Special, so only the fault can silence the hook.
     foreign = _foreign_repo(sb, "builder")
-    (foreign / "docs" / "roles" / "seats.json").write_text("not json", encoding="utf-8")
+    roster = foreign / "docs" / "roles" / "seats.json"
+    roster.write_text("not json", encoding="utf-8")
     proc = _seat_run(sb, "off", "builder", cwd=foreign / "src")
     assert proc.stdout == "" and "no skill instruction" in proc.stderr, (proc.stdout, proc.stderr)
     assert VETO not in proc.stderr, proc.stderr
+    # The control: the same setup with a readable roster prints the instruction, so the roster's
+    # content is what silenced it above.
+    roster.write_text(json.dumps({"aliases": {}}), encoding="utf-8")
+    _undeclared(_seat_run(sb, "off", "builder", cwd=foreign / "src"))
 
 
 def test_a_foreign_special_marker_outranks_korus_seat(sb: Sandbox) -> None:
