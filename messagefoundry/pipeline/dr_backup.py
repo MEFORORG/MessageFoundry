@@ -488,6 +488,24 @@ def _read_chunks(src: _ChunkSource, what: str) -> Iterator[bytes]:
         yield buf
 
 
+class _NoneRefusingReader:
+    """A ``read`` over ``src`` held to :func:`_read_chunks`'s per-read checks, for a reader such as
+    ``shutil.copyfileobj`` that drives its own loop: a ``None`` read, a read that is not bytes and
+    a read over the size asked for are raised as ``OSError`` (``EIO``) (BACKLOG #6687)."""
+
+    def __init__(self, src: _ChunkSource, what: str) -> None:
+        self._src = src
+        self._what = what
+        # Kept for a reader that names its source, as a test seam on `copyfileobj` does.
+        self.name: object = getattr(src, "name", "")
+
+    def read(self, size: int, /) -> bytes:
+        try:
+            return _read_once(cast(BinaryIO, self._src), size, self._what)
+        except BackupCodecError as exc:
+            raise OSError(errno.EIO, str(exc)) from exc
+
+
 def _manifest_time(manifest: dict[str, object]) -> float | None:
     """The archive's ``created_utc`` as epoch seconds, or ``None`` when it is absent or not the
     ``YYYY-MM-DDTHH:MM:SSZ`` the backup writes (BACKLOG #2614)."""
@@ -6919,11 +6937,12 @@ def _place_restored_store(
         placed = False
         try:
             with out, open(src, "rb") as fh:
-                # Not `copyfileobj`, which reads a None read as the end and would place a
-                # truncated store as placed; `_read_chunks` refuses it as an OSError, which the
-                # cleanup below handles as it does any failed read (BACKLOG #6687).
-                for buf in _read_chunks(fh, "staged store"):
-                    out.write(buf)
+                # `copyfileobj` reads a None read as the end and would place a truncated store as
+                # placed, so it reads through `_NoneRefusingReader`, which refuses one as an
+                # OSError that the cleanup below handles as it does any failed read (BACKLOG #6687).
+                shutil.copyfileobj(
+                    cast(BinaryIO, _NoneRefusingReader(fh, "staged store")), out, _COPY_CHUNK_BYTES
+                )
                 out.flush()
                 os.fsync(out.fileno())
             placed = True
