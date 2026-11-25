@@ -57,6 +57,28 @@ async def test_a_falsy_non_text_field_value_on_the_needle_is_refused(
         assert "field_value must be text" in r.json()["detail"]
 
 
+@pytest.mark.parametrize("falsy", [0, False, []])
+async def test_a_falsy_non_text_target_on_the_needle_is_refused(
+    engine: Engine,  # noqa: F811
+    falsy: object,
+) -> None:
+    """Item 10, the same rule for ``target``: ``crit.get("target") or "both"`` searched both
+    columns for a falsy non-text target, while a truthy one was refused. The control: an absent
+    target still reads as ``"both"``."""
+    pytest.importorskip("psutil")
+    service = await _user(engine, Role.OPERATOR, "op")
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        pid = await _presets(c, h, {"content": "MRN999"})
+        ok = await c.get("/search/layered", params={"presets": pid}, headers=h)
+        assert ok.status_code == 200, ok.text
+        await _store_criteria(engine, pid, {"content": "MRN999", "target": falsy})
+        r = await c.get("/search/layered", params={"presets": pid}, headers=h)
+        assert r.status_code == 400, r.text
+        assert "target must be raw, summary or both" in r.json()["detail"]
+
+
 @pytest.mark.parametrize(
     ("second", "cause"),
     [

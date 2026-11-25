@@ -441,6 +441,12 @@ async def test_alert_rules_withhold_a_star_rule_an_outbound_can_raise(
             AlertRule(id="stopped", event_type="connection_stopped", connection="*"),
             AlertRule(id="cert", event_type="cert_expiry", connection="*"),
             AlertRule(id="any", connection="*"),
+            AlertRule(
+                id="restart",
+                event_type="connection_stopped",
+                connection="*",
+                control_action="restart_inbound",
+            ),
             AlertRule(id="sandbox", event_type="sandbox_worker_refused", connection="*"),
             AlertRule(id="storage", event_type="storage_threshold", connection="*"),
             AlertRule(id="mine-stopped", event_type="connection_stopped", connection="IB_A"),
@@ -518,6 +524,8 @@ async def test_alert_rules_with_no_graph_show_a_scoped_caller_no_named_rule(
             AlertRule(id="all", event_type="sandbox_worker_refused", connection="*"),
             AlertRule(id="mine", connection="IB_A"),
             AlertRule(id="ob", connection="OB_X"),
+            # A "*" rule of "any" is withheld with no graph too (BACKLOG #8390 item 14).
+            AlertRule(id="any", connection="*"),
         ]
     )
     service = await _service(engine)
@@ -525,7 +533,7 @@ async def test_alert_rules_with_no_graph_show_a_scoped_caller_no_named_rule(
     await _user(service, "wide", Role.OPERATOR, [ALL_CHANNELS])
     app = create_app(engine, auth=service, alerts_settings=rules)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
-        for username, expected in (("scoped", ["*"]), ("wide", ["*", "IB_A", "OB_X"])):
+        for username, expected in (("scoped", ["*"]), ("wide", ["*", "IB_A", "OB_X", "*"])):
             r = await c.get("/alerts/rules", headers=await _login(c, username))
             assert r.status_code == 200, r.text
             assert [rule["connection"] for rule in r.json()["rules"]] == expected, username

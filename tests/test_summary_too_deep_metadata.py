@@ -6,6 +6,7 @@ on (BACKLOG #6712 item 2). Synthetic data only."""
 from __future__ import annotations
 
 import logging
+import uuid
 
 import pytest
 
@@ -29,9 +30,9 @@ from tests.test_content_search import (  # noqa: F401
 _DEEP_CELL = '{"user": {"k": "v"}, "z": ' + "[" * 200_000 + "]" * 200_000 + "}"
 
 
-def _row(metadata: str | None) -> dict[str, object]:
+def _row(metadata: str | None, message_id: str = "a" * 32) -> dict[str, object]:
     return {
-        "id": "a" * 32,
+        "id": message_id,
         "channel_id": "IB_A",
         "received_at": 1.0,
         "status": "PROCESSED",
@@ -43,14 +44,17 @@ def test_a_too_deep_metadata_cell_shows_as_none_and_is_logged(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """``user_metadata`` raises ``MetadataTooDeepError`` on such a cell; the summary reads it as no
-    metadata and logs a WARNING that names the message and carries none of the cell. The control:
-    a readable cell still shows its user bag."""
+    metadata and logs a WARNING that names the message and carries none of the cell, once per
+    message per interval, so a second read of the same row logs nothing. The control: a readable
+    cell still shows its user bag."""
     assert _summary(_row('{"user": {"k": "v"}}')).metadata == '{"k": "v"}'
+    message_id = uuid.uuid4().hex
     with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
-        assert _summary(_row(_DEEP_CELL)).metadata is None
+        assert _summary(_row(_DEEP_CELL, message_id)).metadata is None
+        assert _summary(_row(_DEEP_CELL, message_id)).metadata is None
     [record] = [r for r in caplog.records if "too deeply nested" in r.getMessage()]
     assert record.levelno == logging.WARNING
-    assert "a" * 12 in record.getMessage()
+    assert message_id[:12] in record.getMessage()
     assert '"k"' not in record.getMessage()
 
 

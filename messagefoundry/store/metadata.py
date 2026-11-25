@@ -300,8 +300,7 @@ def user_metadata(metadata_json: StoredJson, *, row_id: object = None) -> str | 
     A cell too deep to decode or re-encode raises :class:`MetadataTooDeepError` instead, at every
     caller: ``None`` would send a ``dynamic_headers`` delivery out without its headers. The delivery
     worker takes it on its internal-error arm (``InternalErrorPolicy``). The API's message summary
-    catches it and shows that row's metadata as ``None`` (``_summary_metadata`` in
-    ``messagefoundry/api/app.py``, BACKLOG #6712)."""
+    catches it and shows that row without metadata (BACKLOG #6712)."""
     user = _load_object(metadata_json, row_id=row_id).get("user")
     if not isinstance(user, dict) or not user:
         return None

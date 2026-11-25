@@ -1073,11 +1073,11 @@ def _replay_in_scope(identity: Identity, channel_id: str | None) -> bool:
 _CONTROL_ACTION_SIDE: Final = {"restart_inbound": "inbound", "restart_outbound": "outbound"}
 
 #: Which side of the graph raises each alert event type (BACKLOG #3378). ``"outbound"`` marks a type
-#: whose emitters, read on 2026-11-22, raise it only for an outbound lane. ``GET /alerts/rules``
-#: withholds from a channel-scoped caller a rule of an ``"outbound"`` type, or of a type missing
-#: here, and a ``"*"`` rule of a ``"both"`` type, which it treats ``"any"`` as too. The other values
-#: are notes, not checked per emitter: ``"inbound"`` for the side read, ``"none"`` for a type whose
-#: settings comment keys it on something other than a connection name. A test pins the keys to
+#: whose emitters, read on 2026-11-22, raise it only for an outbound lane, ``"both"`` one raised
+#: on both sides, ``"inbound"`` one raised on the inbound side, and ``"none"`` one whose settings
+#: comment keys it on something other than a connection name. ``GET /alerts/rules`` reads every
+#: value, as its ``visible`` test shows, so a wrong reading of an emitter can show a rule that
+#: should be withheld. No test checks a value against the emitters. A test pins the keys to
 #: ``config.settings._ALERT_EVENT_TYPES``, so a new type has to be classified.
 _ALERT_EVENT_SIDE: Final[Mapping[str, str]] = MappingProxyType(
     {
@@ -3914,18 +3914,41 @@ async def _record_start_audit(
     )
 
 
+#: How often, per message, :func:`_summary_metadata` logs a too-deep cell, and how many messages
+#: it remembers, so a page reloaded over such rows does not repeat the line on every read.
+_TOO_DEEP_LOG_INTERVAL_S: Final = 3600.0
+_TOO_DEEP_LOG_MAX: Final = 4096
+_too_deep_logged: dict[str, float] = {}
+
+
+def _first_too_deep_log(ref: str) -> bool:
+    """Whether to log a too-deep cell for the message ``ref`` names now, as the layered search's
+    refusal log decides per preset."""
+    now = time.monotonic()
+    last = _too_deep_logged.pop(ref, None)
+    if last is not None and now - last < _TOO_DEEP_LOG_INTERVAL_S:
+        _too_deep_logged[ref] = last
+        return False
+    _too_deep_logged[ref] = now
+    while len(_too_deep_logged) > _TOO_DEEP_LOG_MAX:
+        _too_deep_logged.pop(next(iter(_too_deep_logged)))
+    return True
+
+
 def _summary_metadata(d: Mapping[str, Any]) -> str | None:
     """The user bag :func:`_summary` shows for one row, or ``None`` when the stored cell is too
-    deep to read (BACKLOG #6712). Raising there would fail the whole list, search or uploaded-file
-    page the row is on, so the row shows no metadata and a WARNING names the message, never the
-    cell. Showing ``None`` changes only what is displayed, unlike the delivery reader."""
+    deep to read (BACKLOG #6712). Raising there would fail the whole answer the row is on: at least
+    a message list or search page, a layered search, or one message's detail. So the row shows no
+    metadata, and a WARNING names the message, never the cell, at most once per message per
+    :data:`_TOO_DEEP_LOG_INTERVAL_S`. The delivery reader still raises."""
     try:
         return user_metadata(d.get("metadata"), row_id=d["id"])
     except MetadataTooDeepError:
-        _log.warning(
-            "message %r: its stored metadata is too deeply nested to read; shown as none",
-            str(d["id"])[:12],
-        )
+        ref = str(d["id"])[:12]
+        if _first_too_deep_log(ref):
+            _log.warning(
+                "message %r: its stored metadata is too deeply nested to read; shown as none", ref
+            )
         return None
 
 
@@ -4199,8 +4222,9 @@ def _needle_shape(needle: str) -> str:
 
     An operator's needle may itself be PHI — an MRN, a patient name (ADR 0046 §4/AC-6). The audit must
     record *that a content search ran and roughly what kind of term*, never the term verbatim. We emit
-    only a structural class (all-digits / all-letters / letters and digits / anything else) — not the
-    characters — so even a 9-digit MRN logs as ``digits`` with a length, never the number itself.
+    only a structural class, the first of ``str.isdigit`` (``digits``), ``isalpha`` (``alpha``) and
+    ``isalnum`` (``alnum``) the needle passes, else ``mixed`` — not the characters — so even a
+    9-digit MRN logs as ``digits`` with a length, never the number itself.
 
     The shape is read with the padding removed: ``make_spec`` keeps a needle's spaces (BACKLOG #6700),
     and a pasted `` 123456789`` is still an MRN-shaped lookup, so it must audit as ``digits``."""
@@ -4264,6 +4288,13 @@ def _search_audit_detail(
     return detail
 
 
+def _preset_target(stored: object) -> Any:
+    """A stored preset's ``target``, with an absent or empty one read as ``"both"``. Any other
+    value reaches ``make_spec`` as stored, so a non-text one is refused rather than dropped
+    (BACKLOG #6700)."""
+    return "both" if stored is None or stored == "" else stored
+
+
 def _compose_preset_layers(
     criterias: list[dict[str, Any]], *, scan_limit: int = DEFAULT_CONTENT_SCAN_LIMIT
 ) -> tuple[SearchSpec, dict[str, str | None]]:
@@ -4307,7 +4338,7 @@ def _compose_preset_layers(
                 content=crit.get("content"),
                 field_path=crit.get("field_path"),
                 field_value=crit.get("field_value"),
-                target=crit.get("target") or "both",
+                target=_preset_target(crit.get("target")),
                 scan_limit=scan_limit,
             )
         except (ContentSearchError, ValueError) as exc:
@@ -10963,10 +10994,7 @@ def create_app(
                 _CONTROL_ACTION_SIDE.get(rule.control_action, "outbound") == "outbound"
             ):
                 return False
-            # An event type only an outbound raises makes the rule an outbound rule, a "*" one
-            # included. A "*" rule fires for every connection, so one of a type both sides raise,
-            # or of "any", matches outbound events too, and is withheld (BACKLOG #3378, #8390). On
-            # a reachable inbound such a rule matches only that inbound's events, so it shows.
+            # The event-type rule is stated in docs/SECURITY.md (BACKLOG #3378, #8390).
             side = (
                 "both"
                 if rule.event_type == "any"
