@@ -881,10 +881,11 @@ def _raised_at(exc: BaseException) -> str:
 
 
 def _write_held(held: list[logging.LogRecord]) -> None:
-    """Write records :func:`_logs_held` held, through each logger's filter, which now screens them
-    with :func:`_screen_record` rather than holding them. So a line :func:`_screened_line` keeps is
-    written as it returns it, and any other line is written withheld, not redacted; docs/DICOM.md,
-    *The rule, stated once here*, says what a withheld line and a screened traceback keep."""
+    """Write records :func:`_logs_held` held, through each logger's filter. Outside any other hold
+    on this thread, the filter screens them with :func:`_screen_record` and lets them through, so a
+    line :func:`_screened_line` keeps is written as it returns it, and any other line is written
+    withheld, not redacted; docs/DICOM.md, *The rule, stated once here*, says what a withheld line
+    and a screened traceback keep. Inside an outer hold, the filter puts them in that hold."""
     for record in held:
         logging.getLogger(record.name).handle(record)
 

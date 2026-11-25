@@ -4068,15 +4068,14 @@ read as Explicit VR Little Endian, as PS3.10 requires, without `pydicom`, up to 
 outside group `0002`. The `(0002,0000)` Group Length is not read, as `pydicom` ignores a wrong one
 too. Both UIDs are read on every send **before the POST**, as the DICOM SCU parses before it
 associates, so the connection's build does not check `pydicom`. The data set read puts back the
-DICOM connectors' screening log record factory, and the SCU's one warnings filter that ignores
-every warning attributed to a `pydicom` module, since `pydicom`'s `warn_and_log` raises a warning
-with the same text as its log line, value included. It holds the lines `pydicom` logs while it
-reads on the loggers the DICOM connectors' filter is on, and writes them only with the first
-read-fault WARNING of the process (below); otherwise it writes none. A line on another `pydicom`
-logger is not held and is written as it is logged. Every such line passes the DICOM connectors'
-default-deny screen ([DICOM.md](DICOM.md), *The rule, stated once here*), so a line no template
-pins is written withheld, not redacted. `pydicom`'s own copy of such a line as a Python warning is
-not held; that filter drops it where it is in force. An object the codec cannot parse is read as no data set
+DICOM connectors' screening log record factory, and the warnings filter the DICOM connectors
+install, which ignores every warning attributed to a `pydicom` module. It holds the lines `pydicom`
+logs while it reads on the loggers the DICOM connectors' filter is on, and writes them only with
+the first read-fault WARNING of the process (below); otherwise it writes none. A line on another
+`pydicom` logger is not held and is written as it is logged. Such lines pass the DICOM connectors'
+default-deny screen, within its limits ([DICOM.md](DICOM.md), *The rule, stated once here* and *How
+far it reaches*), so a line no template pins is written withheld, not redacted. `pydicom`'s own
+copy of such a line as a Python warning is not held; that filter drops it where it is in force. An object the codec cannot parse is read as no data set
 UID, and the object is still sent. The codec takes at least the exception classes it lists for a
 malformed object as a parse failure, so one of those raised by a broken `pydicom` reads the same
 way: the object is sent, and a 202 that names only its data set UID is then refused after the

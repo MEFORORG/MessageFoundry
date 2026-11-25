@@ -565,18 +565,19 @@ def _data_set_instance_uid(obj: bytes) -> tuple[str | None, bool]:
     WARNING per process naming its class, never its text; nothing is refused before the POST. The
     screening log record factory is put back first
     (:func:`~messagefoundry.transports.dicom._install_record_screen`), as the SCP start, each
-    C-STORE and each SCU association put it back. With the extra found, the SCU's ignore is put back
-    next: one ``warnings`` filter for every warning attributed to a pydicom module, since pydicom's
-    ``warn_and_log`` raises a warning with the same text as its log line, value included. pydicom's
+    C-STORE and each SCU association put it back. With the extra found, the DICOM transport's
+    warnings ignore is put back next
+    (:func:`~messagefoundry.transports.dicom._ignore_pydicom_value_warnings`; what it ignores, and
+    why, is beside :data:`~messagefoundry.transports.dicom._PYDICOM_WARNING_MODULES`). pydicom's
     log lines from the parse, on the loggers the DICOM transport's filter is on, are held, as the
     SCP holds its reads' lines (:func:`~messagefoundry.transports.dicom._logs_held`), and written
     only with that first WARNING, through the same default-deny screen as the SCP's
     (:func:`~messagefoundry.transports.dicom._write_held`); otherwise none is written, since the
     object is sent as bytes and a line on how pydicom read it says nothing about the send. A line
     on another pydicom logger is not held: the record factory screens it and it is written as it
-    is logged. pydicom's own copy of such a line as a Python warning is not held;
-    that ignore drops it, where it is in force. A parse failure is logged by exception class only,
-    never the UID or the bytes (PHI-safe)."""
+    is logged. pydicom's own copy of such a line as a Python warning is not held; that ignore drops
+    it, where it is in force. A parse failure is logged by exception class only, never the UID or
+    the bytes (PHI-safe)."""
     _install_record_screen()  # a host may have replaced the record factory since the import
     if not _dicom_extra_installed():
         logger.debug(

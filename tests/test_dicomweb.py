@@ -1388,7 +1388,7 @@ async def test_dicomweb_the_pre_read_puts_a_replaced_record_factory_back(
 
     in_force: list[object] = []
     unlisted = "pydicom.unlisted_probe_6637"
-    assert unlisted not in dicom_module._FILTERED_LOGGERS  # control: no filter on it
+    assert dicom_module._PEER_VALUE_FILTER not in logging.getLogger(unlisted).filters  # control
 
     def host(*args: object, **kwargs: object) -> logging.LogRecord:
         return logging.LogRecord(*args, **kwargs)  # type: ignore[arg-type]
@@ -1410,6 +1410,7 @@ async def test_dicomweb_the_pre_read_puts_a_replaced_record_factory_back(
             assert await dest.send(PAYLOAD) is None
     finally:
         logging.setLogRecordFactory(original)
+        logging.Logger.manager.loggerDict.pop(unlisted, None)  # the probe logger is the test's own
     assert len(in_force) == 1  # control: the read ran
     factory = in_force[0]
     assert isinstance(factory, dicom_module._ScreeningRecordFactory)
