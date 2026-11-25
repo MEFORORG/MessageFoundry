@@ -743,13 +743,15 @@ _GUARDED_BRACED_NO_SPACE = r"\{(?:[^}'\"\s]|\}\})*+\}(?!\})"
 # would take its anchor or its token end away from. So the shape is an ALLOWLIST, as :data:`_SPACED_BRACED_TAIL` is, and each condition is a
 # measured or reviewed reason:
 #
-# * Before the braces' first white space, anything the guarded braced form takes except ";", "&" and
-#   "{". The old class took that head too, so no later pass read it either way. ";" is refused because
-#   the connection-string member pass reads a ``;pwd=`` member there and masks its value up to the
-#   next ";", across white space: a differential against ``origin/main`` printed five values with ";"
-#   allowed.
-# * The first white space is a plain space, U+0020. A line separator such as U+2028 would be deleted,
-#   joining two lines of a multi-line record.
+# * Before the braces' first plain space, any character except white space, a quote, ";", "&", "{"
+#   and "}" (a doubled "}}" is allowed). The old class took that head too, so no later pass read it
+#   either way. ";", "&" and "{" are refused as a precaution carried from an earlier form of this
+#   branch, whose differential against ``origin/main`` printed five values with ";" allowed anywhere
+#   in the braces; the third review round measured no newly printed value with ";" or "&" allowed in
+#   the head alone, so the head refusal may cost coverage only.
+# * The first white space is a plain space, U+0020; any other white space before it, at least a tab,
+#   U+00A0 and a line separator such as U+2028, refuses the branch. Deleting a line separator would
+#   join two lines of a multi-line record.
 # * After it, up to the closer, and in the glued text after the closer, only lower case ASCII letters,
 #   with spaces in the braces and ";", "," and "&" in the glued text, which the plain class runs over
 #   too. That refuses at least a
@@ -757,13 +759,13 @@ _GUARDED_BRACED_NO_SPACE = r"\{(?:[^}'\"\s]|\}\})*+\}(?!\})"
 #   ``PatientName=`` label, a name run or a date the PHI pass reads to the end of the line or across
 #   the next space, a ``://`` or a ``-----BEGIN`` marker. Found by code review on this change, with
 #   ``MEFOR_X={pp PID|x}x rest vq9`` printing "rest vq9" in the bundle.
-# * No word a later pass reads, anywhere in those letters: :data:`_GLUED_REFUSED_WORDS`, which
-#   ``mrn``, ``nonnumeric`` and the scheme words are in. ``MEFOR_X={pp ww}mrn 12345`` printed
+# * No word of :data:`_GLUED_REFUSED_WORDS`, a fixed list of words later passes read, anywhere in
+#   those letters; at least ``mrn``, ``nonnumeric`` and the scheme words are on it. ``MEFOR_X={pp ww}mrn 12345`` printed
 #   "12345" in the bundle without it, and ``nonnumeric port: 'pw@host'`` after the glued text printed
 #   the password, found by the first and second review rounds.
-# * The glued text ends where the plain class stops, at white space, a quote or the end, so the token
-#   after it ends where it did. It is not followed by at least white space and a ":", "=" or quote, a
-#   quote, or white space and a scheme word and white space, which is :data:`_NO_QUOTED_LABEL_AFTER`:
+# * The glued text ends at white space or the end of the text, so the token after it ends where it
+#   did. A quote right after it refuses the branch, as do at least white space and a ":", "=" or
+#   quote, and white space, a scheme word and white space, which is :data:`_NO_QUOTED_LABEL_AFTER`:
 #   ``;password = v`` keeps its label.
 #
 # These are the readings found so far, not a proof that no later pass reads anything else in such

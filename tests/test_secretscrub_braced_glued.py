@@ -63,9 +63,13 @@ def test_key_material_takes_no_glued_branch() -> None:
     """``_KEY_MATERIAL`` reads as it did before this change: such a branch there deleted the space
     that ended the token before it, and the bundle's HL7 field-run pass then printed what followed
     (found by the third review round)."""
-    for module in (scrub_mod, redact_mod):
-        assert scrub_mod._MEFOR_GLUED_BRANCH not in module._KEY_MATERIAL.pattern
-        assert scrub_mod._SPACED_GUARDED_BRACED not in module._KEY_MATERIAL.pattern
+    line = "a|b|private_key={pp ww}x;Smith Jones"
+    # The bundle's PHI pass hides the name run on origin/main; the key branch printed "Jones".
+    bundle = redact_log_line(line)
+    assert "Jones" not in bundle, bundle
+    # The write-time pass has no PHI pass, so the name prints there on origin/main too; what it
+    # must keep is origin/main's reading, which the key branch shortened to "<redacted>;Smith Jones".
+    assert scrub_credentials(line) == f"a|b|private_key={CREDENTIAL_PLACEHOLDER} ww}}x;Smith Jones"
 
 
 def test_the_bundle_copy_shares_what_the_imported_branch_carries() -> None:
