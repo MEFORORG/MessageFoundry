@@ -1625,7 +1625,9 @@ count is above `0` (vault BACKLOG #2613).
   something outside the engine stops it. The SMTP hop carries the login password; the webhook
   URL can carry its path token. **Setting the flag adds no check on the wire.**
 - **What the attestation can truthfully rest on:** for the SMTP relay, `[tls].crl_file` reaches
-  that hop and adds a real check, where you hold the relay issuer's CRL. It is instance-wide:
+  that hop and adds a real check, where you hold the relay issuer's CRL, the `[tls]` policy reaches
+  the caller that builds the sink, and the relay is not loopback; the `alerts.email_tls_revocation_attested`
+  entry `security_loosenings()` prints names which callers hand that policy over. It is instance-wide:
   every non-loopback hop the `[tls]` policy reaches then needs its issuer's CRL in that file, or
   its handshake fails. For the webhook no CRL can reach the hop, so the
   flag is the only way across, and the honest basis is the same as for the Vault hops: a
@@ -1654,11 +1656,15 @@ count is above `0` (vault BACKLOG #2613).
   sent for assistance over https that verifies the endpoint's certificate, and its handshake
   checks no OCSP. **It checks no CRL unless all three of these hold** (BACKLOG #5527):
   `[tls].crl_file` is set; the `[tls]` section reaches the app serving `POST /ai/chat`; and the
-  endpoint is not loopback. `messagefoundry serve` hands its app that section. A direct
-  `create_app` (the embedded path) holds none unless its embedder passes a `TlsSettings` as
-  `tls_settings` or sets `app.state.tls_settings` to one.
+  endpoint's host is not loopback as the engine reads it: `localhost` or a loopback address, as
+  written, so a spelling such as `localhost.` reads as remote and gets the CRL
+  (`is_loopback_hop_host` in `config/tls_policy.py` says which spellings). `messagefoundry serve`
+  hands its app that section. An embedder's `create_managed_app` holds none unless it passes a
+  `TlsSettings` as `tls_settings`. A direct `create_app` (the embedded path) holds none unless its
+  embedder passes one as `tls_settings` or sets `app.state.tls_settings` to one.
   So at least these check no CRL, whatever `[tls].crl_file` says: a loopback endpoint, and an app
-  the `[tls]` section never reached, such as a direct `create_app` whose embedder did neither.
+  the `[tls]` section never reached, such as a `create_managed_app` or a direct `create_app`
+  whose embedder handed it none.
   Without such a CRL, an `[ai].endpoint` whose host is not loopback is refused under
   `[security].enforcement = enforce`, and wherever a broker is built without a known posture,
   which counts as enforcing. The broker is built for each `POST /ai/chat` request, so the refusal

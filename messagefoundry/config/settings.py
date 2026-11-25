@@ -5166,7 +5166,12 @@ def alert_revocation_attestations(
         (
             "alerts.email_tls_revocation_attested",
             "the [alerts] SMTP relay, for a login (email_username) over verified STARTTLS",
-            "and no CRL unless [tls].crl_file is set",
+            "and no CRL unless all three hold: [tls].crl_file is set, the [tls] policy reaches "
+            "the caller that builds the sink (messagefoundry serve and its offline notifiers hand "
+            "it; the alerts test send reads the app's [tls] section, as POST /ai/chat does; an "
+            "embedder's engine or app holds none unless it passes one), and the relay host is "
+            "not loopback as the engine reads it, localhost or a loopback address as written. So "
+            "at least a loopback relay checks no CRL whatever [tls].crl_file says",
             alerts.email_tls_revocation_attested,
             alerts.email_tls_revocation_attested_reason,
         ),
@@ -11542,7 +11547,8 @@ def security_loosenings(
                 "serving POST /ai/chat (messagefoundry serve hands it; an embedder's "
                 "create_managed_app holds none unless it passes tls_settings, and a direct "
                 "create_app none unless it passes tls_settings or sets app.state.tls_settings), "
-                "and the endpoint is not loopback. So at least "
+                "and the endpoint host is not loopback as the engine reads it, localhost or a "
+                "loopback address as written (so localhost. gets the CRL). So at least "
                 "a loopback endpoint, and an app the [tls] section never reached, check no CRL "
                 "whatever [tls].crl_file says. The "
                 "attestation adds no check. Where no CRL is checked, the revocation refusal is "
