@@ -195,7 +195,8 @@ _SCAN_BUDGET_SECONDS = 0.05
 
 def _tile(unit: str, chars: int) -> str:
     """``unit`` repeated and cut to exactly ``chars`` characters, the tiling the sized fixtures below
-    share."""
+    share. Exact for a non-empty ``unit`` and ``chars`` of 0 or more; a negative ``chars`` gives
+    the empty string, and an empty ``unit`` raises."""
     return (unit * (chars // len(unit) + 1))[:chars]
 
 
@@ -1139,8 +1140,10 @@ def test_the_field_run_and_segment_patterns_nest_no_repetition(case: str, nestin
 # input. The field run: its guard and every open repetition over one item in it match one
 # character set, so each such item is one class and not a repetition, an alternation or a group of
 # them, and each of those runs is possessive. The segment pattern: no open repetition before its
-# tail, and a tail of an open ``[^\r\n]*`` with nothing after it. The guard, the nesting and the
-# segment's tail are what make the scans linear. Possessive runs and the segment's fixed head are
+# tail, and a tail of an open ``[^\r\n]*`` with nothing after it. The linearity argument rests on
+# the guard, the nesting and the segment's tail, but this arm does not read every shape that would
+# break it, so a green here is not proof the scans are linear: the shapes it is known to miss are
+# named in the arm's docstring. Possessive runs and the segment's fixed head are
 # pinned because the patterns state them, so a red that names only one of those is not always a
 # linearity red: possessive runs save about half (the comment on ``_HL7_FIELD_RUN``), and an open
 # segment-ID run (``[A-Z0-9]*``) is still linear behind ``\b``, though a repeated group there
@@ -1195,7 +1198,8 @@ def _class_set(item: Any, universe: str) -> frozenset[str]:
 
 
 def _ungroup(body: Any) -> list[Any]:
-    """``body`` with each group around a single item, plain or atomic, taken off."""
+    """``body`` with each group around a single item, plain or atomic, taken off. A group's scoped
+    flags (``(?a:...)``) are dropped with it, unread."""
     body = list(body)
     while len(body) == 1 and body[0][0] in (sre_constants.SUBPATTERN, sre_constants.ATOMIC_GROUP):
         op, arg = body[0]
@@ -1204,8 +1208,9 @@ def _ungroup(body: Any) -> list[Any]:
 
 
 def _sole_repetition(op: Any, arg: Any) -> Any:
-    """The repetition an atomic group holds alone, or None. Such a group matches what the
-    repetition made possessive does (``(?>[^|]*)`` is ``[^|]*+``)."""
+    """The repetition an atomic group holds alone, or None. For a greedy repetition such a group
+    matches what the repetition made possessive does (``(?>[^|]*)`` is ``[^|]*+``). A lazy one is
+    returned the same way and read as possessive too, which it is not (``(?>[^|]*?)``)."""
     if op != sre_constants.ATOMIC_GROUP:
         return None
     inner = _ungroup(arg)
@@ -1308,7 +1313,16 @@ def test_the_field_run_and_segment_patterns_keep_the_shape_their_linearity_argum
     case: str,
 ) -> None:
     """The structural half of the linearity pin: the shape the comment above names, read from the
-    shipped patterns as compiled, for each case."""
+    shipped patterns as compiled, for each case.
+
+    It reads the class of an open repetition over ONE item only. An open repetition over more than
+    one item is skipped, and so are a group's scoped flags and a lazy run's laziness. It does not
+    see, at least: a repeated sequence (``(?:RR)*``, read green while ``(?:R{2})*`` reads red),
+    a repeated overlapping alternation spliced into the run (``(?:R(?:R|RR))*``, read green and
+    measured at 4.9 s on a 64-character token), an atomic lazy run (``(?>R*?)``, read as
+    possessive), and a run under scoped flags (``(?a:R)*+``, its class read with no flags). Here
+    ``R`` is the run class. Whether the meters or the nesting arm read any of these is not recorded
+    here."""
     pair = _linearity_case(case)
     violations = _field_run_violations(pair.field_run.pattern, pair.delimiters)
     violations += _segment_violations(pair.segment.pattern, pair.delimiters)
@@ -1361,7 +1375,8 @@ def test_a_field_run_that_breaks_its_shape_is_read_red(
     case: str, build: Callable[[str], str]
 ) -> None:
     """Live positive control for the structural arm's field-run half: each field run in
-    :data:`_FIELD_RUN_SHAPE_BREAKS` must break the shape the arm asserts."""
+    :data:`_FIELD_RUN_SHAPE_BREAKS` must break the shape the arm asserts. It asserts only that some
+    violation fires, not which check fired, so it does not show that each check is reached."""
     field_run = build(case)
     assert _field_run_violations(field_run, _linearity_case(case).delimiters), field_run
 
@@ -1425,7 +1440,10 @@ def test_a_segment_pattern_that_breaks_its_shape_is_read_red(
     case: str, build: Callable[[str], str]
 ) -> None:
     """Live positive control for the structural arm's segment half: each segment pattern in
-    :data:`_SEGMENT_SHAPE_BREAKS` must break the shape the arm asserts."""
+    :data:`_SEGMENT_SHAPE_BREAKS` must break the shape the arm asserts. It asserts only that some
+    violation fires, not which check fired: ``tail-crosses-a-carriage-return`` fires on the
+    one-class opcode check, since ``[^\\n]`` parses as a negated literal, not on the class
+    comparison."""
     segment = build(case)
     assert segment != _linearity_case(case).segment.pattern
     assert _segment_violations(segment, _linearity_case(case).delimiters), segment
