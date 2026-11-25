@@ -1174,6 +1174,40 @@ async def test_a_scope_write_that_misses_on_every_attempt_fails_the_sign_in(
         await store.close()
 
 
+async def test_a_miss_on_a_row_gone_is_not_reported_as_contention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A miss whose re-read finds no row returns, on the last attempt too, so the caller's re-read
+    before the mint refuses it as a deleted account rather than as a contended write."""
+    store = await MessageStore.open(tmp_path / "svc6887d.db")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await store.set_ad_group_scope_map([("grp-a", "IB_A")])
+        user = await _ad_user(store, "ada")
+        tries = 0
+        real_load = service._load_user
+
+        async def always_moved(*args: Any, **kwargs: Any) -> bool:
+            nonlocal tries
+            tries += 1
+            return False
+
+        async def gone_on_last(user_id: str) -> Any:
+            return None if tries >= _AD_SCOPE_WRITE_ATTEMPTS else await real_load(user_id)
+
+        monkeypatch.setattr(store, "set_ad_channel_scope_if_unchanged", always_moved)
+        monkeypatch.setattr(service, "_load_user", gone_on_last)
+
+        out = await service._sync_ad_channel_scope(user, frozenset(), ["grp-a"])
+
+        assert tries == _AD_SCOPE_WRITE_ATTEMPTS  # positive control: the last attempt ran
+        assert out.id == "ada" and out.channel_scope is None  # returned, nothing written
+        assert await store.list_audit(action="auth.ad_scope_resynced") == []
+    finally:
+        await store.close()
+
+
 async def test_the_ad_scope_write_compare_and_sets_on_scope_and_source(tmp_path: Path) -> None:
     """``set_ad_channel_scope_if_unchanged`` writes only while the row holds both the expected
     scope and the expected source (``None`` matching NULL), and marks what it writes ``ad``. Each

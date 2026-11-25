@@ -5489,7 +5489,10 @@ def scope_withdrawal(expected_scope: str, now: float) -> UserChange:
 
 
 def ad_scope_replacement(
-    scope_json: str, expected_scope: str | None, expected_source: str | None, now: float
+    scope_json: str,
+    expected_scope: str | None,
+    expected_source: ChannelScopeSource | None,
+    now: float,
 ) -> UserChange:
     """``set_ad_channel_scope_if_unchanged``'s compare-and-set (BACKLOG #6887): write the
     directory's scope, marked ``ad``, only while the row still holds ``expected_scope`` AND
@@ -22114,7 +22117,7 @@ class MessageStore:
         scope_json: str,
         *,
         expected_scope: str | None,
-        expected_source: str | None,
+        expected_source: ChannelScopeSource | None,
         now: float | None = None,
     ) -> bool:
         """The AD sign-in's compare-and-set scope write (BACKLOG #6887); see ``AuthStore``."""

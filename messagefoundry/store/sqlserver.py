@@ -17214,7 +17214,7 @@ class SqlServerStore:
         scope_json: str,
         *,
         expected_scope: str | None,
-        expected_source: str | None,
+        expected_source: ChannelScopeSource | None,
         now: float | None = None,
     ) -> bool:
         """The AD sign-in's compare-and-set scope write (BACKLOG #6887); see ``AuthStore``. The

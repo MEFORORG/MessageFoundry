@@ -3256,20 +3256,21 @@ class AuthStore(Protocol):
         scope_json: str,
         *,
         expected_scope: str | None,
-        expected_source: str | None,
+        expected_source: ChannelScopeSource | None,
         now: float | None = None,
     ) -> bool:
         """Write a directory-derived scope, marked ``"ad"``, as a COMPARE-AND-SET on the scope AND
         its source the AD sign-in decided from, and report whether it wrote (BACKLOG #6887).
 
         The sign-in decides from a row it read several awaits earlier, and the per-process sign-in
-        queue does not order a sign-in on another engine shard, a reconciler pass or an
-        administrator. An unconditional write would then judge whether it changed the scope, which
-        is what revokes the account's other sessions, against a value already replaced: it could
-        revoke a concurrent sign-in's brand-new session for a scope that sign-in had already
-        written. The write is bound to ``expected_scope`` and ``expected_source`` (``None``
-        matching NULL) in one statement; if either differs, or the row is gone, nothing is written
-        and this returns ``False``."""
+        queue orders neither a sign-in on another engine shard nor an administrator's write. An
+        unconditional write would then judge whether it changed the scope, which is what revokes
+        the account's other sessions, against a value already replaced: it could revoke a
+        concurrent sign-in's brand-new session for a scope that sign-in had already written. The
+        compare runs in the same transaction as the write, on the row read under the write's lock,
+        as ``withdraw_ad_channel_scope``'s does: if ``expected_scope`` or ``expected_source``
+        (``None`` matching NULL) differs, or the row is gone, nothing is written and this returns
+        ``False``."""
         ...
 
     async def set_user_federated_subject(
