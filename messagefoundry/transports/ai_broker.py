@@ -122,15 +122,17 @@ _AI_HOP_CELL = "[ai] engine AI broker (verified TLS, no revocation check)"
 _AI_HOP_CELL_OTHER = "[ai] engine AI broker (verified TLS)"
 
 #: The ways across that refusal under an enforcing posture where no CRL can reach the hop: the
-#: attestation pair, or an endpoint whose host ``is_loopback_hop_host`` reads as loopback, which
-#: a host spelled ``localhost.`` or ``127.0.0.1.`` is not though a resolver may take it as this
-#: box, so the remedy names the spellings it reads that way. Each remedy is written out in full,
-#: with no text made from another, so a grep for its opening words finds it (BACKLOG #5527 item 13).
+#: attestation pair, or an endpoint the refusal reads as on-box: the host :func:`hop_url_host`
+#: takes from the URL (brackets stripped) read by ``is_loopback_hop_host``, whose "A limit"
+#: paragraph lists spellings it reads as remote. So the remedy names spellings that read as on-box
+#: rather than "this machine". Each remedy is written out in full, with no text made from another,
+#: so a grep for its opening words finds it (BACKLOG #5527 item 13).
 _AI_ATTESTATION_LEVER = (
     "Set [ai].endpoint_revocation_attested = true with an "
     "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
-    "endpoint's certificate, or use an endpoint URL whose host is read as loopback: localhost, or "
-    "a loopback address such as 127.0.0.1 or [::1], written with no trailing dot."
+    "endpoint's certificate, or use an endpoint URL whose host is localhost, 127.0.0.1 or [::1], "
+    "spelled exactly so and listed in [ai].allowed_endpoints: a spelling with a trailing dot, or a "
+    "short form such as 127.1, is read as remote and refused here."
 )
 
 #: The ways across that refusal under an enforcing posture, on the terms below:
@@ -147,8 +149,9 @@ _AI_CRL_LEVER = (
     "is instance-wide: every non-loopback hop it reaches then needs its issuer's CRL in that file, "
     "or its handshake fails), or set [ai].endpoint_revocation_attested = true with an "
     "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
-    "endpoint's certificate, or use an endpoint URL whose host is read as loopback: localhost, or "
-    "a loopback address such as 127.0.0.1 or [::1], written with no trailing dot."
+    "endpoint's certificate, or use an endpoint URL whose host is localhost, 127.0.0.1 or [::1], "
+    "spelled exactly so and listed in [ai].allowed_endpoints: a spelling with a trailing dot, or a "
+    "short form such as 127.1, is read as remote and refused here."
 )
 
 

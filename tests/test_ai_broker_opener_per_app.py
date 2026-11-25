@@ -190,16 +190,16 @@ def test_each_attestation_remedy_is_written_as_it_is_logged() -> None:
 
 
 def test_the_on_box_remedy_names_the_hosts_the_code_reads_as_loopback() -> None:
-    """The refusal's last remedy names the endpoint hosts ``is_loopback_hop_host`` reads as
-    loopback, and says no trailing dot, so following it crosses the refusal. Red before the fix:
-    it said "use an endpoint on this machine", which ``localhost.`` and ``127.0.0.1.`` are, yet
-    each is read as remote and still refused with that same remedy."""
+    """The refusal's last remedy names endpoint hosts the refusal reads as on-box, and the
+    spellings it reads as remote, so following it crosses the refusal. Red before the fix: it said
+    "use an endpoint on this machine", and a resolver may take ``localhost.`` or ``127.0.0.1.`` as
+    this box, yet each is read as remote and refused with that same remedy."""
     named = ("localhost", "127.0.0.1", "[::1]")
+    near_misses = ("localhost.", "127.0.0.1.", "127.1")
     for lever in (ai_broker_mod._AI_ATTESTATION_LEVER, ai_broker_mod._AI_CRL_LEVER):
         assert "this machine" not in lever
-        assert "no trailing dot" in lever
-        for host in named:
-            assert host in lever
+        assert "a spelling with a trailing dot, or a short form such as 127.1" in lever
+        assert "localhost, 127.0.0.1 or [::1], spelled exactly so" in lever
     # Each host the remedy names builds under an enforcing posture, with no CRL or attestation.
     for host in named:
         _broker(
@@ -207,11 +207,20 @@ def test_the_on_box_remedy_names_the_hosts_the_code_reads_as_loopback() -> None:
             allowed=(host,),  # the allowlist matches the host as the URL writes it
             posture=_ENFORCING,
         )
-    # The same host with a trailing dot is on this machine to a resolver, but is still refused.
-    for host in ("localhost.", "127.0.0.1."):
-        with pytest.raises(ai_broker_mod.AiBrokerError) as info:
-            _broker(endpoint=f"https://{host}/v1/messages", allowed=(host,), posture=_ENFORCING)
-        assert ai_broker_mod._AI_ATTESTATION_LEVER in str(info.value)
+    # Each spelling the remedy says reads as remote is refused, with either remedy text.
+    for host in near_misses:
+        for policy, lever in (
+            (None, ai_broker_mod._AI_ATTESTATION_LEVER),
+            (TrustAnchorPolicy(), ai_broker_mod._AI_CRL_LEVER),
+        ):
+            with pytest.raises(ai_broker_mod.AiBrokerError) as info:
+                _broker(
+                    endpoint=f"https://{host}/v1/messages",
+                    allowed=(host,),
+                    posture=_ENFORCING,
+                    policy=policy,
+                )
+            assert str(info.value).endswith(lever), str(info.value)
 
 
 def test_each_caller_of_the_ai_opener_chooser_is_a_census_site() -> None:
