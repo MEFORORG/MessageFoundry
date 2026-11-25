@@ -41,7 +41,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from operator import itemgetter
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, BinaryIO, ClassVar, Literal, NamedTuple, Self, TypeVar
 
 from messagefoundry.config.models import (
@@ -3428,7 +3428,9 @@ def _inside_watch_tree_by_identity(dest_dir: Path, directory: Path) -> bool:
     parent is what is compared. A path that cannot be read compares as not the watch directory, and
     so does every path when the watch directory cannot be read or reports no file identity (an
     inode of 0, as some SMB servers do, which would make every directory on the volume match); each
-    such skip is logged at WARNING. Touches the filesystem, so call it off the event loop."""
+    such skip is logged at WARNING. So is a ``dest_dir`` none of whose parts exists, down to its
+    root, as an unreachable UNC share reads: the WARNING names the path's class, never its text.
+    Touches the filesystem, so call it off the event loop."""
     if _dirs_below(dest_dir, directory) is not None:
         return False
     try:
@@ -3448,10 +3450,12 @@ def _inside_watch_tree_by_identity(dest_dir: Path, directory: Path) -> bool:
             directory,
         )
         return False
+    compared = False
     for candidate in (real, *real.parents):
         try:
             if os.path.samestat(os.stat(candidate), watch):
                 return True
+            compared = True
         except FileNotFoundError:
             continue  # not created yet: its parent is compared next
         except (OSError, ValueError) as exc:
@@ -3461,7 +3465,24 @@ def _inside_watch_tree_by_identity(dest_dir: Path, directory: Path) -> bool:
                 directory,
                 _describe_os_error(exc) if isinstance(exc, OSError) else type(exc).__name__,
             )
+    if not compared:
+        # Every part, the root included, read as absent: on Windows an unreachable share or server
+        # reports ENOENT, so nothing was compared and a False here is no verdict.
+        logger.warning(
+            "file source %s: the archive directory identity check did not run: no part of the "
+            "archive directory's %s path could be read",
+            directory,
+            _path_class(real),
+        )
     return False
+
+
+def _path_class(path: PurePath) -> str:
+    """The class of ``path`` for a log line that must not carry its text: ``UNC`` for a
+    UNC (``//server/share``) path, else ``drive`` on Windows or ``local`` elsewhere."""
+    if path.drive.startswith(("\\\\", "//")):
+        return "UNC"
+    return "drive" if path.drive else "local"
 
 
 def _dirs_below(dest_dir: Path, directory: Path) -> tuple[str, ...] | None:

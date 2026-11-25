@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 import pytest
@@ -477,6 +477,59 @@ def test_a_watch_directory_with_no_file_identity_skips_the_check_and_says_so(
     with caplog.at_level("WARNING", logger="messagefoundry.transports.file"):
         assert not file_module._inside_watch_tree_by_identity(archive, inbox)
     assert "reports no file identity" in caplog.text
+
+
+def test_an_archive_path_with_no_readable_part_skips_the_check_and_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Red before: on Windows an unreachable UNC share reports ENOENT for every part of the path,
+    its root included, so nothing was compared and the check returned False with no word. It now
+    logs a WARNING naming the path's class, and not the archive path's text."""
+    from messagefoundry.transports import file as file_module
+
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    archive = tmp_path / "unreachable-share" / "archive"
+    real_stat = os.stat
+
+    def unreachable(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if os.fspath(path) == os.fspath(inbox):
+            return real_stat(path, *args, **kwargs)
+        raise FileNotFoundError(2, "The network path was not found")
+
+    monkeypatch.setattr(os, "stat", unreachable)
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.file"):
+        assert not file_module._inside_watch_tree_by_identity(archive, inbox)
+    assert "no part of the archive directory's" in caplog.text
+    assert "unreachable-share" not in caplog.text
+
+
+def test_an_archive_path_whose_parent_exists_logs_no_skip(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The control: a not-yet-created archive directory under an existing parent is compared.
+    from messagefoundry.transports import file as file_module
+
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.file"):
+        assert not file_module._inside_watch_tree_by_identity(tmp_path / "new" / "archive", inbox)
+    assert "did not run" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        (PureWindowsPath(r"\\server\share\archive"), "UNC"),
+        (PureWindowsPath("//server/share/archive"), "UNC"),
+        (PureWindowsPath(r"D:\archive"), "drive"),
+        (PurePosixPath("/srv/archive"), "local"),
+    ],
+)
+def test_the_path_class_names_no_path_text(path: Any, expected: str) -> None:
+    from messagefoundry.transports import file as file_module
+
+    assert file_module._path_class(path) == expected
 
 
 def test_an_archive_subdir_outside_the_watch_tree_through_a_link_still_starts(
