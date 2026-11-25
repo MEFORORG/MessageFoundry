@@ -88,6 +88,7 @@ def allocate(
     worktree: Path | None = None,
     branch: str | None = None,
     omit_branch: bool = False,
+    omit_worktree: bool = False,
 ) -> None:
     """Mimic what scripts/coord/alloc.ps1 writes, so the hook's ownership check has something to read.
 
@@ -99,7 +100,7 @@ def allocate(
     the fallback short-circuits on a missing branch.
 
     `omit_branch` reproduces a LEGACY record written before the allocator recorded one, so the
-    path-only behaviour stays pinned.
+    path-only behaviour stays pinned. `omit_worktree` drops the path too, for a record with neither.
     """
     common = git_read(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
     top = git_read(repo, "rev-parse", "--path-format=absolute", "--show-toplevel").strip()
@@ -115,6 +116,8 @@ def allocate(
     d = root / "mefor-coord" / "alloc" / kind
     d.mkdir(parents=True, exist_ok=True)
     claim: dict[str, str] = {"number": number, "kind": kind, "worktree": str(worktree or top)}
+    if omit_worktree:
+        del claim["worktree"]
     if not omit_branch:
         claim["branch"] = branch or git_read(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
     (d / f"{number}.json").write_text(json.dumps(claim), encoding="utf-8")
@@ -299,6 +302,52 @@ def test_a_LEGACY_record_with_no_branch_still_falls_back_to_the_path_alone(
     code, out = run_check(repo)
     assert code == 1
     assert "not allocated to this worktree" in out
+
+
+def _stage_unowned_0002(repo: Path) -> None:
+    write(repo, "docs/adr/0002-new.md", "# 0002 — New\n")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD + ROW.format(n="0002", slug="new", title="New") + "\n",
+    )
+
+
+def test_a_record_whose_worktree_and_branch_are_BOTH_GONE_gets_a_remedy_that_works(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The remedy must end in a step that works when neither recorded key still exists.
+
+    The worktree path and the branch below do not exist. Without the recreate step and the
+    allocator after it, every step the refusal printed needed one of them.
+    """
+    _stage_unowned_0002(repo)
+    gone = tmp_path / "worktree-that-was-deleted"
+    allocate(repo, "adr", "0002", worktree=gone, branch="claude/branch-that-was-deleted")
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "not allocated to this worktree" in out
+    flat = " ".join(out.split())
+    recreate = flat.find("recreate a worktree at the path in 1")
+    alloc = flat.find("ONLY if neither the recorded worktree nor the branch exists")
+    assert recreate != -1, out
+    assert alloc > recreate, out
+    assert r"scripts\coord\alloc.ps1 -Kind adr" in flat[alloc:], out
+
+
+def test_a_record_with_NEITHER_worktree_nor_branch_still_names_the_allocator(repo: Path) -> None:
+    """Nothing recorded can be recovered, so the allocator is the step that works."""
+    _stage_unowned_0002(repo)
+    allocate(repo, "adr", "0002", omit_branch=True, omit_worktree=True)
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    flat = " ".join(out.split())
+    assert "recreate a worktree" not in flat, out
+    assert r"scripts\coord\alloc.ps1 -Kind adr" in flat, out
 
 
 # ----------------------------------------------------------------- restoring a number the base LOST

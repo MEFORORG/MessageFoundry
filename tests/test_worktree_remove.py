@@ -925,6 +925,33 @@ def test_a_backlog_record_with_a_branch_is_named_unrecoverable(fx: Fixture) -> N
     assert fx.is_registered(wt)
 
 
+_DELETE_BRANCH_WARNING = (
+    "A record with no branch, or whose branch is deleted (-DeleteBranch on this run deletes the "
+    "branch checked out here), can then be committed only from a worktree recreated at this path"
+)
+
+
+def test_under_DeleteBranch_a_recorded_branch_is_not_named_recoverable(fx: Fixture) -> None:
+    """The re-run this refusal offers, with -AllowOrphanedAllocations, also deletes the branch
+    checked out here, which is usually the recorded one, so the line must not promise it survives."""
+    wt = fx.add("alpha")
+    _write_alloc(fx, "9111", wt, kind="adr", branch="feat/x")
+
+    proc = run(fx, "-Name", "alpha", "-DeleteBranch")
+    flat = _flat(proc.stderr)
+    assert proc.returncode != 0, "removal proceeded past a recorded allocation"
+    assert _RECOVERABLE not in flat, proc.stderr
+    assert "if that is the recorded branch feat/x, " + _STRANDED in flat, proc.stderr
+    assert _DELETE_BRANCH_WARNING in flat, proc.stderr
+    assert fx.is_registered(wt)
+
+    # The control: without the flag, the same record is named recoverable and no warning prints.
+    plain = run(fx, "-Name", "alpha")
+    assert plain.returncode != 0, "removal proceeded past a recorded allocation"
+    assert _RECOVERABLE in _flat(plain.stderr), plain.stderr
+    assert "-DeleteBranch" not in _flat(plain.stderr), plain.stderr
+
+
 # --- BACKLOG #1829: the retired-allocator tombstone ------------------------------------------------
 #
 # Why remove.ps1 skips this one ownerless record is in its Read-RecordFile comment.

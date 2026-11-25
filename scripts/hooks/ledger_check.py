@@ -805,6 +805,19 @@ class Ledger:
             "       (git refuses an ORDINARY second checkout of a branch another worktree holds. Do",
             "        not force past that. From the worktree in 1 you can still reach it with:",
             "        git checkout -b <alias> <branch>, then push <alias>:<branch>)",
+        ]
+        # A record whose worktree and branch are both gone still has a recovery: the owner-ruled
+        # recreate of the recorded path, which restores the condition owns() tests.
+        if worktree:
+            lines += [
+                "    3. if that worktree is gone and its branch is gone or was never recorded, recreate",
+                "       a worktree at the path in 1 (on the machine 1 names, if it names one) and commit",
+                "       from it",
+            ]
+        lines += [
+            "    4. ONLY if neither the recorded worktree nor the branch exists, and no step above",
+            "       applies, allocate a new number:",
+            f"       {allocate}",
             "",
             "    See docs/LEDGER-GATE.md, 'Recovering a number the gate has refused'.",
         ]
@@ -839,7 +852,8 @@ class Ledger:
         (BACKLOG #5453). Only it gets the lines about a shallow clone and about renaming a restore,
         because only for it do those lines change what will pass. ``fork_unknown`` marks a renamed
         file whose grant failed only because git found no fork point with the base: the number may
-        well be allocated, so that refusal names the fork point first and the allocator only last.
+        well be allocated, so that refusal names the fork point first, then the remedy, which names
+        the allocator, where it names it at all, only as its last step.
         """
         if self.alloc is None:
             # Unresolved is not unowned. Refusing costs a retry; guessing hands out a spent number.
@@ -873,7 +887,7 @@ class Ledger:
                     if renamed
                     else ""
                 )
-                + "      If this is NOT a restore, the number simply needs allocating:\n"
+                + "      If this is NOT a restore, do this instead:\n"
                 f"      {remedy}",
             )
         if seen.number_is_historical:

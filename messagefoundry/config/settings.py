@@ -7178,9 +7178,10 @@ class CertMonitorSettings(_Section):
     @field_validator("check_interval_seconds")
     @classmethod
     def _check_interval(cls, v: float) -> float:
-        # Finite as well as positive (BACKLOG #2008): NaN passed ``v <= 0``, and a NaN sleep wakes
-        # at the loop's next timer, so the monitor rescanned almost continuously and the handshake
-        # re-alert throttle in api/security.py never held.
+        # Finite as well as positive (BACKLOG #2008): NaN passed ``v <= 0``, and a NaN timeout to
+        # the monitor's ``asyncio.wait_for`` would raise ValueError, out of the event loop's poll
+        # rather than out of ``wait_for`` itself (measured, Python 3.14, proactor and selector
+        # loops), and the handshake re-alert throttle in api/security.py would never hold.
         if not (v > 0 and math.isfinite(v)):
             raise ValueError("cert_monitor.check_interval_seconds must be a finite number > 0")
         return v
@@ -10657,7 +10658,8 @@ def _reminder_cadence(
     reminder is on, nothing otherwise (BACKLOG #2008, #3301; ASVS 6.4.5).
 
     The runner scans once at start and then once per interval, so a credential that enters its warn
-    window after start waits up to one interval for its first reminder. Once the interval reaches
+    window after start waits up to one interval plus one scan's duration for its first reminder.
+    Once the interval reaches
     ``warn_days + 1`` days, that first reminder can come after the credential's deadline, and an
     interval of a year means none until the next restart. **The bound is the shipped default, and
     that is a judgment, not a measured threshold.** It follows BACKLOG #1131, which names a limit
@@ -10683,7 +10685,7 @@ def _reminder_cadence(
             # repr round-trips, so a value one step past the default never prints as it.
             f"[{section}].check_interval_seconds = {interval!r}, longer than the default of "
             f"{default:g} -- {what} that enters its warn window after start waits up to "
-            f"{interval!r} s for its first reminder{past_lead}{extra}",
+            f"{interval!r} s plus one scan's duration for its first reminder{past_lead}{extra}",
         )
     ]
 
