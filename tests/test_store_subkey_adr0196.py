@@ -796,9 +796,12 @@ def test_forget_store_salt_refuses_a_file_another_connection_holds(tmp_path: Pat
         holder.close()
 
 
+@pytest.mark.parametrize("sqlite_raised", [False, True], ids=["engine refusal", "sqlite's own"])
 async def test_AC3_restore_refuses_rather_than_place_a_store_it_could_not_resalt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sqlite_raised: bool
 ) -> None:
+    """The refusal keeps its text whether the engine's closed-store write or SQLite itself raised
+    it. Red on this branch's earlier heads (vault BACKLOG #8153): ``safe_exc`` withheld it."""
     from messagefoundry.store import store as store_module
 
     key = generate_key()
@@ -816,8 +819,10 @@ async def test_AC3_restore_refuses_rather_than_place_a_store_it_could_not_resalt
     await store.close()
 
     def _cannot(path: Path) -> bool:
-        # The class forget_store_salt's own refusals raise (vault BACKLOG #8153).
-        raise store_module._ClosedStoreWriteError("simulated: the WAL could not be checkpointed")
+        text = "simulated: the WAL could not be checkpointed"
+        if sqlite_raised:
+            raise sqlite3.OperationalError(text)
+        raise store_module._ClosedStoreWriteError(text)  # forget_store_salt's own refusal
 
     monkeypatch.setattr(store_module, "forget_store_salt", _cannot)
     dest = tmp_path / "restored" / "store.db"

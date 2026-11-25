@@ -4855,7 +4855,7 @@ def _full_open_check(
         forget_store_salt(snap)
     except sqlite3.Error as exc:
         # The walk's verdict, read before this, still leads (the order below).
-        return walked if walked[0] != "PASS" else ("FAIL", safe_exc(exc), 0)
+        return walked if walked[0] != "PASS" else ("FAIL", _sqlite_error_reason(exc), 0)
 
     async def _open() -> tuple[bool, str]:
         # Bind the store BEFORE the try. An open that raises — a keyless or wrong-key open, an
@@ -5879,7 +5879,7 @@ def _restore_blocking(
             try:
                 last_audit_at = newest_audit_time(snap)
             except sqlite3.Error as exc:
-                raise BackupError("restore", safe_exc(exc)) from exc
+                raise BackupError("restore", _sqlite_error_reason(exc)) from exc
             if max_age_seconds is not None:
                 _refuse_an_old_archive(
                     archive_created_at=archive_created_at,
@@ -5896,7 +5896,7 @@ def _restore_blocking(
             try:
                 dropped = forget_store_salt(snap)
             except sqlite3.Error as exc:
-                raise BackupError("restore", safe_exc(exc)) from exc
+                raise BackupError("restore", _sqlite_error_reason(exc)) from exc
             if dropped and "store_salt" in row_counts:
                 # The counts were taken to check the archive; the summary reports the placed store.
                 row_counts = {**row_counts, "store_salt": 0}
@@ -5915,7 +5915,7 @@ def _restore_blocking(
                     restored_at=time.time(),
                 )
             except sqlite3.Error as exc:
-                raise BackupError("restore", safe_exc(exc)) from exc
+                raise BackupError("restore", _sqlite_error_reason(exc)) from exc
             row_counts = {**row_counts, "restore_marker": 1}
             # The second read of the store's names, while nothing is placed; its docstring says why
             # and what it misses.

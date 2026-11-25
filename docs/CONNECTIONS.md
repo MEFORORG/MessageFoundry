@@ -2441,8 +2441,9 @@ Two limits follow from this:
   file and a share Windows could not reach, saying the file must be a plain local path, not a
   share, a network drive, a link to one, or a path the check cannot read. A denial or fault on the
   file's own name can pass the walk, since Windows answers it from the folder's listing; the
-  file's own `stat` and read then judge it, and a refusal there says its `stat` failed or that it
-  could not be read. A missing name, which Windows reports as
+  file's own `stat` and read then judge it. A `stat` failure that libpq could not get past either,
+  at least a denial (code 5) or a missing name, is left to libpq; any other refusal there says its
+  `stat` failed or that it could not be read. A missing name, which Windows reports as
   code 2 or 3, ends the walk and is left to libpq. Another code Windows raises as not found is not
   read as a missing name: a share it could not reach is refused as above, and at least codes 161
   and 206 stop the walk, and the build is refused.

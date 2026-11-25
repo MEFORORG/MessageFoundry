@@ -2896,7 +2896,8 @@ def safe_exc(
     """A PHI-redacted, length-bounded rendering of ``exc`` for a stored ``last_error``/``detail`` or a
     log line. Always keeps the exception **type** (safe + most useful); the message is redacted
     (:func:`redact`) and truncated — so a Router/Handler that did ``raise ValueError(f"...{raw}")``
-    can't leak the HL7 body into the store or logs.
+    can't leak the HL7 body into the store or logs — except a database driver's own error, whose
+    message is withheld (below).
 
     ``file_name`` is the partner-chosen name the exception is **about**, for a caller that has one. An
     ``OSError`` renders its path INTO its message — Windows gives ``[WinError 32] The process cannot
@@ -3154,8 +3155,9 @@ _NON_DBAPI_DRIVERS = frozenset({"asyncpg"})
 #: The package whose own error classes are the engine's, not a driver's, whatever driver class one
 #: inherits: ``store.schema_verify.SchemaMismatchError`` inherits ``sqlite3.DatabaseError`` so a
 #: store-open handler catches it, and its message is the engine's own (vault BACKLOG #8153, item
-#: 17). That message can quote the text SQLite gave a failed schema step, the engine's own DDL,
-#: which a traceback then prints in the engine's link while it withholds the driver link below.
+#: 17). That message can quote the text SQLite gave a failed schema step, which can name a
+#: schema object another tool wrote, such as a trigger, and a traceback prints it in the engine's
+#: link while it withholds the driver link below.
 _ENGINE_PACKAGE = "messagefoundry"
 
 

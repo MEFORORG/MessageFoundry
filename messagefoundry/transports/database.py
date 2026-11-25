@@ -1795,7 +1795,7 @@ def _refuse_encrypted_libpq_root_cert(
         ) from exc
     except _UnholdableShellFolder as exc:
         raise ValueError(
-            f"{_libpq_lead(connection, _LIBPQ_HOME_UNKNOWN)}; libpq's default "
+            f"{_libpq_lead(connection, 'folder outside the code page')}; libpq's default "
             f"root certificate: {exc}"
         ) from exc
     for source, path in found:
@@ -1831,8 +1831,8 @@ def _refuse_libpq_root_cert_file(connection: str | None, source: str, path: str)
             # path leads off the host, so this refusal names the walk's cause, which the general
             # one below does not.
             raise ValueError(
-                f"{_libpq_lead(connection, 'could not be read')}, or check the path and the "
-                f"folders above it; {source}: the {what} could not be read to check "
+                f"{_libpq_lead(connection, 'could not be read')}{_LIBPQ_CHECK_FOLDERS}; "
+                f"{source}: the {what} could not be read to check "
                 f"{_CA_CHECKED_FOR}: {cause}"
             )
         # Where the walk ran, it may have stopped on a local path it could not finish, so the
