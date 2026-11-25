@@ -31,10 +31,10 @@
     worktree the hook input's `cwd` sits in, its `.claude/seat.local.txt`, then $env:KORUS_SEAT,
     then the roster's aliases. Only a worktree sharing this script's git common dir may name the
     seat; for a `cwd` in another repository's checkout, or one whose common dir cannot be read, the
-    seat comes from $env:KORUS_SEAT and this script's roster, else it is undeclared, except that
-    its marker naming Special, or an alias of it in this script's roster, still vetoes the
-    instruction. A fault on this path prints no
-    instruction, so it fails toward no instruction rather than a wrong one. It never runs while the
+    seat comes from $env:KORUS_SEAT and this script's roster, else it is undeclared. That
+    checkout's marker cannot name the seat, but one naming Special, or an alias of Special in
+    either roster, still vetoes the instruction. A fault on this path prints no instruction, so it
+    fails toward no instruction rather than a wrong one. It never runs while the
     switch reads ON.
 
     It writes nothing. Of local state it reads at least the seat marker, the roster and the `.git`
@@ -151,36 +151,58 @@ function Get-SkillInstructionSource {
     $raw = $null
     $marker = Join-Path $root '.claude/seat.local.txt'
     if (Test-Path -LiteralPath $marker) { $raw = Get-Content -LiteralPath $marker -Raw -ErrorAction Stop }
+    $theirSeats = Join-Path $root 'docs/roles/seats.json'
     if (-not $ours) {
         # A marker that cannot NAME the seat may still VETO the instruction: one naming Special, or
-        # an alias of it in this script's roster, prints nothing, as the cwd's marker did before
-        # the repository check. Like the marker it vetoes as, it outranks $env:KORUS_SEAT.
-        if (Test-SpecialSeatLabel $raw $ownSeats) {
+        # an alias of it in either roster, prints nothing, as the cwd's marker did before the
+        # repository check. The cwd's roster only adds vetoes here, so a fault reading it is noted
+        # and skipped; this script's roster, or the marker itself, failing to read still throws.
+        # Like the marker it vetoes as, it outranks $env:KORUS_SEAT. The cost is accepted: a stale
+        # Special marker in a shared foreign checkout silences a non-Special seat there too.
+        $extra = @()
+        if (-not [string]::IsNullOrWhiteSpace($raw) -and (Test-Path -LiteralPath $theirSeats -PathType Leaf)) {
+            try { $extra = @(Get-SeatAliasMap $theirSeats) }
+            catch { [Console]::Error.WriteLine("afk-kill.ps1: the roster $theirSeats could not be read for a veto, so only this script's is used: $($_.Exception.Message)") }
+        }
+        if (Test-SpecialSeatLabel $raw @($ownSeats) $extra) {
             [Console]::Error.WriteLine("afk-kill.ps1: the hook input's cwd $($p.Cwd) is in $root, which is not shown to be a checkout of this repository, and its seat marker names a Special seat, so no instruction")
             return $null
         }
-        [Console]::Error.WriteLine("afk-kill.ps1: the hook input's cwd $($p.Cwd) is in $root, which is not shown to be a checkout of this repository, so its seat marker is not read")
-        $root = $ownRoot
+        [Console]::Error.WriteLine("afk-kill.ps1: the hook input's cwd $($p.Cwd) is in $root, which is not shown to be a checkout of this repository, so its seat marker does not name the seat")
         $raw = $null
+        $theirSeats = $ownSeats
     }
     if ([string]::IsNullOrWhiteSpace($raw)) { $raw = $env:KORUS_SEAT }
     if ([string]::IsNullOrWhiteSpace($raw)) { return $source }  # undeclared
-    $seats = Join-Path $root 'docs/roles/seats.json'
-    if (-not (Test-Path -LiteralPath $seats -PathType Leaf)) { $seats = $ownSeats }
-    if (Test-SpecialSeatLabel $raw $seats) { return $null }
+    if (-not (Test-Path -LiteralPath $theirSeats -PathType Leaf)) { $theirSeats = $ownSeats }
+    if (Test-SpecialSeatLabel $raw @($theirSeats)) { return $null }
     return $source
 }
 
-function Test-SpecialSeatLabel([AllowNull()][string]$Raw, [string]$Seats) {
-    # True when $Raw names Special or an alias of it in the roster at $Seats. A blank label names
-    # no seat. An alias of Special is Special too, so the roster must be read; an unreadable one
-    # throws.
+$script:SeatAliasMaps = @{}
+function Get-SeatAliasMap([string]$Seats) {
+    # The roster's alias map, parsed once per path. An unreadable roster, or one with no alias
+    # map, throws.
+    if (-not $script:SeatAliasMaps.ContainsKey($Seats)) {
+        $aliases = (Get-Content -LiteralPath $Seats -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop).aliases
+        if ($null -eq $aliases) { throw "the roster $Seats has no alias map" }
+        $script:SeatAliasMaps[$Seats] = $aliases
+    }
+    return $script:SeatAliasMaps[$Seats]
+}
+
+function Test-SpecialSeatLabel([string]$Raw, [string[]]$Seats, [object[]]$Maps = @()) {
+    # True when $Raw names Special or an alias of it in the rosters at $Seats or in the alias $Maps
+    # already read. A blank label names no seat and reads no roster. An alias of Special is
+    # Special too, so the rosters are read when the label is not `special` itself.
     if ([string]::IsNullOrWhiteSpace($Raw)) { return $false }
     $label = $Raw.Trim().ToLowerInvariant()
     if ($label -eq 'special') { return $true }
-    $aliases = (Get-Content -LiteralPath $Seats -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop).aliases
-    $alias = $aliases.PSObject.Properties[$label]
-    return [bool]($alias -and [string]$alias.Value -eq 'special')
+    foreach ($map in @(@($Seats | ForEach-Object { Get-SeatAliasMap $_ }) + $Maps)) {
+        $alias = $map.PSObject.Properties[$label]
+        if ($alias -and [string]$alias.Value -eq 'special') { return $true }
+    }
+    return $false
 }
 
 if (-not $sw.On) {

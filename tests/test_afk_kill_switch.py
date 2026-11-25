@@ -325,9 +325,9 @@ def _undeclared(proc: subprocess.CompletedProcess[str]) -> None:
     """The instruction, its Special-skips sentence and the not-ours note were printed.
 
     Every instruction carries that sentence, so this alone does not prove the seat was undeclared.
-    The callers set this repository's own marker to Special, so reading it instead would print
-    nothing. The cwd's marker is non-Special, since a Special one vetoes, so reading it would print
-    the same instruction; only the not-ours note shows it was skipped.
+    Where a caller sets this repository's own marker to Special and the cwd is elsewhere, reading
+    that marker instead would print nothing. A non-Special cwd marker, read as the seat, would print
+    the same instruction, so only the not-ours note shows that it did not name the seat.
     """
     text = _instruction(proc.stdout)
     assert "A Special seat skips this" in text, (proc.stdout, proc.stderr)
@@ -341,15 +341,17 @@ def test_a_foreign_marker_does_not_decide_the_seat(sb: Sandbox) -> None:
     _undeclared(_seat_run(sb, "off", "special", cwd=foreign / "src"))
 
 
-@pytest.mark.parametrize("marker", ["", "﻿", "  \n"])
-def test_a_blank_foreign_marker_reads_as_undeclared_not_as_a_fault(
+@pytest.mark.parametrize("marker", ["", "\ufeff", "  \n"])
+def test_a_blank_foreign_marker_falls_through_to_korus_seat_not_to_a_fault(
     sb: Sandbox, marker: str
 ) -> None:
+    # KORUS_SEAT is Special, so only a fall-through to it prints nothing; returning undeclared on
+    # the blank marker would print the instruction, and a fault would say so on stderr.
     foreign = _foreign_repo(sb, "builder")
     _mark(foreign, marker)
-    proc = _seat_run(sb, "off", "special", cwd=foreign / "src", KORUS_SEAT="builder")
-    _undeclared(proc)
-    assert "no skill instruction" not in proc.stderr, proc.stderr
+    proc = _seat_run(sb, "off", "builder", cwd=foreign / "src", KORUS_SEAT="special")
+    assert proc.stdout == "" and NOT_OURS in proc.stderr, (proc.stdout, proc.stderr)
+    assert VETO not in proc.stderr and "no skill instruction" not in proc.stderr, proc.stderr
 
 
 @pytest.mark.parametrize("seat", ["special", "adhoc"])
@@ -359,6 +361,7 @@ def test_a_foreign_cwd_reads_korus_seat_against_our_roster(sb: Sandbox, seat: st
     proc = _seat_run(sb, "off", None, cwd=foreign / "src", KORUS_SEAT=seat)
     assert proc.stdout == "" and NOT_OURS in proc.stderr, (proc.stdout, proc.stderr)
     assert "no skill instruction" not in proc.stderr, proc.stderr  # read as Special, not a fault
+    assert VETO not in proc.stderr, proc.stderr  # KORUS_SEAT silenced it, not the marker
 
 
 def test_a_foreign_cwd_with_a_non_special_korus_seat_gets_the_instruction(sb: Sandbox) -> None:
@@ -400,6 +403,23 @@ def _orphan_worktree(sb: Sandbox) -> Path:
 def test_a_foreign_special_marker_vetoes_the_instruction(sb: Sandbox, marker: str) -> None:
     foreign = _foreign_repo(sb, marker)
     _veto(_seat_run(sb, "off", "builder", cwd=foreign / "src"))
+
+
+def test_an_alias_only_the_foreign_roster_maps_still_vetoes(sb: Sandbox) -> None:
+    # This script's roster does not know 'special9', so only the cwd's roster can make it Special.
+    foreign = _foreign_repo(sb, "special9")
+    roster = foreign / "docs" / "roles" / "seats.json"
+    roster.write_text(json.dumps({"aliases": {"special9": "special"}}), encoding="utf-8")
+    _veto(_seat_run(sb, "off", "builder", cwd=foreign / "src"))
+
+
+def test_an_unreadable_foreign_roster_is_noted_and_skipped(sb: Sandbox) -> None:
+    # It could only add a veto, so a fault reading it must not silence a non-Special seat.
+    foreign = _foreign_repo(sb, "builder")
+    (foreign / "docs" / "roles" / "seats.json").write_text("not json", encoding="utf-8")
+    proc = _seat_run(sb, "off", "special", cwd=foreign / "src")
+    _undeclared(proc)
+    assert "could not be read for a veto" in proc.stderr, proc.stderr
 
 
 def test_a_foreign_special_marker_outranks_korus_seat(sb: Sandbox) -> None:
