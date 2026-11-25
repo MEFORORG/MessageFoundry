@@ -79,17 +79,21 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # THE SUBSTITUTIONS IN AN UNQUOTED HEREDOC BODY (BACKLOG #5607). Bash runs a `$(...)` or backtick
 # substitution in the body of a heredoc whose delimiter is unquoted (`cat <<EOF`), though the rest
 # of the body is data, so every view above blanks it and allowed `cat <<EOF\n$(find /proc)\nEOF`.
-# This reads each such body from the raw text, with every opener on a line found on $Masked as
-# Hide-HeredocBodies finds one, and adds the text inside each substitution to $Into, to be judged
-# as a command of its own. The bodies of a line's openers follow it in order, and a body ends only
-# at a line that is exactly its delimiter, after leading tabs for `<<-`, as bash reads it. A body
-# whose delimiter is quoted (`<<'EOF'`, `<<"EOF"`) takes no substitution and adds nothing, nor does
-# a `$(` or backtick after a backslash.
+# This reads each such body from the raw text and adds the text inside each substitution to $Into,
+# to be judged as a command of its own. Openers are found on $Masked, the bash reading, which blanks
+# quotes, `$((...))` and comments, glued (`cat<<EOF`) or spaced, every one on a line; an opener on a
+# line after a `((` or `$[` is skipped, as a shift. The bodies of a line's openers follow it in
+# order, and a body ends only at a line that is exactly its delimiter, after leading tabs for `<<-`,
+# as bash reads it. A delimiter with any quote or backslash in it is quoted: its body takes no
+# substitution and adds nothing, nor does a `$(` or backtick after a backslash. A backslash-newline
+# in a body is removed first, as bash removes it.
 # A substitution's end is found by counting parens outside quotes and backticks, and a `case` in it
 # extends its text to the end of the body, since a pattern's `)` closes nothing. At least these can
 # still end it early, so the text after them is not read: a `)` in a comment, and a double quote
-# nested inside a double-quoted substitution. Each distinct text adds its length to $Spent, and past
-# $Cap the rest are skipped.
+# nested inside a double-quoted substitution. It also does not read at least an opener the bash
+# reading blanks, such as one after a body that reading ended early at an indented copy of its
+# delimiter. Each distinct text adds its length to $Spent, and once a text would pass $Cap the rest
+# of its body is skipped.
 function Add-HeredocSubstitutions([string]$Text, [string]$Masked, $Into, $Seen, $Spent, [int]$Cap) {
     if ($Masked.IndexOf('<<') -lt 0) { return }
     $rawLines = $Text.Split([char]10)
@@ -97,13 +101,17 @@ function Add-HeredocSubstitutions([string]$Text, [string]$Masked, $Into, $Seen, 
     $lines = [Math]::Min($rawLines.Count, $maskedLines.Count)
     $queue = [System.Collections.Generic.List[object]]::new()
     $body = $null
+    $flush = {
+        $joined = [regex]::Replace($body.ToString(), '(?<!\\)((?:\\\\)*)\\\n', '$1')
+        Add-BodySubstitutions $joined $Into $Seen $Spent $Cap
+    }
     for ($n = 0; $n -lt $lines; $n++) {
         $raw = $rawLines[$n]
         if ($queue.Count -gt 0 -and $null -ne $body) {
             $cur = $queue[0]
             $line = if ($cur.Dash) { $raw.TrimStart([char]9) } else { $raw }
             if ($line -ceq $cur.T) {
-                if ($cur.Bare) { Add-BodySubstitutions $body.ToString() $Into $Seen $Spent $Cap }
+                if ($cur.Bare) { & $flush }
                 $queue.RemoveAt(0)
                 $body = if ($queue.Count -gt 0) { [System.Text.StringBuilder]::new() } else { $null }
             } else {
@@ -111,18 +119,21 @@ function Add-HeredocSubstitutions([string]$Text, [string]$Masked, $Into, $Seen, 
             }
             continue
         }
-        foreach ($m in [regex]::Matches($maskedLines[$n], '(?:^|\s)(?<!<)<<(?!<)-?[ \t]*')) {
+        $masked = $maskedLines[$n]
+        foreach ($m in [regex]::Matches($masked, '(?<!<)<<(?!<)-?[ \t]*')) {
+            $before = $masked.Substring(0, $m.Index)
+            if ($before.Contains('((') -or $before.Contains('$[')) { break }
             $rest = $raw.Substring([Math]::Min($m.Index + $m.Length, $raw.Length))
-            $d = [regex]::Match($rest, '^(?:''([^'']+)''|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))')
-            if (-not $d.Success) { continue }
-            $t = @($d.Groups[1].Value, $d.Groups[2].Value, $d.Groups[3].Value) |
-                Where-Object { $_ } | Select-Object -First 1
-            $queue.Add(@{ T = $t; Bare = [bool]$d.Groups[3].Value; Dash = $m.Value.Contains('-') })
+            $word = [regex]::Match($rest, '^[^\s;&|<>()]+').Value
+            $t = $word -replace '[''"\\]', ''
+            $bare = $t -ceq $word
+            if (-not $t -or ($bare -and $t -cnotmatch '^[A-Za-z_]')) { continue }
+            $queue.Add(@{ T = $t; Bare = $bare; Dash = $m.Value.Contains('-') })
         }
         if ($queue.Count -gt 0) { $body = [System.Text.StringBuilder]::new() }
     }
     # An unterminated body runs to the end of the command, and bash still expands it.
-    if ($null -ne $body -and $queue[0].Bare) { Add-BodySubstitutions $body.ToString() $Into $Seen $Spent $Cap }
+    if ($null -ne $body -and $queue[0].Bare) { & $flush }
 }
 
 # Index of the quote or backtick closing the one at $At in $Body, or $Body.Length if none does.
@@ -215,7 +226,7 @@ function Add-BodySubstitutions([string]$Body, $Into, $Seen, $Spent, [int]$Cap) {
 # Get-SiteTexts, below, adds texts for at least some of two of these, a spaced shift in arithmetic
 # and a `$((cmd) )` nested inside arithmetic, and for some nestings past this view's budget; this
 # view is unchanged. Add-HeredocSubstitutions, above, reads a third, a substitution in the body
-# of a heredoc whose delimiter is unquoted, for a delimiter its pattern captures whole.
+# of a heredoc whose delimiter is unquoted, with the limits its own comment names.
 function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
     if ($Text.IndexOf('"') -lt 0 -and $Text.IndexOf("'") -lt 0) { return $Text }
     if ($Plain) {
@@ -828,8 +839,8 @@ function Hide-PowerShellSpans([string]$Text) {
 #     walk can go undenied (found by a Lander probe on 2026-11-23);
 #   - a heredoc delimiter it captures only part of, such as `<<END-X`. The pass then reads the body as
 #     running past the real terminator, so a site on a later line is skipped;
-#   - a substitution in the body of a heredoc whose delimiter is unquoted, which bash runs and
-#     Add-HeredocSubstitutions, above, reads instead.
+#   - a substitution in the body of a heredoc whose delimiter is unquoted, which bash runs.
+#     Add-HeredocSubstitutions, above, reads at least some of these, with the limits it names.
 # Past its step budget it returns $null, and the caller then adds nothing. With -From, it reads a
 # command from that offset inside an open `(` and returns where that `(` closes.
 function Get-SiteTexts([string]$Text, [int]$From = -1) {
@@ -1281,10 +1292,12 @@ try {
     # THE UNQUOTED HEREDOC BODIES (BACKLOG #5607) COME LAST, under the same rule as the per-site
     # texts: read only once every earlier bound has been judged and allowed, appended, and a throw
     # returns that allow. Each substitution text is read under the plain and bash views. Built only
-    # for a bash command holding `<<` and a `$(` or a backtick.
+    # for a bash command holding `<<` and a `$(`, a `$\` (a `$` before a backslash-newline) or a
+    # backtick.
     $heredocPending = @{ Value = ($tool -cne 'PowerShell' -and $cmd.IndexOf('<<', [StringComparison]::Ordinal) -ge 0 -and
-        ($cmd.IndexOf('$(', [StringComparison]::Ordinal) -ge 0 -or $cmd.IndexOf('`') -ge 0))
-        Texts = $null; Next = 0 }
+        ($cmd.IndexOf('$(', [StringComparison]::Ordinal) -ge 0 -or $cmd.IndexOf('$\', [StringComparison]::Ordinal) -ge 0 -or
+         $cmd.IndexOf('`') -ge 0))
+        Texts = $null; Next = 0; Seen = $null; Spent = $null; Cap = 0 }
     function Add-HeredocBounds {
         if (-not $heredocPending.Value) { return $false }
         if ($null -eq $heredocPending.Texts) {
@@ -1292,11 +1305,12 @@ try {
             $seen = [System.Collections.Generic.HashSet[string]]::new()
             $spent = @{ Value = 0 }
             $cap = 16 * $cmd.Length + 65536
-            # The masks the plain and bash views were built from, so neither is built again here.
-            foreach ($masked in @($plainMask, $bashMask)) {
-                if ($null -ne $masked) { Add-HeredocSubstitutions $cmd $masked $texts $seen $spent $cap }
-            }
+            # The bash reading the bash view was built from, so it is not built again here.
+            Add-HeredocSubstitutions $cmd $bashMask $texts $seen $spent $cap
             $heredocPending.Texts = $texts
+            $heredocPending.Seen = $seen
+            $heredocPending.Spent = $spent
+            $heredocPending.Cap = $cap
         }
         $texts = $heredocPending.Texts
         while ($heredocPending.Next -lt $texts.Count) {
@@ -1304,7 +1318,10 @@ try {
             $heredocPending.Next++
             if (-not $t.Trim()) { continue }
             $plain = Hide-HeredocBodies $t (Hide-QuotedSpans $t -Plain)
-            $bashView = Hide-HeredocBodies $t (Hide-QuotedSpans $t)
+            $tMask = Hide-QuotedSpans $t
+            $bashView = Hide-HeredocBodies $t $tMask
+            # A heredoc opened inside this text has a body of its own, read the same way.
+            Add-HeredocSubstitutions $t $tMask $texts $heredocPending.Seen $heredocPending.Spent $heredocPending.Cap
             Add-ScanBounds $plain $t "heredoc $($heredocPending.Next)|"
             if ($bashView -cne $plain) { Add-ScanBounds $bashView $t "heredoc $($heredocPending.Next)|" }
             return $true

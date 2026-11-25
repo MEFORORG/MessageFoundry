@@ -1042,6 +1042,16 @@ HEREDOC_SUBSTITUTION_DENY = [
         "cat <<EOF\n" + "$(" * 300 + "echo" + ")" * 300 + " $(find /proc)\nEOF",
         id="walk-after-deep-nesting",
     ),
+    # Each allowed by the second cut: openers were read off the raw text by a pattern that needed
+    # a space before `<<`, so a glued, a `-` or a fd-prefixed opener, a second opener glued to the
+    # first, and a heredoc opened inside a substitution were missed; a backslash-newline between
+    # `$` and `(` was not joined.
+    pytest.param("cat<<EOF\nit's $(find /proc)\nEOF", id="glued-opener"),
+    pytest.param("git commit -F -<<EOF\nDon't break `grep -r x /`\nEOF", id="dash-glued-opener"),
+    pytest.param("cat 0<<EOF\nit's $(find /proc)\nEOF", id="fd-prefixed-opener"),
+    pytest.param("cat <<A<<B\nx\nA\nit's $(find /proc)\nB", id="two-glued-openers"),
+    pytest.param("cat <<EOF\n$(cat <<X\n$(find /proc)\nX\n)\nEOF", id="heredoc-in-a-sub"),
+    pytest.param("cat <<EOF\n$\\\n(find /proc)\nEOF", id="backslash-newline-joined"),
 ]
 
 
@@ -1059,6 +1069,18 @@ HEREDOC_SUBSTITUTION_ALLOW = [
     pytest.param("cat <<EOF\nfind /proc and `echo hi`\nEOF", id="prose-beside-a-bounded-sub"),
     pytest.param("cat <<EOF\n$(echo hi)\nEOF\necho '$(find /proc)'", id="data-after-the-end"),
     pytest.param("echo '<<EOF $(find /proc)'", id="opener-in-single-quotes"),
+    # False-deny controls for the second cut: a shift is not an opener, nor is `<<` in a comment or
+    # in quotes, and a delimiter with a quote anywhere in it is quoted.
+    pytest.param("echo $((x << y))\necho '$(find /proc)'", id="shift-in-arithmetic"),
+    pytest.param("echo hi # then cat <<EOF\necho '$(find /proc)'", id="opener-in-a-comment"),
+    pytest.param(
+        "(( m = 1 << n ))\ncat > s.sh <<'EOF'\nfor f in $(find /proc -maxdepth 1); do :; done\nEOF",
+        id="shift-then-quoted-body",
+    ),
+    pytest.param('cat <<E"O"F\nUse $(find /proc)\nEOF', id="part-quoted-delimiter"),
+    pytest.param(
+        "echo It\\'s 'see <<EOF' and\\'s\necho '$(find /proc)'", id="opener-in-split-quotes"
+    ),
 ]
 
 
@@ -1852,8 +1874,8 @@ EXPECTED_ROW_COUNTS = {
     "REFINED_FALSE_DENY_ALLOW": 14,
     "SITE_TEXT_DENY": 16,
     "SITE_TEXT_ALLOW": 21,
-    "HEREDOC_SUBSTITUTION_DENY": 15,
-    "HEREDOC_SUBSTITUTION_ALLOW": 6,
+    "HEREDOC_SUBSTITUTION_DENY": 21,
+    "HEREDOC_SUBSTITUTION_ALLOW": 11,
 }
 
 
