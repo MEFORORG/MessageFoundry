@@ -508,24 +508,37 @@ def _ps_plain(paths: list[str]) -> list[object]:
 
 # BACKLOG #7569: each device-path spelling, the plain spelling both twins rewrite it to, and the
 # server that plain spelling names. Every consumer of a root (claim.ps1's wildcard -Path cmdlets, the
-# 445 probe, decision.ps1's network check) already handles the plain spelling. \\?\Z:\ stands for a
-# mapped drive: it becomes Z:\, which origin/main never probed either.
+# 445 probe, decision.ps1's network check) already handles the plain spelling. A spelling left alone
+# keeps its '?' as a server no probe reaches, so it fails fast, as every device form did on
+# origin/main. The drive letter is the system drive, so no row depends on a mapped drive.
+_SYS = os.environ.get("SYSTEMDRIVE", "C:")
 _DEVICE_SPELLINGS = {
-    r"\\?\D:\coord": (r"D:\coord", ""),
-    r"\\.\D:\coord": (r"D:\coord", ""),
-    "//?/D:/coord": (r"D:\coord", ""),
-    r"\\?\D:": ("D:\\", ""),
-    r"\\?\D:\\": ("D:\\\\", ""),
-    r"\\?\Z:\coord": (r"Z:\coord", ""),
+    rf"\\?\{_SYS}\coord": (rf"{_SYS}\coord", ""),
+    rf"\\.\{_SYS}\coord": (rf"{_SYS}\coord", ""),
+    rf"//?/{_SYS}\coord": (rf"{_SYS}\coord", ""),
+    rf"\\?\{_SYS}\coord" + "\\": (rf"{_SYS}\coord" + "\\", ""),
+    rf"\\?\{_SYS}" + "\\": (_SYS + "\\", ""),
     r"\\?\UNC\srv\share\x": (r"\\srv\share\x", "srv"),
     r"\\?\unc\srv\share": (r"\\srv\share", "srv"),
     r"\\.\UNC\srv\share\x": (r"\\srv\share\x", "srv"),
     r"\\?\UNC\srv": (r"\\srv", ""),
-    # Other device forms are left alone, so their '?' still names a server no probe reaches and
-    # they fail fast, as on origin/main.
+    # Left alone: other device forms, the bare volume, and a remainder Win32 would respell.
     r"\\?\GLOBALROOT\Device\Mup\srv\share": (r"\\?\GLOBALROOT\Device\Mup\srv\share", "?"),
     r"\\?\Volume{0}\coord": (r"\\?\Volume{0}\coord", "?"),
-    r"\\?\D:x": (r"\\?\D:x", "?"),
+    rf"\\?\{_SYS}x": (rf"\\?\{_SYS}x", "?"),
+    rf"\\?\{_SYS}": (rf"\\?\{_SYS}", "?"),
+    rf"//?/{_SYS}/coord": (rf"//?/{_SYS}/coord", "?"),
+    rf"\\?\{_SYS}\a/b": (rf"\\?\{_SYS}\a/b", "?"),
+    rf"\\?\{_SYS}\\a": (rf"\\?\{_SYS}\\a", "?"),
+    rf"\\?\{_SYS}\a\\b": (rf"\\?\{_SYS}\a\\b", "?"),
+    rf"\\?\{_SYS}\coord.": (rf"\\?\{_SYS}\coord.", "?"),
+    rf"\\?\{_SYS}\coord \x": (rf"\\?\{_SYS}\coord \x", "?"),
+    rf"\\?\{_SYS}\a\..\b": (rf"\\?\{_SYS}\a\..\b", "?"),
+    rf"\\?\{_SYS}\a\.\b": (rf"\\?\{_SYS}\a\.\b", "?"),
+    r"\\?\UNC\srv\share\.\dir": (r"\\?\UNC\srv\share\.\dir", "?"),
+    # The plain form would be MAX_PATH (260) long; one fewer is rewritten.
+    rf"\\?\{_SYS}\{'x' * 257}": (rf"\\?\{_SYS}\{'x' * 257}", "?"),
+    rf"\\?\{_SYS}\{'x' * 256}": (rf"{_SYS}\{'x' * 256}", ""),
     r"\\srv\share\x": (r"\\srv\share\x", "srv"),
     "//srv/share/x": ("//srv/share/x", "srv"),
     r"C:\coord": (r"C:\coord", ""),
@@ -540,6 +553,27 @@ def test_a_device_path_root_is_rewritten_to_one_plain_spelling_on_both() -> None
     assert [coord_root._plain(p) for p in paths] == plain
     assert _ps_unc_hosts(paths) == hosts
     assert [coord_root.unc_host(coord_root._plain(p)) or "" for p in paths] == hosts
+
+
+def _network_drives() -> list[str]:
+    out: list[str] = _pwsh_json(
+        "ConvertTo-Json -Compress -InputObject @([System.IO.DriveInfo]::GetDrives() | "
+        "Where-Object { $_.DriveType -eq 'Network' } | ForEach-Object { $_.Name.Substring(0, 2) })"
+    )
+    return out
+
+
+def test_a_device_path_on_a_network_drive_is_left_to_fail_fast_on_both() -> None:
+    # X:\ on a mapped drive is never probed, so a dead server hangs its first file call; origin/main
+    # failed \\?\X:\ fast on its '?'. Left alone, it still does. Needs a mapped drive on the runner.
+    drives = _network_drives()
+    if not drives:
+        pytest.skip("no network drive is mapped on this runner")
+    paths = [rf"\\?\{d}\coord" for d in drives] + [rf"\\.\{d}\coord" for d in drives]
+    assert _ps_plain(paths) == paths
+    assert [coord_root._plain(p) for p in paths] == paths
+    hosts = ["?"] * len(drives) + ["."] * len(drives)
+    assert _ps_unc_hosts(paths) == hosts == [coord_root.unc_host(p) for p in paths]
 
 
 @pytest.mark.parametrize("prefix", ["\\\\?\\", "\\\\.\\", "//?/"])
@@ -587,8 +621,19 @@ def _claim_checkout(path: Path) -> Path:
     (path / "scripts" / "coord").mkdir(parents=True)
     for name in ("claim.ps1", "coord-root.ps1"):
         shutil.copy2(ROOT / "scripts" / "coord" / name, path / "scripts" / "coord" / name)
-    subprocess.run(["git", "-C", str(path), "init", "-q"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(path), "init", "-q"], check=True, capture_output=True, env=_no_git_env()
+    )
     return path
+
+
+def _no_git_env() -> dict[str, str]:
+    """os.environ without GIT_* (a hook's GIT_DIR would aim git at the live repository) or a root."""
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if not k.upper().startswith("GIT_") and k != "MEFOR_COORD_ROOT"
+    }
 
 
 def _run_claim(tree: Path, env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
@@ -618,7 +663,7 @@ def test_claim_lists_and_releases_a_claim_under_a_device_path_root(
     tree = _claim_checkout(tmp_path / "tree")
     shared = tmp_path / "shared"
     shared.mkdir()
-    env = {k: v for k, v in os.environ.items() if k != "MEFOR_COORD_ROOT"}
+    env = _no_git_env()
     env["MEFOR_COORD_ROOT"] = prefix + str(shared)
     taken = _run_claim(tree, env, "-Take", "device-root-key", "-Note", "device-path fixture")
     assert taken.returncode == 0, taken.stdout + taken.stderr
@@ -659,7 +704,8 @@ def test_every_spelling_of_a_root_names_one_server_on_both() -> None:
         "//srv/share/./dir//",
         r"\\srv\share\dir",
         r"\\srv\share\dir\\",
-        r"\\?\UNC\srv\share\.\dir",
+        r"\\?\UNC\srv\share\dir",
+        r"\\.\UNC\srv\share\dir" + "\\",
     ]
     held = [str(Path(coord_root._plain(p))) for p in spellings]
     assert {coord_root.unc_host(p) for p in held} == {"srv"}

@@ -49,9 +49,12 @@ _BLANK_OR_COMMENT = re.compile(r"\A[ \t]*(#.*)?\Z")
 _LINE_BREAK = re.compile(r"\r\n|\n|\r")
 # A drive letter, colon and separator, a UNC \\server\share, or (off Windows) a leading slash.
 _ABSOLUTE = re.compile(r"\A(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+|/(?![\\/]))")
-# The two patterns ConvertTo-CoordPlainRoot carries; its comment says why.
-_DEVICE_DRIVE = re.compile(r"\A[\\/]{2}[?.][\\/]([A-Za-z]:)(?:[\\/](.*))?\Z", re.S)
-_DEVICE_UNC = re.compile(r"\A[\\/]{2}[?.][\\/][Uu][Nn][Cc][\\/](.*)\Z", re.S)
+# The patterns ConvertTo-CoordPlainRoot carries; its comment says why each exists.
+_DEVICE_DRIVE = re.compile(r"\A[\\/]{2}[?.][\\/]([A-Za-z]:)\\(.*)\Z", re.S)
+_DEVICE_UNC = re.compile(r"\A[\\/]{2}[?.][\\/][Uu][Nn][Cc]\\(.*)\Z", re.S)
+_RESPELLED_REST = re.compile(r"/|\\\\|\A\\|[. ](?:\\|\Z)")
+_MAX_PATH = 260
+_DRIVE_REMOTE = 4
 _UNC = re.compile(r"\A[\\/]{2}([^\\/]+)[\\/]")
 
 
@@ -143,14 +146,35 @@ def shared_root(
 
 
 def _plain(path: str) -> str:
-    """A device-path spelling of a root in its plain form, as ConvertTo-CoordPlainRoot rewrites it."""
+    """A device-path spelling of a root in its plain form, as ConvertTo-CoordPlainRoot rewrites it,
+    and by the same rules: its comment says which spellings are left as they are, and why."""
+    if sys.platform != "win32":
+        return path
     m = _DEVICE_DRIVE.match(path)
     if m:
-        return m.group(1) + "\\" + (m.group(2) or "")
-    m = _DEVICE_UNC.match(path)
-    if m:
-        return "\\\\" + m.group(1)
-    return path
+        drive, rest = m.group(1), m.group(2)
+        if _network_drive(drive):
+            return path
+        plain = drive + "\\" + rest
+    else:
+        m = _DEVICE_UNC.match(path)
+        if not m:
+            return path
+        rest = m.group(1)
+        plain = "\\\\" + rest
+    # UTF-16 code units, as .NET's String.Length counts them.
+    if _RESPELLED_REST.search(rest) or len(plain.encode("utf-16-le")) // 2 >= _MAX_PATH:
+        return path
+    return plain
+
+
+def _network_drive(drive: str) -> bool:
+    """True when Windows reports ``drive`` as a network drive, as DriveInfo.DriveType does."""
+    if sys.platform != "win32":
+        return True
+    import ctypes
+
+    return bool(ctypes.windll.kernel32.GetDriveTypeW(drive + "\\") == _DRIVE_REMOTE)
 
 
 def _absolute(path: str) -> bool:

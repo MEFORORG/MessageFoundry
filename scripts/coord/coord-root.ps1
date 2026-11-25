@@ -181,16 +181,34 @@ function Get-CoordSharedRoot {
 }
 
 function ConvertTo-CoordPlainRoot {
-    # A device-path spelling of a root, rewritten to its plain form: \\?\X:\p and \\.\X:\p become X:\p,
-    # and \\?\UNC\srv\share\p and \\.\UNC\srv\share\p become \\srv\share\p (BACKLOG #7569). Every
-    # consumer then sees a spelling it already handles: claim.ps1 reads the root with wildcard -Path
-    # cmdlets, which misread \\?\, and the 445 probe needs the server a UNC path names. Any other
-    # device form, such as GLOBALROOT or a volume GUID, is left as it is, so its '?' or '.' still
-    # reads as a server no probe reaches and it fails fast. The Python twin carries the same patterns.
+    # A device-path spelling of a root, rewritten to its plain form on Windows: \\?\X:\p and \\.\X:\p
+    # become X:\p, and \\?\UNC\srv\share\p and \\.\UNC\srv\share\p become \\srv\share\p (BACKLOG
+    # #7569). Every consumer then sees a spelling it already handles: claim.ps1 reads the root with
+    # wildcard -Path cmdlets, which misread \\?\, and the 445 probe needs the server a UNC path names.
+    # A spelling is left as it is, so its '?' or '.' still reads as a server no probe reaches and it
+    # fails fast as before, when the rewrite would name another directory or lose the fast probe. At
+    # least these: any other device form, such as GLOBALROOT or a volume GUID; a bare \\?\X:, which
+    # names the volume; a remainder Win32 would respell (a '/', an empty segment, or a segment ending
+    # in '.' or a space, '.' and '..' included); a plain form of MAX_PATH or more, which Python opens
+    # only with long paths enabled; and a drive Windows reports as Network, since X:\ is never probed.
+    # The Python twin, _plain, applies the same rules.
     param([string]$Path)
-    if ($Path -cmatch '(?s)\A[\\/]{2}[?.][\\/]([A-Za-z]:)(?:[\\/](.*))?\z') { return $Matches[1] + '\' + $Matches[2] }
-    if ($Path -cmatch '(?s)\A[\\/]{2}[?.][\\/][Uu][Nn][Cc][\\/](.*)\z') { return '\\' + $Matches[1] }
-    return $Path
+    if (-not $IsWindows) { return $Path }
+    if ($Path -cmatch '(?s)\A[\\/]{2}[?.][\\/]([A-Za-z]:)\\(.*)\z') {
+        $drive = $Matches[1]
+        $rest = $Matches[2]
+        try {
+            if ([System.IO.DriveInfo]::new($drive + '\').DriveType -eq [System.IO.DriveType]::Network) { return $Path }
+        } catch { return $Path }
+        $plain = $drive + '\' + $rest
+    } elseif ($Path -cmatch '(?s)\A[\\/]{2}[?.][\\/][Uu][Nn][Cc]\\(.*)\z') {
+        $rest = $Matches[1]
+        $plain = '\\' + $rest
+    } else {
+        return $Path
+    }
+    if ($rest -cmatch '/|\\\\|\A\\|[. ](?:\\|\z)' -or $plain.Length -ge 260) { return $Path }
+    return $plain
 }
 
 function Test-CoordAbsolutePath {
@@ -207,9 +225,10 @@ function Test-CoordSharedKind {
 }
 
 function Get-CoordUncHost {
-    # The server name of a \\server\share path, or $null for anything else. A root reaches this
-    # already plain (ConvertTo-CoordPlainRoot), so a device form it left alone names its '?' or '.',
-    # which no probe reaches: it fails fast rather than risk a file call that hangs.
+    # The server name of a \\server\share path, or $null for anything else. A resolved root, and
+    # coord-migrate's -Target, pass through ConvertTo-CoordPlainRoot first, so a device form it left
+    # alone names its '?' or '.', which no probe reaches: it fails fast rather than risk a file call
+    # that hangs.
     param([string]$Path)
     if ($Path -match '\A[\\/]{2}([^\\/]+)[\\/]') { return $Matches[1] }
     return $null
