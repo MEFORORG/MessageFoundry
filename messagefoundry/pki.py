@@ -2778,8 +2778,10 @@ def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes]:
     and a block with a ``:`` in its label or in a body line, which OpenSSL reads as a header line.
     :class:`IssuerIndex` refuses such a file at least where the scan reads a certificate OpenSSL
     did not, because it checks this scan's result against what OpenSSL loaded
-    (:func:`_refuse_unless_openssl_loads`). A block of these shapes after the last certificate
-    hides nothing, and the file builds."""
+    (:func:`_refuse_unless_openssl_loads`). To :class:`IssuerIndex` alone, a block of these
+    shapes after the last certificate hides nothing, and the file builds. A configured trust anchor
+    holding one is refused earlier, by ``messagefoundry.auth.trust_anchors.anchor_cadata``, at
+    least where the TLS library stops loading at it (BACKLOG #5229)."""
     lines = _pem_reader_lines(pem)
     for line in lines:
         if not (line.startswith(b"-----BEGIN ") and line.endswith(b"-----")):
