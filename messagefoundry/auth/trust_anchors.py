@@ -2972,10 +2972,12 @@ def _transient_read_fault(exc: OSError | ValueError) -> bool:
     (:func:`~messagefoundry.store.sqlserver.check_pinned_certificate`), so ``serve`` fails at the
     open whatever the network does. On POSIX a share can read as either, depending on the owners
     and mode bits along its path (:func:`~messagefoundry.auth.anchor_path.anchor_path_verdict`),
-    and on Windows a path on a share or a mapped network drive reads as indeterminate
-    (:data:`~messagefoundry.auth.anchor_path.SHARE_CAUSE`). On POSIX so can at least a local disk of a type outside
+    and so can at least a local disk of a type outside
     :data:`~messagefoundry.auth.anchor_path.POSIX_TRUSTED_FS`, such as ZFS, vfat or exfat, and any
-    host without ``/proc/self/mountinfo``. So at ``enforce`` this exemption
+    host without ``/proc/self/mountinfo``. On Windows a path that reaches a share or a mapped
+    network drive reads as indeterminate, unless the walk already found an object others can
+    write, which reads as insecure; so does at least a local volume that is not NTFS or ReFS.
+    So at ``enforce`` this exemption
     takes effect only for a pin whose path passed at the store open, such as on a trusted local
     file system or on block-level network storage formatted with one; at ``warn`` no refusal sets
     the hold at all.
@@ -2998,10 +3000,11 @@ def _transient_read_fault(exc: OSError | ValueError) -> bool:
     such check still refuses the reload. The path verdict does not gate this read at a later
     check: :func:`evaluate_anchor` reads the file before it judges the path, so a pin whose path
     becomes insecure or indeterminate after the open reaches this read, a read fault there is
-    judged here, and the path is not judged at that check. An overlay mount passes the
-    file-system type check (``overlay`` is in
-    :data:`~messagefoundry.auth.anchor_path.POSIX_TRUSTED_FS`) even where its lower layer is on a
-    network file system, so a network fault reading such a pin sets no hold either.
+    judged here, and the path is not judged at that check. An overlay mount whose lower layer is
+    on a network file system passes the file-system type check, since ``overlay`` is in
+    :data:`~messagefoundry.auth.anchor_path.POSIX_TRUSTED_FS`. So the path check can pass a pin
+    whose owner and mode bits the remote server controls, the store open accepts it at
+    ``enforce``, and a network fault reading it later sets no hold.
 
     What still sets the hold: at least a pipe or device refused as not a regular file, a
     ``BrokenPipeError``, which is how a pipe at the path can fail on Windows, a ``ValueError``
