@@ -486,8 +486,7 @@ roster alias of the Lander.
 > file; and the session is pinned to this root or unpinned, so an unpinned session of another root that
 > publishes here counts as live. A first fire is never live, since it has no mark to rise past. A
 > session whose counter restarted, through a resume or a new process on the same id, is not live until
-> its counter passes its old mark. The mark moves on every fire that rises, before the fire knows
-> whether it publishes, so a rising fire that publishes nothing spends that call's live fire.
+> its counter passes its old mark.
 >
 > **The per-reset tests** apply only against a published window stamped with this root, spelled as the
 > collector spells it, unset or unstamped. They refuse, from any session, a reading with the same
