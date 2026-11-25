@@ -1596,45 +1596,92 @@ def _acl(entries: list[bytes], *, count: int | None = None, size: int | None = N
     return (header + body + bytes(max(0, acl_size - 8 - len(body))))[:acl_size]
 
 
+_EVERYONE_ALLOW = (0x00, 0, 0x1F01FF, 16)  # the first entry, so its SID starts at 8 + 8
+
+
 def test_s12_15_the_dacl_walk_reads_each_entry_where_it_starts() -> None:
     """The control: a well-formed DACL walks to each entry, and only the allow entry gets a SID
     offset. A header-only entry of an undefined type last reads nothing past it."""
     deny = _ace(0x01, (0x2).to_bytes(4, "little") + _EVERYONE_SID_BYTES)
     walked = ap.dacl_entries(_acl([deny, _allow_everyone(), _ace(0x20, b"")]))
-    assert walked == ((0x01, 0, 0, None), (0x00, 0, 0x1F01FF, 8 + 20 + 8), (0x20, 0, 0, None))
-    assert ap.dacl_entries(_acl([])) == ()
+    assert walked == (
+        ((0x01, 0, 0, None), (0x00, 0, 0x1F01FF, 8 + 20 + 8), (0x20, 0, 0, None)),
+        None,
+    )
+    assert ap.dacl_entries(_acl([])) == ((), None)
+
+
+def test_s12_15_a_dacl_with_slack_after_its_last_entry_reads_in_full() -> None:
+    """The control for the bound: Windows often leaves an AclSize larger than its entries, and the
+    unused bytes after the last entry are not read as one."""
+    assert ap.dacl_entries(_acl([_allow_everyone()], size=64)) == ((_EVERYONE_ALLOW,), None)
+
+
+def test_s12_15_the_walk_is_bounded_by_the_dacls_own_aclsize() -> None:
+    """Bytes past the header's AclSize are not read as an entry, whatever the caller passed."""
+    acl = _acl([], count=1, size=8) + _allow_everyone()
+    entries, reason = ap.dacl_entries(acl)
+    assert entries == ()
+    assert reason is not None and "starts past the end of the DACL" in reason
 
 
 @pytest.mark.parametrize(
-    ("acl", "reason"),
+    ("acl", "read", "reason"),
     [
         # An entry whose AceSize is 0 or 2. Red: GetAce steps by that size (measured on Windows 11,
-        # 2026-11-25: with 0 it returned entry 0 again for index 1, with 2 an entry starting inside
-        # entry 0), so the Everyone grant after it was never read.
-        (_acl([bytes([0x20, 0, 0, 0]), _allow_everyone()]), "shorter than an entry header"),
-        (_acl([bytes([0x20, 0, 2, 0]), _allow_everyone()]), "shorter than an entry header"),
+        # 2026-11-24 US Central: with 0 it returned entry 0 again for index 1, with 2 an entry
+        # starting inside entry 0), so the Everyone grant after it was never read.
+        (_acl([bytes([0x20, 0, 0, 0]), _allow_everyone()]), (), "shorter than an entry header"),
+        (_acl([bytes([0x20, 0, 2, 0]), _allow_everyone()]), (), "shorter than an entry header"),
+        # The same, after an entry read in full: that entry is returned with the reason.
+        (
+            _acl([_allow_everyone(), bytes([0x20, 0, 0, 0])]),
+            (_EVERYONE_ALLOW,),
+            "shorter than an entry header",
+        ),
         # A last entry whose AceSize runs past AclSize. Red: the copy ran past the DACL.
         (
             _acl([_allow_everyone()[:2] + (0xFFFF).to_bytes(2, "little") + _allow_everyone()[4:]]),
+            (),
             "runs past the end of the DACL",
         ),
         # AceCount names more entries than AclSize holds.
-        (_acl([_allow_everyone()], count=2), "starts past the end of the DACL"),
+        (_acl([_allow_everyone()], count=2), (_EVERYONE_ALLOW,), "starts past the end of the DACL"),
         # An entry that starts within 3 bytes of AclSize, so its AceSize is not inside the DACL.
-        (_acl([_allow_everyone(), bytes(2)], count=2), "starts past the end of the DACL"),
+        (
+            _acl([_allow_everyone(), bytes(2)], count=2),
+            (_EVERYONE_ALLOW,),
+            "starts past the end of the DACL",
+        ),
         # An AclSize below its own 8-byte header.
-        (_acl([], size=4), "too short to hold its header"),
+        (_acl([], size=4), (), "too short to hold its header"),
         # An entry the entry parse refuses.
-        (_acl([_ace(0x00, (0x1F01FF).to_bytes(4, "little"))]), "too short to hold its SID"),
+        (_acl([_ace(0x00, (0x1F01FF).to_bytes(4, "little"))]), (), "too short to hold its SID"),
     ],
 )
-def test_s12_15_a_dacl_with_an_entry_out_of_its_bounds_reads_as_unreadable(
-    acl: bytes, reason: str
+def test_s12_15_a_dacl_with_an_entry_out_of_its_bounds_stops_the_walk(
+    acl: bytes, read: tuple[tuple[int, int, int, int | None], ...], reason: str
 ) -> None:
-    """The whole DACL is refused, never clamped, so the walk records the object as unreadable and
-    can never judge it sound (BACKLOG #6281, member S12-15)."""
-    walked = ap.dacl_entries(acl)
-    assert isinstance(walked, str) and reason in walked, walked
+    """The walk stops at the bad entry, never clamps it, and returns what it read before it with
+    the reason, which the reader records as a failed read (BACKLOG #6281, member S12-15)."""
+    entries, stopped = ap.dacl_entries(acl)
+    assert entries == read
+    assert stopped is not None and reason in stopped, stopped
+
+
+def test_s12_15_a_grant_read_before_a_bad_entry_is_still_judged_insecure() -> None:
+    """[allow Everyone full, an entry with AceSize 0] is definitely insecure, as origin/main judged
+    it: the walk keeps the grant it read, and the evaluation scans it before the failure. Red on
+    6a7a0322719: the walk refused the whole DACL, so the object was only indeterminate, which a
+    matching pin lets through."""
+    entries, stopped = ap.dacl_entries(_acl([_allow_everyone(), bytes([0x20, 0, 0, 0])]))
+    aces = tuple((t, f, m, "S-1-1-0" if at is not None else "") for t, f, m, at in entries)
+    sec = WinSecurity("S-1-5-18", aces, stopped)
+    trust = WinTrust("S-1-5-18", lambda _s: False)
+    findings = evaluate_windows_object("C:\\x", DIRECTORY, sec, trust)
+    assert findings[0].insecure is True and findings[0].sids == ("S-1-1-0",)
+    assert findings[-1].insecure is False and "could not be read" in findings[-1].reason
+    assert _verdict(sec, DIRECTORY, trust) is False
 
 
 def test_s12_15_an_unreadable_dacl_is_never_judged_sound() -> None:
