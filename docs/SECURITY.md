@@ -2351,12 +2351,15 @@ the same permission set on the same method reds CI until it is listed here.
 > actor's own scope, for example one a reload removed. Read such a row as a miss, not a probe.
 > A name that fails the connection-name rule is never in a scope. The per-name JSON routes above
 > declare the rule on the path, so they answer such a name with 422 before any scope check and
-> write no `auth.channel_denied` row for it. Their gate runs before the path is validated, so an
-> `auth.permission_granted` row the gate writes still records the attempt, with the caller's path
-> in its detail. The gate writes one on these routes under the shipped default of
-> `[diagnostics].audit_all_authz`; with that switch off it writes one on the POST routes, whose
-> permissions are in the sensitive set, and none on the GET route. The console checks the rule
-> before it calls in. `audit_channel_denied`
+> write no `auth.channel_denied` row for it. A name with a `/` in it, literal or encoded, never
+> matches the `{name}` segment, so it is answered 404 before any dependency runs and writes no row.
+> For any other name that fails the rule, the gate runs before the path is validated, so the gate's
+> own row still records the attempt with the caller's path in its detail: `auth.permission_granted`
+> for a caller it admits, or its refusal row for one it refuses (at least `auth.permission_denied`,
+> `auth.gate_refused` and `auth.mfa_denied`). An admitted caller's grant row is written under the
+> shipped default of `[security].audit_all_authorization_decisions`; with that switch off it is
+> written on the POST routes, whose permissions are in the sensitive set, and not on the GET routes.
+> The console checks the rule before it calls in. `audit_channel_denied`
 > in `messagefoundry/api/message_scope.py`, which writes every `auth.channel_denied` row the API and
 > the console seam record, checks the name it is given against the rule too, and records a name
 > that fails it as no channel, so `audit_log.channel_id` never holds a caller-chosen string of
