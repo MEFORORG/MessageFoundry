@@ -1182,7 +1182,9 @@ def test_a_sandbox_bootstrap_unicode_failure_is_reported_without_the_character(
     def unreadable(snapshot: object, **_kw: object) -> object:
         raise _encode_error()
 
-    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(buffer=stdin))
+    # main() takes its request stream from _detach_request_pipe, which works on the real fd 0;
+    # stand in for it so the test process's own fd 0 is left alone.
+    monkeypatch.setattr(_sandbox_worker, "_detach_request_pipe", lambda: stdin)
     monkeypatch.setattr(sys, "stdout", types.SimpleNamespace(buffer=stdout))
     monkeypatch.setattr(_sandbox_worker, "_redirect_stdout_to_stderr", lambda: None)
     monkeypatch.setattr(wiring, "load_snapshot", unreadable)

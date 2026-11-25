@@ -74,7 +74,9 @@ def _drive(
     boot = types.SimpleNamespace(
         snapshot=None, code_sets=None, mem_mb=None, forbidden=(), broker=False
     )
-    monkeypatch.setattr("sys.stdin", types.SimpleNamespace(buffer=io.BytesIO()))
+    # main() takes its request stream from _detach_request_pipe, which works on the real fd 0;
+    # stand in for it so the test process's own fd 0 is left alone.
+    monkeypatch.setattr(worker, "_detach_request_pipe", lambda: io.BytesIO())
     monkeypatch.setattr("sys.stdout", types.SimpleNamespace(buffer=io.BytesIO()))
     monkeypatch.setattr(worker, "_redirect_stdout_to_stderr", lambda: None)
     monkeypatch.setattr(worker, "_apply_resource_caps", lambda _mb: "the cap")
