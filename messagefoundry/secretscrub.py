@@ -1205,13 +1205,15 @@ _CAMEL_PLAIN_KEY_VALUE, _CAMEL_KEY_VALUE_CLASSES = _narrowed_value(
 # prints as before in a text the camelCase union returns its reading before for, whole: a text
 # where the shipped reading hid a member key's ";", as in ``userPwd='a;PWD=b' password=b'v w'``,
 # and an untraceable one. :func:`_pre_camel` leaves the tails and the key-block pass out of that
-# reading, so in such a text no tail runs, on any line of it. A key body there is masked all the
-# same: :func:`scrub_credentials` runs the key-block mask once more over the reading it keeps,
-# which writes characters as "x" and nothing else (BACKLOG #5550 added items 14 and 26).
-# ``support.redact.redact_log_text`` splits the text at line breaks, so it masks a block's whole
-# body lines across them first (``_mask_key_body_lines``). ``GET /logs/tail`` reads its lines
-# through ``redact_log_record`` one at a time and does not, so there a body line too short for the
-# long-base64 sweep still prints.
+# reading, so in such a text no tail runs, on any line of it. :func:`scrub_credentials` runs the
+# key-block mask once more over the reading it keeps, which writes characters as "x" and nothing
+# else (BACKLOG #5550 added items 14 and 26), so a key body there is masked where that reading
+# still holds the BEGIN marker. Where a label's value took the marker, as in
+# ``secret=-----BEGIN ...``, the mask finds no block and the body prints in such a text.
+# ``support.redact.redact_log_text`` splits the text at line breaks, so it masks a block's body
+# lines across them first (``support.redact.mask_key_body_lines``, which says what that leaves).
+# ``GET /logs/tail`` reads its lines through ``redact_log_record`` one at a time and does not, so
+# there a body line too short for the long-base64 sweep still prints.
 
 #: The label words a padded token68 may not end in: every family's, and the query keys
 #: ``logging_setup``'s query filter reads. Case-insensitive, one fixed-width lookbehind per word.
@@ -2292,7 +2294,9 @@ def _keep_key_marker(m: re.Match[str]) -> str:
 
 def mask_private_key_blocks(text: str) -> str:
     """``text`` with the body of every PRIVATE KEY block masked, one character for one (BACKLOG
-    #5550). Where it runs, it runs first: :func:`scrub_credentials` runs it as its first pass, and
+    #5550). Where it runs, it runs first: :func:`scrub_credentials` runs it as its first pass (and
+    once more, last, over the reading it keeps; the comment above :data:`_NO_LABEL_BEFORE` says
+    why), and
     ``support/redact.py``, ``logging_setup`` and the tray chain run it before the PHI pass, which
     would rewrite the markers. At least :func:`scrub_credentials_without_tails`, and so the verify
     details (``verify_leaf.safe_detail_text``) and the audit tee's field scrub
@@ -2533,8 +2537,9 @@ def _scrub_credentials(
     """:func:`scrub_credentials` after its gate. With ``tails`` False, the reading without the masked
     tails and the key-block pass (BACKLOG #5546 to #5550), which is what the code before them
     printed. With it True, that reading's output wherever the tailed one is not that output with
-    characters written as "x" (:func:`_mask_only`), and the tailed one otherwise; a line no tail
-    could fire on takes one reading, which the two share there."""
+    characters written as "x" (:func:`_mask_only`), and the tailed one otherwise, either one with
+    the key-block mask run over it once more where a key block's hint is in the text; a line no
+    tail could fire on takes one reading, which the two share there."""
     if not tails:
         return _one_reading(text, placeholder, folded, _without_tails, _without_tails_sub)
     tailed = _one_reading(text, placeholder, folded, _same, None)

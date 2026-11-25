@@ -13,14 +13,16 @@ from __future__ import annotations
 
 import itertools
 import re
+from pathlib import Path
 
 import pytest
 
 from messagefoundry import secretscrub as scrub_mod
 from messagefoundry.secretscrub import scrub_credentials
+from messagefoundry.support import bundle as bundle_mod
 from messagefoundry.support import redact as redact_mod
 from messagefoundry.support.redact import (
-    _mask_key_body_lines,
+    mask_key_body_lines,
     redact_log_record,
     redact_log_text,
     split_log_lines,
@@ -50,23 +52,50 @@ def test_a_short_last_body_line_no_longer_prints() -> None:
     out = redact_log_text(text)
     assert _KEY_LAST[:-2] not in out, out
     assert out.count("\n") == text.count("\n")
-    assert pem_marker("BEGIN", "RSA PRIVATE KEY") in text
+    # The BEGIN line and the lines after the block read as the per-line reading printed them.
+    old, new = _per_line(text).split("\n"), out.split("\n")
+    assert (new[0], new[1], new[4:]) == (old[0], old[1], old[4:])
 
 
-def test_a_body_ending_at_an_escaped_break_leaves_its_line_whole() -> None:
+def test_a_body_ending_at_an_escaped_break_is_masked_to_it() -> None:
     # The last body line is followed on the same line by an escaped break and the END marker, so
-    # the body covers that line only in part; it must not be cut.
-    tail = _KEY_LAST + "\\n" + pem_marker("END", "RSA PRIVATE KEY")
-    lines = [pem_marker("BEGIN", "RSA PRIVATE KEY"), _KEY_LINE, tail]
-    out = _mask_key_body_lines(lines)
-    assert out[0] == lines[0]
-    assert out[1] == "x" * len(_KEY_LINE)
-    assert out[2] == tail
+    # the body covers that line only in part: masked to the break, the rest kept.
+    end = "\\n" + pem_marker("END", "RSA PRIVATE KEY") + " PID|2||ZQROE^ZQRICH"
+    lines = [pem_marker("BEGIN", "RSA PRIVATE KEY"), _KEY_LINE, _KEY_LAST + end]
+    out = mask_key_body_lines(lines)
+    assert out == [lines[0], "x" * len(_KEY_LINE), "x" * len(_KEY_LAST) + end]
+    assert _KEY_LAST[:-2] in _per_line("\n".join(lines))
+    assert _KEY_LAST[:-2] not in redact_log_text("\n".join(lines))
 
 
 def test_a_one_line_escaped_block_is_left_to_the_line_pass() -> None:
     lines = ["before", pem_block("EC PRIVATE KEY", "\\n", _KEY_LINE, _KEY_LAST), "after"]
-    assert _mask_key_body_lines(lines) is lines
+    assert mask_key_body_lines(lines) is lines
+
+
+def test_two_blocks_are_each_masked_at_their_own_lines() -> None:
+    first = pem_block("RSA PRIVATE KEY", "\n", _KEY_LINE, _KEY_LAST)
+    second = pem_block("EC PRIVATE KEY", "\n", _KEY_LAST, _KEY_LINE[:9])
+    lines = ["a", *first.split("\n"), "b", "c", *second.split("\n"), "d"]
+    out = mask_key_body_lines(lines)
+    changed = [i for i, (old, new) in enumerate(zip(lines, out, strict=True)) if old != new]
+    assert changed == [2, 3, 8, 9]
+    assert all(set(out[i]) <= {"x"} for i in changed)
+
+
+def test_the_bundle_masks_a_block_whose_begin_line_is_cut_off_by_the_tail(tmp_path: Path) -> None:
+    lines = [
+        "2026-11-25 12:00:00,001 ERROR mefor.tls key load failed:",
+        *pem_block("RSA PRIVATE KEY", "\n", _KEY_LINE, _KEY_LINE[::-1], _KEY_LAST).split("\n"),
+        "PID|1||MRN7712345^^^HOSP^MR||ZQDOE^ZQJANE||19700101|F",
+    ]
+    (tmp_path / "engine.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # The control: the tail alone, redacted as text, still prints the short body line.
+    assert _KEY_LAST[:-2] in redact_log_text("\n".join(lines[-4:]))
+    out = bundle_mod._log_tail(str(tmp_path), lines=4)
+    assert out is not None
+    assert _KEY_LAST[:-2] not in out, out
+    assert out.count("\n") == 3
 
 
 #: Text before a BEGIN marker, after an END marker, and around a block, HL7-shaped.
@@ -85,6 +114,7 @@ _BODIES = (
     (_KEY_LINE + "  ", _KEY_LINE[::-1], "", _KEY_LAST),
     ("Proc-Type: 4,ENCRYPTED", "DEK-Info: AES-128-CBC,0A1B2C3D4E5F", "", _KEY_LINE, _KEY_LAST),
     (_KEY_LINE[:20] + "\\n" + _KEY_LAST,),
+    (_KEY_LINE, _KEY_LAST + "\\n" + pem_marker("END", "RSA PRIVATE KEY") + " PID|3||ZQDOE^ZQAMY"),
 )
 
 #: A run of letters and digits a line prints, after an escaped line break, which a masked body
@@ -110,10 +140,9 @@ def _corpus() -> list[str]:
 
 @pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
 def test_no_line_prints_a_value_the_per_line_reading_hid(crlf: bool) -> None:
-    """The differential: over HL7-prefixed bundle text, every line reads as the per-line reading
-    printed it, except a line a key body covers whole, which may print no letter or digit run but
-    an "x" run and the placeholder. The control arm: at least one body line the per-line reading
-    printed is hidden now, so the comparison can fail."""
+    """The differential: over HL7-prefixed bundle text, no line prints a letter or digit run the
+    per-line reading did not print on that line. The control arm: at least one run the per-line
+    reading printed is hidden now, so the comparison can fail."""
     hidden = 0
     for text in _corpus():
         if crlf:
@@ -122,10 +151,8 @@ def test_no_line_prints_a_value_the_per_line_reading_hid(crlf: bool) -> None:
         new_lines = redact_log_text(text).split("\n")
         assert len(old_lines) == len(new_lines), text
         for old, new in zip(old_lines, new_lines, strict=True):
-            if old == new:
-                continue
-            assert not _printed(new), (text, old, new)
-            hidden += bool(_printed(old))
+            assert not set(_printed(new)) - set(_printed(old)), (text, old, new)
+            hidden += bool(set(_printed(old)) - set(_printed(new)))
     assert hidden > 0
 
 
@@ -139,14 +166,25 @@ _FALLBACK = "userPwd='a;PWD=b' password=b'v w'"
 @pytest.mark.parametrize("sep", ["\n", "\\n"], ids=["real", "escaped"])
 @pytest.mark.parametrize("trigger_first", [True, False], ids=["trigger-first", "trigger-last"])
 def test_scrub_credentials_masks_a_key_body_on_the_fallback_reading(
-    sep: str, trigger_first: bool
+    sep: str, trigger_first: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     block = pem_block("RSA PRIVATE KEY", sep, _KEY_LINE, _KEY_LAST)
     text = sep.join([_FALLBACK, block] if trigger_first else [block, _FALLBACK])
+    atoms = (_KEY_LINE, _KEY_LAST[:-2])
     out = scrub_credentials(text)
-    printed = [atom for atom in (_KEY_LINE, _KEY_LAST[:-2]) if atom in out]
-    assert not printed, out
-    assert "<redacted>" in out  # the fallback ran: the member key's value is hidden by its pass
+    assert not [atom for atom in atoms if atom in out], out
+    # The control: this text takes the fallback, so without the last mask the body prints.
+    with monkeypatch.context() as patch:
+        patch.setattr(scrub_mod, "mask_private_key_blocks", lambda text: text)
+        unmasked = scrub_credentials(text)
+    assert all(atom in unmasked for atom in atoms), unmasked
+
+
+def test_a_label_value_that_takes_the_begin_marker_still_prints_the_body_on_the_fallback() -> None:
+    """A known residual, pinned so a change to it is seen: the label pass took ``-----BEGIN``, so
+    the last mask finds no block (the comment above ``secretscrub._NO_LABEL_BEFORE`` states it)."""
+    text = _FALLBACK + " secret=" + pem_block("RSA PRIVATE KEY", "\n", _KEY_LINE, _KEY_LAST)
+    assert _KEY_LINE in scrub_credentials(text)
 
 
 def _fallback_corpus() -> list[str]:
@@ -172,7 +210,7 @@ def test_the_fallback_mask_prints_nothing_the_reading_before_it_hid(
     new = {name: [apply(text) for text in corpus] for name, apply in surfaces}
     with monkeypatch.context() as patch:
         patch.setattr(scrub_mod, "mask_private_key_blocks", lambda text: text)
-        patch.setattr(redact_mod, "_mask_key_body_lines", lambda lines: lines)
+        patch.setattr(redact_mod, "mask_key_body_lines", lambda lines: lines)
         old = {name: [apply(text) for text in corpus] for name, apply in surfaces}
     hidden = 0
     for name, _apply in surfaces:
