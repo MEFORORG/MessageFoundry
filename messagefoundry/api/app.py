@@ -1076,9 +1076,10 @@ _CONTROL_ACTION_SIDE: Final = {"restart_inbound": "inbound", "restart_outbound":
 #: whose emitters, read on 2026-11-22, raise it only for an outbound lane, ``"both"`` one raised
 #: on both sides, ``"inbound"`` one raised on the inbound side, and ``"none"`` one whose emitters
 #: were read as keying it on something other than a connection name, a label such as a sink's or
-#: ``dr_backup``. ``GET /alerts/rules`` reads every
-#: value, as its ``visible`` test shows, so a wrong reading of an emitter can show a rule that
-#: should be withheld. No test checks a value against the emitters. A test pins the keys to
+#: ``dr_backup``. ``GET /alerts/rules`` withholds on ``"outbound"`` and, for a ``"*"`` rule,
+#: ``"both"``; ``"inbound"`` and ``"none"`` show alike. So a type an outbound raises that is read
+#: as ``"inbound"`` or ``"none"`` would show a rule that should be withheld. No test checks a value
+#: against the emitters. A test pins the keys to
 #: ``config.settings._ALERT_EVENT_TYPES``, so a new type has to be classified.
 _ALERT_EVENT_SIDE: Final[Mapping[str, str]] = MappingProxyType(
     {
@@ -3941,8 +3942,8 @@ def _summary_metadata(d: Mapping[str, Any]) -> str | None:
     deep to read (BACKLOG #6712). Raising there would fail the whole answer the row is on: at least
     a message list or search page, a layered search, or one message's detail. So the row shows no
     metadata, and a WARNING names the message, never the cell. The line repeats for a message
-    only after :data:`_TOO_DEEP_LOG_INTERVAL_S`, or once more than :data:`_TOO_DEEP_LOG_MAX`
-    others have been logged since. The wire shows such a row as it shows one with no metadata. The
+    after :data:`_TOO_DEEP_LOG_INTERVAL_S`, or once more than :data:`_TOO_DEEP_LOG_MAX` other
+    messages have been logged or re-read since it was last read. The wire shows such a row as it shows one with no metadata. The
     delivery reader still raises."""
     try:
         return user_metadata(d.get("metadata"), row_id=d["id"])
@@ -4314,8 +4315,8 @@ def _compose_preset_layers(
     compose dropping it (BACKLOG #6700). Each needle is validated as it is found, at ``scan_limit``,
     so a malformed one is refused with its own cause rather than counted as a second needle. A
     preset that carries a needle passes its terms to ``make_spec`` as stored, so a non-text one
-    there is refused rather than dropped. Which terms make a preset carry one is
-    :func:`sends_a_needle`'s rule."""
+    there is refused rather than dropped. Whether a preset carries one is :func:`sends_a_needle`
+    applied to its content and path stripped, so a blank one does not count here."""
     meta_keys = ("channel_id", "status", "message_type", "control_id")
     meta: dict[str, str | None] = dict.fromkeys(meta_keys)
     spec: SearchSpec | None = None
