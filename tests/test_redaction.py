@@ -666,8 +666,9 @@ def test_the_separator_sniff_stays_inside_the_scan_budget() -> None:
 # (``tests/test_security_static.py``, ``_UNSCANNABLE_RE_PATTERNS``). The budget arm above times
 # ``redact`` on two inputs, and no input it carries puts the separator-aware field run on a long
 # delimiter-free token. The arms below read the compiled patterns themselves, for real declared
-# delimiter sets and for the hardcoded pair, with a character meter and no clock, plus one structural
-# read for the shape the meters cannot see.
+# delimiter sets and for the hardcoded pair, with a character meter and no clock, plus two structural
+# reads of the parsed patterns: the nesting the meters cannot see, and the invariants their
+# linearity argument rests on.
 
 #: Headers whose declared delimiters reach outside the defaults, so ``redact`` runs the
 #: separator-aware pass on them, keyed by test id. The dash and backslash headers declare a class
@@ -703,6 +704,7 @@ class _LinearityCase(NamedTuple):
     field_run: re.Pattern[str]
 
 
+@functools.cache
 def _linearity_case(case: str) -> _LinearityCase:
     """A header's separator-aware pair, read through the same sniff and union ``redact`` uses, or
     ``"hardcoded"`` for the default-delimiter pair every ``redact`` call runs first."""
@@ -922,16 +924,38 @@ def test_a_reading_over_the_line_says_whether_it_is_quadratic(
     _check_reads(lambda chars: chars, "a synthetic meter")
 
 
-@pytest.mark.parametrize("case", _LINEARITY_CASES)
-@pytest.mark.parametrize(
-    "regression",
-    [
-        "guard-removed",
-        "guard-narrowed",
-        "run-class-widened-over-spaces",
-        "run-class-narrowed-to-a-space",
-    ],
+#: The field-run regressions the controls below build, named for the edit each makes to the
+#: shipped pattern. :func:`test_a_field_run_whose_guard_is_not_the_exact_complement_is_read_red`
+#: says what each costs.
+_FIELD_RUN_REGRESSIONS = (
+    "guard-removed",
+    "guard-narrowed",
+    "run-class-widened-over-spaces",
+    "run-class-narrowed-to-a-space",
 )
+
+
+def _regressed_field_run(case: str, regression: str) -> str:
+    """The case's shipped field run with the one edit ``regression`` names."""
+    pair = _linearity_case(case)
+    guard, spelling = _field_run_guard(pair.field_run)
+    body = pair.field_run.pattern.removeprefix(guard)
+    if regression == "guard-removed":
+        if case == "hardcoded":
+            assert body == _PRE_GUARD_FIELD_RUN.pattern
+        return body
+    if regression == "guard-narrowed":
+        return rf"(?<![^\s{spelling}0-9])" + body
+    run_class = {"run-class-widened-over-spaces": "\\r\\n", "run-class-narrowed-to-a-space": " "}[
+        regression
+    ]
+    widened = body.replace(rf"[^\s{spelling}]", rf"[^{run_class}{spelling}]")
+    assert widened != body
+    return guard + widened
+
+
+@pytest.mark.parametrize("case", _LINEARITY_CASES)
+@pytest.mark.parametrize("regression", _FIELD_RUN_REGRESSIONS)
 def test_a_field_run_whose_guard_is_not_the_exact_complement_is_read_red(
     case: str, regression: str
 ) -> None:
@@ -945,36 +969,24 @@ def test_a_field_run_whose_guard_is_not_the_exact_complement_is_read_red(
     ``run-class-narrowed-to-a-space`` lets the run cross every other white space character, so each
     start the guard admits after a tab reads to the end of a tab-separated line."""
     pair = _linearity_case(case)
-    guard, spelling = _field_run_guard(pair.field_run)
-    body = pair.field_run.pattern.removeprefix(guard)
-    if regression == "guard-removed":
-        regressed = re.compile(body)
-        if case == "hardcoded":
-            assert regressed.pattern == _PRE_GUARD_FIELD_RUN.pattern
-    elif regression == "guard-narrowed":
-        regressed = re.compile(rf"(?<![^\s{spelling}0-9])" + body)
-    else:
-        run_class = "\\r\\n" if regression == "run-class-widened-over-spaces" else " "
-        widened = body.replace(rf"[^\s{spelling}]", rf"[^{run_class}{spelling}]")
-        assert widened != body
-        regressed = re.compile(guard + widened)
+    regressed = re.compile(_regressed_field_run(case, regression))
     _assert_read_red_and_quadratic(
         lambda chars: _field_run_reads(regressed, pair.delimiters, chars),
         f"the {regression} field run",
     )
 
 
+#: What the segment controls below require after the shipped pattern's ``[^\r\n]*``, by test id.
+_SEGMENT_TAILS = {
+    "carriage-return-required": r"\r",
+    "line-feed-required": r"\n",
+    "anchored": "$",
+    "carriage-return-or-end-required": r"(?=\r|\Z)",
+}
+
+
 @pytest.mark.parametrize("case", _LINEARITY_CASES)
-@pytest.mark.parametrize(
-    "tail",
-    [r"\r", r"\n", "$", r"(?=\r|\Z)"],
-    ids=[
-        "carriage-return-required",
-        "line-feed-required",
-        "anchored",
-        "carriage-return-or-end-required",
-    ],
-)
+@pytest.mark.parametrize("tail", _SEGMENT_TAILS.values(), ids=_SEGMENT_TAILS)
 def test_a_segment_pattern_that_needs_more_after_its_run_is_read_red(case: str, tail: str) -> None:
     """Live positive control for the segment arm: the shipped pattern with something required after
     its ``[^\\r\\n]*``, a line break or the end of the string. Every header start on a line without
@@ -990,6 +1002,8 @@ def test_a_segment_pattern_that_needs_more_after_its_run_is_read_red(case: str, 
         f"the {tail!r}-terminated segment pattern",
     )
 
+
+_REPEATS = (sre_constants.MAX_REPEAT, sre_constants.MIN_REPEAT, sre_constants.POSSESSIVE_REPEAT)
 
 #: Parsed opcodes that hold no sub-pattern, which :func:`_nested_repetitions` steps over. An opcode
 #: on neither this list nor its own raises, so a new one is read before it is trusted.
@@ -1019,12 +1033,11 @@ def _nested_repetitions(pattern: str) -> list[str]:
     both. Both pass ``(a+)?``, whose outer count repeats at most once. It does not see, at least,
     fixed-count outer nesting (``(?:a+){3}``), adjacent repetitions (``a*a*``) and overlapping
     alternation (item d)."""
-    repeats = (sre_constants.MAX_REPEAT, sre_constants.MIN_REPEAT, sre_constants.POSSESSIVE_REPEAT)
     found: list[str] = []
 
     def walk(items: Any, inside: bool) -> None:
         for op, arg in items:
-            if op in repeats:
+            if op in _REPEATS:
                 low, high, body = arg
                 open_count = low != high
                 if open_count and inside:
@@ -1082,26 +1095,243 @@ def test_the_field_run_and_segment_patterns_nest_no_repetition_as_shipped(case: 
         assert _nested_repetitions(pattern.pattern) == [], pattern.pattern
 
 
+#: The nesting shapes the field run's first repetition is rewritten into by the controls below, by
+#: test id; ``{}`` is the run class.
+_NESTINGS = {
+    "greedy-in-greedy": r"(?:{}+)*",
+    "lazy-in-greedy": r"(?:{}+?)*",
+    "greedy-in-lazy": r"(?:{}+)*?",
+}
+
+
+def _nested_field_run(case: str, nesting: str) -> str:
+    """The case's shipped field run with its first repetition rewritten into ``nesting``."""
+    pair = _linearity_case(case)
+    _guard, spelling = _field_run_guard(pair.field_run)
+    run = rf"[^\s{spelling}]"
+    nested = pair.field_run.pattern.replace(run + "*+", nesting.format(run), 1)
+    assert nested != pair.field_run.pattern, f"the {nesting} control did not regress the field run"
+    return nested
+
+
 @pytest.mark.parametrize("case", _LINEARITY_CASES)
-@pytest.mark.parametrize(
-    "nesting",
-    [r"(?:{}+)*", r"(?:{}+?)*", r"(?:{}+)*?"],
-    ids=["greedy-in-greedy", "lazy-in-greedy", "greedy-in-lazy"],
-)
+@pytest.mark.parametrize("nesting", _NESTINGS.values(), ids=_NESTINGS)
 def test_the_field_run_and_segment_patterns_nest_no_repetition(case: str, nesting: str) -> None:
     """The control for the regression the meters cannot see: a repetition inside a repeated group,
     which re-reads one token many times from a single start. The field run's first repetition
     rewritten into each nesting shape must be found, so
     :func:`test_the_field_run_and_segment_patterns_nest_no_repetition_as_shipped`, which reads the
     shipped patterns as compiled since the ReDoS scanner cannot reach them statically, can see it."""
+    nested = _nested_field_run(case, nesting)
+    assert _nested_repetitions(nested), (
+        f"the {nesting} control was not read as nested, so "
+        f"test_the_field_run_and_segment_patterns_nest_no_repetition_as_shipped measures nothing"
+    )
+
+
+# --- the structural invariants the linearity argument rests on (BACKLOG #2958 step 8) -------------
+#
+# The meters above read cost on inputs they build, so a regression is seen only on an input someone
+# thought to build. The argument at ``_delimiter_patterns`` instead rests on properties of the
+# patterns themselves, and the arm below asserts three of them on the parsed pattern, for each case,
+# with no input: the field run's guard and every single-class run in it match one character set,
+# each of those runs is possessive, and the segment pattern ends in its open ``[^\r\n]*`` with
+# nothing after it. It reads at least the regressions the meters' controls build. It does not
+# replace the meters: a change that keeps all three properties, such as a repetition nested around
+# a possessive run, is read by the nesting arm above, not here.
+
+#: The characters two classes are compared over: every one up to U+3000, past which ``\s``
+#: matches none (:data:`_NON_ASCII_WHITESPACE`), and a case's own delimiters. Two classes that
+#: differ only past U+3000 are not told apart.
+_CLASS_UNIVERSE = "".join(map(chr, range(0x3001)))
+
+
+@functools.cache
+def _class_universe(delimiters: frozenset[str]) -> str:
+    """:data:`_CLASS_UNIVERSE` with a case's own delimiters added."""
+    return _CLASS_UNIVERSE + "".join(sorted(delimiters))
+
+
+#: The class escapes a parsed class can hold, spelled so ``re`` reads each over the universe. The
+#: same table as ``tests/test_security_static.py``'s, kept here so this suite does not import that
+#: one.
+_CATEGORY_CLASSES = {
+    sre_constants.CATEGORY_SPACE: r"\s",
+    sre_constants.CATEGORY_NOT_SPACE: r"\S",
+    sre_constants.CATEGORY_DIGIT: r"\d",
+    sre_constants.CATEGORY_NOT_DIGIT: r"\D",
+    sre_constants.CATEGORY_WORD: r"\w",
+    sre_constants.CATEGORY_NOT_WORD: r"\W",
+}
+
+
+def _class_set(item: Any, universe: str) -> frozenset[str]:
+    """The characters of ``universe`` the parsed one-character class ``item`` matches, read as a
+    pattern with no flags. A class member this does not read raises, so it is read before it is
+    trusted."""
+    op, members = item
+    assert op == sre_constants.IN, item
+    hit: set[str] = set()
+    for member, arg in members:
+        if member == sre_constants.NEGATE:
+            continue
+        if member == sre_constants.LITERAL:
+            hit.add(chr(arg))
+        elif member == sre_constants.RANGE:
+            hit.update(map(chr, range(arg[0], arg[1] + 1)))
+        elif member == sre_constants.CATEGORY and arg in _CATEGORY_CLASSES:
+            hit.update(re.findall(_CATEGORY_CLASSES[arg], universe))
+        else:
+            raise AssertionError(f"{member} is not read by _class_set: {item!r}")
+    negated = bool(members) and members[0][0] == sre_constants.NEGATE
+    return frozenset(universe) - hit if negated else frozenset(universe) & hit
+
+
+def _open_runs(items: Any) -> Iterator[tuple[Any, Any]]:
+    """``(repeat opcode, item)`` for each repetition in ``items``, at any depth, with no fixed count
+    over one leaf item, a group around one included (``([^|])*``). A repetition over more than one
+    item is read into rather than yielded. Read through the same group kinds as
+    :func:`_nested_repetitions`, and an opcode neither reads raises, so it is read before it is
+    trusted."""
+    for op, arg in items:
+        if op in _REPEATS:
+            low, high, body = arg
+            body = list(body)
+            while len(body) == 1 and body[0][0] == sre_constants.SUBPATTERN:
+                body = list(body[0][1][3])
+            if low != high and len(body) == 1 and body[0][0] in _LEAF_OPCODES:
+                yield op, body[0]
+            else:
+                yield from _open_runs(body)
+        elif op == sre_constants.SUBPATTERN:
+            yield from _open_runs(arg[3])
+        elif op == sre_constants.ATOMIC_GROUP:
+            yield from _open_runs(arg)
+        elif op == sre_constants.GROUPREF_EXISTS:
+            for option in arg[1:]:
+                if option is not None:
+                    yield from _open_runs(option)
+        elif op in (sre_constants.ASSERT, sre_constants.ASSERT_NOT):
+            yield from _open_runs(arg[1])
+        elif op == sre_constants.BRANCH:
+            for option in arg[1]:
+                yield from _open_runs(option)
+        elif op not in _LEAF_OPCODES:
+            raise AssertionError(f"{op} is not read by _open_runs")
+
+
+def _field_run_violations(field_run: str, delimiters: frozenset[str]) -> list[str]:
+    """What in ``field_run`` breaks the guard and run invariants the comment above names."""
+    universe = _class_universe(delimiters)
+    items = list(sre_parser.parse(field_run))
+    first = items[0] if items else None
+    if (
+        first is None
+        or first[0] != sre_constants.ASSERT_NOT
+        or first[1][0] != -1
+        or len(first[1][1]) != 1
+        or first[1][1][0][0] != sre_constants.IN
+    ):
+        return [f"the field run does not open with a one-class negative lookbehind: {field_run!r}"]
+    guard = _class_set(first[1][1][0], universe)
+    runs = list(_open_runs(items[1:]))
+    violations = [] if runs else [f"the field run repeats no single class: {field_run!r}"]
+    for op, item in runs:
+        if item[0] != sre_constants.IN:
+            violations.append(f"a run over {item!r} is not over a class")
+        elif _class_set(item, universe) != guard:
+            violations.append(f"a run class is not the guard's class: {item!r}")
+        if op != sre_constants.POSSESSIVE_REPEAT:
+            violations.append(f"a run over {item!r} is {op}, not possessive")
+    return violations
+
+
+def _segment_violations(segment: str, delimiters: frozenset[str]) -> list[str]:
+    """What in ``segment`` breaks the open-tail invariant the comment above names."""
+    universe = _class_universe(delimiters)
+    items = list(sre_parser.parse(segment))
+    last = items[-1] if items else None
+    if (
+        last is not None
+        and last[0] in (sre_constants.MAX_REPEAT, sre_constants.POSSESSIVE_REPEAT)
+        and last[1][:2] == (0, sre_constants.MAXREPEAT)
+        and len(last[1][2]) == 1
+        and last[1][2][0][0] == sre_constants.IN
+        and _class_set(last[1][2][0], universe) == frozenset(universe) - {"\r", "\n"}
+    ):
+        return []
+    return [f"the segment pattern does not end in an open [^\\r\\n]* alone: {segment!r}"]
+
+
+@pytest.mark.parametrize("case", _LINEARITY_CASES)
+def test_the_field_run_and_segment_patterns_keep_the_invariants_their_linearity_rests_on(
+    case: str,
+) -> None:
+    """The structural half of the linearity pin: the three properties the comment above names,
+    read from the shipped patterns as compiled, for each case."""
+    pair = _linearity_case(case)
+    violations = _field_run_violations(pair.field_run.pattern, pair.delimiters)
+    violations += _segment_violations(pair.segment.pattern, pair.delimiters)
+    assert not violations, "; ".join(violations)
+
+
+def _greedy_run(case: str) -> str:
+    """The case's field run with its first run made greedy rather than possessive."""
+    shipped = _linearity_case(case).field_run.pattern
+    regressed = shipped.replace("]*+", "]*", 1)
+    assert regressed != shipped
+    return regressed
+
+
+def _grouped_greedy_run(case: str) -> str:
+    """The case's field run with its first run made a greedy repetition of a capturing group."""
     pair = _linearity_case(case)
     _guard, spelling = _field_run_guard(pair.field_run)
     run = rf"[^\s{spelling}]"
-    nested = pair.field_run.pattern.replace(run + "*+", nesting.format(run), 1)
-    assert nested != pair.field_run.pattern and _nested_repetitions(nested), (
-        f"the {nesting} control did not regress the field run, so "
-        f"test_the_field_run_and_segment_patterns_nest_no_repetition_as_shipped measures nothing"
-    )
+    regressed = pair.field_run.pattern.replace(run + "*+", f"({run})*", 1)
+    assert regressed != pair.field_run.pattern
+    return regressed
+
+
+#: Every field run the structural control builds, by test id: the meter and nesting controls'
+#: regressions, and three the meters read as linear, because one start still reads its token once.
+_FIELD_RUN_INVARIANT_BREAKS: dict[str, Callable[[str], str]] = {
+    **{
+        name: functools.partial(_regressed_field_run, regression=name)
+        for name in _FIELD_RUN_REGRESSIONS
+    },
+    **{
+        name: functools.partial(_nested_field_run, nesting=shape)
+        for name, shape in _NESTINGS.items()
+    },
+    "run-not-possessive": _greedy_run,
+    "grouped-run-not-possessive": _grouped_greedy_run,
+    "any-character-run-added": lambda case: _linearity_case(case).field_run.pattern + ".*",
+}
+assert len(_FIELD_RUN_INVARIANT_BREAKS) == len(_FIELD_RUN_REGRESSIONS) + len(_NESTINGS) + 3
+
+
+@pytest.mark.parametrize("case", _LINEARITY_CASES)
+@pytest.mark.parametrize(
+    "build", _FIELD_RUN_INVARIANT_BREAKS.values(), ids=_FIELD_RUN_INVARIANT_BREAKS
+)
+def test_a_field_run_that_breaks_an_invariant_is_read_red(
+    case: str, build: Callable[[str], str]
+) -> None:
+    """Live positive control for the structural arm's field-run half: each field run in
+    :data:`_FIELD_RUN_INVARIANT_BREAKS` must break an invariant the arm asserts."""
+    field_run = build(case)
+    assert _field_run_violations(field_run, _linearity_case(case).delimiters), field_run
+
+
+@pytest.mark.parametrize("case", _LINEARITY_CASES)
+@pytest.mark.parametrize("tail", _SEGMENT_TAILS.values(), ids=_SEGMENT_TAILS)
+def test_a_segment_pattern_that_breaks_its_invariant_is_read_red(case: str, tail: str) -> None:
+    """Live positive control for the structural arm's segment half: each tail the segment meter's
+    controls require after the shipped ``[^\\r\\n]*`` must break the open-tail invariant."""
+    pair = _linearity_case(case)
+    segment = pair.segment.pattern + tail
+    assert _segment_violations(segment, pair.delimiters), segment
 
 
 def test_a_headerless_custom_delimiter_fragment_is_an_accepted_residual() -> None:
@@ -2773,13 +3003,11 @@ def test_the_mrn_pass_stays_linear_and_affordable(unit: str) -> None:
     """8x the input must cost well under 64x the time, and a whole window stays well under a second
     on the event loop. The ratio ceiling is the one the structured passes use."""
 
-    sized = functools.partial(_tile, unit)
-
-    small, large = sized(8 * 1024), sized(64 * 1024)
+    small, large = _tile(unit, 8 * 1024), _tile(unit, 64 * 1024)
     t_small = max(_best_of(lambda: redact(small)), 1e-4)
     t_large = _best_of(lambda: redact(large))
     assert t_large / t_small < 24, f"{t_large / t_small:.1f}x for 8x the input on {unit!r}"
-    window = sized(redaction._REDACT_WINDOW)
+    window = _tile(unit, redaction._REDACT_WINDOW)
     assert _best_of(lambda: redact(window)) < 0.5
 
 
@@ -3836,13 +4064,11 @@ def test_the_backstop_and_the_encoded_run_stay_linear_and_affordable(unit: str) 
     """8x the input must cost well under 64x the time, and a whole window stays well under a second
     on the event loop. The same ceilings as the MRN pass above."""
 
-    sized = functools.partial(_tile, unit)
-
-    small, large = sized(8 * 1024), sized(64 * 1024)
+    small, large = _tile(unit, 8 * 1024), _tile(unit, 64 * 1024)
     t_small = max(_best_of(lambda: redact(small)), 1e-4)
     t_large = _best_of(lambda: redact(large))
     assert t_large / t_small < 24, f"{t_large / t_small:.1f}x for 8x the input on {unit!r}"
-    window = sized(redaction._REDACT_WINDOW)
+    window = _tile(unit, redaction._REDACT_WINDOW)
     assert _best_of(lambda: redact(window)) < 0.5
 
 
