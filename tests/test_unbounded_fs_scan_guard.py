@@ -1042,6 +1042,15 @@ _ROUNDS = 2
 #: running when the test fails. pytest-timeout's per-test cap still governs the whole test.
 _REQUEST_TIMEOUT_SECONDS = 100
 
+#: The per-test cap of each test that uses the driver, which pytest-timeout charges with the
+#: driver's start as well as the call. THE SUITE'S 60 s CAP CAN CUT A RETAKE OFF. On a 32-core
+#: machine under 32 spinning processes and four workers, the linear check and the control each
+#: crashed their worker in 1 of 10 runs, after setups of 21.58 s and 27.31 s, and a passing control
+#: call in another run read 38.24 s. That the cap killed them is inferred from those numbers, since
+#: the crash left no traceback. A retake exists for exactly that load. So the cap is set above
+#: three requests and the driver's start, which also lets the watchdog above fire first on a hang.
+_TIMING_TEST_TIMEOUT_SECONDS = 3 * _REQUEST_TIMEOUT_SECONDS + 60
+
 #: Ends every timed command. Only the refined view denies it, and that view is built last, over
 #: the whole command, so a timed call that denies has read every `((` site through that view.
 #: `test_the_timing_driver_reads_a_command_as_the_hook_does` asserts the "only".
@@ -1240,6 +1249,7 @@ def _scaling_ratios(
 # the bare compare and the paren count and failed the substring.
 
 
+@pytest.mark.timeout(_TIMING_TEST_TIMEOUT_SECONDS)
 def test_many_arithmetic_commands_are_read_in_linear_time(timing_driver: _TimingDriver) -> None:
     """`_GROWTH` times the `(( 1 ))` sites must take under `_MAX_LINEAR_RATIO` times as long.
 
@@ -1273,6 +1283,7 @@ exit 0
 """
 
 
+@pytest.mark.timeout(_TIMING_TEST_TIMEOUT_SECONDS)
 def test_the_linear_time_check_fails_a_forward_scan_from_every_site(
     timing_driver: _TimingDriver,
 ) -> None:
@@ -1325,6 +1336,7 @@ def test_the_scaling_rule_takes_another_attempt_only_outside_the_band(
     assert _in_band(readings) is in_band
 
 
+@pytest.mark.timeout(_TIMING_TEST_TIMEOUT_SECONDS)
 def test_the_timing_driver_reads_a_command_as_the_hook_does(
     timing_driver: _TimingDriver,
 ) -> None:
