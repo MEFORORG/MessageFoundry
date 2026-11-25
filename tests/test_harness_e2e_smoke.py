@@ -95,8 +95,10 @@ def _smoke(config: Path, port: int) -> subprocess.CompletedProcess[str]:
         try:
             out, err = proc.communicate(timeout=240)
         except subprocess.TimeoutExpired:
-            # SIGTERM first, as subprocess.run's timeout does not: the smoke's teardown runs on it,
-            # and a SIGKILL would skip it and, on POSIX, orphan the engine with its ports held.
+            # On POSIX, SIGTERM first, as subprocess.run's timeout does not: the smoke's teardown
+            # runs on it, and a SIGKILL would skip it and orphan the engine with its ports held. On
+            # Windows terminate() is a hard kill; the engine dies with the smoke's job, and its temp
+            # directory stays.
             proc.terminate()
             try:
                 out, err = proc.communicate(timeout=50)
@@ -169,10 +171,27 @@ def test_the_mllp_timeout_reaches_the_run(monkeypatch: pytest.MonkeyPatch) -> No
     assert seen["mllp_timeout"] == 3.5
 
 
-def test_a_timeout_of_zero_is_refused() -> None:
+@pytest.mark.parametrize("value", ["0", "-1", "inf", "nan"])
+def test_a_timeout_that_is_not_a_finite_positive_number_is_refused(value: str) -> None:
     with pytest.raises(SystemExit) as exited:
-        e2e_smoke.main(["--mllp-timeout", "0"])
+        e2e_smoke.main(["--mllp-timeout", value])
     assert exited.value.code == 2
+
+
+def test_a_taken_api_port_fails_before_any_engine_starts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config, port = _config(tmp_path, _DANGLING_ROUTER)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
+        holder.bind(("127.0.0.1", 0))
+        holder.listen()
+        api_port = int(holder.getsockname()[1])
+        code = e2e_smoke.main(
+            ["--config", str(config), "--mllp-port", str(port), "--api-port", str(api_port)]
+        )
+    out = capsys.readouterr()
+    assert code == 1, out.err + out.out
+    assert f"FAIL ports: API port {api_port} is in use" in out.err
 
 
 class _Proc:
@@ -298,6 +317,15 @@ def test_stop_signals_a_reaped_leaders_group_only_reuse_safely(
     )
     e2e_smoke._stop(_Proc(returncode), None)  # type: ignore[arg-type]
     assert calls == [expected]
+
+
+def test_stop_warns_when_the_group_could_not_be_signalled(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(e2e_smoke, "ADOPT_NEW_SESSION", True)
+    monkeypatch.setattr(e2e_smoke, "kill_reaped_leader_group", lambda pid: None)
+    e2e_smoke._stop(_Proc(0), None)  # type: ignore[arg-type]
+    assert "could not be signalled" in capsys.readouterr().err
 
 
 def test_checkout_refuses_an_engine_that_imports_another_package(tmp_path: Path) -> None:

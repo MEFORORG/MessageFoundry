@@ -587,8 +587,8 @@ class NoCardCitesAPlaybookPathThatDoesNotExistHere(unittest.TestCase):
 class TheMarkerCannotRideIntoACommit(unittest.TestCase):
     """Both are machine-local. Here they are ignored by the `/.claude/*` wildcard.
 
-    DO NOT ADD A NEGATION TO MAKE THIS PASS. `.gitignore` warns, above its one existing negation,
-    that a second would expose nested checkouts carrying `.venv` and the local database.
+    DO NOT ADD A NEGATION TO MAKE THIS PASS. `.gitignore` warns, beside its negations, that a
+    wider one would expose nested checkouts carrying `.venv` and the local database.
     """
 
     def _ignored(self, rel: str) -> bool:

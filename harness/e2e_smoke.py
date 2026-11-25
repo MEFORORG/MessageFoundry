@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import math
 import os
 import shutil
 import signal
@@ -59,7 +60,7 @@ from types import FrameType
 import messagefoundry
 from harness.load import rigadmin
 from messagefoundry.apiclient import ApiError, EngineClient
-from messagefoundry.childenv import CHILD_INTERPRETER_FLAGS, ENGINE_ENV_PREFIX
+from messagefoundry.childenv import CHILD_INTERPRETER_FLAGS, outside_engine_namespace
 from messagefoundry.mllpcodec import (
     DEFAULT_MAX_FRAME_BYTES,
     FramePayloadError,
@@ -71,6 +72,7 @@ from messagefoundry.parsing.peek import HL7PeekError, Peek, normalize
 from messagefoundry.proctree import (
     ADOPT_CREATIONFLAGS,
     ADOPT_NEW_SESSION,
+    GroupKill,
     kill_process_group,
     kill_reaped_leader_group,
     resume_into_job,
@@ -126,7 +128,8 @@ class _SignalState:
     first signal waits until the block is done and is acted on then, so a second Ctrl+C or a
     repeated SIGTERM cannot cut a teardown halfway, or lose a started engine before it is
     recorded. The flag is the only state the handler reads, so entering the block is one store,
-    with no handler swap for a signal to land in."""
+    with no handler swap for a signal to land in. A signal in the instant before that store still
+    acts at once."""
 
     def __init__(self) -> None:
         self.holding = False
@@ -138,17 +141,21 @@ class _SignalState:
         if self.pending is None:
             self.pending = signum
 
+    def release(self) -> None:
+        """End the hold, then act on a signal that arrived during it."""
+        self.holding = False
+        if self.pending is not None:
+            signum, self.pending = self.pending, None
+            _raise_for(signum)
+
     @contextlib.contextmanager
     def held(self) -> Iterator[None]:
-        outer = self.holding
         self.holding = True
         try:
             yield
         finally:
-            self.holding = outer
-        if not outer and self.pending is not None:
-            signum, self.pending = self.pending, None
-            _raise_for(signum)
+            self.holding = False
+        self.release()
 
 
 _SIGNALS = _SignalState()
@@ -174,9 +181,10 @@ def _free_port() -> int:
 
 
 def _serve_env(cert: Path, key: Path) -> dict[str, str]:
-    """The engine's environment: this one, less every ``MEFOR_*`` (a developer's own store backend
-    or bind host must not redirect the smoke), plus the rig's relaxations."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith(ENGINE_ENV_PREFIX)}
+    """The engine's environment: this one, less the engine's namespace (every ``MEFOR_*`` and the
+    secrets outside it; a developer's own store backend or bind host must not redirect the smoke),
+    plus the rig's relaxations."""
+    env = {k: v for k, v in os.environ.items() if outside_engine_namespace(k)}
     env.update(rigadmin.SERVE_ENV)
     env.update(
         {
@@ -287,7 +295,9 @@ def _wait_inbound(
                     "ready", f"inbound {_shown(inbound)}: {_shown(seen)}, expected port {mllp_port}"
                 )
         time.sleep(_POLL_S)  # GET /connections is paced per actor too
-    raise StepFailed("ready", f"inbound {inbound} never ran on port {mllp_port} ({_shown(seen)})")
+    raise StepFailed(
+        "ready", f"inbound {_shown(inbound)} never ran on port {mllp_port} ({_shown(seen)})"
+    )
 
 
 def _send(port: int, message: str, timeout: float) -> str | None:
@@ -354,9 +364,16 @@ def _stop(proc: subprocess.Popen[bytes], job: int | None) -> None:
         terminate_job(job)
     if ADOPT_NEW_SESSION:
         if proc.returncode is None:
-            kill_process_group(proc.pid, started_as_leader=True)
+            reached = kill_process_group(proc.pid, started_as_leader=True) is not GroupKill.NOT_SENT
         else:
-            kill_reaped_leader_group(proc.pid)
+            reached = kill_reaped_leader_group(proc.pid) is not None
+        if not reached:
+            print(
+                f"WARNING the engine's process group {proc.pid} could not be signalled; a process"
+                " it started may still run",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 def _start(
@@ -401,13 +418,16 @@ def run(
         message = normalize(message_file.read_bytes())
         control_id = Peek.parse(message).control_id
     except (OSError, HL7PeekError) as exc:
-        raise StepFailed("message", f"cannot read {message_file}: {type(exc).__name__}") from None
+        raise StepFailed(
+            "message", f"cannot read {_shown(str(message_file))}: {type(exc).__name__}"
+        ) from None
     if not control_id:
-        raise StepFailed("message", f"{message_file} has no MSH-10 control id")
+        raise StepFailed("message", f"{_shown(str(message_file))} has no MSH-10 control id")
     shown_id = _shown(control_id)
-    state = port_state(mllp_port)
-    if state != "free":
-        raise StepFailed("ports", f"MLLP port {mllp_port} is {state}")
+    shown_inbound = _shown(inbound)
+    for what, port in (("MLLP", mllp_port), ("API", api_port)):
+        if port is not None and (state := port_state(port)) != "free":
+            raise StepFailed("ports", f"{what} port {port} is {state}")
 
     work = Path(tempfile.mkdtemp(prefix="mefor-e2e-smoke-"))
     proc: subprocess.Popen[bytes] | None = None
@@ -452,7 +472,7 @@ def run(
             "--project-root",
             str(project_root),
         ]
-        print(f"step serve: API on {api_port}, inbound {inbound} on {mllp_port}", flush=True)
+        print(f"step serve: API on {api_port}, inbound {shown_inbound} on {mllp_port}", flush=True)
         log = work / "engine.log"
         with _SIGNALS.held():  # a signal here must not lose the engine before ``proc`` holds it
             proc, job = _start(argv, work=work, env=env, log=log)
@@ -481,36 +501,50 @@ def run(
                     raise
                 tail = _log_tail(log)
                 raise StepFailed(exc.step, f"{exc}\n--- engine log tail ---\n{tail}") from None
-            print(f"step ready: inbound {inbound} running on {mllp_port}", flush=True)
-
-            code = _send(mllp_port, message, timeout=mllp_timeout)
-            if code != "AA":
-                raise StepFailed("mllp", f"MSA-1 was {_shown(str(code))}, expected AA")
-            print(f"step mllp: AA for control id {shown_id}", flush=True)
+            print(f"step ready: inbound {shown_inbound} running on {mllp_port}", flush=True)
 
             try:
-                status = _poll_disposition(
-                    client,
-                    inbound=inbound,
-                    control_id=control_id,
-                    deadline=time.monotonic() + timeout,
-                )
-            except ApiError as exc:
+                code = _send(mllp_port, message, timeout=mllp_timeout)
+                # CA is the enhanced-mode commit accept: an inbound with ack_mode="enhanced" says it.
+                if code not in ("AA", "CA"):
+                    raise StepFailed("mllp", f"MSA-1 was {_shown(str(code))}, expected AA")
+                print(f"step mllp: {code} for control id {shown_id}", flush=True)
+
+                try:
+                    status = _poll_disposition(
+                        client,
+                        inbound=inbound,
+                        control_id=control_id,
+                        deadline=time.monotonic() + timeout,
+                    )
+                except ApiError as exc:
+                    raise StepFailed(
+                        "disposition", f"GET /messages failed: {_shown(str(exc))}"
+                    ) from None
+            except StepFailed as exc:
+                if proc.poll() is None:
+                    raise
+                # The engine died on the message: that, not the socket or the API, is the cause.
                 raise StepFailed(
-                    "disposition", f"GET /messages failed: {_shown(str(exc))}"
+                    exc.step,
+                    f"{exc}; the engine exited with code {proc.returncode}\n"
+                    f"--- engine log tail ---\n{_log_tail(log)}",
                 ) from None
             if status != expect:
                 seen = "never stored" if status is None else _shown(status.upper())
                 raise StepFailed(
                     "disposition",
-                    f"control id {shown_id} on {inbound}: {seen}, expected {expect.upper()}",
+                    f"control id {shown_id} on {shown_inbound}: {seen}, expected {expect.upper()}",
                 )
             print(f"step disposition: {status.upper()}", flush=True)
     finally:
-        with _SIGNALS.held():
+        _SIGNALS.holding = True  # first, one store: a signal from here on waits for the teardown
+        try:
             if proc is not None:
                 _stop(proc, job)
             _remove(work)
+        finally:
+            _SIGNALS.release()
 
 
 def _remove(path: Path) -> None:
@@ -536,8 +570,8 @@ def _remove(path: Path) -> None:
 
 def _positive_seconds(text: str) -> float:
     value = float(text)
-    if not value > 0:
-        raise argparse.ArgumentTypeError(f"must be more than 0 seconds, not {text}")
+    if not (value > 0 and math.isfinite(value)):
+        raise argparse.ArgumentTypeError(f"must be a finite number of seconds above 0, not {text}")
     return value
 
 
@@ -565,8 +599,9 @@ def main(argv: list[str] | None = None) -> int:
         help=f"seconds to wait for the ACK (default {_DEFAULT_MLLP_TIMEOUT:.0f})",
     )
     args = parser.parse_args(argv)
-    # A Ctrl+C, a SIGTERM (a CI cancel, a caller's terminate()), a hangup or a Ctrl+Break unwinds
-    # through run()'s finally, so the engine is stopped and the temp directory deleted.
+    # A Ctrl+C, a SIGTERM (a CI cancel, a POSIX caller's terminate()), a hangup or a Ctrl+Break
+    # unwinds through run()'s finally, so the engine is stopped and the temp directory deleted. On
+    # Windows terminate() is TerminateProcess, which no handler sees.
     previous: dict[signal.Signals, signal._HANDLER] = {}
     for sig in _HANDLED_SIGNALS:
         try:
