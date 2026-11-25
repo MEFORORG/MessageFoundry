@@ -11,6 +11,8 @@ server thread, so each claim is a handshake rather than an attribute read:
 * a host name refusal closes the TLS socket it wrapped, where ldap3's own ``Tls``, the control,
   leaves it open while the refusal's traceback is held (BACKLOG #3017);
 * the copy of ldap3's wrap step is pinned to the ldap3 source it was taken from;
+* the ClientHello names the host each connection dials, normalised, where ldap3's own ``Tls``, the
+  control, sends no SNI, and the host name check gets the host less its trailing dot (BACKLOG #6879);
 * on an interpreter with ``SSLContext.set_ciphersuites`` (CPython 3.15) the hop refuses a TLS 1.3
   peer offering only ``TLS_AES_128_GCM_SHA256``, while ldap3's own ``Tls`` accepts it as the
   control, and the bind constructs instead of refusing. On 3.14 the paired test measures the
@@ -54,6 +56,7 @@ _LDAP3_WRAP_SOCKET_SHA256 = "428733b595fea962ca8d0132986fef7aea2df98031bb0efeac4
 
 _TLS13_AES128 = tls_policy._TLS13_AES128_SUITE
 _has_set_ciphersuites = hasattr(ssl.SSLContext, "set_ciphersuites")
+_FULL_WIDTH_DOT = chr(0x3002)  # IDEOGRAPHIC FULL STOP, which IDNA maps to "."
 
 
 def _tls(ca_pem: str, validate: ssl.VerifyMode = ssl.CERT_REQUIRED) -> NarrowedTls:
@@ -100,7 +103,7 @@ def _bind(tls: Any, server: ssl.SSLContext, host: str = "localhost") -> tuple[st
         thread.join(10)
 
 
-def _open_ldaps(tls: Any, server: ssl.SSLContext) -> Any:
+def _open_ldaps(tls: Any, server: ssl.SSLContext, host: str = "127.0.0.1") -> Any:
     """Open a real ``ldap3.Connection`` to ``server`` on a loopback port, so the TLS goes through
     ldap3's own call site rather than a direct ``wrap_socket`` call. Returns the TLS socket ldap3
     kept; the caller closes it. ldap3 raises its own ``LDAPSocketOpenError`` on a refusal."""
@@ -120,12 +123,13 @@ def _open_ldaps(tls: Any, server: ssl.SSLContext) -> Any:
     try:
         conn = ldap3.Connection(
             ldap3.Server(
-                "127.0.0.1",
+                host,
                 port=port,
                 use_ssl=True,
                 tls=tls,
                 get_info=ldap3.NONE,
                 connect_timeout=10,
+                mode=ldap3.IP_V4_ONLY,  # the listener is IPv4: a refused ::1 costs 2 s on Windows
             ),
             receive_timeout=10,
         )
@@ -184,6 +188,17 @@ def test_ldap3s_host_name_check_still_runs_after_the_handshake(pki: _Pki) -> Non
         _bind(_tls(Path(pki.ca).read_text()), _server(pki), host="dc1.example.test")
 
 
+def _close_held_tls_sockets(refusal: BaseException) -> None:
+    """Close whatever TLS socket a refusal's frames still hold, so a control that leaks one ends
+    cleanly rather than at the collector."""
+    tb = refusal.__traceback__
+    while tb is not None:
+        for leaked in list(tb.tb_frame.f_locals.values()):
+            if isinstance(leaked, ssl.SSLSocket):
+                leaked.close()
+        tb = tb.tb_next
+
+
 def _dc_sees_the_end_of_a_host_name_refusal(tls: Any, pki: _Pki, wait: float) -> bool:
     """Run ``tls.wrap_socket`` against a TLS listener on localhost whose leaf names ``localhost``
     while the bind checks ``dc1.example.test``, so the handshake completes and the host name check
@@ -221,14 +236,8 @@ def _dc_sees_the_end_of_a_host_name_refusal(tls: Any, pki: _Pki, wait: float) ->
         assert held is not None, "the host name check did not refuse"
         return ended.wait(timeout=wait)
     finally:
-        # Close whatever TLS socket the refusing frame still holds, so a control that leaks it
-        # ends cleanly rather than at the collector.
-        tb = held.__traceback__ if held is not None else None
-        while tb is not None:
-            for leaked in list(tb.tb_frame.f_locals.values()):
-                if isinstance(leaked, ssl.SSLSocket):
-                    leaked.close()
-            tb = tb.tb_next
+        if held is not None:
+            _close_held_tls_sockets(held)
         held = None
         conn.socket.close()
         client.close()
@@ -302,3 +311,112 @@ def test_on_314_the_ldaps_bind_keeps_the_recorded_tls13_gap() -> None:
     ctx = tls._context_factory()
     assert _tls13(ctx) == _tls13(ssl.create_default_context())
     assert _TLS13_AES128 in tls_policy._APPROVED_TLS_SUITES
+
+
+# --- SNI: each bind names its own directory host (BACKLOG #6879) ----------------------------------
+
+
+def _sni_server(pki: _Pki, seen: list[str | None]) -> ssl.SSLContext:
+    """A DC context that records the ``server_name`` each ClientHello carried, ``None`` for none."""
+    server = _server(pki)
+
+    def record(_sock: ssl.SSLObject, name: str | None, _ctx: ssl.SSLContext) -> None:
+        seen.append(name)
+
+    server.sni_callback = record
+    return server
+
+
+def test_the_bind_names_the_directory_host_in_sni(pki: _Pki) -> None:
+    """One engine ``Tls`` serves every configured server, so each name is the host that connection
+    dials. ldap3's own ``Tls``, the control, sends none."""
+    seen: list[str | None] = []
+    server = _sni_server(pki, seen)
+    _bind(ldap3.Tls(validate=ssl.CERT_NONE), server)
+    assert seen == [None]
+
+    seen.clear()
+    tls = _tls(Path(pki.ca).read_text(), ssl.CERT_NONE)
+    _bind(tls, server, host="dc1.example.test")
+    _bind(tls, server, host="dc2.example.test")
+    assert seen == ["dc1.example.test", "dc2.example.test"]
+
+    seen.clear()
+    tls.sni = "LDAP.Example.Test."  # ldap3's own attribute: the engine never sets it or reads it
+    _bind(tls, server, host="dc1.example.test")
+    tls.sni = "127.0.0.1"
+    _bind(tls, server, host="dc2.example.test")
+    assert seen == ["dc1.example.test", "dc2.example.test"]
+
+
+def test_a_trailing_dot_host_verifies_without_its_dot(pki: _Pki) -> None:
+    """``localhost.`` matches a leaf naming ``localhost``. ldap3's own ``Tls``, the control, checks
+    the host as written and refuses."""
+    ca = Path(pki.ca).read_text()
+    control = ldap3.Tls(validate=ssl.CERT_REQUIRED, ca_certs_data=ca)
+    with pytest.raises(LDAPCertificateError) as refused:
+        _bind(control, _server(pki), host="localhost.")
+    _close_held_tls_sockets(refused.value)
+    seen: list[str | None] = []
+    _bind(_tls(ca), _sni_server(pki, seen), host="localhost.")
+    assert seen == ["localhost"]
+
+
+@pytest.mark.parametrize(
+    ("host", "checked"),
+    [
+        ("stra" + chr(0xDF) + "e.example.test", "stra" + chr(0xDF) + "e.example.test"),
+        ("127.0.0.1", "127.0.0.1"),
+        ("dc1.example.test.", "dc1.example.test"),
+    ],
+)
+def test_the_host_name_check_gets_the_host_not_its_idna_form(
+    pki: _Pki, host: str, checked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """IDNA 2003 maps sharp s to ``ss``, so checking the IDNA form would let a certificate for a
+    different name match. The check gets the host less its trailing dot, and an IP literal, which
+    sends no SNI, is checked as itself."""
+    names: list[str] = []
+    monkeypatch.setattr(
+        "messagefoundry.auth.ldap_tls.check_hostname",
+        lambda _sock, name, _extra: names.append(name),
+    )
+    _bind(_tls(Path(pki.ca).read_text()), _server(pki), host=host)
+    assert names == [checked]
+
+
+def test_a_real_ldap3_connection_sends_its_server_host_as_sni(pki: _Pki) -> None:
+    """Through ``ldap3.Connection.open``, so the host is the one ldap3 itself hands the wrap step,
+    not a stand-in's attribute. Verification is on: the name adds no stdlib host name check,
+    because the engine's context leaves ``check_hostname`` off."""
+    seen: list[str | None] = []
+    sock = _open_ldaps(_tls(Path(pki.ca).read_text()), _sni_server(pki, seen), host="localhost")
+    sock.close()
+    assert seen == ["localhost"]
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("127.0.0.1", None),
+        ("::1", None),
+        ("fe80::1%2", None),
+        ("127.1", None),
+        ("0x7f.1", None),
+        ("127" + _FULL_WIDTH_DOT + "1", None),
+        ("dc1.example.test.", "dc1.example.test"),
+        ("dc1.example.test" + _FULL_WIDTH_DOT, "dc1.example.test"),
+        ("dc" + chr(0xE9) + ".example.test", "xn--dc-cja.example.test"),
+        ("a" * 64 + ".test", None),
+        ("a." * 126 + "b", "a." * 126 + "b"),  # 253 bytes, a DNS name's limit
+        ("a." * 130 + "b", None),  # 261 bytes: OpenSSL would refuse it at the wrap
+        ("DC1.Example.Test", "dc1.example.test"),
+    ],
+)
+def test_the_sni_name_is_normalised(pki: _Pki, host: str, expected: str | None) -> None:
+    """The rules are ``_sni_name``'s. The stdlib already drops a canonical IP literal, so the
+    other rows are the engine's. Verification is off because the test leaf names none of these
+    hosts; the ClientHello is what is measured."""
+    seen: list[str | None] = []
+    _bind(_tls(Path(pki.ca).read_text(), ssl.CERT_NONE), _sni_server(pki, seen), host=host)
+    assert seen == [expected]
