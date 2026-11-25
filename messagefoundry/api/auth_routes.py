@@ -849,8 +849,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     # a page that shows no engine data of its own renders. No console code calls them yet. Each is a
     # static gate, require(p) for one permission, registered in a loop over Permission so the route
     # walk and the route map read it; the permission never comes from the request. Each writes the
-    # grant row its permission's own routes audit (record_check_grant). docs/SECURITY.md (Gate-only
-    # check routes) states what they answer and which rows they write.
+    # grant row its permission's own routes audit (record_check_grant), except the
+    # SCOPED_READER_REFUSALS routes, which first refuse a channel-scoped caller; see below.
+    # docs/SECURITY.md (Gate-only check routes) states what they answer and which rows they write.
     @app.get("/auth/check", response_model=SimpleMessage)
     async def auth_check(_: Identity = Depends(require())) -> SimpleMessage:
         return SimpleMessage(detail="authorized")

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The one by-id message read under ``messagefoundry/api/`` (BACKLOG #2627), and the
-``auth.channel_denied`` row every channel refusal writes (:func:`record_channel_denied`), with the
-refusal of a channel-scoped caller from the audit trail and the application log
-(:data:`SCOPED_READER_REFUSALS`, BACKLOG #4346).
+``auth.channel_denied`` row the request-time channel refusals write
+(:func:`record_channel_denied`), with the refusal of a channel-scoped caller from the audit trail
+and the application log (:data:`SCOPED_READER_REFUSALS`, BACKLOG #4346).
 
 Every route that opens a message by its id used to repeat the same four lines: fetch the row, test
 the caller's channel scope, audit a refusal, and answer 404. Eight routes and the export stream did

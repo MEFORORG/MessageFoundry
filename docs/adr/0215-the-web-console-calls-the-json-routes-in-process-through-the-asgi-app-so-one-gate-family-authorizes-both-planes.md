@@ -540,3 +540,26 @@ PR 3248, and the owner answered *"/driver for all"* in the Lander's chat; an adv
 subagent affirmed the decision. The ruling accepts this amendment: grant rows are added for audited
 check routes and none are removed, so access is unchanged. CORRECTED 2026-11-24: this paragraph
 first cited class B decision `d20261124T092116115-d8b2a5`, whose record is pending and unreviewed.
+
+## Amendment 2026-11-25: three check routes refuse a channel-scoped caller (BACKLOG #4346)
+
+Section 2 says a gate-only check route runs what `require` runs, and that it tells a caller nothing
+it cannot already read from its own `GET /auth/me`; the 2026-11-24 amendment says slice 2a changes
+nothing else in section 2. Neither holds any longer for `/auth/check/audit:read`,
+`/auth/check/audit:export` and `/auth/check/logs:view`, the check routes for the permissions in
+`SCOPED_READER_REFUSALS` (`messagefoundry/api/message_scope.py`). Their real routes, `GET /audit`,
+`GET /audit/export` and `GET /logs/tail`, refuse every channel-scoped caller, and so do these check
+routes. After the `require` gate admits a channel-scoped caller, each writes an
+`auth.channel_denied` row naming no channel and the operation, skips the check route's own grant
+row (`record_check_grant`), and answers 403. The `require` gate's own grant row, where the gate
+writes one, is written before the refusal, as on the real route. The 403 tells the caller that its
+account is channel-scoped, which `GET /auth/me` does not show, since `CurrentUser` carries no
+channel field; it tells no more than the real route's 403 does. Every other check route is as
+section 2 and the 2026-11-24 amendment state. docs/SECURITY.md (Gate-only check routes) states the
+rule.
+
+Provenance. This amendment is a class B follow-on under docs/AUTONOMY-PLAN.md section 3, decided by
+Manager runbook-batch-manager-fa3030 (session e0f59fb7) at the Lander's hold of 2026-11-25 on head
+02973ed99ae; it only tightens the check routes. The Lander's hold on engine PR 3281, which rests on
+its review round-f5d632c0f3 at xhigh, named this amendment's content as the fix; no
+`scripts/coord/decision.ps1` record was written for it.
