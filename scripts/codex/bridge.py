@@ -419,7 +419,7 @@ def dispatch(root: Path, payload: dict) -> dict:
     # as on origin/main. The first fault is raised once the event's hooks end, unless another
     # hook's deny, ask or block stands; that keeps the exit code a lone failing hook gave on main.
     # A fault outside a hook's own run, such as an unsupported hook or a field of the wrong type,
-    # ends them early, before every hook has been tried, and that fault is then the one raised.
+    # ends them at once and takes the first fault's place; a merged deny, ask or block still stands.
     fault: Exception | None = None
 
     def record(exc: Exception, label: str) -> None:
@@ -494,7 +494,8 @@ def dispatch(root: Path, payload: dict) -> dict:
                     update = plain_text_context(event, output)
                 # JSON that is not an object is a failed hook on every event but SessionStart, as
                 # on origin/main; SessionStart reports one as a note, as
-                # tests/test_b616_5879_codex_hook_shell_and_budget.py pins.
+                # tests/test_b616_5879_codex_hook_shell_and_budget.py pins. Claude Code would take
+                # it as plain text on UserPromptSubmit; docs/CODEX.md names that difference.
                 if not isinstance(update, dict):
                     if event != "SessionStart":
                         record(ValueError("Hook JSON output must be an object"), hook_label(hook))

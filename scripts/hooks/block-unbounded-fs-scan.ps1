@@ -16,7 +16,8 @@
 # program); a walk of the segment's own `cd` (`cd /proc && find .`); and a grep long option
 # abbreviation (`grep --rec x /proc`). Recognising the program is required to deny, so each of these
 # is a silent allow. Inverting that, so only provably non-walking programs are allowed, is the
-# deeper fix and is not built.
+# deeper fix and is not built. Nor does it catch a walk on a line after a heredoc whose delimiter
+# bash finds only by joining a backslash-newline (`E\` then `OF`): every view reads that line as body.
 #
 # ROOTS ARE COMPARED AS PATHS, OPTIONS AS GRAMMAR. Every bypass measured on 2026-09-20 came from
 # comparing a spelling instead of what it names: `/.`, `//`-variants, `/pro'c'`, `/pro\c`,
@@ -85,13 +86,15 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # or `$[` is skipped, as a shift. In a command holding a quote, that reading blanks quotes,
 # `$((...))`, comments and heredoc bodies, each body ending at a line that is its delimiter after
 # trimming. A command with no quote is read as it is. There an opener in a comment, such as
-# `#<<\A`, is read as one, and its body never ends, so no opener or substitution after it is read.
+# `#<<\A`, is read as one. Its body runs to a line that is exactly `A`, or to the end, and no opener
+# or substitution before that line is read.
 # The bodies of a line's openers follow it in order. A body ends only at a line that is exactly its
 # delimiter, after leading tabs for `<<-`. For an unquoted delimiter, bash compares the line after
 # joining each backslash-newline. This pass ends the body only where the line is the delimiter
 # both as written and as joined, so a body bash ends at a joined delimiter (`E\` then `OF`) is read
 # on past it. Its later lines are then read as body, which can add a false deny and hides any
-# opener on them. A quoted delimiter's body joins no line. A delimiter with any quote or backslash in
+# opener on them. Bash runs those lines as commands, and the other views keep them blanked, so a
+# walk on them outside a substitution (`cat <<EOF\nE\\\nOF\nfind /proc`) is allowed, as on main. A quoted delimiter's body joins no line. A delimiter with any quote or backslash in
 # it is quoted: its body takes no substitution and adds nothing, nor does a `$(` or backtick after
 # a backslash. A backslash-newline in a body is removed first, as bash removes it.
 # A substitution's end is found by counting parens outside quotes and backticks, and a `case` in it
@@ -112,30 +115,27 @@ function Add-HeredocSubstitutions([string]$Text, [string]$Masked, $Into, $Seen, 
         $joined = [regex]::Replace($body.ToString(), '(?<!\\)((?:\\\\)*)\\\n', '$1')
         Add-BodySubstitutions $joined $Into $Seen $Spent $Cap
     }
-    # The start of a body line a backslash-newline continues, in a body with an unquoted delimiter,
-    # kept only while it is short enough to still equal the delimiter, so a long run stays linear.
-    $logical = ''
-    $joinDead = $false
+    # Whether a backslash-newline has joined text to the start of the current body line, in a body
+    # with an unquoted delimiter. Only that matters: such a line can equal its delimiter as joined
+    # but never also as written.
+    $continued = $false
     for ($n = 0; $n -lt $lines; $n++) {
         $raw = $rawLines[$n]
         if ($queue.Count -gt 0 -and $null -ne $body) {
             $cur = $queue[0]
             $own = if ($cur.Dash) { $raw.TrimStart([char]9) } else { $raw }
-            $joined = if ($joinDead) { $null } elseif ($logical) { $logical + $raw } else { $own }
             if ($cur.Bare -and $raw -cmatch '(?<!\\)(?:\\\\)*\\$') {
                 # Bash joins this line to the next before it compares the delimiter.
-                if ($null -ne $joined -and $joined.Length -le $cur.T.Length + 1) {
-                    $logical = $joined.Substring(0, $joined.Length - 1)
-                } else { $logical = ''; $joinDead = $true }
+                $continued = $continued -or $own -cne '\'
                 [void]$body.Append($raw).Append("`n")
                 continue
             }
-            $logical = ''
-            $joinDead = $false
+            $wasContinued = $continued
+            $continued = $false
             # The body ends only where the line is the delimiter both as written and as bash joins
             # it. The other views compare the line as written, so ending at a joined delimiter they
             # do not see would leave their blanked body as the only reading of the lines after it.
-            if ($own -ceq $cur.T -and $joined -ceq $cur.T) {
+            if (-not $wasContinued -and $own -ceq $cur.T) {
                 if ($cur.Bare) { & $flush }
                 $queue.RemoveAt(0)
                 $body = if ($queue.Count -gt 0) { [System.Text.StringBuilder]::new() } else { $null }
