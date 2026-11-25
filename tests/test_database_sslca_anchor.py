@@ -605,7 +605,7 @@ def test_a_path_like_value_is_checked_at_the_text_the_driver_is_sent(tmp_path: P
 
 
 async def test_a_refused_executor_still_runs_the_lane_check(
-    store: MessageStore, tmp_path: Path, judged: None
+    store: MessageStore, tmp_path: Path, judged: None, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5755, items 3 and 5: a default executor that refuses the hop runs the lane check's
     spec build and CA read on the loop. Red with ``asyncio.to_thread`` at those hops: the check
@@ -627,3 +627,5 @@ async def test_a_refused_executor_still_runs_the_lane_check(
         # The loop outlives the test, and the store fixture's close hops to a thread. The
         # attribute is private to asyncio's base loop; None there means "make one when needed".
         loop._default_executor = original  # type: ignore[attr-defined]
+    # The positive control: the executor did refuse, and the anchor read is the hop it refused.
+    assert "the executor never began the trust anchor read" in caplog.text

@@ -8,8 +8,9 @@
 asyncio-native**, and its C-STORE callback runs on a foreign (acceptor) thread — so the SCP:
 
 * starts/stops the AE server **off the event loop** (``asyncio.to_thread``), so binding/shutdown does
-  not stall other listeners/workers/API calls, except when the default executor refuses the hop and
-  it runs on the loop instead (:func:`~messagefoundry.threadhop.to_thread_or_loop`);
+  not stall other listeners/workers/API calls; a hop the default executor refuses runs on a thread
+  of its own, and on the loop only when no thread can start
+  (:func:`~messagefoundry.threadhop.to_thread_or_loop`);
 * in the C-STORE callback (the foreign thread) re-encodes the received object to its **Part-10 bytes**
   and bridges them back onto the loop-owned ingress via ``asyncio.run_coroutine_threadsafe`` — the same
   loop-bridge pattern as ``db_lookup`` (ADR 0010) — blocking the **worker thread** (never the loop) on
@@ -2305,8 +2306,8 @@ class DicomScpSource(SourceConnector):
         self._loop = asyncio.get_running_loop()  # captured ON the loop, before any off-loop work
         _redact_flagged_peer_values()  # again: warnings filters can be put back after the import
         # start_server binds a socket + spawns acceptor threads — do it OFF the loop, then it is live.
-        # A default executor that refuses the hop binds it on the loop instead, so a reload's
-        # rollback still brings the listener back up (BACKLOG #5755, item 3).
+        # A default executor that refuses the hop binds it on a thread of its own, so a
+        # reload's rollback still brings the listener back up (BACKLOG #5755, item 3).
         await to_thread_or_loop("DICOM listener start", self._start_server)
 
     def _start_server(self) -> None:
@@ -2892,8 +2893,10 @@ class DicomScpSource(SourceConnector):
         server = self._server
         try:
             if server is not None:
-                # A refused hop shuts it down on the loop instead, so a reload's rollback does not
-                # leave the port held by a server it meant to stop (BACKLOG #5755, item 3).
+                # A refused hop shuts it down on a thread of its own, so a reload's rollback does
+                # not leave the port held by a server it meant to stop (BACKLOG #5755, item 3).
+                # Not on the loop unless no thread can start: the shutdown joins connection
+                # threads whose commit waits on the loop.
                 await to_thread_or_loop("DICOM listener stop", server.shutdown)
             # Only once the shutdown returned: one that raised or was cancelled keeps the server,
             # so the next stop() shuts it down again.

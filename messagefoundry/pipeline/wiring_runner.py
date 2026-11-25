@@ -7513,7 +7513,7 @@ class RegistryRunner:
 
         async def close() -> None:
             try:
-                await asyncio.to_thread(session.close)
+                await to_thread_or_loop("sandbox session close", session.close)
             except Exception as exc:  # noqa: BLE001 - logged by type; the session is already dropped
                 # A failed close leaves at most a worker for the collector. It is not the
                 # message's fault, and the dispatch that dropped the session raised it as a close.
@@ -7532,12 +7532,14 @@ class RegistryRunner:
         holding a closed session is retried or re-pended by :meth:`_off_loop_sandboxed`, never
         dead-lettered as a Router or Handler fault.
 
-        The sessions leave tracking before the hop, so nothing may drop them unclosed with their
-        worker children alive (BACKLOG #5755, item 4). A default executor that refuses the hop
-        closes them on the loop instead (:func:`~messagefoundry.threadhop.to_thread_or_loop`). The
-        close runs in a tracked task, so a cancellation of the caller stops only the wait, and
-        :meth:`_teardown_body` waits for it. A session whose close raises is logged and the rest
-        are still closed."""
+        The sessions leave tracking before the hop, so a refused hop or a cancelled caller must
+        not drop them unclosed with their worker children alive (BACKLOG #5755, item 4). A default
+        executor that refuses the hop closes them on a thread of its own, or on the loop when no
+        thread can start (:func:`~messagefoundry.threadhop.to_thread_or_loop`). The close runs in a
+        tracked task, so a cancellation of the caller stops only the wait, and
+        :meth:`_teardown_body` waits for it. At least one case still drops them: a close still
+        queued behind a hung pool when a demotion abandons it and a later SHUTDOWN cancels it. A
+        session whose close raises is logged by type and the rest are still closed."""
         if not self._sandbox_sessions:
             return
         sessions = list(self._sandbox_sessions.values())
@@ -7547,8 +7549,8 @@ class RegistryRunner:
             for session in sessions:
                 try:
                     session.close()
-                except Exception:  # noqa: BLE001 - one session's close stops no other; logged
-                    log.warning("closing a sandbox session failed", exc_info=True)
+                except Exception as exc:  # noqa: BLE001 - one close stops no other; logged by type
+                    log.warning("could not close a sandbox session (%s)", type(exc).__name__)
 
         closing = asyncio.create_task(to_thread_or_loop("sandbox session close", close_all))
         self._track_detached_close(closing)

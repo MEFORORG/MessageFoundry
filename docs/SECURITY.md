@@ -2953,9 +2953,11 @@ before a worker took it, or cancelled or failed before it began, runs on the eve
 with a WARNING in the engine log, so that hop does not fail; a bad config is still refused. So do
 at least the trust-anchor reads (a lane's anchor check and the settings preflight), a reload's
 target check, its reads of the config directory and its approval check, a DICOM listener's start
-and stop, and the sandbox session close (BACKLOG #5755). On that fallback the work blocks the
-event loop while it runs, and an anchor on a stalled share stalls it for as long as the read takes.
-Work still queued behind a busy or hung pool waits for it and is not run on the loop. Other
+and stop, and the sandbox session closes (BACKLOG #5755), except that each of these runs on a
+thread of its own rather than on the loop. Only when no thread can be started does it run on the
+event loop, which then blocks while it runs: an anchor on a stalled share for as long as the read
+takes, and a DICOM stop or sandbox close that waits on the loop itself until that wait times out,
+failing an in-flight C-STORE or brokered lookup. Work still queued behind a busy or hung pool waits for it and is not run on the loop. Other
 worker-thread hops have no such fallback, at least the config load and the environment value read,
 which run author or embedder code, the bundle fingerprint, and a connector's own startup check,
 such as a remote-file listing, so a pool that stays broken still fails the reload. The row does

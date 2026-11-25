@@ -3295,7 +3295,7 @@ class Engine:
         snapshot = await self._content_snapshot(path)
         if snapshot is None:
             raise ConfigDigestUnavailable(None)
-        return await asyncio.to_thread(self._approval_of, snapshot)
+        return await to_thread_or_loop("config approval check", self._approval_of, snapshot)
 
     def _approval_of(self, snapshot: ConfigSnapshot) -> ApprovedConfig:
         """What a hold binds of ``snapshot``: its published content digest, which leaves the value
@@ -3450,8 +3450,9 @@ class Engine:
         :class:`ConfigDirUnreadable` when resolving or listing it raises another ``OSError``.
         Off the event loop: the resolve opens the target and each parent, and a slow
         volume would otherwise stall every listener for as long as that takes (vault BACKLOG
-        #2581). A default executor that refuses the hop runs it on the loop instead, with a
-        WARNING, rather than failing the reload (BACKLOG #5755, item 5)."""
+        #2581). A default executor that refuses the hop runs it on a thread of its own, or on
+        the loop when no thread can start, with a WARNING, rather than failing the reload (BACKLOG
+        #5755, item 5)."""
         return await to_thread_or_loop(
             "config reload target check", self._existing_reload_target_blocking, config_dir
         )

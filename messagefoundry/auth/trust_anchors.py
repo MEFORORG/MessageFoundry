@@ -2956,10 +2956,10 @@ async def _preflight_one(
 _TRANSIENT_WINERRORS: frozenset[int] = frozenset({1236})
 
 #: What a refused anchor hop's WARNING names. A default executor that refuses the hop runs it on
-#: the loop rather than failing a reload's lane check or its rollback
-#: (:func:`~messagefoundry.threadhop.to_thread_or_loop`, BACKLOG #5755, items 3 and 5). The read
-#: has no bound of its own (see ``_ICACLS_TIMEOUT_S``), so on that fallback a CA on a stalled share
-#: stalls the loop for as long as the read takes.
+#: a thread of its own rather than failing a reload's lane check or its rollback
+#: (:func:`~messagefoundry.threadhop.to_thread_or_loop`, BACKLOG #5755, items 3 and 5). Only when
+#: no thread can start does it run on the loop; the read has no bound of its own (see
+#: ``_ICACLS_TIMEOUT_S``), so there a CA on a stalled share stalls the loop as long as it takes.
 _ANCHOR_HOP: Final = "trust anchor read"
 
 

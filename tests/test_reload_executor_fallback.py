@@ -47,19 +47,36 @@ def _refuse_default_executor() -> None:
 # --- the helper ----------------------------------------------------------------------------------
 
 
-async def test_a_refused_hop_runs_on_the_loop_with_a_warning(
+def _add(a: int, b: int) -> tuple[int, threading.Thread]:
+    return a + b, threading.current_thread()
+
+
+async def test_a_refused_hop_runs_on_a_thread_of_its_own_with_a_warning(
     caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Off the loop still: a shut-down executor is not a reason to block the loop."""
+    _refuse_default_executor()
+    caplog.set_level(logging.WARNING, logger=threadhop.__name__)
+    total, ran_on = await to_thread_or_loop("probe hop", _add, 2, b=3)
+    assert total == 5
+    assert ran_on is not threading.current_thread()
+    assert ran_on.name == "threadhop-fallback"
+    assert "the executor never began the probe hop, so it runs on its own thread" in caplog.text
+
+
+async def test_a_refused_hop_runs_on_the_loop_when_no_thread_can_start(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _refuse_default_executor()
     caplog.set_level(logging.WARNING, logger=threadhop.__name__)
 
-    def add(a: int, b: int) -> tuple[int, threading.Thread]:
-        return a + b, threading.current_thread()
+    def no_thread(self: threading.Thread) -> None:
+        raise RuntimeError("can't start new thread")
 
-    total, ran_on = await to_thread_or_loop("probe hop", add, 2, b=3)
-    assert total == 5
-    assert ran_on is threading.current_thread()
-    assert "the executor never began the probe hop" in caplog.text
+    monkeypatch.setattr(threading.Thread, "start", no_thread)
+    total, ran_on = await to_thread_or_loop("probe hop", _add, 2, b=3)
+    assert (total, ran_on) == (5, threading.current_thread())
+    assert "runs on the event loop, since no thread could start" in caplog.text
 
 
 async def test_a_refused_hop_raises_the_work_s_own_refusal_unchained() -> None:
@@ -81,16 +98,23 @@ async def test_a_working_executor_runs_the_hop_off_the_loop() -> None:
 
 
 async def test_work_the_executor_cancels_while_queued_runs_on_the_loop() -> None:
-    """``shutdown(cancel_futures=True)`` cancels queued work; it runs on the loop instead."""
+    """``shutdown(cancel_futures=True)`` cancels queued work; it runs on its own thread instead."""
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     asyncio.get_running_loop().set_default_executor(pool)
-    release = threading.Event()
-    blocker = asyncio.get_running_loop().run_in_executor(None, release.wait)
+    taken, release = threading.Event(), threading.Event()
+
+    def block() -> None:
+        taken.set()
+        release.wait(5)
+
+    blocker = asyncio.get_running_loop().run_in_executor(None, block)
     queued = asyncio.create_task(to_thread_or_loop("probe hop", threading.current_thread))
-    await asyncio.sleep(0.05)
+    while not taken.is_set():  # the one worker holds the blocker, not the hop
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0)  # the hop is submitted, so it sits queued behind the blocker
     pool.shutdown(wait=False, cancel_futures=True)
     release.set()
-    assert await asyncio.wait_for(queued, 5) is threading.current_thread()
+    assert (await asyncio.wait_for(queued, 5)).name == "threadhop-fallback"
     await blocker
 
 
