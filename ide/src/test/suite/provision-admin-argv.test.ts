@@ -5,14 +5,20 @@
 // open the same file. The pins below compare the WHOLE argv, so an element before `provision-admin`
 // or one pushed after the list fails them, and each pin has a negative control showing it would.
 //
-// The argv literals here are the ones tests/test_ide_provision_admin_argv.py hands the engine's own
-// parser, which shows `--service-config=<file>` reaches provision-admin as its service-config file.
-// Change one and change the other.
+// The expected argv is read from ide/src/test/fixtures/provision-admin-argv.json, the file
+// tests/test_ide_provision_admin_argv.py hands the engine's own parser, which shows
+// `--service-config=<file>` reaches provision-admin as its service-config file. One file, so the two
+// suites cannot pin different argv.
 import * as assert from "assert";
+import * as fs from "fs";
+import * as path from "path";
 
 import { buildAdminProbeInvocation, buildProvisionInvocation } from "../../engineControlModel";
 
-const SC = "deploy/prod/messagefoundry.toml";
+const FIXTURE = JSON.parse(
+  fs.readFileSync(path.join(__dirname, "..", "..", "..", "src", "test", "fixtures", "provision-admin-argv.json"), "utf8"),
+) as { serviceConfig: string; provision: string[]; probe: string[] };
+const SC = FIXTURE.serviceConfig;
 
 // Built without the `serviceConfig` property in the type, so this file also compiles against the
 // code before the flag existed, where the pins below then fail on the argv itself.
@@ -20,31 +26,10 @@ const provisionOpts: Record<string, string> = { python: "p", username: "alice", 
 const probeOpts: Record<string, string> = { python: "p", serviceConfig: SC };
 
 /** The provision-admin argv the IDE runs for alice with SC set. */
-export const PROVISION_ARGV: readonly string[] = [
-  "-P",
-  "-X",
-  "disable-remote-debug",
-  "-m",
-  "messagefoundry",
-  "provision-admin",
-  "--username=alice",
-  "--email=alice@example.test",
-  `--service-config=${SC}`,
-];
+const PROVISION_ARGV: readonly string[] = FIXTURE.provision;
 
 /** The admin probe's argv with SC set: provision-admin for the probe account, answering in JSON. */
-export const PROBE_ARGV: readonly string[] = [
-  "-P",
-  "-X",
-  "disable-remote-debug",
-  "-m",
-  "messagefoundry",
-  "provision-admin",
-  "--username=probe",
-  "--email=probe@example.invalid",
-  `--service-config=${SC}`,
-  "--json",
-];
+const PROBE_ARGV: readonly string[] = FIXTURE.probe;
 
 /** The pin: the whole argv, element for element. */
 function pin(actual: readonly string[], expected: readonly string[]): void {
