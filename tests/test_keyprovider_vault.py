@@ -342,6 +342,63 @@ def test_a_kek_name_changed_after_construction_is_checked_again(
     assert transit.read_calls == [] and transit.calls == []
 
 
+def test_the_name_refusal_says_ascii_and_scopes_its_redirect_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6010 item 5: the shape is ASCII, as Go's ``\\w`` is, so the text says so; and only
+    a slash or a name of dots alone, such as ``..``, can move the request path, so the text does
+    not say every refused name could."""
+    monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", "kék")
+    with pytest.raises(KeyProviderError) as excinfo:
+        keyprovider_vault.kek_required_capabilities()
+    text = str(excinfo.value)
+    assert "ASCII letters" in text
+    assert "Any other name could change which Vault path" not in text
+
+
+@pytest.mark.parametrize("name", _MALFORMED_KEK_NAMES)
+def test_the_key_type_check_refuses_a_malformed_name_before_reading_it(name: str) -> None:
+    """BACKLOG #6010 item 9: ``require_transit_key_type`` puts its name into a request path, so it
+    checks the name itself rather than trust each caller to have read it through the check."""
+    transit = _FakeTransit(KEY_A)
+    with pytest.raises(KeyProviderError, match="SOME_SELECTOR is not a Vault transit key name"):
+        keyprovider_vault.require_transit_key_type(
+            _FakeClient(transit),
+            name,
+            allowed=keyprovider_vault.TRANSIT_KEY_TYPES_KEK,
+            use="a test",
+            selector="SOME_SELECTOR",
+        )
+    assert transit.read_calls == []
+
+
+def _no_client_built(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A test whose refusal must come before any client fails here, not by dialling Vault."""
+
+    def _refuse(addr: str, token: str, **_: Any) -> _FakeClient:
+        raise AssertionError("a Vault client was built")
+
+    monkeypatch.setattr(keyprovider_vault, "_build_client", _refuse)
+
+
+def test_a_malformed_kek_name_keeps_its_text_at_the_key_seam(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6010 item 3: the key seam replaces a provider's error with fixed text unless the
+    engine recorded the refusal's own text. The name refusal is recorded, so the operator still
+    reads which variable to fix rather than "the key source failed"."""
+    from messagefoundry.store.base import resolve_active_key
+
+    _configure_env(monkeypatch)
+    _no_client_built(monkeypatch)
+    monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", "a/../../../sys/x")
+    with pytest.raises(KeyProviderError) as excinfo:
+        resolve_active_key(StoreSettings(key_provider="vault"))
+    text = str(excinfo.value)
+    assert "MEFOR_STORE_VAULT_TRANSIT_KEY is not a Vault transit key name" in text
+    assert "a/../../../sys/x" not in text
+
+
 @pytest.mark.parametrize("name", ["mefor-store-kek", "kek.v2", "K_1", "a", "a.b-c_d"])
 def test_a_well_formed_kek_name_unwraps_and_names_the_probe_paths(
     monkeypatch: pytest.MonkeyPatch, name: str
@@ -388,14 +445,16 @@ def test_a_plaintext_that_is_not_base64_of_32_bytes_refuses(
 
 def test_a_misshapen_dek_refuses_at_the_key_seam(monkeypatch: pytest.MonkeyPatch) -> None:
     """Before this check ``resolve_active_key`` returned a misshapen DEK unjudged, and only a later
-    decode refused it. Now the seam refuses it, with its fixed text for a key source that failed,
-    which names the setting to check and no key material."""
+    decode refused it. Now the seam refuses it, with the provider's own text, which the engine
+    recorded when it built the refusal, so the seam's fixed-text replacement keeps it (BACKLOG
+    #6710 item 3). It names the variable to fix and holds no key material."""
     from messagefoundry.store.base import resolve_active_key
 
     plaintext = _NOT_A_32_BYTE_KEY[0]
     _provider_on(monkeypatch, _FakeTransit(plaintext))
-    with pytest.raises(KeyProviderError, match=r"check \[store\]\.key_provider") as excinfo:
+    with pytest.raises(KeyProviderError, match="not base64 of 32 bytes") as excinfo:
         resolve_active_key(StoreSettings(key_provider="vault"))
+    assert "MEFOR_STORE_VAULT_WRAPPED_DEK" in str(excinfo.value)
     assert plaintext not in str(excinfo.value)
 
 

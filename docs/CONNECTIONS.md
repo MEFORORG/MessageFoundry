@@ -3034,9 +3034,9 @@ follow-on and is **not** built.
 | `soap_action` | — | the `SOAPAction` (1.1 header; 1.2 `action` content-type param) |
 | `soap_version` | `1.1` | `1.1` (`text/xml`) or `1.2` (`application/soap+xml`) |
 | `headers` | `{}` | extra **static** headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine) |
-| `bearer_token` | — | `Authorization: Bearer …` (a **secret** — via `env()`). A Basic pair set beside it wins |
+| `bearer_token` | — | `Authorization: Bearer …` (a **secret** — via `env()`). Beside a Basic pair it is refused at construction, since the two share the header (BACKLOG #5526) |
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`). Set both or neither: one alone is refused at construction (BACKLOG #5526). A configured `bearer_token` or Basic pair replaces a static `Authorization` header of any casing |
-| OAuth2 client credentials | — | wrap the spec: `with_oauth2_client_credentials(Soap(...), token_url=..., client_id=..., client_secret=...)` (from `messagefoundry.transports.http_auth`; keep the secret in `env()`). A static `Authorization` header, a `bearer_token` and a Basic pair are then not sent, and the construction length check does not judge them. |
+| OAuth2 client credentials | — | wrap the spec: `with_oauth2_client_credentials(Soap(...), token_url=..., client_id=..., client_secret=...)` (from `messagefoundry.transports.http_auth`; keep the secret in `env()`). A static `Authorization` header, a `bearer_token` or a Basic pair is then not sent, and the construction length check does not judge it; a `bearer_token` and a Basic pair together are still refused at construction (BACKLOG #5526). |
 | `timeout_seconds` | `30` | per-request timeout, in seconds above zero: zero or a negative is refused when the connection is built |
 | `verify_tls` | `true` | TLS cert verification — the same posture-keyed cell as [REST](#rest--rest): `false` is **refused at construction** off loopback, and the `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the shipped default) |
 | `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert with the chain's signatures + hostname still verified (not the other chain certificates' validity periods; see the MLLP row). **No posture gate and no escape variable covers the setting itself**. It takes one lever away from the revocation gate: a `[tls].crl_file` cannot admit a hop that sets it, so off-box on an enforcing instance only `tls_revocation_attested` with its reason crosses (ADR 0173 §13). It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) — see the [MLLP row](#mllp--mllp) |
@@ -3048,34 +3048,23 @@ follow-on and is **not** built.
 500 **or** an HTTP 200 body). A **Sender/Client** fault → `NegativeAckError` → **dead-letter** (the
 request is rejected; a retry won't help). A **Receiver/Server** fault → `DeliveryError` → **retry**. The
 Sender/Receiver class is read first from the Fault's first child element: SOAP 1.2's `Code`, then the
-`Value` that is that Code's own first child, or SOAP 1.1's `faultcode`. A comment, CDATA section or
-processing instruction before either child is stepped over, with at least these exceptions, each of
-which leaves that read with no code: such markup that has no terminator; a `<!` that opens anything
-else, such as a DOCTYPE or a lowercase `<![cdata[`; and a first `</` inside such markup within the
-`faultcode` or `Value` itself that is not that element's own close tag. Otherwise the code text
-runs to that first `</`, any markup in it included. One shape is read again (BACKLOG #5912): where
-that first `</` is the element's own close tag inside a comment, CDATA section or processing
-instruction the text opens and does not terminate, and the text names no Sender, Client, Receiver
-or Server class, the element is read on to the first tag outside such markup, if that is its own
-close tag, with terminated comments and processing instructions left out and CDATA kept, and
-that reading is used unless it is empty. So
-`<faultcode><!-- </faultcode> -->soap:Server</faultcode>` reads `soap:Server` and retries. Where that read
-yields no code, for
-those shapes, for a first child that is neither element (a SOAP 1.1 `faultstring` before the
-`faultcode`, a SOAP 1.2 `Reason` before the `Code`), or for a code element that holds no code, the
-code falls back to the earlier search's rule, from the Fault start tag to the first `</Fault>`
-after it, or the reply's end: the first `Value` ahead of the Fault's first `faultcode`, else that
-`faultcode`, and an empty one is not passed over for a later one. Like the earlier
-search, the fallback steps over no markup: a `faultcode` or `Value` inside a comment counts, and a
-`</Fault>` inside one ends its range. For example,
+`Value` that is that Code's own first child, or SOAP 1.1's `faultcode`. A terminated comment, CDATA
+section or processing instruction before either child is stepped over. Where that read yields no code,
+for at least a first child that is neither element (a SOAP 1.1 `faultstring` before the `faultcode`, a
+SOAP 1.2 `Reason` before the `Code`), a code element that is empty, self-closing or holds only
+whitespace, and markup the read does not step over, the code falls back to the search the engine ran
+before BACKLOG #5912. That fallback steps over no markup: a `faultcode` or `Value` inside a comment
+can decide the class, and a `</Fault>` inside one ends its range, so
 `<soap:Fault><faultstring>busy</faultstring><!-- </soap:Fault> --><faultcode>soap:Server</faultcode>`
-reads no code and dead-letters, as the earlier search read it. A Fault start tag inside terminated markup is stepped over when
-the Fault is chosen, and a `</Fault>` or `</Code>` inside terminated markup does not end the
-first-child read, except where the Fault was itself taken from inside markup; only where every Fault start tag after the first Body start tag,
-or with none there every one, is inside such markup is the first of them taken as the Fault, so such
-a reply never reads as delivered. A Fault where neither read finds a code reads as a permanent fault.
+reads no code and dead-letters. The read, its fallback and the one shape read again are stated once,
+in the `_fault_code` and `_child_code_text` docstrings in
+[`transports/soap.py`](../messagefoundry/transports/soap.py). The
+Fault is the first Fault start tag after the first Body start tag outside terminated markup, or with
+no Fault after it the first in the reply, the Fault start tag also searched for outside such markup; only where every Fault start tag after that Body start tag (with none there, every
+one) is inside such markup is the first of them taken as the Fault, so such a reply never reads as
+delivered. A Fault where neither read finds a code reads as a permanent fault.
 The WS-Security check is separate: a WS-Security code anywhere from where the Fault search starts (after
-the first Body start tag when a Fault follows it, else the whole reply), inside the Fault or not, still
+the first Body start tag outside terminated markup when a Fault follows it, else the whole reply), inside the Fault or not, still
 dead-letters the reply. An
 unrecognized fault is treated as permanent (so a rejected request can't loop the lane). With no fault, the
 HTTP status decides (2xx delivered, 5xx retry, other 4xx / refused 3xx dead-letter); a connection/timeout
@@ -3152,7 +3141,7 @@ wrapping an HL7 payload) — **not** the full envelope. The transport builds the
   element with a close tag (SOAP 1.1 `faultcode`, or SOAP 1.2 `Code` with its `Subcode`) that
   names a WS-Security code, the fault reads as `MessageExpired` only if that element names it.
   Otherwise it does if `MessageExpired` is anywhere the WS-Security code search looks: after the
-  first Body start tag when a Fault follows it, else the whole reply (BACKLOG #5798). This bullet is where the rule is stated; the `soap.py`
+  first Body start tag outside terminated markup when a Fault follows it, else the whole reply (BACKLOG #5798). This bullet is where the rule is stated; the `soap.py`
   module docstring points here.
 
 ```python
@@ -3484,18 +3473,18 @@ source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
-| `url` | — (required) | the FHIR service **base** URL (e.g. `https://host/fhir`); `http`/`https` only. Use `env()`. |
+| `url` | — (required) | the FHIR service **base** URL (e.g. `https://host/fhir`); `http`/`https` only. Use `env()`. A url that is not ASCII, or holds whitespace or a `#`, is refused at construction (BACKLOG #5911) |
 | `fhir_version` | `R4B` | `R4B` (default) / `R5` / `STU3` — explicit (no plain-R4 on pydantic-v2 wheels) |
 | `format` | `json` | `json` only; FHIR-XML is deferred to a hardened-`lxml` path |
 | `interaction` | `create` | `create` (`POST {base}/{ResourceType}`) / `update` (`POST {base}` with a one-entry `transaction` `Bundle` whose entry is `PUT {ResourceType}/{id}`; see [the id stays out of the URL](#an-update-keeps-the-resource-id-out-of-the-url)) / `transaction` / `batch` (`POST {base}` with a `Bundle`) |
 | `conditional` | — | opt-in: `if-none-exist` (conditional create) / `conditional-update` (search-based PUT) / `if-match` (version-aware update, sent like `update` with the ETag in the entry, or in an `If-Match` header with `update_url_form="path"`) |
-| `conditional_query` | — | FHIR search params for `if-none-exist` / `conditional-update` (e.g. `identifier=sys\|val`). A `#` is refused at construction under either (percent-encode it as `%23`). With either set, a credential-looking parameter or segment in it is refused at construction on an `https` hop with `verify_tls = false`, loopback included, and on plain `http` to a host off this machine. It is not refused on a verified `https` hop or on plain `http` to this machine, whatever `verify_tls` says, since plain `http` has no certificate to verify. There it is warned about once the connection constructs; a connection that another construction check refuses first logs no warning. The refusal and the warning name each credential-looking parameter of the `&`-split query, never its value. Where that split names none, a credential-looking segment can still be reported, unnamed, as for `identifier=sys\|1;token=...`: the message carries `conditional_query segment with a credential-looking name`. At least some shapes are not counted, such as a segment beside a named parameter, a bare name with no `=` (`api_key;identifier=1`), and a percent-encoded `;` (`%3B`). Nor is a `code` name, which is FHIR's search parameter (BACKLOG #5350, #5353) |
+| `conditional_query` | — | FHIR search params for `if-none-exist` / `conditional-update` (e.g. `identifier=sys\|val`). A `#` is refused at construction under either (percent-encode it as `%23`). With either set, a credential-looking parameter or segment in it is refused at construction on an `https` hop with `verify_tls = false`, loopback included, and on plain `http` to a host off this machine. It is not refused on a verified `https` hop or on plain `http` to this machine, whatever `verify_tls` says, since plain `http` has no certificate to verify. There it is warned about once the connection constructs; a connection that another construction check refuses first logs no warning. The refusal and the warning name each credential-looking parameter of the `&`-split query, never its value. Where that split names none, a credential-looking segment can still be reported, unnamed, as for `identifier=sys\|1;token=...`: the message carries `conditional_query segment with a credential-looking name`. At least some shapes are not counted, such as a segment beside a named parameter, a bare name with no `=` (`api_key;identifier=1`), and a percent-encoded `;` (`%3B`). Nor is a `code` name, which is FHIR's search parameter (BACKLOG #5350, #5353). At least these are refused at construction too, rather than at each send: an all-whitespace value; under `conditional-update`, a value that is not ASCII or holds a space, and one that makes a request URL over the length limit; under `if-none-exist`, a value Latin-1 cannot encode (BACKLOG #5911) |
 | `update_url_form` | `transaction` | how an `update` or `if-match` is sent. `transaction` keeps the id out of the URL. `path` is the plain `PUT {base}/{ResourceType}/{id}` with the ETag in an `If-Match` header, for a server with no `transaction` interaction. `path` is a **listed loosening**; see [vendor compatibility](#vendor-compatibility-and-the-path-form-opt-in) An `env()` value is read by `check` and `GET /security/posture` as [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#update_url_form--path-on-a-fhir-connection--the-resource-id-in-the-request-url) says |
 | `allowed_entry_methods` | — (**required** on `transaction`/`batch`) | (vault BACKLOG #2804) the verbs a Bundle entry may carry, from `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `PATCH`, spelled in upper case. There is no default: a `transaction` or `batch` connection without it does not load, or, where `interaction` is an `env()`, does not build. Refused on any other interaction. Both lists take an `env()` for the whole list: its default is checked at load, and the value it resolves to when the connection is built. A bad item is named by position, never quoted. See [A Bundle connection screens every entry](#a-bundle-connection-screens-every-entry) |
 | `allowed_entry_types` | — (any type) | (vault BACKLOG #2804) `transaction`/`batch` only: the resource types an entry's `request.url` may name, such as `["Patient", "Encounter"]`. Unset means any type. Refused on any other interaction |
-| `headers` | `{}` | extra **static** headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine) |
+| `headers` | `{}` | extra **static** headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine). Refused at construction, among others: a value that is not a table, a header name that is not an RFC 9110 token, and a value holding a control character other than HTAB (BACKLOG #5911, #8299) |
 | `bearer_token` | — | `Authorization: Bearer …` (SMART/OAuth — a **secret**, via `env()`) |
-| `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
+| `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`). Set both or neither, with no `:` in `basic_user`, and not beside `bearer_token`; a FHIR destination or `FhirLookup` that breaks one of these is refused at construction (BACKLOG #8299) |
 | `timeout_seconds` | `30` | per-request timeout, in seconds above zero: zero or a negative is refused when the connection is built |
 | `verify_tls` | `true` | TLS cert verification — the same posture-keyed cell as [REST](#rest--rest): `false` is **refused at construction** off loopback, and the `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the shipped default) |
 | `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert with the chain's signatures + hostname still verified (not the other chain certificates' validity periods; see the MLLP row). **No posture gate and no escape variable covers the setting itself**. It takes one lever away from the revocation gate: a `[tls].crl_file` cannot admit a hop that sets it, so off-box on an enforcing instance only `tls_revocation_attested` with its reason crosses (ADR 0173 §13). It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) — see the [MLLP row](#mllp--mllp) |
@@ -5277,7 +5266,7 @@ reading this page already applies to a file the scan never opened.
 | Syslog forwarder (`[logging].forward_host`) | 5 s pinned on the socket for both `tcp` and `tls` (the TLS handshake runs under it); UDP is connectionless and carries none | a single long-lived socket owned by the logging handler | on timeout the handler drops **that record** and continues | **single-shot** per record — no retry |
 | SNTP clock-sync probe (`[logging].ntp_peer`) | 2 s pinned with `sock.settimeout`, so a silent peer cannot block `serve()` | the datagram socket is closed after the single probe | skew warns loudly, or refuses to start under `time_sync_fail_closed` | **single-shot** — one probe per start |
 | Forward / egress web proxy (`[egress].proxy_url`) | **inherits the destination connector's `timeout_seconds`** — the proxy hop has no separate timeout | released with the destination request; the per-connection `ProxyHandler` never mutates the shared opener | a proxy error surfaces as the destination request's failure | the destination's `RetryPolicy` |
-| Loopback ECH sidecar (`ech_sidecar`) | **inherits the connection's `timeout_seconds`** | released with the destination request | fails closed at config load, and on a connector built directly, on at least a missing or non-loopback sidecar, or one with a credential, a query or a fragment in its URL; at config load also on one not in `[egress].allowed_ech_sidecar` (BACKLOG #5528) | the destination's `RetryPolicy` |
+| Loopback ECH sidecar (`ech_sidecar`) | **inherits the connection's `timeout_seconds`** | released with the destination request | fails closed at config load, and on a connector built directly, on at least a missing or non-loopback sidecar, or one with a credential, a query or a fragment in its URL; on a REST connection, at build, beside HTTP Digest, whose handler cannot answer a challenge through the sidecar (BACKLOG #5529); at config load also on one not in `[egress].allowed_ech_sidecar` (BACKLOG #5528) | the destination's `RetryPolicy` |
 
 ## Competitive parity — full connector catalog
 
