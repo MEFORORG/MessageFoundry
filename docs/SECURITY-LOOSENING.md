@@ -1367,8 +1367,7 @@ count is above `0` (vault BACKLOG #2613).
     as one rotated out after a compromise, verifying id_tokens for longer. The key cache also serves a
     cached key until it may fetch again, so `oidc_jwks_min_refetch_seconds` above `3600` s does the
     same. Below its own default of `300` s it weakens the bound on how often an unknown key id can
-    make the engine fetch the key set, and `0` removes that bound. The key cache refuses a negative
-    value, or one above a year, so `serve` does not start with one.
+    make the engine fetch the key set, and `0` or less removes that bound.
   - `oidc_flow_ttl_seconds` above `300` s keeps a pending sign-in's staged state, nonce and PKCE
     verifier redeemable for longer, and holds an abandoned start's flow-cache slot for longer.
   - `oidc_max_age_seconds` above `43200` s accepts a sign-in whose last identity-provider
