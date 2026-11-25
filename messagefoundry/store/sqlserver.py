@@ -11390,12 +11390,12 @@ class SqlServerStore(ServerCipherWalk):
 
         The eviction runs after the connection is released, an await later than the DELETE, so a
         same-key write that commits and publishes in that window would be evicted while its row
-        survives. So a key this node publishes to the cache at any point from the start of the pass
-        to its eviction is kept (BACKLOG #5734). That is sound while ``older_than`` lies well behind
-        every write in flight, as the retention runner's cutoff does, at least a whole day back (it
-        runs only when the integer ``state_max_age_days`` is above zero): such a write's row is newer
-        than the cutoff, so the DELETE did not remove it. A caller passing a cutoff near the present could
-        keep a cached value whose row the DELETE removed."""
+        survives. So a watched publish of a key, at any point from the start of the pass to its
+        eviction, keeps that key cached (BACKLOG #5734). At least a publish of this node's own committed
+        writes (``publish_state_cache``) is watched. A :meth:`reload_state_cache` swap is not, so a key
+        a reload loads in that window is evicted as before. Keeping a watched key is sound only under the cutoff premise
+        that :meth:`~messagefoundry.store.base.QueueStore.purge_state` states; a cutoff near the
+        present could keep a cached value whose row the DELETE removed."""
         touched: set[tuple[str, str]] = set()
         self._state_purge_watches = (*self._state_purge_watches, touched)
         try:

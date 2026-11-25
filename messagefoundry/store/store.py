@@ -230,7 +230,6 @@ from messagefoundry.store.row_seal import (
     seal_bytes,
     seal_chunks,
     seal_row_ref,
-    transit_mac_version,
     transit_seal_refusals,
 )
 from messagefoundry.store.schema_verify import (
@@ -6730,11 +6729,9 @@ _AUDIT_ANCHOR_HEX = frozenset("0123456789abcdefABCDEF")
 AUDIT_ANCHOR_DIGEST_HEX_LEN = AUDIT_MAC_HEX_LEN
 #: ADR 0138 ``vault_transit``: the row MAC is computed INSIDE Vault/OpenBao Transit
 #: (``crypto_transit.TransitCipher.audit_hmac``), which returns its own opaque ``vault:v<N>:<base64>``
-#: string — not hex, not 64 characters — and that string lands in ``row_hash`` verbatim. A head with
-#: this prefix must also pass ``row_seal.transit_mac_version``, which holds its own copy of the prefix
-#: and the Transit MAC's shape (vault BACKLOG #5987). A future isolated-module MAC provider with a
-#: different prefix MUST be added here AND given its own shape check in ``_audit_head_shape``, or a
-#: legitimate anchor from that deployment is refused as malformed.
+#: string — not hex, not 64 characters — and that string lands in ``row_hash`` verbatim. A future
+#: isolated-module MAC provider with a different prefix MUST be added here, or a legitimate anchor from
+#: that deployment is refused as malformed.
 AUDIT_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
 
 
@@ -6859,10 +6856,8 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
       12-character head pasted out of a FAIL message's display truncation is refused as malformed
       input instead of being reported as tampering.
     * an **isolated-module MAC** — ADR 0138 ``vault_transit`` mode, whose ``vault:v1:…`` string is
-      passed through UNCHANGED once it is well formed: :func:`~messagefoundry.store.row_seal.
-      transit_mac_version` must accept it, as the writer requires of every MAC it stores (vault
-      BACKLOG #5987). ``partition`` splits on the FIRST colon, so its internal colons survive the
-      ``COUNT:HEAD`` split.
+      passed through UNCHANGED. ``partition`` splits on the FIRST colon, so its internal colons
+      survive the ``COUNT:HEAD`` split.
 
     An EMPTY head is legal and load-bearing — :meth:`MessageStore.audit_anchor` returns ``(0, "")`` for
     an empty log, so ``0:`` must round-trip or a fresh instance is the one state that cannot be anchored.
@@ -6888,14 +6883,19 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
     # any length up to Python's digit limit (vault BACKLOG #5987). The count is quoted in `str(exc)`
     # via `text`; no reason names a value, not even the count: `--expected-anchor-file` prints the
     # reason, and the count is that file's content (vault BACKLOG #2612).
-    negative = count_text.startswith("-")
-    count = _audit_decimal(count_text.removeprefix("-"))
-    if count is None or (negative and not count):  # "-0" is no count a store prints
+    # A minus sign before ASCII digits is judged on the sign before the width, so each reason is
+    # true of its input: "-0" is a signed zero, not a negative count, and a minus before 20 or more
+    # digits is negative whatever its width.
+    unsigned = count_text.removeprefix("-")
+    if unsigned != count_text and unsigned.isascii() and unsigned.isdigit():
+        if not unsigned.strip("0"):
+            raise AuditAnchorError("the row count is a signed zero, which no store prints", text)
+        raise AuditAnchorError("the row count is negative", text)
+    count = _audit_decimal(count_text)
+    if count is None:
         raise AuditAnchorError(
             "the row count is not a plain decimal integer of up to 19 digits", text
         )
-    if negative:
-        raise AuditAnchorError("the row count is negative", text)
     if count > _AUDIT_SEQ_MAX:
         raise AuditAnchorError("the row count is larger than any store can hold", text)
     head = head.strip()
@@ -6934,16 +6934,9 @@ def _audit_head_shape(head: str, noun: str = "the head") -> tuple[str | None, st
             )
         return None, head.lower()
     if head.startswith(AUDIT_ANCHOR_ISOLATED_MAC_PREFIX):
-        # Opaque by construction, so never normalised, but held to the shape the writer itself
-        # requires (`TransitCipher.audit_hmac` refuses any reply `transit_mac_version` does not
-        # accept): a truncated `vault:v1:` or one carrying a space is one the store never wrote,
-        # and a comparator would report it as tampering (vault BACKLOG #5987 item 1).
-        if transit_mac_version(head) is None:
-            return (
-                f"{noun} starts like an isolated-module {AUDIT_ANCHOR_ISOLATED_MAC_PREFIX}… MAC "
-                "(ADR 0138) but is not a well-formed one",
-                head,
-            )
+        # Opaque by construction; never normalise what we do not define. Not held to the Transit MAC's
+        # shape either: `audit-anchor` prints whatever head the store holds, and a shape check here
+        # would refuse a head that command printed instead of walking the chain (vault BACKLOG #5987).
         return None, head
     return (
         f"{noun} is neither a {AUDIT_ANCHOR_DIGEST_HEX_LEN}-character hex digest nor an "
@@ -9193,7 +9186,7 @@ def forget_store_salt(path: Path) -> bool:
     # `Store_Salt` table is the one the next open reads.
     salt_table = (
         "SELECT count(*) FROM sqlite_master AS m"
-        f" WHERE {_ORDINARY_TABLE} AND lower(m.name) = 'store_salt'"
+        f" WHERE ({_ORDINARY_TABLE}) AND lower(m.name) = 'store_salt'"
     )
 
     def drop(conn: sqlite3.Connection) -> bool:
@@ -14355,7 +14348,7 @@ class MessageStore:
         cur = await db.execute(
             # Exact case, unlike the salt probe: nothing but this fold reads `outbox`, and it drops
             # the table, so a case variant another tool left must be left alone.
-            f"SELECT name FROM sqlite_master AS m WHERE {_ORDINARY_TABLE} AND m.name = 'outbox'"
+            f"SELECT name FROM sqlite_master AS m WHERE ({_ORDINARY_TABLE}) AND m.name = 'outbox'"
         )
         if await cur.fetchone() is None:
             return  # already migrated (or a fresh DB) — nothing to fold in
@@ -23115,7 +23108,7 @@ class MessageStore:
             # (BACKLOG #6719 item 5). The NULL-sql case the old copy also took is unreachable: SQLite
             # refuses to load a schema holding a table row with no SQL.
             cur = await db.execute(
-                f"SELECT m.name FROM main.sqlite_master AS m WHERE {_ORDINARY_TABLE}"
+                f"SELECT m.name FROM main.sqlite_master AS m WHERE ({_ORDINARY_TABLE})"
                 " AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
             )
             names = [str(row[0]) for row in await cur.fetchall()]

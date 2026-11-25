@@ -244,10 +244,8 @@ def test_parse_audit_row_pair_shares_the_anchor_head_rule() -> None:
     assert store_mod.parse_audit_row_pair(f" 7:{head} ") == (7, head.lower())
     mac = "vault:v1:" + base64.b64encode(b"\x03" * 32).decode("ascii")
     assert store_mod.parse_audit_row_pair(f"7:{mac}") == (7, mac)
-    # A truncated or space-bearing MAC is one the writer never emits (vault BACKLOG #5987 item 1).
-    for bad in ("7:vault:v1:abc", "7:vault:v1:", "7:vault:v", f"7:{mac[:-4]} {mac[-4:]}"):
-        with pytest.raises(store_mod.AuditRowPairError, match="not a well-formed one"):
-            store_mod.parse_audit_row_pair(bad)
+    # Opaque, not held to the Transit MAC's shape, as the anchor rule (vault BACKLOG #5987).
+    assert store_mod.parse_audit_row_pair("7:vault:v1:abc") == (7, "vault:v1:abc")
     for bad in ("7:", "0:" + head, "7:" + "a" * 12, "7:zz", "seven:" + head):
         with pytest.raises(store_mod.AuditRowPairError) as exc:
             store_mod.parse_audit_row_pair(bad)

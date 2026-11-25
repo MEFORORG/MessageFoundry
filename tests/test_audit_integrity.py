@@ -1973,7 +1973,8 @@ _NOT_A_DECIMAL = "the row count is not a plain decimal integer of up to 19 digit
         ("1_000", _NOT_A_DECIMAL),
         (chr(0x0663), _NOT_A_DECIMAL),  # ARABIC-INDIC DIGIT THREE, which int() accepts
         ("--5", _NOT_A_DECIMAL),
-        ("-0", _NOT_A_DECIMAL),
+        ("-0", "the row count is a signed zero, which no store prints"),
+        ("-" + "1" * 20, "the row count is negative"),
         ("0" * 19 + "5", _NOT_A_DECIMAL),  # 20 digits, as the row pair refuses them
         ("9" * 5000, _NOT_A_DECIMAL),
         (str(2**63), "the row count is larger than any store can hold"),
@@ -1985,6 +1986,7 @@ _NOT_A_DECIMAL = "the row count is not a plain decimal integer of up to 19 digit
         "arabic-indic-digit",
         "double-minus",
         "minus-zero",
+        "negative-twenty-digits",
         "twenty-digits",
         "long",
         "past-int64",
@@ -2003,24 +2005,41 @@ def test_parse_audit_anchor_takes_only_a_count_a_store_can_hold(count: str, reas
 
 @pytest.mark.parametrize(
     "head",
-    [
-        "vault:v",
-        "vault:v1:",
-        "vault:v1:c3ludGhldGlj",
-        "vault:v01:{b}",
-        "vault:v1:{b} x",
-        "vault:v1:{b}=",
-    ],
-    ids=["prefix-only", "no-body", "short-digest", "leading-zero", "inner-space", "trailing-pad"],
+    ["vault:v", "vault:v1:", "vault:v1:c3ludGhldGlj", "vault:v1:{b} x"],
+    ids=["prefix-only", "no-body", "short-digest", "inner-space"],
 )
-def test_parse_audit_anchor_refuses_a_transit_mac_the_writer_never_emits(head: str) -> None:
-    """Vault BACKLOG #5987 item 1: a ``vault:v`` head is held to the shape
-    ``TransitCipher.audit_hmac`` writes, so a truncated or space-bearing copy is refused as
-    malformed input rather than reported as tampering on an intact chain."""
-    body = base64.b64encode(b"\x04" * 32).decode("ascii")
-    with pytest.raises(AuditAnchorError, match="not a well-formed one"):
-        parse_audit_anchor(f"3:{head.format(b=body)}")
-    assert parse_audit_anchor(f"3:vault:v12:{body}") == (3, f"vault:v12:{body}")  # the control
+def test_parse_audit_anchor_passes_any_isolated_module_head_through(head: str) -> None:
+    """A ``vault:v`` head is opaque and is NOT held to the Transit MAC's shape (vault BACKLOG #5987):
+    ``audit-anchor`` prints whatever head the store holds, so a shape check here would refuse an
+    anchor that command printed. The CLI pin is
+    ``test_audit_verify_walks_on_an_anchor_audit_anchor_printed_for_a_malformed_transit_head``."""
+    body = base64.b64encode(bytes([4]) * 32).decode("ascii")
+    head = head.format(b=body)
+    assert parse_audit_anchor(f"3:{head}") == (3, head)
+
+
+@pytest.mark.usefixtures("keyless_verify")
+def test_audit_verify_walks_on_an_anchor_audit_anchor_printed_for_a_malformed_transit_head(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #5987: whatever head ``audit-anchor`` prints, ``audit-verify`` takes as an
+    anchor and walks the chain. The newest row's hash is overwritten with a truncated ``vault:v1:``
+    string, a head no Transit backend returns, so the walk FAILS on it (exit 1). Exit 2, a refusal
+    of the anchor as malformed before any walk, would leave the tampered row unreported."""
+    db = tmp_path / "transit_head.db"
+    _seed_audit_rows(db, 3)
+    with contextlib.closing(sqlite3.connect(db)) as conn:
+        conn.execute("UPDATE audit_log SET row_hash = 'vault:v1:' WHERE id = 3")
+        conn.commit()
+
+    assert main(["audit-anchor", "--db", str(db)]) == 0
+    anchor = capsys.readouterr().out.strip()
+    assert anchor == "3:vault:v1:", anchor
+
+    assert main(["audit-verify", "--db", str(db), "--expected-anchor", anchor]) == 1
+    captured = capsys.readouterr()
+    assert "malformed audit anchor" not in captured.err, captured.err
+    assert "FAIL" in captured.out, captured.out
 
 
 @pytest.mark.parametrize(
