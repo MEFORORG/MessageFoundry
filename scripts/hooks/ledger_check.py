@@ -711,31 +711,9 @@ class Ledger:
         happens the recorded path stops matching for EVERY session, the number is uncommittable by
         anyone, and nothing reports it. Measured 2026-08-30: 43 numbers were already in that state.
 
-        ***THE FALLBACK PRESERVES THE EXCLUSIVITY THE PATH WAS PROVIDING, AND THAT IS THE ONLY REASON
-        IT IS SAFE: GIT REFUSES AN ORDINARY SECOND CHECKOUT OF ONE BRANCH IN TWO WORKTREES.*** So "the
-        session on this branch" is as single-valued as "the session in this worktree" ever was -- the
-        gate exists to stop two sessions filing one number, and two sessions do not hold one branch.
-        What changes is that the key now survives its worktree.
-
-        ***THAT REFUSAL IS A DEFAULT, NOT A GUARANTEE, AND THIS SENTENCE USED TO SAY "GIT REFUSES"
-        FLAT (BACKLOG #1039).*** Measured: `git worktree add --force` (and `-f`) check the same branch
-        out again and succeed, and `git checkout --ignore-other-worktrees` switches -- the same two
-        bypasses `worktree_gate.ps1` already spells out in its own rule-3b deny text. A claim about
-        this repository's CONFIGURATION was being written as a claim about git.
-
-        **So there is a real residual, stated rather than repaired here, because repairing it is a
-        change to the ownership model and not to a docstring.** Force a second checkout of the
-        recorded branch and BOTH trees satisfy the fallback, so entitlement to the number leaks to a
-        tree that never allocated it. It is narrow: the fallback is unreachable while the recorded
-        path still matches (see the early return below), so the leak needs the recorded worktree to be
-        gone AND a deliberate `--force`. It stops the ACCIDENT, not a determined bypass -- which is
-        the same bound `worktree_gate.ps1` reaches about its own guard, and it is the honest strength
-        of the argument above rather than a hole this change opens.
-
-        WHY THIS AND NOT A TRANSFER VERB: a transfer verb would let a seat take a number another
-        session is actively holding, which is the collision the gate exists to prevent. The branch
-        fallback only becomes reachable once the original worktree is GONE -- and a branch that is
-        free to check out is one nobody is working in.
+        ***THE FALLBACK IS NOT EXCLUSIVE.*** It is tried whenever the committing tree's path misses, so
+        at least two trees can be entitled to one number (docs/LEDGER-GATE.md, "When the owning
+        worktree is gone"). Repairing that is a change to the ownership model, not made here.
 
         ***THE LIMIT, STATED RATHER THAN DISCOVERED: A DELETED BRANCH STRANDS THE NUMBER AGAIN.***
         That is a smaller hole (a branch is cheap to recreate at any commit, and a branch deleted
@@ -796,8 +774,8 @@ class Ledger:
         remedy block is precisely what that defect forged.
         """
         allocate = f'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind {kind} -Title "<title>"'
-        # No record at all: nobody holds it, so allocating is the only move and the ONLY case where it
-        # is the right one.
+        # No record at all: nobody holds it, so allocating is the only move. With a record that names
+        # neither key (below), these are the ONLY cases where it is the right one.
         if self.alloc is None:
             return allocate
         try:
@@ -814,6 +792,9 @@ class Ledger:
             return allocate
         worktree = _safe_for_message(claim.get("worktree", ""))
         branch = _safe_for_message(claim.get("branch", ""))
+        if not worktree and not branch:
+            # A record naming neither key holds nothing owns() can ever match, so nothing recovers it.
+            return allocate
         lines = ["this number is already allocated -- RECOVER it, do not allocate another:", ""]
         coord = self._coord
         if worktree and coord is not None and not coord.record_is_here(claim):
@@ -822,13 +803,23 @@ class Ledger:
         elif worktree:
             lines.append(f"    1. commit from the worktree that holds it:  {worktree}")
         if branch:
-            lines.append(f"    2. or check that branch out and commit there: {branch}")
+            lines += [
+                f"    2. or check that branch out and commit there: {branch}",
+                "       (git refuses an ORDINARY second checkout of a branch another worktree holds. Do",
+                "        not force past that. From the worktree in 1 you can still reach it with:",
+                "        git checkout -b <alias> <branch>, then push <alias>:<branch>)",
+            ]
+        # A record whose worktree and branch are both gone still has a recovery: the owner-ruled
+        # recreate of the recorded path, which restores the condition owns() tests.
+        if worktree:
+            lines += [
+                "    3. if that worktree is gone and its branch is gone or was never recorded, recreate",
+                "       a worktree at the path in 1 (on the machine 1 names, if it names one) and commit",
+                "       from it",
+            ]
         lines += [
-            "       (git refuses an ORDINARY second checkout of a branch another worktree holds. Do",
-            "        not force past that -- two trees on one branch is what makes the branch key above",
-            "        stop being exclusive. From the worktree in 1 you can still reach it with:",
-            "        git checkout -b <alias> <branch>, then push <alias>:<branch>)",
-            "    3. ONLY if neither tree nor branch still exists, allocate a new number:",
+            "    4. ONLY if neither the recorded worktree nor the branch exists, and no step above",
+            "       applies, allocate a new number:",
             f"       {allocate}",
             "",
             "    See docs/LEDGER-GATE.md, 'Recovering a number the gate has refused'.",
@@ -864,7 +855,8 @@ class Ledger:
         (BACKLOG #5453). Only it gets the lines about a shallow clone and about renaming a restore,
         because only for it do those lines change what will pass. ``fork_unknown`` marks a renamed
         file whose grant failed only because git found no fork point with the base: the number may
-        well be allocated, so that refusal names the fork point first and the allocator only last.
+        well be allocated, so that refusal names the fork point first, then the remedy, which names
+        the allocator, where it names it at all, only as its last step.
         """
         if self.alloc is None:
             # Unresolved is not unowned. Refusing costs a retry; guessing hands out a spent number.
@@ -898,7 +890,7 @@ class Ledger:
                     if renamed
                     else ""
                 )
-                + "      If this is NOT a restore, the number simply needs allocating:\n"
+                + "      If this is NOT a restore, do this instead:\n"
                 f"      {remedy}",
             )
         if seen.number_is_historical:

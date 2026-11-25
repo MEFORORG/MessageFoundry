@@ -5428,7 +5428,7 @@ class AuthService:
         # Before every account write, the repair branch's clears included (R3-F1).
         if await self._unverifiable_account_held():
             raise FirstAdministratorRefused(_UNVERIFIABLE_ACCOUNT_REFUSAL)
-        violations = self._policy.violations(password, username=username)
+        violations = await self._screened_violations(password, username=username)
         if violations:
             raise FirstAdministratorRefused("; ".join(violations))
         # ADR 0197 Amendment A (N-A): the code is proved in memory, before any write.
@@ -8637,6 +8637,11 @@ class AuthService:
             # required no pair, so it could sign in an account bound to another identity. No
             # production caller did.
             raise ValueError("a federated login (mech='oidc') needs the verified federated_subject")
+        if federated_subject is not None and mech != "oidc":
+            # BACKLOG #4977, the other direction. A pair with ``mech`` None (or any other value)
+            # minted an OIDC session whose success row, which names ``mech`` only when it is set,
+            # did not say ``"mech": "oidc"``. The pair and the mechanism name travel together.
+            raise ValueError("a federated login (one carrying federated_subject) needs mech='oidc'")
         federated = federated_subject is not None
         if federated != (session_mechanism is SessionMechanism.OIDC):
             # A programming error, not a login outcome: a verified federated pair minted under any
@@ -15531,6 +15536,75 @@ class AuthService:
     def password_violations(self, password: str, *, username: str | None = None) -> list[str]:
         return self._policy.violations(password, username=username)
 
+    async def _screened_violations(self, password: str, *, username: str) -> list[str]:
+        """:meth:`PasswordPolicy.violations`, run off the event loop (BACKLOG #6881).
+
+        The screen can read a file. ``lru_cache`` caches no exception, so a missing or unreadable
+        operator corpus is opened again on every call, and a file placed after startup is read
+        whole by the first call; a broken bundled corpus is re-read the same way. Run on a worker
+        thread, none of that blocks the loop. The answer, and any exception, is unchanged.
+
+        One screen at a time per service instance, as the loop used to run them, and the lock is
+        held until the screen's THREAD ends, not until its caller stops waiting. The lock is this
+        instance's while the corpus cache is the module's, so the claims that follow hold within
+        one instance; two instances can each load a corpus, or each block a thread, at once. Within
+        one, a corpus that appears is loaded once, not by every screen that missed the cache
+        together, and a corpus on a path that stops answering blocks one worker thread in all,
+        however many callers give up on it;
+        the others wait on the lock, which a caller may leave by being cancelled. The one way the
+        lock goes early is a cancel of the screen task itself, at loop teardown for example, which
+        releases it while the thread runs on. The screen itself is set lookups, so the queue costs
+        nothing measurable. A screen that fails after its caller left is logged at ERROR, as
+        :func:`_write_through_cancellation` logs a write, since nobody else reads it."""
+        if self._screen_lock is None:
+            self._screen_lock = asyncio.Lock()
+        lock = self._screen_lock
+        await lock.acquire()
+        caller_left = False
+        reported = False
+
+        def report(done: asyncio.Future[list[str]]) -> None:
+            nonlocal reported
+            if reported or done.cancelled() or done.exception() is None:
+                return
+            reported = True
+            _log.error(
+                "a password screen failed after its caller was cancelled",
+                exc_info=done.exception(),
+            )
+
+        def finished(done: asyncio.Future[list[str]]) -> None:
+            lock.release()
+            if not done.cancelled():
+                done.exception()  # retrieved: the caller re-raises it below, or report() logs it
+            if caller_left:
+                report(done)
+
+        try:
+            screen = asyncio.ensure_future(
+                asyncio.to_thread(self._policy.violations, password, username=username)
+            )
+            screen.add_done_callback(finished)
+        except BaseException:
+            # Nothing was scheduled to release it, so a later screen would wait forever.
+            lock.release()
+            raise
+        # ``wait``, not ``await screen``: a cancel of the caller then leaves the screen running,
+        # and its callback, not the caller, releases the lock when the thread is done.
+        try:
+            await asyncio.wait((screen,))
+        except asyncio.CancelledError:
+            caller_left = True
+            if screen.done():
+                # ``finished`` may already have run, before it could know the caller left; report
+                # here, and ``reported`` keeps it to one line if ``finished`` runs after this.
+                report(screen)
+            raise
+        return screen.result()
+
+    #: Serializes :meth:`_screened_violations`; made on first use, inside the running loop.
+    _screen_lock: asyncio.Lock | None = None
+
     async def verify_current_password(
         self,
         identity: Identity,
@@ -17400,7 +17474,7 @@ class AuthService:
             # before the policy, so the answer does not depend on the password typed, and before the
             # hash, so no password_changed row is written for an absent account.
             raise ValueError("no such user")
-        violations = self._policy.violations(new_password, username=identity.username)
+        violations = await self._screened_violations(new_password, username=identity.username)
         if violations:
             return violations
         covered = self._covered_by_requirement(user, identity.roles)

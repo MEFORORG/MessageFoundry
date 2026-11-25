@@ -276,8 +276,9 @@ async def test_an_error_raised_mid_store_counts_toward_the_same_bound(
     assert [isinstance(exc, NegativeAckError) for exc in raised] == [False] * (limit - 1) + [True]
     final = raised[-1]
     assert isinstance(final, NegativeAckError) and final.code == "unanswered-over-ceiling"
-    # The final refusal names the transport error as its cause.
-    assert isinstance(final.__cause__, ConnectionResetError)
+    # The final refusal names the transport error as its cause, by class and with none of its text.
+    assert isinstance(final.__cause__, dicom_module._LibraryCause)
+    assert final.__cause__.library_class == "ConnectionResetError"
 
 
 def _key(n: int) -> int:

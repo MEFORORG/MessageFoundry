@@ -96,7 +96,9 @@ def test_the_axis_parses_and_counts_toward_the_sweep() -> None:
             # sandbox refusal is the one that fires.
             _SANDBOX_AB.replace('claim_modes = ["pooled"]', 'claim_modes = ["per_lane"]')
             + "\n[connscale.slo]\nempty_claims_base_reading = true\n",
-            "would mix the two sandbox arms",
+            # Its lanes split by arm since BACKLOG #5090, so the reason is the missing per-arm
+            # bound, as for fd_monotonic below.
+            "graded each sandbox arm's base reading",
         ),
         (
             # Its lanes split by arm since BACKLOG #5570, so the reason is now the missing per-arm
@@ -438,6 +440,9 @@ async def test_a_subprocess_arm_with_a_worker_per_inbound_passes(
     # 2 processes per worker tree, as a Windows venv starts them.
     report = await _sweep(monkeypatch, {"off": 0, "subprocess": 40})
     assert _check(report, "sandbox_workers").ok, report.slos
+    # A pass is a floor, and the report says so beside it (BACKLOG #5090): workers on half the
+    # inbounds clear it too, and the per-inbound proof is deferred to ADR 0187's pool.
+    assert "a floor, not a per-inbound proof" in str(_check(report, "sandbox_workers").threshold)
     assert _check(report, "warmup_delivered").ok
     assert {r.sandbox_mode for r in report.records} == {"off", "subprocess"}
     assert report.result_ok

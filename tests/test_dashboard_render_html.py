@@ -133,8 +133,8 @@ def test_missing_data_renders_as_no_data(data: dict[str, Any]) -> None:
 
 
 def test_null_values_are_no_data_not_zero() -> None:
-    page = rh.render({"weeks": WEEKS, "metrics": [_metric("flow_health", label="Flow")]})
-    tile = page[page.index("<h3>Flow") :]
+    page = rh.render({"weeks": WEEKS, "metrics": [_metric("owner_waiting", label="Owner")]})
+    tile = page[page.index("<h3>Owner") :]
     assert '<span class="big"><span class="nodata">no data</span>' in tile
 
 
@@ -508,6 +508,8 @@ def test_the_priority_table_has_totals_and_every_status() -> None:
     snap["metrics"][0]["detail"]["by_priority"] = {
         "P1": {"open": 2, "closed": 3},
         "unscored": {"partial": 1, "declined": 1},
+        "scored, no tier": {"open": 1},
+        "DEMAND-GATE": {"open": 1},
     }
     page = rh.render(snap)
     table = page[page.index('<table class="prio">') : page.index("</table>")]
@@ -527,12 +529,20 @@ def test_the_priority_table_has_totals_and_every_status() -> None:
         in table
     )
     assert "<th>Unscored</th>" in table
+    assert "<th>Scored, no tier</th>" in table
+    assert "<th>DEMAND-GATE</th>" in table
     assert (
-        '<tr class="sum"><th>Total</th><td>2</td><td>1</td><td>0</td><td>3</td><td>1</td><td>0</td><td>7</td></tr>'
+        '<tr class="sum"><th>Total</th><td>4</td><td>1</td><td>0</td><td>3</td><td>1</td><td>0</td><td>9</td></tr>'
         in table
     )
     # The table sits above the charts.
     assert page.index("Ledger rows by priority") < page.index("Ledger range")
+    # The note names each fallback bucket by the label the table shows, as one sentence each.
+    note = " ".join(
+        page.split('<p class="note">Every ledger row', 1)[1].split("</p>", 1)[0].split()
+    )
+    assert f'is in the "{rh.tr.PRIORITY_LABELS[rh.tr.ESTIMATE_LABEL]}" row;' in note
+    assert "is unscored." in note
 
 
 def test_a_snapshot_without_a_priority_census_says_no_data() -> None:

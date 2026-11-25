@@ -2509,10 +2509,11 @@ def _posture_loosenings(
             # BACKLOG #2489, vault #3123: the dual-control dwell, expiry and held list, read off the
             # gate that enforces them.
             approvals=gate.settings if gate is not None else ApprovalsSettings(),
-            # BACKLOG #2227: a short or zero warn_days is named. The managed lifespan stashes the
-            # live section. An app built without it (an embedding, or a test) is read at the
-            # shipped default, the stash-or-default rule [secret_rotation] follows above. KNOWN
-            # GAP: such an engine may run no cert monitor at all, and this then reads it as on.
+            # BACKLOG #2227, #2008: a short or zero warn_days is named, and so is a long interval.
+            # The managed lifespan stashes the live section. An app built without it (an
+            # embedding, or a test) is read at the shipped default, the stash-or-default rule
+            # [secret_rotation] follows above. KNOWN GAP: such an engine may run no cert monitor at
+            # all, and this then reads it as on.
             cert_monitor=getattr(state, "cert_monitor_settings", None) or CertMonitorSettings(),
             # Vault BACKLOG #2302: the cleartext-archive escape, off the [backup] section the
             # managed lifespan stashed. The same stash-or-default rule: an app built without it
@@ -7564,9 +7565,12 @@ def create_app(
             )
             success = True
         except Exception as exc:  # noqa: BLE001 — any SMTP/config failure is a test FAILURE, not a 500
-            # safe_exc scrubs + bounds the message so no SMTP server banner / internal detail (possible
-            # host/credential hints) escapes to the caller. A hop refusal from the build is the
-            # exception: the build dials nothing, so it is the engine's own text, the operator's
+            # safe_exc keeps the exception type, redacts PHI and credential shapes in the message and
+            # cuts it at 200 characters, adding short notes of what it cut, so the detail can run a
+            # little past 200. A banner or host name is not one of those shapes, so most of what the
+            # relay or the socket said, up to that cut, can reach the caller, who holds
+            # service:configure. A hop refusal from the build gets a
+            # longer bound: the build dials nothing, so it is the engine's own text, the operator's
             # host and the remedy. A send's refusal can quote what the relay advertised.
             if building and isinstance(exc, InsecureHopRefused):
                 detail = safe_exc(exc, limit=_TEST_SEND_BUILD_REFUSAL_LIMIT)
