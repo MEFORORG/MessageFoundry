@@ -823,6 +823,18 @@ def test_an_unpadded_isa_declares_nothing_so_its_data_is_replaced_and_sent(offse
     assert wire == reply.replace("中", "?").encode("ascii")
 
 
+@pytest.mark.parametrize("isa11", ["?", "é"], ids=["question-mark", "unencodable"])
+def test_a_pre_00501_isa11_is_data_so_the_reply_is_replaced_and_sent(isa11: str) -> None:
+    """Round-1 review of the fixed-width repair: ISA11 was declared a delimiter in every version,
+    though before 00501 it is data, as ``discover_delimiters`` reads it. A fixed-width 00401 ISA
+    whose ISA11 is ``?`` or a character the charset cannot hold refused a reply main replaced and
+    sent. Green on main, red on 1f27b49."""
+    header = _isa(repetition=isa11).replace("*00501*", "*00401*")
+    reply = header + "TA1*000000001*260101*1200*A*000中~"
+    wire = framing_mod.encode_reply(reply, "ascii", connection="IB_X12_00401")
+    assert wire == reply.encode("ascii", errors="replace")
+
+
 def test_an_lf_inside_a_field_of_a_cr_reply_is_data_not_a_header() -> None:
     """Round-2 review: lines were split at LF too, so ``MSH`` after an LF inside a field was read
     as a header and its characters as delimiters, and a reply main replaced and sent was refused.

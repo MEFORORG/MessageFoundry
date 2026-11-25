@@ -34,8 +34,11 @@ from messagefoundry.parsing.sniff import _LEADING_WS_STR
 from messagefoundry.parsing.split import _sends_more_than_one_message
 from messagefoundry.parsing.x12.delimiters import (
     _COMPONENT_SEP_OFFSET,
+    _REPETITION_MIN_VERSION,
     _REPETITION_SEP_OFFSET,
     _SEGMENT_TERM_OFFSET,
+    _VERSION_END,
+    _VERSION_START,
     ELEMENT_SEP_OFFSETS,
     ISA_SEGMENT_LEN,
 )
@@ -345,11 +348,14 @@ def _reply_delimiters(reply: str) -> frozenset[str]:
     at the ISA's fixed delimiter offsets only when the ISA is fixed-width: all 106 characters are
     present and every element-separator offset holds the character at +3. Those offsets are read
     raw, without the distinctness and element-data checks ``discover_delimiters`` makes, so a
-    fixed-width ISA that read refuses still declares what its offsets hold. An ISA that is not
-    fixed-width, such as one whose elements are unpadded or one cut short, declares nothing, as
-    every ``ISA``-led reply did before: its offsets hold element data, not delimiters, and reading
-    them would refuse a reply whose data at offset 82, 104 or 105 the charset cannot hold. A
-    reply with any other lead declares nothing here.
+    fixed-width ISA that read refuses still declares what its offsets hold; ISA11 counts only
+    from version 00501, as that read counts it. An ISA that is not fixed-width, such as one whose
+    elements are unpadded or one cut short, declares nothing, as every ``ISA``-led reply did
+    before this read: in an unpadded ISA, offsets 82, 104 and 105 can hold element data, and
+    reading them refused a reply whose data there the charset cannot hold. That leaves a residual:
+    +3 holds the element separator in any ISA, so an unpadded or short ISA whose separator is
+    ``?`` has ``?`` written into its data, as before. A reply with any other lead declares
+    nothing here.
 
     Leading whitespace and a BOM are skipped first, as the engine's one definition of tolerated
     leading noise (``sniff._LEADING_WS_STR``) skips them. A header line of ``MSH`` alone has no
@@ -359,6 +365,8 @@ def _reply_delimiters(reply: str) -> frozenset[str]:
         if not _isa_is_fixed_width(body):
             return frozenset()
         isa = {body[i] for i in _ISA_DELIMITER_OFFSETS}
+        if body[_VERSION_START:_VERSION_END] >= _REPETITION_MIN_VERSION:
+            isa.add(body[_REPETITION_SEP_OFFSET])  # before 00501, ISA11 is data, not a delimiter
         if body[_SEGMENT_TERM_OFFSET : _SEGMENT_TERM_OFFSET + 2] == "\r\n":
             isa.add("\n")  # a CR+LF terminator is two characters, and `?` for either breaks it
         return frozenset(isa)
@@ -375,15 +383,10 @@ def _reply_delimiters(reply: str) -> frozenset[str]:
     return frozenset(found)
 
 
-#: The ISA's delimiter offsets, read from ``parsing.x12.delimiters``: the element separator (+3),
-#: ISA11 (the repetition separator from 00501), ISA16 (the component separator) and the segment
-#: terminator.
-_ISA_DELIMITER_OFFSETS = (
-    ELEMENT_SEP_OFFSETS[0],
-    _REPETITION_SEP_OFFSET,
-    _COMPONENT_SEP_OFFSET,
-    _SEGMENT_TERM_OFFSET,
-)
+#: The ISA's delimiter offsets read in every version, from ``parsing.x12.delimiters``: the element
+#: separator (+3), ISA16 (the component separator) and the segment terminator. ISA11, the
+#: repetition separator, is read only from 00501, as ``discover_delimiters`` reads it.
+_ISA_DELIMITER_OFFSETS = (ELEMENT_SEP_OFFSETS[0], _COMPONENT_SEP_OFFSET, _SEGMENT_TERM_OFFSET)
 
 
 def _isa_is_fixed_width(body: str) -> bool:

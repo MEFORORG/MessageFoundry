@@ -895,12 +895,11 @@ def test_a_value_over_the_window_ends_with_its_bound_note_and_hides_the_name(cap
     clamped = clamp_untrusted(value)
     scrubbed = audit_tee._scrub_field(value)
     assert scrubbed.endswith(clamped[clamped.rfind("\n") :]) and "DOE" not in scrubbed
-    # A detail's note is the one safe_text_bound gives the value, and its counts are that bound's
-    # own. The tee builds safe_text(head) + note, not safe_text(value), which since BACKLOG #5925
-    # reads the head knowing a note follows it; the two agree here only by this value's shape.
-    head, note = safe_text_bound(value)
-    old = safe_text(head) + note
-    assert note and audit_tee._bounded_detail(head, note, old) == old
+    # A detail's note is the one safe_text gives the value, so its counts are safe_text's own. The
+    # tee builds safe_text(head) + note, not safe_text(value), which since BACKLOG #5925 reads the
+    # head knowing a note follows it, so only the note is compared.
+    _head, note = safe_text_bound(value)
+    assert note and safe_text(value).endswith(note)
     (line,) = _tee_lines([{"detail": value}], capsys)
     detail = _shipped_detail(line)
     assert detail.endswith(note) and "DOE" not in detail
