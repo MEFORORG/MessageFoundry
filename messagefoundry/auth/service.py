@@ -8637,6 +8637,11 @@ class AuthService:
             # required no pair, so it could sign in an account bound to another identity. No
             # production caller did.
             raise ValueError("a federated login (mech='oidc') needs the verified federated_subject")
+        if federated_subject is not None and mech != "oidc":
+            # BACKLOG #4977, the other direction. A pair with ``mech`` None (or any other value)
+            # minted an OIDC session whose success row, which names ``mech`` only when it is set,
+            # did not say ``"mech": "oidc"``. The pair and the mechanism name travel together.
+            raise ValueError("a federated login (one carrying federated_subject) needs mech='oidc'")
         federated = federated_subject is not None
         if federated != (session_mechanism is SessionMechanism.OIDC):
             # A programming error, not a login outcome: a verified federated pair minted under any
