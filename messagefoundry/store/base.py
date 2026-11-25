@@ -5559,7 +5559,9 @@ class StoreAcquireTimeout(RuntimeError):
     cluster coordinator's clamped borrow whose clamp, floored at 1 s, is no longer than
     ``[store].acquire_timeout`` advises one fixed text that points to the docs/CONFIGURATION.md
     [cluster] paragraph instead
-    (``SqlServerStore._acquire_clamped``, BACKLOG #5064).
+    (``SqlServerStore._acquire_clamped``, BACKLOG #5064). The SQL Server lease claim also raises it,
+    with no limit exceeded, when its borrow returned with under 1 s of the claim's shared deadline
+    left, so its statement was not issued (``SqlServerStore._statement_timeout_left``).
 
     An ordinary ``Exception`` on purpose, so it lands in the store callers' existing ``except
     Exception`` handling and is treated as a transient stage failure (retry / dead-letter) — never a

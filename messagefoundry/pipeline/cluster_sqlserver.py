@@ -155,7 +155,8 @@ class SqlServerCoordinator:
         # runs under _leadership_lock, or runs in the loop's side pass, which a statement at
         # [store].command_timeout would hold for that long. SqlServerStore._fetchone_clamped says
         # how it is applied, why one costs up to about twice the clamp, three times when its
-        # rollback runs, and why the COMMIT is outside it. Since BACKLOG #5710 the heartbeat and
+        # rollback runs, why the claim alone shares one deadline instead, and why the COMMIT is
+        # outside it. Since BACKLOG #5710 the heartbeat and
         # the refresh no longer delay the renew (run_maintenance_loop), so the gap between two
         # renews is the heartbeat interval or the renew's own cost, whichever is longer; nothing
         # checks that cost against the fence. The paused tick's owner read takes the smaller of
@@ -524,9 +525,10 @@ class SqlServerCoordinator:
             # conservative direction. In lockstep with DbCoordinator._maintain_leadership, whose
             # docstring carries the full argument.
             #
-            # The claim's borrow and statement are each bounded by _renew_timeout rather than
-            # [store].acquire_timeout and [store].command_timeout (both 30 s, the stock lease TTL
-            # itself); SqlServerStore._fetchone_clamped says what that leaves unbounded. A stepdown
+            # The claim's borrow and statement share one deadline of _renew_timeout rather than
+            # waiting out [store].acquire_timeout and [store].command_timeout (both 30 s, the stock
+            # lease TTL itself, BACKLOG #5064); SqlServerStore._fetchone_clamped says what that
+            # leaves unbounded. A stepdown
             # waits on this lock for the fence timeout (acquire_leadership_lock).
             issued_at = self._monotonic()
             prior_epoch = self._leader_epoch
@@ -642,7 +644,9 @@ class SqlServerCoordinator:
                 self._no_claim_until = 0.0
                 self._last_renew_ok = None  # BACKLOG #5711; DbCoordinator's lift says why
             return False
-        # ADR 0157 Inc 0: the statement runs under the renew clamp, not [store].command_timeout.
+        # ADR 0157 Inc 0: the statement runs under the renew clamp, not [store].command_timeout,
+        # and its borrow and statement share the clamp's deadline (BACKLOG #5064): only the claim
+        # re-extends the lease, so only it must not land past the clamp.
         row = await self._store._fetchone_clamped(
             "SET NOCOUNT ON;"
             f" DECLARE @now FLOAT = {_DB_NOW};"
@@ -668,6 +672,7 @@ class SqlServerCoordinator:
                 self._lease_ttl,  # INSERT lease_expires_at
             ),
             timeout_clamp=self._renew_timeout,
+            share_deadline=True,
         )
         if row is None or row["owner"] != self.node_id:
             # The DB saw another owner's live lease; see DbCoordinator._claim_or_renew_lease (#1508).

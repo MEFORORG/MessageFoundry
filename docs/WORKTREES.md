@@ -541,7 +541,10 @@ description blames.
 
 **Liveness may only ever VETO, never PERMIT.** There is no heartbeat anywhere on this host, so nothing
 can *prove* a session is gone — a `DEAD`/`STALE`/absent verdict is the absence of a veto, not a
-permission. And **if the fence cannot look at all, nothing is pruned**: an empty roster and an
+permission. A `DEAD` or `STALE` record inside a candidate still keeps that candidate, for another
+reason: removing the tree would leave a record the fence cannot place, and every later run would
+refuse. The script leaves both the record and the tree, and `-Name` does not lift this.
+And **if the fence cannot look at all, nothing is pruned**: an empty roster and an
 unreadable one produce the same empty answer, so availability is asserted explicitly — at least one
 config root with a registry, at least one readable record, **and no record that cannot be placed**.
 That last one matters more than it sounds. Three shapes qualify — a file that will not parse, a
@@ -609,11 +612,15 @@ it is no longer in `git worktree list`, so it drops out of the candidate set and
 print a green all-clear over a directory this script had broken. Orphans are now recorded in
 `<git-common-dir>/prune-merged-orphans.json` and re-reported with the recipe on every later run until
 the directory is gone or re-registered — as is any unregistered `<repo>-*` directory whose `.git`
-pointer still names this repo.
+pointer still names this repo. An entry whose directory is gone stays in the ledger while a
+coordination claim still names that tree: the run names the claim's key, file and host, releases
+none, and points at `claim.ps1 -List` to see whether the claim can be released.
 
 Exit codes, **highest severity wins**: `0` nothing wrong; `1` something was attempted and failed
-without destroying anything; `2` **refused** — something you asked for was not attempted, because
-safety could not be established; `3` **orphaned** — a directory is broken on disk right now. `3`
+without destroying anything, or git exited `0` on a tree it still lists whose end state could not be
+read; `2` **refused** — something you asked for was not attempted, because safety could not be
+established; `3` **orphaned** — a directory is broken on disk right now, or git exited non-zero on a
+tree it still lists whose end state could not be read. `3`
 outranks `2` because damage on disk outranks a refusal to act. In the JSON receipt `counts.orphaned`
 is a *subset* of `counts.failed` (`failedNonOrphan` is spelled out alongside it); `removed + failed +
 skipped` covers every candidate exactly once.
