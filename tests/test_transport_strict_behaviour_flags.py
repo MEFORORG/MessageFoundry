@@ -2,7 +2,10 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The transports read their default-off behaviour flags strictly (vault BACKLOG #3234): at least
 ``no_ack``, ``persistent``, ``capture_response``, ``verify_ack_control_id``, ``dynamic_headers``
-and ``overwrite``, on the destinations that carry them.
+and ``overwrite``, on the destinations this file builds. At least these default-off reads are
+still ``bool()``: DICOMweb and DATABASE ``capture_response``, TCP and X12 ``expect_reply``, X12
+``ta1_required``, SOAP ``ws_addressing`` and ``ws_security``, FILE and REMOTEFILE
+``validate_directory``, and FILE source ``recursive``.
 
 The load and the runner's builds refuse a non-bool literal on a boolean setting. A connector
 constructed directly from a ``Destination``, as tests and embedders do, passes neither, and reached

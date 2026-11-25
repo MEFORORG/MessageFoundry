@@ -2725,7 +2725,7 @@ def test_a_version_1_cert_another_party_issued_is_refused_as_an_anchor(
 @pytest.mark.parametrize(
     "mint",
     [
-        pytest.param({"addresses": ("other@hisp.example",)}, id="another-mailbox"),
+        pytest.param({"addresses": ("other@hisp.example",), "dns_names": ()}, id="another-mailbox"),
         pytest.param({"addresses": (), "dns_names": ("elsewhere.example",)}, id="another-domain"),
         pytest.param({"addresses": (), "dns_names": ()}, id="no-subject-alt-name"),
         pytest.param(

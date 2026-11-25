@@ -3452,8 +3452,15 @@ def _inside_watch_tree_by_identity(dest_dir: Path, directory: Path) -> bool:
         try:
             if os.path.samestat(os.stat(candidate), watch):
                 return True
-        except (OSError, ValueError):
-            continue  # not created yet, or unreadable: its parent is compared next
+        except FileNotFoundError:
+            continue  # not created yet: its parent is compared next
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "file source %s: an archive directory path could not be read for the identity "
+                "check, so its parent is compared instead: %s",
+                directory,
+                _describe_os_error(exc) if isinstance(exc, OSError) else type(exc).__name__,
+            )
     return False
 
 

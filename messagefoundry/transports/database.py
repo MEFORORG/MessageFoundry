@@ -4419,7 +4419,7 @@ async def _connect(get_pool: Callable[[], Any], timeout: float) -> tuple[Any, An
             code="db",
             permanent=True,
             config_fault=True,
-            remedy="install the aioodbc release pyproject.toml pins",
+            remedy="the installed aioodbc package (the release pyproject.toml pins, then a restart)",
         ) from exc
     except Exception as exc:
         state = _log_sqlstate(exc)  # never a codec name read as a SQLSTATE

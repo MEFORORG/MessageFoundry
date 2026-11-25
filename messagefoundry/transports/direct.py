@@ -26,7 +26,8 @@ decrypt/verify), **MDN** disposition notifications, **DNS CERT / LDAP** certific
 
 **Fail-loud at construction** (the ``RestDestination``/``EmailDestination`` pattern): a missing
 host/sender/recipient, an unreadable/malformed signing key, cert, recipient cert, or trust anchor, a
-signing key that does not match its cert, a recipient cert whose key is not RSA, key material of a
+signing key that does not match its cert, a signing cert that does not name the sender address
+(BACKLOG #5631), a recipient cert whose key is not RSA, key material of a
 type or strength off the floor (``_require_key_strength``), a recipient cert the trust check refuses
 (docs/CONNECTIONS.md, *Recipient trust*, lists what it checks), a trial S/MIME build that fails, or a
 cleartext-credential misconfiguration **raises here**, so it fails at ``check``/dry-run/start.
