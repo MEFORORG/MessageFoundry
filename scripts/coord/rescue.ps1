@@ -32,13 +32,15 @@
     SO NO CLEANUP, PRUNE OR REAPER MAY DELETE A RESCUE REF in any namespace this script audits,
     which includes at least `refs/rescue/`, `refs/tags/rescue/`, `refs/remotes/<r>/rescuetags/` and
     `refs/remotes/<r>/rescue/` (`Get-RescueNamespaces` is the list). A `git fetch --prune` deletes a
-    remote-tracking one whose server copy is gone, which is when it may be the last copy, and so
-    does `git remote prune <r>`. A fetch with pruning on (at least `--prune`, `fetch.prune` or
-    `remote.<r>.prune`) also deletes local refs the remote lacks, in at least two cases. With
-    `--prune-tags`, `fetch.pruneTags` or `remote.<r>.pruneTags`, or a refspec mapping tags locally,
-    it deletes local tags, which includes every `-Anchor` tag never pushed. With a refspec mapping
-    `refs/rescue/` locally, it deletes local `refs/rescue/` refs; `git remote prune <r>` follows
-    that refspec too. Measured 2026-09-20: this checkout held 328 refs under
+    remote-tracking one whose server copy is gone, which is when it may be the last copy, and so do
+    at least git remote prune <r>, git remote update --prune and git pull --prune. A fetch with
+    pruning on (at least `--prune`, `fetch.prune` or `remote.<r>.prune`) also deletes local refs the
+    remote lacks, in at least two cases. With `--prune-tags`, `fetch.pruneTags` or
+    `remote.<r>.pruneTags`, or a refspec mapping tags locally, it deletes local tags, which includes
+    every `-Anchor` tag never pushed. With a refspec mapping `refs/rescue/` locally, it deletes
+    local `refs/rescue/` refs. git remote prune <r> follows every configured remote.<r>.fetch
+    refspec, so it deletes local tags under a tag-mapping refspec and local refs/rescue/ refs under
+    a refs/rescue/ one. Measured 2026-09-20: this checkout held 328 refs under
     `refs/rescue/` alone, not a total across the namespaces above, at least one being the sole
     remaining copy of files deleted from the working tree. Some are named `POISONED-DO-NOT-RESTORE-*` and are deliberate records of what must
     not be brought back, not junk to sweep up.
