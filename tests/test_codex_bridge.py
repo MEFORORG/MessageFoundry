@@ -618,12 +618,13 @@ def test_a_failed_hook_still_runs_the_later_hooks_then_raises(bridge, tmp_path, 
     assert ran.exists()
 
 
-def test_a_hooks_exit_2_still_runs_the_later_hooks_then_blocks(bridge, tmp_path):
+def test_a_hooks_exit_2_still_ends_the_event_at_once(bridge, tmp_path):
+    """As on main: nothing a later hook does outranks a block, so none runs to delay it."""
     ran = tmp_path / "later-hook-ran"
     settings(tmp_path, [_py("import sys; sys.exit(2)"), _marker(ran)])
     with pytest.raises(bridge.HookBlocked):
         bridge.dispatch(tmp_path, _PAYLOAD)
-    assert ran.exists()
+    assert not ran.exists()
 
 
 @pytest.mark.parametrize("order", ["fault-first", "deny-first"])
@@ -653,6 +654,22 @@ def test_a_later_error_does_not_lose_a_recorded_block(bridge, tmp_path, later):
     settings(tmp_path, [_py("import sys; sys.exit(2)"), *later])
     with pytest.raises(bridge.HookBlocked):
         bridge.dispatch(tmp_path, _PAYLOAD)
+
+
+@pytest.mark.parametrize(
+    "later",
+    [
+        [{"type": "command", "command": sys.executable, "async": True}],
+        [handler(json.dumps({"systemMessage": 5}))],
+        [_EXIT_1, handler(json.dumps({"hookSpecificOutput": "x"}))],
+    ],
+    ids=["async-transport", "malformed-output", "fault-then-malformed-output"],
+)
+def test_a_later_error_does_not_lose_a_merged_deny(bridge, tmp_path, later):
+    settings(tmp_path, [_deny_hook(), *later])
+    result = bridge.dispatch(tmp_path, _PAYLOAD)
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "a hook failed" in result["systemMessage"]
 
 
 def test_a_later_groups_bad_matcher_does_not_lose_a_recorded_block(bridge, tmp_path):

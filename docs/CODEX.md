@@ -46,10 +46,12 @@ any event, unreadable settings, a bad payload or a missing `.venv`. A hook that
 exits non-zero, times out or prints JSON that is not an object does not stop
 the event's later hooks: they still run while the event's shared budget lasts,
 and once it is spent each later hook is recorded as timed out without running.
-The first such failure is raised once every hook has been tried. If any hook of
-the event exited 2, the event is blocked as for a lone exit 2. If another hook
-returned a deny, an ask or a block, the bridge prints the event's output with
-that decision and a `systemMessage` naming the failure, and exits 0. How Codex handles
+The first such failure is raised once every hook has been tried. A hook's exit
+2 still ends the event at once, as a block, and no later hook runs. If another
+hook returned a deny, an ask or a block, the bridge prints the event's output
+with that decision and a `systemMessage` naming the failure, and exits 0; that
+holds too when a fault outside a hook's own run, such as malformed output or an
+unsupported hook, ends the event's hooks early. How Codex handles
 that 1 is not measured here. The assumed behaviour is that Codex treats an exit
 other than 0 or 2 as a non-blocking error, so the event is not blocked: a
 PreToolUse fault lets the tool run, a PostToolUse fault loses the event's
