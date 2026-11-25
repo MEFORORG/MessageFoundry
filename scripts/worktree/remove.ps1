@@ -29,8 +29,8 @@
       * a target under a .claude/worktrees path segment. That is where the Claude Code harness puts
         its worktrees, and a subagent started with `isolation: worktree` is recorded under its
         PARENT's directory, so the occupancy check below would read its tree as empty (BACKLOG
-        #1038, Manager decision batch 184). A sibling new.ps1 made beside a linked worktree also
-        sits there; the copy of this script in that worktree still removes it by -Name. A segment
+        #1038, Manager decision batch 184). A sibling an older new.ps1 made beside a linked worktree
+        also sits there; -RepoRoot <that worktree> -Name still removes it (BACKLOG #1894). A segment
         ABOVE the primary checkout does not count, so a clone that lives below one is reachable;
       * a target that CONTAINS another registered worktree, since the removal would delete that
         checkout too and leave it registered with no directory;
@@ -163,12 +163,12 @@
     refuse a claimed tree, so after a removal no claim should name it. One taken in the moment between the check and the removal is reported, never deleted:
     claim.ps1 -Release -Force is the release that leaves a record.
 
-    WHICH COPY YOU RUN DECIDES WHAT -Name SEARCHES. -Name anchors on $PSScriptRoot (or -RepoRoot), not
-    on your cwd, so run the copy living in the checkout the worktree was created FROM -- which is
-    not necessarily the primary, since new.ps1 anchors the same way and creates its worktree beside
-    itself. By absolute path it works from any cwd outside the worktree being removed. new.ps1 prints
-    the exact command with the root already filled in (BACKLOG #1078). -Path and -List read the
-    clone's whole worktree list, so every copy gives the same answer. See docs/WORKTREES.md.
+    EVERY COPY SEARCHES THE SAME PLACE (BACKLOG #1894). -Name reaches <parent>\<leaf>-<Name> of the
+    clone's PRIMARY checkout, the first entry of `git worktree list`, whichever copy runs and from
+    whatever cwd outside the worktree being removed. new.ps1 creates its sibling there from every
+    copy too. Until #1894 both anchored on the copy's own checkout, so a copy in a linked worktree
+    made and searched `<that worktree>-<Name>`; -RepoRoot <that worktree> still reaches a tree made
+    that way. -Path and -List read the clone's whole worktree list. See docs/WORKTREES.md.
 
     -Name is the DIRECTORY component only. -DeleteBranch deletes whichever branch that worktree
     actually has checked out, read from git -- not a branch named after the directory. Since new.ps1
@@ -238,9 +238,9 @@ param(
     [Parameter(ParameterSetName = 'ByPath')]
     [switch]$AllowOrphanedAllocations,
 
-    # Repo to operate on. Defaults to this script's own checkout -- which is what makes an absolute-
-    # path invocation from ANY cwd resolve the checkout that owns the worktree. Tests point it at a
-    # fixture so the real logic is what gets exercised.
+    # Repo to operate on, used as given. Defaults to the PRIMARY checkout of the clone this copy
+    # belongs to (BACKLOG #1894), so an absolute-path invocation from any cwd and any copy resolves
+    # the same checkout. Tests point it at a fixture so the real logic is what gets exercised.
     [Parameter(Position = 1)]
     [string]$RepoRoot
 )
@@ -271,12 +271,13 @@ if ($gitRedirects) {
         "the one named. Unset it and re-run. Nothing was removed.")
 }
 
+# The checkout this copy lives in. Without -RepoRoot it is only where to ASK: it is replaced by the
+# clone's primary below, once the config-carrier refusal has run, because that one comes before any
+# git call.
+$anchorOnPrimary = -not $RepoRoot
 if (-not $RepoRoot) { $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path }
 elseif (-not (Test-Path -LiteralPath $RepoRoot)) { throw "RepoRoot does not exist: $RepoRoot" }
 else { $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path }
-
-$Parent = Split-Path $RepoRoot -Parent
-$RepoName = Split-Path $RepoRoot -Leaf
 
 # Refs that do not keep a commit alive for long, so they never count as holding one. refs/stash moves
 # with any session's next stash; the others are cleared by prefetch, bisect reset, a finished rebase
@@ -367,6 +368,24 @@ if ($gitCarriers.Count -gt 0) {
     throw ("$($gitCarriers -join ', ') is set, so git would read config the operator did not set up " +
         "for this clone. Unset it and re-run. Nothing was removed.")
 }
+
+# ANCHOR ON THE PRIMARY, NOT ON THIS COPY (BACKLOG #1894). $PSScriptRoot\..\.. is the checkout the
+# copy sits in, so a copy in a linked worktree used to search `<that worktree>-<Name>`: what -Name
+# reached depended on which copy ran. The first entry of `git worktree list` is the same from every
+# worktree of one clone. This narrows -Name: no copy reaches a sibling of a LINKED worktree any more,
+# only siblings of the primary, which the primary's own copy reached already. An explicit -RepoRoot
+# is kept as given, and is the route to a tree an older new.ps1 made beside a linked worktree.
+# FAIL CLOSED: an unreadable list must not fall back to this copy's own checkout.
+if ($anchorOnPrimary) {
+    $anchorList = @(Get-RepoWorktrees $RepoRoot)
+    if ($anchorList.Count -eq 0) {
+        throw "Could not list the registered worktrees of '$RepoRoot', so the primary checkout is unknown. Nothing was removed."
+    }
+    $RepoRoot = [System.IO.Path]::GetFullPath($anchorList[0].Path).TrimEnd('\', '/')
+}
+$Parent = Split-Path $RepoRoot -Parent
+$RepoName = Split-Path $RepoRoot -Leaf
+
 if ($byPath -or $listing) {
     # Every registered worktree, primary first. FAIL CLOSED: an unreadable list is the same empty
     # answer as a clone with none, and must never read as permission.
@@ -379,9 +398,9 @@ if ($byPath -or $listing) {
 }
 
 if ($listing) {
-    # The class is where a worktree sits; the route is what reaches it. A sibling is a sibling of THE
-    # CHECKOUT THIS COPY LIVES IN, because that is the only place this copy's -Name looks.
-    Write-Host "Primary: $PrimaryRoot   this copy: $RepoRoot   linked worktrees: $($linked.Count)"
+    # The class is where a worktree sits; the route is what reaches it. A sibling is a sibling of
+    # $RepoRoot, the primary unless -RepoRoot named another checkout, because that is where -Name looks.
+    Write-Host "Primary: $PrimaryRoot   -Name root: $RepoRoot   linked worktrees: $($linked.Count)"
     $siblingPrefix = (ConvertTo-Norm (Join-Path $Parent $RepoName)) + '-'
     # -Name's own pattern, read off the parameter rather than written out a fifth time.
     $namePattern = ($MyInvocation.MyCommand.Parameters['Name'].Attributes |
@@ -456,8 +475,8 @@ if ($byPath) {
         Write-Host "REFUSED: '$WorktreePath' is under .claude/worktrees, where the Claude Code harness puts its worktrees." -ForegroundColor Red
         Write-Host ("-Path never removes one: a subagent's tree there is recorded under its parent's directory, " +
             "so the occupancy check would read it as empty.") -ForegroundColor Red
-        Write-Host ("If new.ps1 made it as a sibling of a linked worktree, the copy of remove.ps1 in THAT " +
-            "worktree removes it by -Name. Otherwise removing it is the user's decision.") -ForegroundColor Red
+        Write-Host ("If an older new.ps1 made it as a sibling of a linked worktree, remove.ps1 -RepoRoot <THAT " +
+            "worktree> -Name <n> removes it. Otherwise removing it is the user's decision.") -ForegroundColor Red
         throw "Target is under .claude/worktrees. Nothing was removed."
     }
 
@@ -480,7 +499,7 @@ if ($byPath) {
 else {
     $WorktreePath = Join-Path $Parent "$RepoName-$Name"
     if (-not (Test-Path $WorktreePath)) { throw "No such worktree: $WorktreePath" }
-    Assert-NotInsideTarget $WorktreePath "Run the copy in the checkout the worktree was created from ($RepoRoot)."
+    Assert-NotInsideTarget $WorktreePath "Run a copy in another checkout of this clone, such as $RepoRoot."
     # A worktree registered INSIDE the target goes with it, and a harness tree under the target's own
     # .claude/worktrees is one: a session launched in the target puts its subagents there. Refused as
     # on -Path, and for the same reason not overridable.

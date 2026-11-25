@@ -6,8 +6,8 @@ THE DEFECT. ``new.ps1`` anchors on ``$PSScriptRoot``, so run from a linked workt
 new tree beside **itself** -- e.g. under ``.claude/worktrees/`` -- and then printed *"When done (run
 from the MAIN checkout): scripts\\worktree\\remove.ps1 -Name <name>"*. ``remove.ps1`` anchors on its
 own location too, so the main checkout's copy derives ``<main-parent>/<main-leaf>-<name>``, which
-does not exist, and it throws ``No such worktree``. The anchoring is correct (BACKLOG #1060); the
-sentence was wrong.
+does not exist, and it throws ``No such worktree``. The sentence was wrong; since BACKLOG #1894 the
+anchoring changed too: both scripts anchor the sibling on the MAIN worktree, whichever copy runs.
 
 THE INSTRUMENT. A text assertion that the advice "mentions $RepoRoot" would pass on advice that is
 still unrunnable, so the commands are **extracted from the script and executed** against a synthetic
@@ -197,47 +197,44 @@ def test_every_printed_cleanup_command_actually_removes_the_worktree(fx: Fixture
         )
 
 
-def test_the_advice_that_used_to_be_printed_still_throws_today(fx: Fixture) -> None:
-    """The live positive control, in the shape that produced the item.
+def test_a_linked_copy_makes_the_sibling_of_the_main_worktree_and_its_advice_removes_it(
+    fx: Fixture,
+) -> None:
+    """The shape that produced both items, run as printed.
 
-    ``inner`` stands in for a linked worktree new.ps1 was run from; ``inner-feature`` is the tree it
-    would then create beside itself. The retired advice -- the MAIN checkout's own relative
-    ``remove.ps1 -Name feature`` -- is run against that tree and must still fail, and the advice
-    printed today must then clean it up. One test, both directions.
+    ``inner`` is a linked worktree under ``.claude/worktrees``, as a harness session's is. Red before
+    BACKLOG #1894: new.ps1's copy there made ``inner-feature`` beside ITSELF, under
+    ``.claude/worktrees``, where remove.ps1 -Path refuses to reach. It must land at ``repo-feature``
+    beside the primary, and the advice it prints -- naming ``inner``'s own copy of remove.ps1 -- must
+    remove it.
     """
     inner = fx.primary / ".claude" / "worktrees" / "inner"
     _git(fx.primary, "worktree", "add", "-q", "-b", "inner", str(inner))
-    target = fx.worktree(inner.parent / "inner-feature", "feature")
+    for rel in ("scripts/worktree/new.ps1", "scripts/coord/lock.ps1"):
+        dst = inner / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(_REPO / rel, dst)
 
-    retired = _run(
-        [
-            "pwsh",
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            str(fx.primary / "scripts" / "worktree" / "remove.ps1"),
-            "-Name",
-            "feature",
-        ]
+    made = _run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File"]
+        + [str(inner / "scripts" / "worktree" / "new.ps1"), "-Name", "feature", "-NoInstall"]
     )
 
-    assert retired.returncode != 0, (
-        "the retired advice succeeded, so this control proves nothing -- re-derive it before trusting "
-        "the assertions above"
-    )
-    assert "No such worktree" in retired.stderr
-    assert str(fx.primary.parent / "repo-feature") in retired.stderr
-    assert target.exists()
+    assert made.returncode == 0, f"{made.stdout}\n{made.stderr}"
+    target = fx.primary.parent / "repo-feature"
+    assert target.is_dir(), f"new.ps1 did not make the sibling of the primary:\n{made.stdout}"
+    assert not (inner.parent / "inner-feature").exists(), "it made the tree beside the linked copy"
+    advice = _printed_advice(made.stdout)
+    assert any("remove.ps1" in a for a in advice), advice
 
     settle_worktrees(fx.primary)
-    for cmd in _advice_commands():
-        if not target.exists():
-            break
-        proc = _run(_render(cmd, repo_root=inner, worktree=target, name="feature"))
-        assert proc.returncode == 0, f"advice failed: {cmd}\n{proc.stdout}\n{proc.stderr}"
+    cmd = next(a for a in advice if "remove.ps1" in a)
+    proc = _run([t.strip('"') for t in shlex.split(cmd, posix=False)])
 
+    assert proc.returncode == 0, f"advice failed: {cmd}\n{proc.stdout}\n{proc.stderr}"
     assert not target.exists()
     assert str(target).replace("\\", "/") not in _registered(fx.primary)
+    assert inner.is_dir()
 
 
 # --- BACKLOG #1038: a -Nested tree, made by new.ps1 itself, then torn down by its own advice -------

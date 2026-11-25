@@ -3671,16 +3671,16 @@ function Find-FirstAnsweringRoot([string[]]$Cands, [string]$CwdRaw) {
 # comment below link here by this heading rather than restating it.
 #
 # At least two mechanisms make worktrees against one .git here, in two layouts, and both are live:
-#   * scripts/worktree/new.ps1 anchors on its OWN checkout. By default it makes a SIBLING of that
-#     checkout, <its parent>/<its leaf>-<Name>; from the primary that is <repo-parent>/<repo-name>-<Name>.
-#     spawn.ps1 calls it for that sibling form only. With -Nested it makes
-#     <main worktree>/.claude/worktrees/<Name>, whichever checkout's copy runs. Either way it copies the
+#   * scripts/worktree/new.ps1 anchors on the MAIN worktree, whichever checkout's copy runs
+#     (BACKLOG #1894; it used to anchor its sibling on its own checkout). By default it makes a
+#     SIBLING, <repo-parent>/<repo-name>-<Name>. spawn.ps1 calls it for that sibling form only. With
+#     -Nested it makes <main worktree>/.claude/worktrees/<Name>. Either way it copies the
 #     leak-gate token list, builds the .venv and holds the add lock. remove.ps1 has two removal
-#     routes (vault BACKLOG #1017). -Name tears down only the sibling of the checkout its copy lives
-#     in. -Path is the checked route: any registered linked worktree that is NOT under
-#     .claude/worktrees. So a tree under .claude/worktrees has NO scripted teardown, with one
-#     overlap: a sibling made beside a linked worktree sits there too, and that worktree's copy
-#     still removes it by -Name (see new.ps1's Show-NextSteps for why the rest are not reached).
+#     routes (vault BACKLOG #1017). -Name tears down only the sibling of the main worktree, or of the
+#     checkout -RepoRoot names. -Path is the checked route: any registered linked worktree that is
+#     NOT under .claude/worktrees. So a tree under .claude/worktrees has NO scripted teardown, except
+#     a sibling an older new.ps1 made beside a linked worktree there, which -RepoRoot <that worktree>
+#     -Name still reaches (see new.ps1's Show-NextSteps for why the rest are not reached).
 #   * The Claude Code harness makes a NESTED one at <main worktree>/.claude/worktrees/<slug> --
 #     `claude --worktree`, and a subagent's `isolation: worktree`. MEASURED 2026-09-30 for the second:
 #     a subagent whose parent session sat in a nested tree still got its own tree under the MAIN

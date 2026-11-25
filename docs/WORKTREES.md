@@ -357,15 +357,15 @@ proof that a tree is free:
 prune also drops other worktrees' registrations whose directories are missing for the moment, with
 their HEAD reflogs. `-Name` ran one until BACKLOG #5648.
 
-### `-Name` removes the sibling this copy made
+### `-Name` removes the sibling of the primary
 
-**Which copy you run decides which checkout `-Name` searches.** `remove.ps1` anchors on its own location,
-not on your cwd, so run the copy that lives in the checkout the worktree was created **from** — which
-is not necessarily the primary, because `new.ps1` anchors the same way and creates its worktree
-beside *itself*. Invoked by absolute path it works from any cwd outside the worktree being removed
-(git can't remove the worktree you're standing in). This page used to say "run from the main
-checkout"; that was false for every worktree created from a linked one, and `new.ps1` now prints the
-exact command with the root already filled in. (BACKLOG #1078.)
+**Every copy searches the same place.** `remove.ps1 -Name <n>` reaches `<repo-parent>\<repo-name>-<n>`,
+where the repo is the clone's **primary** checkout, the first entry of `git worktree list`, whichever
+copy runs and from any cwd outside the worktree being removed (git can't remove the worktree you're
+standing in). `new.ps1` creates its sibling in the same place from every copy. Until BACKLOG #1894 both
+anchored on the copy's own checkout, so a copy in a linked worktree made and searched
+`<that worktree>-<n>`; `-RepoRoot <that worktree> -Name <n>` still reaches a tree made that way.
+`new.ps1` prints the exact command with the root filled in. (BACKLOG #1078.)
 
 ```powershell
 scripts\worktree\remove.ps1 -Name alerts            # refuses on uncommitted tracked changes or untracked files

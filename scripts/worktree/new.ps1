@@ -83,23 +83,28 @@ if ($Branch.StartsWith('-')) { throw "-Branch may not start with '-': '$Branch'"
 & git check-ref-format ("refs/heads/" + $Branch)
 if ($LASTEXITCODE -ne 0) { throw "-Branch is not a valid git branch name: '$Branch'" }
 
-# Repo root is two levels up from scripts\worktree\.
+# Repo root is two levels up from scripts\worktree\. It is where git is ASKED; where the new tree
+# goes is computed from the MAIN worktree below.
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+# BOTH LAYOUTS ANCHOR ON THE MAIN WORKTREE, whichever copy runs (BACKLOG #1894 for the sibling; the
+# nested layout always did). The sibling used to be `<this copy's checkout>-<Name>`, so a copy in a
+# linked worktree made the tree beside ITSELF, often under .claude\worktrees, where remove.ps1 -Path
+# refuses to reach it. remove.ps1 -Name anchors on the main worktree the same way.
+$mainLine = @(& git -C $RepoRoot worktree list --porcelain 2>$null) |
+    Where-Object { $_ -like 'worktree *' } | Select-Object -First 1
+if (-not $mainLine) { throw "cannot find the main worktree of $RepoRoot" }
+$MainRoot = [System.IO.Path]::GetFullPath($mainLine.Substring('worktree '.Length)).TrimEnd('\', '/')
 if ($Nested) {
     # Nested: under the MAIN worktree's .claude\worktrees, which the repository gitignores -- where the
     # harness puts its trees, and never inside a linked checkout, whose removal would take a tree nested
     # in it along (prune-merged.ps1 refuses that shape for the same reason).
     if ($Name -match '\A\.+\z') { throw "-Name may not be only dots under -Nested: '$Name'" }
-    $mainLine = @(& git -C $RepoRoot worktree list --porcelain 2>$null) |
-        Where-Object { $_ -like 'worktree *' } | Select-Object -First 1
-    if (-not $mainLine) { throw "cannot find the main worktree of $RepoRoot" }
-    $MainRoot = [System.IO.Path]::GetFullPath($mainLine.Substring('worktree '.Length))
     $Parent = Join-Path (Join-Path $MainRoot ".claude") "worktrees"
     $WorktreePath = Join-Path $Parent $Name
 }
 else {
-    $Parent = Split-Path $RepoRoot -Parent
-    $RepoName = Split-Path $RepoRoot -Leaf
+    $Parent = Split-Path $MainRoot -Parent
+    $RepoName = Split-Path $MainRoot -Leaf
     $WorktreePath = Join-Path $Parent "$RepoName-$Name"
 }
 
@@ -224,13 +229,10 @@ function Show-NextSteps {
         Write-Host "  code --extensionDevelopmentPath=`"$WorktreePath\ide`" `"$WorktreePath\mefor.code-workspace`""
     }
     Write-Host "  # ... build/commit/push on branch '$Branch'; open a PR as usual."
-    # THE CLEANUP ADVICE NAMES $RepoRoot, NOT "the MAIN checkout" (BACKLOG #1078). This script anchors
-    # on $PSScriptRoot, so run from a linked worktree it creates the new tree beside ITSELF -- and
-    # remove.ps1 anchors on its own location too, so the MAIN checkout's copy would derive
-    # <main-parent>\<main-leaf>-$Name, a path that does not exist, and throw "No such worktree". The
-    # anchoring is correct (#1060); the sentence was not. Both forms below carry the root explicitly,
-    # so they work from any cwd. -Name here is the DIRECTORY, which is what remove.ps1 takes --
-    # correct even when it differs from the branch.
+    # THE CLEANUP ADVICE NAMES $RepoRoot (BACKLOG #1078), the copy that ran. Since BACKLOG #1894 both
+    # this script and remove.ps1 anchor the sibling on the main worktree, so any copy's remove.ps1
+    # reaches it; naming the root keeps the command runnable from any cwd. -Name here is the
+    # DIRECTORY, which is what remove.ps1 takes -- correct even when it differs from the branch.
     #
     # EXTRACTION CONTRACT: a line beginning "  #   " (hash, THREE spaces) is a command meant to be run
     # verbatim; "  # " (hash, one space) is prose. tests/test_worktree_new_cleanup_advice.py extracts
@@ -243,9 +245,9 @@ function Show-NextSteps {
     # deletion tool whose fence fails open is worse than none. So the advice is plain git, and says
     # what git does and does not check.
     # THAT STILL HOLDS AFTER remove.ps1 GAINED -Path (vault BACKLOG #1017). -Path is the checked route
-    # for every OTHER registered worktree, and it refuses this population for the reason above. The
-    # one exception is not a nested tree at all: a SIBLING this script makes beside a linked worktree
-    # also sits under .claude\worktrees, and the plain branch below prints the -Name line for it.
+    # for every OTHER registered worktree, and it refuses this population for the reason above. A
+    # SIBLING never lands there since BACKLOG #1894: it sits beside the main worktree whichever copy
+    # runs, and the plain branch below prints the -Name line for it.
     # The command line is built from parts so the static extractor in
     # tests/test_worktree_new_cleanup_advice.py, which drives a SIBLING fixture, skips it; the nested
     # test there runs it from this script's real output instead.

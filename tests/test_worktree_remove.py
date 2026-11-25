@@ -351,6 +351,40 @@ def test_the_script_location_default_still_anchors_when_no_root_is_passed(fx: Fi
     assert not fx.is_registered(wt)
 
 
+def test_a_copy_in_a_LINKED_worktree_anchors_name_on_the_primary(fx: Fixture) -> None:
+    """Red before the fix (BACKLOG #1894): the default root was ``$PSScriptRoot\\..\\..``, so the
+    copy in linked worktree ``repo-host`` searched ``repo-host-foo`` and threw "No such worktree"
+    while ``repo-foo``, the sibling of the primary, stood there.
+
+    The fix narrows -Name and must not widen it: ``repo-host-foo``, the tree the old anchoring would
+    have reached, survives the run. The explicit ``-RepoRoot`` override still reaches it, unchanged.
+    """
+    host = fx.add("host")
+    target = fx.add("foo")
+    beside_host = host.parent / f"{host.name}-foo"
+    _git(fx.primary, "worktree", "add", "-q", "-b", "host-foo", str(beside_host))
+    copy_real_scripts(host)
+    copied = host / "scripts" / "worktree" / "remove.ps1"
+
+    proc = run(fx, "-Name", "foo", script=copied, repo_root="")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not target.exists()
+    assert not fx.is_registered(target)
+    assert beside_host.exists() and fx.is_registered(beside_host)
+    assert host.exists() and fx.is_registered(host)
+
+    listing = run(fx, "-List", script=copied, repo_root="")
+    assert listing.returncode == 0, listing.stdout + listing.stderr
+    assert f"-Name root: {fx.primary}" in listing.stdout, listing.stdout
+
+    # Control: -RepoRoot is used as given, so naming the linked worktree reaches its own sibling.
+    again = run(fx, "-Name", "foo", script=copied, repo_root=host)
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert not beside_host.exists()
+    assert not fx.is_registered(beside_host)
+
+
 # --- BACKLOG #1038: what the removal must not lose ------------------------------------------------
 #
 # A `remove.ps1 -Nested` route existed for one round and was withdrawn: its occupancy fence could not
