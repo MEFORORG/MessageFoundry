@@ -1133,6 +1133,21 @@ def test_a_constant_expression_whole_field_to_leaf_insert_is_the_action_call(
     assert len(rows) == 1
 
 
+def test_a_constant_expression_leaf_source_inserts_with_set_data() -> None:
+    # Review round-5745f9d775: a leaf source spelled as a constant expression writes as the plain
+    # string does. NEGATIVE CONTROL: on ba226f46ad it wrote msg.set, so decoded separators in
+    # PID-3.1 became structure in PV1-19.
+    out = _lens_insert_copy({"expr": '"PID-3.1"'}, "PV1-19")
+    assert "msg.set_data(" in out
+
+
+def test_an_over_deep_expression_source_is_a_lens_refusal() -> None:
+    # Review round-5745f9d775: the classifier must not let a parser MemoryError escape, so the
+    # caller still gets its LensRewriteError. NEGATIVE CONTROL: on ba226f46ad MemoryError escaped.
+    with pytest.raises(LensRewriteError):
+        _lens_insert_copy({"expr": "-" * 200000 + "1"}, "NK1-2.1")
+
+
 def test_a_copy_edit_that_keeps_a_whole_field_destination_is_not_refused() -> None:
     # The refusal is the whole-field-to-leaf case only: a whole field into a whole field is a copy
     # of the structure as it is.

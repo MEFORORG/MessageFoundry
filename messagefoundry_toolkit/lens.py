@@ -3910,7 +3910,13 @@ def _repick_write(source: str, line_start: int, line_end: int, before: ast.AST) 
     write escaped the value, so it was data, and ``set`` into a whole field would turn its
     separators into structure. Keeping ``set_data`` instead would leave a line the recognizer reads
     as code, so the edit is refused rather than guessed. Whether the value was kept is read from
-    the arguments, not from which parameters the edit named."""
+    the arguments, not from which parameters the edit named.
+
+    A copy edit whose result reads a literal whole field into a literal component or subcomponent,
+    with no other argument on either call, is refused too, whether or not the row had that shape
+    before: either native write escapes the field's escape sequences a second time, and the insert
+    of that copy is the ``copy_field`` call instead (BACKLOG #5821). A copy carrying another
+    argument keeps its native form, as an insert carrying one does."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -3955,7 +3961,8 @@ def _repick_write(source: str, line_start: int, line_end: int, before: ast.AST) 
             # ``copy_field`` does: both escape its escape sequences a second time (BACKLOG #5821).
             raise LensRewriteError(
                 "this edit would copy a whole field into a component or subcomponent, which a "
-                "native msg.set escapes a second time - delete the row and insert a Copy Field "
+                "native msg.set or msg.set_data escapes a second time - delete the row and "
+                "insert a Copy Field "
                 "(it is written as the copy_field call), or edit it as text"
             )
         if not isinstance(src, str) or _is_leaf_literal(getattr(dst, "value", None)):
@@ -6919,7 +6926,7 @@ def _copy_write_method(src: Any) -> str:
     handler-security lint cannot see that one either. An insert of a literal whole-field ``src``
     into a literal component or subcomponent ``dst`` with no other parameter writes no native form
     at all (:func:`_copy_needs_wrapper`)."""
-    return "set_data" if _is_leaf_literal(src) else "set"
+    return "set_data" if _is_leaf_literal(_constant_text(src)) else "set"
 
 
 #: A literal HL7 path to a whole field, the grammar of ``parsing.peek.parse_path`` with no component.
@@ -6942,17 +6949,24 @@ def _copy_needs_wrapper(params: dict[str, Any]) -> bool:
     )
 
 
+def _expr_constant(value: Any) -> ast.Constant | None:
+    """The literal an ``{"expr": ...}`` parameter holds, or None when ``value`` is not one, does
+    not parse, or is not a literal. A parse the parser refuses is None too: the splice or the
+    renderer refuses it with its own message."""
+    if not (isinstance(value, dict) and set(value) == {"expr"} and isinstance(value["expr"], str)):
+        return None
+    try:
+        node = ast.parse(value["expr"].strip(), mode="eval").body
+    except (SyntaxError, *_PARSER_REFUSALS):
+        return None
+    return node if isinstance(node, ast.Constant) else None
+
+
 def _constant_text(value: Any) -> Any:
     """``value``, or the string an ``{"expr": ...}`` holding only a string literal spells, so
     ``{"expr": '"PID-5"'}`` classifies as ``"PID-5"`` does (BACKLOG #5821, PR 3036 finding 3)."""
-    if isinstance(value, dict) and set(value) == {"expr"} and isinstance(value["expr"], str):
-        try:
-            node = ast.parse(value["expr"].strip(), mode="eval").body
-        except SyntaxError:
-            return value
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            return node.value
-    return value
+    node = _expr_constant(value)
+    return node.value if node is not None and isinstance(node.value, str) else value
 
 
 #: The characters that template text carries as structure the author meant: the HL7 component,
@@ -7060,15 +7074,9 @@ def _refuse_non_text_set_params(row: dict[str, Any], params: dict[str, Any]) -> 
             continue
         literal: object = value
         if isinstance(value, dict):
-            expr = value.get("expr") if set(value) == {"expr"} else None
-            if not isinstance(expr, str):
-                continue
-            try:
-                node = ast.parse(expr.strip(), mode="eval").body
-            except (SyntaxError, *_PARSER_REFUSALS):
-                continue  # the splice refuses it with its own message
-            if not isinstance(node, ast.Constant):
-                continue
+            node = _expr_constant(value)
+            if node is None:
+                continue  # the splice refuses any other shape with its own message
             literal = node.value
         if not (literal is None or isinstance(literal, bool | int | float)):
             continue
