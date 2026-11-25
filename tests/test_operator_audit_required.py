@@ -393,7 +393,7 @@ def test_the_ingress_refusal_keys_on_an_operator_origin() -> None:
         with pytest.raises(TypeError, match="returned no row"):
             silent("m")
         # BACKLOG #6589: the operator label names its user, so an inject with no actor is refused.
-        for actor in (None, "", "  "):
+        for actor in (None, "", "  ", " op "):
             with pytest.raises(TypeError, match="needs the origin_actor"):
                 require_ingress_audit(lambda _mid: row, origin, actor)
     for receipt in (MessageOrigin.PARTNER, MessageOrigin.REINGRESS):
@@ -406,7 +406,11 @@ def test_the_ingress_refusal_keys_on_an_operator_origin() -> None:
     with pytest.raises(TypeError, match="was given an audit with origin 'partner'"):
         require_ingress_audit(partner_audit, MessageOrigin.PARTNER, None)
     with pytest.raises(TypeError, match="BACKLOG #5071"):
-        require_ingress_audit("not-a-callable", MessageOrigin.PARTNER, None)  # type: ignore[arg-type]
+        require_ingress_audit(
+            "not-a-callable",  # type: ignore[arg-type]
+            MessageOrigin.PARTNER,
+            None,
+        )
     # So is an actor with any other origin (BACKLOG #6589): only an operator origin names a user.
     with pytest.raises(TypeError, match="was given an origin_actor with origin 'partner'"):
         require_ingress_audit(None, MessageOrigin.PARTNER, "op")
@@ -468,7 +472,8 @@ def test_every_origin_is_classified() -> None:
     assert set(MessageOrigin) == OPERATOR_ORIGINS | not_operator
 
 
-#: The alert mutations and the connection flag, which take one ``AuditAppend`` (vault BACKLOG #3217).
+#: The alert mutations and the connection flag, which take one ``AuditAppend`` (vault BACKLOG
+#: #3217).
 _ALERT_MUTATIONS = (
     "set_connection_flag",
     "ack_alert_instance",
@@ -500,7 +505,7 @@ _ENTRY_GUARDS: dict[str, Guard] = {
         require_ingress_audit,
         {"audit": "audit", "origin": "origin", "origin_actor": "origin_actor"},
     ),
-    **{m: Guard("record", if_applied, {"audit": "audit"}) for m in _ALERT_MUTATIONS},
+    **{m: Guard("audit_row", if_applied, {"audit": "audit"}) for m in _ALERT_MUTATIONS},
 }
 
 
@@ -614,7 +619,7 @@ def test_control_a_missing_or_discarded_guard_fails_the_check() -> None:
         {
             "at the append": "now = time.time() if now is None else now",
             "dropped": "if_applied(audit)",
-            "real": "record = if_applied(audit)",
+            "real": "audit_row = if_applied(audit)",
         },
         _ENTRY_GUARDS["ack_alert_instance"],
     )

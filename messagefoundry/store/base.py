@@ -470,12 +470,9 @@ class QueueStore(StoreLifecycle, Protocol):
         ``audit`` is for an operator's inject only (BACKLOG #2624): its row, built from the new
         message id, commits in the same transaction. A live receipt passes none. It stays optional
         in the type because this one method is both paths, so nothing at the type level holds a
-        direct caller here. The runtime refusal is ``store.require_ingress_audit`` (BACKLOG #5071,
-        #6589), which names the cases and states its limit: it keys on ``origin``, and an operator
-        origin is one in ``store.OPERATOR_ORIGINS``. In short: an operator origin with no audit or
-        no ``origin_actor``, and an audit or ``origin_actor`` given with any other origin, raise
-        :class:`TypeError` before anything is written; an operator inject whose audit builds no row
-        raises inside the transaction, which rolls the inject back. The engine's inject,
+        direct caller here. The runtime refusals of ``audit``, ``origin`` and ``origin_actor`` are
+        stated once, on ``store.require_ingress_audit`` (BACKLOG #5071, #6589), with the limit that
+        it keys on ``origin``. The engine's inject,
         :meth:`~messagefoundry.pipeline.Engine.inject_message`, requires its audit.
 
         ``origin`` and ``origin_actor`` fill the plain ``messages.origin`` pair (vault BACKLOG #2615).
