@@ -604,7 +604,8 @@ function logResult(label: string, res: { stdout: string; stderr: string }): void
 // index after a Cancel, one stray `git commit` away from history (BACKLOG #5413). The pre-flight
 // check reads the files on disk, not the index, so it needs nothing staged. The `.` pathspec keeps a
 // workspace that is a subfolder of a larger repository from staging its parent's changes. Staged
-// files setup's own gitignore entries match are then taken back out ({@link unstageIgnored}).
+// files that setup's own gitignore entries match, and that the repository's own ignore rules still
+// ignore, are then taken back out ({@link unstageIgnored}).
 async function stageBaseline(bin: string, ws: string): Promise<boolean> {
   const res = await git(bin, ["add", "-A", "--", "."], ws);
   if (res.code !== 0) {
@@ -645,8 +646,9 @@ function unstageBatches(paths: readonly string[]): string[][] {
 const LITERAL_ENTRIES = new Set(GITIGNORE_ENTRIES.filter((e) => !/[*?[\]/]/.test(e)));
 
 /** The Checks-channel summary of the paths left out: a count per top-level folder, and a top-level
- *  file by name only when its name is one of setup's exact entries (such as the minted key), so no
- *  name that could hold message content is printed. */
+ *  file by name only when its name is one of setup's exact entries (such as the minted key). No
+ *  name below a top-level folder is printed. Open limit: a top-level folder's own name is printed
+ *  when it is printable ASCII, and a folder named from message data would show. */
 function unstagedSummary(paths: readonly string[]): string[] {
   const counts = new Map<string, number>();
   let otherFiles = 0;
