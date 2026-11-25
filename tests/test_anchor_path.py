@@ -1543,6 +1543,8 @@ def test_s12_15_the_reader_still_reads_a_well_formed_allow_entry(tmp_path: Path)
 @pytest.mark.parametrize(
     ("entry", "expected"),
     [
+        # Less than a header.
+        (bytes([0x00, 0]), "too short to hold its header"),
         # An undefined type, header only: no rights recorded, and nothing past the header read.
         (bytes([0x20, 0, 4, 0]), (0x20, 0, 0)),
         # A deny entry grants nothing, so its mask is not recorded.

@@ -1076,6 +1076,8 @@ def dacl_entry_fields(entry: bytes) -> tuple[int, int, int] | str:
     whole SID, which starts at offset 8 and is 8 bytes plus 4 per sub-authority; the SID's second
     byte, at offset 9, counts them. The caller renders that SID once this answers. Kept free of
     ctypes so every platform tests it."""
+    if len(entry) < 4:
+        return "too short to hold its header"
     ace_type, flags = entry[0], entry[1]
     if ace_type not in _GRANTING_ACE_TYPES:
         return ace_type, flags, 0
@@ -1184,9 +1186,12 @@ def windows_host_readers() -> WinHost:
             aces: list[tuple[int, int, int, str]] = []
             for index in range(count):
                 ace_ptr = ctypes.c_void_p()
-                if not advapi32.GetAce(dacl_ptr.value, index, ctypes.byref(ace_ptr)):
+                if (
+                    not advapi32.GetAce(dacl_ptr.value, index, ctypes.byref(ace_ptr))
+                    or not ace_ptr.value
+                ):
                     return WinSecurity(owner, (), f"entry {index} of its DACL could not be read")
-                base = ace_ptr.value or 0
+                base = ace_ptr.value
                 # The header's AceSize, at offset 2, bounds the copy, so nothing past the entry is
                 # read. The header itself is always there: GetAce pointed at it.
                 ace_size = ctypes.cast(base + 2, ctypes.POINTER(wintypes.WORD))[0]

@@ -5,8 +5,8 @@
 
 :func:`~messagefoundry.auth.anchor_path.windows_host_readers` and ``_win32_config_source_probes``
 in ``config/wiring.py`` take them from here. They open an object differently and report a failed
-read differently, so each keeps its own reader, and each keeps its own read of the local
-Administrators group. What they share is here: the prototypes of the SID, entry, account and token
+read differently, so each keeps its own reader. Each also keeps its own read of the local
+Administrators group, because the two answer a partial read differently. What they share is here: the prototypes of the SID, entry, account and token
 calls, the text of a binary SID, and the SID of the account this process runs as. Other readers
 still declare their own, at least ``restricted_file.py``'s.
 

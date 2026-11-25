@@ -11519,9 +11519,11 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
                 if not advapi32.GetAce(dacl_ptr, i, ctypes.byref(ace_ptr)):
                     return _WinPathSecurity(owner_sid=owner_sid, aces=None)
                 header = ctypes.cast(ace_ptr, ctypes.POINTER(_ACE_HEADER)).contents
-                # Every ACE type carries its access mask right after the 4-byte header, so the mask
-                # is read for all of them: the policy refuses a callback or object entry granting a
-                # write-class right, and recording it as 0 would hide that (BACKLOG #5622).
+                # Every ACE type Windows defines carries its access mask right after the 4-byte
+                # header, so the mask is read for all of them: the policy refuses a callback or
+                # object entry granting a write-class right, and recording it as 0 would hide that
+                # (BACKLOG #5622). An entry of an undefined type may be its header alone, and this
+                # read does not check AceSize first, unlike anchor_path's (BACKLOG #6281).
                 allowed = ctypes.cast(ace_ptr, ctypes.POINTER(_ACCESS_ALLOWED_ACE)).contents
                 trustee = ""  # parsed for type 0x00 only
                 if header.AceType == _WIN_ACCESS_ALLOWED_ACE_TYPE:
