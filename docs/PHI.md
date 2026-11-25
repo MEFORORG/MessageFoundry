@@ -3028,6 +3028,7 @@ and fills the rest of the value at the same width. BACKLOG #2248 added it.
 | `PV1-6`, `PV1-11`, `PV1-42`, `PV1-43` | Prior, temporary, pending and prior temporary patient locations (BACKLOG #5533) | `freetext`, the whole field becomes `[REDACTED]` |
 | `PID-23` | Birth place (BACKLOG #5533) | `freetext`, the whole field becomes `[REDACTED]` |
 | `GT1-24` | Guarantor's death date and time (BACKLOG #5533) | `date` |
+| `PID-33`, `NK1-8`, `NK1-9`, `GT1-13`, `GT1-14`, `GT1-31`, `GT1-32`, `PV1-25`, `PV1-30`, `PV1-35` | Last update time; contact start and end; guarantor begin and end, hire and employment stop; contract effective, bad debt transfer and account delete dates (BACKLOG #5533) | `date` |
 | `GT1-56`, `NK1-38` | Birth places of the guarantor and the next of kin (BACKLOG #5533) | `freetext`, the whole field becomes `[REDACTED]` |
 | `PV1-37` | Discharged-to location and its effective date (BACKLOG #5533) | `freetext`, the whole field becomes `[REDACTED]`, its location code too |
 

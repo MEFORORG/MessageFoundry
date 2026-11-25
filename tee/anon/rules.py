@@ -47,9 +47,9 @@ _FIELD_PATH_RE = re.compile(r"[A-Z][A-Z0-9]{2}-[1-9][0-9]{0,2}")
 class SurrogateKind(StrEnum):
     """The kind of surrogate a field gets. ``KEEP``/``DROP`` are overlay actions, not surrogates."""
 
-    NAME = "name"  # XPN person name (PID-5/6/9, NK1-2/30, GT1-3, IN1-16, MRG-7)
+    NAME = "name"  # XPN person name (PID-5/6/9, NK1-2/30, GT1-3, IN1-16, MRG-7); MRG-4, a CX
     ADDRESS = "address"  # XAD address (PID-11, NK1-4/32, GT1-5, IN1-19)
-    MRN = "mrn"  # CX medical-record / patient identifier (PID-2/3/21, MRG-1/3/4)
+    MRN = "mrn"  # CX medical-record / patient identifier (PID-2/3/21, MRG-1/3)
     SSN = "ssn"  # social-security / national id (PID-19, NK1-37, GT1-12, IN2-2)
     PHONE = "phone"  # XTN phone/contact (PID-13/14, NK1-5/6/7/31, GT1-6/7)
     DOB = "dob"  # DT/TS date of birth (PID-7)
@@ -143,16 +143,17 @@ class FieldRule:
 # The DATE and location rules map these Safe Harbor date and location fields, and that is NOT Safe
 # Harbor de-identification: MSH-7 keeps the full message time, the order and accession numbers
 # (ORC-2/3, OBR-2/3) are left unmapped (BACKLOG #2248). The date fields BACKLOG #2330 listed are
-# mapped: an event date takes DATE, and a date of birth takes DOB like PID-7. A date field outside
-# that list still has no rule, and only the coverage report names it.
+# mapped: an event date takes DATE, and a date of birth takes DOB like PID-7. BACKLOG #5533 mapped
+# more dates below. A date field with no rule below is named only by the coverage report.
 #
 # The ID, MRN and NAME kinds key a surrogate on the dataset salt, the kind and the whole
 # repetition's text (keying.Keyer.seed). So a prior value in MRG gets the same surrogate as that
 # value carried as current in its pair field of an earlier message only where the two kinds match,
-# and only when it is written identically in both. The kinds match for MRG-1 and PID-3, and
-# MRG-4 and PID-2 (MRN), for MRG-2 and PID-4, MRG-5 and PV1-19, and MRG-6 and PV1-50 (ID), and for
-# MRG-7 and PID-5 (NAME). They do not match for one pair. MRG-3, the prior account number, takes
-# MRN, while PID-18 takes ID.
+# and only when it is written identically in both. The kinds match for MRG-1 and PID-3
+# (MRN), for MRG-2 and PID-4, MRG-5 and PV1-19, and MRG-6 and PV1-50 (ID), and for MRG-7 and PID-5
+# (NAME). They do not match for two pairs. MRG-3, the prior account number, takes MRN, while
+# PID-18 takes ID. MRG-4, the prior patient id, is a CX paired with PID-2, yet takes NAME: NAME
+# rewrites the whole repetition, where MRN would keep CX.3 to CX.6, CX.9 and CX.10 as captured.
 #
 # BACKLOG #5533 mapped fourteen identifier, name, location and contact fields that were unmapped
 # inside segments this map already scrubs: PID-2/21/23, NK1-13/30/31/32/33/37, GT1-2 and
@@ -163,10 +164,9 @@ class FieldRule:
 # marital status and sex, and PV1-2/4/10 patient class, admission type and hospital service.
 # A second pass mapped twenty more fields of the same class: GT1-4/19/21/24/29/42/45/46/51/56,
 # NK1-12/26/38, MRG-2/5/6 and PV1-5/37/50/52. A third pass mapped the dates PID-33, NK1-8/9,
-# GT1-13/14/31/32 and PV1-25/30/35, the job titles NK1-10 and GT1-49, and moved MRG-4, the prior
-# patient id, a CX, from NAME to MRN. Any other field of these segments that is neither in the
-# coded list above nor mapped below has no rule yet: only the coverage report names it, and
-# require_full_coverage refuses it.
+# GT1-13/14/31/32 and PV1-25/30/35, and the job titles NK1-10 and GT1-49. A field of these
+# segments with no rule below, the coded ones above included, is named by the coverage report,
+# and require_full_coverage refuses it.
 DEFAULT_RULES: tuple[FieldRule, ...] = (
     # PID — patient identity
     FieldRule("PID-2", SurrogateKind.MRN),  # patient id (external), a CX like PID-3
@@ -193,7 +193,7 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("MRG-1", SurrogateKind.MRN),
     FieldRule("MRG-2", SurrogateKind.ID),  # prior alternate patient id, keyed like PID-4
     FieldRule("MRG-3", SurrogateKind.MRN),
-    FieldRule("MRG-4", SurrogateKind.MRN),  # prior patient id, a CX keyed like PID-2
+    FieldRule("MRG-4", SurrogateKind.NAME),
     FieldRule("MRG-5", SurrogateKind.ID),  # prior visit number, keyed like PV1-19
     FieldRule("MRG-6", SurrogateKind.ID),  # prior alternate visit id, keyed like PV1-50
     FieldRule("MRG-7", SurrogateKind.NAME),

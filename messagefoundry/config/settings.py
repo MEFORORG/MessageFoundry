@@ -5161,7 +5161,8 @@ def alert_revocation_attestations(
     """Each ``[alerts]`` revocation attestation that is set: its switch name, the hop it covers,
     what that hop's own handshake can check, and its reason (BACKLOG #2193). The ``[alerts]``
     sibling of :func:`vault_revocation_attestations`, read by :func:`security_loosenings`. A CRL
-    reaches the SMTP hop's context; none can reach the webhook's shared opener."""
+    can reach the SMTP hop's context, on the conditions its entry names; none can reach the
+    webhook's shared opener."""
     pairs = (
         (
             "alerts.email_tls_revocation_attested",
@@ -5169,8 +5170,9 @@ def alert_revocation_attestations(
             "and no CRL unless all three hold: [tls].crl_file is set, the [tls] policy reaches "
             "the caller that builds the sink (messagefoundry serve and its offline notifiers hand "
             "it; the alerts test send reads the app's [tls] section, as POST /ai/chat does; an "
-            "embedder's engine or app holds none unless it passes one), and the relay host is "
-            "not loopback as the engine reads it, localhost or a loopback address as written. So "
+            "embedder's notifier_from_settings call or app holds none unless it is passed one), "
+            "and the relay host is not loopback as the engine reads it: localhost in any case, "
+            "or a loopback address, spelled with no trailing dot or brackets. So "
             "at least a loopback relay checks no CRL whatever [tls].crl_file says",
             alerts.email_tls_revocation_attested,
             alerts.email_tls_revocation_attested_reason,
@@ -11547,8 +11549,9 @@ def security_loosenings(
                 "serving POST /ai/chat (messagefoundry serve hands it; an embedder's "
                 "create_managed_app holds none unless it passes tls_settings, and a direct "
                 "create_app none unless it passes tls_settings or sets app.state.tls_settings), "
-                "and the endpoint host is not loopback as the engine reads it, localhost or a "
-                "loopback address as written (so localhost. gets the CRL). So at least "
+                "and the endpoint host is not loopback as the engine reads it: localhost in any "
+                "case, or a loopback address, spelled with no trailing dot or brackets (so "
+                "localhost. gets the CRL). So at least "
                 "a loopback endpoint, and an app the [tls] section never reached, check no CRL "
                 "whatever [tls].crl_file says. The "
                 "attestation adds no check. Where no CRL is checked, the revocation refusal is "

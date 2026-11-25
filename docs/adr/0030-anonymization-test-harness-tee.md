@@ -155,12 +155,11 @@
   `ID`. `MRG-4`, the prior patient id, is a CX paired with `PID-2`, yet takes `NAME`. `PV1-37`
   is redacted whole, its table-coded location with its date, because no kind rewrites one
   component of a field. **This adds to the §3 field list; §3 named none of these fields.**
-- **AMENDED 2026-11-25 (BACKLOG #5533): a third pass, and `MRG-4` moves to `MRN`.** The default
-  map adds the dates `PID-33`, `NK1-8`, `NK1-9`, `GT1-13`, `GT1-14`, `GT1-31`, `GT1-32`,
-  `PV1-25`, `PV1-30` and `PV1-35` as `DATE`, and the job titles `NK1-10` and `GT1-49` as
-  `FREETEXT`. `MRG-4`, the prior patient id, moves from `NAME` to `MRN`, the kind of `PID-2`, so
-  the `MRG-4` sentence of the amendment above no longer holds; `MRG-3` still takes `MRN` while
-  `PID-18` takes `ID`. This supersedes `MRG-4 (NAME)` in the §3 field list.
+- **AMENDED 2026-11-25 (BACKLOG #5533): a third pass.** The default map adds the dates `PID-33`,
+  `NK1-8`, `NK1-9`, `GT1-13`, `GT1-14`, `GT1-31`, `GT1-32`, `PV1-25`, `PV1-30` and `PV1-35` as
+  `DATE`, and the job titles `NK1-10` and `GT1-49` as `FREETEXT`. `MRG-4` stays `NAME`: `MRN`
+  would key it like `PID-2` but keep its CX.3 to CX.6, CX.9 and CX.10 as captured, where `NAME`
+  rewrites the whole repetition, so the move would scrub less.
 - **Decision in one line:** ship a **pure-stdlib, dependency-free `anon` package** that turns real,
   messy HL7 v2 into structurally-faithful **PHI-free** datasets via a **two-layer rule model — a
   declarative field-*selection* map (data) over a code registry of pure surrogate *functions* (logic)** —

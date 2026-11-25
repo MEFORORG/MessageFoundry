@@ -9,8 +9,9 @@ the serve-start warning and ``security show`` stated a check that does not run o
 Item 55 finding 8: the ``[ai]`` entry's "the endpoint is not loopback" means the engine's own
 reading of loopback, under which ``localhost.`` is remote and gets the CRL.
 
-The text tests pin the entries. The anchor tests pin the behaviour the text describes, so a
-change to either that leaves them disagreeing goes red here. No message body is involved.
+The text tests pin the entries. The anchor tests pin, through ``resolve_trust_anchor`` alone,
+the loopback reading the text describes; no test here builds the SMTP sink or the AI opener,
+and none pins which callers hand the ``[tls]`` policy over. No message body is involved.
 """
 
 from __future__ import annotations
@@ -91,14 +92,14 @@ def test_the_smtp_clause_names_the_loopback_relay_as_checking_no_crl() -> None:
 
 def test_the_ai_entry_says_how_loopback_is_read() -> None:
     entry = _ai_entry()
-    assert "the endpoint host is not loopback as the engine reads it" in entry
+    assert "the endpoint host is not loopback as the engine reads it: localhost in any" in entry
     assert "(so localhost. gets the CRL)" in entry
 
 
 def test_a_loopback_relay_resolves_no_crl_whatever_the_file_says() -> None:
     """The behaviour the SMTP clause's loopback condition describes."""
     policy = TrustAnchorPolicy(crl_file=_CRL)
-    for host in ("127.0.0.1", "localhost", "::1"):
+    for host in ("127.0.0.1", "localhost", "LOCALHOST", "::1"):
         anchor = resolve_trust_anchor(connection_ca_file=None, host=host, policy=policy)
         assert anchor.crl_file is None, host
     pinned = resolve_trust_anchor(

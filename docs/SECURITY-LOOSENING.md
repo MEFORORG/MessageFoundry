@@ -1656,8 +1656,9 @@ count is above `0` (vault BACKLOG #2613).
   sent for assistance over https that verifies the endpoint's certificate, and its handshake
   checks no OCSP. **It checks no CRL unless all three of these hold** (BACKLOG #5527):
   `[tls].crl_file` is set; the `[tls]` section reaches the app serving `POST /ai/chat`; and the
-  endpoint's host is not loopback as the engine reads it: `localhost` or a loopback address, as
-  written, so a spelling such as `localhost.` reads as remote and gets the CRL
+  endpoint's host is not loopback as the engine reads it: `localhost` in any case, or a loopback
+  address, spelled with no trailing dot or brackets, so a spelling such as `localhost.` reads as
+  remote and gets the CRL
   (`is_loopback_hop_host` in `config/tls_policy.py` says which spellings). `messagefoundry serve`
   hands its app that section. An embedder's `create_managed_app` holds none unless it passes a
   `TlsSettings` as `tls_settings`. A direct `create_app` (the embedded path) holds none unless its
