@@ -13,10 +13,13 @@ in the ``users`` table.
 
 from __future__ import annotations
 
+import functools
 import logging
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError
+
+from messagefoundry.controlchars import has_lone_surrogate
 
 _log = logging.getLogger(__name__)
 
@@ -64,31 +67,56 @@ def hash_password(password: str) -> str:
     return _hasher.hash(password)
 
 
+#: The fixed input of the constant-work verify below. Not a credential: nothing stores its hash.
+_CONSTANT_WORK_INPUT = "mf-verify-constant-work"
+
+
+@functools.cache
+def _constant_work_hash() -> str:
+    """A hash at the pinned parameters, made on first use rather than at import, so importing this
+    module stays free of argon2 work. The first call pays one extra hash."""
+    return _hasher.hash(_CONSTANT_WORK_INPUT)
+
+
+def _spend_one_verify() -> None:
+    """One argon2id verify at the pinned cost, its answer discarded.
+
+    Callers equalize timing on the premise that each ``verify_password`` call costs one verify: at
+    least the recovery-code walk, which runs every slot so the attempt's cost does not reveal which
+    slot matched (ADR 0170). An input refused before the hasher runs would break that premise per
+    refused slot, so the refusal pays the same work here."""
+    _hasher.verify(_constant_work_hash(), _CONSTANT_WORK_INPUT)
+
+
 def verify_password(stored_hash: str, password: str) -> bool:
-    """True iff ``password`` matches ``stored_hash``. Never raises on a bad password or malformed hash."""
+    """True iff ``password`` matches ``stored_hash``. Never raises on a bad password or malformed hash.
+
+    Every call does one argon2id verify's work, including the two refusals below (BACKLOG #6880)."""
     # argon2-cffi encodes the hash as ASCII and the password as UTF-8 before argon2 sees either, and
-    # neither encode failure becomes one of its own exception types (BACKLOG #6880).
+    # neither encode failure becomes one of its own exception types. Both inputs are therefore
+    # screened first, so no ``UnicodeEncodeError`` is ever raised here: that exception carries the
+    # whole hash or password, and would chain onto anything a failing log handler prints.
     #
     # ``hash_password`` only ever emits ASCII, so a non-ASCII stored hash, whether of a password or
     # of a recovery code, is at least one of: corruption of an unsealed row, a defect in a path that
     # writes the hash, or tampering. Where the users row is sealed, at-rest corruption fails the seal
-    # before this runs. Hence a WARNING that names no single cause. It is checked here, before the
-    # hasher runs, so the log call never sits inside an ``except`` whose exception would chain onto
-    # anything a failing handler prints: that exception carries the whole hash or password.
+    # before this runs. Hence a WARNING that names no single cause.
     if not stored_hash.isascii():
+        _spend_one_verify()
         _log.warning("stored argon2 hash is not ASCII; treating it as a non-match")
+        return False
+    # A surrogate code point is the one thing strict UTF-8 refuses. It is caller input, and no stored
+    # hash can match it, because ``hash_password`` cannot hash it either. At least the sign-in request
+    # model refuses one with a 422 (pinned in tests/test_auth_hardening.py), so this guards any
+    # caller that skips such a model.
+    if has_lone_surrogate(password):
+        _spend_one_verify()
+        _log.debug("password does not encode as UTF-8; treating it as a non-match")
         return False
     try:
         return _hasher.verify(stored_hash, password)
     except (VerificationError, InvalidHashError):
         return False
-    except UnicodeEncodeError:
-        # The password will not encode (a lone surrogate). It is caller input, and no stored hash can
-        # match it, because ``hash_password`` cannot hash it either. The API's request models refuse
-        # one with a 422, so this guards callers that skip them. Logged below, outside the handler.
-        pass
-    _log.debug("password does not encode as UTF-8; treating it as a non-match")
-    return False
 
 
 def needs_rehash(stored_hash: str) -> bool:

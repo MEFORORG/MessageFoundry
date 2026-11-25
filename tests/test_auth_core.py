@@ -12,6 +12,7 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+from argon2 import PasswordHasher
 
 from messagefoundry.auth import (
     AuthProvider,
@@ -23,6 +24,7 @@ from messagefoundry.auth import (
     hash_token,
     mint_token,
     needs_rehash,
+    passwords,
     permissions_for_roles,
     verify_password,
 )
@@ -221,6 +223,48 @@ def test_verify_password_unencodable_password_is_a_quiet_non_match(
     assert "Str0ng!" not in text and "position" not in text
     for form in escapes("\ud800"):
         assert form not in text
+
+
+class _VerifySpy:
+    """Stands in for the module's slotted ``PasswordHasher``: records each verify, then delegates."""
+
+    def __init__(self, real: PasswordHasher) -> None:
+        self.real = real
+        self.verified: list[str] = []
+
+    def hash(self, password: str) -> str:
+        return self.real.hash(password)
+
+    def check_needs_rehash(self, stored_hash: str) -> bool:
+        return self.real.check_needs_rehash(stored_hash)
+
+    def verify(self, stored_hash: str, password: str) -> bool:
+        self.verified.append(stored_hash)
+        return self.real.verify(stored_hash, password)
+
+
+@pytest.mark.parametrize("refusal", ["non-ASCII hash", "unencodable password"])
+def test_verify_password_refusals_still_pay_one_argon2_verify(
+    refusal: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The recovery-code walk keeps constant work per slot (ADR 0170) only if a refused slot costs
+    # what a checked one does, so each refusal must still run exactly one real argon2id verify.
+    h = hash_password("Str0ng!Passphrase")
+    stored, password = (
+        (h[:-1] + SECRET_CHAR, "Str0ng!Passphrase")
+        if refusal == "non-ASCII hash"
+        else (h, "Str0ng!\ud800Passphrase")
+    )
+    spy = _VerifySpy(passwords._hasher)
+    monkeypatch.setattr(passwords, "_hasher", spy)
+    assert verify_password(stored, password) is False
+    assert len(spy.verified) == 1
+    worked_on = spy.verified[0]
+    assert worked_on not in (stored, h)  # the constant-work hash, never the refused input
+    assert needs_rehash(worked_on) is False  # at the pinned parameters, so the same cost
+    # Control: an ordinary mismatch goes through the same spy once, on the stored hash itself.
+    assert verify_password(h, "wrong") is False
+    assert spy.verified[1:] == [h]
 
 
 def test_tokens_are_unique_and_only_the_hash_is_storable() -> None:
