@@ -74,7 +74,7 @@ _CONSTANT_WORK_INPUT = "mf-verify-constant-work"
 @functools.cache
 def _constant_work_hash() -> str:
     """A hash at the pinned parameters, made on first use rather than at import, so importing this
-    module stays free of argon2 work. The first call pays one extra hash."""
+    module stays free of argon2 work. Which refusals pay for making it: :func:`verify_password`."""
     return _hasher.hash(_CONSTANT_WORK_INPUT)
 
 
@@ -102,8 +102,10 @@ def verify_password(stored_hash: str, password: str) -> bool:
     """True iff ``password`` matches ``stored_hash``. Never raises on a bad password or malformed hash.
 
     What a call costs (BACKLOG #6880): a refusal of a non-ASCII stored hash, or of a password holding
-    a surrogate code point, pays one argon2id verify at the pinned parameters against a fixed hash;
-    the first such refusal in a process also pays one hash to make that fixed hash. A well-formed
+    a surrogate code point, pays one argon2id verify at the pinned parameters against a fixed hash.
+    Until that fixed hash is cached, a refusal also pays one hash to make it: at least the first
+    refusal in a process, any refusal that runs while another is still making it (the cache does not
+    serialize a miss), and every refusal after a failed hash (a failure is not cached). A well-formed
     stored hash at the pinned parameters costs one verify. Other stored hashes cost what argon2-cffi
     spends on them: at least a malformed ASCII hash is refused before any hashing and costs almost
     nothing, and a hash at other parameters costs its own verify."""
