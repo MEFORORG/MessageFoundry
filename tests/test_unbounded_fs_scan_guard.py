@@ -913,8 +913,8 @@ def _guard_seconds(command: str) -> float:
 # the thread itself ran. The process clock it replaced also charged pwsh's other threads, in
 # proportion to how long a call took on the wall: on a 32-core machine at 100 percent load, one
 # call of a file holding only `exit 0` read 8 ms to 44 ms on it, and 24 to 29 million cycles on
-# this one. Elsewhere the driver falls back to the process clock, whose unit is 100 ns; only
-# ratios of one clock are ever taken.
+# this one. Elsewhere it is the calling thread's `CLOCK_THREAD_CPUTIME_ID` through libc, and only
+# where that cannot be loaded the process clock; only ratios of one clock are ever taken.
 #
 # One request per line on stdin, one reply per line on stdout. A request names a script, its
 # payloads and the payload index of each sample. Each payload in `warm` is run once untimed the
@@ -932,8 +932,18 @@ using System.Runtime.InteropServices;
 public static class MefTimingThreadClock {
     [DllImport("kernel32.dll")] private static extern IntPtr GetCurrentThread();
     [DllImport("kernel32.dll")] private static extern bool QueryThreadCycleTime(IntPtr thread, out ulong cycles);
+    [StructLayout(LayoutKind.Sequential)] private struct Timespec { public long Sec; public long Nsec; }
+    [DllImport("libc")] private static extern int clock_gettime(int clock, out Timespec t);
     public static double Read() {
         if (!OperatingSystem.IsWindows()) {
+            try {
+                Timespec t;
+                if (clock_gettime(OperatingSystem.IsMacOS() ? 16 : 3, out t) == 0) {
+                    return t.Sec * 1e9 + t.Nsec;
+                }
+            } catch (DllNotFoundException) {
+            } catch (EntryPointNotFoundException) {
+            }
             return System.Diagnostics.Process.GetCurrentProcess().TotalProcessorTime.Ticks;
         }
         ulong cycles;
@@ -1002,7 +1012,7 @@ _GROWTH = 16
 
 #: The large input must take under this many times as long as the small one: twice the growth,
 #: as tests/test_ad_group_dn_only.py sets its line at twice its own. A quadratic reader tends to
-#: the growth squared, 64. The MEASURED SCALING comment records what the guard read here.
+#: the growth squared, 256. The MEASURED SCALING comment records what the guard read here.
 _MAX_LINEAR_RATIO = 2.0 * _GROWTH
 
 #: Under this, half the growth, the large input took barely longer than the small one, so the
@@ -1016,16 +1026,16 @@ _MIN_WORKING_RATIO = _GROWTH / 2
 #: and it reads over the line only once its share of the large call's time is large enough. The
 #: MEASURED SCALING comment says which such scans, put back into the guard at its `((` frame, this
 #: size catches.
-_SITES = 225
+_SITES = 300
 
 #: Each sample repeats its call until this many wall seconds have passed, so a cheap call is read
 #: as the average of several.
 _SAMPLE_FLOOR_SECONDS = 0.25
 
-#: Rounds per attempt. Each round takes one sample of each size, in a drawn order, and one sample
-#: of `_EMPTY_PAYLOAD` goes at a drawn place among them, its reading used for every round. With one
-#: round, the guard read 5.18x to 8.87x and the stand-in once 18.08x; with two, the MEASURED
-#: SCALING comment's spreads.
+#: Rounds per attempt. Each round takes one sample of each size and one of `_EMPTY_PAYLOAD`, in a
+#: drawn order. ONE BASELINE SAMPLE PER ATTEMPT WAS TRIED AND DROPPED: in 1 of 22 loaded runs it
+#: read over the stand-in's small call, and that attempt could not be read. Each baseline sample
+#: costs `_SAMPLE_FLOOR_SECONDS` of wall time.
 _ROUNDS = 2
 
 #: One request takes seconds. A timer kills the driver past this, so a hung pwsh is not left
@@ -1140,8 +1150,9 @@ def _attempt_ratio(
     driver: _TimingDriver, script: Path, small: str, large: str, *, denies: bool
 ) -> tuple[float, float]:
     """Per-call time on ``large`` over per-call time on ``small``, after taking off the per-call
-    cost of the script file itself, each the cheapest of `_ROUNDS` samples, on the process CPU clock
-    and then on the wall clock. Which payload goes first is drawn per round from an unseeded
+    cost of the script file itself, each the cheapest of `_ROUNDS` samples, on the CPU clock
+    `_TIMING_DRIVER` names and then on the wall clock. A reading the baseline makes unreadable is
+    NaN, which is outside the band, so it is taken again. Which payload goes first is drawn per round from an unseeded
     generator, as :func:`tests._growth._growth_between` says why. Every call on ``small`` or
     ``large`` must deny when ``denies`` is set, and allow otherwise.
 
@@ -1156,13 +1167,12 @@ def _attempt_ratio(
     cost per call that does not grow with the input pulls the ratio toward 1, so
     the baseline sample's cheapest per-call time comes off both before they are divided."""
     draw = random.Random()
-    samples = [index for _ in range(_ROUNDS) for index in draw.sample((0, 1), 2)]
-    samples.insert(draw.randrange(len(samples) + 1), 2)
+    samples = [index for _ in range(_ROUNDS) for index in draw.sample((0, 1, 2), 3)]
     readings = driver.run(script, [small, large, _EMPTY_PAYLOAD], samples, warm=(0, 2))
     for reading in readings:
         if reading["index"] == 2:
             continue
-        wrong = [out for out in reading["outputs"] if bool(out.strip()) is not denies]
+        wrong = [out for out in reading["outputs"] if _denies(out) is not denies]
         assert not wrong, f"a timed call {'allowed' if denies else 'denied'}: {wrong[0]!r}"
 
     def ratio(clock: str) -> float:
@@ -1174,9 +1184,18 @@ def _attempt_ratio(
             return math.nan
         return float((large_call - base) / (small_call - base))
 
-    cpu = ratio("cpu")
-    assert not math.isnan(cpu), f"the small sample read no more CPU than the baseline: {readings}"
-    return cpu, ratio("wall")
+    return ratio("cpu"), ratio("wall")
+
+
+def _denies(output: str) -> bool:
+    """Whether ``output`` is the guard's deny for a walk of /proc. Anything else written is not a
+    deny, so an allow that printed something cannot pass for one."""
+    if not output.strip():
+        return False
+    decision = json.loads(output)["hookSpecificOutput"]
+    return bool(
+        decision["permissionDecision"] == "deny" and "/proc" in decision["permissionDecisionReason"]
+    )
 
 
 def _in_band(readings: list[float]) -> bool:
@@ -1206,19 +1225,19 @@ def _scaling_ratios(
 
 
 # MEASURED SCALING, recorded here once and cited rather than restated. Measured locally on
-# 2026-11-24, on a loaded 32-core machine, with this module's sizes and sampling, on the calling
-# thread's cycle clock. A reading is the lowest attempt of a run.
+# 2026-11-24 and 2026-11-25, on a loaded 32-core machine, with this module's sizes and sampling, on
+# the calling thread's cycle clock. A reading is the lowest attempt of a run.
 #
-# - The guard: 15.91x to 16.12x over three runs, each passing on its first attempt.
-# - The control's stand-in: 145.34x to 219.24x on every attempt of three runs.
+# - The guard: 16.38x to 20.05x over three runs, each passing on its first attempt.
+# - The control's stand-in: 135.56x to 186.82x over three runs, every attempt over the line.
 # - Mutants, each a forward scan from every `((` to the end of the text put back into the guard at
-#   that frame, all failing every attempt:
-#   - a bare compare per character: 36.50x and 36.89x;
-#   - a paren count per character: 52.28x to 56.16x over three runs, 1.63x the line or more;
-#   - a one-character substring at every fifth character: 127.45x.
-# At 150 sites the paren count's lowest attempt read 34.08x, too near the line, which is why the
-# size is 225. The old `3 * half + 3` bound at 3,000 and 6,000 sites passed the bare compare and
-# the paren count and failed the substring.
+#   that frame:
+#   - a bare compare per character: 38.37x and 39.45x, so it failed both runs, 1.2x the line;
+#   - a paren count per character: 56.35x to 69.68x over four runs, 1.76x the line or more;
+#   - a one-character substring at every fifth character: 110.96x at 225 sites.
+# At 225 sites the paren count's lowest attempt read 39.86x, and at 150 sites 34.08x, too near the
+# line, which is why the size is 300. The old `3 * half + 3` bound at 3,000 and 6,000 sites passed
+# the bare compare and the paren count and failed the substring.
 
 
 def test_many_arithmetic_commands_are_read_in_linear_time(timing_driver: _TimingDriver) -> None:
@@ -1248,7 +1267,7 @@ _QUADRATIC_STAND_IN = r"""
 $raw = [Console]::In.ReadToEnd()
 $walked = 0
 foreach ($site in [regex]::Matches($raw, '\(\(')) {
-    for ($j = $site.Index + 2; $j -lt $raw.Length; $j += 4) { if ($raw[$j] -ceq ')') { $walked++ } }
+    for ($j = $site.Index + 2; $j -lt $raw.Length; $j += 8) { if ($raw[$j] -ceq ')') { $walked++ } }
 }
 exit 0
 """
@@ -1265,7 +1284,7 @@ def test_the_linear_time_check_fails_a_forward_scan_from_every_site(
         stand_in = Path(tmp) / "quadratic.ps1"
         stand_in.write_text(_QUADRATIC_STAND_IN, encoding="utf-8")
         readings, record = _scaling_ratios(timing_driver, stand_in, _SITES, denies=False)
-    assert min(readings) >= _MAX_LINEAR_RATIO, (
+    assert all(reading >= _MAX_LINEAR_RATIO for reading in readings), (
         f"a quadratic reader scaled by only {min(readings):.2f}x ({record})"
     )
 
