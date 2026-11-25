@@ -1856,7 +1856,7 @@ exempt like any other, and the save re-seals the row as it always has.
 | `GET` | `/uploads` | `files:browse` | `require` | metadata only — no body, no summary; **owner-scoped** (ASVS 8.2.2) — the caller sees only the files they uploaded unless they hold `files:access_any`; **paged** `limit`/`offset` (50, 1..500 / 0..), the window applied AFTER the owner filter so a page's length can never encode another operator's file count |
 | `GET` | `/uploads/{file_id}/messages` | `files:browse` | `require_step_up` | explicit `enforce_phi_read_hop` + `enforce_phi_read_pacing` (bulk decrypt + split); **owner-only** — another operator's file answers **404**, before the decrypt |
 | `POST` | `/uploads/{file_id}/messages/search` | `files:browse` | `require_step_up` | the needle-bearing sibling of the browse GET (BACKLOG #1184); same owner-only 404 before the decrypt, same bulk PHI-read pacing |
-| `POST` | `/uploads/{file_id}/resend` | `files:browse` **+** `messages:edit` | `require_step_up_action` (action `upload_resend`) | vault BACKLOG #2625: it injects a message, so `files:browse`, a read, is not enough alone; fails closed on either permission. Per-channel `can_access_channel` check on the target inbound (403) **and** an owner check on the source file (404) |
+| `POST` | `/uploads/{file_id}/resend` | `files:browse` **+** `messages:edit` | `require_step_up_action` (action `upload_resend`) | vault BACKLOG #2625: it injects a message, so `files:browse`, a read, is not enough alone; fails closed on either permission. Per-channel `can_access_channel` check on the target inbound (403) **and** an owner check on the source file (404). After the channel check, an acting username that is blank or has surrounding whitespace is refused 403 with `X-Refusal-Code: username_unusable` and an `upload.resend_reject` row, since it cannot label the injected message (BACKLOG #6589) |
 | `DELETE` | `/uploads/{file_id}` | `files:delete` | `require_step_up` | destructive, audited; **owner-only** — another operator's file answers **404** and is never unlinked |
 
 > **Object-level authorization for uploaded files (ASVS 8.2.2).** An uploaded file belongs to the
@@ -7794,7 +7794,7 @@ user: `auth.login_success` / `auth.login_failed` / `auth.login_locked` / `auth.d
 `auth.login_new_ip` / `auth.login_address_unevaluated` (the first-seen sign-in address, BACKLOG #288;
 on a directory sign-in the row's `mech` names the leg, `kerberos` or `oidc`) /
 `auth.permission_denied` / `auth.channel_denied` / `auth.gate_refused` / `auth.self_target_refused` / `auth.session_revoke_missed`, the 6.3.5 events `auth.account_locked` /
-`auth.login_after_failures`, the re-proof rows `auth.reauth` / `auth.password_change_failed`, plus `user.created` / `user.roles_changed` /
+`auth.login_after_failures`, the re-proof rows `auth.reauth` / `auth.password_change_failed`, plus `user.created` / `auth.ad_user_created` (a directory sign-in that creates the account's row, committed with it; BACKLOG #6589) / `user.roles_changed` /
 `user.channel_scope_changed` / `user.channel_scope_change_refused` / `user.deleted`, `ad_group_map.updated` / `ad_group_scope_map.updated`,
 and `auth.ad_scope_resynced`. Most reads narrowed to the caller's channel scope write no row
 that records the narrowing. The alert-rules read is an exception. When it withholds a rule, it

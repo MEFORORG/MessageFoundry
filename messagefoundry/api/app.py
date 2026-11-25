@@ -4286,6 +4286,11 @@ def _plaintext_columns(backend: str, *, encryption_enabled: bool) -> list[str]:
 #: refuses fewer bodies than the listener: ``admit_resubmitted_body`` says which. A ``parse``
 #: refusal there is at least a parser fault, and a body past ``Peek.parse``'s segment cap is a
 #: ``size`` refusal, as on a re-route.
+#: The ``X-Refusal-Code`` value of the upload resend's 403 for an acting username that cannot label
+#: an injected message (BACKLOG #6589). The channel denial's 403 carries none, so a client tells the
+#: two apart by it; the web console's ``uploaded_logs`` routes read the same value.
+RESEND_USERNAME_REFUSAL_CODE: Final = "username_unusable"
+
 _INGRESS_GUARD_STATUS: dict[str, int] = {
     "size": 413,
     "type": 415,
@@ -10045,7 +10050,11 @@ def create_app(
                 client=client_ip(request),
             )
             _log.warning("upload.resend_reject: the acting username cannot label an inject")
-            raise HTTPException(403, reason)
+            # `X-Refusal-Code` tells this 403 apart from the channel denial above, for a JSON
+            # client and for the web console, which maps a bare 403 to that denial.
+            raise HTTPException(
+                403, reason, headers={"X-Refusal-Code": RESEND_USERNAME_REFUSAL_CODE}
+            )
         rr = engine.registry_runner
         if rr is None or body.to not in rr.registry.inbound:
             raise HTTPException(404, f"no such inbound connection: {body.to}")

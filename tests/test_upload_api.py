@@ -814,6 +814,8 @@ async def test_resend_by_a_padded_username_is_refused_403_with_nothing_injected(
         r = await c.post(f"/uploads/{fid}/resend", json={"index": 1, "to": "in1"}, headers=h)
         assert r.status_code == 403, r.text
         assert "surrounding whitespace" in r.json()["detail"]
+        # Told apart from the channel denial's 403, which carries no code.
+        assert r.headers["X-Refusal-Code"] == "username_unusable"
     after = int(await engine.store.count_messages(channel_id="in1", allowed_channels=None))
     assert after == before
     # The refusal is audited, as main audits the resend it refuses (BACKLOG #6589): exactly one

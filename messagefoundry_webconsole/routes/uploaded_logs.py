@@ -148,6 +148,7 @@ RESEND_DENIED_CODE = "resend_denied"
 RESEND_STOPPED_CODE = "resend_stopped"
 RESEND_REFUSED_CODE = "resend_refused"
 RESEND_LOCKED_CODE = "resend_locked"
+RESEND_USERNAME_CODE = "resend_username_refused"
 DELETE_FAILED_CODE = "delete_failed"
 DELETE_LOCKED_CODE = "delete_locked"
 BROWSE_LOCKED_CODE = "browse_locked"
@@ -181,6 +182,14 @@ RESEND_FAILED_NOTICE = (
 RESEND_DENIED_NOTICE = (
     "That resend did not run — nothing was injected. You are not authorized to inject into that "
     "inbound connection."
+)
+#: BACKLOG #6589: the engine refused the resend because the operator's own username is blank or
+#: has spaces around it, so it cannot label the injected message. Not a channel denial, which the
+#: same 403 status otherwise means here.
+RESEND_USERNAME_NOTICE = (
+    "That resend did not run, and nothing was injected. Your account's username is blank or has "
+    "spaces before or after it, so it cannot be recorded as the user who injected the message. "
+    "An administrator should correct the username."
 )
 RESEND_STOPPED_NOTICE = (
     "That resend did not run — nothing was injected. The target inbound connection is registered but "
@@ -334,6 +343,7 @@ _LIST_NOTICES: dict[str, str] = {
     RESEND_STOPPED_CODE: RESEND_STOPPED_NOTICE,
     RESEND_REFUSED_CODE: RESEND_REFUSED_NOTICE,
     RESEND_LOCKED_CODE: RESEND_LOCKED_NOTICE,
+    RESEND_USERNAME_CODE: RESEND_USERNAME_NOTICE,
     DELETE_FAILED_CODE: DELETE_FAILED_NOTICE,
     DELETE_LOCKED_CODE: DELETE_LOCKED_NOTICE,
     BROWSE_LOCKED_CODE: BROWSE_LOCKED_NOTICE,
@@ -373,6 +383,14 @@ _RESEND_CODES: dict[int, str] = {
     # BACKLOG #1169, PR 1506 follow-up A: no uploads store is configured.
     _UNAVAILABLE_STATUS: UPLOADS_UNAVAILABLE_CODE,
 }
+
+#: The ``X-Refusal-Code`` header, and the value, that mark the resend's 403 for an unusable acting
+#: username (BACKLOG #6589); the engine sets them in ``resend_uploaded_message``
+#: (``RESEND_USERNAME_REFUSAL_CODE`` in ``messagefoundry/api/app.py``). Read here as a literal, as
+#: the 503's ``Retry-After`` is, so this console takes no new seam import; a console test drives the
+#: engine route and pins the two together.
+_REFUSAL_CODE_HEADER = "X-Refusal-Code"
+_USERNAME_REFUSAL = "username_unusable"
 
 #: The same for a refused delete. 404 covers an absent file and an owner denial alike (ASVS 8.2.2).
 #: A refused sidecar's 423 reaches only a files:access_any holder: the engine answers everyone else
@@ -871,6 +889,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             code = _refusal_code(exc, _RESEND_CODES)
             if code is None:
                 raise
+            if (
+                code == RESEND_DENIED_CODE
+                and (exc.headers or {}).get(_REFUSAL_CODE_HEADER) == _USERNAME_REFUSAL
+            ):
+                # BACKLOG #6589: the same 403 status, but not a channel denial.
+                code = RESEND_USERNAME_CODE
             # And the refusal is recorded SERVER-SIDE; see :func:`_refused_by_engine`.
             return _refused_by_engine("resend", file_id, exc.status_code, code)
         return RedirectResponse(f"/ui/uploaded-logs/file/{file_id}", status_code=303)
