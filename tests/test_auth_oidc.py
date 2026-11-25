@@ -1272,14 +1272,16 @@ def _run_lookup(
 
 
 def _warm_cache(
-    rsa_key: rsa.RSAPrivateKey, later: bytes, *, at: float = 400.0
+    rsa_key: rsa.RSAPrivateKey, later: bytes, *, at: float = 400.0, gate_wait: float = 10.0
 ) -> tuple[oidc.JwksCache, _BlockingFetch, object]:
     """A cache that fetched ``k1`` at 0 s, its clock moved to ``at``, past the 300 s refetch floor,
     so the next miss fetches, and that fetch parks until released. The TTL is the default 3600 s."""
     first = _jwks_bytes(_rsa_jwk(rsa_key, "k1"))
     fetch = _BlockingFetch(later, first=first)
     now = [0.0]
-    cache = oidc.JwksCache(fetch, min_refetch_seconds=300.0, clock=lambda: now[0])
+    cache = oidc.JwksCache(
+        fetch, min_refetch_seconds=300.0, clock=lambda: now[0], gate_wait_seconds=gate_wait
+    )
     warm = cache.get_key("k1", alg=SignatureAlgorithm.RS256)
     now[0] = at
     return cache, fetch, warm
@@ -1337,6 +1339,46 @@ def test_a_kid_past_its_ttl_is_not_served_while_the_refresh_withdrawing_it_runs(
     assert fetch.calls == 2
 
 
+@pytest.mark.parametrize("kid", ["k1", "k9"], ids=["past-its-ttl", "unknown"])
+def test_a_lookup_waiting_on_a_stalled_refresh_fails_closed_when_its_wait_runs_out(
+    rsa_key: rsa.RSAPrivateKey, kid: str
+) -> None:
+    """BACKLOG #6905. A lookup that must wait for the gate a stalled refresh holds, for a key past
+    its TTL or an unknown one, waits at most ``gate_wait_seconds`` and is then refused. It is never
+    served the past-TTL key instead, and never left pinned for the length of the stall.
+
+    REDS when the wait is unbounded: the waiter is then still parked when the refresh is released.
+    """
+    later = _jwks_bytes(_rsa_jwk(rsa_key, "k1"))
+    cache, fetch, _ = _warm_cache(rsa_key, later, at=4000.0, gate_wait=0.2)
+
+    results: dict[str, object] = {}
+    refreshing = _run_lookup(cache, "k1", results, "refreshing")
+    assert fetch.entered.wait(timeout=10), "the expired-kid lookup never reached the fetch"
+    waiter = _run_lookup(cache, kid, results, "waiter")
+    try:
+        waiter.join(timeout=5)
+        assert not waiter.is_alive(), "the waiting lookup stayed pinned behind the stalled refresh"
+    finally:
+        fetch.release.set()
+        refreshing.join(timeout=10)
+        waiter.join(timeout=10)
+    refused = results["waiter"]
+    assert isinstance(refused, oidc.JwksError), f"the waiter was served: {refused!r}"
+    assert "did not finish within" in str(refused)
+    assert not isinstance(results["refreshing"], BaseException), results["refreshing"]
+    assert fetch.calls == 2
+
+
+def test_the_gate_wait_is_one_idp_round_trip() -> None:
+    """The 10 s the cache waits for a refresh is the bound on one IdP round trip, stated twice
+    because ``oidc_http`` imports ``jwks`` and so cannot be imported by it."""
+    from messagefoundry.auth.oidc import jwks as jwks_mod
+    from messagefoundry.auth.oidc_http import DEFAULT_IDP_TIMEOUT_SECONDS
+
+    assert jwks_mod.DEFAULT_JWKS_GATE_WAIT_SECONDS == DEFAULT_IDP_TIMEOUT_SECONDS
+
+
 @pytest.mark.parametrize("field", ["ttl_seconds", "min_refetch_seconds"])
 @pytest.mark.parametrize(
     "value",
@@ -1351,15 +1393,18 @@ def test_a_kid_past_its_ttl_is_not_served_while_the_refresh_withdrawing_it_runs(
         pytest.param(10**400, id="int-too-large-for-a-float"),
         pytest.param(Decimal("1e-400"), id="rounds-to-zero"),
         pytest.param(Decimal("sNaN"), id="signalling-nan"),
+        pytest.param("3600", id="text"),
+        pytest.param(1e300, id="huge-finite"),
+        pytest.param(365 * 24 * 3600 + 1, id="past-one-year"),
     ],
 )
 def test_the_cache_refuses_an_interval_that_is_not_finite_non_negative_seconds(
     field: str, value: float
 ) -> None:
-    """BACKLOG #6904. A NaN or infinite floor wedges key rotation after the first fetch, a negative
-    interval has no meaning, a bool is not a number of seconds, and a value that only rounds to zero
-    would silently remove the bound. Each is a ValueError naming the field and withholding the
-    value."""
+    """BACKLOG #6904. A NaN, infinite or past-one-year floor wedges key rotation after the first
+    fetch, a negative interval has no meaning, a bool or text is not a number of seconds, and a
+    value that only rounds to zero would silently remove the bound. Each is a ValueError naming the
+    field and withholding the value."""
     with pytest.raises(ValueError, match=field) as refused:
         _cache_with(field, value, lambda: b"")
     assert "value withheld" in str(refused.value)
@@ -1372,7 +1417,10 @@ def _cache_with(field: str, value: float, fetch: Callable[[], bytes]) -> oidc.Jw
 
 
 @pytest.mark.parametrize("field", ["ttl_seconds", "min_refetch_seconds"])
-def test_the_cache_accepts_a_zero_interval(field: str, rsa_key: rsa.RSAPrivateKey) -> None:
-    """BACKLOG #6904. Zero is existing design for both, not a value the guard refuses."""
-    cache = _cache_with(field, 0, lambda: _jwks_bytes(_rsa_jwk(rsa_key, "k1")))
+@pytest.mark.parametrize("value", [0, 365 * 24 * 3600], ids=["zero", "one-year"])
+def test_the_cache_accepts_both_ends_of_the_interval(
+    field: str, value: int, rsa_key: rsa.RSAPrivateKey
+) -> None:
+    """BACKLOG #6904. Zero is existing design for both, and one year is the ceiling, inclusive."""
+    cache = _cache_with(field, value, lambda: _jwks_bytes(_rsa_jwk(rsa_key, "k1")))
     cache.get_key("k1", alg=SignatureAlgorithm.RS256)

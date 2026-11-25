@@ -54,6 +54,15 @@ _JOSE_CURVES: dict[str, Callable[[], ec.EllipticCurve]] = {
 
 DEFAULT_JWKS_TTL_SECONDS = 3600.0
 DEFAULT_JWKS_MIN_REFETCH_SECONDS = 300.0
+#: How long a lookup waits for the gate a refresh holds across its fetch before it fails closed
+#: (BACKLOG #6905). The same 10 s as ``oidc_http.DEFAULT_IDP_TIMEOUT_SECONDS``, the bound on one IdP
+#: round trip, which says a hung IdP must degrade the login and never pin a worker thread. A test
+#: holds the two equal; this module cannot import that one, which imports this module.
+DEFAULT_JWKS_GATE_WAIT_SECONDS = 10.0
+#: The largest ``ttl_seconds`` or ``min_refetch_seconds`` the cache takes: one year. A larger value
+#: is no different from forever, which wedges key rotation; the settings report names anything past
+#: the 3600 s TTL default as a loosening, so this ceiling refuses only the absurd (BACKLOG #6904).
+_MAX_INTERVAL_SECONDS = 365 * 24 * 3600.0
 # A JWKS document larger than this is refused unread — a defensive bound on a remote body the engine
 # fetches on an unauthenticated caller's behalf.
 _MAX_JWKS_BYTES = 512 * 1024
@@ -241,14 +250,18 @@ def _require_interval(name: str, value: float) -> float:
     Zero stays legal: ``ttl_seconds=0`` treats every cached key as past its TTL, and
     ``min_refetch_seconds=0`` removes the amplification bound, a choice the security-loosening
     report names. Every comparison against NaN is false, so a NaN floor refuses every refetch after
-    the first and wedges key rotation for good, as an infinite floor does. A negative value has no
-    meaning of its own as an interval. :func:`float_setting` holds the rest of the rule (a bool, a
-    number too large for a float, and a value ``float()`` only rounds to zero are refused too), and
-    its refusal withholds the value.
+    the first and wedges key rotation for good, as an infinite floor does, and so does any value
+    past ``_MAX_INTERVAL_SECONDS`` in practice. A negative value has no meaning as an interval. Text
+    is refused, since an interval here is a number and never parsed. :func:`float_setting` holds the
+    rest of the rule, and its refusal withholds the value.
     """
+    if isinstance(value, str):
+        raise ValueError(f"JwksCache {name} must be a number, not text (value withheld)")
     seconds = float_setting(value, knob=name, transport="JwksCache")
-    if seconds < 0:
-        raise ValueError(f"JwksCache {name} must be >= 0 (value withheld)")
+    if not 0 <= seconds <= _MAX_INTERVAL_SECONDS:
+        raise ValueError(
+            f"JwksCache {name} must be between 0 and {_MAX_INTERVAL_SECONDS:.0f} (value withheld)"
+        )
     return seconds
 
 
@@ -265,11 +278,13 @@ class JwksCache:
     * a miss (unknown ``kid``, or the TTL has expired) triggers **at most one** fetch per
       ``min_refetch_seconds``, globally — the amplification bound — after which an unknown ``kid``
       simply raises :class:`JwksError` until the floor elapses. A miss that arrives while a fetch
-      is in progress waits for it, then decides again against the keys it finds once that fetch
-      ends: the new ones, or on a failed fetch the old ones;
+      is in progress waits for it, at most ``gate_wait_seconds``, then decides again against the
+      keys it finds once that fetch ends: the new ones, or on a failed fetch the old ones. A wait
+      that runs out fails closed with :class:`JwksError`; a key past the TTL is never served
+      instead (BACKLOG #6905);
     * a fetch that fails leaves the previous good keys in place (fail-static within the TTL).
 
-    ``ttl_seconds`` and ``min_refetch_seconds`` must be finite and non-negative, or construction
+    ``ttl_seconds`` and ``min_refetch_seconds`` must be numbers from 0 to one year, or construction
     raises :class:`ValueError` (BACKLOG #6904).
     """
 
@@ -280,10 +295,16 @@ class JwksCache:
         ttl_seconds: float = DEFAULT_JWKS_TTL_SECONDS,
         min_refetch_seconds: float = DEFAULT_JWKS_MIN_REFETCH_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        gate_wait_seconds: float = DEFAULT_JWKS_GATE_WAIT_SECONDS,
     ) -> None:
         self._fetch = fetch
         self._ttl = _require_interval("ttl_seconds", ttl_seconds)
         self._min_refetch = _require_interval("min_refetch_seconds", min_refetch_seconds)
+        # Clamped, because Lock.acquire raises OverflowError past TIMEOUT_MAX (about 49 days on
+        # Windows), and a wait that long is no different from the unbounded one it replaces.
+        self._gate_wait = min(
+            _require_interval("gate_wait_seconds", gate_wait_seconds), threading.TIMEOUT_MAX
+        )
         self._clock = clock
         self._state: _CacheState | None = None
         self._last_fetch_attempt: float | None = None
@@ -301,7 +322,11 @@ class JwksCache:
         #: takes the gate, so it waits out a fetch in progress and is never served once that fetch
         #: has withdrawn it.
         #:
-        #: A blocking lock is safe here because ``get_key`` never runs on the event loop. Its one
+        #: EVERY WAIT FOR IT IS BOUNDED, AND RUNNING OUT FAILS CLOSED (BACKLOG #6905). A stalled
+        #: IdP otherwise pinned each waiting lookup, and the ``asyncio.to_thread`` worker under it,
+        #: for as long as the fetch ran. ``DEFAULT_JWKS_GATE_WAIT_SECONDS`` says why 10 s.
+        #:
+        #: A blocking wait is safe here because ``get_key`` never runs on the event loop. Its one
         #: caller outside this module is ``claims.py`` ``get_key(kid, alg=alg)``, reached from
         #: ``service.py``'s ``_exchange_and_validate``, which the caller runs under
         #: ``asyncio.to_thread``. Verified by search, not assumed.
@@ -317,8 +342,9 @@ class JwksCache:
         body = self._fetch()
         if len(body) > _MAX_JWKS_BYTES:
             raise JwksError(f"JWKS body exceeds the {_MAX_JWKS_BYTES}-byte bound")
-        self._state = _CacheState(keys=MappingProxyType(_parse_bound(body)), fetched_at=now)
-        return self._state
+        state = _CacheState(keys=MappingProxyType(_parse_bound(body)), fetched_at=now)
+        self._state = state
+        return state
 
     def get_key(self, kid: str, *, alg: SignatureAlgorithm) -> _PublicKey:
         """Return the verifying key for ``kid``, refetching within the amplification bound on a miss.
@@ -350,23 +376,33 @@ class JwksCache:
         if bound is not None:
             return bound
 
-        with self._gate:
-            now = self._clock()
-            state = self._state
-            bound = self._fresh(state, kid, now)
-            if bound is not None:
-                return bound
+        if not self._gate.acquire(timeout=self._gate_wait):
+            raise JwksError(
+                f"no key for kid {kid!r}; a JWKS refresh in progress did not finish within "
+                f"{self._gate_wait:.0f}s"
+            )
+        try:
+            return self._lookup_holding_gate(kid)
+        finally:
+            self._gate.release()
 
-            if not self._may_fetch(now):
-                # Serve a still-cached key even past the soft TTL rather than fail while throttled...
-                stale = None if state is None else state.keys.get(kid)
-                if stale is not None:
-                    return stale
-                raise JwksError(
-                    f"no key for kid {kid!r}; JWKS refetch is throttled "
-                    f"(min {self._min_refetch:.0f}s between fetches)"
-                )
-            bound = self._refresh(now).keys.get(kid)
-            if bound is None:
-                raise JwksError(f"kid {kid!r} not present in the JWKS after refetch")
+    def _lookup_holding_gate(self, kid: str) -> _BoundKey:
+        now = self._clock()
+        state = self._state
+        bound = self._fresh(state, kid, now)
+        if bound is not None:
             return bound
+
+        if not self._may_fetch(now):
+            # Serve a still-cached key even past the soft TTL rather than fail while throttled...
+            stale = None if state is None else state.keys.get(kid)
+            if stale is not None:
+                return stale
+            raise JwksError(
+                f"no key for kid {kid!r}; JWKS refetch is throttled "
+                f"(min {self._min_refetch:.0f}s between fetches)"
+            )
+        bound = self._refresh(now).keys.get(kid)
+        if bound is None:
+            raise JwksError(f"kid {kid!r} not present in the JWKS after refetch")
+        return bound
