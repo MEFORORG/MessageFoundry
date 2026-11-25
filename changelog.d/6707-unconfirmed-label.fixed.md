@@ -1,6 +1,6 @@
 - **A Transit audit MAC 400 reads "refused" only when its errors list names a version refusal.**
   At least unknown Vault wording, an empty list and a body past the re-parse bound that hvac
-  parsed now take the "could not be confirmed" text instead. Only the text changes, not the
+  parsed now take the unconfirmed text instead. Only the text changes, not the
   row's verdict. The warning logged beside such a 400 is logged at most once an hour per process
   for each audit key and stated cause, unless logging it raises; it names neither the body's
   length nor a suppressed 400's key version. (vault `BACKLOG #6707`)

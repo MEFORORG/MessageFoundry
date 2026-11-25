@@ -97,6 +97,14 @@ def _capped_backoff(base: float, exp: int, cap: float) -> float:
     return min(float(base * (2 ** min(max(exp, 0), 20))), cap)
 
 
+class RependWithoutFault(Exception):  # noqa: N818 - a marker mixin, not an error of its own
+    """A mixin for an exception a per-item body raises to hand its row back when nothing failed,
+    such as a sandbox refusal a reload overtook (BACKLOG #6830). :meth:`StageDispatcher._drain_lane`
+    treats it exactly as a T17 infra fault, escalating backoff and infra-fault STOP bound included,
+    so a condition that keeps raising it still stops the lane; only its line differs: INFO, with
+    no traceback."""
+
+
 class HoldResult(Enum):
     """How a hold on a failed re-pend of claimed rows ended (BACKLOG #1611): the pooled
     :meth:`StageDispatcher._land_while_holding` and the per-lane
@@ -354,6 +362,12 @@ class _LaneState:
     # Consecutive re-pend episodes of that record that sent nothing and parked, for their backoff
     # and to log a lease-read fault once. Reset when the record clears.
     stranded_waits: int = 0
+    # BACKLOG #5704: this lane's run of pre-claim gate faults (_lane_may_claim), so a gate that keeps
+    # raising for it logs on a backoff (BACKLOG #1844). One run per lane, because each lane asks the
+    # gate and re-asks on its own timer: a run shared across lanes let one lane's answer close a run
+    # another lane's fault opened. The runner's gate (_may_claim_internal) reads mostly shared state,
+    # so a fault every lane hits logs once per lane at each backoff step. stop() closes an open one.
+    gate_faults: FailureRun = field(default_factory=FailureRun)
 
 
 @dataclass
@@ -975,6 +989,9 @@ class StageDispatcher:
                 self._stage.value,
                 dropped,
             )
+        for lane, st in self._states.items():
+            if st.gate_faults.count:
+                self._close_run_on_stop(st.gate_faults, f"may_claim for lane {lane}")
         # POST-gather clear — safe now that every task is done (mirrors _teardown_unsafe:1187-1204).
         self._states.clear()
         self._timers.clear()
@@ -1277,7 +1294,7 @@ class StageDispatcher:
             st = self._states.get(lane)
             if st is None or st.phase is not _LanePhase.READY:
                 continue  # stale: the lane already left READY (e.g. teardown, or a double entry)
-            may = self._lane_may_claim(lane)
+            may = self._lane_may_claim(lane, st)
             if may is None:  # the gate raised: a timed park, so the lane asks again after a backoff
                 self._park(lane, st, self._clock() + _LANE_ERROR_BACKOFF_SECONDS)
                 continue
@@ -2104,15 +2121,27 @@ class StageDispatcher:
         st = self._states.get(lane)
         streak = st.infra_error_streak if (st is not None and i == 0) else 0
         park_until = self._clock() + self._infra_backoff(streak)
-        log.error(
-            "StageDispatcher %s lane %s serializer failed at item %d (T17 infra fault); "
-            "re-pending head with backoff until %.3f",
-            self._stage.value,
-            lane,
-            i,
-            park_until,
-            exc_info=exc,
-        )
+        if isinstance(exc, RependWithoutFault):
+            # Not a fault (BACKLOG #6830), so no traceback; still counted and backed off as one, so
+            # the STOP bound still holds if whatever raises it never stops.
+            log.info(
+                "StageDispatcher %s lane %s: item %d handed back (%s); re-pending head until %.3f",
+                self._stage.value,
+                lane,
+                i,
+                type(exc).__name__,
+                park_until,
+            )
+        else:
+            log.error(
+                "StageDispatcher %s lane %s serializer failed at item %d (T17 infra fault); "
+                "re-pending head with backoff until %.3f",
+                self._stage.value,
+                lane,
+                i,
+                park_until,
+                exc_info=exc,
+            )
         head_id = items[i].id
         tail = [it.id for it in items[i + 1 :]]  # tail only — the head is re-pended, not released
         return (
@@ -2288,19 +2317,36 @@ class StageDispatcher:
         if until is not None:
             self._arm_timer(lane, until)
 
-    def _lane_may_claim(self, lane: str) -> bool | None:
+    def _lane_may_claim(self, lane: str, st: _LaneState) -> bool | None:
         """Ask the pre-claim gate; None when it raised, which is logged. The caller parks the lane
-        on a timer rather than letting the raise kill the claimer with the lane popped and READY."""
+        on a timer rather than letting the raise kill the claimer with the lane popped and READY.
+
+        The fault is logged through the lane's own :class:`FailureRun` (BACKLOG #1844, #5704), so a
+        gate that keeps raising for a lane writes that lane's 1st, 2nd, 4th, 8th ... record of a
+        cause, each with the run's count and the traceback, rather than one per re-check. The gate
+        answering for that lane again closes its run with one recovery line, and :meth:`stop`
+        closes a run still open."""
         try:
-            return self._may_claim(lane)
+            may = self._may_claim(lane)
         except Exception as exc:  # noqa: BLE001 — a gate fault must not kill the claimer
-            log.error(
+            st.gate_faults = st.gate_faults.record(
+                log,
+                exc,
                 "StageDispatcher %s may_claim raised %s for lane %s; parking it for a backoff",
                 self._stage.value,
                 type(exc).__name__,
                 lane,
             )
             return None
+        if st.gate_faults.count:
+            st.gate_faults = st.gate_faults.clear(
+                log,
+                "StageDispatcher %s may_claim for lane %s",
+                self._stage.value,
+                lane,
+                level=logging.WARNING,
+            )
+        return may
 
     def _park_gated(self, lane: str, st: _LaneState) -> None:
         """Park a lane the pre-claim gate refused (BACKLOG #5704), with no timer: nothing is due to

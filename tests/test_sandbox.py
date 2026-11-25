@@ -671,9 +671,30 @@ def test_on_github_actions_linux_both_thread_tests_run(
         ("6.8.0-1017-azure", True),
         ("5.15.0-91-generic", True),
         ("4.7.0", True),
+        ("4.7", True),
+        ("4.7-rc1", True),
+        # Numeric, not lexical: "10" and "14" sort below "4" and "7" as strings.
+        ("4.10", True),
+        ("4.14.0-1-generic", True),
+        ("10.0", True),
+        # Positive control for the off-Linux test below: its release passes here.
+        ("14.0-RELEASE", True),
+        ("6.1.0-13-amd64", True),
+        # A two-component release whose minor carries a suffix (BACKLOG #6811).
+        ("6.12-rc4", True),
+        ("5.15-aws", True),
+        ("5.15+", True),
+        ("4.6", False),
+        ("4.6-rc1", False),
         ("4.4.0-210-generic", False),
         ("3.10.0-1160.el7.x86_64", False),
         ("unparseable", False),
+        ("garbage", False),
+        ("6", False),
+        ("6-rc1", False),
+        ("4." + "9" * 5000, False),
+        ("\uff14.\uff17", False),  # fullwidth digits: a kernel release is ASCII
+        ("", False),
     ],
 )
 def test_rlimit_data_is_trusted_only_from_linux_4_7(
@@ -686,8 +707,36 @@ def test_rlimit_data_is_trusted_only_from_linux_4_7(
     from messagefoundry.pipeline import _sandbox_worker
 
     # The worker's own `os` is this module; raising=False because Windows has no os.uname.
-    monkeypatch.setattr(os, "uname", lambda: SimpleNamespace(release=release), raising=False)
+    monkeypatch.setattr(
+        os, "uname", lambda: SimpleNamespace(sysname="Linux", release=release), raising=False
+    )
     assert _sandbox_worker._rlimit_data_counts_mmap() is counts
+
+
+@pytest.mark.parametrize("sysname", ["FreeBSD", "Darwin"])
+def test_rlimit_data_is_not_trusted_off_linux(
+    sysname: str,
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_run_one: Any,  # noqa: F811 - imports the worker without keeping its root handler
+) -> None:
+    # "14.0-RELEASE" would pass the Linux 4.7 threshold, but another kernel's RLIMIT_DATA need not
+    # count mmap, so the worker keeps the absolute RLIMIT_AS cap there (BACKLOG #6811).
+    from messagefoundry.pipeline import _sandbox_worker
+
+    monkeypatch.setattr(
+        os, "uname", lambda: SimpleNamespace(sysname=sysname, release="14.0-RELEASE"), raising=False
+    )
+    assert _sandbox_worker._rlimit_data_counts_mmap() is False
+
+
+def test_rlimit_data_is_not_trusted_without_uname(
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_run_one: Any,  # noqa: F811 - imports the worker without keeping its root handler
+) -> None:
+    from messagefoundry.pipeline import _sandbox_worker
+
+    monkeypatch.delattr(os, "uname", raising=False)
+    assert _sandbox_worker._rlimit_data_counts_mmap() is False
 
 
 def test_a_memory_error_is_reported_as_the_memory_cap_and_recycles_the_worker(
@@ -2342,6 +2391,10 @@ def test_the_relay_survives_hostile_bytes_and_a_dead_pipe(
 
     class _Exploding:
         def read(self, _n: int) -> bytes:
+            raise OSError("pipe died with the worker")
+
+        def close(self) -> None:
+            # The relay closes the stream it drained (BACKLOG #6831); this one fails that too.
             raise OSError("pipe died with the worker")
 
     _StderrRelay("IB_U", 1, 1).run(_Exploding())  # type: ignore[arg-type]

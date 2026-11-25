@@ -1696,11 +1696,16 @@ class FirstAdministratorGrantedSessionsLive(FirstAdministratorRefused):
     """The run granted the Administrator role to ``username``, then gave up on the revoke that
     ends the account's earlier sessions (vault BACKLOG #3023 residual (4)). Not a decline: the
     grant stands, so the command still raises the ``administrator_granted`` alert before it exits
-    non-zero with this operator-facing message."""
+    non-zero with this operator-facing message. ``administrators_at_check`` is the other enabled
+    Administrators the run's check found, as on :class:`ProvisionedAdministrator`, so the command
+    can name them when the page was not delivered (vault BACKLOG #3023 items 11 and 30)."""
 
-    def __init__(self, message: str, *, username: str) -> None:
+    def __init__(
+        self, message: str, *, username: str, administrators_at_check: tuple[str, ...] = ()
+    ) -> None:
         super().__init__(message)
         self.username = username
+        self.administrators_at_check = administrators_at_check
 
 
 class LastAdministratorRefused(RuntimeError):
@@ -2309,13 +2314,14 @@ class UserSealRefused(RuntimeError):
     seal (BACKLOG #5520). :meth:`AuthService.change_password` raises it too, from that read or
     from the store write's own seal refusal, each reported the same way, and ``POST /me/password``
     answers it 423 (BACKLOG #5902). The failure was handed to the seal-failure report, which
-    writes the audit row and raises the alert only for the first failure of the account in each report interval
-    (:data:`~messagefoundry.store.row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS`) of this
-    service's process, so a refusal inside that interval adds no row. Not "no such user": the row is there, and an administrator
-    may still delete it. ``auth_routes._checked_user``, and so the JSON admin routes that read an
-    account through it, answer it 423; docs/SECURITY.md, *What an admin user read reports*, states
-    what at least some web console pages answer. A record Vault transit cannot verify is
-    refused the same way, reported under ``integrity.authority_seal_unverifiable`` (ADR 0217)."""
+    writes the audit row and raises the alert only for the first failure of the account in each
+    report interval (:data:`~messagefoundry.store.row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS`)
+    of this service's process, so a refusal inside that interval adds no row. Not "no such user":
+    the row is there, and an administrator may still delete it. ``auth_routes._checked_user``, and
+    so the JSON admin routes that read an account through it, answer it 423; docs/SECURITY.md,
+    *What an admin user read reports*, states what at least some web console pages answer. A
+    record Vault transit cannot verify is refused the same way, reported under
+    ``integrity.authority_seal_unverifiable`` (ADR 0217)."""
 
 
 async def read_user_or_unreadable(read: Awaitable[UserRecord | None]) -> UserRecord | None:
@@ -3797,8 +3803,12 @@ _PROVISION_REVOKE_RETRY: Final = _RevokeRetry(
 )
 
 
-#: How long ``provision-admin``'s revoke re-ran before it was given up on, for its texts.
-_PROVISION_REVOKE_GAVE_UP: Final = f"on every attempt, re-running for up to {_PROVISION_REVOKE_RETRY.budget_seconds / 60:g} minutes"
+#: How ``provision-admin``'s revoke was re-run before it was given up on, for its texts. It names
+#: the budget, not a duration: an attempt itself is unbounded, and a re-run may start up to one
+#: pause past the budget (vault BACKLOG #3023 items 16, 31 and 39).
+_PROVISION_REVOKE_GAVE_UP: Final = (
+    f"on every attempt, re-run on a {_PROVISION_REVOKE_RETRY.budget_seconds / 60:g}-minute budget"
+)
 
 
 #: What ``provision-admin`` tells the operator to do when a revoke after a grant that may have
@@ -3807,8 +3817,8 @@ _PROVISION_REVOKE_GAVE_UP: Final = f"on every attempt, re-running for up to {_PR
 _PROVISION_REVOKE_RECOVERY: Final = (
     "Running provision-admin again does not help: it refuses an account that holds the role. Once "
     "the store answers again, run 'messagefoundry admin-revoke-sessions' on this host, with the "
-    "--service-config or --db this command used: it ends every account's sessions, that one's "
-    "included"
+    "--service-config or --db this command used: it ends the sessions it finds, of any account. "
+    "docs/SECURITY.md, Limits of the session sweep, says what it may miss"
 )
 #: Said after :data:`_PROVISION_REVOKE_RECOVERY` where the give-up wrote its miss row.
 _PROVISION_REVOKE_MISS_ROW: Final = (
@@ -3844,6 +3854,8 @@ _SESSION_ID_SHAPE: Final = re.compile(r"[0-9a-f]{1,64}")
 #: Vault BACKLOG #3260: the row an admin route writes when it refuses the caller's own account.
 #: Its detail's ``op`` names the route, one of :data:`SelfTargetOp`.
 SELF_TARGET_REFUSED_ACTION: Final = "auth.self_target_refused"
+#: The row ``GET /me/step-up`` writes for each answered read (ADR 0215 section 2, BACKLOG #2603).
+STEP_UP_STATUS_READ_ACTION: Final = "auth.step_up_status_read"
 SelfTargetOp = Literal[
     "password_reset",
     "mfa_reset",
@@ -4411,6 +4423,18 @@ class AuthService:
             if settings.phi_read_rate_limit_enabled
             else None
         )
+        # Per-actor pacing for six monitoring:read GETs (vault BACKLOG #1191, ASVS
+        # 15.2.2), consulted by require_monitoring_read. Its own bucket, so dashboard polling never
+        # spends the PHI-read budget.
+        self._monitoring_read_limiter: SlidingWindowRateLimiter | None = (
+            SlidingWindowRateLimiter(
+                per_key=settings.monitoring_read_rate_limit_per_actor,
+                glob=settings.monitoring_read_rate_limit_global,
+                window_seconds=settings.monitoring_read_rate_limit_window_seconds,
+            )
+            if settings.monitoring_read_rate_limit_enabled
+            else None
+        )
         # Per-actor anti-automation pacing for the state-changing admin surface (BACKLOG #193, ASVS
         # 2.4.2). Built like _phi_read_limiter but consulted from the step-up gate for NON-GET sensitive
         # ops. glob=0 (no cross-actor dimension): one operator's write burst must never throttle
@@ -4907,6 +4931,18 @@ class AuthService:
         depends on other accounts' reads (:meth:`SlidingWindowRateLimiter.retry_after`). The JSON
         API and the ``/ui`` console both send it."""
         return _retry_after_seconds(self._phi_read_limiter, actor)
+
+    def allow_monitoring_read(self, actor: str) -> bool:
+        """Per-actor pacing for six monitoring:read GETs (vault BACKLOG #1191, ASVS
+        15.2.2). True = proceed; False = throttle. Always True when the limiter is disabled."""
+        if self._monitoring_read_limiter is None:
+            return True
+        return self._monitoring_read_limiter.allow(actor)
+
+    def monitoring_read_retry_after(self, actor: str) -> int:
+        """The ``Retry-After`` value for a monitoring read just refused for ``actor``, rounded as
+        :meth:`phi_read_retry_after` rounds it, on the monitoring-read limiter."""
+        return _retry_after_seconds(self._monitoring_read_limiter, actor)
 
     def login_retry_after(self) -> int:
         """The ``Retry-After`` value for a sign-in attempt refused by :meth:`allow_login_attempt`:
@@ -5779,6 +5815,7 @@ class AuthService:
         raise FirstAdministratorGrantedSessionsLive(
             _provision_revoke_missed_text(username, enrolled=totp_secret is not None),
             username=username,
+            administrators_at_check=standing_admins,
         ) from missed
 
     async def _unexpected_grant_refusal(
@@ -6617,7 +6654,14 @@ class AuthService:
             )
         except _BindingChangedMidLogin:
             # BACKLOG #2733: the account was deleted after the load above, so no session was
-            # minted. The answer, and its deferred row, are an unknown account's.
+            # minted. The answer, and its deferred row, are an unknown account's. The log line
+            # says what happened, which that row does not (vault BACKLOG #2733 item 7).
+            _log.info(
+                "a local sign-in for account id %s was refused because the account was deleted "
+                "before its session was minted; it is answered and audited as an unknown account "
+                "(vault BACKLOG #2733)",
+                user.id,
+            )
             await later(unknown_row)
             return LoginOutcome(ok=False, error="invalid credentials")
         except SessionMintContended as contended:
@@ -8967,14 +9011,15 @@ class AuthService:
                 # BACKLOG #1474. THE UNBIND'S SESSION SWEEP CANNOT SEE A SESSION THAT DOES NOT EXIST
                 # YET, which is the race this closes: an admin unbinding this account mid-login
                 # revokes what is live at that instant, and without the guard this login's own
-                # INSERT lands just after it. The password leg passes no guard, so it skips the
-                # binding comparison; its account read still runs, for the session epoch.
+                # INSERT lands just after it. The local password sign-in (`_login_local`), which
+                # does not reach this mint, passes no guard, so it skips the binding comparison;
+                # its account read still runs, for the session epoch.
                 #
-                # vault BACKLOG #2609. THE WINDOWS SSO LEG NOW PASSES THE MIRROR GUARD, so the
-                # sentence above holds for the password leg only. The refusal further up read
-                # the row before this mint, and a bind can commit between the two: its sweep
-                # runs in the bind's own transaction and cannot see a session inserted after
-                # it. So the insert itself requires an unbound row, under the lock the bind
+                # vault BACKLOG #2609. THE WINDOWS SSO LEG NOW PASSES THE MIRROR GUARD, so both
+                # legs that reach this mint pass one (vault BACKLOG #2733 item 9). The refusal
+                # further up read the row before this mint, and a bind can commit between the two:
+                # its sweep runs in the bind's own transaction and cannot see a session inserted
+                # after it. So the insert itself requires an unbound row, under the lock the bind
                 # takes. That also covers a rebind's gap, where the row is unbound between the
                 # clear and the write.
                 require_federated_subject=federated_subject if federated else _UNBOUND,
@@ -10483,7 +10528,7 @@ class AuthService:
                 applied.append(revocation)
             if outcome == "reported":
                 reported.append(revocation)
-        for refresh in plan.renames:
+        for i, refresh in enumerate(plan.renames):
             # BACKLOG #1532. Applied only on a pass that was NOT aborted, with every other write the
             # plan carries: the reconciler's invariant is that an aborted pass leaves the store
             # byte-identical, and a rename is a store write like any other.
@@ -10493,15 +10538,45 @@ class AuthService:
             # row, so renaming first would put two different names on one account's records for one
             # pass -- reachable whenever an account is renamed and role-demoted in the same pass.
             # Both reads see the pre-rename name this way, and the rename still lands on this pass.
-            await self._refresh_cached_username(
-                user_id=refresh.user_id,
-                old_username=refresh.old_username,
-                new_username=refresh.new_username,
-                held=await self._load_user_by_username(refresh.new_username),
-                from_plan=True,
-                # BACKLOG #3018: a refused audit write here must not skip the renames after it.
-                audit_soft=True,
-            )
+            #
+            # Vault BACKLOG #3069 item 1: one catch around the held read here and the refresh. An
+            # Unverifiable answer at a checked read in either is about one record, so it skips
+            # this rename and the pass goes on (see _rename_read_seal_answer). An Outage, at a
+            # read or at the rename's write, is the key service being down, which every later
+            # rename would meet again, so it is paged once and the rename loop stops; the
+            # recorders below still run and the plan is returned, so the revocations already
+            # applied keep their alerts (Manager decisions, 2026-11-22). Before this catch an
+            # Outage at a read raised out of the pass, unpaged, and those alerts were lost; one at
+            # the write was paged and the renames went on.
+            try:
+                await self._refresh_cached_username(
+                    user_id=refresh.user_id,
+                    old_username=refresh.old_username,
+                    new_username=refresh.new_username,
+                    held=await self._load_user_by_username(refresh.new_username),
+                    from_plan=True,
+                    # BACKLOG #3018: a refused audit write here must not skip the renames after it.
+                    audit_soft=True,
+                )
+            except TransitSealUnverifiableError as exc:
+                self._rename_read_seal_answer(
+                    exc, user_id=refresh.user_id, new_username=refresh.new_username
+                )
+            except TransitSealUnavailableError as exc:
+                _log.error(
+                    "directory reconcile: account %s (renaming to %s): Vault transit did not "
+                    "answer for a record one of the rename's reads or its write checked, so this "
+                    "rename and the %d after it were not applied on this pass; the rest of the "
+                    "pass goes on (vault BACKLOG #3069)",
+                    refresh.user_id,
+                    scrub_log_argument(refresh.new_username),
+                    len(plan.renames) - i - 1,
+                    exc_info=exc,
+                )
+                # Paged here alone: the write's seal arm raises its Outage to this arm too, and
+                # the break means one page per pass.
+                self._user_seal_outage("rename")
+                break
         # BACKLOG #2538. After the revocations, like the hold below: the referred accounts were left
         # unjudged, and every other account's revocation above has already been applied.
         await self._record_reconcile_referral(plan, first=referral)
@@ -10900,6 +10975,35 @@ class AuthService:
         elif event == "settled" and current in _HOLD_RELEASABLE:
             self._reconcile_hold_standing = "settled"
 
+    def _rename_read_seal_answer(
+        self,
+        exc: TransitSealUnverifiableError,
+        *,
+        user_id: str,
+        new_username: str,
+    ) -> None:
+        """Answer an Unverifiable answer that one of a reconciler rename's checked reads raised:
+        Vault transit could not verify the record it read (vault BACKLOG #3069 item 1). The loop
+        then skips that one rename and goes on, as the write's seal arm in
+        :meth:`_refresh_cached_username` does (note T2), though unlike that arm it pages and audits
+        nothing (below): a raise would end the pass and every rename after it. The checked reads it was written for run before the
+        rename's write lands, or after a write that wrote nothing, which is why the line says the
+        rename was not applied. A record that fails its seal is mostly not raised by these reads:
+        it comes back refused, for the refresh to handle as it already does. A row whose id cannot
+        be read is still raised (:func:`read_user_or_unreadable`) and is not caught here.
+
+        Logged at ERROR. It is not reported under an account here: the answer does not say which
+        record raised it, and the rename reads more than one, so this line names the account being
+        renamed and no other."""
+        _log.error(
+            "directory reconcile: account %s (renaming to %s): Vault transit could not verify the "
+            "integrity seal of a record one of the rename's reads checked, so the rename was not "
+            "applied; the pass goes on (vault BACKLOG #3069)",
+            user_id,
+            scrub_log_argument(new_username),
+            exc_info=exc,
+        )
+
     async def _refresh_cached_username(
         self,
         *,
@@ -10924,8 +11028,12 @@ class AuthService:
         commits with the write (step 7), rolls the rename back and is logged rather than raised.
         The login path leaves it off, so there a refused write still fails the sign-in, as it always
         has. It also lets a store fault on the ``held`` re-read skip the rename rather than raise
-        (BACKLOG #3070; the reason is at that read), and a seal refusal at the write be logged and
-        reported rather than raised (vault BACKLOG #3069 note T2; the reason is at that arm).
+        (BACKLOG #3070; the reason is at that read), and a Forged or Unverifiable seal refusal at the
+        write be logged and reported rather than raised (vault BACKLOG #3069 note T2; the reason
+        is at that arm); an Outage there is raised to the reconcile loop, as at the reads. A
+        Vault transit answer at one of its checked reads still raises out of it; the reconcile loop
+        absorbs an Unverifiable one (:meth:`_rename_read_seal_answer`, item 1) and stops its
+        renames on an Outage.
 
         **ONE implementation for two callers, deliberately.** The login path
         (:meth:`_upsert_ad_user`) and the ADR 0079 reconciler pass both reach a renamed account and
@@ -11243,16 +11351,17 @@ class AuthService:
             # or did not answer (Outage). A sign-in raises it. On the reconciler a raise would
             # cost the pass what the refused row below says it costs, so it logs and goes on, and
             # the answer is reported as an admin read reports the same answer for a record: the
-            # seal-failure report, which pages ``integrity_drift``, the store's Unverifiable page,
-            # or its Outage page. Which accounts a later pass reads is ``_load_users``'s.
-            if not audit_soft:
+            # seal-failure report, which pages ``integrity_drift``, or the store's Unverifiable
+            # page. Which accounts a later pass reads is ``_load_users``'s. An Outage is raised to
+            # the reconcile loop instead, which pages it once and stops the renames, as it does
+            # for an Outage at a read (vault BACKLOG #3069 item 1).
+            if not audit_soft or isinstance(exc, TransitSealUnavailableError):
                 raise
-            if isinstance(exc, RowSealError):
-                what = "its record failed its integrity check"
-            elif isinstance(exc, RowSealUnverifiableError):
-                what = "Vault transit could not verify its record's integrity seal"
-            else:
-                what = "Vault transit did not answer for its record's integrity seal"
+            what = (
+                "its record failed its integrity check"
+                if isinstance(exc, RowSealError)
+                else "Vault transit could not verify its record's integrity seal"
+            )
             _log.error(
                 "directory reconcile: account %s (%s, renaming to %s): %s at the rename's write, "
                 "so the rename was not applied; the pass goes on, and the seal answer is reported "
@@ -11265,10 +11374,8 @@ class AuthService:
             )
             if isinstance(exc, RowSealError):
                 await self._user_seal_failed(user_id)
-            elif isinstance(exc, RowSealUnverifiableError):
-                await self._user_seal_unverifiable(user_id, exc)
             else:
-                self._user_seal_outage("rename")
+                await self._user_seal_unverifiable(user_id, exc)
             return
         except Exception as exc:
             # THE RESIDUAL RACE, absorbed here because the store's in-statement guard cannot close it
@@ -13769,8 +13876,12 @@ class AuthService:
     async def checked_user(self, user_id: str) -> VerifiedUser | None:
         """The account ``user_id`` names, its whole record checked against its seal, for a caller
         outside this service that SHOWS it (BACKLOG #5520), and for :meth:`change_password`, which
-        decides on it (BACKLOG #5902), so its raise-or-``None`` contract binds that control too. ``None`` when no row is there. Raises
-        :class:`UserSealRefused` only when :meth:`_verified` established that the record fails,
+        decides on it (BACKLOG #5902), so its raise-or-``None`` contract binds that control too, as
+        it binds at least the admin role, channel-scope and password-reset routes, which answer
+        404 or 423 on it and, for the role write, decide the directory refusal and the
+        administrator-granted alert on what it returns (BACKLOG #5520 items 2 and 13).
+        ``None`` when no row is there. Raises :class:`UserSealRefused` only when
+        :meth:`_verified` established that the record fails,
         or :meth:`_checked_by_id` failed closed, and handed that to the seal-failure report, so
         the caller can say so rather than answer "no such user". A record Vault transit cannot
         verify raises it too, reported under its own cause (ADR 0217 (a)). A Vault transit Outage
@@ -16465,9 +16576,22 @@ class AuthService:
         # and notice are written at the clear, above.
         return elevation
 
-    #: The step-up actions a pending session may NOT be granted once its account HAS a factor. Every
-    #: one of them rides a ``*_reauth_only_action`` gate (``mfa_gate=False``), which exists so an
-    #: account with no factor is not locked out of it. For an account that already has one:
+    #: The actions of :data:`_PENDING_REFUSED_ACTIONS` that end sessions. Refused to a pending
+    #: session whether or not its account holds a factor (BACKLOG #1149). Part of that set by
+    #: construction, so an action added here is refused.
+    _PENDING_SESSION_ENDING_ACTIONS = frozenset(
+        {
+            STEP_UP_ACTION_SESSION_TERMINATE,
+            STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
+            STEP_UP_ACTION_REVOKE_ALL_SESSIONS,
+        }
+    )
+
+    #: The step-up actions a pending session may NOT be granted once its account HAS a factor (and,
+    #: for the session-ending ones above, even when it has none). At least the enrolment actions
+    #: and ``session_terminate`` ride a ``*_reauth_only_action`` gate (``mfa_gate=False``), which
+    #: exists so an account with no factor is not locked out of enrolment. For an account that
+    #: already has one:
     #:
     #: - binding a new factor (``mfa_enroll``, ``mfa_confirm``, ``webauthn_enroll``) is a promotion
     #:   path, because both ceremonies mark the session MFA-satisfied on success;
@@ -16489,15 +16613,21 @@ class AuthService:
     #: password re-proof from an MFA-pending session does not count as authenticating again, so
     #: ``POST /me/reauth`` and ``/ui/reauth`` mint that session no grant for it.
     #: ``revoke_all_sessions`` (BACKLOG #2614) is listed for the same reason.
-    _PENDING_REFUSED_ACTIONS = frozenset(
-        {
-            STEP_UP_ACTION_MFA_ENROLL,
-            STEP_UP_ACTION_MFA_CONFIRM,
-            STEP_UP_ACTION_WEBAUTHN_ENROLL,
-            STEP_UP_ACTION_SESSION_TERMINATE,
-            STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
-            STEP_UP_ACTION_REVOKE_ALL_SESSIONS,
-        }
+    #:
+    #: The three session-ending actions in :data:`_PENDING_SESSION_ENDING_ACTIONS` are refused to
+    #: EVERY pending session, the account's factors aside (BACKLOG #1149, ASVS 7.5.2). Under
+    #: ``require_mfa`` a session on an account with no factor is MFA-pending, so it is confined like
+    #: any other pending session: it enrols first, and the confirm that binds its first factor
+    #: satisfies the session. Only the enrolment actions keep the first-enrolment carve-out.
+    _PENDING_REFUSED_ACTIONS = (
+        frozenset(
+            {
+                STEP_UP_ACTION_MFA_ENROLL,
+                STEP_UP_ACTION_MFA_CONFIRM,
+                STEP_UP_ACTION_WEBAUTHN_ENROLL,
+            }
+        )
+        | _PENDING_SESSION_ENDING_ACTIONS
     )
 
     async def _factor_binding_is_blocked(self, token: str | None, purpose: str) -> bool:
@@ -16515,34 +16645,47 @@ class AuthService:
 
         So: if the session has not satisfied its second factor and the account already has one, the
         existing factor must be proven first (``POST /auth/mfa-verify``). First enrolment is
-        untouched: an account with NO factor still enrols, and ends sessions, from a password-only
-        session, which is exactly the deadlock carve-out. Disable/delete actions are NOT listed:
-        they run behind ``require_step_up_action``, which keeps its own ``mfa_satisfied`` check.
+        untouched: an account with NO factor still enrols from a password-only session, which is
+        exactly the deadlock carve-out. It no longer ends sessions from one: the session-ending
+        actions are refused to every pending session (BACKLOG #1149), so such an account enrols
+        first, and the enrolment that binds its first factor satisfies the session. Disable/delete
+        actions are NOT listed: they run behind ``require_step_up_action``, which keeps its own
+        ``mfa_satisfied`` check.
         """
         if purpose not in self._PENDING_REFUSED_ACTIONS:
             return False
-        return await self._owes_enrolled_factor(token)
+        return await self._owes_enrolled_factor(
+            token, any_pending=purpose in self._PENDING_SESSION_ENDING_ACTIONS
+        )
 
     async def _factor_binding_is_blocked_hash(self, token_hash: str, purpose: str) -> bool:
         """:meth:`_factor_binding_is_blocked` keyed on the session's hash (see
         :meth:`_elevated_hash`)."""
         if purpose not in self._PENDING_REFUSED_ACTIONS:
             return False
-        return await self._owes_enrolled_factor_hash(token_hash)
+        return await self._owes_enrolled_factor_hash(
+            token_hash, any_pending=purpose in self._PENDING_SESSION_ENDING_ACTIONS
+        )
 
-    async def _owes_enrolled_factor(self, token: str | None, *, local_only: bool = False) -> bool:
+    async def _owes_enrolled_factor(
+        self, token: str | None, *, local_only: bool = False, any_pending: bool = False
+    ) -> bool:
         """Whether the session is MFA-pending on an account that already HAS a second factor.
 
         Fails closed (True) when the session or its user cannot be found. ``local_only`` answers
         False for a directory account, whose password the engine does not hold. It names AD rather
         than excluding everything that is not LOCAL: ``_build_identity`` maps an unrecognized
-        provider back to LOCAL, so the password handler treats that row as local and changes it."""
+        provider back to LOCAL, so the password handler treats that row as local and changes it.
+        ``any_pending`` drops the "HAS a factor" half: True for every pending session, including
+        one on an account with no factor that ``require_mfa`` covers (BACKLOG #1149)."""
         if not token:
             return True  # no session to act on, so fail closed (as below)
-        return await self._owes_enrolled_factor_hash(hash_token(token), local_only=local_only)
+        return await self._owes_enrolled_factor_hash(
+            hash_token(token), local_only=local_only, any_pending=any_pending
+        )
 
     async def _owes_enrolled_factor_hash(
-        self, token_hash: str, *, local_only: bool = False
+        self, token_hash: str, *, local_only: bool = False, any_pending: bool = False
     ) -> bool:
         """:meth:`_owes_enrolled_factor` keyed on the session's hash (see :meth:`_elevated_hash`)."""
         session = await self._load_session(token_hash)
@@ -16551,7 +16694,7 @@ class AuthService:
         satisfied, user = await self._session_satisfaction(session)
         if satisfied:
             return False
-        if user is None:
+        if user is None or any_pending:
             return True
         if local_only and user.auth_provider == AuthProvider.AD.value:
             return False
@@ -17096,8 +17239,10 @@ class AuthService:
         reads, the console's ``phi=True`` arm) and the paced writes (``require_paced``, the
         console's write gate), which refuse on ``True``. Not every caller refuses: the console's
         reauth-only action gate records the signal on a request it is refusing for another reason.
-        The JSON plane's base gate (``require``) never calls it, so the monitoring polls are not
-        refused. The console's base gate (``require_ui``) calls it for a PHI read or a write, and,
+        The JSON plane's base gate (``require``) and its monitoring-read gate
+        (``require_monitoring_read``) never call it, so the JSON monitoring polls are not refused;
+        a monitoring ``reveal`` read is, through the HTTP reveal path above. The console's base
+        gate (``require_ui``) calls it for a PHI read or a write, and,
         since BACKLOG #5646, on every request a step-up gate serves, GET included, because the
         step-up factories hand it their question; the console's plain monitoring polls ride none
         of those, so they are not refused either.
@@ -20164,8 +20309,9 @@ class AuthService:
         authenticator reported user verification, clearing it otherwise. A session that had already
         met its factor when that write ran, and any ``oidc`` session, is neither re-anchored nor
         stamped (vault BACKLOG #2964 item 14, owner rulings 2026-11-14, ADR 0068 amendment of that
-        date). Returns a not-``ok`` :class:`Elevation` (never raises) for any invalid input, always
-        audited.
+        date). Returns a not-``ok`` :class:`Elevation` for invalid input rather than raising, but an
+        exception can still raise, at least from the passkey re-read as the last paragraph says. A
+        missing token, session or account, or a disabled account, returns one with no ``auth.*`` row.
 
         For a passkey-only account this is the ONLY leg of ``POST /ui/mfa``, so the rotation here is
         what keeps the 7.2.4 claim honest rather than TOTP-shaped. **Deliberate divergence from
@@ -22428,6 +22574,35 @@ class AuthService:
             client=client,
         )
 
+    async def audit_step_up_status_read(
+        self,
+        identity: Identity,
+        path: str,
+        *,
+        action: str | None,
+        window_live: bool,
+        action_proof_live: bool | None,
+        client: str | None,
+    ) -> None:
+        """Audit one answered ``GET /me/step-up`` read (ADR 0215 section 2, BACKLOG #2603).
+
+        The read tells its caller whether a proof is live, so each answer leaves a row naming who
+        asked, about which action, and what it was told. ``client`` is required, as for
+        :meth:`audit_self_target_refused`."""
+        await self._audit(
+            STEP_UP_STATUS_READ_ACTION,
+            actor=identity.username,
+            detail=_json(
+                {
+                    "path": path,
+                    "action": action,
+                    "window_live": window_live,
+                    "action_proof_live": action_proof_live,
+                }
+            ),
+            client=client,
+        )
+
     async def audit_gate_refused(
         self,
         identity: Identity,
@@ -22436,20 +22611,36 @@ class AuthService:
         *,
         reason: str,
         client: str | None,
+        answered_status: int | None = None,
+        answered_reason: str | None = None,
     ) -> None:
         """Audit a request refused by a check its gate makes AFTER the permission check passed
         (BACKLOG #1197, ASVS 16.3.2), such as a stale step-up (``reason`` ``step_up``) or the
         per-actor pacing (``throttled``).
 
+        Where ``answered_status`` is given, the row also records it and ``answered_reason`` (null
+        if that is not given): a different refusal the caller was actually answered with, as when
+        a held monitoring-read 429 is recorded but a route's own refusal is returned in its place
+        (vault BACKLOG #1191). Without ``answered_status``, ``answered_reason`` is not recorded.
+
         The caller holds ``permission``, so this is not :meth:`audit_permission_denied`: that row
         says the permission was missing, and the denial-burst detector counts it.
-        ``_recorded_decision`` in ``api/security.py`` decides when this row is written for a gate's
-        own refusals, and ``_record_route_refusal`` for the step-up refusals a ``proof_in_route``
-        route body makes. ``client`` is required, as for :meth:`audit_self_target_refused`."""
+        Its writers in ``api/security.py`` include at least ``_recorded_decision`` for a gate's own
+        refusals, ``_record_route_refusal`` for the step-up refusals a ``proof_in_route`` route
+        body makes, and ``raise_deferred_monitoring_refusal`` and
+        ``record_deferred_monitoring_refusal`` for a monitoring-read 429 a gate held for its
+        route body. ``client`` is required, as for :meth:`audit_self_target_refused`."""
         await self._audit(
             "auth.gate_refused",
             actor=identity.username,
-            detail=_json({"permission": permission.value, "path": path, "reason": reason}),
+            detail=_json(
+                {"permission": permission.value, "path": path, "reason": reason}
+                | (
+                    {}
+                    if answered_status is None
+                    else {"answered_status": answered_status, "answered_reason": answered_reason}
+                )
+            ),
             client=client,
         )
 

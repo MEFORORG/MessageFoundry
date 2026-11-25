@@ -65,7 +65,10 @@ _PEM_MARKER: Final = "-----BEGIN"
 #: The remedy for a key file an operator supplied.
 KEY_FILE_REMEDY: Final = (
     "Restrict it to the account the engine runs as, as a file rather than a link, with no junction "
-    "or link above it that another account can change (Windows: in a directory no broad group "
+    "or link above it, or folder holding or above one, that an account the check does not trust "
+    "can change (it trusts at least SYSTEM and Administrators on Windows, root on POSIX, and the "
+    "engine's own account unless it is Local service or Network service, or cannot be read) (Windows: in a "
+    "directory no broad group "
     "may delete a file in or change the access list of; POSIX: a file that account owns, in a "
     "directory that account "
     "or root owns and only it may write, or that has the sticky bit; for a key kept behind a link, "
@@ -104,10 +107,10 @@ def key_file_problem(
 
     A known broad group or an application package must not be able to read or change the file
     (:func:`~messagefoundry.restricted_file.broad_access_problem`). That check also judges some
-    junctions and links on the path, and on Windows it reads the folder that holds
-    the file (vault BACKLOG #5656, #5657). On POSIX it also
-    refuses a file another account owns, and a directory holding it that another account
-    owns or that a group or other may write with no sticky bit. ``what`` names the file for
+    junctions and links on the path, and on Windows it reads the folder that holds the file
+    (vault BACKLOG #5656, #5657). On POSIX it also refuses a file owned by an account
+    other than the engine's own or root, and a directory holding it that such an account owns or
+    that a group or other may write with no sticky bit. ``what`` names the file for
     the operator and ``remedy`` says what to do about it; the reason never carries the file's
     contents. With ``absent_ok``, a missing file passes: the loader that opens it refuses it and
     says why, which is the fault the operator needs to hear about. With ``engine_owned``, the file is

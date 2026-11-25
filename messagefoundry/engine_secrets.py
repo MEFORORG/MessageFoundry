@@ -22,8 +22,12 @@ the readers of those settings go through. The design is ADR 0214.
   UTF-8, or one over :data:`MAX_FILE_BYTES`.
 * **The store key is not read from here as a setting.** A file named for the store key, or for its
   retired keys, is refused. The key custody host blob and its handoff (:data:`CUSTODY_FILE_NAMES`)
-  may sit here, and the listing passes over them: the ``host`` key provider reads them itself
-  (:mod:`messagefoundry.store.custody_host`, vault BACKLOG #3411), checking each as a key file.
+  may sit here, and the listing passes over them: with :data:`CUSTODY_DIRECTORY_VARIABLE` unset,
+  the ``host`` key provider reads them itself (:mod:`messagefoundry.store.custody_host`, vault
+  BACKLOG #3411), checking each as a key file. With it set, the provider reads them in the
+  directory that variable names instead, and a key file left here is not checked as one: its
+  name alone refuses another key provider, and a read or a mint while that directory holds
+  neither file.
 
 **What this slice does not do**, at least: refuse a secret found in the environment (slice B
 later made the NSSM reading in :mod:`messagefoundry.serviceenv` refuse one in the service's own
@@ -50,6 +54,7 @@ from pathlib import Path
 from typing import Final
 
 __all__ = [
+    "CUSTODY_DIRECTORY_VARIABLE",
     "CUSTODY_FILE_NAMES",
     "DIRECTORY_SETTING_NAMES",
     "KEY_CLASS_NAMES",
@@ -103,6 +108,11 @@ SECRET_SETTING_NAMES: Final[tuple[str, ...]] = (*KEY_CLASS_NAMES, *DIRECTORY_SET
 #: in this directory when it is set, so the listing passes over them.
 CUSTODY_FILE_NAMES: Final[tuple[str, str]] = ("master.key", "handoff.key")
 
+#: The variable that names a custody directory of its own for those two files (vault BACKLOG
+#: #3411, ADR 0214's 2026-11-22 amendment). Set, it wins over this directory for them. A path, not
+#: a secret.
+CUSTODY_DIRECTORY_VARIABLE: Final = "MEFOR_CUSTODY_DIRECTORY"
+
 #: The prefix of an ``env()`` value's variable, ``MEFOR_VALUE_<KEY>``. A file in the directory with
 #: this prefix supplies that value. ``config.environments.VALUE_ENV_PREFIX`` is this constant.
 VALUE_PREFIX: Final = "MEFOR_VALUE_"
@@ -113,7 +123,10 @@ MAX_FILE_BYTES: Final = 64 * 1024
 #: The remedy every access refusal ends with.
 _REMEDY: Final = (
     "Restrict it to SYSTEM, Administrators and the account the engine runs as, as real files and "
-    "directories rather than links, with no junction or link above them that another account can change (Windows: "
+    "directories rather than links, with no junction or link above them, or folder holding or "
+    "above one, that an account the check does not trust can change (it trusts at least SYSTEM "
+    "and Administrators on Windows, root on POSIX, and the engine's own account unless it is "
+    "Local service or Network service, or cannot be read) (Windows: "
     "in a folder no broad group may delete a file in or change the access list of; POSIX: the "
     "engine's own account, mode 0700 for the directory and 0600 for a file, in a folder that "
     "account or root owns and only it may write, or that has the sticky bit)"

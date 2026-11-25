@@ -315,7 +315,12 @@ class _FakeSqlStore:
         self.executed.append(sql)
 
     async def _execute_clamped(
-        self, sql: str, params: tuple[Any, ...], *, timeout_clamp: float
+        self,
+        sql: str,
+        params: tuple[Any, ...],
+        *,
+        timeout_clamp: float,
+        count_output: bool = False,
     ) -> None:
         self.executed.append(sql)  # the release's entry point (BACKLOG #5064)
 

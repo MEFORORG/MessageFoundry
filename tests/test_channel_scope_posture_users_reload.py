@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -643,3 +645,114 @@ async def test_the_engine_refusal_audits_no_malformed_name(
     assert all("A" * 64 not in str(r["detail"]) for r in rows)
     marked = [json.loads(str(r["detail"])).get("malformed_name", False) for r in rows]
     assert sorted(marked) == [False, True, True]
+
+
+# --- vault BACKLOG #3748 item 7: a denial that names no channel names its operation ---------------
+
+
+async def _denial_details(engine: Engine, actor: str) -> list[dict[str, object]]:
+    rows = await engine.store.list_audit(limit=200, actor=actor, action="auth.channel_denied")
+    return [json.loads(str(r["detail"])) for r in rows]
+
+
+async def test_refusals_naming_no_channel_name_their_operation(engine: Engine) -> None:
+    """A channel-scoped caller's refused reload, dry-run reload, reset of every statistic and
+    replay of every channel each write a denial row naming no channel. Each now names the
+    operation, so they are told apart. The control: a reset refused for one named target names its
+    channel and carries no operation."""
+    service = await _service(engine)
+    await _user(service, "scoped-dep", [Role.DEPLOYMENT.value], ["IB_T_ADT"])
+    await _user(service, "scoped-op", [Role.OPERATOR.value], ["IB_T_ADT"])
+    async with _client(engine, service) as c:
+        dep = await _login(c, "scoped-dep")
+        for dry_run in (True, False):
+            r = await c.post("/config/reload", json={"dry_run": dry_run}, headers=dep)
+            assert r.status_code == 403, r.text
+        op = await _login(c, "scoped-op")
+        r = await c.post("/dead-letters/replay", json={}, headers=op)
+        assert r.status_code == 403, r.text
+        r = await c.post("/statistics/reset", json={"all": True}, headers=op)
+        assert r.status_code == 403, r.text
+        r = await c.post(
+            "/statistics/reset",
+            json={"targets": [{"role": "source", "channel_id": "IB_OTHER"}]},
+            headers=op,
+        )
+        assert r.status_code == 403, r.text
+    assert sorted(await _denial_details(engine, "scoped-dep"), key=str) == sorted(
+        [
+            {"channel": None, "operation": "config_reload_check"},
+            {"channel": None, "operation": "config_reload"},
+        ],
+        key=str,
+    )
+    assert sorted(await _denial_details(engine, "scoped-op"), key=str) == sorted(
+        [
+            {"channel": None, "operation": "dead_letter_replay"},
+            {"channel": None, "operation": "stats_reset"},
+            {"channel": "IB_OTHER"},
+        ],
+        key=str,
+    )
+
+
+async def test_an_unknown_denied_operation_is_left_out_and_the_row_is_still_written(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The console hands ``operation`` through an untyped seam callback, so a value outside
+    ``DeniedOperation`` is left out of the row rather than refusing the audit."""
+    from messagefoundry.api.message_scope import audit_channel_denied
+
+    actor = "unknown-op-caller"
+    scoped = Identity.build(
+        user_id="unknown-op-caller-id",
+        username=actor,
+        auth_provider=AuthProvider.LOCAL,
+        roles=[Role.OPERATOR],
+        allowed_channels=frozenset({MINE}),
+    )
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.message_scope"):
+        for bogus in ("drop_table", ["connection_purge"]):
+            value: Any = bogus
+            await audit_channel_denied(engine, scoped, None, None, operation=value)
+    unknown = [r for r in caplog.records if "unknown operation" in r.getMessage()]
+    assert len(unknown) == 2
+    await audit_channel_denied(engine, scoped, None, None, operation="connection_purge")
+    # An unknown value passed with a named channel is logged too, not dropped silently.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.message_scope"):
+        await audit_channel_denied(engine, scoped, THEIRS, None, operation=value)
+    assert any("unknown operation" in r.getMessage() for r in caplog.records)
+    # A row that names a channel never carries an operation, whatever the caller passed.
+    await audit_channel_denied(engine, scoped, THEIRS, None, operation="connection_purge")
+    assert sorted(await _denial_details(engine, actor), key=str) == sorted(
+        [
+            {"channel": None},
+            {"channel": None},
+            {"channel": None, "operation": "connection_purge"},
+            {"channel": THEIRS},
+            {"channel": THEIRS},
+        ],
+        key=str,
+    )
+
+
+async def test_the_unknown_operation_warning_scrubs_the_username(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The warning carries the actor's name, which a directory can supply; a line break in it
+    must not forge a second log line."""
+    from messagefoundry.api.message_scope import audit_channel_denied
+
+    forged = Identity.build(
+        user_id="forged-id",
+        username="mallory\nFAKE LINE",
+        auth_provider=AuthProvider.LOCAL,
+        roles=[Role.OPERATOR],
+        allowed_channels=frozenset({MINE}),
+    )
+    bogus: Any = "drop_table"
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.message_scope"):
+        await audit_channel_denied(engine, forged, None, None, operation=bogus)
+    [record] = [r for r in caplog.records if "unknown operation" in r.getMessage()]
+    assert "\n" not in record.getMessage()

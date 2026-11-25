@@ -2465,6 +2465,29 @@ def configure_logging(
                 )
             root.addHandler(_build_queued_forwarder(fwd_handler, fmt=forward.fmt, spool=spool))
             forwarder_installed = True
+            if spool is None and forward.spool_dir and forward.spool_max_bytes <= 0:
+                # Logged once the forwarder is installed, so the line is sent to the collector too
+                # (best effort, like every forwarded line), and only when it is. A start whose
+                # forwarder does not install says so through the arm above that it takes: at least
+                # a WARNING for a transient connect failure and an ERROR for a permanent one, both
+                # of which [logging].level can still filter, while a refused hop raises. A clean
+                # spool-off start was otherwise silent (vault BACKLOG #1199). Through Logger.handle,
+                # which skips the logger's level, so [logging].level does not filter this line.
+                # Unlike __main__._write_start_audit it does not check logging.disable() and records
+                # no caller location (at least the line number and function name).
+                _log.handle(
+                    _log.makeRecord(
+                        _log.name,
+                        logging.WARNING,
+                        __file__,
+                        0,
+                        "off-box log forwarding to %s:%d (%s) runs without loss protection: the "
+                        "on-disk log spool is turned off ([logging].forward_spool_max_bytes = 0), "
+                        "so a record whose send fails is dropped, not kept on disk for a later send",
+                        (forward.host, forward.port, forward.protocol),
+                        None,
+                    )
+                )
 
     # Let uvicorn's loggers flow to the root handler(s) (one shared format/stream/forwarder).
     for name in _UVICORN_LOGGERS:
@@ -2554,7 +2577,8 @@ def ensure_logger_sink(logger: logging.Logger) -> None:
 
     **Not a forwarder.** This puts the record in front of an operator and into whatever the service
     manager captures; it does not transmit anything off the host. The durable off-box forwarder, and
-    the question of what ASVS 16.4.3 requires beyond it, stay open on BACKLOG #1199.
+    the question of what the ASVS off-box logging requirement asks beyond it, stay open on BACKLOG
+    #1199.
 
     Costs nothing on a configured process: it takes the ``hasHandlers`` branch and builds nothing, so
     no new work lands on the event-loop thread a caller may be running on.

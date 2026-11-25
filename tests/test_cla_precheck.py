@@ -105,8 +105,9 @@ def _verdict(scenario: str) -> tuple[str, ...]:
 
 
 def test_it_pages_past_the_hundredth_commit_and_refuses_the_impersonator_there() -> None:
-    """BACKLOG #5645 (the 100-commit cap): the action reads one page. The impersonating commit is
-    the 101st, so only a reader that follows hasNextPage sees it."""
+    """BACKLOG #5645 (the 100-commit cap): upstream's action read one page, and the patched one
+    pages too. The impersonating commit is the 101st, so only a reader that follows hasNextPage
+    sees it."""
     replay = _Replay("impersonation_on_page_two")
     read = fetch_commits(replay, "MEFORORG", "MessageFoundry", 7)
     assert (len(read.commits), read.total, read.head) == (101, 101, _HEAD)
@@ -216,9 +217,9 @@ def test_a_repeated_commit_is_a_fault_too() -> None:
 def test_a_malformed_first_page_commit_keeps_its_slot() -> None:
     """The reviewer's case: page one is [malformed, octo], page two [new-person, unsigned]. The
     malformed commit must still count toward the first page, or new-person slides into the
-    action's simulated view and its refusal is lost. A null author is now refused under rule 1,
+    first page's keys and rule 2's refusal is lost. A null author is now refused under rule 1,
     so the malformed shape here is one GitHub never sends: this guards the slot-keeping path as
-    defence in depth, and test_only_a_readable_unlinked_commit_keys_the_actions_view covers it
+    defence in depth, and test_only_a_readable_unlinked_commit_keys_the_first_page covers it
     for a refused commit."""
     malformed = {"oid": f"{1:040x}", "author": "not-an-object", "committer": None}
     pages = [
@@ -231,25 +232,31 @@ def test_a_malformed_first_page_commit_keeps_its_slot() -> None:
 
 
 def test_an_author_first_seen_past_the_hundredth_commit_is_refused() -> None:
-    """BACKLOG #5645: the action never reads commit 101, so its new author is never checked."""
+    """BACKLOG #5645: upstream's action never read commit 101, so it never asked that commit's new
+    author to sign; rule 2 of this pre-check refused them. The patched action reads past page one
+    and asks that author to sign, and rule 2 still refuses them while the signature file lacks
+    their id."""
     refusals = _verdict("new_author_past_100")
     assert len(refusals) == 1 and "new-person" in refusals[0]
 
 
-def test_the_actions_view_is_the_first_page_however_short_it_is() -> None:
-    """The action reads one page, whatever its length. An author first seen on page two is never
-    checked, even though fewer than 100 commits came before it."""
+def test_rule_two_keys_the_first_page_however_short_it_is() -> None:
+    """Rule 2 keys the first page, whatever its length. An unsigned author first seen on page two
+    is refused, even though fewer than 100 commits came before it. (Upstream's action read that
+    one page only; the patched action reads page two as well and asks the author to sign.)"""
     read = fetch_commits(_Replay("short_first_page"), "MEFORORG", "MessageFoundry", 7)
     assert read.first_page == 1
     refusals = evaluate(read, _ALLOWLIST).refusals
     assert (
-        len(refusals) == 1 and "new-person" in refusals[0] and "past the 1 commits" in refusals[0]
+        len(refusals) == 1
+        and "new-person" in refusals[0]
+        and "past the first 1 commits" in refusals[0]
     )
 
 
 def test_an_author_past_the_first_page_who_signed_is_not_refused() -> None:
-    """The action never sees this author, but the signature file it keeps already holds their id,
-    so refusing would be a false refusal of a signed contributor."""
+    """The author is first seen past page one, and the signature file the action keeps already
+    holds their id, so refusing would be a false refusal of a signed contributor."""
     read = fetch_commits(_Replay("new_author_past_100"), "MEFORORG", "MessageFoundry", 7)
     calls: list[int] = []
 
@@ -259,10 +266,14 @@ def test_an_author_past_the_first_page_who_signed_is_not_refused() -> None:
 
     assert evaluate(read, _ALLOWLIST, signed).refusals == ()
     assert len(evaluate(read, _ALLOWLIST, _no_signatures).refusals) == 1
-    assert calls == [1], "the signature file is read once, and only for an unseen author"
+    assert calls == [1], (
+        "the signature file is read once, and only for an author first seen past the first page"
+    )
     linked = fetch_commits(_Replay("linked_on_page_two"), "MEFORORG", "MessageFoundry", 7)
     evaluate(linked, _ALLOWLIST, signed)
-    assert calls == [1], "a pull request with no unseen author never reads the signature file"
+    assert calls == [1], (
+        "a pull request with no author first seen past the first page does not read the signature file"
+    )
 
 
 def _serve(pages: list[Mapping[str, Any]]) -> cla_precheck.Transport:
@@ -294,7 +305,7 @@ def _commit(
 
 
 def test_a_linked_signed_author_does_not_cover_an_unlinked_commit_sharing_its_name() -> None:
-    """Past the first page the action sees nothing, so an unlinked 'alice' cannot have signed,
+    """Rule 1 judges an unlinked author on its own, so an unlinked 'alice' cannot have signed,
     whatever a linked alice before it did; the verdict must not depend on commit order."""
     signed = frozenset({90000004})
     for later in (
@@ -360,7 +371,7 @@ def test_an_unlinked_author_with_a_null_or_malformed_committer_is_refused(
     committer: object, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """BACKLOG #5644 added item 1: rule 1 refuses an unlinked author whatever the committer. The
-    commit sits past the action's one page, where nothing else refuses it; before the fix an
+    commit sits past the first page, where rule 2 does not read it; before the fix an
     unreadable committer made this a fault (exit 3), which the workflow passes. No rule reads the
     key of a commit past that page, so its committer is not a fault either."""
     commit: dict[str, object] = {"oid": f"{2:040x}", "author": {"name": "Mallory", "user": None}}
@@ -392,8 +403,8 @@ def test_a_linked_author_with_a_null_or_malformed_committer_passes_past_page_one
 def test_a_null_author_is_refused_and_not_also_a_fault(
     page: int, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A null author (schema-legal) has no account linked, so rule 1 refuses it, on the action's
-    page or past it, and the refusal is not also reported as a fault about a valid reply."""
+    """A null author (schema-legal) has no account linked, so rule 1 refuses it, on the first page
+    or past it, and the refusal is not also reported as a fault about a valid reply."""
     commit = {"oid": f"{2:040x}", "author": None, "committer": {"name": "C", "user": None}}
     if page == 1:
         pages = [_page([commit, _commit(3, "Octo", "octo-contributor", 90000001)], 2, False)]
@@ -483,7 +494,7 @@ def test_both_rules_reach_the_first_annotations_and_the_rest_reach_the_log(
     ],
     ids=["unreadable-user", "null-committer", "readable"],
 )
-def test_only_a_readable_unlinked_commit_keys_the_actions_view(
+def test_only_a_readable_unlinked_commit_keys_the_first_page(
     committer: Mapping[str, Any] | None, refusals: int
 ) -> None:
     """A page-one unlinked commit is filed under its author name when its committer reads, as the
@@ -601,10 +612,15 @@ def test_a_reply_that_cannot_be_trusted_is_a_fault(scenario: str) -> None:
 
 
 def test_wildcard_and_empty_entries_match_as_the_action_matches() -> None:
-    """Mirrored, not endorsed: `bot*` matches anywhere in the name, which is why cla.yml's
-    allowlist holds no glob; an empty entry from a doubled comma matches an empty name; and the
-    wildcard stops at a carriage return, as JavaScript's `.` does."""
-    assert matches_allowlist("robot-person", ["bot*"])
+    """Mirrored: `bot*` matches the whole name only, as the patched action anchors it (BACKLOG
+    #5644 item 2); an empty entry from a doubled comma matches an empty name; and the wildcard
+    stops at a carriage return, as JavaScript's `.` does."""
+    assert matches_allowlist("bot-person", ["bot*"])
+    assert not matches_allowlist("robot-person", ["bot*"])
+    assert not matches_allowlist("evilbot-x", ["bot*"])
+    assert not matches_allowlist("bot-x\n", ["bot*"])
+    assert matches_allowlist("dependabot[bot]", ["*[bot]"])
+    assert not matches_allowlist("aXb-1", ["a.b*"])
     assert not matches_allowlist("robot-person", ["bot"])
     assert matches_allowlist("wshallwshall", [" wshallwshall "])
     assert not matches_allowlist("wshallwshal", ["wshallwshall"])
@@ -759,8 +775,8 @@ def test_every_first_page_commit_without_a_key_narrows_the_rule_two_reason(
     verdict = evaluate(fetch_commits(_serve(pages), "M", "N", 7), _ALLOWLIST, _no_signatures)
     rule_two = [r for r in verdict.refusals if f"{3:040x}" in r]
     assert rule_two == [
-        f"commit {3:040x} is past the 2 commits the action reads, none of the 1 of them this "
-        "read could key carries its author's key 'new-person' (the login, or else the git name, "
+        f"commit {3:040x} is past the first 2 commits of this pull request, none of the 1 of "
+        "them this read could key carries its author's key 'new-person' (the login, or else the git name, "
         "the action files a commit under), and the CLA signature file holds no signature for "
         "that account"
     ]
@@ -770,8 +786,8 @@ def test_every_first_page_commit_without_a_key_narrows_the_rule_two_reason(
 
 def test_a_fully_keyed_first_page_names_keys_not_people() -> None:
     """The author past page one is a first-page COMMITTER under a linked author, so they appear
-    in the action's page; only their key is absent. The reason says that, not that they appear
-    nowhere."""
+    on the first page; only their key is absent from its keys. The reason says that, not that they
+    appear nowhere."""
     bob = {"name": "Bob", "user": {"databaseId": 90000002, "login": "bob"}}
     pages = [
         _page([{"oid": f"{1:040x}", "author": _OCTO, "committer": bob}], 2, True),
@@ -781,8 +797,8 @@ def test_a_fully_keyed_first_page_names_keys_not_people() -> None:
     verdict = evaluate(read, _ALLOWLIST, _no_signatures)
     assert verdict == cla_precheck.Verdict(
         (
-            f"commit {2:040x} is past the 1 commits the action reads, none of them carries its "
-            "author's key 'bob' (the login, or else the git name, the action files a commit "
+            f"commit {2:040x} is past the first 1 commits of this pull request, none of them "
+            "carries its author's key 'bob' (the login, or else the git name, the action files a commit "
             "under), and the CLA signature file holds no signature for that account",
         )
     )

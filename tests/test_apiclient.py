@@ -178,6 +178,30 @@ def test_list_readers_still_decode_a_well_formed_reply(
     assert result.total == 0
 
 
+def test_list_users_decodes_both_shapes_of_the_union() -> None:
+    """BACKLOG #5520 item 10: ``GET /users`` answers a list mixing full summaries and accounts
+    listed by id alone (``IntegrityFailedUser``); the client decodes each row to its own shape and
+    keeps nothing of a failed row but its id."""
+    from messagefoundry.api.auth_models import IntegrityFailedUser, UserSummary
+
+    rows = [
+        {
+            "id": "a" * 32,
+            "username": "intact",
+            "auth_provider": "local",
+            "disabled": False,
+            "roles": ["viewer"],
+            "channel_scope_withheld": True,
+        },
+        {"id": "b" * 32, "integrity_failed": True},
+    ]
+    with _client_answering(json.dumps(rows).encode()) as client:
+        listed = client.list_users()
+    assert isinstance(listed[0], UserSummary) and listed[0].username == "intact"
+    assert isinstance(listed[1], IntegrityFailedUser)
+    assert listed[1].model_dump() == {"id": "b" * 32, "integrity_failed": True}
+
+
 @pytest.mark.parametrize(
     "content",
     [

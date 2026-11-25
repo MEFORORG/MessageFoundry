@@ -440,6 +440,11 @@ _LOOSER_THAN_DEFAULT = [
     ("phi_read_rate_limit_window_seconds", -1.0),
     ("phi_read_rate_limit_window_seconds", 59.0),
     ("phi_read_rate_limit_window_seconds", 1e-6),
+    ("monitoring_read_rate_limit_enabled", False),
+    ("monitoring_read_rate_limit_per_actor", 0),
+    ("monitoring_read_rate_limit_per_actor", 601),
+    ("monitoring_read_rate_limit_window_seconds", 59.0),
+    ("monitoring_read_rate_limit_window_seconds", 1e-6),
     ("admin_write_rate_limit_enabled", False),
     ("admin_write_rate_limit_per_actor", 0),
     ("admin_write_rate_limit_per_actor", 13),
@@ -503,6 +508,13 @@ _STRICTER_OR_DEFAULT = [
     ("phi_read_rate_limit_global", 1),
     ("phi_read_rate_limit_window_seconds", 60.0),
     ("phi_read_rate_limit_window_seconds", 61.0),
+    ("monitoring_read_rate_limit_per_actor", 600),
+    ("monitoring_read_rate_limit_per_actor", 599),
+    # The all-users monitoring-read count ships OFF, so no value of it is looser.
+    ("monitoring_read_rate_limit_global", 0),
+    ("monitoring_read_rate_limit_global", 1),
+    ("monitoring_read_rate_limit_window_seconds", 60.0),
+    ("monitoring_read_rate_limit_window_seconds", 61.0),
     ("admin_write_rate_limit_per_actor", 12),
     ("admin_write_rate_limit_per_actor", 11),
     # A negative admin-write count is refused at load (BACKLOG #3293), so it has no row here.
@@ -1032,6 +1044,16 @@ _NUMERIC_AUTH_NAMED: dict[str, tuple[Any, object, str]] = {
         59.0,
         "phi_read_rate_limit_window_seconds",
     ),
+    "monitoring_read_rate_limit_per_actor": (
+        AuthSettings,
+        601,
+        "monitoring_read_rate_limit_per_actor",
+    ),
+    "monitoring_read_rate_limit_window_seconds": (
+        AuthSettings,
+        59.0,
+        "monitoring_read_rate_limit_window_seconds",
+    ),
     "admin_write_rate_limit_per_actor": (AuthSettings, 13, "admin_write_rate_limit_per_actor"),
     "admin_write_rate_limit_window_seconds": (
         AuthSettings,
@@ -1045,6 +1067,7 @@ _NUMERIC_AUTH_EXEMPT = {
     "oidc_session_max_hours": "never looser",
     # Ships OFF (0), so no value of it is looser than the default.
     "phi_read_rate_limit_global": "ships off",
+    "monitoring_read_rate_limit_global": "ships off",
 }
 
 

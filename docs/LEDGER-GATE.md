@@ -106,7 +106,8 @@ on the maintainer clone: the backlog floor is **314** counting every ref, but **
 allocator silently resumes issuing numbers that are already in use, with no error. So the highest floor
 ever computed is stored at `<git-common-dir>/mefor-coord/alloc/<kind>/.floor-highwater` and the floor
 never goes below it; a computed floor beneath the mark prints a loud NOTE rather than quietly handing
-out a used number. The mark can only rise.
+out a used number. One run never lowers the mark, but two concurrent runs can leave the lower value,
+because the last writer wins.
 
 **Two maximums, not one — and conflating them bricked the allocator on 2026-08-03.** The public backlog
 sequence is partitioned from the maintainer-internal one at `PUBLIC_BACKLOG_FLOOR` (`#1000`), so the
