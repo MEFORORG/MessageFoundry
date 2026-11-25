@@ -14188,9 +14188,11 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
     ``admin-unlock`` no longer works this way: its row commits in the clear's own transaction
     (BACKLOG #5633).
 
-    A revoke whose link to the store failed may have committed, so it is reported as unknown, as
-    the transit-bound commands report a write (BACKLOG #5093), and its own row records the attempt
-    with ``"outcome": "unknown"`` and no count, where the store accepts that row."""
+    A revoke whose link to a server store failed may have committed, so it is reported as
+    unknown (BACKLOG #5093), and its own row records the attempt with ``"outcome": "unknown"`` and
+    no count, where the store accepts that row; :func:`_revoke_link_lost` says which failures
+    count. A failure of the report the store runs after the revoke committed is reported as a
+    revoke that landed, with ``"outcome": "committed"`` and no count, since the count is lost."""
     import getpass
 
     from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
@@ -14206,6 +14208,7 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
         store_call_errors,
         store_connect_errors,
     )
+    from messagefoundry.store.store import REVOKE_COMMITTED_NOTE
 
     settings = _host_gated_store_settings(args, false_finding="'no sessions revoked'")
     if isinstance(settings, int):
@@ -14222,10 +14225,13 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
             as_json=args.json,
         )
 
+    network = _store_on_network(settings)
+
     async def run() -> tuple[
-        Literal["revoked", "refused", "unknown"], int | None, str | None, str | None
+        Literal["revoked", "committed", "refused", "unknown"], int | None, str | None, str | None
     ]:
         """``(outcome, count, problem, audit_problem)``. ``revoked`` carries the count;
+        ``committed`` the failure of the report after a revoke that landed, whose count is lost;
         ``refused`` the store's refusal, which rolled the revoke back; ``unknown`` the link
         failure, after which the revoke may have committed. ``audit_problem`` is the refusal of
         this command's row, or ``None`` once it is written."""
@@ -14240,14 +14246,16 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
 
         async def audit(detail: dict[str, object]) -> str | None:
             """Append the row once the revoke has run. A refusal ``audit_write_errors()`` names,
-            the audit-write defects and a Transit MAC failure among them, is returned as text
-            rather than raised, so it does not replace what the command says about the revoke.
-            The class goes to ERROR and the traceback to DEBUG: a driver's message can quote a
-            stored value."""
+            a Transit MAC failure among them, is returned as text rather than raised, so it does
+            not replace what the command says about the revoke. The audit-write defects are
+            raised, as on main: a bug is not a refusal. The class goes to ERROR and the traceback
+            to DEBUG: a driver's message can quote a stored value."""
             try:
                 await store.record_audit(
                     "auth.session_revoked", actor=actor, detail=json.dumps(detail)
                 )
+            except AUDIT_WRITE_DEFECTS:
+                raise  # a bug, not a refused write
             except audit_write_errors() as exc:
                 log = logging.getLogger(__name__)
                 log.error(
@@ -14268,9 +14276,21 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
             _refuse_an_unauditable_write(store)
             try:
                 revoked = (await store.revoke_all_sessions()).count
-            except AUDIT_WRITE_DEFECTS:
-                raise  # a bug, not a refused write
-            except (*store_call_errors(), *store_connect_errors()) as exc:
+            except Exception as exc:
+                if REVOKE_COMMITTED_NOTE in getattr(exc, "__notes__", ()):
+                    # The revoke committed and the store's report after it failed, so the
+                    # sessions are ended and only the count is lost. The row records the act.
+                    committed: dict[str, object] = {
+                        "scope": "all",
+                        "count": None,
+                        "outcome": "committed",
+                    }
+                    return "committed", None, _store_error_text(exc), await audit(committed)
+                if isinstance(exc, AUDIT_WRITE_DEFECTS):
+                    raise  # a bug, not a refused write
+                if not isinstance(exc, (*store_call_errors(), *store_connect_errors())):
+                    raise
+                lost = _revoke_link_lost(exc, network=network)
                 # pyodbc's bare Error root on a SQLSTATE that is not transient, such as a
                 # bind-count mismatch, is a defect, as the transit-bound commands treat it, which
                 # the dispatch floor reports by class and SQLSTATE only. Unless a lost link sits
@@ -14280,9 +14300,9 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
                 defect = not isinstance(exc, store_call_errors()) and not (
                     _is_transient_driver_error(exc)
                 )
-                if defect and not _write_outcome_unknown(exc):
+                if defect and not lost:
                     raise _StoreDefect(_store_error_text(exc)) from exc
-                if _write_outcome_unknown(exc):
+                if lost:
                     # The link failed, possibly after the server applied the COMMIT, so nothing
                     # here can say whether the sessions ended. The row records the attempt.
                     detail: dict[str, object] = {
@@ -14323,6 +14343,18 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     if outcome == "refused":
         return _emit_error(f"nothing was revoked: {problem}", as_json=args.json)
+    if outcome == "committed":
+        recorded = (
+            "An auth.session_revoked row with the outcome committed and no count records it"
+            if audit_problem is None
+            else f"The audit row could not be written either ({audit_problem}); record the act "
+            "by hand"
+        )
+        return _emit_error(
+            "the revoke committed, so the sessions it found are ended, but the report the store "
+            f"runs after it failed ({problem}), so its count is not known. {recorded}",
+            as_json=args.json,
+        )
     if outcome == "unknown":
         recorded = (
             "An auth.session_revoked row with the outcome unknown records the attempt"
@@ -14333,7 +14365,8 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
         return _emit_error(
             "the connection to the store failed during the revoke, so whether it took effect is "
             f"unknown ({problem}). {recorded}. Re-run the command: a second revoke ends what "
-            "this one would have, and also every session signed in since this attempt",
+            "this one would have, within the limits docs/SECURITY.md, Limits of the session "
+            "sweep, names, and also every session signed in since this attempt",
             as_json=args.json,
         )
     if audit_problem is not None:
@@ -15713,22 +15746,45 @@ def _is_transient_driver_error(exc: BaseException) -> bool:
 
 def _write_outcome_unknown(exc: BaseException) -> bool:
     """Whether a failed write may still have committed: a lost connection (OSError, or SQLSTATE
-    class 08), or 40003, "statement completion unknown" (BACKLOG #2337).
-
-    The implicit ``__context__`` is followed, never an explicit ``__cause__`` (BACKLOG #5093): a
-    backend that rolls back in an ``except`` block and re-raises loses the COMMIT's lost link to
-    the rollback's own error on a dead connection, which then carries it only as its context. An
-    error raised ``from`` another was raised as that error's meaning, at least the pool's
-    ``StoreAcquireTimeout`` from a ``TimeoutError`` before any transaction began, so a chain
-    stops there, as it does at a suppressed context."""
+    class 08), or 40003, "statement completion unknown" (BACKLOG #2337)."""
     from messagefoundry.store.base import driver_sqlstate
 
+    if isinstance(exc, OSError):
+        return True
+    state = driver_sqlstate(exc)
+    return state is not None and (state.startswith("08") or state == "40003")
+
+
+def _store_on_network(settings: ServiceSettings) -> bool:
+    """Whether the store is a server database reached over a connection, not a SQLite file."""
+    from messagefoundry.config.settings import StoreBackend
+
+    return settings.store.backend != StoreBackend.SQLITE
+
+
+def _revoke_link_lost(exc: BaseException, *, network: bool) -> bool:
+    """Whether ``admin-revoke-sessions``' failed revoke may have committed (BACKLOG #5093).
+
+    Never on SQLite: the file has no link to lose, and a revoke that raised there rolled back.
+    On a server store, an ``OSError`` raised by the revoke itself, but not a ``TimeoutError``,
+    which a driver's own statement or pool timeout raises before a COMMIT is in doubt; or a
+    SQLSTATE of class 08, or 40003, "statement completion unknown", on the error or in its
+    implicit ``__context__`` chain. The chain is read for a SQLSTATE only: a rollback on a dead
+    connection after a COMMIT whose link failed raises its own error with the lost link as its
+    context, while a refusal raised inside an ``except OSError`` block names no lost COMMIT. An
+    explicit cause or a suppressed context ends the chain: the raiser chose what it means. The
+    reading is an approximation from the outside; the store does not say whether its COMMIT was
+    sent."""
+    from messagefoundry.store.base import driver_sqlstate
+
+    if not network:
+        return False
+    if isinstance(exc, OSError) and not isinstance(exc, TimeoutError):
+        return True
     link: BaseException | None = exc
     seen: set[int] = set()
     while link is not None and id(link) not in seen:
         seen.add(id(link))
-        if isinstance(link, OSError):
-            return True
         state = driver_sqlstate(link)
         if state is not None and (state.startswith("08") or state == "40003"):
             return True

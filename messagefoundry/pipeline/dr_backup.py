@@ -5406,8 +5406,9 @@ def restored_accounts_notice(sessions_revoked: int) -> str:
     than it ended."""
     return (
         f"{RESTORE_ROLLBACK_NOTICE} The restore ended {sessions_revoked} unrevoked session(s), "
-        "expired ones included, in the store it placed, and the first engine start on this store "
-        "ends every session again and records the restore."
+        "expired ones included, in the store it placed. The first engine start on this store "
+        "revokes again the sessions it finds and raises the global session epoch, within the "
+        "limits docs/SECURITY.md, Limits of the session sweep, names, and records the restore."
     )
 
 

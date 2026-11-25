@@ -1786,6 +1786,12 @@ def _refusal_key(refusal: _RevokeSealRefusal) -> tuple[object, ...]:
     return ("refusal", refusal.unverifiable, refusal.kind, refusal.ident)
 
 
+#: The note :meth:`RevokeSealOutcome.committing` adds to a failure of the report it runs after the
+#: revoke committed, so a caller can tell a revoke that landed from one that rolled back (BACKLOG
+#: #5093): ``admin-revoke-sessions`` reads it.
+REVOKE_COMMITTED_NOTE = "raised by the report after the revoke committed"
+
+
 @dataclass
 class RevokeSealOutcome:
     """What one revoke's sealed writes met (decision d20261109T200352805-599b24 on ADR 0217, items
@@ -1815,7 +1821,8 @@ class RevokeSealOutcome:
         known, on every exit (decision d20261110T063908944-857965, item 6).
 
         **On a clean exit** the revoke has committed, and :meth:`report` runs here, so no path
-        between the commit and a separate call can skip it.
+        between the commit and a separate call can skip it. A failure of that report carries
+        :data:`REVOKE_COMMITTED_NOTE`, since the revoke it reports on has landed (BACKLOG #5093).
 
         **If the transaction raises**, the report says the revoke failed before its commit was
         confirmed, rather than that it went ahead, and the exception propagates (decision
@@ -1851,7 +1858,11 @@ class RevokeSealOutcome:
         carry = _REVOKE_CARRY.get()
         if carry is not None and not carry.closed:
             carry.covered_by(self)
-        await self.report(record_audit)
+        try:
+            await self.report(record_audit)
+        except Exception as exc:
+            exc.add_note(REVOKE_COMMITTED_NOTE)
+            raise
 
     def refused(self, exc: Exception, *, what: str, kind: str, ident: str) -> None:
         """Take one refusal :func:`revoke_seal_refusals` names, which the revoke goes ahead without.
