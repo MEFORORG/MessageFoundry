@@ -2542,6 +2542,12 @@ async def _write_through_cancellation(
             # Recorded before anything else, so a cancel that lands in the turn the writes finish
             # is still re-raised rather than swallowed.
             cancelled = True
+        except Exception:  # noqa: BLE001 -- read from ``task`` below, by the cancelled check
+            # BACKLOG #6884. A write that fails on an await after an earlier cancel raises here,
+            # not CancelledError. Escaping the loop with it skipped the branch below, so the
+            # cancelled caller left with the write's error and its cancel unconsumed. The task is
+            # done now, so the loop ends and the branches below decide what the caller sees.
+            pass
     if cancelled:
         if not task.cancelled() and task.exception() is not None:
             # Nobody else will read it: the caller is leaving with the cancel.
