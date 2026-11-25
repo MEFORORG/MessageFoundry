@@ -679,10 +679,13 @@ _LINEARITY_HEADERS = {
 #: builds its line from 4-character headers.
 _LINEARITY_CHARS = 2_000
 
-#: What ends one of the segment meter's two lines: a line break, then one more segment. A regression
-#: that anchors the segment to the end of the string is linear on a line that ends the string, and
-#: one that requires a line break is linear on a line that has one, so the meter reads both lines.
-_SEGMENT_LINE_END = "\rOBX{}xyz"
+#: What ends the segment meter's lines after the first: a line break, then one more segment. A
+#: regression that anchors the segment to the end of the string is linear on a line that ends the
+#: string, and one that requires a line break is linear on a line that has one, so the meter reads a
+#: line of each kind. Both breaks are read, because one that accepts a carriage return or the end of
+#: the string (``(?=\r|\Z)``) is linear on those lines and quadratic on a line-feed-ended one
+#: (BACKLOG #2958 step 6 item a).
+_SEGMENT_LINE_ENDS = ("\rOBX{}xyz", "\nOBX{}xyz")
 
 
 class _LinearityCase(NamedTuple):
@@ -743,9 +746,12 @@ def _field_run_reads(field_run: re.Pattern[str], delimiters: frozenset[str], cha
     starts are admitted is read from the compiled pattern, not modelled: the token is followed by two
     more delimited fields, so an admitted start MATCHES and a refused one does not.
 
-    **One-character words.** The guard admits a start after each space, which is correct; what keeps
-    it cheap is that the run class stops at the next space. Each start is charged what it matched, so
-    a run class widened over whitespace, which matches from every word to the end, is charged that.
+    **One-character words.** The guard admits a start after each white space character, which is
+    correct; what keeps it cheap is that the run class stops at the next one. Each start is charged
+    what it matched, so a run class widened over whitespace, which matches from every word to the
+    end, is charged that. The words are read once per white space character, each line separated by
+    one of them alone, so a run class narrowed from ``\\s`` to a literal space crosses the tabs or line
+    breaks of a line and is charged that too (BACKLOG #2958 step 6 item b).
 
     The charge per start is the model. A start that re-reads its token more than once, the nested
     shape, is not seen; :func:`test_the_field_run_and_segment_patterns_nest_no_repetition` reads it."""
@@ -758,19 +764,29 @@ def _field_run_reads(field_run: re.Pattern[str], delimiters: frozenset[str], cha
         f"would not show as a match and the meter would read zero"
     )
     token = sum(chars - start for start in range(chars) if field_run.match(probe, start))
-    words = "a " * (chars // 2 - 1) + "a" + fields
-    spaced = sum(
-        match.end() - start
-        for start in range(len(words))
-        if (match := field_run.match(words, start)) is not None
-    )
+    spaced = 0
+    for space in _WHITESPACE:
+        words = f"a{space}" * (chars // 2 - 1) + "a" + fields
+        spaced = max(
+            spaced,
+            sum(
+                match.end() - start
+                for start in range(len(words))
+                if (match := field_run.match(words, start)) is not None
+            ),
+        )
     return max(token, spaced)
 
 
+#: The ASCII white space characters ``\s`` holds, each separating one of the field-run meter's word
+#: lines.
+_WHITESPACE = " \t\n\r\x0b\x0c"
+
+
 def _segment_reads(segment: re.Pattern[str], separator: str, chars: int) -> int:
-    """Characters ``segment`` reads, on the larger of two inputs of ``chars`` characters: a line of
-    segment headers over ``separator`` (``OBX*OBX*...``) that ends the string, and one ended by
-    :data:`_SEGMENT_LINE_END`.
+    """Characters ``segment`` reads, on the largest of three inputs of ``chars`` characters: a line
+    of segment headers over ``separator`` (``OBX*OBX*...``) that ends the string, and one ended by
+    each of :data:`_SEGMENT_LINE_ENDS`.
 
     The sweep is ``finditer``'s: from each position the segment header occurs at, a match reads its
     own span and the sweep resumes after it, and a start that fails is charged the rest of its line,
@@ -780,16 +796,17 @@ def _segment_reads(segment: re.Pattern[str], separator: str, chars: int) -> int:
     also the meter's stated false red: a linear pattern that refuses ``OBX`` early would be charged
     as if it had read to the end of the line, so a change to what counts as a segment re-derives
     this meter rather than reading its red as quadratic."""
-    end = _SEGMENT_LINE_END.format(separator)
-    assert chars % 4 == 0 and (chars - len(end)) % 4 == 0, (
-        f"{chars} does not split into 4-character headers, so the meter cannot build its lines; "
-        f"_LINEARITY_CHARS must be a multiple of 8"
+    ends = [end.format(separator) for end in _SEGMENT_LINE_ENDS]
+    unfit = [len(end) for end in ends if (chars - len(end)) % 4]
+    assert chars % 4 == 0 and not unfit, (
+        f"{chars} characters do not split into 4-character headers, alone or before a "
+        f"{unfit}-character line end, so the meter cannot build its lines"
     )
     header = re.compile(rf"\bOBX{re.escape(separator)}")
     readings = []
     for text in (
         f"OBX{separator}" * (chars // 4),
-        f"OBX{separator}" * ((chars - len(end)) // 4) + end,
+        *(f"OBX{separator}" * ((chars - len(end)) // 4) + end for end in ends),
     ):
         assert len(text) == chars and header.search(text) is not None
         reads = 0
@@ -798,8 +815,8 @@ def _segment_reads(segment: re.Pattern[str], separator: str, chars: int) -> int:
             start = found.start()
             match = segment.match(text, start)
             if match is None:
-                line_end = text.find("\r", start)
-                reads += (len(text) if line_end < 0 else line_end) - start
+                breaks = [i for i in (text.find("\r", start), text.find("\n", start)) if i >= 0]
+                reads += min(breaks, default=len(text)) - start
                 pos = start + 1
             else:
                 reads += match.end() - start
@@ -808,21 +825,36 @@ def _segment_reads(segment: re.Pattern[str], separator: str, chars: int) -> int:
     return max(readings)
 
 
-def _check_reads(reads: int, what: str) -> None:
+def _check_reads(reads: Callable[[int], int], what: str) -> None:
     """Both arms' assertion, on a reading taken at :data:`_LINEARITY_CHARS`: at most one read of each
-    character. A control reads the same line through the same call."""
-    assert reads <= _LINEARITY_CHARS, (
-        f"{what} read {reads} characters of a {_LINEARITY_CHARS}-character input, so a start re-read "
-        f"what an earlier start read and the scan is quadratic again (BACKLOG #1437)"
+    character. A control reads the same line through the same call.
+
+    A reading over the line is read again at half the input, so the failure says which it is: reads
+    that more than tripled when the input doubled are quadratic again, and reads that did not are a
+    constant factor, such as each character read twice (BACKLOG #2958 step 6 item e). The line is at
+    most one read of each character either way, so the shipped token reading sits on it, at no
+    margin, by design: it reads each character once (item f)."""
+    large = reads(_LINEARITY_CHARS)
+    if large <= _LINEARITY_CHARS:
+        return
+    small = reads(_LINEARITY_CHARS // 2)
+    assert large <= 3 * small, (
+        f"{what} read {large} characters of a {_LINEARITY_CHARS}-character input, and {small} of half "
+        f"of it, so a start re-read what an earlier start read and the scan is quadratic again "
+        f"(BACKLOG #1437)"
+    )
+    raise AssertionError(
+        f"{what} read {large} characters of a {_LINEARITY_CHARS}-character input, and {small} of half "
+        f"of it: linear, but more than one read of each character, so a constant factor changed"
     )
 
 
 def _assert_read_red_and_quadratic(reads: Callable[[int], int], what: str) -> None:
     """A control's two claims: the arms' own assertion reds on the regressed pattern, and the
     pattern's reads grow quadratically when the input doubles, so the red is not a constant factor."""
-    large = reads(_LINEARITY_CHARS)
     with pytest.raises(AssertionError, match="quadratic again"):
-        _check_reads(large, what)
+        _check_reads(reads, what)
+    large = reads(_LINEARITY_CHARS)
     small = reads(_LINEARITY_CHARS // 2)
     assert large > 3 * small, (
         f"doubling the input took {what} from {small} to {large} reads, which is not quadratic, so "
@@ -843,16 +875,41 @@ def test_the_field_run_and_segment_patterns_read_each_character_once(case: str) 
     and not every regression a pattern could take."""
     pair = _linearity_case(case)
     _check_reads(
-        _field_run_reads(pair.field_run, pair.delimiters, _LINEARITY_CHARS), "the field run"
+        lambda chars: _field_run_reads(pair.field_run, pair.delimiters, chars), "the field run"
     )
     _check_reads(
-        _segment_reads(pair.segment, pair.separator, _LINEARITY_CHARS), "the segment pattern"
+        lambda chars: _segment_reads(pair.segment, pair.separator, chars), "the segment pattern"
     )
+
+
+@pytest.mark.parametrize(
+    ("factor", "message"),
+    [(2, "linear, but more than one read"), (None, "quadratic again")],
+    ids=["linear-twice", "quadratic"],
+)
+def test_a_reading_over_the_line_says_whether_it_is_quadratic(
+    factor: int | None, message: str
+) -> None:
+    """A linear change that reads each character twice is not reported as quadratic (BACKLOG #2958
+    step 6 item e), and a quadratic one still is."""
+
+    def reads(chars: int) -> int:
+        return factor * chars if factor is not None else chars * chars // 100
+
+    with pytest.raises(AssertionError, match=message):
+        _check_reads(reads, "a synthetic meter")
+    _check_reads(lambda chars: chars, "a synthetic meter")
 
 
 @pytest.mark.parametrize("case", _LINEARITY_CASES)
 @pytest.mark.parametrize(
-    "regression", ["guard-removed", "guard-narrowed", "run-class-widened-over-spaces"]
+    "regression",
+    [
+        "guard-removed",
+        "guard-narrowed",
+        "run-class-widened-over-spaces",
+        "run-class-narrowed-to-a-space",
+    ],
 )
 def test_a_field_run_whose_guard_is_not_the_exact_complement_is_read_red(
     case: str, regression: str
@@ -863,7 +920,9 @@ def test_a_field_run_whose_guard_is_not_the_exact_complement_is_read_red(
     ``guard-removed`` is the pre-#1437 shape (on the hardcoded case, ``_PRE_GUARD_FIELD_RUN``).
     ``guard-narrowed`` admits a start after a digit too, so a token holding digits is re-read from
     every one. ``run-class-widened-over-spaces`` leaves the guard alone and lets the run cross a
-    space, so each start the guard admits after a space reads to the end of the line."""
+    space, so each start the guard admits after a space reads to the end of the line.
+    ``run-class-narrowed-to-a-space`` lets the run cross every other white space character, so each
+    start the guard admits after a tab reads to the end of a tab-separated line."""
     pair = _linearity_case(case)
     guard, spelling = _field_run_guard(pair.field_run)
     body = pair.field_run.pattern.removeprefix(guard)
@@ -874,7 +933,8 @@ def test_a_field_run_whose_guard_is_not_the_exact_complement_is_read_red(
     elif regression == "guard-narrowed":
         regressed = re.compile(rf"(?<![^\s{spelling}0-9])" + body)
     else:
-        widened = body.replace(rf"[^\s{spelling}]", rf"[^\r\n{spelling}]")
+        run_class = "\\r\\n" if regression == "run-class-widened-over-spaces" else " "
+        widened = body.replace(rf"[^\s{spelling}]", rf"[^{run_class}{spelling}]")
         assert widened != body
         regressed = re.compile(guard + widened)
     _assert_read_red_and_quadratic(
@@ -885,7 +945,14 @@ def test_a_field_run_whose_guard_is_not_the_exact_complement_is_read_red(
 
 @pytest.mark.parametrize("case", _LINEARITY_CASES)
 @pytest.mark.parametrize(
-    "tail", [r"\r", r"\n", "$"], ids=["carriage-return-required", "line-feed-required", "anchored"]
+    "tail",
+    [r"\r", r"\n", "$", r"(?=\r|\Z)"],
+    ids=[
+        "carriage-return-required",
+        "line-feed-required",
+        "anchored",
+        "carriage-return-or-end-required",
+    ],
 )
 def test_a_segment_pattern_that_needs_more_after_its_run_is_read_red(case: str, tail: str) -> None:
     """Live positive control for the segment arm: the shipped pattern with something required after
@@ -903,11 +970,34 @@ def test_a_segment_pattern_that_needs_more_after_its_run_is_read_red(case: str, 
     )
 
 
+#: Parsed opcodes that hold no sub-pattern, which :func:`_nested_repetitions` steps over. An opcode
+#: on neither this list nor its own raises, so a new one is read before it is trusted.
+_LEAF_OPCODES = frozenset(
+    {
+        sre_constants.LITERAL,
+        sre_constants.NOT_LITERAL,
+        sre_constants.ANY,
+        sre_constants.IN,
+        sre_constants.AT,
+        sre_constants.CATEGORY,
+        sre_constants.GROUPREF,
+    }
+)
+
+
 def _nested_repetitions(pattern: str) -> list[str]:
-    """Every repetition in ``pattern`` with no fixed count that sits inside another such repetition
-    and can give characters back: anything but a possessive one. That is the shape that lets one
-    start re-read its token many times, whether either repetition is greedy or lazy. Read from the
-    parsed pattern."""
+    """The repetitions in ``pattern`` that can repeat more than once with no fixed count, sit inside
+    another such repetition, and can give characters back: anything but a possessive one. That is
+    the shape that lets one start re-read its token many times, whether either repetition is greedy
+    or lazy. Read from the parsed pattern, through groups, atomic groups, both arms of a conditional
+    group, lookarounds and alternations (BACKLOG #2958 step 6 item c).
+
+    **Stricter than ``tests/test_security_static.py``'s ``_has_nested_quantifier``, on purpose.**
+    That scanner reads the whole tree and flags only an unbounded outer count, so it passes
+    ``(a+){2,5}`` and the lazy ``(a+?)+?``; this guard reads two runtime-built patterns and flags
+    both. Both pass ``(a+)?``, whose outer count repeats at most once. It does not see fixed-count
+    outer nesting (``(?:a+){3}``), adjacent repetitions (``a*a*``) or overlapping alternation
+    (item d)."""
     repeats = (sre_constants.MAX_REPEAT, sre_constants.MIN_REPEAT, sre_constants.POSSESSIVE_REPEAT)
     found: list[str] = []
 
@@ -915,22 +1005,56 @@ def _nested_repetitions(pattern: str) -> list[str]:
         for op, arg in items:
             if op in repeats:
                 low, high, body = arg
-                open_count = low != high
-                if open_count and inside and op != sre_constants.POSSESSIVE_REPEAT:
+                open_count = low != high and high > 1
+                if open_count and inside:
+                    if op == sre_constants.POSSESSIVE_REPEAT:
+                        continue
                     found.append(f"{op} {{{low},{high}}}")
-                if open_count and inside and op == sre_constants.POSSESSIVE_REPEAT:
-                    continue
                 walk(body, inside or open_count)
             elif op == sre_constants.SUBPATTERN:
                 walk(arg[3], inside)
+            elif op == sre_constants.ATOMIC_GROUP:
+                walk(arg, inside)
+            elif op == sre_constants.GROUPREF_EXISTS:
+                for option in arg[1:]:
+                    if option is not None:
+                        walk(option, inside)
             elif op in (sre_constants.ASSERT, sre_constants.ASSERT_NOT):
                 walk(arg[1], inside)
             elif op == sre_constants.BRANCH:
                 for option in arg[1]:
                     walk(option, inside)
+            elif op not in _LEAF_OPCODES:
+                raise AssertionError(f"{op} is not read by _nested_repetitions: {pattern!r}")
 
     walk(sre_parser.parse(pattern), False)
     return found
+
+
+@pytest.mark.parametrize(
+    ("pattern", "nested"),
+    [
+        (r"(?>(?:a+)*)b", True),
+        (r"(a)?(?(1)(?:b+)*|c)", True),
+        (r"(a)?(?(1)c|(?:b+)*)", True),
+        (r"(?=(?:a+)*)", True),
+        (r"(a+)?", False),
+        (r"(?:a*+)*", False),
+        (r"(?:ab)+", False),
+    ],
+)
+def test_the_nesting_reader_reads_every_group_kind(pattern: str, nested: bool) -> None:
+    """An atomic group and a conditional group are read like any other (BACKLOG #2958 step 6 item
+    c), and an outer count that repeats at most once nests nothing."""
+    assert bool(_nested_repetitions(pattern)) is nested
+
+
+@pytest.mark.parametrize("case", _LINEARITY_CASES)
+def test_the_field_run_and_segment_patterns_nest_no_repetition_as_shipped(case: str) -> None:
+    """The shipped patterns, read once per case rather than once per nesting control below."""
+    pair = _linearity_case(case)
+    for pattern in (pair.segment, pair.field_run):
+        assert _nested_repetitions(pattern.pattern) == [], pattern.pattern
 
 
 @pytest.mark.parametrize("case", _LINEARITY_CASES)
@@ -945,8 +1069,6 @@ def test_the_field_run_and_segment_patterns_nest_no_repetition(case: str, nestin
     cannot reach the separator-aware ones statically, with a control per nesting shape: the field
     run's first repetition rewritten into each must be found."""
     pair = _linearity_case(case)
-    for pattern in (pair.segment, pair.field_run):
-        assert _nested_repetitions(pattern.pattern) == [], pattern.pattern
     _guard, spelling = _field_run_guard(pair.field_run)
     run = rf"[^\s{spelling}]"
     nested = pair.field_run.pattern.replace(run + "*+", nesting.format(run), 1)

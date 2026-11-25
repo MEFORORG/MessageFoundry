@@ -712,7 +712,9 @@ _UNSCANNABLE_RE_PATTERNS = {
     # character -- the linear-scan property BACKLOG #1437 bought, carried onto this path rather than
     # given back. ``tests/test_redaction.py`` times both against the scan budget, and reads both
     # with a clock-free character meter on at least the input shapes its arms name
-    # (``test_the_field_run_and_segment_patterns_read_each_character_once``, BACKLOG #2958).
+    # (``test_the_field_run_and_segment_patterns_read_each_character_once``, BACKLOG #2958), and reads
+    # both for a nested repetition from the compiled patterns
+    # (``test_the_field_run_and_segment_patterns_nest_no_repetition_as_shipped``).
     "messagefoundry/redaction.py": (
         "f'\\\\b([A-Z][A-Z0-9]{{2}})([{chars}])[^\\\\r\\\\n]*'",
         "f'(?<![^\\\\s{chars}])[^\\\\s{chars}]*+[{chars}][^\\\\s{chars}]*+(?:[{chars}][^\\\\s{chars}]*+)+'",
