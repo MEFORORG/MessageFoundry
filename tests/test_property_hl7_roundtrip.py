@@ -9,11 +9,12 @@ segment ids from a fixed grid, empty fields, repetitions, components, subcompone
 in a leaf, escape sequences, and non-ASCII data. Not generated, at least: separators that are
 letters, digits, control or non-ASCII characters, a short MSH-2, and BHS or FHS headers.
 
-The normalization the parser intends, and the only one asserted here, is :meth:`Message.parse`'s
-own docstring and :func:`~messagefoundry.parsing.peek.drop_blank_segments`: every line ending
-(``\\r``, ``\\n``, ``\\r\\n``) becomes ``\\r``, exactly-empty lines are dropped, whitespace around
-the whole message is dropped, and ``encode()`` ends with a single ``\\r``. Everything inside a
-segment line is kept byte for byte.
+The normalization the parser intends, and the only one asserted here, comes from three places.
+:meth:`Message.parse`'s docstring: every line ending (``\\r``, ``\\n``, ``\\r\\n``) becomes ``\\r``.
+:func:`~messagefoundry.parsing.peek.drop_blank_segments`: exactly-empty lines are dropped.
+:func:`messagefoundry.parsing._builtin_hl7.parse`'s docstring: whitespace around the whole message
+is stripped. ``encode()`` ends with a single ``\\r``. Everything inside a segment line is kept byte
+for byte.
 
 Every message is synthetic: random tokens from a fixed alphabet, never PHI.
 """
