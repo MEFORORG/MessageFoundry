@@ -525,8 +525,9 @@ def exchange_code(
         # Close the unread reply, and its socket with it, now rather than when the last reference
         # goes (BACKLOG #6903). CPython frees it once this function lets go today; the close keeps
         # that true if a later edit holds it longer. Outside the arm, so a close that fails carries
-        # no HTTPError on its `__context__`. A failure is logged by class alone, and the refusal
-        # below is raised either way.
+        # no HTTPError on its `__context__`. A close that fails with OSError or ValueError is
+        # logged by class alone, and the refusal below is still raised; any other exception from
+        # the close propagates in its place.
         try:
             refused_reply.close()
         except (OSError, ValueError) as close_exc:
