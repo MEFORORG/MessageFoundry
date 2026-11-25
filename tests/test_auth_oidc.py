@@ -844,8 +844,8 @@ def test_a_flow_cache_refuses_a_ttl_outside_its_bounds(ttl: Any) -> None:
     "ttl", [1.0, 7, 300.0, 86_400.0, Decimal("300"), Fraction(601, 2)], ids=str
 )
 def test_a_flow_cache_reads_a_ttl_inside_its_bounds_as_a_float(ttl: Any) -> None:
-    """BACKLOG #6902. The control for the refusals above, at both bounds. A Decimal TTL used to be
-    kept as one, so ``put`` then raised TypeError adding it to a float clock reading."""
+    """BACKLOG #6902. The control for the refusals above, at both bounds. Each TTL is stored as a
+    float, a Decimal or a Fraction included, so ``put`` adds it to a float clock reading."""
     clock = [1e9]
     cache = oidc.FlowCache(ttl_seconds=ttl, clock=lambda: clock[0])
     flow = oidc.PendingFlow(
