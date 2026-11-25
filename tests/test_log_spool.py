@@ -2132,6 +2132,174 @@ def test_a_stream_arm_send_error_reconnects_and_retries(
         handler.close()
 
 
+def test_a_failed_udp_send_rebuilds_a_socket_older_than_the_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5923 step 2: a UDP socket that went bad was never rebuilt, since only a stream
+    socket was dropped after a failed send. One older than the rebuild interval is now dropped, and
+    the next send builds a fresh one that delivers. NEGATIVE CONTROL: on 33870a40944 the bad socket
+    stayed in place and took the second send too."""
+    handler = _TimeoutSysLogHandler(
+        address=("127.0.0.1", 9), socktype=socket.SOCK_DGRAM, defer_connect=True
+    )
+    try:
+        bad = _FailingDatagramSocket(OSError(errno.EBADF, "bad file descriptor"))
+        _swap_socket(handler, bad)
+        monkeypatch.setattr(logging_setup, "_UDP_SOCKET_REBUILD_SECONDS", 0.0)
+        handler.emit(logging.makeLogRecord({"msg": "one", "levelname": "WARNING"}))
+        assert handler.send_failed is True
+        handler.send_failed = False
+        handler.emit(logging.makeLogRecord({"msg": "two", "levelname": "WARNING"}))
+        assert len(bad.sent) == 1, "the bad socket took the next send too"
+        assert handler.send_failed is False
+        assert handler.socket is not None and handler.socket is not bad
+    finally:
+        handler.close()
+
+
+@pytest.mark.parametrize("error", [OSError(errno.EBADF, "bad"), socket.gaierror(-2, "lookup")])
+def test_a_failed_udp_send_keeps_a_young_socket_or_one_a_lookup_failed(
+    monkeypatch: pytest.MonkeyPatch, error: OSError
+) -> None:
+    """The controls for the test above: a socket younger than the interval is kept, so an outage
+    does not cost a socket per record, and a failed name lookup keeps the socket whatever its age,
+    since a new socket would not fix it."""
+    handler = _TimeoutSysLogHandler(
+        address=("127.0.0.1", 9), socktype=socket.SOCK_DGRAM, defer_connect=True
+    )
+    try:
+        bad = _FailingDatagramSocket(error)
+        _swap_socket(handler, bad)
+        if isinstance(error, socket.gaierror):
+            monkeypatch.setattr(logging_setup, "_UDP_SOCKET_REBUILD_SECONDS", 0.0)
+        for n in range(3):
+            handler.emit(logging.makeLogRecord({"msg": f"m{n}", "levelname": "WARNING"}))
+        assert len(bad.sent) == 3
+        assert handler.socket is bad
+    finally:
+        handler.socket = None
+        handler.close()
+
+
+class _RefusesOneFrame:
+    """A connected stream socket whose collector closes the connection on a frame holding
+    ``refused`` (one over its size limit, say), so that ``sendall`` fails, and takes every other
+    frame. Shared by every connection a test makes, so it records each frame it was handed."""
+
+    def __init__(self, refused: bytes, frames: list[bytes]) -> None:
+        self.refused = refused
+        self.frames = frames
+
+    def sendall(self, data: bytes) -> None:
+        self.frames.append(data)
+        if self.refused in data:
+            raise ConnectionResetError(errno.ECONNRESET, "the collector closed the connection")
+
+    def settimeout(self, _timeout: float | None) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def _stream_listener(
+    spool: LogSpool, monkeypatch: pytest.MonkeyPatch, connect: Callable[[Any], None]
+) -> tuple[_ForwardQueueListener, _TimeoutSysLogHandler]:
+    """A stopped listener over a TCP handler whose connect is ``connect``, so a test drives
+    replay by hand with no network."""
+    monkeypatch.setattr(logging.handlers.SysLogHandler, "createSocket", connect)
+    handler = _TimeoutSysLogHandler(
+        address=("127.0.0.1", 9), socktype=socket.SOCK_STREAM, defer_connect=True
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    return _ForwardQueueListener(queue.Queue(), handler, spool=spool), handler
+
+
+def _replay_retries(listener: _ForwardQueueListener, times: int) -> None:
+    for _ in range(times):
+        listener._retry_at = 0.0
+        listener._replay()
+
+
+def test_a_spooled_record_the_collector_refuses_does_not_hold_the_head_for_good(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5923 step 1: a collector that closes the connection on one frame fails that send on
+    every retry while it takes the others. After _SPOOL_HEAD_REFUSALS such failures in a row the
+    entry is dropped as undeliverable and the entries behind it are sent, in order. NEGATIVE
+    CONTROL: on 33870a40944 the entry stayed at the head and nothing behind it was ever sent."""
+    frames: list[bytes] = []
+
+    def connect(self: Any) -> None:
+        self.socket = _RefusesOneFrame(b"REFUSED", frames)
+
+    spool = LogSpool(spool_dir, max_bytes=1_000_000)
+    spool.open()
+    listener, handler = _stream_listener(spool, monkeypatch, connect)
+    try:
+        for line in ("REFUSED", "second", "third"):
+            assert spool.append(SpoolEntry(level="WARNING", line=line))
+        _replay_retries(listener, logging_setup._SPOOL_HEAD_REFUSALS - 1)
+        assert spool.pending and listener.undeliverable == 0  # held, below the cap
+        assert not any(b"second" in frame for frame in frames)
+        _replay_retries(listener, 1)
+        assert listener.undeliverable == 1
+        assert not spool.pending
+        assert b"second" in frames[-2] and b"third" in frames[-1]
+        assert listener.send_failing is False
+    finally:
+        handler.close()
+        spool.close()
+
+
+def test_a_collector_that_is_down_never_has_a_spooled_record_dropped(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the test above: a connect that fails is not a refusal, however often it
+    happens, so the head is kept and nothing is dropped."""
+
+    def connect(self: Any) -> None:
+        raise ConnectionRefusedError(errno.ECONNREFUSED, "refused")
+
+    spool = LogSpool(spool_dir, max_bytes=1_000_000)
+    spool.open()
+    listener, handler = _stream_listener(spool, monkeypatch, connect)
+    try:
+        assert spool.append(SpoolEntry(level="WARNING", line="head"))
+        _replay_retries(listener, logging_setup._SPOOL_HEAD_REFUSALS * 3)
+        assert spool.pending and listener.undeliverable == 0
+        assert listener.send_failures == logging_setup._SPOOL_HEAD_REFUSALS * 3
+    finally:
+        handler.close()
+        spool.close()
+
+
+def test_a_connect_failure_between_refusals_starts_the_count_over(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Refusals count only in a row: a failed connect between them resets the count, so a
+    collector that flaps is not read as refusing the entry."""
+    frames: list[bytes] = []
+    attempts: list[int] = []
+
+    def connect(self: Any) -> None:
+        attempts.append(1)
+        if len(attempts) % 2 == 0:
+            raise ConnectionRefusedError(errno.ECONNREFUSED, "refused")
+        self.socket = _RefusesOneFrame(b"head", frames)
+
+    spool = LogSpool(spool_dir, max_bytes=1_000_000)
+    spool.open()
+    listener, handler = _stream_listener(spool, monkeypatch, connect)
+    try:
+        assert spool.append(SpoolEntry(level="WARNING", line="head"))
+        _replay_retries(listener, logging_setup._SPOOL_HEAD_REFUSALS * 2)
+        assert spool.pending and listener.undeliverable == 0
+    finally:
+        handler.close()
+        spool.close()
+
+
 @pytest.mark.parametrize(
     "code", [getattr(errno, "WSAEAFNOSUPPORT", errno.EAFNOSUPPORT), errno.EMSGSIZE]
 )

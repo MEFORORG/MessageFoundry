@@ -915,6 +915,17 @@ _SPOOL_POLL = 1.0
 #: instead, which keeps the order.
 _SPOOL_REPLAY_BATCH = 500
 
+#: How many times in a row a spooled entry's stream send may fail on a connection that was up before
+#: the listener drops it as undeliverable (BACKLOG #5923). A collector that closes the connection on
+#: a frame it refuses, one over its size limit for one, fails that send on every retry while it
+#: would take the next entry, so kept at the head the entry would hold every later one behind it.
+_SPOOL_HEAD_REFUSALS = 5
+
+#: The least time, in seconds, from a UDP forwarder's socket being built to its rebuild after a
+#: failed send (BACKLOG #5923). A rebuild clears a socket that went bad; the interval keeps an
+#: outage from costing a new socket per record.
+_UDP_SOCKET_REBUILD_SECONDS = 30.0
+
 
 def is_permanent_connect_error(exc: BaseException) -> bool:
     """Whether a connect failure will not fix itself by waiting (BACKLOG #1966).
@@ -985,8 +996,16 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
     #: listener's report (BACKLOG #5923). Never the exception's text, which for a formatting error
     #: can quote the record, and never a record field.
     send_error_cause: str = ""
+    #: Whether the last stream send was written to a connection that was up, so a failure of it
+    #: came after the connect, set by :meth:`emit` (BACKLOG #5923). ``False`` for a datagram, and
+    #: for a send that failed before or in its connect. :meth:`_ForwardQueueListener._replay`
+    #: reads it to tell a collector that refuses one entry from one that is down.
+    send_reached_collector: bool = False
     #: The connect error a ``defer_connect`` handler absorbed at construction, or ``None``.
     startup_error: OSError | None = None
+    #: When :meth:`createSocket` last ran, on the monotonic clock: a UDP socket is rebuilt after a
+    #: failed send only once :data:`_UDP_SOCKET_REBUILD_SECONDS` have passed since.
+    _socket_built_at: float = 0.0
 
     def __init__(
         self,
@@ -1022,6 +1041,7 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
             self.startup_error = exc
 
     def createSocket(self) -> None:
+        self._socket_built_at = time.monotonic()
         super().createSocket()
         # SysLogHandler.socket is set at runtime (not in typeshed); getattr keeps this mypy-clean
         # across typeshed versions without a fragile per-version type: ignore.
@@ -1040,6 +1060,7 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         encoding, the same lazy reconnect, and every failure routed to :meth:`handleError`. The
         stdlib's Unix-socket branch is left out, because every forwarder arm is built with a
         ``(host, port)`` address; do not build this class with a socket path."""
+        self.send_reached_collector = False
         try:
             msg = self.format(record)
             if self.ident:
@@ -1053,6 +1074,7 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
                     payload += b"\x00"
                 self.socket.sendto(payload, self.address)
             else:
+                self.send_reached_collector = True
                 self.socket.sendall(b"%d %b" % (len(payload), payload))
         except Exception:
             self.handleError(record)
@@ -1107,9 +1129,19 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         elif isinstance(exc, OSError):
             self.send_failed = True
             sock = getattr(self, "socket", None)
-            # An unconnected datagram socket stays usable after a failed sendto, so only a stream
-            # socket is dropped; a UDP reset would cost a fresh lookup per record in an outage.
-            if sock is not None and self.socktype != socket.SOCK_DGRAM:
+            # A stream socket is dropped on every failure. An unconnected datagram socket usually
+            # stays usable after a failed sendto, so it is dropped, for the next send to rebuild,
+            # only once it is older than an interval (BACKLOG #5923): never dropped, one that went
+            # bad stayed bad for good; dropped each time, an outage would cost a new socket per
+            # record. A failed lookup of the collector's name is no fault of the socket, so it
+            # drops nothing.
+            if sock is not None and (
+                self.socktype != socket.SOCK_DGRAM
+                or (
+                    not isinstance(exc, socket.gaierror)
+                    and time.monotonic() - self._socket_built_at >= _UDP_SOCKET_REBUILD_SECONDS
+                )
+            ):
                 self.socket = None  # cleared first; a concurrent emit must not use a closing socket
                 # Already-broken sockets raise here. Closing was housekeeping; the point (stop reusing
                 # it) is achieved above, and logging from inside the logging error path would recurse.
@@ -1524,6 +1556,10 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         self._last_undeliverable_report: float | None = None
         #: When :meth:`_send` last reported a failed network send (BACKLOG #5923).
         self._last_send_failure_report: float | None = None
+        #: The spooled entry whose stream send failed after the connect, and how many times in a
+        #: row; :meth:`_head_refused` reads both (BACKLOG #5923).
+        self._head_entry: SpoolEntry | None = None
+        self._head_refusals = 0
         self._spool_drops_reported = 0
         self._last_spool_drop_report: float | None = None
         #: ``spool.read_errors`` as of the last read-fault report (BACKLOG #2278).
@@ -1614,6 +1650,7 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
             target.send_failed = False
             target.send_error = False
             target.send_error_cause = ""
+            target.send_reached_collector = False
         super().handle(record)
         cause = getattr(target, "send_error_cause", "") or "no exception recorded"
         if getattr(target, "send_error", False):
@@ -1720,10 +1757,49 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
                 }
             )
             if not self._send(replayed):
+                if self._head_refused(entry):
+                    spool.advance()
+                    continue
                 self._collector_failed()
                 return
             spool.advance()
+            self._head_refusals = 0
             self._retry_delay = _SPOOL_RETRY_MIN
+
+    def _head_refused(self, entry: SpoolEntry) -> bool:
+        """Whether the spooled ``entry``, whose send just failed, is dropped as undeliverable
+        (BACKLOG #5923): its stream send failed after the connect :data:`_SPOOL_HEAD_REFUSALS`
+        times in a row. Counted in :attr:`undeliverable` and reported, throttled and with no record
+        content. A failure before or in the connect, any datagram failure included, starts the
+        count over, since a collector that is down holds every entry alike and dropping would only
+        lose them. What this cannot tell apart is a collector that takes the connection and then
+        fails every send for a reason of its own: the head is dropped then too, one entry per
+        :data:`_SPOOL_HEAD_REFUSALS` tries."""
+        if not getattr(self._target, "send_reached_collector", False):
+            self._head_refusals = 0
+            return False
+        if entry != self._head_entry:
+            self._head_entry, self._head_refusals = entry, 0
+        self._head_refusals += 1
+        if self._head_refusals < _SPOOL_HEAD_REFUSALS:
+            return False
+        self._head_entry, self._head_refusals = None, 0
+        self.undeliverable += 1
+        now = time.monotonic()
+        last = self._last_undeliverable_report
+        if last is None or now - last >= _FORWARD_DROP_REPORT_INTERVAL:
+            self._last_undeliverable_report = now
+            cause = getattr(self._target, "send_error_cause", "") or "no exception recorded"
+            _log.error(
+                "off-box log forwarding dropped a spooled record as undeliverable: its send failed "
+                "%d times in a row on a connection the collector had accepted (%s), so it would "
+                "hold every later record behind it; %d undeliverable so far. Record content is "
+                "not shown here.",
+                _SPOOL_HEAD_REFUSALS,
+                cause,
+                self.undeliverable,
+            )
+        return True
 
     def _report_spool_drop(self) -> None:
         """Report spool drops at most once per :data:`_FORWARD_DROP_REPORT_INTERVAL`. The report is a
@@ -2214,8 +2290,9 @@ class ForwarderStatus:
     queue_dropped: int = 0
     #: Records a network error cost, with no spool to keep them.
     unsent: int = 0
-    #: Records dropped for a datagram too large to send (``EMSGSIZE``) or a send error that was
-    #: not a network error.
+    #: Records dropped for a datagram too large to send (``EMSGSIZE``), a send error that was not a
+    #: network error, or a spooled record whose stream send failed on an accepted connection
+    #: ``_SPOOL_HEAD_REFUSALS`` times in a row (BACKLOG #5923).
     undeliverable: int = 0
     #: Records the on-disk spool refused: full, or the write failed.
     spool_dropped: int = 0
