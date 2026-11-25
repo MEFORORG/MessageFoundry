@@ -3263,14 +3263,15 @@ class AuthStore(Protocol):
         its source the AD sign-in decided from, and report whether it wrote (BACKLOG #6887).
 
         The sign-in decides from a row it read several awaits earlier, and the per-process sign-in
-        queue orders neither a sign-in on another engine shard nor an administrator's write. The
-        compare-and-set keeps the sign-in from silently overwriting a scope another writer wrote
-        after this sign-in read the row: if ``expected_scope`` or ``expected_source`` (``None``
-        matching NULL) differs from the row read, or the row is gone, nothing is written and this
-        returns ``False``, and the caller reads the row again and decides again, or refuses. It
-        does not stop concurrent sign-ins from revoking each other's sessions; the caller's
-        docstring, ``AuthService._sync_ad_channel_scope``, says which revokes remain under *WHAT
-        THE COMPARE-AND-SET DOES NOT CLOSE*.
+        queue orders neither a sign-in on another engine shard nor an administrator's write. If
+        ``expected_scope`` or ``expected_source`` (``None`` matching NULL) differs from the row
+        read, or the row is gone, nothing is written and this returns ``False``; how far that
+        compare holds against another process is the next paragraph's. It does not keep the
+        caller from replacing a newer scope: on a miss the caller reads the row again and decides
+        again from its own groups, which may be the older ones, and a scope written back to the
+        value read passes the compare. Nor does it stop concurrent sign-ins from revoking each
+        other's sessions; the caller's docstring, ``AuthService._sync_ad_channel_scope``, names at
+        least three revokes that remain under *WHAT THE COMPARE-AND-SET DOES NOT CLOSE*.
 
         **What makes that compare hold differs per backend**, as for every user-record write. Each
         reads the row, compares in Python, and writes with a compare on the seal it read. Whether a

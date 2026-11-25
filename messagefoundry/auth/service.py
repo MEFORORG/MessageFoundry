@@ -9385,14 +9385,21 @@ class AuthService:
             )
         if decision.scope_json is None:
             # ``withdrawn`` keeps the removed grant, which the row itself no longer holds.
-            detail = _json({"channels": None, "withdrawn": user.channel_scope})
-        else:
-            detail = _json(
-                {"channels": ALL_CHANNELS if decision.wildcard else list(decision.channels)}
+            await self._audit(
+                AD_SCOPE_RESYNCED_ACTION,
+                actor=user.username,
+                detail=_json({"channels": None, "withdrawn": user.channel_scope}),
+                client=client,
             )
-        await self._audit(
-            AD_SCOPE_RESYNCED_ACTION, actor=user.username, detail=detail, client=client
-        )
+        else:
+            await self._audit(
+                AD_SCOPE_RESYNCED_ACTION,
+                actor=user.username,
+                detail=_json(
+                    {"channels": ALL_CHANNELS if decision.wildcard else list(decision.channels)}
+                ),
+                client=client,
+            )
         return await self._load_user(user.id) or user
 
     async def _upsert_ad_user(
