@@ -79,80 +79,96 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # THE SUBSTITUTIONS IN AN UNQUOTED HEREDOC BODY (BACKLOG #5607). Bash runs a `$(...)` or backtick
 # substitution in the body of a heredoc whose delimiter is unquoted (`cat <<EOF`), though the rest
 # of the body is data, so every view above blanks it and allowed `cat <<EOF\n$(find /proc)\nEOF`.
-# This reads each such body from the raw text, with its opener found on $Masked as
-# Hide-HeredocBodies finds it, and adds the text inside each substitution to $Into, to be judged as
-# a command of its own. A body whose delimiter is quoted (`<<'EOF'`, `<<"EOF"`) takes no
-# substitution and adds nothing, nor does a `$(` or backtick after a backslash. The extent of a
-# substitution is read by counting parens, so a quoted paren can make it longer than bash reads it,
-# which can only add text. Each found text adds to $Spent, and past $Cap the rest are skipped.
-function Add-HeredocSubstitutions([string]$Text, [string]$Masked, $Into, $Spent, [int]$Cap) {
+# This reads each such body from the raw text, with every opener on a line found on $Masked as
+# Hide-HeredocBodies finds one, and adds the text inside each substitution to $Into, to be judged
+# as a command of its own. The bodies of a line's openers follow it in order, and a body ends only
+# at a line that is exactly its delimiter, after leading tabs for `<<-`, as bash reads it. A body
+# whose delimiter is quoted (`<<'EOF'`, `<<"EOF"`) takes no substitution and adds nothing, nor does
+# a `$(` or backtick after a backslash.
+# A substitution's end is found by counting parens outside quotes and backticks, and a `case` in it
+# extends its text to the end of the body, since a pattern's `)` closes nothing. At least these can
+# still end it early, so the text after them is not read: a `)` in a comment, and a double quote
+# nested inside a double-quoted substitution. Each distinct text adds its length to $Spent, and past
+# $Cap the rest are skipped.
+function Add-HeredocSubstitutions([string]$Text, [string]$Masked, $Into, $Seen, $Spent, [int]$Cap) {
     if ($Masked.IndexOf('<<') -lt 0) { return }
     $rawLines = $Text.Split([char]10)
     $maskedLines = $Masked.Split([char]10)
-    $terminator = $null
-    $body = $null
     $lines = [Math]::Min($rawLines.Count, $maskedLines.Count)
-    for ($n = 0; $n -le $lines; $n++) {
-        if ($null -ne $terminator) {
-            $last = $n -eq $lines
-            if ($last -or $maskedLines[$n].Trim() -ceq $terminator -or $rawLines[$n].Trim() -ceq $terminator) {
-                $terminator = $null
-                if ($null -ne $body) { Add-BodySubstitutions $body.ToString() $Into $Spent $Cap }
-                $body = $null
+    $queue = [System.Collections.Generic.List[object]]::new()
+    $body = $null
+    for ($n = 0; $n -lt $lines; $n++) {
+        $raw = $rawLines[$n]
+        if ($queue.Count -gt 0 -and $null -ne $body) {
+            $cur = $queue[0]
+            $line = if ($cur.Dash) { $raw.TrimStart([char]9) } else { $raw }
+            if ($line -ceq $cur.T) {
+                if ($cur.Bare) { Add-BodySubstitutions $body.ToString() $Into $Seen $Spent $Cap }
+                $queue.RemoveAt(0)
+                $body = if ($queue.Count -gt 0) { [System.Text.StringBuilder]::new() } else { $null }
             } else {
-                if ($null -ne $body) { [void]$body.Append($rawLines[$n]).Append("`n") }
+                [void]$body.Append($raw).Append("`n")
             }
             continue
         }
-        if ($n -eq $lines) { break }
-        $m = [regex]::Match($maskedLines[$n], '(?:^|\s)(?<!<)<<(?!<)-?[ \t]*')
-        if (-not $m.Success) { continue }
-        $raw = $rawLines[$n]
-        $rest = $raw.Substring([Math]::Min($m.Index + $m.Length, $raw.Length))
-        $d = [regex]::Match($rest, '^(?:''([^'']+)''|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))')
-        if ($d.Success) {
-            $terminator = @($d.Groups[1].Value, $d.Groups[2].Value, $d.Groups[3].Value) |
+        foreach ($m in [regex]::Matches($maskedLines[$n], '(?:^|\s)(?<!<)<<(?!<)-?[ \t]*')) {
+            $rest = $raw.Substring([Math]::Min($m.Index + $m.Length, $raw.Length))
+            $d = [regex]::Match($rest, '^(?:''([^'']+)''|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))')
+            if (-not $d.Success) { continue }
+            $t = @($d.Groups[1].Value, $d.Groups[2].Value, $d.Groups[3].Value) |
                 Where-Object { $_ } | Select-Object -First 1
-            $body = if ($d.Groups[3].Value) { [System.Text.StringBuilder]::new() } else { $null }
+            $queue.Add(@{ T = $t; Bare = [bool]$d.Groups[3].Value; Dash = $m.Value.Contains('-') })
         }
+        if ($queue.Count -gt 0) { $body = [System.Text.StringBuilder]::new() }
     }
+    # An unterminated body runs to the end of the command, and bash still expands it.
+    if ($null -ne $body -and $queue[0].Bare) { Add-BodySubstitutions $body.ToString() $Into $Seen $Spent $Cap }
 }
 
-function Add-BodySubstitutions([string]$Body, $Into, $Spent, [int]$Cap) {
+# Index of the quote or backtick closing the one at $At in $Body, or $Body.Length if none does.
+function Get-QuoteEnd([string]$Body, [int]$At) {
+    $q = $Body[$At]
+    for ($j = $At + 1; $j -lt $Body.Length; $j++) {
+        if ($q -cne "'" -and $Body[$j] -ceq '\') { $j++; continue }
+        if ($Body[$j] -ceq $q) { return $j }
+    }
+    return $Body.Length
+}
+
+function Add-BodySubstitutions([string]$Body, $Into, $Seen, $Spent, [int]$Cap) {
     $len = $Body.Length
     $i = 0
     while ($i -lt $len) {
         $c = $Body[$i]
         if ($c -ceq '\') { $i += 2; continue }
-        $start = -1
-        $end = $len
         if ($c -ceq '$' -and $i + 1 -lt $len -and $Body[$i + 1] -ceq '(') {
-            # Nested substitutions are found again from here, so each is judged on its own too.
             $start = $i + 2
+            $end = $len
             $depth = 0
             for ($j = $i + 1; $j -lt $len; $j++) {
                 $x = $Body[$j]
                 if ($x -ceq '\') { $j++; continue }
+                if ($x -ceq "'" -or $x -ceq '"' -or $x -ceq '`') { $j = Get-QuoteEnd $Body $j; continue }
                 if ($x -ceq '(') { $depth++ }
                 elseif ($x -ceq ')') { $depth--; if ($depth -eq 0) { $end = $j; break } }
             }
-            $next = $i + 2
+            if ($Body.Substring($start, $end - $start) -cmatch '(?<![\w$-])case\b') { $end = $len }
         } elseif ($c -ceq '`') {
             $start = $i + 1
-            for ($j = $start; $j -lt $len; $j++) {
-                if ($Body[$j] -ceq '\') { $j++; continue }
-                if ($Body[$j] -ceq '`') { $end = $j; break }
-            }
-            $next = $end + 1
+            $end = Get-QuoteEnd $Body $i
         } else {
             $i++
             continue
         }
-        $width = [Math]::Max(0, [Math]::Min($end, $len) - $start)
-        if ($Spent.Value + $width -gt $Cap) { return }
-        $Spent.Value += $width
-        $Into.Add($Body.Substring($start, $width))
-        $i = $next
+        # A nested substitution stays inside this text, whose `(`, `)` and backticks Add-ScanBounds
+        # splits on, so the scan goes on past this one rather than reading each nested one again.
+        $text = $Body.Substring($start, [Math]::Max(0, $end - $start))
+        if ($Seen.Add($text)) {
+            if ($Spent.Value + $text.Length -gt $Cap) { return }
+            $Spent.Value += $text.Length
+            $Into.Add($text)
+        }
+        $i = $end + 1
     }
 }
 
@@ -1154,9 +1170,12 @@ try {
     # names at least the forms it does not.
     # The price is the toggle's own false denies, such as `'It'\''s; find /proc'`, which main had.
     # Most commands mask the same under both, and then one scan is enough.
-    $scans = @(Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd -Plain))
+    $plainMask = Hide-QuotedSpans $cmd -Plain
+    $bashMask = $null
+    $scans = @(Hide-HeredocBodies $cmd $plainMask)
     if ($tool -cne 'PowerShell') {
-        $bashScan = Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd)
+        $bashMask = Hide-QuotedSpans $cmd
+        $bashScan = Hide-HeredocBodies $cmd $bashMask
         if ($bashScan -cne $scans[0]) { $scans += $bashScan }
     }
     # The PowerShell tool's reading, beside the toggle under the same rule (BACKLOG #5451). Without
@@ -1270,10 +1289,12 @@ try {
         if (-not $heredocPending.Value) { return $false }
         if ($null -eq $heredocPending.Texts) {
             $texts = [System.Collections.Generic.List[string]]::new()
+            $seen = [System.Collections.Generic.HashSet[string]]::new()
             $spent = @{ Value = 0 }
             $cap = 16 * $cmd.Length + 65536
-            foreach ($masked in @((Hide-QuotedSpans $cmd -Plain), (Hide-QuotedSpans $cmd))) {
-                Add-HeredocSubstitutions $cmd $masked $texts $spent $cap
+            # The masks the plain and bash views were built from, so neither is built again here.
+            foreach ($masked in @($plainMask, $bashMask)) {
+                if ($null -ne $masked) { Add-HeredocSubstitutions $cmd $masked $texts $seen $spent $cap }
             }
             $heredocPending.Texts = $texts
         }

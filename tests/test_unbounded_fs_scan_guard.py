@@ -1029,6 +1029,19 @@ HEREDOC_SUBSTITUTION_DENY = [
     pytest.param("cat <<EOF\nnested $(echo $(find /proc))\nEOF", id="nested-in-a-bare-body"),
     pytest.param("cat <<EOF > f\n$((find /proc) )\nEOF", id="subshell-site-in-a-bare-body"),
     pytest.param("cat <<EOF\nnever closed $(find /proc)", id="unterminated-bare-body"),
+    # Each allowed by the first cut of this pass: a quoted or backticked `)`, and a case pattern's
+    # `)`, ended the substitution early; only a line's first opener was read; a body ended at an
+    # indented copy of its delimiter; and deep nesting spent the budget before a later walk.
+    pytest.param('cat <<EOF\n$(echo ")"; find /proc)\nEOF', id="double-quoted-paren"),
+    pytest.param("cat <<EOF\n$(echo ')'; find /proc)\nEOF", id="single-quoted-paren"),
+    pytest.param("cat <<EOF\n$(case x in x) find /proc;; esac)\nEOF", id="case-pattern-paren"),
+    pytest.param("cat <<EOF\n$(echo `echo )`; find /proc)\nEOF", id="backticked-paren"),
+    pytest.param("cat <<'A' <<B\nx\nA\nit's $(find /proc)\nB", id="second-opener-on-a-line"),
+    pytest.param("cat <<EOF\n  EOF\nit's $(find /proc)\nEOF", id="indented-delimiter-copy"),
+    pytest.param(
+        "cat <<EOF\n" + "$(" * 300 + "echo" + ")" * 300 + " $(find /proc)\nEOF",
+        id="walk-after-deep-nesting",
+    ),
 ]
 
 
@@ -1839,7 +1852,7 @@ EXPECTED_ROW_COUNTS = {
     "REFINED_FALSE_DENY_ALLOW": 14,
     "SITE_TEXT_DENY": 16,
     "SITE_TEXT_ALLOW": 21,
-    "HEREDOC_SUBSTITUTION_DENY": 8,
+    "HEREDOC_SUBSTITUTION_DENY": 15,
     "HEREDOC_SUBSTITUTION_ALLOW": 6,
 }
 

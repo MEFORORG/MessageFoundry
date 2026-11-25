@@ -408,7 +408,8 @@ class _Scan:
     kw3: str = ""  # the keyword before those, for `export default async function`
     newline: bool = False  # a line break since the previous token, a block comment's included
     colon: str = ""  # what the last `:` was: "key", "cond" or "label"
-    classes: list[tuple[int, bool]] = field(default_factory=list)  # (depth, expression) per head
+    # (depth, whether its closing brace ends a value) per class head
+    classes: list[tuple[int, bool]] = field(default_factory=list)
     fn: int = 0  # 1 after `function`, 2 after its name: the next `(` opens parameters
     fn_value: bool = False
     # Whether that function's body ends a value. `export default function` is a declaration, so its
