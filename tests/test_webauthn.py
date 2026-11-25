@@ -629,6 +629,30 @@ async def test_the_rehash_pass_counts_an_undecodable_stored_credential_id_as_ref
         await store.close()
 
 
+async def test_the_registration_leg_does_not_use_up_the_begin_legs_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6886. RED when: the registration options leg's report of an undecodable stored id
+    uses up the throttle slot the assertion begin leg needs, so that leg writes no
+    ``stored_key_refused`` row for the interval. The two legs are throttled apart."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        _, token = await _enroll(service, identity, token)
+        _with_stored(monkeypatch, store, discoverable=True, credential_id="AAAAA")
+        await service.begin_webauthn_registration(
+            identity, token=token, rp_id=RP, rp_name="MessageFoundry"
+        )
+        with pytest.raises(StoredPasskeysUnreadable):
+            await service.begin_webauthn_assertion(token, rp_id=RP)
+        events = await service.security_events_for(identity.username)
+        failed = [json.loads(e["detail"]) for e in events if e["action"] == "auth.webauthn_failed"]
+        assert failed == [{"reason": "stored_key_refused", "label": "test key"}]
+    finally:
+        await store.close()
+
+
 async def test_a_good_assertion_never_encodes_the_stored_label(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -6977,9 +6977,10 @@ class AuthService:
             )
 
         try:
-            # The id is decoded only to be checked: the begin legs leave out a passkey whose id
-            # does not decode (:meth:`_split_stored_credential_ids`), and this refuses it too, so
-            # such a row signs in nowhere.
+            # The id is decoded only to be checked. The second-factor begin leg and the registration
+            # options leave out a passkey whose id does not decode
+            # (:meth:`_split_stored_credential_ids`), but the usernameless begin leg names no
+            # credential, so a combined sign-in reaches here with one, and this refuses it.
             self._b64url_decode(cred.credential_id)
             public_key = self._b64url_decode(cred.public_key)
         except (ValueError, TypeError):
@@ -15550,7 +15551,9 @@ class AuthService:
             await asyncio.wait((screen,))
         except asyncio.CancelledError:
             caller_left = True
-            if screen.done():  # finished already ran, before it could know the caller left
+            if screen.done():
+                # ``finished`` may already have run, before it could know the caller left; report
+                # here, and ``reported`` keeps it to one line if ``finished`` runs after this.
                 report(screen)
             raise
         return screen.result()
@@ -19778,7 +19781,7 @@ class AuthService:
         return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
     def _split_stored_credential_ids(
-        self, creds: Sequence[WebAuthnCredential], *, username: str
+        self, creds: Sequence[WebAuthnCredential], *, username: str, leg: str
     ) -> tuple[list[bytes], list[WebAuthnCredential]]:
         """The raw ids of ``creds`` that decode, in order, and the passkeys whose stored id does
         not (BACKLOG #6886): one ``base64.urlsafe_b64decode`` raises on, or one that is not text.
@@ -19787,15 +19790,17 @@ class AuthService:
         store holds one: on a sealed store the passkey digest refuses it first.
 
         The second list holds only the passkeys due a report, at most once per passkey per
-        :class:`SealFailureThrottle` interval, since a begin leg runs on every page render. Each
-        reported one is logged by label, never by its value; the others are left out silently."""
+        :class:`SealFailureThrottle` interval and ``leg``, since a begin leg runs on every page
+        render; keyed by leg, so the registration leg's report does not use up the assertion leg's,
+        which writes the audit row. Each reported one is logged by label, never by its value; the
+        others are left out silently."""
         ids: list[bytes] = []
         due: list[WebAuthnCredential] = []
         for cred in creds:
             try:
                 ids.append(self._b64url_decode(cred.credential_id))
             except (ValueError, TypeError):  # binascii.Error is a ValueError
-                if self._seal_failures_reported.due(f"passkey-id:{cred.credential_id_hash}"):
+                if self._seal_failures_reported.due(f"passkey-id:{leg}:{cred.credential_id_hash}"):
                     _log.warning(
                         "passkey %r of %s has a stored credential id that cannot be decoded and "
                         "must be registered again",
@@ -19857,7 +19862,7 @@ class AuthService:
             # BACKLOG #6886: a passkey whose stored id does not decode is left out, so the holder
             # can register that authenticator again, the remedy its log line names.
             exclude_credential_ids=self._split_stored_credential_ids(
-                [c for c in existing if c.discoverable], username=user.username
+                [c for c in existing if c.discoverable], username=user.username, leg="register"
             )[0],
         )
         self._webauthn_challenges.put((hash_token(token), "register"), user.id, challenge)
@@ -20311,7 +20316,9 @@ class AuthService:
         creds = [c for c in held or () if c.rp_id == rp_id]
         if not creds or user is None:
             return None
-        allowed, due = self._split_stored_credential_ids(creds, username=user.username)
+        allowed, due = self._split_stored_credential_ids(
+            creds, username=user.username, leg="assert"
+        )
         for cred in due:
             # BACKLOG #6886: a passkey whose stored id does not decode can never sign in, so it is
             # refused here as a refused stored key is at the finish leg, row and all. The row is
