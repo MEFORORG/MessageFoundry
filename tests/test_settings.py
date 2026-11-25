@@ -2055,13 +2055,14 @@ def test_vip_enabled_warns_that_nothing_moves_the_address(
 
 def test_dr_activate_with_cluster_is_rejected(tmp_path: Path) -> None:
     # A DR box coming up under the DR run-profile must not also contend for the cluster lease (it could
-    # win leadership and drive the primary store cross-WAN). Refused at config load.
+    # win leadership and drive the primary store cross-WAN). Refused at config load, naming the key.
     cfg = _write(
         tmp_path / "messagefoundry.toml",
         '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
-        "[cluster]\nenabled = true\n[dr]\nenabled = true\nactivate = true\n",
+        "[cluster]\nenabled = true\n[dr]\nenabled = true\nactivate = true\n"
+        "seed_archive = 'seed.mfbak'\n",
     )
-    with pytest.raises(ValidationError, match="dr.*activate|activate.*cluster"):
+    with pytest.raises(ValidationError, match=r"\[dr\]\.activate cannot be combined"):
         load_settings(config_path=cfg, environ={})
 
 
@@ -2072,7 +2073,8 @@ def test_dr_enabled_but_not_activated_with_cluster_is_rejected(tmp_path: Path) -
     cfg = _write(
         tmp_path / "messagefoundry.toml",
         '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
-        "[cluster]\nenabled = true\n[dr]\nenabled = true\nactivate = false\n",
+        "[cluster]\nenabled = true\n[dr]\nenabled = true\nactivate = false\n"
+        "seed_archive = 'seed.mfbak'\n",
     )
     with pytest.raises(ValidationError, match=r"\[dr\]\.enabled cannot be combined"):
         load_settings(config_path=cfg, environ={})
@@ -2094,7 +2096,7 @@ def test_dr_activate_without_cluster_is_ok(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.chdir(tmp_path)
     cfg = _write(
         tmp_path / "messagefoundry.toml",
-        "[dr]\nenabled = true\nactivate = true\n",
+        "[dr]\nenabled = true\nactivate = true\nseed_archive = 'seed.mfbak'\n",
     )
     s = load_settings(config_path=cfg, environ={})
     assert s.dr.activate is True and s.cluster.enabled is False
@@ -2228,7 +2230,7 @@ def test_delivery_priority_default_and_dr_section(tmp_path: Path) -> None:
         tmp_path / "h.toml",
         "[delivery]\npriority = 'critical'\n"
         "[dr]\nenabled = true\nactivate = true\npriority_threshold = 'normal'\n"
-        "takeover_hook = 'echo ok'\ntakeover_timeout_seconds = 5\n",
+        "seed_archive = 'seed.mfbak'\ntakeover_hook = 'echo ok'\ntakeover_timeout_seconds = 5\n",
     )
     s = load_settings(config_path=cfg, environ={})
     assert s.delivery.priority.value == "critical"
@@ -2242,7 +2244,8 @@ def test_invalid_priority_and_dr_settings_rejected(tmp_path: Path) -> None:
     bad_configs = [
         "[delivery]\npriority = 'urgent'\n",  # unknown tier
         "[dr]\npriority_threshold = 'bogus'\n",  # invalid threshold
-        "[dr]\nenabled = true\nactivation_mode = 'auto'\n",  # not-yet-supported (deferred) mode
+        # not-yet-supported (deferred) mode; the seed keeps the seed refusal out of the way
+        "[dr]\nenabled = true\nseed_archive = 'seed.mfbak'\nactivation_mode = 'auto'\n",
         "[dr]\ntakeover_hook = '   '\n",  # blank-but-present hook
         "[dr]\ntakeover_timeout_seconds = 0\n",  # non-positive timeout
         "[dr]\nseed_archive = 's3://bucket/seed.mfbak'\n",  # cloud seed source
@@ -2260,9 +2263,11 @@ def test_dr_restore_token_local_path_parses(tmp_path: Path) -> None:
     # BACKLOG #223 / ADR 0102: a LOCAL restore-token path parses (default "" = OFF, byte-identical to
     # #102); a cloud URL is the only rejected form (covered above).
     assert DrSettings().restore_token == ""  # opt-in default OFF
+    # A server-DB store: on SQLite no check reads the token, so it is refused (BACKLOG #5965).
     cfg = _write(
         tmp_path / "dr_token.toml",
-        "[dr]\nenabled = true\nrestore_token = 'D:/dr/restore.token'\n",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
+        "[dr]\nenabled = true\nseed_archive = 'seed.mfbak'\nrestore_token = 'D:/dr/restore.token'\n",
     )
     s = load_settings(config_path=cfg, environ={})
     assert s.dr.restore_token == "D:/dr/restore.token"
@@ -2275,9 +2280,10 @@ def test_dr_seed_dir_parses_and_defaults_off(tmp_path: Path) -> None:
     seeds = (tmp_path / "seeds").as_posix()  # absolute on the platform running the test
     cfg = _write(tmp_path / "dr_seed_dir.toml", f"[dr]\nenabled = true\nseed_dir = '{seeds}'\n")
     assert load_settings(config_path=cfg, environ={}).dr.seed_dir == seeds
-    # Blank-but-present reads as off. It must never reach the engine as a path, where it would
-    # resolve to the working directory.
-    assert DrSettings(seed_dir="   ").seed_dir == ""
+    # Blank-but-present is refused, as seed_archive's is (BACKLOG #5965). It must never reach the
+    # engine as a path, where it would resolve to the working directory.
+    with pytest.raises(ValidationError, match=r"\[dr\]\.seed_dir must be a non-blank path"):
+        DrSettings(seed_dir="   ")
     # "Absolute" is this platform's. A rooted path with no drive is relative on Windows, and a
     # drive-letter path is a relative name anywhere else.
     other_platform = "/srv/dr/seeds" if os.name == "nt" else "D:/dr/seeds"

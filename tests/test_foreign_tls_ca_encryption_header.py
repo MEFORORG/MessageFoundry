@@ -25,10 +25,12 @@ from __future__ import annotations
 import copy
 import errno
 import functools
+import logging
 import os
 import re
 import sys
 import types
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -273,6 +275,15 @@ def _build_psql(sslmode: str = "verify-full") -> str:
     return _build_generic("PostgreSQL Unicode", {"SSLmode": sslmode})
 
 
+@pytest.fixture(autouse=True)
+def _fresh_shell32() -> Iterator[None]:
+    """The shell call is loaded once per process (vault BACKLOG #8153, item 19), so a test that
+    fakes ``ctypes.WinDLL`` drops the kept one before and after it."""
+    database._shell_get_folder_path_a.cache_clear()
+    yield
+    database._shell_get_folder_path_a.cache_clear()
+
+
 @pytest.fixture
 def _no_libpq_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """A libpq home with no ``root.crt`` and no ``PGSSLROOTCERT``, so nothing reads the runner's
@@ -341,15 +352,10 @@ def test_libpqs_root_certificate_controls_still_build(
 
 
 #: The refusal of a path the host check does not clear, worded as ``_refuse_remote_path`` words
-#: it, naming both causes, and its remedy, which names who may write the copy's folder.
-_NOT_CLEARED = (
-    "root certificate file must be a plain local path on this host: not a share, a network "
-    "drive, a link to one, or a path it cannot read"
-)
-_NOT_CLEARED_REMEDY = (
-    "point PGSSLROOTCERT at a readable copy in a local folder only administrators and the "
-    "service account can write"
-)
+#: it, escaped for ``match=`` (vault BACKLOG #8153, item 26), and its remedy, which names who may
+#: write the copy's folder.
+_NOT_CLEARED = re.escape(f"root certificate file {database.REMOTE_PATH_RULE}")
+_NOT_CLEARED_REMEDY = f"{database._LIBPQ_REMEDY}{database._LIBPQ_CHECK_FOLDERS}"
 
 
 @pytest.mark.usefixtures("_no_libpq_root")
@@ -401,7 +407,7 @@ def test_a_local_root_certificate_the_walk_cannot_read_is_refused_as_unread(
         _build_psql()
     text = str(refused.value)
     assert "a name in the path could not be read" in text
-    assert "set PGSSLROOTCERT to a readable local path" in text
+    assert _NOT_CLEARED_REMEDY in text
     assert "must be a plain local path" not in text
 
 
@@ -457,15 +463,17 @@ def test_a_root_certificate_the_walk_stops_in_without_a_read_failure_is_not_clea
     text = str(refused.value)
     assert _NOT_CLEARED_REMEDY in text
     assert "could not be read to check" not in text  # not the unread refusal
-    assert "set PGSSLROOTCERT to a local path" not in text
+    assert ": not cleared as a local path; " in text  # its short cause, which claims no host
 
 
 @pytest.mark.parametrize("source", ["default", "PGSSLROOTCERT"])
 def test_libpqs_root_certificate_the_check_cannot_read_is_refused(
     _no_libpq_root: Path, monkeypatch: pytest.MonkeyPatch, source: str
 ) -> None:
-    """A file libpq can ``stat`` but not open fails every connect in libpq too, where
-    ``SSL_CTX_load_verify_locations`` refuses it; the engine refuses it at build."""
+    """A file the engine can ``stat`` but not open is refused at build. Off Windows libpq 17's
+    source fails every connect on it, where ``SSL_CTX_load_verify_locations`` refuses it; on
+    Windows libpq's own ``stat`` may fail first and skip it, which was not measured (vault BACKLOG
+    #8153, items 5 and 29)."""
     root = _write(_no_libpq_root, _certificate(), "root.crt")
     if source == "PGSSLROOTCERT":
         monkeypatch.setenv("PGSSLROOTCERT", root)
@@ -601,6 +609,7 @@ def test_libpqs_windows_home_comes_from_the_ansi_shell_call(
         except UnicodeEncodeError:  # a host code page with no e-acute: only the ASCII case runs
             continue
         monkeypatch.setattr(ctypes, "WinDLL", lambda name, encoded=encoded: _FakeShell32(encoded))
+        database._shell_get_folder_path_a.cache_clear()  # the call is kept once loaded (item 19)
         assert database._windows_roaming_appdata() == folder
 
 
@@ -618,7 +627,7 @@ def test_a_shell_folder_the_code_page_could_not_hold_refuses_the_build(
     with pytest.raises(ValueError, match="cannot hold the roaming folder's name") as refused:
         _build_psql()
     message = str(refused.value)
-    assert _CONNECTION in message and "set PGSSLROOTCERT to a local path" in message
+    assert _CONNECTION in message and database._LIBPQ_REMEDY in message
     assert folder not in message  # the cause is named, never the path, which holds a user name
 
 
@@ -681,7 +690,8 @@ def test_a_missing_pwd_module_is_a_valueerror_from_the_build(
     monkeypatch.setitem(sys.modules, "pwd", None)
     with pytest.raises(OSError, match="password file could not be read"):
         database._libpq_homes()
-    with pytest.raises(ValueError, match="set PGSSLROOTCERT to a local path"):
+    remedy = f"DATABASE: libpq's home is unknown; {database._LIBPQ_REMEDY}"
+    with pytest.raises(ValueError, match=re.escape(remedy)):
         _build_psql()
 
 
@@ -794,7 +804,7 @@ def test_a_root_certificate_the_engine_cannot_stat(
     """libpq 17's ``initialize_SSL`` loads the root file only when its ``stat`` succeeds; any
     other ``stat`` result skips the file, or fails a ``verify`` connect, without loading it. So a
     ``stat`` failure that says no file is there, or that libpq could not ``stat`` it either, is
-    left to libpq. Red before ``leave_unstatable``: the failure refused the build. The sampled
+    left to libpq. Red before that rule was built: the failure refused the build. The sampled
     others are refused, an unreached share or an I/O fault, since libpq stats again at each
     connect and may load the file once the fault clears, when the check does not run again. Red
     on the I/O rows before the allowed set: the stat branch left every failure but 53 and 67."""
@@ -810,7 +820,7 @@ def test_a_root_certificate_the_engine_cannot_stat(
 
     monkeypatch.setattr(os, "stat", unstatable)
     if refused:
-        with pytest.raises(ValueError, match="root certificate file could not be read to check"):
+        with pytest.raises(ValueError, match="root certificate file could not be stat'ed to check"):
             _build_psql()
     else:
         assert "SSLmode=verify-full;" in _build_psql()
@@ -821,7 +831,8 @@ def test_a_refused_stat_failure_takes_no_second_look(
 ) -> None:
     """A Windows ``PermissionError`` outside the left set is refused at once, even on a
     directory: ``os.path.isdir`` would wait out the same device or network fault again, on the
-    event loop, and its answer would leave the file. Red when the read's directory look ran."""
+    event loop, and its answer would leave the file. Red when the read's directory look ran.
+    The host check is stood in for, so only the file's own ``stat`` meets the fault."""
     target = str(tmp_path)
     real_stat = os.stat
 
@@ -833,48 +844,27 @@ def test_a_refused_stat_failure_takes_no_second_look(
     def no_second_look(path: Any) -> bool:
         raise AssertionError("the path was looked at again after its stat failed")
 
+    monkeypatch.setattr(database, "names_another_host", lambda value, verdicts=None: False)
     monkeypatch.setattr(os, "stat", faulting)
     monkeypatch.setattr(os.path, "isdir", no_second_look)
-    with pytest.raises(ValueError, match="could not be read to check it"):
-        database._read_driver_file(target, "setting", "file", "it", leave_unstatable=True)
+    with pytest.raises(ValueError, match="could not be stat'ed to check it"):
+        database._refuse_libpq_root_cert_file(None, "setting", target)
 
 
 def test_a_directory_swapped_in_after_a_passing_stat_is_still_left(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The control for the test above: when the stat passes and the open then fails with a
-    ``PermissionError`` on what is now a directory, the read's directory look still runs and leaves
-    it. Red when a passing stat also skipped that look."""
+    """The control for the test above, through the same check: when the stat passes and the open
+    then fails with a ``PermissionError`` on what is now a directory, the read's directory look
+    still runs and leaves it. Red when a passing stat also skipped that look."""
     target = str(tmp_path)
 
     def swapped(path: Any, limit: int) -> bytes | None:
         raise PermissionError(errno.EACCES, "Permission denied")
 
+    monkeypatch.setattr(database, "names_another_host", lambda value, verdicts=None: False)
     monkeypatch.setattr(database, "read_if_regular", swapped)
-    assert (
-        database._read_driver_file(target, "setting", "file", "it", leave_unstatable=True) is None
-    )
-
-
-def test_an_unreached_share_at_the_stat_still_honours_leave_unreachable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A refused ``stat`` failure is judged as a failed read is, so ``leave_unreachable`` still
-    turns a share Windows could not reach into :class:`_UnreachedShare`, not a refusal. Red when
-    the stat branch raised the refusal itself."""
-    target = str(tmp_path / "root.crt")
-    real_stat = os.stat
-
-    def unreached(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
-        if str(path) == target:
-            raise _ShareNotReached(errno.ENOENT, "No network path")
-        return real_stat(path, *args, **kwargs)
-
-    monkeypatch.setattr(os, "stat", unreached)
-    with pytest.raises(database._UnreachedShare):
-        database._read_driver_file(
-            target, "setting", "file", "it", leave_unstatable=True, leave_unreachable=True
-        )
+    database._refuse_libpq_root_cert_file(None, "setting", target)  # left, not refused
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="libpq reads the password file off Windows")
@@ -921,7 +911,8 @@ def test_a_libpq_home_the_engine_cannot_name_refuses_the_build(
         raise OSError("synthetic: shell32 did not load")
 
     monkeypatch.setattr(database, "_libpq_homes", unnamed)
-    with pytest.raises(ValueError, match="root certificate: set PGSSLROOTCERT to a local path"):
+    remedy = f"DATABASE: libpq's home is unknown; {database._LIBPQ_REMEDY}"
+    with pytest.raises(ValueError, match=re.escape(remedy)):
         _build_psql()
 
 
@@ -958,7 +949,7 @@ def test_a_shell32_failure_is_an_oserror_the_build_refuses(
     with pytest.raises(OSError, match=expected):
         database._windows_roaming_appdata()
     monkeypatch.delenv("PGSSLROOTCERT", raising=False)
-    with pytest.raises(ValueError, match="set PGSSLROOTCERT to a local path"):
+    with pytest.raises(ValueError, match=re.escape(database._LIBPQ_REMEDY)):
         _build_psql()
 
 
@@ -968,3 +959,270 @@ def test_other_drivers_ca_keywords_never_reach_a_driver(keyword: str) -> None:
     generic dialect's list, so this connector never hands their paths to a driver."""
     with pytest.raises(ValueError, match="must not set"):
         _build(**{keyword: "/etc/ssl/synthetic.pem"})
+
+
+# --- Vault BACKLOG #8153: the refusals' remedies, the shell call, and the real stat -------------
+
+
+def _refused(monkeypatch: pytest.MonkeyPatch, home: Path, shape: str) -> ValueError:
+    """The build's refusal for one ``shape`` of libpq root certificate."""
+    if shape == "another host":
+        monkeypatch.setenv("PGSSLROOTCERT", "//db.synthetic.test/share/root.crt")
+    elif shape == "home not named":
+
+        def unnamed() -> list[tuple[str, str]]:
+            raise OSError("synthetic: the home could not be named")
+
+        monkeypatch.setattr(database, "_libpq_homes", unnamed)
+    elif shape == "stat fault":
+        root = _write(home, _certificate(), "root.crt")
+        real_stat = os.stat
+        fault = _windows_stat_failure(32) if sys.platform == "win32" else OSError(errno.EIO, "I/O")
+
+        def faulting(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            if str(path) == root:
+                raise copy.copy(fault)
+            return real_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "stat", faulting)
+    else:  # "walk unread", Windows only: the folder holding the file cannot be read
+        _write(home, _certificate(), "root.crt")
+        folder = home.name.lower()
+        real_lstat = os.lstat
+
+        def unreadable(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            if os.path.basename(str(path)).lower() == folder:
+                raise OSError(None, "Windows error 5", None, 5)
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "lstat", unreadable)
+    with pytest.raises(ValueError) as refused:
+        _build_psql()
+    return refused.value
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "another host",
+        "home not named",
+        "stat fault",
+        pytest.param(
+            "walk unread",
+            marks=pytest.mark.skipif(sys.platform != "win32", reason="the walk runs on Windows"),
+        ),
+    ],
+)
+def test_each_libpq_refusal_keeps_its_remedy_in_a_stored_failure(
+    _no_libpq_root: Path, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    """Vault BACKLOG #8153, items 6, 24 and 31. A build failure is stored and alerted as
+    ``safe_exc`` renders it, which keeps about the first 200 characters. Red on the previous
+    head: the host refusal's remedy began past 200 characters and the unread refusal's near 180,
+    before the connection's name, so the stored text lost both."""
+    rendered = safe_exc(_refused(monkeypatch, _no_libpq_root, shape))
+    assert _CONNECTION in rendered
+    assert database._LIBPQ_REMEDY in rendered, rendered
+    # Round-1 review: the remedy first left every shape's stored text alike. A short cause
+    # before it keeps them apart.
+    cause = {
+        "another host": "not cleared as a local path; ",
+        "home not named": "libpq's home is unknown; ",
+        "stat fault": "its stat failed; ",
+        "walk unread": "could not be read; ",
+    }[shape]
+    assert f": {cause}{database._LIBPQ_REMEDY}" in rendered, rendered
+
+
+def test_the_remedy_names_who_may_write_the_folder_for_this_platform() -> None:
+    """Vault BACKLOG #8153, item 25: "administrators" and "network drive" are Windows words, and
+    the refusal named them on every platform."""
+    if sys.platform == "win32":
+        assert "administrators" in database._LIBPQ_REMEDY
+        assert "network drive" in database.REMOTE_PATH_RULE
+    else:
+        assert "root and the service account" in database._LIBPQ_REMEDY
+        assert "administrators" not in database._LIBPQ_REMEDY
+        assert "network drive" not in database.REMOTE_PATH_RULE
+
+
+@pytest.mark.parametrize("source", ["default", "PGSSLROOTCERT"])
+def test_a_left_stat_failure_is_logged_with_its_class_and_codes(
+    _no_libpq_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    source: str,
+) -> None:
+    """Vault BACKLOG #8153, item 32 finding 9: a stat failure left to libpq was logged at DEBUG
+    with no class or code. A denial, which is not the ordinary missing file, is logged at INFO
+    with both, and never with the path."""
+    root = _write(_no_libpq_root, _headered(_certificate()), "root.crt")
+    if source == "PGSSLROOTCERT":
+        monkeypatch.setenv("PGSSLROOTCERT", root)
+    real_stat = os.stat
+    denial = (
+        _windows_stat_failure(5)
+        if sys.platform == "win32"
+        else PermissionError(errno.EACCES, "Permission denied")
+    )
+
+    def denied(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if str(path) == root:
+            raise copy.copy(denial)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", denied)
+    with caplog.at_level(logging.INFO, logger=database.logger.name):
+        assert "SSLmode=verify-full;" in _build_psql()
+    (line,) = [r for r in caplog.records if "left to libpq" in r.getMessage()]
+    assert line.levelno == logging.INFO
+    assert type(denial).__name__ in line.getMessage()
+    assert f"errno {errno.EACCES}" in line.getMessage()
+    assert root not in line.getMessage()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the walk and ERROR_INVALID_NAME are Windows")
+def test_a_padded_pgsslrootcert_meets_invalid_name_at_the_real_stat(
+    _no_libpq_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #8153, item 7, through the real walk and the real ``stat``, nothing stood in
+    for. A ``PGSSLROOTCERT`` with a leading space is a spelling the walk stops on alone, which
+    the host check does not refuse, and its ``stat`` meets 123 ``ERROR_INVALID_NAME``: libpq,
+    given the same text, cannot ``stat`` it either, so the build is left to it. So 123 in the left
+    set is reachable, which the item said it was not."""
+    root = _write(_no_libpq_root, _headered(_certificate()), "root.crt")
+    monkeypatch.setenv("PGSSLROOTCERT", f" {root}")
+    with caplog.at_level(logging.INFO, logger=database.logger.name):
+        assert "SSLmode=verify-full;" in _build_psql()
+    (line,) = [r for r in caplog.records if "left to libpq" in r.getMessage()]
+    assert "winerror 123" in line.getMessage()
+    # The control: the same file, unpadded, is read and refused.
+    monkeypatch.setenv("PGSSLROOTCERT", root)
+    with pytest.raises(ValueError, match=re.escape(ENCRYPTION_HEADER_SCOPE)):
+        _build_psql()
+
+
+class _CountingShell32:
+    """A ``WinDLL`` stand-in that counts how often ``shell32`` is loaded."""
+
+    def __init__(self, folder: bytes) -> None:
+        self.loads = 0
+        self.folder = folder
+
+    def __call__(self, name: str, *args: Any, **kwargs: Any) -> _FakeShell32:
+        self.loads += 1
+        return _FakeShell32(self.folder)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="shell32 is loaded on Windows only")
+def test_shell32_is_loaded_once_across_builds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Vault BACKLOG #8153, item 19: every build loaded shell32 again. Red on the previous head:
+    two lookups loaded it twice."""
+    import ctypes
+
+    counting = _CountingShell32(b"C:\\Users\\synthetic\\AppData\\Roaming")
+    monkeypatch.setattr(ctypes, "WinDLL", counting)
+    first = database._windows_roaming_appdata()
+    assert database._windows_roaming_appdata() == first
+    assert counting.loads == 1
+
+
+class _UndecodableValue:
+    """A shell buffer's ``value`` whose decode fails, as bytes the ANSI code page cannot decode
+    would: a cp1252 host decodes every byte, so the branch is reached by standing in for it."""
+
+    def decode(self, encoding: str) -> str:
+        raise UnicodeDecodeError(encoding, b"C:\\synthetic\\\x81", 13, 14, "synthetic")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the shell folder is read on Windows only")
+def test_a_shell_folder_that_does_not_decode_refuses_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #8153 (engine PR 2927, defect 5): the decode-error branch had no test. The
+    ``OSError`` carries no cause or context, since the decode error holds the folder's bytes, and
+    the build refuses with its remedy."""
+    import ctypes
+
+    silent = types.SimpleNamespace(SHGetFolderPathA=lambda *args: 0)  # writes nothing
+    monkeypatch.setattr(ctypes, "WinDLL", lambda name, *a, **k: silent)
+    monkeypatch.setattr(
+        ctypes,
+        "create_string_buffer",
+        lambda size: types.SimpleNamespace(value=_UndecodableValue()),
+    )
+    with pytest.raises(OSError, match="does not decode") as raised:
+        database._windows_roaming_appdata()
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+    monkeypatch.delenv("PGSSLROOTCERT", raising=False)
+    with pytest.raises(ValueError, match=re.escape(database._LIBPQ_REMEDY)):
+        _build_psql()
+
+
+#: A connection name of 40 characters, the length round-2 finding 2 asks the remedy to survive.
+_LONG_CONNECTION = "OB_ACME_REGIONAL_LABORATORY_RESULTS_FEED"
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "another host",
+        "home not named",
+        "stat fault",
+        pytest.param(
+            "walk unread",
+            marks=pytest.mark.skipif(sys.platform != "win32", reason="the walk runs on Windows"),
+        ),
+    ],
+)
+def test_the_cause_and_remedy_survive_a_40_character_connection_name(
+    _no_libpq_root: Path, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    """Vault BACKLOG #8153, review round 2, finding 2. Red on the previous head: the setting came
+    first, so a name of about 19 characters or more pushed the remedy past ``safe_exc``'s cut.
+    The walk-unread shape pins what ``_LIBPQ_REMEDY``'s comment claims: what survives is the
+    cause and :data:`~database._LIBPQ_REMEDY`, and the raised error keeps the second remedy, which
+    ``_LIBPQ_REMEDY``'s comment says a stored failure can lose."""
+    assert len(_LONG_CONNECTION) == 40
+    named = {"sslmode": "verify-full"}
+    if shape == "walk unread":
+        _write(_no_libpq_root, _certificate(), "root.crt")
+        folder = _no_libpq_root.name.lower()
+        real_lstat = os.lstat
+
+        def unreadable(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            if os.path.basename(str(path)).lower() == folder:
+                raise OSError(None, "Windows error 5", None, 5)
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "lstat", unreadable)
+    elif shape == "another host":
+        monkeypatch.setenv("PGSSLROOTCERT", "//db.synthetic.test/share/root.crt")
+    elif shape == "home not named":
+
+        def unnamed() -> list[tuple[str, str]]:
+            raise OSError("synthetic: the home could not be named")
+
+        monkeypatch.setattr(database, "_libpq_homes", unnamed)
+    else:
+        root = _write(_no_libpq_root, _certificate(), "root.crt")
+        monkeypatch.setenv("PGSSLROOTCERT", root)
+        real_stat = os.stat
+        fault = _windows_stat_failure(32) if sys.platform == "win32" else OSError(errno.EIO, "I/O")
+
+        def faulting(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            if str(path) == root:
+                raise copy.copy(fault)
+            return real_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "stat", faulting)
+    with pytest.raises(ValueError) as refused:
+        database._refuse_encrypted_libpq_root_cert(
+            named, family="psqlodbc", connection=_LONG_CONNECTION
+        )
+    rendered = safe_exc(refused.value)
+    assert _LONG_CONNECTION in rendered
+    assert database._LIBPQ_REMEDY in rendered, rendered
+    if shape == "walk unread":
+        assert f"DATABASE: could not be read; {database._LIBPQ_REMEDY}" in rendered, rendered
+        assert database._LIBPQ_CHECK_FOLDERS in str(refused.value)

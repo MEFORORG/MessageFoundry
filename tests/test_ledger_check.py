@@ -88,6 +88,7 @@ def allocate(
     worktree: Path | None = None,
     branch: str | None = None,
     omit_branch: bool = False,
+    omit_worktree: bool = False,
 ) -> None:
     """Mimic what scripts/coord/alloc.ps1 writes, so the hook's ownership check has something to read.
 
@@ -99,7 +100,7 @@ def allocate(
     the fallback short-circuits on a missing branch.
 
     `omit_branch` reproduces a LEGACY record written before the allocator recorded one, so the
-    path-only behaviour stays pinned.
+    path-only behaviour stays pinned. `omit_worktree` drops the path too, for a record with neither.
     """
     common = git_read(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
     top = git_read(repo, "rev-parse", "--path-format=absolute", "--show-toplevel").strip()
@@ -115,6 +116,8 @@ def allocate(
     d = root / "mefor-coord" / "alloc" / kind
     d.mkdir(parents=True, exist_ok=True)
     claim: dict[str, str] = {"number": number, "kind": kind, "worktree": str(worktree or top)}
+    if omit_worktree:
+        del claim["worktree"]
     if not omit_branch:
         claim["branch"] = branch or git_read(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
     (d / f"{number}.json").write_text(json.dumps(claim), encoding="utf-8")
@@ -225,8 +228,9 @@ def test_a_number_allocated_to_a_DIFFERENT_worktree_is_blocked(repo: Path, tmp_p
 
     ***THE OTHER BRANCH IS LOAD-BEARING AND USED TO BE IMPLICIT.*** A sibling SESSION is in another
     worktree AND on another branch -- git refuses an ORDINARY second checkout of one branch in two
-    worktrees (a DEFAULT, not a law of git; `Ledger.owns` records what defeats it, BACKLOG #1039), so
-    that pairing is not a coincidence, it is the shape a live sibling has. Once ownership grew a
+    worktrees (a DEFAULT, not a law of git: `git worktree add --force` and `git checkout
+    --ignore-other-worktrees` get past it, BACKLOG #1039), so that pairing is not a coincidence, it
+    is the shape a live sibling has. Once ownership grew a
     branch fallback (BACKLOG #1282) this arm had to name the branch or it would have been asserting
     the weaker "different path" and passing for a reason unrelated to sibling-ness.
     """
@@ -260,21 +264,8 @@ def test_a_number_whose_worktree_IS_GONE_is_committable_from_the_SAME_BRANCH(
     permanently -- 43 of them by 2026-08-30 -- because `owns` compared a path and nothing else, and
     nothing anywhere reported the loss.
 
-    ***IT IS SAFE ONLY BECAUSE GIT REFUSES AN ORDINARY SECOND CHECKOUT OF ONE BRANCH IN TWO
-    WORKTREES.*** The gate exists to stop two sessions filing one number, and two sessions do not hold
-    one branch -- so "the session on this branch" is as single-valued as "the session in this
-    worktree" was, while outliving it. A branch that is free to check out is one nobody is working in.
-
-    ***THAT REFUSAL IS A DEFAULT, NOT A LAW OF GIT, AND THIS DOCSTRING SAID IT FLAT (BACKLOG #1039).***
-    `git worktree add --force` / `-f` and `git checkout --ignore-other-worktrees` both get past it, so
-    forcing a second checkout makes the branch key non-exclusive and leaks entitlement to a tree that
-    never allocated the number. `Ledger.owns` carries the full statement of the residual; it is named
-    here because THIS is the sentence that licenses the loosening, and a flat version of it here
-    contradicts the qualified version there.
-
-    **Recorded because the miss generalises: the first sweep for this premise used a CASE-SENSITIVE
-    grep and this site is in capitals**, so the strongest instance in the repository was the one left
-    behind while the ledger row said the sweep was finished.
+    The branch key is not exclusive: docs/LEDGER-GATE.md, "When the owning worktree is gone", says
+    how at least two trees can be entitled to one number.
     """
     write(repo, "docs/adr/0002-new.md", "# 0002 — New\n")
     write(
@@ -311,6 +302,52 @@ def test_a_LEGACY_record_with_no_branch_still_falls_back_to_the_path_alone(
     code, out = run_check(repo)
     assert code == 1
     assert "not allocated to this worktree" in out
+
+
+def _stage_unowned_0002(repo: Path) -> None:
+    write(repo, "docs/adr/0002-new.md", "# 0002 — New\n")
+    write(
+        repo,
+        "docs/adr/README.md",
+        README_HEAD + ROW.format(n="0002", slug="new", title="New") + "\n",
+    )
+
+
+def test_a_record_whose_worktree_and_branch_are_BOTH_GONE_gets_a_remedy_that_works(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The remedy must end in a step that works when neither recorded key still exists.
+
+    The worktree path and the branch below do not exist. Without the recreate step and the
+    allocator after it, every step the refusal printed needed one of them.
+    """
+    _stage_unowned_0002(repo)
+    gone = tmp_path / "worktree-that-was-deleted"
+    allocate(repo, "adr", "0002", worktree=gone, branch="claude/branch-that-was-deleted")
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    assert "not allocated to this worktree" in out
+    flat = " ".join(out.split())
+    recreate = flat.find("recreate a worktree at the path in 1")
+    alloc = flat.find("ONLY if neither the recorded worktree nor the branch exists")
+    assert recreate != -1, out
+    assert alloc > recreate, out
+    assert r"scripts\coord\alloc.ps1 -Kind adr" in flat[alloc:], out
+
+
+def test_a_record_with_NEITHER_worktree_nor_branch_still_names_the_allocator(repo: Path) -> None:
+    """Nothing recorded can be recovered, so the allocator is the step that works."""
+    _stage_unowned_0002(repo)
+    allocate(repo, "adr", "0002", omit_branch=True, omit_worktree=True)
+    git(repo, "add", "-A")
+
+    code, out = run_check(repo)
+    assert code == 1, out
+    flat = " ".join(out.split())
+    assert "recreate a worktree" not in flat, out
+    assert r"scripts\coord\alloc.ps1 -Kind adr" in flat, out
 
 
 # ----------------------------------------------------------------- restoring a number the base LOST
@@ -1411,8 +1448,8 @@ def test_MAIN_merged_INTO_another_seats_branch_is_committable(repo: Path, tmp_pa
     disjoint FROM EACH OTHER, which says nothing about whether either points at the real shape.
 
     ***THE MERGER MUST BE ON A DIFFERENTLY-NAMED BRANCH, AND THAT IS NOT INCIDENTAL.*** git refuses
-    an ORDINARY second checkout of one branch in two worktrees (a DEFAULT, not a law of git;
-    `Ledger.owns` records what defeats it, BACKLOG #1039), so a merger does not stand on the author's
+    an ORDINARY second checkout of one branch in two worktrees (a DEFAULT, not a law of git,
+    BACKLOG #1039), so a merger does not stand on the author's
     branch -- it cuts its own from theirs, exactly as `lander-fix/850` was cut. Stay on the author's
     branch NAME and `owns()`'s branch fallback (BACKLOG #1282) returns True, so the run passes for a
     reason unrelated to merging.

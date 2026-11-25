@@ -1821,6 +1821,38 @@ def test_a_cipher_build_failure_in_the_full_walk_is_a_fail_verdict(
     assert (status, cells) == ("FAIL", 0) and "key service" in reason, reason
 
 
+def test_a_sqlite_failure_in_the_full_walk_keeps_sqlites_text(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #8153. Red while the walk arm rendered a SQLite error through
+    ``safe_exc``, which withholds a driver's message."""
+    db, settings = _copy(_template, tmp_path)
+
+    def locked(*_a: Any, **_kw: Any) -> tuple[str, str, int]:
+        raise sqlite3.OperationalError("synthetic: database is locked")
+
+    monkeypatch.setattr(dr_backup, "_decrypt_check", locked)
+    status, reason, _cells = dr_backup._full_open_check(db, settings)
+    assert status == "FAIL" and "OperationalError: synthetic: database is locked" in reason, reason
+
+
+def test_a_sqlite_failure_in_the_full_open_keeps_sqlites_text(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #8153: the open's catch-all arm, the same way, red while it used safe_exc."""
+    import messagefoundry.store.base as store_base
+
+    db, settings = _copy(_template, tmp_path)
+    monkeypatch.setattr(dr_backup, "_decrypt_check", lambda *_a, **_kw: ("PASS", "ok", 0))
+
+    async def locked(*_a: Any, **_kw: Any) -> None:
+        raise sqlite3.OperationalError("synthetic: database is locked")
+
+    monkeypatch.setattr(store_base, "open_store", locked)
+    status, reason, _cells = dr_backup._full_open_check(db, settings)
+    assert status == "FAIL" and "OperationalError: synthetic: database is locked" in reason, reason
+
+
 def test_a_salt_reset_failure_keeps_the_walks_verdict(
     tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
 ) -> None:

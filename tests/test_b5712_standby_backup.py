@@ -45,7 +45,7 @@ async def standby_engine(tmp_path: Path) -> AsyncIterator[Engine]:
         poll_interval=0.05,
         store_settings=StoreSettings(path=str(db)),
         backup_settings=_backup_settings(tmp_path),
-        dr_settings=DrSettings(enabled=True),
+        dr_settings=DrSettings(enabled=True, seed_archive="seed.mfbak"),
         egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
@@ -170,7 +170,7 @@ async def test_a_boot_latched_active_backs_up(tmp_path: Path) -> None:
         poll_interval=0.05,
         store_settings=StoreSettings(path=str(db)),
         backup_settings=_backup_settings(tmp_path),
-        dr_settings=DrSettings(enabled=True, activate=True),
+        dr_settings=DrSettings(enabled=True, activate=True, seed_archive="seed.mfbak"),
         egress_settings=EgressSettings(deny_by_default=False),
     )
     try:

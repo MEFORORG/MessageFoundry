@@ -103,7 +103,7 @@ from messagefoundry.credential import constant_time_equal
 from messagefoundry.logging_guard import _last_resort
 from messagefoundry.parsing.binary import doc_ref_addresses_in_hl7 as _doc_ref_addresses_in_hl7
 from messagefoundry.parsing.binary import may_hold_doc_ref as _may_hold_doc_ref
-from messagefoundry.redaction import json_loads_or_refusal, safe_text
+from messagefoundry.redaction import engine_text_only, json_loads_or_refusal, safe_text
 from messagefoundry.service_status import _system_exe
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
@@ -1818,6 +1818,12 @@ def _refusal_key(refusal: _RevokeSealRefusal) -> tuple[object, ...]:
     return ("refusal", refusal.unverifiable, refusal.kind, refusal.ident)
 
 
+#: The note :meth:`RevokeSealOutcome.committing` adds to a failure of the report it runs after the
+#: revoke committed, so a caller can tell a revoke that landed from one that rolled back (BACKLOG
+#: #5093): ``admin-revoke-sessions`` reads it.
+REVOKE_COMMITTED_NOTE = "raised by the report after the revoke committed"
+
+
 @dataclass
 class RevokeSealOutcome:
     """What one revoke's sealed writes met (decision d20261109T200352805-599b24 on ADR 0217, items
@@ -1847,7 +1853,8 @@ class RevokeSealOutcome:
         known, on every exit (decision d20261110T063908944-857965, item 6).
 
         **On a clean exit** the revoke has committed, and :meth:`report` runs here, so no path
-        between the commit and a separate call can skip it.
+        between the commit and a separate call can skip it. A failure of that report carries
+        :data:`REVOKE_COMMITTED_NOTE`, since the revoke it reports on has landed (BACKLOG #5093).
 
         **If the transaction raises**, the report says the revoke failed before its commit was
         confirmed, rather than that it went ahead, and the exception propagates (decision
@@ -1883,7 +1890,11 @@ class RevokeSealOutcome:
         carry = _REVOKE_CARRY.get()
         if carry is not None and not carry.closed:
             carry.covered_by(self)
-        await self.report(record_audit)
+        try:
+            await self.report(record_audit)
+        except Exception as exc:
+            exc.add_note(REVOKE_COMMITTED_NOTE)
+            raise
 
     def refused(self, exc: Exception, *, what: str, kind: str, ident: str) -> None:
         """Take one refusal :func:`revoke_seal_refusals` names, which the revoke goes ahead without.
@@ -9180,6 +9191,18 @@ def forget_store_salt(path: Path) -> bool:
     )
 
 
+class _ClosedStoreWriteError(sqlite3.OperationalError):
+    """:func:`_write_closed_store`'s own refusal, whose text the engine wrote: the store's path,
+    the journal mode SQLite reported and a fixed sentence, never a row's value or SQLite's message.
+    Marked :func:`~messagefoundry.redaction.engine_text_only`, so a renderer that withholds a
+    database driver's message keeps it (vault BACKLOG #8153). ``safe_exc`` and the DR reasons show
+    it as ``OperationalError``; a traceback names this class itself.
+    Still a ``sqlite3.OperationalError``, so every handler that caught one catches it."""
+
+
+engine_text_only(_ClosedStoreWriteError, named_as_driver=True)
+
+
 def _write_closed_store[T](
     path: Path,
     write: Callable[[sqlite3.Connection], T],
@@ -9201,7 +9224,7 @@ def _write_closed_store[T](
     try:
         mode = str(conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]).lower()
         if mode != "delete":
-            raise sqlite3.OperationalError(
+            raise _ClosedStoreWriteError(
                 f"could not take {path} out of WAL mode (it is still {mode!r}); another "
                 f"connection holds it, so {what}"
             )
@@ -9209,14 +9232,14 @@ def _write_closed_store[T](
     finally:
         conn.close()
     if wal.exists() and wal.stat().st_size:
-        raise sqlite3.OperationalError(f"{wal} still holds changes after leaving WAL mode")
+        raise _ClosedStoreWriteError(f"{wal} still holds changes after leaving WAL mode")
     proof = sqlite3.connect(_sqlite_readonly_uri(str(path.absolute())), uri=True)
     try:
         proven = prove(proof)
     finally:
         proof.close()
     if not proven:
-        raise sqlite3.OperationalError(f"{path} {proof_failed}")
+        raise _ClosedStoreWriteError(f"{path} {proof_failed}")
     return result
 
 
