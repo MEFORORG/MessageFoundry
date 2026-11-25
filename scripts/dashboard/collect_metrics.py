@@ -9,10 +9,10 @@ JSON for the ``messagefoundry`` package; the engine's ``origin/main`` for the re
 the git checkout ``--engine-repo`` names (default: the checkout this script sits in); and, from the
 tree THIS script sits in, ``scripts/asvs/scorecard.py``, which it runs. That tree need not be a
 git checkout: the scheduled refresh runs a ``git archive`` copy, and passes ``--archive-ref`` with
-the commit it archived, because the scorecard tool then stamps ``engine=NO-GIT``. It also reads the ``Batch queue`` tab of the
-``/batch`` runbook workbook (``--runbook``, else ``MEFOR_RUNBOOK``, else
-``%USERPROFILE%/OneDrive/Desktop/MEFOR/MEFOR-backlog-runbook.xlsx``), parsed with the engine's
-vendored defusedxml loaded by path.
+the commit it archived, because the scorecard tool then stamps ``engine=NO-GIT``. It also reads
+the ``Batch queue`` tab of the ``/batch`` runbook workbook (``--runbook``, else
+``MEFOR_RUNBOOK``, else ``%USERPROFILE%/OneDrive/Desktop/MEFOR/MEFOR-backlog-runbook.xlsx``),
+parsed with the engine's vendored defusedxml loaded by path.
 
 THE SNAPSHOT IS PRIVATE. It quotes counts read from the vault, so it must never land inside a git
 repository, where a ``git add .`` would publish it. ``--out``'s directory, and the work directory the
@@ -47,10 +47,11 @@ WHAT IT WRITES outside ``--out``, at least: unless ``--no-fetch``, two
 ``git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main``, one in the vault and one
 in the engine checkout. Each moves only ``refs/remotes/origin/main``, and also writes
 ``FETCH_HEAD`` and fetched objects, and may start git's own auto-maintenance. No local tag or branch
-is created; the release tag is resolved with ``git ls-remote``. Vault files and downloads go
-to a fresh ``mf-metrics-*`` directory under ``--work-dir`` (default: Python's temporary directory), removed at
-exit; a removal that fails is an error, and such directories older than two hours are swept at the
-start of the next run, since a run killed by a time limit skips its cleanup.
+is created; the release tag is resolved with ``git ls-remote``. Loading the vendored defusedxml
+by path can write ``__pycache__`` in the tree this script sits in. Vault files and downloads go to
+a fresh ``mf-metrics-*`` directory under ``--work-dir`` (default: Python's temporary directory),
+removed at exit; a removal that fails is an error, and such directories older than two hours are
+swept at the start of the next run, since a run killed by a time limit skips its cleanup.
 
 WINDOWED AND CURRENT METRICS. ``--weeks``/``--through`` bound the weekly series. The state metrics
 (open alerts, ASVS counts, open ledger rows, release distance) are read as they stand at
@@ -696,7 +697,7 @@ class Context:
     fetch: Fetcher = fetch_url
     #: False when the caller already fetched both repositories' main this run.
     git_fetch: bool = True
-    #: The tree the engine scripts are run and imported from.
+    #: The tree the engine scorecard tool is run from.
     engine_root: Path = ENGINE_ROOT
     #: The engine git checkout for the release distance.
     engine_repo: Path = ENGINE_ROOT

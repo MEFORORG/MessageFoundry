@@ -1613,6 +1613,12 @@ _ESTIMATE_LINE = "> **Filed 2026-11-20.** Value **4/10** . Difficulty **2/10**"
         ([_SCORED.format(arrow="->", tier="P2")], _CLUSTER_P3, "P2"),
         ([_SCORED.format(arrow="\u2192", tier="P1")], _CLUSTER_P3, "P1"),
         ([_SCORED.format(arrow="->", tier="DEMAND-GATE")], None, "DEMAND-GATE"),
+        # Two tiers before the score: the one nearest it was written with it.
+        (
+            ["> SHIPPED, earlier moved -> P3. " + _SCORED.format(arrow="->", tier="P1")[2:]],
+            None,
+            "P1",
+        ),
         # Only the FIRST score line counts: a later tier does not override an untiered first one.
         ([_ESTIMATE_LINE, _SCORED.format(arrow="->", tier="P1")], None, "estimate only"),
         # An untiered estimate: the Cluster priority wins, else the estimate bucket.

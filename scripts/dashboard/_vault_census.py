@@ -120,9 +120,11 @@ def row_priority(item: Any, lines: Sequence[str]) -> str:
     found = next(((ln, s) for ln in block if (s := _SCORE.search(ln)) is not None), None)
     if found is not None:
         line, score = found
-        tier = _TIER.search(line, 0, score.start())
-        if tier:
-            return tier[1]
+        # The tier nearest the score is the one written with it; an earlier one on the same
+        # line belongs to an older banner sharing it.
+        tiers = list(_TIER.finditer(line, 0, score.start()))
+        if tiers:
+            return tiers[-1][1]
     for n in item.section_lines[:1]:
         m = _PRIORITY.search(lines[n - 1])
         if m:
