@@ -313,6 +313,7 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import errno
 import hashlib
@@ -868,11 +869,11 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     holds none. The text is derived from ``data`` alone and nothing here opens a file, which is the
     point.
 
-    This rests on OpenSSL's PEM reader as measured on CPython 3.14 with OpenSSL 3.5, and
+    This rests on OpenSSL's PEM reader as measured on CPython 3.14 with OpenSSL 3.5.7, and
     ``tests/test_trust_anchor_byte_binding.py`` holds it against ``cafile=`` itself. Another
-    OpenSSL that reads differently can make the two differ again. The mark rule is measured only
-    on OpenSSL 3.5, so below OpenSSL 3.5 (:data:`_MARK_RULE_MEASURED_FROM`) a file where this would
-    drop a mark in front of a BEGIN refuses instead.
+    OpenSSL, a later 3.5 or 3.x included, that reads differently can make the two differ again.
+    Below OpenSSL 3.5 (:data:`_MARK_RULE_MEASURED_FROM`) a file where this would drop a mark in
+    front of a BEGIN refuses instead.
 
     **No PEM block refuses.** ``create_default_context`` tests ``cadata`` for truth, so an empty
     string loads the WHOLE OS trust store: measured, 87 anchors on one Windows host. ``cafile=``
@@ -897,7 +898,9 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     the verdict is OpenSSL's own. Measured on CPython 3.14.6 / OpenSSL 3.5.7: a lone ``X509 CRL``
     block refuses, and a well-formed CRL beside a certificate, in either order, loads the one
     certificate and no CRL, so that file still passes. The throwaway context is discarded. It checks
-    that the text loads, not that a certificate in it is a CA; a leaf still loads here.
+    that the text loads, not that a certificate in it is a CA; a leaf still loads here. A load that
+    stops at a damaged block without an error refuses too (:func:`_reads_to_the_end`, BACKLOG
+    #5229), since ``cafile=`` refuses that file.
 
     **An encryption header name after the first BEGIN refuses, before that load** (BACKLOG
     #2270), whether or not it sits inside a block. A
@@ -1018,7 +1021,51 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             "that checks revocation reads its CRL from its own CRL setting",
             scope="unloadable",
         ) from exc
+    if not _reads_to_the_end(text):
+        raise TrustAnchorError(
+            f"{spec.setting}: the TLS library stops reading the trust anchor {spec.path!r} at a PEM "
+            "block it cannot use, without an error, so it would trust only the certificates before "
+            "that block, and a load by path refuses the file. Every PEM block in it must be "
+            "well-formed: remove or repair the damaged block",
+            scope="unloadable",
+        )
     return text
+
+
+#: A throwaway self-signed CA, whose key was discarded when it was made, that
+#: :func:`_reads_to_the_end` appends to an anchor's text. It is loaded only into a context that is
+#: thrown away, so it is never trusted for anything (BACKLOG #5229).
+_READ_TO_END_PROBE = """-----BEGIN CERTIFICATE-----
+MIIBiDCCAS+gAwIBAgIUfBy5qrAZ0eAJzWkSztPHI0P6OoUwCgYIKoZIzj0EAwIw
+OjE4MDYGA1UEAwwvTWVzc2FnZUZvdW5kcnkgcmVhZC10by1lbmQgcHJvYmUsIG5l
+dmVyIHRydXN0ZWQwHhcNMjYwMTAxMDAwMDAwWhcNMjYwMTAyMDAwMDAwWjA6MTgw
+NgYDVQQDDC9NZXNzYWdlRm91bmRyeSByZWFkLXRvLWVuZCBwcm9iZSwgbmV2ZXIg
+dHJ1c3RlZDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABKgx1XhF2xxCko9DB3z2
+6JrpcakJcGDUz6nDkHWSjGIjYQiZrNgqDHW55rydRcAPS4TROVKVryOiRK8Cf/CA
+7G6jEzARMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDRwAwRAIgRxcGFzLQ
+LiyM+nx5SJtd7AHmNRRBO7ZA7lLrUDniuvECIBGFmLR4OxJFX+jrhGQtrNxabwcB
+JTQ7zlQBG0UQeXnz
+-----END CERTIFICATE-----
+"""
+_READ_TO_END_PROBE_DER = base64.b64decode("".join(_READ_TO_END_PROBE.splitlines()[1:-1]))
+
+
+def _reads_to_the_end(text: str) -> bool:
+    """Whether OpenSSL's ``cadata=`` load of ``text`` reads to its end (BACKLOG #5229).
+
+    At some damaged PEM blocks, at least a block that decodes to no data or holds a header line
+    OpenSSL cannot use, the ``cadata=`` load stops reading without an error and keeps the
+    certificates before that block, while ``cafile=`` refuses the whole file with ``PEM lib``. So
+    this loads ``text`` with :data:`_READ_TO_END_PROBE` after it into a throwaway context: a load
+    that stopped early never reaches the probe. A load that raises here counts as not reaching it.
+    It does not judge a block's contents once decoded: at least a ``X509 CRL`` block whose base64
+    decodes to bytes that are no CRL loads here and refuses under ``cafile=``."""
+    probe = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    try:
+        probe.load_verify_locations(cadata=text + "\n" + _READ_TO_END_PROBE)
+    except ssl.SSLError:
+        return False
+    return _READ_TO_END_PROBE_DER in probe.get_ca_certs(binary_form=True)
 
 
 # --- read-only DACL inspection (icacls, verify-only) ---------------------------------------------

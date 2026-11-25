@@ -796,6 +796,26 @@ def test_a_nul_byte_beside_a_private_key_still_names_the_key(cas: tuple[_Ca, _Ca
     assert refused.value.scope == "private_key"
 
 
+def test_a_block_the_load_stops_at_refuses_as_cafile_does(
+    tmp_path: Path, cas: tuple[_Ca, _Ca]
+) -> None:
+    """A block holding a header line and data OpenSSL cannot use stops the ``cadata=`` load there
+    without an error, keeping the certificate before it, while ``cafile=`` refuses the whole file.
+    The check refuses it too. The control: the certificate alone loads."""
+    good, _ = cas
+    damaged = b"-----BEGIN EXAMPLE DATA-----\nName: value\nAAAA\n-----END EXAMPLE DATA-----\n"
+    data = good.pem + damaged
+    anchor = tmp_path / "ca.pem"
+    anchor.write_bytes(data)
+    with pytest.raises(ssl.SSLError):
+        ssl.create_default_context(cafile=str(anchor))
+    assert _subjects(ssl.create_default_context(cadata=data.decode())) == ["good-ca"]  # the gap
+    with pytest.raises(TrustAnchorError, match="stops reading") as refused:
+        anchor_cadata(data, _SPEC)
+    assert refused.value.scope == "unloadable"
+    assert anchor_cadata(good.pem, _SPEC)
+
+
 @pytest.mark.parametrize(
     ("version", "refuses"),
     [
