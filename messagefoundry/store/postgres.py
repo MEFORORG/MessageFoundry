@@ -110,11 +110,13 @@ from messagefoundry.store.base import (
     SchemaLockTimeout,
     SchemaNotProvisionedError,
     SchemaProvisionResult,
+    ServerCipherWalk,
     StoreGrantsMissingError,
     StoreNotFoundError,
     _codec_chain_reading,
     _flush_unjudged,
     acquire_pooled,
+    check_walk_identifiers,
     driver_sqlstate,
     seed_filter_clause,
     warm_pool_connections,
@@ -478,14 +480,6 @@ _PG_EPOCH_NOW = "EXTRACT(EPOCH FROM statement_timestamp())::double precision"
 # which is the memory budget the 500-row passes actually spend; 500 here would be ~650 MiB held in a
 # single transaction while the store is still opening.
 _ATTACHMENT_CHUNK_BATCH = 16
-
-
-def _check_walk_identifiers(*names: str) -> None:
-    """Refuse a cipher-walk identifier that is not a plain ASCII name. The walk's names are declared
-    constants (BACKLOG #1719), so this only stops a caller that passed something else."""
-    for name in names:
-        if not (name.isascii() and name.isidentifier()):
-            raise ValueError(f"not a plain identifier for the cipher walk: {name!r}")
 
 
 # BACKLOG #3383: write a surface's `keyed_surface` marker unless it exists. RETURNING yields a row
@@ -2083,7 +2077,7 @@ def _refuse_store_revocation(
     ).enforce_construction()
 
 
-class PostgresStore:
+class PostgresStore(ServerCipherWalk):
     """PostgreSQL-backed durable queue (the :class:`Store` protocol). Open with :meth:`open`."""
 
     # Postgres implements the full staged ingress pipeline (enqueue_ingress/route_handoff/
@@ -4019,9 +4013,8 @@ class PostgresStore:
         return row is not None
 
     # --- the read-only cipher-cell walk (BACKLOG #1719) ----------------------
-    # The source `cipher_cells.read_server_cipher_cells` reads, for `messagefoundry cipher-audit`.
-    # Each call is one SELECT on its own bounded borrow, so no read transaction spans chunks. Every
-    # identifier is a declared constant from `cipher_cells`; only values are parameters.
+    # This dialect's reads; `store/base.py` says what the walk's reads share, and holds the one
+    # read that is not dialect, `cipher_walk_surface_sealed`.
 
     async def cipher_walk_columns(self, tables: Sequence[str]) -> dict[str, frozenset[str]]:
         """The columns of each of ``tables`` this store's schema holds; an absent table is left out."""
@@ -4042,14 +4035,6 @@ class PostgresStore:
         )
         return None if row is None else (str(row[0]), str(row[1]))
 
-    async def cipher_walk_surface_sealed(self, table: str, column: str, *, keyed: bool) -> bool:
-        """Whether the store has sealed ``table.column``, by the rule its at-open sweep applies
-        (BACKLOG #3383); ``keyed`` says the ``keyed_surface`` table exists to be asked."""
-        _check_walk_identifiers(table, column)
-        if keyed and await self._surface_keyed(table, column):
-            return True
-        return await self._surface_holds_ciphertext(table, column, f"{_ENC_MARKER_PREFIX}%")
-
     async def cipher_walk_chunk(
         self,
         table: str,
@@ -4065,7 +4050,7 @@ class PostgresStore:
         ``after`` (``None`` for the first chunk), in ``order``. Each row is the ``select`` values,
         then ``column``'s. ``sealed_only`` keeps a value only when it starts with the marker in any
         ASCII case, as ``cipher_cells._sealed_test`` reads one."""
-        _check_walk_identifiers(table, column, *select, *order)
+        check_walk_identifiers(table, column, *select, *order)
         params: list[Any] = []
 
         def bind(value: Any) -> str:

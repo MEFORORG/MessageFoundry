@@ -22,8 +22,15 @@ and a street's space, is judged first, against the field separator and the MSH-2
 same on both adapters, in the shared ``surrogates.surrogate_field_recorded`` (BACKLOG #5540).
 :func:`_whole_field` then checks the whole field a rule wrote, sender text it kept included, for
 the field separator, CR, LF, an MLLP frame byte or NUL, which the engine adapter's whole-field
-``Message.set`` refuses too. The shared site-code pass that runs after the rules writes no digit
-the message declares as a separator.
+``Message.set`` refuses too. CR, LF and the frame bytes never reach a field:
+``normalized_message`` turns CR and LF into segment breaks and strips the frame bytes, so of the
+five only NUL can reach :func:`_whole_field`. Under a rule other than a ``keep``,
+``surrogate_field_recorded`` refuses an undeclared C0 byte in what the surrogate wrote first
+(BACKLOG #5533 item 14), so there a NUL reaches :func:`_whole_field` only when the message
+declares it. A ``keep`` rule passed straight to this adapter skips that shared C0 refusal, and
+the kept value is written back, so an undeclared NUL in it reaches :func:`_whole_field`, which
+refuses it. The shared site-code pass that runs after the rules writes no digit the message
+declares as a separator.
 """
 
 from __future__ import annotations
@@ -69,7 +76,8 @@ def anonymize_message(
     delimiter in a value it wrote itself (``surrogates._written``).
 
     ``blanked``, when given, collects the address of every field the ``DATE`` kind scrubbed to empty
-    (``surrogate_field_recorded``), as the engine adapter does.
+    (``surrogate_field_recorded``), as the engine adapter does. Those addresses are added only once
+    the message has been written, so a refused message adds none (BACKLOG #5540).
     """
     _refuse_unwritable_rules(rules)
     # A keep rewrites nothing, so it never makes a line reachable (BACKLOG #3001).
@@ -82,6 +90,8 @@ def anonymize_message(
             raise AnonError("message MSH-2 repeats an encoding character — refusing to emit")
         raise AnonError("message has no parseable MSH / encoding characters — refusing to emit")
     seps, field_sep = parsed
+    # None when the caller asked for no record, so the date check is not run for nothing.
+    found: list[str] | None = [] if blanked is not None else None
     segments = [seg.split(field_sep) for seg in text.split("\r")]
     # The header may be spelled ``Msh``: the separators are read from it in any case and the
     # leak-check skips it in any case, so an MSH rule must reach it in any case too. Only the
@@ -103,11 +113,14 @@ def anonymize_message(
                 continue
             if index < len(fields):
                 value = surrogate_field_recorded(
-                    rule.path, _kind_for(rule, fields), fields[index], keyer, seps, blanked
+                    rule.path, _kind_for(rule, fields), fields[index], keyer, seps, found
                 )
                 fields[index] = _whole_field(rule.path, value, field_sep)
     encoded = "\r".join(field_sep.join(fields) for fields in segments)
-    return scrub_message_site_codes(encoded, keyer, rules)
+    output = scrub_message_site_codes(encoded, keyer, rules)
+    if blanked is not None and found:
+        blanked.extend(found)
+    return output
 
 
 #: Beside the field separator, what the engine's whole-field ``Message.set`` refuses: CR, LF, then

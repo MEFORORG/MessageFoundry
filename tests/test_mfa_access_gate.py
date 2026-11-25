@@ -41,6 +41,8 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
+from messagefoundry.store.crypto import CipherError
+from messagefoundry.store.row_seal import TransitSealUnavailableError
 from messagefoundry.store.store import WebAuthnCredential
 from tests._admin_account import create_admin, create_local_user_chosen
 from tests._enrolment_code import enrolment_code_for
@@ -583,24 +585,211 @@ async def test_a_session_that_proved_its_second_factor_can_end_sessions(
         assert await service.identity_for_token(tok) is not None
 
 
-async def test_an_account_with_no_factor_still_ends_sessions_from_a_pending_session(
-    engine: Engine,
-) -> None:
-    """RED when: the refusal over-reaches and blocks the un-enrolled case too.
+_ENROL_NAMED = "enrol one first"
 
-    This is the path the comment on ``_MFA_EXEMPT_ROUTES`` keeps on purpose. An account with no
-    factor is pending under the default ``require_mfa``, and it has nothing to prove at
-    ``/auth/mfa-verify``. A password re-proof is the only way it can end a session it does not
-    recognise. Pinned beside the refusal so a fix for one cannot silently break the other.
+
+@pytest.mark.parametrize("action_step_up", (True, False), ids=("enforced", "opted-out"))
+async def test_a_pending_session_with_no_factor_cannot_end_sessions(
+    engine: Engine, action_step_up: bool
+) -> None:
+    """RED when: ``session_terminate`` is refused only to a pending session that HAS a factor.
+
+    BACKLOG #1149 (ASVS 7.5.2). Under the default ``require_mfa`` a session on an account with no
+    factor is MFA-pending. It may reach enrolment and sign-out, and is refused elsewhere, the
+    terminate routes included, with a refusal that names enrolment. Before this the password
+    re-proof below minted it a ``session_terminate`` grant and the terminate ran.
+
+    The ``opted-out`` arm is the one the route-side refusal carries alone: there a re-auth refreshes
+    the session window, which is the whole gate. The ``enforced`` arm also pins the mint-side
+    refusal: the re-auth leaves no grant behind for a later request to spend.
     """
-    service = await _service(engine)
+    service = await _service(
+        engine,
+        AuthSettings(
+            login_rate_limit_enabled=False,
+            mfa_verify_min_elapsed_seconds=0,
+            require_action_step_up=action_step_up,
+        ),
+    )
     await _add(service, "fresh", Role.VIEWER)
     other = await service.login("fresh", PW)
     assert other.ok and other.token is not None
 
     async with _client(engine, service) as c:
         tok = await _login(c, "fresh")
-        assert (await c.get("/messages", headers=_auth(tok))).status_code == 403  # pending
+        assert await service.mfa_satisfied(tok) is False  # pending, with nothing to prove
+
+        for path in (f"/me/sessions/{hash_token(other.token)}", "/me/sessions"):
+            tok = await _reauth_to_terminate(c, tok)
+            assert await service.has_recent_step_up(tok) is True  # the positive control
+            ended = await c.delete(path, headers=_auth(tok))
+            assert ended.status_code == 403, (
+                f"DELETE {path} from an MFA-pending session with no factor succeeded"
+            )
+            assert ended.headers.get("X-MFA-Required") == "1"
+            assert "X-Step-Up-Required" not in ended.headers
+            assert _ENROL_NAMED in ended.json()["detail"], ended.json()
+            if action_step_up:
+                assert (
+                    await service.has_action_step_up(tok, STEP_UP_ACTION_SESSION_TERMINATE) is False
+                ), "the re-auth minted a session_terminate grant for a pending session"
+
+        assert await service.identity_for_token(other.token) is not None
+
+    audit = await engine.store.list_audit()
+    reauths = [json.loads(a["detail"]) for a in audit if a["action"] == "auth.reauth"]
+    assert [r["grant_refused"] for r in reauths] == [True, True]
+    denied = [a["detail"] or "" for a in audit if a["action"] == "auth.mfa_denied"]
+    assert any("/me/sessions" in d for d in denied)
+
+
+@pytest.mark.parametrize("purpose", ("save_ends_own_sessions", "revoke_all_sessions"))
+async def test_a_pending_session_with_no_factor_is_minted_no_session_ending_grant(
+    engine: Engine, purpose: str
+) -> None:
+    """RED when: a password re-proof from a pending session with no factor mints a grant for an
+    action that ends sessions.
+
+    BACKLOG #1149, the vault's residual (g): such a session minted a ``save_ends_own_sessions``
+    grant, carried it through its first enrolment, which satisfies the session, and spent it on a
+    save that ended its own sessions. The grant must not exist to carry.
+    """
+    service = await _service(engine)
+    await _add(service, "fresh", Role.VIEWER)
+
+    async with _client(engine, service) as c:
+        tok = await _login(c, "fresh")
+        r = await c.post(
+            "/me/reauth", json={"password": PW, "purpose": purpose}, headers=_auth(tok)
+        )
+        assert r.status_code == 200  # a genuine password proof, re-keyed either way
+        tok = str(r.json()["token"])
+        assert await service.has_recent_step_up(tok) is True  # the positive control
+        assert await service.holds_action_step_up(tok, purpose) is False
+
+
+async def test_a_no_factor_session_ends_sessions_once_it_has_enrolled(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the refusal outlives enrolment. The way out the refusal names must work.
+
+    Enrolment is reachable from the pending session, the confirm that binds the first factor
+    satisfies the session, and the terminate then runs on a fresh password proof.
+    """
+    service = await _service(engine)
+    await _add(service, "fresh", Role.VIEWER)
+    other = await service.login("fresh", PW)
+    assert other.ok and other.token is not None
+    t0 = 1_000_000.0
+    pin_totp_clock(monkeypatch, t0)
+
+    async with _client(engine, service) as c:
+        tok = await _login(c, "fresh")
+        r = await c.post(
+            "/me/reauth", json={"password": PW, "purpose": "mfa_enroll"}, headers=_auth(tok)
+        )
+        assert r.status_code == 200
+        tok = str(r.json()["token"])
+        enrolled = await c.post("/me/mfa/enroll", headers=_auth(tok))
+        assert enrolled.status_code == 200, enrolled.text
+        secret = str(enrolled.json()["secret"])
+        r = await c.post(
+            "/me/reauth", json={"password": PW, "purpose": "mfa_confirm"}, headers=_auth(tok)
+        )
+        assert r.status_code == 200
+        tok = str(r.json()["token"])
+        confirmed = await c.post(
+            "/me/mfa/confirm", json={"code": totp.totp(secret, now=t0)}, headers=_auth(tok)
+        )
+        assert confirmed.status_code == 200, confirmed.text
+        tok = str(confirmed.json()["token"])
+        assert await service.mfa_satisfied(tok) is True
+
+        tok = await _reauth_to_terminate(c, tok)
+        r = await c.delete("/me/sessions", headers=_auth(tok))
+        assert r.status_code == 200, r.text
+        assert await service.identity_for_token(other.token) is None
+
+
+async def test_the_access_gate_names_enrolment_to_a_pending_session_with_no_factor(
+    engine: Engine,
+) -> None:
+    """RED when: the 6.3.3 refusal tells a session with no factor to verify one.
+
+    It has nothing to give ``/auth/mfa-verify``, so the refusal names enrolment (BACKLOG #1149).
+    The control: a pending session on an account that HAS a factor keeps the verify wording.
+    """
+    service = await _service(engine)
+    await _add(service, "fresh", Role.VIEWER)
+    await _add(service, "vic", Role.VIEWER)
+    await _add_passkey(service, "vic")
+
+    async with _client(engine, service) as c:
+        fresh = await c.get("/messages", headers=_auth(await _login(c, "fresh")))
+        enrolled = await c.get("/messages", headers=_auth(await _login(c, "vic")))
+    for r in (fresh, enrolled):
+        assert r.status_code == 403
+        assert r.headers.get("X-MFA-Required") == "1"
+        assert r.json()["detail"].startswith("multi-factor verification required")
+    assert _ENROL_NAMED in fresh.json()["detail"]
+    assert enrolled.json()["detail"] == (
+        "multi-factor verification required; POST /auth/mfa-verify then retry"
+    )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    (
+        OSError("synthetic store fault"),
+        TransitSealUnavailableError(),
+        CipherError("synthetic undecryptable row"),
+    ),
+    ids=("store", "transit", "cipher"),
+)
+async def test_a_store_fault_on_the_wording_read_keeps_the_mfa_refusal(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, fault: Exception
+) -> None:
+    """RED when: the read that picks the refusal's wording lets a store, seal or Transit fault
+    through, so the 403 + ``X-MFA-Required`` becomes a 500. The fault answers with the verify
+    wording."""
+    service = await _service(engine)
+    await _add(service, "fresh", Role.VIEWER)
+
+    async def broken(*_: object, **__: object) -> bool:
+        raise fault
+
+    async with _client(engine, service) as c:
+        tok = await _login(c, "fresh")
+        monkeypatch.setattr(service, "factor_binding_is_blocked", broken)
+        r = await c.get("/messages", headers=_auth(tok))
+    assert r.status_code == 403
+    assert r.headers.get("X-MFA-Required") == "1"
+    assert r.json()["detail"] == (
+        "multi-factor verification required; POST /auth/mfa-verify then retry"
+    )
+
+
+async def test_a_no_factor_session_without_require_mfa_still_ends_sessions(
+    engine: Engine,
+) -> None:
+    """The control for the refusals above. RED when: they reach a session that owes no factor.
+
+    With ``require_mfa`` off an account with no factor is not pending, so a password re-proof ends
+    its other sessions as it did before BACKLOG #1149.
+    """
+    service = await _service(
+        engine,
+        AuthSettings(
+            require_mfa=False, mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False
+        ),
+    )
+    await _add(service, "fresh", Role.VIEWER)
+    other = await service.login("fresh", PW)
+    assert other.ok and other.token is not None
+
+    async with _client(engine, service) as c:
+        tok = await _login(c, "fresh")
+        assert await service.mfa_satisfied(tok) is True
         tok = await _reauth_to_terminate(c, tok)
         r = await c.delete("/me/sessions", headers=_auth(tok))
         assert r.status_code == 200

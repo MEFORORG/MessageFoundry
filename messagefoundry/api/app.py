@@ -49,6 +49,7 @@ from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
+from types import MappingProxyType
 from typing import Annotated, Any, Final, Literal, NoReturn, TypeVar
 from uuid import uuid4
 
@@ -532,7 +533,7 @@ from messagefoundry.serviceenv import (
     ServiceEnvironmentRefused,
     ServiceEnvPosture,
     service_env_posture,
-    service_env_refusal,
+    service_env_start_refusal,
 )
 from messagefoundry.startupcode import StartupPosture, startup_posture
 from messagefoundry.store import Row, open_store, sqlite_settings
@@ -578,7 +579,7 @@ from messagefoundry.store.transit_attestation import (
     read_transit_bound_attestation,
     transit_bound_gap,
 )
-from messagefoundry.transports.ai_broker import AiBrokerError, ai_broker_from_settings
+from messagefoundry.transports.ai_broker import AiBrokerError, AiOpenerSlot, ai_broker_from_settings
 from messagefoundry.transports.base import (
     DeliveryError,
     DestinationConnector,
@@ -1071,6 +1072,73 @@ def _replay_in_scope(identity: Identity, channel_id: str | None) -> bool:
 
 #: Which namespace each alert control action restarts (BACKLOG #2528).
 _CONTROL_ACTION_SIDE: Final = {"restart_inbound": "inbound", "restart_outbound": "outbound"}
+
+#: Which side of the graph raises each alert event type (BACKLOG #3378). ``"outbound"`` marks a type
+#: whose emitters, read on 2026-11-22, raise it only for an outbound lane. ``GET /alerts/rules``
+#: reads only that value: it withholds a rule of an ``"outbound"`` type, or of a type missing here,
+#: from a channel-scoped caller. The other values are notes, not checked per emitter: ``"inbound"``
+#: and ``"both"`` for the side or sides read, ``"none"`` for a type whose settings comment keys it
+#: on something other than a connection name. A test pins the keys to
+#: ``config.settings._ALERT_EVENT_TYPES``, so a new type has to be classified.
+_ALERT_EVENT_SIDE: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        # RegistryRunner._note_lane_unhealthy and _note_lane_config_fault, outbound lanes only.
+        "connection_error": "outbound",
+        # _maybe_alert_stall reads the OUTBOUND stage; the in-flight watch passes no stall threshold
+        # to the inbound stages.
+        "message_stall": "outbound",
+        # Raised per stage, the inbound stages included, or by an inbound or an outbound stop.
+        "connection_stopped": "both",
+        "queue_buildup": "both",
+        "saturation": "both",
+        "lane_stuck": "both",
+        # certs_from_registry keys a certificate on an inbound's or an outbound's name, and on labels
+        # such as "api" that are not connection names.
+        "cert_expiry": "both",
+        # Keyed by the inbound's name (config.settings).
+        "sandbox_worker_refused": "inbound",
+        **dict.fromkeys(
+            (
+                "storage_threshold",
+                "secret_rotation",
+                "integrity_drift",
+                "gcm_invocations",
+                "update_available",
+                "backup_failed",
+                "store_privilege_warning",
+                "vault_privilege_warning",
+                "leadership_acquired",
+                "dr_activated",
+                "initial_credential_expiring",
+                "log_write_failed",
+                "log_forward_failed",
+                "approval_stale_requester",
+                "approval_too_early",
+                "approval_approver_provenance",
+                "administrator_granted",
+                "no_enabled_administrator",
+                "audit_write_failed",
+                "audit_offbox_copy_missing",
+                "ad_reconcile_aborted",
+                "ad_session_revoked",
+                "ad_reconcile_held",
+                "intake_paused",
+                "config_changed",
+                "crl_reload_refused",
+                "signin_failure_burst",
+                "access_denied_burst",
+                "body_view_burst",
+                "bulk_export",
+                "log_level_debug",
+                "posture_loosened",
+                "peer_refused_burst",
+                "remote_debug_refused",
+                "store_restored",
+            ),
+            "none",
+        ),
+    }
+)
 
 
 async def _alert_control_action(
@@ -4777,13 +4845,20 @@ _FASTAPI_TELEMETRY_OFF: TelemetryConfig = {
 }
 
 
-def _refuse_a_secret_in_the_service_environment(caller: str) -> None:
+def _refuse_a_secret_in_the_service_environment(
+    caller: str, security_settings: SecuritySettings | None
+) -> None:
     """Raise where ``serve`` would refuse to start on its own Windows service environment.
 
-    The rule is ``serve``'s and ``supervise``'s, :func:`service_env_refusal`, so an app built here
-    without either of them refuses on the same finding (vault BACKLOG #2595, #8212 item 1).
-    ``service_env_posture`` says what the reading covers, and when it cannot read the lists."""
-    refused = service_env_refusal(service_env_posture())
+    The rule is ``serve``'s and ``supervise``'s, :func:`service_env_start_refusal`, so an app
+    built here without either of them refuses on the same finding (vault BACKLOG #2595, #8212
+    item 1). ``service_env_posture`` says what the reading covers, and when it cannot read the
+    lists. The dial is ``security_settings.enforcement``, as every other check in ``create_app``
+    reads it, so ``create_managed_app``'s ``security_enforcement`` does not change this one."""
+    enforcing = (security_settings or SecuritySettings()).enforcement
+    refused = service_env_start_refusal(
+        service_env_posture(), enforcing=enforcing is SecurityEnforcement.ENFORCE
+    )
     if refused is not None:
         raise ServiceEnvironmentRefused(f"{caller}: refusing to start: {refused}")
 
@@ -4837,7 +4912,7 @@ def create_app(
     # messagefoundry/remotedebug.py says what the hook does, and why a repeat call adds no copy and
     # no second unraisable-hook wrapper (the Lander's finding 2 on engine PR 2573).
     install_remote_debug_guard()
-    _refuse_a_secret_in_the_service_environment("create_app")
+    _refuse_a_secret_in_the_service_environment("create_app", security_settings)
     # The open mode is the opt-in with no service, and nothing else (vault BACKLOG #2825). Beside a
     # service the opt-in would leave a live open-mode flag on a signed-in app, so it is refused.
     if allow_no_auth and auth is not None:
@@ -4903,6 +4978,9 @@ def create_app(
     # read. On a direct create_app it is the embedder's to pass, and it should be the policy its
     # engine's connections were built with. create_managed_app's lifespan stashes its own at start.
     app.state.tls_settings = tls_settings
+    # BACKLOG #5527 items 3 to 5: where POST /ai/chat holds its anchored opener, so the opener
+    # lives as long as this app, and another app in the same process holds its own.
+    app.state.ai_opener_slot = AiOpenerSlot()
     # Store settings back the M5 GET /security/posture view (backend, key_provider source,
     # require_encryption / allow_unencrypted_phi). The managed-app lifespan sets the live value once the
     # store opens; here it supports the direct-construction (test) path.
@@ -4974,8 +5052,8 @@ def create_app(
     # ASVS 16.3.2 (#244): audit every authorization grant, not just the sensitive set. ON by default
     # since BACKLOG #1277; `serve` passes the resolved [diagnostics].audit_all_authz over the top.
     app.state.audit_all_authz = audit_all_authz
-    # Loaded [alerts] config for the read-only /alerts/rules view (independent of engine; may be None,
-    # in which case the route falls back to all-off defaults). The lifespan path sets the live value.
+    # Loaded [alerts] config for the read-only /alerts/rules view (may be None, in which case the
+    # route falls back to all-off defaults; a scoped caller's view also reads the engine's graph). The lifespan path sets the live value.
     app.state.alerts_settings = alerts_settings
     # [service] service-status reporting (L6a): default-off; the managed lifespan sets the live value,
     # here it backs the direct-construction (test) path.
@@ -5510,16 +5588,24 @@ def create_app(
         # context that reads the system trust store, under a lock a worker thread may hold, or
         # builds the held anchored opener, which reads the [tls] CA and CRL files when it is built.
         tls_settings = getattr(request.app.state, "tls_settings", None)
+        # The app's own slot for the held anchored opener (BACKLOG #5527 items 3 to 5), which
+        # create_app always sets.
+        opener_slot = getattr(request.app.state, "ai_opener_slot", None)
         try:
             # BACKLOG #5527: an embedder's stash of another type is a misconfiguration, mapped to
             # the 503 below, rather than an AttributeError the route would answer 500 for.
             if tls_settings is not None and not isinstance(tls_settings, TlsSettings):
                 raise AiBrokerError("app.state.tls_settings is not a TlsSettings")
+            # Refused as the stash above is, None or absent included, rather than built around
+            # with an opener for each request that re-reads the [tls] files.
+            if not isinstance(opener_slot, AiOpenerSlot):
+                raise AiBrokerError("app.state.ai_opener_slot is not an AiOpenerSlot")
             broker = await asyncio.to_thread(
                 ai_broker_from_settings,
                 ai,
                 posture=_phi_read_posture,
                 trust_anchor_policy=tls_settings.policy() if tls_settings is not None else None,
+                opener_slot=opener_slot,
             )
         except AiBrokerError as exc:
             _log.warning("engine AI broker misconfigured: %s", exc)
@@ -6472,7 +6558,11 @@ def create_app(
         deployment, and a caller's in-scope inbound on a sibling engine shard is no denial. Both
         give the same refusal for an outbound and for a name outside the scope, and so does the web
         console's flag route for a direction that names neither side. A change to that refusal has
-        to be made in at least those three places."""
+        to be made in at least those three places. :func:`alerts_rules` reads the same
+        ``inbound_names()`` set for a scoped caller in its own code. The two differ at least with no
+        graph loaded, where this route lets an in-scope name reach the engine and that one
+        withholds every rule naming a connection, and on a name the runner also knows as an
+        outbound, which that one withholds and this one admits for ``direction=inbound``."""
         rr = engine.registry_runner
         wrong_direction = req.direction != "inbound"
         if identity.allowed_channels is not None and (
@@ -6846,7 +6936,9 @@ def create_app(
         if req.all:
             # "Reset all" spans every channel, so a channel-scoped user may not run it (mirror purge).
             if identity.allowed_channels is not None:
-                await _audit_channel_denied(engine, identity, None, client_ip(request))
+                await _audit_channel_denied(
+                    engine, identity, None, client_ip(request), operation="stats_reset"
+                )
                 raise HTTPException(403, "channel-scoped users cannot reset all statistics")
         else:
             for t in req.targets:
@@ -7622,7 +7714,15 @@ def create_app(
         # A channel-scoped user must target one of their channels (replay isn't channel-filtered at
         # the engine level, so an unscoped "replay all" would cross channels).
         if not _replay_in_scope(identity, req.channel_id):
-            await _audit_channel_denied(engine, identity, req.channel_id, client_ip(request))
+            # A replay of every channel names none, so its row names the operation instead (vault
+            # BACKLOG #3748 item 7); the helper writes it only on a row with no channel.
+            await _audit_channel_denied(
+                engine,
+                identity,
+                req.channel_id,
+                client_ip(request),
+                operation="dead_letter_replay",
+            )
             raise HTTPException(403, "specify a channel within your scope to replay")
         if (
             gate is not None
@@ -7903,10 +8003,17 @@ def create_app(
         ``hold_refusal`` is the refusal taking them met instead. The console passes neither, and
         the params are captured here."""
         # BACKLOG #3189: here rather than in the route, so the console's path is refused too. The
-        # refusal names no channel, so its audit row carries none.
+        # refusal names no channel, so its audit row carries none, and names the operation instead
+        # (vault BACKLOG #3748 item 7).
         refusal = _reload_refusal(user)
         if refusal is not None:
-            await _audit_channel_denied(engine, user, None, client_ip(request))
+            await _audit_channel_denied(
+                engine,
+                user,
+                None,
+                client_ip(request),
+                operation="config_reload_check" if req.dry_run else "config_reload",
+            )
             raise HTTPException(403, refusal)
         # Hold a real (non-dry-run) reload for a second approver when dual-control gates it. A dry_run
         # is a read-only pre-flight (no swap), so it is never held. The guard runs AFTER the caller's
@@ -10825,18 +10932,21 @@ def create_app(
         # CoreHandlers seam, and the seam digest does not cover keyword names.
         _user: Identity = Depends(require(Permission.MONITORING_READ)),
     ) -> AlertsConfig:
-        """Read-only view of the loaded [alerts] rules + transport config (ADR 0014). No engine
-        access; the store is touched only for the audit row below. No secrets: the webhook URL, SMTP
-        password and username are never returned — transports are reported present-or-not. Gated by
-        monitoring:read like /stats.
+        """Read-only view of the loaded [alerts] rules + transport config (ADR 0014). The engine is
+        read for its graph's connection names; the store is touched only for the audit row below.
+        No secrets: the webhook URL, SMTP password and username are never returned — transports are
+        reported present-or-not. Gated by monitoring:read like /stats.
 
         A channel-scoped caller sees only the rules that name no connection outside its scope
         (BACKLOG #1152): ``connection`` is ``"*"`` or a name in its scope, and ``control_target``
         is unset or in its scope. Scope membership is exact text, so any other glob, such as
         ``IB_ACME_*``, is withheld.
 
-        What such a caller reads of each rule's ``id``, and why, is stated once in
-        ``docs/SECURITY.md``, in the ``GET /alerts/rules`` paragraph (BACKLOG #3378).
+        Which further rules such a caller is denied, and what it reads of each rule's ``id``, are
+        stated once in ``docs/SECURITY.md``, in the ``GET /alerts/rules`` paragraph (BACKLOG
+        #3378). The alert-instance reads and acts were left as they were on purpose, so a scoped
+        operator keeps handling its listed outbound's alerts. The same paragraph says who decided
+        that and on what reading of the owner's ruling.
 
         A read that withholds at least one rule writes an audit row; see
         :func:`_audit_alert_rules_withheld`."""
@@ -10844,13 +10954,47 @@ def create_app(
             getattr(request.app.state, "alerts_settings", None) or AlertsSettings()
         )
 
+        # Read from app.state, not a dependency: the console calls this handler across the seam.
+        engine: Engine | None = getattr(request.app.state, "engine", None)
+        rr = engine.registry_runner if engine is not None else None
+        scoped = _user.allowed_channels is not None
+        # An allowlist (BACKLOG #3378 item 4; the batch Manager's 2026-11-22 reading of the owner's
+        # 2026-11-04 ruling that part 4 "stays strict"): a scoped caller reaches a name only when
+        # it is in its scope AND an inbound of the deployment, the set the flag route's scope test
+        # reads (on an engine shard, every engine shard's inbounds), AND not an outbound this
+        # runner knows, a name declared on both sides included, since a rule on it can match the
+        # outbound's events. Read once per scoped request.
+        inbounds = rr.registry.inbound_names() if scoped and rr is not None else frozenset[str]()
+
+        def reachable(name: str) -> bool:
+            if not _user.can_access_channel(name):
+                return False
+            if not scoped:
+                return True
+            return rr is not None and name in inbounds and not rr.knows_outbound(name)
+
         def visible(rule: AlertRule) -> bool:
-            return (rule.connection == "*" or _user.can_access_channel(rule.connection)) and (
-                rule.control_target is None or _user.can_access_channel(rule.control_target)
+            if not (rule.connection == "*" or reachable(rule.connection)):
+                return False
+            if rule.control_target is not None and not reachable(rule.control_target):
+                return False
+            if not scoped:
+                return True
+            # restart_outbound acts on an outbound whatever the graph holds, a name that is also an
+            # inbound and a "*" rule's firing connection included. An action or an event type with
+            # no side recorded is withheld too, so a new one fails closed.
+            if rule.control_action is not None and (
+                _CONTROL_ACTION_SIDE.get(rule.control_action, "outbound") == "outbound"
+            ):
+                return False
+            # An event type only an outbound raises makes the rule an outbound rule, a "*" one
+            # included. "any" matches every side, as connection_stopped does, so it shows.
+            return rule.event_type == "any" or (
+                _ALERT_EVENT_SIDE.get(rule.event_type, "outbound") != "outbound"
             )
 
         rules = [r for r in alerts.rules if visible(r)]
-        show_ids = _user.allowed_channels is None
+        show_ids = not scoped
 
         config = AlertsConfig(
             webhook_configured=bool(alerts.webhook_url),
@@ -13207,7 +13351,7 @@ def create_managed_app(
     """
     # The remote-debugging guard goes in before the reading, as create_app installs it.
     install_remote_debug_guard()
-    _refuse_a_secret_in_the_service_environment("create_managed_app")
+    _refuse_a_secret_in_the_service_environment("create_managed_app", security_settings)
     if store_settings is None:
         if db_path is None:
             raise ValueError("create_managed_app requires either store_settings or db_path")

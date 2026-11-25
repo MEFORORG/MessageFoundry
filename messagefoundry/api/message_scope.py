@@ -24,12 +24,13 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, Literal, get_args
 
 from fastapi import HTTPException, Request
 
 from messagefoundry.api.security import client_ip
 from messagefoundry.connection_names import is_connection_name
+from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.store.cell_tag import CellTagError
 from messagefoundry.store.crypto import CipherError, CipherUnavailableError, gave_no_verdict
 from messagefoundry.transports.http_listener import TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS
@@ -45,6 +46,21 @@ _log = logging.getLogger(__name__)
 #: console's flag route answer with one text (BACKLOG #3378).
 CONNECTION_DENIED_DETAIL: Final = "not authorized for this connection"
 
+#: What a refused request whose row names no channel was asking for (vault BACKLOG #3748 item 7):
+#: a config reload, its dry run, a reset of every statistic, a replay of every channel's dead
+#: letters, a purge, and a start, stop or restart. Each value is the name of the audit action
+#: that operation writes when it runs and has an effect. A row names no channel either by design or
+#: because the name failed the connection-name rule, which ``"malformed_name"`` marks.
+DeniedOperation = Literal[
+    "config_reload",
+    "config_reload_check",
+    "stats_reset",
+    "dead_letter_replay",
+    "connection_purge",
+    "connection_control",
+]
+_DENIED_OPERATIONS: Final[frozenset[str]] = frozenset(get_args(DeniedOperation))
+
 
 async def audit_channel_denied(
     engine: Engine,
@@ -53,13 +69,14 @@ async def audit_channel_denied(
     client: str | None = None,
     *,
     flag_direction_not_inbound: bool = False,
+    operation: DeniedOperation | None = None,
 ) -> None:
     """Audit a per-channel RBAC denial (mirrors auth.permission_denied).
 
     ``client`` (ADR 0150) is the caller's address — a denial is exactly the record an investigator
     wants a host for. It is OPTIONAL because this helper is also handed to the console seam as a bare
-    callback (``audit_channel_denied=``), which has no request in hand; there it stays NULL rather than
-    inheriting some other caller's address.
+    callback (``audit_channel_denied=``). The console's callers pass the browser's address; a caller
+    that passes none leaves it NULL rather than inheriting some other caller's address.
 
     A ``channel`` that fails the connection-name rule is recorded as no channel (BACKLOG #3031).
     Some callers pass a caller-chosen name, and at least the core handlers the console seam calls
@@ -73,13 +90,32 @@ async def audit_channel_denied(
     ``inbound``, which a scoped caller may flag only (BACKLOG #3378). The detail then carries
     ``"flag_direction_not_inbound": true``. Such a row can name an inbound inside the actor's own
     scope, and without the marker it would read like a request asked of the wrong engine shard. The
-    direction itself is not recorded, since the console's form carries it as caller text."""
+    direction itself is not recorded, since the console's form carries it as caller text.
+
+    ``operation`` names what was refused when the row names no channel (vault BACKLOG #3748 item
+    7). The detail then carries ``"operation"`` with one of the :data:`DeniedOperation` values. It
+    is written only on a row that names no channel, so a row naming a channel never carries one. A
+    value outside them is left out of the row and logged, whether or not the row names a channel,
+    rather than refusing the audit: the console hands this helper its keyword through an untyped
+    seam callback. A core handler such as ``_dual_role_control`` in ``messagefoundry/api/app.py``
+    passes no operation, so it would write a row with no channel and no operation only if called
+    directly with a malformed name; no shipped route does."""
     detail: dict[str, object] = {"channel": channel}
     if channel is not None and not is_connection_name(channel):
         channel = None
         detail = {"channel": None, "malformed_name": True}
     if flag_direction_not_inbound:
         detail["flag_direction_not_inbound"] = True
+    if operation is not None:
+        # isinstance first: the console's value arrives untyped, and an unhashable one would
+        # raise in the set test and lose the row.
+        if not (isinstance(operation, str) and operation in _DENIED_OPERATIONS):
+            _log.warning(
+                "a channel denial for %s named an unknown operation; the row omits it",
+                scrub_log_argument(identity.username),
+            )
+        elif channel is None:
+            detail["operation"] = operation
     await engine.store.record_audit(
         "auth.channel_denied",
         actor=identity.username,

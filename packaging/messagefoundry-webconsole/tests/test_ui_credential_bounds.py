@@ -36,7 +36,7 @@ from messagefoundry_webconsole._auth import PASSKEY_SIGN_IN_COOKIE_NAME
 _REVOKE_OTHERS = "/ui/account/sessions/revoke-others"
 
 
-async def _service(engine: Engine) -> AuthService:
+async def _service(engine: Engine, *, require_mfa: bool = True) -> AuthService:
     service = AuthService(
         engine.store,
         AuthSettings(
@@ -45,6 +45,7 @@ async def _service(engine: Engine) -> AuthService:
             admin_write_min_interval_seconds=0,
             # One slot keeps the enrolment and the recovery-code walk to one argon2 hash each.
             mfa_recovery_code_count=1,
+            require_mfa=require_mfa,
         ),
     )
     await service.initialize()
@@ -304,8 +305,9 @@ async def test_an_oversized_step_up_password_never_reaches_reauth(
     """RED when: ui_reauth's password leg stops checking the password's length before reauth.
 
     An account with no factor goes straight to the password leg, which is the one a directory
-    account's step-up would bind with."""
-    service = await _service(engine)
+    account's step-up would bind with. ``require_mfa`` is off: under it this session is
+    MFA-pending, and the terminate it starts from sends it to enrol instead (BACKLOG #1149)."""
+    service = await _service(engine, require_mfa=False)
     await _add(service)
     calls = _spy(monkeypatch, service, "reauth")
     async with ui_client(engine, service) as c:

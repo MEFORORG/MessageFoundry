@@ -3810,14 +3810,16 @@ ADR 0023), JWKS hosting, `.well-known` discovery, and Bulk Data `$export`.
 A **DICOM** connector (`ConnectorType.DIMSE`) is both an **inbound C-STORE SCP** listener and an
 **outbound C-STORE SCU** sender over DIMSE/`pynetdicom` ([ADR 0025](adr/0025-dicom-codec-store-connectors.md));
 `DICOMweb(...)` (`ConnectorType.DICOMWEB`) is the modern HTTP imaging lane — an **outbound STOW-RS** store/send
-destination. All three carry the object **opaquely** — pair an inbound `DICOM(...)` with `content_type="dicom"`
+destination. All three carry the object **opaquely**, though a DICOMweb 202 reads the object's SOP Instance UIDs (see *DICOMweb*) — pair an inbound `DICOM(...)` with `content_type="dicom"`
 so each received object routes as a `RawMessage` ([ADR 0004](adr/0004-payload-agnostic-ingress.md)); a
 Router/Handler parses it on demand via `messagefoundry.parsing.dicom` (a cheap `DicomPeek` for routing,
 `DicomDataset` + SR→HL7 helpers for transform), and a forwarding Handler re-emits the carried bytes to a SCU
 or STOW-RS destination. The codec is **headers and Structured Report only — no pixel data**. The DIMSE
 connectors need the **`[dicom]` optional extra** (`pip install 'messagefoundry[dicom]'`:
 `pydicom>=3.0.2,<3.1` + `pynetdicom==3.0.4`, pure-Python, no numpy), lazily imported; **DICOMweb needs no
-extra** (it stores the object as opaque bytes over the shared `rest.py` HTTP plumbing). Still out of scope:
+extra** (it stores the object as bytes over the shared `rest.py` HTTP plumbing, and checks a 202
+against its File Meta SOP Instance UID, read by hand, and, with the extra, its data set SOP
+Instance UID). Still out of scope:
 MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 
 | Setting | Default | Meaning |
@@ -4015,7 +4017,14 @@ The modern HTTP imaging lane — a **STOW-RS** `POST {base}/studies` (or `{base}
 **sibling of the REST destination**: it reuses the hardened HTTP plumbing (no-redirect TLS-verifying opener,
 cleartext-credential refusal, the retry/dead-letter classification, the `[egress].allowed_http` gate) and
 adds only the `multipart/related; type="application/dicom"` framing + `application/dicom+json` response
-handling. It needs **no `[dicom]` extra** (the object is opaque bytes).
+handling. It needs **no `[dicom]` extra**: the object rides as bytes. A 202 reply is compared with
+the object's SOP Instance UIDs, as *Status classification* below says; the extra, when installed,
+adds the data set's UID to that comparison. An installed extra that does not load, or whose
+read of an object raises a fault the codec does not wrap, adds no data set UID, with a WARNING; a
+read the codec cannot parse adds none either, with no WARNING, and a `MemoryError` is raised
+before the POST, so the object is not sent. That changes what a 202 is
+compared with, and in one case what confirms it, as *Status classification* below says. So
+on a host running DICOMweb, fix or remove a broken `pydicom`, then restart the engine.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
@@ -4044,11 +4053,52 @@ well-formed FailedSOPSequence with an item); and a
 202 with no **ReferencedSOPSequence** (`00081199`) item whose ReferencedSOPInstanceUID (`00081155`)
 element has `vr` `UI`, carries no key but `vr` and `Value`, and has a `Value` of exactly one string
 in the UID grammar once trailing NUL or space padding is dropped (dot-separated ASCII digits, at
-most 64 characters), an empty 202 included (code
-`unconfirmed-202`). A ReferencedSOPSequence that is not an object, has a `Value` that
+most 64 characters) that equals a SOP Instance UID of the object sent: the **Media Storage SOP
+Instance UID** (`0002,0003`) in its File Meta group, or the **SOP Instance UID** (`0008,0018`) of
+its data set, an empty 202 included (code `unconfirmed-202`). A 202 that none of the rules above
+refuses is also `unconfirmed-202`, whatever its reply names, when the object sent has neither UID
+to compare, and its reason names why the File Meta has none, except where the data set read raised
+a fault the codec does not wrap, as below. At least these leave no File Meta
+UID: no `DICM` magic after the 128-byte preamble, no `(0002,0003)` in the File Meta group, a
+`(0002,0003)` whose VR is not `UI`, any File Meta element up to it whose header or value runs past
+the end of the object, a value that is not ASCII or is not in the UID grammar once its NUL or
+space padding is dropped, and a `(0002,0003)` that does not lie within the first 64 KiB after
+`DICM`, the most the reader reads (BACKLOG #5914, decisions of 2026-11-23). The File Meta group is
+read as Explicit VR Little Endian, as PS3.10 requires, without `pydicom`, up to the first element
+outside group `0002`. The `(0002,0000)` Group Length is not read, as `pydicom` ignores a wrong one
+too. Both UIDs are read on every send **before the POST**, as the DICOM SCU parses before it
+associates, so the connection's build does not check `pydicom`. The data set read puts back the
+SCU's ignores for `pydicom` warnings that would name a value, and holds the lines `pydicom` logs
+while it reads. It writes them, redacted as the DICOM connectors' `pydicom` lines are, only with
+the first read-fault WARNING of the process (below); otherwise it writes none. `pydicom`'s own copy of such a line
+as a Python warning is not held, so it can still reach stderr. An object the codec cannot parse is read as no data set
+UID, and the object is still sent. The codec takes at least the exception classes it lists for a
+malformed object as a parse failure, so one of those raised by a broken `pydicom` reads the same
+way: the object is sent, and a 202 that names only its data set UID is then refused after the
+partner has answered. Before the object is read, the extra is loaded apart from it, as the SCU
+loads it: the `dcmread` reader and the readers the deflate guard replays. A load that raises, for
+example from a `pydicom` that is found but will not import, or that lacks such a reader, is
+taken as no extra: the object is sent, and a 202 is compared with its File Meta UID alone, as on a
+host without the extra. One WARNING per process names the class of what the load raised and says
+to repair or remove the extra. A `pydicom` directory with no `__init__.py`, as an uninstall can
+leave, is taken as no extra too. After fixing or removing `pydicom`, restart the engine: the
+`pydicom` modules an import has already loaded stay loaded until a restart. Any other fault in
+the read of the object itself, such as a `TypeError` from a `pydicom` whose private readers changed,
+or a warning the filters turn into an error, also reads as no data set UID: the object is sent, and
+one WARNING per process names the exception class only, never its text. Where the object also has
+no File Meta UID, nothing can be compared, so a 202 is confirmed as the BACKLOG #5914 reply check did before the UID comparison, by a
+ReferencedSOPSequence item that names any UID (one naming none is still refused); on a host without the extra the same 202 is
+`unconfirmed-202`. A `MemoryError` is not caught there. The data set UID is read
+with the engine's DICOM codec, which needs the optional `[dicom]` extra; without it, or for an
+object the codec cannot parse, only the File Meta UID is compared. So, with the extra installed, an
+object whose data set was given a new SOP Instance UID without its File Meta being rewritten is
+confirmed by a 202 naming either UID; without it, only by one naming the File Meta UID. A server that assigns a new UID of its own on a 202 names neither, and that object is
+dead-lettered on every such 202 although the server may hold it, except in the read-fault case
+above, which also needs no File Meta UID. A ReferencedSOPSequence that is not an object, has a `Value` that
 is not an array, or carries any key but `vr` and `Value` names no instance; its own `vr` is not
 checked. **Not every 2xx that fails to confirm the store is refused.** A 200 is not
-required to carry a ReferencedSOPSequence, so a 200 dataset that confirms nothing and is not
+required to carry a ReferencedSOPSequence, and is not compared with the object sent, so a 200
+dataset that confirms nothing, or names another instance, and is not
 refused above, `{}` included, is delivered; and an empty 2xx other than a 202 (empty, or JSON
 whitespace after any leading BOMs) is delivered, `no_reply` when capturing. **PHI:** the response can
 name patient/study identifiers, so it is never logged — only the HTTP status and a redacted URL are.
@@ -4936,8 +4986,16 @@ Facts that are easy to get wrong, stated plainly first:
   failure — the row stays claimable, the stage handoff re-runs idempotently, and nothing is
   accepted-and-dropped. It is deliberately **not** a `TimeoutError` (since Python 3.11 an `OSError`
   subclass, which connector-error handling reads as a network fault). A borrow abandoned at the limit
-  never strands a pooled connection: if the pool hands one over after the borrower gave up it is
-  released back, so a wedged pool does not shrink by a slot per retry. For a `DatabaseRef` sync the
+  is cancelled, and if the pool hands a connection over after the borrower gave up and the borrow
+  ends holding it, it is released back, so a wedged pool does not shrink by a slot per retry. In
+  driver shapes the cancel cannot check, it can land in place of a connection already handed over,
+  so the borrow never ends holding it and nothing releases it. The shapes are named in the
+  docstrings of `_cancel_borrow` and `_value_in_flight` in `messagefoundry/store/base.py`; they
+  include at least a driver that keeps polling with bare yields past the bounded deferral, a shield
+  or other combinator inside the driver, and a borrow that is, or waits on, a task whose
+  `_fut_waiter` the check cannot read, a task type with no `_fut_waiter` among them. The
+  `_cancel_borrow` docstring is the one place that says which borrows the check reads, and what
+  each caller does and logs where it cannot. For a `DatabaseRef` sync the
   set fails like any other source failure — the last-good snapshot keeps serving reads and the
   AlertSink fires; because the runner walks the declared sets sequentially, this bound is also what
   stops one unresponsive reference server from stalling every *other* set's refresh.
@@ -5246,7 +5304,7 @@ reading this page already applies to a file the scan never opened.
 | Engine API + `/ui` + `/ws/stats` (`[api].port`) | uvicorn defaults (the engine passes no `timeout_keep_alive`) | the ASGI lifespan calls `engine.stop()`, cancelling every worker | throttled requests get `429` + an audit row | n/a — the caller retries |
 | Reverse proxy → engine segment (`[api].trusted_proxies`) | **none the engine owns** — the proxy's timeouts govern | connection lifetime is the proxy's | operator-owned | n/a |
 | Store — SQLite (`[store].backend = sqlite`) | `PRAGMA busy_timeout` 5000 ms on the writer and on every read-pool connection; **the pool borrow itself carries no timeout**; no network timeout applies | connections are closed on store close | a busy database retries inside the store layer | n/a |
-| Store — SQL Server (`[store].backend = sqlserver`) | three distinct bounds: `[store].connect_timeout` 15 s (**login**, passed as pyodbc `timeout=`), `[store].command_timeout` 30 s (**statement**, applied per acquire as the pyodbc connection attribute) and `[store].acquire_timeout` 30 s (the **pool borrow**); `[store].warm_pool_timeout` 15 s bounds the warm-up; `[store].schema_lock_timeout` 600 s bounds a store open's wait for the schema lock, and the holder's DDL lock waits, while the open-time DDL batch itself runs with no statement timeout (BACKLOG #1726; [CONFIGURATION.md](CONFIGURATION.md) has the detail) | every acquire releases back to the pool; the pool is closed on shutdown; a borrow the pool satisfies after the borrower gave up is released back rather than stranded | a driver error — or a `StoreAcquireTimeout` — propagates to the stage worker and the row stays claimable | stage handoffs re-run idempotently; `reset_stale_inflight` recovers on restart |
+| Store — SQL Server (`[store].backend = sqlserver`) | three distinct bounds: `[store].connect_timeout` 15 s (**login**, passed as pyodbc `timeout=`), `[store].command_timeout` 30 s (**statement**, applied per acquire as the pyodbc connection attribute) and `[store].acquire_timeout` 30 s (the **pool borrow**); `[store].warm_pool_timeout` 15 s bounds the warm-up; `[store].schema_lock_timeout` 600 s bounds a store open's wait for the schema lock, and the holder's DDL lock waits, while the open-time DDL batch itself runs with no statement timeout (BACKLOG #1726; [CONFIGURATION.md](CONFIGURATION.md) has the detail) | every acquire releases back to the pool; the pool is closed on shutdown; a borrow the pool satisfies after the borrower gave up is released back when the borrow ends holding the connection; in the driver shapes the acquire-limit paragraph above names, the cancel can replace the connection first and strand it | a driver error — or a `StoreAcquireTimeout` — propagates to the stage worker and the row stays claimable | stage handoffs re-run idempotently; `reset_stale_inflight` recovers on restart |
 | Store — Postgres (`[store].backend = postgres`) | `[store].connect_timeout` 15 s (`create_pool(timeout=…)`), `[store].command_timeout` 30 s as `asyncpg`'s per-statement bound, and `[store].acquire_timeout` 30 s on the message-pipeline pool borrows (see the coverage note above); `[store].schema_lock_timeout` 600 s bounds a store open's wait for the schema advisory lock, and the holder's DDL lock waits, while the FIFO covering-index rebuild and `ix_messages_received` run with no client timeout (BACKLOG #1726; [CONFIGURATION.md](CONFIGURATION.md) has the detail) | as SQL Server | as SQL Server | as SQL Server |
 | Active Directory — login binds (`[auth].ad_server`) | `[auth].ad_connect_timeout` 10 s on the LDAP TCP connect and `[auth].ad_receive_timeout` 10 s on every LDAP response read — threaded into **every** `ldap3` `Server`/`Connection` construction. The nested group search is paged, and **all its pages share one `[auth].ad_group_search_deadline`** 120 s: each socket read of a page after the first waits at most the shorter of `ad_receive_timeout` and what was left when the page was asked for, no page is asked for once it is spent, and the abandon of a refused search gets only what is left (vault BACKLOG #3696). **It is not a hard wall-clock bound**: the cap is set once per page and applies to each read, so a page that arrives over several reads, each inside that cap, can hold the search up to the number of reads times what was left. The page size is the directory's choice, since it may ignore the 500 the engine asks for | the service-account connection is context-managed; the user bind is unbound in a `finally`, so a **rejected** password releases it too (the common adversarial case) | fails closed with `LdapError`; the login is rejected and audited, and so is a group search past its deadline or past 10,000 groups, whatever page size the directory returns (one WARNING per process for each) | **single-shot** — two binds, no retry loop; the group search's pages are one search, not retries |
 | Active Directory — session reconciler (`ad_session_recheck_seconds`) | the same `ad_connect_timeout` / `ad_receive_timeout` / `ad_group_search_deadline` | as the login path — context-managed connections | a pass that fails is retried on the next interval; strike state is process-local. A group search refused for its deadline, its 10,000-group cap or its page backstop reads that account as unavailable on every pass. A disable or deletion still revokes it, because the user search runs first, but its roles and channel scope are not re-diffed while that lasts. So it pages, as `ad_reconcile_aborted` under the source `directory-reconciler-paging:<username>`, and audits `auth.ad_reconcile_paging_refused`, once as the account enters that state, never on every pass. It pages again only after a pass judges the account, which an outage, a referral, a configuration refusal or a probe fault does not, or after a restart (vault BACKLOG #3696). A plain outage still pages nobody | **single-shot per pass**; `ad_session_recheck_strikes` (2) required before a revoke |

@@ -558,8 +558,7 @@ function Get-CloneReport($R) {
                     # A DEAD record is no veto, but once the directory is gone its cwd names a checkout git
                     # no longer lists. occupancy.ps1 then calls it unplaceable, and the fence stays
                     # unavailable on every later run -- for this clone and, by the name prefix, others.
-                    $norm2 = ConvertTo-Norm $e.Path
-                    $records = @($occ.Sessions | Where-Object { $w = ConvertTo-Norm $_.WorktreePath; $w -eq $norm2 -or $w.StartsWith("$norm2/") })
+                    $records = @(Get-StrandableRecords -Occupancy $occ -Path $e.Path)
                     if ($records.Count -gt 0) { $reasons.Add("a $($records[0].State) session record ($($records[0].Short)) names it; removing the tree would leave that record unplaceable and switch the liveness fence off until the record is gone") }
                 }
             }

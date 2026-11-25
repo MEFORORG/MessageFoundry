@@ -38,6 +38,7 @@ import logging
 import math
 import queue
 import re
+import sys
 import time
 from collections.abc import (
     AsyncIterator,
@@ -50,7 +51,7 @@ from collections.abc import (
     MutableMapping,
     Sequence,
 )
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import (
     AbstractAsyncContextManager,
     AsyncExitStack,
@@ -62,7 +63,7 @@ from dataclasses import replace
 from functools import partial
 from time import perf_counter
 from types import MappingProxyType
-from typing import Any, Final, Literal, assert_never
+from typing import TYPE_CHECKING, Any, Final, Literal, assert_never
 from uuid import uuid4
 
 from messagefoundry.config.models import RetryPolicy
@@ -74,6 +75,8 @@ from messagefoundry.config.settings import (
     StorePrivilegeStatus,
     StoreSettings,
     _clamped_statement_timeout,
+    _sqlserver_shared_borrow_limit,
+    _sqlserver_statement_timeout_left,
 )
 from messagefoundry.config.tls_policy import HopPosture, StoreTlsRefused, current_hop_posture
 from messagefoundry.connection_events import check_connection_event_kind
@@ -101,9 +104,12 @@ from messagefoundry.store.base import (
     SchemaLockTimeout,
     SchemaNotProvisionedError,
     SchemaProvisionResult,
+    ServerCipherWalk,
+    StoreAcquireTimeout,
     StoreNotFoundError,
     TableCensusIncomplete,
     acquire_pooled,
+    check_walk_identifiers,
     driver_sqlstate,
     seed_filter_clause,
     warm_pool_connections,
@@ -472,6 +478,9 @@ from messagefoundry.store.store import (
 from messagefoundry.store.transit_attestation import TransitBoundAttestation
 from messagefoundry.support.redact import redact_log_line
 
+if TYPE_CHECKING:
+    from messagefoundry.auth.trust_anchors import AnchorSpec
+
 log = logging.getLogger(__name__)
 
 # ADR 0066 §3.3: claim_fifo_heads lane-chunk clamp. Lane names are the only per-lane parameters (row
@@ -501,21 +510,23 @@ _MSSQL_EPOCH_NOW = (
 _ATTACHMENT_CHUNK_BATCH = 16
 
 
-def _check_walk_identifiers(*names: str) -> None:
-    """Refuse a cipher-walk identifier that is not a plain ASCII name. The walk's names are declared
-    constants (BACKLOG #1719), so this only stops a caller that passed something else."""
-    for name in names:
-        if not (name.isascii() and name.isidentifier()):
-            raise ValueError(f"not a plain identifier for the cipher walk: {name!r}")
-
-
 def _key_after(order: tuple[str, ...], after: tuple[Any, ...]) -> tuple[str, list[Any]]:
-    """``(a, b) > (x, y)`` as T-SQL spells it, ``a > x OR (a = x AND b > y)``, and its values in
-    placeholder order: T-SQL has no row-value comparison."""
+    """``(a, b) > (x, y)`` as T-SQL spells it, and its values in placeholder order: T-SQL has no
+    row-value comparison. A composite key leads with ``a >= x``, which the expansion below implies,
+    so the optimizer can seek the key's index to ``x`` rather than scan from its start on every
+    chunk (BACKLOG #1719 item 31)."""
+    bound, values = _key_after_expanded(order, after)
+    if len(order) == 1:
+        return bound, values
+    return f"[{order[0]}] >= ? AND {bound}", [after[0], *values]
+
+
+def _key_after_expanded(order: tuple[str, ...], after: tuple[Any, ...]) -> tuple[str, list[Any]]:
+    """``a > x OR (a = x AND b > y)``, nested for each further key column."""
     column, value = order[0], after[0]
     if len(order) == 1:
         return f"[{column}] > ?", [value]
-    inner, values = _key_after(order[1:], after[1:])
+    inner, values = _key_after_expanded(order[1:], after[1:])
     return f"([{column}] > ? OR ([{column}] = ? AND {inner}))", [value, value, *values]
 
 
@@ -1584,6 +1595,18 @@ class SyncHandoffUnavailable(RuntimeError):
     cannot be built fail-closed — today only when ``[store].command_timeout == 0`` (which would make the
     finalize ``sp_getapplock`` wait forever on a worker thread, ADR 0071). The future fused-hop caller
     (PR2/PR3) catches this as 'fusion unavailable' and falls back to the async handoff path."""
+
+
+class StorePinConnectRefused(RuntimeError):
+    """A new store connection refused before it dialled, because a settings check at ``enforce``
+    refused the SQL Server ``[store].ssl_root_cert`` pin, while that hold stands (vault BACKLOG
+    #3714 step 11, :func:`refuse_connect_after_pin_refusal`; trust anchors module item 11).
+
+    It is not a :class:`~messagefoundry.config.tls_policy.StoreTlsRefused`, so a handler of that
+    refusal does not read it as a start gate refusing. It is a ``RuntimeError``, so it is in
+    :func:`~messagefoundry.store.base.store_call_errors`, which callers that degrade on a refused
+    store call catch. It is raised mostly while the store runs, but a store open whose own pin
+    check did not lift the hold can raise it too."""
 
 
 class _SyncHandoffPool:
@@ -3303,7 +3326,9 @@ def check_pinned_certificate(
 
     The file is read once, and the certificate checks read the bytes the anchor checks read
     (BACKLOG #3714). It writes no audit row. A pin that passes becomes the process's in-process
-    baseline, unless an earlier one is held (:func:`~messagefoundry.auth.trust_anchors.note_store_pin_checked`). The audited check is the settings preflight
+    baseline, unless an earlier one is held (:func:`~messagefoundry.auth.trust_anchors.note_store_pin_checked`).
+    It may also lift a held refusal of new connects
+    (:func:`~messagefoundry.auth.trust_anchors.release_store_pin_refusal`, module item 11). The audited check is the settings preflight
     (:mod:`messagefoundry.auth.trust_anchors`, module item 11, which says what a reload skips).
 
     Blocking: it reads the file and, on Windows, runs ``icacls``. :meth:`SqlServerStore.open` and
@@ -3314,6 +3339,7 @@ def check_pinned_certificate(
         TrustAnchorError,
         enforced_anchor,
         note_store_pin_checked,
+        release_store_pin_refusal,
         store_pin_anchor_spec,
     )
     from messagefoundry.pki import (
@@ -3367,6 +3393,37 @@ def check_pinned_certificate(
     # The pin this open checked becomes the in-process baseline the settings preflight compares
     # the file with, off the store hop (vault BACKLOG #3714 step 9); the first one is kept.
     note_store_pin_checked(spec, verdict.fingerprint)
+    if enforcing:
+        # Step 11: these are the store open's checks, which refuse what the settings check only
+        # warns of, and they passed at enforce.
+        release_store_pin_refusal(spec, verdict.fingerprint)
+
+
+def refuse_connect_after_pin_refusal(settings: StoreSettings) -> None:
+    """Raise :class:`StorePinConnectRefused` when a settings check at ``enforce`` refused this
+    store's SQL Server pin, while that hold stands (vault BACKLOG #3714 step 11,
+    :func:`~messagefoundry.auth.trust_anchors.store_pin_connect_refusal`). The trust anchors
+    module's item 11 states the hold and the connects it covers. Through
+    :class:`_PinGatedExecutor` the pool's connects take the same check."""
+    from messagefoundry.auth.trust_anchors import store_pin_anchor_spec
+
+    spec = store_pin_anchor_spec(settings)
+    if spec is not None:
+        _refuse_connect(spec)
+
+
+def _refuse_connect(spec: AnchorSpec) -> None:
+    """The body of :func:`refuse_connect_after_pin_refusal`, for a caller that holds the spec."""
+    from messagefoundry.auth.trust_anchors import store_pin_connect_refusal
+
+    refusal = store_pin_connect_refusal(spec)
+    if refusal is not None:
+        raise StorePinConnectRefused(
+            f"[store].ssl_root_cert {spec.path!r}: a new store connection was refused, because a "
+            "settings check at enforce refused the pin and the hold stands; the ERROR logged "
+            "when it started gives the refusal, and item 11 of the "
+            "messagefoundry.auth.trust_anchors module docstring says what lifts it"
+        )
 
 
 def connection_string(settings: StoreSettings) -> str:
@@ -3454,11 +3511,54 @@ def _build_pool_executor(settings: StoreSettings, maxsize: int | None = None) ->
     unused headroom costs nothing, and the margin absorbs the pool's own in-flight ``connect()`` during
     growth and the window where a closing connection still holds a worker.
     """
+    from messagefoundry.auth.trust_anchors import store_pin_anchor_spec
+
     maxsize = max(1, settings.pool_size if maxsize is None else maxsize)
-    return ThreadPoolExecutor(
-        max_workers=maxsize + 4,
-        thread_name_prefix="mefor-sqlserver",
-    )
+    spec = store_pin_anchor_spec(settings)
+    if spec is None:  # no pin, so nothing can refuse a connect (vault BACKLOG #3714 step 11)
+        return ThreadPoolExecutor(max_workers=maxsize + 4, thread_name_prefix="mefor-sqlserver")
+    return _PinGatedExecutor(spec, max_workers=maxsize + 4, thread_name_prefix="mefor-sqlserver")
+
+
+class _PinGatedExecutor(ThreadPoolExecutor):
+    """The pool's executor, which refuses a ``pyodbc.connect`` while an ``enforce`` settings check
+    holds the store's pin refused (:func:`refuse_connect_after_pin_refusal`, vault BACKLOG #3714
+    step 11). The pool opens its connections itself, as it grows or replaces one, and aioodbc
+    0.5.0, pinned exactly, runs each through this executor as a ``functools.partial`` of
+    ``pyodbc.connect``, so this is where a pool connect can be refused before it dials. Every
+    other call runs as before.
+
+    **The gate depends on that shape.** It refuses a call only when :func:`_is_odbc_connect`
+    reads it as ``pyodbc.connect``, bare or as a ``functools.partial``, as it reaches ``submit``
+    through the event loop's ``run_in_executor``. An aioodbc whose pool stopped handing this
+    executor to its connects, that dialled off it, or that wrapped the connect in another
+    callable, would dial with no refusal.
+    ``test_the_installed_aioodbc_submits_its_connect_in_the_shape_the_gate_reads`` in
+    ``tests/test_store_pin_connect_refusal.py`` drives the installed aioodbc's own
+    ``create_pool``, at its fill and at a grow, over a stub ``pyodbc.connect``, and fails if
+    the shape changes. It runs only where the ``sqlserver`` extra is installed, at least in CI's
+    ``sqlserver-store`` leg. That leg runs in the merge queue and nightly, but on a pull request
+    only when the paths it watches change, so a pull request that changes only the aioodbc pin
+    and the lock files first runs it in the merge queue."""
+
+    def __init__(self, spec: AnchorSpec, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._pin_spec = spec
+
+    def submit[**P, T](self, fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs) -> Future[T]:
+        if _is_odbc_connect(fn):
+            _refuse_connect(self._pin_spec)
+        return super().submit(fn, *args, **kwargs)
+
+
+def _is_odbc_connect(fn: Callable[..., Any]) -> bool:
+    """Whether ``fn`` is ``pyodbc.connect``, bare or as the ``functools.partial`` aioodbc 0.5.0
+    submits. Before pyodbc is imported nothing can submit it."""
+    pyodbc = sys.modules.get("pyodbc")
+    if pyodbc is None:
+        return False
+    target = fn.func if isinstance(fn, partial) else fn
+    return target is getattr(pyodbc, "connect", None)
 
 
 #: The two database options the store wants ON, each with the statement that turns it on. RCSI's
@@ -3563,7 +3663,7 @@ def _any_grant(answers: str) -> str:
     )
 
 
-class SqlServerStore:
+class SqlServerStore(ServerCipherWalk):
     """SQL Server-backed durable queue (the :class:`Store` protocol). Open with :meth:`open`."""
 
     # The staged ingress pipeline (enqueue_ingress + the ingress->routed->outbound handoffs) is
@@ -4152,6 +4252,7 @@ class SqlServerStore:
         import aioodbc
 
         disable_driver_manager_pooling()  # BACKLOG #2049: a close must end the server session
+        refuse_connect_after_pin_refusal(self._settings)  # vault BACKLOG #3714 step 11
         return await aioodbc.connect(
             dsn=connection_string(self._settings),
             autocommit=False,
@@ -4825,24 +4926,28 @@ class SqlServerStore:
         return row is not None
 
     # --- the read-only cipher-cell walk (BACKLOG #1719) ----------------------
-    # The source `cipher_cells.read_server_cipher_cells` reads, for `messagefoundry cipher-audit`.
-    # Each call is one SELECT through `_fetchall`, which ends its read transaction, so none spans
-    # chunks. Every identifier is a declared constant from `cipher_cells`, bracket-quoted because
-    # `key` and `count` are reserved here; only values are parameters.
+    # This dialect's reads; `store/base.py` says what the walk's reads share, and holds the one
+    # read that is not dialect, `cipher_walk_surface_sealed`. Identifiers are bracket-quoted here
+    # because `key` and `count` are reserved.
 
     async def cipher_walk_columns(self, tables: Sequence[str]) -> dict[str, frozenset[str]]:
         """The columns of each of ``tables`` this store's schema holds; an absent table is left out.
-        ``OBJECT_ID`` resolves a name the way the store's own unqualified statements do."""
-        found: dict[str, frozenset[str]] = {}
-        for table in tables:
-            _check_walk_identifiers(table)
-            rows = await self._fetchall(
-                "SELECT c.name AS name FROM sys.columns c WHERE c.object_id = OBJECT_ID(?, 'U')",
-                (table,),
-            )
-            if rows:
-                found[table] = frozenset(str(r["name"]) for r in rows)
-        return found
+        ``OBJECT_ID`` resolves a name the way the store's own unqualified statements do. One
+        statement for every table, with each name a parameter (BACKLOG #1719 item 7)."""
+        names = list(dict.fromkeys(tables))
+        if not names:
+            return {}
+        check_walk_identifiers(*names)
+        rows = await self._fetchall(
+            "SELECT t.name AS table_name, c.name AS column_name"
+            f" FROM (VALUES {', '.join('(?)' for _ in names)}) AS t(name)"
+            " JOIN sys.columns c ON c.object_id = OBJECT_ID(t.name, 'U')",
+            tuple(names),
+        )
+        found: dict[str, set[str]] = {}
+        for r in rows:
+            found.setdefault(str(r["table_name"]), set()).add(str(r["column_name"]))
+        return {t: frozenset(c) for t, c in found.items()}
 
     async def cipher_walk_keyed_surface(self) -> tuple[str, str] | None:
         """The first ``keyed_surface`` row, by name, or ``None``. The caller checks the table exists."""
@@ -4851,14 +4956,6 @@ class SqlServerStore:
             " ORDER BY surface_table, surface_column"
         )
         return None if row is None else (str(row["surface_table"]), str(row["surface_column"]))
-
-    async def cipher_walk_surface_sealed(self, table: str, column: str, *, keyed: bool) -> bool:
-        """Whether the store has sealed ``table.column``, by the rule its at-open sweep applies
-        (BACKLOG #3383); ``keyed`` says the ``keyed_surface`` table exists to be asked."""
-        _check_walk_identifiers(table, column)
-        if keyed and await self._surface_keyed(table, column):
-            return True
-        return await self._surface_holds_ciphertext(table, column, f"{_ENC_MARKER_PREFIX}%")
 
     async def cipher_walk_chunk(
         self,
@@ -4873,9 +4970,12 @@ class SqlServerStore:
     ) -> list[tuple[Any, ...]]:
         """Up to ``limit`` rows of ``table`` whose ``column`` is not NULL, after the ``order`` key
         ``after`` (``None`` for the first chunk), in ``order``. Each row is the ``select`` values,
-        then ``column``'s. ``sealed_only`` keeps a value only when it starts with the marker in any
-        ASCII case, as ``cipher_cells._sealed_test`` reads one."""
-        _check_walk_identifiers(table, column, *select, *order)
+        then ``column``'s. ``sealed_only`` keeps a value that starts with the marker in any ASCII
+        case, as ``cipher_cells._sealed_test`` reads one. The comparison runs under the column's
+        collation, so one that folds characters, at least by ignoring width or accents, can also
+        keep a non-ASCII lookalike of the marker; the walk's own marker test then reads that value
+        as unsealed (BACKLOG #1719 item 19)."""
+        check_walk_identifiers(table, column, *select, *order)
         params: list[Any] = [int(limit)]
         where = [f"[{column}] IS NOT NULL"]
         if sealed_only:
@@ -4983,6 +5083,8 @@ class SqlServerStore:
             for attempt in range(_RCSI_REREADS):
                 if attempt:
                     await asyncio.sleep(_RCSI_REREAD_DELAY_S)
+                # Outside the try, whose `except Exception` reads any failure as OFF.
+                refuse_connect_after_pin_refusal(settings)  # vault BACKLOG #3714 step 11
                 try:
                     probe = await aioodbc.connect(
                         dsn=dsn, autocommit=True, timeout=settings.connect_timeout
@@ -5016,6 +5118,7 @@ class SqlServerStore:
                     return True
             return False
 
+        refuse_connect_after_pin_refusal(settings)  # step 11, outside the RuntimeError wrap
         try:
             conn = await aioodbc.connect(
                 dsn=dsn,
@@ -6188,10 +6291,12 @@ class SqlServerStore:
         disable_driver_manager_pooling()  # BACKLOG #2049: a close must end the server session
         dsn = connection_string(self._settings)
         login_timeout = self._settings.connect_timeout
+        settings = self._settings
 
         def _factory() -> Any:
             # `timeout=` is pyodbc's LOGIN timeout (SQL_ATTR_LOGIN_TIMEOUT, #1626); `conn.timeout`
             # below is the separate per-statement bound.
+            refuse_connect_after_pin_refusal(settings)  # vault BACKLOG #3714 step 11
             conn = pyodbc.connect(dsn, autocommit=False, timeout=login_timeout)
             conn.timeout = ct  # seconds; finite (ct==0 refused above) — per-statement bound
             return conn
@@ -6583,37 +6688,71 @@ class SqlServerStore:
         return await self._fetch_rows(sql, params)
 
     def _clamp_bounds(
-        self, timeout_clamp: float | None
+        self, timeout_clamp: float | None, *, share_deadline: bool = False
     ) -> tuple[AbstractAsyncContextManager[Any], int | None, float | None]:
         """``(borrow, statement timeout, rollback bound)`` for one statement. ``timeout_clamp`` is
         ``None`` for every caller outside the SQL Server cluster coordinator, and ``None`` keeps the :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets
         the borrow, the statement and the rollback bounds, so none can be set without the others; a
         shorter ``[store].command_timeout`` still ends the statement first, and bounds neither of
-        the other two."""
+        the other two. With ``share_deadline`` the statement timeout is only a cap, which
+        :meth:`_statement_timeout_left` cuts to what the borrow left (BACKLOG #5064)."""
         if timeout_clamp is None:
             return self._acquire(), None, None
         # The borrow is floored at 1 s like the statement, so a sub-second clamp runs as 1 s on
         # both, as the coordinator's warning says, and a 0 clamp never refuses every borrow. The
         # rollback after a failure gets the same floored clamp (BACKLOG #5066).
         floored_clamp = max(1.0, timeout_clamp)
+        borrow_limit = (
+            _sqlserver_shared_borrow_limit(timeout_clamp) if share_deadline else floored_clamp
+        )
         return (
-            self._acquire_clamped(floored_clamp),
+            self._acquire_clamped(borrow_limit),
             _clamped_statement_timeout(timeout_clamp, self._settings.command_timeout),
             floored_clamp,
         )
 
+    @staticmethod
+    def _statement_timeout_left(timeout_clamp: float, statement_cap: int, started: float) -> int:
+        """The statement timeout of a statement whose borrow and statement share the clamp's
+        deadline, given the ``perf_counter()`` taken before its borrow: the whole seconds the borrow
+        left (:func:`~messagefoundry.config.settings._sqlserver_statement_timeout_left`). Raises
+        :class:`StoreAcquireTimeout` when the borrow left less than the 1 s a statement needs, so
+        the statement is never issued past the deadline; a renew refused here extends nothing
+        (BACKLOG #5064). The message stays inside ``safe_exc``'s default limit."""
+        elapsed = perf_counter() - started
+        seconds = _sqlserver_statement_timeout_left(timeout_clamp, elapsed, statement_cap)
+        if seconds is None:
+            raise StoreAcquireTimeout(
+                f"sqlserver: pool wait left under 1s of a {max(1.0, timeout_clamp):g}s clamp;"
+                f" statement not issued; retune with {CLAMPED_BORROW_ADVICE}"
+            )
+        return seconds
+
     async def _fetch_rows(
-        self, sql: str, params: tuple[Any, ...], timeout_clamp: float | None = None
+        self,
+        sql: str,
+        params: tuple[Any, ...],
+        timeout_clamp: float | None = None,
+        *,
+        share_deadline: bool = False,
     ) -> list[dict[str, Any]]:
         """The body of :meth:`_fetchall` and :meth:`_fetchone_clamped`; :meth:`_clamp_bounds`
         says what ``timeout_clamp`` sets. A failure of the pool release alone, after the commit,
         keeps the result, as :meth:`_write_rows` does: the lease claim and the config-version
         refresh are MERGEs that come through here, so a claim that committed must not read as a
         failed renew (BACKLOG #5064)."""
-        borrow, statement_timeout, floored_clamp = self._clamp_bounds(timeout_clamp)
+        borrow, statement_timeout, floored_clamp = self._clamp_bounds(
+            timeout_clamp, share_deadline=share_deadline
+        )
+        started = perf_counter()
         result: list[dict[str, Any]] | None = None
         try:
             async with borrow as conn:
+                if share_deadline and timeout_clamp is not None and statement_timeout is not None:
+                    # Before the try: a refusal here has issued nothing, so nothing to roll back.
+                    statement_timeout = self._statement_timeout_left(
+                        timeout_clamp, statement_timeout, started
+                    )
                 try:
                     async with (
                         self._statement_timeout(conn, statement_timeout),
@@ -6653,7 +6792,12 @@ class SqlServerStore:
         return rows[0] if rows else None
 
     async def _fetchone_clamped(
-        self, sql: str, params: tuple[Any, ...], *, timeout_clamp: float
+        self,
+        sql: str,
+        params: tuple[Any, ...],
+        *,
+        timeout_clamp: float,
+        share_deadline: bool = False,
     ) -> dict[str, Any] | None:
         """:meth:`_fetchone` bounded by ``timeout_clamp`` (ADR 0157 Inc 0). The cluster lease
         claim/renew and the config-version refresh are at least its callers (BACKLOG #5064);
@@ -6665,17 +6809,27 @@ class SqlServerStore:
         the floor, :meth:`_acquire_clamped` the minimum): a renew that waited out a saturated pool past the
         fence would otherwise still extend the lease after this node self-fenced. The statement's
         own timeout is :func:`_clamped_statement_timeout`, applied by :meth:`_statement_timeout`.
+        So a call can take up to about twice the clamp before its statement returns.
 
-        **Not the Postgres bound.** ``DbCoordinator``'s borrow and statement SHARE one deadline
-        (``pipeline.cluster._call_within``), so its renew is in flight for at most the clamp after
-        it is issued. Here they do not: the statement timeout counts whole seconds, so what a borrow
-        leaves of a 1 s clamp cannot be expressed. A renew can therefore land up to about twice the
-        clamp after it is issued, while ``ClusterSettings._renew_fits_the_margin`` compares the
-        clamp alone with the margin. The COMMIT after the statement is a call on the connection, not a
-        statement, so neither the clamp nor ``[store].command_timeout`` is known to bound it, by a
-        reading of pyodbc's documentation, not a measurement. Whether msodbcsql bounds
-        ``SQLEndTran`` needs a live SQL Server, and BACKLOG #6621 measures it; until then the COMMIT
-        is outside both windows (BACKLOG #5064 keeps that as a stated reason, not a bound).
+        **``share_deadline``, which only the lease claim passes (BACKLOG #5064),** puts the two
+        under one deadline, the clamp floored at 1 s from before the borrow, as
+        ``DbCoordinator``'s borrow and statement share one (``pipeline.cluster._call_within``). The
+        borrow waits at most
+        :func:`~messagefoundry.config.settings._sqlserver_shared_borrow_limit`, and the statement
+        timeout is then cut to the whole seconds the borrow left, or the statement is refused
+        (:meth:`_statement_timeout_left`). From a 2 s clamp up the statement timeout therefore
+        expires by the deadline. Under 2 s the whole-second timeout cannot fit after any borrow, so
+        it runs at 1 s and the claim can overrun the clamp by up to 1 s less its fraction.
+        ``ServiceSettings._sqlserver_renew_bounds`` still counts the two as separate windows. Only
+        the claim takes this because only it re-extends the lease; the heartbeat, refresh and
+        release keep both windows, so a busy pool fails them no sooner than before.
+
+        **Outside both windows, and outside the shared deadline:** at least the cursor's creation,
+        an executor dispatch between the borrow and the statement, and the COMMIT after it. The
+        COMMIT is a call on the connection, not a statement, so neither the clamp nor
+        ``[store].command_timeout`` is known to bound it, by a reading of pyodbc's documentation,
+        not a measurement. Whether msodbcsql bounds ``SQLEndTran`` needs a live SQL Server, and
+        BACKLOG #6621 measures it (BACKLOG #5064 keeps that as a stated reason, not a bound).
 
         **The ROLLBACK after a failure has its own bound (BACKLOG #5066):** the clamp floored at
         1 s, applied on the event loop by :meth:`_rollback_or_discard`. One that fails or runs past
@@ -6686,18 +6840,24 @@ class SqlServerStore:
         session keeps its open transaction, and the ``HOLDLOCK`` locks on ``leader_lease``, until
         its close lands or the server ends it, and the timed-out rollback keeps its executor thread
         until the driver returns."""
-        rows = await self._fetch_rows(sql, params, timeout_clamp)
+        rows = await self._fetch_rows(sql, params, timeout_clamp, share_deadline=share_deadline)
         return rows[0] if rows else None
 
     async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:
         """Run a single write statement (or T-SQL batch) in its own committed transaction, and return
-        the driver's row count (``-1`` when it reports none). Most callers ignore it; the cluster
-        stepdown reads it, through :meth:`_execute_clamped`, to say truthfully whether its
-        owner-scoped release matched a row."""
+        the driver's row count (``-1`` when it reports none). Not a match signal (see
+        :meth:`_exec_terminal` on ``SET NOCOUNT ON``): a caller that must know whether its write
+        matched reads an ``OUTPUT`` rowset, as the cluster stepdown's release does through
+        :meth:`_execute_clamped` (BACKLOG #6795)."""
         return await self._write_rows(sql, params)
 
     async def _execute_clamped(
-        self, sql: str, params: tuple[Any, ...], *, timeout_clamp: float
+        self,
+        sql: str,
+        params: tuple[Any, ...],
+        *,
+        timeout_clamp: float,
+        count_output: bool = False,
     ) -> int:
         """:meth:`_execute` bounded by ``timeout_clamp`` exactly as :meth:`_fetchone_clamped` bounds
         a read, whose docstring says what that leaves unbounded, the COMMIT included, and what a
@@ -6706,14 +6866,25 @@ class SqlServerStore:
         heartbeat runs in the maintenance loop's side pass, which a statement at
         ``[store].command_timeout`` would hold that long (BACKLOG #6472, #5710), and a stepdown's
         release under ``_leadership_lock``, where it would delay the renew; ``stop()`` passes its
-        own bound instead of the renew clamp."""
-        return await self._write_rows(sql, params, timeout_clamp)
+        own bound instead of the renew clamp.
+
+        ``count_output`` returns the number of rows the statement's ``OUTPUT`` clause returned
+        instead of ``cursor.rowcount`` (BACKLOG #6795; :meth:`_exec_terminal` says why, and
+        :meth:`_execute_output` does the same, #2283). The SQL must carry an ``OUTPUT`` clause, or the drain raises. A write that output no row
+        commits uncounted, as ``empty_is_read`` does there (BACKLOG #5675). The lease release
+        passes it, because it reads whether its owner-scoped UPDATE matched."""
+        return await self._write_rows(sql, params, timeout_clamp, count_output=count_output)
 
     async def _write_rows(
-        self, sql: str, params: tuple[Any, ...], timeout_clamp: float | None = None
+        self,
+        sql: str,
+        params: tuple[Any, ...],
+        timeout_clamp: float | None = None,
+        *,
+        count_output: bool = False,
     ) -> int:
         """The body of :meth:`_execute` and :meth:`_execute_clamped`; :meth:`_clamp_bounds` says
-        what ``timeout_clamp`` sets.
+        what ``timeout_clamp`` sets, and :meth:`_execute_clamped` what ``count_output`` does.
 
         A failure of the pool release alone, after the write committed, is logged and the row count
         returned, as ``cluster._call_within`` does on Postgres: reporting that write as failed would
@@ -6729,11 +6900,19 @@ class SqlServerStore:
                         self._cursor(conn) as cur,
                     ):
                         await cur.execute(sql, params)
-                        # getattr: some test cursors model no row count, and -1 is the DB-API
-                        # 'unknown'.
-                        count = getattr(cur, "rowcount", -1)
-                        rows = count if isinstance(count, int) else -1
-                        await self._commit(conn)
+                        if count_output:
+                            # Drained before the commit; _cursor frees the handle OUTPUT leaves.
+                            rows = len(await cur.fetchall())
+                            if rows == 0:
+                                await self._commit_read(conn)  # changed nothing (BACKLOG #5675)
+                            else:
+                                await self._commit(conn)
+                        else:
+                            # getattr: some test cursors model no row count, and -1 is the DB-API
+                            # 'unknown'.
+                            count = getattr(cur, "rowcount", -1)
+                            rows = count if isinstance(count, int) else -1
+                            await self._commit(conn)
                 except Exception:
                     # A rollback that fails would otherwise recycle a connection still holding the
                     # write's X locks; _rollback_or_discard discards it instead. After the cursor
@@ -17804,25 +17983,20 @@ class SqlServerStore:
         gives (BACKLOG #3023).
 
         LOCK ORDER (BACKLOG #4974). The re-key takes its account's ``users`` row under ``UPDLOCK,
-        ROWLOCK`` before its session row, the order the bind, the unbind, the TOTP re-enrolment and
-        the per-account revoke take them in: each locks the account row first and sweeps after. The
-        unbind takes it through its own prior-pair ``UPDLOCK`` read in
-        :meth:`clear_user_federated_subject`, before its account write, and a rebind's first sweep
-        is that transaction's; the bind's own write and the TOTP re-enrolment take it through the
-        write helper, and the per-account revoke through the epoch raise. ``enforce_session_cap``'s
-        trim takes no account row. ``revoke_all_sessions`` locks only the accounts its list read
-        returns, so a session of any other account is not ordered against a re-key. The re-key
+        ROWLOCK`` before its session row, the order in which the whole-account sweeps that take an
+        account row take them, at least those docs/SECURITY.md, *Limits of the session sweep*,
+        names. That section says how each takes the row, which sweeps take none, and which are
+        raced. The re-key
         moves the row to a new clustered key, and a sweep that met the row locked mid-move could
         find the old key gone and the new one out of its read, or deadlock with the re-key,
         depending on the plan. With the account row first, a re-key either commits before a sweep of
         its account locks that row, and the sweep reads the new key, or waits until the sweep
         commits and then finds the session ended. The session's account is read unlocked first:
         ``user_id`` never changes, and a session already gone locks nothing. Each path in this file
-        read for this change that locks both rows takes the account row first, so the re-key
-        closes no cycle with any of them. Read from the code; the race is replayed on the SQL
-        Server leg by ``tests/_federated_unbind_store_contract.py``, against store calls only, and
-        not against the TOTP re-enrolment's. docs/SECURITY.md, *Limits of the session sweep*, says
-        which are raced and which are not."""
+        that was read when this order was set (BACKLOG #4974) and that locks both rows takes the
+        account row first, so the re-key closes no cycle with any of them. Read from the code; the
+        race is replayed on the SQL Server leg by ``tests/_federated_unbind_store_contract.py``,
+        against store calls only, and not against a TOTP re-enrolment."""
 
         async def _link(cur: Any) -> None:
             retired_at = time.time() if now is None else now

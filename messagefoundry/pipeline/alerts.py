@@ -1115,9 +1115,12 @@ class AlertSink(Protocol):
         #2596 a worker runs the snapshot the engine sends it, so an edit on disk is not a cause.
 
         Raised once per refusal, on the event loop, by the runner: not again for each later
-        message the session refuses from its cached refusal, and not for a refusal computed
-        against a graph a reload has since replaced. A reload makes fresh sessions, so a refusal
-        that outlives the reload raises again. A sink that raises here is logged, not retried. ``name`` is the inbound connection's name.
+        message the session refuses from its cached refusal, and not for a refusal the runner
+        finds overtaken (``RegistryRunner._sandboxed_dispatch`` says when, BACKLOG #6830): that
+        message runs again instead, and its rerun's refusal, if the cause stands, raises it. A
+        reload makes fresh sessions, so a refusal that outlives the reload raises again, from the
+        fresh session. A sink that raises here is logged, not retried. ``name`` is the inbound
+        connection's name.
         Fixed words only, built by :func:`sandbox_worker_refused_detail`: no message content, no
         PHI. Not in the control-action set: a restart reloads nothing, so it cannot clear this.
         Nothing resolves it automatically; an operator resolves the instance after the reload."""

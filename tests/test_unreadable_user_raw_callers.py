@@ -102,7 +102,8 @@ async def test_a_role_change_on_an_unreadable_account_is_refused_before_any_writ
     engine_at: tuple[Engine, Path], monkeypatch: pytest.MonkeyPatch, provider: str
 ) -> None:
     """The stand-in's ``auth_provider`` is invented, so a corrupt directory account must not be
-    read as local: the route refuses on the read, before the AD check or the role write runs."""
+    read as local: the route refuses on the read, before the AD check or the role write runs. The
+    read is the checked one (BACKLOG #5520 items 2 and 13), so the refusal is its 423."""
     engine, path = engine_at
     service = await _auth_service(engine)
     await _auth_add(service, "root", Role.ADMINISTRATOR)
@@ -118,7 +119,7 @@ async def test_a_role_change_on_an_unreadable_account_is_refused_before_any_writ
     async with _auth_client(engine, service) as c:
         h = _auth((await _login(c, "root")).json()["token"])
         r = await c.put(f"/users/{_TARGET}/roles", headers=h, json={"roles": ["operator"]})
-    assert r.status_code == 409, r.text
+    assert r.status_code == 423, r.text
     assert "integrity" in r.json()["detail"]
     assert calls == []
 

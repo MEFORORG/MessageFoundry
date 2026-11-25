@@ -97,6 +97,14 @@ def _capped_backoff(base: float, exp: int, cap: float) -> float:
     return min(float(base * (2 ** min(max(exp, 0), 20))), cap)
 
 
+class RependWithoutFault(Exception):  # noqa: N818 - a marker mixin, not an error of its own
+    """A mixin for an exception a per-item body raises to hand its row back when nothing failed,
+    such as a sandbox refusal a reload overtook (BACKLOG #6830). :meth:`StageDispatcher._drain_lane`
+    treats it exactly as a T17 infra fault, escalating backoff and infra-fault STOP bound included,
+    so a condition that keeps raising it still stops the lane; only its line differs: INFO, with
+    no traceback."""
+
+
 class HoldResult(Enum):
     """How a hold on a failed re-pend of claimed rows ended (BACKLOG #1611): the pooled
     :meth:`StageDispatcher._land_while_holding` and the per-lane
@@ -2104,15 +2112,27 @@ class StageDispatcher:
         st = self._states.get(lane)
         streak = st.infra_error_streak if (st is not None and i == 0) else 0
         park_until = self._clock() + self._infra_backoff(streak)
-        log.error(
-            "StageDispatcher %s lane %s serializer failed at item %d (T17 infra fault); "
-            "re-pending head with backoff until %.3f",
-            self._stage.value,
-            lane,
-            i,
-            park_until,
-            exc_info=exc,
-        )
+        if isinstance(exc, RependWithoutFault):
+            # Not a fault (BACKLOG #6830), so no traceback; still counted and backed off as one, so
+            # the STOP bound still holds if whatever raises it never stops.
+            log.info(
+                "StageDispatcher %s lane %s: item %d handed back (%s); re-pending head until %.3f",
+                self._stage.value,
+                lane,
+                i,
+                type(exc).__name__,
+                park_until,
+            )
+        else:
+            log.error(
+                "StageDispatcher %s lane %s serializer failed at item %d (T17 infra fault); "
+                "re-pending head with backoff until %.3f",
+                self._stage.value,
+                lane,
+                i,
+                park_until,
+                exc_info=exc,
+            )
         head_id = items[i].id
         tail = [it.id for it in items[i + 1 :]]  # tail only — the head is re-pended, not released
         return (

@@ -340,10 +340,16 @@ def resolve_key_provider(
         return HostKeyProvider(settings, posture)
     # Every caller that resolves a key, not only a store open, refuses a host blob beside another
     # provider (vault BACKLOG #3411).
-    from messagefoundry.store.custody_host import HostCustodyRefused, foreign_custody_refusal
+    from messagefoundry.store.custody_host import (
+        HostCustodyRefused,
+        _recorded_as,
+        foreign_custody_refusal,
+    )
 
     if (refusal := foreign_custody_refusal(settings)) is not None:
-        raise HostCustodyRefused(refusal)
+        # Recorded as built by the engine, so a seam that replaces it (resolve_active_key and its
+        # siblings, BACKLOG #4882) keeps the files it names and the way on.
+        raise _recorded_as(HostCustodyRefused, refusal)
     builtin = _BUILTIN_PROVIDER_CLASSES.get(name)
     if builtin is not None:
         return builtin(settings)

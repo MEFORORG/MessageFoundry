@@ -5,7 +5,7 @@ on:
   # Branch protection evaluates required contexts on the MERGE-GROUP commit, so a required context
   # whose workflow has no merge_group trigger never reports in the queue and NOTHING MERGES. That
   # is not hypothetical: codeql.yml's header records PR 619 sitting AWAITING_CHECKS on the queue's
-  # first entry with its CodeQL contexts simply absent.
+  # first entry with its CodeQL contexts absent.
   #
   # THIS COMMENT USED TO SAY "INERT UNTIL A MERGE QUEUE EXISTS ... behaves identically today".
   # That was true when the trigger landed on 2026-08-26 and became false once a queue was
@@ -193,7 +193,7 @@ jobs:
       # relative `(releases/...`, and neither grep form alone finds them all), and a `docs/SECURITY.md`
       # route-table row asserted a refusal `DELETE /me/mfa` does not make.
       #
-      # IT RECURRED ON 2026-08-11, AND THIS STEP WAS ALREADY HERE — the list was simply incomplete.
+      # IT RECURRED ON 2026-08-11, AND THIS STEP WAS ALREADY HERE — the list was incomplete.
       # `tests/test_dast_claims.py` scans documents for prose reading as though the independence gap
       # were closed, but was never added, so a docs-only PR (#322) merged green and RED MAIN on the push
       # afterwards. The blind mode is worse than a plain gap because of WHO PAYS: the failure surfaces
@@ -287,7 +287,9 @@ jobs:
             tests/test_architecture_diagrams.py
             tests/test_oauth2_auth_style_default_is_recorded.py
             tests/test_control_premises.py
-            tests/test_review_standards.py"
+            tests/test_review_standards.py
+            tests/test_phi_reencrypt_on_write_doc.py
+            tests/test_security_events_feed_doc_once.py"
           # FIVE MEMBERS LEFT THIS LIST WITH THE LEDGER (BACKLOG #1250), and this note exists because
           # the ruling above says removing a guard is a different act from adding one. They were
           # test_backlog_status_check, test_backlog_citation_check, test_dangling_citation_check,
@@ -994,7 +996,7 @@ jobs:
       #   W22     4:05 + 54:59 + 2:51 = 61:55 vs 66:00  +4:05   |  old: 42:55 vs 46:00  +3:04
       #   W25     2:32 + 54:59 + 3:59 = 61:30 vs 66:00  +4:30   |  old: 42:30 vs 46:00  +3:30
       #
-      # UBUNTU WAS THE LEG ACTUALLY BROKEN, at -0:43, and nobody had measured it: BACKLOG #1096 was filed
+      # UBUNTU WAS THE LEG BROKEN, at -0:43, and nobody had measured it: BACKLOG #1096 was filed
       # as a Windows problem. A negative row here means the JOB cap can fire before the STEP cap, and a
       # job-level kill reports NO step conclusion -- so the instrument this item was measured with is
       # destroyed exactly when it is needed. Max measured post-step teardown is 0:24, so all three new
@@ -1127,7 +1129,7 @@ jobs:
         # WORKER instead of once -- `tests/test_worktree_prune_merged.py` alone pays ~3s of setup per
         # test. (2) `tests/test_multishard_smoke.py` is the sole consumer of MEFOR_TEST_PORT_BASE and
         # binds a real port window; keeping a file's tests together keeps that window inside one
-        # process. The cost of `loadfile` is that the run cannot finish faster than its single largest
+        # process. `loadfile`'s cost: the run cannot finish faster than its single largest
         # FILE, which is why the per-file hot spots are worth attacking next.
         # `-m 'not tooling'` DESELECTS the repo-harness tier, which the `tooling` job runs instead.
         # Measured 2026-08-16 on a 20-core box: 1,882 of 12,990 tests carry the mark but they are 66
@@ -1147,7 +1149,7 @@ jobs:
         # BACKLOG #1260: WRAPPED SO A NATIVE CRASH IS NOT REPORTED AS A TEST FAILURE. A segfault kills
         # the interpreter, so pytest returns 139/134 with no verdict and THREE layers of naming then
         # say "tests failed" -- the check name, the step name, and `steps.tests.outcome`, which is what
-        # `step_margin.py` below consumes. None of them is true: the engine was fine and a process died.
+        # `step_margin.py` below consumes. None is true: the engine was fine and a process died.
         # The wrapper re-runs ONLY on 139/134 and re-raises exit 1 immediately, so it cannot mask a
         # regression.
         #
@@ -1606,7 +1608,7 @@ jobs:
       # needs this job, so a LOW margin here ejects the merge group whatever the engine leg is doing --
       # which is the defect, and it is measured below rather than projected.
       #
-      # WHAT THE SERIAL STEP WAS ACTUALLY COSTING. Pool: the 80 most recent ci.yml runs, spanning
+      # WHAT THE SERIAL STEP WAS COSTING. Pool: the 80 most recent ci.yml runs, spanning
       # 2026-09-22T00:57Z to 2026-09-22T13:11Z -- about twelve hours of ONE DAY, not a long tail. 211
       # web console jobs were seen; 198 of them (66 per leg) carried a timed `Web console tests
       # (pytest)` step, and the other 13 did not -- a job whose gated step was skipped has no start or
@@ -1771,7 +1773,7 @@ jobs:
       # windows-2022 is the tightest and is the leg to watch, since the third re-derivation raised its
       # kill to 11 (15 since the fifth, 17 since the sixth). Its setup has to reach 9:00 before the JOB
       # cap fires ahead of the step cap and the failure stops naming the step. That is 0:25 past the 8:35 this table budgets and 4:55 past the
-      # 4:05 actually recorded for the leg, so the pad is most of what protects it. windows-2025 was
+      # 4:05 recorded for the leg, so the pad is most of what protects it. windows-2025 was
       # the tightest until then, at 0:58. The lever if it ever bites is `webconsole_job_timeout`, which is
       # a deadlock backstop rather than a tightness gate -- not a smaller kill, which would re-narrow
       # the observation window this change was made to open.
@@ -2607,10 +2609,10 @@ jobs:
       # needs to interrupt the wedged main thread. Anyone porting this on the belief that the thread
       # method cannot fire on a C-level wait is porting it for a reason that does not hold.
       #
-      # WHAT IT ACTUALLY BUYS, which is narrower and still worth the two lines. A SECOND watchdog on an
+      # WHAT IT BUYS, narrower and still worth the two lines. A SECOND watchdog on an
       # INDEPENDENT mechanism (CPython's C-level `dump_traceback_later`, not a Python `threading.Timer`),
       # writing down a DIFFERENT path: faulthandler dumps to a raw dup'd stderr fd, while pytest-timeout
-      # writes through `config.get_terminal_writer()`. That distinction is why it is worth having on the
+      # writes through `config.get_terminal_writer()`. That is why it is worth having on the
       # tier that spawns the most children under `-n` (the count itself is per-leg now, see
       # TOOLING_WORKERS below) -- `_pytest/faulthandler.py` comments that xdist monkeypatches
       # `sys.stderr` with a non-file, and whether the terminal-writer dump survives a worker's `os._exit`
@@ -3386,7 +3388,7 @@ jobs:
           # must meet them on its own PR rather than first on the nightly after the merge.
           # scripts/ci/db-tls-cert.sh makes the certificate these legs' databases serve and the engine
           # verifies (vault BACKLOG #3533 item 2), so an edit to it alone must pull them.
-          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/pki|messagefoundry/api/(__init__|app|approvals)|messagefoundry/auth/(service|tokens|trust_anchors|anchor_path)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|reference_sync|retention|sharding|stage_dispatcher|wiring_runner)|messagefoundry/connection_events|messagefoundry/sqlserver_roles|messagefoundry/(logging_setup|redaction)|messagefoundry/odbc_(call_gate|env|dsn)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|uploads_shard_quota|embedded_document_pruning)|tests/_live_scratch\.py|tests/_claim_lock_helpers\.py|tests/audit_chain_cases\.py|tests/_replay_settle_contract\.py|tests/_finalize_race_contract\.py|tests/_pending_approval_store_contract\.py|tests/_ad_group_map_store_contract\.py|tests/_keyed_reopen_contract\.py|tests/_lockout_store_contract\.py|tests/test_store_cipher_sweep_parity\.py|tests/test_transit_bound_attestation_server_backends\.py|ci/python-version|scripts/ci/db-tls-cert\.sh|\.github/workflows/ci\.yml)'; then
+          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__init__|messagefoundry/__main__|messagefoundry/pki|messagefoundry/api/(__init__|app|approvals)|messagefoundry/auth/(__init__|service|tokens|trust_anchors|anchor_path)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|reference_sync|retention|sharding|stage_dispatcher|wiring_runner)|messagefoundry/connection_events|messagefoundry/sqlserver_roles|messagefoundry/(logging_setup|redaction)|messagefoundry/odbc_(call_gate|env|dsn)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|store_pin_connect_refusal|uploads_shard_quota|embedded_document_pruning)|tests/_live_scratch\.py|tests/_claim_lock_helpers\.py|tests/audit_chain_cases\.py|tests/_replay_settle_contract\.py|tests/_finalize_race_contract\.py|tests/_pending_approval_store_contract\.py|tests/_ad_group_map_store_contract\.py|tests/_keyed_reopen_contract\.py|tests/_lockout_store_contract\.py|tests/test_store_cipher_sweep_parity\.py|tests/test_transit_bound_attestation_server_backends\.py|ci/python-version|scripts/ci/db-tls-cert\.sh|\.github/workflows/ci\.yml)'; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
@@ -3865,7 +3867,7 @@ jobs:
         # pyodbc 5.3.0 + py3.14 native-crash retry (#973 follow-up, upstream pyodbc#1459): re-runs ONLY on a 139/134 crash exit, never on exit 1, so it never retries a test failure. A native crash of our own can still be retried away (BACKLOG #2049). See scripts/ci/retry-native-crash.sh.
         run: >-
           bash scripts/ci/retry-native-crash.sh
-          pytest -v tests/test_sqlserver_store.py
+          pytest -v tests/test_sqlserver_store.py tests/test_store_pin_connect_refusal.py
 
       - name: Run the SQL Server coordinator suite (active-passive HA leader election)
         env:
