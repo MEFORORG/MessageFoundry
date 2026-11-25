@@ -164,10 +164,11 @@
     refuse a claimed tree, so after a removal no claim should name it. One taken in the moment between the check and the removal is reported, never deleted:
     claim.ps1 -Release -Force is the release that leaves a record.
 
-    EVERY COPY SEARCHES THE SAME PLACE (BACKLOG #1894). -Name reaches <parent>\<leaf>-<Name> of the
-    clone's PRIMARY checkout, the first entry of `git worktree list`, whichever copy runs and from
-    whatever cwd outside the worktree being removed. new.ps1 creates its sibling there from every
-    copy too. Until #1894 both anchored on the copy's own checkout, so a copy in a linked worktree
+    RUN THE PRIMARY'S COPY (BACKLOG #1894). -Name reaches <parent>\<leaf>-<Name> of the clone's
+    PRIMARY checkout, the first entry of `git worktree list`, from whatever cwd outside the worktree
+    being removed. A copy in a linked worktree, or below a checkout's top, refuses -Name unless
+    -RepoRoot names the checkout. new.ps1 creates its sibling beside the primary from every copy.
+    Until #1894 both anchored on the copy's own checkout, so a copy in a linked worktree
     made and searched `<that worktree>-<Name>`; -RepoRoot <that worktree> still reaches a tree made
     that way. -Path and -List read the clone's whole worktree list. See docs/WORKTREES.md.
 
@@ -373,29 +374,46 @@ if ($gitCarriers.Count -gt 0) {
 # ANCHOR ON THE PRIMARY, NOT ON THIS COPY (BACKLOG #1894). $PSScriptRoot\..\.. is the checkout the
 # copy sits in, so a copy in a linked worktree used to search `<that worktree>-<Name>`: what -Name
 # reached depended on which copy ran. The first entry of `git worktree list` is the same from every
-# worktree of one clone. Across all copies -Name now reaches fewer trees, only siblings of the
-# primary; a linked copy's own run moves from its own siblings to the primary's, and refuses below
-# while its old target still exists. An explicit -RepoRoot is kept as given, as before #1894. FAIL
-# CLOSED: an unreadable list must not fall back to this copy's own checkout. The list is reused
-# below; nothing between here and there changes it.
+# worktree of one clone. FAIL CLOSED: an unreadable list must not fall back to this copy's own
+# checkout. The list is reused below; nothing between here and there changes it.
 #
-# The copy's root is also read as git resolves it, because the ambiguity guard below compares it to
-# git's own list: a copy run through a junction is spelled differently, and on that spelling alone
-# the guard would miss the tree the copy's older command meant (BACKLOG #1894 review round 3).
-$CopyRoots = @($RepoRoot)
+# -NAME WITHOUT -RepoRoot RUNS ONLY FROM A COPY AT THE PRIMARY'S TOP (BACKLOG #1894 review round 4).
+# A linked copy re-anchored on the primary would reach `<primary>-<Name>`, a tree its own run never
+# could, and a command printed before #1894 that names such a copy meant `<that copy>-<Name>`. No
+# test of that old target can tell the two apart: an earlier guard refused only while the old
+# target was a registered worktree, so with it absent or unregistered the run removed the primary's
+# sibling. A copy below a checkout's top would likewise move from `<subdir>-<Name>` to the primary's.
+# So both refuse, and the caller names the checkout with -RepoRoot. Neither test reads a spelling:
+# git-dir differs from the common dir in a linked worktree however the copy was reached, and
+# --show-prefix is empty only at a checkout's top. On this route -Name reaches exactly the tree
+# the pre-#1894 script did from the same copy, or refuses.
 $anchorList = @()
 if ($anchorOnPrimary) {
-    $copyTop = "$(& git -C $RepoRoot rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $copyTop) {
-        throw "Could not read the checkout of '$RepoRoot' as git resolves it. Nothing was removed."
-    }
-    $copyTop = [System.IO.Path]::GetFullPath($copyTop).TrimEnd('\', '/')
-    if ((ConvertTo-Norm $copyTop) -ne (ConvertTo-Norm $RepoRoot)) { $CopyRoots += $copyTop }
     $anchorList = @(Get-RepoWorktrees $RepoRoot)
     if ($anchorList.Count -eq 0) {
         throw "Could not list the registered worktrees of '$RepoRoot', so the primary checkout is unknown. Nothing was removed."
     }
-    $RepoRoot = [System.IO.Path]::GetFullPath($anchorList[0].Path).TrimEnd('\', '/')
+    $primaryOfClone = [System.IO.Path]::GetFullPath($anchorList[0].Path).TrimEnd('\', '/')
+    if (-not ($byPath -or $listing)) {
+        $copyGitDir = "$(& git -C $RepoRoot rev-parse --path-format=absolute --git-dir 2>$null)".Trim()
+        $okGitDir = $LASTEXITCODE -eq 0
+        $copyCommon = "$(& git -C $RepoRoot rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
+        $okCommon = $LASTEXITCODE -eq 0
+        $copyPrefix = "$(& git -C $RepoRoot rev-parse --show-prefix 2>$null)".Trim()
+        $okPrefix = $LASTEXITCODE -eq 0
+        if (-not ($okGitDir -and $okCommon -and $okPrefix) -or -not $copyGitDir -or -not $copyCommon) {
+            throw "Could not read the checkout of '$RepoRoot' as git resolves it. Nothing was removed."
+        }
+        $copyIsLinked = (ConvertTo-Norm $copyGitDir) -ne (ConvertTo-Norm $copyCommon)
+        if ($copyIsLinked -or $copyPrefix) {
+            Write-Host "REFUSED: this copy of remove.ps1 is not at the top of the primary checkout ('$primaryOfClone')." -ForegroundColor Red
+            Write-Host "  It runs from '$RepoRoot'. Run the primary's copy, or name the checkout whose sibling you mean:" -ForegroundColor Red
+            Write-Host "  remove.ps1 -Name $Name -RepoRoot `"$primaryOfClone`"   reaches $(Join-Path (Split-Path $primaryOfClone -Parent) "$(Split-Path $primaryOfClone -Leaf)-$Name")" -ForegroundColor Red
+            $copyKind = if ($copyIsLinked) { "a linked worktree's copy" } else { "a copy below a checkout's top" }
+            throw "-Name from $copyKind needs -RepoRoot. Nothing was removed."
+        }
+    }
+    $RepoRoot = $primaryOfClone
 }
 elseif (-not ($byPath -or $listing)) {
     # -Name builds its target from this spelling, so it must BE a checkout's top. A subdirectory, or a
@@ -531,23 +549,6 @@ else {
         throw "Could not list the registered worktrees of '$RepoRoot'. Nothing was removed."
     }
     $linkedNorms = @($nameRegistered | Select-Object -Skip 1 | ForEach-Object { ConvertTo-Norm $_.Path })
-    # A COMMAND PRINTED BEFORE BACKLOG #1894 names a linked copy and meant `<that copy>-<Name>`. Run
-    # now, it would reach `<primary>-<Name>`, another tree that may be someone else's. While the tree
-    # it meant is still a registered worktree, refuse and name both, rather than pick one. Once it is
-    # gone this cannot tell such a command from a current one.
-    # Each spelling of the copy's root is tried: as invoked, and as git resolves it.
-    foreach ($CopyRoot in $(if ($anchorOnPrimary) { $CopyRoots } else { @() })) {
-        if ((ConvertTo-Norm $CopyRoot) -eq (ConvertTo-Norm $RepoRoot)) { continue }
-        $beside = "$CopyRoot-$Name"
-        $besideNorm = ConvertTo-Norm $beside
-        if ($besideNorm -ne (ConvertTo-Norm $WorktreePath) -and $linkedNorms -contains $besideNorm) {
-            Write-Host "REFUSED: -Name $Name from the copy in '$CopyRoot' is ambiguous." -ForegroundColor Red
-            Write-Host "  -Name now reaches the sibling of the primary: $WorktreePath" -ForegroundColor Red
-            Write-Host "  An older new.ps1 run from that copy made:     $beside" -ForegroundColor Red
-            Write-Host "Name the one you mean: run the primary's copy for the first, or add -RepoRoot `"$CopyRoot`" for the second." -ForegroundColor Red
-            throw "Ambiguous -Name. Nothing was removed."
-        }
-    }
     if (-not (Test-Path $WorktreePath)) { throw "No such worktree: $WorktreePath" }
     # The target must be a registered LINKED worktree of this clone. A directory that only sits at the
     # sibling path, such as a separate clone beside the primary, would have every read below asked of

@@ -351,16 +351,14 @@ def test_the_script_location_default_still_anchors_when_no_root_is_passed(fx: Fi
     assert not fx.is_registered(wt)
 
 
-def test_a_copy_in_a_LINKED_worktree_anchors_name_on_the_primary(fx: Fixture) -> None:
-    """Red before the fix (BACKLOG #1894): the default root was ``$PSScriptRoot\\..\\..``, so the
-    copy in linked worktree ``repo-host`` searched ``repo-host-foo`` and threw "No such worktree"
-    while ``repo-foo``, the sibling of the primary, stood there.
+_LINKED_REFUSAL = "-Name from a linked worktree's copy needs -RepoRoot"
 
-    While ``repo-host-foo``, the tree an older new.ps1 run from that copy made and its printed
-    command meant, still exists, the anchored run is ambiguous and refuses, naming both, so a stale
-    command cannot quietly reach a different tree while the tree it meant is still registered.
-    ``-RepoRoot`` is used as given and reaches it.
-    """
+
+def test_a_copy_in_a_LINKED_worktree_refuses_name_without_repo_root(fx: Fixture) -> None:
+    """BACKLOG #1894. Before it, the copy in linked worktree ``repo-host`` searched ``repo-host-foo``;
+    anchored on the primary it would reach ``repo-foo`` instead, a different tree that may be another
+    session's. A linked copy therefore refuses -Name unless -RepoRoot names the checkout meant, and
+    -RepoRoot is used as given: the linked worktree reaches its own sibling, the primary reaches its."""
     host = fx.add("host")
     target = fx.add("foo")
     beside_host = host.parent / f"{host.name}-foo"
@@ -368,21 +366,19 @@ def test_a_copy_in_a_LINKED_worktree_anchors_name_on_the_primary(fx: Fixture) ->
     copy_real_scripts(host)
     copied = host / "scripts" / "worktree" / "remove.ps1"
 
-    ambiguous = run(fx, "-Name", "foo", script=copied, repo_root="")
-    assert ambiguous.returncode != 0
-    assert "Ambiguous -Name" in ambiguous.stderr, ambiguous.stdout + ambiguous.stderr
-    assert str(target) in ambiguous.stdout and str(beside_host) in ambiguous.stdout
+    refused = run(fx, "-Name", "foo", script=copied, repo_root="")
+    assert refused.returncode != 0
+    assert _LINKED_REFUSAL in refused.stderr, refused.stdout + refused.stderr
+    assert "Nothing was removed" in refused.stderr, refused.stderr
     assert target.exists() and beside_host.exists()
 
-    # -RepoRoot is used as given, so naming the linked worktree reaches its own sibling.
     old_shape = run(fx, "-Name", "foo", script=copied, repo_root=host)
     assert old_shape.returncode == 0, old_shape.stdout + old_shape.stderr
     assert not beside_host.exists()
     assert not fx.is_registered(beside_host)
     assert target.exists()
 
-    proc = run(fx, "-Name", "foo", script=copied, repo_root="")
-
+    proc = run(fx, "-Name", "foo", script=copied, repo_root=fx.primary)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert not target.exists()
     assert not fx.is_registered(target)
@@ -391,6 +387,32 @@ def test_a_copy_in_a_LINKED_worktree_anchors_name_on_the_primary(fx: Fixture) ->
     listing = run(fx, "-List", script=copied, repo_root="")
     assert listing.returncode == 0, listing.stdout + listing.stderr
     assert f"-Name root: {fx.primary}" in listing.stdout, listing.stdout
+
+
+@pytest.mark.parametrize("leftover", ["absent", "unregistered-dir"])
+def test_a_linked_copy_never_reaches_the_primarys_sibling_when_its_own_is_not_registered(
+    fx: Fixture, leftover: str
+) -> None:
+    """Red at 265e6e87 (BACKLOG #1894 review round 4, finding 1): the guard refused only while
+    ``repo-host-foo`` was a REGISTERED worktree, so with it absent, or left as a plain directory,
+    the linked copy removed ``repo-foo``. Before #1894 that copy threw on ``repo-host-foo``, so the
+    run reached a tree it never could. It must refuse and leave both in place."""
+    host = fx.add("host")
+    target = fx.add("foo")
+    copy_real_scripts(host)
+    beside_host = host.parent / f"{host.name}-foo"
+    if leftover == "unregistered-dir":
+        beside_host.mkdir()
+        (beside_host / "left.txt").write_text("x", encoding="utf-8")
+
+    proc = run(
+        fx, "-Name", "foo", script=host / "scripts" / "worktree" / "remove.ps1", repo_root=""
+    )
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert _LINKED_REFUSAL in proc.stderr, proc.stdout + proc.stderr
+    assert target.exists() and fx.is_registered(target)
+    assert (beside_host / "left.txt").is_file() == (leftover == "unregistered-dir")
 
 
 def test_name_refuses_a_directory_that_is_not_a_registered_worktree(fx: Fixture) -> None:
@@ -1084,19 +1106,22 @@ def test_name_through_a_junction_alias_of_the_primary_is_neither_ambiguous_nor_u
     spelling given, so the spelling must be the checkout's top as git resolves it."""
     alias = fx.root / "alias"
     _junction(alias, fx.primary.parent)
-    copy_real_scripts(fx.primary)
-    via_alias = alias / fx.primary.name / "scripts" / "worktree" / "remove.ps1"
+    try:
+        copy_real_scripts(fx.primary)
+        via_alias = alias / fx.primary.name / "scripts" / "worktree" / "remove.ps1"
 
-    first = fx.add("viaalias")
-    proc = run(fx, "-Name", "viaalias", script=via_alias, repo_root="")
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert not first.exists() and not fx.is_registered(first)
+        first = fx.add("viaalias")
+        proc = run(fx, "-Name", "viaalias", script=via_alias, repo_root="")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert not first.exists() and not fx.is_registered(first)
 
-    second = fx.add("viaroot")
-    proc = run(fx, "-Name", "viaroot", repo_root=alias / fx.primary.name)
-    assert proc.returncode != 0, proc.stdout + proc.stderr
-    assert "not the top of a checkout" in proc.stderr, proc.stdout + proc.stderr
-    assert second.exists() and fx.is_registered(second)
+        second = fx.add("viaroot")
+        proc = run(fx, "-Name", "viaroot", repo_root=alias / fx.primary.name)
+        assert proc.returncode != 0, proc.stdout + proc.stderr
+        assert "not the top of a checkout" in proc.stderr, proc.stdout + proc.stderr
+        assert second.exists() and fx.is_registered(second)
+    finally:
+        os.rmdir(alias)
 
 
 @pytest.mark.parametrize("how", ["explicit", "positional-dot"])
@@ -1123,10 +1148,11 @@ def test_name_refuses_a_repo_root_below_the_checkout_top(fx: Fixture, how: str) 
     assert not target.exists()
 
 
-def test_a_linked_copy_run_through_a_junction_still_refuses_as_ambiguous(fx: Fixture) -> None:
+def test_a_linked_copy_run_through_a_junction_still_refuses(fx: Fixture) -> None:
     """Red in review round 3 (BACKLOG #1894): the ambiguity guard built the copy's old sibling from the
     junction spelling it was invoked through, which git's list never matches, so it removed
-    ``repo-foo`` while ``repo-host-foo``, the tree the copy's older command meant, was registered."""
+    ``repo-foo`` while ``repo-host-foo``, the tree the copy's older command meant, was registered.
+    The linked-copy refusal reads git's own record of the copy's checkout, so no spelling skips it."""
     host = fx.add("host")
     target = fx.add("foo")
     beside_host = host.parent / f"{host.name}-foo"
@@ -1142,7 +1168,49 @@ def test_a_linked_copy_run_through_a_junction_still_refuses_as_ambiguous(fx: Fix
         os.rmdir(alias)
 
     assert proc.returncode != 0, proc.stdout + proc.stderr
-    assert "Ambiguous -Name" in proc.stderr, proc.stdout + proc.stderr
-    assert str(beside_host) in proc.stdout, proc.stdout
+    assert _LINKED_REFUSAL in proc.stderr, proc.stdout + proc.stderr
     assert target.exists() and fx.is_registered(target)
     assert beside_host.exists() and fx.is_registered(beside_host)
+
+
+def test_a_linked_copy_through_a_junction_of_its_parent_refuses_with_its_sibling_absent(
+    fx: Fixture,
+) -> None:
+    """Red at 265e6e87 (BACKLOG #1894 review round 4, finding 4, the double-alias family): with the
+    copy's parent reached through a junction and its own old sibling absent, nothing matched the
+    guard, so the run removed ``repo-foo``. The refusal does not depend on any spelling."""
+    host = fx.add("host")
+    target = fx.add("foo")
+    copy_real_scripts(host)
+    alias = fx.root / "parentalias"
+    _junction(alias, host.parent)
+    try:
+        proc = run(
+            fx,
+            "-Name",
+            "foo",
+            script=alias / host.name / "scripts" / "worktree" / "remove.ps1",
+            repo_root="",
+        )
+    finally:
+        os.rmdir(alias)
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert _LINKED_REFUSAL in proc.stderr, proc.stdout + proc.stderr
+    assert target.exists() and fx.is_registered(target)
+
+
+def test_a_copy_below_the_primarys_top_refuses_name(fx: Fixture) -> None:
+    """A copy at ``<primary>/sub/scripts/worktree`` used to search ``<primary>/sub-<Name>`` and throw
+    "No such worktree". Re-anchored on the primary it would reach ``<primary>-<Name>``, a tree it
+    never could, so -Name refuses unless the copy's root is its checkout's top."""
+    target = fx.add("foo")
+    sub = fx.primary / "sub"
+    sub.mkdir()
+    copy_real_scripts(sub)
+
+    proc = run(fx, "-Name", "foo", script=sub / "scripts" / "worktree" / "remove.ps1", repo_root="")
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "Nothing was removed" in proc.stderr, proc.stdout + proc.stderr
+    assert target.exists() and fx.is_registered(target)
