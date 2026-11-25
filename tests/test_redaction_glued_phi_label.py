@@ -73,7 +73,7 @@ def _paths_keeping(text: str, *values: str) -> list[str]:
 def _rule_off() -> Iterator[None]:
     """The redactor as it was before BACKLOG #3318: every field run scrubbed as main scrubs it."""
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(redaction, "_glued_value", lambda *args: None)
+        patch.setattr(redaction, "_glued_value", lambda *args, **kwargs: None)
         yield
 
 

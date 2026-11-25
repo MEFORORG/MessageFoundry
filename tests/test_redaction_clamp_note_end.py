@@ -73,7 +73,12 @@ def _main() -> Iterator[None]:
         return end_tag(*args, **kwargs)
 
     def main_glued_value(
-        text: str, body: str, run: re.Match[str], field_run: re.Pattern[str]
+        text: str,
+        body: str,
+        run: re.Match[str],
+        field_run: re.Pattern[str],
+        *,
+        noted: bool = False,
     ) -> str | None:
         token, end = run.group(), run.end()
         note_follows = len(body) < len(text) and text.startswith("\n", len(body))
@@ -138,16 +143,55 @@ def test_the_log_chain_masks_a_value_its_clamp_left_last(text: str, value: str) 
 
 
 @pytest.mark.parametrize(("text", "value"), _FIELD_RUN_VALUES[:4] + _END_TAG_RESTS[:2])
-def test_safe_text_still_judges_its_heads_last_value_as_ending_the_text(
-    text: str, value: str
-) -> None:
-    """A residual the changelog names: :func:`redaction.safe_text` appends its note after it
-    redacts, and its answer is main's. Reading a stand-in note after the head was withdrawn after
-    code review round 3, which found a ``bearer`` gate it flipped (pinned below)."""
+def test_safe_text_masks_a_value_its_bound_left_last(text: str, value: str) -> None:
+    """The root fix on the ``safe_text`` route: it redacts its head told, out of band, that its
+    bound note follows, so a value the bound left last is masked as the clamp route masks it. Red
+    on the code before: the value printed in front of the note. The answer is main's with letters
+    and digits masked, nothing else changed."""
     routed = text + " " + "q" * 70_000
     with _main():
-        main = (safe_text(routed, limit=400), safe_exc(ValueError(routed)))
-    assert (safe_text(routed, limit=400), safe_exc(ValueError(routed))) == main
+        main = safe_text(routed, limit=400)
+    assert value in main  # the premise: main printed it
+    out = safe_text(routed, limit=400)
+    assert value not in out, out
+    assert _is_main_masked(out, main), (out, main)
+
+
+@pytest.mark.parametrize(("text", "value"), _FIELD_RUN_VALUES[:2] + _END_TAG_RESTS[:2])
+def test_verify_detail_masks_a_value_its_clamp_left_last(text: str, value: str) -> None:
+    """The same fix on ``verify_leaf.safe_detail_text``, which clamps and appends the note after its
+    passes. Red on the code before: the value printed in front of the note."""
+    from messagefoundry.verify_leaf import safe_detail_text
+
+    routed = text + " " + "q" * 70_000
+    with _main():
+        main = safe_detail_text(routed, limit=400)
+    assert value in main  # the premise: main printed it
+    assert value not in safe_detail_text(routed, limit=400)
+
+
+@pytest.mark.parametrize("gap", ["\t", " \t", "\t\t", "  "], ids=repr)
+def test_safe_text_masks_a_value_whitespace_left_before_its_cut(gap: str) -> None:
+    """The cut lands on the last whitespace, so a run of it can stay after the head's last value.
+    That whitespace is dropped before the head is read, as the answer drops it anyway, so the value
+    is still the one the note follows. Red on the code before: ``12345`` printed."""
+    routed = "a|b|mrn: 12345" + gap + "q" * 70_000
+    with _main():
+        main = safe_text(routed)
+    assert "12345" in main  # the premise
+    out = safe_text(routed)
+    assert "12345" not in out and _is_main_masked(out, main), (out, main)
+
+
+def test_safe_exc_masks_it_through_safe_text() -> None:
+    """``safe_exc`` renders a message through :func:`safe_text`, so it takes the fix with no change
+    of its own. Red on the code before: the value printed."""
+    routed = "a|b|mrn: 12345 " + "q" * 70_000
+    with _main():
+        main = safe_exc(ValueError(routed))
+    assert "12345" in main  # the premise
+    out = safe_exc(ValueError(routed))
+    assert "12345" not in out and _is_main_masked(out, main), (out, main)
 
 
 @pytest.mark.parametrize(
@@ -187,6 +231,16 @@ _CORPUS = tuple(text for text, _ in _FIELD_RUN_VALUES + _END_TAG_RESTS) + (
     '{"name": "Zqx Doe", "id": 4455}',
     "DOE, JANE 19800505",
     "nonnumeric port: 'Zqx 4455",
+    # The inputs of this row's earlier regressions, so the safe_text fix is measured on them: the
+    # round-3 scheme gate, the reverted PR 3093 rests, and a round main ran that a mask must not.
+    "x%7Cy%7Cz bearer",
+    "PID%7C123%7CDOE bearer",
+    "PID%7C1%7C2 a|b|mrn: 12345 bearer",
+    "a|b|</family Zqxdoe>",
+    "a|b|</family Zqxdoe Vandt",
+    "a|b|</family Li",
+    "</given Doe>&Smith, Jones=PID|x",
+    "user svcadmin Login Password: svcadmin",
 )
 
 
@@ -200,6 +254,9 @@ def test_no_route_unmasks_what_main_masked(text: str, suffix: str) -> None:
         "redact twice": lambda t: redact(redact(t)),
         "safe_text": lambda t: safe_text(t, limit=4096),
         "safe_text padded": lambda t: safe_text(t + " " + "q" * 70_000, limit=4096),
+        "safe_text padded twice": lambda t: safe_text(
+            safe_text(t + " " + "q" * 70_000, limit=4096) + " " + "q" * 70_000, limit=4096
+        ),
         "chain padded": lambda t: _through_the_chain(t + " " + "q" * 70_000),
         "untrusted stacked": lambda t: redaction.redact_untrusted(f"{t}\n{_NOTE} " + "q" * 70_000),
     }
