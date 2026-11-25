@@ -120,6 +120,7 @@ __all__ = [
     "safe_exc",
     "safe_name",
     "safe_text",
+    "redact_bounded_head",
     "safe_text_bound",
     "safe_traceback",
     "sqlite_errorname_of",
@@ -2844,14 +2845,28 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     out of band (:func:`_redact_noted`), not written into the head: a stand-in note in the text let
     a whole-text gate in :func:`_redact_unguarded` read a final ``bearer`` as a scheme, which
     switched off a scrub the answer without it made. A text that fits the window has no note, and
-    is redacted as before."""
+    is redacted as before. :func:`redact_bounded_head` holds this part."""
     head, note = safe_text_bound(text)
+    return f"{_held_back(redact_bounded_head(head, note), limit)}{note}"
+
+
+def redact_bounded_head(head: str, note: str) -> str:
+    """``head``, the part of a text a bound cut kept, redacted knowing that ``note``, the bound
+    note appended after it, follows (BACKLOG #5925), and stripped. ``note`` is ``""`` when nothing
+    was cut, and ``head`` is then redacted as :func:`redact` redacts any text.
+
+    One place for what :func:`safe_text`, the off-box audit tee and
+    ``verify_leaf.safe_detail_text`` each do with a head they bound, so the three answer alike:
+    ``_held_back(redact_bounded_head(head, note), limit) + note`` is ``safe_text(text, limit=limit)``
+    for ``(head, note) = safe_text_bound(text)``. With a note, the head's trailing whitespace is
+    dropped first: a cut can leave it after the head's last value, the answer is stripped anyway,
+    and without it that value ends the head and is judged as the note's neighbour. The note goes
+    to the passes out of band (:func:`_redact_noted`); this changes more than the end-of-text
+    refusals, at least a whole-text gate that reads trailing whitespace, such as the one
+    :func:`_redact_unguarded` keeps for a final ``bearer``."""
     if note:
-        # The cut can leave whitespace after the head's last value, and the answer is stripped
-        # anyway; without it, that value ends the head and is judged as the note's neighbour.
         head = head.rstrip()
-    message = _held_back(_redact_noted(head, noted=bool(note)).strip(), limit)
-    return f"{message}{note}"
+    return _redact_noted(head, noted=bool(note)).strip()
 
 
 def safe_text_bound(text: str) -> tuple[str, str]:
@@ -2860,7 +2875,10 @@ def safe_text_bound(text: str) -> tuple[str, str]:
 
     For a caller that scrubs that part itself before :func:`safe_text` bounds it, as the off-box
     audit tee does (BACKLOG #3045). A scrub that lengthens ``head`` past the window makes
-    :func:`safe_text` cut it again and append a second bound note."""
+    :func:`safe_text` cut it again and append a second bound note. ``safe_text(head) + note`` is
+    not ``safe_text(text)``: :func:`safe_text` on the head alone sees no note after it, so a value
+    the cut left last is judged as ending the text (BACKLOG #5925). :func:`redact_bounded_head`
+    gives the head's answer as :func:`safe_text` gives it."""
     head, dropped = _clamp(text, _REDACT_WINDOW)
     return head, (f" {_clamp_marker(dropped)}" if dropped else "")
 

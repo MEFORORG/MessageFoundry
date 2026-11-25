@@ -1853,12 +1853,16 @@ def test_safe_text_reports_the_two_counts_apart() -> None:
 
 
 def test_safe_text_bound_splits_safe_text_into_its_head_and_its_note() -> None:
-    """``safe_text(head) + note`` is ``safe_text(text)`` (BACKLOG #3045). A text that fits has no
-    note and is its own head."""
-    for text in (_over_window(" tail"), "DOE JANE short"):
+    """``redact_bounded_head(head, note)``, held back and with the note after it, is
+    ``safe_text(text)`` (BACKLOG #3045, #5925). A text that fits has no note and is its own head.
+    The last input ends in a value the cut leaves last, which ``safe_text(head)`` alone keeps."""
+    for text in (_over_window(" tail"), "DOE JANE short", "a|b|mrn: 12345 " + "q" * 70_000):
         head, note = safe_text_bound(text)
-        assert safe_text(head) + note == safe_text(text)
+        bounded = redaction._held_back(redaction.redact_bounded_head(head, note), 200)
+        assert bounded + note == safe_text(text)
         assert (head is text) == (note == "")
+    head, note = safe_text_bound("a|b|mrn: 12345 " + "q" * 70_000)
+    assert "12345" in safe_text(head) and "12345" not in safe_text(head + " " + "q" * 70_000)
     assert safe_text_bound(_over_window(" tail"))[1].startswith(" [redaction bound: dropped ")
 
 

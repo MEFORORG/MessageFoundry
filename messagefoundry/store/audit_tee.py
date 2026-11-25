@@ -49,9 +49,12 @@ from messagefoundry.logging_setup import (
     sink_readings,
 )
 from messagefoundry.redaction import (
+    _DEFAULT_LIMIT,
     _REDACT_WINDOW,
     _REDACTED,
+    _held_back,
     clamp_untrusted,
+    redact_bounded_head,
     safe_text,
     safe_text_bound,
 )
@@ -306,7 +309,12 @@ def _bounded_detail(kept: str, note: str, old: str) -> str:
     """``kept``, the scrubbed detail, bounded by :func:`~messagefoundry.redaction.safe_text` as
     the value was, with ``note``, the bound note ``safe_text`` gave the value, which the scrub's
     own window cut off. Where ``old``, the detail the line before #3045 shipped, parses as JSON
-    and the bounded result does not, it ships as the JSON string ``"[redacted]"`` instead."""
+    and the bounded result does not, it ships as the JSON string ``"[redacted]"`` instead.
+
+    ``safe_text`` here does not see ``note``, so a value the cut left last in ``kept`` is judged
+    as ending the text and can print, where the unscrubbed path's answer
+    (:func:`~messagefoundry.redaction.redact_bounded_head`) masks it: a residual of BACKLOG
+    #5925."""
     shipped = safe_text(kept) + note
     if _parses(old) and not _parses(shipped):
         return json.dumps(_FIELD_REDACTED)
@@ -630,9 +638,10 @@ def emit_audit_tee(
             tee_detail = _withhold_detail(detail)
         except Exception:  # noqa: BLE001 - its fault warning can raise; the row is committed
             tee_detail = _DETAIL_WITHHELD_WHOLE
-    # safe_text(head) + note is safe_text(tee_detail); the note is kept for a scrubbed detail.
+    # This is safe_text(tee_detail), split so the note is kept for a scrubbed detail: the head is
+    # redacted knowing the note follows (redact_bounded_head, BACKLOG #5925), as safe_text does.
     head, note = safe_text_bound(tee_detail) if tee_detail else ("", "")
-    old_detail = safe_text(head) + note
+    old_detail = _held_back(redact_bounded_head(head, note), _DEFAULT_LIMIT) + note
     texts: dict[str, str | None] = {
         "action": action,
         "actor": actor,

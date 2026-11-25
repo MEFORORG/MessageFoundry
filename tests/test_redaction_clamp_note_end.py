@@ -14,6 +14,7 @@ from __future__ import annotations
 import inspect
 import logging
 import re
+from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -22,6 +23,7 @@ import pytest
 
 from messagefoundry import logging_setup, redaction
 from messagefoundry.redaction import redact, safe_exc, safe_text
+from messagefoundry.verify_leaf import safe_detail_text
 
 _NOTE = redaction._clamp_marker(70_000)
 _JOINERS = {"newline": "\n", "space": " "}
@@ -103,12 +105,35 @@ def _main() -> Iterator[None]:
         note = redaction._TRAILING_NOTES.search(text)
         return text if note is None else text[: note.start()]
 
+    def main_bounded_head(head: str, note: str) -> str:
+        # Main's safe_text head: redacted as it stood, no whitespace dropped, no note told.
+        return redact(head).strip()
+
     with pytest.MonkeyPatch.context() as patch:
+        if hasattr(redaction, "redact_bounded_head"):
+            patch.setattr(redaction, "redact_bounded_head", main_bounded_head)
         patch.setattr(redaction, "_without_trailing_note", last_note_only)
         patch.setattr(redaction, "_glued_value", main_glued_value)
         patch.setattr(redaction, "_maskable_rest", maskable_off)
         patch.setattr(redaction, "_end_tag_rest", end_tag_off)
         yield
+
+
+#: Routes whose dropped whitespace at the cut can switch a whole-text gate, such as the final
+#: ``bearer`` one, toward more scrubbing, so their answer is not main's with masks alone.
+_GATE_ROUTES = frozenset({"safe_text tab gap", "verify tab gap"})
+
+
+def _hides_at_least_main(out: str, main: str) -> bool:
+    """Whether every word ``out`` prints is a word ``main`` prints (counted), a shape mask, or holds
+    the placeholder: so ``out`` prints nothing ``main`` hid."""
+    left = Counter(main.split())
+    for word in out.split():
+        if left[word] > 0:
+            left[word] -= 1
+        elif redaction._REDACTED not in word and word.translate(redaction._SHAPE) != word:
+            return False
+    return True
 
 
 def _is_main_masked(out: str, main: str) -> bool:
@@ -259,12 +284,29 @@ def test_no_route_unmasks_what_main_masked(text: str, suffix: str) -> None:
         ),
         "chain padded": lambda t: _through_the_chain(t + " " + "q" * 70_000),
         "untrusted stacked": lambda t: redaction.redact_untrusted(f"{t}\n{_NOTE} " + "q" * 70_000),
+        # Round-1 review of this fix: whitespace at the cut, which the bounded head drops, and
+        # the verify detail route, which takes the same head rule.
+        "safe_text tab gap": lambda t: safe_text(t + " \t" + "q" * 70_000, limit=4096),
+        "verify padded": lambda t: safe_detail_text(t + " " + "q" * 70_000, limit=4096),
+        "verify tab gap": lambda t: safe_detail_text(t + "\t\t" + "q" * 70_000, limit=4096),
     }
     for route, call in routes.items():
         with _main():
             main = call(text + suffix)
         out = call(text + suffix)
-        assert _is_main_masked(out, main), (route, out, main)
+        check = _hides_at_least_main if route in _GATE_ROUTES else _is_main_masked
+        assert check(out, main), (route, out, main)
+
+
+def test_whitespace_dropped_at_the_cut_switches_the_bearer_gate_toward_scrubbing() -> None:
+    """Round-1 review of the safe_text fix: dropping the head's trailing whitespace changes
+    ``_redact_unguarded``'s final-``bearer`` gate too, the gate a stand-in note once flipped the
+    wrong way. Here it goes the safe way: main printed the encoded run, the bounded head scrubs it."""
+    routed = "x%7Cy%7Cz bearer \t" + "q" * 70_000
+    with _main():
+        main = safe_text(routed)
+    assert "%7C" in main  # the premise
+    assert "%7C" not in safe_text(routed)
 
 
 @pytest.mark.parametrize("joiner", list(_JOINERS.values()), ids=list(_JOINERS))

@@ -88,7 +88,12 @@ def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     path, the words an operator needs here. This is best-effort, with at least the residuals
     ``secretscrub`` and :mod:`messagefoundry.redaction` state, and the PHI pass can blank a
     capitalized two-word phrase such as ``Program Files``."""
-    from messagefoundry.redaction import _DEFAULT_LIMIT, _held_back, _redact_noted, clamp_untrusted
+    from messagefoundry.redaction import (
+        _DEFAULT_LIMIT,
+        _held_back,
+        clamp_untrusted,
+        redact_bounded_head,
+    )
 
     # Without the masked tails (BACKLOG #5546 to #5550): _printed_by_both counts word fragments, and
     # a tail's "x" run is a fragment neither result hid, so the tails printed words this hid.
@@ -100,20 +105,15 @@ def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     head, note = bounded.rsplit("\n", 1) if bounded is not text else (bounded, "")
     # Each PHI pass is told the note follows the head, so a value the clamp left last is not judged
     # as ending the text and kept (BACKLOG #5925, as safe_text and the clamp route judge it).
-    noted = bool(note)
-    if noted:  # trailing whitespace would hide the last value from the note, as in safe_text
-        head = head.rstrip()
-    phi_first = scrub_credentials(_redact_noted(head, noted=noted), placeholder=_PLACEHOLDER)
-    credentials_first = _redact_noted(
-        scrub_credentials(head, placeholder=_PLACEHOLDER), noted=noted
-    )
+    phi_first = scrub_credentials(redact_bounded_head(head, note), placeholder=_PLACEHOLDER)
+    credentials_first = redact_bounded_head(scrub_credentials(head, placeholder=_PLACEHOLDER), note)
     cleaned = _printed_by_both(phi_first, credentials_first, head)
     # Not safe_text: every character of ``cleaned`` was scanned above, but its placeholders can push
     # it past safe_text's work window, whose note would then call scanned characters unscanned. So
     # the PHI pass once more over the whole of it, which the placeholders at most multiply from a
     # bounded head, then safe_text's length bound alone.
     shown = _held_back(
-        _redact_noted(cleaned, noted=noted).strip(), _DEFAULT_LIMIT if limit is None else limit
+        redact_bounded_head(cleaned, note), _DEFAULT_LIMIT if limit is None else limit
     )
     return f"{shown} {note}" if note else shown
 
