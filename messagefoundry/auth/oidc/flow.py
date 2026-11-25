@@ -50,7 +50,7 @@ DEFAULT_FLOW_TTL_SECONDS = 300.0
 #: the operator's choice, which ``[auth].oidc_flow_ttl_seconds`` bounds more tightly. The floor is
 #: far above the float spacing of any clock reading this engine will see, so every deadline moves
 #: past the instant it is stamped at. The ceiling is a judgment: past a day, one abandoned flow
-#: holds its cap slot for as good as ever.
+#: holds its cap slot for as good as forever.
 _MIN_FLOW_TTL_SECONDS = 1.0
 _MAX_FLOW_TTL_SECONDS = 86_400.0
 DEFAULT_FLOW_CACHE_MAX = 512
@@ -201,8 +201,8 @@ class FlowCache:
         # one as it is staged. It is read by the rule ``transports.base.float_setting`` holds, which
         # also keeps the value out of the message; imported lazily, as ``exchange_code`` imports
         # transports, so this package takes no module-scope transports import. Text is refused
-        # first: that rule reads text because settings can arrive as text, and this cache's only
-        # caller passes a validated number.
+        # first: that rule reads text because settings can arrive as text, and ``AuthService``
+        # passes the validated ``[auth].oidc_flow_ttl_seconds`` int.
         from messagefoundry.transports.base import float_setting  # noqa: PLC0415
 
         if isinstance(ttl_seconds, str):
@@ -560,12 +560,14 @@ def exchange_code(
         # below is raised either way.
         try:
             refused_reply.close()
-        except OSError as close_exc:
-            _log.debug(
+        except (OSError, ValueError) as close_exc:
+            _log.warning(
                 "closing a refused token-endpoint reply failed: %s", type(close_exc).__name__
             )
-        # The HTTPError's traceback holds this frame, so the local would keep the two in a cycle.
-        del refused_reply
+        finally:
+            # The HTTPError's traceback holds this frame, so the local would keep the two in a
+            # cycle, and the frame would keep the unread reply reachable.
+            del refused_reply
     if refusal is not None:
         if unreachable:
             raise TokenEndpointUnreachableError(refusal)

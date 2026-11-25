@@ -19,13 +19,17 @@ from __future__ import annotations
 import contextlib
 import datetime
 import gc
+import io
 import ipaddress
+import logging
 import socket
 import ssl
 import threading
+import traceback
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
+from email.message import Message
 from pathlib import Path
 from typing import Any
 
@@ -221,7 +225,12 @@ class _KeepingOpener(urllib.request.OpenerDirector):
         self._inner = inner
         self.kept: list[urllib.error.HTTPError] = []
 
-    def open(self, fullurl: Any, data: Any = None, timeout: Any = None) -> Any:
+    def open(
+        self,
+        fullurl: Any,
+        data: Any = None,
+        timeout: Any = socket._GLOBAL_DEFAULT_TIMEOUT,  # type: ignore[attr-defined]
+    ) -> Any:
         try:
             return self._inner.open(fullurl, data, timeout)
         except urllib.error.HTTPError as exc:
@@ -295,3 +304,51 @@ def test_the_instrument_reads_a_held_error_reply_as_open(tmp_path: Path) -> None
             for kept in held:
                 kept.close()
     assert len(held) == 1 and held[0].code == 400
+
+
+class _ClosingFails(io.BytesIO):
+    """An error reply whose first close raises, as a socket torn down mid-close can. Later closes
+    succeed, so finalization does not raise again."""
+
+    failed = False
+
+    def close(self) -> None:
+        if not self.failed:
+            self.failed = True
+            raise OSError("synthetic close failure")
+        super().close()
+
+
+class _RefusingOpener(urllib.request.OpenerDirector):
+    """Raises one ``HTTPError`` over a reply whose close fails, with no socket at all."""
+
+    def open(
+        self,
+        fullurl: Any,
+        data: Any = None,
+        timeout: Any = socket._GLOBAL_DEFAULT_TIMEOUT,  # type: ignore[attr-defined]
+    ) -> Any:
+        raise urllib.error.HTTPError(
+            "https://idp.invalid/token", 400, "Bad Request", Message(), _ClosingFails(b"body")
+        )
+
+
+def test_a_close_that_fails_still_refuses_with_nothing_chained(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """RED when: a failing close escapes ``exchange_code``, chains the ``HTTPError`` onto the
+    refusal, logs more than the failure's class, or leaves the reply on the frame."""
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.auth.oidc.flow"),
+        pytest.raises(oidc.TokenRefusedError) as raised,
+    ):
+        _exchange("https://idp.invalid/token", _RefusingOpener())
+    err = raised.value
+    assert err.status == 400
+    assert err.__context__ is None and err.__cause__ is None
+    assert [r.getMessage() for r in caplog.records] == [
+        "closing a refused token-endpoint reply failed: OSError"
+    ]
+    walked = traceback.walk_tb(err.__traceback__)
+    mine = [frame for frame, _ in walked if frame.f_code.co_name == "exchange_code"]
+    assert mine and "refused_reply" not in mine[0].f_locals
