@@ -3,8 +3,8 @@
 """``store/metadata.py`` JSON hardening: no bare NaN/Infinity token from the reference sink (BACKLOG
 #6711), and deeply nested JSON does not escape the decoders tested here as json's ``RecursionError``
 (BACKLOG #6712): the header decoder reads it as malformed, while ``merge_user_metadata`` and
-``user_metadata`` raise ``MetadataTooDeepError``. ``intake_of`` is another reader of the same cell and
-is not covered here."""
+``user_metadata`` raise ``MetadataTooDeepError``. Other readers of ``messages.metadata``, at least
+``intake_of`` and readers in the store backends, are not covered here."""
 
 from __future__ import annotations
 
@@ -157,7 +157,7 @@ async def test_a_toml_nan_fails_the_sync_and_writes_no_snapshot(
         await store.close()
 
 
-# --- #6712: the three decoders; only the header decoder reads deep nesting as empty ----------
+# --- #6712: the decoders above; only the header decoder reads deep nesting as empty ----------
 
 
 def test_the_deep_input_really_reaches_the_recursion_limit() -> None:
@@ -228,8 +228,9 @@ def test_user_metadata_reads_plain_malformed_input_as_none() -> None:
 
 @pytest.mark.parametrize("deep", [_DEEP, _DEEP.encode("ascii")], ids=["str", "bytes"])
 def test_user_metadata_raises_on_a_cell_too_deep_to_decode(deep: Any) -> None:
-    """None would send a dynamic_headers delivery out without its headers; on main json's
-    RecursionError faulted it instead, so the delivery retried. Raised unchained, content-free."""
+    """None would send a dynamic_headers delivery out without its headers; before PR 2879 json's
+    RecursionError reached the delivery worker's internal-error arm instead, as this error does
+    now. Raised unchained, content-free."""
     with pytest.raises(MetadataTooDeepError) as info:
         user_metadata(deep)
     assert info.value.__cause__ is None
@@ -292,8 +293,9 @@ async def test_the_delivery_worker_takes_a_too_deep_bag_on_its_internal_error_ar
     status: OutboxStatus,
 ) -> None:
     """BACKLOG #6712 item 17: the worker's handling of ``MetadataTooDeepError``, pinned as main
-    behaves. Nothing is sent; the default policy dead-letters the row and ``stop`` halts the lane
-    with the row kept pending. Control: an intact cell on the same runner delivers its headers."""
+    behaves. Nothing is sent; the default policy dead-letters the row, and ``stop`` returns STOPPED
+    with the row re-pended below the retry cap (lane hold and alert are not asserted here).
+    Control: an intact cell on the same runner delivers its headers."""
     store = await MessageStore.open(tmp_path / "worker.db")
     try:
         sender = _Sender(consumes_metadata=True)
