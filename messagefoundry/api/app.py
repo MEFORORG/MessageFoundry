@@ -1075,17 +1075,19 @@ _CONTROL_ACTION_SIDE: Final = {"restart_inbound": "inbound", "restart_outbound":
 #: Which side of the graph raises each alert event type (BACKLOG #3378). ``"outbound"`` marks a type
 #: whose emitters, read on 2026-11-22, raise it only for an outbound lane, ``"both"`` one raised
 #: on both sides, ``"inbound"`` one raised only on the inbound side, and ``"none"`` one whose
-#: emitters were read as keying it only on something other than a connection name, a label such
-#: as a sink's or ``dr_backup``. The withholding rule is stated in docs/SECURITY.md, in the
-#: ``GET /alerts/rules`` paragraph, and applied in that route's ``visible()``; it binds a
-#: channel-scoped caller only, since an all-channels caller sees every rule whatever the side.
-#: For a scoped caller, a side recorded lower than the emitters justify (outbound above both,
-#: both above inbound and none) shows a rule that should be withheld, in at least these cases: an
-#: outbound-only type read as ``"inbound"`` or ``"none"`` (a ``"*"`` rule, or one naming an
-#: in-scope inbound) or as ``"both"`` (a rule naming an in-scope inbound); and a type both sides
-#: raise read as ``"inbound"`` or ``"none"`` (a ``"*"`` rule). A higher side only withholds more,
-#: so record ``"outbound"`` when unsure, as an unmapped type already reads. No test checks a value
-#: against the emitters. A test pins the keys to
+#: emitters were read as keying it on something other than a connection name, a label such as a
+#: sink's or ``dr_backup``; a type any emitter keys on a connection name is not ``"none"``. The
+#: withholding rule is stated in docs/SECURITY.md, in the text that opens "``GET /alerts/rules``
+#: shows a scoped caller", and applied in that route's ``visible()``; it binds a channel-scoped
+#: caller only, since an all-channels caller sees every rule whatever the side. For a scoped
+#: caller, a side recorded lower than the emitters justify (outbound above both, both above
+#: inbound and none, which rank alike) lets a rule pass the side test that should fail it, in at
+#: least these cases: an outbound-only type read as ``"inbound"`` or ``"none"`` (a ``"*"`` rule,
+#: or one naming a connection) or as ``"both"`` (a rule naming a connection); and a type both
+#: sides raise read as ``"inbound"`` or ``"none"`` (a ``"*"`` rule). A higher side only withholds
+#: more, so record ``"outbound"`` when unsure, which is also how ``visible()`` reads a type missing
+#: from this map, except ``"any"``, which it reads as ``"both"``. No test checks a value against
+#: the emitters. A test pins the keys to
 #: ``config.settings._ALERT_EVENT_TYPES``, so a new type has to be classified.
 _ALERT_EVENT_SIDE: Final[Mapping[str, str]] = MappingProxyType(
     {
