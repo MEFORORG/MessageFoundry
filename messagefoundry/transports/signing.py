@@ -617,9 +617,10 @@ def unverified_jws_header(jws: str) -> dict[str, Any]:
     Named for the danger. A relying party must read ``kid`` *before* it can select a key, so this step
     is unavoidable — but nothing it returns is trustworthy. Use it to pick a key, and to refuse a
     JWS before its signature is checked, as :func:`refuse_critical_extensions` and the ``id_token``
-    ``typ`` assertion do: a value read here may refuse the JWS, never accept it. Use it for nothing
-    else; every value that matters (``alg`` included) is re-read from the verified header inside
-    :func:`verify_compact_jws`."""
+    ``typ`` assertion do: a value read here may refuse the JWS, never accept it. In
+    :func:`verify_compact_jws` its ``alg`` also selects the verification algorithm, held to the
+    allowed set and bound by the signing input; nothing re-reads a verified copy of this header.
+    Use it for nothing else."""
     parts = jws.split(".")
     if len(parts) != 3:
         raise SigningError("compact JWS must be 'header.payload.signature' (three segments)")
