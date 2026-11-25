@@ -30,7 +30,7 @@ from messagefoundry_toolkit.anon import anonymize as engine_anonymize
 from tee.anon import anonymize as tee_anonymize
 
 _BOTH = pytest.mark.parametrize("rules_module", (engine_rules, tee_rules), ids=("engine", "tee"))
-_SALT = "b254-2997-salt-0123456789abcdef"
+_SALT = "b254-2997-salt-0123456789abcdef-0123456789"
 _MSG = "\r".join(
     (
         r"MSH|^~\&|APP|FAC|RCV|RFAC|20260101120000||ADT^A01|M1|P|2.5.1",

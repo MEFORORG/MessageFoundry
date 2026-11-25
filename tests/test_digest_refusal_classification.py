@@ -1036,8 +1036,10 @@ _DIGEST_PROXY_SETTINGS: dict[str, object] = {
 }
 
 
-def _digest_proxied_lookup(**token: object) -> FhirLookupExecutor:
-    settings = {"url": "http://fhir.partner.invalid/fhir", **_DIGEST_PROXY_SETTINGS, **token}
+def _digest_proxied_lookup(
+    token: dict[str, object], *, url: str = "http://fhir.partner.invalid/fhir"
+) -> FhirLookupExecutor:
+    settings = {"url": url, **_DIGEST_PROXY_SETTINGS, **token}
     with active_hop_posture(_WARN_DIAL):
         return FhirLookupExecutor({"epic": settings}, egress=permitting(settings))
 
@@ -1054,7 +1056,7 @@ def _smart_settings(private_key: str) -> dict[str, object]:
 
 @pytest.mark.usefixtures("no_bypass")
 def test_a_fhir_lookup_with_oauth2_settings_behind_a_digest_proxy_builds() -> None:
-    ex = _digest_proxied_lookup(**_OAUTH2_SETTINGS)
+    ex = _digest_proxied_lookup(_OAUTH2_SETTINGS)
     assert ex._token["epic"] is None
 
 
@@ -1063,11 +1065,15 @@ def test_a_fhir_lookup_with_smart_and_oauth2_settings_is_refused_by_its_smart_pr
     ec_pem: str,
 ) -> None:
     """THE CONTROL, as on main: a FhirLookup builds its SMART provider whatever OAuth2 settings sit
-    beside it, and that provider refuses the Digest proxy when it is built."""
+    beside it, and that provider refuses the Digest proxy when it is built. The read hop is
+    loopback, because a cleartext read off this machine now refuses the SMART bearer before the
+    provider is built (BACKLOG #8299 item 4)."""
     from messagefoundry.transports.smart import SmartAuthError
 
     with pytest.raises(SmartAuthError, match=_DIGEST_PROXY_REFUSED):
-        _digest_proxied_lookup(**_smart_settings(ec_pem), **_OAUTH2_SETTINGS)
+        _digest_proxied_lookup(
+            {**_smart_settings(ec_pem), **_OAUTH2_SETTINGS}, url="http://127.0.0.1:9/fhir"
+        )
 
 
 @pytest.mark.usefixtures("no_bypass")

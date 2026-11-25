@@ -139,6 +139,7 @@ from messagefoundry.store.crypto import (
     AADComponentError,
     AesGcmCipher,
     AuditKeyVersionRefusedError,
+    AuditKeyVersionUnverifiedError,
     AuditMacFn,
     AuditMacMalformedError,
     AuditMacVerifier,
@@ -155,7 +156,6 @@ from messagefoundry.store.crypto import (
     cipher_info,
     cipher_meta_key,
     decrypt_json_cell,
-    encrypt_many,
     report_sealed_surface,
     reseal_rotation_fingerprints,
     rotation_fingerprint_cipher,
@@ -227,6 +227,7 @@ from messagefoundry.store.row_seal import (
     revoke_seal_refusals,
     row_sealer_for_cipher,
     seal_bytes,
+    seal_chunks,
     seal_row_ref,
     transit_seal_refusals,
 )
@@ -2172,19 +2173,42 @@ def cancels_at_entry() -> int:
 
 def _force_failed_open_release(
     force_release: Callable[[], object] | None, *, after: str = "a failed store open"
-) -> None:
+) -> bool:
     """Call a backend's synchronous release, logging a failure by class (vault BACKLOG #3054).
-    None is a caller with nothing it can release without waiting."""
+    None is a caller with nothing it can release without waiting. True only when a release ran
+    and returned something other than ``False``, which a release made of several steps returns
+    when one of them failed, so a caller's log line says the release happened only then (BACKLOG
+    #5720)."""
     if force_release is None:
-        return
+        return False
     try:
-        force_release()
+        return force_release() is not False
     except Exception as failure:  # noqa: BLE001 — never mask the open's error
         log.warning(
             "forcing the release after %s also failed (%s)",
             after,
             type(failure).__name__,
         )
+        return False
+
+
+def _forced_outcome(
+    force_release: Callable[[], object] | None,
+    released: bool,
+    *,
+    built: str = "what it had not closed",
+    left: str = "may still be open",
+) -> str:
+    """What a forced release left, for the log line that follows it (BACKLOG #5720). ``built``
+    names what was to be released, and ``left`` what follows when nothing released it. A release
+    that ran is not said to have released everything: on SQL Server it marks the pool closing and
+    shuts its executor down, which leaves the pool's free connections open, and on SQLite a
+    statement that ignores the interrupt keeps its worker running."""
+    if released:
+        return f"a forced release of {built} ran without waiting for it"
+    if force_release is None:
+        return f"{built} {left}"
+    return f"forcing its release failed, so {built} {left}"
 
 
 def _read_stop_outcome(future: asyncio.Future[Any]) -> None:
@@ -2204,6 +2228,20 @@ def _stop_unawaited(conn: aiosqlite.Connection) -> None:
     future = conn.stop()
     if future is not None:
         future.add_done_callback(_read_stop_outcome)
+
+
+def _force_stop_connections(conns: Sequence[aiosqlite.Connection]) -> bool:
+    """Interrupt and stop each of ``conns`` without waiting, each step's failure logged by class.
+    False when any step failed, so the caller does not report them released (BACKLOG #5720).
+    interrupt() aborts a statement the worker is running, so the close stop() queues behind it is
+    reached; stop() does not await it."""
+    released = True
+    for conn in conns:
+        raw = getattr(conn, "_connection", None)
+        if raw is not None:
+            released &= _force_failed_open_release(raw.interrupt)
+        released &= _force_failed_open_release(functools.partial(_stop_unawaited, conn))
+    return released
 
 
 def _log_abandoned_end(what: str, task: asyncio.Future[tuple[bool, BaseException | None]]) -> None:
@@ -2272,8 +2310,8 @@ async def cleanup_failed_open(
     cleanup until a cancel lands; from then it gets at most :data:`FAILED_OPEN_CANCEL_BOUND_S`.
     The bound starts at once when the open's own end was a cancel, or a cancel this open received
     under another exception, or an exit such as ``SystemExit`` that must not wait unbounded. Past
-    the bound, ``force_release`` drops what the open built without waiting, and this stops
-    waiting for the cleanup. ``force_release`` is synchronous for the same reason it is the only
+    the bound, ``force_release`` runs without waiting, which need not release everything the open
+    built (see :func:`_forced_outcome`), and this stops waiting for the cleanup. ``force_release`` is synchronous for the same reason it is the only
     thing a ``GeneratorExit`` runs: a coroutine being closed cannot await, and awaiting would
     replace the exit with a ``RuntimeError``. A ``GeneratorExit`` thrown into the wait runs it
     too, then is re-raised. ``force_release`` None is a caller with nothing to release without
@@ -2322,15 +2360,18 @@ async def cleanup_failed_open(
         remaining = None if deadline is None else deadline - loop.time()
         if remaining is not None and remaining <= 0:
             # Checked before each wait, so a cancel repeated on every pass cannot keep it away.
-            _force_failed_open_release(force_release, after=after)
+            released = _force_failed_open_release(force_release, after=after)
             log.warning(
                 "%s did not finish within %s s of %s; %s",
                 what,
                 FAILED_OPEN_CANCEL_BOUND_S,
                 trigger,
-                "what the open built was released without waiting for it"
-                if force_release is not None
-                else "it was left to finish on its own",
+                _forced_outcome(
+                    force_release,
+                    released,
+                    built="what the open built",
+                    left="is left to the cleanup, until it finishes, if it does",
+                ),
             )
             task.add_done_callback(functools.partial(_log_abandoned_end, what))
             _hold_abandoned_open_cleanup(task, what)
@@ -2365,14 +2406,10 @@ async def cleanup_failed_open(
                 break
     if task.done() and (task.cancelled() or task.result()[1] is not None):
         # The cleanup ended cancelled or failed, so what it should have closed may be open,
-        # the read pool included: drop it without waiting (BACKLOG #5720).
-        _force_failed_open_release(force_release, after=after)
+        # the read pool included: force its release without waiting (BACKLOG #5720).
+        released = _force_failed_open_release(force_release, after=after)
         ended = None if task.cancelled() else task.result()[1]
-        left = (
-            "what it had not closed was released without waiting for it"
-            if force_release is not None
-            else "what it had not closed may still be open"
-        )
+        left = _forced_outcome(force_release, released)
         if ended is None or isinstance(ended, asyncio.CancelledError):
             log.warning("%s ended cancelled before it finished; %s", what, left)
         else:
@@ -2523,6 +2560,24 @@ async def _held_seal_ok(
         return True
     parts = tuple(fields)
     return _encodes(kind, parts) and await sealer.verify_held_async(kind, parts, stored)
+
+
+def sign_in_state_refused(
+    disabled: object,
+    locked_until: float | None,
+    second_step_locked_until: float | None,
+    now: float,
+) -> bool:
+    """Whether an account's row, read inside ``create_session``'s transaction, may not take a new
+    session under ``require_sign_in_eligible`` (BACKLOG #5653): disabled, or either lock live at
+    ``now``. The values are the raw columns, so each backend's integer, boolean or bit reads alike.
+    The service's own check before the mint reads the same three states
+    (``_directory_login_refusal``); this repeats it where a concurrent disable or lockout can no
+    longer land between that check and the INSERT. A lock is live on the boundary
+    :meth:`UserRecord.sign_in_locked` and :meth:`UserRecord.second_step_locked` use."""
+    return bool(disabled) or any(
+        until is not None and now < until for until in (locked_until, second_step_locked_until)
+    )
 
 
 def new_session_record(
@@ -2995,6 +3050,56 @@ class AdminGrant(StrEnum):
 _ADMIN_GRANT_BUSY_ATTEMPTS: Final = 5
 _ADMIN_GRANT_BUSY_BACKOFF_SECONDS: Final = 0.05
 
+#: How many times ``create_session`` runs on every backend before it gives up: once per seal over
+#: the session epochs it read, made again when a revoke raised one before the insert's locked read,
+#: and on SQLite also once per busy ``BEGIN IMMEDIATE`` (BACKLOG #5653), which backs off as the
+#: first-administrator grant does. Both are rare, so a bound that is reached raises
+#: :class:`SessionMintContended` rather than spin; it is not a refusal, so it is never ``False``.
+SESSION_MINT_ATTEMPTS: Final = _ADMIN_GRANT_BUSY_ATTEMPTS
+
+#: The ``cause`` of a :class:`SessionMintContended` when SQLite answered busy to every
+#: ``BEGIN IMMEDIATE`` the insert ran (BACKLOG #5653).
+SESSION_MINT_BUSY: Final = "busy"
+#: The ``cause`` of a :class:`SessionMintContended` when a revoke raised a session epoch the seal
+#: covers before every locked read the insert ran (BACKLOG #5653).
+SESSION_MINT_EPOCH_RAISED: Final = "session_epoch_raised"
+#: The ``cause`` of a :class:`SessionMintContended` when the SQLite insert's attempts met both: at
+#: least one answered busy and at least one found the session epochs raised (BACKLOG #5653).
+SESSION_MINT_BUSY_AND_EPOCH_RAISED: Final = "busy_and_session_epoch_raised"
+#: Every ``cause`` a :class:`SessionMintContended` carries.
+SESSION_MINT_CAUSES: Final[frozenset[str]] = frozenset(
+    {SESSION_MINT_BUSY, SESSION_MINT_EPOCH_RAISED, SESSION_MINT_BUSY_AND_EPOCH_RAISED}
+)
+
+
+def session_mint_cause(*, busy: int, epoch_raised: int) -> str:
+    """The ``cause`` a contended insert names from how many of its attempts met each kind of
+    contention, so a run that met both says so rather than naming the last one alone."""
+    if busy and epoch_raised:
+        return SESSION_MINT_BUSY_AND_EPOCH_RAISED
+    return SESSION_MINT_BUSY if busy else SESSION_MINT_EPOCH_RAISED
+
+
+class SessionMintContended(RuntimeError):
+    """:meth:`~messagefoundry.store.base.AuthStore.create_session` ran its bounded attempts and
+    wrote nothing, because each one met contention rather than a refusal (BACKLOG #5653).
+    ``cause`` is one of :data:`SESSION_MINT_CAUSES`, as :func:`session_mint_cause` names it from
+    every attempt; ``attempts`` is how many ran. Exported from :mod:`messagefoundry.store`.
+
+    **Raised, never returned as ``False``.** ``False`` means the account itself refused the
+    session (gone, disabled, locked, or its binding changed), and a caller renders it as that
+    refusal. Contention says nothing about the account, so a sign-in that meets it fails as a
+    temporary server-side failure and is audited under its own reason. The message is numeric and
+    PHI-free."""
+
+    def __init__(self, cause: str, attempts: int) -> None:
+        super().__init__(cause, attempts)
+        self.cause = cause
+        self.attempts = attempts
+
+    def __str__(self) -> str:
+        return f"session insert contended ({self.cause}) after {self.attempts} attempts"
+
 
 def _is_sqlite_busy(exc: sqlite3.OperationalError) -> bool:
     """Whether ``exc`` is SQLite's busy family, ``SQLITE_BUSY_SNAPSHOT`` included."""
@@ -3238,7 +3343,7 @@ class UserRecord:
     password_claimed_at: float | None = None
     # THE ENGINE-OWNED NOTIFICATION ADDRESS (BACKLOG #1139, ASVS 6.3.7). Every out-of-band security
     # notice about this account is addressed here, and NOTHING in the directory-sync path writes it:
-    # ``update_user_profile`` -- the one call ``_upsert_ad_user`` makes on every AD/OIDC login --
+    # ``update_user_profile`` -- the one call ``_upsert_ad_user`` makes on an AD/OIDC login --
     # touches ``display_name`` and ``email`` only.
     #
     # WHY THE COLUMN EXISTS AT ALL. Before the split, one nullable column was simultaneously the
@@ -4491,10 +4596,11 @@ def discoverable_way_past(
 
 
 #: What a TOTP judgement found (BACKLOG #3422). ``"usable"``: the engine can compute codes with it.
-#: ``"refused"``: a KNOWN no, an enrolment whose marker this release refuses. ``"unknown"``: it
-#: could not be judged (the cell did not open, a cipher service did not answer, or the value could
-#: not be computed with). Only a KNOWN refusal moves any decision away from the plain
-#: ``totp_enabled`` rule; an unknown answer is treated exactly as that rule treats it.
+#: ``"refused"``: a KNOWN no, an enrolment whose marker this release refuses or whose key is too
+#: short to compute with (BACKLOG #5340), or no secret at all. ``"unknown"``: it could not be judged
+#: (the cell did not open, a cipher service did not answer, or the value is not base32). Only a
+#: KNOWN refusal moves any decision away from the plain ``totp_enabled`` rule; an unknown answer is
+#: treated exactly as that rule treats it.
 TotpState = Literal["usable", "refused", "unknown"]
 
 #: The caller's rule for what an OPENED TOTP secret is (:data:`TotpState`): the auth service's
@@ -8450,7 +8556,10 @@ async def settle_audit_ranges(
                 problem = f"the audit key-range row at seq={seq} {refusal}"  # BACKLOG #3420
                 break
             out_secret = _audit_secret_for(current, keys, host._audit_mac_fn)
-            if out_secret is not None and not _audit_tag_ok(parsed, out_secret):
+            # Under the Transit MAC the tag check is a round trip, so it runs off the loop (#3929).
+            if out_secret is not None and not await cipher_call(
+                out_secret[1], _audit_tag_ok, parsed, out_secret
+            ):
                 problem = (
                     f"the audit key-range row at seq={seq} is not authorised by the key it closes"
                 )
@@ -8618,12 +8727,15 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
         prev_hash=(rows[split - 1]["row_hash"] or "") if split else "",
     )
     sealed_head = rows[-1]["row_hash"] or ""
+    # The handover tag is a MAC under the outgoing key, routed like the open's tag check (#3929).
+    # docs/CONNECTIONS.md, the Vault Transit bulk-cipher row, says where it runs today.
+    detail = await cipher_call(out_secret[1], audit_epoch_detail, active_id, closes, out_secret)
     host._audit_range_key_id = active_id  # the range row is the first row of the new range
     try:
         await host.record_audit(
             AUDIT_KEY_EPOCH_ACTION,
             actor="system:rotate-key",
-            detail=audit_epoch_detail(active_id, closes, out_secret),
+            detail=detail,
             expect_prev=sealed_head,
         )
     except AuditHeadMovedError:
@@ -9160,14 +9272,51 @@ def write_restore_marker(
     )
 
 
-def _secure_file(path: Path) -> None:
-    """Restrict a store file to its owner — it holds PHI at rest.
+def _secure_file(path: Path, *, keep_explicit_entries: bool = False) -> None:
+    """Restrict a file to the account this process runs as — a store file holds PHI at rest.
 
     Best-effort and non-fatal: failing to tighten permissions must never stop the engine from
     starting (``docs/PHI.md``'s ops checklist covers directory-level ACLs as the backstop). On
-    POSIX this is ``chmod 0600``; on Windows ``os.chmod`` only toggles the read-only bit, so we set
-    an owner-only DACL via ``icacls`` (inheritance disabled) instead. A skipped or failed
-    restriction is **logged** (STORE-2) so it isn't silently world-readable.
+    POSIX this is ``chmod 0600``; on Windows ``os.chmod`` only toggles the read-only bit, so it
+    writes one protected DACL whole instead, granting full control to the account read from this
+    process's token. Written whole, the list replaces the entries the file carried: inherited ones,
+    and explicit allows (an explicit grant on a moved-in file, or the entries a temp directory hands
+    a file). The owner is not changed.
+
+    **What the one list carries over** (this is the one statement of the rule; ADR 0163 and the
+    helpers point here). Explicit entries only, never inherited ones, their SDDL text copied as
+    written, and ``icacls /grant:r`` kept each of them:
+
+    - every deny, placed first;
+    - the explicit OWNER RIGHTS entries, decided as a set: they are all dropped only when no deny
+      is carried and each is a plain allow (``A``) with no flags holding both READ_CONTROL and
+      WRITE_DAC; otherwise every one is carried.
+
+    Any OWNER RIGHTS entry turns off the READ_CONTROL and WRITE_DAC Windows otherwise gives an
+    owner beyond the list, and those implicit rights are granted before any deny is read, so the
+    entries are decided together and against the carried denies. When they are carried, they stay
+    as that rewrite left them. When they are dropped, the owner gets its implicit READ_CONTROL and
+    WRITE_DAC, which each dropped entry already granted, and no deny was there to withhold them.
+    An object allow (``OA``) is always carried, as ``icacls /grant:r`` kept it: one carrying an
+    ObjectType GUID grants the owner nothing on a file yet still turns off the implicit rights
+    (measured). Either way an owner other than this account can end with less than
+    ``icacls /grant:r`` left it, since the one list drops every other principal's allow, one for
+    the owner's own account or groups included: a narrowing, not a loosening. A null DACL carries
+    nothing.
+
+    Where the current list cannot be read or parsed, or the write fails other than by access
+    denied, the kept icacls rewrite below runs instead, and it keeps every explicit entry, other
+    principals' allows included. For an unreadable list that is a deliberate choice: it is what
+    the code before this one-list write did, and the bare list, the other option, would drop a
+    deny or a narrowing OWNER RIGHTS entry it cannot see, so neither is strictly safer. Each of
+    these is **logged** (STORE-2). A restriction that is skipped, or refused with access denied,
+    leaves the file's access list as it was.
+
+    ``keep_explicit_entries`` is the store trio's fallback (:func:`_secure_store_file`), unchanged,
+    and it is NOT owner-only: ``icacls /inheritance:r /grant:r``, which removes only INHERITED
+    entries and replaces only this account's own grant, so every explicit entry the file carries
+    stays. ADR 0163 relies on that: an existing store file keeps the service account's trio entry
+    when an open falls back.
 
     **NOT FOR A FILE THAT HOLDS A KEY** (vault BACKLOG #2601). This tightens a file that already
     exists, and only logs when it cannot, so a key written and then passed here would sit under the
@@ -9186,38 +9335,150 @@ def _secure_file(path: Path) -> None:
                     path,
                 )
                 return
-            # The principal is the token's SID in icacls's ``*S-...`` form, never a name, so no
-            # environment variable or name lookup chooses who is granted (vault BACKLOG #5612).
-            # icacls is pinned to its absolute System32 path and invoked without a shell; the
-            # principal is a single argv token, never a shell word, so it can't inject a flag
-            # (low-27/STORE-5). The pin is what makes "fixed system tool" true:
-            # CreateProcess resolves an unqualified name through a search path that reaches the
-            # caller's working directory, and because this call only logs on a non-zero exit, a
-            # planted icacls.exe that exits 0 would leave this PHI-adjacent file its inherited
-            # (possibly broad) ACL while reporting nothing (BACKLOG #1769).
-            result = subprocess.run(  # nosec B603 B607
-                [_system_exe("icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"*{sid}:F"],
-                check=False,
-                env=system_tool_environment(),  # the platform's start-up names only (#2716)
-                capture_output=True,
-                text=True,
-                # icacls echoes the path in the OEM code page. Neither the cp1252 locale default nor
-                # UTF-8 decodes every OEM byte (cp437 0x81, u-umlaut, is undefined in both), and a
-                # failed decode loses the output this warning logs. Only logged, so replace.
-                encoding="oem",
-                errors="replace",
-            )
-            if result.returncode != 0:
+            # The principal is the token's SID, never a name, so no environment variable or name
+            # lookup chooses who is granted (vault BACKLOG #5612).
+            if keep_explicit_entries:
+                _icacls_grant_keeping_explicit_entries(path, sid)
+                return
+            current = _read_dacl_sddl(path)
+            kept = None if current is None else _entries_the_one_list_keeps(current)
+            if kept is None:
+                if current is not None:
+                    log.warning(
+                        "could not parse the access list of %s; restricting it with icacls, which "
+                        "keeps its explicit entries",
+                        path,
+                    )
+                _icacls_grant_keeping_explicit_entries(path, sid)
+                return
+            denies, owner_rights = kept
+            # One SetNamedSecurityInfoW call, as _write_trio_dacl makes: icacls cannot drop an
+            # unnamed principal's explicit entry while granting. Denies first, the canonical order.
+            sddl = "D:P" + "".join(denies) + f"(A;;FA;;;{sid})" + "".join(owner_rights)
+            result = _set_security_from_sddl(path, sddl, protected=True)
+            if result.failure is not None or result.dacl_status != 0:
                 log.warning(
-                    "icacls could not restrict %s (exit %s): %s",
+                    "could not restrict %s to this account: %s",
                     path,
-                    result.returncode,
-                    (result.stderr or result.stdout or "").strip(),
+                    result.failure or f"Win32 status {result.dacl_status}",
                 )
+                if result.dacl_status != _ERROR_ACCESS_DENIED:
+                    # The list may be what failed (a carried entry that does not convert, say);
+                    # icacls needs no list text. It needs the same WRITE_DAC, so not after a denial.
+                    log.warning(
+                        "restricting %s with icacls instead, which keeps its explicit entries", path
+                    )
+                    _icacls_grant_keeping_explicit_entries(path, sid)
         else:
             os.chmod(path, _OWNER_ONLY)
     except OSError as exc:
         log.warning("could not restrict permissions on %s: %s", path, exc)
+
+
+#: An SDDL right that includes WRITE_DAC: file all, generic all, key all (the renderer may pick
+#: it for a file's mask), or WRITE_DAC itself.
+_SDDL_RIGHTS_WITH_WRITE_DAC = frozenset({"FA", "GA", "KA", "WD"})
+#: An SDDL right that includes READ_CONTROL: READ_CONTROL itself, and each file or generic right,
+#: since a file's generic mapping and each FILE_GENERIC_* right hold it (and key all).
+_SDDL_RIGHTS_WITH_READ_CONTROL = frozenset(
+    {"RC", "FA", "FR", "FW", "FX", "GA", "GR", "GW", "GX", "KA"}
+)
+_WRITE_DAC = 0x40000
+_READ_CONTROL = 0x20000
+_GENERIC_ALL = 0x10000000
+#: GENERIC_ALL, GENERIC_EXECUTE, GENERIC_WRITE and GENERIC_READ: each maps to READ_CONTROL on a
+#: file.
+_GENERIC_ANY = 0xF0000000
+#: OWNER RIGHTS, as an SDDL alias and as a SID.
+_OWNER_RIGHTS = frozenset({"OW", "S-1-3-4"})
+_ERROR_ACCESS_DENIED = 5
+
+
+def _grants_owner_implicit_rights(rights: str) -> bool:
+    """Does the upper-cased SDDL ``rights`` field include both READ_CONTROL and WRITE_DAC, the
+    access Windows gives an owner when no OWNER RIGHTS entry applies? A field this cannot read
+    answers ``False``, so the OWNER RIGHTS entries are carried, as ``icacls /grant:r`` kept them."""
+    if rights.startswith("0X"):
+        try:
+            mask = int(rights, 16)
+        except ValueError:
+            return False
+        return bool(mask & (_WRITE_DAC | _GENERIC_ALL)) and bool(
+            mask & (_READ_CONTROL | _GENERIC_ANY)
+        )
+    tokens = {rights[i : i + 2] for i in range(0, len(rights), 2)}
+    return bool(tokens & _SDDL_RIGHTS_WITH_WRITE_DAC) and bool(
+        tokens & _SDDL_RIGHTS_WITH_READ_CONTROL
+    )
+
+
+def _entries_the_one_list_keeps(sddl: str) -> tuple[list[str], list[str]] | None:
+    """The explicit entries of ``sddl`` that :func:`_secure_file`'s one list carries over, as SDDL
+    ACE text: ``(denies, owner_rights)``. ``None`` when the list is not plainly parseable.
+
+    The rule, and what the owner ends with, is stated once in :func:`_secure_file`'s docstring,
+    under *What the one list carries over*."""
+    start = sddl.find("D:")
+    body = sddl[start + 2 :] if start >= 0 else ""
+    end = body.find("S:")
+    if end >= 0:
+        body = body[:end]
+    first = body.find("(")
+    if start >= 0 and "NO_ACCESS_CONTROL" in (body if first < 0 else body[:first]):
+        return [], []
+    dacl = _parse_sddl_dacl(sddl)
+    if dacl is None:
+        return None
+    texts = _SDDL_ACE.findall(body)
+    if len(texts) != len(dacl.aces):
+        return None
+    denies: list[str] = []
+    owner_rights: list[str] = []
+    all_full = True
+    for text, (kind, flags, rights, ace_sid) in zip(texts, dacl.aces, strict=True):
+        flag_set = _sddl_flag_set(flags)
+        if "ID" in flag_set:
+            continue
+        if kind in _SDDL_DENY_TYPES:
+            denies.append(f"({text})")
+        elif ace_sid in _OWNER_RIGHTS:
+            owner_rights.append(f"({text})")
+            all_full = all_full and (
+                kind == "A" and not flag_set and _grants_owner_implicit_rights(rights)
+            )
+    # A carried deny can withhold the owner's implicit READ_CONTROL and WRITE_DAC only while an
+    # OWNER RIGHTS entry stays: with none left, those two are granted before any deny is read.
+    return denies, ([] if all_full and not denies else owner_rights)
+
+
+def _icacls_grant_keeping_explicit_entries(path: Path, sid: str) -> None:
+    """:func:`_secure_file`'s ``keep_explicit_entries`` rewrite. Windows only; logs, never raises
+    except ``OSError``, which the caller logs."""
+    # icacls is pinned to its absolute System32 path and invoked without a shell; the principal is
+    # a single argv token in icacls's ``*S-...`` form, never a shell word, so it can't inject a
+    # flag (low-27/STORE-5). The pin is what makes "fixed system tool" true: CreateProcess resolves
+    # an unqualified name through a search path that reaches the caller's working directory, and
+    # because this call only logs on a non-zero exit, a planted icacls.exe that exits 0 would leave
+    # this PHI-adjacent file its inherited (possibly broad) ACL while reporting nothing (#1769).
+    result = subprocess.run(  # nosec B603 B607
+        [_system_exe("icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"*{sid}:F"],
+        check=False,
+        env=system_tool_environment(),  # the platform's start-up names only (#2716)
+        capture_output=True,
+        text=True,
+        # icacls echoes the path in the OEM code page. Neither the cp1252 locale default nor
+        # UTF-8 decodes every OEM byte (cp437 0x81, u-umlaut, is undefined in both), and a
+        # failed decode loses the output this warning logs. Only logged, so replace.
+        encoding="oem",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        log.warning(
+            "icacls could not restrict %s (exit %s): %s",
+            path,
+            result.returncode,
+            (result.stderr or result.stdout or "").strip(),
+        )
 
 
 def _grant_read(path: Path, principal: str) -> None:
@@ -9239,7 +9500,10 @@ def _grant_read(path: Path, principal: str) -> None:
             env=system_tool_environment(),  # the platform's start-up names only (#2716)
             capture_output=True,
             text=True,
-            encoding="oem",  # icacls's piped output; see _secure_file for why "replace"
+            # icacls echoes the path in the OEM code page. Neither the cp1252 locale default nor
+            # UTF-8 decodes every OEM byte (cp437 0x81, u-umlaut, is undefined in both), and a
+            # failed decode loses the output this warning logs. Only logged, so replace.
+            encoding="oem",
             errors="replace",
         )
     except OSError as exc:
@@ -9257,8 +9521,10 @@ def _grant_read(path: Path, principal: str) -> None:
 async def _secure_file_async(path: Path) -> None:
     """:func:`_secure_file` dispatched off the event loop, for a caller that runs ON one.
 
-    On Windows the restriction is an ``icacls`` subprocess, measured at 21 to 28 ms per file. Called
-    straight from a coroutine, that span is dead time for every other task on the loop: a deploying
+    On Windows the restriction was an ``icacls`` subprocess, measured at 21 to 28 ms per file. It is
+    now a blocking security-descriptor read and write, unmeasured, still file I/O, and that
+    subprocess again on the fallbacks :func:`_secure_file` names. Called straight from a
+    coroutine, that span is dead time for every other task on the loop: a deploying
     site would see one such stall per secured file of every in-flight ACK, claim and delivery on each
     DR backup, because ``snapshot_to`` runs on the SERVING loop by design (see
     ``pipeline/dr_backup.py``, which keeps the consistent snapshot there and moves only the tar+AEAD
@@ -9353,8 +9619,11 @@ def _parse_sddl_dacl(sddl: str) -> _SddlDacl | None:
     """The owner and ``D:`` section of an SDDL string, or ``None`` when the DACL is absent or not
     plainly parseable.
 
-    ``None`` is the fail-closed answer: every caller treats it as "not hardened", so a shape this does
-    not understand (a callback ACE, a resource attribute, a null DACL) gets the owner-only rewrite."""
+    For the store-trio callers ``None`` is the fail-closed answer: they treat it as "not hardened",
+    so a shape this does not understand (a callback ACE, a resource attribute, a null DACL) gets the
+    owner-only rewrite. :func:`_secure_file` checks for a null DACL first, and for any other
+    ``None`` it cannot tell what a whole list would drop, so it runs the kept icacls rewrite, which
+    keeps every explicit entry."""
     owner_match = _SDDL_OWNER.search(sddl)
     owner = _resolve_sid(owner_match.group(1)) if owner_match else None
     start = sddl.find("D:")
@@ -9534,7 +9803,8 @@ def _read_dacl_sddl(path: Path, *, owner: bool = False) -> str | None:
 
     GetNamedSecurityInfoW asks for the DACL and owner alone, so it needs only READ_CONTROL, and SDDL
     names principals by SID, so the answer does not depend on the display language. A failure is
-    logged with its Win32 status, because the caller then falls back to the owner-only rewrite."""
+    logged with its Win32 status, because the caller then falls back: a store-trio caller to the
+    owner-only rewrite, :func:`_secure_file` to the kept icacls rewrite."""
     if sys.platform != "win32":
         return None
     import ctypes
@@ -9677,7 +9947,9 @@ def _reaches_through_a_link(path: Path) -> bool:
             return True
         if attributes & reparse:
             log.warning(
-                "%s is reached through a link, so the store there is restricted owner-only", path
+                "%s is reached through a link, so the store there gets this account's grant and "
+                "keeps its explicit entries",
+                path,
             )
             return True
     return False
@@ -9705,7 +9977,8 @@ def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
         # (a developer checkout) is the expected fallback. Both keep the reason at DEBUG.
         if parsed.protected and not any(sid == "OW" for _t, _f, _r, sid in parsed.aces):
             log.warning(
-                "%s is locked down but %s, so the store there is restricted owner-only; the service "
+                "%s is locked down but %s, so the store there gets the opener's grant and keeps its "
+                "explicit entries; the service "
                 "account and an operator's provision-admin cannot then both open it (ADR 0163 notes "
                 "of 2026-09-24 and 2026-11-05)",
                 directory,
@@ -9859,7 +10132,9 @@ def _secure_store_file(path: Path, *, dir_grants: Sequence[str] | None) -> None:
     """Restrict one file of the SQLite store trio, or a restored store.
 
     ``dir_grants`` is :func:`_store_dir_grants` of the file's directory. ``None`` -- off Windows, or
-    outside a hardened directory -- is :func:`_secure_file`, owner-only, exactly as before. Otherwise
+    outside a hardened directory -- is :func:`_secure_file` with ``keep_explicit_entries``, the
+    icacls rewrite, exactly as before: it grants the opener and keeps every explicit entry.
+    Otherwise
     the file gets an explicit, protected DACL naming exactly those principals, which is the same
     whoever opens, and which drops any entry for anyone else (a moved-in or restored file can carry
     one). An owner outside those principals is moved to Administrators where the opener may do that,
@@ -9868,7 +10143,7 @@ def _secure_store_file(path: Path, *, dir_grants: Sequence[str] | None) -> None:
     fail and warn on every start. A file that is itself a link gets the old owner-only rewrite, as
     before this change. Best-effort, like :func:`_secure_file`: it logs rather than raises."""
     if dir_grants is None or not _is_windows() or _reaches_through_a_link(path):
-        _secure_file(path)
+        _secure_file(path, keep_explicit_entries=True)
         return
     current = _read_dacl_sddl(path, owner=True)
     parsed = _parse_sddl_dacl(current) if current is not None else None
@@ -10262,19 +10537,31 @@ async def settle_transit_bound_attestation(
     ``None`` when no row is recorded. The check reuses the chain's own pieces: the row MAC
     (:func:`_audit_row_mac`, under the key of the row's range, by Transit's own ``verify`` for a
     Transit MAC) and the constant-time compare. It walks no chain, so it costs one MAC. A MAC
-    provider runs off the event loop, because it is a blocking Vault call. A Transit refusal of
-    that call, such as a key version a forged hash names that does not exist, reads as a gap, not
-    an error, so a row anyone with DML wrote cannot stop a ``warn`` start."""
+    provider runs off the event loop, because it is a blocking Vault call. A cipher failure of
+    that call reads as a gap, not an error, so a row anyone with DML wrote cannot stop a ``warn``
+    start. A 400 whose reply's wording reads as a version refusal, while the probe under the
+    latest version answers a well-formed MAC naming another version, such as one for a version a
+    forged hash names, says
+    Transit refused the check; the code reads only that wording, which a proxy can imitate. At
+    least a 400 not read as a version refusal, a 400 whose probe answers no well-formed MAC, and
+    an outage that raises :class:`CipherError` say the MAC could not be checked (vault BACKLOG
+    #6707 items 24 and 73). A timeout
+    on both asks is not raised here: :func:`_audit_row_mac` reads it as a MAC that does not
+    verify."""
     attestation = read.attestation
     if attestation is None or read.mac_check is None:
         return attestation
     seq = read.mac_check[0]["seq"]
     try:
         verified = await _audit_row_mac_verifies(*read.mac_check)
-    except CipherError as exc:
+    except AuditKeyVersionUnverifiedError as exc:  # no verdict on the MAC, so not "does not verify"
+        return replace(attestation, audit_gap=f"audit row {seq}'s MAC could not be checked: {exc}")
+    except AuditKeyVersionRefusedError as exc:  # the reply's wording read as a version refusal
         return replace(
             attestation, audit_gap=f"Transit refused to check audit row {seq}'s MAC: {exc}"
         )
+    except CipherError as exc:
+        return replace(attestation, audit_gap=f"audit row {seq}'s MAC could not be checked: {exc}")
     if not verified:
         return replace(
             attestation, audit_gap=f"audit row {seq}'s MAC does not verify under the audit key"
@@ -12362,14 +12649,8 @@ class MessageStore:
             # Read now: close() empties the list, and a forced release must still reach each one.
             conns = [*(store._read_conns if store is not None else ()), db]
 
-            def _force_release() -> None:
-                # interrupt() aborts a statement the worker is running, so the close stop()
-                # queues behind it is reached; stop() does not await it (BACKLOG #5720).
-                for conn in conns:
-                    raw = getattr(conn, "_connection", None)
-                    if raw is not None:
-                        _force_failed_open_release(raw.interrupt)
-                    _force_failed_open_release(functools.partial(_stop_unawaited, conn))
+            def _force_release() -> bool:
+                return _force_stop_connections(conns)
 
             await cleanup_failed_open(exc, _release, _force_release, cancels_before=cancels_before)
             raise
@@ -12413,7 +12694,8 @@ class MessageStore:
             )
             await db.commit()
         # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
-        # Off the loop (BACKLOG #1634): three files, each an icacls subprocess on Windows. Open
+        # Off the loop (BACKLOG #1634): three files, each an ACL write on Windows, and outside a
+        # hardened directory an icacls subprocess (21 to 28 ms each, measured). Open
         # completes before anything is serving, so this one is consistency rather than a fix.
         if str(path) != ":memory:":
             main = Path(path)
@@ -13031,30 +13313,24 @@ class MessageStore:
                 rows = list(await cur.fetchall())
                 if not rows:
                     break
-                # One batch per page, so a Transit cipher seals it in few requests (BACKLOG #6706).
-                sealed_values = await cipher_call(
+                async for chunk, sealed_values in seal_chunks(
                     self._cipher,
-                    encrypt_many,
-                    self._cipher,
-                    [
-                        (
-                            r["v"],
-                            aad_of(r)
-                            if aad_of is not None
-                            else cell_aad(table, column, *(r[c] for c in aad_cols)),
-                        )
-                        for r in rows
-                    ],
-                )
-                await self._update_every_row(
-                    f"UPDATE {table} SET {column}=? WHERE {where_keys}",
-                    [
-                        (value, *(r[c] for c in keys))
-                        for value, r in zip(sealed_values, rows, strict=True)
-                    ],
-                    f"{table}.{column}",
-                    exact=True,
-                )
+                    table,
+                    column,
+                    rows,
+                    aad_cols=aad_cols,
+                    aad_of=aad_of,
+                    local_whole_page=True,
+                ):
+                    await self._update_every_row(
+                        f"UPDATE {table} SET {column}=? WHERE {where_keys}",
+                        [
+                            (value, *(r[c] for c in keys))
+                            for value, r in zip(sealed_values, chunk, strict=True)
+                        ],
+                        f"{table}.{column}",
+                        exact=True,
+                    )
                 sealed += len(rows)
             await self._commit()
         except BaseException as exc:
@@ -14045,6 +14321,8 @@ class MessageStore:
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
+        # KNOWN GAP (BACKLOG #5720): a cancel in the settle, a write on a keyed store, skips every
+        # close step after it, so the connections' worker threads stay running; this close is not cancel-safe.
         try:
             # A read-only handle reserved nothing and cannot write the settlement (BACKLOG #1780).
             if not self._cipher_foreign and not self._read_only:
@@ -20741,8 +21019,8 @@ class MessageStore:
         audits: Sequence[AuditAppend],
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
-        calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
-        #1139). Adding that column to this SET list would hand the directory the notification target
+        calls it on an AD/OIDC login whose profile changed — so it deliberately does NOT name
+        ``notify_email`` (BACKLOG #1139). Adding that column to this SET list would hand the directory the notification target
         back and restore the defect the split removes. ``audits``: see
         ``AuthStore.update_user_profile``."""
         now = time.time() if now is None else now
@@ -22050,42 +22328,156 @@ class MessageStore:
         auth_mechanism: str | None = None,
         idp_auth_time: float | None = None,
         mfa_verified: bool = False,
+        require_sign_in_eligible: bool = False,
     ) -> bool:
-        now = time.time() if now is None else now
+        # BACKLOG #5653: the seal is made BEFORE the writer transaction opens. Under a Vault Transit
+        # sealer it is an HTTP call, and under ``require_sign_in_eligible`` the transaction holds
+        # SQLite's write lock from its BEGIN, so sealing inside it would stall every writer on every
+        # engine shard behind Vault. The seal covers the account's and the store's session epochs,
+        # so they are read first, unlocked, and the transaction reads them again: if a revoke raised
+        # either in between, nothing is written and the record is sealed again over the new values.
+        busy = epoch_raised = 0
+        last_busy: sqlite3.OperationalError | None = None
+        for attempt in range(1, SESSION_MINT_ATTEMPTS + 1):
+            epochs = await self._session_epochs_unlocked(user_id)
+            if epochs is None:
+                # A deleted account is refused, guarded or not (BACKLOG #2733), not left to the
+                # INSERT's foreign-key error. The locked read refuses one deleted after this read.
+                return False
+            record = await seal_session_async(
+                self._row_sealer,
+                new_session_record(
+                    token_hash=token_hash,
+                    user_id=user_id,
+                    now=time.time() if now is None else now,
+                    expires_at=expires_at,
+                    client=client,
+                    seed_reauth=seed_reauth,
+                    auth_mechanism=auth_mechanism,
+                    idp_auth_time=idp_auth_time,
+                    mfa_verified=mfa_verified,
+                    user_epoch=epochs[0],
+                    global_epoch=epochs[1],
+                ),
+            )
+            try:
+                inserted = await self._insert_sealed_session(
+                    record,
+                    now=now,
+                    require_federated_subject=require_federated_subject,
+                    require_sign_in_eligible=require_sign_in_eligible,
+                )
+            except sqlite3.OperationalError as exc:
+                # Only the BEGIN IMMEDIATE path is run again: its busy arises at the BEGIN, once
+                # ``busy_timeout`` is outlasted, before anything is read or written.
+                if not require_sign_in_eligible or not _is_sqlite_busy(exc):
+                    raise
+                busy += 1
+                last_busy = exc
+                if attempt < SESSION_MINT_ATTEMPTS:
+                    log.info(
+                        "sqlite: a session insert met a busy database (attempt %d of %d);"
+                        " running it again",
+                        attempt,
+                        SESSION_MINT_ATTEMPTS,
+                    )
+                    await asyncio.sleep(_ADMIN_GRANT_BUSY_BACKOFF_SECONDS * attempt)
+                continue
+            if inserted is not None:
+                return inserted
+            epoch_raised += 1
+        # Contention, not a refusal: ``False`` would tell the caller the account refused the
+        # session. The directory sign-in that asked has already written its roles and profile, so
+        # it fails as a temporary failure rather than see this escape. The cause and the counts
+        # cover every attempt, not only the last one.
+        log.warning(
+            "sqlite: a session insert gave up after %d attempts: %d met a busy database,"
+            " %d found the session epochs raised",
+            SESSION_MINT_ATTEMPTS,
+            busy,
+            epoch_raised,
+        )
+        raise SessionMintContended(
+            session_mint_cause(busy=busy, epoch_raised=epoch_raised), SESSION_MINT_ATTEMPTS
+        ) from last_busy
+
+    async def _session_epochs_unlocked(self, user_id: str) -> tuple[int, int] | None:
+        """The account's session epoch and the store's global one, read on a reader connection
+        with no lock, or ``None`` for no such account. ``create_session`` seals over them and
+        compares them again in its writer transaction (BACKLOG #5653)."""
+        async with self._read() as db:
+            cur = await db.execute(
+                f"SELECT session_epoch, {GLOBAL_SESSION_EPOCH_SQL} AS global_epoch"
+                " FROM users WHERE id=?",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return int(row["session_epoch"]), global_epoch_or_refuse(row["global_epoch"])
+
+    async def _insert_sealed_session(
+        self,
+        record: SessionRecord,
+        *,
+        now: float | None,
+        require_federated_subject: tuple[str | None, str | None] | None,
+        require_sign_in_eligible: bool,
+    ) -> bool | None:
+        """``create_session``'s writer transaction: insert ``record``, already sealed, if the
+        account's row still allows it. ``False`` is a refusal. ``None`` means a revoke raised an
+        epoch the seal covers after the seal was made, so nothing was written and the caller seals
+        again. Nothing here seals (BACKLOG #5653)."""
         # _writer_txn, not a short writer: the account's row is read first in the same transaction
         # (BACKLOG #2592 for its session epoch, which the seal covers; BACKLOG #1474 for the guarded
-        # path's binding check). The lock alone is what makes the read and the INSERT atomic against
-        # clear_user_federated_subject and every whole-account revoke, which take the same lock.
-        # The refusal below rolls back itself, as that helper's contract requires (ADR 0159).
-        async with _writer_txn(self._db, self._lock):
+        # path's binding check; BACKLOG #5653 for the eligibility check). Within this process the
+        # asyncio lock is what makes the read and the INSERT atomic against
+        # clear_user_federated_subject, a disable, a lockout and every whole-account revoke, which
+        # take the same lock. Another engine shard on the same file takes only SQLite's own write
+        # lock. Under ``require_sign_in_eligible`` the transaction is BEGIN IMMEDIATE, so that lock
+        # is held before the read: a disable or lockout another shard commits first is read and
+        # refused. Under the deferred BEGIN the same write fails the INSERT as ``database is
+        # locked`` instead, an error rather than a refusal (BACKLOG #5653; BACKLOG #3078 F5 is the
+        # first-administrator grant's same choice).
+        # Each refusal below rolls back itself, as that helper's contract requires (ADR 0159).
+        async with _writer_txn(self._db, self._lock, immediate=require_sign_in_eligible):
+            # Read once the locks are held, so a BEGIN that waited out another writer judges a
+            # lock's expiry at the time of the read, not when this sign-in began to wait.
+            judged_at = time.time() if now is None else now
             cur = await self._db.execute(
-                "SELECT oidc_issuer, oidc_subject, session_epoch,"
+                "SELECT oidc_issuer, oidc_subject, session_epoch, disabled, locked_until,"
+                " second_step_locked_until,"
                 f" {GLOBAL_SESSION_EPOCH_SQL} AS global_epoch FROM users WHERE id=?",
-                (user_id,),
+                (record.user_id,),
             )
             row = await cur.fetchone()
             # A deleted account is refused, guarded or not (BACKLOG #2733), not left to the
             # INSERT's foreign-key error.
-            if row is None or (
-                require_federated_subject is not None
-                and (row["oidc_issuer"], row["oidc_subject"]) != require_federated_subject
+            if (
+                row is None
+                or (
+                    require_federated_subject is not None
+                    and (row["oidc_issuer"], row["oidc_subject"]) != require_federated_subject
+                )
+                or (
+                    require_sign_in_eligible
+                    and sign_in_state_refused(
+                        row["disabled"],
+                        row["locked_until"],
+                        row["second_step_locked_until"],
+                        judged_at,
+                    )
+                )
             ):
                 await self._db.rollback()
                 return False
-            record = new_session_record(
-                token_hash=token_hash,
-                user_id=user_id,
-                now=now,
-                expires_at=expires_at,
-                client=client,
-                seed_reauth=seed_reauth,
-                auth_mechanism=auth_mechanism,
-                idp_auth_time=idp_auth_time,
-                mfa_verified=mfa_verified,
+            if not session_epochs_current(
+                record,
                 user_epoch=int(row["session_epoch"]),
                 global_epoch=global_epoch_or_refuse(row["global_epoch"]),
-            )
-            record = await seal_session_async(self._row_sealer, record)
+            ):
+                await self._db.rollback()
+                return None
             await self._db.execute(_SESSION_INSERT, session_insert_params(record))
             await self._commit()
         return True
@@ -23276,7 +23668,7 @@ class MessageStore:
         # encrypted .mfbak the BackupRunner wraps it in is the at-rest protection, but the transient
         # plaintext snapshot must not be world-readable either.
         # Off the loop (BACKLOG #1634): this is the call that matters. A DR backup runs on the SERVING
-        # loop, so a synchronous icacls here stalls every in-flight ACK, claim and delivery with it.
+        # loop, so a synchronous ACL write here stalls every in-flight ACK, claim and delivery with it.
         await _secure_file_async(dest)
 
     async def _copy_snapshot(self, dest: Path, method: str) -> None:

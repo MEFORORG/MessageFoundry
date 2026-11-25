@@ -75,10 +75,25 @@ from messagefoundry.logging_guard import (
 from messagefoundry.redaction import _REDACTED as PHI_PLACEHOLDER
 from messagefoundry.redaction import (
     ExcInfo,
+    clamp_untrusted,
     prepare_log_record,
+    redact,
     redact_binary_carriage,
     redact_untrusted,
     safe_traceback,
+)
+from messagefoundry.secretscrub import (
+    _BYTES_PROBE,
+    _KV_TAILS,
+    _SHIPPED_TAILS,
+    CREDENTIAL_PLACEHOLDER,
+    _braced_tail,
+    _mask_only,
+    _without_tails,
+    could_take_a_tail,
+    mask_private_key_blocks_then,
+    scrub_credentials,
+    scrub_credentials_without_tails,
 )
 
 # THE OTHER LEAF IMPORTED FOR ITS DEFINITION (BACKLOG #1478): the credential-label vocabulary, held in
@@ -91,7 +106,6 @@ from messagefoundry.redaction import (
 from messagefoundry.secretscrub import (
     _CREDENTIAL_QUERY_KEYS as _CREDENTIAL_QUERY_KEYS,
 )
-from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, scrub_credentials
 
 __all__ = [
     "LogFile",
@@ -308,7 +322,7 @@ class RedactionFilter(logging.Filter):
         # pattern can tell from prose. The tray's chain shares the step, through the same function.
         prepare_log_record(record)
         try:
-            _rewrite_record(record, redact_untrusted)
+            _rewrite_record(record, _redact_masking_key_blocks)
         except Exception as exc:  # noqa: BLE001 -- a log call must never raise, as in the tray's filter
             # getMessage() runs the caller's % format and its arguments' own __str__/__repr__, and
             # Handler.handle does not guard a filter. Fail closed: a fixed line, never the raw record.
@@ -390,9 +404,16 @@ _QUERY_VALUE = (
     r"(?:[A-Za-z0-9._\-]++|[^A-Za-z0-9._\-&\s\"'](?!" + _LABEL_WITH_ITS_VALUE_OUTSIDE + r"))++"
 )
 
+#: A query value that is a Python bytes literal, ``token=b"v w"``, takes ``secretscrub``'s bytes tail
+#: after the ``b`` the value class takes, and writes it back masked (BACKLOG #5547). Refusing the
+#: ``b`` instead would print what the value class hid.
 _CREDENTIAL_QUERY_RE = re.compile(
-    r"(?i)\b(" + "|".join(_CREDENTIAL_QUERY_KEYS) + r")=" + _QUERY_VALUE,
+    r"(?i)\b(" + "|".join(_CREDENTIAL_QUERY_KEYS) + r")=" + _BYTES_PROBE + _QUERY_VALUE + _KV_TAILS,
 )
+# Registered where secretscrub's ``_without_tails`` checks it, so a strip of this pattern that
+# changes nothing, a respelled fragment, raises rather than leaving :func:`_scrub_credential_query`
+# comparing a reading with itself.
+_SHIPPED_TAILS[id(_CREDENTIAL_QUERY_RE)] = (_KV_TAILS, _BYTES_PROBE)
 
 
 def _scrub_credential_query(text: str) -> str:
@@ -401,7 +422,47 @@ def _scrub_credential_query(text: str) -> str:
     ``CREDENTIAL_PLACEHOLDER`` rather than a second literal ``<redacted>``: one log line must not be
     able to carry two spellings of "a credential was here", and a hand-copied literal is how it
     would."""
-    return _CREDENTIAL_QUERY_RE.sub(lambda m: f"{m.group(1)}={CREDENTIAL_PLACEHOLDER}", text)
+    tailed = _CREDENTIAL_QUERY_RE.sub(_query_repl, text)
+    if tailed is text or not could_take_a_tail(text):
+        return tailed
+    # A bytes tail masks text the credential pass after this filter reads (BACKLOG #5547), and this
+    # filter has no union behind it. So the tailed value is kept only where what that pass then
+    # prints is what it printed before the tails, with characters written as "x"; the comment on
+    # secretscrub's _NO_LABEL_BEFORE states this control.
+    before = _scrub_credential_query_without_tails(text)
+    if tailed == before or _mask_only(
+        scrub_credentials_without_tails(before), scrub_credentials(tailed)
+    ):
+        return tailed
+    return before
+
+
+def _scrub_credential_query_without_tails(text: str) -> str:
+    """:func:`_scrub_credential_query` as it read before the masked tails (BACKLOG #5547)."""
+    return _without_tails(_CREDENTIAL_QUERY_RE).sub(_query_repl, text)
+
+
+def _query_repl(m: re.Match[str]) -> str:
+    return f"{m.group(1)}={CREDENTIAL_PLACEHOLDER}{_braced_tail(m)}"
+
+
+def _redact_masking_key_blocks(text: str) -> str:
+    """:func:`~messagefoundry.redaction.redact_untrusted` with the PRIVATE KEY block mask between
+    its clamp and its scan (BACKLOG #5550). The mask runs before the PHI pass because that pass reads
+    a block's markers as a name run and rewrites them, so no pass after it could find the block;
+    after the clamp, so it scans no more than the PHI pass does (BACKLOG #1576).
+    :func:`~messagefoundry.secretscrub.mask_private_key_blocks_then` keeps the PHI pass's reading of
+    the unmasked text wherever, read through the credential passes the chain runs next
+    (:func:`_credential_passes`), the masked one differs from it at anything but an "x". The
+    comparison holds only as read through those passes, so a caller that does not run them after
+    compares through the PHI pass alone, as :class:`JsonFormatter`'s ``exc_info`` branch does."""
+    return mask_private_key_blocks_then(clamp_untrusted(text), redact, _credential_passes)
+
+
+def _credential_passes(text: str) -> str:
+    """The credential passes the chain runs after the PHI pass, which the key-block comparison
+    reads through: a masked body line can take away a label they read."""
+    return scrub_credentials(_scrub_credential_query(text))
 
 
 def _shipped_filters() -> tuple[logging.Filter, ...]:
@@ -697,9 +758,12 @@ class JsonFormatter(_SafeExcFormatter):
     alphabet. It writes the rest raw: at least DEL, the C1 controls, the format characters such as a
     bidirectional override, U+2028 and U+2029, a lone surrogate, and the private-use and unassigned
     code points (vault BACKLOG #2815). Such a handler also leaves the message, its arguments and
-    ``stack_info`` unredacted, and scrubs no credential anywhere. The ``exc_info`` branch below is
-    the only PHI redaction on it, and it runs only when no earlier formatter on the same record has
-    already cached a raw traceback in ``exc_text``. Every handler :func:`configure_logging` builds
+    ``stack_info`` unredacted, and scrubs no credential anywhere, except that the ``exc_info``
+    branch below can mask the body of a PRIVATE KEY block in the traceback it renders, where the
+    masked reading passes that branch's comparison; where it does not, the body prints whole
+    (BACKLOG #5550). That branch is the only
+    PHI redaction on it, and it runs only when no earlier formatter on the same record has already
+    cached a raw traceback in ``exc_text``. Every handler :func:`configure_logging` builds
     carries the filters, so none of this reaches a configured sink. Use this formatter only on a
     handler that carries the same filters.
 
@@ -726,7 +790,12 @@ class JsonFormatter(_SafeExcFormatter):
             # lists what still passes.
             # Bounded for the same reason and on the same terms as the filter's own call (#1576): a
             # filter-less handler is exactly the one with nothing upstream to have clamped it already.
-            payload["exception"] = redact_untrusted(self.formatException(record.exc_info))
+            # The key-block mask is compared through the PHI pass alone: no credential pass runs
+            # after this branch, so its output is the PHI pass's reading of the clamped traceback,
+            # or that reading with characters written as "x" (BACKLOG #5550).
+            payload["exception"] = mask_private_key_blocks_then(
+                clamp_untrusted(self.formatException(record.exc_info)), redact
+            )
         if record.stack_info:
             payload["stack"] = record.stack_info
         return json.dumps(payload, ensure_ascii=False)
@@ -1235,15 +1304,22 @@ def _install_phi_filters(handler: logging.Handler) -> None:
 
 
 def scrub_log_text(text: str) -> str:
-    """``text`` through the text passes :func:`_install_phi_filters` installs, in its order: PHI
-    redaction (bounded), the credential query scrub, the credential scrub, then the binary-carriage
-    pass. The control scrub, which runs last on a handler, is left out, so a control character stays
+    """``text`` through the text passes :func:`_install_phi_filters` installs, in its order, as
+    they read before the masked tails (see below): PHI redaction (bounded), the credential query
+    scrub, the credential scrub, then the binary-carriage pass. The control scrub, which runs last on a handler, is left out, so a control character stays
     as it is.
 
     For a caller that must filter a value before it is encoded, as the audit tee does (BACKLOG
-    #3045). A handler still runs its chain over the encoded line afterwards."""
+    #3045). A handler still runs its chain over the encoded line afterwards.
+
+    It reads as those passes did before the masked tails and the PRIVATE KEY block mask (BACKLOG
+    #5546 to #5550). The tee compares readings of a value with its controls read as spaces, where a
+    tail can fire that the value itself refuses, and it hid the whole field where the two
+    differed. The chain a handler runs over the encoded line still takes the tails."""
     return redact_binary_carriage(
-        scrub_credentials(_scrub_credential_query(redact_untrusted(text)))
+        scrub_credentials_without_tails(
+            _scrub_credential_query_without_tails(redact_untrusted(text))
+        )
     )
 
 

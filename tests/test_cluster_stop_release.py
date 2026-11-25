@@ -162,7 +162,12 @@ class _SqlStore:
         return self._lease.claim(params[1])
 
     async def _fetchone_clamped(
-        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+        self,
+        sql: str,
+        params: tuple[object, ...],
+        *,
+        timeout_clamp: float,
+        share_deadline: bool = False,
     ) -> dict[str, object] | None:
         return await self._fetchone(sql, params)
 

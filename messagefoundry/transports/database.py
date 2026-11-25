@@ -137,6 +137,7 @@ from messagefoundry.redaction import (
 from messagefoundry.sqlserver_roles import (
     SQLSERVER_FIXED_DATABASE_ROLES,
     SQLSERVER_FIXED_SERVER_ROLES,
+    probed_grant,
 )
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
@@ -5797,10 +5798,10 @@ class LoginRoleReading:
 def classify_login_roles(row: Sequence[Any]) -> LoginRoleReading:
     """Judge one row of the role probe (BACKLOG #2617). Pure, so every verdict is unit-testable.
 
-    Read three ways, as ``store/privilege.py`` ``probed_grant`` reads the store login: ``1`` held,
-    ``0`` not held, NULL **not read**. Only an int or a bool that is 0 or 1 reads, so any other
-    value, such as the text ``"1"``, ``1.0`` or ``2``, is not read either, and ``probed_grant``
-    reads all three the same way (BACKLOG #6015). Not even a ``1`` of another type reads as held,
+    Read three ways by :func:`~messagefoundry.sqlserver_roles.probed_grant`, the function the SQL
+    Server store preflight reads its own login with (BACKLOG #6015): ``1`` held, ``0`` not held, NULL
+    **not read**. Only an int or a bool that is 0 or 1 reads, so any other value, such as the text
+    ``"1"``, ``1.0`` or ``2``, is not read either. Not even a ``1`` of another type reads as held,
     because a held ``db_denydatawriter`` takes a finding away.
     ``IS_SRVROLEMEMBER`` and ``IS_ROLEMEMBER`` answer NULL for a name that does not resolve for this
     login, and a NULL folded to "not a member" would be a false clean. A role read as held is still
@@ -5823,10 +5824,10 @@ def classify_login_roles(row: Sequence[Any]) -> LoginRoleReading:
     held: list[tuple[str, str]] = []
     unread: list[str] = []
     for (kind, role), value in zip(_LOGIN_ROLE_PROBE_ROLES, row, strict=True):
-        # The rule is the docstring's: anything but an int or bool 0 or 1 is unread.
-        if not isinstance(value, int) or value not in (0, 1):
+        grant = probed_grant(value)
+        if grant is None:
             unread.append(f"{kind} role {role}")
-        elif value == 1:
+        elif grant:
             held.append((kind, role))
     allowed = set(LOOKUP_LOGIN_READ_ROLES)
     if ("database", "db_denydatawriter") in held:

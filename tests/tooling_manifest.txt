@@ -61,6 +61,7 @@ tests/test_ci_gate_annotation.py
 tests/test_ci_leg_data_class.py
 tests/test_ci_merge_group_gate.py
 tests/test_ci_odbc_installer_pipefail.py
+tests/test_ci_packaging_gate.py
 tests/test_ci_postgres_windows_leg.py
 tests/test_ci_red_clearer.py
 tests/test_ci_red_reader.py
@@ -71,7 +72,9 @@ tests/test_ci_step_margin.py
 tests/test_ci_tool_and_image_pins.py
 tests/test_ci_tooling_gate.py
 tests/test_ci_venv_pinning.py
+tests/test_ci_windows_smoke_mllp_read.py
 tests/test_cla_action_advisory_gate.py
+tests/test_cla_action_patches.py
 tests/test_cla_action_provenance.py
 tests/test_claim_check.py
 tests/test_claim_shared_registry.py
@@ -219,6 +222,7 @@ tests/test_semgrep_install_retry.py
 tests/test_session_context_presence.py
 tests/test_session_mail_held.py
 tests/test_session_mail.py
+tests/test_session_mail_toplevel.py
 tests/test_session_mail_watch_standdown.py
 tests/test_install_coordination_retired.py
 tests/test_session_registry.py

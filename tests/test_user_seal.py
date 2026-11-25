@@ -225,7 +225,7 @@ async def test_a_key_rotation_reseals_every_account_under_the_active_key(tmp_pat
         await AuthService(store, AuthSettings()).initialize()  # the built-in roles
         await _user(store, "u")
         await store.set_user_roles("u", [Role.VIEWER.value], audits=())
-        await store.set_totp_secret("u", secret="JBSWY3DPEHPK3PXP")
+        await store.set_totp_secret("u", secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
     finally:
         await store.close()
 
@@ -255,7 +255,7 @@ async def test_a_key_rotation_reseals_every_account_under_the_active_key(tmp_pat
         loaded = await AuthService(dropped, AuthSettings())._load_user("u")
         assert loaded is not None and loaded.role_ids == (Role.VIEWER.value,)
         # The secret was re-encrypted with the seal, so it still opens without the old key.
-        assert await dropped.get_totp_secret("u") == "JBSWY3DPEHPK3PXP"
+        assert await dropped.get_totp_secret("u") == "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
     finally:
         await dropped.close()
 

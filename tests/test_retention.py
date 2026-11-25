@@ -8,12 +8,14 @@ for determinism."""
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import json
 import logging
 import os
 import sqlite3
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -23,6 +25,14 @@ from messagefoundry.config.settings import (
     RetentionSettings,
     StoreBackend,
     StoreSettings,
+)
+from messagefoundry.config.wiring import (
+    MLLP,
+    File,
+    Registry,
+    build_inbound_connection,
+    build_outbound_connection,
+    load_config,
 )
 from messagefoundry.pipeline import retention as retention_mod
 from messagefoundry.pipeline.alerts import LoggingAlertSink
@@ -830,6 +840,69 @@ async def test_a_purge_pass_with_no_truncate_records_null_not_false(store: Messa
     assert [json.loads(r["detail"])["wal_left_untruncated"] for r in audit] == [None]
 
 
+async def test_wal_cadence_survives_a_backward_wall_clock_step(store: MessageStore) -> None:
+    """BACKLOG #6526: the wall clock steps back a day after the first truncate, then both clocks
+    run forward a full cadence, and the third pass still truncates. Only the step makes the wall
+    clock read the cadence as unelapsed, so this fails on a wall-clock cadence for that reason
+    alone. The control is the second pass, one second short of the cadence, which does not."""
+    wall = {"t": 30 * DAY}
+    mono = {"t": 500.0}
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(wal_checkpoint_seconds=3600),
+        clock=lambda: wall["t"],
+        monotonic=lambda: mono["t"],
+    )
+    assert (await runner.run_once()).wal_checkpointed is True  # never run yet, so due at once
+    wall["t"] -= DAY
+    wall["t"] += 3599.0
+    mono["t"] += 3599.0
+    assert (await runner.run_once()).wal_checkpointed is False  # the control: not yet due
+    wall["t"] += 1.0
+    mono["t"] += 1.0
+    assert (await runner.run_once()).wal_checkpointed is True
+
+
+async def test_wal_cadence_ignores_an_explicit_now(store: MessageStore) -> None:
+    """``run_once(now=...)`` sets the retention windows, not the WAL cadence: two passes at the same
+    monotonic instant truncate once, whatever ``now`` each is handed."""
+    runner = RetentionRunner(
+        store, RetentionSettings(wal_checkpoint_seconds=3600), monotonic=lambda: 10.0
+    )
+    assert (await runner.run_once(now=30 * DAY)).wal_checkpointed is True
+    assert (await runner.run_once(now=40 * DAY)).wal_checkpointed is False
+
+
+async def test_a_capped_pass_leaves_the_wal_marker_unadvanced(store: MessageStore) -> None:
+    """A WAL truncate the #121 cap skips keeps the marker its last truncate set, so it stays due.
+    Pass 1 truncates at monotonic 0. Pass 2 is past the cadence but capped before the WAL phase,
+    and the marker stays 0. Pass 3 is uncapped and truncates, which it could not do had the skip
+    moved the marker to pass 2's reading."""
+    clock = {"start": 0.0, "later": 0.0, "first": True}
+
+    def mono() -> float:
+        # The pass reads `start` once as its start time; every later read is `later`.
+        if clock["first"]:
+            clock["first"] = False
+            return float(clock["start"])
+        return float(clock["later"])
+
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(max_pass_seconds=1, wal_checkpoint_seconds=3600),
+        monotonic=mono,
+    )
+    assert (await runner.run_once()).wal_checkpointed is True
+    assert runner._last_wal == 0.0
+    clock.update(start=5000.0, later=1e9, first=True)
+    result = await runner.run_once()
+    assert result.capped is True and result.wal_checkpointed is False
+    assert runner._last_wal == 0.0
+    clock.update(start=9000.0, later=9000.0, first=True)
+    result = await runner.run_once()
+    assert result.capped is False and result.wal_checkpointed is True
+
+
 # --- RetentionRunner ----------------------------------------------------------
 
 
@@ -1074,7 +1147,7 @@ async def test_run_once_cap_skips_phase_after_deadline(store: MessageStore, monk
     result = await runner.run_once()
 
     assert result.wal_checkpointed is True  # ran before the deadline was hit
-    assert runner._last_wal == now  # the phase that RAN advanced its marker
+    assert runner._last_wal == 0.0  # the phase that RAN advanced its (monotonic) marker
     assert result.capped is True  # the pass hit the cap after WAL
     assert result.vacuumed is False  # the DUE vacuum was skipped by the cap
     assert vacuum_calls == 0  # ...and never even started
@@ -1950,3 +2023,221 @@ async def test_engine_without_retention_settings_has_no_runner(tmp_path) -> None
         assert engine._retention_runner is None
     finally:
         await engine.stop()
+
+
+# --- a reload that first sets a per-connection window starts passes (BACKLOG #6804) -------------
+
+# Every default-ON knob off, so only the graph can give the runner something to do.
+_ALL_OFF = {"min_free_disk_mb": 0, "wal_checkpoint_seconds": 0, "audit_log_warn_rows": 0}
+
+
+def _write_retention_graph(cfg: Path, inbox: Path, outdir: Path, *, window: str = "") -> None:
+    """One file inbound -> router -> handler -> file outbound; ``window`` adds keyword arguments to
+    the inbound (a leading ``i:``) or the outbound (``o:``), such as a per-connection window."""
+    cfg.mkdir(parents=True, exist_ok=True)
+    inbox.mkdir(parents=True, exist_ok=True)
+    outdir.mkdir(parents=True, exist_ok=True)
+    ib_kw = f", {window[2:]}" if window.startswith("i:") else ""
+    ob_kw = f", {window[2:]}" if window.startswith("o:") else ""
+    (cfg / "cfg.py").write_text(
+        "from messagefoundry import inbound, outbound, router, handler, Send, File\n"
+        f"inbound('IB_RET', File(directory={str(inbox)!r}, pattern='*.hl7', poll_seconds=0.05), "
+        f"router='r'{ib_kw})\n"
+        f"outbound('OB_RET', File(directory={str(outdir)!r}, filename='{{MSH-10}}.hl7'){ob_kw})\n"
+        "@router('r')\n"
+        "def route(msg):\n"
+        "    return ['h']\n"
+        "@handler('h')\n"
+        "def handle(msg):\n"
+        "    return Send('OB_RET', msg)\n",
+        encoding="utf-8",
+    )
+
+
+def test_enabled_by_a_per_connection_window(store: MessageStore) -> None:
+    """A per-connection messages_days or dead_letter_days above 0 purges with the global window
+    off, so it gives the runner something to do on its own; 0 keeps forever and does not."""
+    off = RetentionSettings.model_validate(_ALL_OFF)
+
+    def enabled(*, messages_days: int | None = None, dead_letter_days: int | None = None) -> bool:
+        reg = Registry()
+        reg.add_inbound(
+            build_inbound_connection("IB", MLLP(port=2610), router="r", messages_days=messages_days)
+        )
+        reg.add_outbound(
+            build_outbound_connection(
+                "OB", File(directory="./out"), dead_letter_days=dead_letter_days
+            )
+        )
+        return RetentionRunner(store, off, registry_source=lambda: reg).enabled
+
+    assert enabled() is False
+    assert enabled(messages_days=3) is True
+    assert enabled(dead_letter_days=3) is True
+    assert enabled(messages_days=0, dead_letter_days=0) is False
+
+
+async def test_a_disabled_runner_with_a_registry_idles(store: MessageStore) -> None:
+    """With a registry wired, the loop runs even when nothing is set, and runs no pass until the
+    live graph sets a window; with no registry a disabled runner spawns no loop."""
+    passes: list[None] = []
+    settings = RetentionSettings.model_validate({**_ALL_OFF, "purge_interval_seconds": 0.01})
+    holder: dict[str, Registry] = {"reg": Registry()}
+    runner = RetentionRunner(store, settings, registry_source=lambda: holder["reg"])
+
+    async def _counting(now: float | None = None) -> Any:
+        passes.append(None)
+
+    runner.run_once = _counting  # type: ignore[method-assign]
+    runner.start()
+    try:
+        assert runner._task is not None
+        await asyncio.sleep(0.1)
+        assert passes == [], "an idle runner ran a pass with nothing configured"
+        reg = Registry()
+        reg.add_inbound(
+            build_inbound_connection("IB", MLLP(port=2611), router="r", messages_days=1)
+        )
+        holder["reg"] = reg
+        for _ in range(200):
+            if passes:
+                break
+            await asyncio.sleep(0.01)
+        assert passes, "the loop did not pick up a window the live graph set"
+        holder["reg"] = Registry()
+        await asyncio.sleep(0.05)
+        settled = len(passes)
+        await asyncio.sleep(0.1)
+        assert len(passes) == settled, "the loop kept running passes after the window was cleared"
+    finally:
+        await runner.stop()
+    assert runner._task is None
+
+    bare = RetentionRunner(store, settings)
+    bare.start()
+    assert bare._task is None
+
+
+async def test_wake_runs_a_pass_only_when_it_makes_the_loop_active(store: MessageStore) -> None:
+    """A reload's wake() on an active loop adds no pass; one that gives an idle loop a window runs
+    one at once. The 3600 s interval means no pass below can come from the timer."""
+    passes: list[None] = []
+    settings = RetentionSettings.model_validate({**_ALL_OFF, "purge_interval_seconds": 3600})
+    window = Registry()
+    window.add_inbound(build_inbound_connection("IB", MLLP(port=2612), router="r", messages_days=1))
+    holder: dict[str, Registry] = {"reg": window}
+    runner = RetentionRunner(store, settings, registry_source=lambda: holder["reg"])
+
+    async def _counting(now: float | None = None) -> Any:
+        passes.append(None)
+
+    runner.run_once = _counting  # type: ignore[method-assign]
+    runner.start()
+    try:
+        for _ in range(200):
+            if passes:
+                break
+            await asyncio.sleep(0.01)
+        assert len(passes) == 1
+        runner.wake()  # a reload while active
+        await asyncio.sleep(0.1)
+        assert len(passes) == 1, "a reload added a pass to an already-active loop"
+    finally:
+        await runner.stop()
+
+    holder["reg"] = Registry()
+    passes.clear()
+    runner.start()
+    try:
+        await asyncio.sleep(0.1)
+        assert passes == [], "a restarted idle loop ran a pass (a stale wake was left set)"
+        holder["reg"] = window
+        runner.wake()  # the reload that makes it active
+        for _ in range(200):
+            if passes:
+                break
+            await asyncio.sleep(0.01)
+        assert len(passes) == 1, "the reload that gave the idle loop a window ran no pass"
+    finally:
+        await runner.stop()
+
+
+async def test_a_wake_before_the_first_iteration_runs_one_pass(store: MessageStore) -> None:
+    """A reload that wakes the loop between start() and its first iteration gets one pass, not
+    two back to back: the 3600 s interval means a second pass could only come from a stale wake."""
+    passes: list[None] = []
+    settings = RetentionSettings.model_validate({**_ALL_OFF, "purge_interval_seconds": 3600})
+    holder: dict[str, Registry] = {"reg": Registry()}
+    runner = RetentionRunner(store, settings, registry_source=lambda: holder["reg"])
+
+    async def _counting(now: float | None = None) -> Any:
+        passes.append(None)
+
+    runner.run_once = _counting  # type: ignore[method-assign]
+    runner.start()  # idle: the task exists but has not run yet
+    try:
+        window = Registry()
+        window.add_inbound(
+            build_inbound_connection("IB", MLLP(port=2613), router="r", messages_days=1)
+        )
+        holder["reg"] = window
+        runner.wake()  # the reload, before the loop's first iteration
+        await asyncio.sleep(0.15)
+        assert len(passes) == 1, f"expected one pass, got {len(passes)}"
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize(
+    "window",
+    ["i:messages_days=1", "i:prune_documents_after=1", "o:dead_letter_days=1"],
+    ids=["messages_days", "prune", "dead_letter_days"],
+)
+async def test_reload_that_sets_a_window_runs_a_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, window: str
+) -> None:
+    """BACKLOG #6804: the engine started with nothing for retention to do, then a reload set a
+    per-connection window. A pass must run without a restart, on the same single loop."""
+    passes: list[None] = []
+    real_run_once = RetentionRunner.run_once
+
+    async def _counting_run_once(self: RetentionRunner, now: float | None = None) -> Any:
+        passes.append(None)
+        return await real_run_once(self, now)
+
+    monkeypatch.setattr(RetentionRunner, "run_once", _counting_run_once)
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    idle_cfg, window_cfg = tmp_path / "idle", tmp_path / "window"
+    _write_retention_graph(idle_cfg, inbox, outdir)
+    _write_retention_graph(window_cfg, inbox, outdir, window=window)
+
+    engine = await Engine.create(
+        tmp_path / "engine.db",
+        retention_settings=RetentionSettings.model_validate(
+            # An interval no test waits out: only the reload's wake can run the pass in time.
+            {**_ALL_OFF, "purge_interval_seconds": 3600}
+        ),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    engine.add_registry(load_config(idle_cfg))
+    await engine.start()
+    try:
+        runner = engine._retention_runner
+        assert runner is not None
+        task = runner._task
+        assert task is not None
+        await asyncio.sleep(0.1)
+        assert runner.enabled is False and passes == []
+
+        outcome = await engine.reload_detail(window_cfg)
+        assert outcome.applied is True and outcome.failures == ()
+        assert runner.enabled is True
+        for _ in range(200):
+            if passes:
+                break
+            await asyncio.sleep(0.01)
+        assert passes, "a reload that set a per-connection window left retention off"
+        assert runner._task is task, "the reload started a second retention loop"
+    finally:
+        await engine.stop()
+    assert runner._task is None and task.done()

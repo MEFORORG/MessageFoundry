@@ -27,7 +27,7 @@ from messagefoundry_toolkit.anon import surrogates as engine_surrogates
 from tee.anon import keying as tee_keying
 from tee.anon import surrogates as tee_surrogates
 
-_SALT = "b214-5534-salt-0123456789abcdef"
+_SALT = "b214-5534-salt-0123456789abcdef-0123456789"
 _MODULES = pytest.mark.parametrize(
     ("surrogates", "keying"),
     [(engine_surrogates, engine_keying), (tee_surrogates, tee_keying)],
