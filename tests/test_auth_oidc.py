@@ -692,6 +692,17 @@ def test_a_crit_header_is_refused_at_key_selection(rsa_key: rsa.RSAPrivateKey, c
     assert fetch.calls == 0
 
 
+def test_typ_is_checked_before_crit(rsa_key: rsa.RSAPrivateKey) -> None:
+    """The first step of the rung order: a token declaring another class AND carrying crit is
+    refused as wrong_token_type, so this test fails if the crit check moves above the typ check."""
+    jws = _mint_with_typ(
+        rsa_key, "k1", _good_claims(), typ="at+jwt", extra_header={"crit": ["exp"]}
+    )
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert exc.value.reason == "wrong_token_type"
+
+
 @pytest.mark.parametrize(
     ("header", "other_reason"),
     [

@@ -123,10 +123,10 @@ class FederatedPrincipal:
     ``username`` selects no account. The relying party selects the account by the non-reassignable
     ``(issuer, subject)`` pair alone (ADR 0184), refuses a pair no account is bound to (only the
     administrative binding surface binds one), and carries the claimed username into that refusal's
-    audit row as a hint. The ladder still refuses a token whose username claim is missing. Only
-    while ``username_strip_domain`` is on does it also refuse a claim with no suffix or a suffix off
-    the allow-list; with it off the claim is used verbatim and no suffix is checked
-    (:func:`_resolve_username`). A username is reassignable, so selecting by it would hand a
+    audit row as a hint. The ladder still refuses at least a token whose username claim is missing.
+    Only while ``username_strip_domain`` is on does it also refuse at least a claim with no suffix,
+    an empty local part, or a suffix off the allow-list; with it off the claim is used verbatim and
+    no suffix is checked (:func:`_resolve_username` holds the full rule). A username is reassignable, so selecting by it would hand a
     reassigned name the prior holder's account."""
 
     username: str

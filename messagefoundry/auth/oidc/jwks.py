@@ -297,9 +297,10 @@ class JwksCache:
         raises :class:`JwkAlgMismatch` (BACKLOG #5517). A key whose JWK names none is returned, and
         the caller still checks that it fits ``alg``.
 
-        Raises :class:`JwksError` if the key is unknown and the min-refetch floor has not elapsed, or
-        if a forced refetch still does not yield the ``kid``; :class:`JwksAmbiguousKid` if that refetch
-        returns a set giving two usable keys one ``kid``.
+        Raises :class:`JwksError` in at least these cases: the key is unknown and the min-refetch
+        floor has not elapsed; a forced refetch still does not yield the ``kid``; or a refetch, for
+        an unknown ``kid`` or a cached one past its TTL, returns a body the parse refuses. That last
+        is :class:`JwksAmbiguousKid` when the set gives two usable keys one ``kid``.
         """
         bound = self._lookup(kid)
         if bound.alg is not None and bound.alg != alg:
