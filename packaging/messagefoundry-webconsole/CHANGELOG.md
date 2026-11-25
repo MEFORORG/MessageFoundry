@@ -295,8 +295,10 @@ this line.**
   page that stages a passkey ceremony through `_reauth_webauthn_state` in `routes/core.py`
   catches it and shows the new `WEBAUTHN_UNREADABLE_NOTICE`, exported from the package, in place
   of the origin-migration notice its `None` would have shown. The notice sends a holder with
-  another factor to sign in with it and remove the unreadable passkey, and one with no other
-  factor to an administrator for an MFA reset. The supported engine seam moved with it:
+  another factor to sign in with it and remove the unreadable passkey. One with no other factor
+  is sent first to "Sign in with password and passkey", which names no credential and so may
+  still accept a discoverable passkey whose stored id cannot be read, and to an administrator
+  for an MFA reset only if that fails too. The supported engine seam moved with it:
   `StoredPasskeysUnreadable` is part of it, and `SUPPORTED_ENGINE_SEAMS` names the new digest.
   (`BACKLOG #6886`)
 - **The High Availability pages degrade when the store does not answer.** The page, its live

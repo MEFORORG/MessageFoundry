@@ -2519,11 +2519,14 @@ WEBAUTHN_RP_CHANGED_NOTICE = (
     "administrator to reset your MFA so you can re-enroll."
 )
 #: BACKLOG #6886: the account's passkeys under this origin are stored in a form that cannot be read.
-#: A holder with another working factor needs no reset, so the notice sends only one without it.
+#: A holder with another working factor needs no reset, and one without may not need one either: a
+#: discoverable passkey whose stored id cannot be read still signs in through the combined sign-in,
+#: which names no credential, so the notice sends the holder there before it sends them to a reset.
 WEBAUTHN_UNREADABLE_NOTICE = (
     "Your passkeys could not be read and are unusable here. Sign in with another factor and "
-    "remove the unreadable passkey, or, if you have no other factor, contact your administrator "
-    "to reset your MFA."
+    'remove the unreadable passkey. If you have no other factor, try "Sign in with password and '
+    'passkey" on the sign-in page, which may still accept it; only if that fails too, contact '
+    "your administrator to reset your MFA."
 )
 
 

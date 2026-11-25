@@ -633,7 +633,8 @@ async def test_the_rehash_pass_reads_a_bytes_hash_as_the_sign_in_does(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """BACKLOG #6886. RED when: the rehash pass refuses a ``credential_id_hash`` that reads back as
-    bytes holding today's hash (RED on ``f8e68d56cb3``), whose WARNING would then call a passkey
+    bytes holding today's hash, as when the pass parsed the stored value as text, whose WARNING
+    would then call a passkey
     the sign-in finds unusable. The sign-in's compare reads it as its text, so the pass leaves it
     as it is and counts nothing. The control: bytes that are not UTF-8 match no hash, and are
     refused."""
@@ -679,9 +680,10 @@ async def test_the_registration_leg_does_not_use_up_the_begin_legs_report(
 
 async def test_the_finish_leg_accepts_a_passkey_whose_stored_id_does_not_decode() -> None:
     """BACKLOG #6886. RED when: the verify refuses a valid assertion because the stored
-    ``credential_id`` does not decode (RED on ``f8e68d56cb3``). The finish leg finds the passkey by
-    the hash of the id the browser sends, and the signature check reads only the stored key, so
-    the stored id plays no part and the passkey signs in, as on ``main``. The begin leg leaves such
+    ``credential_id`` does not decode, as when the verify decoded that id to check it. The finish
+    leg finds the passkey by the hash of the id the browser sends, and the signature check reads
+    only the stored key, so the stored id plays no part and the passkey signs in, as it did before
+    BACKLOG #6886. The begin leg leaves such
     a passkey out of the allow list and reports it, but a browser can still answer with it. Here
     the account holds a good passkey, so a ceremony is staged, and the second one answers it: it
     signs in, and the finish leg writes no refusal row."""

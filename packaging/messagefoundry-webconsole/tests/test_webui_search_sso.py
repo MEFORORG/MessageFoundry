@@ -534,6 +534,8 @@ async def test_reauth_unreadable_credentials_render_their_own_notice(engine: Eng
         r = await c.get("/ui/reauth?next=" + quote(delete_path, safe=""))
         assert r.status_code == 200
         assert "Your passkeys could not be read" in r.text
+        # The combined sign-in comes before the reset, since it may still accept such a passkey.
+        assert "Sign in with password and" in r.text and "reset your MFA" in r.text
         assert "enrolled under a different origin" not in r.text
         assert "data-mf-webauthn-get" not in r.text
 

@@ -1693,11 +1693,13 @@ class MfaStatus:
 
 class StoredPasskeysUnreadable(Exception):
     """Every passkey an account holds under the ceremony's ``rp_id`` has a stored credential id
-    that does not decode (BACKLOG #6886), so no assertion ceremony can be staged. Raised by
+    that does not decode (BACKLOG #6886), so this assertion ceremony cannot be staged. Raised by
     :meth:`AuthService.begin_webauthn_assertion` in place of its ``None``, which means the passkeys
     were minted under another origin. The holder signs in with another factor where it has one and
-    removes the unreadable passkey, or asks an administrator for an MFA reset where it has none.
-    The message names no passkey and no stored value."""
+    removes the unreadable passkey. Where it has none, a discoverable passkey may still sign it in
+    through the combined passkey sign-in, which names no credential and does not read the stored
+    id; only where that fails too does it need an administrator's MFA reset. The message names no
+    passkey and no stored value."""
 
     def __init__(self) -> None:
         super().__init__("the account's passkeys could not be read")
@@ -5204,8 +5206,9 @@ class AuthService:
         never matched, and counted. So are a ``credential_id`` that is not base64url, which the
         pass cannot hash, a today-tagged hash its raw id does not give, and a move the store
         refuses: the account's seal failed between the read and the write, or the new hash is
-        already held. A refused row whose hash is in today's scheme is still found by the sign-in;
-        the pass only cannot check it. An account or passkey set already failing its seal is left
+        already held. A refused row whose hash is in today's scheme is still found by the sign-in
+        when that hash is the genuine credential id's, which the pass cannot check; one whose hash
+        is not matches no id a browser sends. An account or passkey set already failing its seal is left
         to the checked loaders, which report it. Returns ``(rehashed, refused)``; a refusal never
         stops start-up."""
         rehashed = refused = 0

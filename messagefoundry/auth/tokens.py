@@ -148,12 +148,13 @@ def stored_b64url_decodes(stored: str) -> bool:
 
 
 def stored_credential_id_hash_text(stored: object) -> str | None:
-    """A stored ``credential_id_hash`` as the text the sign-in compares it as, or ``None`` where no
-    sign-in can match it. The sign-in finds a passkey with
-    :func:`~messagefoundry.credential.constant_time_equal`, which compares bytes, so a BLOB in the
-    TEXT column (it reads back as bytes) holding today's hash as UTF-8 matches as that text does.
-    Bytes that are not UTF-8 never equal a hash this release computes, which is ASCII, and a value
-    of any other type is not one the compare takes."""
+    """A stored ``credential_id_hash`` as the text the sign-in compares it as, or ``None``. The
+    sign-in finds a passkey with :func:`~messagefoundry.credential.constant_time_equal`, which
+    compares bytes, so a BLOB in the TEXT column (it reads back as bytes) holding today's hash as
+    UTF-8 matches as that text does. Bytes that are not UTF-8 never equal a hash this release
+    computes, which is ASCII, and read as ``None``. A value of any other type reads as ``None``
+    here too, though the compare itself would accept a bytes-like one such as a ``memoryview``; no
+    store backend returns one today."""
     if isinstance(stored, str):
         return stored
     if isinstance(stored, (bytes, bytearray)):
