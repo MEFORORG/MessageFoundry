@@ -13,8 +13,15 @@ in the ``users`` table.
 
 from __future__ import annotations
 
+import functools
+import logging
+
 from argon2 import PasswordHasher
-from argon2.exceptions import InvalidHashError, VerificationError
+from argon2.exceptions import Argon2Error, InvalidHashError, VerificationError
+
+from messagefoundry.controlchars import has_lone_surrogate
+
+_log = logging.getLogger(__name__)
 
 # argon2id cost parameters (ASVS 11.4.2, 11.4.4). These are RFC 9106 section 4's SECOND recommended
 # option, and argon2-cffi exposes the same tuple as ``argon2.profiles.RFC_9106_LOW_MEMORY``. They
@@ -60,8 +67,79 @@ def hash_password(password: str) -> str:
     return _hasher.hash(password)
 
 
+#: The fixed input of the constant-work verify below. Not a credential: nothing stores its hash.
+_CONSTANT_WORK_INPUT = "mf-verify-constant-work"
+
+
+@functools.cache
+def _constant_work_hash() -> str:
+    """A hash at the pinned parameters, made on first use rather than at import, so importing this
+    module stays free of argon2 work. Which refusals pay for making it: :func:`verify_password`."""
+    return _hasher.hash(_CONSTANT_WORK_INPUT)
+
+
+def _spend_one_verify() -> None:
+    """One argon2id verify at the pinned cost, its answer discarded, for the two refusals in
+    :func:`verify_password`.
+
+    What it does: either refusal returns before the hasher runs, so without this it would cost
+    almost nothing; with it, a refused verify costs one argon2id verify at the pinned parameters.
+    That matches an ordinary mismatch only when the stored hash is at the pinned parameters too: a
+    mismatch costs a verify at the stored hash's own parameters, so for a stored hash at other
+    parameters, for example one that ``needs_rehash`` would upgrade, the two costs differ. While the
+    fixed hash is not cached, a refusal also pays one hash to make it, at least the first refusal in
+    a process and every refusal after a failed hash; :func:`verify_password` lists when. The padding
+    plays no part in hiding which recovery-code slot matched; the walk (ADR 0170) runs every slot
+    whatever the result, and neither refusal's cost depends on the presented code: a non-ASCII
+    stored hash is refused for any code, and a surrogate in the code makes every slot refuse the
+    same way. This does not raise: if argon2 itself fails here, the failure is logged without
+    content, and the refusal then costs whatever was spent."""
+    failure: str | None = None
+    try:
+        _hasher.verify(_constant_work_hash(), _CONSTANT_WORK_INPUT)
+    except (
+        Argon2Error,
+        InvalidHashError,
+    ) as exc:  # InvalidHashError is a ValueError, not Argon2Error
+        failure = type(exc).__name__
+    if failure is not None:
+        _log.warning("constant-work argon2 verify failed (%s); the refusal stands", failure)
+
+
 def verify_password(stored_hash: str, password: str) -> bool:
-    """True iff ``password`` matches ``stored_hash``. Never raises on a bad password or malformed hash."""
+    """True iff ``password`` matches ``stored_hash``. Never raises on a bad password or malformed hash.
+
+    What a call costs (BACKLOG #6880): a refusal of a non-ASCII stored hash, or of a password holding
+    a surrogate code point, pays one argon2id verify at the pinned parameters against a fixed hash.
+    Until that fixed hash is cached, a refusal also pays one hash to make it: at least the first
+    refusal in a process, any refusal that runs while another is still making it (the cache does not
+    serialize a miss), and every refusal after a failed hash (a failure is not cached). A password
+    holding a surrogate is refused at that cost whatever ASCII stored hash it meets, a malformed one
+    included. For any other password, a well-formed stored hash at the pinned parameters costs one
+    verify, and other stored hashes cost what argon2-cffi spends on them: at least a malformed ASCII
+    hash is refused before any hashing and costs almost nothing, and a hash at other parameters
+    costs its own verify, which is not what a refusal costs."""
+    # argon2-cffi encodes the hash as ASCII and the password as UTF-8 before argon2 sees either, and
+    # neither encode failure becomes one of its own exception types. Both inputs are therefore
+    # screened first, so no ``UnicodeEncodeError`` is ever raised here: that exception carries the
+    # whole hash or password, and would chain onto anything a failing log handler prints.
+    #
+    # ``hash_password`` only ever emits ASCII, so a non-ASCII stored hash, whether of a password or
+    # of a recovery code, is at least one of: corruption of an unsealed row, a defect in a path that
+    # writes the hash, or tampering. Where the users row is sealed, at-rest corruption fails the seal
+    # before this runs. Hence a WARNING that names no single cause.
+    if not stored_hash.isascii():
+        _spend_one_verify()
+        _log.warning("stored argon2 hash is not ASCII; treating it as a non-match")
+        return False
+    # A surrogate code point is the one thing strict UTF-8 refuses. It is caller input, and no stored
+    # hash can match it, because ``hash_password`` cannot hash it either. At least the sign-in request
+    # model refuses one with a 422 (pinned in tests/test_auth_hardening.py), so this guards any
+    # caller that skips such a model.
+    if has_lone_surrogate(password):
+        _spend_one_verify()
+        _log.debug("password does not encode as UTF-8; treating it as a non-match")
+        return False
     try:
         return _hasher.verify(stored_hash, password)
     except (VerificationError, InvalidHashError):
