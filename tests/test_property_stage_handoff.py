@@ -152,6 +152,9 @@ async def test_handoff_rerun_is_a_no_op(
         assert await _snapshot(store) == claimed
         kwargs = _route_kwargs(item.id, mid, spec, raw)
         assert await store.route_handoff(**kwargs, now=_NOW)
+        # The positive control for every snapshot equality: a committed handoff, which consumes the
+        # ingress row and logs an event, must show in the snapshot.
+        assert await _snapshot(store) != claimed, "the snapshot did not see a committed handoff"
         # A payload the first run never wrote, so the re-run always differs from it.
         every_handler = [(h, "RERUN") for h in _HANDLERS]
         rerun = {**kwargs, "handlers": every_handler, "disposition": MessageStatus.ROUTED}
