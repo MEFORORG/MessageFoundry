@@ -4,8 +4,9 @@
 
 BACKLOG #7576 and #7577. EVERY PATH HERE IS UNDER ``tmp_path``. The installer writes into a config
 root's settings.json, so a test that let it fall through to its own root resolution would wire the
-real account this suite runs under. Each call names ``-SettingsPath`` explicitly, pops the
-``CLAUDE_CONFIG_DIR`` pin, and passes ``-HomeDir`` inside ``tmp_path``.
+real account this suite runs under. Each call pops the ``CLAUDE_CONFIG_DIR`` pin and passes a
+``-HomeDir`` inside ``tmp_path``; all but the relative ``-HomeDir`` test also name ``-SettingsPath``,
+and that one runs with both its ``$PWD`` and its process directory inside ``tmp_path``.
 """
 
 from __future__ import annotations
@@ -40,6 +41,11 @@ def _env() -> dict[str, str]:
     return env
 
 
+def _q(path: Path | str) -> str:
+    """A PowerShell single-quoted literal: an apostrophe in a path is doubled, not a parse error."""
+    return "'" + str(path).replace("'", "''") + "'"
+
+
 def _spawn(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     return run_single(
         cmd, capture_output=True, text=True, timeout=TIMEOUT, check=False, env=_env(), cwd=cwd
@@ -67,9 +73,9 @@ def _install_in_session(
     """Call the installer with ``&`` inside one pwsh session, the only way to bind an ARRAY to
     ``-SettingsPath`` (``pwsh -File`` refuses a repeated parameter) or to give it a ``$PWD`` that
     differs from the process directory (``location``)."""
-    script = f"& '{INSTALL}' -HomeDir '{_home(tmp_path)}' -CollectorPath '{COLLECT}' {args}"
+    script = f"& {_q(INSTALL)} -HomeDir {_q(_home(tmp_path))} -CollectorPath {_q(COLLECT)} {args}"
     if location is not None:
-        script = f"Set-Location -LiteralPath '{location}'; {script}"
+        script = f"Set-Location -LiteralPath {_q(location)}; {script}"
     return _spawn(
         ["pwsh", "-NoProfile", "-NonInteractive", "-Command", f"{script}; exit $LASTEXITCODE"], cwd
     )
@@ -165,7 +171,9 @@ def test_a_settings_path_in_a_missing_directory_stops_the_run_before_any_write(
     root = _root(tmp_path, {"keep": True})
     good = root / "settings.json"
     missing = tmp_path / "no-such-dir" / "settings.json"
-    proc = _install_in_session(tmp_path, f"-SettingsPath @('{good}', '{missing}')", cwd=tmp_path)
+    proc = _install_in_session(
+        tmp_path, f"-SettingsPath @({_q(good)}, {_q(missing)})", cwd=tmp_path
+    )
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert "CANNOT START" in proc.stdout
     assert json.loads(good.read_text(encoding="utf-8")) == {"keep": True}
@@ -229,7 +237,7 @@ def test_a_path_on_a_drive_that_does_not_exist_is_a_usage_error(tmp_path: Path) 
         pytest.skip("every drive letter is in use")
     proc = _install(tmp_path, "-SettingsPath", f"{free}:\\nope\\settings.json", cwd=tmp_path)
     assert proc.returncode == 2, proc.stdout + proc.stderr
-    assert "CANNOT START" in proc.stdout
+    assert "cannot be resolved" in proc.stdout
 
 
 def test_status_and_uninstall_still_report_on_a_deleted_root(tmp_path: Path) -> None:
@@ -242,18 +250,17 @@ def test_status_and_uninstall_still_report_on_a_deleted_root(tmp_path: Path) -> 
         assert proc.returncode != 2, (mode, proc.stdout + proc.stderr)
 
 
-def test_a_hard_linked_settings_file_is_refused_and_left_untouched(tmp_path: Path) -> None:
-    """A RENAME CUTS A HARD LINK: the root would become a standalone copy while the shared file kept
-    its old content. There is no single real side to write through to, so the root fails loudly."""
+def test_a_hard_linked_settings_file_is_written_through_not_cut(tmp_path: Path) -> None:
+    """A REPLACE CUTS A HARD LINK: the root would become a standalone copy while the shared file kept
+    its old content. A linked file is still written in place, so both names see the statusLine."""
     root = _root(tmp_path, {"shared": True})
     settings = root / "settings.json"
     other = tmp_path / "shared.json"
     os.link(settings, other)
     proc = _install(tmp_path, "-SettingsPath", str(settings), cwd=tmp_path)
-    assert proc.returncode == 1, proc.stdout + proc.stderr
-    assert "hard link" in proc.stdout
+    assert proc.returncode == 0, proc.stdout + proc.stderr
     assert os.stat(settings).st_ino == os.stat(other).st_ino
-    assert json.loads(other.read_text(encoding="utf-8")) == {"shared": True}
+    assert "statusLine" in json.loads(other.read_text(encoding="utf-8"))
 
 
 def test_a_symlinked_settings_file_is_written_through_to_its_target(tmp_path: Path) -> None:
@@ -295,10 +302,47 @@ def test_a_relative_home_dir_resolves_against_the_powershell_location(tmp_path: 
     elsewhere = tmp_path / "elsewhere"
     (elsewhere / ".claude").mkdir(parents=True)
     script = (
-        f"Set-Location -LiteralPath '{home}'; "
-        f"& '{INSTALL}' -HomeDir . -CollectorPath '{COLLECT}'; exit $LASTEXITCODE"
+        f"Set-Location -LiteralPath {_q(home)}; "
+        f"& {_q(INSTALL)} -HomeDir . -CollectorPath {_q(COLLECT)}; exit $LASTEXITCODE"
     )
     proc = _spawn(["pwsh", "-NoProfile", "-NonInteractive", "-Command", script], elsewhere)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert (home / ".claude" / "settings.json").exists()
     assert not (elsewhere / ".claude" / "settings.json").exists()
+
+
+def test_status_and_uninstall_ignore_a_low_refresh_interval(tmp_path: Path) -> None:
+    """Only an install uses the interval, so a wrapper passing the same arguments to every mode can
+    still audit and uninstall."""
+    root = _root(tmp_path, {})
+    settings = root / "settings.json"
+    for mode in ("-Status", "-Uninstall"):
+        proc = _install(
+            tmp_path, mode, "-SettingsPath", str(settings), "-RefreshInterval:500", cwd=tmp_path
+        )
+        assert "CANNOT START" not in proc.stdout, (mode, proc.stdout)
+
+
+def test_a_rewrite_keeps_the_file_acl_and_attributes(tmp_path: Path) -> None:
+    """A RENAME OF A FRESH TEMP FILE WIDENS A LOCKED-DOWN FILE: it carries the directory's inherited ACL
+    and default attributes. The replace keeps the old file's, as the in-place write did."""
+    root = _root(tmp_path, {})
+    settings = root / "settings.json"
+    lock = (
+        f"$p = {_q(settings)}; $a = Get-Acl -LiteralPath $p; $a.SetAccessRuleProtection($true, $false); "
+        "$me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name; "
+        "$a.SetAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($me, 'FullControl', 'Allow')); "
+        "Set-Acl -LiteralPath $p -AclObject $a; (Get-Item -LiteralPath $p).Attributes = 'Hidden'"
+    )
+    probe = (
+        f"$p = {_q(settings)}; $a = Get-Acl -LiteralPath $p; "
+        "'{0} {1} {2}' -f $a.AreAccessRulesProtected, $a.Access.Count, "
+        "[bool]((Get-Item -LiteralPath $p -Force).Attributes -band [IO.FileAttributes]::Hidden)"
+    )
+    pw = ["pwsh", "-NoProfile", "-NonInteractive", "-Command"]
+    assert _spawn([*pw, lock], tmp_path).returncode == 0
+    before = _spawn([*pw, probe], tmp_path).stdout.strip()
+    assert before == "True 1 True", before
+    proc = _install(tmp_path, "-SettingsPath", str(settings), cwd=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _spawn([*pw, probe], tmp_path).stdout.strip() == before

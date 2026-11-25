@@ -65,9 +65,10 @@
     pwsh -NoProfile -File scripts\coord\install-usage-statusline.ps1 -AllRoots
     pwsh -NoProfile -File scripts\coord\install-usage-statusline.ps1 -Status
     pwsh -NoProfile -File scripts\coord\install-usage-statusline.ps1 -Uninstall
-    # ONE -ConfigDir PER VALUE. `pwsh -File` hands each argument over as a single string, so
-    # `-ConfigDir A,B` binds as the one value "A,B" (measured). Nothing splits it, deliberately: a
-    # Windows path may legally contain a comma.
+    # ONE PATH PER RUN under `pwsh -File`. It hands each argument over as a single string, so
+    # `-ConfigDir A,B` binds as the one value "A,B" (measured), and it refuses a repeated -ConfigDir
+    # (measured). Nothing splits it, deliberately: a Windows path may legally contain a comma. Several
+    # paths at once need a pwsh session: & <script> -ConfigDir @('A', 'B').
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
@@ -188,15 +189,6 @@ function Write-SettingsFile([string]$Path, $Data) {
     # 771 bytes of run 1's POST-install content. The only pre-install copy was destroyed by the run
     # that claimed to be making one, which is worse than not backing up at all: the operator is told a
     # backup exists and it holds the wrong content.
-    # A RENAME REPLACES THE NAME, NOT THE FILE IT LINKS TO, so the replace below would cut a link that
-    # Set-Content wrote through. A symbolic link is followed to its final target, which is the file the
-    # operator meant; a hard link has no "real" side to follow, so it is refused, loudly, and the
-    # root counts FAILED rather than silently becoming a standalone copy.
-    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-    if ($item -and $item.LinkType -eq 'SymbolicLink') { $Path = $item.ResolveLinkTarget($true).FullName }
-    elseif ($item -and $item.LinkType -eq 'HardLink') {
-        throw "settings.json is a hard link; replacing it would cut the link, so it was left untouched"
-    }
     $backedTo = $null
     if (Test-Path -LiteralPath $Path) {
         $dest = "$Path.bak-usage-$BackupStamp"
@@ -205,26 +197,49 @@ function Write-SettingsFile([string]$Path, $Data) {
         Copy-Item -LiteralPath $Path -Destination $dest -Force
         $backedTo = $dest
     }
-    # TEMP-THEN-RENAME, the discipline account-availability.ps1 and the collector already use. Claude
+    # TEMP-THEN-REPLACE, the discipline account-availability.ps1 and the collector already use. Claude
     # Code reads this file at session start, and an in-place Set-Content truncates the live file first,
     # so a crash or a concurrent session start mid-write sees a partial file that disables every
     # setting in it (BACKLOG #7576). The encoding is UTF-8 WITHOUT a BOM, which is what Set-Content
     # -Encoding UTF8 wrote on pwsh 7; [Text.Encoding]::UTF8 would add one. $Path is absolute (the
     # target resolver makes it so), which matters because these .NET calls resolve a relative path
-    # against the process directory, not $PWD. THE RENAME IS RETRIED, as the collector's is: a file
-    # just created is often held open for a moment by a scanner, and one sharing violation would
-    # otherwise fail the root. The finally removes a temp file a failed write or rename leaves behind;
-    # after a successful rename it no longer exists.
+    # against the process directory, not $PWD.
+    #
+    # File.Replace, NOT File.Move, OVER AN EXISTING FILE: Move gives settings.json the new temp file's
+    # inherited ACL and default attributes, while Replace keeps the old file's (measured: an owner-only
+    # protected ACL and Hidden both survive Replace, and both were lost to Move).
+    #
+    # A LINKED FILE IS STILL WRITTEN IN PLACE. Either replace swaps the directory entry, so it would cut a
+    # symbolic or hard link that the old Set-Content wrote through, leaving a standalone copy while the
+    # shared file kept its old content. For a link, writing through matters more than atomicity, so that
+    # case keeps the old behaviour rather than gaining a new failure.
+    #
+    # ONLY A SHARING VIOLATION IS RETRIED, because a file just created is often held open for a moment by
+    # a scanner. A read-only file or a missing directory fails at once.
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($item -and $item.LinkType) {
+        Set-Content -LiteralPath $Path -Value $json -Encoding UTF8
+        return $backedTo
+    }
     $tmp = "$Path.$PID.tmp"
     try {
         [System.IO.File]::WriteAllText($tmp, $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
         foreach ($attempt in 1..3) {
             # Untyped catch: a .NET method's exception arrives wrapped in MethodInvocationException.
-            try { [System.IO.File]::Move($tmp, $Path, $true); break }
-            catch { if ($attempt -eq 3) { throw }; Start-Sleep -Milliseconds (50 * $attempt) }
+            try {
+                if ($item) { [System.IO.File]::Replace($tmp, $Path, [NullString]::Value) }
+                else { [System.IO.File]::Move($tmp, $Path, $false) }
+                break
+            }
+            catch {
+                $sharing = $_.Exception.GetBaseException().HResult -eq -2147024864  # ERROR_SHARING_VIOLATION
+                if ($attempt -eq 3 -or -not $sharing) { throw }
+                Start-Sleep -Milliseconds (50 * $attempt)
+            }
         }
     }
     finally {
+        # After a successful replace the temp file no longer exists, so this removes nothing.
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     }
     return $backedTo
@@ -292,17 +307,17 @@ function Resolve-ArgPath([string]$Path, [string]$What) {
     if ([string]::IsNullOrWhiteSpace($Path)) { Stop-Cannot "$What was given as an empty string" }
     $provider = $null; $drive = $null
     try { $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path, [ref]$provider, [ref]$drive) }
-    catch { Stop-Cannot "$What cannot be resolved to a file path: $Path ($($_.Exception.GetBaseException().Message))" }
+    catch {
+        # AN AUDIT OR AN UNINSTALL REPORTS ON A GONE ROOT rather than stopping, as it did before this
+        # resolver existed: one root on an unmapped share must not hide the rest.
+        if ($Status -or $Uninstall) { return $Path }
+        Stop-Cannot "$What cannot be resolved to a file path: $Path ($($_.Exception.GetBaseException().Message))"
+    }
     if ($provider.Name -ne 'FileSystem') { Stop-Cannot "$What does not name a file-system path: $Path (it resolved under $($provider.Name))" }
     return $full
 }
 
 $HomeDir = Resolve-ArgPath $HomeDir "-HomeDir"
-# IN THE BODY, NOT A [ValidateRange]: a binding failure exits 1 with pwsh's own text, and exit 1 here
-# means "roots were targeted and none reached the desired state". A usage error is exit 2.
-if ($RefreshInterval -lt 1000) {
-    Stop-Cannot "-RefreshInterval $RefreshInterval is under 1000 ms, the minimum Claude Code honours"
-}
 
 $targets = @()
 $targetFrom = ""
@@ -396,7 +411,8 @@ if ($Status) {
             }
             if ($relColl) {
                 Write-Host "    collector     : $coll   -- RELATIVE; a session resolves it from its own directory, so it may name nothing" -ForegroundColor Yellow
-                Write-Host "                    re-install this root to wire an absolute path: -ConfigDir `"$($t.Root)`""
+                # One re-install line per root: the legacy and PowerShell-source arms may have printed it.
+                if ($null -ne $wired -and -not $psSource) { Write-Host "                    re-install this root to wire an absolute path: -ConfigDir `"$($t.Root)`"" }
             }
             elseif ($coll) { Write-Host "    collector     : $coll   exists: $(Test-Path -LiteralPath $coll)" }
             else { Write-Host "    collector     : UNKNOWN (command shape not recognised)" }
@@ -525,6 +541,12 @@ if (-not (Test-Path -LiteralPath $CollectorPath)) {
 # both bash and pwsh, and a partial run would leave the box in a mixed state.
 Assert-ShellQuotable $CollectorPath "the collector path"
 foreach ($t in $targets) { Assert-ShellQuotable (Get-UsageStateDir $t.Root) "the publish path for $($t.Root)" }
+# IN THE BODY, NOT A [ValidateRange], and on the install path only: a binding failure exits 1 with
+# pwsh's own text, and exit 1 here means "roots were targeted and none reached the desired state". A
+# usage error is exit 2. -Status and -Uninstall never use the interval.
+if ($RefreshInterval -lt 1000) {
+    Stop-Cannot "-RefreshInterval $RefreshInterval is under 1000 ms, the minimum Claude Code honours"
+}
 # A -SettingsPath directory is checked HERE, on the install path only, and before any write: a missing
 # directory found inside the write loop fails that one target after the others were written, the mixed
 # state these pre-passes exist to prevent. -Status and -Uninstall still report on a deleted root.
