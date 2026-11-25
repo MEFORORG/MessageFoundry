@@ -134,9 +134,9 @@ EXIT CODES: 0 nothing refused and no fault; 1 refused, with a ``CLA pre-check re
 annotation, whatever fault is reported beside it; 3 a fault caught by this script with nothing
 refused, at least: bad input, network, a reply in the wrong shape, a short read, a head still
 stale after the re-reads, a commit list that does not include ``CLA_HEAD_SHA`` or cannot show that
-it does, a commit GraphQL reported an error inside (outside its ``committer``, or inside the
-committer of an unlinked author's first-page commit, whose key it hides), or an exception raised
-inside ``run``. At
+it does, a commit GraphQL reported an error inside outside its ``committer``, or an exception
+raised inside ``run``. An error inside the committer of an unlinked author's first-page commit is
+reported as a fault beside that commit's rule 1 refusal, so it exits 1. At
 least one other path exits 1 with no refusal annotation: an error before ``main`` runs, such as at
 import. The interpreter itself exits 2 when it cannot open the script. The workflow tells these
 apart by the annotation, not the code alone.
