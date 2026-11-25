@@ -874,7 +874,8 @@ named as well. A value that is not a finite number above `0` is refused at load.
   and at an interval of a year nothing is reminded until the next restart. `[cert_monitor]`'s
   interval also throttles the handshake alert for a service caller's expiring client certificate,
   so that alert repeats no more often than once per interval.
-- **What you keep:** the scan at each start. For `[secret_rotation]`, also the start-time expiry
+- **What you keep:** the scan at each start, and the first handshake alert for each expiring client
+  certificate, which fires immediately whatever the interval. For `[secret_rotation]`, also the start-time expiry
   checks the entry above describes; `[cert_monitor]` has no start-time check beyond its first scan.
 - **When acceptable:** an instance that restarts more often than the interval, or where something
   outside the engine tracks the same credentials.

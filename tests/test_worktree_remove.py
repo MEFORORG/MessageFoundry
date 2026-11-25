@@ -747,16 +747,13 @@ def test_removal_still_succeeds_with_no_claims_directory(fx: Fixture) -> None:
 # --- BACKLOG #1293: allocations a removed worktree owns ------------------------
 #
 # Ownership of a ledger number is a casefolded PATH-STRING comparison against the worktree recorded
-# at allocation time. When the committing tree's path misses, `owns()` falls back to the recorded
-# BRANCH (BACKLOG #1282): a commit from a worktree on that branch NAME is entitled, whenever the
-# record carries one. owns() matches the name of the current HEAD, so a branch recreated under that
-# name counts and nothing checks it is the original. Without a recorded branch, removal leaves the
-# number committable only from a worktree recreated at the recorded path (docs/LEDGER-GATE.md). PR
-# #397 was stranded exactly this way, before the fallback.
+# at allocation time, with no fallback when that directory is gone. So removal BURNS the number:
+# `owns()` returns false for every session forever and any PR that must re-introduce the heading is
+# unlandable by anyone. PR #397 was stranded exactly this way.
 #
-# IT REFUSES RATHER THAN WARNS BECAUSE THE FALLBACK IS NOT A GUARANTEE. A claim can be released
-# afterwards; an allocation cannot be re-keyed -- ownership is documented non-transferable -- and a
-# record with no branch has no second key, so the removal is the moment this is stopped.
+# IT REFUSES RATHER THAN WARNS BECAUSE THERE IS NO POST-HOC FIX. A claim can be released afterwards;
+# an allocation cannot be re-keyed -- ownership is documented non-transferable -- so the removal is
+# the only moment this can be stopped.
 
 
 def _alloc_dir(fx: Fixture, kind: str = "backlog") -> Path:
@@ -864,6 +861,19 @@ def test_the_override_is_NOT_Force(fx: Fixture) -> None:
     allowed = run(fx, "-Name", "alpha", "-AllowOrphanedAllocations")
     assert allowed.returncode == 0, allowed.stderr
     assert not fx.is_registered(wt)
+
+
+def test_the_refusal_names_no_branch_deletion_when_DeleteBranch_was_not_passed(fx: Fixture) -> None:
+    """The refusal must not say this run deletes a branch when -DeleteBranch was not passed, and it
+    keeps the unqualified warning: removing the worktree BURNS the number."""
+    wt = fx.add("alpha")
+    _write_alloc(fx, "9106", wt)
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode != 0, "removal proceeded past a recorded allocation"
+    assert "-DeleteBranch" not in proc.stderr, proc.stderr
+    assert "Removing it BURNS those numbers." in proc.stderr, proc.stderr
+    assert fx.is_registered(wt)
 
 
 # --- BACKLOG #1829: the retired-allocator tombstone ------------------------------------------------

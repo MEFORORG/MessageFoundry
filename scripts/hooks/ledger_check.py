@@ -711,31 +711,9 @@ class Ledger:
         happens the recorded path stops matching for EVERY session, the number is uncommittable by
         anyone, and nothing reports it. Measured 2026-08-30: 43 numbers were already in that state.
 
-        ***THE FALLBACK PRESERVES THE EXCLUSIVITY THE PATH WAS PROVIDING, AND THAT IS THE ONLY REASON
-        IT IS SAFE: GIT REFUSES AN ORDINARY SECOND CHECKOUT OF ONE BRANCH IN TWO WORKTREES.*** So "the
-        session on this branch" is as single-valued as "the session in this worktree" ever was -- the
-        gate exists to stop two sessions filing one number, and two sessions do not hold one branch.
-        What changes is that the key now survives its worktree.
-
-        ***THAT REFUSAL IS A DEFAULT, NOT A GUARANTEE, AND THIS SENTENCE USED TO SAY "GIT REFUSES"
-        FLAT (BACKLOG #1039).*** Measured: `git worktree add --force` (and `-f`) check the same branch
-        out again and succeed, and `git checkout --ignore-other-worktrees` switches -- the same two
-        bypasses `worktree_gate.ps1` already spells out in its own rule-3b deny text. A claim about
-        this repository's CONFIGURATION was being written as a claim about git.
-
-        **So there is a real residual, stated rather than repaired here, because repairing it is a
-        change to the ownership model and not to a docstring.** Force a second checkout of the
-        recorded branch and BOTH trees satisfy the fallback, so entitlement to the number leaks to a
-        tree that never allocated it. It is narrow: the fallback is unreachable while the recorded
-        path still matches (see the early return below), so the leak needs the recorded worktree to be
-        gone AND a deliberate `--force`. It stops the ACCIDENT, not a determined bypass -- which is
-        the same bound `worktree_gate.ps1` reaches about its own guard, and it is the honest strength
-        of the argument above rather than a hole this change opens.
-
-        WHY THIS AND NOT A TRANSFER VERB: a transfer verb would let a seat take a number another
-        session is actively holding, which is the collision the gate exists to prevent. The branch
-        fallback only becomes reachable once the original worktree is GONE -- and a branch that is
-        free to check out is one nobody is working in.
+        ***THE FALLBACK IS NOT EXCLUSIVE.*** It is tried whenever the committing tree's path misses, so
+        at least two trees can be entitled to one number (docs/LEDGER-GATE.md, "When the owning
+        worktree is gone"). Repairing that is a change to the ownership model, not made here.
 
         ***THE LIMIT, STATED RATHER THAN DISCOVERED: A DELETED BRANCH STRANDS THE NUMBER AGAIN.***
         That is a smaller hole (a branch is cheap to recreate at any commit, and a branch deleted
@@ -825,11 +803,8 @@ class Ledger:
             lines.append(f"    2. or check that branch out and commit there: {branch}")
         lines += [
             "       (git refuses an ORDINARY second checkout of a branch another worktree holds. Do",
-            "        not force past that -- two trees on one branch is what makes the branch key above",
-            "        stop being exclusive. From the worktree in 1 you can still reach it with:",
+            "        not force past that. From the worktree in 1 you can still reach it with:",
             "        git checkout -b <alias> <branch>, then push <alias>:<branch>)",
-            "    3. ONLY if neither tree nor branch still exists, allocate a new number:",
-            f"       {allocate}",
             "",
             "    See docs/LEDGER-GATE.md, 'Recovering a number the gate has refused'.",
         ]

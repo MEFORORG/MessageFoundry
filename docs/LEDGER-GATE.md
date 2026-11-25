@@ -292,22 +292,18 @@ removing a worktree that held an unlanded allocation stranded the number:
 `owns()` returned false for **every** session from then on, and any PR that had to re-introduce that
 heading was unlandable **by anyone**. PR #397 was stranded exactly this way.
 
-**The fallback is NOT exclusive.** It is tried whenever the
-committing tree's path misses, not only once the recorded worktree is gone. So while the recorded
-worktree still exists but stands on another branch (the `drifted-branch-free` state below), a second
-worktree can check out the recorded branch with an ordinary `git checkout`, and both trees are then
-entitled: the first by path, the second by branch. Where the recorded worktree is gone, git's
-single-checkout default keeps two worktrees of one clone off one branch, and `git worktree add
---force` and `git checkout --ignore-other-worktrees` defeat that default (BACKLOG #1039). The
-`Checker.owns` docstring states the forced case only. **The match is by name.**
+**The fallback is NOT exclusive.** It is tried whenever the committing tree's path misses, so at
+least two trees can be entitled to one number, for example the recorded worktree by path while it
+stands on another branch (the `drifted-branch-free` state below) and a second worktree on the
+recorded branch. **The match is by name.**
 `owns()` reads the name of the current branch and never checks that it is the branch the allocation
 saw, so a deleted branch recreated under the same name restores entitlement, and an unrelated branch
 that reuses the name inherits it. **A number still strands when the record carries no branch**, as
 one made before the branch field existed does, and its worktree is gone. Then the recovery below is
 the one that works.
 
-**Prevention is enforced.** `scripts/worktree/remove.ps1` refuses a removal while this worktree owns a
-number whose item is not yet on `origin/main`, and a cannot-tell reads as at-risk. The override is
+**Prevention is enforced.** `scripts/worktree/remove.ps1` refuses a removal while an allocation record
+names this worktree's path, matched by path only, for a number whose item is not yet on `origin/main`, and a cannot-tell reads as at-risk. The override is
 `-AllowOrphanedAllocations` and deliberately **not** `-Force`: that one already means *"I accept losing
 uncommitted changes"*, and one consent must not silently cover a second, irreversible risk.
 

@@ -1805,6 +1805,18 @@ def test_a_reminder_interval_above_its_default_is_a_named_loosening() -> None:
     # The after-the-deadline clause only where the interval reaches the warn_days lead.
     assert "after the deadline itself" in named["cert_monitor.check_interval_seconds"]
     assert "after the deadline itself" not in named["secret_rotation.check_interval_seconds"]
+    # At equality with the lead the clause still prints, and says "at least", as the >= check does.
+    equal = dict(
+        _pairs(
+            cert_monitor=CertMonitorSettings(warn_days=14, check_interval_seconds=1_209_600.0),
+            backup=BackupSettings(),
+            rotation=SecretRotationSettings(),
+        )
+    )
+    assert (
+        "which is at least the 14-day warn_days lead"
+        in equal["cert_monitor.check_interval_seconds"]
+    )
     # No "; " inside an entry: the serve warning joins whole entries with it.
     assert not any("; " in named[k] for k in named if k.endswith("check_interval_seconds"))
     keys = ("cert_monitor.check_interval_seconds", "secret_rotation.check_interval_seconds")

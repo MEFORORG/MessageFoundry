@@ -276,8 +276,7 @@ if ($For) {
 # exists to prevent, arrived at from the other direction.
 #
 # IT DOES NOT CONSULT THE BRANCH, THOUGH `owns` HAS A BRANCH FALLBACK (BACKLOG #1282). That fallback
-# is unreachable while the recorded path still matches, and `git worktree add --force` can put two
-# trees on one branch -- so matching on branch here could hand tree B a number tree A is actively
+# is not exclusive (docs/LEDGER-GATE.md) -- so matching on branch here could hand tree B a number tree A is actively
 # holding. THE TWO ERRORS ARE NOT SYMMETRIC: failing to match costs a hole, which is exactly the
 # status quo this block improves on, and matching wrongly costs a collision. Holes are free,
 # collisions are not, so the check is deliberately the narrow one.
