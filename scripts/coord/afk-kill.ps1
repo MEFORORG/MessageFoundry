@@ -31,9 +31,9 @@
     worktree the hook input's `cwd` sits in, its `.claude/seat.local.txt`, then $env:KORUS_SEAT,
     then the roster's aliases. Only a worktree sharing this script's git common dir may name the
     seat; for a `cwd` in another repository's checkout, or one whose common dir cannot be read, the
-    seat comes from $env:KORUS_SEAT and this script's roster, else it is undeclared. That
-    checkout's marker cannot name the seat, but one naming Special, or an alias of Special in
-    either roster, still vetoes the instruction. A fault on this path prints no instruction, so it
+    seat comes from $env:KORUS_SEAT, read against this script's roster and that checkout's, else
+    it is undeclared. That checkout's marker cannot name the seat, but one naming Special, or an
+    alias of Special in either roster, still vetoes the instruction. A fault on this path prints no instruction, so it
     fails toward no instruction rather than a wrong one. It never runs while the
     switch reads ON.
 
@@ -135,8 +135,9 @@ function Get-SkillInstructionSource {
     # Only a checkout of this repository may name the seat: another repository's marker, or its
     # roster with no Special alias, would hand a Special seat the instruction. Such a cwd, or one
     # whose common dir (or this script's) cannot be read, is read as undeclared instead: its roster
-    # is skipped, its marker may only VETO (below), $env:KORUS_SEAT is read against this script's
-    # own roster, and an undeclared seat gets the instruction with its Special-skips sentence.
+    # may only add Special aliases, its marker may only VETO (below), $env:KORUS_SEAT is read
+    # against both rosters, and an undeclared seat gets the instruction with its Special-skips
+    # sentence.
     # Refusing would cost a non-Special seat whose shell sits in another checkout its reload after
     # a compaction. Compared through links as well as by text, because the script's path and a
     # worktree's gitdir line may spell one directory differently.
@@ -152,16 +153,19 @@ function Get-SkillInstructionSource {
     $marker = Join-Path $root '.claude/seat.local.txt'
     if (Test-Path -LiteralPath $marker) { $raw = Get-Content -LiteralPath $marker -Raw -ErrorAction Stop }
     $theirSeats = Join-Path $root 'docs/roles/seats.json'
+    $extra = @()
     if (-not $ours) {
         # A marker that cannot NAME the seat may still VETO the instruction: one naming Special, or
         # an alias of it in either roster, prints nothing, as the cwd's marker did before the
-        # repository check. The cwd's roster only adds vetoes here, so a fault reading it, like one
-        # reading this script's roster or the marker, throws, and no instruction is printed.
+        # repository check. The cwd's roster only adds vetoes here, for the marker and for
+        # $env:KORUS_SEAT alike, so a fault reading it, like one reading this script's roster or
+        # the marker, throws, and no instruction is printed.
         # Like the marker it vetoes as, it outranks $env:KORUS_SEAT. The cost is accepted: a stale
         # Special marker in a shared foreign checkout silences a non-Special seat there too.
-        $extra = @()
-        if (-not [string]::IsNullOrWhiteSpace($raw) -and (Test-Path -LiteralPath $theirSeats -PathType Leaf)) {
-            $extra = @(Get-SeatAliasMap $theirSeats)
+        $anyLabel = -not ([string]::IsNullOrWhiteSpace($raw) -and [string]::IsNullOrWhiteSpace($env:KORUS_SEAT))
+        if ($anyLabel -and (Test-Path -LiteralPath $theirSeats -PathType Leaf)) {
+            try { $extra = @(Get-SeatAliasMap $theirSeats) }
+            catch { throw "the roster $theirSeats could not be read: $($_.Exception.Message)" }
         }
         if (Test-SpecialSeatLabel $raw @($ownSeats) $extra) {
             [Console]::Error.WriteLine("afk-kill.ps1: the hook input's cwd $($p.Cwd) is in $root, which is not shown to be a checkout of this repository, and its seat marker names a Special seat, so no instruction")
@@ -174,7 +178,7 @@ function Get-SkillInstructionSource {
     if ([string]::IsNullOrWhiteSpace($raw)) { $raw = $env:KORUS_SEAT }
     if ([string]::IsNullOrWhiteSpace($raw)) { return $source }  # undeclared
     if (-not (Test-Path -LiteralPath $theirSeats -PathType Leaf)) { $theirSeats = $ownSeats }
-    if (Test-SpecialSeatLabel $raw @($theirSeats)) { return $null }
+    if (Test-SpecialSeatLabel $raw @($theirSeats) $extra) { return $null }
     return $source
 }
 

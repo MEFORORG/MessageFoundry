@@ -413,20 +413,45 @@ def test_an_alias_only_the_foreign_roster_maps_still_vetoes(sb: Sandbox) -> None
     _veto(_seat_run(sb, "off", "builder", cwd=foreign / "src"))
 
 
-def test_an_unreadable_foreign_roster_gives_no_instruction(sb: Sandbox) -> None:
-    # A Special alias only that roster maps would be lost if the fault were skipped, so it throws
-    # and prints no instruction, as a fault reading this script's roster or the marker does.
-    # Every marker here is non-Special, so only the fault can silence the hook.
+def test_a_foreign_cwd_reads_korus_seat_against_the_cwd_roster_too(sb: Sandbox) -> None:
+    # With no marker, KORUS_SEAT is the label read. This script's roster does not know 'special9',
+    # so only the cwd's roster can make it Special, as it does for the marker above.
     foreign = _foreign_repo(sb, "builder")
+    (foreign / ".claude" / "seat.local.txt").unlink()
+    roster = foreign / "docs" / "roles" / "seats.json"
+    roster.write_text(json.dumps({"aliases": {"special9": "special"}}), encoding="utf-8")
+    proc = _seat_run(sb, "off", "builder", cwd=foreign / "src", KORUS_SEAT="special9")
+    assert proc.stdout == "" and NOT_OURS in proc.stderr, (proc.stdout, proc.stderr)
+    assert "no skill instruction" not in proc.stderr, proc.stderr  # read as Special, not a fault
+    assert VETO not in proc.stderr, proc.stderr  # KORUS_SEAT silenced it, not the marker
+    # The control: the same setup with a non-Special KORUS_SEAT prints the instruction.
+    _undeclared(_seat_run(sb, "off", "builder", cwd=foreign / "src", KORUS_SEAT="builder"))
+
+
+@pytest.mark.parametrize("label", ["marker", "korus_seat"])
+def test_an_unreadable_foreign_roster_gives_no_instruction(sb: Sandbox, label: str) -> None:
+    # A Special alias only that roster maps would be lost if the fault were skipped, so it throws
+    # and prints no instruction, as a fault reading this script's roster or the marker does. The
+    # label it would be read for is the cwd's marker or, with no marker, KORUS_SEAT. Every label
+    # here is non-Special, so only the fault can silence the hook.
+    foreign = _foreign_repo(sb, "builder")
+    env = {}
+    if label == "korus_seat":
+        (foreign / ".claude" / "seat.local.txt").unlink()
+        env["KORUS_SEAT"] = "builder"
     roster = foreign / "docs" / "roles" / "seats.json"
     roster.write_text("not json", encoding="utf-8")
-    proc = _seat_run(sb, "off", "builder", cwd=foreign / "src")
-    assert proc.stdout == "" and "no skill instruction" in proc.stderr, (proc.stdout, proc.stderr)
+    proc = _seat_run(sb, "off", "builder", cwd=foreign / "src", **env)
+    assert proc.stdout == "", (proc.stdout, proc.stderr)
     assert VETO not in proc.stderr, proc.stderr
+    # The fault names the roster it could not read: the JSON error alone names no file.
+    fault = [line for line in proc.stderr.splitlines() if "no skill instruction" in line]
+    assert len(fault) == 1, proc.stderr
+    assert "foreign" in fault[0] and "seats.json" in fault[0], fault[0]
     # The control: the same setup with a readable roster prints the instruction, so the roster's
     # content is what silenced it above.
     roster.write_text(json.dumps({"aliases": {}}), encoding="utf-8")
-    _undeclared(_seat_run(sb, "off", "builder", cwd=foreign / "src"))
+    _undeclared(_seat_run(sb, "off", "builder", cwd=foreign / "src", **env))
 
 
 def test_a_foreign_special_marker_outranks_korus_seat(sb: Sandbox) -> None:
