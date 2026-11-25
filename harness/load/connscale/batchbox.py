@@ -182,8 +182,8 @@ def check_operator_sign_in_limits(procs: int, environ: Mapping[str, str]) -> Non
 
     No limit passes: 0 for any of the three, and either rate count while ``environ`` turns the
     rate limiter off. A session cap below 0 passes too, and the engine's loader refuses it. A
-    value that is not a number is left for the engine's loader to refuse. One the loader reads as a whole number, such as ``3.0``, is read
-    here as a number too.
+    value that is not a number is left for the engine's loader to refuse. One the loader reads
+    as a whole number, such as ``3.0``, is read here as a number too.
     """
     limiter_off = _rate_limiter_off(environ)
     size = _fleet_sign_in_size(procs)
