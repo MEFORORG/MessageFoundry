@@ -4229,7 +4229,9 @@ class _SealCheck:
 #: deletes or re-keys the row (BACKLOG #5520). Read by at least :meth:`AuthService.checked_user`,
 #: :meth:`AuthService.list_checked_users` and the directory sign-in's settled read,
 #: ``AuthService._lookup_user_settled`` (vault BACKLOG #3085 item 7), which reads again on a failed
-#: check too. What happens once every pass has raced is :meth:`AuthService._checked_by_id`'s to say.
+#: check too. What happens once every pass has raced is each reader's to say: the settled read
+#: answers refused and reports only what each ``_verified`` check reported, while
+#: :meth:`AuthService._checked_by_id` reports a seal failure.
 _CHECKED_READ_PASSES: Final = 3
 
 
@@ -8565,14 +8567,15 @@ class AuthService:
         across one check's reads can fail it, so a later read decides. Refused on every read is
         refused, which fails closed.
 
-        Vault BACKLOG #3085 item 7: this read at most twice, so contention on two reads refused
-        the sign-in as a seal failure; :meth:`_checked_by_id`, which the admin reads use, allows
+        It backs at least the directory sign-in's role re-read and pre-mint read, and the role
+        read-back the sign-in and the reconciler share (:meth:`_roles_read_back`). Vault BACKLOG
+        #3085 item 7: this read at most twice, so contention on two reads refused the sign-in as a
+        seal failure; :meth:`_checked_by_id`, which the admin reads use, allows
         :data:`_CHECKED_READ_PASSES` checks. What each read raises still raises."""
-        stored = await self._lookup_user(user_id)
-        for _pass in range(_CHECKED_READ_PASSES - 1):
+        for _pass in range(_CHECKED_READ_PASSES):
+            stored = await self._lookup_user(user_id)
             if not stored.refused:
                 break
-            stored = await self._lookup_user(user_id)
         return stored
 
     async def _roles_read_back(
