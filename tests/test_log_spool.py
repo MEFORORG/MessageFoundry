@@ -25,7 +25,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry import log_spool
+from messagefoundry import log_spool, logging_setup
 from messagefoundry.log_spool import SPOOL_FORMAT_VERSION, LogSpool, SpoolEntry, SpoolUnavailable
 from messagefoundry.logging_setup import (
     SyslogForward,
@@ -1399,49 +1399,61 @@ def test_a_spool_turned_off_warns_once_about_segments_it_leaves_and_deletes_none
 
     with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
         assert _open_forward_spool(_forward_to(spool_dir, spool_max_bytes=0)) is None
-    warnings = [r.getMessage() for r in caplog.records if "spool segment(s)" in r.getMessage()]
+    warnings = [r.getMessage() for r in caplog.records if "turned off" in r.getMessage()]
     assert len(warnings) == (1 if leftover else 0)
     if leftover:
         assert str(spool_dir) in warnings[0] and "2 spool segment(s)" in warnings[0]
     assert [(p.name, p.read_bytes()) for p in _segments(spool_dir)] == before
 
 
-@pytest.mark.parametrize("leftover", [2, 0], ids=["segments-left", "nothing-left"])
-def test_a_spool_turned_off_says_once_that_forwarding_runs_without_loss_protection(
-    spool_dir: Path, caplog: pytest.LogCaptureFixture, leftover: int
-) -> None:
-    """Vault BACKLOG #1199, ASVS 16.4.3 gap (iii): a clean spool-off start used to say nothing."""
-    earlier = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=1)
-    earlier.open()
-    for n in range(leftover):
-        earlier.append(_entry(n))
-    earlier.close()
+class _ListCollector(logging.Handler):
+    """Stands in for the collector socket: keeps every record the forwarder hands it."""
 
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
-        assert _open_forward_spool(_forward_to(spool_dir, spool_max_bytes=0)) is None
-    said = [
-        r
-        for r in caplog.records
-        if "runs without loss protection" in r.getMessage()
-        and r.name == "messagefoundry.logging_setup"
-    ]
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+def _start_forwarding_to_a_list(
+    monkeypatch: pytest.MonkeyPatch, forward: SyslogForward
+) -> _ListCollector:
+    collector = _ListCollector()
+    monkeypatch.setattr(logging_setup, "_build_syslog_handler", lambda _forward, **_kw: collector)
+    assert configure_logging("INFO", forward=forward) is True
+    root = logging.getLogger()
+    (fwd,) = [h for h in root.handlers if isinstance(h, _ForwardQueueHandler)]
+    root.removeHandler(fwd)
+    fwd.close()  # drains the hand-off queue into the collector
+    return collector
+
+
+_NO_LOSS_PROTECTION = "runs without loss protection"
+
+
+def test_a_spool_turned_off_says_once_to_the_collector_that_it_has_no_loss_protection(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #1199, ASVS 16.4.3 gap (iii): a clean spool-off start used to say nothing.
+
+    Read off the collector, not caplog, because the separate system is the reader that counts."""
+    collector = _start_forwarding_to_a_list(monkeypatch, _forward_to(spool_dir, spool_max_bytes=0))
+    said = [r for r in collector.records if _NO_LOSS_PROTECTION in r.getMessage()]
     assert len(said) == 1
     assert said[0].levelno == logging.WARNING
-    message = said[0].getMessage()
-    assert "siem.example.org:6514 (tcp)" in message
-    assert "forward_spool_max_bytes = 0" in message
+    assert "siem.example.org:6514 (tcp)" in said[0].getMessage()
+    assert "forward_spool_max_bytes = 0" in said[0].getMessage()
 
 
-def test_a_spool_that_opens_does_not_say_it_runs_without_loss_protection(
-    spool_dir: Path, caplog: pytest.LogCaptureFixture
+def test_a_spool_that_opens_does_not_say_it_has_no_loss_protection(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
-        spool = _open_forward_spool(_forward_to(spool_dir))
-    assert spool is not None
-    try:
-        assert "runs without loss protection" not in caplog.text
-    finally:
-        spool.close()
+        collector = _start_forwarding_to_a_list(monkeypatch, _forward_to(spool_dir))
+    assert _NO_LOSS_PROTECTION not in caplog.text
+    assert not [r for r in collector.records if _NO_LOSS_PROTECTION in r.getMessage()]
 
 
 def test_records_spooled_at_shutdown_are_reported_once_with_their_count(

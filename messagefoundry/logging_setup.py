@@ -2123,18 +2123,6 @@ def _open_forward_spool(forward: SyslogForward) -> LogSpool | None:
     if not forward.spool_dir:
         return None
     if forward.spool_max_bytes <= 0:
-        # Said on every such start, not only when segments are left over: a spool turned off by
-        # configuration is a choice to drop what a down collector does not take, and a clean start
-        # that says nothing hides that choice from whoever reads the log (vault BACKLOG #1199,
-        # ASVS 16.4.3 gap (iii)).
-        _log.warning(
-            "off-box log forwarding to %s:%d (%s) runs without loss protection: the on-disk log "
-            "spool is turned off ([logging].forward_spool_max_bytes = 0), so records the "
-            "collector does not take are dropped, not kept for a later send",
-            forward.host,
-            forward.port,
-            forward.protocol,
-        )
         _warn_leftover_segments(
             forward.spool_dir,
             "the on-disk log spool is turned off ([logging].forward_spool_max_bytes = 0)",
@@ -2477,6 +2465,19 @@ def configure_logging(
                 )
             root.addHandler(_build_queued_forwarder(fwd_handler, fmt=forward.fmt, spool=spool))
             forwarder_installed = True
+            if spool is None and forward.spool_dir and forward.spool_max_bytes <= 0:
+                # Logged once the forwarder is installed, so the collector gets the line too, and
+                # only when it is: a start that never forwards says so above instead. A clean
+                # spool-off start was otherwise silent (vault BACKLOG #1199, ASVS 16.4.3 gap
+                # (iii)). A WARNING, so a [logging].level above WARNING still filters it.
+                _log.warning(
+                    "off-box log forwarding to %s:%d (%s) runs without loss protection: the "
+                    "on-disk log spool is turned off ([logging].forward_spool_max_bytes = 0), so "
+                    "records the collector does not take are dropped, not kept for a later send",
+                    forward.host,
+                    forward.port,
+                    forward.protocol,
+                )
 
     # Let uvicorn's loggers flow to the root handler(s) (one shared format/stream/forwarder).
     for name in _UVICORN_LOGGERS:
