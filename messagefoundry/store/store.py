@@ -1733,8 +1733,9 @@ def _refuse_new_non_finite(
     """On a store with no sealer, raise :class:`NonFiniteSealValueError`, the type
     :meth:`RowSealer.seal` raises, for a NaN or an infinity in ``fields`` that ``prior``, the row
     as it was read, does not already hold under that name (BACKLOG #6717). No seal is made here:
-    the reason is that SQLite would store a NaN as ``NULL``, so the value would change silently,
-    as that class says. A value carried forward from the stored row is
+    SQLite stores a NaN as ``NULL``, so a nullable column would change silently and a ``NOT NULL``
+    one would refuse the write, and no sealed field means anything by an infinity, as that class
+    says. A value carried forward from the stored row is
     written as before, so only a new value is refused. A name may repeat (a user's role grants),
     so a value counts as held when any field of that name in ``prior`` holds the same kind."""
     if sealer is not None:
