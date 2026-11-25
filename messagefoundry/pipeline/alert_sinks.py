@@ -621,24 +621,33 @@ _WEBHOOK_WAYS_ACROSS = (
 #: reaches this hop's context through the trust anchor :func:`send_plain_email` resolves, but only
 #: where the caller handed the sink a ``[tls]`` policy, so it is offered beside the ``[alerts]`` pair
 #: only then; a connection's attestation is not, as this is no connection.
+_CRL_IS_INSTANCE_WIDE = (
+    "(it is instance-wide: every non-loopback hop it reaches then needs its issuer's CRL in that "
+    "file, or its handshake fails)"
+)
+_SMTP_ATTEST = (
+    "set [alerts].email_tls_revocation_attested = true with an "
+    "[alerts].email_tls_revocation_attested_reason"
+)
+_SMTP_NO_LOGIN = (
+    "Or remove [alerts].email_username and the password to send unauthenticated, which takes no "
+    "revocation guard."
+)
 _ALERT_SMTP_WAYS_ACROSS = (
-    "Configure [tls].crl_file so the engine checks a CRL on this hop (it is instance-wide: every "
-    "non-loopback hop it reaches then needs its issuer's CRL in that file, or its handshake "
-    "fails), or set [alerts].email_tls_revocation_attested = true with an "
-    "[alerts].email_tls_revocation_attested_reason. Or remove [alerts].email_username and the "
-    "password to send unauthenticated, which takes no revocation guard."
+    f"Configure [tls].crl_file so the engine checks a CRL on this hop {_CRL_IS_INSTANCE_WIDE}, "
+    f"or {_SMTP_ATTEST}. {_SMTP_NO_LOGIN}"
 )
 
-#: The same refusal's way across where the caller handed the sink no ``[tls]`` policy (BACKLOG
+#: The same refusal's way across where the sink was built with no ``[tls]`` policy (BACKLOG
 #: #5527): ``[tls].crl_file`` cannot reach this hop's context then, whatever the file says, so
 #: setting it is not offered as a remedy on its own.
 _ALERT_SMTP_WAYS_ACROSS_NO_POLICY = (
-    "No [tls] policy was handed to the caller that built this sink, so [tls].crl_file does not "
-    "reach this hop. Set [alerts].email_tls_revocation_attested = true with an "
-    "[alerts].email_tls_revocation_attested_reason, or build the sink with the instance [tls] "
-    "policy and a [tls].crl_file holding the relay issuer's CRL. Or remove "
-    "[alerts].email_username and the password to send unauthenticated, which takes no revocation "
-    "guard."
+    "This sink was built with no [tls] policy, so [tls].crl_file does not reach this hop. "
+    f"{_SMTP_ATTEST[0].upper()}{_SMTP_ATTEST[1:]}, or build the sink with the instance [tls] "
+    "policy (trust_anchor_policy where the sink or its notifier factory is called, or "
+    "tls_settings for an app) "
+    f"and a [tls].crl_file holding the relay issuer's CRL {_CRL_IS_INSTANCE_WIDE}. "
+    f"{_SMTP_NO_LOGIN}"
 )
 
 

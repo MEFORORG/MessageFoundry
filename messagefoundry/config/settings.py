@@ -5048,7 +5048,7 @@ class AiSettings(_Section):
     # reaches the app serving POST /ai/chat, and the endpoint host is not loopback as
     # config.tls_policy.is_loopback_hop_host reads it (BACKLOG #5527;
     # docs/SECURITY-LOOSENING.md states it in full). So without that CRL an
-    # off-box endpoint is REFUSED under [security].enforcement = enforce unless this is set. What
+    # endpoint whose host reads as remote there is REFUSED under [security].enforcement = enforce unless this is set. What
     # the refusal keys on is stated once, on transports.ai_broker._refuse_an_unrevoked_ai_hop.
     # Setting it adds no check on the wire. The reason is MANDATORY; at least a flag without one, a
     # blank one, a reason without the flag, or a control character in the reason refuses at load.
@@ -11548,7 +11548,7 @@ def security_loosenings(
                 f"the engine (reason: {ai.endpoint_revocation_attested_reason}) -- the AI broker "
                 "verifies that certificate but its own handshake checks no OCSP, and checks no CRL "
                 "unless all three hold: [tls].crl_file is set, the [tls] section reaches the app "
-                "serving POST /ai/chat (messagefoundry serve hands it; an embedder's "
+                "serving POST /ai/chat (messagefoundry serve hands it, an embedder's "
                 "create_managed_app holds none unless it passes tls_settings, and a direct "
                 "create_app none unless it passes tls_settings or sets app.state.tls_settings), "
                 "and the endpoint host is not loopback as config.tls_policy.is_loopback_hop_host "

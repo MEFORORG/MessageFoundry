@@ -1209,7 +1209,8 @@ bind-guard ladder above:
   - **The SMTP relay, when `[alerts].email_username` is set.** The login password crosses that
     hop, and the per-user security-event notifier sends over it with the same login, so both
     builds are refused, and so is the alerts test send. The levers are a `[tls].crl_file`, which
-    reaches this hop's context, or `[alerts].email_tls_revocation_attested = true` with its
+    reaches this hop's context where the sink is built with the `[tls]` policy, as `serve` builds
+    it, or `[alerts].email_tls_revocation_attested = true` with its
     reason. A relay with no login stays ungated (the table below).
   - **The https webhook.** The URL can carry the webhook's path token, and the guard applies
     whether it does or not. Its one lever is

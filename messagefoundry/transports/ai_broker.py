@@ -30,9 +30,9 @@ the vetted network call.
 * **Revocation (BACKLOG #2193 slice (e), BACKLOG #5527).** The endpoint's certificate is verified,
   and stdlib ssl checks no OCSP. It checks no CRL unless ``[tls].crl_file`` is set, the ``[tls]``
   policy is handed in, and the endpoint host is not loopback as
-  ``tls_policy.is_loopback_hop_host`` reads it. So an
-  off-box endpoint is refused under an enforcing or unknown posture unless that CRL is checked or
-  ``[ai].endpoint_revocation_attested`` is set with its reason: :func:`_refuse_an_unrevoked_ai_hop`.
+  ``tls_policy.is_loopback_hop_host`` reads it. So an endpoint whose host reads as remote there,
+  on the box or off it, is refused under an enforcing or unknown posture unless that CRL is
+  checked or ``[ai].endpoint_revocation_attested`` is set with its reason: :func:`_refuse_an_unrevoked_ai_hop`.
 * **Secrets / PHI.** The prompt, the reply, and the provider ``api_key`` are NEVER logged. A failure names
   only the redacted endpoint host + HTTP status — never the request or response body (either may echo
   content or the key).

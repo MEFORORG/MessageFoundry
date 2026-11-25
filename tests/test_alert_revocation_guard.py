@@ -152,7 +152,8 @@ def test_a_login_built_with_no_tls_policy_is_not_offered_the_crl_as_its_remedy()
             build(ENFORCING)
         text = str(exc.value)
         assert "Configure [tls].crl_file so the engine checks a CRL on this hop" not in text
-        assert "No [tls] policy was handed to the caller that built this sink" in text
+        assert "This sink was built with no [tls] policy" in text
+        assert "instance-wide" in text
         assert "[alerts].email_tls_revocation_attested" in text
 
 
@@ -164,7 +165,7 @@ def test_a_login_built_with_a_tls_policy_is_offered_the_crl_as_its_remedy() -> N
             build(ENFORCING, trust_anchor_policy=TrustAnchorPolicy())
         text = str(exc.value)
         assert "Configure [tls].crl_file so the engine checks a CRL on this hop" in text
-        assert "No [tls] policy was handed" not in text
+        assert "built with no [tls] policy" not in text
 
 
 def test_the_security_notifier_takes_the_same_guard() -> None:

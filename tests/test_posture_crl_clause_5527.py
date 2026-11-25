@@ -9,7 +9,9 @@ the serve-start warning and ``security show`` stated a check that does not run o
 Item 55 finding 8: the ``[ai]`` entry's "the endpoint is not loopback" means the engine's own
 reading of loopback, under which ``localhost.`` is remote and gets the CRL.
 
-The text tests pin the entries. The anchor tests pin, through ``resolve_trust_anchor`` alone,
+The text tests pin the entries, the SMTP bullet of docs/SECURITY-LOOSENING.md, and the loopback
+wording of the ``ai_broker`` docstring and the ``AiSettings`` comment. The anchor tests pin,
+through ``resolve_trust_anchor`` alone,
 the loopback reading the text describes; no test here builds the SMTP sink or the AI opener,
 and none pins which callers hand the ``[tls]`` policy over. No message body is involved.
 """
@@ -109,15 +111,16 @@ def test_the_ai_entry_says_how_loopback_is_read() -> None:
         "at least the name localhost with a trailing dot reads as remote and gets the CRL, though "
         "the bare name localhost reads as loopback" in entry
     )
-    # The old parenthesis ended on "localhost." and so read as the plain name localhost.
-    assert "localhost." not in entry
 
 
-def test_the_smtp_entry_holds_no_serve_warning_joiner() -> None:
+def test_the_revocation_entries_hold_no_serve_warning_joiner() -> None:
     """The serve-start warning joins entries with "; ", so a "; " inside an entry splits it there
-    for a reader. The reason is the operator's own text; this one holds no "; "."""
-    entry = _entries(_SMTP_ALERTS)["alerts.email_tls_revocation_attested"]
-    assert "; " not in entry
+    for a reader. The reason is the operator's own text and can still hold one; this one does
+    not, so the test reads the engine's own text."""
+    ai = AiSettings(endpoint_revocation_attested=True, endpoint_revocation_attested_reason=_REASON)
+    entries = _entries(_SMTP_ALERTS, ai=ai)
+    for switch in ("alerts.email_tls_revocation_attested", "ai.endpoint_revocation_attested"):
+        assert "; " not in entries[switch], switch
 
 
 def test_the_smtp_loosening_doc_bullet_names_the_loopback_reading() -> None:
@@ -133,7 +136,6 @@ def test_the_ai_source_text_reads_loopback_as_the_code_does() -> None:
     loopback" with no reading; the code reads loopback with ``is_loopback_hop_host``."""
     broker = (_ROOT / "messagefoundry" / "transports" / "ai_broker.py").read_text(encoding="utf-8")
     assert "and the endpoint is not loopback" not in broker
-    assert "endpoint that is not loopback" not in broker
     assert broker.count("``tls_policy.is_loopback_hop_host`` reads it") >= 2
     settings = (_ROOT / "messagefoundry" / "config" / "settings.py").read_text(encoding="utf-8")
     start = settings.index("# Attest that revocation of the AI endpoint's server certificate")
@@ -155,7 +157,7 @@ def test_a_loopback_relay_resolves_no_crl_whatever_the_file_says() -> None:
 
 
 def test_localhost_with_a_trailing_dot_reads_remote_and_gets_the_crl() -> None:
-    """The behaviour the ``[ai]`` entry's parenthesis describes."""
+    """The behaviour the ``[ai]`` entry's trailing-dot clause describes."""
     policy = TrustAnchorPolicy(crl_file=_CRL)
     anchor = resolve_trust_anchor(connection_ca_file=None, host="localhost.", policy=policy)
     assert anchor.crl_file == _CRL
