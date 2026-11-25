@@ -75,7 +75,8 @@ def _eol_style(raw: str) -> str | None:
 
     A body that mixes styles takes the one most of its breaks use, which rewrites the fewest of
     them; the browser's CRLF would rewrite every one. A tie takes CR, then LF, HL7's terminator
-    first. A body with no line break is CR when it is HL7 (it opens with MSH), since an added
+    first. A body with no line break is CR when it is HL7 (:func:`missing_eol_style` says which
+    leads count: ``MSH``, or a ``BHS`` or ``FHS`` batch header), since an added
     segment must end in CR; otherwise there is no style to restore and None renders no ``eol``
     field."""
     crlf = raw.count("\r\n")
@@ -100,8 +101,11 @@ def missing_eol_style(raw: str) -> str | None:
     return "cr" if starts_with_msh(raw) or _LEADS_WITH_BATCH_HEADER.match(raw) else None
 
 
-#: A ``BHS`` or ``FHS`` batch header after leading whitespace, as ``starts_with_msh`` reads ``MSH``.
-_LEADS_WITH_BATCH_HEADER = re.compile(r"\s*(?:BHS|FHS)")
+#: A ``BHS`` or ``FHS`` batch header after leading whitespace: the segment id, a field separator
+#: that is not a word or space character, up to five non-space encoding characters, and the same
+#: separator again. Stricter than ``starts_with_msh``, so prose that opens with the letters, such
+#: as ``FHS: 140 bpm``, is not read as a batch.
+_LEADS_WITH_BATCH_HEADER = re.compile(r"\s*(?:BHS|FHS)([^\w\s])\S{0,5}?\1")
 
 
 def restore_eol(raw: str, eol: str) -> str | None:
