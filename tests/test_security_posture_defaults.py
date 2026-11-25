@@ -1783,6 +1783,42 @@ def test_a_reminder_lead_below_its_default_is_a_named_loosening() -> None:
     assert "warn_days = 1, shorter than the default of 14" in named["secret_rotation.warn_days"]
 
 
+def test_a_reminder_interval_above_its_default_is_a_named_loosening() -> None:
+    """BACKLOG #2008, #3301: a slow rescan delays a reminder, and a very large value used to load
+    with nothing named. The default, and a faster cadence, name nothing; with the reminder off the
+    interval is not named on top of the warn_days entry."""
+    named = dict(
+        _pairs(
+            cert_monitor=CertMonitorSettings(check_interval_seconds=1e9),
+            backup=BackupSettings(),
+            rotation=SecretRotationSettings(check_interval_seconds=86_401.0),
+        )
+    )
+    assert (
+        "check_interval_seconds = 1000000000, longer than the default of 43200"
+        in named["cert_monitor.check_interval_seconds"]
+    )
+    assert (
+        "check_interval_seconds = 86401, longer than the default of 86400"
+        in named["secret_rotation.check_interval_seconds"]
+    )
+    keys = ("cert_monitor.check_interval_seconds", "secret_rotation.check_interval_seconds")
+    for cert, rotation in ((43_200.0, 86_400.0), (60.0, 3_600.0)):
+        on = _names(
+            cert_monitor=CertMonitorSettings(check_interval_seconds=cert),
+            backup=BackupSettings(),
+            rotation=SecretRotationSettings(check_interval_seconds=rotation),
+        )
+        assert not any(k in on for k in keys), on
+    off = _names(
+        cert_monitor=CertMonitorSettings(warn_days=0, check_interval_seconds=1e9),
+        backup=BackupSettings(),
+        rotation=SecretRotationSettings(warn_days=0, check_interval_seconds=1e9),
+    )
+    assert not any(k in off for k in keys), off
+    assert "cert_monitor.warn_days" in off and "secret_rotation.warn_days" in off
+
+
 def _rules(*rules: dict[str, object]) -> AlertsSettings:
     return AlertsSettings.model_validate({"rules": list(rules)})
 

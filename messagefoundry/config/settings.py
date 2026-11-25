@@ -10646,6 +10646,32 @@ def _reminder_lead(
     return []
 
 
+def _reminder_cadence(
+    section: str, warn_days: int, interval: float, default: float, what: str
+) -> list[tuple[str, str]]:
+    """One reminder's ``check_interval_seconds`` entry: named above the shipped default while the
+    reminder is on, nothing otherwise (BACKLOG #2008, #3301; ASVS 6.4.5).
+
+    The runner scans once at start and then once per interval, so a credential that enters its warn
+    window after start waits up to one interval for its first reminder. **The bound is the shipped
+    default, and that is a judgment:** the default cadence is the one each section's ``warn_days``
+    lead was sized against, so any slower cadence spends part of that lead before anyone is told,
+    and an interval of a year means no reminder until the next restart. This follows BACKLOG
+    #1131, which names a limit looser than its default rather than picking a second threshold.
+    With ``warn_days = 0`` the runner does not start, and :func:`_reminder_lead` already names
+    that, so the interval is not named on top of it."""
+    if warn_days == 0 or interval <= default:
+        return []
+    return [
+        (
+            f"{section}.check_interval_seconds",
+            f"[{section}].check_interval_seconds = {interval:.15g}, longer than the default of "
+            f"{default:g} -- {what} that enters its warn window after start waits up to "
+            f"{interval:.15g} s for its first reminder, which spends the lead warn_days gives",
+        )
+    ]
+
+
 def _reminder_loosenings(
     cert_monitor: CertMonitorSettings,
     secret_rotation: SecretRotationSettings,
@@ -10655,8 +10681,10 @@ def _reminder_loosenings(
 
     BACKLOG #2227: each ``warn_days = 0`` turned its reminder off with only a debug line from the
     runner. A lead shorter than the shipped default is named too, as BACKLOG #1131 names a limit
-    looser than its default: a reminder one day ahead leaves no time to renew. Each section's
-    ``check_interval_seconds`` also delays a reminder and is NOT named here.
+    looser than its default: a reminder one day ahead leaves no time to renew.
+
+    BACKLOG #2008, #3301: each section's ``check_interval_seconds`` above its shipped default is
+    named too, while that reminder is on (:func:`_reminder_cadence`).
 
     BACKLOG #2008 step 4: an ``[[alerts.rules]]`` entry that can send a reminder to no transport
     (:func:`reminder_silencing_rules`)."""
@@ -10689,6 +10717,20 @@ def _reminder_loosenings(
         "[secret_rotation].warn_days = {value}, shorter than the default of {default} -- a "
         "secret is first flagged only {value} day(s) before it is due, which may leave too "
         "little time to rotate it",
+    )
+    out += _reminder_cadence(
+        "cert_monitor",
+        cert_monitor.warn_days,
+        cert_monitor.check_interval_seconds,
+        CertMonitorSettings.model_fields["check_interval_seconds"].default,
+        "a certificate or CRL file the monitor watches",
+    )
+    out += _reminder_cadence(
+        "secret_rotation",
+        secret_rotation.warn_days,
+        secret_rotation.check_interval_seconds,
+        SecretRotationSettings.model_fields["check_interval_seconds"].default,
+        "a secret",
     )
     silencing = reminder_silencing_rules(alerts)
     if silencing:
