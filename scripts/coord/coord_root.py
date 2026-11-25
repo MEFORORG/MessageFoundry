@@ -49,9 +49,9 @@ _BLANK_OR_COMMENT = re.compile(r"\A[ \t]*(#.*)?\Z")
 _LINE_BREAK = re.compile(r"\r\n|\n|\r")
 # A drive letter, colon and separator, a UNC \\server\share, or (off Windows) a leading slash.
 _ABSOLUTE = re.compile(r"\A(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+|/(?![\\/]))")
-# A \\server\share or \\?\UNC\server\share path's server. \\?\D:\x and \\.\D:\x are local: unc_host
-# refuses their '?' or '.', which is a namespace, not a server to probe on 445.
-_UNC = re.compile(r"\A[\\/]{2}(?:[?.][\\/][Uu][Nn][Cc][\\/])?([^\\/]+)[\\/]")
+# A \\server\share or \\?\UNC\server\share path's server. \\?\D:\x and \\.\D:\x are local: the
+# lookahead refuses their '?' or '.', which is a namespace, not a server to probe on 445.
+_UNC = re.compile(r"\A[\\/]{2}(?:[?.][\\/][Uu][Nn][Cc][\\/])?(?![?.][\\/])([^\\/]+)[\\/]")
 _SEP = re.compile(r"[\\/]")
 
 
@@ -151,7 +151,7 @@ def _decode(raw: bytes) -> str:
 
 def unc_host(path: str) -> str | None:
     m = _UNC.match(path)
-    return m.group(1) if m and m.group(1) not in ("?", ".") else None
+    return m.group(1) if m else None
 
 
 def _root_key(path: str) -> str:
@@ -175,12 +175,7 @@ def probe_root(path: Path, local: Path | None) -> str | None:
             if down is not None and down.is_file():
                 age = time.time() - down.stat().st_mtime
                 cached = json.loads(down.read_text(encoding="utf-8")).get("root")
-                if (
-                    isinstance(cached, str)
-                    and len(cached) >= 2
-                    and _root_key(cached) == key
-                    and 0 <= age < DOWN_TTL_SECONDS
-                ):
+                if cached == key and 0 <= age < DOWN_TTL_SECONDS:
                     return f"shared root {path} was unreachable {int(age)} s ago (cached in {down})"
         except (OSError, ValueError, AttributeError):
             pass

@@ -476,20 +476,24 @@ def test_each_twin_reads_the_down_verdict_the_other_wrote(
     assert py.error is not None and "cached" in py.error, py
 
 
-def _ps_unc_hosts(paths: list[str]) -> list[object]:
-    quoted = ", ".join("'" + p.replace("'", "''") + "'" for p in paths)
-    script = (
-        f". '{PS}'; ConvertTo-Json -Compress -InputObject @(foreach ($p in @({quoted})) "
-        "{ $h = Get-CoordUncHost $p; if ($null -eq $h) { '' } else { $h } })"
-    )
+def _pwsh_json(body: str) -> Any:
+    """Dot-source the PowerShell twin, run ``body``, and parse the JSON it prints (read as UTF-8)."""
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", f". '{PS}'; {body}"],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         check=True,
         timeout=60,
     )
-    out: list[object] = json.loads(proc.stdout)
+    return json.loads(proc.stdout)
+
+
+def _ps_unc_hosts(paths: list[str]) -> list[object]:
+    quoted = ", ".join("'" + p.replace("'", "''") + "'" for p in paths)
+    out: list[object] = _pwsh_json(
+        f"ConvertTo-Json -Compress -InputObject @(foreach ($p in @({quoted})) "
+        "{ $h = Get-CoordUncHost $p; if ($null -eq $h) { '' } else { $h } })"
+    )
     return out
 
 
@@ -533,17 +537,4 @@ def test_a_non_ascii_checkout_path_reads_the_same_on_both(tmp_path: Path) -> Non
     subprocess.run(["git", "-C", str(r), "init", "-q"], check=True, capture_output=True)
     want = r / ".git" / "mefor-coord"
     assert coord_root.local_root(r) == want
-    proc = subprocess.run(
-        [
-            "pwsh",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            f". '{PS}'; Get-CoordLocalRoot -From '{r}' | ConvertTo-Json",
-        ],
-        capture_output=True,
-        encoding="utf-8",
-        check=True,
-        timeout=60,
-    )
-    assert Path(json.loads(proc.stdout)) == want
+    assert Path(_pwsh_json(f"Get-CoordLocalRoot -From '{r}' | ConvertTo-Json")) == want

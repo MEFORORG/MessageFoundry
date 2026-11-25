@@ -177,8 +177,7 @@ function Get-CoordUncHost {
     # \\?\D:\x and \\.\D:\x are local: their '?' or '.' is a namespace, not a server to probe on 445.
     # The Python twin carries the same pattern.
     param([string]$Path)
-    if ($Path -cmatch '\A[\\/]{2}(?:[?.][\\/][Uu][Nn][Cc][\\/])?([^\\/]+)[\\/]' -and
-        $Matches[1] -cne '?' -and $Matches[1] -cne '.') { return $Matches[1] }
+    if ($Path -cmatch '\A[\\/]{2}(?:[?.][\\/][Uu][Nn][Cc][\\/])?(?![?.][\\/])([^\\/]+)[\\/]') { return $Matches[1] }
     return $null
 }
 
@@ -205,8 +204,7 @@ function Test-CoordRoot {
             if ($down -and (Test-Path -LiteralPath $down -PathType Leaf)) {
                 $age = ([DateTime]::UtcNow - (Get-Item -LiteralPath $down).LastWriteTimeUtc).TotalSeconds
                 $cached = ([System.IO.File]::ReadAllText($down) | ConvertFrom-Json -ErrorAction Stop).root
-                if ($cached -is [string] -and $cached.Length -ge 2 -and (ConvertTo-CoordRootKey $cached) -ceq $key -and
-                    $age -ge 0 -and $age -lt $script:CoordDownTtlSeconds) {
+                if ($cached -ceq $key -and $age -ge 0 -and $age -lt $script:CoordDownTtlSeconds) {
                     return @{ Ok = $false; Error = "shared root $Path was unreachable $([int]$age) s ago (cached in $down)" }
                 }
             }
