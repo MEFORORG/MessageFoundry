@@ -246,7 +246,7 @@ def test_parse_audit_row_pair_shares_the_anchor_head_rule() -> None:
     assert store_mod.parse_audit_row_pair(f"7:{mac}") == (7, mac)
     # A truncated or space-bearing MAC is one the writer never emits (vault BACKLOG #5987 item 1).
     for bad in ("7:vault:v1:abc", "7:vault:v1:", "7:vault:v", f"7:{mac[:-4]} {mac[-4:]}"):
-        with pytest.raises(store_mod.AuditRowPairError, match="not a whole one"):
+        with pytest.raises(store_mod.AuditRowPairError, match="not a well-formed one"):
             store_mod.parse_audit_row_pair(bad)
     for bad in ("7:", "0:" + head, "7:" + "a" * 12, "7:zz", "seven:" + head):
         with pytest.raises(store_mod.AuditRowPairError) as exc:

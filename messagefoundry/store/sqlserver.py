@@ -3665,7 +3665,7 @@ def _any_grant(answers: str) -> str:
 class SqlServerStore(ServerCipherWalk):
     """SQL Server-backed durable queue (the :class:`Store` protocol). Open with :meth:`open`."""
 
-    #: Keys published to ``_state_cache`` while a :meth:`purge_state` is between its DELETE and its
+    #: Keys published to ``_state_cache`` while a :meth:`purge_state` pass runs, from its start to its
     #: post-release eviction, one set per pass in flight (BACKLOG #5734). Empty, so free, otherwise.
     #: A tuple, so the class default is never shared mutable state.
     _state_purge_watches: tuple[set[tuple[str, str]], ...] = ()
@@ -11390,8 +11390,10 @@ class SqlServerStore(ServerCipherWalk):
 
         The eviction runs after the connection is released, an await later than the DELETE, so a
         same-key write that commits and publishes in that window would be evicted while its row
-        survives. A key published to the cache after the DELETE was sent is therefore kept: its
-        value came from a write that committed after this pass read the table (BACKLOG #5734)."""
+        survives. So a key this node publishes to the cache once the pass has begun, before it has
+        a connection, is kept (BACKLOG #5734). A write that committed before the DELETE stamped its
+        row with its own time, which is not older than ``older_than`` while the cutoff lies in the
+        past, as the retention runner's always does, so the DELETE never removed that row."""
         touched: set[tuple[str, str]] = set()
         self._state_purge_watches = (*self._state_purge_watches, touched)
         try:

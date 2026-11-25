@@ -6748,10 +6748,16 @@ AUDIT_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
 #: the PHI rule in CLAUDE.md section 9.
 AUDIT_ANCHOR_MAX_BYTES = 4096
 
-#: The largest row count an anchor can name: the audit ``seq`` is a signed 64-bit column on every
-#: backend. Checked on the digit count first, so ``int()`` never parses a long run of digits.
-_AUDIT_ANCHOR_COUNT_MAX = 2**63 - 1
-_AUDIT_ANCHOR_COUNT_MAX_DIGITS = len(str(_AUDIT_ANCHOR_COUNT_MAX))
+
+def _audit_decimal(text: str) -> int | None:
+    """``text`` as an int when it is ASCII digits only, at most 19 of them (the width of the signed
+    64-bit ``seq`` column every backend uses), else ``None``. The one count grammar of
+    :func:`parse_audit_anchor` and :func:`parse_audit_row_pair`: ``int()`` alone would read
+    ``1_0`` as 10, accept a sign or non-ASCII digits, and parse any length up to Python's limit.
+    The caller checks the value against :data:`_AUDIT_SEQ_MAX`."""
+    if not (text.isascii() and text.isdigit()) or len(text) > 19:
+        return None
+    return int(text)
 
 
 class AuditAnchorError(ValueError):
@@ -6851,8 +6857,10 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
       12-character head pasted out of a FAIL message's display truncation is refused as malformed
       input instead of being reported as tampering.
     * an **isolated-module MAC** — ADR 0138 ``vault_transit`` mode, whose ``vault:v1:…`` string is
-      passed through UNCHANGED. ``partition`` splits on the FIRST colon, so its internal colons
-      survive the ``COUNT:HEAD`` split.
+      passed through UNCHANGED once it is well formed: :func:`~messagefoundry.store.row_seal.
+      transit_mac_version` must accept it, as the writer requires of every MAC it stores (vault
+      BACKLOG #5987). ``partition`` splits on the FIRST colon, so its internal colons survive the
+      ``COUNT:HEAD`` split.
 
     An EMPTY head is legal and load-bearing — :meth:`MessageStore.audit_anchor` returns ``(0, "")`` for
     an empty log, so ``0:`` must round-trip or a fresh instance is the one state that cannot be anchored.
@@ -6874,19 +6882,20 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
     if not sep:
         raise AuditAnchorError("no ':' separator", text)
     count_text = count_text.strip()
-    digits = count_text.removeprefix("-")
-    # ASCII digits only, not `int()`'s grammar: it also takes `+5`, `1_000` and non-ASCII digits,
-    # and any length up to Python's digit limit, none of which a store can emit (vault BACKLOG
-    # #5987). The count is quoted in `str(exc)` via `text`, so each reason stays content-free.
-    if not digits or not all("0" <= c <= "9" for c in digits):
-        raise AuditAnchorError("the row count is not an integer", text)
-    if count_text.startswith("-"):
-        # No value in a reason, not even the count: `--expected-anchor-file` prints the reason, and
-        # the count is that file's content (vault BACKLOG #2612).
+    # The row pair's grammar, not `int()`'s, which also takes `+5`, `1_000`, non-ASCII digits and
+    # any length up to Python's digit limit (vault BACKLOG #5987). The count is quoted in `str(exc)`
+    # via `text`; no reason names a value, not even the count: `--expected-anchor-file` prints the
+    # reason, and the count is that file's content (vault BACKLOG #2612).
+    negative = count_text.startswith("-")
+    count = _audit_decimal(count_text.removeprefix("-"))
+    if count is None or (negative and not count):  # "-0" is no count a store prints
+        raise AuditAnchorError(
+            "the row count is not a plain decimal integer of up to 19 digits", text
+        )
+    if negative:
         raise AuditAnchorError("the row count is negative", text)
-    if len(digits) > _AUDIT_ANCHOR_COUNT_MAX_DIGITS or int(digits) > _AUDIT_ANCHOR_COUNT_MAX:
+    if count > _AUDIT_SEQ_MAX:
         raise AuditAnchorError("the row count is larger than any store can hold", text)
-    count = int(digits)
     head = head.strip()
     if not head:
         if count != 0:
@@ -6930,7 +6939,7 @@ def _audit_head_shape(head: str, noun: str = "the head") -> tuple[str | None, st
         if transit_mac_version(head) is None:
             return (
                 f"{noun} starts like an isolated-module {AUDIT_ANCHOR_ISOLATED_MAC_PREFIX}… MAC "
-                "(ADR 0138) but is not a whole one",
+                "(ADR 0138) but is not a well-formed one",
                 head,
             )
         return None, head
@@ -6970,13 +6979,11 @@ def parse_audit_row_pair(text: str) -> tuple[int, str]:
     if not sep:
         raise AuditRowPairError("no ':' separator", text)
     seq_text = seq_text.strip()  # space either side of the ':' reads alike
-    # ASCII digits only, and no wider than a store's sequence column: `int()` alone would read
-    # '1_0' as 10, accept non-ASCII digits, and admit a seq no store can hold.
-    if not (seq_text.isascii() and seq_text.isdigit()) or len(seq_text) > 19:
+    seq = _audit_decimal(seq_text)
+    if seq is None:
         raise AuditRowPairError(
             "the sequence number is not a plain decimal of up to 19 digits", text
         )
-    seq = int(seq_text)
     if not 1 <= seq <= _AUDIT_SEQ_MAX:
         raise AuditRowPairError(
             "the sequence number is outside 1 to 2**63-1, so it names no row", text
@@ -9180,8 +9187,11 @@ def forget_store_salt(path: Path) -> bool:
 
     # The ordinary-table predicate, so a virtual `store_salt` another tool left, whose module may
     # not be loaded here, is not probed and cannot raise "no such module" (BACKLOG #6719 item 4).
+    # lower(), as schema_verify's salt read matches it: SQLite resolves the name case-blind, so a
+    # `Store_Salt` table is the one the next open reads.
     salt_table = (
-        f"SELECT count(*) FROM sqlite_master AS m WHERE {_ORDINARY_TABLE} AND m.name = 'store_salt'"
+        "SELECT count(*) FROM sqlite_master AS m"
+        f" WHERE {_ORDINARY_TABLE} AND lower(m.name) = 'store_salt'"
     )
 
     def drop(conn: sqlite3.Connection) -> bool:
@@ -14341,7 +14351,8 @@ class MessageStore:
         # The ordinary-table predicate: a virtual `outbox` is another tool's, and reading it could
         # raise "no such module" (BACKLOG #6719 item 4).
         cur = await db.execute(
-            f"SELECT name FROM sqlite_master AS m WHERE {_ORDINARY_TABLE} AND m.name = 'outbox'"
+            f"SELECT name FROM sqlite_master AS m WHERE {_ORDINARY_TABLE}"
+            " AND lower(m.name) = 'outbox'"
         )
         if await cur.fetchone() is None:
             return  # already migrated (or a fresh DB) — nothing to fold in

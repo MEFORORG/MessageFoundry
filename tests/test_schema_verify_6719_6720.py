@@ -223,6 +223,15 @@ def test_forget_store_salt_leaves_a_virtual_salt_table_alone(tmp_path: Path) -> 
     other = tmp_path / "salt.db"
     _sql(other, "CREATE TABLE store_salt (salt TEXT)", "INSERT INTO store_salt VALUES ('s')")
     assert forget_store_salt(other) is True
+    # SQLite resolves the name case-blind, so a case variant is the salt the next open reads.
+    variant = tmp_path / "variant.db"
+    _sql(variant, "CREATE TABLE Store_Salt (salt TEXT)", "INSERT INTO Store_Salt VALUES ('s')")
+    assert forget_store_salt(variant) is True
+    conn = sqlite3.connect(variant)
+    try:
+        assert conn.execute("SELECT count(*) FROM store_salt").fetchone()[0] == 0
+    finally:
+        conn.close()
 
 
 async def test_the_census_reads_tables_through_the_schema_checks_predicate(

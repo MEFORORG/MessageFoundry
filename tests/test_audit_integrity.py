@@ -1963,17 +1963,33 @@ def test_parse_audit_anchor_refuses_a_head_with_a_zero_count(head: str) -> None:
     assert parse_audit_anchor(f"1:{head}") == (1, head)  # the control: the head itself is legal
 
 
+_NOT_A_DECIMAL = "the row count is not a plain decimal integer of up to 19 digits"
+
+
 @pytest.mark.parametrize(
     ("count", "reason"),
     [
-        ("+5", "the row count is not an integer"),
-        ("1_000", "the row count is not an integer"),
-        ("٣", "the row count is not an integer"),  # a non-ASCII digit int() accepts
-        ("--5", "the row count is not an integer"),
+        ("+5", _NOT_A_DECIMAL),
+        ("1_000", _NOT_A_DECIMAL),
+        (chr(0x0663), _NOT_A_DECIMAL),  # ARABIC-INDIC DIGIT THREE, which int() accepts
+        ("--5", _NOT_A_DECIMAL),
+        ("-0", _NOT_A_DECIMAL),
+        ("0" * 19 + "5", _NOT_A_DECIMAL),  # 20 digits, as the row pair refuses them
+        ("9" * 5000, _NOT_A_DECIMAL),
         (str(2**63), "the row count is larger than any store can hold"),
-        ("9" * 5000, "the row count is larger than any store can hold"),
+        ("-5", "the row count is negative"),
     ],
-    ids=["plus-sign", "underscore", "arabic-indic-digit", "double-minus", "past-int64", "long"],
+    ids=[
+        "plus-sign",
+        "underscore",
+        "arabic-indic-digit",
+        "double-minus",
+        "minus-zero",
+        "twenty-digits",
+        "long",
+        "past-int64",
+        "negative",
+    ],
 )
 def test_parse_audit_anchor_takes_only_a_count_a_store_can_hold(count: str, reason: str) -> None:
     """Vault BACKLOG #5987: the count is ASCII digits bounded by the signed 64-bit ``seq`` column,
@@ -2002,7 +2018,7 @@ def test_parse_audit_anchor_refuses_a_transit_mac_the_writer_never_emits(head: s
     ``TransitCipher.audit_hmac`` writes, so a truncated or space-bearing copy is refused as
     malformed input rather than reported as tampering on an intact chain."""
     body = base64.b64encode(b"\x04" * 32).decode("ascii")
-    with pytest.raises(AuditAnchorError, match="not a whole one"):
+    with pytest.raises(AuditAnchorError, match="not a well-formed one"):
         parse_audit_anchor(f"3:{head.format(b=body)}")
     assert parse_audit_anchor(f"3:vault:v12:{body}") == (3, f"vault:v12:{body}")  # the control
 
