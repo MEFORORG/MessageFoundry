@@ -362,8 +362,8 @@ path** (no separate at-rest tier):
 - **DICOM objects `[BUILT]` (ADR 0025).** A received DICOM object is **PHI** — the header carries
   PatientName / MRN / DOB — and is stored through the store cipher like any other body, never logged at
   INFO+, egress-allowlisted, and TLS off-loopback. Logs/errors carry only **routing-safe identifiers**
-  (SOPClassUID / Modality / UIDs / AE title), never the dataset or element values, except as
-  [DICOM.md](DICOM.md) section 5's limits state. That rule covers
+  (SOPClassUID / Modality / UIDs / AE title), never the dataset or element values, except where
+  [DICOM.md](DICOM.md) section 5 says otherwise. That rule covers
   third-party library loggers too, such as pynetdicom's and pydicom's, and a peer-sent value either
   library refuses or flags as non-conformant must never be logged verbatim (owner ruling 2026-11-03,
   BACKLOG #5081). The DICOM transport applies that rule by default-deny on those libraries' loggers
