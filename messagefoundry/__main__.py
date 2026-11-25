@@ -7821,9 +7821,9 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         # BACKLOG #3510: the store's write helper refused the clear, which wrote nothing; the open
         # before it may have (BACKLOG #5067).
         left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
-        # The name as typed, not the stored one the other refusals use: neither this text nor
-        # _seal_refusal's WARNING prints a value from a record that failed its seal (BACKLOG #5633
-        # item 7; tests/test_cli.py pins it).
+        # This Forged arm names the user as typed, where the refusals below name the stored one:
+        # neither this text nor _seal_refusal's WARNING prints a value from a record that failed its
+        # seal (BACKLOG #5633 item 7; tests/test_cli.py pins it).
         return _emit_error(f"{_seal_refusal(wanted, 'unlock')}. {left}", as_json=args.json)
     if outcome == "open-failed":
         if isinstance(extra, (StoreKeylessError, CipherError)):
@@ -11885,17 +11885,24 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
                 # or a pool acquire that timed out. A busy store is not "could not start", so it
                 # keeps exit 1. The command has written nothing yet, but the open may have, so the
                 # text names it (BACKLOG #5067).
-                # The class only, never the text, on the console and in the WARNING log alike: a
-                # driver's message can quote a stored value (ASVS 16.5.4), as admin-unlock renders
-                # its refusals (vault BACKLOG #5067 added item B).
-                logging.getLogger(__name__).warning(
+                # A refusal the engine wrote, such as an acquire timeout, prints whole, since its
+                # text names its fix. Any other error prints its class only: a driver's message can
+                # quote a stored value (ASVS 16.5.4; vault BACKLOG #5067 added item B). The WARNING
+                # names the class and the traceback goes to DEBUG, as admin-unlock logs a refusal.
+                log = logging.getLogger(__name__)
+                log.warning(
                     "admin-set-notify-email: the store refused the audit row for %r (%s)",
                     user.username,
                     type(exc).__name__,
                 )
+                log.debug("admin-set-notify-email: the refusal's traceback", exc_info=exc)
                 left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
-                refused = f"the store refused the audit row ({type(exc).__name__})"
-                return ("audit-refused", user.username, f"{refused}. {left}")
+                refused = (
+                    _engine_refusal_text(exc)
+                    if _is_engine_refusal(exc)
+                    else f"the store refused the audit row ({type(exc).__name__})"
+                )
+                return ("audit-refused", user.username, f"{_sentence(refused)} {left}")
             try:
                 await store.set_user_notify_email(user.id, email=address)
             except BaseException as exc:

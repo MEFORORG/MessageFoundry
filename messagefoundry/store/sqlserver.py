@@ -14905,9 +14905,7 @@ class SqlServerStore(ServerCipherWalk):
 
     async def _charge_bound_batch(self) -> None:
         """Top the AES-GCM invocation reserve up mid-burst — called after EVERY committed batch of a
-        rotation / at-rest-migration loop (ASVS 11.3.4; the SQLite twin documents why), and by the
-        user re-seal pass after every record it did not refuse, a compare-and-set that lost and
-        wrote nothing included, since that record's re-encrypt was already spent (BACKLOG #5738).
+        rotation / at-rest-migration loop (ASVS 11.3.4; the SQLite twin documents why).
 
         Runs on its own pooled connection, OUTSIDE the batch transaction: the batch is already committed,
         and an accounting write must never be rolled back with a retried batch."""
@@ -16223,10 +16221,10 @@ class SqlServerStore(ServerCipherWalk):
                 continue
             if written is not None:
                 resealed += 1
-            # Each re-encrypted TOTP secret is an AES-GCM invocation under the active key (ASVS
-            # 11.3.4), charged after each record, written or not: a compare-and-set that lost
-            # has already spent it (BACKLOG #5738; store.py's copy says more).
-            await self._charge_bound_batch()
+                # Each re-encrypted TOTP secret is an AES-GCM invocation under the active key
+                # (ASVS 11.3.4), charged after each committed record, so an interrupted pass
+                # leaves at most the one record in flight to the reserve-ahead (BACKLOG #5738).
+                await self._charge_bound_batch()
         return resealed, refused
 
     async def count_unsealed_users(self) -> int:

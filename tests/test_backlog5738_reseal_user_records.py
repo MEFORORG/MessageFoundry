@@ -5,8 +5,8 @@
 Two defects, one test each, each with its control:
 
 * The AES-GCM invocation bound was charged once, after the whole loop, and outside the writer lock
-  the charge's commit needs. It is now charged after each record the pass did not refuse, a lost
-  compare-and-set included, through ``checkpoint_cipher_invocations``, which takes the lock.
+  the charge's commit needs. It is now charged after each committed record, through
+  ``checkpoint_cipher_invocations``, which takes the lock.
 * The work filter used ``NOT LIKE``, which SQLite folds for ASCII case, so a record whose seal
   prefix differed from the active one only in case was skipped, neither moved nor counted refused.
 
@@ -83,70 +83,3 @@ async def test_a_seal_prefix_differing_only_in_case_is_not_skipped(
         db.execute("UPDATE users SET authz_seal=? WHERE id=?", (folded, "c-1"))
     # Selected and refused (its seal names no key this store holds), never silently passed over.
     assert await store.reseal_user_records() == (0, 1)
-
-
-# --- a compare-and-set that lost is still charged (engine PR 2989 open finding 5) -------------------
-#
-# The change re-encrypts the TOTP secret before the compare-and-set write, so a write that lost to a
-# concurrent writer has already spent an AES-GCM invocation. The pass charged the bound only when the
-# write landed, so a lost compare left that invocation to a later checkpoint: the next record's, or
-# the close's settle. A hard kill before either outran the reserve-ahead by that record's spend.
-# These tests pin that the pass checkpoints after a lost compare; the accounts carry no TOTP secret,
-# so they do not measure the spend itself, which the checkpoint charges whatever it is.
-
-
-async def test_a_lost_compare_and_set_is_still_charged(
-    keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from messagefoundry.store import store as store_module
-
-    store, _ = keyed
-    await _user(store, "l-1")
-    _rotate_sealer(store)
-    charged: list[str] = []
-
-    async def checkpoint(**_kwargs: Any) -> None:
-        charged.append("checkpoint")
-
-    real_params = store_module.user_reseal_params
-
-    def lost_compare(new: Any, old: Any) -> tuple[object, ...]:
-        # The seal the compare expects is not the stored one: what a concurrent write leaves.
-        *head, _seal = real_params(new, old)
-        return (*head, "seal-a-concurrent-writer-left")
-
-    monkeypatch.setattr(store, "checkpoint_cipher_invocations", checkpoint)
-    monkeypatch.setattr(store_module, "user_reseal_params", lost_compare)
-    assert await store.reseal_user_records() == (0, 0)  # neither re-sealed nor refused
-    assert charged == ["checkpoint"]
-
-
-def _server_store(cls: type[Any], charged: list[str]) -> Any:
-    store = object.__new__(cls)
-    store._cipher = make_cipher(generate_key(), write_v2=True)
-    store._row_sealer = RowSealer(bytes(32))
-
-    async def fetchall(*_args: Any, **_kwargs: Any) -> list[dict[str, str]]:
-        return [{"id": "s-1"}]
-
-    async def write_user_txn(_user_id: str, _change: Any) -> None:
-        return None  # the compare-and-set lost
-
-    async def charge() -> None:
-        charged.append("charge")
-
-    store._fetchall = fetchall
-    store._write_user_txn = write_user_txn
-    store._charge_bound_batch = charge
-    return store
-
-
-@pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
-async def test_a_lost_compare_and_set_is_still_charged_on_the_server_backends(backend: str) -> None:
-    from messagefoundry.store.postgres import PostgresStore
-    from messagefoundry.store.sqlserver import SqlServerStore
-
-    charged: list[str] = []
-    store = _server_store(PostgresStore if backend == "postgres" else SqlServerStore, charged)
-    assert await store.reseal_user_records() == (0, 0)
-    assert charged == ["charge"]
