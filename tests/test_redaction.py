@@ -193,6 +193,12 @@ _HOSTILE_RUN_CHARS = 16_000
 _SCAN_BUDGET_SECONDS = 0.05
 
 
+def _tile(unit: str, chars: int) -> str:
+    """``unit`` repeated and cut to exactly ``chars`` characters, the tiling the sized fixtures below
+    share."""
+    return (unit * (chars // len(unit) + 1))[:chars]
+
+
 def _hostile_free_text() -> str:
     """An exception-shaped message carrying one long delimiter-free run, the input the field-run scan
     is quadratic on.
@@ -201,8 +207,7 @@ def _hostile_free_text() -> str:
     the shape that really reaches ``redact``. What makes it hostile is asserted in
     :func:`test_the_hostile_fixture_is_actually_hostile`, which every arm below depends on."""
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-    blob = (alphabet * (_HOSTILE_RUN_CHARS // len(alphabet) + 1))[:_HOSTILE_RUN_CHARS]
-    return f"cannot decode mfb64:v1:{blob} at offset 0"
+    return f"cannot decode mfb64:v1:{_tile(alphabet, _HOSTILE_RUN_CHARS)} at offset 0"
 
 
 def _longest_token(text: str) -> int:
@@ -736,7 +741,7 @@ def _delimiter_free_run(delimiters: frozenset[str], chars: int) -> str:
     after any one of them has somewhere to admit it. A guard that admits one only after a non-ASCII
     character is not seen."""
     alphabet = "".join(c for c in string.printable if not c.isspace() and c not in delimiters)
-    return (alphabet * (chars // len(alphabet) + 1))[:chars]
+    return _tile(alphabet, chars)
 
 
 def _field_run_reads(field_run: re.Pattern[str], delimiters: frozenset[str], chars: int) -> int:
@@ -1395,7 +1400,7 @@ _FILLER = "ordinary-ops-filler "
 
 
 def _filler(chars: int) -> str:
-    return (_FILLER * (chars // len(_FILLER) + 1))[:chars]
+    return _tile(_FILLER, chars)
 
 
 def _over_window(tail: str) -> str:
@@ -2768,8 +2773,7 @@ def test_the_mrn_pass_stays_linear_and_affordable(unit: str) -> None:
     """8x the input must cost well under 64x the time, and a whole window stays well under a second
     on the event loop. The ratio ceiling is the one the structured passes use."""
 
-    def sized(chars: int) -> str:
-        return (unit * (chars // len(unit) + 1))[:chars]
+    sized = functools.partial(_tile, unit)
 
     small, large = sized(8 * 1024), sized(64 * 1024)
     t_small = max(_best_of(lambda: redact(small)), 1e-4)
@@ -3832,8 +3836,7 @@ def test_the_backstop_and_the_encoded_run_stay_linear_and_affordable(unit: str) 
     """8x the input must cost well under 64x the time, and a whole window stays well under a second
     on the event loop. The same ceilings as the MRN pass above."""
 
-    def sized(chars: int) -> str:
-        return (unit * (chars // len(unit) + 1))[:chars]
+    sized = functools.partial(_tile, unit)
 
     small, large = sized(8 * 1024), sized(64 * 1024)
     t_small = max(_best_of(lambda: redact(small)), 1e-4)
