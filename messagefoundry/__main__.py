@@ -7739,7 +7739,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     )
 
     # The stored username once the account is found, as the output and the audit row name it
-    # (BACKLOG #5633 item 7). The Forged arm below does not use it; its comment says which do.
+    # (BACKLOG #5633 item 7). The Forged arm below does not use it.
     named = [wanted]
 
     async def run() -> tuple[str, Any]:
@@ -7823,11 +7823,10 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
         # This Forged arm names the user as typed, so neither this text nor _seal_refusal's WARNING
         # prints a value from the record that failed its seal (BACKLOG #5633 item 7;
-        # tests/test_cli.py pins the text, not the WARNING). The read-refused and no-such-user arms
-        # below name the typed name too. At least the Transit, Unverifiable, refused and changed
-        # arms name named[0], the stored username, which get_user_by_username returns without
-        # checking the record's seal, so the Unverifiable arm prints it from a record whose seal
-        # Transit would not check.
+        # tests/test_cli.py pins the text, not the WARNING). An arm below that prints named[0]
+        # prints the username as get_user_by_username returned it, with no seal check, so a record
+        # whose seal fails another way, at least as Unverifiable or in a Transit outage, has its
+        # stored username printed.
         return _emit_error(f"{_seal_refusal(wanted, 'unlock')}. {left}", as_json=args.json)
     if outcome == "open-failed":
         if isinstance(extra, (StoreKeylessError, CipherError)):
@@ -11901,9 +11900,11 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
                 )
                 log.debug("admin-set-notify-email: the refusal's traceback", exc_info=exc)
                 left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
+                # A blank engine refusal falls back to the class, so the text never ends empty.
+                whole = _engine_refusal_text(exc) if _is_engine_refusal(exc) else ""
                 refused = (
-                    f"the store refused the audit row: {_engine_refusal_text(exc)}"
-                    if _is_engine_refusal(exc)
+                    f"the store refused the audit row: {whole}"
+                    if whole
                     else f"the store refused the audit row ({type(exc).__name__})"
                 )
                 return ("audit-refused", user.username, f"{_sentence(refused)} {left}")
