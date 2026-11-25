@@ -1417,7 +1417,7 @@ def test_a_subst_drive_splices_its_target_with_a_separator() -> None:
     assert chain[-1] == ("C:\\real\\w\\certs\\ca.pem", FILE)
 
 
-# --- BACKLOG #6281 member S12-15: the real reader reads a mask only where an entry holds one -------
+# --- BACKLOG #6281 member S12-15: the real reader reads a mask only where an entry holds one -----
 
 #: ``S-1-1-0`` (Everyone) as a binary SID: revision 1, one sub-authority, authority 1, value 0.
 _EVERYONE_SID_BYTES = bytes([1, 1, 0, 0, 0, 0, 0, 1]) + (0).to_bytes(4, "little")
@@ -1471,9 +1471,8 @@ def test_s12_15_an_entry_of_an_undefined_type_has_no_mask_read_past_its_end(
 ) -> None:
     """An entry of a type Windows does not define may be its 4-byte header alone, and the kernel
     accepts it in a DACL. The reader records no rights for it. Red: it read the four bytes after
-    the header as a mask, here the next entry's header, ``0x00140000``. No caller reads a mask for
-    a type that grants nothing, so no verdict changes; after the DACL's last entry the same read
-    ran off the descriptor."""
+    the header as a mask, here the next entry's header, ``0x00140000``. Why that changes no
+    verdict is in :func:`~messagefoundry.auth.anchor_path.dacl_entry_fields`."""
     target = tmp_path / "short-entry.txt"
     target.write_bytes(b"synthetic")
     assert _set_protected_dacl(target, [_ace(0x20, b""), _allow_everyone()]) == 0
@@ -1529,8 +1528,8 @@ def test_s12_52_the_shared_sid_helpers_refuse_off_windows() -> None:
 @_windows_only
 def test_s12_15_the_reader_still_reads_a_well_formed_allow_entry(tmp_path: Path) -> None:
     """The control: a well-formed allow entry reads with its mask and SID as before. The deny entry
-    beside it now records no rights. It recorded ``0x2`` before, and no caller reads the rights of
-    an entry that grants nothing."""
+    beside it now records no rights; it recorded ``0x2`` before. Which callers that leaves unchanged
+    is in :func:`~messagefoundry.auth.anchor_path.dacl_entry_fields`."""
     target = tmp_path / "well-formed.txt"
     target.write_bytes(b"synthetic")
     deny_write = _ace(0x01, (0x00000002).to_bytes(4, "little") + _EVERYONE_SID_BYTES)
@@ -1580,3 +1579,67 @@ def test_s12_15_a_dacl_entry_is_read_only_as_far_as_it_reaches(
     The kernel refuses a too-short granting entry in a file's DACL (error 1340, measured on Windows
     11, 2026-11-24), so these shapes reach no real-host test."""
     assert ap.dacl_entry_fields(entry) == expected
+
+
+def _acl(entries: list[bytes], *, count: int | None = None, size: int | None = None) -> bytes:
+    """A DACL's bytes: the 8-byte header, then ``entries``. ``count`` and ``size`` override the
+    header's AceCount and AclSize; the bytes returned are always exactly ``size`` long, as the
+    reader copies them."""
+    body = b"".join(entries)
+    acl_size = 8 + len(body) if size is None else size
+    header = (
+        bytes([2, 0])
+        + acl_size.to_bytes(2, "little")
+        + (len(entries) if count is None else count).to_bytes(2, "little")
+        + bytes(2)
+    )
+    return (header + body + bytes(max(0, acl_size - 8 - len(body))))[:acl_size]
+
+
+def test_s12_15_the_dacl_walk_reads_each_entry_where_it_starts() -> None:
+    """The control: a well-formed DACL walks to each entry, and only the allow entry gets a SID
+    offset. A header-only entry of an undefined type last reads nothing past it."""
+    deny = _ace(0x01, (0x2).to_bytes(4, "little") + _EVERYONE_SID_BYTES)
+    walked = ap.dacl_entries(_acl([deny, _allow_everyone(), _ace(0x20, b"")]))
+    assert walked == ((0x01, 0, 0, None), (0x00, 0, 0x1F01FF, 8 + 20 + 8), (0x20, 0, 0, None))
+    assert ap.dacl_entries(_acl([])) == ()
+
+
+@pytest.mark.parametrize(
+    ("acl", "reason"),
+    [
+        # An entry whose AceSize is 0 or 2. Red: GetAce steps by that size (measured on Windows 11,
+        # 2026-11-25: with 0 it returned entry 0 again for index 1, with 2 an entry starting inside
+        # entry 0), so the Everyone grant after it was never read.
+        (_acl([bytes([0x20, 0, 0, 0]), _allow_everyone()]), "shorter than an entry header"),
+        (_acl([bytes([0x20, 0, 2, 0]), _allow_everyone()]), "shorter than an entry header"),
+        # A last entry whose AceSize runs past AclSize. Red: the copy ran past the DACL.
+        (
+            _acl([_allow_everyone()[:2] + (0xFFFF).to_bytes(2, "little") + _allow_everyone()[4:]]),
+            "runs past the end of the DACL",
+        ),
+        # AceCount names more entries than AclSize holds.
+        (_acl([_allow_everyone()], count=2), "starts past the end of the DACL"),
+        # An entry that starts within 3 bytes of AclSize, so its AceSize is not inside the DACL.
+        (_acl([_allow_everyone(), bytes(2)], count=2), "starts past the end of the DACL"),
+        # An AclSize below its own 8-byte header.
+        (_acl([], size=4), "too short to hold its header"),
+        # An entry the entry parse refuses.
+        (_acl([_ace(0x00, (0x1F01FF).to_bytes(4, "little"))]), "too short to hold its SID"),
+    ],
+)
+def test_s12_15_a_dacl_with_an_entry_out_of_its_bounds_reads_as_unreadable(
+    acl: bytes, reason: str
+) -> None:
+    """The whole DACL is refused, never clamped, so the walk records the object as unreadable and
+    can never judge it sound (BACKLOG #6281, member S12-15)."""
+    walked = ap.dacl_entries(acl)
+    assert isinstance(walked, str) and reason in walked, walked
+
+
+def test_s12_15_an_unreadable_dacl_is_never_judged_sound() -> None:
+    """What the reader returns for a refused DACL, an error, makes the object indeterminate."""
+    sec = WinSecurity("S-1-5-18", (), "entry 0 of its DACL is shorter than an entry header")
+    trust = WinTrust("S-1-5-18", lambda _sid: True)
+    [finding] = evaluate_windows_object("C:\\x", DIRECTORY, sec, trust)
+    assert finding.insecure is False and "could not be read" in finding.reason

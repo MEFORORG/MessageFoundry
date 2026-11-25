@@ -1069,9 +1069,11 @@ def dacl_entry_fields(entry: bytes) -> tuple[int, int, int] | str:
     """``(type, flags, mask)`` of one DACL entry, from as many bytes as its own AceSize gives, or
     what the entry is too short to hold.
 
-    Only a granting entry's mask is read, and the mask is 0 for any other type, because no caller
-    reads a mask of a type that grants nothing. An entry of a type Windows does not define may be
-    its 4-byte header alone, so reading a mask from it would read the next entry, or past the DACL.
+    Only a granting entry's mask is read, and the mask is 0 for any other type. The callers that
+    read :class:`WinSecurity` entries, :func:`evaluate_windows_object` and ``restricted_file.py``'s
+    link and holder checks, skip every type that grants nothing. An entry of a type Windows does
+    not define may be its 4-byte header alone, so reading a mask from it would read the next entry,
+    or past the DACL.
     Every granting type carries its mask right after the header. An allow entry must also hold its
     whole SID, which starts at offset 8 and is 8 bytes plus 4 per sub-authority; the SID's second
     byte, at offset 9, counts them. The caller renders that SID once this answers. Kept free of
@@ -1086,6 +1088,39 @@ def dacl_entry_fields(entry: bytes) -> tuple[int, int, int] | str:
     if ace_type == ACCESS_ALLOWED_ACE_TYPE and (len(entry) < 16 or len(entry) < 16 + 4 * entry[9]):
         return "too short to hold its SID"
     return ace_type, flags, int.from_bytes(entry[4:8], "little")
+
+
+def dacl_entries(acl: bytes) -> tuple[tuple[int, int, int, int | None], ...] | str:
+    """Each entry of one DACL, from a copy of exactly its ``AclSize`` bytes, as ``(type, flags,
+    mask, sid_offset)``, or why the DACL cannot be read.
+
+    ``sid_offset`` is where an allow entry's SID starts in ``acl``, for the caller to render, and
+    ``None`` for any other type. The walk steps from entry to entry by each one's own AceSize, as
+    ``GetAce`` does. It refuses the whole DACL when an entry is shorter than its 4-byte header or
+    runs past ``AclSize``: a size below 4 would make every later index read the same entry again,
+    so a grant after it would go unseen. Kept free of ctypes so every platform tests it."""
+    if len(acl) < 8:
+        return "its DACL is too short to hold its header"
+    # ACL header: revision, sbz1 (bytes), AclSize, AceCount, sbz2 (words).
+    count = int.from_bytes(acl[4:6], "little")
+    entries: list[tuple[int, int, int, int | None]] = []
+    offset = 8
+    for index in range(count):
+        if offset + 4 > len(acl):
+            return f"entry {index} of its DACL starts past the end of the DACL"
+        size = int.from_bytes(acl[offset + 2 : offset + 4], "little")
+        if size < 4:
+            return f"entry {index} of its DACL is shorter than an entry header"
+        if offset + size > len(acl):
+            return f"entry {index} of its DACL runs past the end of the DACL"
+        fields = dacl_entry_fields(acl[offset : offset + size])
+        if isinstance(fields, str):
+            return f"entry {index} of its DACL is {fields}"
+        ace_type, flags, mask = fields
+        sid_offset = offset + 8 if ace_type == ACCESS_ALLOWED_ACE_TYPE else None
+        entries.append((ace_type, flags, mask, sid_offset))
+        offset += size
+    return tuple(entries)
 
 
 def windows_host_readers() -> WinHost:
@@ -1181,31 +1216,22 @@ def windows_host_readers() -> WinHost:
             owner = sid_text(owner_ptr.value)
             if not dacl_ptr.value:
                 return WinSecurity(owner, None)
-            # ACL header: revision, sbz1 (bytes), size, count, sbz2 (words). Count is at offset 4.
-            count = ctypes.cast(dacl_ptr.value + 4, ctypes.POINTER(wintypes.WORD))[0]
+            # Copy the DACL once, bounded by its own AclSize at offset 2, and walk the copy, so no
+            # entry's size can carry a read past the DACL.
+            acl_size = ctypes.cast(dacl_ptr.value + 2, ctypes.POINTER(wintypes.WORD))[0]
+            acl = ctypes.create_string_buffer(ctypes.string_at(dacl_ptr.value, acl_size), acl_size)
+            walked = dacl_entries(acl.raw)
+            if isinstance(walked, str):
+                return WinSecurity(owner, (), walked)
             aces: list[tuple[int, int, int, str]] = []
-            for index in range(count):
-                ace_ptr = ctypes.c_void_p()
-                if (
-                    not advapi32.GetAce(dacl_ptr.value, index, ctypes.byref(ace_ptr))
-                    or not ace_ptr.value
-                ):
-                    return WinSecurity(owner, (), f"entry {index} of its DACL could not be read")
-                base = ace_ptr.value
-                # The header's AceSize, at offset 2, bounds the copy, so nothing past the entry is
-                # read. The header itself is always there: GetAce pointed at it.
-                ace_size = ctypes.cast(base + 2, ctypes.POINTER(wintypes.WORD))[0]
-                fields = dacl_entry_fields(ctypes.string_at(base, max(ace_size, 4)))
-                if isinstance(fields, str):
-                    return WinSecurity(owner, (), f"entry {index} of its DACL is {fields}")
-                ace_type, ace_flags, ace_mask = fields
+            for index, (ace_type, ace_flags, ace_mask, sid_offset) in enumerate(walked):
                 sid = ""
-                if ace_type == ACCESS_ALLOWED_ACE_TYPE:
-                    parsed = sid_text(base + 8)
+                if sid_offset is not None:
+                    parsed = sid_text(ctypes.addressof(acl) + sid_offset)
                     if parsed is None:
                         return WinSecurity(owner, (), f"the SID in entry {index} could not be read")
                     sid = parsed
-                aces.append((int(ace_type), int(ace_flags), int(ace_mask), sid))
+                aces.append((ace_type, ace_flags, ace_mask, sid))
             return WinSecurity(owner, tuple(aces))
         finally:
             if sd_ptr.value:

@@ -6,9 +6,10 @@
 :func:`~messagefoundry.auth.anchor_path.windows_host_readers` and ``_win32_config_source_probes``
 in ``config/wiring.py`` take them from here. They open an object differently and report a failed
 read differently, so each keeps its own reader. Each also keeps its own read of the local
-Administrators group, because the two answer a partial read differently. What they share is here: the prototypes of the SID, entry, account and token
-calls, the text of a binary SID, and the SID of the account this process runs as. Other readers
-still declare their own, at least ``restricted_file.py``'s.
+Administrators group, because the two answer a partial read differently. What they share is
+here: the prototypes of the SID, entry, account and token calls, the text of a binary SID, and the
+SID of the account this process runs as. Other readers still declare their own, at least
+``restricted_file.py``'s.
 
 ctypes stays behind the platform guard in each function, so mypy and lint pass on the Linux CI leg.
 """
@@ -117,7 +118,7 @@ def process_user_sid(advapi32: Any, kernel32: Any) -> str | None:
         buf = ctypes.create_string_buffer(size.value)
         if not advapi32.GetTokenInformation(token, token_user, buf, size.value, ctypes.byref(size)):
             return None
-        # TOKEN_USER is SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes; }; the SID pointer is first.
+        # TOKEN_USER is SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes; }; the SID pointer leads.
         return sid_text(advapi32, kernel32, ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0])
     finally:
         kernel32.CloseHandle(token)
