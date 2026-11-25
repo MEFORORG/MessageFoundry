@@ -130,9 +130,9 @@ _AI_HOP_CELL_OTHER = "[ai] engine AI broker (verified TLS)"
 _AI_ATTESTATION_LEVER = (
     "Set [ai].endpoint_revocation_attested = true with an "
     "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
-    "endpoint's certificate, or use an endpoint URL whose host is localhost, 127.0.0.1 or [::1], "
-    "spelled exactly so and listed in [ai].allowed_endpoints: a spelling with a trailing dot, or a "
-    "short form such as 127.1, is read as remote and refused here."
+    "endpoint's certificate, or use an endpoint URL whose host reads as loopback here, such as "
+    "localhost, 127.0.0.1 or [::1], listed in [ai].allowed_endpoints; a spelling with a trailing "
+    "dot, or a short form such as 127.1, reads as remote."
 )
 
 #: The ways across that refusal under an enforcing posture, on the terms below:
@@ -149,9 +149,9 @@ _AI_CRL_LEVER = (
     "is instance-wide: every non-loopback hop it reaches then needs its issuer's CRL in that file, "
     "or its handshake fails), or set [ai].endpoint_revocation_attested = true with an "
     "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
-    "endpoint's certificate, or use an endpoint URL whose host is localhost, 127.0.0.1 or [::1], "
-    "spelled exactly so and listed in [ai].allowed_endpoints: a spelling with a trailing dot, or a "
-    "short form such as 127.1, is read as remote and refused here."
+    "endpoint's certificate, or use an endpoint URL whose host reads as loopback here, such as "
+    "localhost, 127.0.0.1 or [::1], listed in [ai].allowed_endpoints; a spelling with a trailing "
+    "dot, or a short form such as 127.1, reads as remote."
 )
 
 
