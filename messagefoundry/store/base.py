@@ -3266,11 +3266,17 @@ class AuthStore(Protocol):
         queue orders neither a sign-in on another engine shard nor an administrator's write. An
         unconditional write would then judge whether it changed the scope, which is what revokes
         the account's other sessions, against a value already replaced: it could revoke a
-        concurrent sign-in's brand-new session for a scope that sign-in had already written. The
-        compare runs in the same transaction as the write, on the row read under the write's lock,
-        as ``withdraw_ad_channel_scope``'s does: if ``expected_scope`` or ``expected_source``
-        (``None`` matching NULL) differs, or the row is gone, nothing is written and this returns
-        ``False``."""
+        concurrent sign-in's brand-new session for a scope that sign-in had already written. If
+        ``expected_scope`` or ``expected_source`` (``None`` matching NULL) differs from the row
+        read, or the row is gone, nothing is written and this returns ``False``.
+
+        **What makes that compare hold differs per backend**, as for every user-record write. Each
+        reads the row, compares in Python, and writes with a compare on the seal it read, so a row
+        changed after the read writes nothing and this returns ``False``. Postgres and SQL Server
+        also read the row under a lock held to the write (``FOR UPDATE``, ``UPDLOCK, ROWLOCK``), so
+        there the seal compare is a second guard. SQLite's read takes no lock against another
+        process, so there the seal compare in the ``UPDATE`` is the guard; a row changed in ANY
+        column after the read loses it too, and the caller reads that as a miss."""
         ...
 
     async def set_user_federated_subject(

@@ -2800,8 +2800,9 @@ def _in_directory_sign_in_queue[**P](
 
 
 #: How many times a directory sign-in tries its compare-and-set scope write before it fails
-#: (BACKLOG #6887). A miss on a row still there means another writer committed a different scope
-#: or source in between, so a bound this small is reached only by a row other writers keep moving.
+#: (BACKLOG #6887). A miss on a row still there means another writer committed in between: a
+#: different scope or source, or, on SQLite, whose guard is the seal compare, a change to any column.
+#: A bound this small is reached only by a row other writers keep moving.
 _AD_SCOPE_WRITE_ATTEMPTS: Final = 3
 
 
@@ -2818,6 +2819,20 @@ class _AdChannelScopeContended(RuntimeError):
 
     def __str__(self) -> str:
         return f"directory scope write contended after {self.attempts} attempts"
+
+
+class _AdChannelScopeRefused(Exception):
+    """A directory sign-in's scope write missed, and the row read again refuses the sign-in
+    (BACKLOG #6887): gone or failing its seal (:data:`ACCOUNT_REFUSED`, as the role write names it),
+    or disabled or locked (:func:`_directory_login_refusal`'s reason). Nothing was written.
+
+    Raised by :meth:`AuthService._sync_ad_channel_scope` and left to propagate, so the sign-in
+    fails and mints no session, as :class:`_AdChannelScopeContended` does. ``reason`` is the
+    closed-set slug the role write's refusal would carry for the same row."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -9219,8 +9234,11 @@ class AuthService:
         a second time. On a miss the grant is NOT taken from the row the other writer left, since
         that writer may have read older group memberships; the row is read again and decided again
         from this sign-in's own groups, at most :data:`_AD_SCOPE_WRITE_ATTEMPTS` times, and past
-        that the sign-in fails (:class:`_AdChannelScopeContended`). A withdrawal that misses still
-        returns the row as it now stands (BACKLOG #1927).
+        that the sign-in fails (:class:`_AdChannelScopeContended`). A re-read that finds the row
+        gone, failing its seal, disabled or locked fails the sign-in too, with nothing written
+        (:class:`_AdChannelScopeRefused`), as the role write refuses it. Both are raised, not yet
+        audited as refusals. A withdrawal that misses still returns the row as it now stands
+        (BACKLOG #1927), and the caller judges that row before the mint.
 
         **WHAT THE COMPARE-AND-SET DOES NOT CLOSE.** At least two paths still end a concurrent
         sign-in's new session. The revoke after a grant is a separate transaction, so a sign-in
@@ -9278,9 +9296,28 @@ class AuthService:
             # write is moving as refused, and that must not end the loop with nothing written.
             fresh = (await self._lookup_user_settled(user.id)).user
             if fresh is None:
-                # Nothing was written. A row gone, or one failing its seal, is refused by the
-                # caller's re-read before the mint, so it is never reported as contention.
-                return user
+                # Refused here, as the role write refuses it, not returned: the caller's own
+                # re-read before the mint can find the row readable again, and would then mint on
+                # a scope this sign-in neither wrote nor checked. Nothing was written.
+                _log.error(
+                    "auth: the record of account id %r is gone or fails its seal, read after the "
+                    "sign-in's scope write missed; nothing was written and the sign-in is refused",
+                    user.id,
+                )
+                raise _AdChannelScopeRefused(ACCOUNT_REFUSED)
+            # The re-read decides eligibility too, as the role write's does: the account may have
+            # been disabled or locked since the read the sign-in's own gate ran on. ``federated``
+            # is True here only to skip the binding check, the last one, which the session
+            # insert's own guard judges; the disabled and lock states are what this reads.
+            ineligible = _directory_login_refusal(fresh, time.time(), federated=True)
+            if ineligible is not None:
+                _log.error(
+                    "auth: account id %r was refused (%s) on the read after the sign-in's scope "
+                    "write missed; nothing was written and the sign-in is refused",
+                    user.id,
+                    ineligible,
+                )
+                raise _AdChannelScopeRefused(ineligible)
             user = fresh
             decision = decide(user)
             if not decision.write or decision.scope_json is None:

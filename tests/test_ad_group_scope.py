@@ -25,9 +25,11 @@ from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import (
     _AD_SCOPE_WRITE_ATTEMPTS,
+    ACCOUNT_REFUSED,
     CHANNEL_SCOPE_CHANGE_REFUSED_ACTION,
     AuthService,
     _AdChannelScopeContended,
+    _AdChannelScopeRefused,
     _allowed_channels,
 )
 from messagefoundry.config.settings import AuthSettings, EgressSettings
@@ -1148,8 +1150,9 @@ async def test_a_miss_decides_again_from_this_sign_ins_own_groups(tmp_path: Path
 async def test_a_scope_write_that_misses_on_every_attempt_fails_the_sign_in(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Past the bound the sync raises rather than return a row this sign-in did not decide on, so
-    no session is minted under a scope another writer chose. Nothing is revoked or audited."""
+    """Past the bound the sync raises, so a grant that keeps missing mints no session under a
+    scope another writer chose. That claim is this path's only: a WITHDRAWAL that misses still
+    returns the row the other writer left (BACKLOG #1927). Nothing is revoked or audited."""
     store = await MessageStore.open(tmp_path / "svc6887c.db")
     try:
         service = AuthService(store, AuthSettings())
@@ -1175,17 +1178,21 @@ async def test_a_scope_write_that_misses_on_every_attempt_fails_the_sign_in(
         await store.close()
 
 
-async def test_a_miss_on_a_row_gone_is_not_reported_as_contention(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("on_try", [1, _AD_SCOPE_WRITE_ATTEMPTS])
+async def test_a_miss_whose_re_read_finds_no_row_refuses_the_sign_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, on_try: int
 ) -> None:
-    """A miss whose re-read finds no row returns, on the last attempt too, so the caller's re-read
-    before the mint refuses it as a deleted account rather than as a contended write."""
-    store = await MessageStore.open(tmp_path / "svc6887d.db")
+    """A miss whose settled re-read returns no user refuses the sign-in as the role write does,
+    ``account_refused``, with nothing written, on the first attempt and the last. It is not
+    returned for the caller to judge: the caller's own re-read could find the row readable again
+    and mint on a scope this sign-in neither wrote nor checked. Nor is it reported as contention."""
+    store = await MessageStore.open(tmp_path / f"svc6887d{on_try}.db")
     try:
         service = AuthService(store, AuthSettings())
         await service.initialize()
         await store.set_ad_group_scope_map([("grp-a", "IB_A")])
         user = await _ad_user(store, "ada")
+        await _session_for(store, "ada", f"h-ada-6887-d{on_try}")
         tries = 0
         real_lookup = service._lookup_user_settled
 
@@ -1194,18 +1201,56 @@ async def test_a_miss_on_a_row_gone_is_not_reported_as_contention(
             tries += 1
             return False
 
-        async def gone_on_last(user_id: str) -> Any:
-            if tries >= _AD_SCOPE_WRITE_ATTEMPTS:
+        async def gone_on_try(user_id: str) -> Any:
+            if tries >= on_try:
                 return SimpleNamespace(user=None, held=False)
             return await real_lookup(user_id)
 
         monkeypatch.setattr(store, "set_ad_channel_scope_if_unchanged", always_moved)
-        monkeypatch.setattr(service, "_lookup_user_settled", gone_on_last)
+        monkeypatch.setattr(service, "_lookup_user_settled", gone_on_try)
 
-        out = await service._sync_ad_channel_scope(user, frozenset(), ["grp-a"])
+        with pytest.raises(_AdChannelScopeRefused) as refused:
+            await service._sync_ad_channel_scope(user, frozenset(), ["grp-a"])
 
-        assert tries == _AD_SCOPE_WRITE_ATTEMPTS  # positive control: the last attempt ran
-        assert out.id == "ada" and out.channel_scope is None  # returned, nothing written
+        assert refused.value.reason == ACCOUNT_REFUSED
+        assert tries == on_try  # positive control: the refusing attempt ran, and no later one
+        assert (await store.get_user("ada")).channel_scope is None  # nothing written
+        assert await store.list_sessions("ada"), "a refused sync revoked"
+        assert await store.list_audit(action="auth.ad_scope_resynced") == []
+    finally:
+        await store.close()
+
+
+async def test_a_miss_whose_re_read_finds_the_account_disabled_refuses_the_sign_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The re-read decides eligibility as the role write's does: an account disabled since the
+    sign-in's own gate is refused with ``disabled``, and its scope is not written."""
+    store = await MessageStore.open(tmp_path / "svc6887f.db")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await store.set_ad_group_scope_map([("grp-a", "IB_A")])
+        user = await _ad_user(store, "ada")
+        await _session_for(store, "ada", "h-ada-6887-f")
+        real_cas = store.set_ad_channel_scope_if_unchanged
+
+        async def disabled_first(*args: Any, **kwargs: Any) -> bool:
+            # An administrator sets a scope and disables the account between the sign-in's read
+            # and its write, so the write misses and the re-read finds the account disabled.
+            await store.set_user_channel_scope("ada", '["IB_X"]', source=SCOPE_SOURCE_MANUAL)
+            await store.set_user_disabled("ada", disabled=True)
+            return await real_cas(*args, **kwargs)
+
+        monkeypatch.setattr(store, "set_ad_channel_scope_if_unchanged", disabled_first)
+
+        with pytest.raises(_AdChannelScopeRefused) as refused:
+            await service._sync_ad_channel_scope(user, frozenset(), ["grp-a"])
+
+        assert refused.value.reason == "disabled"
+        got = await store.get_user("ada")
+        assert got.disabled  # positive control
+        assert got.channel_scope == '["IB_X"]', "the sync wrote over a refused row"
         assert await store.list_audit(action="auth.ad_scope_resynced") == []
     finally:
         await store.close()
