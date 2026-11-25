@@ -473,7 +473,15 @@ class LogSpool:
         (:func:`_directory_unreachable`), is not a gone segment: like any other
         ``OSError`` (out of descriptors, a sharing violation) it retires nothing and returns
         ``None``, so the caller tries again later instead of deleting undelivered records. It also
-        closes the writer, for the reason the comment below gives."""
+        closes the writer, for the reason the comment below gives.
+
+        A segment confirmed gone as a file is retired without being unlinked, so a segment whose
+        own ``lstat`` reports it gone when it is not is skipped, not deleted: a DFS or share
+        failover that briefly reports a live file gone, in the same directory, can still take it
+        out of the order, and the next start replays it, possibly after newer records were sent.
+        A dangling link segment is unlinked, so records in a target that is only out of reach
+        just now, on a mount that is down for one, are not replayed from it once it is back
+        (BACKLOG #5811)."""
         while True:
             try:
                 entry = self._peek()

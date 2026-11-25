@@ -1073,7 +1073,8 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
             self.handleError(record)
 
     def handleError(self, record: logging.LogRecord) -> None:
-        """Drop the socket after a network error, so the **next** record reconnects (BACKLOG #1199).
+        """Drop a stream socket after a network error, so the **next** record reconnects (BACKLOG
+        #1199); a UDP socket only on the age and error terms the comment in the body gives.
 
         ``SysLogHandler.emit`` reconnects only under ``if not self.socket``, and it never clears
         ``self.socket`` when a send fails. On the shipped handler a stream forwarder that broke

@@ -968,7 +968,7 @@ def test_a_dangling_symlink_segment_is_retired_and_its_link_unlinked(
     spool_dir: Path, monkeypatch: pytest.MonkeyPatch, winerror: int
 ) -> None:
     """A head segment whose path is a dangling symlink (lstat shows a link, stat says not found)
-    can never be opened, so it counts as gone: it is retired, the link itself is unlinked, and
+    cannot be opened now, so it counts as gone: it is retired, the link itself is unlinked, and
     the read moves on. On Windows a link into a missing directory gives winerror 3, which counts
     here too. NEGATIVE CONTROL: on cf6bfe2d12 the link was not unlinked, and winerror 3 wedged
     the spool."""
@@ -2041,8 +2041,9 @@ def test_a_failed_udp_send_rebuilds_a_socket_older_than_the_interval(
 ) -> None:
     """BACKLOG #5923 step 2: a UDP socket that went bad was never rebuilt, since only a stream
     socket was dropped after a failed send. One older than the rebuild interval is now dropped, and
-    the next send builds a fresh one that delivers. NEGATIVE CONTROL: on 33870a40944 the bad socket
-    stayed in place and took the second send too."""
+    the next send builds a fresh one that delivers. NEGATIVE CONTROL: on 33870a40944, with
+    ``_UDP_SOCKET_REBUILD_SECONDS`` added to logging_setup by hand so the setattr applies, the bad
+    socket stayed in place and took the second send too."""
     handler = _TimeoutSysLogHandler(
         address=("127.0.0.1", 9), socktype=socket.SOCK_DGRAM, defer_connect=True
     )
