@@ -964,7 +964,7 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
                 mark_dropped = True
                 body = piece.removesuffix(b"\n")
                 text_bytes[start:end] = body.translate(_HIGH_AS_QUERY) + b"   " + piece[len(body) :]
-    if not blocks:
+    if not blocks and not non_ascii:  # a non-ASCII byte that hid the only BEGIN refuses as such
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} holds no PEM block, so it names no "
             "certificate to trust",
