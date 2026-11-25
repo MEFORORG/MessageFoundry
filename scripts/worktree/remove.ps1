@@ -1221,8 +1221,11 @@ $allocDirRoot = Join-Path $ownShared.Path 'alloc'
 
 function Format-RecordText($Value) {
     # A record field lands in prose an operator or agent acts on, so a line break or other invisible
-    # character in it must not be able to forge a line (the BACKLOG #1040 route).
-    ([string]$Value).Trim() -replace '[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]', '?'
+    # character in it must not be able to forge a line (the BACKLOG #1040 route). \p{C} includes the
+    # surrogate halves .NET sees for an astral format character; the cap matches _safe_for_message.
+    $t = ([string]$Value).Trim() -replace '[\p{C}\p{Zl}\p{Zp}]', '?'
+    if ($t.Length -gt 400) { $t = $t.Substring(0, 400) + '...' }
+    $t
 }
 
 function Test-LedgerNumberOnMain([string]$Kind, [string]$Number) {
@@ -1257,7 +1260,7 @@ if (Test-RegistryDirPresent $allocDirRoot 'the allocation directory') {
         $r = Read-RecordFile $f
         # The retired-allocator tombstone names no worktree on purpose, so it can strand nothing.
         if ($r.Tombstone) { continue }
-        if ($r.Problem) { $allocUnreadable += "$($f.Name) ($($r.Problem))"; continue }
+        if ($r.Problem) { $allocUnreadable += "$(Format-RecordText $f.Name) ($($r.Problem))"; continue }
         if ($r.Elsewhere -or $targetNorms -notcontains $r.Holder) { continue }
         $a = $r.Record
         $onMain = Test-LedgerNumberOnMain ([string]$a.kind) ([string]$a.number)
@@ -1270,9 +1273,10 @@ if (Test-RegistryDirPresent $allocDirRoot 'the allocation directory') {
             $outcome = if ([string]$a.kind -eq 'adr' -and $recBranch) {
                 "a recorded branch $recBranch can still commit it: a worktree on a branch of that name is entitled to it"
             } else {
-                'nothing else can commit it once this worktree is removed, short of recreating a worktree at this path'
+                'no other worktree can commit it once this one is removed, short of one recreated at this path'
             }
-            $atRisk += "$(Format-RecordText $a.kind) #$(Format-RecordText $a.number) -- $why -- $(Format-RecordText $a.title) -- $outcome."
+            # The outcome before the title, so a title cannot put a forged outcome ahead of the real one.
+            $atRisk += "$(Format-RecordText $a.kind) #$(Format-RecordText $a.number) -- $why -- $outcome -- title: $(Format-RecordText $a.title)"
         }
     }
     if (($atRisk.Count -gt 0 -or $allocUnreadable.Count -gt 0) -and -not $AllowOrphanedAllocations) {
@@ -1287,7 +1291,7 @@ if (Test-RegistryDirPresent $allocDirRoot 'the allocation directory') {
         $lines += ""
         $lines += "Do this instead:"
         $lines += "  land the item(s) first, so the heading is on origin/main and ownership stops mattering;"
-        $lines += "  or, having read each line above, re-run with -AllowOrphanedAllocations to remove it anyway."
+        $lines += "  or, if the operator accepts each line above, they may re-run with -AllowOrphanedAllocations."
         throw ($lines -join "`n")
     }
 }

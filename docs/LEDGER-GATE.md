@@ -302,8 +302,8 @@ that reuses the name inherits it. **A number still strands when the record carri
 one made before the branch field existed does, and its worktree is gone. Then the recovery below is
 the one that works.
 
-`scripts/worktree/remove.ps1` refuses at least a removal while an allocation record names this
-worktree's path, matched by path only, for a number whose item is not yet on `origin/main`, and a
+`scripts/worktree/remove.ps1` refuses at least the removal of a worktree whose path an allocation
+record names, matched by path only, for a number whose item is not yet on `origin/main`, and a
 cannot-tell reads as at-risk. It does not stop every way a number can strand. The override is
 `-AllowOrphanedAllocations` and deliberately **not** `-Force`: that one already means *"I accept losing
 uncommitted changes"*, and one consent must not silently cover a second risk.

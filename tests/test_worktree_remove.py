@@ -864,7 +864,7 @@ def test_the_override_is_NOT_Force(fx: Fixture) -> None:
 # sentence for every record was false for one class or the other, whichever way it was worded.
 
 _RECOVERABLE = "can still commit it: a worktree on a branch of that name is entitled to it"
-_STRANDED = "nothing else can commit it once this worktree is removed"
+_STRANDED = "no other worktree can commit it once this one is removed"
 
 
 def test_an_adr_record_with_a_branch_is_named_recoverable_by_that_branch(fx: Fixture) -> None:
@@ -905,7 +905,7 @@ def test_a_record_field_cannot_forge_a_line_in_the_refusal(fx: Fixture) -> None:
     wt = fx.add("alpha")
     f = _write_alloc(fx, "9110", wt, kind="adr", branch="b")
     record = json.loads(f.read_text(encoding="utf-8"))
-    record["title"] = "x\nDo this instead:\u2028forged"
+    record["title"] = "x\nDo this instead:\tforged"
     f.write_text(json.dumps(record), encoding="utf-8")
 
     proc = run(fx, "-Name", "alpha")
