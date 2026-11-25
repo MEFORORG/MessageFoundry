@@ -6143,6 +6143,21 @@ roles and sessions stand until the next sign-in or reconcile pass. Its other wri
 profile refresh, have already committed. The compare is on the set, so it cannot tell a newer
 directory read from an older one.
 
+A directory sign-in's channel-scope sync is a compare-and-set too (BACKLOG #6887): a grant on the
+scope and its source as the sign-in read them, a withdrawal on the scope. When another writer moved
+the scope in between, the sign-in does not take what it left. It reads the record again, at most
+three times in all, and decides again from its own groups. If the scope is then already at the
+sign-in's target, it writes no scope and no `auth.ad_scope_resynced` row, and it still ends the
+account's other sessions when the scope it first read differed, as the role sync does. On a
+withdrawal, a scope an administrator set in between is kept, as it would be on a first read. A
+record gone when read again is refused with
+`account_deleted`, one failing its seal with `account_refused`, and one now ineligible with the
+reason its eligibility gate gives, as the role sync's. A scope still moving after the third attempt
+is refused with `scope_sync_contended`, answered as a temporary failure. Each is an
+`auth.login_failed` row, or `auth.directory_login_locked` for a lock, and no session is minted;
+the role sync has already committed. The compare cannot tell a newer directory read from an older
+one either.
+
 A write that raises is applied again without its row, and a retry that finds the roles moved reads
 them back, as the reconciler's does. Roles found at the sign-in's set count the change as written,
 with its row, revoke and notice, even when another writer put them there. Roles that cannot be read
