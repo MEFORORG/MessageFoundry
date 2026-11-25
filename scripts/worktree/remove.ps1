@@ -1219,6 +1219,12 @@ else {
 # found" (vault BACKLOG #2985, item 11, and #2988).
 $allocDirRoot = Join-Path $ownShared.Path 'alloc'
 
+function Format-RecordText($Value) {
+    # A record field lands in prose an operator or agent acts on, so a line break or other invisible
+    # character in it must not be able to forge a line (the BACKLOG #1040 route).
+    ([string]$Value).Trim() -replace '[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]', '?'
+}
+
 function Test-LedgerNumberOnMain([string]$Kind, [string]$Number) {
     <# $true on origin/main, $false absent, $null CANNOT TELL (which the caller treats as at-risk).
 
@@ -1257,15 +1263,16 @@ if (Test-RegistryDirPresent $allocDirRoot 'the allocation directory') {
         $onMain = Test-LedgerNumberOnMain ([string]$a.kind) ([string]$a.number)
         if ($onMain -ne $true) {
             $why = if ($null -eq $onMain) { 'COULD NOT CHECK origin/main' } else { 'not on origin/main' }
-            # The branch key counts only where the engine's gate checks ownership with owns(), which it
-            # does for adr alone; a backlog number is matched by path only.
-            $recBranch = if ($a.branch -is [string]) { $a.branch.Trim() -replace '[\p{Cc}\p{Cf}]', '?' } else { '' }
-            $outcome = if ([string]$a.kind -ceq 'adr' -and $recBranch) {
-                "a recorded branch $recBranch can still commit it while that branch exists: recreate a worktree on that branch"
+            # The engine's gate checks only adr numbers with owns(), so only an adr record's branch is a
+            # second key. alloc.ps1 records a detached HEAD as `detached@<sha>`, which names no branch.
+            $recBranch = if ($a.branch -is [string]) { Format-RecordText $a.branch } else { '' }
+            if ($recBranch -like 'detached@*') { $recBranch = '' }
+            $outcome = if ([string]$a.kind -eq 'adr' -and $recBranch) {
+                "a recorded branch $recBranch can still commit it: a worktree on a branch of that name is entitled to it"
             } else {
                 'nothing else can commit it once this worktree is removed, short of recreating a worktree at this path'
             }
-            $atRisk += "$([string]$a.kind) #$([string]$a.number) -- $why -- $([string]$a.title)`n    $outcome"
+            $atRisk += "$(Format-RecordText $a.kind) #$(Format-RecordText $a.number) -- $why -- $(Format-RecordText $a.title) -- $outcome."
         }
     }
     if (($atRisk.Count -gt 0 -or $allocUnreadable.Count -gt 0) -and -not $AllowOrphanedAllocations) {
@@ -1280,7 +1287,7 @@ if (Test-RegistryDirPresent $allocDirRoot 'the allocation directory') {
         $lines += ""
         $lines += "Do this instead:"
         $lines += "  land the item(s) first, so the heading is on origin/main and ownership stops mattering;"
-        $lines += "  or, if you accept the outcome stated for each number, re-run with -AllowOrphanedAllocations."
+        $lines += "  or, having read each line above, re-run with -AllowOrphanedAllocations to remove it anyway."
         throw ($lines -join "`n")
     }
 }

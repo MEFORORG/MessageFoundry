@@ -1809,8 +1809,8 @@ def test_a_reminder_interval_above_its_default_is_a_named_loosening() -> None:
     # deadline: 15 days, 1_296_000 s, for warn_days = 14. The clause prints from exactly that value,
     # and a second less prints none.
     clause = (
-        ", which is at least the 15 days from the 14-day warn_days window opening to the "
-        "deadline, as that lead counts whole days, so that reminder can come after the deadline "
+        ", which is at least the 15 days between the warn window opening and the deadline, "
+        "since warn_days = 14 counts whole days, so that reminder can come after the deadline "
         "itself"
     )
     for interval, printed in ((1_296_000.0, True), (1_295_999.0, False)):

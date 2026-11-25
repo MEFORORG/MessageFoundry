@@ -225,7 +225,8 @@ def test_a_number_allocated_to_a_DIFFERENT_worktree_is_blocked(repo: Path, tmp_p
 
     ***THE OTHER BRANCH IS LOAD-BEARING AND USED TO BE IMPLICIT.*** A sibling SESSION is in another
     worktree AND on another branch -- git refuses an ORDINARY second checkout of one branch in two
-    worktrees (a DEFAULT, not a law of git, BACKLOG #1039), so that pairing is not a coincidence, it
+    worktrees (a DEFAULT, not a law of git: `git worktree add --force` and `git checkout
+    --ignore-other-worktrees` get past it, BACKLOG #1039), so that pairing is not a coincidence, it
     is the shape a live sibling has. Once ownership grew a
     branch fallback (BACKLOG #1282) this arm had to name the branch or it would have been asserting
     the weaker "different path" and passing for a reason unrelated to sibling-ness.

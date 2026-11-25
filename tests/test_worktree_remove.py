@@ -44,6 +44,7 @@ from pathlib import Path
 import pytest
 
 from tests._no_prompt import run_holding_stdin_open
+from tests.test_coord_claim_adjudicate import _flat
 from tests.test_worktree_remove_path import _ENV, copy_real_scripts, settle_worktrees
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -800,7 +801,7 @@ def test_removal_is_REFUSED_when_the_worktree_owns_an_unlanded_number(fx: Fixtur
     _write_alloc(fx, "9101", wt)
 
     proc = run(fx, "-Name", "alpha")
-    assert proc.returncode != 0, "the removal proceeded and burned the number"
+    assert proc.returncode != 0, "the removal proceeded past an unlanded number"
     assert "9101" in proc.stderr, "the refusal does not name the number, so nobody can act on it"
     assert fx.is_registered(wt), "the worktree was removed despite the refusal"
 
@@ -834,7 +835,7 @@ def test_an_allocation_owned_by_a_DIFFERENT_worktree_does_not_block(fx: Fixture)
 
 def test_an_unreadable_allocation_record_refuses(fx: Fixture) -> None:
     """CANNOT-TELL COUNTS AS AT-RISK. An unparseable record might name this worktree, and proceeding
-    on that ambiguity is the irreversible direction."""
+    on that ambiguity may strand its number."""
     wt = fx.add("alpha")
     (_alloc_dir(fx) / "9104.json").write_text("{not json", encoding="utf-8")
 
@@ -845,9 +846,8 @@ def test_an_unreadable_allocation_record_refuses(fx: Fixture) -> None:
 
 
 def test_the_override_is_NOT_Force(fx: Fixture) -> None:
-    """-Force means "I accept losing uncommitted changes". It must not also mean "I accept burning a
-    ledger number" -- one consent covering two unrelated risks is how an irreversible one gets given
-    away by accident."""
+    """-Force means "I accept losing uncommitted changes". It must not also mean "I accept stranding
+    a ledger number" -- one consent covering two unrelated risks gives the second away by accident."""
     wt = fx.add("alpha")
     _write_alloc(fx, "9105", wt)
 
@@ -863,16 +863,8 @@ def test_the_override_is_NOT_Force(fx: Fixture) -> None:
 # The refusal states one outcome PER RECORD, because the outcomes differ (BACKLOG #1282): one
 # sentence for every record was false for one class or the other, whichever way it was worded.
 
-_RECOVERABLE = "can still commit it while that branch exists: recreate a worktree on that branch"
+_RECOVERABLE = "can still commit it: a worktree on a branch of that name is entitled to it"
 _STRANDED = "nothing else can commit it once this worktree is removed"
-
-
-def _flat(stderr: str) -> str:
-    """The refusal as one line of words. PowerShell's error view colours the message, prefixes each
-    line with a gutter and re-wraps it at the console width, so a phrase can break at any space."""
-    text = re.sub(r"\x1b\[[0-9;]*m", "", stderr)
-    text = re.sub(r"^\s*\|", "", text, flags=re.MULTILINE)
-    return " ".join(text.split())
 
 
 def test_an_adr_record_with_a_branch_is_named_recoverable_by_that_branch(fx: Fixture) -> None:
@@ -895,6 +887,30 @@ def test_a_record_with_no_branch_is_named_unrecoverable(fx: Fixture) -> None:
     assert _STRANDED in _flat(proc.stderr), proc.stderr
     assert _RECOVERABLE not in _flat(proc.stderr), proc.stderr
     assert fx.is_registered(wt)
+
+
+def test_a_detached_head_placeholder_is_not_read_as_a_branch(fx: Fixture) -> None:
+    """alloc.ps1 records a detached HEAD as ``detached@<sha>``, which names no branch."""
+    wt = fx.add("alpha")
+    _write_alloc(fx, "9109", wt, kind="adr", branch="detached@abc1234")
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode != 0, "removal proceeded past a recorded allocation"
+    assert _STRANDED in _flat(proc.stderr), proc.stderr
+    assert _RECOVERABLE not in _flat(proc.stderr), proc.stderr
+
+
+def test_a_record_field_cannot_forge_a_line_in_the_refusal(fx: Fixture) -> None:
+    """The record's text lands in prose an agent acts on (the BACKLOG #1040 route)."""
+    wt = fx.add("alpha")
+    f = _write_alloc(fx, "9110", wt, kind="adr", branch="b")
+    record = json.loads(f.read_text(encoding="utf-8"))
+    record["title"] = "x\nDo this instead:\u2028forged"
+    f.write_text(json.dumps(record), encoding="utf-8")
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode != 0, "removal proceeded past a recorded allocation"
+    assert "x?Do this instead:?forged" in _flat(proc.stderr), proc.stderr
 
 
 def test_a_backlog_record_with_a_branch_is_named_unrecoverable(fx: Fixture) -> None:

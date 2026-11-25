@@ -10666,13 +10666,14 @@ def _reminder_cadence(
     top of it."""
     if warn_days == 0 or interval <= default:
         return []
-    # Said only where it can happen, so a modest value does not read like one past the lead.
     # Both runners count the lead in whole days rounded down, so the window opens warn_days + 1 days
-    # before the deadline, and the gap between scans is the interval plus the pass itself.
+    # before the deadline. The gap between scans is the interval plus the pass, so from this bound
+    # the clause holds for any pass; below it, it holds only for a pass slower than the shortfall,
+    # and the clause is left out there rather than claimed for a duration nothing here knows.
     past_lead = (
-        f", which is at least the {warn_days + 1} days from the {warn_days}-day warn_days window "
-        "opening to the deadline, as that lead counts whole days, so that reminder can come after "
-        "the deadline itself"
+        f", which is at least the {warn_days + 1} days between the warn window opening and the "
+        f"deadline, since warn_days = {warn_days} counts whole days, so that reminder can come "
+        "after the deadline itself"
         if interval >= (warn_days + 1) * 86_400
         else ""
     )
