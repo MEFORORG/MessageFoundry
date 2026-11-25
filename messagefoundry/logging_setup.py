@@ -593,9 +593,9 @@ def redacted_log_field(
     text: str,
     limit: int,
     *,
-    before: str = "",
+    before: str,
     after: str = "",
-    checks: tuple[tuple[str, str], ...] = (),
+    checks: tuple[tuple[str, str], ...],
 ) -> str:
     """``text`` as one ``key="value"`` field value of a log line (BACKLOG #3770): ``text`` as
     :func:`redact_log_value` reads it in the line ``before`` + ``text`` + ``after``, escaped and
@@ -613,7 +613,12 @@ def redacted_log_field(
     or ``after``. What a caller passes there decides what the field hides, and empty or wrongly
     spelled context can leave readable what the shipped filters would redact in the full line. A new
     caller adds its own hides-no-less-than-main test, as tests/test_admin_new_ip.py does, before it
-    ships.
+    ships. Two checks back this up in code (BACKLOG #3770): ``before`` and ``checks`` have no
+    default, so a caller states both, an empty one included; and
+    ``tests/test_redacted_log_field_census.py`` pins every production reference to this function,
+    :func:`redact_log_value` and :func:`~messagefoundry.controlchars.log_field_token`, fails on a
+    new one or on a ``before`` or ``after`` that is not a literal or a module constant, and names
+    each pinned caller's hides-no-less-than-main test.
 
     The reading is the one every later shipped handler leaves, not a fixed number of handler
     passes, so the field hides what the last sink of a logger with any number of handlers would
