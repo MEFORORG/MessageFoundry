@@ -4,15 +4,17 @@
 
 A non-blocking source answers ``None`` when it has nothing ready. A copy loop that stops on
 ``if not buf: break`` ends the copy short there, and so does ``shutil.copyfileobj``. Six copies in
-``pipeline/dr_backup.py`` now share :func:`dr_backup._read_chunks`, which reads through the codec's
-``_read_once`` and so refuses a ``None`` read, as the keyed branch does: the no-key build, the
-plaintext verify, the config-member restore, ``_extract_member``, the plaintext branch of
-``_restore_blocking`` and the copy fallback of ``_place_restored_store``. It raises the refusal as
-an ``OSError``, so each site reports it the way it reports any ``OSError`` in that copy; these
-tests drive each site and check that report, the last three against an ``OSError`` read as the
-control. ``_sha256_file`` is not changed: a ``None`` read there raises a ``TypeError`` from the
-hash rather than ending the read short. The sources are synthetic: a store with one made-up row,
-and a tar of made-up config bytes."""
+``pipeline/dr_backup.py`` now read through :class:`dr_backup._NoneRefusingReader`, which reads
+through the codec's ``_read_once`` and so refuses a ``None`` read, as the keyed branch does. Five
+do so by way of :func:`dr_backup._read_chunks`: the no-key build, the plaintext verify, the
+config-member restore, ``_extract_member`` and the plaintext branch of ``_restore_blocking``. The
+sixth, the copy fallback of ``_place_restored_store``, hands the reader to ``shutil.copyfileobj``.
+The refusal is raised as an ``OSError``, so each site reports it the way it reports any ``OSError``
+in that copy; these tests drive each site and check that report, the last three against an
+``OSError`` read as the control. Reads in that module this branch does not change include at least
+``_sha256_file``, where a ``None`` read raises a ``TypeError`` from the hash rather than ending the
+read short, ``_looks_encrypted`` and ``_read_manifest_from_tar``. The sources are synthetic: a
+store with one made-up row, and a tar of made-up config bytes."""
 
 from __future__ import annotations
 
@@ -262,10 +264,38 @@ class _Failing(_Stalling):
         return data
 
 
+class _StallingLate(_Stalling):
+    """A ``None`` read after the first copy-sized read has returned data, so the copy has already
+    written part of the stream when the stall comes, which a refusal on the first read only would
+    miss."""
+
+    def __init__(self, inner: Any) -> None:
+        super().__init__(inner)
+        self._reads = 0
+
+    def read(self, size: int = -1, /) -> bytes | None:
+        if size == _CHUNK:
+            self._reads += 1
+            if self._reads == 2:
+                self.stalls += 1
+                return None
+        data: bytes | None = self._inner.read(size)
+        return data
+
+
 _FAULTS: dict[str, tuple[type[_Stalling], str]] = {
     "none-read": (_Stalling, "no data ready reading the {what}"),
+    "none-read-midway": (_StallingLate, "no data ready reading the {what}"),
     "oserror": (_Failing, "synthetic read fault"),
 }
+
+
+def _assert_no_staging_left(caught: BaseException, dest: Path) -> None:
+    """The restore tore its staging down: it names no leftover, and nothing is left beside the
+    destination or in the OS temp dir the ``own_os_temp`` fixture gives the test."""
+    assert "Separately" not in str(caught)
+    assert not dest.parent.exists() or list(dest.parent.iterdir()) == []
+    assert list((dest.parent.parent / "ostemp").iterdir()) == []
 
 
 @pytest.fixture
@@ -379,6 +409,7 @@ def test_restore_reports_a_none_read_of_the_store_member_as_it_reports_an_oserro
     assert caught.value.kind == "restore"
     assert str(caught.value).startswith("the restore failed: OSError: [Errno 5] ")
     assert not dest.exists()
+    _assert_no_staging_left(caught.value, dest)
 
 
 @pytest.mark.usefixtures("own_os_temp")
@@ -399,6 +430,7 @@ def test_restore_reports_a_none_read_of_a_plaintext_archive_as_it_reports_an_ose
     assert caught.value.kind == "restore"
     assert str(caught.value).startswith("the restore failed: OSError: [Errno 5] ")
     assert not dest.exists()
+    _assert_no_staging_left(caught.value, dest)
 
 
 def _refuse_links(monkeypatch: pytest.MonkeyPatch) -> None:

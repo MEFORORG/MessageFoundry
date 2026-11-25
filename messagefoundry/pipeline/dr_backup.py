@@ -445,8 +445,8 @@ class _HashingReader:
         # A read that is not bytes-like (None from a non-blocking source with nothing ready, or a
         # str) passes through unhashed. On the keyed branch the codec's own refusal then names it,
         # rather than a TypeError from the digest escaping the BackupCodecError arm. The no-key
-        # copy loop has no such refusal, but its only source is the archive path opened 'rb', a
-        # blocking buffered reader whose reads return bytes.
+        # copies do not read through this class; they read through `_read_chunks`, which refuses
+        # such a read itself (BACKLOG #6687).
         if isinstance(data, (bytes, bytearray, memoryview)):
             self.digest.update(data)
         return data
@@ -478,20 +478,18 @@ def _read_chunks(src: _ChunkSource, what: str) -> Iterator[bytes]:
     caller handles it as it handles any ``OSError`` from that copy, which the callers' own ``except``
     arms define. A ``BackupCodecError`` would instead be reported as an encrypt or decrypt failure,
     and a no-key copy does neither."""
-    while True:
-        try:
-            buf = _read_once(cast(BinaryIO, src), _COPY_CHUNK_BYTES, what)
-        except BackupCodecError as exc:
-            raise OSError(errno.EIO, str(exc)) from exc
-        if not buf:
-            return
+    reader = _NoneRefusingReader(src, what)
+    while buf := reader.read(_COPY_CHUNK_BYTES):
         yield buf
 
 
 class _NoneRefusingReader:
-    """A ``read`` over ``src`` held to :func:`_read_chunks`'s per-read checks, for a reader such as
-    ``shutil.copyfileobj`` that drives its own loop: a ``None`` read, a read that is not bytes and
-    a read over the size asked for are raised as ``OSError`` (``EIO``) (BACKLOG #6687)."""
+    """A ``read`` over ``src`` held to the codec's ``_read_once`` checks. :func:`_read_chunks` reads
+    through it, and so does a reader such as ``shutil.copyfileobj`` that drives its own loop: a
+    ``None`` read, a read that is not bytes-like and a read over the size asked for are raised as
+    ``OSError`` (``EIO``) (BACKLOG #6687). A ``bytearray`` or ``memoryview`` read is returned as
+    ``bytes``. ``size`` must be positive: the io convention of a negative size for "read all" is
+    not supported."""
 
     def __init__(self, src: _ChunkSource, what: str) -> None:
         self._src = src
@@ -499,7 +497,7 @@ class _NoneRefusingReader:
         # Kept for a reader that names its source, as a test seam on `copyfileobj` does.
         self.name: object = getattr(src, "name", "")
 
-    def read(self, size: int, /) -> bytes:
+    def read(self, size: int = _COPY_CHUNK_BYTES, /) -> bytes:
         try:
             return _read_once(cast(BinaryIO, self._src), size, self._what)
         except BackupCodecError as exc:
@@ -6940,9 +6938,7 @@ def _place_restored_store(
                 # `copyfileobj` reads a None read as the end and would place a truncated store as
                 # placed, so it reads through `_NoneRefusingReader`, which refuses one as an
                 # OSError that the cleanup below handles as it does any failed read (BACKLOG #6687).
-                shutil.copyfileobj(
-                    cast(BinaryIO, _NoneRefusingReader(fh, "staged store")), out, _COPY_CHUNK_BYTES
-                )
+                shutil.copyfileobj(_NoneRefusingReader(fh, "staged store"), out, _COPY_CHUNK_BYTES)
                 out.flush()
                 os.fsync(out.fileno())
             placed = True
