@@ -2119,9 +2119,10 @@ async def test_app_log_compression_reports_a_source_that_vanished_after_placemen
 async def test_app_log_sweep_ages_out_claimed_archives_with_the_archives(
     store: MessageStore, tmp_path
 ) -> None:
-    """A claimed archive (``<name>.gz.<pid>-<ns>.mfclaim``) holds log content, so the ``app_log_days``
-    sweep ages it out on its own mtime, under the same gate as the ``.gz`` archives: only while
-    compression is on, and only for a name the compressor produces (BACKLOG #6805)."""
+    """A claimed archive (``<name>.gz.<pid>-<ns>.mfclaim``) holds log content, so the
+    ``app_log_days`` sweep ages it out on its own mtime, under the same gate as the ``.gz``
+    archives: only while compression is on, and only for a name the compressor produces
+    (BACKLOG #6805)."""
     logs = tmp_path / "logs"
     logs.mkdir()
     now = 30 * DAY
@@ -2159,7 +2160,7 @@ async def test_app_log_sweep_ages_out_claimed_archives_with_the_archives(
 
 
 def _claim_fixture(tmp_path: Path) -> tuple[Path, Path, os.stat_result, bytes]:
-    """A source log and a valid archive of it at ``dest``, with the ``fstat`` it was read through."""
+    """A source log and a valid archive of it at ``dest``, with the ``fstat`` read through it."""
     source = tmp_path / "old.log"
     data = b"engine started\n" * 50
     source.write_bytes(data)
@@ -2170,20 +2171,39 @@ def _claim_fixture(tmp_path: Path) -> tuple[Path, Path, os.stat_result, bytes]:
     return source, dest, read_st, data
 
 
+def _remove_failing_on_claims(monkeypatch, error: OSError) -> None:
+    """Make ``os.remove`` raise ``error`` for a claim name and behave normally for anything else."""
+    real_remove = os.remove
+
+    def remove(path, *args, **kwargs):
+        if str(path).lower().endswith(".mfclaim"):
+            raise error
+        real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "remove", remove)
+
+
+def _peer_removes_claims_first(monkeypatch) -> None:
+    """Make a peer's sweep win the race for every claim: the claim is gone when ``os.remove`` runs,
+    so it raises ``FileNotFoundError`` for real."""
+    real_remove = os.remove
+
+    def remove(path, *args, **kwargs):
+        if str(path).lower().endswith(".mfclaim"):
+            real_remove(path)
+        real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "remove", remove)
+
+
 def test_drop_redundant_archive_is_false_when_the_claim_cannot_be_removed(
     tmp_path, monkeypatch, caplog
 ) -> None:
     """A claim whose removal fails is NOT reported as removed: the archive's bytes are still on disk
-    under the claim name, and a WARNING names it (BACKLOG #6805)."""
+    under the claim name, a WARNING names it, and the sweep recognises the name the producer made
+    (BACKLOG #6805)."""
     source, dest, read_st, data = _claim_fixture(tmp_path)
-    real_remove = os.remove
-
-    def refuse_claims(path, *args, **kwargs):
-        if str(path).endswith(".mfclaim"):
-            raise PermissionError("locked")
-        real_remove(path, *args, **kwargs)
-
-    monkeypatch.setattr(os, "remove", refuse_claims)
+    _remove_failing_on_claims(monkeypatch, PermissionError("locked"))
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
         dropped = retention_mod._drop_redundant_archive(
             str(source), read_st, data, str(dest), name="old.log"
@@ -2193,6 +2213,52 @@ def test_drop_redundant_archive_is_false_when_the_claim_cannot_be_removed(
     claims = list(tmp_path.glob("*.mfclaim"))
     assert len(claims) == 1 and gzip.decompress(claims[0].read_bytes()) == data
     assert "could not be removed" in caplog.text
+    assert retention_mod._is_app_log_name(claims[0].name, include_archives=True)
+
+
+def test_drop_redundant_archive_counts_a_claim_a_peer_already_removed(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """A claim already gone when its removal runs (a peer's ``app_log_days`` sweep took it) is
+    counted as removed, not logged as a failure (BACKLOG #6805)."""
+    source, dest, read_st, data = _claim_fixture(tmp_path)
+    _peer_removes_claims_first(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        assert_capture_sees(caplog, retention_mod.__name__)
+        dropped = retention_mod._drop_redundant_archive(
+            str(source), read_st, data, str(dest), name="old.log"
+        )
+
+    assert dropped is True
+    assert not list(tmp_path.glob("*.mfclaim")) and not dest.exists()
+    assert "could not be removed" not in caplog.text
+
+
+def test_drop_redundant_archive_reports_a_claim_gone_before_its_put_back(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """A claim removed (by a peer's ``app_log_days`` sweep, say) before it could be put back is
+    reported as gone, not as KEPT under a name that no longer exists (BACKLOG #6805)."""
+    source, dest, read_st, data = _claim_fixture(tmp_path)
+    answers = iter([True, False])  # holds before the claim, changed after it
+
+    def holds_then_peer_sweeps(*args):
+        answer = next(answers)
+        if not answer:
+            for claim in tmp_path.glob("*.mfclaim"):
+                claim.unlink()
+        return answer
+
+    monkeypatch.setattr(retention_mod, "_source_still_holds", holds_then_peer_sweeps)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        dropped = retention_mod._drop_redundant_archive(
+            str(source), read_st, data, str(dest), name="old.log"
+        )
+
+    assert dropped is False
+    assert not list(tmp_path.glob("*.mfclaim")) and not dest.exists()
+    assert "was removed meanwhile" in caplog.text
+    assert "KEPT" not in caplog.text
 
 
 @pytest.mark.parametrize("fail", ["link", "remove"])
@@ -2205,12 +2271,6 @@ def test_drop_redundant_archive_warns_when_a_put_back_leaves_the_claim(
     source, dest, read_st, data = _claim_fixture(tmp_path)
     answers = iter([True, False])  # holds before the claim, changed after it
     monkeypatch.setattr(retention_mod, "_source_still_holds", lambda *a: next(answers))
-    real_remove = os.remove
-
-    def refuse_claims(path, *args, **kwargs):
-        if str(path).endswith(".mfclaim"):
-            raise PermissionError("locked")
-        real_remove(path, *args, **kwargs)
 
     def refuse_link(*args, **kwargs):
         raise OSError("no hard links here")
@@ -2218,7 +2278,7 @@ def test_drop_redundant_archive_warns_when_a_put_back_leaves_the_claim(
     if fail == "link":
         monkeypatch.setattr(os, "link", refuse_link)
     else:
-        monkeypatch.setattr(os, "remove", refuse_claims)
+        _remove_failing_on_claims(monkeypatch, PermissionError("locked"))
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
         dropped = retention_mod._drop_redundant_archive(
             str(source), read_st, data, str(dest), name="old.log"
@@ -2232,6 +2292,27 @@ def test_drop_redundant_archive_warns_when_a_put_back_leaves_the_claim(
     else:
         assert gzip.decompress(dest.read_bytes()) == data
         assert "was linked back but could not be removed" in caplog.text
+
+
+def test_drop_redundant_archive_put_back_counts_a_claim_a_peer_already_removed(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """After a put-back links the archive back to ``dest``, a claim a peer already removed is not
+    a failure: ``dest`` holds the archive and no WARNING says the claim was kept (BACKLOG #6805)."""
+    source, dest, read_st, data = _claim_fixture(tmp_path)
+    answers = iter([True, False])  # holds before the claim, changed after it
+    monkeypatch.setattr(retention_mod, "_source_still_holds", lambda *a: next(answers))
+    _peer_removes_claims_first(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        assert_capture_sees(caplog, retention_mod.__name__)
+        dropped = retention_mod._drop_redundant_archive(
+            str(source), read_st, data, str(dest), name="old.log"
+        )
+
+    assert dropped is False
+    assert gzip.decompress(dest.read_bytes()) == data
+    assert not list(tmp_path.glob("*.mfclaim"))
+    assert "could not be removed" not in caplog.text
 
 
 async def test_app_log_compression_stages_through_an_unpredictable_exclusive_temp_file(

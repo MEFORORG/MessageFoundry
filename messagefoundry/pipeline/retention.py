@@ -80,8 +80,8 @@ _APP_LOG_SUFFIXES = (".log", ".txt")
 _GZ_SUFFIX = ".gz"
 _GZ_TMP_SUFFIX = ".gz.mftmp"
 #: Suffix of an archive claimed for removal, ``<name>.gz.<pid>-<ns>.mfclaim`` (#6805,
-#: :func:`_drop_redundant_archive`). It holds a whole archive, so log content, and the sweep ages it out
-#: with the archives.
+#: :func:`_drop_redundant_archive`). It holds a whole archive, so log content; which sweep removes it
+#: is stated once, on :func:`_is_app_log_name`.
 _CLAIM_SUFFIX = ".mfclaim"
 #: Prefix of the staging file. The rest of the name is RANDOM (:func:`tempfile.mkstemp`), never derived
 #: from the source: a predictable staging path in a directory a second process (or an attacker) can write
@@ -109,9 +109,10 @@ def _is_app_log_name(name: str, *, include_archives: bool) -> bool:
     ``.gz`` parked in the log directory is never swept, and neither is any ``.gz`` at all on a deployment
     that has not enabled compression).
 
-    Under the same ``include_archives`` gate it also owns a claimed archive, ``<archive>.<pid>-<ns>``
-    plus :data:`_CLAIM_SUFFIX`, where ``<archive>`` is one of those archive names (#6805). A claim keeps
-    the mtime of the archive it was renamed from, so it ages out on that archive's clock."""
+    Under the same ``include_archives`` gate it also owns a claimed archive,
+    ``<archive>.<pid>-<ns>`` plus :data:`_CLAIM_SUFFIX`, where ``<archive>`` is one of those archive
+    names (#6805). A claim keeps the mtime of the archive it was renamed from (inherited from the
+    source), so the sweep removes a claim only when it would remove that archive."""
     lowered = name.lower()
     stem, ext = os.path.splitext(lowered)
     if ext in _APP_LOG_SUFFIXES:
@@ -121,12 +122,11 @@ def _is_app_log_name(name: str, *, include_archives: bool) -> bool:
     if include_archives and ext == _CLAIM_SUFFIX:
         archive, tag = os.path.splitext(stem)
         pid, sep, ns = tag[1:].partition("-")
-        archive_stem, archive_ext = os.path.splitext(archive)
         return (
             sep == "-"
             and all(part.isascii() and part.isdigit() for part in (pid, ns))
-            and archive_ext == _GZ_SUFFIX
-            and os.path.splitext(archive_stem)[1] in _APP_LOG_SUFFIXES
+            and archive.endswith(_GZ_SUFFIX)
+            and _is_app_log_name(archive, include_archives=True)
         )
     return False
 
@@ -247,22 +247,25 @@ def _drop_redundant_archive(
     source: str, read_st: os.stat_result, data: bytes, dest: str, *, name: str
 ) -> bool:
     """Remove the archive of ``data`` at ``dest`` when the kept ``source`` still holds every byte of it.
-    Returns True only once the claim was removed. A failed removal is logged and returns False, leaving
-    the ``.mfclaim`` file in place (#6805).
+    Returns True only once the claim was removed. A failed removal is logged and returns False,
+    leaving the ``.mfclaim`` file in place (#6805). A claim already gone (removed by a peer's
+    ``app_log_days`` sweep, say) counts as removed.
 
     ``dest`` is first CLAIMED by renaming it to a unique sibling name, so a peer compressor cannot act
     on it, and only then are the claimed bytes re-validated and the source re-checked. If either fails
     (the source went or changed meanwhile, or the claimed file is a peer's different archive), the
     claim is linked back to ``dest``, which never replaces a file that appeared there; if that fails
-    too, the claim is kept under its name and a WARNING names it. A claim name ends
-    :data:`_CLAIM_SUFFIX`, which no compression pass touches; it stays until an operator acts or, while
-    compression is on, the ``app_log_days`` sweep ages it out with the archives.
+    too, the claim is kept under its name and a WARNING names it, unless the claim is already gone
+    (a WARNING says so). A claim name ends
+    :data:`_CLAIM_SUFFIX`, which no compression pass touches; :func:`_is_app_log_name` says when the
+    ``app_log_days`` sweep removes one.
 
-    What this closes: a source removed between the first check and the claim. What it does NOT close,
-    so a copy can still be lost: at least a source truncated or removed after the post-claim re-check
-    and before the claim is removed. Two windows in the caller remain open as well: a peer's archive placed
-    between its ``exists(dest)`` check and ``os.replace`` is renamed over, and an append or rotation
-    between its last :func:`_source_change` and ``os.remove(source)`` is deleted."""
+    What this closes: a source removed between the first check and the claim. What it does NOT
+    close, so a copy can still be lost: at least a source truncated or removed after the post-claim
+    re-check and before the claim is removed. Two windows in the caller remain open as well: a
+    peer's archive placed between its ``exists(dest)`` check and ``os.replace`` is renamed over, and
+    an append or rotation between its last :func:`_source_change` and ``os.remove(source)`` is
+    deleted."""
     if not (_source_still_holds(source, read_st, data) and _verify_archive(dest, data, name=name)):
         return False
     claim = f"{dest}.{os.getpid()}-{time.monotonic_ns()}{_CLAIM_SUFFIX}"
@@ -278,6 +281,10 @@ def _drop_redundant_archive(
     if _verify_archive(claim, data, name=name) and _source_still_holds(source, read_st, data):
         try:
             os.remove(claim)
+        except FileNotFoundError:
+            # Already gone (a peer's `app_log_days` sweep, say), so removed: nothing is left under
+            # the claim name, and the source still holds every archived byte.
+            log.debug("app-log %r: the claim %r was already gone", name, os.path.basename(claim))
         except OSError:
             log.warning(
                 "app-log %r: the redundant archive, claimed as %r, could not be removed",
@@ -288,6 +295,14 @@ def _drop_redundant_archive(
         return True
     try:
         os.link(claim, dest)
+    except FileNotFoundError:
+        log.warning(
+            "app-log %r: the claimed archive %r was removed meanwhile (by a peer's app_log_days "
+            "sweep, say), so it could not be put back",
+            name,
+            os.path.basename(claim),
+        )
+        return False
     except OSError:
         log.warning(
             "app-log %r: the source or the claimed archive changed while the archive was being "
@@ -298,6 +313,9 @@ def _drop_redundant_archive(
         return False
     try:
         os.remove(claim)
+    except FileNotFoundError:
+        # Already gone; the linked-back `dest` holds the archive.
+        log.debug("app-log %r: the claim %r was already gone", name, os.path.basename(claim))
     except OSError:
         log.warning(
             "app-log %r: the claimed archive %r was linked back but could not be removed; it is KEPT "
@@ -1346,9 +1364,9 @@ class RetentionRunner:
         When (and ONLY when) compression is enabled (#119) the sweep also covers the archives it
         produces — ``*.log.gz``/``*.txt.gz`` — on the same window, so compressing a file does not make
         it immortal (the archive inherits the source's mtime, so it ages out on the original's clock).
-        It covers a claimed archive left behind by :func:`_drop_redundant_archive` too (#6805): it holds
-        log content, and a rename keeps the archive's mtime, so the sweep removes a claim only when it
-        would remove the archive the claim was taken from. With ``app_log_compress_days = 0`` the eligible set is exactly the pre-#119 one, so a deployment
+        It covers a claimed archive left behind by :func:`_drop_redundant_archive` too (#6805; the
+        names and the clock are on :func:`_is_app_log_name`).
+        With ``app_log_compress_days = 0`` the eligible set is exactly the pre-#119 one, so a deployment
         that hasn't opted into compression is byte-identical."""
         days = self._settings.app_log_days
         if days <= 0 or not self._log_dir:
@@ -1646,7 +1664,7 @@ class RetentionRunner:
             log.warning(
                 "app-log %r: the source %s after its archive was placed; the source path is left "
                 "alone and NOT counted as compressed. %r, or a claim name logged above, holds the "
-                "bytes read before that.",
+                "bytes read before that, unless a WARNING above says the claim is gone.",
                 name,
                 change,
                 os.path.basename(dest),
