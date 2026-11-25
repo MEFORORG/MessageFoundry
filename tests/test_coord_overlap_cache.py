@@ -36,6 +36,7 @@ import os
 import shutil
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -114,15 +115,16 @@ def _run(
         argv = ["-File", str(OVERLAP), *script_args]
     else:
         # A quoted '-Refresh' binds as a positional STRING, not the switch, so names stay bare.
-        quoted = " ".join(
-            a if a.startswith("-") else "'" + a.replace("'", "''") + "'" for a in script_args
-        )
+        def lit(a: str) -> str:
+            return "'" + a.replace("'", "''") + "'"
+
+        quoted = " ".join(a if a.startswith("-") else lit(a) for a in script_args)
         argv = [
             "-Command",
-            f"[System.Globalization.CultureInfo]::CurrentCulture = '{culture}'; "
+            f"[System.Globalization.CultureInfo]::CurrentCulture = {lit(culture)}; "
             "[Console]::Error.WriteLine('culture=' + "
             "[System.Globalization.CultureInfo]::CurrentCulture.Name); "
-            f"& '{OVERLAP}' {quoted}; exit $LASTEXITCODE",
+            f"& {lit(str(OVERLAP))} {quoted}; exit $LASTEXITCODE",
         ]
     proc = subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", *argv],
@@ -277,7 +279,31 @@ def test_an_unreadable_cache_stamp_is_a_miss_that_says_so(tmp_path: Path) -> Non
     assert json.loads(cache.read_text(encoding="utf-8"))["at"] != "not a date", (
         "an unreadable stamp must miss and re-walk, which rewrites the cache"
     )
-    assert "cache timestamp" in proc.stderr, f"the miss was silent: {proc.stderr!r}"
+    assert "FormatException" in proc.stderr, f"the miss was silent: {proc.stderr!r}"
+    assert "not a date" not in proc.stderr, "the raw stamp, foreign text, reached the terminal"
+
+
+@pytest.mark.parametrize("culture", ["en-US", "th-TH"])
+def test_a_string_stamp_is_parsed_invariantly(tmp_path: Path, culture: str) -> None:
+    """The STRING branch: a stamp ConvertFrom-Json leaves as text is parsed with InvariantCulture.
+
+    ``ConvertFrom-Json`` turns the script's own ISO stamp into a ``[datetime]``, so the culture test
+    above never reaches this branch. An invariant ``MM/dd/yyyy`` stamp stays a string. Under th-TH a
+    culture-sensitive parse (``-as [datetime]`` or ``[datetime]::Parse``) reads its year as Buddhist
+    and misdates it by 543 years, so the fresh cache misses. en-US is the control.
+    """
+    repo = _repo(tmp_path, "stringstamp")
+    _run(repo, tmp_path, "-Refresh", "-Json")
+    cache = _cache_path(repo)
+    body = json.loads(cache.read_text(encoding="utf-8"))
+    body["at"] = datetime.now().strftime("%m/%d/%Y %H:%M:%S")
+    cache.write_text(json.dumps(body), encoding="utf-8")
+    before = cache.read_bytes()
+
+    proc = _run(repo, tmp_path, "-CacheSeconds", "3600", "-Json", culture=culture)
+    assert cache.read_bytes() == before, (
+        f"under {culture} a fresh invariant string stamp missed: {proc.stderr!r}"
+    )
 
 
 def test_a_write_sweeps_cache_files_a_day_old_and_keeps_fresh_ones(tmp_path: Path) -> None:

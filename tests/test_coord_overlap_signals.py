@@ -175,53 +175,45 @@ def test_an_untouched_file_is_not_reported(
 # segment names the same file git reports as ``docs/gamma.txt``, and must match it. ConvertTo-Norm once
 # only flipped slashes, trimmed and lowercased, so every dotted spelling below missed, and the gate read
 # a real collision as an all-clear.
-@pytest.mark.parametrize(
-    "spelling",
-    [
-        "docs/gamma.txt",  # the control: git's own spelling must match, or the rest prove nothing
-        "./docs/gamma.txt",
-        ".\\docs\\gamma.txt",
-        ".//docs//gamma.txt",
-        "docs/./gamma.txt",
-        "docs/../docs/gamma.txt",
-        "./alpha.txt/../docs/gamma.txt",
-    ],
-)
 def test_a_dotted_or_tab_completed_spelling_matches_gits_path(
-    peer_worktree: tuple[Path, Path], tmp_path: Path, spelling: str
+    peer_worktree: tuple[Path, Path], tmp_path: Path
 ) -> None:
+    """Every spelling of ``docs/gamma.txt`` matches; a ``..`` that leaves the repo matches nothing.
+
+    One fixture serves every spelling, since only the query string varies. git's own spelling runs
+    first as the control, so an empty answer below cannot come from a fixture that reports nothing.
+    """
     primary, peer = peer_worktree
     (peer / "docs").mkdir()
     (peer / "docs" / "gamma.txt").write_text("theirs\n", encoding="utf-8")
     git(peer, "add", "docs/gamma.txt")
     git(peer, "commit", "-qm", "peer adds a nested file")
 
-    rows = query(primary, tmp_path, spelling)
-    assert rows, f"{spelling!r} names docs/gamma.txt, which the peer committed, yet nothing matched"
+    matching = [
+        "docs/gamma.txt",  # the control
+        "./docs/gamma.txt",
+        ".\\docs\\gamma.txt",
+        ".//docs//gamma.txt",
+        "docs/./gamma.txt",
+        "docs/../docs/gamma.txt",
+        "./alpha.txt/../docs/gamma.txt",
+        "docs/gamma.txt.",  # Windows trims a trailing dot, so this is the same file
+        f"{primary}\\docs\\..\\.\\docs\\gamma.txt",
+    ]
+    for spelling in matching:
+        assert query(primary, tmp_path, spelling), f"{spelling!r} names docs/gamma.txt; no match"
 
-
-def test_a_rooted_spelling_with_a_dotdot_segment_matches(
-    peer_worktree: tuple[Path, Path], tmp_path: Path
-) -> None:
-    primary, peer = peer_worktree
-    (peer / "alpha.txt").write_text("base\nunsaved only\n", encoding="utf-8")
-    rooted = f"{primary}\\docs\\..\\.\\alpha.txt"
-    assert query(primary, tmp_path, rooted), f"{rooted!r} is alpha.txt in this repo and must match"
-
-
-def test_a_dotdot_that_climbs_above_the_root_does_not_match(
-    peer_worktree: tuple[Path, Path], tmp_path: Path
-) -> None:
-    """``..`` resolves INSIDE the repo only: ``../alpha.txt`` is a file beside the repo, not in it.
-
-    The control is the same edit queried by its real name, so an empty answer below cannot come from a
-    fixture that reports nothing at all.
-    """
-    primary, peer = peer_worktree
-    (peer / "alpha.txt").write_text("base\nunsaved only\n", encoding="utf-8")
-    assert query(primary, tmp_path, "alpha.txt"), "control: the real spelling must match"
-    assert query(primary, tmp_path, "../alpha.txt") == []
-    assert query(primary, tmp_path, "docs/../../alpha.txt") == []
+    # ``..`` resolves the way Windows does: climbing out of the repo, or past the drive root, names a
+    # file that is not this one, so it must not be credited to the peer.
+    drive = Path(primary).drive
+    for spelling in (
+        "../docs/gamma.txt",
+        "docs/../../docs/gamma.txt",
+        f"{primary}\\..\\docs\\gamma.txt",
+        f"{drive}\\..\\docs\\gamma.txt",
+        "\\..\\docs\\gamma.txt",
+    ):
+        assert query(primary, tmp_path, spelling) == [], f"{spelling!r} is outside the repo"
 
 
 # --------------------------------------------- whose commit is it? (attribution of the committed half)

@@ -189,28 +189,9 @@ $ErrorActionPreference = "Stop"
 # arrow came through as a raw 0x1A), which turns valid output into JSON a consumer cannot parse.
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
-# ONE SPELLING PER FILE. A -File typed the way a shell tab-completes it (`.\docs\x.md`) or carrying a
-# `.` or `..` segment names the same file git reports as `docs/x.md`, and an exact `-contains` against
-# git's spelling missed every such form, so the gate read a real collision as an all-clear. `.` and
-# empty segments drop; `..` pops the segment before it but never a drive or a leading `/`, and a
-# RELATIVE `..` with nothing left to pop is kept, so `../x` stays outside the repo and matches nothing
-# in it. The fast path skips the walk for the clean paths git itself prints, which is nearly every call.
 function ConvertTo-Norm([string]$p) {
     if (-not $p) { return "" }
-    $p = ($p -replace '\\', '/').ToLowerInvariant()
-    if ($p -notmatch '(^|/)\.\.?(/|$)|.//') { return $p.TrimEnd('/') }
-    $lead = if ($p.StartsWith('//')) { '//' } elseif ($p.StartsWith('/')) { '/' } else { '' }
-    $out = [System.Collections.Generic.List[string]]::new()
-    foreach ($s in $p.Substring($lead.Length).Split('/')) {
-        if ($s -eq '' -or $s -eq '.') { continue }
-        if ($s -ne '..') { $out.Add($s); continue }
-        $last = if ($out.Count) { $out[$out.Count - 1] } else { $null }
-        if ($null -ne $last -and $last -ne '..' -and -not ($out.Count -eq 1 -and $last -match '^[a-z]:$')) {
-            $out.RemoveAt($out.Count - 1)
-        }
-        elseif (-not $lead -and ($null -eq $last -or $last -eq '..')) { $out.Add('..') }
-    }
-    return $lead + ($out -join '/')
+    return ($p -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
 }
 
 # One emitter for every -Json exit, so no path can print nothing. See the note at the -File query below.
@@ -505,8 +486,8 @@ function Format-Census($C) {
     # "task(s)", never "task file(s)". tests/test_coord_overlap_attribution.py selects the changed-file
     # line by searching every line for the substring "file(s)", so a census that spelled the unit out
     # would be picked up as a file count and asserted against a rule written for a different sentence.
-    $ages = "newest task " + $(if ($C.TaskNewest) { ([datetime]$C.TaskNewest).ToString("yyyy-MM-dd HH:mm") } else { "none" }) +
-            ", newest seat record " + $(if ($C.SeatNewest) { ([datetime]$C.SeatNewest).ToString("yyyy-MM-dd HH:mm") } else { "none" })
+    $ages = "newest task " + $(if ($C.TaskNewest) { ([datetime]$C.TaskNewest).ToString("yyyy-MM-dd HH:mm", [cultureinfo]::InvariantCulture) } else { "none" }) +
+            ", newest seat record " + $(if ($C.SeatNewest) { ([datetime]$C.SeatNewest).ToString("yyyy-MM-dd HH:mm", [cultureinfo]::InvariantCulture) } else { "none" })
     $lines = @(
         "work signal: read $($C.TaskFiles) task(s) across $($C.StoresPresent) of $($C.StoresConfigured) task store(s) " +
         "and $($C.SeatRecords) seat record(s); $ages."
@@ -976,19 +957,26 @@ function Build-Map {
 # --- cache -------------------------------------------------------------------------------------
 $map = $null
 if (-not $Refresh -and (Test-Path -LiteralPath $cacheFile)) {
-    # The catch covers only the read: a cache file that is missing, locked or not JSON is a miss.
+    # A cache that is missing, locked or not JSON is a silent miss: that is ordinary churn.
     $c = try { Get-Content $cacheFile -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { $null }
-    # THE STAMP IS ISO-8601 AND IS READ AS ISO-8601. ConvertFrom-Json hands it back as a [datetime];
-    # `[datetime]::Parse` once took that, rendered it as an invariant-culture string, and re-parsed it
-    # under the CURRENT culture, which threw under th-TH, fi-FI and ar-SA (and can misdate elsewhere),
-    # and a catch-all turned the throw into a cache that silently never hit. `-as [datetime]` passes a
-    # [datetime] through and parses a string with the INVARIANT culture, as every PowerShell conversion
-    # does, giving $null rather than a throw; an unreadable stamp is a miss that says so on stderr.
-    $stamp = if ($c) { $c.at -as [datetime] }
-    if ($c -and -not $stamp) {
-        [Console]::Error.WriteLine("overlap.ps1: cache timestamp '$($c.at)' is unreadable; re-walking.")
-    }
-    if ($stamp) {
+    # THE STAMP IS ISO-8601 AND IS READ CULTURE-INVARIANTLY. ConvertFrom-Json hands it back as a
+    # [datetime]; `[datetime]::Parse` once took that, rendered it as an invariant-culture string, and
+    # re-parsed it under the CURRENT culture, which threw under th-TH, fi-FI and ar-SA (and can misdate
+    # elsewhere), and a catch-all turned the throw into a cache that silently never hit. A [datetime]
+    # passes through; a string is parsed with InvariantCulture. NOT `-as [datetime]`: that conversion is
+    # culture-sensitive (measured under th-TH and fi-FI). An unreadable stamp is a miss that says so.
+    #
+    # Still caught, because a caller's strict mode reaches this scope and turns a field an older cache
+    # lacks into a throw; but every miss past the read is reported on stderr, never silent.
+    if ($c) { try {
+        $stamp = $null
+        if ($c.at -is [datetime]) { $stamp = $c.at }
+        else {
+            $parsed = [datetime]::MinValue
+            if ([datetime]::TryParse([string]$c.at, [System.Globalization.CultureInfo]::InvariantCulture,
+                    [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) { $stamp = $parsed }
+            else { throw [System.FormatException]::new("cache timestamp is unreadable") }
+        }
         # Both sides in UTC, so a stamp read back as Local, Utc or Unspecified ages the same way.
         $age = ([datetime]::UtcNow - $stamp.ToUniversalTime()).TotalSeconds
         # Bound BOTH ways: a cache stamped in the future (clock skew, or a file copied between boxes)
@@ -1012,7 +1000,10 @@ if (-not $Refresh -and (Test-Path -LiteralPath $cacheFile)) {
             # A cache written before this field existed reads back null and the census says so.
             if ($c.census) { foreach ($k in @($script:Census.Keys)) { if ($null -ne $c.census.$k) { $script:Census[$k] = $c.census.$k } } }
         }
-    }
+    } catch {
+        $map = $null
+        [Console]::Error.WriteLine("overlap.ps1: cache not used ($($_.Exception.GetType().Name)); re-walking.")
+    } }
 }
 if ($null -eq $map) {
     # @() for the SAME reason Write-JsonArray filters nulls, at the other end of the same round trip.
@@ -1086,13 +1077,18 @@ function Write-PartialBanner {
 
 # --- single-file query (the hook's fast path) ----------------------------------------------------
 if ($File) {
+    # ONE SPELLING PER FILE. A -File typed the way a shell tab-completes it (`.\docs\x.md`), or carrying
+    # a `.` or `..` segment, names the same file git reports as `docs/x.md`, and an exact `-contains`
+    # against git's spelling once missed every such form, so the gate read a real collision as an
+    # all-clear. GetFullPath resolves the query the way Windows does, against the REPO ROOT (a relative
+    # -File is repo-relative, as the usage line above shows, not relative to the caller's directory), and
+    # the root is then stripped. A `..` that climbs out of the repo leaves the path outside the root, so it
+    # matches nothing. Only the query is resolved: git's own paths are already clean.
     $q = $File
-    if ([System.IO.Path]::IsPathRooted($q)) {
-        $qn = ConvertTo-Norm $q
-        $rn = "$myRootNorm/"
-        if ($qn.StartsWith($rn)) { $q = $qn.Substring($rn.Length) } else { $q = $qn }
-    }
+    try { $q = [System.IO.Path]::GetFullPath($q, $myRoot) } catch [System.ArgumentException] { }
     $q = ConvertTo-Norm $q
+    $rn = "$myRootNorm/"
+    if ($q.StartsWith($rn)) { $q = $q.Substring($rn.Length) }
     $hits = @()
     foreach ($r in $map) {
         if (@($r.Files | ForEach-Object { ConvertTo-Norm $_ }) -contains $q) {
