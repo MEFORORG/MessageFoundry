@@ -110,7 +110,10 @@ refuse a commit the pull request no longer holds.
 UNMEASURED: that every field a partial error nulled lies on the ``path`` of an error naming its
 commit node. The GraphQL specification implies it: an error's path names the field that raised it,
 and null propagation reaches only that field's ancestors. A nulled ``author.user`` that no error
-path reaches reads as an unlinked author and is refused.
+path reaches reads as an unlinked author and is refused. That includes a commit whose only error
+path is inside its ``committer``: if one failure nulled ``author.user`` too but GitHub reported
+only the committer's path, its author is refused under rule 1, where before BACKLOG #5644 added
+item 1 the commit was a fault that passes.
 
 INPUT COMES ONLY FROM THE ENVIRONMENT, never from the command line or a templated ``run:`` line,
 so a workflow step can pass event data through ``env:`` (zizmor's template-injection rule):
@@ -131,7 +134,9 @@ EXIT CODES: 0 nothing refused and no fault; 1 refused, with a ``CLA pre-check re
 annotation, whatever fault is reported beside it; 3 a fault caught by this script with nothing
 refused, at least: bad input, network, a reply in the wrong shape, a short read, a head still
 stale after the re-reads, a commit list that does not include ``CLA_HEAD_SHA`` or cannot show that
-it does, a commit GraphQL reported an error inside, or an exception raised inside ``run``. At
+it does, a commit GraphQL reported an error inside (outside its ``committer``, or inside the
+committer of an unlinked author's first-page commit, whose key it hides), or an exception raised
+inside ``run``. At
 least one other path exits 1 with no refusal annotation: an error before ``main`` runs, such as at
 import. The interpreter itself exits 2 when it cannot open the script. The workflow tells these
 apart by the annotation, not the code alone.
@@ -238,7 +243,8 @@ class PullRequestRead:
     head: str
     #: How many commits the first page held. Rule 2 keys that page, first commit seen per key.
     first_page: int
-    #: Indexes into ``commits`` that a GraphQL error points inside. They are not judged.
+    #: Indexes into ``commits`` that a GraphQL error points inside, other than an error inside the
+    #: commit's ``committer`` alone (``committer_tainted``). They are not judged.
     tainted: frozenset[int] = frozenset()
     #: Indexes, none in ``tainted``, whose errors all point inside the commit's ``committer``.
     #: Their author is judged; their committer is not read.
@@ -463,6 +469,14 @@ def _fetch_pages(
             raise PrecheckFault(
                 "GraphQL returned an error for a commit node the page does not hold"
             )
+        # A committer-only error on a node that came back with no commit object contradicts the
+        # premise the carve-out rests on, so that node is unjudged whole, as before the carve-out,
+        # and its siblings are still judged.
+        for index in list(committer_errored):
+            node = nodes[index]
+            if not isinstance(node, Mapping) or not isinstance(node.get("commit"), Mapping):
+                committer_errored.discard(index)
+                errored.add(index)
         page: list[Mapping[str, Any]] = []
         for index, node in enumerate(nodes):
             commit = node.get("commit") if isinstance(node, Mapping) else None

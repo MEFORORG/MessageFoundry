@@ -756,6 +756,19 @@ def test_a_committer_error_under_an_unlinked_page_one_author_refuses_and_faults_
     assert "error inside its committer" in verdict.fault and "key is missing" in verdict.fault
 
 
+@pytest.mark.parametrize("node", [None, {"commit": None}, {}])
+def test_a_committer_error_on_a_node_with_no_commit_keeps_the_others_judged(
+    node: object, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review round e8390625a8: a committer-only error on a node GraphQL nulled whole must leave
+    that slot unjudged, as origin/main did, not fault the page and lose the refusal beside it."""
+    page = _page([{"oid": f"{1:040x}", "author": _UNLINKED, "committer": _OCTO}], 2, False)
+    page["data"]["repository"]["pullRequest"]["commits"]["nodes"].append(node)
+    page = {**page, "errors": [_node_error(1, "commit", "committer", "user")]}
+    assert _run(_ENV, _serve([page])) == EXIT_REFUSED
+    assert "GraphQL reported an error inside it" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize(
     "path",
     [
