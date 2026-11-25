@@ -139,7 +139,9 @@ def _detach_request_pipe() -> io.BufferedReader:
             import msvcrt
 
             if _winapi.GetStdHandle(_winapi.STD_INPUT_HANDLE) != msvcrt.get_osfhandle(0):
-                raise OSError("the standard input handle still names the request pipe")
+                raise OSError(
+                    "the standard input handle does not name the null device fd 0 now holds"
+                )
         return os.fdopen(private, "rb")
     except OSError as exc:
         try:
