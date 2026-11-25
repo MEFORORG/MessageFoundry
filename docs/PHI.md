@@ -366,8 +366,8 @@ path** (no separate at-rest tier):
   [DICOM.md](DICOM.md) section 5 says otherwise. That rule covers
   third-party library loggers too, such as pynetdicom's and pydicom's, and a peer-sent value either
   library refuses or flags as non-conformant must never be logged verbatim (owner ruling 2026-11-03,
-  BACKLOG #5081). The DICOM transport applies that rule by default-deny on those libraries' loggers
-  (BACKLOG #6637).
+  BACKLOG #5081). The DICOM transport applies default-deny on those libraries' loggers (BACKLOG #6637),
+  which meets that rule only within the limits in [DICOM.md](DICOM.md) section 5.
   The pin tests fail when either library's version changes in the environment they run in,
   which is not a site's own install. The default-deny rule, what a withheld library line keeps,
   what stays, what an operator loses and the limits are in [DICOM.md](DICOM.md) section 5. (Pixel
