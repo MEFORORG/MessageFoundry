@@ -194,6 +194,25 @@ def test_a_broken_hvac_import_is_refused_by_class_with_no_text(
     assert "0451" not in warnings[0].getMessage()
 
 
+@pytest.mark.parametrize("error", [MemoryError, RecursionError])
+def test_the_processs_own_limits_are_not_read_as_a_broken_hvac(
+    monkeypatch: pytest.MonkeyPatch, error: type[BaseException]
+) -> None:
+    # Vault BACKLOG #6709 item 11: out of memory or stack is not a broken install.
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "hvac":
+            raise error()
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _import)
+    with pytest.raises(error):
+        keyprovider_vault._import_hvac()
+
+
 def test_a_missing_hvac_says_install_not_reinstall(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "hvac", None)
     with pytest.raises(KeyProviderError) as caught:

@@ -770,41 +770,87 @@ def _chain(error: CipherError, links: int) -> CipherError:
     return error
 
 
-def test_detached_past_its_limit_returns_a_fresh_error_with_no_links(
+def _graph_nodes(error: BaseException) -> int:
+    """How many exceptions ``error``'s graph holds, walked apart from ``crypto.detached``."""
+    seen: set[int] = set()
+    queue: collections.deque[BaseException] = collections.deque([error])
+    while queue:
+        node = queue.popleft()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        queue.extend(e for e in (node.__cause__, node.__context__) if e is not None)
+        if isinstance(node, BaseExceptionGroup):
+            queue.extend(node.exceptions)
+    return len(seen)
+
+
+def test_detached_past_its_limit_cuts_off_what_it_did_not_clear(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     # Item 1: past _DETACH_LIMIT the error was returned with the rest of its tracebacks attached.
     monkeypatch.setattr(crypto, "_DETACH_LIMIT", 3)
     caplog.set_level(logging.WARNING)
-    error = _chain(CipherError("synthetic outer text zz0451"), 5)
+    error = _chain(CipherError("synthetic"), 5)
     assert _frames_reach(error, "value 0")
-    fresh = detached(error)
-    assert fresh is not error and type(fresh) is CipherError
-    assert fresh.__cause__ is None and fresh.__context__ is None and fresh.__traceback__ is None
-    assert "zz0451" not in str(fresh)
-    assert not _frames_reach(fresh, "value 0")
+    assert detached(error) is error  # in place: a caller that keeps `error` keeps it cleared
+    assert not _frames_reach(error, "value 0")
+    assert _graph_nodes(error) == 3
     assert any(
-        r.name == "messagefoundry.store.crypto"
-        and "returned as a fresh CipherError" in r.getMessage()
+        r.name == "messagefoundry.store.crypto" and "the rest are cut off it" in r.getMessage()
         for r in caplog.records
     )
 
 
-def test_detached_past_its_limit_keeps_an_outage_an_outage(
+def test_detached_at_its_limit_keeps_every_link(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The boundary: a graph of exactly _DETACH_LIMIT exceptions is cleared whole, and one more is
+    # cut off.
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 4)
+    whole = _chain(CipherError("synthetic"), 3)
+    assert detached(whole) is whole and _graph_nodes(whole) == 4
+    assert not _frames_reach(whole, "value 0")
+    over = _chain(CipherError("synthetic"), 4)
+    assert detached(over) is over and _graph_nodes(over) == 4
+    assert not _frames_reach(over, "value 0")
+
+
+def test_detached_past_its_limit_keeps_the_errors_own_cause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The nearest links are kept, so an outage stays an outage (gave_no_verdict reads the cause).
     monkeypatch.setattr(crypto, "_DETACH_LIMIT", 3)
     error = _chain(CipherError("synthetic"), 5)
     error.__cause__ = requests.ConnectionError("synthetic unreachable")
     assert crypto.gave_no_verdict(error)
-    fresh = detached(error)
-    assert isinstance(fresh, CipherUnavailableError) and crypto.gave_no_verdict(fresh)
-    assert fresh.__cause__ is None and fresh.__context__ is None
+    assert detached(error) is error
+    assert crypto.gave_no_verdict(error) and not _frames_reach(error, "value 0")
+
+
+def test_detached_past_its_limit_clears_an_unvisited_group_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raised(exc: Exception) -> Exception:
+        try:
+            raise exc
+        except Exception as caught:  # noqa: BLE001 -- builds a traceback for the test
+            return caught
+
+    secret = "value 0"  # a local the members' frames reach until they are cleared
+    members = [raised(ValueError(f"member {i} {secret[:0]}")) for i in range(4)]
+    for member in members:
+        member.__context__ = raised(KeyError("deeper"))
+    group = raised(ExceptionGroup("group", members))
+    error = CipherError("outer")
+    error.__context__ = group
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 3)
+    assert detached(error) is error
+    assert not _frames_reach(error, "value 0")
 
 
 def test_detached_under_its_limit_returns_the_same_error() -> None:
     error = _chain(CipherError("synthetic"), 3)
     assert detached(error) is error and not _frames_reach(error, "value 0")
+    assert _graph_nodes(error) == 4
 
 
 def _switch_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -907,4 +953,5 @@ def test_the_cipher_audit_help_states_the_batch_bound_as_a_number() -> None:
     help_text = next(c.help for c in sub._choices_actions if c.dest == "cipher-audit")
     assert help_text is not None
     assert f"batches of up to {crypto.BATCH_MAX_ITEMS} values" in help_text
+    assert f"{crypto.BATCH_MAX_CHARS:,} characters" in help_text
     assert "BATCH_MAX_ITEMS" not in help_text and "store/crypto.py" not in help_text

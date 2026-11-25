@@ -306,12 +306,14 @@ def _classify_batch_failure(exc: Exception) -> tuple[bool, bool]:
     caller keeps nothing of ``exc``. Runs inside the caller's handler, so a classifier that
     raises is caught here and logged by type alone. A failure it cannot read reads as a 400:
     the batch's values are asked for alone, and an unknown failure never turns batching off for
-    the cipher. The two checks are asked apart, so a fault in the 400 check does not discard an
-    outage the outage check named (vault BACKLOG #6706 item 7)."""
+    the cipher. An outage is answered before the 400 check runs, so a fault in that check cannot
+    discard it (vault BACKLOG #6706 item 7)."""
     unavailable = _classified(is_vault_unavailable, exc)
     if unavailable is None:
         return False, True
-    return unavailable, _classified(is_vault_bad_request, exc) is not False
+    if unavailable:
+        return True, False
+    return False, _classified(is_vault_bad_request, exc) is not False
 
 
 def _classified(check: Callable[[BaseException], bool], exc: Exception) -> bool | None:
@@ -960,14 +962,13 @@ class TransitCipher(_UnmarkedPolicy):
                 continue
             sealed.extend(self.encrypt(plaintext, aad=aad) for plaintext, aad in batch)
             if outcome is not None:
-                why, _, failure_type = outcome.partition(":")
-                self._send_alone_from_now("encrypt", why, failure_type)
+                self._send_alone_from_now("encrypt", *outcome)
         return sealed
 
-    def _encrypt_batch(self, batch: list[CipherItem]) -> list[str] | str | None:
+    def _encrypt_batch(self, batch: list[CipherItem]) -> list[str] | tuple[str, str] | None:
         """One batch request of :meth:`encrypt_many`: the sealed values in its order; else why the
-        values must be sealed alone and later ones too, ``"refused:<failure type>"`` or ``"did not
-        echo the reference of"``; else ``None``, for Vault's 400 or an unread failure, sealed alone with
+        values must be sealed alone and later ones too, with the refused batch's failure type,
+        ``("refused", <type>)`` or ``("did not echo the reference of", "")``; else ``None``, for Vault's 400 or an unread failure, sealed alone with
         batching left on."""
         sent = [
             (base64.b64encode(plaintext.encode("utf-8")).decode("ascii"), aad)
@@ -991,10 +992,10 @@ class TransitCipher(_UnmarkedPolicy):
                 f"Transit encrypt failed (key={self._key!r}): {failure_type}"
             )
         if failed:
-            return None if bad_request else f"refused:{failure_type}"
+            return None if bad_request else ("refused", failure_type)
         replies = _batch_replies(response, len(batch))
         if replies == UNECHOED:
-            return "did not echo the reference of"
+            return ("did not echo the reference of", "")
         if not isinstance(replies, list):
             raise CipherUnavailableError(
                 f"Transit's batch encrypt reply does not match the request (key={self._key!r})"

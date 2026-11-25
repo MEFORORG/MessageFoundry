@@ -118,32 +118,40 @@ def _token_unset(platform: str | None = None) -> str:
 def _import_hvac() -> Any:
     """Lazily import ``hvac`` (the optional ``[vault]`` extra), failing closed with a
     :class:`KeyProviderError` that names the extra, as ``secretprovider_vault._import_hvac`` does
-    (vault BACKLOG #6709). Any ``Exception`` is caught, not only ``ImportError``: importing runs
-    hvac's and its dependencies' top-level code, which can raise an ``OSError`` or another class.
-    Only a ``ModuleNotFoundError`` for ``hvac`` itself reads as a missing extra; anything else is a
-    broken install, refused by class with "reinstall" and logged at WARNING by class. The refusal is
-    raised outside the handler with no chain: an import error's text can carry a filesystem path,
-    and before this an ``OSError``'s text reached the client-build refusal."""
+    (vault BACKLOG #6709). Any ``Exception`` but ``MemoryError`` and ``RecursionError`` is caught,
+    not only ``ImportError``: importing runs hvac's and its dependencies' top-level code, which can
+    raise an ``OSError`` or another class. Only a ``ModuleNotFoundError`` for ``hvac`` itself reads
+    as a missing extra; anything else is a broken install, refused by class with "reinstall" and
+    logged at WARNING by class. The refusal is raised outside the handler with no chain: an import
+    error's text can carry a filesystem path. The key provider and the Transit cipher both build
+    their client through here, so the text names the store's Vault client, not one setting."""
     try:
         # hvac ships no type stubs; the targeted ignore contains that here (never a repo-wide ignore).
         import hvac  # type: ignore[import-untyped]  # noqa: PLC0415  (lazy — base install pulls no SDK)
+    except (MemoryError, RecursionError):
+        raise  # the process's own limits, not a broken install (vault BACKLOG #6709 item 11)
     except Exception as exc:  # noqa: BLE001 -- an import runs top-level code that may raise any class; refused below, logged by class
         if isinstance(exc, ModuleNotFoundError) and exc.name == "hvac":
             failed = None
         else:
             failed = type(exc).__name__
-            log_import_failure(f"[store].key_provider={_EXTRA!r}", exc, logger=_log)
+            log_import_failure(_HVAC_CLIENT, exc, logger=_log)
     else:
         return hvac
     if failed is None:
         raise KeyProviderError(
-            f"[store].key_provider={_EXTRA!r} requires the optional {_EXTRA!r} extra (hvac not "
-            f"importable): install 'messagefoundry[{_EXTRA}]'."
+            f"{_HVAC_CLIENT} requires the optional {_EXTRA!r} extra (hvac not importable): "
+            f"install 'messagefoundry[{_EXTRA}]'."
         )
     raise KeyProviderError(
-        f"[store].key_provider={_EXTRA!r}: hvac is installed but did not import ({failed}): "
+        f"{_HVAC_CLIENT}: hvac is installed but did not import ({failed}): "
         f"reinstall 'messagefoundry[{_EXTRA}]'."
     )
+
+
+#: Who :func:`_import_hvac`'s refusals and WARNING name: the store's Vault client, which
+#: ``[store].key_provider = "vault"`` and ``[store].cipher_provider = "vault_transit"`` both build.
+_HVAC_CLIENT = "the store's Vault client ([store].key_provider or [store].cipher_provider)"
 
 
 def _vault_ca_kwargs(addr: str | None) -> dict[str, str]:

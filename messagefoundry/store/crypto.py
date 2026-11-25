@@ -103,6 +103,7 @@ this code can enforce. See the PR for the acceptance statement.
 from __future__ import annotations
 
 import base64
+import collections
 import contextlib
 import ctypes
 import hashlib
@@ -1063,25 +1064,32 @@ _DETACH_LIMIT = 10_000
 def detached(error: CipherError) -> CipherError:
     """``error``, with the traceback cleared on every exception reachable from it through
     ``__cause__``, ``__context__`` and an exception group's ``exceptions``, each visited once,
-    for an error that is returned rather than raised (BACKLOG #6706). A traceback's frames,
-    through ``f_back``, reach the batch path's locals, which hold the other values' plaintext;
-    the errors' types, texts and links are kept. Past :data:`_DETACH_LIMIT` exceptions it stops,
-    logs a WARNING and returns a fresh error in ``error``'s place, carrying no link and no
-    traceback, so nothing it could not clear is returned (vault BACKLOG #6706 item 1)."""
+    nearest first, for an error that is returned rather than raised (BACKLOG #6706). A
+    traceback's frames, through ``f_back``, reach the batch path's locals, which hold the other
+    values' plaintext; the errors' types, texts and links are kept. Cleared in place, so a caller
+    that keeps ``error`` itself keeps the cleared error.
+
+    Past :data:`_DETACH_LIMIT` exceptions it stops, logs a WARNING and cuts the graph there, so no
+    exception it did not clear stays reachable (vault BACKLOG #6706 item 1): a visited error's
+    link to an unvisited one is set to ``None``, and an unvisited member of a visited group, which
+    its group's tuple keeps, has its traceback and its own links cleared. The nearest links are
+    visited first, so ``error``'s own cause, which :func:`gave_no_verdict` reads, is kept."""
     seen: set[int] = set()
-    pending: list[BaseException] = [error]
+    visited: list[BaseException] = []
+    pending: collections.deque[BaseException] = collections.deque([error])
     while pending:
-        link = pending.pop()
+        link = pending.popleft()
         if id(link) in seen:
             continue
         if len(seen) >= _DETACH_LIMIT:
             _log.warning(
-                "an error's exception graph has more than %d links; returned as a fresh %s",
+                "an error's exception graph has more than %d links; the rest are cut off it",
                 _DETACH_LIMIT,
-                type(error).__name__,
             )
-            return _fresh_in_place_of(error)
+            _cut_unvisited(visited, seen)
+            break
         seen.add(id(link))
+        visited.append(link)
         link.__traceback__ = None
         pending.extend(e for e in (link.__cause__, link.__context__) if e is not None)
         if isinstance(link, BaseExceptionGroup):
@@ -1089,20 +1097,21 @@ def detached(error: CipherError) -> CipherError:
     return error
 
 
-def _fresh_in_place_of(error: CipherError) -> CipherError:
-    """A new error standing for ``error`` with no cause, context or traceback (vault BACKLOG #6706
-    item 1). One that gave no verdict (:func:`gave_no_verdict`) is a
-    :class:`CipherUnavailableError`, since its cause, which that reading needs, is dropped. Any
-    other keeps ``error``'s class where that class builds and words itself as
-    :class:`CipherError` does, else is a :class:`CipherError`. Its text names the class only:
-    ``error``'s own text is not repeated."""
-    kind = type(error)
-    text = f"{kind.__name__} (its exception graph was too large to return)"
-    if gave_no_verdict(error):
-        return CipherUnavailableError(text)
-    if kind.__init__ is CipherError.__init__ and kind.__str__ is CipherError.__str__:
-        return kind(text)
-    return CipherError(text)
+def _cut_unvisited(visited: list[BaseException], seen: set[int]) -> None:
+    """For :func:`detached` past its limit: unlink every exception not in ``seen`` from the
+    ``visited`` ones. A group's members cannot be unlinked, so an unvisited member is cleared
+    instead, and its own links cut."""
+    for link in visited:
+        if link.__cause__ is not None and id(link.__cause__) not in seen:
+            link.__cause__ = None
+        if link.__context__ is not None and id(link.__context__) not in seen:
+            link.__context__ = None
+        if isinstance(link, BaseExceptionGroup):
+            for member in link.exceptions:
+                if id(member) not in seen:
+                    member.__traceback__ = None
+                    member.__cause__ = None
+                    member.__context__ = None
 
 
 def decrypt_or_error(cipher: Cipher, stored: str, aad: bytes | None) -> str | CipherError:

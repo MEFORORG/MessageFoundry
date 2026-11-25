@@ -113,7 +113,8 @@ def _import_hvac() -> Any:
     """Lazily import ``hvac`` (the optional ``[vault]`` extra), failing closed with a
     :class:`SecretProviderError` naming the extra. ``ImportError`` (not just ``ModuleNotFoundError``) is
     caught so a partially-broken install also fails closed, and so is any other ``Exception`` from
-    hvac's or a dependency's top-level code, such as an ``OSError`` (vault BACKLOG #6709). A broken
+    hvac's or a dependency's top-level code, such as an ``OSError``, but ``MemoryError`` and
+    ``RecursionError``, which propagate (vault BACKLOG #6709). A broken
     install's refusal names the error's class, says to reinstall, and is logged at WARNING by
     class. Only a ``ModuleNotFoundError`` for ``hvac`` itself reads as a missing extra; one for an
     hvac submodule or a dependency is a broken install. The refusal is raised outside the handler
@@ -122,6 +123,8 @@ def _import_hvac() -> Any:
     try:
         # hvac ships no type stubs; the targeted ignore is contained here (never a repo-wide ignore).
         import hvac  # type: ignore[import-untyped]  # noqa: PLC0415  (lazy — base install pulls no SDK)
+    except (MemoryError, RecursionError):
+        raise  # the process's own limits, not a broken install (vault BACKLOG #6709 item 11)
     except Exception as exc:  # noqa: BLE001 -- an import runs top-level code that may raise any class; refused below, logged by class
         if isinstance(exc, ModuleNotFoundError) and exc.name == "hvac":
             failed = None
