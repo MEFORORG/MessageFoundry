@@ -1814,19 +1814,18 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # the body model. A body that fails ``RolesUpdateRequest`` is answered first, with no audit
         # row: FastAPI answers 422 on the JSON plane, and the console route that builds the model
         # renders "invalid input" with a 400.
-        user = await service.store.get_user(user_id)
         await _refuse_if_self(
             request,
             service,
             identity,
             user_id,
-            user,
             op="set_roles",
             detail="another administrator must change your own roles",
         )
         await _validate_roles(service, body.roles)
-        if user is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+        # BACKLOG #5520 items 2 and 13: the route decides on the record, so it reads it checked: a
+        # record that fails its seal answers the reads' 423, not the write's own 409.
+        user = await _checked_user(service, user_id)
         if _externally_managed(user.auth_provider):
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "AD users get roles from the AD-group map"
@@ -1834,8 +1833,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # BACKLOG #315: promotion mints an approver exactly as creation does, so it pages too. Only a
         # GRANT pages: re-saving an existing Administrator's roles changes nothing.
         granted = (
-            Role.ADMINISTRATOR.value in body.roles
-            and Role.ADMINISTRATOR.value not in await service.store.get_user_role_ids(user_id)
+            Role.ADMINISTRATOR.value in body.roles and Role.ADMINISTRATOR.value not in user.role_ids
         )
         try:
             # The last-administrator guard is inside, in one store transaction with the role write
@@ -1884,6 +1882,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             op="password_reset",
             detail="use change-password for your own account",
         )
+        # BACKLOG #5520 items 2 and 13: a record that fails its seal answers the reads' 423, not
+        # the service loader's 404. The service reads the account again before it writes.
+        await _checked_user(service, user_id)
         try:
             issued = await service.admin_reset_password(user_id, actor=identity.username)
         except ValueError as exc:
@@ -2229,6 +2230,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         ``ChannelScope`` is answered 422 by FastAPI before the guard runs, with no audit row; the
         console route runs the guard before its own checks (BACKLOG #3393)."""
         await _refuse_own_channel_scope(request, service, identity, user_id)
+        # BACKLOG #5520 items 2 and 13: as on the role write, a record that fails its seal answers
+        # the reads' 423, not the service loader's 404. The service reads it again to decide.
+        await _checked_user(service, user_id)
         try:
             await service.set_channel_scope(
                 user_id,

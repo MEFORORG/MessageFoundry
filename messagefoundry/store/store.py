@@ -139,6 +139,7 @@ from messagefoundry.store.crypto import (
     AADComponentError,
     AesGcmCipher,
     AuditKeyVersionRefusedError,
+    AuditKeyVersionUnverifiedError,
     AuditMacFn,
     AuditMacMalformedError,
     AuditMacVerifier,
@@ -10540,19 +10541,31 @@ async def settle_transit_bound_attestation(
     ``None`` when no row is recorded. The check reuses the chain's own pieces: the row MAC
     (:func:`_audit_row_mac`, under the key of the row's range, by Transit's own ``verify`` for a
     Transit MAC) and the constant-time compare. It walks no chain, so it costs one MAC. A MAC
-    provider runs off the event loop, because it is a blocking Vault call. A Transit refusal of
-    that call, such as a key version a forged hash names that does not exist, reads as a gap, not
-    an error, so a row anyone with DML wrote cannot stop a ``warn`` start."""
+    provider runs off the event loop, because it is a blocking Vault call. A cipher failure of
+    that call reads as a gap, not an error, so a row anyone with DML wrote cannot stop a ``warn``
+    start. A 400 whose reply's wording reads as a version refusal, while the probe under the
+    latest version answers a well-formed MAC naming another version, such as one for a version a
+    forged hash names, says
+    Transit refused the check; the code reads only that wording, which a proxy can imitate. At
+    least a 400 not read as a version refusal, a 400 whose probe answers no well-formed MAC, and
+    an outage that raises :class:`CipherError` say the MAC could not be checked (vault BACKLOG
+    #6707 items 24 and 73). A timeout
+    on both asks is not raised here: :func:`_audit_row_mac` reads it as a MAC that does not
+    verify."""
     attestation = read.attestation
     if attestation is None or read.mac_check is None:
         return attestation
     seq = read.mac_check[0]["seq"]
     try:
         verified = await _audit_row_mac_verifies(*read.mac_check)
-    except CipherError as exc:
+    except AuditKeyVersionUnverifiedError as exc:  # no verdict on the MAC, so not "does not verify"
+        return replace(attestation, audit_gap=f"audit row {seq}'s MAC could not be checked: {exc}")
+    except AuditKeyVersionRefusedError as exc:  # the reply's wording read as a version refusal
         return replace(
             attestation, audit_gap=f"Transit refused to check audit row {seq}'s MAC: {exc}"
         )
+    except CipherError as exc:
+        return replace(attestation, audit_gap=f"audit row {seq}'s MAC could not be checked: {exc}")
     if not verified:
         return replace(
             attestation, audit_gap=f"audit row {seq}'s MAC does not verify under the audit key"

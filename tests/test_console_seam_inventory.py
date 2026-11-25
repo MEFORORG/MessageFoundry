@@ -513,6 +513,10 @@ _SEAM_FIELDS: dict[str, Field] = {
             "GET /users/{user_id}/channel-scope",
             "GET /users/{user_id}/permissions",
             "PATCH /users/{user_id}",
+            # BACKLOG #5520 items 2 and 13: the writes that decide on the record read it checked.
+            "PUT /users/{user_id}/roles",
+            "PUT /users/{user_id}/channel-scope",
+            "POST /users/{user_id}/reset-password",
         ),
     ),
     "admin.list_custom_roles": _endpoint("GET /roles/custom"),

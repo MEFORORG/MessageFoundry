@@ -2309,13 +2309,14 @@ class UserSealRefused(RuntimeError):
     seal (BACKLOG #5520). :meth:`AuthService.change_password` raises it too, from that read or
     from the store write's own seal refusal, each reported the same way, and ``POST /me/password``
     answers it 423 (BACKLOG #5902). The failure was handed to the seal-failure report, which
-    writes the audit row and raises the alert only for the first failure of the account in each report interval
-    (:data:`~messagefoundry.store.row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS`) of this
-    service's process, so a refusal inside that interval adds no row. Not "no such user": the row is there, and an administrator
-    may still delete it. ``auth_routes._checked_user``, and so the JSON admin routes that read an
-    account through it, answer it 423; docs/SECURITY.md, *What an admin user read reports*, states
-    what at least some web console pages answer. A record Vault transit cannot verify is
-    refused the same way, reported under ``integrity.authority_seal_unverifiable`` (ADR 0217)."""
+    writes the audit row and raises the alert only for the first failure of the account in each
+    report interval (:data:`~messagefoundry.store.row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS`)
+    of this service's process, so a refusal inside that interval adds no row. Not "no such user":
+    the row is there, and an administrator may still delete it. ``auth_routes._checked_user``, and
+    so the JSON admin routes that read an account through it, answer it 423; docs/SECURITY.md,
+    *What an admin user read reports*, states what at least some web console pages answer. A
+    record Vault transit cannot verify is refused the same way, reported under
+    ``integrity.authority_seal_unverifiable`` (ADR 0217)."""
 
 
 async def read_user_or_unreadable(read: Awaitable[UserRecord | None]) -> UserRecord | None:
@@ -13793,8 +13794,12 @@ class AuthService:
     async def checked_user(self, user_id: str) -> VerifiedUser | None:
         """The account ``user_id`` names, its whole record checked against its seal, for a caller
         outside this service that SHOWS it (BACKLOG #5520), and for :meth:`change_password`, which
-        decides on it (BACKLOG #5902), so its raise-or-``None`` contract binds that control too. ``None`` when no row is there. Raises
-        :class:`UserSealRefused` only when :meth:`_verified` established that the record fails,
+        decides on it (BACKLOG #5902), so its raise-or-``None`` contract binds that control too, as
+        it binds at least the admin role, channel-scope and password-reset routes, which answer
+        404 or 423 on it and, for the role write, decide the directory refusal and the
+        administrator-granted alert on what it returns (BACKLOG #5520 items 2 and 13).
+        ``None`` when no row is there. Raises :class:`UserSealRefused` only when
+        :meth:`_verified` established that the record fails,
         or :meth:`_checked_by_id` failed closed, and handed that to the seal-failure report, so
         the caller can say so rather than answer "no such user". A record Vault transit cannot
         verify raises it too, reported under its own cause (ADR 0217 (a)). A Vault transit Outage
