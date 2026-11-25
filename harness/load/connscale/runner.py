@@ -2933,10 +2933,14 @@ def _sandbox_workers_slo(records: list[ConnScaleRecord]) -> SloCheck:
     IT IS A FLOOR, NOT A PER-INBOUND PROOF. On a Windows venv a worker tree is two processes, so
     workers on half the inbounds also clear it. It catches an arm with no workers or with far too
     few; a per-inbound proof would group the started processes by worker root, which this does not.
+    A passing step is therefore NOT evidence that every inbound had a worker, and not, on its own,
+    ADR 0052 AC-2 evidence for the subprocess arm. The SLO's threshold says so, so a report carries it.
 
-    It grades TODAY'S worker shape, one worker tree per traffic-carrying inbound. ADR 0187 (option
-    1, accepted) replaces that with a bounded shared pool; once the pool is built, a subprocess step
-    starts far fewer processes than inbounds, and this floor must change with it.
+    NOT TIGHTENED; DEFERRED TO ADR 0187 (BACKLOG #5090). The per-root grouping would grade TODAY'S
+    worker shape, one worker tree per traffic-carrying inbound, and ADR 0187 (option 1, accepted)
+    replaces that with a bounded shared pool. Once the pool is built a subprocess step starts far
+    fewer processes than inbounds, so this floor is rewritten against the pool then, rather than
+    tightened now against a shape that is being retired.
     """
     problems: list[str] = []
     for r in records:
@@ -2965,7 +2969,8 @@ def _sandbox_workers_slo(records: list[ConnScaleRecord]) -> SloCheck:
     observed = "; ".join(problems) if problems else f"ok ({graded} subprocess step(s) graded)"
     return SloCheck(
         "sandbox_workers",
-        "the asked-for mode runs; subprocess starts >= 1 process per driven inbound",
+        "the asked-for mode runs; subprocess starts >= 1 process per driven inbound "
+        "(a floor, not a per-inbound proof: deferred to ADR 0187)",
         observed,
         not problems,
     )

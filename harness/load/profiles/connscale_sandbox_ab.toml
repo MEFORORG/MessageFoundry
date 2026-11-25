@@ -18,7 +18,10 @@
 # route, which must fail) is a separate step. Each step writes its graph into a generated config directory, so the worker builds the
 # engine's graph; the warm-up brings every worker up before the hold and records the first-delivery
 # latency beside [sandbox].startup_seconds; the `sandbox_workers` SLO fails a subprocess step that
-# did not start a process per driven inbound. A subprocess arm that cannot reach the top count is a
+# did not start a process per driven inbound. That SLO is a FLOOR, not a per-inbound proof: on a
+# Windows venv a worker tree is two processes, so workers on half the inbounds clear it. A passing
+# subprocess step is not, on its own, AC-2 evidence that every inbound had a worker; that proof is
+# deferred to ADR 0187's pool (BACKLOG #5090). A subprocess arm that cannot reach the top count is a
 # valid result: its records and SLOs say where it stopped.
 #
 # All values synthetic + generic. See docs/LOAD-TESTING.md.

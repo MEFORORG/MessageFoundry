@@ -1524,6 +1524,38 @@ def test_a_single_arm_off_its_default_keeps_the_plain_lane_label() -> None:
     assert [r.label for r in herd_floor_readings(recs, _KEY, base_count=12)] == [pair.label]
 
 
+def test_each_arm_of_a_sandbox_ab_grades_its_own_base_reading() -> None:
+    """The herd floor grouped on ``(sweep_mode, claim_mode)`` and graded the FIRST record at the base
+    count, so an A/B's second arm was recorded and never graded (BACKLOG #5090). It now groups on
+    ``monotonic_lane``, as the pairs do. The ``off`` arm's reading here is far above the floor and the
+    ``subprocess`` arm's far below it, so the old grouping, which graded only the first, passed.
+    """
+    arm = {
+        "sandbox": SandboxReading(
+            requested="subprocess", effective="subprocess", startup_seconds=1.0
+        )
+    }
+    recs = [
+        _rec("fixed_aggregate", 12, per_msg=40.0),
+        _rec("fixed_aggregate", 24, per_msg=50.0),
+        dataclasses.replace(_rec("fixed_aggregate", 12, per_msg=0.5), **arm),  # type: ignore[arg-type]
+        dataclasses.replace(_rec("fixed_aggregate", 24, per_msg=0.5), **arm),  # type: ignore[arg-type]
+    ]
+    readings = {r.label: r for r in herd_floor_readings(recs, _KEY, base_count=12)}
+    pair_labels = {p.label for p in monotonic_pairs(recs, _KEY, tolerance=_MONOTONIC_TOLERANCE)}
+    assert (
+        set(readings)
+        == pair_labels
+        == {
+            "fixed_aggregate/sandbox=off",
+            "fixed_aggregate/sandbox=subprocess",
+        }
+    )
+    assert readings["fixed_aggregate/sandbox=off"].ok is True
+    assert readings["fixed_aggregate/sandbox=subprocess"].ok is False
+    assert readings["fixed_aggregate/sandbox=subprocess"].value == 0.5
+
+
 def test_a_nan_fd_reading_fails_the_fd_monotonicity_slo() -> None:
     # The FD SLO is the one consumer still graded; it must go red on a NaN rather than read green.
     recs = [

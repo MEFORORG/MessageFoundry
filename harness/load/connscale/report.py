@@ -802,8 +802,8 @@ class HerdFloorReading:
     """
 
     label: (
-        # Through `lane_label`, the stem of `MonotonicPair`'s label, so the two spell a default-arm
-        # lane the same way.
+        # Through `monotonic_lane_labeler`, as `MonotonicPair`'s label is, so the two name every lane,
+        # an A/B arm's included, the same way.
         str
     )
     count: int
@@ -837,19 +837,24 @@ def herd_floor_readings(
     fail, and this repo already records one of those as a defect (the FD "never compared" guard in
     tests/test_connscale_smoke.py).
 
-    Lanes are grouped on ``(sweep_mode, claim_mode)``, which is NOT the key :func:`monotonic_pairs`
-    uses since BACKLOG #5570: that one also splits the fusion, batching and sandbox arms and the
-    trials. Here the first record at ``base_count`` in each such group is the one graded. Only
-    ``per_lane`` lanes are graded: the prediction's premise is one worker set per lane per stage,
-    which a pooled dispatcher does not satisfy.
+    Lanes are :func:`monotonic_lane`, the key :func:`monotonic_pairs` uses, so the fusion, batching
+    and sandbox arms and the trials each grade their own base reading, and each is named by
+    :func:`monotonic_lane_labeler` as the pairs name it. Grouping on ``(sweep_mode, claim_mode)``
+    alone graded the first record at ``base_count`` and dropped its sibling arm's reading unseen, so
+    an A/B's second arm was recorded and never graded (BACKLOG #5090). Every axis a profile varies
+    is in the lane, so a lane runs each N once; were two records to share a lane and ``base_count``,
+    the first would still be the one graded. Only ``per_lane`` lanes are graded: the prediction's
+    premise is one worker set per lane per stage, which a pooled dispatcher does not satisfy.
     """
-    by_lane: dict[tuple[str, str], list[ConnScaleRecord]] = {}
+    name = monotonic_lane_labeler(records)
+    by_lane: dict[MonotonicLane, list[ConnScaleRecord]] = {}
     for r in records:
-        by_lane.setdefault((r.sweep_mode, r.claim_mode), []).append(r)
+        by_lane.setdefault(monotonic_lane(r), []).append(r)
 
     out: list[HerdFloorReading] = []
-    for (mode, claim_mode), rs in sorted(by_lane.items()):
-        label = lane_label(mode, claim_mode)
+    for _lane, rs in sorted(by_lane.items()):
+        label = name(rs[0])
+        claim_mode = rs[0].claim_mode
         if claim_mode != "per_lane":
             out.append(
                 HerdFloorReading(

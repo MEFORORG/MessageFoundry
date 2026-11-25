@@ -455,8 +455,10 @@ def _validate(profile: ConnScaleProfile, where: str) -> None:
         "empty_claims_base_reading": profile.slo.empty_claims_base_reading,
         "empty_claims_herd_floor_legs": bool(profile.slo.empty_claims_herd_floor_legs),
     }
-    # The floor grades the FIRST record at the base count in each lane (`herd_floor_readings`), so a
-    # repeat trial would be recorded and never graded: refuse the pairing rather than grade one of N.
+    # The floor once graded only the FIRST record at the base count of each (sweep_mode, claim_mode),
+    # so a repeat trial was recorded and never graded. Since BACKLOG #5090 `herd_floor_readings`
+    # groups on `monotonic_lane`, so each trial is graded in its own lane, labelled `.../trial=<n>`;
+    # the harvest behind the arming never read a lane so named, so the pairing stays refused.
     if profile.slo.empty_claims_herd_floor_legs and profile.trials > 1:
         raise ConnScaleProfileError(
             f"{where}: slo.empty_claims_herd_floor_legs grades one base reading per lane, so it "

@@ -60,6 +60,36 @@ COLLAPSE_INCONCLUSIVE = "INCONCLUSIVE"  # per_lane idle-poll below the noise flo
 COLLAPSE_MISSING = "MISSING"  # no pooled arm to compare
 
 
+def _sandbox_arms(records: Iterable[ConnScaleRecord]) -> tuple[str, ...]:
+    """The ``[sandbox]`` arms ``records`` ran under, sorted (BACKLOG #5090).
+
+    No comparison here keys a cell on the sandbox arm: ``profile._validate`` refuses a sandbox A/B
+    beside any other A/B, so one run's records carry one arm. Records from two arms would pool into
+    one cell, so a comparison handed them fails rather than grade the mixture, and every comparison
+    names the arm it ran under, which its table did not.
+    """
+    return tuple(sorted({r.sandbox_mode for r in records}))
+
+
+def _sandbox_line(arms: tuple[str, ...]) -> str:
+    """The table line naming the sandbox arm, or saying the arms were mixed and the A/B fails."""
+    if len(arms) > 1:
+        return (
+            f"SANDBOX ARMS MIXED ({', '.join(arms)}) -> the A/B FAILS: each cell pools records "
+            "from more than one [sandbox] arm"
+        )
+    return f"sandbox: {arms[0] if arms else 'no records'}"
+
+
+def _sandbox_note(arms: tuple[str, ...]) -> list[str]:
+    if len(arms) < 2:
+        return []
+    return [
+        f"the records span {len(arms)} [sandbox] arms ({', '.join(arms)}); no cell is keyed on "
+        "the arm, so each would pool them -- the A/B fails rather than grade the mixture."
+    ]
+
+
 @dataclass(frozen=True)
 class _ArmMetrics:
     """One arm's read-off for a ``(sweep_mode, count)`` cell (all from the tagged record)."""
@@ -222,11 +252,20 @@ class ClaimModeComparison:
     # ``(sweep_mode, count)`` cells the CANDIDATE produced that the baseline never did (BACKLOG #5429).
     # They have no row to fail, so the verdict fails on them directly rather than skipping them.
     orphan_candidate_cells: list[tuple[str, int]] = field(default_factory=list)
+    # The [sandbox] arms the records ran under (:func:`_sandbox_arms`); more than one fails the A/B.
+    sandbox_arms: tuple[str, ...] = ()
+
+    @property
+    def sandbox_arms_mixed(self) -> bool:
+        return len(self.sandbox_arms) > 1
 
     @property
     def ok(self) -> bool:
         return (
-            all(row.ok for row in self.rows) and bool(self.rows) and not self.orphan_candidate_cells
+            all(row.ok for row in self.rows)
+            and bool(self.rows)
+            and not self.orphan_candidate_cells
+            and not self.sandbox_arms_mixed
         )
 
     @property
@@ -292,6 +331,7 @@ class ClaimModeComparison:
             "baseline": self.baseline_mode,
             "candidate": self.candidate_mode,
             "rate_window": self.rate_window,
+            "sandbox_arms": list(self.sandbox_arms),
             "guards": {
                 "throughput_tolerance": self.throughput_tolerance,
                 "collapse_material_ratio": self.collapse_material_ratio,
@@ -326,6 +366,7 @@ class ClaimModeComparison:
             f"(pooled <= per_lane * {self.collapse_material_ratio:.2f} where per_lane > "
             f"{self.idle_floor_per_s:.1f}/s)"
         )
+        lines.append(_sandbox_line(self.sandbox_arms))
         overall = "PASS" if self.ok else "FAIL"
         lines.append(
             f"overall: {overall}  (candidate_zero_loss_ok={self.candidate_zero_loss_ok}, "
@@ -505,6 +546,8 @@ def build_comparison(
             f"{len(orphans)} pooled cell(s) with NO per_lane baseline to compare against: "
             f"{', '.join(f'[{sm}] N={n}' for sm, n in orphans)} -- the A/B fails rather than skip them."
         )
+    sandbox_arms = _sandbox_arms(records)
+    notes.extend(_sandbox_note(sandbox_arms))
     return ClaimModeComparison(
         baseline_mode=baseline_mode,
         candidate_mode=candidate_mode,
@@ -515,6 +558,7 @@ def build_comparison(
         notes=notes,
         rate_window=records_rate_window(records),
         orphan_candidate_cells=orphans,
+        sandbox_arms=sandbox_arms,
     )
 
 
@@ -946,6 +990,12 @@ class FuseModeComparison:
     # have no row and no baseline gap, so without this a GO on the other counts would mask them
     # (BACKLOG #5430).
     unrun_cells: list[tuple[str, str, int]] = field(default_factory=list)
+    # The [sandbox] arms the records ran under (:func:`_sandbox_arms`); more than one is a NO-GO.
+    sandbox_arms: tuple[str, ...] = ()
+
+    @property
+    def sandbox_arms_mixed(self) -> bool:
+        return len(self.sandbox_arms) > 1
 
     @property
     def overall_verdict(self) -> str:
@@ -955,7 +1005,7 @@ class FuseModeComparison:
         verdicts = [row.verdict for row in self.rows]
         # A swallowed B0 baseline or an unrun cell is a run gap, never a GO. Checked before the
         # empty-rows branch, because every cell unrun is not INCONCLUSIVE.
-        if self.baseline_missing or self.unrun_cells:
+        if self.baseline_missing or self.unrun_cells or self.sandbox_arms_mixed:
             return FUSE_NO_GO
         if not verdicts:
             return FUSE_INCONCLUSIVE
@@ -976,6 +1026,7 @@ class FuseModeComparison:
             and all(row.ok for row in self.rows)
             and not self.baseline_missing
             and not self.unrun_cells
+            and not self.sandbox_arms_mixed
         )
 
     @property
@@ -1004,6 +1055,7 @@ class FuseModeComparison:
             "baseline": self.baseline_label,
             "candidate": self.candidate_label,
             "rate_window": self.rate_window,
+            "sandbox_arms": list(self.sandbox_arms),
             "guards": {
                 "min_lift_pct": self.min_lift_pct,
                 "sigma_multiple": self.sigma_multiple,
@@ -1038,6 +1090,7 @@ class FuseModeComparison:
             f"sigma | in_pipeline flat-or-lower | delivered/offered >= {self.min_delivered_offered:.2f}"
             f" | zero-loss held  (SQL Server is the valid leg; SQLite is NOT a throughput proxy)"
         )
+        lines.append(_sandbox_line(self.sandbox_arms))
         lines.append(
             f"overall: {self.overall_verdict}  (GO={self.go_cells}, NO-GO={self.no_go_cells}, "
             f"INCONCLUSIVE={self.inconclusive_cells}, missing={self.missing_arms}, "
@@ -1242,6 +1295,8 @@ def build_fuse_comparison(
             + " -- both arms failed to start there, so nothing was compared. This FAILS the run "
             "(overall NO-GO) so a GO on other counts can never mask it."
         )
+    sandbox_arms = _sandbox_arms(records)
+    notes.extend(_sandbox_note(sandbox_arms))
     return FuseModeComparison(
         min_lift_pct=min_lift_pct,
         sigma_multiple=sigma_multiple,
@@ -1257,6 +1312,7 @@ def build_fuse_comparison(
         baseline_label=baseline_label,
         candidate_label=candidate_label,
         rate_window=records_rate_window(records),
+        sandbox_arms=sandbox_arms,
     )
 
 
