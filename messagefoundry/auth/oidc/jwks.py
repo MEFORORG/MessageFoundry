@@ -87,8 +87,10 @@ class JwksAmbiguousKid(JwksError):
 
 
 class JwksRefreshBusy(JwksError):
-    """A :class:`JwksCache` lookup waited the whole ``gate_wait_seconds`` for a refresh in progress
-    and its key was still not current (BACKLOG #6905). A slow or stalled IdP, not a fault in the
+    """A :class:`JwksCache` lookup waited the whole ``gate_wait_seconds`` for a refresh in progress,
+    and its read of the published keys after the wait served no key: its ``kid`` had no key within
+    the TTL, :meth:`JwksCache._may_skip_gate` did not allow the read, or the published snapshot
+    changed under it (BACKLOG #6905). A slow or stalled IdP, not a fault in the
     token; ``claims.py`` records the refusal as ``jwks_refresh_busy``, never ``unknown_kid``."""
 
 
@@ -291,9 +293,10 @@ class JwksCache:
       simply raises :class:`JwksError` until the floor elapses. A miss that arrives while a fetch
       is in progress waits for the gate that fetch holds, at most ``gate_wait_seconds``. If it gets
       the gate it decides again against the keys it finds: the new ones, or on a failed fetch the
-      old ones. If its wait runs out first, it is refused with :class:`JwksRefreshBusy`, unless the keys
-      published by then hold the ``kid`` within the TTL, and it is refused even if that fetch later
-      fails and leaves the old keys in place. A key past the TTL is never served instead
+      old ones. If its wait runs out first, it reads the published keys once more, and a key within
+      the TTL is served only if :meth:`_may_skip_gate` allows and the published snapshot is still
+      the one it read. Otherwise it is refused with :class:`JwksRefreshBusy`, even if that fetch
+      later fails and leaves the old keys in place. A key past the TTL is never served instead
       (BACKLOG #6905). The wait is bounded; the fetch is bounded only per socket operation;
     * a fetch that fails leaves the previous good keys in place (fail-static within the TTL).
     """
