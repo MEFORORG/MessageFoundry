@@ -189,9 +189,28 @@ $ErrorActionPreference = "Stop"
 # arrow came through as a raw 0x1A), which turns valid output into JSON a consumer cannot parse.
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
+# ONE SPELLING PER FILE. A -File typed the way a shell tab-completes it (`.\docs\x.md`) or carrying a
+# `.` or `..` segment names the same file git reports as `docs/x.md`, and an exact `-contains` against
+# git's spelling missed every such form, so the gate read a real collision as an all-clear. `.` and
+# empty segments drop; `..` pops the segment before it but never a drive or a leading `/`, and a
+# RELATIVE `..` with nothing left to pop is kept, so `../x` stays outside the repo and matches nothing
+# in it. The fast path skips the walk for the clean paths git itself prints, which is nearly every call.
 function ConvertTo-Norm([string]$p) {
     if (-not $p) { return "" }
-    return ($p -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
+    $p = ($p -replace '\\', '/').ToLowerInvariant()
+    if ($p -notmatch '(^|/)\.\.?(/|$)|.//') { return $p.TrimEnd('/') }
+    $lead = if ($p.StartsWith('//')) { '//' } elseif ($p.StartsWith('/')) { '/' } else { '' }
+    $out = [System.Collections.Generic.List[string]]::new()
+    foreach ($s in $p.Substring($lead.Length).Split('/')) {
+        if ($s -eq '' -or $s -eq '.') { continue }
+        if ($s -ne '..') { $out.Add($s); continue }
+        $last = if ($out.Count) { $out[$out.Count - 1] } else { $null }
+        if ($null -ne $last -and $last -ne '..' -and -not ($out.Count -eq 1 -and $last -match '^[a-z]:$')) {
+            $out.RemoveAt($out.Count - 1)
+        }
+        elseif (-not $lead -and ($null -eq $last -or $last -eq '..')) { $out.Add('..') }
+    }
+    return $lead + ($out -join '/')
 }
 
 # One emitter for every -Json exit, so no path can print nothing. See the note at the -File query below.

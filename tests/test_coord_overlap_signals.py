@@ -171,6 +171,59 @@ def test_an_untouched_file_is_not_reported(
     assert query(primary, tmp_path, "beta.txt") == []
 
 
+# A ``-File`` spelled the way a shell tab-completes it (``.\docs\gamma.txt``) or with a ``.`` or ``..``
+# segment names the same file git reports as ``docs/gamma.txt``, and must match it. ConvertTo-Norm once
+# only flipped slashes, trimmed and lowercased, so every dotted spelling below missed, and the gate read
+# a real collision as an all-clear.
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "docs/gamma.txt",  # the control: git's own spelling must match, or the rest prove nothing
+        "./docs/gamma.txt",
+        ".\\docs\\gamma.txt",
+        ".//docs//gamma.txt",
+        "docs/./gamma.txt",
+        "docs/../docs/gamma.txt",
+        "./alpha.txt/../docs/gamma.txt",
+    ],
+)
+def test_a_dotted_or_tab_completed_spelling_matches_gits_path(
+    peer_worktree: tuple[Path, Path], tmp_path: Path, spelling: str
+) -> None:
+    primary, peer = peer_worktree
+    (peer / "docs").mkdir()
+    (peer / "docs" / "gamma.txt").write_text("theirs\n", encoding="utf-8")
+    git(peer, "add", "docs/gamma.txt")
+    git(peer, "commit", "-qm", "peer adds a nested file")
+
+    rows = query(primary, tmp_path, spelling)
+    assert rows, f"{spelling!r} names docs/gamma.txt, which the peer committed, yet nothing matched"
+
+
+def test_a_rooted_spelling_with_a_dotdot_segment_matches(
+    peer_worktree: tuple[Path, Path], tmp_path: Path
+) -> None:
+    primary, peer = peer_worktree
+    (peer / "alpha.txt").write_text("base\nunsaved only\n", encoding="utf-8")
+    rooted = f"{primary}\\docs\\..\\.\\alpha.txt"
+    assert query(primary, tmp_path, rooted), f"{rooted!r} is alpha.txt in this repo and must match"
+
+
+def test_a_dotdot_that_climbs_above_the_root_does_not_match(
+    peer_worktree: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """``..`` resolves INSIDE the repo only: ``../alpha.txt`` is a file beside the repo, not in it.
+
+    The control is the same edit queried by its real name, so an empty answer below cannot come from a
+    fixture that reports nothing at all.
+    """
+    primary, peer = peer_worktree
+    (peer / "alpha.txt").write_text("base\nunsaved only\n", encoding="utf-8")
+    assert query(primary, tmp_path, "alpha.txt"), "control: the real spelling must match"
+    assert query(primary, tmp_path, "../alpha.txt") == []
+    assert query(primary, tmp_path, "docs/../../alpha.txt") == []
+
+
 # --------------------------------------------- whose commit is it? (attribution of the committed half)
 #
 # Measured 2026-08-22. The gate told a session that ``scripts/coord/handoff.ps1`` had been "CHANGED AND
