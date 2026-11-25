@@ -297,6 +297,7 @@ from messagefoundry.store.store import (
     FederatedUnbind,
     FullAuthenticationWrite,
     InboundMetrics,
+    InjectAudit,
     KeptSessionRestamp,
     LatencyHistogram,
     LockoutCounter,
@@ -7712,7 +7713,7 @@ class SqlServerStore:
         metadata: str | None = None,
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
-        audit: OperatorAudit[str] | None = None,
+        audit: InjectAudit | None = None,
         origin: MessageOrigin = MessageOrigin.PARTNER,
         origin_actor: str | None = None,
     ) -> str:
@@ -7728,7 +7729,7 @@ class SqlServerStore:
         is inserted (Phase 3a). A missing ref fails loud → the whole ingress rolls back → no ACK for a
         body we couldn't reference (content-addressing dedups the sender's resend; the startup sweep
         reclaims the orphan). Empty/None → the byte-identical no-detach path."""
-        audit = require_ingress_audit(audit, origin)  # BACKLOG #5071
+        audit = require_ingress_audit(audit, origin, origin_actor)  # BACKLOG #5071, #6589
         now = time.time() if now is None else now
         mid = uuid4().hex
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
@@ -9358,6 +9359,7 @@ class SqlServerStore:
         it. Where a non-zero ``command_timeout`` is at or under the bound, that fires first as
         HYT00, which the retry re-runs as it would without the bound, and each attempt then holds
         the applock for up to that timeout."""
+        record = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         now = time.time() if now is None else now
         bound = CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS
         if flagged:
@@ -9415,7 +9417,7 @@ class SqlServerStore:
                             bounded = False
 
                     await _retry_idempotent_merge(write_flag, on_retry=release, statement=statement)
-                    await self._append_operator_audit(cur, written, if_applied(audit), True)
+                    await self._append_operator_audit(cur, written, record, True)
                     await self._commit(conn)
             except Exception:
                 # The transaction may hold the audit applock and an audit row (BACKLOG #2624).
@@ -9431,11 +9433,13 @@ class SqlServerStore:
         return {(str(d["connection"]), str(d["direction"])) for d in rows}
 
     async def _alert_write(
-        self, sql: str, params: tuple[Any, ...], audit: AuditAppend, now: float
+        self, sql: str, params: tuple[Any, ...], record: OperatorAudit[bool], now: float
     ) -> bool:
         """One operator alert UPDATE with its audit row, in one transaction (vault BACKLOG #3217).
         The row is appended only when the UPDATE matched, so a 404 writes nothing. The append takes
-        the audit applock at the tail, as :meth:`cancel_queued`'s does.
+        the audit applock at the tail, as :meth:`cancel_queued`'s does. ``record`` is the caller's
+        :func:`if_applied`, taken as its first statement, so a missing row was refused before this
+        borrows a connection (BACKLOG #6589).
 
         ``sql`` carries ``OUTPUT inserted.id``, and the match is read from that rowset, never from
         ``cursor.rowcount``: a session-wide ``SET NOCOUNT ON`` can make the count read -1, which
@@ -9445,7 +9449,7 @@ class SqlServerStore:
                 async with self._cursor(conn) as cur:
                     await cur.execute(sql, params)
                     applied = bool(await cur.fetchall())
-                    await self._append_operator_audit(cur, written, if_applied(audit), applied)
+                    await self._append_operator_audit(cur, written, record, applied)
                     await self._commit(conn)
             except Exception:
                 # The transaction may hold the audit applock and an audit row (BACKLOG #2624).
@@ -9456,24 +9460,26 @@ class SqlServerStore:
     async def ack_alert_instance(
         self, alert_id: int, *, actor: str, audit: AuditAppend, now: float | None = None
     ) -> bool:
+        record = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         now = time.time() if now is None else now
         return await self._alert_write(
             "UPDATE alert_instance SET status='acknowledged', acked_by=?, acked_at=?"
             " OUTPUT inserted.id WHERE id=? AND status<>'resolved'",
             (actor, now, alert_id),
-            audit,
+            record,
             now,
         )
 
     async def resolve_alert_instance(
         self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> bool:
+        record = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         now = time.time() if now is None else now
         return await self._alert_write(
             "UPDATE alert_instance SET status='resolved', resolved_at=?"
             " OUTPUT inserted.id WHERE id=? AND status<>'resolved'",
             (now, alert_id),
-            audit,
+            record,
             now,
         )
 
@@ -9555,13 +9561,14 @@ class SqlServerStore:
     async def suspend_alert_instance(
         self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
+        record = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # #143 windowed suspend (NOTIFICATION-only): set suspended_until on a live instance. Refuses a
         # resolved one; returns the updated row (for the API echo + seeding the sink cache) or None.
         if not await self._alert_write(
             "UPDATE alert_instance SET suspended_until=? OUTPUT inserted.id"
             " WHERE id=? AND status<>'resolved'",
             (until, alert_id),
-            audit,
+            record,
             time.time() if now is None else now,
         ):
             return None
@@ -9570,12 +9577,13 @@ class SqlServerStore:
     async def resume_alert_instance(
         self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
+        record = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # #143: clear a windowed suspend. Idempotent; returns the row or None (unknown/already resolved).
         if not await self._alert_write(
             "UPDATE alert_instance SET suspended_until=NULL OUTPUT inserted.id"
             " WHERE id=? AND status<>'resolved'",
             (alert_id,),
-            audit,
+            record,
             time.time() if now is None else now,
         ):
             return None

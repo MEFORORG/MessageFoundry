@@ -292,6 +292,7 @@ from messagefoundry.store.store import (
     FederatedUnbind,
     FullAuthenticationWrite,
     InboundMetrics,
+    InjectAudit,
     KeptSessionRestamp,
     LatencyHistogram,
     LockoutCounter,
@@ -4962,7 +4963,7 @@ class PostgresStore:
         metadata: str | None = None,
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
-        audit: OperatorAudit[str] | None = None,
+        audit: InjectAudit | None = None,
         origin: MessageOrigin = MessageOrigin.PARTNER,
         origin_actor: str | None = None,
     ) -> str:
@@ -4977,7 +4978,7 @@ class PostgresStore:
         skeleton row — the two-object commit's second half — AND its ``message_attachment`` linkage row is
         inserted (Phase 3a). A missing ref fails loud → the whole ingress rolls back → no ACK for a body
         we couldn't reference. Empty/None → the byte-identical no-detach path."""
-        audit = require_ingress_audit(audit, origin)  # BACKLOG #5071
+        audit = require_ingress_audit(audit, origin, origin_actor)  # BACKLOG #5071, #6589
         now = time.time() if now is None else now
         mid = uuid4().hex
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
@@ -7554,6 +7555,7 @@ class PostgresStore:
         :class:`~messagefoundry.store.base.ConnectionFlagLockTimeout`, and the transaction rolls
         back. Where a non-zero ``command_timeout`` is at or under the bound, that ends the wait
         first, as asyncpg's own timeout, not retried."""
+        record = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         now = time.time() if now is None else now
         bound = CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS
         async with (
@@ -7575,28 +7577,33 @@ class PostgresStore:
                 if driver_sqlstate(exc) == _LOCK_NOT_AVAILABLE:
                     raise ConnectionFlagLockTimeout(self.backend, bound) from exc
                 raise
-            await self._append_operator_audit(conn, written, if_applied(audit), True)
+            await self._append_operator_audit(conn, written, record, True)
 
     async def list_connection_flags(self) -> set[tuple[str, str]]:
         """See :meth:`messagefoundry.store.base.QueueStore.list_connection_flags`."""
         rows = await self._fetchall("SELECT connection, direction FROM connection_flag")
         return {(str(r["connection"]), str(r["direction"])) for r in rows}
 
-    async def _alert_write(self, sql: str, *params: Any, audit: AuditAppend, now: float) -> bool:
+    async def _alert_write(
+        self, sql: str, *params: Any, record: OperatorAudit[bool], now: float
+    ) -> bool:
         """One operator alert UPDATE with its audit row, in one transaction (vault BACKLOG #3217).
-        The row is appended only when the UPDATE matched, so a 404 writes nothing."""
+        The row is appended only when the UPDATE matched, so a 404 writes nothing. ``record`` is the
+        caller's :func:`if_applied`, taken as its first statement, so a missing row was refused
+        before this borrows a connection (BACKLOG #6589)."""
         async with (
             AuditedWrite(now) as written,
             self._timed_acquire(record=False) as conn,
             conn.transaction(),
         ):
             applied = _rowcount(await conn.execute(sql, *params)) > 0
-            await self._append_operator_audit(conn, written, if_applied(audit), applied)
+            await self._append_operator_audit(conn, written, record, applied)
         return applied
 
     async def ack_alert_instance(
         self, alert_id: int, *, actor: str, audit: AuditAppend, now: float | None = None
     ) -> bool:
+        record = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         now = time.time() if now is None else now
         return await self._alert_write(
             "UPDATE alert_instance SET status='acknowledged', acked_by=$1, acked_at=$2"
@@ -7604,20 +7611,21 @@ class PostgresStore:
             actor,
             now,
             alert_id,
-            audit=audit,
+            record=record,
             now=now,
         )
 
     async def resolve_alert_instance(
         self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> bool:
+        record = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         now = time.time() if now is None else now
         return await self._alert_write(
             "UPDATE alert_instance SET status='resolved', resolved_at=$1"
             " WHERE id=$2 AND status<>'resolved'",
             now,
             alert_id,
-            audit=audit,
+            record=record,
             now=now,
         )
 
@@ -7696,13 +7704,14 @@ class PostgresStore:
     async def suspend_alert_instance(
         self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
+        record = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # #143 windowed suspend (NOTIFICATION-only): set suspended_until on a live instance. Refuses a
         # resolved one; returns the updated row (for the API echo + seeding the sink cache) or None.
         if not await self._alert_write(
             "UPDATE alert_instance SET suspended_until=$1 WHERE id=$2 AND status<>'resolved'",
             until,
             alert_id,
-            audit=audit,
+            record=record,
             now=time.time() if now is None else now,
         ):
             return None
@@ -7711,11 +7720,12 @@ class PostgresStore:
     async def resume_alert_instance(
         self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
+        record = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # #143: clear a windowed suspend. Idempotent; returns the row or None (unknown/already resolved).
         if not await self._alert_write(
             "UPDATE alert_instance SET suspended_until=NULL WHERE id=$1 AND status<>'resolved'",
             alert_id,
-            audit=audit,
+            record=record,
             now=time.time() if now is None else now,
         ):
             return None

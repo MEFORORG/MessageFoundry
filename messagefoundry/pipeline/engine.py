@@ -133,6 +133,7 @@ from messagefoundry.store.store import (
     ConnectionMetrics,
     DestinationMetrics,
     InboundMetrics,
+    InjectAudit,
     MessageOrigin,
     OperatorAudit,
     OwnedLanes,
@@ -4124,7 +4125,7 @@ class Engine:
         raw: str,
         source_type: str = "upload",
         metadata: str | None = None,
-        audit: OperatorAudit[str],
+        audit: InjectAudit,
         actor: str,
     ) -> str:
         """Inject a fresh ``RECEIVED`` message onto ``channel_id``'s **ingress** stage — the DISTINCT
@@ -4137,7 +4138,8 @@ class Engine:
         has none of. ``enqueue_ingress`` takes the target inbound channel **directly**. Target
         validation (registered/running), RBAC and the target inbound's ingress guards (BACKLOG
         #1911) are the API's job. The API also builds the ``audit`` row that commits with the message
-        (BACKLOG #2624). Returns the new message id. The message's origin is ``operator_upload`` with
+        (BACKLOG #2624). It is an :data:`~messagefoundry.store.store.InjectAudit`, which always
+        builds a row, as the store requires of an inject (BACKLOG #6589). Returns the new message id. The message's origin is ``operator_upload`` with
         ``actor`` as its acting user (vault BACKLOG #2615). The row records the control id, type and
         summary, less any value over the bounds of :meth:`RegistryRunner.ingress_fields_for`, which
         apply the narrowest backend's column widths on every backend (BACKLOG #5707). With no runner
