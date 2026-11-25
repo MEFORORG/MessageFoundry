@@ -370,9 +370,9 @@ decision.
   construction, then once per connection.
 - `auth/ldap_tls.py` adds `NarrowedTls`, a subclass of `ldap3.Tls`. Its `wrap_socket` wraps the
   socket with the factory's context and then calls ldap3's own host name check, unchanged.
-  *(CHANGED 2026-11-25, BACKLOG #6879: the check now gets the host less its trailing dot, as
-  `messagefoundry/auth/ldap_tls.py` states.)* That wrap step is copied from ldap3, and `tests/test_ldap_tls.py` pins a hash of ldap3's
-  `wrap_socket` source. Patching ldap3's module global for one call was rejected, because binds
+  *(CHANGED 2026-11-24, BACKLOG #6879: the check now gets the host less one trailing dot, and
+  the wrap sends SNI, as `messagefoundry/auth/ldap_tls.py` states.)* That wrap step is copied
+  from ldap3, and `tests/test_ldap_tls.py` pins a hash of ldap3's `wrap_socket` source. Patching ldap3's module global for one call was rejected, because binds
   run on worker threads and a module global is shared by all of them.
 - The bind no longer passes `ciphers=`. `NarrowedTls` builds the factory itself from `validate`
   and `ca_certs_data`, and takes no other ldap3 argument, because the engine's context would not

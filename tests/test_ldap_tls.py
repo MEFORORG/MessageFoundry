@@ -360,6 +360,10 @@ def test_a_trailing_dot_host_verifies_without_its_dot(pki: _Pki) -> None:
     seen: list[str | None] = []
     _bind(_tls(ca), _sni_server(pki, seen), host="localhost.")
     assert seen == ["localhost"]
+    # ldap3 accepts any certificate for the name "*", so "*." must not lose its dot.
+    with pytest.raises(LDAPCertificateError) as refused:
+        _bind(_tls(ca), _server(pki), host="*.")
+    _close_held_tls_sockets(refused.value)
 
 
 @pytest.mark.parametrize(
@@ -368,14 +372,16 @@ def test_a_trailing_dot_host_verifies_without_its_dot(pki: _Pki) -> None:
         ("stra" + chr(0xDF) + "e.example.test", "stra" + chr(0xDF) + "e.example.test"),
         ("127.0.0.1", "127.0.0.1"),
         ("dc1.example.test.", "dc1.example.test"),
+        ("dc1.example.test..", "dc1.example.test."),
+        ("*.", "*."),
     ],
 )
 def test_the_host_name_check_gets_the_host_not_its_idna_form(
     pki: _Pki, host: str, checked: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """IDNA 2003 maps sharp s to ``ss``, so checking the IDNA form would let a certificate for a
-    different name match. The check gets the host less its trailing dot, and an IP literal, which
-    sends no SNI, is checked as itself."""
+    different name match. The check gets the host less one trailing dot, ``*.`` excepted, and an
+    IP literal, which sends no SNI, is checked as itself."""
     names: list[str] = []
     monkeypatch.setattr(
         "messagefoundry.auth.ldap_tls.check_hostname",
@@ -387,8 +393,9 @@ def test_the_host_name_check_gets_the_host_not_its_idna_form(
 
 def test_a_real_ldap3_connection_sends_its_server_host_as_sni(pki: _Pki) -> None:
     """Through ``ldap3.Connection.open``, so the host is the one ldap3 itself hands the wrap step,
-    not a stand-in's attribute. Verification is on: the name adds no stdlib host name check,
-    because the engine's context leaves ``check_hostname`` off."""
+    not a stand-in's attribute. Verification is on. This test cannot show that the name adds no
+    stdlib host name check, since the leaf names the host; ``check_hostname`` being off is pinned
+    in ``tests/test_tls_cipher_assertion_sites.py``."""
     seen: list[str | None] = []
     sock = _open_ldaps(_tls(Path(pki.ca).read_text()), _sni_server(pki, seen), host="localhost")
     sock.close()

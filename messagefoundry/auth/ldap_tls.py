@@ -17,7 +17,7 @@ before it re-raises, where ldap3 leaves it open while the error's traceback is h
 anyway (BACKLOG #3017). The ClientHello names the host the connection dials, in the form
 :func:`_sni_name` gives, where ldap3 sends its ``sni`` attribute, normally none; this copy never
 reads ``sni``, and nothing in the engine sets it. The host name check runs against the host less
-its trailing dot, where ldap3 checks it as written (BACKLOG #6879).
+one trailing dot, ``*.`` excepted, where ldap3 checks it as written (BACKLOG #6879).
 The alternative was to patch ``ldap3.core.tls.create_default_context`` for the length of one call.
 That is a module global, and ``AuthService`` runs binds on worker threads, so two concurrent binds
 could each see the other's patch. ``tests/test_ldap_tls.py`` pins the source of ldap3's
@@ -158,15 +158,18 @@ class NarrowedTls(ldap3.Tls):  # type: ignore[misc]  # ldap3 ships no type infor
         )
         if do_handshake and self.validate in (ssl.CERT_REQUIRED, ssl.CERT_OPTIONAL):
             try:
-                # The host as written, less an ASCII trailing dot, so ``localhost.`` matches a
-                # leaf naming ``localhost``. Not the IDNA form: IDNA 2003 folds distinct names
+                # The host as written, less one ASCII trailing dot, so ``localhost.`` matches a
+                # leaf naming ``localhost``. ``*.`` keeps its dot: ldap3 accepts any certificate
+                # for the name ``*``. Not the IDNA form: IDNA 2003 folds distinct names
                 # together (sharp s to ``ss``), so a certificate for the folded name would match.
                 # The raw host is not safe either, as before BACKLOG #6879: ldap3's match does
                 # not split labels at a full-width dot, so ``dc1``, U+3002, ``corp.example.test``
                 # matches a ``*.example.test`` wildcard that the dialled ``dc1.corp.example.test``
                 # would not. Not built: refusing a non-ASCII ``ad_server`` at settings load, so
                 # the dial, the SNI and this check all use one name.
-                check_hostname(wrapped, connection.server.host.rstrip("."), self.valid_names)
+                host = connection.server.host
+                name = host.removesuffix(".")
+                check_hostname(wrapped, host if name == "*" else name, self.valid_names)
             except BaseException:
                 # ssl took the socket over, so ``connection.socket`` holds a detached one and
                 # ``wrapped`` is reachable only through the error's traceback: close it here
