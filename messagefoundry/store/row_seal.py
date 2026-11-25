@@ -130,11 +130,14 @@ _MAC_HEX_LEN: Final = 64  # HMAC-SHA256, hex
 
 
 class NonFiniteSealValueError(ValueError):
-    """Raised when a seal is made over a float that is a NaN or an infinity (BACKLOG #6717).
+    """Raised for a float that is a NaN or an infinity in a sealed field (BACKLOG #6717): when a
+    seal is made over one, and by a keyless SQLite store, which makes no seal, when a write brings
+    in a new one (``_refuse_new_non_finite`` in ``store.py``).
 
     SQLite stores a NaN as ``NULL``: a ``NOT NULL`` column refuses the write, and a nullable one
-    reads back ``None``, so the seal would fail the next read as if the row had been changed. An
-    infinity round-trips, but no sealed field means anything by one, so it is refused with the NaN.
+    reads back ``None``. On a keyed store the seal would then fail the next read as if the row had
+    been changed; on a keyless store the value would change silently. An infinity round-trips, but
+    no sealed field means anything by one, so it is refused with the NaN.
     Its own type, so a caller can tell it from the ``ValueError`` a malformed field pair raises
     when it is unpacked. It is raised before any field is encoded, so a row that also holds a value
     the encoder cannot read raises this, whatever the field order."""
