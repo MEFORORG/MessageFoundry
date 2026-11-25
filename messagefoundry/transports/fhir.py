@@ -1215,7 +1215,7 @@ class FhirDestination(DestinationConnector):
         self.encoding: str = s.get("encoding", "utf-8")
         # ADR 0013: capture the FHIR server reply (assigned resource / ETag / OperationOutcome). Default
         # False → returns None, byte-identical.
-        self.capture_response: bool = bool(s.get("capture_response", False))
+        self.capture_response: bool = flag_from_settings(s, "capture_response")
         # #154: allow-list of HTTP response headers to capture — Location/ETag of a FHIR create are the
         # motivating case. Empty default → byte-identical. Shared parser/filter with REST.
         self.capture_response_headers = normalize_header_allowlist(
@@ -1224,7 +1224,7 @@ class FhirDestination(DestinationConnector):
         # #68: opt in to per-message HTTP headers a Handler stamps into the ADR 0081 metadata bag
         # (http.header.* entries). Default False → the delivery worker skips the metadata read and send
         # is byte-identical. When True, consumes_metadata tells the worker to pass this message's bag.
-        self.consumes_metadata: bool = bool(s.get("dynamic_headers", False))
+        self.consumes_metadata: bool = flag_from_settings(s, "dynamic_headers")
         self._headers = self._build_headers(s)
         # vault BACKLOG #1965: on an update sent as a transaction entry, a static conditional header,
         # which qualified every PUT, moves into the entry with the rest; on the outer POST it would

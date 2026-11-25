@@ -804,7 +804,7 @@ class SoapDestination(DestinationConnector):
         # The action is the single source of truth: the 1.2 Content-Type action param AND wsa:Action.
         self.soap_action: str = str(s.get("soap_action") or "")
         # ADR 0013: capture the SOAP response envelope. Default False → returns None, byte-identical.
-        self.capture_response: bool = bool(s.get("capture_response", False))
+        self.capture_response: bool = flag_from_settings(s, "capture_response")
         # #154: allow-list of HTTP response headers to capture into the DeliveryResponse (empty default →
         # byte-identical). Shared parser/filter with REST (SOAP reuses REST's HTTP plumbing).
         self.capture_response_headers = normalize_header_allowlist(

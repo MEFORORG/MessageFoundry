@@ -50,6 +50,7 @@ from messagefoundry.config.models import (
     Destination,
     Source,
     WindowsCredential,
+    flag_from_settings,
 )
 from messagefoundry.parsing.compression import CompressionError, gzip_compress, gzip_decompress
 from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek
@@ -548,7 +549,7 @@ class FileDestination(DestinationConnector):
         self.validate_directory: bool = bool(s.get("validate_directory", False))
         self.filename_template: str = s.get("filename", "{MSH-10}.hl7")
         # When two messages resolve to the same name, append a counter rather than clobber.
-        self._overwrite: bool = bool(s.get("overwrite", False))
+        self._overwrite: bool = flag_from_settings(s, "overwrite")
         self.encoding: str = s.get("encoding", "utf-8")
         # Alternate Windows/UNC credential (ADR 0132, #111). None (the default) => the ambient
         # service-account identity, byte-identical. On a non-Windows host a configured credential

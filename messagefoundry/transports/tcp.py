@@ -31,7 +31,12 @@ import logging
 import time
 from collections.abc import Callable, Mapping
 
-from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.models import (
+    ConnectorType,
+    Destination,
+    Source,
+    flag_from_settings,
+)
 from messagefoundry.proactor_accept import guard_accepts
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.admission import FrameClock, ListenerAdmission
@@ -185,12 +190,12 @@ class TcpDestination(DestinationConnector):
         # ADR 0013: capture the framed reply. Requires expect_reply=True (enforced at wiring). A missing
         # reply is already a retryable DeliveryError (peer-close in _read_reply) and stays one — enabling
         # capture does NOT change delivery semantics, it only returns the frame that was already read.
-        self.capture_response: bool = bool(s.get("capture_response", False))
+        self.capture_response: bool = flag_from_settings(s, "capture_response")
         # ADR 0067 §9 (BACKLOG #97): persistent outbound connection — opt-in reuse of ONE lazily-
         # established TCP connection across deliveries (default False = connect-per-send, byte-identical).
         # Same knobs/semantics as MLLP (ADR 0067) minus TLS (raw TCP has none). Key absent → off; the two
         # freshness knobs follow the receive_timeout convention (None/0 in any spelling = disabled).
-        self.persistent: bool = bool(s.get("persistent", False))
+        self.persistent: bool = flag_from_settings(s, "persistent")
         self.idle_timeout_seconds: float | None = positive_cap(
             s.get("idle_timeout_seconds", 60.0),
             float,
