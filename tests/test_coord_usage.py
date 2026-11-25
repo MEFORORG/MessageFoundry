@@ -479,6 +479,20 @@ def test_the_status_line_truncates_hours_rather_than_rounding_them(tmp_path: Pat
     assert re.search(r"resets 1h30m", line), line
 
 
+def test_the_status_line_floors_the_minutes_rather_than_rounding_them(tmp_path: Path) -> None:
+    """59m45s left is 0h59m. A cast to [int] rounded the total minutes up to 1h00m (BACKLOG #7597)."""
+    line = collect(
+        tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(9.0, 59 * 60 + 45)}}
+    )
+    assert re.search(r"resets 0h59m", line), line
+
+
+def test_a_reset_seconds_ago_is_a_gone_window_not_zero_minutes(tmp_path: Path) -> None:
+    """Rounding -0.3 minutes to 0 printed a 0h00m countdown for a window that had already reset."""
+    line = collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(99.0, -20)}})
+    assert line == "7d reset passed, no current reading", line
+
+
 @pytest.mark.parametrize("bad", ["", "not json at all", "{truncated", "null"])
 def test_the_collector_never_fails_on_a_bad_payload(tmp_path: Path, bad: str) -> None:
     """It decorates a live session. A throw or a non-zero exit here is worse than a missing reading."""
