@@ -221,8 +221,10 @@ def encrypt_stream(
 ) -> str:
     """Encrypt the byte stream ``src`` into the ``.mfbak`` stream ``dst`` under ``key`` (the resolved
     32-byte store DEK), returning the key's ``key_id`` fingerprint (recorded in the manifest by the
-    caller). Streaming: a small, fixed number of chunk-sized buffers is held at a time (the one-ahead
-    read below, the frame being sealed and its ciphertext), and never the whole archive.
+    caller). Streaming: a bounded number of chunk-sized buffers is held at a time, and never the
+    whole archive. They include at least the one-ahead read below, the frame being sealed, its
+    ciphertext, and a transient copy while a short-reading or buffer-reusing source is read. That
+    list is read from this code; the peak is not measured here.
     Synchronous; the BackupRunner calls it off the event loop (``asyncio.to_thread``).
 
     ``on_frames`` receives the number of AES-GCM invocations this run performed — one per frame, each
