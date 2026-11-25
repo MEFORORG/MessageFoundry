@@ -516,8 +516,9 @@ async def test_alert_rules_with_no_graph_show_a_scoped_caller_no_named_rule(
     engine: Engine,  # noqa: F811
 ) -> None:
     """BACKLOG #3378 item 4: with no graph loaded no name is known to be an inbound, so a scoped
-    caller sees no rule that names a connection, even one on a name its scope lists. A rule naming
-    nobody still shows. The control: an all-channels caller reads every rule."""
+    caller sees no rule that names a connection, even one on a name its scope lists. A ``"*"`` rule
+    of an inbound-only type still shows, and a ``"*"`` rule of ``"any"`` does not (BACKLOG #8390
+    item 14). The control: an all-channels caller reads every rule."""
     assert engine.registry_runner is None
     rules = AlertsSettings(
         rules=[

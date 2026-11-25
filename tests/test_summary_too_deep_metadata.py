@@ -62,15 +62,17 @@ async def test_a_too_deep_metadata_cell_does_not_fail_the_message_list(
     enc_engine: Engine,  # noqa: F811
 ) -> None:
     """End to end: ``GET /messages`` over two messages, one with a too-deep metadata cell, answers
-    200 with that row's metadata null, where it answered 500 for the whole page."""
+    200 with that row's metadata null, where it answered 500 for the whole page. The control: the
+    other message's readable user bag still comes back non-null."""
     store = enc_engine.store
     assert isinstance(store, MessageStore)
     deep = await store.enqueue_message(channel_id="IB_A", raw=ADT, deliveries=[])
-    await store.enqueue_message(channel_id="IB_A", raw=ADT, deliveries=[])
-    aad = message_cell_aad("metadata", message_id=deep, channel_id="IB_A")
-    await store._db.execute(
-        "UPDATE messages SET metadata=? WHERE id=?", (store._enc(_DEEP_CELL, aad=aad), deep)
-    )
+    readable = await store.enqueue_message(channel_id="IB_A", raw=ADT, deliveries=[])
+    for mid, cell in ((deep, _DEEP_CELL), (readable, '{"user": {"k": "v"}}')):
+        aad = message_cell_aad("metadata", message_id=mid, channel_id="IB_A")
+        await store._db.execute(
+            "UPDATE messages SET metadata=? WHERE id=?", (store._enc(cell, aad=aad), mid)
+        )
     await store._db.commit()
     service = await _service(enc_engine)
     await _add_user(service, "boss", [Role.ADMINISTRATOR.value])
@@ -79,5 +81,7 @@ async def test_a_too_deep_metadata_cell_does_not_fail_the_message_list(
         r = await c.get("/messages", headers=_auth(token))
         assert r.status_code == 200, r.text
         rows = {m["id"]: m for m in r.json()["messages"]}
-    assert len(rows) == 2 and deep in rows
+    assert set(rows) == {deep, readable}
     assert rows[deep]["metadata"] is None
+    # This caller reads a present bag masked; masked or not, it is not null.
+    assert rows[readable]["metadata"] is not None

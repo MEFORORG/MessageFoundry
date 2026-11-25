@@ -1074,8 +1074,9 @@ _CONTROL_ACTION_SIDE: Final = {"restart_inbound": "inbound", "restart_outbound":
 
 #: Which side of the graph raises each alert event type (BACKLOG #3378). ``"outbound"`` marks a type
 #: whose emitters, read on 2026-11-22, raise it only for an outbound lane, ``"both"`` one raised
-#: on both sides, ``"inbound"`` one raised on the inbound side, and ``"none"`` one whose settings
-#: comment keys it on something other than a connection name. ``GET /alerts/rules`` reads every
+#: on both sides, ``"inbound"`` one raised on the inbound side, and ``"none"`` one whose emitters
+#: were read as keying it on something other than a connection name, a label such as a sink's or
+#: ``dr_backup``. ``GET /alerts/rules`` reads every
 #: value, as its ``visible`` test shows, so a wrong reading of an emitter can show a rule that
 #: should be withheld. No test checks a value against the emitters. A test pins the keys to
 #: ``config.settings._ALERT_EVENT_TYPES``, so a new type has to be classified.
@@ -3921,15 +3922,15 @@ _TOO_DEEP_LOG_MAX: Final = 4096
 _too_deep_logged: dict[str, float] = {}
 
 
-def _first_too_deep_log(ref: str) -> bool:
-    """Whether to log a too-deep cell for the message ``ref`` names now, as the layered search's
-    refusal log decides per preset."""
+def _first_too_deep_log(message_id: str) -> bool:
+    """Whether to log a too-deep cell for ``message_id`` now, as the layered search's refusal log
+    decides per preset."""
     now = time.monotonic()
-    last = _too_deep_logged.pop(ref, None)
+    last = _too_deep_logged.pop(message_id, None)
     if last is not None and now - last < _TOO_DEEP_LOG_INTERVAL_S:
-        _too_deep_logged[ref] = last
+        _too_deep_logged[message_id] = last
         return False
-    _too_deep_logged[ref] = now
+    _too_deep_logged[message_id] = now
     while len(_too_deep_logged) > _TOO_DEEP_LOG_MAX:
         _too_deep_logged.pop(next(iter(_too_deep_logged)))
     return True
@@ -3939,15 +3940,18 @@ def _summary_metadata(d: Mapping[str, Any]) -> str | None:
     """The user bag :func:`_summary` shows for one row, or ``None`` when the stored cell is too
     deep to read (BACKLOG #6712). Raising there would fail the whole answer the row is on: at least
     a message list or search page, a layered search, or one message's detail. So the row shows no
-    metadata, and a WARNING names the message, never the cell, at most once per message per
-    :data:`_TOO_DEEP_LOG_INTERVAL_S`. The delivery reader still raises."""
+    metadata, and a WARNING names the message, never the cell. The line repeats for a message
+    only after :data:`_TOO_DEEP_LOG_INTERVAL_S`, or once more than :data:`_TOO_DEEP_LOG_MAX`
+    others have been logged since. The wire shows such a row as it shows one with no metadata. The
+    delivery reader still raises."""
     try:
         return user_metadata(d.get("metadata"), row_id=d["id"])
     except MetadataTooDeepError:
-        ref = str(d["id"])[:12]
-        if _first_too_deep_log(ref):
+        message_id = str(d["id"])
+        if _first_too_deep_log(message_id):
             _log.warning(
-                "message %r: its stored metadata is too deeply nested to read; shown as none", ref
+                "message %r: its stored metadata is too deeply nested to read; shown as none",
+                message_id[:12],
             )
         return None
 
@@ -4296,20 +4300,22 @@ def _preset_target(stored: object) -> Any:
 
 
 def _compose_preset_layers(
-    criterias: list[dict[str, Any]], *, scan_limit: int = DEFAULT_CONTENT_SCAN_LIMIT
+    criterias: list[dict[str, Any]], *, scan_limit: int
 ) -> tuple[SearchSpec, dict[str, str | None]]:
     """AND-compose N saved-preset criteria into one ``(SearchSpec, metadata-filters)`` for
     ``search_messages`` (ADR 0136 §5, BACKLOG #151). Each metadata scalar
     (``channel_id``/``status``/``message_type``/``control_id``) takes the first non-empty value and
     **rejects a conflicting second** (400). **Exactly one** preset may carry a content needle (a
     ``content`` substring or a ``field_path``[+``field_value``]); >1 or 0 → 400. Raises
-    :class:`HTTPException` (400) on a conflict / missing-or-duplicate needle; the caller maps the
-    ``ContentSearchError`` from a malformed field path likewise.
+    :class:`HTTPException` (400) on a conflict / missing-or-duplicate needle, and maps
+    ``make_spec``'s refusal of a malformed needle to a 400 too.
 
     A lone ``field_value`` counts as a needle too, so ``make_spec`` refuses it (400) rather than the
     compose dropping it (BACKLOG #6700). Each needle is validated as it is found, at ``scan_limit``,
-    so a malformed one is refused with its own cause rather than counted as a second needle, and
-    its terms reach ``make_spec`` as stored, so a non-text one is refused rather than dropped."""
+    so a malformed one is refused with its own cause rather than counted as a second needle. A
+    preset that carries a needle passes its terms to ``make_spec`` as stored, so a non-text one
+    there is refused rather than dropped. Which terms make a preset carry one is
+    :func:`sends_a_needle`'s rule."""
     meta_keys = ("channel_id", "status", "message_type", "control_id")
     meta: dict[str, str | None] = dict.fromkeys(meta_keys)
     spec: SearchSpec | None = None
