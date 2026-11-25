@@ -493,6 +493,7 @@ def test_a_pyodbc_rollback_error_over_a_lost_commit_reads_as_unknown(
     only as its context. The sessions ended, so the outcome is unknown and the row records it,
     not the defect a bare root otherwise reports. pyodbc is not installed on every leg, so the
     stand-ins the transit-bound tests use take its place."""
+    from messagefoundry.store.base import store_call_errors
     from tests.test_keyless_chain_every_command import _PyodbcError, _ServerDriverError
     from tests.test_transit_bound_attestation import _stand_in_server_drivers
 
@@ -500,6 +501,9 @@ def test_a_pyodbc_rollback_error_over_a_lost_commit_reads_as_unknown(
     setenv_at_rest_opt_out(monkeypatch)
     db = tmp_path / "cli.db"
     tokens = asyncio.run(_seed(db))
+    # Warmed before the stand-ins: the tuple is cached, and a first call under them would
+    # keep the stand-in in it for every later test on this worker.
+    store_call_errors()
     _stand_in_server_drivers(monkeypatch)
     revoke = MessageStore.revoke_all_sessions
 
@@ -532,6 +536,7 @@ def test_a_bare_pyodbc_root_is_a_defect_unless_its_state_is_transient(
 ) -> None:
     """The pyodbc-root arm with no lost link: a bind-count mismatch is a defect the dispatch floor
     reports by class and SQLSTATE, and a deadlock victim is a refusal that rolled back."""
+    from messagefoundry.store.base import store_call_errors
     from tests.test_keyless_chain_every_command import _PyodbcError
     from tests.test_transit_bound_attestation import _stand_in_server_drivers
 
@@ -539,6 +544,9 @@ def test_a_bare_pyodbc_root_is_a_defect_unless_its_state_is_transient(
     setenv_at_rest_opt_out(monkeypatch)
     db = tmp_path / "cli.db"
     tokens = asyncio.run(_seed(db))
+    # Warmed before the stand-ins: the tuple is cached, and a first call under them would
+    # keep the stand-in in it for every later test on this worker.
+    store_call_errors()
     _stand_in_server_drivers(monkeypatch)
 
     async def refused(self: MessageStore, **kwargs: object) -> RevokeResult:
