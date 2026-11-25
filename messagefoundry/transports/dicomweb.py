@@ -10,7 +10,17 @@ a DICOMweb service via STOW-RS.
 PHI-bearing POST to an unintended host; ASVS 15.3.2), the cleartext-credential refusal, and the outbound
 length limits. The fail-closed ``[egress].allowed_http`` host gate is enforced by ``build_destination`` (it folds
 DICOMWEB into the REST/SOAP/FHIR arm — see transports.egress ``_allowlist_for`` / ``check_egress_allowed``).
-It needs **no** ``pydicom``: the object rides as opaque bytes, so DICOMweb works without the DIMSE stack.
+It needs **no** ``pydicom``: the object rides as bytes, so DICOMweb works without the DIMSE stack. A
+202 reply is compared with the object's File Meta Media Storage SOP Instance UID, read by hand
+(:func:`_sent_instance_uid`), and, when ``pydicom`` is installed, its data set SOP Instance UID
+(:func:`_data_set_instance_uid`), both read before the POST (:func:`_read_sent_uids`; BACKLOG
+#5914). An installed ``pydicom`` that does not load, or whose read of the object raises, is taken
+as reading no data set UID, with one WARNING per process for each of the two, so the object is
+still sent; a :class:`MemoryError` from the load or the read is raised instead, before the POST,
+and the object is not sent. A read that raises a fault the codec wraps (an object it cannot
+parse) also reads as no data set UID, with no WARNING. A read that raises a fault the codec does not wrap, on an object with no File Meta UID,
+lets a 202 naming any UID confirm it (:func:`_unconfirmed_202`). :func:`_data_set_instance_uid` says
+which faults do what.
 
 **STOW-RS layer (on top of REST):**
 - The outgoing object is a **binary** DICOM Part-10 body, base64-carried through the str/store substrate
@@ -38,17 +48,23 @@ from __future__ import annotations
 import asyncio
 import base64
 import http.client
+import importlib.util
 import logging
 import secrets
+import struct
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, NamedTuple
 
 from messagefoundry.config.models import ConnectorType, Destination, bool_setting
 from messagefoundry.config.tls_policy import refuse_chain_check_on_os_roots
 from messagefoundry.controlchars import has_control_char, has_lone_surrogate
+from messagefoundry.parsing.dicom._deps import load_dcmread, load_header_readers
+from messagefoundry.parsing.dicom.errors import DicomError
+from messagefoundry.parsing.dicom.peek import DicomPeek
 from messagefoundry.redaction import json_loads_or_refusal, refuse_repeated_keys
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -64,7 +80,12 @@ from messagefoundry.transports.bounded_read import (
     hop_identity,
     read_2xx_reply_text,
 )
-from messagefoundry.transports.dicom import recover_dicom_object_bytes
+from messagefoundry.transports.dicom import (
+    _ignore_pydicom_value_warnings,
+    _logs_held,
+    _write_held,
+    recover_dicom_object_bytes,
+)
 
 # Reuse REST's hardened HTTP plumbing — same transports/ package, same no-redirect + TLS posture (NOT a
 # wrapper around RestDestination; ADR 0025 §2, exactly as fhir.py / soap.py do).
@@ -109,10 +130,36 @@ _DICOM_PART_TYPE = "application/dicom"
 _DICOM_JSON = "application/dicom+json"
 # DICOM Tag (group,element) for the STOW-RS FailedSOPSequence in the dicom+json response (DICOM PS3.18).
 _FAILED_SOP_SEQUENCE = "00081198"
-# ReferencedSOPSequence: the instances the server stored. A 202 must name at least one (#5914);
-# see _names_an_instance.
+# ReferencedSOPSequence: the instances the server stored. A 202 must name the instance sent (#5914),
+# except as _unconfirmed_202 says; see _named_uid and _sent_instance_uid.
 _REFERENCED_SOP_SEQUENCE = "00081199"
 _REFERENCED_SOP_INSTANCE_UID = "00081155"
+# PS3.10 section 7.1: a 128-byte preamble, then "DICM", then the File Meta group in Explicit VR
+# Little Endian. These VRs take the short form, a 2-byte length (PS3.5 section 7.1.2). Every other
+# VR, an unknown one included, takes the long form: two reserved bytes, then a 4-byte length, as
+# PS3.5 tells a reader to assume for a VR it does not know.
+_PART10_PREAMBLE = 128
+# fmt: off
+_SHORT_FORM_VRS = frozenset({
+    b"AE", b"AS", b"AT", b"CS", b"DA", b"DS", b"DT", b"FL", b"FD", b"IS", b"LO",
+    b"LT", b"PN", b"SH", b"SL", b"SS", b"ST", b"TM", b"UI", b"UL", b"US",
+})
+# fmt: on
+# The File Meta group read is bounded by this many bytes after "DICM": a conformant group is a few
+# hundred bytes, so the cap refuses only a broken or hostile object (BACKLOG #5914).
+_FILE_META_CAP = 64 * 1024
+# Why the object sent has no File Meta UID to compare: fixed text, never a value (PHI-safe). No two
+# capitalised words sit side by side, so the PHI name-run redaction leaves them whole. They end the
+# unconfirmed-202 reason (_unconfirmed_202), which is cut twice before it is stored: safe_exc cuts
+# the message at 200 characters, and the store cuts again at 200 after the "NegativeAckError: "
+# prefix. The replay advice before the cause survives both cuts, as on main; the cause may be cut
+# part-way in the stored text.
+_META_NO_MAGIC = "no Part-10 preamble and DICM magic"
+_META_NO_0003 = "no (0002,0003) in the file meta group"
+_META_WRONG_VR = "a (0002,0003) whose VR is not UI"
+_META_NOT_A_UID = "a (0002,0003) value that is not a UID"
+_META_OVERRUN = "a file meta element past the object end"
+_META_TOO_LONG = "a file meta group past the read cap"
 # PS3.18 Annex F: the only keys a sequence (SQ) or UID (UI) element may carry. BulkDataURI and
 # InlineBinary are never allowed on SQ or UI, so an element read here carrying any other key is
 # malformed and fails closed -- an allow-list, so a misspelt "value" cannot read as an empty
@@ -343,26 +390,246 @@ def _failed_sop_state(datasets: list[dict[str, Any]]) -> tuple[bool, bool]:
     return proven, malformed
 
 
-def _names_an_instance(item: Any) -> bool:
-    """True when a ReferencedSOPSequence item is a dataset whose ReferencedSOPInstanceUID element
-    has ``vr`` ``UI``, passes :func:`_element_values`, and holds exactly one value (the attribute's
-    VM is 1): a string that passes :func:`_is_uid` once trailing NUL or space padding, which a
-    binary-to-JSON converter can leave, is dropped. Anything else confirms nothing (BACKLOG #5914):
-    no Value, an empty or null one, a blank, non-string or non-UID entry, or more than one entry.
-    The UID is tested, never logged or returned (PHI-safe)."""
+def _sent_instance_uid(obj: bytes) -> tuple[str | None, str]:
+    """``(uid, "")`` for the Media Storage SOP Instance UID (``0002,0003``) in the File Meta group
+    of the Part-10 object sent, or ``(None, cause)`` when there is none to compare, ``cause`` being
+    one of the fixed ``_META_*`` strings (BACKLOG #5914).
+
+    Read by hand, so the destination still needs no ``pydicom``: after the 128-byte preamble and
+    ``DICM``, the File Meta elements are always Explicit VR Little Endian (PS3.10 section 7.1). The
+    walk stops at the first element outside group ``0002`` and at :data:`_FILE_META_CAP` bytes, so
+    a hostile object cannot make it walk the whole object. The (0002,0000) Group Length is not
+    read: pydicom ignores a wrong one too, so one that is absent, zero, too short, over the cap or
+    undefined changes nothing. The VR of (0002,0003) is checked before its value, at most the cap,
+    is sliced; its NUL or space padding is dropped before the 64-character check. The UID is never
+    logged (PHI-safe)."""
+    if obj[_PART10_PREAMBLE : _PART10_PREAMBLE + 4] != b"DICM":
+        return None, _META_NO_MAGIC
+    pos = _PART10_PREAMBLE + 4
+    size = len(obj)
+    limit = min(size, pos + _FILE_META_CAP)
+
+    def past(reach: int) -> str:
+        # Bytes needed up to ``reach`` that the object does not hold are an overrun; ones it holds
+        # past the cap are a group longer than the reader reads.
+        return _META_OVERRUN if reach > size else _META_TOO_LONG
+
+    while pos + 8 <= limit:
+        group, element = struct.unpack_from("<HH", obj, pos)
+        if group != 0x0002:
+            return None, _META_NO_0003
+        vr = obj[pos + 4 : pos + 6]
+        if vr in _SHORT_FORM_VRS:
+            (length,) = struct.unpack_from("<H", obj, pos + 6)
+            start = pos + 8
+        else:
+            if pos + 12 > limit:
+                return None, past(pos + 12)
+            (length,) = struct.unpack_from("<I", obj, pos + 8)
+            start = pos + 12
+        end = start + length  # an undefined length (0xFFFFFFFF) runs past the limit, so is refused
+        if end > limit:
+            return None, past(end)
+        if element == 0x0003:
+            if vr != b"UI":
+                return None, _META_WRONG_VR
+            raw = obj[start:end].rstrip(b"\0 ")
+            if len(raw) > _DICOM_UID_MAX_LEN or not raw.isascii():
+                return None, _META_NOT_A_UID
+            uid = raw.decode("ascii")
+            return (uid, "") if _is_uid(uid) else (None, _META_NOT_A_UID)
+        pos = end
+    # The walk met its limit: a partial element header was cut off by it, or the cap stopped the
+    # walk; otherwise the object ended with no (0002,0003).
+    if pos < limit:
+        return None, past(pos + 8)
+    if limit < size:
+        return None, _META_TOO_LONG
+    return None, _META_NO_0003
+
+
+def _dicom_extra_installed() -> bool:
+    """Whether ``pydicom``, the optional ``[dicom]`` extra, can be found on this host, asked on each
+    send. A spec with no ``origin`` is a namespace package, such as a ``pydicom`` directory an
+    uninstall left behind, and is taken as absent: it holds no ``pydicom`` to load. Once ``pydicom``
+    is imported, ``find_spec`` answers from the imported module, so an extra removed after that is
+    still taken as installed. A ``pydicom`` in ``sys.modules`` with no spec, on which ``find_spec``
+    raises, is taken as installed, so :func:`_dicom_extra_fault` judges it."""
+    try:
+        spec = importlib.util.find_spec("pydicom")
+    except ValueError:
+        return True
+    return spec is not None and spec.origin is not None
+
+
+class _SentUids(NamedTuple):
+    """The SOP Instance UIDs of the object sent that a 202 is compared with, read before the POST
+    (:func:`_read_sent_uids`). ``meta`` is the File Meta (0002,0003) UID or ``None``, with
+    ``cause`` one of the fixed ``_META_*`` strings saying why when it is ``None``; ``data_set`` is
+    the data set (0008,0018) UID or ``None``; ``read_fault`` is whether the codec's read of the
+    object raised a fault it does not wrap, so the data set UID is unknown rather than absent.
+    Never logged (PHI-safe)."""
+
+    meta: str | None
+    cause: str
+    data_set: str | None
+    read_fault: bool = False
+
+
+# Which of the two pre-read WARNINGs ("load", "read") have been written in this process (BACKLOG
+# #5914). The read runs on every send, so without it each send would warn.
+_pre_read_warned: set[str] = set()
+_pre_read_warned_lock = threading.Lock()
+
+
+def _first_pre_read_warning(kind: str) -> bool:
+    """Whether this is the first pre-read WARNING of ``kind`` in this process, marking it written."""
+    with _pre_read_warned_lock:
+        if kind in _pre_read_warned:
+            return False
+        _pre_read_warned.add(kind)
+        return True
+
+
+def _dicom_extra_fault() -> str | None:
+    """The class name of what the ``[dicom]`` extra raised when loaded, or ``None`` when it loads:
+    the ``dcmread`` reader and the readers the deflate guard replays
+    (:mod:`messagefoundry.parsing.dicom._deps`), checked apart from any object, as the SCU loads
+    them before its parse. An import can raise an exception of any class, so any
+    :class:`Exception` but a :class:`MemoryError` counts; a :class:`BaseException` that is not an
+    :class:`Exception` is not caught (BACKLOG #5914)."""
+    try:
+        load_dcmread()
+        load_header_readers()
+    except MemoryError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a broken package's import can raise any class
+        return type(exc).__name__
+    return None
+
+
+def _warn_extra_unusable(fault: str) -> None:
+    """Write, once per process, the WARNING that the installed ``[dicom]`` extra does not load, so
+    DICOMweb compares a 202 with the File Meta UID alone, as with no extra (BACKLOG #5914).
+    ``fault`` is the class name of what the load raised; the load's own text is not written. A
+    reload keeps the ``pydicom`` modules already imported, so the line says to restart."""
+    if not _first_pre_read_warning("load"):
+        return
+    logger.warning(
+        "DICOMweb: the [dicom] extra (pydicom) on this host is installed but does not load (%s), "
+        "so a 202 is compared with the file meta SOP Instance UID alone, as without the extra; "
+        "repair or remove the extra, then restart the engine",
+        fault,
+    )
+
+
+def _warn_read_fault(fault: str, held: list[logging.LogRecord]) -> None:
+    """Write, once per process, the WARNING that the codec's read of an object raised ``fault``, the
+    class name of a fault it does not wrap, so that object's data set UID is not compared (BACKLOG
+    #5914). The fault's own text can carry a value, so it is not written (PHI-safe). With the first
+    WARNING go the lines pydicom logged during that read, ``held``, through the redacting filter;
+    later reads' lines are dropped, as on a read that succeeds."""
+    if not _first_pre_read_warning("read"):
+        return
+    _write_held(held)
+    logger.warning(
+        "DICOMweb: reading an object's data set with the [dicom] extra (pydicom) raised %s before "
+        "it was sent, so its data set SOP Instance UID is not compared: a 202 is compared with the "
+        "file meta SOP Instance UID alone, or, for an object with none, confirmed by any UID it "
+        "names; this is written once per process, and the extra may be broken",
+        fault,
+    )
+
+
+def _data_set_instance_uid(obj: bytes) -> tuple[str | None, bool]:
+    """The data set's SOP Instance UID (``0008,0018``) of the object sent, read with the engine's
+    DICOM codec (:class:`~messagefoundry.parsing.dicom.peek.DicomPeek`: a header read that never
+    materialises pixel data, behind its deflate guard, though not held to :data:`_FILE_META_CAP`),
+    or ``None`` when none is read: the optional ``[dicom]`` extra is absent or does not load, the
+    object does not parse (a :class:`~messagefoundry.parsing.dicom.errors.DicomError`), the read
+    raises another fault, or it carries no UID in the grammar :func:`_is_uid` checks. The second
+    item is whether the read raised such another fault. A server builds its reply from this UID, so a 202 for an object
+    whose File Meta was not rewritten after a re-UID still names it (BACKLOG #5914).
+
+    Run before the POST. The extra is loaded first, apart from the object, as the SCU loads it
+    before its parse (``DicomScuDestination._store_object``): an extra that is found but does not
+    load is taken as absent, so the object is sent and a 202 is compared with its File Meta UID
+    alone, and :func:`_warn_extra_unusable` writes one WARNING per process. A
+    :class:`~messagefoundry.parsing.dicom.errors.DicomError` from the parse reads as no
+    UID, and so does a fault of a class the codec wraps into one, even one a broken extra raised.
+    Any other :class:`Exception` but a :class:`MemoryError` from the parse, a warning the filters
+    turn into an error included, also reads as no UID, and :func:`_warn_read_fault` writes one
+    WARNING per process naming its class, never its text; nothing is refused before the POST. The
+    SCU's ignores for pydicom's value warnings, which name a value, are put back first. pydicom's
+    log lines from the parse are held, as the SCP holds its reads' lines
+    (:func:`~messagefoundry.transports.dicom._logs_held`), and written, through the same redacting
+    filter, only with that first WARNING; otherwise none is written, since the object is sent as
+    bytes and a line on how pydicom read it says nothing about the send.
+    pydicom's own copy of such a line as a Python warning is not held. A parse failure is logged by
+    exception class only, never the UID or the bytes (PHI-safe)."""
+    if not _dicom_extra_installed():
+        logger.debug(
+            "DICOMweb: the [dicom] extra is absent, so no data set SOP Instance UID is read"
+        )
+        return None, False
+    _ignore_pydicom_value_warnings()
+    extra_fault = _dicom_extra_fault()
+    if extra_fault is not None:
+        _warn_extra_unusable(extra_fault)
+        return None, False
+    parse_fault: str | None = None
+    uid: str | None = None
+    with _logs_held() as held:
+        try:
+            uid = DicomPeek.parse(obj).sop_instance_uid
+        except DicomError as exc:
+            logger.debug("DICOMweb: no data set SOP Instance UID read (%s)", type(exc).__name__)
+            return None, False
+        except MemoryError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - pydicom's faults on an object share no base
+            parse_fault = type(exc).__name__
+    if parse_fault is not None:
+        _warn_read_fault(parse_fault, held)
+        return None, True
+    if uid is None:
+        return None, False
+    uid = uid.rstrip("\0 ")
+    return (uid if _is_uid(uid) else None), False
+
+
+def _read_sent_uids(obj: bytes) -> _SentUids:
+    """Both comparable UIDs of the object sent: the File Meta one by hand
+    (:func:`_sent_instance_uid`) and the data set one with the codec
+    (:func:`_data_set_instance_uid`). Called before the POST, as the SCU parses before it
+    associates (BACKLOG #5914). At least a :class:`MemoryError` from loading the extra or from the
+    codec's read, a :class:`BaseException` that is not an :class:`Exception`, and a fault in finding
+    the extra (:func:`_dicom_extra_installed`) other than a :class:`ValueError` are not caught; any
+    other fault in the read reads as no data set UID, and the object is still sent."""
+    meta, cause = _sent_instance_uid(obj)
+    data_set, read_fault = _data_set_instance_uid(obj)
+    return _SentUids(meta, cause, data_set, read_fault)
+
+
+def _named_uid(item: Any) -> str | None:
+    """The UID a ReferencedSOPSequence item names, padding dropped, or ``None``: a dataset whose
+    ReferencedSOPInstanceUID element has ``vr`` ``UI``, passes :func:`_element_values`, and holds
+    exactly one value (the attribute's VM is 1), a string that passes :func:`_is_uid` once
+    trailing NUL or space padding, which a binary-to-JSON converter can leave, is dropped.
+    Anything else names nothing (BACKLOG #5914). The UID is compared, never logged (PHI-safe)."""
     if not isinstance(item, dict):
-        return False
+        return None
     element = item.get(_REFERENCED_SOP_INSTANCE_UID)
     if not isinstance(element, dict) or element.get("vr") != "UI":
-        return False
+        return None
     value = _element_values(element)
-    if value is None or len(value) != 1:
-        return False
-    uid = value[0]
-    return isinstance(uid, str) and _is_uid(uid.rstrip("\0 "))
+    if value is None or len(value) != 1 or not isinstance(value[0], str):
+        return None
+    uid = value[0].rstrip("\0 ")
+    return uid if _is_uid(uid) else None
 
 
-def _stowrs_refusal(body: str, status: int) -> tuple[str, str] | None:
+def _stowrs_refusal(body: str, status: int, sent: _SentUids) -> tuple[str, str] | None:
     """The refusal for a 2xx STOW-RS reply, or ``None`` when it is a delivery. Not every reply
     that fails to confirm the store is refused (see the last paragraph). Every code is permanent: a
     re-send would get the same reply.
@@ -376,19 +643,24 @@ def _stowrs_refusal(body: str, status: int) -> tuple[str, str] | None:
       proves no rejection (BACKLOG #5914).
     - ``failed-sop``: a well-formed FailedSOPSequence (``00081198``) with an item, in any of the
       datasets, a proven rejection.
-    - ``unconfirmed-202``: a 202 (stored with warnings, or some instances failed) whose reply names
-      no stored instance: no ReferencedSOPSequence (``00081199``) item that names one by its
-      ReferencedSOPInstanceUID (``00081155``; :func:`_names_an_instance`). An empty 202 is one.
+    - ``unconfirmed-202``: a 202 (stored with warnings, or some instances failed) not refused
+      above whose reply does not name the instance sent (:func:`_unconfirmed_202`): no
+      ReferencedSOPSequence (``00081199``) item that names its File Meta Media Storage SOP Instance
+      UID or its data set SOP Instance UID. An empty 202 is one. When ``sent`` has neither UID
+      there is nothing to compare, so a 202 not refused above is one whatever its reply names,
+      with a reason naming why (BACKLOG #5914, decisions of 2026-11-23), except where the data
+      set read raised a fault the codec does not wrap (``read_fault``): then an item naming any UID
+      confirms it, as the BACKLOG #5914 reply check did before the UID comparison; an empty 202, or one naming no valid UID, is still refused
+      (Manager decision of 2026-11-24).
 
     An empty reply (:func:`_reply_is_empty`) on any other 2xx is not refused. A 200 is not held to
-    the ReferencedSOPSequence rule (BACKLOG #5914 ruling), so a 200 dataset that confirms nothing
-    and is not refused above, ``{}`` included, is delivered. docs/CONNECTIONS.md *DICOMweb*, *Status classification*, states
-    the rule in full.
+    the ReferencedSOPSequence rule and is not compared with ``sent`` (BACKLOG #5914 ruling), so a 200
+    dataset that confirms nothing and is not refused above, ``{}`` included, is delivered.
+    docs/CONNECTIONS.md *DICOMweb*, *Status classification*, states the rule in full.
 
-    Returned as ``(code, reason)``; both are fixed strings that name no reply content."""
-    unconfirmed = ("unconfirmed-202", f"no ReferencedSOPSequence confirming the store; {_NOT_SENT}")
+    Returned as ``(code, reason)``; both are fixed strings that name no reply content and no UID."""
     if _reply_is_empty(body):
-        return unconfirmed if status == 202 else None
+        return _unconfirmed_202([], sent) if status == 202 else None
     # A refused parse is (None, hint), and None is not a dataset, so the hint need not be read.
     obj, _ = json_loads_or_refusal(body.lstrip(_BOM), object_pairs_hook=refuse_repeated_keys)
     if isinstance(obj, dict):
@@ -408,10 +680,28 @@ def _stowrs_refusal(body: str, status: int) -> tuple[str, str] | None:
             f"a FailedSOPSequence in a shape dicom+json does not allow; {_NOT_SENT}",
         )
     if status == 202:
-        referenced = _sequence_items(datasets, _REFERENCED_SOP_SEQUENCE) or []
-        if not any(_names_an_instance(i) for i in referenced):
-            return unconfirmed
+        return _unconfirmed_202(_sequence_items(datasets, _REFERENCED_SOP_SEQUENCE) or [], sent)
     return None
+
+
+def _unconfirmed_202(referenced: list[Any], sent: _SentUids) -> tuple[str, str] | None:
+    """The ``unconfirmed-202`` refusal for a 202 whose ReferencedSOPSequence items are
+    ``referenced``, or ``None`` when an item names the instance sent: by its File Meta UID or its
+    data set's SOP Instance UID, both read before the POST (:func:`_read_sent_uids`), so nothing
+    here parses the object. With neither UID to compare, the reason names why the File Meta has
+    none (BACKLOG #5914). The exception is an object with no File Meta UID whose data set read
+    raised a fault the codec does not wrap (``read_fault``): nothing can be compared, so a 202 is
+    confirmed as the BACKLOG #5914 reply check did before the UID comparison, by an item that names any UID; with none named it is
+    still refused."""
+    named = {uid for uid in map(_named_uid, referenced) if uid is not None}
+    if any(uid in named for uid in (sent.meta, sent.data_set)):
+        return None
+    if sent.meta is None and sent.read_fault and named:
+        return None
+    if sent.meta is None and sent.data_set is None:
+        # The replay advice goes before the cause, so the stored text's two cuts keep it.
+        return "unconfirmed-202", f"no UID to compare; {_NOT_SENT}; the object has {sent.cause}"
+    return "unconfirmed-202", f"no ReferencedSOPSequence confirming the instance sent; {_NOT_SENT}"
 
 
 def _classify_stowrs(status: int, base_url: str) -> DeliveryError:
@@ -709,6 +999,10 @@ class DicomWebDestination(DestinationConnector):
         if self._hop_guard is not None:
             # BACKLOG #2989: classified, so a refusal does not leave _post as a raw ValueError.
             self._hop_guard.assert_delivery_url(self.base_url, connector="DICOMweb")
+        # BACKLOG #5914: the UIDs a 202 is compared with are read before a byte is sent, as the SCU
+        # parses before it associates; a fault in the read reads as no data set UID
+        # (_data_set_instance_uid says which).
+        sent = _read_sent_uids(dicom_bytes)
         data, boundary = self._multipart_body(dicom_bytes)
         headers = {
             **self._headers,
@@ -776,7 +1070,7 @@ class DicomWebDestination(DestinationConnector):
         # here, and with no handler active no decode error -- which holds the whole body -- rides
         # the refusal's __context__. The code leads the text, so a cut stored error keeps it; the
         # text names no reply content.
-        refused = _stowrs_refusal(body, status)
+        refused = _stowrs_refusal(body, status, sent)
         if refused is not None:
             code, reason = refused
             raise NegativeAckError(

@@ -397,25 +397,6 @@ function Invoke-FinishedWorktreeRemoval {
     }
 }
 
-# Whether the tree's directory is still there after the removal: 'present', 'absent', or 'unknown: <why>'.
-# FAIL CLOSED. Test-Path answers $false for a path it may not read, so it cannot say "gone". Absent is
-# only what Test-ConfirmedGoneOrThrow confirms, the rule prune-merged.ps1's orphan ledger is read by,
-# with -Plain, as the root check required of the folders above the tree, and -RequireParent, so a tree
-# whose parent folder is gone too is not confirmed gone here.
-# A directory git has just deleted can sit delete-pending for a moment while another process (an
-# indexer, an antivirus scan) still holds it, and answers access-denied until it goes; so an unreadable
-# reading is taken again a few times before it stands. Only 'unknown' is retried, never 'present'.
-function Get-EndStatePresence([string]$Path, [int]$Tries = 5, [int]$WaitMs = 400) {
-    for ($i = 1; ; $i++) {
-        try { return $(if (Test-ConfirmedGoneOrThrow $Path 'the removed tree' -Plain -RequireParent) { 'absent' } else { 'present' }) }
-        catch {
-            # The readers end their message "Nothing was removed.", which is false once git has run.
-            if ($i -ge $Tries) { return "unknown: $($_.Exception.Message -replace '\s*Nothing was removed\.\s*$', '')" }
-        }
-        Start-Sleep -Milliseconds $WaitMs
-    }
-}
-
 function Invoke-OneRemoval {
     param([string]$Primary, [object]$Row, [double]$IdleHours, [string]$OwnClaimsDir, [string]$AllocDir)
     $path = $Row.Path
@@ -448,7 +429,9 @@ function Invoke-OneRemoval {
     $listing = @(& git -C $Primary worktree list --porcelain 2>$null)
     $listOk = ($LASTEXITCODE -eq 0 -and $listing.Count -gt 0)
     $stillRegistered = @($listing | Where-Object { $_ -like 'worktree *' -and (ConvertTo-Norm $_.Substring(9).Trim()) -eq $norm }).Count -gt 0
-    $dir = Get-EndStatePresence $path
+    # -Plain, as the root check required of the folders above the tree; -RequireParent, so a tree whose
+    # parent folder is gone too is not confirmed gone here.
+    $dir = Get-EndStatePresence $path -Plain -RequireParent
     if (-not $listOk) {
         $Row.Outcome = 'FAILED'
         $Row.Reason = "git exit $removeExit, and the worktree list could not be re-read; directory $($dir): $gitText"

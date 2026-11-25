@@ -2198,7 +2198,12 @@ count is above `0` (vault BACKLOG #2613).
 - **When acceptable:** during bring-up, while a DBA reduces the grant. Not as a steady state.
 - **It is never silent:** a WARN at every start naming each excess grant; a `store_privilege_preflight`
   audit row; a `store_principal_over_granted` entry here and in `GET /security/posture`, whose
-  `store_privilege` field carries the full observation.
+  `store_privilege` field carries the observation's status, excess list and detail. When the probe
+  also named grants it could not read, the entry lists them and says the excess list may be
+  incomplete (BACKLOG #6015). An entry without that clause is not proof the list is complete: at
+  least a failed SQL Server user-defined role enumeration is noted in the detail, and the audit
+  row's, rather than in the entry, and a SQL Server read with a fixed role unread skips that
+  enumeration without noting it.
 - **How it refuses:** by default under `enforce`. `[store].require_least_privilege = true`
   ([`CONFIGURATION.md`](CONFIGURATION.md)) makes the refusal outrank the opt-out and extends it to an
   unobservable probe. The refuse/warn split is `[security].enforcement`.

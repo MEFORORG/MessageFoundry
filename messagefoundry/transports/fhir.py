@@ -74,7 +74,9 @@ from messagefoundry.config.models import (
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
+    TrustAnchor,
     TrustAnchorPolicy,
+    hop_name_prefix,
     refuse_chain_check_on_os_roots,
 )
 from messagefoundry.connection_names import fhir_lookup_record_name
@@ -122,6 +124,7 @@ from messagefoundry.transports.rest import (
     _no_redirect_opener,
     _query_credentials_sent,
     _redact_url,
+    _refuse_unsendable_static_auth,
     _shared_no_redirect_opener,
     assert_probe_hop,
     auth_challenge_refused,
@@ -862,6 +865,24 @@ def _reject_config_control_chars(value: str, setting: str, where: str = "destina
     return value
 
 
+def _refuse_unsendable_static_headers(
+    s: Mapping[str, Any], *, setting: str, connection: str | None
+) -> None:
+    """Refuse at construction at least these static settings ``_build_headers`` would drop or
+    send other than as configured (BACKLOG #8299 item 8): a ``headers`` that is not a ``dict``, the
+    one table type ``_build_headers`` and the static-credential census read, and the credential
+    rules of :func:`~messagefoundry.transports.rest._refuse_unsendable_static_auth`. A static
+    ``Authorization`` entry in ``headers`` beside ``bearer_token`` or Basic is not refused here.
+    Names settings, never a value."""
+    extra = s.get("headers")
+    if extra is not None and not isinstance(extra, dict):
+        raise ValueError(
+            f"{hop_name_prefix(connection)}{setting} 'headers' must be a table of header names "
+            "to values"
+        )
+    _refuse_unsendable_static_auth(s, connection=connection, transport=setting)
+
+
 def _refuse_unsendable_conditional_query(query: str, conditional: str | None, base: str) -> None:
     """Refuse at CONSTRUCTION a ``conditional_query`` its sink could never send (BACKLOG #5911).
 
@@ -1098,13 +1119,14 @@ class FhirDestination(DestinationConnector):
         self.base_url = url
         # BACKLOG #2060: names this hop in a bounded-read refusal, which never carries the URL.
         self._hop = hop_identity("FHIR", config.name)
-        # BACKLOG #5529: refused before any hop gate logs a crossing for a connection that never builds.
+        # BACKLOG #5529: refused before any hop gate, so a build this refuses logs no crossing.
         from messagefoundry.transports.http_auth import (
-            refuse_authorization_signer_beside_digest,
+            refuse_authorization_signer_beside_credential,
             refuse_http_digest_conflicts,
         )
 
         digest_selected = refuse_http_digest_conflicts(s)
+        _refuse_unsendable_static_headers(s, setting="FHIR destination", connection=config.name)
         self.fhir_version: str = str(s.get("fhir_version", "R4B"))
         self.format: str = str(s.get("format", "json"))
         if self.format != "json":
@@ -1215,7 +1237,7 @@ class FhirDestination(DestinationConnector):
         }
         # BACKLOG #5911: a static url or header the wire refuses fails the connection here, as a
         # bad conditional_query does, rather than every message at send time. Before any hop gate,
-        # so none audits a crossing for a connection that never builds (#5529). A static
+        # so a build this screen refuses leaves no crossing record (#5529). A static
         # conditional moved into the Bundle entry above is JSON there, never an HTTP header, so it
         # is not judged by the header rules.
         refuse_unsendable_static_request(url, self._headers, setting="FHIR destination")
@@ -1279,8 +1301,12 @@ class FhirDestination(DestinationConnector):
         # ASVS 4.1.5 (ADR 0018): opt-in detached-JWS signing; None = off (byte-identical). Built here so
         # a bad key fails loud at construction; the signature is minted in _post over the body bytes.
         self._signer: MessageSigner | None = signer_from_destination(config)
-        refuse_authorization_signer_beside_digest(
+        # BACKLOG #5526 item 6, the FHIR twin (merge review of engine PR 3206, item 4): under the
+        # Authorization name the signature would replace the configured or minted credential
+        # _post writes before it.
+        refuse_authorization_signer_beside_credential(
             None if self._signer is None else self._signer.header_name,
+            s,
             digest=digest_selected,
             connection=config.name,
         )
@@ -2000,6 +2026,33 @@ def _mint_bearer(token: Any, prefix: str) -> str:
     return bearer
 
 
+def _bounded_lookup_request(url: str, headers: dict[str, str], label: str) -> None:
+    """:func:`enforce_outbound_length_limits` for a ``FhirLookup``, its refusal named by
+    :func:`hop_name_prefix` (BACKLOG #8299 item 9)."""
+    try:
+        enforce_outbound_length_limits(url, headers)
+    except ValueError as exc:
+        raise ValueError(f"{hop_name_prefix(label)}FhirLookup {exc}") from exc
+
+
+class _LookupPlan(NamedTuple):
+    """What :meth:`FhirLookupExecutor._planned` settles for one lookup before any is built."""
+
+    url: str
+    scheme: str
+    headers: dict[str, str]
+    timeout: float
+    attested: bool
+    accepted: bool
+    reason: str | None
+    revocation_attested: bool
+    revocation_reason: str | None
+    #: The read hop's trust anchor, resolved here, and chain-checked here for an http url only;
+    #: an https url's chain check runs when the build loop builds its opener. ``None`` with
+    #: verify_tls off.
+    anchor: TrustAnchor | None
+
+
 class FhirLookupExecutor:
     """GET-only executor for handler-callable **live** FHIR reads (``fhir_lookup``, ADR 0043).
 
@@ -2043,14 +2096,18 @@ class FhirLookupExecutor:
         # the runner. A FhirLookup connection has no Destination to carry it (unlike every other
         # HTTP-family hop), which is why this executor's opener map could not name an internal CA at
         # all. `None` (a direct test build) = the OS trust store, byte-identical.
-        from messagefoundry.transports.smart import token_provider_from_settings
+        from messagefoundry.transports.smart import (
+            smart_auth_configured,
+            token_provider_from_settings,
+        )
 
-        # BACKLOG #5911: every lookup's static url and headers are screened before any lookup is
-        # built, so a refusal from this screen leaves no hop-gate crossing record (#5529). A
-        # failure later in the loop below still can leave one, from the failing lookup itself or
-        # from a lookup built before it.
-        screened = {
-            cname: self._screened_static_request(cname, raw) for cname, raw in connections.items()
+        # BACKLOG #5911, #8299 items 2, 3 and 9: the checks _planned runs, for every lookup, come
+        # before any lookup is built, so a lookup one of them refuses leaves no hop-gate crossing
+        # record (#5529). A refusal later in the loop below, from a check _planned does not run,
+        # still can leave one, from the failing lookup itself or from a lookup built before it.
+        planned = {
+            cname: self._planned(cname, raw, trust_anchor_policy)
+            for cname, raw in connections.items()
         }
         self._base: dict[str, str] = {}
         self._headers: dict[str, dict[str, str]] = {}
@@ -2071,33 +2128,13 @@ class FhirLookupExecutor:
             # are their own namespace: an outbound and a lookup may share a name, and the records must
             # still tell them apart. The same prefix the loosening reports use (accepted_cleartext_hops).
             label = fhir_lookup_record_name(cname)
-            url, scheme, headers = screened[cname]
+            plan = planned[cname]
+            url, scheme, headers = plan.url, plan.scheme, plan.headers
+            attested, lk_accepted, lk_reason = plan.attested, plan.accepted, plan.reason
             self._base[cname] = url
-            # BACKLOG #5959: above zero, as REST's; positive_seconds says why.
-            self._timeout[cname] = positive_seconds(
-                s.get("timeout_seconds", 30.0),
-                knob="timeout_seconds",
-                transport=f"FhirLookup {cname!r}",
-            )
+            self._timeout[cname] = plan.timeout
             self._encoding[cname] = str(s.get("encoding", "utf-8"))
-            # #200 (ADR 0092): the per-connection insecure-hop attestation keys the posture-keyed refusal.
-            # Validated like the DB lookups': a flag written into this mutable dict without its
-            # reason is refused here rather than crossing unexplained.
-            # ADR 0153: a FhirLookup connection has no Destination, so its cleartext-acceptance pair
-            # arrives in these settings, mirrored from the spec's typed fields by
-            # wiring_runner._fhir_lookup_settings (never from a raw key in `spec.settings`, BACKLOG #2050).
-            # Vault BACKLOG #3139: a refusal from either reader names the lookup, as the url checks do.
-            try:
-                attested = hop_attestation_from_settings(s)
-                lk_accepted, lk_reason, _ = cleartext_acceptance_from_settings(s)
-                # FhirLookupSpec refuses an acceptance or a revocation attestation with no reason,
-                # and FhirLookup() and the runner's settings builder refuse the attested-plus-
-                # accepted pair. A directly built executor meets those rules here too.
-                _check_cleartext_acceptance(lk_accepted, lk_reason)
-                _check_revocation_attestation(*revocation_attestation_from_settings(s)[:2])
-                check_attested_and_accepted(attested, lk_accepted)
-            except ValueError as exc:
-                raise ValueError(f"FhirLookup {cname!r}: {exc}") from exc
+            smart = smart_auth_configured(s)
             # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy for the read hop AND
             # the SMART token endpoint (None → byte-identical). Bypass resolved per target host (#128).
             proxy = egress_route_from_settings(
@@ -2111,13 +2148,13 @@ class FhirLookupExecutor:
             proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
             if proxy_dest is not None:
                 headers.update(proxy_dest.auth_headers())  # pre-emptive Proxy-Authorization (0126)
+                # ASVS 4.2.5: _planned bounded the static url and headers; this bounds the header
+                # just added, after the proxy route's gate.
+                _bounded_lookup_request(url, headers, label)
             # The read sends Authorization (static or SMART) — refuse it over cleartext http.
-            # #1660: the SMART token hop takes the same instance [tls] anchor policy the read hop
-            # resolves below, against the TOKEN host rather than this lookup's base URL.
-            token = token_provider_from_settings(
-                s, proxy=proxy, trust_anchor_policy=trust_anchor_policy
-            )
-            check_headers = {**headers, "Authorization": "Bearer"} if token is not None else headers
+            # BACKLOG #8299 item 4: judged before the SMART provider is built, so a lookup this
+            # refuses builds no token hop. smart_auth_configured is the provider's own switch.
+            check_headers = {**headers, "Authorization": "Bearer"} if smart else headers
             refuse_cleartext_credentials(
                 scheme,
                 check_headers,
@@ -2131,6 +2168,11 @@ class FhirLookupExecutor:
                 ),
                 connection=label,
             )
+            # #1660: the SMART token hop takes the same instance [tls] anchor policy the read hop
+            # resolves below, against the TOKEN host rather than this lookup's base URL.
+            token = token_provider_from_settings(
+                s, proxy=proxy, trust_anchor_policy=trust_anchor_policy
+            )
             # ASVS 12.2.1: a cleartext read pulls the PHI resource/searchset back over the wire, so a
             # cleartext http read to a non-loopback host is refused too (loopback stays byte-identical).
             self._hop_guard[cname] = refuse_cleartext_egress(
@@ -2141,28 +2183,10 @@ class FhirLookupExecutor:
                 cleartext_reason=lk_reason,
                 connection=label,
             )
-            # ASVS 4.2.5: this executor never called the construction gate at all -- fhir.py's only
-            # call site was the DESTINATION's __init__, so a lookup connection's base URL and static
-            # headers were unbounded on both sides.
-            enforce_outbound_length_limits(url, headers)
             self._headers[cname] = headers
             self._token[cname] = token
-            if bool_setting(s, "verify_tls", default=True):
-                # #1180 (ADR 0093): the sanctioned live read-only lookup against an internal FHIR
-                # server is the most on-point instance of 12.3.4's condition in the product, and it
-                # could not name an anchor at all.
-                lookup_anchor = http_family_trust_anchor(
-                    s,
-                    url=url,
-                    trust_anchor_policy=trust_anchor_policy,
-                    cell=f"FhirLookup {cname!r}",
-                )
-                if scheme == "http":
-                    # The same refusal for an http url, worded so it does not say the hop verifies its
-                    # server: the opener makes no TLS connection to the partner (vault BACKLOG #5511).
-                    refuse_chain_check_on_os_roots(
-                        lookup_anchor, cleartext=True, connection_kind=f"FhirLookup {cname!r}"
-                    )
+            lookup_anchor = plan.anchor
+            if lookup_anchor is not None:
                 self._opener[cname] = (
                     _no_redirect_opener(*proxy_handlers, trust_anchor=lookup_anchor)
                     if proxy_handlers or lookup_anchor.narrows
@@ -2173,16 +2197,12 @@ class FhirLookupExecutor:
                 # the hop that pulls patient data back. Called AFTER the opener, and handed it, so a
                 # [tls].crl_file that reached THIS lookup's own context relaxes the refusal and a
                 # lookup the CRL never reached keeps it (BACKLOG #2188).
-                try:
-                    rev_attested, rev_reason, _ = revocation_attestation_from_settings(s)
-                except ValueError as exc:
-                    raise ValueError(f"FhirLookup {cname!r}: {exc}") from exc
                 refuse_unrevoked_verified_hop(
                     scheme,
                     url,
                     connector=f"FhirLookup {cname!r}",
-                    revocation_attested=rev_attested,
-                    revocation_attested_reason=rev_reason,
+                    revocation_attested=plan.revocation_attested,
+                    revocation_attested_reason=plan.revocation_reason,
                     opener=self._opener[cname],
                     connection=label,
                     description="sends read requests over verified https, with no certificate "
@@ -2207,10 +2227,17 @@ class FhirLookupExecutor:
                 self._opener[cname] = _insecure_opener(*proxy_handlers)
 
     @classmethod
-    def _screened_static_request(
-        cls, cname: str, s: Mapping[str, Any]
-    ) -> tuple[str, str, dict[str, str]]:
-        """The lookup's base url, its scheme and its static headers, once they pass the screens.
+    def _planned(
+        cls, cname: str, s: Mapping[str, Any], trust_anchor_policy: TrustAnchorPolicy | None
+    ) -> _LookupPlan:
+        """What this lookup's checks run before any lookup is built settle, once it passes them
+        (BACKLOG #8299 items 2, 3 and 9): its base url, scheme and static headers, screened and
+        bounded, its timeout, its hop declarations, the SMART settings refusals of BACKLOG #5800,
+        and its read hop's trust anchor, with the #5511 chain-check refusal of an http url. At
+        least the SMART refusals and a non-bool ``verify_tls`` name the setting and not the lookup.
+        The build loop runs at least the cleartext-credential check, the #5511 refusal of an https
+        url on the OS roots, and the rest of the SMART provider's checks later, so a refusal from
+        one of those can still follow a crossing record.
 
         #1241: the SECOND url construction site in this module. The destination screens its own;
         screening one and not its sibling reproduces the asymmetry the item reports. BACKLOG #5911:
@@ -2225,9 +2252,75 @@ class FhirLookupExecutor:
                 f"FhirLookup {cname!r} 'url' must be http or https, got scheme {scheme!r}"
             )
         refuse_url_credentials(url, f"FhirLookup {cname!r} 'url'")
+        # Named by hop_name_prefix, whose `;` keeps a credential-word lookup name from making
+        # the log scrubber redact the rest of the refusal.
+        label = fhir_lookup_record_name(cname)
+        _refuse_unsendable_static_headers(s, setting="FhirLookup", connection=label)
         headers = cls._build_headers(s)
         refuse_unsendable_static_request(url, headers, setting=f"FhirLookup {cname!r}")
-        return url, scheme, headers
+        # BACKLOG #5959: above zero, as REST's; positive_seconds says why.
+        timeout = positive_seconds(
+            s.get("timeout_seconds", 30.0),
+            knob="timeout_seconds",
+            transport=f"FhirLookup {cname!r}",
+        )
+        # ASVS 4.2.5: the lookup's static url and headers are bounded at construction, as the
+        # destination's are. Before this gate was added here, they were unbounded on both sides.
+        _bounded_lookup_request(url, headers, label)
+        # #200 (ADR 0092): the per-connection insecure-hop attestation keys the posture-keyed refusal.
+        # Validated like the DB lookups': a flag written into this mutable dict without its
+        # reason is refused here rather than crossing unexplained.
+        # ADR 0153: a FhirLookup connection has no Destination, so its cleartext-acceptance pair
+        # arrives in these settings, mirrored from the spec's typed fields by
+        # wiring_runner._fhir_lookup_settings (never from a raw key in `spec.settings`, BACKLOG #2050).
+        # Vault BACKLOG #3139: a refusal from either reader names the lookup, as the url checks do.
+        try:
+            attested = hop_attestation_from_settings(s)
+            accepted, reason, _ = cleartext_acceptance_from_settings(s)
+            # FhirLookupSpec refuses an acceptance or a revocation attestation with no reason,
+            # and FhirLookup() and the runner's settings builder refuse the attested-plus-
+            # accepted pair. A directly built executor meets those rules here too.
+            _check_cleartext_acceptance(accepted, reason)
+            rev_attested, rev_reason, _ = revocation_attestation_from_settings(s)
+            _check_revocation_attestation(rev_attested, rev_reason)
+            check_attested_and_accepted(attested, accepted)
+        except ValueError as exc:
+            raise ValueError(f"FhirLookup {cname!r}: {exc}") from exc
+        # Merge review of engine PR 3206, item 1: main's #5800 SMART settings refusals and #5511
+        # http chain-check refusal read no wire, so they run here, before any lookup reaches a hop
+        # gate, rather than in the build loop after the gates of the lookups built before this one.
+        from messagefoundry.transports.smart import refuse_unusable_smart_settings
+
+        refuse_unusable_smart_settings(s)
+        anchor: TrustAnchor | None = None
+        if bool_setting(s, "verify_tls", default=True):
+            # #1180 (ADR 0093): the sanctioned live read-only lookup against an internal FHIR
+            # server is the most on-point instance of 12.3.4's condition in the product, and it
+            # could not name an anchor at all.
+            anchor = http_family_trust_anchor(
+                s,
+                url=url,
+                trust_anchor_policy=trust_anchor_policy,
+                cell=f"FhirLookup {cname!r}",
+            )
+            if scheme == "http":
+                # The same refusal for an http url, worded so it does not say the hop verifies its
+                # server: the opener makes no TLS connection to the partner (vault BACKLOG #5511).
+                refuse_chain_check_on_os_roots(
+                    anchor, cleartext=True, connection_kind=f"FhirLookup {cname!r}"
+                )
+        return _LookupPlan(
+            url,
+            scheme,
+            headers,
+            timeout,
+            attested,
+            accepted,
+            reason,
+            rev_attested,
+            rev_reason,
+            anchor,
+        )
 
     @staticmethod
     def _build_headers(s: Mapping[str, Any]) -> dict[str, str]:
