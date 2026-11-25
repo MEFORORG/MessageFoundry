@@ -181,7 +181,8 @@
     branch-delete path was therefore covered by review only, and it is the one place in
     scripts/worktree/ where being wrong loses commits reachable from no ref and no reflog. Same
     parameter, same reason, as prune-merged.ps1. See tests/test_worktree_remove.py and
-    tests/test_worktree_remove_path.py.
+    tests/test_worktree_remove_path.py. It is also the operator's route to a sibling an older new.ps1
+    made beside a linked worktree (BACKLOG #1894): -RepoRoot <that worktree> -Name <n>.
 
 .EXAMPLE
     .\remove.ps1 -Name alerts
@@ -385,6 +386,13 @@ if ($anchorOnPrimary) {
     }
     $RepoRoot = [System.IO.Path]::GetFullPath($anchorList[0].Path).TrimEnd('\', '/')
 }
+else {
+    # An explicit root names the same checkout, spelled as git records it, so a -RepoRoot given
+    # through a junction or 8.3 alias still matches git's own worktree list below. An unreadable
+    # answer keeps the spelling given, which the registration check then refuses.
+    $top = "$(& git -C $RepoRoot rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
+    if ($LASTEXITCODE -eq 0 -and $top) { $RepoRoot = [System.IO.Path]::GetFullPath($top).TrimEnd('\', '/') }
+}
 $Parent = Split-Path $RepoRoot -Parent
 $RepoName = Split-Path $RepoRoot -Leaf
 
@@ -500,12 +508,21 @@ if ($byPath) {
 }
 else {
     $WorktreePath = Join-Path $Parent "$RepoName-$Name"
+    # Read from the clone's own list, never from the target, so a directory that is not this clone's
+    # worktree is refused before any git call runs inside it.
+    $nameRegistered = @(if ($anchorOnPrimary) { $anchorList } else { Get-RepoWorktrees $RepoRoot })
+    if ($nameRegistered.Count -eq 0) {
+        throw "Could not list the registered worktrees of '$RepoRoot'. Nothing was removed."
+    }
+    $linkedNorms = @($nameRegistered | Select-Object -Skip 1 | ForEach-Object { ConvertTo-Norm $_.Path })
     # A COMMAND PRINTED BEFORE BACKLOG #1894 names a linked copy and meant `<that copy>-<Name>`. Run
     # now, it would reach `<primary>-<Name>`, another tree that may be someone else's. While the tree
-    # it meant still exists, refuse and name both, rather than pick one.
+    # it meant is still a registered worktree, refuse and name both, rather than pick one. Once it is
+    # gone this cannot tell such a command from a current one.
     if ($anchorOnPrimary -and (ConvertTo-Norm $CopyRoot) -ne (ConvertTo-Norm $RepoRoot)) {
         $beside = Join-Path (Split-Path $CopyRoot -Parent) ("{0}-{1}" -f (Split-Path $CopyRoot -Leaf), $Name)
-        if (Test-Path -LiteralPath $beside) {
+        $besideNorm = ConvertTo-Norm $beside
+        if ($besideNorm -ne (ConvertTo-Norm $WorktreePath) -and $linkedNorms -contains $besideNorm) {
             Write-Host "REFUSED: -Name $Name from the copy in '$CopyRoot' is ambiguous." -ForegroundColor Red
             Write-Host "  -Name now reaches the sibling of the primary: $WorktreePath" -ForegroundColor Red
             Write-Host "  An older new.ps1 run from that copy made:     $beside" -ForegroundColor Red
@@ -514,21 +531,16 @@ else {
         }
     }
     if (-not (Test-Path $WorktreePath)) { throw "No such worktree: $WorktreePath" }
+    # The target must be a registered LINKED worktree of this clone. A directory that only sits at the
+    # sibling path, such as a separate clone beside the primary, would have every read below asked of
+    # the wrong repository's refs and registries.
+    if (@($linkedNorms | Where-Object { $_ -eq (ConvertTo-Norm $WorktreePath) }).Count -ne 1) {
+        throw "'$WorktreePath' is not a registered linked worktree of '$RepoRoot'. Nothing was removed."
+    }
     Assert-NotInsideTarget $WorktreePath "Run a copy in another checkout of this clone, such as $RepoRoot."
     # A worktree registered INSIDE the target goes with it, and a harness tree under the target's own
     # .claude/worktrees is one: a session launched in the target puts its subagents there. Refused as
     # on -Path, and for the same reason not overridable.
-    $nameRegistered = @(if ($anchorOnPrimary) { $anchorList } else { Get-RepoWorktrees $RepoRoot })
-    if ($nameRegistered.Count -eq 0) {
-        throw "Could not list the registered worktrees of '$RepoRoot'. Nothing was removed."
-    }
-    # The target must be a registered LINKED worktree of this clone. A directory that only sits at the
-    # sibling path, such as a separate clone beside the primary, would have every read below asked of
-    # the wrong repository's refs and registries.
-    $nameNorm = ConvertTo-Norm $WorktreePath
-    if (@($nameRegistered | Select-Object -Skip 1 | Where-Object { (ConvertTo-Norm $_.Path) -eq $nameNorm }).Count -ne 1) {
-        throw "'$WorktreePath' is not a registered linked worktree of '$RepoRoot'. Nothing was removed."
-    }
     $nestedTrees = @(Get-NestedWorktrees -Occupancy ([pscustomobject]@{ Worktrees = $nameRegistered }) -Path $WorktreePath)
     if ($nestedTrees.Count -gt 0) {
         Write-Host "REFUSED: '$WorktreePath' contains $($nestedTrees.Count) other registered worktree(s):" -ForegroundColor Red

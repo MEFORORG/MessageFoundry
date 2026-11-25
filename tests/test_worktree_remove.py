@@ -358,7 +358,8 @@ def test_a_copy_in_a_LINKED_worktree_anchors_name_on_the_primary(fx: Fixture) ->
 
     While ``repo-host-foo``, the tree an older new.ps1 run from that copy made and its printed
     command meant, still exists, the anchored run is ambiguous and refuses, naming both, so a stale
-    command cannot quietly reach a different tree. ``-RepoRoot`` is used as given and reaches it.
+    command cannot quietly reach a different tree while the tree it meant is still registered.
+    ``-RepoRoot`` is used as given and reaches it.
     """
     host = fx.add("host")
     target = fx.add("foo")
@@ -1072,3 +1073,25 @@ def test_a_call_without_a_target_refuses_instead_of_prompting(
     assert "-Name" in err, err
     assert fx.is_registered(wt)
     assert fx.branch_exists("alpha")
+
+
+def test_name_through_a_junction_alias_of_the_primary_is_neither_ambiguous_nor_unregistered(
+    fx: Fixture,
+) -> None:
+    """Red in review round 2 (BACKLOG #1894): reached through a junction, the primary's own copy read
+    its alias spelling as a second candidate and refused as ambiguous, and an alias -RepoRoot built a
+    target path git's list never matched. Both must remove the one real tree."""
+    alias = fx.root / "alias"
+    _junction(alias, fx.primary.parent)
+    copy_real_scripts(fx.primary)
+    via_alias = alias / fx.primary.name / "scripts" / "worktree" / "remove.ps1"
+
+    first = fx.add("viaalias")
+    proc = run(fx, "-Name", "viaalias", script=via_alias, repo_root="")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not first.exists() and not fx.is_registered(first)
+
+    second = fx.add("viaroot")
+    proc = run(fx, "-Name", "viaroot", repo_root=alias / fx.primary.name)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not second.exists() and not fx.is_registered(second)

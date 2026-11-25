@@ -202,8 +202,8 @@ def test_a_linked_copy_makes_the_sibling_of_the_main_worktree_and_its_advice_rem
     ``inner`` is a linked worktree under ``.claude/worktrees``, as a harness session's is. Red before
     BACKLOG #1894: new.ps1's copy there made ``inner-feature`` beside ITSELF, under
     ``.claude/worktrees``, where remove.ps1 -Path refuses to reach. It must land at ``repo-feature``
-    beside the primary, and the advice it prints -- naming ``inner``'s own copy of remove.ps1 -- must
-    remove it.
+    beside the primary, and the advice it prints -- naming the MAIN worktree's copy of remove.ps1,
+    which outlives ``inner`` -- must remove it.
     """
     inner = fx.primary / ".claude" / "worktrees" / "inner"
     _git(fx.primary, "worktree", "add", "-q", "-b", "inner", str(inner))
@@ -223,6 +223,7 @@ def test_a_linked_copy_makes_the_sibling_of_the_main_worktree_and_its_advice_rem
     assert not (inner.parent / "inner-feature").exists(), "it made the tree beside the linked copy"
     advice = _printed_advice(made.stdout)
     assert any("remove.ps1" in a for a in advice), advice
+    assert all(str(fx.primary) in a and str(inner) not in a for a in advice), advice
 
     settle_worktrees(fx.primary)
     cmd = next(a for a in advice if "remove.ps1" in a)
