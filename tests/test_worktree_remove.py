@@ -927,8 +927,7 @@ def test_a_backlog_record_with_a_branch_is_named_unrecoverable(fx: Fixture) -> N
 
 _DELETE_BRANCH_WARNING = (
     "A record with no branch, or whose branch is deleted (-DeleteBranch on this run can delete the "
-    "branch checked out here), can then be committed only from a worktree recreated at this path, "
-    "or from one on a branch recreated under the recorded name"
+    "branch checked out here), can then be committed from a worktree recreated at this path"
 )
 
 
@@ -946,7 +945,10 @@ def test_under_DeleteBranch_a_recorded_branch_is_not_named_recoverable(fx: Fixtu
     flat = _flat(proc.stderr)
     assert proc.returncode != 0, "removal proceeded past a recorded allocation"
     assert _RECOVERABLE not in flat, proc.stderr
-    assert f"if that is the recorded branch {here}, " + _STRANDED in flat, proc.stderr
+    assert (
+        f"if that is the recorded branch {here}, the number then rests on a worktree recreated"
+        in flat
+    ), proc.stderr
     assert _DELETE_BRANCH_WARNING in flat, proc.stderr
     assert fx.is_registered(wt)
 

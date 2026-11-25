@@ -1270,11 +1270,10 @@ if (Test-RegistryDirPresent $allocDirRoot 'the allocation directory') {
             # second key. alloc.ps1 records a detached HEAD as `detached@<sha>`, which names no branch.
             $recBranch = if ($a.branch -is [string]) { Format-RecordText $a.branch } else { '' }
             if ($recBranch -like 'detached@*') { $recBranch = '' }
-            # Under -DeleteBranch the re-run this refusal offers can delete the branch checked out here
-            # (it keeps one with commits not on origin/main), which is usually the recorded one, so
-            # the line must not promise that branch survives.
+            # Under -DeleteBranch the re-run this refusal offers can delete the branch checked out here,
+            # which is usually the recorded one, so the line must not promise that branch survives.
             $outcome = if ([string]$a.kind -eq 'adr' -and $recBranch -and $DeleteBranch) {
-                "-DeleteBranch on this run can delete the branch checked out here, and if that is the recorded branch $recBranch, no other worktree can commit it once this one is removed, short of one recreated at this path or one on a branch recreated under that name"
+                "-DeleteBranch on this run can delete the branch checked out here, and if that is the recorded branch $recBranch, the number then rests on a worktree recreated at this path (docs/LEDGER-GATE.md)"
             } elseif ([string]$a.kind -eq 'adr' -and $recBranch) {
                 "a recorded branch $recBranch can still commit it: a worktree on a branch of that name is entitled to it"
             } else {
@@ -1294,8 +1293,8 @@ if (Test-RegistryDirPresent $allocDirRoot 'the allocation directory') {
         $lines += ""
         if ($DeleteBranch) {
             $lines += "A record with no branch, or whose branch is deleted (-DeleteBranch on this run can delete the"
-            $lines += "branch checked out here), can then be committed only from a worktree recreated at this"
-            $lines += "path, or from one on a branch recreated under the recorded name (docs/LEDGER-GATE.md)."
+            $lines += "branch checked out here), can then be committed from a worktree recreated at this path"
+            $lines += "(docs/LEDGER-GATE.md)."
             $lines += ""
         }
         $lines += "Recovery for a stranded number: docs/LEDGER-GATE.md, `"When the owning worktree is gone`"."

@@ -7178,11 +7178,9 @@ class CertMonitorSettings(_Section):
     @field_validator("check_interval_seconds")
     @classmethod
     def _check_interval(cls, v: float) -> float:
-        # Finite as well as positive (BACKLOG #2008): NaN passed ``v <= 0``, and a NaN timeout to
-        # the monitor's ``asyncio.wait_for`` would raise ValueError, on the proactor and selector
-        # loops out of the event loop's poll rather than out of ``wait_for`` itself (measured,
-        # Python 3.14; uvloop, which Linux installs, was not measured), and the handshake re-alert
-        # throttle in api/security.py would never hold.
+        # Finite as well as positive (BACKLOG #2008): NaN passed ``v <= 0``, and a NaN sleep wakes
+        # at the loop's next timer, so the monitor rescanned almost continuously and the handshake
+        # re-alert throttle in api/security.py never held.
         if not (v > 0 and math.isfinite(v)):
             raise ValueError("cert_monitor.check_interval_seconds must be a finite number > 0")
         return v
@@ -10660,8 +10658,7 @@ def _reminder_cadence(
 
     The runner scans once at start and then once per interval, so a credential that enters its warn
     window after start waits up to one interval plus one scan's duration for its first reminder.
-    Once the interval reaches
-    ``warn_days + 1`` days, that first reminder can come after the credential's deadline, and an
+    Once the interval reaches ``warn_days + 1`` days, that first reminder can come after the credential's deadline, and an
     interval of a year means none until the next restart. **The bound is the shipped default, and
     that is a judgment, not a measured threshold.** It follows BACKLOG #1131, which names a limit
     looser than its default rather than picking a second number. With ``warn_days = 0`` the runner

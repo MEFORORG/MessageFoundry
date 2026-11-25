@@ -774,8 +774,8 @@ class Ledger:
         remedy block is precisely what that defect forged.
         """
         allocate = f'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind {kind} -Title "<title>"'
-        # No record at all: nobody holds it, so allocating is the only move and the ONLY case where it
-        # is the right one.
+        # No record at all: nobody holds it, so allocating is the only move. With a record that names
+        # neither key (below), these are the ONLY cases where it is the right one.
         if self.alloc is None:
             return allocate
         try:
@@ -792,6 +792,9 @@ class Ledger:
             return allocate
         worktree = _safe_for_message(claim.get("worktree", ""))
         branch = _safe_for_message(claim.get("branch", ""))
+        if not worktree and not branch:
+            # A record naming neither key holds nothing owns() can ever match, so nothing recovers it.
+            return allocate
         lines = ["this number is already allocated -- RECOVER it, do not allocate another:", ""]
         coord = self._coord
         if worktree and coord is not None and not coord.record_is_here(claim):
@@ -814,11 +817,6 @@ class Ledger:
                 "       a worktree at the path in 1 (on the machine 1 names, if it names one) and commit",
                 "       from it",
             ]
-            if branch:
-                lines.append(
-                    "       (a branch recreated under the name in 2 is entitled too: owns() matches it"
-                    " by name)"
-                )
         lines += [
             "    4. ONLY if neither the recorded worktree nor the branch exists, and no step above",
             "       applies, allocate a new number:",
