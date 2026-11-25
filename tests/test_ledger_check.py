@@ -225,8 +225,8 @@ def test_a_number_allocated_to_a_DIFFERENT_worktree_is_blocked(repo: Path, tmp_p
 
     ***THE OTHER BRANCH IS LOAD-BEARING AND USED TO BE IMPLICIT.*** A sibling SESSION is in another
     worktree AND on another branch -- git refuses an ORDINARY second checkout of one branch in two
-    worktrees (a DEFAULT, not a law of git; `Ledger.owns` records what defeats it, BACKLOG #1039), so
-    that pairing is not a coincidence, it is the shape a live sibling has. Once ownership grew a
+    worktrees (a DEFAULT, not a law of git, BACKLOG #1039), so that pairing is not a coincidence, it
+    is the shape a live sibling has. Once ownership grew a
     branch fallback (BACKLOG #1282) this arm had to name the branch or it would have been asserting
     the weaker "different path" and passing for a reason unrelated to sibling-ness.
     """
@@ -260,21 +260,8 @@ def test_a_number_whose_worktree_IS_GONE_is_committable_from_the_SAME_BRANCH(
     permanently -- 43 of them by 2026-08-30 -- because `owns` compared a path and nothing else, and
     nothing anywhere reported the loss.
 
-    ***IT IS SAFE ONLY BECAUSE GIT REFUSES AN ORDINARY SECOND CHECKOUT OF ONE BRANCH IN TWO
-    WORKTREES.*** The gate exists to stop two sessions filing one number, and two sessions do not hold
-    one branch -- so "the session on this branch" is as single-valued as "the session in this
-    worktree" was, while outliving it. A branch that is free to check out is one nobody is working in.
-
-    ***THAT REFUSAL IS A DEFAULT, NOT A LAW OF GIT, AND THIS DOCSTRING SAID IT FLAT (BACKLOG #1039).***
-    `git worktree add --force` / `-f` and `git checkout --ignore-other-worktrees` both get past it, so
-    forcing a second checkout makes the branch key non-exclusive and leaks entitlement to a tree that
-    never allocated the number. `Ledger.owns` carries the full statement of the residual; it is named
-    here because THIS is the sentence that licenses the loosening, and a flat version of it here
-    contradicts the qualified version there.
-
-    **Recorded because the miss generalises: the first sweep for this premise used a CASE-SENSITIVE
-    grep and this site is in capitals**, so the strongest instance in the repository was the one left
-    behind while the ledger row said the sweep was finished.
+    The branch key is not exclusive: docs/LEDGER-GATE.md, "When the owning worktree is gone", says
+    how at least two trees can be entitled to one number.
     """
     write(repo, "docs/adr/0002-new.md", "# 0002 — New\n")
     write(
@@ -1411,8 +1398,8 @@ def test_MAIN_merged_INTO_another_seats_branch_is_committable(repo: Path, tmp_pa
     disjoint FROM EACH OTHER, which says nothing about whether either points at the real shape.
 
     ***THE MERGER MUST BE ON A DIFFERENTLY-NAMED BRANCH, AND THAT IS NOT INCIDENTAL.*** git refuses
-    an ORDINARY second checkout of one branch in two worktrees (a DEFAULT, not a law of git;
-    `Ledger.owns` records what defeats it, BACKLOG #1039), so a merger does not stand on the author's
+    an ORDINARY second checkout of one branch in two worktrees (a DEFAULT, not a law of git,
+    BACKLOG #1039), so a merger does not stand on the author's
     branch -- it cuts its own from theirs, exactly as `lander-fix/850` was cut. Stay on the author's
     branch NAME and `owns()`'s branch fallback (BACKLOG #1282) returns True, so the run passes for a
     reason unrelated to merging.

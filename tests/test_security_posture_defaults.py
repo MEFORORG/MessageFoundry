@@ -1802,21 +1802,27 @@ def test_a_reminder_interval_above_its_default_is_a_named_loosening() -> None:
         "check_interval_seconds = 86401.0, longer than the default of 86400"
         in named["secret_rotation.check_interval_seconds"]
     )
-    # The after-the-deadline clause only where the interval reaches the warn_days lead.
+    # The after-the-deadline clause only where the interval reaches warn_days + 1 days.
     assert "after the deadline itself" in named["cert_monitor.check_interval_seconds"]
     assert "after the deadline itself" not in named["secret_rotation.check_interval_seconds"]
-    # At equality with the lead the clause still prints, and says "at least", as the >= check does.
-    equal = dict(
-        _pairs(
-            cert_monitor=CertMonitorSettings(warn_days=14, check_interval_seconds=1_209_600.0),
-            backup=BackupSettings(),
-            rotation=SecretRotationSettings(),
-        )
+    # The lead counts whole days rounded down, so the window opens warn_days + 1 days before the
+    # deadline: 15 days, 1_296_000 s, for warn_days = 14. The clause prints from exactly that value,
+    # and a second less prints none.
+    clause = (
+        ", which is at least the 15 days from the 14-day warn_days window opening to the "
+        "deadline, as that lead counts whole days, so that reminder can come after the deadline "
+        "itself"
     )
-    assert (
-        "which is at least the 14-day warn_days lead"
-        in equal["cert_monitor.check_interval_seconds"]
-    )
+    for interval, printed in ((1_296_000.0, True), (1_295_999.0, False)):
+        entry = dict(
+            _pairs(
+                cert_monitor=CertMonitorSettings(warn_days=14, check_interval_seconds=interval),
+                backup=BackupSettings(),
+                rotation=SecretRotationSettings(),
+            )
+        )["cert_monitor.check_interval_seconds"]
+        assert (clause in entry) is printed, entry
+        assert ("after the deadline" in entry) is printed, entry
     # No "; " inside an entry: the serve warning joins whole entries with it.
     assert not any("; " in named[k] for k in named if k.endswith("check_interval_seconds"))
     keys = ("cert_monitor.check_interval_seconds", "secret_rotation.check_interval_seconds")

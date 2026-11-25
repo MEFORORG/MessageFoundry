@@ -10658,7 +10658,7 @@ def _reminder_cadence(
 
     The runner scans once at start and then once per interval, so a credential that enters its warn
     window after start waits up to one interval for its first reminder. Once the interval reaches
-    the ``warn_days`` lead, that first reminder can come after the credential has expired, and an
+    ``warn_days + 1`` days, that first reminder can come after the credential's deadline, and an
     interval of a year means none until the next restart. **The bound is the shipped default, and
     that is a judgment, not a measured threshold.** It follows BACKLOG #1131, which names a limit
     looser than its default rather than picking a second number. With ``warn_days = 0`` the runner
@@ -10667,10 +10667,13 @@ def _reminder_cadence(
     if warn_days == 0 or interval <= default:
         return []
     # Said only where it can happen, so a modest value does not read like one past the lead.
+    # Both runners count the lead in whole days rounded down, so the window opens warn_days + 1 days
+    # before the deadline, and the gap between scans is the interval plus the pass itself.
     past_lead = (
-        f", which is at least the {warn_days}-day warn_days lead, so that reminder can come "
-        "after the deadline itself"
-        if interval >= warn_days * 86_400
+        f", which is at least the {warn_days + 1} days from the {warn_days}-day warn_days window "
+        "opening to the deadline, as that lead counts whole days, so that reminder can come after "
+        "the deadline itself"
+        if interval >= (warn_days + 1) * 86_400
         else ""
     )
     return [

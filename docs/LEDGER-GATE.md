@@ -302,10 +302,11 @@ that reuses the name inherits it. **A number still strands when the record carri
 one made before the branch field existed does, and its worktree is gone. Then the recovery below is
 the one that works.
 
-**Prevention is enforced.** `scripts/worktree/remove.ps1` refuses a removal while an allocation record
-names this worktree's path, matched by path only, for a number whose item is not yet on `origin/main`, and a cannot-tell reads as at-risk. The override is
+`scripts/worktree/remove.ps1` refuses at least a removal while an allocation record names this
+worktree's path, matched by path only, for a number whose item is not yet on `origin/main`, and a
+cannot-tell reads as at-risk. It does not stop every way a number can strand. The override is
 `-AllowOrphanedAllocations` and deliberately **not** `-Force`: that one already means *"I accept losing
-uncommitted changes"*, and one consent must not silently cover a second, irreversible risk.
+uncommitted changes"*, and one consent must not silently cover a second risk.
 
 **Recovery, for a number refused after its worktree is gone: follow the table below. A recorded branch
 that exists is the `orphan-branch-held` and `orphan-branch-free` rows; where the record names no

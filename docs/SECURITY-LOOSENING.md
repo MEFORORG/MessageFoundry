@@ -870,7 +870,9 @@ against theirs. With `warn_days = 0` the reminder is already named as off, so it
 named as well. A value that is not a finite number above `0` is refused at load.
 - **What you lose:** time. A certificate, CRL file or secret that enters its warn window after start
   waits up to one interval for its first reminder, which spends part of the lead `warn_days` gives.
-  An interval longer than that lead can put the first reminder after the expiry or due date itself,
+  The lead counts whole days, so the window opens `warn_days + 1` days before a certificate or CRL
+  expires or a secret's due day ends, and an interval of at least that can put the first reminder
+  after that point,
   and at an interval of a year nothing is reminded until the next restart. `[cert_monitor]`'s
   interval also throttles the handshake alert for a service caller's expiring client certificate,
   so that alert repeats no more often than once per interval.
