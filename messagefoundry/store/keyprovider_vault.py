@@ -28,12 +28,14 @@ stubs**, so the client is contained as a typed ``Any`` local here — never a re
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sys
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
+from messagefoundry.config.secretprovider import log_import_failure
 from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     assert_hvac_tls_suites,
@@ -47,6 +49,8 @@ from messagefoundry.store.keyprovider import KeyProviderError, _split_retired
 if TYPE_CHECKING:
     from messagefoundry.config.settings import StoreSettings
     from messagefoundry.config.tls_policy import HopPosture
+
+_log = logging.getLogger(__name__)
 
 #: The optional extra that carries ``hvac`` — named in every fail-closed message so the operator knows
 #: exactly what to install.
@@ -113,18 +117,33 @@ def _token_unset(platform: str | None = None) -> str:
 
 def _import_hvac() -> Any:
     """Lazily import ``hvac`` (the optional ``[vault]`` extra), failing closed with a
-    :class:`KeyProviderError` that names the extra — mirrors ``keyprovider.py``'s missing-backend message.
-    ``ImportError`` (not just ``ModuleNotFoundError``) is caught so a partially-broken install also fails
-    closed rather than surfacing a bare import error out of ``open_store``."""
+    :class:`KeyProviderError` that names the extra, as ``secretprovider_vault._import_hvac`` does
+    (vault BACKLOG #6709). Any ``Exception`` is caught, not only ``ImportError``: importing runs
+    hvac's and its dependencies' top-level code, which can raise an ``OSError`` or another class.
+    Only a ``ModuleNotFoundError`` for ``hvac`` itself reads as a missing extra; anything else is a
+    broken install, refused by class with "reinstall" and logged at WARNING by class. The refusal is
+    raised outside the handler with no chain: an import error's text can carry a filesystem path,
+    and before this an ``OSError``'s text reached the client-build refusal."""
     try:
         # hvac ships no type stubs; the targeted ignore contains that here (never a repo-wide ignore).
         import hvac  # type: ignore[import-untyped]  # noqa: PLC0415  (lazy — base install pulls no SDK)
-    except ImportError as exc:
+    except Exception as exc:  # noqa: BLE001 -- an import runs top-level code that may raise any class; refused below, logged by class
+        if isinstance(exc, ModuleNotFoundError) and exc.name == "hvac":
+            failed = None
+        else:
+            failed = type(exc).__name__
+            log_import_failure(f"[store].key_provider={_EXTRA!r}", exc, logger=_log)
+    else:
+        return hvac
+    if failed is None:
         raise KeyProviderError(
             f"[store].key_provider={_EXTRA!r} requires the optional {_EXTRA!r} extra (hvac not "
             f"importable): install 'messagefoundry[{_EXTRA}]'."
-        ) from exc
-    return hvac
+        )
+    raise KeyProviderError(
+        f"[store].key_provider={_EXTRA!r}: hvac is installed but did not import ({failed}): "
+        f"reinstall 'messagefoundry[{_EXTRA}]'."
+    )
 
 
 def _vault_ca_kwargs(addr: str | None) -> dict[str, str]:

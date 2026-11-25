@@ -142,6 +142,92 @@ def test_missing_hvac_fails_closed_naming_the_extra(monkeypatch: pytest.MonkeyPa
         provider.active_key()
 
 
+#: Synthetic text a broken hvac import might carry: a path and a marker. Neither may reach the refusal.
+_BROKEN_HVAC_TEXT = "DLL load failed: C:/synthetic/site-packages/_hvac.pyd marker zz0451"
+
+
+@pytest.mark.parametrize(
+    "make_error",
+    [
+        pytest.param(lambda: ImportError(_BROKEN_HVAC_TEXT), id="broken-c-extension"),
+        pytest.param(
+            lambda: ModuleNotFoundError(_BROKEN_HVAC_TEXT, name="hvac.v1"), id="submodule-missing"
+        ),
+        pytest.param(lambda: OSError(_BROKEN_HVAC_TEXT), id="os-error"),
+        pytest.param(lambda: AttributeError(_BROKEN_HVAC_TEXT), id="attribute-error"),
+        pytest.param(lambda: ValueError(_BROKEN_HVAC_TEXT), id="value-error"),
+    ],
+)
+def test_a_broken_hvac_import_is_refused_by_class_with_no_text(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, make_error: Any
+) -> None:
+    # Vault BACKLOG #6709 item 4: the store-side hvac import caught only ImportError, said
+    # "install" for a broken install, and chained the error, so an OSError's text reached the
+    # client-build refusal. It now refuses as the secrets twin does.
+    import builtins
+    import logging
+
+    _configure_env(monkeypatch)
+    real_import = builtins.__import__
+    type_name = type(make_error()).__name__
+
+    def _import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "hvac":
+            raise make_error()
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _import)
+    caplog.set_level(logging.WARNING)
+    with pytest.raises(KeyProviderError) as caught:
+        keyprovider_vault._import_hvac()
+    text = str(caught.value)
+    assert f"hvac is installed but did not import ({type_name})" in text
+    assert "reinstall 'messagefoundry[vault]'" in text
+    assert "synthetic" not in text and "0451" not in text
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and r.name == "messagefoundry.store.keyprovider_vault"
+    ]
+    assert len(warnings) == 1 and type_name in warnings[0].getMessage()
+    assert "0451" not in warnings[0].getMessage()
+
+
+def test_a_missing_hvac_says_install_not_reinstall(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "hvac", None)
+    with pytest.raises(KeyProviderError) as caught:
+        keyprovider_vault._import_hvac()
+    text = str(caught.value)
+    assert "install 'messagefoundry[vault]'" in text and "reinstall" not in text
+
+
+def test_a_provider_build_that_fails_is_a_key_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Vault BACKLOG #6709: build_provider ran outside the dispatch's try, so a ValueError from a
+    # provider's construction escaped raw, which store.base reads as a refused key.
+    def _boom(*_a: Any, **_k: Any) -> Any:
+        raise ValueError(_BROKEN_HVAC_TEXT)
+
+    monkeypatch.setattr(keyprovider_vault, "build_provider", _boom)
+    with pytest.raises(KeyProviderError) as caught:
+        resolve_key_provider(StoreSettings(key_provider="vault"))
+    assert "could not be built (ValueError" in str(caught.value)
+    assert "0451" not in str(caught.value)
+
+
+def test_a_providers_own_refusal_from_its_build_keeps_its_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _refuse(*_a: Any, **_k: Any) -> Any:
+        raise KeyProviderError("the provider's own refusal")
+
+    monkeypatch.setattr(keyprovider_vault, "build_provider", _refuse)
+    with pytest.raises(KeyProviderError, match="^the provider's own refusal$"):
+        resolve_key_provider(StoreSettings(key_provider="vault"))
+
+
 def test_missing_config_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     # Neither env var set → misconfiguration, not a no-key degrade. The message names the missing var.
     monkeypatch.delenv("MEFOR_STORE_VAULT_TRANSIT_KEY", raising=False)

@@ -40,7 +40,7 @@ import importlib
 import logging
 import os
 import re
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import SecretsSettings
@@ -125,17 +125,21 @@ _log = logging.getLogger(__name__)
 _MODULE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,199}")
 
 
-def log_import_failure(label: str, exc: BaseException) -> None:
+def log_import_failure(
+    label: str, exc: BaseException, *, logger: logging.Logger | None = None
+) -> None:
     """Log at WARNING that an import behind ``label`` failed, by the error's class (vault BACKLOG
     #6709). The refusal the caller raises drops the error, so this line is what is left to
     diagnose from. The error's text is not logged: neither the engine's PHI redaction nor its
     credential scrub removes a filesystem path, and an import error's text can carry one, or a
-    source line. An ``ImportError``'s module name is logged when it is a plain dotted name."""
+    source line. An ``ImportError``'s module name is logged when it is a plain dotted name.
+    ``logger`` is the caller's own module logger, so the line names the module that refused; this
+    module's logger when ``None``."""
     module = getattr(exc, "name", None) if isinstance(exc, ImportError) else None
     named = (
         f", module {module!r}" if isinstance(module, str) and _MODULE_NAME.fullmatch(module) else ""
     )
-    _log.warning(
+    (logger or _log).warning(
         "%s: an import failed (%s%s); its text is not logged, as it can carry a filesystem path",
         label,
         type(exc).__name__,
@@ -185,12 +189,32 @@ def _load_external_provider(
         failed = type(exc).__name__
         log_import_failure(f"[secrets].provider={name!r}", exc)
     else:
-        provider: SecretProvider = module.build_provider(settings, posture=posture)
-        return provider
+        return _build_external_provider(name, module, settings, posture)
     raise SecretProviderError(
         f"[secrets].provider={name!r} could not load its provider module or backend (an import "
         f"failed: {failed}) — reinstall MessageFoundry with the optional {extra!r} extra "
         f"('messagefoundry[{extra}]')."
+    )
+
+
+def _build_external_provider(
+    name: str, module: Any, settings: SecretsSettings, posture: HopPosture | None
+) -> SecretProvider:
+    """Call ``module.build_provider``, refusing any error it raises that is not a
+    :class:`SecretProviderError` with one by class (vault BACKLOG #6709). A provider's own refusal
+    keeps its text. Any other error is a fault in the provider's construction: its text is not
+    repeated or chained, for the reason :func:`_load_external_provider` gives for an import's."""
+    try:
+        provider: SecretProvider = module.build_provider(settings, posture=posture)
+    except SecretProviderError:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- a provider's construction may raise any class; refused below, logged by class
+        failed = type(exc).__name__
+        _log.warning("[secrets].provider=%r: building the provider failed (%s)", name, failed)
+    else:
+        return provider
+    raise SecretProviderError(
+        f"[secrets].provider={name!r}: its provider could not be built ({failed})."
     )
 
 

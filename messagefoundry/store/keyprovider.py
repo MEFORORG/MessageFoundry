@@ -312,15 +312,26 @@ def _load_external_provider(
         # the operator to generate a new one; a failed import is never a bad key. The error is
         # chained, not swallowed. This seam's own text does not reach an operator through
         # resolve_active_key or resolve_decrypt_keys, which replace any error with a fixed text of
-        # their own. An error raised later, inside build_provider or a provider's lazy SDK import,
-        # is not caught here.
+        # their own. An error raised later, inside build_provider, is refused below; one from a
+        # provider's lazy SDK import is that provider's to refuse.
         raise KeyProviderError(
             f"[store].key_provider={name!r} could not load its provider module or backend (an "
             f"import failed: {type(exc).__name__}, chained below) — reinstall MessageFoundry "
             f"with the optional {extra!r} extra."
         ) from exc
     # The provider module owns its own construction; annotate the local so mypy keeps the contract.
-    provider: KeyProvider = module.build_provider(settings, posture=posture)
+    # A provider's own KeyProviderError keeps its text. Any other error from its construction is
+    # refused as one by class (vault BACKLOG #6709): left raw, a ValueError would reach store.base,
+    # which reads a ValueError as a refused key. Chained, as the import refusal above is.
+    try:
+        provider: KeyProvider = module.build_provider(settings, posture=posture)
+    except KeyProviderError:
+        raise
+    except Exception as exc:
+        raise KeyProviderError(
+            f"[store].key_provider={name!r}: its provider could not be built "
+            f"({type(exc).__name__}, chained below)."
+        ) from exc
     return provider
 
 

@@ -24,6 +24,7 @@ from messagefoundry.config.secretprovider import (
     EnvSecretProvider,
     SecretProvider,
     SecretProviderError,
+    log_import_failure,
     resolve_connector_secret,
     resolve_secret_provider,
 )
@@ -216,13 +217,18 @@ def test_an_external_provider_whose_import_breaks_fails_closed_with_a_fixed_text
     assert f"import failed: {type(raised[0]).__name__}" in text
     assert "synthetic" not in text and "0451" not in text and "Client" not in text
     assert caught.value.__cause__ is None and caught.value.__context__ is None
-    _assert_one_class_only_warning(caplog, type(raised[0]).__name__)
+    _assert_one_class_only_warning(
+        caplog, type(raised[0]).__name__, "messagefoundry.config.secretprovider"
+    )
 
 
-def _assert_one_class_only_warning(caplog: pytest.LogCaptureFixture, type_name: str) -> None:
+def _assert_one_class_only_warning(
+    caplog: pytest.LogCaptureFixture, type_name: str, logger_name: str
+) -> None:
     """Round-3 finding 2 on BACKLOG #6709: the dropped cause is logged at WARNING, by its class,
-    with none of its text (a path, a source line or a secret)."""
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    with none of its text (a path, a source line or a secret). Counted on ``logger_name`` only,
+    so a WARNING from another module neither satisfies nor breaks the count (#6709 items 9, 12)."""
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING and r.name == logger_name]
     assert len(warnings) == 1
     message = warnings[0].getMessage()
     assert type_name in message
@@ -257,7 +263,7 @@ def test_vault_lazy_hvac_import_that_breaks_fails_closed_with_a_fixed_text(
     assert "reinstall 'messagefoundry[vault]'" in text
     assert "synthetic" not in text and "0451" not in text and "Client" not in text
     assert caught.value.__cause__ is None and caught.value.__context__ is None
-    _assert_one_class_only_warning(caplog, type_name)
+    _assert_one_class_only_warning(caplog, type_name, "messagefoundry.config.secretprovider_vault")
 
 
 @pytest.mark.parametrize(
@@ -289,6 +295,58 @@ def test_vault_lazy_hvac_import_tells_missing_from_broken_by_module_name(
     assert remedy in text
     if missing == "hvac":
         assert "reinstall" not in text
+
+
+@pytest.mark.parametrize(
+    ("module", "logged"),
+    [
+        pytest.param("hvac.v1", "module 'hvac.v1'", id="dotted-name-logged"),
+        pytest.param("C:/synthetic/zz0451", None, id="path-shaped-name-withheld"),
+    ],
+)
+def test_log_import_failure_names_a_plain_module_and_withholds_any_other(
+    caplog: pytest.LogCaptureFixture, module: str, logged: str | None
+) -> None:
+    # Vault BACKLOG #6709 item 7: the logged module name had no test.
+    caplog.set_level(logging.WARNING)
+    log_import_failure("label", ImportError("synthetic", name=module))
+    (record,) = [r for r in caplog.records if r.name == "messagefoundry.config.secretprovider"]
+    message = record.getMessage()
+    if logged is None:
+        assert "module" not in message and "zz0451" not in message
+    else:
+        assert logged in message
+
+
+def test_an_external_provider_whose_build_fails_is_refused_by_class(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Vault BACKLOG #6709: build_provider ran outside the dispatch's try, so an error from a
+    # provider's construction escaped raw. It is refused by class, with no text and no chain.
+    caplog.set_level(logging.WARNING)
+
+    def _boom(*_a: Any, **_k: Any) -> Any:
+        raise ValueError(_BROKEN_IMPORT_TEXT)
+
+    monkeypatch.setattr(secretprovider_vault, "build_provider", _boom)
+    with pytest.raises(SecretProviderError) as caught:
+        resolve_secret_provider(SecretsSettings(provider="vault"))
+    text = str(caught.value)
+    assert "could not be built (ValueError)" in text
+    assert "synthetic" not in text and "0451" not in text
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    _assert_one_class_only_warning(caplog, "ValueError", "messagefoundry.config.secretprovider")
+
+
+def test_an_external_providers_own_refusal_from_its_build_keeps_its_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _refuse(*_a: Any, **_k: Any) -> Any:
+        raise SecretProviderError("the provider's own refusal")
+
+    monkeypatch.setattr(secretprovider_vault, "build_provider", _refuse)
+    with pytest.raises(SecretProviderError, match="^the provider's own refusal$"):
+        resolve_secret_provider(SecretsSettings(provider="vault"))
 
 
 # --- vault backend: mocked KV ------------------------------------------------

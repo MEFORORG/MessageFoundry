@@ -28,6 +28,7 @@ is contained as a typed ``Any`` local here (never a repo-wide ignore).
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from collections.abc import Iterable
@@ -45,6 +46,8 @@ from messagefoundry.engine_secrets import SecretsDirectoryError, secret_setting
 if TYPE_CHECKING:
     from messagefoundry.config.settings import SecretsSettings
     from messagefoundry.config.tls_policy import HopPosture
+
+_log = logging.getLogger(__name__)
 
 #: The optional extra that carries ``hvac`` — named in every fail-closed message. Deliberately the SAME
 #: extra the store's Vault KeyProvider uses (no second Vault dependency).
@@ -124,7 +127,7 @@ def _import_hvac() -> Any:
             failed = None
         else:
             failed = type(exc).__name__
-            log_import_failure(f"[secrets].provider={_EXTRA!r}", exc)
+            log_import_failure(f"[secrets].provider={_EXTRA!r}", exc, logger=_log)
     else:
         return hvac
     if failed is None:
