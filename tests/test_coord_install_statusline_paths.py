@@ -35,9 +35,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _env() -> dict[str, str]:
+def _env(extra: dict[str, str] | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env.pop("CLAUDE_CONFIG_DIR", None)
+    env.pop("MEFOR_TEST_STATUSLINE_SWAP_FAULT", None)
+    env.update(extra or {})
     return env
 
 
@@ -46,9 +48,17 @@ def _q(path: Path | str) -> str:
     return "'" + str(path).replace("'", "''") + "'"
 
 
-def _spawn(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+def _spawn(
+    cmd: list[str], cwd: Path, extra_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     return run_single(
-        cmd, capture_output=True, text=True, timeout=TIMEOUT, check=False, env=_env(), cwd=cwd
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=_env(extra_env),
+        cwd=cwd,
     )
 
 
@@ -59,12 +69,26 @@ def _home(tmp_path: Path) -> Path:
 
 
 def _install(
-    tmp_path: Path, *args: str, cwd: Path, collector: str | None = None
+    tmp_path: Path,
+    *args: str,
+    cwd: Path,
+    collector: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """The documented invocation, ``pwsh -File``."""
     cmd = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(INSTALL)]
     cmd += ["-HomeDir", str(_home(tmp_path)), "-CollectorPath", collector or str(COLLECT), *args]
-    return _spawn(cmd, cwd)
+    return _spawn(cmd, cwd, extra_env)
+
+
+def _free_drive() -> str:
+    """A drive letter nothing is mapped to, found at run time; skips the test when all are taken."""
+    free = next(
+        (d for d in reversed(string.ascii_uppercase) if not os.path.exists(f"{d}:\\")), None
+    )
+    if free is None:
+        pytest.skip("every drive letter is in use, so no gone drive can be named")
+    return free
 
 
 def _install_in_session(
@@ -230,14 +254,77 @@ def test_a_non_numeric_refresh_interval_on_our_own_status_line_is_rewired(tmp_pa
 def test_a_path_on_a_drive_that_does_not_exist_is_a_usage_error(tmp_path: Path) -> None:
     """An unmapped drive made the resolver throw, uncaught, so the run ended on a raw exception and
     exit 1, which here means "roots were targeted and none reached the desired state"."""
-    free = next(
-        (d for d in reversed(string.ascii_uppercase) if not os.path.exists(f"{d}:\\")), None
-    )
-    if free is None:
-        pytest.skip("every drive letter is in use")
+    free = _free_drive()
     proc = _install(tmp_path, "-SettingsPath", f"{free}:\\nope\\settings.json", cwd=tmp_path)
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert "cannot be resolved" in proc.stdout
+
+
+def test_uninstall_reports_a_root_on_a_gone_drive_as_unknown_not_absent(tmp_path: Path) -> None:
+    """NOT PRESENT IS A READING, AND NOTHING WAS READ. Test-Path is False for a path on a drive that
+    is not there, which Read-Settings turned into an empty document, so the run reported NOT PRESENT
+    and exited 0 while the root may still carry a live statusLine."""
+    gone = f"{_free_drive()}:\\nope\\settings.json"
+    proc = _install(tmp_path, "-Uninstall", "-SettingsPath", gone, cwd=tmp_path)
+    assert re.search(r"^\s*UNKNOWN\s+" + re.escape(gone), proc.stdout, re.M), proc.stdout
+    assert "NOT PRESENT" not in proc.stdout, proc.stdout
+    assert "not present: 0" in proc.stdout and "unknown: 1" in proc.stdout, proc.stdout
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+
+
+def test_status_reports_a_root_on_a_gone_drive_as_unknown(tmp_path: Path) -> None:
+    """The publish-path line threw on a missing drive, so the audit ended there on a raw error."""
+    gone = f"{_free_drive()}:\\nope\\settings.json"
+    proc = _install(tmp_path, "-Status", "-SettingsPath", gone, cwd=tmp_path)
+    assert re.search(r"statusLine\s+: UNKNOWN", proc.stdout), proc.stdout + proc.stderr
+    assert "Cannot find drive" not in proc.stdout + proc.stderr
+    assert "This reads the FILE" in proc.stdout, proc.stdout
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+
+
+# --- #7576: a swap that fails part way -------------------------------------------------------------
+
+
+def test_a_swap_that_fails_part_way_puts_the_original_back(tmp_path: Path) -> None:
+    """NEITHER FILE IS THE ONE OUTCOME THAT MUST NOT HAPPEN. ReplaceFile can fail after it has moved
+    settings.json aside; with no backup name and an unconditional temp-file delete, the original was
+    gone and the only copy of the new content was deleted after it. The fault seam reproduces that
+    swap state, and the run must fail loudly with the original back in place."""
+    root = _root(tmp_path, {"keep": True})
+    settings = root / "settings.json"
+    proc = _install(
+        tmp_path,
+        "-SettingsPath",
+        str(settings),
+        cwd=tmp_path,
+        extra_env={"MEFOR_TEST_STATUSLINE_SWAP_FAULT": "original-moved-aside"},
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "FAILED" in proc.stdout and "was not updated" in proc.stdout, proc.stdout
+    assert json.loads(settings.read_text(encoding="utf-8")) == {"keep": True}
+    assert not [p.name for p in root.iterdir() if p.name.endswith((".tmp", ".swap-bak"))]
+
+
+def test_a_swap_whose_restore_also_fails_keeps_both_copies_and_names_them(tmp_path: Path) -> None:
+    """When the original cannot be put back either, the temp file is the new content and the swap
+    backup is the old one; both stay, and the FAILED line names each path."""
+    root = _root(tmp_path, {"keep": True})
+    settings = root / "settings.json"
+    proc = _install(
+        tmp_path,
+        "-SettingsPath",
+        str(settings),
+        cwd=tmp_path,
+        extra_env={"MEFOR_TEST_STATUSLINE_SWAP_FAULT": "original-moved-aside-restore-fails"},
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert not settings.exists()
+    (tmp,) = [p for p in root.iterdir() if p.name.endswith(".tmp")]
+    (bak,) = [p for p in root.iterdir() if p.name.endswith(".swap-bak")]
+    assert "statusLine" in json.loads(tmp.read_text(encoding="utf-8"))
+    assert json.loads(bak.read_text(encoding="utf-8")) == {"keep": True}
+    flat = " ".join(proc.stdout.split())
+    assert str(tmp) in flat and str(bak) in flat, proc.stdout
 
 
 def test_status_and_uninstall_still_report_on_a_deleted_root(tmp_path: Path) -> None:
