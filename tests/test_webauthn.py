@@ -555,9 +555,12 @@ async def test_an_undecodable_stored_credential_id_is_refused_at_the_begin_leg(
     """BACKLOG #6886, the id. RED when: a stored ``credential_id`` that does not decode raises a
     decode error out of :meth:`AuthService.begin_webauthn_assertion`, when that leg answers
     ``None`` for it (the web console reads ``None`` as an origin migration), or when it writes the
-    refusal on every call. The passkey is left out of the allow list and refused as a stored key
-    is: the WARNING by label and the ``stored_key_refused`` row, once per throttle interval. It
-    was the only passkey, so no ceremony can be staged: :class:`StoredPasskeysUnreadable`."""
+    refusal on every call, or when the WARNING or the row says the passkey can never sign in. The
+    passkey is left out of the allow list and reported: the WARNING by label, saying the combined
+    sign-in can still use it, and the ``stored_id_unreadable`` row, once per throttle interval.
+    Not ``stored_key_refused``, which the verify writes for a stored key that never signs in
+    again. It was the only passkey, so no ceremony can be staged:
+    :class:`StoredPasskeysUnreadable`."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
@@ -572,10 +575,12 @@ async def test_an_undecodable_stored_credential_id_is_refused_at_the_begin_leg(
                     await service.begin_webauthn_assertion(token, rp_id=RP)
         warned = _undecodable_id_warnings(caplog)
         assert len(warned) == 1 and "'test key'" in warned[0], warned
+        assert "allow list" in warned[0] and "combined sign-in can still use it" in warned[0]
+        assert "registered again" not in warned[0], warned
         assert _as_text(stored) not in caplog.text
         events = await service.security_events_for(identity.username)
         failed = [json.loads(e["detail"]) for e in events if e["action"] == "auth.webauthn_failed"]
-        assert failed == [{"reason": "stored_key_refused", "label": "test key"}]
+        assert failed == [{"reason": "stored_id_unreadable", "label": "test key"}]
     finally:
         await store.close()
 
@@ -659,7 +664,7 @@ async def test_the_registration_leg_does_not_use_up_the_begin_legs_report(
 ) -> None:
     """BACKLOG #6886. RED when: the registration options leg's report of an undecodable stored id
     uses up the throttle slot the assertion begin leg needs, so that leg writes no
-    ``stored_key_refused`` row for the interval. The two legs are throttled apart."""
+    ``stored_id_unreadable`` row for the interval. The two legs are throttled apart."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
@@ -673,7 +678,7 @@ async def test_the_registration_leg_does_not_use_up_the_begin_legs_report(
             await service.begin_webauthn_assertion(token, rp_id=RP)
         events = await service.security_events_for(identity.username)
         failed = [json.loads(e["detail"]) for e in events if e["action"] == "auth.webauthn_failed"]
-        assert failed == [{"reason": "stored_key_refused", "label": "test key"}]
+        assert failed == [{"reason": "stored_id_unreadable", "label": "test key"}]
     finally:
         await store.close()
 
@@ -753,10 +758,10 @@ async def test_a_bytes_label_does_not_break_the_finish_legs_stored_key_refusal(
 async def test_a_bytes_label_does_not_break_the_begin_legs_stored_key_refusal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #6886. RED when: the begin leg's ``stored_key_refused`` row for a passkey whose
+    """BACKLOG #6886. RED when: the begin leg's ``stored_id_unreadable`` row for a passkey whose
     stored id does not decode raises ``TypeError`` on a label that reads back as bytes, a server
-    error in place of :class:`StoredPasskeysUnreadable`. The row is the same one the finish leg
-    writes, built by one builder."""
+    error in place of :class:`StoredPasskeysUnreadable`. The row is built by the same builder as
+    the finish leg's ``stored_key_refused`` row, with its own reason."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
@@ -766,7 +771,7 @@ async def test_a_bytes_label_does_not_break_the_begin_legs_stored_key_refusal(
         with pytest.raises(StoredPasskeysUnreadable):
             await service.begin_webauthn_assertion(token, rp_id=RP)
         failed = await _refusal_details(service, identity.username, "auth.webauthn_failed")
-        assert failed == [{"reason": "stored_key_refused", "label": "bytes key"}]
+        assert failed == [{"reason": "stored_id_unreadable", "label": "bytes key"}]
     finally:
         await store.close()
 

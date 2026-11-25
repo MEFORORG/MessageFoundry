@@ -3653,11 +3653,16 @@ def _passkey_label(label: object) -> str | None:
     return None
 
 
-def _stored_key_refused_detail(cred: WebAuthnCredential) -> str:
-    """The one audit detail for a passkey a stored cell refuses (BACKLOG #1963, #6886), written by
-    both the assertion begin leg (a stored id it cannot list) and the verify (a stored key it
-    cannot use): a fixed slug and the label, never the refusal text, which can quote the key."""
-    return _json({"reason": "stored_key_refused", "label": _passkey_label(cred.label)})
+def _stored_cell_refused_detail(
+    cred: WebAuthnCredential, reason: Literal["stored_key_refused", "stored_id_unreadable"]
+) -> str:
+    """The one audit detail for a passkey a stored cell refuses (BACKLOG #1963, #6886): a fixed
+    slug and the label, never the refusal text, which can quote the key. The verify writes
+    ``stored_key_refused`` for a stored key it cannot use, which never signs in again. The
+    assertion begin leg writes ``stored_id_unreadable`` for a stored id it cannot list: that
+    ceremony cannot offer the passkey, but the combined sign-in, which names no credential, can
+    still use it, so the key's reason would overstate it."""
+    return _json({"reason": reason, "label": _passkey_label(cred.label)})
 
 
 def _is_idp_transport_failure(exc: BaseException) -> bool:
@@ -7030,7 +7035,7 @@ class AuthService:
 
         def refused_key() -> tuple[str, str | None]:
             # Built only on a refusal, so a good assertion never encodes the label.
-            return "auth.webauthn_failed", _stored_key_refused_detail(cred)
+            return "auth.webauthn_failed", _stored_cell_refused_detail(cred, "stored_key_refused")
 
         try:
             public_key = self._b64url_decode(cred.public_key)
@@ -19881,11 +19886,14 @@ class AuthService:
                 ids.append(self._b64url_decode(cred.credential_id))
             except (ValueError, TypeError):  # binascii.Error is a ValueError
                 if self._seal_failures_reported.due(f"passkey-id:{leg}:{cred.credential_id_hash}"):
+                    # Not "must be registered again": the combined sign-in names no credential
+                    # and finds the passkey by the id the browser sends, so it can still use it.
                     _log.warning(
-                        "passkey %r of %s has a stored credential id that cannot be decoded and "
-                        "must be registered again",
+                        "passkey %r of %s has a stored credential id that cannot be decoded; it is "
+                        "left out of this ceremony's %s, and the combined sign-in can still use it",
                         cred.label,
                         username,
+                        "allow list" if leg == "assert" else "exclude list",
                     )
                     due.append(cred)
         return ids, due
@@ -20401,14 +20409,14 @@ class AuthService:
         )
         for cred in due:
             # BACKLOG #6886: a passkey whose stored id does not decode cannot be listed, so this
-            # ceremony cannot offer it, and it is refused here as a refused stored key is at the
-            # finish leg, row and all. The combined sign-in, which lists no credential, can still
-            # use it. The row is throttled with the WARNING, because the web console begins a
-            # ceremony on every render.
+            # ceremony cannot offer it, and the row says so with its own reason. The combined
+            # sign-in, which lists no credential, can still use it, so the finish leg's
+            # ``stored_key_refused`` would overstate it. The row is throttled with the WARNING,
+            # because the web console begins a ceremony on every render.
             await self._audit(
                 "auth.webauthn_failed",
                 actor=user.username,
-                detail=_stored_key_refused_detail(cred),
+                detail=_stored_cell_refused_detail(cred, "stored_id_unreadable"),
             )
         if not allowed:
             # Not ``None``: the console reads that as an origin migration, and none happened.
