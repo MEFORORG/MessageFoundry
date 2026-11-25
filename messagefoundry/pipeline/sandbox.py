@@ -1269,9 +1269,10 @@ class SandboxSession:
                     return  # the stream is out of step, so nothing after the header is a frame
         except OSError as exc:
             # Read as the peer being gone, as a clean EOF is. Stamped before the log line, so a
-            # slow handler cannot delay the stamp _died_before_first_check reads. DEBUG, not
-            # WARNING: a read error on a pipe the reap has just broken is the ordinary end of a
-            # killed worker. The type name only, since an OSError's text can name a path.
+            # slow handler cannot delay the stamp _died_before_first_check reads. A reaped worker's
+            # pipe reads EOF, not an error, so this branch is only an unusual reader fault, such as
+            # EIO or a closed handle; it is logged at DEBUG, its level when it was added. The type
+            # name only, since an OSError's text can name a path.
             eof_at.append(time.monotonic())
             log.debug(
                 "inbound %r: sandbox frame reader stopped on %s, read as EOF",
@@ -1550,7 +1551,11 @@ class SandboxSession:
 
         The reader stamps the EOF once its read returns, which is after the pipe closed, and the
         pass's time is taken before it looks at the worker, so a worker that dies during that pass
-        or while the request is encoded never reads True, and its death is recorded. A worker that
+        or while the request is encoded never reads True. Its death is recorded when the second
+        call finds it. When the first call itself finds it, through its queued EOF in that same
+        pass, the first call handles it as it handles any kept worker: a silent reap with no cause
+        recorded and no WARNING, or :attr:`KillCause.STDOUT_CLOSED` if the worker is still running
+        once the grace is spent, and this method is never asked. A worker that
         died before the pass still reads False, and is recorded as a ``CRASH`` (or
         ``STDOUT_CLOSED``, as :meth:`_live_worker` says), when the reader read its EOF only after
         the pass began, for example because the reader thread was not scheduled until then, or read
