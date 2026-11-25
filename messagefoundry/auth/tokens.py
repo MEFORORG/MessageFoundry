@@ -128,6 +128,24 @@ def credential_id_hash_scheme(stored: str) -> str:
     return scheme
 
 
+def decode_stored_b64url(value: str) -> bytes:
+    """Decode a stored base64url passkey column (``credential_id``, ``public_key``), padding
+    restored. The one decoder the passkey code uses for a stored value. It raises ``ValueError``
+    (``binascii.Error`` is one) for text it cannot decode, and ``TypeError`` for a value that is
+    not text. It skips characters outside the alphabet, so not every malformed value raises."""
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def stored_credential_id_decodes(stored: str) -> bool:
+    """Whether a stored ``credential_id`` decodes with :func:`decode_stored_b64url` (BACKLOG
+    #6886). The verify refuses a passkey whose id does not, so no sign-in can use it."""
+    try:
+        decode_stored_b64url(stored)
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
 def credential_id_hash_is_current(stored: str) -> bool:
     """Whether a stored ``credential_id_hash`` is under today's scheme, the only key the sign-in
     looks a passkey up by (BACKLOG #3423). A bare digest the start-up rehash has not moved, an

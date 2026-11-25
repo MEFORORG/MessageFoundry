@@ -968,8 +968,9 @@ from typing import Any
 #: ``7c3240bbbaf0605a`` to ``a888b8fed812bbe6``.
 #:
 #: BACKLOG #6886: the console imports ``StoredPasskeysUnreadable``, which
-#: ``AuthService.begin_webauthn_assertion`` now raises where it answered ``None`` for passkeys whose
-#: stored ids do not decode, and shows its own notice for it. A console built against the old seam
+#: ``AuthService.begin_webauthn_assertion`` now raises for an account whose passkeys under the
+#: relying party all have stored ids that do not decode, and shows its own notice for it. Before,
+#: that leg let the decode error escape, a 500. A console built against the old seam
 #: would meet that exception unhandled, so the seam moves. Re-derived with ``--write``, from
 #: ``a888b8fed812bbe6`` to ``79061715c6b96b83``.
 #:

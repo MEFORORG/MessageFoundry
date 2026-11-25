@@ -141,6 +141,7 @@ from messagefoundry.auth.tokens import (
     ENROLMENT_CODE_MAX,
     credential_id_hash_is_current,
     credential_id_hash_scheme,
+    decode_stored_b64url,
     enrolment_code_digest,
     enrolment_code_matches,
     hash_token,
@@ -19778,7 +19779,7 @@ class AuthService:
 
     @staticmethod
     def _b64url_decode(value: str) -> bytes:
-        return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        return decode_stored_b64url(value)
 
     def _split_stored_credential_ids(
         self, creds: Sequence[WebAuthnCredential], *, username: str, leg: str

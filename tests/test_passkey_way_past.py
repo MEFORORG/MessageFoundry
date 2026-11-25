@@ -348,6 +348,73 @@ async def test_totp_can_be_removed_while_a_discoverable_passkey_remains(
         await store.close()
 
 
+async def _set_stored_credential_id(store: MessageStore, user_id: str, value: str) -> None:
+    """Write ``value`` into the account's passkey ``credential_id``, as a row written outside the
+    store might hold. The store is keyless, so no seal refuses the row first."""
+    await store._db.execute(
+        "UPDATE webauthn_credentials SET credential_id=? WHERE user_id=?", (value, user_id)
+    )
+    await store._db.commit()
+
+
+async def test_a_passkey_whose_stored_id_does_not_decode_opens_no_rotation_gate() -> None:
+    """BACKLOG #6886. RED when: a passkey whose stored ``credential_id`` does not decode counts as a
+    way past the sign-in lock. The verify refuses such a passkey, so an account whose only factor it
+    is has no way past, and the rotation gate stays shut. The same row with its own id is the
+    control that opens it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store)
+        identity, token, _ = await login_admin(service)
+        await _register(service, identity, token)
+        (cred,) = await store.list_webauthn_credentials(identity.user_id)
+        await _set_stored_credential_id(store, identity.user_id, "AAAAA")
+        assert await service.must_enrol_before_rotating(identity)
+        with pytest.raises(FactorEnrolmentRequired):
+            await service.change_password(identity, _NEW_PASSWORD)
+
+        await _set_stored_credential_id(store, identity.user_id, cred.credential_id)
+        assert not await service.must_enrol_before_rotating(identity)
+        assert await service.change_password(identity, _NEW_PASSWORD) == []
+    finally:
+        await store.close()
+
+
+async def test_totp_stays_while_the_only_passkey_has_a_stored_id_that_does_not_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6886. RED when: TOTP may be removed beside a discoverable passkey whose stored
+    ``credential_id`` does not decode. That passkey cannot sign in, so removing TOTP would leave
+    the account no way past the sign-in lock. The same row with its own id is the control that lets
+    TOTP go."""
+    from messagefoundry.auth import totp
+    from tests._totp_clock import pin_totp_clock
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store)
+        identity, token, _ = await login_admin(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+        pin_totp_clock(monkeypatch, 1_000_000.0)
+        confirmed = await service.confirm_mfa_enrollment(
+            identity, totp.totp(enroll.secret, now=1_000_000.0), token=token
+        )
+        assert confirmed.ok and confirmed.token is not None
+        _, token = await _register(service, identity, confirmed.token, label="resident")
+        (cred,) = await store.list_webauthn_credentials(identity.user_id)
+        await _set_stored_credential_id(store, identity.user_id, "AAAAA")
+        with pytest.raises(ValueError) as refused:
+            await service.disable_mfa(identity)
+        assert str(refused.value) == TOTP_REMOVAL_REFUSED
+
+        await _set_stored_credential_id(store, identity.user_id, cred.credential_id)
+        await service.disable_mfa(identity)
+        row = await store.get_user(identity.user_id)
+        assert row is not None and not row.totp_enabled
+    finally:
+        await store.close()
+
+
 async def test_the_census_counts_a_discoverable_passkey_as_a_way_past() -> None:
     """AC-A9 with wave 2: a covered account with a chosen password and only a discoverable passkey
     is not named as lockable; it is named as passkey-only, which is informational."""
@@ -627,20 +694,18 @@ async def test_a_valid_assertion_beside_a_wrong_password_counts_on_the_second_st
         ("public_key", "AAAAA"),
         ("public_key", "\u00e9\u00e9\u00e9\u00e9"),
         ("public_key", b"AAAA"),
-        ("credential_id", "AAAAA"),
     ],
-    ids=["key-one-past-four", "key-non-ascii", "key-bytes", "id-one-past-four"],
+    ids=["key-one-past-four", "key-non-ascii", "key-bytes"],
 )
 async def test_an_undecodable_stored_key_refuses_the_combined_sign_in(
     monkeypatch: pytest.MonkeyPatch, field: str, stored: Any
 ) -> None:
-    """BACKLOG #6886, the sign-in leg. RED when: a stored key or id ``base64.urlsafe_b64decode``
-    cannot read raises out of :meth:`AuthService.login` (whose assertion check "never raises for
-    bad input"), or, for the id, signs in, instead of refusing. The usernameless begin leg names no
-    credential, so a row whose stored id does not decode is still looked up by its hash; the verify
-    refuses it. On this keyless store no digest check reads the row first. The refusal is the
-    ``stored_key_refused`` row, deferred with the sign-in's own refused row; the right password
-    does not sign the account in past it."""
+    """BACKLOG #6886, the sign-in leg. RED when: a stored key ``base64.urlsafe_b64decode`` cannot
+    read raises out of :meth:`AuthService.login` (whose assertion check "never raises for bad
+    input") instead of refusing. On this keyless store no digest check reads the row first. The
+    refusal is the ``stored_key_refused`` row, deferred with the sign-in's own refused row; the
+    right password does not sign the account in past it. A stored id that does not decode has its
+    own test below: such a passkey is no way past, so the combined leg is not taken at all."""
     store = await MessageStore.open(":memory:")
     try:
         service, identity, password, auth = await _passkey_owner(store)
@@ -667,6 +732,33 @@ async def test_an_undecodable_stored_key_refuses_the_combined_sign_in(
         assert '"key"' in decoded_details and '"label": "key"' in "".join(stored_details)
         assert needle not in decoded_details
         assert json.dumps(needle)[1:-1] not in "".join(stored_details)
+    finally:
+        await store.close()
+
+
+async def test_a_passkey_whose_stored_id_does_not_decode_is_no_combined_sign_in() -> None:
+    """BACKLOG #6886. RED when: a passkey whose stored ``credential_id`` does not decode still
+    takes the combined passkey sign-in, which satisfies the second factor. Such a passkey is no
+    way past (:func:`~messagefoundry.store.store.passkey_is_way_past`), so the request is the
+    password sign-in it would be with no passkey: the right password gives a session that still
+    owes its second factor, and under a live sign-in lock the sign-in is refused. The same row
+    with its own id is the control that signs in with the factor met."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, password, auth = await _passkey_owner(store)
+        (cred,) = await store.list_webauthn_credentials(identity.user_id)
+        await _set_stored_credential_id(store, identity.user_id, "AAAAA")
+        out = await service.login(identity.username, password, passkey=_proof(service, auth))
+        assert out.ok and out.token is not None and out.mfa_required is True
+        assert await service.mfa_satisfied(out.token) is False
+
+        await _set_sign_in_lock(store, identity.user_id)
+        locked = await service.login(identity.username, password, passkey=_proof(service, auth))
+        assert not locked.ok, "the passkey opened the sign-in lock"
+
+        await _set_stored_credential_id(store, identity.user_id, cred.credential_id)
+        full = await service.login(identity.username, password, passkey=_proof(service, auth))
+        assert full.ok and full.token is not None and full.mfa_required is False
     finally:
         await store.close()
 
