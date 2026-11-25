@@ -14,7 +14,6 @@ senders and ACK writers use too.
 from __future__ import annotations
 
 import logging
-import re
 import time
 
 from messagefoundry.config.wiring import _is_text_codec
@@ -33,6 +32,11 @@ from messagefoundry.framing import (
 from messagefoundry.parsing._builtin_hl7 import HEADER_IDS, _extract_separators
 from messagefoundry.parsing.sniff import _LEADING_WS_STR
 from messagefoundry.parsing.split import _sends_more_than_one_message
+from messagefoundry.parsing.x12.delimiters import (
+    _COMPONENT_SEP_OFFSET,
+    _REPETITION_SEP_OFFSET,
+    _SEGMENT_TERM_OFFSET,
+)
 from messagefoundry.transports.base import NegativeAckError, encode_wire_body
 
 __all__ = [
@@ -331,13 +335,15 @@ def _reply_delimiters(reply: str) -> frozenset[str]:
 
     Two layouts are read (BACKLOG #5799 item 2: before, only the first line of an ``MSH``-led reply
     was read, so an X12 reply or a batch member declaring ``?`` had ``?`` written into its data).
-    An HL7 reply led by one of ``HEADER_IDS`` (``MSH``, ``BHS``, ``FHS``) is read on every line
+    An HL7 reply led by one of ``HEADER_IDS`` (``MSH``, ``BHS``, ``FHS``) is read on every segment
     that starts with one of them, each in the MSH-1/MSH-2 layout ``_extract_separators`` reads, so
-    a batch member's own ``MSH`` counts as its envelope does; lines are split at CR, LF or CRLF, as
-    the parser normalizes them. An X12 reply led by ``ISA`` is read at the ISA's fixed delimiter
-    offsets, raw and without the header checks ``discover_delimiters`` makes, so an ISA that read
-    refuses still declares what its offsets hold, and an offset past the reply's end declares
-    nothing. A reply with any other lead declares nothing here.
+    a batch member's own ``MSH`` counts as its envelope does. Its segments end at CR when the reply
+    holds one, so an LF inside a field is data, and at LF only in a reply with no CR; that
+    terminator, and the LF of a CR+LF end, are declared too. An X12 reply led by ``ISA`` is read
+    at the ISA's fixed delimiter offsets, raw and without the header checks
+    ``discover_delimiters`` makes, so an ISA that read refuses still declares what its offsets
+    hold, and an offset past the reply's end declares nothing. A reply with any other lead
+    declares nothing here.
 
     Leading whitespace and a BOM are skipped first, as the engine's one definition of tolerated
     leading noise (``sniff._LEADING_WS_STR``) skips them. A header line of ``MSH`` alone has no
@@ -345,22 +351,23 @@ def _reply_delimiters(reply: str) -> frozenset[str]:
     body = reply.lstrip(_LEADING_WS_STR)
     if body.startswith("ISA"):
         isa = {body[i] for i in _ISA_DELIMITER_OFFSETS if i < len(body)}
-        if body[105:107] == "\r\n":
+        if body[_SEGMENT_TERM_OFFSET : _SEGMENT_TERM_OFFSET + 2] == "\r\n":
             isa.add("\n")  # a CR+LF terminator is two characters, and `?` for either breaks it
         return frozenset(isa)
     if not body.startswith(HEADER_IDS):
         return frozenset()
-    found = {"\r"}
-    for line in _LINE_BREAK.split(body):
-        if line.startswith(HEADER_IDS) and len(line) >= 4:
-            found.update(_extract_separators(line))
+    terminator = "\r" if "\r" in body else "\n"
+    found = {terminator}
+    for segment in body.split(terminator):
+        if terminator == "\r" and segment.startswith("\n"):
+            found.add("\n")  # a CR+LF end: the LF opens the next piece
+            segment = segment[1:]
+        if segment.startswith(HEADER_IDS) and len(segment) >= 4:
+            found.update(_extract_separators(segment))
     return frozenset(found)
 
 
-#: The ISA's delimiter offsets, as ``parsing.x12.delimiters`` reads them: the element separator
-#: (+3), ISA11 (+82, the repetition separator from 00501), ISA16 (+104, the component separator)
-#: and the segment terminator (+105).
-_ISA_DELIMITER_OFFSETS = (3, 82, 104, 105)
-
-#: A line break as the parser's normalization reads one.
-_LINE_BREAK = re.compile(r"\r\n|\r|\n")
+#: The ISA's delimiter offsets, read from ``parsing.x12.delimiters``: the element separator (+3),
+#: ISA11 (the repetition separator from 00501), ISA16 (the component separator) and the segment
+#: terminator.
+_ISA_DELIMITER_OFFSETS = (3, _REPETITION_SEP_OFFSET, _COMPONENT_SEP_OFFSET, _SEGMENT_TERM_OFFSET)

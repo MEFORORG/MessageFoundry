@@ -804,6 +804,15 @@ def test_control_an_x12_reply_with_ordinary_delimiters_is_replaced_and_sent(term
     assert framing_mod.encode_reply(short, "ascii") == b"ISA*00*?~"
 
 
+def test_an_lf_inside_a_field_of_a_cr_reply_is_data_not_a_header() -> None:
+    """Round-2 review: lines were split at LF too, so ``MSH`` after an LF inside a field was read
+    as a header and its characters as delimiters, and a reply main replaced and sent was refused.
+    A reply that holds a CR ends its segments at CR only. Red on the round-1 head: it raised."""
+    reply = "MSH|^~" + BS + "&|R" + CR + "MSA|AA|1|ok\nMSH中" + CR
+    wire = framing_mod.encode_reply(reply, "latin-1", connection="IB_LF_DATA")
+    assert wire == reply.replace("中", "?").encode("latin-1")
+
+
 def test_an_isa_the_header_read_refuses_still_declares_its_offsets() -> None:
     """Round-1 review: an ISA ``discover_delimiters`` refuses (here ISA11 and ISA16 are both ``?``,
     so not distinct) declared nothing, and its data was replaced into ``?``. Its offsets are read
