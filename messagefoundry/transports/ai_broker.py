@@ -127,8 +127,8 @@ _AI_ATTESTATION_LEVER = (
     "endpoint's certificate, or use an endpoint on this machine."
 )
 
-#: The ways across that refusal under an enforcing posture where a CRL can reach the hop: that
-#: CRL, the attestation pair, or an endpoint on this machine.
+#: The ways across that refusal under an enforcing posture, on the terms below:
+#: ``[tls].crl_file``, the attestation pair, or an endpoint on this machine.
 #: ``[tls].crl_file`` reaches this hop since BACKLOG #5527, the later CRL lever ADR 0173 section 12
 #: foresaw when the owner ruling of 2026-10-27 built the attestation pair alone. It is offered only
 #: to a broker that was handed a ``[tls]`` policy, on a context whose only reason for no CRL
@@ -231,13 +231,14 @@ def _ai_endpoint_opener(
     so ``loaded_crls`` records the CRL it holds, the expiry monitor judges that copy, and
     ``crl_reload`` brings it current when the file is replaced. An opener that is no longer held
     keeps its ``loaded_crls`` record until it is garbage-collected. An opener and its handlers form
-    a reference cycle, so only the cyclic collector frees it, and an opener that lived long enough
-    to reach the oldest generation waits for a full collection, which may come well after it is
-    dropped; until then ``crl_reload`` and the expiry monitor still see that record. With no slot,
-    as for a broker built directly, a call whose anchor narrows nothing returns the shared opener
-    and builds none. A call whose anchor narrows builds an opener of its own, held nowhere: it
-    reads and judges the CA and CRL files every time, and records a copy in ``loaded_crls`` for
-    each such context until that is collected.
+    a reference cycle, so only the cyclic collector frees it. The engine's expiry monitor, and
+    ``crl_reload`` on a newly changed file, run a full collection before they read
+    ``loaded_crls``, so neither judges a dropped opener's copy; a ``crl_reload`` pass whose changes
+    are all retries reads without collecting and can still see it. With no slot, as for a broker
+    built directly, a call whose anchor narrows nothing returns the shared opener and builds no
+    opener of its own. A call whose anchor narrows builds an opener of its own, held only by that
+    broker: it reads and judges the CA and CRL files every time, and records a copy in
+    ``loaded_crls`` for each such context until that is collected.
 
     Raises ``ValueError`` or ``OSError`` for a file that cannot be loaded or a CRL that
     ``harden_crl_check`` refuses."""
