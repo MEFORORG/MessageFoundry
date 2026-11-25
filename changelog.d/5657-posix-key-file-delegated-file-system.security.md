@@ -7,8 +7,7 @@
   the check's other refusals. The same walk judges at least the secrets directory, which is
   refused on such a mount under either setting, and the key custody directory. Mount types are
   judged only where `/proc/self/mountinfo` can be read, and not elsewhere, for example on macOS and
-  the BSDs, whose mount tables the check does not read. The list of types is open, so at least a
-  type it does not name, the mount at `/`, and a network file system beneath an overlay mount are
-  not judged; [PHI.md](../docs/PHI.md), *Key files*, says what else the check leaves to the
+  the BSDs, whose mount tables the check does not read. At least a type the list does not name, the
+  mount at `/`, and a network file system beneath an overlay mount are not judged; [PHI.md](../docs/PHI.md), *Key files*, says what else the check leaves to the
   operator. The store key gate also judges a link to a missing file, and a key file whose status
   cannot be read, rather than leaving them to the key provider.

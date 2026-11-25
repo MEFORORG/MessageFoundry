@@ -496,7 +496,8 @@ than a path is not checked
   read, the path is refused. It does not judge mount types where it cannot read that file, for
   example on macOS and the BSDs, whose mount tables it does not read. The secrets directory's own
   check refuses such a mount on its path too, under either enforcement setting. The list of types
-  is open: it does not judge at least a type it does not name, the mount at `/`, a mount an
+  is open: it does not judge at least a type it does not name, the mount at `/`, a mount
+  `/proc/self/mountinfo` does not list, as in a chroot whose root is not a mount, a mount an
   automounter has not made yet, a network file system beneath an overlay mount, or a file in the
   secrets directory that is a mount of its own. Keep key files on a local file system. It reads no
   access list itself, so it can pass a key that a file system of a type it does not judge, or an

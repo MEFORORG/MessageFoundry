@@ -1263,7 +1263,7 @@ def _posix_host_link_problem(path: Path) -> str | None:
     mounts = read_mounts()
     if mounts is None and sys.platform.startswith("linux"):
         return (
-            "this process's mount table could not be read, so the file system under its path was "
+            "/proc/self/mountinfo could not be read, so the file system under its path was "
             "not judged"
         )
 
@@ -1411,9 +1411,9 @@ def broad_access_problem(
     (:func:`_posix_key_file_problem`): a file owned by an account other than the engine's own or
     root, a group or other read or write bit, and a directory holding it that such an account owns
     or that a group or other may write with no sticky bit. Where ``/proc/self/mountinfo`` can be
-    read, the walk below also refuses a path on a mount whose type leaves access to a server or a user-space
-    program (:func:`_posix_delegated_file_system`), since those owner and mode bits do not decide
-    who reaches the file there.
+    read, the walk below also refuses a path on a mount below ``/`` of at least the types
+    :func:`_posix_delegated_file_system` names, since those owner and mode bits do not decide who
+    reaches the file there; the list is open, so a type it does not name passes.
 
     On both, the folders above ``path`` are walked too (vault BACKLOG #5656, #5657). A junction or
     link among them is refused when an account the check does not trust can change it: on

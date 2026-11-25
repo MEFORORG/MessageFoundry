@@ -269,15 +269,17 @@ services:
       #   sudo chown -R 10001:10001 ./tls && sudo find ./tls -type f -exec chmod 0600 {} + && sudo chmod 0700 ./tls
       # Under rootless Docker, Podman or userns-remap, chown to the host uid that container uid 10001
       # maps to instead. A Docker-Desktop-on-Windows bind mount surfaces as 0o777 and would be
-      # refused, as config is. A Docker Desktop for Mac bind mount is refused too, whatever its
-      # owner and mode: it surfaces as a mount of a type the check refuses, such as fakeowner or a
-      # fuse subtype, where the owner and mode bits do not decide who reaches the file, so chown and
-      # chmod on the Mac do not clear it.
+      # refused, as config is. A Docker Desktop for Mac bind mount of ./tls is refused too, at least
+      # where it surfaces as a mount of a type the key-file check refuses, such as fakeowner or a
+      # fuse subtype: the owner and mode bits do not decide who reaches the file there, so chown
+      # and chmod on the Mac do not clear it.
       # There, mount a named volume at /etc/mefor/tls in place of ./tls (on this service and the
       # `ha` engines), filled and owned inside Docker's Linux VM, for example:
       #   docker volume create mefor-tls
-      #   docker run --rm -v "$PWD/tls:/src:ro" -v mefor-tls:/dst alpine sh -c 'cp -R /src/. /dst/ && chown -R 10001:10001 /dst && chmod 0700 /dst && find /dst -type f -exec chmod 0600 {} +'
-      # and declare mefor-tls under the top-level volumes: as external: true. Repeat after each rotation.
+      #   docker run --rm -v "$PWD/tls:/src:ro" -v mefor-tls:/dst alpine:3.20 sh -c 'find /dst -mindepth 1 -delete && cp -RL /src/. /dst/ && chown -R 10001:10001 /dst && chmod 0700 /dst && find /dst -type f -exec chmod 0600 {} +'
+      # and declare mefor-tls under the top-level volumes: as external: true. -L copies the files a
+      # link names rather than the link, and the first find empties the volume, so a retired key
+      # does not stay in it. Run it again after each rotation. Pin alpine to a digest you trust.
       - ./tls:/etc/mefor/tls:ro
       # OPTIONAL secrets directory (vault BACKLOG #2595, ADR 0214), an alternative to env_file for
       # the engine's own secret settings other than the store key, and env() values: one file per

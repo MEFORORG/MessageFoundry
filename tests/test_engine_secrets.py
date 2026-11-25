@@ -652,7 +652,7 @@ def test_a_posix_secrets_directory_whose_parent_others_may_write_is_refused(
         open_secrets_directory(_env(directory))
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="the mount table is read off Windows")
+@pytest.mark.skipif(sys.platform == "win32", reason="a POSIX walk; the mount list is patched")
 def test_a_posix_secrets_directory_on_nfs_is_refused_naming_that_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

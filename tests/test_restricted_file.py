@@ -1073,7 +1073,7 @@ def test_a_posix_mount_refusal_names_no_role_its_caller_does_not_hold() -> None:
     the custody directory, so its remedy must work for each: it once told a secrets-directory
     refusal to move "its store directory", which that directory has none of (vault BACKLOG #5657)."""
     mounts = [("/", "ext4"), ("/private/tmp", "nfs")]
-    problem = _typed_link_problem("/private/tmp/secrets", mounts)
+    problem = _typed_link_problem("/private/tmp/keys", mounts)
     assert problem is not None
     assert "store directory" not in problem and "the engine mints" not in problem
     assert problem.endswith(
@@ -1147,7 +1147,7 @@ def test_broad_access_problem_refuses_where_the_linux_mount_table_cannot_be_read
     os.chmod(key, 0o600)
     monkeypatch.setattr(restricted_file, "read_mounts", lambda: None, raising=False)
     problem = restricted_file.broad_access_problem(key)
-    assert problem is not None and "mount table could not be read" in problem
+    assert problem is not None and "/proc/self/mountinfo could not be read" in problem
 
 
 def test_a_posix_link_another_account_can_change_is_refused() -> None:
