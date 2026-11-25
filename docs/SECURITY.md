@@ -1697,9 +1697,19 @@ tuple: they act only on the caller's own account.
 
 One `GET /auth/check/<permission>` per permission, registered in a loop over `Permission`, each
 gated `require(<that permission>)` (ADR 0215 section 2). Each answers 200 once the ladder admits
-the caller and reads nothing else. They are built for the web console's later ADR 0215 slices to
+the caller and reads nothing else, except the check routes for the permissions in
+`SCOPED_READER_REFUSALS`. At the time of writing those are `/auth/check/audit:read`,
+`/auth/check/audit:export` and `/auth/check/logs:view`, which refuse a channel-scoped caller 403, as
+`GET /audit`, `GET /audit/export` and `GET /logs/tail` refuse every such caller, and write the
+rows those routes write for it: the gate's grant row where the gate writes one, then the same
+`auth.channel_denied` row (`SCOPED_READER_REFUSALS` in `messagefoundry/api/message_scope.py`,
+BACKLOG #4346). They match those routes on channel scope only: `/auth/check/logs:view` does not
+run the PHI-read gate `GET /logs/tail` runs. A check route whose permission's routes refuse a
+scoped caller for another reason still answers it 200: at least `/auth/check/messages:purge`
+does, although every purge route refuses a channel-scoped caller. They are built for the web console's later ADR 0215 slices to
 sub-request before a page that shows no engine data of its own renders; no console page calls one
-yet. A caller learns nothing it cannot read from its own `GET /auth/me`. Each writes an
+yet. Apart from those refusals, which tell a channel-scoped caller what the real route's 403
+tells it, a caller learns nothing it cannot read from its own `GET /auth/me`. Each writes an
 `auth.permission_granted` row naming its permission wherever a grant of that permission is
 audited (`record_check_grant`). Under `[security].audit_all_authorization_decisions`, on by default, that is every
 permission, the two PHI views `messages:view_raw` and `messages:view_summary` included: their own
@@ -2427,12 +2437,28 @@ the same permission set on the same method reds CI until it is listed here.
 > What stays global is the **aggregate queue counters**, which carry no connection identity to narrow:
 > `GET /stats`, `GET /metrics/history`, and the `outbox_by_status` field of the `/ws/stats` frame —
 > whose sibling `connections_html` field **is** scoped, so a single frame carries both rules.
-> `GET /metrics` is the exception in the other direction: the Prometheus exposition is keyed by
-> connection and destination and is **not** narrowed, so on a first deployment any `monitoring:read`
-> holder would read every connection's series regardless of scope (tracked as BACKLOG #1152).
-> This paragraph is derived, not asserted: `tests/test_monitoring_scope_doc_drift.py` executes each
-> route above against a scoped caller with an all-channels caller as the control, and reds if the
-> prose and the app disagree.
+> `GET /metrics` is narrowed as well (BACKLOG #4346): a scoped caller reads the per-connection series
+> of its own inbounds only, and no per-destination or latency series, because their `destination`
+> label names an outbound, and the connections dashboard and the graph hide outbounds from such a
+> caller. Its aggregates that carry no connection or destination label stay global, like the
+> counters above. A scraper that needs the whole
+> estate is given the all-channels grant. `GET /logs/tail`, `GET /audit` and `GET /audit/export`,
+> with the console's `/ui/audit` and `/ui/audit/export`, refuse a scoped caller 403 and write an
+> `auth.channel_denied` row naming no channel and the operation, `audit_read`, `audit_export` or
+> `logs_view`: a log line names no single channel, and the owner's answer for the
+> audit trail was to narrow or refuse such a reader. So a built-in Auditor, or an Operator reading
+> the log, needs the all-channels grant. `tests/test_scoped_caller_metrics_logs_audit.py` executes
+> these refusals on the JSON routes. `/ui/audit/export` calls the `GET /audit/export` handler, and
+> `/ui/audit` calls the same core as `GET /audit` through the console seam; no test executes those
+> two refusals.
+> `tests/test_monitoring_scope_doc_drift.py` executes GET /channels, GET /connections,
+> GET /events, GET /graph/edges, GET /alerts/active and GET /metrics as narrowed reads, and
+> GET /stats and GET /metrics/history as global ones, against a scoped caller with an
+> all-channels caller as the control. It does not measure at least the `/ws/stats` fields, the
+> per-name 403s, an outbound the scope lists in GET /alerts/active, the control half of the
+> GET /connections shared-outbound suppression, or the GET /metrics latency-series drop. On the prose side it checks, among other things, that each of those route tokens appears
+> somewhere in this DLQ-SCOPE blockquote; it does not check which paragraph holds a token or which
+> side of the rule it is on. It does not check the refusal sentence.
 
 > **The per-name connection routes do not tell a scoped caller which names exist (BACKLOG #2551).**
 > This covers at least `GET /connections/{name}/metadata` and `POST /connections/{name}/test`,
@@ -2456,9 +2482,9 @@ the same permission set on the same method reds CI until it is listed here.
 > `auth.gate_refused` and `auth.mfa_denied`). An admitted caller's grant row is written under the
 > shipped default of `[security].audit_all_authorization_decisions`; with that switch off it is
 > written on the POST routes, whose permissions are in the sensitive set, and not on the GET routes.
-> The console checks the rule before it calls in. `audit_channel_denied`
+> The console checks the rule before it calls in. `record_channel_denied`
 > in `messagefoundry/api/message_scope.py`, which writes every `auth.channel_denied` row the API and
-> the console seam record, checks the name it is given against the rule too, and records a name
+> the console seam record (`audit_channel_denied` and `refuse_a_channel_scoped_reader` call it), checks the name it is given against the rule too, and records a name
 > that fails it as no channel, so `audit_log.channel_id` never holds a caller-chosen string of
 > unbounded length. For its own refusal of a channel-scoped actor's bulk selection the console
 > gives it an empty name, never the caller's text. A row written for a name that fails the rule
@@ -2555,13 +2581,13 @@ the same permission set on the same method reds CI until it is listed here.
 > `audit_all_authorization_decisions`, every JSON request already writes a grant row, so this
 > adds at most one row per request. With that switch off, this row is the only one such a read
 > writes. The console's alerts page does not poll, which `test_ui_object_scope.py` pins; a page
-> that polled would need the row coalesced. The counts are a disclosure in their own right. A
-> scoped caller that holds `audit:read`, such as an Auditor, reads in `GET /audit` how many rules
-> it was not shown. That count includes at least rules outside its scope, rules withheld by the
-> inbound, outbound, `restart_outbound` and event-type tests above, and, with no graph loaded, every rule that names a
-> connection, so it is not a count of rules outside the scope alone. A `logs:view` holder reads them in the ERROR line a lost row leaves.
-> Without either, one extra write's latency can show that some rule was withheld. It cannot show
-> which rules or how many. Why it is not
+> that polled would need the row coalesced. The counts are a disclosure in their own right, but
+> not to the scoped caller itself: `GET /audit` and `GET /logs/tail`, where they are written,
+> refuse a channel-scoped caller (BACKLOG #4346). The withheld count includes at least rules
+> outside the caller's scope, rules withheld by the inbound, outbound, `restart_outbound` and
+> event-type tests above, and, with no graph loaded, every rule that names a connection, so it is
+> not a count of rules outside the scope alone. One extra write's latency can show the scoped
+> caller that some rule was withheld. It cannot show which rules or how many. Why it is not
 > `auth.channel_denied` is in `_audit_alert_rules_withheld` in
 > `messagefoundry/api/app.py` (BACKLOG #3403).
 > `tests/test_channel_rbac.py` pins the six routes, not that list.
@@ -6174,7 +6200,9 @@ on that session, for example) ends it as a revocation would.
   `users:manage`, would still receive the lock rows. A role change through the API revokes the
   session, so that loss stops the export with the reason `standing_changed`. Only when the session
   survives the loss, as after a direct store write or on a page checked before the revoke lands,
-  does it stop with the reason `scope_changed`. A stop records `audit.export.stopped` with the counted and streamed rows and
+  does it stop with the reason `scope_changed`. A caller that comes back channel-scoped on a
+  surviving session stops it with the reason `channel_scoped`, since such a caller may not read
+  the trail at all (BACKLOG #4346). A stop records `audit.export.stopped` with the counted and streamed rows and
   the reason, then raises to abort the transfer, which reaches the client as a failed download,
   as the bulk export bullet above says. The idle clock moves at most every quarter of the window,
   as the bulk export's does, but the quarter is counted from when the stream starts sending, not
@@ -8229,7 +8257,8 @@ begun to close, a cut close leaves the notice queued or cuts its send, or the se
 engine tries to write one more row, with the notice's recipient as the actor; when that write
 can fail is under *Still open* below. A lock
 notice writes `auth.lock_notice_undelivered`, hidden as above. Every other notice kind writes
-`auth.security_notice_undelivered`, which every `audit:read` reader sees. The detail names the
+`auth.security_notice_undelivered`, which every all-channels `audit:read` reader sees; a
+channel-scoped one is refused the trail (BACKLOG #4346). The detail names the
 notice kind and the `reason`, at least `queue_full`, `closing`, `abandoned`, `interrupted` or
 `send_failed`. An issuer's reminder also names the
 holder. The row never carries the address, the rest of the notice's detail, or the error. The

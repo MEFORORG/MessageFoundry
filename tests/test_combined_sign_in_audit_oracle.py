@@ -56,7 +56,7 @@ from messagefoundry.auth.audit_visibility import (
     HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE,
     LOCAL_MINT_CONTENDED_DETAILS,
 )
-from messagefoundry.auth.identity import Identity
+from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.service import AuthService, _opened_totp_state
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
@@ -317,6 +317,9 @@ async def _add_reader(service: AuthService, username: str, role: Role) -> None:
     )
     # A wired notifier makes the API refuse an account with no notification address.
     await service.store.set_user_notify_email(user_id, email=f"{username}@example.test")
+    # A channel-scoped caller is refused the audit trail and the log tail (BACKLOG #4346),
+    # so a reader of either is given the all-channels grant.
+    await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
 
 
 @dataclass

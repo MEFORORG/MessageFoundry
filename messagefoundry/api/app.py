@@ -113,6 +113,7 @@ from messagefoundry.api.message_scope import (
     MessageKeyServiceUnavailableError,
     get_scoped_message,
     read_scoped_message,
+    refuse_a_channel_scoped_reader,
 )
 from messagefoundry.api.message_scope import audit_channel_denied as _audit_channel_denied
 from messagefoundry.api.metrics import (
@@ -10734,12 +10735,21 @@ def create_app(
     @app.get("/metrics")
     async def metrics_endpoint(
         engine: Engine = Depends(_get_engine),
-        _user: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
+        identity: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
     ) -> Response:
         """Prometheus exposition (text/plain). Gated by monitoring:read like /stats — a scraper
         authenticates with a service token. Contains only aggregate counts/latency keyed by
-        connection name + status — no PHI."""
-        return Response(content=await render_metrics(engine), media_type=METRICS_CONTENT_TYPE)
+        connection name + status — no PHI.
+
+        A channel-scoped caller reads only its own inbounds' series, and no per-destination or
+        latency series at all (BACKLOG #4346, the route build of #1152):
+        :func:`~messagefoundry.api.metrics.scoped_snapshot` says why. A scraper that needs the
+        whole estate is given the all-channels grant."""
+        in_scope = identity.can_access_channel if identity.allowed_channels is not None else None
+        return Response(
+            content=await render_metrics(engine, in_scope=in_scope),
+            media_type=METRICS_CONTENT_TYPE,
+        )
 
     @app.get("/metrics/history", response_model=MetricsHistoryResponse)
     async def metrics_history(
@@ -11359,7 +11369,14 @@ def create_app(
         refuses to emit) + the per-actor anti-automation throttle — under the new ``logs:view`` permission,
         exactly like a message-detail read. Each served page writes a ``logs_view`` audit row counting how
         many lines were exposed (**metadata only, never the content**). Degrades gracefully to an empty,
-        ``available=false`` page when no ``[logging].log_dir`` is configured or the file is unreadable."""
+        ``available=false`` page when no ``[logging].log_dir`` is configured or the file is unreadable.
+
+        A channel-scoped caller is refused 403, with an ``auth.channel_denied`` row (BACKLOG #4346,
+        the route build of #1152). A log line is not attributable to one channel, so there is
+        nothing to narrow the page by; a reader who needs the log is given the all-channels grant."""
+        await refuse_a_channel_scoped_reader(
+            engine.store, identity, Permission.LOGS_VIEW, client_ip(request)
+        )
         log_dir = getattr(request.app.state, "log_dir", None)
         # Blocking file read + redaction pass — off the event loop, like /status app-log metering.
         lines, total, available = await asyncio.to_thread(
