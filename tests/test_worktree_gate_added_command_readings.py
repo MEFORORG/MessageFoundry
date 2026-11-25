@@ -422,8 +422,9 @@ def test_a_failed_git_answer_is_asked_again(
 
     Rule 3b decides `git -C <wt> checkout <b>` from `worktree list`, which origin/main asked once per
     spelling and path form, four times here. Its cache once kept a failure after two asks, so with two
-    or three failed asks that head allowed the hijack origin/main refused. The given pass asks a
-    failure again on every ask (Invoke-GitRead's note). The stub fails the first ``fails`` asks.
+    or three failed asks that head allowed the hijack origin/main refused. Invoke-GitRead keeps no
+    failure in the given pass (its note says when); a caller's own cache, such as rule 3b's judged
+    set, can still skip a repeat question. The stub fails the first ``fails`` asks.
     """
     state = _install_stub_git(tmp_path, monkeypatch, fails, "worktree list")
     reason = _verdict(rig, ("git -C {wt} checkout {b}", "outside", "Bash"))
@@ -496,7 +497,10 @@ def test_a_failed_absolute_common_dir_is_asked_again(
 def test_a_failure_on_a_missing_directory_is_asked_again(
     rig: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A failed git question about a `-C` that names no directory is asked again in the given pass.
+    """Invoke-GitRead keeps no failure for a `-C` that names no directory in the given pass.
+
+    Get-CommonDirAnswer's own cache, which rule 3c reads, keeps a failed answer and asks again only
+    under -Reask, which rule 3d passes.
 
     The hook kept such a failure for the run where .NET's Directory.Exists read false, which it also
     reads on an unreachable network path, so one transient failure on a mapped drive stood for the
