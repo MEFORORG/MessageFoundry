@@ -131,7 +131,9 @@ async def test_a_passive_standby_binds_nothing_and_an_activation_binds_the_criti
     feed and parks the normal one, and a release then a reload return to binding nothing."""
     cfg = tmp_path / "cfg"
     crit_port, norm_port = _write_graph(cfg, tmp_path)
-    async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
+    async with _served(
+        tmp_path, cfg, DrSettings(enabled=True, activate=False, seed_archive="seed.mfbak")
+    ) as engine:
         rr = engine.registry_runner
         assert rr is not None
         assert not await _accepts(crit_port) and not await _accepts(norm_port)
@@ -163,7 +165,8 @@ async def test_a_box_activated_at_startup_binds_only_the_critical_feed(tmp_path:
     """``activate = true`` is not passive: the box serves its critical feed from the start."""
     cfg = tmp_path / "cfg"
     crit_port, norm_port = _write_graph(cfg, tmp_path)
-    async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=True)) as engine:
+    latched = DrSettings(enabled=True, activate=True, seed_archive="seed.mfbak")
+    async with _served(tmp_path, cfg, latched) as engine:
         rr = engine.registry_runner
         assert rr is not None
         assert await _accepts(crit_port)
@@ -179,7 +182,9 @@ async def test_only_an_operator_start_binds_a_listener_on_a_passive_standby(
     alert rule's restart cannot undo that person's start either."""
     cfg = tmp_path / "cfg"
     crit_port, norm_port = _write_graph(cfg, tmp_path)
-    async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
+    async with _served(
+        tmp_path, cfg, DrSettings(enabled=True, activate=False, seed_archive="seed.mfbak")
+    ) as engine:
         rr = engine.registry_runner
         assert rr is not None
         await rr.start_inbound(_NORM)  # the scheduler's call: an engine door
@@ -203,7 +208,9 @@ async def test_no_engine_door_binds_a_listener_while_a_release_drains(
     once the drain ended: the scheduler's start bound the critical listener mid-drain."""
     cfg = tmp_path / "cfg"
     crit_port, _norm_port = _write_graph(cfg, tmp_path)
-    async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
+    async with _served(
+        tmp_path, cfg, DrSettings(enabled=True, activate=False, seed_archive="seed.mfbak")
+    ) as engine:
         rr = engine.registry_runner
         assert rr is not None
         await engine._dr_activate_profile()
@@ -238,7 +245,9 @@ async def test_a_failed_release_leaves_the_box_active_with_the_profile_parks(
     rebuilding the markers from ``auto_start`` alone lost it."""
     cfg = tmp_path / "cfg"
     crit_port, norm_port = _write_graph(cfg, tmp_path, norm_inbound_auto_start=norm_auto_start)
-    async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
+    async with _served(
+        tmp_path, cfg, DrSettings(enabled=True, activate=False, seed_archive="seed.mfbak")
+    ) as engine:
         rr = engine.registry_runner
         assert rr is not None
         await engine._dr_activate_profile()
@@ -303,7 +312,9 @@ async def test_a_failed_release_parks_a_normal_feed_a_reload_added_during_the_dr
     crit_port, norm_port = _write_graph(cfg, tmp_path)
     # Those two sockets are closed now, so the OS may hand either back; skip them.
     added_port = next(p for p in _free_ports(3) if p not in (crit_port, norm_port))
-    async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
+    async with _served(
+        tmp_path, cfg, DrSettings(enabled=True, activate=False, seed_archive="seed.mfbak")
+    ) as engine:
         rr = engine.registry_runner
         assert rr is not None
         await engine._dr_activate_profile()
@@ -339,7 +350,9 @@ async def test_a_failed_release_parks_a_feed_an_operator_started_before_it(
     inbound it stopped."""
     cfg = tmp_path / "cfg"
     crit_port, norm_port = _write_graph(cfg, tmp_path, norm_inbound_auto_start=norm_auto_start)
-    async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
+    async with _served(
+        tmp_path, cfg, DrSettings(enabled=True, activate=False, seed_archive="seed.mfbak")
+    ) as engine:
         rr = engine.registry_runner
         assert rr is not None
         await engine._dr_activate_profile()
@@ -386,7 +399,9 @@ async def test_an_activation_parks_the_normal_feed_before_its_reload_runs(
     fails on no answer rather than reading it as unbound."""
     cfg = tmp_path / "cfg"
     _crit_port, norm_port = _write_graph(cfg, tmp_path, norm_inbound_auto_start=norm_auto_start)
-    async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
+    async with _served(
+        tmp_path, cfg, DrSettings(enabled=True, activate=False, seed_archive="seed.mfbak")
+    ) as engine:
         rr = engine.registry_runner
         assert rr is not None
         if not norm_auto_start:
@@ -417,7 +432,9 @@ async def test_an_operator_start_onto_a_held_port_raises_rather_than_reading_unb
     an older head (BACKLOG #3456). The ``inbound_failed`` record came after that head."""
     cfg = tmp_path / "cfg"
     _crit_port, norm_port = _write_graph(cfg, tmp_path, norm_inbound_auto_start=False)
-    async with _served(tmp_path, cfg, DrSettings(enabled=True, activate=False)) as engine:
+    async with _served(
+        tmp_path, cfg, DrSettings(enabled=True, activate=False, seed_archive="seed.mfbak")
+    ) as engine:
         rr = engine.registry_runner
         assert rr is not None
         holder = _hold_port(norm_port)

@@ -184,7 +184,18 @@ async def test_missing_seed_archive_aborts(tmp_path: Path) -> None:
     # and none supplied → abort (never start against an empty/unverified store).
     store, _, ss = await _make_seed(tmp_path, generate_key())
     try:
-        coord, _state = _coord(store, ss)  # no seed_archive
+        # The load refuses an enabled box with no seed (BACKLOG #5965); the coordinator's own
+        # fail-closed stays, so build the settings the load would refuse.
+        async def _noop() -> None:
+            return None
+
+        coord = DrCoordinator(
+            store,
+            DrSettings.model_construct(enabled=True),
+            store_settings=ss,
+            activate_profile=_noop,
+            deactivate_profile=_noop,
+        )
         with pytest.raises(DrActivationError) as exc:
             await coord.activate(actor="bob")
         assert exc.value.kind == "seed"

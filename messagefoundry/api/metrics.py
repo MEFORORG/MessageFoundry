@@ -32,8 +32,8 @@ from __future__ import annotations
 import math
 import time
 from collections import deque
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 import psutil
@@ -60,6 +60,7 @@ __all__ = [
     "build_otel_meter_provider",
     "gather_snapshot",
     "render_metrics",
+    "scoped_snapshot",
 ]
 
 
@@ -670,9 +671,31 @@ def _render_snapshot(snap: _Snapshot) -> bytes:
     return _render_exposition(_MetricsCollector(snap).collect())
 
 
-async def render_metrics(engine: Engine) -> bytes:
-    """Gather a snapshot (off-loop) then render the Prometheus text exposition (pure sync)."""
-    return _render_snapshot(await gather_snapshot(engine))
+def scoped_snapshot(snap: _Snapshot, in_scope: Callable[[str], bool]) -> _Snapshot:
+    """``snap`` as a channel-scoped caller may read it (BACKLOG #4346, the route build of #1152).
+
+    It keeps the per-inbound series of each inbound ``in_scope`` admits, and drops every
+    per-destination series and the latency histogram outright, the caller's own inbound's
+    included. Those series count only their own inbound's rows, but their ``destination`` label
+    names an outbound, and the connections dashboard and ``GET /graph/edges`` show such a caller
+    no outbound at all. The aggregates
+    that carry no connection or destination label stay, as they do on ``GET /stats``."""
+    return replace(
+        snap,
+        inbound={name: m for name, m in snap.inbound.items() if in_scope(name)},
+        sync_replies={name: m for name, m in snap.sync_replies.items() if in_scope(name)},
+        destinations={},
+        latency=(),
+    )
+
+
+async def render_metrics(engine: Engine, *, in_scope: Callable[[str], bool] | None = None) -> bytes:
+    """Gather a snapshot (off-loop) then render the Prometheus text exposition (pure sync).
+
+    ``in_scope`` is a channel-scoped caller's access test, and narrows the exposition through
+    :func:`scoped_snapshot`. ``None`` is an all-channels caller, who reads the whole estate."""
+    snap = await gather_snapshot(engine)
+    return _render_snapshot(snap if in_scope is None else scoped_snapshot(snap, in_scope))
 
 
 # --- optional OpenTelemetry seam (off by default) ---------------------------

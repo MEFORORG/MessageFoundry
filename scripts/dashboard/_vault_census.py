@@ -76,7 +76,16 @@ def clipped_census(report: Any, sources: Any, through: dt.date) -> tuple[Any, in
 
 #: A row's priority, as its section marker line writes it: ``**Cluster:** X. **Priority:** P3.``
 _PRIORITY = re.compile(r"\*\*Priority:\*\*\s*(P[0-9]+)\b")
-#: The priority bucket of a row whose section marker names none.
+#: A banner-block score, ``Value **6/10**``: a copy of the vault ``backlog_status_check._SCORE``,
+#: so the FIRST banner-block line it matches is the line ``parse_items`` takes its score from.
+_SCORE = re.compile(r"[Vv]alue\s*\**\s*(?P<value>\d+)\s*/\s*10", re.I)
+#: The tier a scoring pass writes in that line's lead-in, before the score:
+#: ``**Re-scored 2026-11-25 -> P2.** Value **6/10**``. Some rows write the arrow as U+2192.
+_TIER = re.compile(r"(?:->|\u2192)\s*(P[0-9]+|DEMAND-GATE)\.")
+#: The priority bucket of a row whose first score line carries no tier, and whose section marker
+#: names no priority. Most are filing estimates; a tierless score with a Cluster priority is not here.
+ESTIMATE = "scored, no tier"
+#: The priority bucket of a row with no tier, no section-marker priority and no score.
 UNSCORED = "unscored"
 
 
@@ -101,12 +110,26 @@ def row_status(checker: Any, item: Any, lines: Sequence[str]) -> str | None:
 
 
 def row_priority(item: Any, lines: Sequence[str]) -> str:
-    """The priority on the row's OWN section marker line, never one its prose quotes."""
+    """The row's priority bucket, read only from its OWN lines, never from one its prose quotes.
+
+    First, the tier in the lead-in of the FIRST banner-block line holding a ``Value **N/10**``
+    score, the line a scoring pass writes (it never rewrites the Cluster line); else the priority
+    on the row's section marker line; else :data:`ESTIMATE` when that score line carries no tier;
+    else :data:`UNSCORED`. A tier after the score is prose on that line, not the row's tier."""
+    block = lines[item.line : item.body_line - 1]
+    found = next(((ln, s) for ln in block if (s := _SCORE.search(ln)) is not None), None)
+    if found is not None:
+        line, score = found
+        # The tier nearest the score is the one written with it; an earlier one on the same
+        # line belongs to an older banner sharing it.
+        tiers = list(_TIER.finditer(line, 0, score.start()))
+        if tiers:
+            return tiers[-1][1]
     for n in item.section_lines[:1]:
         m = _PRIORITY.search(lines[n - 1])
         if m:
             return m[1]
-    return UNSCORED
+    return UNSCORED if found is None else ESTIMATE
 
 
 def priority_census(checker: Any, sources: Sequence[tuple[str, str]]) -> dict[str, dict[str, int]]:

@@ -71,12 +71,16 @@ def _filter_removed() -> Iterator[None]:
     """The CONTROL's state: the redaction is off every logger it is on, the SCP's start does not put
     it back, and it is back on after."""
     install = dicom_module._redact_flagged_peer_values
+    screen = dicom_module._screen_record
     for name in dicom_module._FILTERED_LOGGERS:
         logging.getLogger(name).removeFilter(dicom_module._PEER_VALUE_FILTER)
     dicom_module._redact_flagged_peer_values = lambda: None
+    # The record factory stays installed and calls this by name, so this turns it off too.
+    dicom_module._screen_record = lambda record: None
     try:
         yield
     finally:
+        dicom_module._screen_record = screen
         dicom_module._redact_flagged_peer_values = install
         install()
 
@@ -267,7 +271,10 @@ def test_a_flagged_value_is_redacted_and_the_line_kept(
         ("pynetdicom._handlers", "Affected SOP Class UID        : 1.2.826.0.1.3680043.9.9"),
         ("pynetdicom._handlers", "Move Originator               : MODALITY1"),
         ("pydicom", "The value length (76) exceeds the maximum length of 64 allowed for VR UI."),
-        ("pynetdicom.dimse_messages", "Non-conformant VM 2 for 'AffectedSOPInstanceUID'"),
+        (
+            "pynetdicom.dimse_messages",
+            "Non-conformant VM 2 for 'AffectedSOPInstanceUID', taking the first value",
+        ),
         # A line that names no value keeps its reason.
         (
             "pynetdicom.utils",
@@ -310,7 +317,8 @@ def test_a_traceback_the_filter_cannot_read_is_withheld_not_raised() -> None:
     )
     assert dicom_module._PEER_VALUE_FILTER.filter(record) is True
     assert record.exc_info is None
-    assert record.exc_text == "Unprintable (traceback withheld: it did not render)"
+    assert record.exc_text is not None
+    assert record.exc_text.endswith("Unprintable: [message withheld]")
 
 
 def _refusal_from_a_codec_error() -> logging.LogRecord:
@@ -356,7 +364,7 @@ def test_a_traceback_rendered_without_the_private_line_is_withheld(
     assert passed is True
     assert record.exc_info is None and record.exc_text is not None
     assert _PLANTED not in record.exc_text, record.exc_text
-    assert record.exc_text == "ValueError (traceback withheld: its value was not redacted)"
+    assert record.exc_text == "ValueError (traceback withheld: it did not render)"
 
 
 def test_a_message_that_will_not_format_is_withheld_with_its_args(
@@ -375,14 +383,16 @@ def test_a_message_that_will_not_format_is_withheld_with_its_args(
     assert "value '[redacted]' - must not exceed 64 characters" in written
 
 
-def test_a_traceback_with_no_flagged_value_is_left_to_the_formatter() -> None:
+def test_a_traceback_with_no_flagged_value_keeps_its_message() -> None:
     try:
         raise ValueError("Unable to decode the received PDU data")
     except ValueError as exc:
         info = (ValueError, exc, exc.__traceback__)
     record = logging.LogRecord("pynetdicom.dul", logging.ERROR, __file__, 1, "x", (), info)
     assert dicom_module._PEER_VALUE_FILTER.filter(record) is True
-    assert record.exc_info == info and record.exc_text is None
+    # Rendered now, so a formatter never renders the live exception after the screen.
+    assert record.exc_info is None and record.exc_text is not None
+    assert "ValueError: Unable to decode the received PDU data" in record.exc_text
 
 
 def test_the_filter_is_on_each_logger_by_name() -> None:
@@ -497,7 +507,7 @@ async def test_the_capture_sees_the_planted_uid_and_the_pre_reads_copy_without_t
 
 
 def test_the_line_shapes_the_filter_reads_are_still_pynetdicoms_and_pydicoms() -> None:
-    """Read against pynetdicom 3.0.4 and pydicom 3.0.2. A reworded line would pass the filter whole."""
+    """Read against pynetdicom 3.0.4 and pydicom 3.0.2."""
     import inspect
 
     from pydicom import misc, valuerep
@@ -542,8 +552,8 @@ def test_the_line_shapes_the_filter_reads_are_still_pynetdicoms_and_pydicoms() -
 
 
 def test_the_filter_was_read_against_these_library_versions() -> None:
-    """The shapes are a list read from these two releases. A new release can add a line of a shape
-    the list lacks, which would pass whole, so a version change fails here until it is read."""
+    """The shapes are a list read from these two releases, so a version change fails here until it
+    is read."""
     import pydicom
     import pynetdicom
 
@@ -662,10 +672,10 @@ def test_a_hold_inside_another_hands_back_to_it() -> None:
     log = logging.getLogger("pynetdicom.utils")
     with dicom_module._logs_held() as outer:
         with dicom_module._logs_held() as inner:
-            log.warning("inner")
-        log.warning("outer")
-    assert [r.getMessage() for r in inner] == ["inner"]
-    assert [r.getMessage() for r in outer] == ["outer"]
+            log.warning("Network timeout reached")
+        log.warning("Association Released")
+    assert [r.getMessage() for r in inner] == ["Network timeout reached"]
+    assert [r.getMessage() for r in outer] == ["Association Released"]
     assert getattr(dicom_module._PRE_READ, "held", None) is None
 
 
@@ -1221,6 +1231,23 @@ def _pydicom_flags_planted_values() -> None:
     DSdecimal(_PLANTED_NAN, validation_mode=config.WARN)
 
 
+def _flags_from_inside_pydicom() -> None:
+    """:func:`_pydicom_flags_planted_values`, its charset calls made from a frame in a pydicom
+    module. They warn at stack level 2, so a warning is attributed to their caller, and the ignore
+    is scoped by module."""
+    from pydicom import charset, config
+    from pydicom.valuerep import DSdecimal
+
+    calls = (
+        "charset._warn_about_invalid_encoding(planted, 'ISO_IR 192')\n"
+        "charset._warn_about_invalid_encoding(planted)\n"
+        "charset._handle_illegal_standalone_encodings(['ISO_IR 192', planted], ['utf8', 'ascii'])\n"
+    )
+    scope = {"__name__": "pydicom.charset", "charset": charset, "planted": _PLANTED}
+    exec(calls, scope)  # noqa: S102 - a fixed string
+    DSdecimal(_PLANTED_NAN, validation_mode=config.WARN)
+
+
 #: A DS the decimal parser takes and the DS check refuses: the case that reaches pydicom's own line.
 _PLANTED_NAN = "NaN"
 
@@ -1249,12 +1276,12 @@ def test_pydicoms_warning_copies_of_those_lines_are_ignored() -> None:
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")  # so only the filters installed next can ignore them
         dicom_module._redact_flagged_peer_values()
-        _pydicom_flags_planted_values()
+        _flags_from_inside_pydicom()
     assert not [w for w in caught if _PLANTED in str(w.message)], [str(w.message) for w in caught]
     assert not [w for w in caught if "is not valid for elements" in str(w.message)]
     with warnings.catch_warnings(record=True) as caught:  # CONTROL: unignored, they carry the value
         warnings.simplefilter("always")
-        _pydicom_flags_planted_values()
+        _flags_from_inside_pydicom()
     assert len([w for w in caught if _PLANTED in str(w.message)]) == 3
 
 
@@ -1307,7 +1334,10 @@ def test_the_no_presentation_context_line_loses_a_flagged_sop_class(
     filtered = _formatted(_associate_against(_captured_ac(), caplog, _no_context_store(_PLANTED)))
     assert filtered
     assert not [line for line in filtered if _PLANTED in line], filtered
-    assert "pynetdicom.association: No presentation context for '[redacted]" in filtered
+    assert (
+        "pynetdicom.association: No presentation context for '[redacted]' has been accepted by "
+        "the peer with 'Implicit VR Little Endian' transfer syntax for the SCU role"
+    ) in filtered
 
 
 def test_the_no_presentation_context_line_keeps_a_real_sop_class(
@@ -1324,21 +1354,36 @@ def test_the_no_presentation_context_line_keeps_a_real_sop_class(
 
 
 @pytest.mark.parametrize(
-    "message",
+    ("message", "expected"),
     [
-        f"No presentation context for 'CT Image Storage' has been accepted by the peer with "
-        f"'{_PLANTED}' transfer syntax for the SCU role",
-        f"No presentation context for '{_PLANTED}' has been accepted by the peer for the SCU role",
-        f"No presentation context for 'x' has been accepted by the peer {_PLANTED}",
-        f"No presentation context for 'it's {_PLANTED}' has been accepted by the peer for the "
-        "SCU role",
+        (
+            f"No presentation context for 'CT Image Storage' has been accepted by the peer with "
+            f"'{_PLANTED}' transfer syntax for the SCU role",
+            "No presentation context for 'CT Image Storage' has been accepted by the peer with "
+            "'[redacted]' transfer syntax for the SCU role",
+        ),
+        (
+            f"No presentation context for '{_PLANTED}' has been accepted by the peer for the SCU "
+            "role",
+            "No presentation context for '[redacted]' has been accepted by the peer for the SCU "
+            "role",
+        ),
+        (
+            f"No presentation context for 'x' has been accepted by the peer {_PLANTED}",
+            "No presentation context for '[redacted]",
+        ),
+        (
+            f"No presentation context for 'it's {_PLANTED}' has been accepted by the peer for the "
+            "SCU role",
+            "No presentation context for '[redacted]",
+        ),
     ],
     ids=["syntax", "class", "unknown-end", "quote"],
 )
-def test_a_no_presentation_context_line_with_any_flagged_part_loses_it(message: str) -> None:
-    assert _filtered("pynetdicom.association", message) == (
-        "No presentation context for '[redacted]"
-    )
+def test_a_no_presentation_context_line_with_any_flagged_part_loses_it(
+    message: str, expected: str
+) -> None:
+    assert _filtered("pynetdicom.association", message) == expected
 
 
 def test_the_no_presentation_context_line_is_still_pynetdicoms() -> None:
@@ -1424,26 +1469,22 @@ def test_the_warnings_filters_are_not_reinstalled_while_they_are_first(
         warnings.simplefilter("always")
         monkeypatch.setattr(warnings, "filterwarnings", counted)
         dicom_module._ignore_pydicom_value_warnings()
-        assert len(calls) == len(dicom_module._PYDICOM_VALUE_WARNINGS)  # CONTROL: it installs them
+        assert len(calls) == len(dicom_module._PYDICOM_WARNING_MODULES)  # CONTROL: it installs them
         calls.clear()
         dicom_module._ignore_pydicom_value_warnings()
         assert calls == []
         warnings.simplefilter("always")  # now ahead of them, so they must go back in front
         dicom_module._ignore_pydicom_value_warnings()
-        assert len(calls) == len(dicom_module._PYDICOM_VALUE_WARNINGS)
+        assert len(calls) == len(dicom_module._PYDICOM_WARNING_MODULES)
         monkeypatch.undo()
 
 
-def test_no_warning_filter_nests_an_unbounded_scan_inside_a_leading_one() -> None:
-    # Every UserWarning meets these filters, on text a peer can fill with a pattern's own opening
-    # words, up to the 64 KiB command set cap. A leading `.*` with a second unbounded scan after it
-    # is quadratic there. Read from the patterns, so a loaded machine cannot fail it.
-    def nested(pattern: str) -> bool:
-        return pattern.startswith(".*") and "*" in pattern[2:]
-
-    assert nested(r'.*Value ".*" is not valid for elements with a VR of ')  # CONTROL
-    assert dicom_module._PYDICOM_VALUE_WARNINGS
-    assert not [p for p in dicom_module._PYDICOM_VALUE_WARNINGS if nested(p)]
+def test_no_warning_filter_reads_a_warnings_text() -> None:
+    # A warning's text can hold a peer's value, up to the 64 KiB command set cap, so a pattern over it
+    # is a cost on a peer's input. The ignore is by module, so no pattern reads the text at all.
+    filters = dicom_module._PYDICOM_WARNING_FILTERS
+    assert filters  # CONTROL: there is a filter to read
+    assert [entry[1] for entry in filters] == [None] * len(filters)
 
 
 def test_the_scu_ignores_pydicoms_copies_before_it_reads_the_object(
@@ -1498,7 +1539,7 @@ def test_context_aware_warnings_always_reinstall(monkeypatch: pytest.MonkeyPatch
         flags = SimpleNamespace(context_aware_warnings=1)
         monkeypatch.setattr(dicom_module, "sys", SimpleNamespace(flags=flags))
         dicom_module._ignore_pydicom_value_warnings()
-        assert len(calls) == len(dicom_module._PYDICOM_VALUE_WARNINGS)
+        assert len(calls) == len(dicom_module._PYDICOM_WARNING_MODULES)
         monkeypatch.undo()
 
 
@@ -1750,8 +1791,8 @@ def _no_service_line(value: str) -> str:
 
 
 def test_the_no_service_class_line_keeps_only_a_conformant_class() -> None:
-    assert _filtered("pynetdicom.association", _no_service_line(_PLANTED)) == (
-        "No supported service class available for the SOP Class UID '[redacted]"
+    assert _filtered("pynetdicom.association", _no_service_line(_PLANTED)) == _no_service_line(
+        "[redacted]"
     )
     # The CONTROL: a real private class is what an operator needs from this line.
     real = _no_service_line("1.2.826.0.1.3680043.2.1")
@@ -1853,10 +1894,12 @@ def test_a_bad_private_creator_in_a_raised_error_is_redacted(
     assert not [line for line in lines if _PLANTED in line], lines
 
 
-def test_a_tag_and_quote_on_any_other_line_stay_as_they_are() -> None:
-    # The CONTROL on the shape's width: the head alone is not enough to redact a line.
+def test_a_tag_and_quote_on_any_other_line_are_withheld() -> None:
+    # No library line reads this, so it matches no template: the screen is default-deny.
     line = "Element (0009,0010) 'LO' has no value"
-    assert _filtered("pydicom", line) == line
+    assert _filtered("pydicom", line) == (
+        "pydicom WARNING line withheld: it matches no pinned template"
+    )
 
 
 def test_a_private_creator_holding_a_double_quote_is_redacted() -> None:

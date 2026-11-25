@@ -774,7 +774,9 @@ _GUARDED_BRACED_NO_SPACE = r"\{(?:[^}'\"\s]|\}\})*+\}(?!\})"
 # widened branch as its positive control; the conditions before that space are tested only by the
 # refused-shape cases.
 #: Words a later pass reads, as lower case ASCII letters spell them, at least: :data:`_MEMBER_KEEP_WORDS`
-#: and the PHI pass's anchor and unbounded words (``redaction._ANCHOR_PREFIXES``' sources and
+#: (and :data:`_QUERY_CREDENTIAL_WORDS`, which it held until BACKLOG #5030 added item 1 and no
+#: log pass reads as words of their own; ``key`` and ``auth`` stand for the compound key labels
+#: ``_KEY_MATERIAL`` reads, and ``sig`` and ``jwt`` stay since refusing costs coverage only) and the PHI pass's anchor and unbounded words (``redaction._ANCHOR_PREFIXES``' sources and
 #: ``redaction._UNBOUNDED_WORDS``, ``nonnumeric`` among them), reduced by subsumption, with entries
 #: holding "_", "-" or a digit left out, since no such text holds one. Refusing a short word such as
 #: ``id`` refuses every glued word holding it; that costs coverage only.
@@ -1874,10 +1876,12 @@ def _dsn_password_repl(m: re.Match[str], placeholder: str) -> str:
 _MEMBER_EXTRA_WORDS = ("token",)
 
 # A connection-string member whose KEY ends in a credential word, its value taken to the next ";"
-# (BACKLOG #5030). A credential an ODBC connection string sends WITHOUT braces may hold a space, ",",
-# "&" or "=": the generic dialect sends a password plain for a driver it has not measured, and every
-# ``odbc_params`` value plain, ``sslpassword`` among them. ``_CREDENTIAL_KV``'s plain value class
-# stops at the first three, so an echoed ``;PWD=Zq7 kx,Pw&mv=Ty9;`` printed " kx,Pw&mv=Ty9", and
+# (BACKLOG #5030). The generic dialect sends every ``odbc_params`` value plain, ``sslpassword``
+# among them, and such a value may hold a space, "," and "&". A plain password can still reach a
+# log by another route, at least a driver's own error text echoing a string, and may also hold
+# "="; since BACKLOG #5041 the builder braces every password it sends. ``_CREDENTIAL_KV``'s plain
+# value class stops at the first three, so an echoed ``;PWD=Zq7 kx,Pw&mv=Ty9;`` printed
+# " kx,Pw&mv=Ty9", and
 # ``;sslpassword=...`` printed whole: "ssl" glued to "password" leaves no ``\b`` for a label.
 #
 # IT IS ITS OWN PASS, AND IT RUNS LAST in :func:`_run`, over the text every other pass left. Its
@@ -1925,7 +1929,7 @@ _MEMBER_EXTRA_WORDS = ("token",)
 #   whole when a ":" or "=" follows the word (after an optional quote and spaces), or a "#" and
 #   the word ends in "MRN", and so does a word ending in a scheme word or "MRN" when a space
 #   follows it, a "#" after that space included. The whole word stays, not only the anchor, so
-#   ``a1qkey=`` keeps ``a1qkey``. Anywhere else it is masked, so a password such as
+#   ``a1qpwd=`` keeps ``a1qpwd``. Anywhere else it is masked, so a password such as
 #   ``Passw0rd!2024`` or a token holding ``sig`` is masked like any other;
 # * a percent-encoded HL7 separator, a DICOM tag ``(gggg,eeee)``, the ``nonnumeric port: `` opener
 #   of the PHI pass's userinfo backstop, and the support bundle's ``mfb64:v1:`` marker stay whole,
@@ -1947,15 +1951,23 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # an ``origin/main`` tree, where it does not print there. On its last run, seeds 101 to 110 and
 # 201 to 210, 3,000,000 random lines of which 1,215,761 hold a ";" and 807,717 a marker shape, it
 # printed no line on any path, against the member pass off and against an ``origin/main`` tree
-# alike. The word mask before it, ``redacted`` for every word, printed 1 line on a chain line the
+# alike. That run PREDATES two changes under BACKLOG #5030 and was not repeated: added item 1,
+# which took the URL query-credential words off :data:`_MEMBER_KEEP_WORDS` and put the key-label
+# words on it, and added item 3, which keeps a hex escape before a segment ID. What covers those
+# two is the fixed cases and the seeded sample in ``tests/test_connection_string_member_scrub.py``,
+# a far smaller corpus: it holds ``key=``, ``auth=`` and two compound key-label lines, but no
+# ``sig`` or ``jwt`` word, and only three fixed cases of a hex escape before a segment ID. The
+# word mask before it, ``redacted`` for every word, printed 1 line on a chain line the
 # bundle read back on the first ten seeds, and the "#" rule before its fix printed on five later
 # paths.
 #
-# THE COST, at least these. The value's spaces and punctuation print, so a reader sees that a
-# password held a space, a "," and an "&", and how many words. The mask prints each word's LENGTH,
+# THE COST, at least these. Every character of the value outside a word prints as it was: its
+# spaces, its punctuation and symbols, ASCII ones such as "@" and "!" and non-ASCII ones such
+# as a currency sign, and its combining marks (``P@ss!w0rd`` is ``x@xx!x0xx``). So a reader sees
+# that a password held a space, a "," and an "&", and how many words. The mask prints each word's LENGTH,
 # where its digits, "_", "." and "-" sat, and where a name-shaped piece had its capitals. A word that holds
 # a kept word anywhere inside it prints whole when a ":" or "=" follows it, such as the ``pass`` of
-# ``pass=word`` or the ``a1qkey`` of ``a1qkey=``, and so does a three-character segment ID before a
+# ``pass=word`` or the ``a1qpwd`` of ``a1qpwd=``, and so does a three-character segment ID before a
 # "|". Each of those printed on ``origin/main`` too, which hid at most the first word. Redacting a
 # record ONCE, so a later handler reads nothing this pass wrote, was measured and not taken:
 # ``origin/main``'s own second handler hides a value its first prints on 313 to 584 lines per
@@ -1980,7 +1992,7 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # the placeholder, stops there, so ``;PWD=P'Kv9_Sec;`` prints ``Kv9_Sec``. Taking a quote after a
 # placeholder was tried and changed what the member differential's whole-value control reads. Spaces
 # and then one quote may open it. Stopping at a later quote costs
-# nothing the builder sends, since a plain password and every ``odbc_params`` value refuse quotes,
+# nothing the builder sends, since every ``odbc_params`` value refuses quotes,
 # and it keeps the rest of a quoted echo (``'...;PWD=a b' refused``) readable. A braced value is
 # taken by ``_ODBC_BRACED`` with its body kept to one line, and then on to the same stops, so
 # ``;sslpassword={a;b} c`` is masked whole, and a "{" not closed on its line takes the rest of the
@@ -2027,25 +2039,28 @@ _CONNECTION_STRING_MEMBER = re.compile(
 
 #: Words a member value keeps where a word holds one, matched as a substring ignoring case, and a
 #: later pass reads the word there (:func:`_kept_word`; BACKLOG #5030). Each is a word some pass
-#: after the member pass reads, so masking it would change what that pass does on a second redaction. At least: this module's credential, token and key-material
-#: words and its ``MEFOR_`` prefix; its URL query-credential words (``key``, ``sig``, ``auth``,
-#: ``jwt``; ``signature`` holds ``sig``); the write-time query filter's keys
+#: after the member pass reads, so masking it would change what that pass does on a second
+#: redaction. At least: this module's credential and token words, its key-label words
+#: (:data:`_KEY_LABEL_WORDS`, the compound ones such as ``accessKey`` and ``AccountKey`` among them,
+#: which ``_KEY_MATERIAL`` reads) and its ``MEFOR_`` prefix; the write-time query filter's keys
 #: (``logging_setup._CREDENTIAL_QUERY_KEYS``: ``code`` and ``state``, the rest hold ``token`` or
 #: ``session``); the support bundle's ``mfb64`` marker and ``basic``/``digest`` scheme words; and the
 #: PHI pass's anchors: ``mrn``, its JSON key words (``redaction._JSON_PHI_KEY``: ``family``,
 #: ``given``, ``birthDate``, ``identifier``, ``telecom`` beside ``name`` and ``address``) and the
 #: DICOM label words.
+#:
+#: NOT the words of :data:`_QUERY_CREDENTIAL_WORDS`, at least ``key``, ``sig``, ``auth`` and ``jwt``,
+#: which this list held until BACKLOG #5030 added item 1: :func:`credential_query_params` reads them in a configured
+#: URL's parameter names. A log pass reads ``key`` and ``auth`` only inside a longer label this
+#: list keeps, at least the key-label words above. Kept alone, they kept a password word that held
+#: one before a ":" or "=", so ``;sslpassword=Monkey:Banana42;`` printed ``Monkey``.
 #: ``tests/test_connection_string_member_scrub.py`` holds this to those sources.
 _MEMBER_KEEP_WORDS = (
     *_CREDENTIAL_WORDS,
     *_TOKEN_WORDS,
-    *_KEY_MATERIAL_WORDS,
+    *_KEY_LABEL_WORDS,
     *_MEMBER_EXTRA_WORDS,
     _ENV_PREFIX,
-    "key",
-    "sig",
-    "auth",
-    "jwt",
     "code",
     "state",
     "mfb64",
@@ -2065,12 +2080,16 @@ _MEMBER_KEEP_WORDS = (
     "responsibleperson",
 )
 #: :data:`_MEMBER_KEEP_WORDS` as one search, reduced by subsumption (``pass`` holds ``password``,
-#: ``key`` holds ``api_key``, ``auth`` holds ``authorization``). Spelled literally, so the regex
-#: scanner in ``tests/test_security_static.py`` reads it; the member test holds it to the tuple.
+#: ``api_key`` holds ``intake_api_key_next``, ``encryption_key`` holds ``encryption_keys_retired``,
+#: ``secret`` holds ``secretkey``, ``accesskey`` holds ``sharedaccesskey``).
+#: Spelled literally, so the regex scanner in ``tests/test_security_static.py`` reads it; the member
+#: test holds it to the tuple.
 _MEMBER_KEEP = re.compile(
-    r"(?i)medicalrecordlocator|responsibleperson|identifier|credential|birthdate|address|patient"
-    r"|session|telecom|mefor_|bearer|family|secret|digest|given|state|token|basic|mfb64|pass|code"
-    r"|name|0010|auth|pwd|key|sig|jwt|mrn"
+    r"(?i)medicalrecordlocator|responsibleperson|subscriptionkey|encryption_key|encryptionkey"
+    r"|authorization|secondarykey|private_key|identifier|credential|accountkey|privatekey"
+    r"|birthdate|accesskey|masterkey|address|patient|session|telecom|api_key|api-key|authkey"
+    r"|mefor_|bearer|family|secret|digest|apikey|given|state|token|basic|mfb64|pass|code|name"
+    r"|0010|pwd|mrn"
 )
 
 #: One unit of a member value. Group 1 is a WORD, which the mask may replace; every other
@@ -2108,8 +2127,9 @@ _MEMBER_SPACED_WORD = re.compile(r"(?i)(?:bearer|basic|digest|mrn)\Z")
 _MEMBER_SEGMENT_ID = re.compile(r"(?:\A|[.\-])([A-Z][A-Z0-9]{2})\Z")
 #: The two token shapes of ``redaction._NAME_RUN``, a capital then lower case, or all capitals.
 _MEMBER_NAME_TOKEN = re.compile(r"[A-Z][a-z]+|[A-Z]{2,}")
-#: What :func:`_masked_word` writes for an ASCII letter, a digit, and a hex escape's two
-#: characters after a "%".
+#: What :func:`_masked_word` writes for a lower case letter of a name-shaped piece, whose capitals
+#: it writes as ``X``. :data:`_MEMBER_ALNUM_MASK` writes every other ASCII letter as ``x`` and
+#: digit as ``0``, and :data:`_MEMBER_HEX_MASK` a hex escape's two characters as ``A`` or ``0``.
 _MEMBER_MASK = "x"
 _MEMBER_PIECE = re.compile(r"([.\-])")
 _MEMBER_NON_ASCII = re.compile(r"[^\x00-\x7f]")
@@ -2181,13 +2201,17 @@ def _mask_member_value(text: str, start: int, end: int) -> str:
         out.append(text[pos:word_start])
         pos = word_end
         segment = _MEMBER_SEGMENT_ID.search(word)
+        after_percent = word_start > 0 and text[word_start - 1] == "%"
         if _kept_word(text, word, word_end):
             out.append(word)
         elif segment is not None and text.startswith("|", word_end):
-            # The ID stays for the segment pattern; a prefix before its "." or "-" is masked.
-            out.append(_masked_word(word[: segment.start(1)]) + segment.group(1))
+            # The ID stays for the segment pattern; a prefix before its "." or "-" is masked,
+            # and right after a "%" its hex escape stays one, as in the branch below: masked
+            # without it, ``%3B.PID|`` became ``%0x.PID|`` (BACKLOG #5030 added item 3).
+            prefix = _masked_word(word[: segment.start(1)], after_percent)
+            out.append(prefix + segment.group(1))
         else:
-            out.append(_masked_word(word, word_start > 0 and text[word_start - 1] == "%"))
+            out.append(_masked_word(word, after_percent))
     out.append(text[pos:end])
     return "".join(out)
 

@@ -118,6 +118,7 @@ from messagefoundry.store.store import (
     EnrolmentCodeOutcome,
     FailOutcome,
     FederatedUnbind,
+    InjectAudit,
     LatencyHistogram,
     LockoutCounter,
     LockoutIncrement,
@@ -456,7 +457,7 @@ class QueueStore(StoreLifecycle, Protocol):
         metadata: str | None = None,
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
-        audit: OperatorAudit[str] | None = None,
+        audit: InjectAudit | None = None,
         origin: MessageOrigin = MessageOrigin.PARTNER,
         origin_actor: str | None = None,
     ) -> str:
@@ -472,12 +473,10 @@ class QueueStore(StoreLifecycle, Protocol):
         ``audit`` is for an operator's inject only (BACKLOG #2624): its row, built from the new
         message id, commits in the same transaction. A live receipt passes none. It stays optional
         in the type because this one method is both paths, so nothing at the type level holds a
-        direct caller here. At runtime an operator ``origin`` (``operator_edit``,
-        ``operator_upload``) with no audit raises :class:`TypeError` before anything is written;
-        an operator inject whose audit builds no row raises inside the transaction, which rolls
-        the inject back (BACKLOG #5071,
-        ``store.require_ingress_audit``, where the limit is stated: it keys on ``origin``). The
-        engine's inject, :meth:`~messagefoundry.pipeline.Engine.inject_message`, requires one.
+        direct caller here. The runtime refusals of ``audit``, ``origin`` and ``origin_actor`` are
+        stated once, on ``store.require_ingress_audit`` (BACKLOG #5071, #6589), with the limit that
+        it keys on ``origin``. The engine's inject,
+        :meth:`~messagefoundry.pipeline.Engine.inject_message`, requires its audit.
 
         ``origin`` and ``origin_actor`` fill the plain ``messages.origin`` pair (vault BACKLOG #2615).
         A live receipt keeps the default, ``partner``; an operator's inject names itself and the user."""
