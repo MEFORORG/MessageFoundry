@@ -33,6 +33,7 @@ through the real routes as the built-in Auditor.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import csv
 import io
 import json
@@ -1367,7 +1368,7 @@ async def test_a_cancel_then_a_failing_write_ends_in_the_cancel_and_logs_the_err
 ) -> None:
     """BACKLOG #6884. RED when: ``_write_through_cancellation`` lets a write's error escape after
     an earlier cancel. The cancel lands while the write waits; the write then fails on the loop's
-    next shielded await. The caller must end in ``CancelledError``, with the write's error logged,
+    next wait. The caller must end in ``CancelledError``, with the write's error logged,
     and not leave with the write's error and its cancel unconsumed. The test above covers a cancel
     in the turn the write finishes; this one parts the two by a whole wait."""
     from messagefoundry.auth.service import _write_through_cancellation
@@ -1381,24 +1382,29 @@ async def test_a_cancel_then_a_failing_write_ends_in_the_cancel_and_logs_the_err
         raise _WriteFailed("synthetic write failure")
 
     task = asyncio.ensure_future(_write_through_cancellation([write], what="the test's write"))
-    await started.wait()
-    task.cancel()
-    for _ in range(3):  # let the cancel land on the shielded await before the write fails
-        await asyncio.sleep(0)
-    assert not task.done(), "the caller left before its write finished"
-    with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+    try:
+        await started.wait()
+        task.cancel()
+        for _ in range(3):  # let the cancel land on the caller's wait before the write fails
+            await asyncio.sleep(0)
+        assert not task.done(), "the caller left before its write finished"
+        # Every logger, at ERROR: the failure is logged once, by the service, and asyncio adds no
+        # second record of it (a cancelled shield used to add "exception in shielded future").
+        with caplog.at_level(logging.ERROR):
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+    finally:
+        # A failed assertion above must not leave the write pending past the test.
         release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, _WriteFailed):
+                await task
     assert task.cancelled()
-    # Only the service's own line is counted. asyncio also reports the failure of a future whose
-    # shield was cancelled first ("exception in shielded future"), on its own logger.
-    errors = [
-        r
-        for r in caplog.records
-        if r.name == "messagefoundry.auth.service" and r.levelno == logging.ERROR
-    ]
-    assert len(errors) == 1, [r.getMessage() for r in errors]
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1, [(r.name, r.getMessage()) for r in errors]
+    assert errors[0].name == "messagefoundry.auth.service"
     assert "the test's write failed while the request was cancelled" in errors[0].getMessage()
     assert errors[0].exc_info is not None and isinstance(errors[0].exc_info[1], _WriteFailed)
 

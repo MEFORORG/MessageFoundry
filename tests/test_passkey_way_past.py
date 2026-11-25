@@ -621,7 +621,9 @@ async def test_a_valid_assertion_beside_a_wrong_password_counts_on_the_second_st
         await store.close()
 
 
-@pytest.mark.parametrize("stored", ["AAAAA", "éééé"], ids=["one-past-four", "non-ascii"])
+@pytest.mark.parametrize(
+    "stored", ["AAAAA", "\u00e9\u00e9\u00e9\u00e9"], ids=["one-past-four", "non-ascii"]
+)
 async def test_an_undecodable_stored_key_refuses_the_combined_sign_in(
     monkeypatch: pytest.MonkeyPatch, stored: str
 ) -> None:

@@ -2529,25 +2529,26 @@ async def _write_through_cancellation(
 ) -> None:
     """Run ``writes`` to completion even if the caller is cancelled, then re-raise the cancel.
 
-    Shielded, and awaited again after each cancel, so a repeated cancellation neither abandons the
-    writes nor lets the caller leave (and release the account's queue) before they finish. A write
-    that fails raises as it did when the rows were written inline. ``what`` names the writes in
-    the ERROR line logged when one fails while the caller is cancelled."""
+    Waited on, and waited on again after each cancel, so a repeated cancellation neither abandons
+    the writes nor lets the caller leave (and release the account's queue) before they finish. A
+    write that fails raises as it did when the rows were written inline. ``what`` names the writes
+    in the ERROR line logged when one fails while the caller is cancelled.
+
+    BACKLOG #6884: :func:`asyncio.wait`, not :func:`asyncio.shield`. A cancel of the caller cancels
+    neither, but an awaited shield raises the write's own error, so a write that failed after an
+    earlier cancel left the loop with that error, skipping the branch below: the caller left with
+    the write's error and its cancel unconsumed. ``wait`` raises only the caller's cancel, so every
+    outcome is read from ``task`` below. It also leaves no shield behind to log the same failure a
+    second time on asyncio's own logger."""
     task = asyncio.ensure_future(_run_in_order(writes))
     cancelled = False
     while not task.done():
         try:
-            await asyncio.shield(task)
+            await asyncio.wait((task,))
         except asyncio.CancelledError:
             # Recorded before anything else, so a cancel that lands in the turn the writes finish
             # is still re-raised rather than swallowed.
             cancelled = True
-        except Exception:  # noqa: BLE001 -- read from ``task`` below, by the cancelled check
-            # BACKLOG #6884. A write that fails on an await after an earlier cancel raises here,
-            # not CancelledError. Escaping the loop with it skipped the branch below, so the
-            # cancelled caller left with the write's error and its cancel unconsumed. The task is
-            # done now, so the loop ends and the branches below decide what the caller sees.
-            pass
     if cancelled:
         if not task.cancelled() and task.exception() is not None:
             # Nobody else will read it: the caller is leaving with the cancel.
@@ -6950,48 +6951,55 @@ class AuthService:
         runs each audit row: at once on the second-factor leg, deferred into the failure pad on the
         sign-in.
 
-        * A stored key the registration rule refuses (BACKLOG #1963) will never sign in again, so it
-          is logged and audited with a fixed slug, never the refusal text, which can quote the key.
+        * A stored key the registration rule refuses (BACKLOG #1963), or one that does not decode
+          (BACKLOG #6886), will never sign in again, so it is logged and audited with a fixed slug,
+          never the refusal text, which can quote the key. The log line says which of the two.
         * py_webauthn's own counter-regression rejection is a clone signal (ADR 0068 decision 4).
         * Any other refusal is audited ``auth.webauthn_failed`` only when ``audit_bad_signature``."""
+        refused_key: tuple[str, str | None] = (
+            "auth.webauthn_failed",
+            _json({"reason": "stored_key_refused", "label": cred.label}),
+        )
         try:
-            public_key: bytes | None = self._b64url_decode(cred.public_key)
-        except ValueError:
-            # BACKLOG #6886. A stored key that is not base64url (a length one past a multiple of
-            # four, or non-ASCII text; ``binascii.Error`` is a ``ValueError``) escaped as an
-            # unhandled error. It will never sign in either, so it takes the refused-key path
-            # below. Decoded apart from the verify, so a ``ValueError`` the verify raises is not
-            # read as the stored key's.
-            public_key = None
-        try:
-            if public_key is None:
-                raise webauthn.StoredKeyRefusedError("the stored credential key is not base64url")
-            return webauthn.verify_assertion(
-                response_json=response_json,
-                challenge=challenge,
-                rp_id=rp_id,
-                origin=origin,
-                public_key=public_key,
-                current_sign_count=cred.sign_count,
-            )
-        except webauthn.StoredKeyRefusedError:
+            public_key = self._b64url_decode(cred.public_key)
+        except (ValueError, TypeError):
+            # BACKLOG #6886. A stored key that is not base64url text (a length one past a multiple
+            # of four, non-ASCII text, or not a string at all; ``binascii.Error`` is a
+            # ``ValueError``) escaped as an unhandled error. Decoded apart from the verify, so an
+            # error the verify raises is not read as the stored key's. Only a row written outside
+            # the store holds one: on a sealed store the passkey digest refuses such a row first.
             _log.warning(
-                "passkey sign-in refused for %s: stored credential %r fails the registration key "
-                "check and must be registered again",
+                "passkey sign-in refused for %s: stored credential %r cannot be decoded and must "
+                "be registered again",
                 user.username,
                 cred.label,
             )
-            action, detail = (
-                "auth.webauthn_failed",
-                _json({"reason": "stored_key_refused", "label": cred.label}),
-            )
-        except webauthn.WebAuthnVerificationError as exc:
-            if "sign count" in str(exc).lower():
-                action, detail = "auth.webauthn_clone_suspected", _json({"label": cred.label})
-            elif audit_bad_signature:
-                action, detail = "auth.webauthn_failed", None
-            else:
-                return None
+            action, detail = refused_key
+        else:
+            try:
+                return webauthn.verify_assertion(
+                    response_json=response_json,
+                    challenge=challenge,
+                    rp_id=rp_id,
+                    origin=origin,
+                    public_key=public_key,
+                    current_sign_count=cred.sign_count,
+                )
+            except webauthn.StoredKeyRefusedError:
+                _log.warning(
+                    "passkey sign-in refused for %s: stored credential %r fails the registration "
+                    "key check and must be registered again",
+                    user.username,
+                    cred.label,
+                )
+                action, detail = refused_key
+            except webauthn.WebAuthnVerificationError as exc:
+                if "sign count" in str(exc).lower():
+                    action, detail = "auth.webauthn_clone_suspected", _json({"label": cred.label})
+                elif audit_bad_signature:
+                    action, detail = "auth.webauthn_failed", None
+                else:
+                    return None
 
         async def refused_row() -> None:
             await self._audit(action, actor=user.username, detail=detail, client=client)
@@ -15472,8 +15480,20 @@ class AuthService:
         The screen can read a file. ``lru_cache`` caches no exception, so a missing or unreadable
         operator corpus is opened again on every call, and a file placed after startup is read
         whole by the first call; a broken bundled corpus is re-read the same way. Run on a worker
-        thread, none of that blocks the loop. The answer, and any exception, is unchanged."""
-        return await asyncio.to_thread(self._policy.violations, password, username=username)
+        thread, none of that blocks the loop. The answer, and any exception, is unchanged.
+
+        One screen at a time, as the loop used to run them. So a corpus that appears is loaded
+        once, not by every screen that missed the cache together. A corpus on a path that stops
+        answering blocks a worker thread only for the screen that is running, while the others
+        wait on the lock, though a screen whose caller gives up still leaves its thread blocked.
+        The screen itself is set lookups, so the queue costs nothing measurable."""
+        if self._screen_lock is None:
+            self._screen_lock = asyncio.Lock()
+        async with self._screen_lock:
+            return await asyncio.to_thread(self._policy.violations, password, username=username)
+
+    #: Serializes :meth:`_screened_violations`; made on first use, inside the running loop.
+    _screen_lock: asyncio.Lock | None = None
 
     async def verify_current_password(
         self,

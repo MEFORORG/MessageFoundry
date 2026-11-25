@@ -473,13 +473,14 @@ async def test_a_stored_key_registration_would_refuse_fails_sign_in_audited(
 
 
 #: Stored keys ``base64.urlsafe_b64decode`` cannot read: a length one past a multiple of four
-#: (``binascii.Error``), and non-ASCII text (``ValueError``). Synthetic, and neither is a key.
-_UNDECODABLE_KEYS = ("AAAAA", "éééé")
+#: (``binascii.Error``), non-ASCII text (``ValueError``), and bytes, as a BLOB written into the
+#: TEXT column reads back (``TypeError``). Synthetic, and none is a key.
+_UNDECODABLE_KEYS: tuple[Any, ...] = ("AAAAA", "\u00e9\u00e9\u00e9\u00e9", b"AAAA")
 
 
-@pytest.mark.parametrize("stored", _UNDECODABLE_KEYS, ids=["one-past-four", "non-ascii"])
+@pytest.mark.parametrize("stored", _UNDECODABLE_KEYS, ids=["one-past-four", "non-ascii", "bytes"])
 async def test_an_undecodable_stored_key_is_a_refused_key_on_the_second_factor_leg(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, stored: str
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, stored: Any
 ) -> None:
     """BACKLOG #6886. RED when: a stored key that is not base64url raises out of
     :meth:`AuthService.finish_webauthn_assertion` instead of being refused. Such a key will never
@@ -501,9 +502,11 @@ async def test_an_undecodable_stored_key_is_a_refused_key_on_the_second_factor_l
         with caplog.at_level(logging.WARNING, logger=_SERVICE_LOG):
             refused = await _finish_assertion(service, token, auth)
         assert refused == Elevation(), "the caller must see the same refusal as a bad signature"
-        warned = _stored_key_warnings(caplog)
+        # Its own line, so a corrupted row is not reported as an old key the rule now refuses.
+        assert not _stored_key_warnings(caplog)
+        warned = [r.getMessage() for r in caplog.records if "cannot be decoded" in r.getMessage()]
         assert len(warned) == 1 and "'test key'" in warned[0], warned
-        assert stored not in caplog.text
+        assert str(stored) not in caplog.text
         events = await service.security_events_for(identity.username)
         failed = [e for e in events if e["action"] == "auth.webauthn_failed"]
         assert len(failed) == 1
