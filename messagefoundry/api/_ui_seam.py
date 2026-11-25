@@ -976,12 +976,17 @@ from typing import Any
 #: ADR 0215's slice 5 drops the callback from the bundle, and each JSON route then writes its own
 #: row.
 #:
+#: BACKLOG #1149: the console's reauth-only action gate sends a pending session with no factor to
+#: enrolment when a session-ending action refuses it. The snapshot hashes that gate's body, so the
+#: digest moved. No engine surface changed. Re-derived with ``--write``, from
+#: ``a888b8fed812bbe6`` to ``c5417861cbb1bd67``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "a888b8fed812bbe6"
+ENGINE_UI_SEAM: str = "c5417861cbb1bd67"
 
 
 @dataclass(frozen=True, slots=True)

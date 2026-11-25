@@ -81,6 +81,10 @@ this line.**
 
 ### Security
 
+- **A pending session with no second factor is sent to enrol before it can end sessions.** Under
+  `[security].require_mfa`, the two session-terminate POSTs refuse such a session and redirect it
+  to `/ui/account?m=enroll_first`, where it was sent to `/ui/reauth`; the enrolment that binds its
+  first factor satisfies the session. The supported engine seam moved with it. (`BACKLOG #1149`)
 - **A step-up request refused for a new client address spends no budget.** The step-up gates
   (`require_ui_step_up` and its action, re-auth-only and own-sessions variants) asked the
   new-address question after their `require_ui` base had already charged the admin-write budget,

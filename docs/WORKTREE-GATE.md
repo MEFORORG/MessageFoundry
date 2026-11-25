@@ -147,6 +147,16 @@ close the class: the unquoting does not match the shell in every form, and at le
 and some invocations are still allowed. The ADDED READINGS note in the hook lists some of what the
 added reading misses and some of its false refusals.
 
+**Rules 3c, 3d, 3 and 3b also judge rewritten spellings of the command.** Under BACKLOG #5655
+step 3, once the command as given is allowed, the hook judges a few rewrites of it as well, such as
+`\git` spelled `git` and a Bash backtick substitution spelled `$( )`. A rewrite can only add a
+refusal, because the command as given has already been judged. One visible effect: inside double
+quotes Bash runs a backtick, so `` git commit -m "... `git reset --hard` ..." `` in the primary is now
+refused, while the same message in single quotes is not. The `Get-AddedCommandReadings` note in the
+hook is the source of record for what the rewrites are, what they read and what they miss;
+[`tests/test_worktree_gate_added_command_readings.py`](../tests/test_worktree_gate_added_command_readings.py)
+holds the measured rows and a differential test against a fixed baseline commit.
+
 This list is not the whole rule set. The hook itself,
 [`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1), is the source of record.
 
