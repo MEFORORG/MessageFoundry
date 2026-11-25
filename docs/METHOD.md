@@ -219,14 +219,17 @@ the worktree in place and untouched either way, so the next session can see what
 ### The harness guards refuse the tool call, not the commit
 
 The user-scope PreToolUse guards, at least `collision_gate.ps1` and `worktree_gate.ps1`, are not git
-hooks: where one fires, it denies an edit tool's call itself, long before commit time, but neither
-judges where an ordinary shell write, such as a redirect into a file, lands, and the worktree gate's
-own deny text says a shell write that lands where it denied an edit still breaks the same rule.
-Which tools each guard sees is in
+hooks. Where one fires, it denies the tool call itself, long before commit time. The worktree gate
+guards at least the shared primary checkout, so write inside your own worktree, by absolute path.
+Neither guard judges where an ordinary shell write, such as a redirect into a file, lands. The
+worktree gate's deny text for an edit into the primary's working tree says a write that lands there
+by another route breaks the same rule. Which tools each guard sees is in
 [*A Builder gets one turn, items 2, 5 and 6, from section 5*](#a-builder-gets-one-turn-items-2-5-and-6-from-section-5),
-item 2; for the worktree gate the source of record is the hook,
-[`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1), and
-[WORKTREE-GATE.md](WORKTREE-GATE.md), *What it blocks*, describes only part of it.
+item 2. For the worktree gate, the source of record is the hook,
+[`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1), though what runs is the
+copy `scripts/worktree/install-gate.ps1` installed, which can lag it.
+[WORKTREE-GATE.md](WORKTREE-GATE.md), *What it blocks*, is a partial description, and where it and
+the hook disagree, the hook wins.
 
 ### Stage explicit paths; a guard catches only the common blanket spellings
 
