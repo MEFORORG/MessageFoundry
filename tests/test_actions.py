@@ -939,7 +939,8 @@ def test_date_diff_field_still_refuses_a_code_beside_a_subcomponent(start: str) 
 
 
 def test_date_diff_field_shares_timezones_time_precisions() -> None:
-    # BACKLOG #5822 added item 4 ("`_TIME_PRECISIONS` repeats a tuple from timezone.py"): the
+    # BACKLOG #5822 added item 4 ("`_TIME_PRECISIONS` repeats a tuple from timezone.py"). It pins
+    # behaviour already on origin/main, with no negative control: the
     # helper reads the one tuple timezone.py defines rather than keeping its own copy.
     import messagefoundry.timezone as timezone_mod
 
