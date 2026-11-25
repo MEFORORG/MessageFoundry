@@ -1094,13 +1094,12 @@ def _posix_parent(path: Path) -> Path:
     return path / ".." if path.name in {"", ".."} else path.parent
 
 
-#: At least these Linux file system types, and every ``fuse.*`` and ``fuseblk.*`` subtype, leave who
-#: may read or replace a file to a server, another host, a user-space program or the mount's own
-#: options, so the owner and mode bits they report can look clean while another account can still
-#: reach the file (vault BACKLOG #5657 step 6 (f)). ``autofs`` is a mount trigger: what it mounts
-#: is often a network file system, and the mount table read before the walk shows only the
-#: trigger. A type not named here is not judged by this rule. Unlike the closed lists elsewhere in
-#: this module, this list is open, so a type it misses passes.
+#: At least these Linux file system types, and every subtype of one, such as ``fuse.sshfs``, leave
+#: who may read or replace a file to a server, another host or operating system, or a user-space
+#: program, so the owner and mode bits they report can look clean while another account can still
+#: reach the file (vault BACKLOG #5657 step 6 (f)). A type not named here is not judged by this
+#: rule. Unlike the closed lists elsewhere in this module, this list is open, so a type it misses
+#: passes.
 _POSIX_DELEGATED_FILE_SYSTEMS = frozenset(
     {
         "nfs",
@@ -1111,7 +1110,6 @@ _POSIX_DELEGATED_FILE_SYSTEMS = frozenset(
         "9p",
         "fuse",
         "fuseblk",
-        "autofs",
         "ceph",
         "afs",
         "coda",
@@ -1150,8 +1148,9 @@ def _posix_link_problem(
     readlink_fn: Callable[[str], str],
     fstype_fn: Callable[[str], tuple[str, str] | None] | None = None,
 ) -> str | None:
-    """Why a link on ``path`` lets another account move the key file, or ``None`` (vault BACKLOG
-    #5656). The walk is :func:`~messagefoundry.auth.anchor_path.posix_path_verdict`, ``..`` and
+    """Why a link on ``path`` lets another account move the key file, or the file system under
+    ``path`` is not one whose owner and mode bits decide who reaches it, or ``None`` (vault BACKLOG
+    #5656, #5657). The walk is :func:`~messagefoundry.auth.anchor_path.posix_path_verdict`, ``..`` and
     links followed as the kernel does, and only its findings about a link are kept: one about the
     link itself (another account owns it in a folder others may write), one about a folder that
     holds a link or lies above one (another account owns it, or a group or other may write it
@@ -1164,8 +1163,10 @@ def _posix_link_problem(
     :func:`~messagefoundry.auth.anchor_path.mount_of` does. A visited file or folder on a mount of
     a type :func:`_posix_delegated_file_system` names is refused, since the owner and mode bits this
     whole check reads are not what decides who reaches the file there (vault BACKLOG #5657 step 6
-    (f)). Any other type, a type that cannot be read, and every type when ``fstype_fn`` is left out,
-    is not judged. Kept free of I/O so the decision is testable everywhere."""
+    (f)). The mount at ``/`` is not judged by its type: a sandbox whose root is a ``9p`` or
+    ``virtiofs`` share, as at least some container runtimes give, would otherwise refuse every key.
+    Any other type, a type that cannot be read, and every type when ``fstype_fn`` is left out, is
+    not judged. Kept free of I/O so the decision is testable everywhere."""
     links: list[str] = []
     delegated: dict[str, str] = {}
 
@@ -1177,10 +1178,9 @@ def _posix_link_problem(
 
     def typed(part: str) -> tuple[str, str]:
         mounted = None if fstype_fn is None else fstype_fn(part)
-        if mounted is not None and _posix_delegated_file_system(mounted[1]):
+        if mounted is not None and mounted[0] != "/" and _posix_delegated_file_system(mounted[1]):
             delegated.setdefault(mounted[0], mounted[1])
-            return mounted
-        # Not judged: a type the walk trusts, so it records no finding for it.
+        # The walk's own type rule is not this one, so it is told every type is one it trusts.
         return ("/", "ext4")
 
     verdict = posix_path_verdict(
@@ -1196,19 +1196,19 @@ def _posix_link_problem(
         prefix = folder.rstrip("/") + "/"
         return any(link.startswith(prefix) for link in links)
 
+    if delegated:
+        # The mount point is a path; this text names none.
+        fstype = next(iter(delegated.values()))
+        shown = fstype if _PRINTABLE_FILE_SYSTEM_TYPE.fullmatch(fstype) else "network or FUSE"
+        return (
+            f"its path is on a mount of type {shown}, where something other than the owner and "
+            "mode bits this check reads decides who may read or replace it; keep it, or for a key "
+            "the engine mints, its store directory, on a local file system"
+        )
     for finding in verdict.findings:
-        if finding.kind == DIRECTORY and not finding.insecure and finding.path in delegated:
-            # Its path is the mount point; this text names none.
-            fstype = delegated[finding.path]
-            shown = fstype if _PRINTABLE_FILE_SYSTEM_TYPE.fullmatch(fstype) else "network or FUSE"
-            return (
-                f"its path is on a {shown} mount, where something other than the owner and mode "
-                "bits this check reads decides who may read or replace it; keep it on a local "
-                "file system"
-            )
         about_holder = finding.kind == DIRECTORY and above_a_link(finding.path)
         # A folder that could not be read, ``/`` included: the walk stopped there, so no link
-        # below it was judged. Every other type answers trusted above, so no other directory
+        # below it was judged. Every type answers trusted to the walk, so no other directory
         # finding is neither insecure nor about an owner or a write bit.
         if finding.kind == DIRECTORY and not finding.insecure:
             return (
@@ -1229,8 +1229,9 @@ def _posix_link_problem(
 def _posix_host_link_problem(path: Path) -> str | None:
     """:func:`_posix_link_problem` for ``path`` on this host. A read that fails is a finding whose
     reason quotes the error, so the error is rebuilt without the file name it carries. The mount
-    types are read from this process's mount table, where it can be read (Linux), once per call.
-    POSIX only."""
+    types are read from this process's mount table once per call. On Linux a table that cannot be
+    read is refused, since no type on the path was judged; elsewhere, as on macOS, there is none
+    to read and no type is judged. POSIX only."""
     if sys.platform == "win32":  # pragma: no cover - guard for the type checker on Windows
         raise OSError("a POSIX path is walked on POSIX only")
 
@@ -1257,6 +1258,11 @@ def _posix_host_link_problem(path: Path) -> str | None:
         return target
 
     mounts = read_mounts()
+    if mounts is None and sys.platform.startswith("linux"):
+        return (
+            "this process's mount table could not be read, so the file system under its path was "
+            "not judged"
+        )
 
     def fstype_fn(part: str) -> tuple[str, str] | None:
         return None if mounts is None else mount_of(part, mounts)

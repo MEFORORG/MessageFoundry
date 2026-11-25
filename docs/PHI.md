@@ -432,8 +432,8 @@ than a path is not checked
   does not prove that only the accounts you meant can reach the file. `protect-key
   --grant-account` refuses the same list. A name it is given must resolve to a user account, a
   well-known account or a computer account; a name of any other kind is refused, at least a group,
-  an alias, a domain and one that resolves to no live account, and the refusal names the kind the
-  name resolved to. A well-known account here includes SYSTEM, a
+  an alias, a domain and one that resolves to no live account, and for a name that resolved the
+  refusal names its kind. A well-known account here includes SYSTEM, a
   virtual service account, and well-known groups Windows reports the same way. Among those, at
   least the broad groups on the list above and an application package are refused, and other
   well-known groups are admitted. A computer account is admitted
@@ -491,13 +491,14 @@ than a path is not checked
   whoever is in the group, and one held in a directory that such an account owns or that a group or
   other may write without the sticky bit (vault BACKLOG #5636). Where it can read the host's
   mount table, as on Linux, its walk of the key file's path also refuses a path on at least an
-  NFS, CIFS or SMB, 9p, FUSE or automount (`autofs`) mount, where something other than the owner
-  and mode bits decides who reaches the file (vault BACKLOG #5657). The secrets directory's own
-  check refuses such a mount on its path too, under either enforcement setting. The list of types
-  is open: it does not judge at least a type it does not name, any type where no mount table can
-  be read, such as on macOS, a network file system beneath an overlay mount, or the mount of a
-  file in the secrets directory beyond the directory's own path. Keep key files on a local file
-  system. It reads no access list itself, so it can pass a key that such a file
+  NFS, CIFS or SMB, 9p, virtiofs or FUSE mount, where something other than the owner and mode
+  bits decides who reaches the file (vault BACKLOG #5657); on Linux a mount table it cannot read is
+  refused. The secrets directory's own check refuses such a mount on its path too, under either
+  enforcement setting. The list of types is open: it does not judge at least a type it does not
+  name, the mount at `/`, any type on a host with no mount table, such as macOS, a mount an
+  automounter has not made yet, a network file system beneath an overlay mount, or a file in the
+  secrets directory that is a mount of its own. Keep key files on a local file system. It reads no
+  access list itself, so it can pass a key that a file system of a type it does not judge
   system, or an access list such as an NFSv4 or macOS one, lets another account reach. Check
   those yourself. A directory a group or other account may write is accepted
   when it has the sticky bit, since that bit keeps them from deleting or renaming a file they do

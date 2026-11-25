@@ -1029,8 +1029,8 @@ def test_a_posix_root_that_could_not_be_read_is_refused() -> None:
 
 
 def _typed_link_problem(path: str, mounts: list[tuple[str, str]]) -> str | None:
-    """:func:`_posix_link_problem` over :data:`_KEY_TREE`, every object root's or the engine's with
-    no group or other write bit, so only the mount type can refuse."""
+    """:func:`_posix_link_problem` over :data:`_KEY_TREE`, every object root's or the engine's and
+    no folder others may write without the sticky bit, so only the mount type can refuse."""
 
     def lstat_fn(part: str) -> PosixStat:
         if part not in _KEY_TREE:
@@ -1064,8 +1064,17 @@ def test_a_posix_key_on_a_delegated_file_system_is_refused(fstype: str) -> None:
     one was passed. The refusal names the type and no path."""
     mounts = [("/", "ext4"), ("/private/tmp", fstype)]
     problem = _typed_link_problem("/private/tmp/keys/k.key", mounts)
-    assert problem is not None and f"its path is on a {fstype} mount" in problem
+    assert problem is not None and f"its path is on a mount of type {fstype}," in problem
     assert "/private" not in problem
+
+
+@pytest.mark.parametrize("fstype", ["9p", "virtiofs", "nfs4"])
+def test_a_posix_root_mount_is_not_judged_by_its_type(fstype: str) -> None:
+    """A sandbox whose ``/`` is a 9p or virtiofs share would otherwise refuse every key file; a
+    delegated mount below ``/`` on the same path is still refused."""
+    assert _typed_link_problem("/private/tmp/keys/k.key", [("/", fstype)]) is None
+    below = [("/", fstype), ("/private", "nfs")]
+    assert "mount of type nfs," in str(_typed_link_problem("/private/tmp/keys/k.key", below))
 
 
 @pytest.mark.parametrize("fstype", ["ext4", "xfs", "tmpfs", "overlay", "zfs", "vfat"])
@@ -1081,7 +1090,7 @@ def test_a_posix_mount_type_the_refusal_cannot_print_is_not_quoted() -> None:
     is replaced in the refusal rather than copied into the start error and the log."""
     mounts = [("/", "ext4"), ("/private/tmp", "fuse.\x1b[2Jodd")]
     problem = _typed_link_problem("/private/tmp/keys/k.key", mounts)
-    assert problem is not None and "its path is on a network or FUSE mount" in problem
+    assert problem is not None and "on a mount of type network or FUSE," in problem
     assert "\x1b" not in problem
 
 
@@ -1110,7 +1119,22 @@ def test_broad_access_problem_refuses_a_key_the_mount_table_puts_on_nfs(
         raising=False,
     )
     problem = restricted_file.broad_access_problem(key)
-    assert problem is not None and "its path is on a nfs4 mount" in problem
+    assert problem is not None and "its path is on a mount of type nfs4," in problem
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux has a mount table to read")
+def test_broad_access_problem_refuses_where_the_linux_mount_table_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Linux no mount table means no type on the path was judged, so it is refused rather than
+    passed as if it had been."""
+    os.chmod(tmp_path, 0o700)
+    key = tmp_path / "k.key"
+    key.write_bytes(b"synthetic")
+    os.chmod(key, 0o600)
+    monkeypatch.setattr(restricted_file, "read_mounts", lambda: None, raising=False)
+    problem = restricted_file.broad_access_problem(key)
+    assert problem is not None and "mount table could not be read" in problem
 
 
 def test_a_posix_link_another_account_can_change_is_refused() -> None:

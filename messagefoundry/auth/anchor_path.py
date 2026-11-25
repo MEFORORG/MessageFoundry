@@ -1008,12 +1008,9 @@ def mount_of(path: str, mounts: list[tuple[str, str]]) -> tuple[str, str] | None
 
 def read_mounts() -> list[tuple[str, str]] | None:
     """This process's mounts as ``(mount point, type)``, from ``/proc/self/mountinfo``, or ``None``
-    where that table cannot be read: not Linux, or no ``/proc``. Decoded as a path is, so a mount
-    point with bytes that are not UTF-8 still matches the path ``os.fspath`` gives for it."""
+    where that table cannot be read: not Linux, or no ``/proc``."""
     try:
-        with open(
-            "/proc/self/mountinfo", encoding=sys.getfilesystemencoding(), errors="surrogateescape"
-        ) as fh:
+        with open("/proc/self/mountinfo", encoding="utf-8", errors="replace") as fh:
             return _parse_mountinfo(fh.read())
     except OSError:
         return None
