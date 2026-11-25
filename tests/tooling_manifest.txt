@@ -35,7 +35,6 @@ tests/test_afk_tripwire_config_env.py
 tests/test_ai_provenance_claims.py
 tests/test_announce_hook.py
 tests/test_attribution_trailer_check.py
-tests/test_verified_by_trailer.py
 tests/test_announce_wiring.py
 tests/test_asvs_anchor_provenance.py
 tests/test_asvs_anchor_report.py
@@ -241,6 +240,7 @@ tests/test_fs_scan_escaped_quotes.py
 tests/test_unbounded_fs_scan_guard.py
 tests/test_shell_guard_dispatch.py
 tests/test_api_burn_guard.py
+tests/test_verified_by_trailer.py
 tests/test_vuln_metrics_fetch_failure_5447.py
 tests/test_block_api_burn_loops.py
 tests/test_webconsole_engine_floor.py

@@ -831,10 +831,11 @@ Manager's watch reached the cloud session 29 seconds after its question.
   of record for the reasoning and the traps; do not restate them here.
 - Name [`docs/REVIEW-STANDARDS.md`](docs/REVIEW-STANDARDS.md) in the `code-review` skill's
   arguments as an instruction, never as a bare path: a bare path makes the skill review that file
-  instead of your diff. Name the diff too, so it matches what you committed. Have the skill read
-  the standard as it stands at `origin/main`, never your worktree's copy, so a change to it is not
-  reviewed against itself. The other files a review reads still come from the worktree. Write the level as a bare first word, with no punctuation after it. For example:
-  `xhigh round-<hex> Review this branch's diff against origin/main; read docs/REVIEW-STANDARDS.md as it stands at origin/main (git show origin/main:docs/REVIEW-STANDARDS.md) and apply its rules.`
+  instead of your diff. Name the diff too, so it matches what you committed. Have the skill fetch
+  and read the standard as it stands at `origin/main`, never your worktree's copy, for the reason
+  korus `roles/BUILDER.md` *4c* gives. Write the level as a bare first word, with no punctuation
+  after it. For example:
+  `xhigh round-<hex> Review this branch's diff against origin/main; read docs/REVIEW-STANDARDS.md as it stands at origin/main (run git fetch origin, then git show origin/main:docs/REVIEW-STANDARDS.md) and apply its rules.`
   Pass the arguments on one line. The period form, `xhigh.`, does not parse as a level. In two
   trials the skill then ran at the previous call's level (measured 2026-10-13). Make the
   `round-<hex>` nonce fresh each round with korus 4e's recipe, and put it right after the level,
@@ -847,6 +848,13 @@ Manager's watch reached the cloud session 29 seconds after its question.
   format.
 - `pre-commit` does not run mypy. Run it by hand before you commit, or strict typing first fails in
   CI, after your process is gone.
+- End each commit message with a `Verified-by:` trailer naming what ran on that commit's content
+  before the commit: `code-review <low|medium|high|xhigh|max>`, `verify`, `tests` or `none`. A
+  first commit usually says `tests`; a fix commit made after a review may name the review, as
+  `code-review xhigh`. The `commit-msg` hook (`scripts/hooks/claim_check.py`) is observe-only here: it prints
+  an advisory line for a missing, unknown or contradictory value and never refuses the commit. The
+  trailer is the author's own word, so it is **not** proof of code review for the Lander; the QA
+  line under the `qa` label stays that proof.
 - If the full suite will not finish inside your turn, run the tests covering your change and push.
   Record in your exit report which checks you ran and which you skipped, for the Manager to carry
   into the PR body. An unpushed branch is lost.
