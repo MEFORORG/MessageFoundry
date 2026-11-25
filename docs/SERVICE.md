@@ -380,8 +380,8 @@ settings there, or with any `MEFOR_VALUE_*` variable, secret or not. Where it kn
 a retired store key or another engine secret setting found in their own environment, under every
 enforcement setting. Where the engine could read the lists, and only under
 `[security].enforcement = "enforce"`, they also refuse an engine secret setting other than a store
-key that is in their own environment, is not in those lists, and is set in the machine-wide
-environment's registry key, where the engine could read that key (vault BACKLOG #2595). Use the DPAPI
+key or a retired store key that is in their own environment, is not in those lists, and is set
+in the machine-wide environment's registry key, where the engine could read that key (vault BACKLOG #2595). Use the DPAPI
 key file for
 the store key, and the secrets directory for the rest (see
 [Protect the store encryption key at rest](#protect-the-store-encryption-key-at-rest-wp-11d)).

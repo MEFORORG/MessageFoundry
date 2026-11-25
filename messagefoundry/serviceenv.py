@@ -38,9 +38,10 @@ key, and the Service Control Manager's own ``Environment`` value on the service'
   that second half for the machine-wide environment, so :func:`service_env_enforced_refusal`
   carries it and the caller applies the setting. The engine refuses only a name it finds set in
   that environment's registry key: a secret a ``python.exe`` wrapper between NSSM and the
-  engine exports into the engine's own environment is named and not refused. Under a wrapper
-  the walk does not pass through, such as ``cmd.exe``, the engine does not find its service and
-  this reading names nothing. A store key
+  engine exports into the engine's own environment is named and not refused, unless the
+  machine-wide key also sets that name. Under a wrapper the walk does not pass through, such as
+  ``cmd.exe``, with ``nssm.exe`` above it, the engine cannot tell whether it runs as that
+  service: it names ``service_environment_unobservable`` and refuses nothing here. A store key
   from outside the lists stays named and not refused, as the bullet above says.
 
 **How the engine finds its own service.** Under NSSM the engine is a child of ``nssm.exe``, or a
