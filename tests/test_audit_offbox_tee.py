@@ -895,9 +895,12 @@ def test_a_value_over_the_window_ends_with_its_bound_note_and_hides_the_name(cap
     clamped = clamp_untrusted(value)
     scrubbed = audit_tee._scrub_field(value)
     assert scrubbed.endswith(clamped[clamped.rfind("\n") :]) and "DOE" not in scrubbed
-    # A detail's note is the one safe_text gives the value, and its counts are safe_text's own.
+    # A detail's note is the one safe_text_bound gives the value, and its counts are that bound's
+    # own. The tee builds safe_text(head) + note, not safe_text(value), which since BACKLOG #5925
+    # reads the head knowing a note follows it; the two agree here only by this value's shape.
     head, note = safe_text_bound(value)
-    assert note and audit_tee._bounded_detail(head, note, safe_text(value)) == safe_text(value)
+    old = safe_text(head) + note
+    assert note and audit_tee._bounded_detail(head, note, old) == old
     (line,) = _tee_lines([{"detail": value}], capsys)
     detail = _shipped_detail(line)
     assert detail.endswith(note) and "DOE" not in detail
@@ -1153,8 +1156,9 @@ def test_a_detail_hidden_whole_is_the_bounded_placeholder(monkeypatch) -> None:
     _raw_tee_lines([{"detail": d} for d in details], monkeypatch, scrub=True)
     assert len(seen) == len(details)
     for value, (old_detail, whole) in zip(details, seen, strict=True):
-        _head, note = safe_text_bound(value)
-        assert old_detail == safe_text(value)
+        head, note = safe_text_bound(value)
+        # The tee's old detail is safe_text(head) + note, not safe_text(value).
+        assert old_detail == safe_text(head) + note
         assert whole == audit_tee._bounded_detail("[redacted]", note, old_detail)
     # The JSON detail keeps its JSON-ness, and the long one its bound note.
     assert seen[0][1] == json.dumps("[redacted]")

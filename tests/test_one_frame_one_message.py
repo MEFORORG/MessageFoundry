@@ -799,9 +799,28 @@ def test_control_an_x12_reply_with_ordinary_delimiters_is_replaced_and_sent(term
     reply = _isa(term=term) + "TA1*000000001*260101*1200*A*000中" + term
     body, replaced = framing_mod.encode_reply_reporting(reply, "ascii", connection="IB_X12_OK")
     assert replaced and body == reply.replace("中", "?").encode("ascii")
-    # A truncated ISA declares only the offsets it holds, here `*`, so its data is replaced.
+    # A truncated ISA is not fixed-width, so it declares nothing and its data is replaced.
     short = "ISA*00*中" + "~"
     assert framing_mod.encode_reply(short, "ascii") == b"ISA*00*?~"
+
+
+#: An unpadded ISA: its elements are not at their fixed widths, so offsets 82, 104 and 105 hold
+#: whatever follows rather than ISA11, ISA16 and the terminator.
+_UNPADDED_ISA = "ISA*00**00**ZZ*SENDER*ZZ*RECEIVER*260101*1200*^*00501*000000001*0*P*:~"
+
+
+@pytest.mark.parametrize("offset", [82, 104, 105])
+def test_an_unpadded_isa_declares_nothing_so_its_data_is_replaced_and_sent(offset: int) -> None:
+    """Review of the #5799 X12 read: the ISA offsets were read raw even when the ISA was unpadded,
+    so an unencodable data character at offset 82, 104 or 105 read as a delimiter the charset
+    cannot hold and the reply was refused, where main replaced it and sent it (the X12 listener
+    closes on a refusal, and the sender resends). An ISA that is not fixed-width declares nothing,
+    as on main. Green on main, red on 1f27b49: the call raised."""
+    filler = list((_UNPADDED_ISA + "TA1*000000001*260101*1200*A*000").ljust(120, "0"))
+    filler[offset] = "中"
+    reply = "".join(filler) + "~"
+    wire = framing_mod.encode_reply(reply, "ascii", connection="IB_X12_UNPADDED")
+    assert wire == reply.replace("中", "?").encode("ascii")
 
 
 def test_an_lf_inside_a_field_of_a_cr_reply_is_data_not_a_header() -> None:

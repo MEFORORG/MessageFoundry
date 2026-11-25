@@ -36,6 +36,8 @@ from messagefoundry.parsing.x12.delimiters import (
     _COMPONENT_SEP_OFFSET,
     _REPETITION_SEP_OFFSET,
     _SEGMENT_TERM_OFFSET,
+    ELEMENT_SEP_OFFSETS,
+    ISA_SEGMENT_LEN,
 )
 from messagefoundry.transports.base import NegativeAckError, encode_wire_body
 
@@ -340,17 +342,23 @@ def _reply_delimiters(reply: str) -> frozenset[str]:
     a batch member's own ``MSH`` counts as its envelope does. Its segments end at CR when the reply
     holds one, so an LF inside a field is data, and at LF only in a reply with no CR; that
     terminator, and the LF of a CR+LF end, are declared too. An X12 reply led by ``ISA`` is read
-    at the ISA's fixed delimiter offsets, raw and without the header checks
-    ``discover_delimiters`` makes, so an ISA that read refuses still declares what its offsets
-    hold, and an offset past the reply's end declares nothing. A reply with any other lead
-    declares nothing here.
+    at the ISA's fixed delimiter offsets only when the ISA is fixed-width: all 106 characters are
+    present and every element-separator offset holds the character at +3. Those offsets are read
+    raw, without the distinctness and element-data checks ``discover_delimiters`` makes, so a
+    fixed-width ISA that read refuses still declares what its offsets hold. An ISA that is not
+    fixed-width, such as one whose elements are unpadded or one cut short, declares nothing, as
+    every ``ISA``-led reply did before: its offsets hold element data, not delimiters, and reading
+    them would refuse a reply whose data at offset 82, 104 or 105 the charset cannot hold. A
+    reply with any other lead declares nothing here.
 
     Leading whitespace and a BOM are skipped first, as the engine's one definition of tolerated
     leading noise (``sniff._LEADING_WS_STR``) skips them. A header line of ``MSH`` alone has no
     field separator to read and declares nothing, rather than indexing past its end."""
     body = reply.lstrip(_LEADING_WS_STR)
     if body.startswith("ISA"):
-        isa = {body[i] for i in _ISA_DELIMITER_OFFSETS if i < len(body)}
+        if not _isa_is_fixed_width(body):
+            return frozenset()
+        isa = {body[i] for i in _ISA_DELIMITER_OFFSETS}
         if body[_SEGMENT_TERM_OFFSET : _SEGMENT_TERM_OFFSET + 2] == "\r\n":
             isa.add("\n")  # a CR+LF terminator is two characters, and `?` for either breaks it
         return frozenset(isa)
@@ -370,4 +378,19 @@ def _reply_delimiters(reply: str) -> frozenset[str]:
 #: The ISA's delimiter offsets, read from ``parsing.x12.delimiters``: the element separator (+3),
 #: ISA11 (the repetition separator from 00501), ISA16 (the component separator) and the segment
 #: terminator.
-_ISA_DELIMITER_OFFSETS = (3, _REPETITION_SEP_OFFSET, _COMPONENT_SEP_OFFSET, _SEGMENT_TERM_OFFSET)
+_ISA_DELIMITER_OFFSETS = (
+    ELEMENT_SEP_OFFSETS[0],
+    _REPETITION_SEP_OFFSET,
+    _COMPONENT_SEP_OFFSET,
+    _SEGMENT_TERM_OFFSET,
+)
+
+
+def _isa_is_fixed_width(body: str) -> bool:
+    """Whether the ``ISA`` that opens ``body`` is laid out at its fixed widths: all
+    ``ISA_SEGMENT_LEN`` characters are present and every element-separator offset holds the
+    character at +3, so its delimiter offsets hold delimiters rather than element data."""
+    if len(body) < ISA_SEGMENT_LEN:
+        return False
+    element = body[ELEMENT_SEP_OFFSETS[0]]
+    return all(body[i] == element for i in ELEMENT_SEP_OFFSETS)
