@@ -10658,8 +10658,9 @@ def _reminder_cadence(
     reminder is on, nothing otherwise (BACKLOG #2008, #3301; ASVS 6.4.5).
 
     The runner scans once at start and then once per interval, so a credential that enters its warn
-    window after start waits up to one interval plus one scan's duration for its first reminder.
-    Once the interval reaches ``warn_days + 1`` days, that first reminder can come after the credential's deadline, and an
+    window after start waits up to one interval plus up to two scans' duration for its first
+    reminder. Once the interval reaches ``warn_days + 1`` days, that first reminder can come after
+    the credential's deadline, and an
     interval of a year means none until the next restart. **The bound is the shipped default, and
     that is a judgment, not a measured threshold.** It follows BACKLOG #1131, which names a limit
     looser than its default rather than picking a second number. With ``warn_days = 0`` the runner
@@ -10684,7 +10685,8 @@ def _reminder_cadence(
             # repr round-trips, so a value one step past the default never prints as it.
             f"[{section}].check_interval_seconds = {interval!r}, longer than the default of "
             f"{default:g} -- {what} that enters its warn window after start waits up to "
-            f"{interval!r} s plus one scan's duration for its first reminder{past_lead}{extra}",
+            f"{interval!r} s plus up to two scans' duration for its first "
+            f"reminder{past_lead}{extra}",
         )
     ]
 
