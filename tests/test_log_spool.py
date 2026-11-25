@@ -1418,11 +1418,11 @@ class _ListCollector(logging.Handler):
 
 
 def _start_forwarding_to_a_list(
-    monkeypatch: pytest.MonkeyPatch, forward: SyslogForward
+    monkeypatch: pytest.MonkeyPatch, forward: SyslogForward, *, level: str = "INFO"
 ) -> _ListCollector:
     collector = _ListCollector()
     monkeypatch.setattr(logging_setup, "_build_syslog_handler", lambda _forward, **_kw: collector)
-    assert configure_logging("INFO", forward=forward) is True
+    assert configure_logging(level, forward=forward) is True
     root = logging.getLogger()
     (fwd,) = [h for h in root.handlers if isinstance(h, _ForwardQueueHandler)]
     root.removeHandler(fwd)
@@ -1433,13 +1433,17 @@ def _start_forwarding_to_a_list(
 _NO_LOSS_PROTECTION = "runs without loss protection"
 
 
+@pytest.mark.parametrize("level", ["INFO", "ERROR"])
 def test_a_spool_turned_off_says_once_to_the_collector_that_it_has_no_loss_protection(
-    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, level: str
 ) -> None:
     """Vault BACKLOG #1199, ASVS 16.4.3 gap (iii): a clean spool-off start used to say nothing.
 
-    Read off the collector, not caplog, because the separate system is the reader that counts."""
-    collector = _start_forwarding_to_a_list(monkeypatch, _forward_to(spool_dir, spool_max_bytes=0))
+    Read off the collector, not caplog, because the separate system is the reader that counts.
+    At ERROR too: a level above WARNING must not make the start silent again."""
+    collector = _start_forwarding_to_a_list(
+        monkeypatch, _forward_to(spool_dir, spool_max_bytes=0), level=level
+    )
     said = [r for r in collector.records if _NO_LOSS_PROTECTION in r.getMessage()]
     assert len(said) == 1
     assert said[0].levelno == logging.WARNING
@@ -1448,12 +1452,32 @@ def test_a_spool_turned_off_says_once_to_the_collector_that_it_has_no_loss_prote
 
 
 def test_a_spool_that_opens_does_not_say_it_has_no_loss_protection(
-    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
-        collector = _start_forwarding_to_a_list(monkeypatch, _forward_to(spool_dir))
-    assert _NO_LOSS_PROTECTION not in caplog.text
+    collector = _start_forwarding_to_a_list(monkeypatch, _forward_to(spool_dir))
     assert not [r for r in collector.records if _NO_LOSS_PROTECTION in r.getMessage()]
+
+
+def test_a_spool_off_start_whose_forwarder_does_not_install_does_not_say_it_runs(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No forwarder, no claim that forwarding runs: the 'unavailable' line says what happened."""
+    seen: list[str] = []
+
+    class _Seen(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            seen.append(record.getMessage())
+            return True
+
+    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _refuse)
+    watcher = _Seen()
+    logging_setup._log.addFilter(watcher)
+    try:
+        assert configure_logging("INFO", forward=_forward_to(spool_dir, spool_max_bytes=0)) is False
+    finally:
+        logging_setup._log.removeFilter(watcher)
+    assert any("is unavailable" in m for m in seen)  # control: the filter sees this logger
+    assert not [m for m in seen if _NO_LOSS_PROTECTION in m]
 
 
 def test_records_spooled_at_shutdown_are_reported_once_with_their_count(
