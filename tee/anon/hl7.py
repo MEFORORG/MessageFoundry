@@ -22,14 +22,15 @@ and a street's space, is judged first, against the field separator and the MSH-2
 same on both adapters, in the shared ``surrogates.surrogate_field_recorded`` (BACKLOG #5540).
 :func:`_whole_field` then checks the whole field a rule wrote, sender text it kept included, for
 the field separator, CR, LF, an MLLP frame byte or NUL, which the engine adapter's whole-field
-``Message.set`` refuses too. Under a rule other than a ``keep``, ``surrogate_field_recorded``
-refuses an undeclared C0 byte first (BACKLOG #5533 item 14), so there the last four reach
-:func:`_whole_field` only as a declared delimiter; a ``keep`` rule passed straight to this adapter
-skips that shared C0 refusal, so an undeclared NUL in the field it keeps reaches
-:func:`_whole_field`, which refuses it. CR, LF and the frame bytes never reach a field:
-``normalized_message`` turns CR and LF into segment breaks and strips the frame bytes. The
-shared site-code pass that runs after the rules writes no digit the message declares as a
-separator.
+``Message.set`` refuses too. CR, LF and the frame bytes never reach a field:
+``normalized_message`` turns CR and LF into segment breaks and strips the frame bytes, so of the
+five only NUL can reach :func:`_whole_field`. Under a rule other than a ``keep``,
+``surrogate_field_recorded`` refuses an undeclared C0 byte in what the surrogate wrote first
+(BACKLOG #5533 item 14), so there a NUL reaches :func:`_whole_field` only when the message
+declares it. A ``keep`` rule passed straight to this adapter skips that shared C0 refusal, and
+the kept value is written back, so an undeclared NUL in it reaches :func:`_whole_field`, which
+refuses it. The shared site-code pass that runs after the rules writes no digit the message
+declares as a separator.
 """
 
 from __future__ import annotations

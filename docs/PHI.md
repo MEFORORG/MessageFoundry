@@ -2937,13 +2937,15 @@ that line.
 - Whitespace after the last field of the last line. The engine's parser trims it before a rule
   reads the value, and the tee does not. So a date in that field is filled by the engine and
   emptied by the tee. A control byte there that the parser's trim removes, at least TAB, FF,
-  GS, RS and US, is trimmed by the engine the same way. Unless `MSH-2` declares it, the tee
-  refuses it where the surrogate copies it into the field it writes, at least in the first
-  component under an `id`, `mrn` or `dln` rule and in a component an identifier rule keeps. It
-  does not where the surrogate replaces or blanks that text, for example an `ssn` rule's first
-  component or a component an identifier rule blanks, and there the two adapters can emit
-  different surrogates, because each keys its surrogate on the value it read. In a field no rule
-  maps, the tee emits the byte (BACKLOG #5533 item 14).
+  GS, RS and US, is trimmed by the engine the same way. Unless `MSH-1` or `MSH-2` declares it,
+  the tee refuses it where the surrogate copies it into the field it writes, at least in the
+  first component under an `id`, `mrn` or `dln` rule and in a component an identifier rule
+  keeps. It does not where the surrogate replaces or blanks that text, for example an `ssn`
+  rule's first component or a component an identifier rule blanks, and there the two adapters
+  can emit different surrogates: each keys its surrogate on the value it read, and the shape can
+  differ too, as for a dashed SSN the tee writes undashed. Where the message declares the byte,
+  neither adapter refuses it, and the two can emit different surrogates the same way. In a field
+  no rule maps, the tee emits the byte (BACKLOG #5533 item 14).
 
 **The coverage report is the record of those fields.** It lists the address of every present
 field that no rule mapped, never its value. A caller gets it through `on_report` on the clean path

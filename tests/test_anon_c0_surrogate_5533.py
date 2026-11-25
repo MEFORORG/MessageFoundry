@@ -9,8 +9,9 @@ whole-field ``Message.set`` refuses CR, LF, the two MLLP frame bytes and NUL but
 and the tee copied that set, so both emitted them. Both
 now refuse a C0 byte the message does not declare, TAB included, in a field a surrogate rule
 writes, with the same :class:`SurrogateSeparatorRefused` naming the rule and never the value. A
-``keep`` writes nothing, so a field it keeps is not checked. DEL (0x7F) is not a C0 byte and the
-decision does not name it.
+``keep`` leaves the value as read, so the shared C0 check skips a field it keeps; a direct
+adapter call still writes that value back through the adapter's whole-field check, which refuses
+at least a NUL. DEL (0x7F) is not a C0 byte and the decision does not name it.
 
 Every value here is synthetic.
 """
@@ -91,8 +92,10 @@ def test_a_field_a_keep_rule_leaves_is_not_checked(char: str) -> None:
 
 @pytest.mark.parametrize("char", ["\x07", "\t"], ids=["BEL", "TAB"])
 def test_a_keep_rule_passed_straight_to_an_adapter_is_not_checked(char: str) -> None:
-    """Each adapter's ``anonymize_message`` takes keep rules too. A keep writes nothing, so the
-    field it keeps passes, as on origin/main, on both adapters alike."""
+    """Each adapter's ``anonymize_message`` takes keep rules too. The shared C0 check skips a
+    keep, so the field it keeps passes for these bytes, as on origin/main, on both adapters alike.
+    The adapter's whole-field check still runs on the kept value; it refuses a NUL, which this
+    test does not cover."""
     message = _message(f"{_NEEDLE}{char}34^^^H^MR")
     engine_keep = (engine_anon.FieldRule("PID-3", engine_anon.SurrogateKind.KEEP),)
     tee_keep = (tee_anon.FieldRule("PID-3", tee_anon.SurrogateKind.KEEP),)
