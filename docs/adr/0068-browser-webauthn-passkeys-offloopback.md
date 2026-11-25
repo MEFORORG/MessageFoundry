@@ -683,7 +683,10 @@ roots and pyodbc's `Error` root where those drivers are installed, and `StoreAcq
 connection raises `ValueError`. These classes do not tell a store fault from a bug, so a bug that
 raises one of them is refused as `store_error` too. Every other exception that reaches the catch
 raises out of the ceremony, `sqlite3.InterfaceError` among them: it is a `sqlite3.Error` but not a
-`DatabaseError`. The session, account and lock re-read, which since 2026-11-05 follows that set read
+`DatabaseError`. Since 2026-11-25 each such raise, the `AUDIT_WRITE_DEFECTS` classes included, is
+first audited `auth.webauthn_failed` with `reason=read_raised` unless the store refuses that row
+too (BACKLOG #3775 added item 9), because the sign count has already moved and the raise otherwise
+left the attempt with no audit row. A cancel writes no row. The session, account and lock re-read, which since 2026-11-05 follows that set read
 rather than preceding it (BACKLOG #3068), is outside this catch, so an exception there raises.
 
 **Why a gone passkey still raises the signal.** A self-service passkey delete takes no account

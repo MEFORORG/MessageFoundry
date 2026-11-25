@@ -1324,16 +1324,71 @@ def _error_log_text(caplog: pytest.LogCaptureFixture) -> str:
     return "\n".join(formatter.format(r) for r in caplog.records if r.levelno >= logging.ERROR)
 
 
+async def _raise_with_the_set_read_failing(
+    monkeypatch: pytest.MonkeyPatch,
+    read_fault: Exception,
+    audit_fault: Exception | None = None,
+) -> tuple[MessageStore, str]:
+    """:func:`_assert_with_the_set_read_failing` for a fault that must raise out of the ceremony:
+    asserts that it does, with ``read_fault`` itself, and returns the store, still open, and the
+    token. The caller closes the store."""
+    store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
+    try:
+        service, token, response, _user_id = await _local_assertion(store)
+        real_update = store.update_webauthn_sign_count
+
+        async def _fault(*_args: Any, **_kwargs: Any) -> Any:
+            raise read_fault
+
+        async def _audit_fault(*_args: Any, **_kwargs: Any) -> Any:
+            assert audit_fault is not None
+            raise audit_fault
+
+        async def _moved(*args: Any, **kwargs: Any) -> SignCountAnswer:
+            answer = await real_update(*args, **kwargs)
+            assert answer == "moved"
+            monkeypatch.setattr(store, "list_webauthn_credentials", _fault)
+            if audit_fault is not None:
+                monkeypatch.setattr(store, "record_audit", _audit_fault)
+            return answer
+
+        monkeypatch.setattr(store, "update_webauthn_sign_count", _moved)
+        try:
+            with pytest.raises(type(read_fault)) as raised:
+                await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
+        finally:
+            monkeypatch.undo()
+        assert raised.value is read_fault
+        return store, token
+    except BaseException:
+        await store.close()
+        raise
+
+
+async def _assert_the_raise_left_a_row(store: MessageStore, token: str) -> None:
+    """The raise left exactly one ``auth.webauthn_failed`` row, naming ``read_raised``, no
+    ``store_error`` row, no verified row, and the factor unmarked."""
+    failures = await _audited_assertion_failures(store)
+    assert failures == [{"reason": "read_raised"}]
+    assert await store.list_audit(action="auth.webauthn_verified") == []
+    session = await store.get_session(hash_token(token))
+    assert session is not None and session.mfa_verified_at is None
+
+
 async def test_a_defect_in_the_passkey_re_read_still_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """BACKLOG #3775. ``sqlite3.ProgrammingError`` is a ``DatabaseError`` but a defect (a bad
-    statement or bind, ``AUDIT_WRITE_DEFECTS``), so it is not passed over as a store refusal. RED
-    when: it is answered as a ``store_error`` refusal instead of raising."""
-    with pytest.raises(sqlite3.ProgrammingError, match="synthetic"):
-        await _assert_with_the_set_read_failing(
-            monkeypatch, sqlite3.ProgrammingError("synthetic: a bad bind")
-        )
+    statement or bind, ``AUDIT_WRITE_DEFECTS``), so it is not passed over as a store refusal, and
+    since added item 9 it is audited ``read_raised`` before it raises. RED when: it is answered as
+    a ``store_error`` refusal instead of raising, or it raises with no audit row."""
+    store, token = await _raise_with_the_set_read_failing(
+        monkeypatch, sqlite3.ProgrammingError("synthetic: a bad bind")
+    )
+    try:
+        await _assert_the_raise_left_a_row(store, token)
+    finally:
+        await store.close()
 
 
 class _PyodbcError(Exception):
@@ -1420,16 +1475,82 @@ async def test_a_pyodbc_root_read_fault_takes_the_connect_class_path(
     adds. RED when: the catch drops ``store_connect_errors()`` and the fault raises. CONTROL: the
     call set alone really misses it."""
     assert not isinstance(_PyodbcError(), store_call_errors())
-    await _assert_the_read_fault_refuses(_PyodbcError("40001"), monkeypatch, caplog)
+    # pyodbc puts the SQLSTATE first and the driver message second; the SQLSTATE is logged
+    # (BACKLOG #3775 added item 14), the message is not.
+    await _assert_the_read_fault_refuses(
+        _PyodbcError("40001", "synthetic: chosen as the deadlock victim"), monkeypatch, caplog
+    )
 
 
-async def test_a_sqlite_interface_error_in_the_passkey_re_read_still_raises(
+#: Faults outside the refusal set, each built in the test (BACKLOG #3775 added item 9).
+_RAISED_FAULTS: dict[str, Callable[[], Exception]] = {
+    "sqlite-interface": lambda: sqlite3.InterfaceError("synthetic: SQLITE_MISUSE"),
+    "cipher": lambda: CipherError("synthetic: the passkey row did not decrypt"),
+    "type-error": lambda: TypeError("synthetic: a code defect"),
+}
+
+
+@pytest.mark.parametrize("case", list(_RAISED_FAULTS))
+async def test_a_fault_outside_the_refusal_set_raises_after_an_audit_row(
+    case: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3775 added item 9. ``sqlite3.InterfaceError`` is outside both sets the catch takes
+    (it is a ``sqlite3.Error``, not a ``DatabaseError``), and ADR 0068 says it still raises there;
+    so do ``CipherError`` and a plain code defect. The sign count has already moved, so each is
+    audited ``auth.webauthn_failed`` with ``reason=read_raised`` before it raises. RED when: a
+    wider catch answers one as a ``store_error`` refusal, it raises with no audit row, or the ERROR
+    line carries the fault's message."""
+    fault = _RAISED_FAULTS[case]()
+    store, token = await _raise_with_the_set_read_failing(monkeypatch, fault)
+    try:
+        await _assert_the_raise_left_a_row(store, token)
+        error_lines = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any(
+            type(fault).__qualname__ in line and "the ceremony raises" in line
+            for line in error_lines
+        )
+        assert not any(str(fault) in line for line in error_lines)
+    finally:
+        await store.close()
+
+
+async def test_a_raise_whose_audit_row_is_refused_still_raises_the_read_fault(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #3775. ``sqlite3.InterfaceError`` is outside both sets the catch takes (it is a
-    ``sqlite3.Error``, not a ``DatabaseError``), and ADR 0068 says it still raises there. RED when:
-    a wider catch answers it as a ``store_error`` refusal while the ADR still says otherwise."""
-    with pytest.raises(sqlite3.InterfaceError, match="synthetic"):
-        await _assert_with_the_set_read_failing(
-            monkeypatch, sqlite3.InterfaceError("synthetic: SQLITE_MISUSE")
-        )
+    """BACKLOG #3775 added item 9. The ``read_raised`` row is soft: a store that refuses it too
+    still gets the read fault back, not the audit write's error. RED when: the audit refusal
+    replaces the read fault, or turns the raise into a return."""
+    store, token = await _raise_with_the_set_read_failing(
+        monkeypatch,
+        sqlite3.InterfaceError("synthetic: SQLITE_MISUSE"),
+        sqlite3.OperationalError("synthetic: the audit write was refused"),
+    )
+    try:
+        assert await _audited_assertion_failures(store) == []
+        session = await store.get_session(hash_token(token))
+        assert session is not None and session.mfa_verified_at is None
+    finally:
+        await store.close()
+
+
+async def test_a_server_driver_sqlstate_is_named_on_the_refusal_line(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3775 added item 14. A refused re-read's ERROR line names the SQLSTATE a server
+    driver's error carries, read with ``driver_sqlstate``, and still not the message. RED when: the
+    SQLSTATE is dropped from the ERROR line."""
+
+    class _AsyncpgLike(RuntimeError):
+        sqlstate = "40P01"
+
+    store, _token, refused = await _assert_with_the_set_read_failing(
+        monkeypatch, _AsyncpgLike("synthetic: deadlock detected")
+    )
+    try:
+        assert refused.ok is False
+        error_lines = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any("40P01" in line and "refused as a store error" in line for line in error_lines)
+        assert not any("deadlock detected" in line for line in error_lines)
+        assert {"reason": "store_error"} in await _audited_assertion_failures(store)
+    finally:
+        await store.close()
