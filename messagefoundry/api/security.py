@@ -2564,7 +2564,7 @@ async def step_up_status(
     pacing those gates charge, here charged on this GET too. :func:`require_paced` uses this
     order, and :func:`require_phi_read` asks the new-address question before its own PHI-read
     pacing, a separate budget. :func:`require_step_up` and :func:`require_step_up_action` pace
-    first, and :func:`require_reauth_only` does not pace. A read refused for a new address
+    first, and :func:`require_reauth_only_action` does not pace. A read refused for a new address
     therefore spends no budget. Then ``window_live`` is :func:`step_up_window_live`, and with
     ``action``, ``action_proof_live`` is whether :func:`_action_step_up_ok` would admit, with the
     grant left unspent. It does not know which ids a gate names. Each answer writes an
