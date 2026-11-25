@@ -11335,8 +11335,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
         got.
 
         Names the exception CLASS only, never its text. The driver's message carries the constraint,
-        the table and the duplicate key value, and ``safe_exc`` keeps all three: it redacts PHI
-        shapes, not schema names or a username. This arm sits ahead of the CLI floor, which never
+        the table and the duplicate key value. ``safe_exc`` withholds the message of a driver's own
+        error class, but it keeps all three, at least, where the error is raised as a builtin type
+        or wrapped in another library's class: it redacts PHI shapes, not schema names or a
+        username. This arm sits ahead of the CLI floor, which never
         formats the exception, so it must not print what that floor would not.
 
         Under a shown key it names the entry: keep it once the write has started, or, where the
@@ -15917,9 +15919,13 @@ def _emit_store_open_error(
     a job keeps in its log (vault BACKLOG #3054, item 10). The column name stays. A server driver's
     error that carries a SQLSTATE renders as its class, SQLSTATE and native error number, never its
     text: a server message can quote a stored value, such as SQL Server's "The duplicate key value
-    is (...)", and ``safe_exc``'s pattern redaction keeps that (measured in BACKLOG #1661). An
-    error with no SQLSTATE goes through ``safe_exc``: at least asyncpg's refused connection, an
-    OSError, and its client errors, whose text ``safe_exc`` redacts by pattern only.
+    is (...)", and ``safe_exc``'s pattern redaction keeps that (measured in BACKLOG #1661). A
+    SQLite error (a ``sqlite3.DatabaseError``) prints its own text, apart from that decode tail,
+    and never goes through ``safe_exc``, as before vault BACKLOG #8153. Any other error with no
+    SQLSTATE goes through ``safe_exc``: another driver's own error class, at least one of
+    asyncpg's client errors, renders as its class and a withheld message (vault BACKLOG #8153);
+    any other, at least asyncpg's refused connection and an OSError, keeps its text, redacted by
+    pattern only.
 
     ``text``, when given, replaces that rendering, for a caller that has already rendered the error
     its own way: the transit-bound commands print an engine refusal whole (BACKLOG #2337), and

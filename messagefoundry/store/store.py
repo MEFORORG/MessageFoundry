@@ -103,7 +103,7 @@ from messagefoundry.credential import constant_time_equal
 from messagefoundry.logging_guard import _last_resort
 from messagefoundry.parsing.binary import doc_ref_addresses_in_hl7 as _doc_ref_addresses_in_hl7
 from messagefoundry.parsing.binary import may_hold_doc_ref as _may_hold_doc_ref
-from messagefoundry.redaction import json_loads_or_refusal, safe_text
+from messagefoundry.redaction import engine_text_only, json_loads_or_refusal, safe_text
 from messagefoundry.service_status import _system_exe
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
@@ -9191,6 +9191,18 @@ def forget_store_salt(path: Path) -> bool:
     )
 
 
+class _ClosedStoreWriteError(sqlite3.OperationalError):
+    """:func:`_write_closed_store`'s own refusal, whose text the engine wrote: the store's path,
+    the journal mode SQLite reported and a fixed sentence, never a row's value or SQLite's message.
+    Marked :func:`~messagefoundry.redaction.engine_text_only`, so a renderer that withholds a
+    database driver's message keeps it (vault BACKLOG #8153). ``safe_exc`` and the DR reasons show
+    it as ``OperationalError``; a traceback names this class itself.
+    Still a ``sqlite3.OperationalError``, so every handler that caught one catches it."""
+
+
+engine_text_only(_ClosedStoreWriteError, named_as_driver=True)
+
+
 def _write_closed_store[T](
     path: Path,
     write: Callable[[sqlite3.Connection], T],
@@ -9212,7 +9224,7 @@ def _write_closed_store[T](
     try:
         mode = str(conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]).lower()
         if mode != "delete":
-            raise sqlite3.OperationalError(
+            raise _ClosedStoreWriteError(
                 f"could not take {path} out of WAL mode (it is still {mode!r}); another "
                 f"connection holds it, so {what}"
             )
@@ -9220,14 +9232,14 @@ def _write_closed_store[T](
     finally:
         conn.close()
     if wal.exists() and wal.stat().st_size:
-        raise sqlite3.OperationalError(f"{wal} still holds changes after leaving WAL mode")
+        raise _ClosedStoreWriteError(f"{wal} still holds changes after leaving WAL mode")
     proof = sqlite3.connect(_sqlite_readonly_uri(str(path.absolute())), uri=True)
     try:
         proven = prove(proof)
     finally:
         proof.close()
     if not proven:
-        raise sqlite3.OperationalError(f"{path} {proof_failed}")
+        raise _ClosedStoreWriteError(f"{path} {proof_failed}")
     return result
 
 
