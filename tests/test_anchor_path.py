@@ -1415,3 +1415,82 @@ def test_a_subst_drive_splices_its_target_with_a_separator() -> None:
     chain, cause = windows_chain("certs\\ca.pem", "S:\\w", _plain_probe, drive_target=_subst_s)
     assert cause is None
     assert chain[-1] == ("C:\\real\\w\\certs\\ca.pem", FILE)
+
+
+# --- BACKLOG #6281 member S12-15: the real reader reads a mask only where an entry holds one -------
+
+#: ``S-1-1-0`` (Everyone) as a binary SID: revision 1, one sub-authority, authority 1, value 0.
+_EVERYONE_SID_BYTES = bytes([1, 1, 0, 0, 0, 0, 0, 1]) + (0).to_bytes(4, "little")
+
+
+def _ace(ace_type: int, body: bytes) -> bytes:
+    """One access entry: type, flags, the entry's size counting its own 4-byte header, then body."""
+    return bytes([ace_type, 0]) + (4 + len(body)).to_bytes(2, "little") + body
+
+
+def _allow_everyone() -> bytes:
+    return _ace(0x00, (0x001F01FF).to_bytes(4, "little") + _EVERYONE_SID_BYTES)
+
+
+def _set_protected_dacl(path: Path, aces: list[bytes]) -> int:
+    """Write ``aces`` as the protected DACL of ``path``, byte for byte, and return the Win32 status.
+    The kernel validates the list, so a status other than 0 means it refused that shape."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("writes a real NTFS DACL")
+    import ctypes
+    from ctypes import wintypes
+
+    body = b"".join(aces)
+    # ACL header: revision 2, sbz1, AclSize, AceCount, sbz2.
+    acl = (
+        bytes([2, 0])
+        + (8 + len(body)).to_bytes(2, "little")
+        + len(aces).to_bytes(2, "little")
+        + bytes(2)
+        + body
+    )
+    buffer = ctypes.create_string_buffer(acl, len(acl))
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi32.SetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR,
+        ctypes.c_int,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    # SE_FILE_OBJECT; DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION.
+    return int(advapi32.SetNamedSecurityInfoW(str(path), 1, 0x80000004, None, None, buffer, None))
+
+
+@_windows_only
+def test_s12_15_an_entry_of_an_undefined_type_has_no_mask_read_past_its_end(
+    tmp_path: Path,
+) -> None:
+    """An entry of a type Windows does not define may be its 4-byte header alone, and the kernel
+    accepts it in a DACL. The reader records no rights for it. Red: it read the four bytes after
+    the header as a mask, here the next entry's header, ``0x00140000``. No caller reads a mask for
+    a type that grants nothing, so no verdict changes; after the DACL's last entry the same read
+    ran off the descriptor."""
+    target = tmp_path / "short-entry.txt"
+    target.write_bytes(b"synthetic")
+    assert _set_protected_dacl(target, [_ace(0x20, b""), _allow_everyone()]) == 0
+    sec = ap.windows_host_readers().read_security(str(target), FILE)
+    assert sec.error is None
+    assert sec.aces == ((0x20, 0, 0, ""), (0x00, 0, 0x001F01FF, "S-1-1-0"))
+
+
+@_windows_only
+def test_s12_15_the_reader_still_reads_a_well_formed_allow_entry(tmp_path: Path) -> None:
+    """The control: a well-formed allow entry reads with its mask and SID as before. The deny entry
+    beside it now records no rights. It recorded ``0x2`` before, and no caller reads the rights of
+    an entry that grants nothing."""
+    target = tmp_path / "well-formed.txt"
+    target.write_bytes(b"synthetic")
+    deny_write = _ace(0x01, (0x00000002).to_bytes(4, "little") + _EVERYONE_SID_BYTES)
+    assert _set_protected_dacl(target, [deny_write, _allow_everyone()]) == 0
+    sec = ap.windows_host_readers().read_security(str(target), FILE)
+    assert sec.error is None
+    assert sec.aces == ((0x01, 0, 0, ""), (0x00, 0, 0x001F01FF, "S-1-1-0"))

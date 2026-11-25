@@ -1209,10 +1209,32 @@ def windows_host_readers() -> WinHost:
                 base = ace_ptr.value or 0
                 ace_type = ctypes.cast(base, ctypes.POINTER(ctypes.c_ubyte))[0]
                 ace_flags = ctypes.cast(base + 1, ctypes.POINTER(ctypes.c_ubyte))[0]
-                # Every granting entry type carries its access mask right after the 4-byte header.
-                ace_mask = ctypes.cast(base + 4, ctypes.POINTER(wintypes.DWORD))[0]
+                ace_size = ctypes.cast(base + 2, ctypes.POINTER(wintypes.WORD))[0]
+                # Only a granting entry's mask is read, because no caller reads any other type's.
+                # An entry of a type Windows does not define may be its 4-byte header alone, so
+                # reading a mask from it would read the next entry, or past the DACL. Every
+                # granting type carries its mask right after the header, so each is checked long
+                # enough to hold one first.
+                ace_mask = 0
+                if ace_type in _GRANTING_ACE_TYPES:
+                    if ace_size < 8:
+                        return WinSecurity(
+                            owner, (), f"entry {index} of its DACL is too short to hold its rights"
+                        )
+                    ace_mask = ctypes.cast(base + 4, ctypes.POINTER(wintypes.DWORD))[0]
                 sid = ""
                 if ace_type == ACCESS_ALLOWED_ACE_TYPE:
+                    # The SID starts at offset 8. It is 8 bytes plus 4 per sub-authority, and its
+                    # second byte, at offset 9, counts them.
+                    sub_authorities = (
+                        ctypes.cast(base + 9, ctypes.POINTER(ctypes.c_ubyte))[0]
+                        if ace_size >= 16
+                        else 0
+                    )
+                    if ace_size < 16 + 4 * sub_authorities:
+                        return WinSecurity(
+                            owner, (), f"entry {index} of its DACL is too short to hold its SID"
+                        )
                     parsed = sid_text(base + 8)
                     if parsed is None:
                         return WinSecurity(owner, (), f"the SID in entry {index} could not be read")
