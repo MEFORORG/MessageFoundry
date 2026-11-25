@@ -282,9 +282,12 @@ class SurrogateSeparatorRefused(AnonError):
     delimiter (:func:`_no_control`, BACKLOG #5533 item 14). What a surrogate writes itself is
     judged here, the same on both adapters (:func:`_written`). The whole written field is checked
     by each adapter as it writes it: the tee raises this class, while the engine adapter's
-    ``Message.set`` refusal, which an undeclared CR, LF, MLLP frame byte or NUL no longer reaches,
-    comes out as a plain :class:`AnonError` with no address. A ``keep`` on that field does not
-    help: it would emit the captured value. ``path`` is the rule's field address, never a value."""
+    ``Message.set`` refusal comes out as a plain :class:`AnonError` with no address. Under a rule
+    other than a ``keep``, an undeclared CR, LF, MLLP frame byte or NUL no longer reaches either
+    whole-field check, because :func:`_no_control` refuses it first; a ``keep`` rule passed
+    straight to an adapter skips :func:`_no_control`, so such a byte in the field it keeps still
+    reaches them. A ``keep`` on that field does not help: it would emit the captured value.
+    ``path`` is the rule's field address, never a value."""
 
     def __init__(self, path: str, cause: str) -> None:
         super().__init__(f"the surrogate for {path} would hold {cause} — refusing to emit")
@@ -680,9 +683,9 @@ def _no_control(value: str, seps: Seps) -> None:
     such as an identifier's punctuation or a kept CX.4, is checked with the rest. Both adapters
     reach it through :func:`surrogate_field_recorded`, so where they read the same value they
     refuse the same undeclared bytes with the same cause; a declared C0 delimiter is left to each
-    adapter's own whole-field guard, and those differ. DEL (0x7F), a C1 control and an escape
-    sequence such as ``\\X09\\`` are not checked, and neither is a field no rule writes: one a
-    keep leaves, or an OBX-5 value the free-text rule preserves."""
+    adapter's own whole-field guard, and those differ. Not checked, at least: DEL (0x7F), a C1
+    control, an escape sequence such as ``\\X09\\``, and a field no rule writes, such as one a
+    keep leaves or an OBX-5 value the free-text rule preserves."""
     reserved = _reserved(seps)
     if any(char < " " and char not in reserved for char in value):
         raise _HeldDelimiter("a C0 control character")

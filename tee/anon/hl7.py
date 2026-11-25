@@ -22,9 +22,12 @@ and a street's space, is judged first, against the field separator and the MSH-2
 same on both adapters, in the shared ``surrogates.surrogate_field_recorded`` (BACKLOG #5540).
 :func:`_whole_field` then checks the whole field a rule wrote, sender text it kept included, for
 the field separator, CR, LF, an MLLP frame byte or NUL, which the engine adapter's whole-field
-``Message.set`` refuses too; ``surrogate_field_recorded`` refuses every undeclared C0 byte
-first (BACKLOG #5533 item 14), so the last four reach it only as a declared delimiter. The shared site-code pass that runs after the rules writes no digit
-the message declares as a separator.
+``Message.set`` refuses too. Under a rule other than a ``keep``, ``surrogate_field_recorded``
+refuses an undeclared C0 byte first (BACKLOG #5533 item 14), so there the last four reach
+:func:`_whole_field` only as a declared delimiter; a ``keep`` rule passed straight to this adapter
+is not checked for C0 bytes, so an undeclared one in the field it keeps still reaches it. The
+shared site-code pass that runs after the rules writes no digit the message declares as a
+separator.
 """
 
 from __future__ import annotations

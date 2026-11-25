@@ -4,9 +4,10 @@
 #5533 item 14, which closes #5540; decision d20261121T180600851-e821ef).
 
 The identifier kinds copy every character of the sender's value that is not a letter or digit, so
-a BEL, an ESC or a TAB in a captured identifier reached the output. The engine adapter's
-``Message.set`` refuses only CR, LF, the two MLLP frame bytes and NUL, and the tee copied that set,
-so both emitted the rest. Both now refuse every C0 byte, TAB included, in a field a surrogate rule
+a BEL, an ESC or a TAB in a captured identifier reached the output. Of the C0 bytes the message
+does not declare as a delimiter, the engine adapter's whole-field ``Message.set`` refuses only CR,
+LF, the two MLLP frame bytes and NUL, and the tee copied that set, so both emitted the rest. Both
+now refuse a C0 byte the message does not declare, TAB included, in a field a surrogate rule
 writes, with the same :class:`SurrogateSeparatorRefused` naming the rule and never the value. A
 ``keep`` writes nothing, so a field it keeps is not checked. DEL (0x7F) is not a C0 byte and the
 decision does not name it.
@@ -128,9 +129,9 @@ def test_a_control_character_the_message_declares_as_a_delimiter_is_not_refused(
 @pytest.mark.parametrize("char", ["\t", "\x0c", "\x1f"], ids=["TAB", "FF", "US"])
 def test_a_control_byte_ending_the_message_is_a_known_difference(char: str) -> None:
     """The engine's parser trims white space after the last field of the last line before a rule
-    reads it, and the tee does not (``docs/PHI.md`` section 9 lists the difference). So a ruled
-    identifier ending the message with a TAB is emitted without it by the engine and refused by
-    the tee. Both fail closed on the byte: neither emits it."""
+    reads it, and the tee does not (``docs/PHI.md`` section 9 lists the difference). So a TAB
+    ending the message in the CX.5 an identifier rule keeps is emitted without it by the engine
+    and refused by the tee. Both fail closed on the byte: neither emits it."""
     message = _message(f"{_NEEDLE}34^^^H^MR").split("|||||")[0] + char
     assert char not in engine_anon.anonymize(message, salt=_SALT)
     with pytest.raises(tee_surrogates.SurrogateSeparatorRefused, match="C0 control character"):
