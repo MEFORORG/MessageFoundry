@@ -1141,7 +1141,7 @@ class FileSource(SourceConnector):
         if self.after_read == "move":
             archives.insert(0, ("processed_subdir", self.processed_dir))
         for knob, dest in archives:
-            if _inside_watch_tree_by_identity(dest, self.directory):
+            if _inside_watch_tree_by_identity(dest, self.directory, knob):
                 raise SourceStartupError(
                     f"file source {knob} reaches the watch directory {self.directory} or a "
                     "directory inside it through another spelling (a link, a junction or a short "
@@ -3419,7 +3419,9 @@ def _open_dest(dest_dir: Path, directory: Path, root_real: Path) -> _Dest:
     return _Dest(root_real.joinpath(*dirs), held=_win_hold_dirs(root_real, dirs))
 
 
-def _inside_watch_tree_by_identity(dest_dir: Path, directory: Path) -> bool:
+def _inside_watch_tree_by_identity(
+    dest_dir: Path, directory: Path, setting: str = "archive directory"
+) -> bool:
     """True when ``dest_dir`` is spelled outside the watch ``directory`` but is, by file identity,
     that directory or one inside it (BACKLOG #5682). Each of ``dest_dir``'s resolved path and its
     parents is compared with the watch directory by ``os.path.samestat``. A ``dest_dir`` spelled
@@ -3428,9 +3430,11 @@ def _inside_watch_tree_by_identity(dest_dir: Path, directory: Path) -> bool:
     parent is what is compared. A path that cannot be read compares as not the watch directory, and
     so does every path when the watch directory cannot be read or reports no file identity (an
     inode of 0, as some SMB servers do, which would make every directory on the volume match); each
-    such skip is logged at WARNING. So is a ``dest_dir`` none of whose parts exists, down to its
-    root, as an unreachable UNC share reads: the WARNING names the path's class, never its text.
-    Touches the filesystem, so call it off the event loop."""
+    such skip is logged at WARNING. A Windows share fault that reports ENOENT (a ``winerror`` other
+    than 2 or 3, such as an unreachable server or share) is read as unreadable, not as absent. When
+    no part of ``dest_dir``, down to its root, gave an identity to compare, the WARNING says the
+    check gave no verdict, naming ``setting`` and the path's class, never the path's text. Touches
+    the filesystem, so call it off the event loop."""
     if _dirs_below(dest_dir, directory) is not None:
         return False
     try:
@@ -3453,11 +3457,19 @@ def _inside_watch_tree_by_identity(dest_dir: Path, directory: Path) -> bool:
     compared = False
     for candidate in (real, *real.parents):
         try:
-            if os.path.samestat(os.stat(candidate), watch):
-                return True
-            compared = True
-        except FileNotFoundError:
-            continue  # not created yet: its parent is compared next
+            st = os.stat(candidate)
+        except FileNotFoundError as exc:
+            if getattr(exc, "winerror", None) in (None, 2, 3):
+                continue  # not created yet: its parent is compared next
+            # ERROR_BAD_NETPATH (53), ERROR_BAD_NET_NAME (67) and their kin map to ENOENT, but
+            # they are a share fault, not a directory still to be created.
+            logger.warning(
+                "file source %s: an archive directory path could not be read for the identity "
+                "check, so its parent is compared instead: %s",
+                directory,
+                _describe_os_error(exc),
+            )
+            continue
         except (OSError, ValueError) as exc:
             logger.warning(
                 "file source %s: an archive directory path could not be read for the identity "
@@ -3465,24 +3477,36 @@ def _inside_watch_tree_by_identity(dest_dir: Path, directory: Path) -> bool:
                 directory,
                 _describe_os_error(exc) if isinstance(exc, OSError) else type(exc).__name__,
             )
+            continue
+        if os.path.samestat(st, watch):
+            return True
+        # An inode of 0 is no identity (some SMB servers), so it is no comparison either.
+        compared = compared or st.st_ino != 0
     if not compared:
-        # Every part, the root included, read as absent: on Windows an unreachable share or server
-        # reports ENOENT, so nothing was compared and a False here is no verdict.
+        # No part, the root included, gave an identity: each was absent, unreadable or reported
+        # none, as on an unreachable share or server, so a False here is no verdict.
         logger.warning(
-            "file source %s: the archive directory identity check did not run: no part of the "
-            "archive directory's %s path could be read",
+            "file source %s: the %s identity check gave no verdict: no part of its %s path "
+            "gave a file identity to compare",
             directory,
+            setting,
             _path_class(real),
         )
     return False
 
 
 def _path_class(path: PurePath) -> str:
-    """The class of ``path`` for a log line that must not carry its text: ``UNC`` for a
-    UNC (``//server/share``) path, else ``drive`` on Windows or ``local`` elsewhere."""
-    if path.drive.startswith(("\\\\", "//")):
+    """The class of ``path`` for a log line that must not carry its text: ``UNC`` for a UNC path,
+    verbatim ``//?/UNC/`` form included, ``device`` for any other ``//?/`` or ``//./`` form,
+    ``drive`` for any other Windows path with a drive, else ``local``."""
+    drive = path.drive
+    if drive.startswith("\\\\?\\UNC\\"):
         return "UNC"
-    return "drive" if path.drive else "local"
+    if drive.startswith(("\\\\?\\", "\\\\.\\")):
+        return "device"
+    if drive.startswith("\\\\"):
+        return "UNC"
+    return "drive" if drive else "local"
 
 
 def _dirs_below(dest_dir: Path, directory: Path) -> tuple[str, ...] | None:
