@@ -11390,10 +11390,12 @@ class SqlServerStore(ServerCipherWalk):
 
         The eviction runs after the connection is released, an await later than the DELETE, so a
         same-key write that commits and publishes in that window would be evicted while its row
-        survives. So a key this node publishes to the cache once the pass has begun, before it has
-        a connection, is kept (BACKLOG #5734). A write that committed before the DELETE stamped its
-        row with its own time, which is not older than ``older_than`` while the cutoff lies in the
-        past, as the retention runner's always does, so the DELETE never removed that row."""
+        survives. So a key this node publishes to the cache at any point from the start of the pass
+        to its eviction is kept (BACKLOG #5734). That is sound while ``older_than`` lies well behind
+        every write in flight, as the retention runner's cutoff does, at least a whole day back (it
+        runs only when the integer ``state_max_age_days`` is above zero): such a write's row is newer
+        than the cutoff, so the DELETE did not remove it. A caller passing a cutoff near the present could
+        keep a cached value whose row the DELETE removed."""
         touched: set[tuple[str, str]] = set()
         self._state_purge_watches = (*self._state_purge_watches, touched)
         try:

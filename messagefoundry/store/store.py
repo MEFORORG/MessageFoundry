@@ -6730,9 +6730,11 @@ _AUDIT_ANCHOR_HEX = frozenset("0123456789abcdefABCDEF")
 AUDIT_ANCHOR_DIGEST_HEX_LEN = AUDIT_MAC_HEX_LEN
 #: ADR 0138 ``vault_transit``: the row MAC is computed INSIDE Vault/OpenBao Transit
 #: (``crypto_transit.TransitCipher.audit_hmac``), which returns its own opaque ``vault:v<N>:<base64>``
-#: string — not hex, not 64 characters — and that string lands in ``row_hash`` verbatim. A future
-#: isolated-module MAC provider with a different prefix MUST be added here, or a legitimate anchor from
-#: that deployment is refused as malformed.
+#: string — not hex, not 64 characters — and that string lands in ``row_hash`` verbatim. A head with
+#: this prefix must also pass ``row_seal.transit_mac_version``, which holds its own copy of the prefix
+#: and the Transit MAC's shape (vault BACKLOG #5987). A future isolated-module MAC provider with a
+#: different prefix MUST be added here AND given its own shape check in ``_audit_head_shape``, or a
+#: legitimate anchor from that deployment is refused as malformed.
 AUDIT_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
 
 
@@ -14351,8 +14353,9 @@ class MessageStore:
         # The ordinary-table predicate: a virtual `outbox` is another tool's, and reading it could
         # raise "no such module" (BACKLOG #6719 item 4).
         cur = await db.execute(
-            f"SELECT name FROM sqlite_master AS m WHERE {_ORDINARY_TABLE}"
-            " AND lower(m.name) = 'outbox'"
+            # Exact case, unlike the salt probe: nothing but this fold reads `outbox`, and it drops
+            # the table, so a case variant another tool left must be left alone.
+            f"SELECT name FROM sqlite_master AS m WHERE {_ORDINARY_TABLE} AND m.name = 'outbox'"
         )
         if await cur.fetchone() is None:
             return  # already migrated (or a fresh DB) — nothing to fold in
@@ -23108,6 +23111,9 @@ class MessageStore:
         from messagefoundry.store.base import seed_filter_clause
 
         async with self._read() as db:
+            # schema_verify's own predicate, so the census and the schema reads cannot drift apart
+            # (BACKLOG #6719 item 5). The NULL-sql case the old copy also took is unreachable: SQLite
+            # refuses to load a schema holding a table row with no SQL.
             cur = await db.execute(
                 f"SELECT m.name FROM main.sqlite_master AS m WHERE {_ORDINARY_TABLE}"
                 " AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"

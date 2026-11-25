@@ -208,6 +208,14 @@ async def test_a_virtual_outbox_is_not_folded_into_the_queue(tmp_path: Path) -> 
         with pytest.raises(sqlite3.OperationalError, match="no such module"):
             await db.execute("SELECT COUNT(*) FROM outbox")  # control: reading it raises
         await MessageStore._migrate_outbox_to_queue(db)  # nothing to fold, and no raise
+    # A case variant another tool left is not the legacy table either: it is neither read nor
+    # dropped, as on origin/main.
+    variant = tmp_path / "variant-outbox.db"
+    _sql(variant, "CREATE TABLE Outbox (a TEXT)", "INSERT INTO Outbox VALUES ('x')")
+    async with _connected(variant) as db:
+        await MessageStore._migrate_outbox_to_queue(db)
+        async with db.execute("SELECT count(*) FROM Outbox") as cur:
+            assert await cur.fetchone() == (1,)
 
 
 def test_forget_store_salt_leaves_a_virtual_salt_table_alone(tmp_path: Path) -> None:

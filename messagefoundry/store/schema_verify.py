@@ -97,10 +97,7 @@ _FOREIGN_OBJECTS_SQL = "SELECT type, name FROM sqlite_master WHERE type IN ('vie
 # THIS BUILD CREATES NO VIRTUAL TABLE, NO VIEW AND NO TRIGGER, which
 # tests/test_schema_verify_6719_6720.py pins; the other notes in this module rely on that and point
 # here.
-# A table row with no stored SQL is not a virtual one, so it counts as ordinary: the census in
-# MessageStore.table_occupancy and the store's migration probes use this same predicate, so the
-# reads cannot disagree on such a row (BACKLOG #6719 item 5).
-_ORDINARY_TABLE = "m.type = 'table' AND (m.sql IS NULL OR m.sql NOT LIKE 'CREATE VIRTUAL TABLE%')"
+_ORDINARY_TABLE = "m.type = 'table' AND m.sql NOT LIKE 'CREATE VIRTUAL TABLE%'"
 # Each pragma is read through its table-valued form, so one statement reads every table, and the
 # table names travel as bound parameters rather than being spliced into SQL. Only tables the EXPECTED
 # shape names are read for columns. The placeholder list is built from a count, never from a name.
