@@ -4,7 +4,8 @@
 
 A Builder copies that example into the code-review skill's arguments. Read from the worktree, the
 standard is the branch's own copy, so a branch that edits REVIEW-STANDARDS.md would be reviewed
-against its own edit: the change could rewrite its own judge. Reading it at origin/main closes that.
+against its own edit. Reading it at origin/main closes that route for this one file; the other
+sources a review reads, CLAUDE.md among them, still come from the worktree.
 """
 
 from __future__ import annotations

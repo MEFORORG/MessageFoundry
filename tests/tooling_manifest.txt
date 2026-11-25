@@ -35,6 +35,7 @@ tests/test_afk_tripwire_config_env.py
 tests/test_ai_provenance_claims.py
 tests/test_announce_hook.py
 tests/test_attribution_trailer_check.py
+tests/test_verified_by_trailer.py
 tests/test_announce_wiring.py
 tests/test_asvs_anchor_provenance.py
 tests/test_asvs_anchor_report.py
@@ -79,6 +80,7 @@ tests/test_cla_action_patches.py
 tests/test_cla_action_provenance.py
 tests/test_claim_check.py
 tests/test_claim_shared_registry.py
+tests/test_claude_md_review_standards_from_main.py
 tests/test_claude_md_wiki_state_root.py
 tests/test_codex_bridge.py
 tests/test_connscale_harvest.py

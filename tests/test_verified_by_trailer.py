@@ -84,9 +84,12 @@ def test_an_indented_or_quoted_trailer_does_not_count(tmp_path: Path) -> None:
     assert proc.stderr.startswith("advisory: no 'Verified-by:' trailer")
 
 
-def test_the_advisory_never_masks_a_refusal(tmp_path: Path) -> None:
-    """A message the gate refuses for another reason is still refused, trailer or not."""
-    session = "Claude-Session" + ": https://claude.ai/code/session_x"
-    proc = _run(tmp_path, f"docs: a plain subject\n\nBody.\n\n{session}\nVerified-by: tests\n")
+@pytest.mark.parametrize("trailer", ["", "\nVerified-by: tests\n"])
+def test_the_advisory_never_masks_a_later_refusal(tmp_path: Path, trailer: str) -> None:
+    """The bare-citation refusal runs AFTER the advisory, and still refuses, trailer or not.
+
+    Its subject needs no git read, so no repository is needed for the real ordering.
+    """
+    proc = _run(tmp_path, f"fix: x (#1, #2)\n\nBody.\n{trailer}")
     assert proc.returncode == 1, proc.stderr
-    assert "attribution-trailer check" in proc.stderr
+    assert ("advisory:" in proc.stderr) == (trailer == "")

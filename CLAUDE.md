@@ -832,8 +832,8 @@ Manager's watch reached the cloud session 29 seconds after its question.
 - Name [`docs/REVIEW-STANDARDS.md`](docs/REVIEW-STANDARDS.md) in the `code-review` skill's
   arguments as an instruction, never as a bare path: a bare path makes the skill review that file
   instead of your diff. Name the diff too, so it matches what you committed. Have the skill read
-  the standard as it stands at `origin/main`, never your worktree's copy, so a change cannot edit
-  its own judge. Write the level as a bare first word, with no punctuation after it. For example:
+  the standard as it stands at `origin/main`, never your worktree's copy, so a change to it is not
+  reviewed against itself. The other files a review reads still come from the worktree. Write the level as a bare first word, with no punctuation after it. For example:
   `xhigh round-<hex> Review this branch's diff against origin/main; read docs/REVIEW-STANDARDS.md as it stands at origin/main (git show origin/main:docs/REVIEW-STANDARDS.md) and apply its rules.`
   Pass the arguments on one line. The period form, `xhigh.`, does not parse as a level. In two
   trials the skill then ran at the previous call's level (measured 2026-10-13). Make the

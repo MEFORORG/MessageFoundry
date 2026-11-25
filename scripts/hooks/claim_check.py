@@ -35,11 +35,13 @@ not start with one of them, such as an indented or backticked quote, passes. It 
 
 A fourth check is ADVISORY ONLY (observe mode) and never refuses a commit:
 
-    A `Verified-by:` trailer names how the change was checked: `code-review xhigh`, `verify`,
-    `tests` or `none`. A missing or unrecognised one prints one line to stderr, and the commit
-    goes ahead.
+    A `Verified-by:` trailer is the author's own statement of how the change was checked:
+    `code-review xhigh`, `verify`, `tests` or `none`. A missing or unrecognised one prints one
+    line to stderr, and the commit goes ahead.
 
-It exists to measure how often commits say how they were verified before anything enforces it.
+Nothing checks the statement, nothing records the advisory, and `--no-verify` skips it, so the
+trailer is never proof that a review ran. It only makes the convention visible before anything
+enforces it.
 
 Three scoping decisions for the claim rule, each load-bearing:
 
