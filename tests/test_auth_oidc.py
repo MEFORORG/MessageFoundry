@@ -1183,19 +1183,27 @@ class _BlockingFetch:
     holds the cache in exactly the state a concurrent reader must survive: floor armed, keys absent.
     """
 
-    def __init__(self, body: bytes) -> None:
+    def __init__(
+        self, body: bytes, *, first: bytes | None = None, fail: BaseException | None = None
+    ) -> None:
         self.body = body
+        self.first = first  # when given, answers the first call at once, unparked
+        self.fail = fail  # when given, raised instead of answering once released
         self.calls = 0
         self.entered = threading.Event()
         self.release = threading.Event()
 
     def __call__(self) -> bytes:
         self.calls += 1
+        if self.first is not None and self.calls == 1:
+            return self.first
         self.entered.set()
         # Bounded. A missed release must fail the assertion below, never hang the worker: an
         # unbounded wait here is the exact shape that got a pytest-xdist worker killed by the
         # per-test timeout and reported as "worker crashed" with no stack.
         assert self.release.wait(timeout=10), "the test never released the parked fetch"
+        if self.fail is not None:
+            raise self.fail
         return self.body
 
 
@@ -1251,3 +1259,106 @@ def test_a_concurrent_reader_is_not_refused_while_the_first_fetch_is_in_flight(
     # lock could be "fixed" by simply letting both fetch, which reopens the amplification bound that
     # test_unknown_kid_is_throttled_by_the_min_refetch_floor exists to hold.
     assert fetch.calls == 1, f"expected exactly one fetch, got {fetch.calls}"
+
+
+def _run_lookup(
+    cache: oidc.JwksCache, kid: str, results: dict[str, object], tag: str
+) -> threading.Thread:
+    def call() -> None:
+        try:
+            results[tag] = cache.get_key(kid, alg=SignatureAlgorithm.RS256)
+        except BaseException as exc:  # noqa: BLE001 - the failure IS the subject; asserted on
+            results[tag] = exc
+
+    thread = threading.Thread(target=call, daemon=True)
+    thread.start()
+    return thread
+
+
+def _warm_cache(
+    rsa_key: rsa.RSAPrivateKey, later: bytes, *, fail: BaseException | None = None
+) -> tuple[oidc.JwksCache, _BlockingFetch, object]:
+    """A cache holding ``k1``, its clock past the refetch floor and within the TTL, so the next
+    miss fetches, and that fetch parks until released."""
+    first = _jwks_bytes(_rsa_jwk(rsa_key, "k1"))
+    fetch = _BlockingFetch(later, first=first, fail=fail)
+    now = [0.0]
+    cache = oidc.JwksCache(fetch, min_refetch_seconds=300.0, clock=lambda: now[0])
+    warm = cache.get_key("k1", alg=SignatureAlgorithm.RS256)
+    now[0] = 400.0
+    return cache, fetch, warm
+
+
+def test_a_cached_kid_lookup_does_not_wait_on_a_stalled_refresh(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #6905. An unknown ``kid`` starts a refresh that stalls on the IdP; a lookup of a kid
+    already cached and within its TTL must return at once rather than queue behind the network call.
+
+    REDS when the fast path takes the gate the refresh holds: the cached lookup then waits for the
+    release.
+    """
+    later = _jwks_bytes(_rsa_jwk(rsa_key, "k1"), _rsa_jwk(rsa_key, "k2"))
+    cache, fetch, warm = _warm_cache(rsa_key, later)
+
+    results: dict[str, object] = {}
+    stalled = _run_lookup(cache, "k2", results, "stalled")
+    assert fetch.entered.wait(timeout=10), "the unknown-kid lookup never reached the fetch"
+    try:
+        cached = _run_lookup(cache, "k1", results, "cached")
+        cached.join(timeout=5)
+        assert not cached.is_alive(), "a cached-kid lookup waited on the stalled refresh"
+        assert results["cached"] is warm
+    finally:
+        fetch.release.set()
+        stalled.join(timeout=10)
+    assert not stalled.is_alive(), "the stalled lookup never finished"
+    assert not isinstance(results["stalled"], BaseException), results["stalled"]
+    assert fetch.calls == 2
+
+
+def test_a_failed_refresh_frees_the_lookups_queued_behind_it(rsa_key: rsa.RSAPrivateKey) -> None:
+    """BACKLOG #6905. A miss that queued behind a refresh that then fails decides again against the
+    keys still in place, here as throttled, rather than hang or fetch again; the failure costs the
+    IdP one fetch, and the previous keys stay in place (fail-static)."""
+    boom = urllib.error.URLError("synthetic IdP outage")
+    cache, fetch, _ = _warm_cache(rsa_key, b"", fail=boom)
+
+    results: dict[str, object] = {}
+    first = _run_lookup(cache, "k2", results, "first")
+    assert fetch.entered.wait(timeout=10), "the first lookup never reached the fetch"
+    second = _run_lookup(cache, "k2", results, "second")
+    second.join(timeout=0.5)
+    assert second.is_alive(), "the second lookup did not wait for the refresh in flight"
+
+    fetch.release.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+    assert not first.is_alive() and not second.is_alive(), "a lookup never finished"
+    assert results["first"] is boom
+    assert isinstance(results["second"], oidc.JwksError)
+    assert "throttled" in str(results["second"])
+    assert fetch.calls == 2
+    cache.get_key("k1", alg=SignatureAlgorithm.RS256)
+
+
+@pytest.mark.parametrize("field", ["ttl_seconds", "min_refetch_seconds"])
+@pytest.mark.parametrize("value", [-1.0, -0.001, float("nan"), float("inf"), float("-inf")])
+def test_the_cache_refuses_a_negative_or_non_finite_interval(field: str, value: float) -> None:
+    """BACKLOG #6904. A NaN or infinite floor wedges key rotation after the first fetch, and a
+    negative floor lifts the amplification bound without saying so; the cache refuses each."""
+    with pytest.raises(ValueError, match=field):
+        _cache_with(field, value, lambda: b"")
+
+
+def _cache_with(field: str, value: float, fetch: Callable[[], bytes]) -> oidc.JwksCache:
+    if field == "ttl_seconds":
+        return oidc.JwksCache(fetch, ttl_seconds=value)
+    return oidc.JwksCache(fetch, min_refetch_seconds=value)
+
+
+@pytest.mark.parametrize("field", ["ttl_seconds", "min_refetch_seconds"])
+def test_the_cache_accepts_a_zero_interval(field: str, rsa_key: rsa.RSAPrivateKey) -> None:
+    """BACKLOG #6904. Zero is existing design for both, not a value the guard refuses."""
+    cache = _cache_with(field, 0, lambda: _jwks_bytes(_rsa_jwk(rsa_key, "k1")))
+    cache.get_key("k1", alg=SignatureAlgorithm.RS256)
