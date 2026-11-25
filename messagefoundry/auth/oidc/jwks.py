@@ -326,9 +326,13 @@ class JwksCache:
         #: and concurrent misses cost the IdP one fetch.
         #:
         #: A LOOKUP OF A KEY WITHIN THE TTL DOES NOT TAKE IT (BACKLOG #6905). Taking it there made
-        #: such a lookup sit out a stalled IdP. That read touches ``_state`` alone, never the floor,
-        #: and ``_state`` is an immutable snapshot replaced in one assignment, so the ordering hazard
-        #: above cannot reach it: it sees the old keys or the new ones. A key PAST the TTL still
+        #: such a lookup sit out a stalled IdP. That read touches ``_state`` and
+        #: ``_refresh_started``, never the floor, so the ordering hazard above does not reach it.
+        #: ``_state`` is an immutable snapshot replaced in one assignment, so the read sees the old
+        #: keys or the new ones, and it serves a key only if the snapshot it read is still the
+        #: published one after it reads ``_refresh_started`` (``_read_without_gate``), so a refresh
+        #: that publishes and clears that time between the two reads cannot get an older snapshot
+        #: served. A key PAST the TTL still
         #: takes the gate, so it waits out a fetch in progress and is never served once that fetch
         #: has withdrawn it. Nor does a key within the TTL skip it once the refresh in flight is as
         #: old as the gate wait: the fetch has no overall bound, and skipping it for the whole of a
