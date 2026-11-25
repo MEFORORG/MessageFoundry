@@ -111,17 +111,21 @@ function Test-OwnStamp([string]$Stamp, [string]$Root) {
 }
 
 # THE NUMBER usage.ps1 WOULD GRADE THIS WINDOW BY NOW, or $null. The window has a number, its reset is
-# absent or still ahead, and its age is at most 20 minutes, usage.ps1's default -MaxAgeMinutes, which
-# the gate's reader runs with. A window dated after now counts, because usage.ps1 keeps a level_floor
-# at its number. The caller has tested that the window is this root's own. Without config-roots.ps1
-# the age cannot be read the reader's way, so the answer is $null.
+# absent or still ahead, and its age, rounded as usage.ps1's Get-AgeMinutes rounds it, is at most
+# $GradedMaxAgeMinutes. A window dated after now counts, because usage.ps1 keeps a level_floor at its
+# number. Whose window it is, is the caller's test. Without config-roots.ps1 the age cannot be read the
+# reader's way, so the answer is $null.
+#
+# usage.ps1's default -MaxAgeMinutes, which the gate's reader runs with. tests/test_coord_usage.py pins
+# the two equal, because a param() default cannot be dot-sourced from one place.
+$GradedMaxAgeMinutes = 20
 function Get-GradedPercentage($w, [long]$NowEpoch) {
     if (-not $w -or -not $HaveConfigRoots) { return $null }
     $pct = Get-Percentage $w.used_percentage
     $reset = $w.resets_at_epoch -as [long]
     if ($null -eq $pct -or ($reset -and $reset -le $NowEpoch)) { return $null }
     $at = ConvertTo-UtcDateTime $w.captured_at
-    if ($null -eq $at -or ([datetime]::UtcNow - $at).TotalMinutes -gt 20) { return $null }
+    if ($null -eq $at -or [math]::Round(([datetime]::UtcNow - $at).TotalMinutes, 1) -gt $GradedMaxAgeMinutes) { return $null }
     return $pct
 }
 
@@ -351,15 +355,14 @@ try {
     # An idle session keeps reporting its cached number on a timer and every session publishes here, so
     # without the rule a stale 60 replaces a live 99 and reads as freshly observed.
     #
-    # A refused reading leaves the window it keeps whole, so the staleness guard keeps counting from
-    # the last real observation. $confirmed is the one exception: a live session's refused equal reading
-    # for the same running reset refreshes the age and nothing else.
+    # A refused reading publishes the window it keeps whole, its age included, so the staleness guard
+    # keeps counting from the last real observation. $confirmed is the one exception: a live session's
+    # refused equal reading for the same running reset refreshes the age and nothing else.
     #
-    # $perReset is the per-reset rule, over this root's own published window only. $guard is the
-    # live-session rule. It holds an idle reading of this root's to $ownWin, this root's own last
-    # window, and only while usage.ps1 would grade that window by its number (Get-GradedPercentage), so the
-    # window it keeps reads at least as high as the reading it refuses. Over a window stamped with
-    # another root, $ownWin is the own_window that window carries, and a refusal publishes it again.
+    # $perReset is the per-reset rule. $guard is the live-session rule, and it holds a reading only to
+    # $ownWin, this root's own last window, which over a window of another root's is the own_window that
+    # window carries. ADR 0211 says why each refuses only where the window it keeps answers at least
+    # as strictly as the reading would.
     #
     # THE READ AND THE WRITE ARE NOT LOCKED. Every session publishes here, so a reading can pass this
     # check and then land over a higher one written in between. The next live fire corrects it.
@@ -372,7 +375,9 @@ try {
     $stampOwn = Test-OwnStamp $stampEnv $ownRoot
     if ($published) {
         $publishedOwn = Test-OwnStamp ([string]$published.config_root_env) $ownRoot
-        $ownWin = if ($publishedOwn) { $published } else { $published.own_window }
+        $carried = $published.own_window
+        $ownWin = if ($publishedOwn) { $published }
+        elseif ($carried -and (Test-OwnStamp ([string]$carried.config_root_env) $ownRoot)) { $carried }
     }
     if ($seven -and $published) {
         $nowEpoch = [System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
@@ -382,13 +387,22 @@ try {
         $publishedPct = Get-Percentage $published.used_percentage
         $notHigher = $null -ne $publishedPct -and $seven.used_percentage -le $publishedPct
         $live = $calledApi -and $stampOwn
-        $perReset = if (-not $publishedOwn) { $false }
-        elseif ($seenEpoch -and $publishedEpoch) {
-            ($notHigher -and $seenEpoch -eq $publishedEpoch) -or
-            ($seenEpoch -lt $publishedEpoch -and $seenEpoch -le $nowEpoch)
+        # The stamp spelled exactly as this root, unset or absent. A window in another spelling of this
+        # root meets only the same-reset test, and only while usage.ps1 grades it.
+        $publishedRoot = [string]$published.config_root_env
+        $sameSpelling = -not $publishedRoot -or $publishedRoot -eq "unset" -or $publishedRoot -ieq $ownRoot
+        $sameReset = $notHigher -and $seenEpoch -and $seenEpoch -eq $publishedEpoch
+        $perReset = if ($sameSpelling) {
+            if ($seenEpoch -and $publishedEpoch) {
+                $sameReset -or ($seenEpoch -lt $publishedEpoch -and $seenEpoch -le $nowEpoch)
+            }
+            else { $publishedEpoch -gt $nowEpoch }
         }
-        else { $publishedEpoch -gt $nowEpoch }
-        $ownPct = if ($stampOwn -and -not $live) { Get-GradedPercentage $ownWin $nowEpoch }
+        else { $publishedOwn -and $sameReset -and $null -ne (Get-GradedPercentage $published $nowEpoch) }
+        # A reading with no reset, or one already passed, holds only to an own window with no reset.
+        $ownPct = if ($stampOwn -and -not $live -and ($seenEpoch -gt $nowEpoch -or -not ($ownWin.resets_at_epoch -as [long]))) {
+            Get-GradedPercentage $ownWin $nowEpoch
+        }
         $guard = $null -ne $ownPct -and $seven.used_percentage -le $ownPct
         if ($guard) { $holdWin = $ownWin }
         elseif ($perReset) { $holdWin = $published }

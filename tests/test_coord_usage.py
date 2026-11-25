@@ -558,6 +558,67 @@ def test_a_reading_of_another_root_replaces_by_the_per_reset_rule_alone(tmp_path
     assert read(state)[0] == CRITICAL
 
 
+@pytest.mark.parametrize("reset_offset", [None, -300], ids=["no-reset", "passed-reset"])
+def test_over_a_foreign_window_a_reading_with_no_reset_ahead_is_not_held(
+    tmp_path: Path, reset_offset: int | None
+) -> None:
+    """BACKLOG #5178, review round 1. A reading with no reset, or one already passed, reads UNKNOWN when
+    taken, so publishing this root's graded 70 again over it could read OK. Such a reading holds only
+    to an own window with no reset; here the per-reset rule takes it."""
+    state, other = _foreign_state(tmp_path)
+    now = int(time.time())
+    _session_fire(state, {"used_percentage": 70.0, "resets_at": now + 500000}, "live", 1000)
+    _session_fire(state, {"used_percentage": 75.0, "resets_at": now + 500000}, "F", 1000, pin=other)
+    idle: dict[str, Any] = {"used_percentage": 60.0}
+    if reset_offset is not None:
+        idle["resets_at"] = now + reset_offset
+    _session_fire(state, idle, "idle", 1000)
+    assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(60.0)
+    if reset_offset is not None:
+        assert read(state)[0] == UNKNOWN
+
+
+def test_a_carried_window_of_another_root_is_not_this_roots_own(tmp_path: Path) -> None:
+    """BACKLOG #5178, review round 1. A hand-copied document can carry an own_window stamped with
+    another root. The live-session rule holds a reading only to a window whose stamp is this root's."""
+    state, other = _foreign_state(tmp_path)
+    reset = int(time.time()) + 500000
+    _session_fire(state, {"used_percentage": 99.0, "resets_at": reset}, "live", 1000)
+    _session_fire(state, {"used_percentage": 99.5, "resets_at": reset}, "F", 1000, pin=other)
+    doc = latest(state)
+    doc["seven_day"]["own_window"]["config_root_env"] = str(tmp_path / "third-root")
+    (state / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    _session_fire(state, {"used_percentage": 95.0, "resets_at": reset}, "idle", 1000)
+    assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(95.0)
+
+
+def test_a_respelled_own_stamp_meets_only_the_same_reset_test(tmp_path: Path) -> None:
+    """BACKLOG #5178, review round 1. Under another spelling of this root, the per-reset tests that
+    refuse a reading with no reset, or with an earlier passed reset, would keep a 50 that reads OK where
+    the refused reading reads at the ceiling or UNKNOWN. Only the same-reset test holds there."""
+    now = int(time.time())
+    collect(tmp_path, {"session_id": "live", "rate_limits": {"seven_day": window(50.0, 280000)}})
+    doc = latest(tmp_path)
+    doc["seven_day"]["config_root_env"] = str(tmp_path.parent).replace("\\", "/") + "/"
+    respelled = json.dumps(doc)
+    (tmp_path / "latest.json").write_text(respelled, encoding="utf-8")
+    _session_fire(tmp_path, {"used_percentage": 99.0}, "idle", 1000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(99.0)
+    assert read(tmp_path)[0] == CRITICAL
+
+    (tmp_path / "latest.json").write_text(respelled, encoding="utf-8")
+    _session_fire(tmp_path, {"used_percentage": 99.0, "resets_at": now - 300}, "idle", 1000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(99.0)
+
+
+def test_the_collectors_graded_age_is_the_readers_default_max_age() -> None:
+    """The collector cannot dot-source usage.ps1's param() default, so the two are pinned equal here."""
+    reader = READ.read_text(encoding="utf-8")
+    collector = (READ.parent / "usage-collect.ps1").read_text(encoding="utf-8")
+    assert "[int]$MaxAgeMinutes = 20," in reader
+    assert "$GradedMaxAgeMinutes = 20\n" in collector.replace("\r\n", "\n")
+
+
 def test_a_higher_reading_with_no_reset_is_refused_and_the_floor_stays_armed(
     tmp_path: Path,
 ) -> None:
