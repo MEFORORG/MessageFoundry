@@ -11,7 +11,6 @@ session that still owes its second factor choose the address.
 
 from __future__ import annotations
 
-import inspect
 import json
 import logging
 import os
@@ -42,6 +41,7 @@ from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import AuditAppend, MessageStore
 from tests._admin_account import create_local_user_chosen, forget_addresses, provision_totp
+from tests.test_operator_audit_required import signature_problem
 
 PW = "a-strong-test-passphrase"
 ADDRESS = "ops@example.org"
@@ -364,20 +364,31 @@ async def test_a_refused_birth_and_its_audit_row_roll_back_together() -> None:
             await service._create_directory_row(
                 _directory_principal("torn", _UNADOPTABLE_DIRECTORY_MAIL[0][1]),
                 client=None,
-                audits=(),
+                audits=(AuditAppend("auth.ad_user_created", actor="torn"),),
             )
         assert await store.get_user_by_username("torn") is None
         assert await store.list_audit(action="auth.ad_notify_email_not_adopted") == []
+        assert await store.list_audit(action="auth.ad_user_created") == []
     finally:
         await store.close()
 
 
-def test_the_directory_birth_requires_its_audits() -> None:
-    """BACKLOG #6589: ``_create_directory_row`` takes ``audits`` keyword-only with no default, so
-    each caller states the row that records a birth rather than leave it out."""
-    param = inspect.signature(AuthService._create_directory_row).parameters["audits"]
-    assert param.kind is inspect.Parameter.KEYWORD_ONLY
-    assert param.default is inspect.Parameter.empty
+async def test_the_directory_birth_requires_its_audits() -> None:
+    """BACKLOG #6589: ``_create_directory_row`` takes ``audits`` keyword-only, not ``None``, with
+    no default, so each caller states the row that records a birth; an empty one is refused
+    before anything is written."""
+    assert signature_problem(AuthService, "_create_directory_row", "audits") is None
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _ad_service(store)
+        await service.initialize()
+        with pytest.raises(ValueError, match="BACKLOG #6589"):
+            await service._create_directory_row(
+                _directory_principal("empty", "empty@example.org"), client=None, audits=()
+            )
+        assert await store.get_user_by_username("empty") is None
+    finally:
+        await store.close()
 
 
 async def test_a_sign_in_birth_commits_its_own_audit_row() -> None:

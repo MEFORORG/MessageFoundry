@@ -10920,8 +10920,8 @@ def if_applied(audit: AuditAppend) -> OperatorAudit[bool]:
 
     Anything but an :class:`AuditAppend`, an explicit ``None`` included, raises :class:`TypeError`
     here, so an alert mutation given no row cannot change the alert and record nothing (BACKLOG
-    #5069). Each alert mutation and ``set_connection_flag`` calls it as its first statement, so
-    that refusal comes before any write or lock (BACKLOG #6589)."""
+    #5069). Its callers take it as their first statement, so that refusal comes before any write
+    or lock (BACKLOG #6589)."""
     if not isinstance(audit, AuditAppend):
         raise TypeError(
             f"an operator alert mutation or connection flag needs an AuditAppend; got {type(audit).__name__}"

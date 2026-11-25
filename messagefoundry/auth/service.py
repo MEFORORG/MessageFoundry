@@ -9543,8 +9543,11 @@ class AuthService:
         ``audits`` are the caller's own rows for this birth. They commit in the INSERT's
         transaction, after any not-adopted row (BACKLOG #2221). Required with no default (BACKLOG
         #6589), so each caller states the row that records the birth: ``user.created`` for an
-        administrator's create, ``auth.ad_user_created`` for a sign-in's.
+        administrator's create, ``auth.ad_user_created`` for a sign-in's. An empty ``audits``
+        raises :class:`ValueError` before anything is written.
         """
+        if not audits:
+            raise ValueError("a directory account's birth needs its audit row (BACKLOG #6589)")
         user_id = uuid4().hex
         # BACKLOG #2014, ASVS 6.3.7. The birth seed is the one time the directory's `mail` can
         # become `notify_email`, where every later security notice goes. So it must pass the test

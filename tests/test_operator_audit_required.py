@@ -57,6 +57,7 @@ from messagefoundry.store.store import (
     require_ingress_audit,
     require_mutation_audit,
 )
+from tests._ast_sites import callee_name
 
 #: The protocol, every backend that implements it, and the engine that wraps them.
 CLASSES: tuple[type[Any], ...] = (Store, MessageStore, PostgresStore, SqlServerStore, Engine)
@@ -519,9 +520,7 @@ def guard_problem(stmt: ast.stmt, guard: Guard) -> str | None:
     if not (isinstance(target, ast.Name) and target.id == guard.target):
         return f"starts with {shown!r}, which does not bind {guard.target}"
     name = guard.func.__name__
-    if not (
-        isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == name
-    ):
+    if not (isinstance(value, ast.Call) and callee_name(value, bare_only=True) == name):
         return f"starts with {shown!r}, not a call to {name}"
     if any(isinstance(a, ast.Starred) for a in value.args) or any(
         k.arg is None for k in value.keywords
