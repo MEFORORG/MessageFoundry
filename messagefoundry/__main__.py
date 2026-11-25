@@ -14455,7 +14455,8 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
             f"({audit_problem}); record the attempt by hand"
         )
         return _emit_error(
-            "the connection to the store failed during the revoke, so whether it took effect is "
+            "the store connection failed or timed out during the revoke, so whether it took "
+            "effect is "
             f"unknown ({problem}). {recorded}. Re-run the command: a second revoke ends what "
             "this one would have, within the limits docs/SECURITY.md, Limits of the session "
             "sweep, names, and also every session signed in since this attempt",
@@ -15863,10 +15864,11 @@ def _revoke_link_lost(exc: BaseException, *, network: bool) -> bool:
 
     Never on SQLite: the file has no link to lose, and a revoke that raised there rolled back.
     On a server store, an ``OSError`` raised by the revoke itself, a ``TimeoutError`` among them,
-    as :func:`_write_outcome_unknown` reads one for the transit-bound commands: a driver's command
-    timeout covers the COMMIT too, so it can fire after the server committed; or a SQLSTATE of
+    as :func:`_write_outcome_unknown` reads one for the transit-bound commands, or a SQLSTATE of
     class 08, or 40003, "statement completion unknown", on the error or in its implicit
-    ``__context__`` chain. The chain is read for a SQLSTATE only: a rollback on a dead
+    ``__context__`` chain. asyncpg's command timeout covers the COMMIT too, so its
+    ``TimeoutError`` can fire after the server committed. pyodbc's query timeout, SQLSTATE
+    ``HYT00``, is not a ``TimeoutError`` and reads as a refusal. The chain is read for a SQLSTATE only: a rollback on a dead
     connection after a COMMIT whose link failed raises its own error with the lost link as its
     context, while a refusal raised inside an ``except OSError`` block names no lost COMMIT. An
     explicit cause or a suppressed context ends the chain: the raiser chose what it means. The
