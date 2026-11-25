@@ -687,8 +687,9 @@ _CONTEXTUAL_PROSE_ONLY = frozenset(
 # -1 BACKLOG #1136 (ADR 0183 Amendment A, Wave 4): the first-run account's claim-state row went with
 # that account; +2 BACKLOG #288: the first-seen sign-in address, split by outcome; +1 BACKLOG #1957
 # (ADR 0198): the reconciler's scope re-diff; +2 BACKLOG #2301: the two second-step time floors;
-# +1 BACKLOG #2298: a session whose temporary credential lapsed is ended.
-_CONTEXT_TABLE_A_ROWS = 43
+# +1 BACKLOG #2298: a session whose temporary credential lapsed is ended; +1 vault BACKLOG #1191:
+# the monitoring-read volume per actor.
+_CONTEXT_TABLE_A_ROWS = 44
 # +1 BACKLOG #4907 (Table B): the MLLP listener's expected-sender allowlist, tls_client_subjects.
 _CONTEXT_TABLE_B_ROWS = 14
 
@@ -1401,6 +1402,7 @@ _STEP_UP_GATES = frozenset(
 _NOT_STEP_UP_GATES = frozenset(
     {
         "require",
+        "require_monitoring_read",
         "require_paced",
         "require_phi_read",
         "require_ui",
@@ -2337,9 +2339,9 @@ def test_gate_wrapper_preamble_matches_the_table_it_introduces() -> None:
     block = _section(_doc_text(), _H_DESIGN)
     table = _table_with_header(block, "Gate wrapper")
     rows = len(table) - 1
-    assert rows == 7, f"the gate-wrapper table now has {rows} rows; restate the preamble"
+    assert rows == 8, f"the gate-wrapper table now has {rows} rows; restate the preamble"
     assert (
-        f"The table below has **{['', 'one', 'two', 'three', 'four', 'five', 'six', 'seven'][rows]}** rows"
+        f"The table below has **{['', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight'][rows]}** rows"
         in block
     ), f"the gate-wrapper preamble must state the real row count ({rows})"
     assert "deliberately\n**bypasses**" in block or "deliberately **bypasses**" in block, (

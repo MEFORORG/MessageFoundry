@@ -64,8 +64,8 @@ _WEBCONSOLE = _ROOT / "messagefoundry_webconsole"
 
 _H_CONFIG_AUTH = "### `[auth]` — authentication & RBAC"
 
-#: The four limiter accessors that defend the AUTHENTICATION surface (6.1.1). The other two
-#: (``allow_phi_read``, ``allow_admin_write``) are post-authentication business-logic limits and
+#: The four limiter accessors that defend the AUTHENTICATION surface (6.1.1). The other three
+#: (``allow_phi_read``, ``allow_admin_write``, ``allow_monitoring_read``) are post-authentication business-logic limits and
 #: belong to the 2.1.3 table instead. The split is asserted rather than assumed:
 #: ``test_every_sliding_window_limiter_is_filed_under_the_right_requirement`` fails if a new
 #: limiter appears, forcing an explicit decision about which table it joins.
@@ -78,7 +78,10 @@ _AUTH_SURFACE_ACCESSORS = frozenset(
         "allow_step_up_return_audit",
     }
 )
-_BUSINESS_LIMIT_ACCESSORS = frozenset({"allow_phi_read", "allow_admin_write"})
+_BUSINESS_LIMIT_ACCESSORS = frozenset(
+    # vault BACKLOG #1191: the monitoring-read pace joins the 2.1.3 table.
+    {"allow_phi_read", "allow_admin_write", "allow_monitoring_read"}
+)
 
 #: Anti-automation controls that are not objects and so cannot be derived: they are enforcement
 #: SHAPES (a counter on a user row, a semaphore, ASGI middleware, a CIDR test). Each is pinned to a
@@ -104,6 +107,9 @@ _COUNT_WORDS = {
     10: "Ten",
     11: "Eleven",
     12: "Twelve",
+    13: "Thirteen",
+    14: "Fourteen",
+    15: "Fifteen",
 }
 
 _H_BRUTE = "## Brute-force & abuse protection"

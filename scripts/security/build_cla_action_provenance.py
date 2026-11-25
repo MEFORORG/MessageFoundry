@@ -27,11 +27,14 @@ WHAT IS ACTUALLY PROVEN, and it is more than the ledger checksum was. BOTH vendo
 artifacts are derived offline rather than asserted, so an auditor with no network recomputes them
 from the files on disk:
 
-    sha256 of (dist/index.js with its first two lines removed) == UPSTREAM_BUNDLE_SHA256
-    git blob id of upstream-package-lock.json               == UPSTREAM_LOCK_BLOB_ID
+    sha256 of (dist/index.js, first two lines removed, BUNDLE_PATCHES reverted) == UPSTREAM_BUNDLE_SHA256
+    git blob id of upstream-package-lock.json                                  == UPSTREAM_LOCK_BLOB_ID
 
-The first is what :func:`split_vendoring_header` checks -- the vendored bundle is the upstream blob
-at commit ``ca4a40a7`` with a 176-byte two-line header prepended, verified byte for byte. The second
+The first is what :func:`split_vendoring_header` and :func:`revert_bundle_patches_reporting` check -- the
+vendored bundle is the upstream blob at commit ``ca4a40a7`` with the recorded patches applied and a
+two-line header prepended, verified byte for byte. Since 2026-11-23 the bundle is a PATCHED FORK
+(BACKLOG #5644, #5645; see :data:`BUNDLE_PATCHES`), so the derivation reverts the patches before it
+digests: a change outside a recorded patch still reds it. The second
 is :func:`git_blob_id`, and ``git hash-object`` agrees with it. Both turn a recorded number into a
 reproducible derivation, and :func:`verify_derivation` runs both.
 
@@ -223,12 +226,123 @@ PINNED_DIGESTS: dict[str, str] = {
 UNRECORDED_BY_DESIGN = frozenset({f"{ACTION_DIR}/README.md", RECORD_PATH})
 
 #: The vendoring header prepended to the upstream bundle, byte for byte. The vendored file is this
-#: followed by the upstream blob and nothing else, which :func:`split_vendoring_header` verifies.
+#: followed by the upstream blob with :data:`BUNDLE_PATCHES` applied and nothing else, which
+#: :func:`split_vendoring_header` and :func:`revert_bundle_patches_reporting` verify between them. The second
+#: line says the file is modified because Apache-2.0 section 4(b) asks a modified file to carry a
+#: prominent notice saying so.
 VENDORING_HEADER = (
     b"// SPDX-License-Identifier: Apache-2.0\n"
     b"// Vendored from contributor-assistant/github-action@"
-    b"ca4a40a7d1004f18d9960b404b97e5f30a505a08 (v2.6.1). See README.md in this directory.\n"
+    b"ca4a40a7d1004f18d9960b404b97e5f30a505a08 (v2.6.1), with local modifications. "
+    b"See README.md in this directory.\n"
 )
+
+#: THE BUNDLE IS A PATCHED FORK (owner ruling 2026-11-23, "Fork, patch, re-provenance"). Each entry
+#: is ``(upstream bytes, patched bytes)``; the vendored body is the upstream blob with each upstream
+#: span replaced by its patched one. :func:`revert_bundle_patches_reporting` runs that backwards, so the
+#: upstream digest is still DERIVED from the file on disk rather than asserted. Changing a patch is
+#: a deliberate edit to this constant, the same friction :data:`PINNED_DIGESTS` puts on its files.
+#:
+#: 1. BACKLOG #5644 item 2: ``checkAllowList`` built an UNANCHORED RegExp from a wildcard allowlist
+#:    entry, so ``bot*`` matched ``evilbot-x`` mid-string. The non-wildcard parts were already
+#:    escaped by lodash's ``escapeRegExp``; the patch adds the ``^`` and ``$``.
+#: 2-4. BACKLOG #5645 item 2: ``getCommitters`` read ONE page of 100 commits with an empty cursor
+#:    and never followed ``pageInfo.hasNextPage``, so an author first seen past page one was not in
+#:    the list a sign comment is recorded against. The patch loops on ``endCursor``, and raises when
+#:    a further page is claimed with a cursor that is missing or already seen, which the action
+#:    reports as a failed step. It does NOT compare the commits read with ``totalCount``: GitHub's
+#:    connection stops at 250 commits while ``totalCount`` reports the full number (the reading is
+#:    recorded once, in ``scripts/security/cla_precheck.py``), so that comparison would red every
+#:    larger pull request with no way to clear it. An author first seen past commit 250 is
+#:    therefore not checked.
+#:
+#: Every patched span carries a ``MessageFoundry patch`` comment, so a grep of the bundle finds all
+#: of them.
+BUNDLE_PATCHES: tuple[tuple[bytes, bytes], ...] = (
+    (
+        b"            return new RegExp(regex).test(committer);\n",
+        b"            // MessageFoundry patch (BACKLOG #5644): anchor the pattern to the whole name.\n"
+        b"            return new RegExp('^' + regex + '$').test(committer);\n",
+    ),
+    (
+        b"            let filteredCommitters = [];\n            let response = yield",
+        b"            let filteredCommitters = [];\n"
+        b"            // MessageFoundry patch (BACKLOG #5645): read every page of commits.\n"
+        b"            let cursor = '';\n"
+        b"            let hasNextPage = true;\n"
+        b"            const seenCursors = new Set(['']);\n"
+        b"            while (hasNextPage) {\n"
+        b"            let response = yield",
+    ),
+    (
+        b"                cursor: ''\n            });\n",
+        b"                cursor: cursor // MessageFoundry patch (BACKLOG #5645)\n            });\n",
+    ),
+    (
+        b"            });\n            filteredCommitters = committers.filter(",
+        b"            });\n"
+        b"            // MessageFoundry patch (BACKLOG #5645): stop after the last page, and fail on a\n"
+        b"            // next page whose cursor is missing or already seen.\n"
+        b"            const commits = response.repository.pullRequest.commits;\n"
+        b"            hasNextPage = commits.pageInfo.hasNextPage === true;\n"
+        b"            if (hasNextPage && (typeof commits.pageInfo.endCursor !== 'string' || "
+        b"seenCursors.has(commits.pageInfo.endCursor))) {\n"
+        b"                throw new Error('pagination reported a next page with no new cursor');\n"
+        b"            }\n"
+        b"            cursor = commits.pageInfo.endCursor;\n"
+        b"            seenCursors.add(cursor);\n"
+        b"            }\n"
+        b"            filteredCommitters = committers.filter(",
+    ),
+)
+
+
+def revert_bundle_patches(body: bytes) -> bytes:
+    """Return *body* with every :data:`BUNDLE_PATCHES` entry reverted, which is the upstream blob.
+
+    Each patched span must occur EXACTLY ONCE in *body*, and each upstream span exactly once in the
+    result. The second condition is what makes the reversal unique: were an upstream span repeated,
+    a body carrying the patched text at the OTHER site would revert to the same upstream bytes, and
+    the derivation would sign off on a patch applied somewhere it was never reviewed.
+
+    Raises :class:`ValueError` naming every bad patch, so a moved or edited hunk reads as that rather
+    than as a bare digest mismatch. :func:`verify_derivation` uses
+    :func:`revert_bundle_patches_reporting` instead, so the digest is still compared when a patch
+    is bad.
+    """
+    reverted, problems = revert_bundle_patches_reporting(body)
+    if problems:
+        raise ValueError("; ".join(problems))
+    return reverted
+
+
+def revert_bundle_patches_reporting(body: bytes) -> tuple[bytes, list[str]]:
+    """Revert what can be reverted, and return it with EVERY problem found, not the first.
+
+    A patch whose patched span does not occur exactly once is left as it is, and the others are
+    still reverted, and every bad patch is named. Stopping at the first bad patch also skipped the
+    digest comparison. Comparing it anyway names a change outside the patches when each bad patch is
+    an exact revert to upstream text; an EDITED patch mismatches the digest by itself, so a second
+    change beside one still shows only once that patch is fixed.
+    """
+    problems: list[str] = []
+    for number, (upstream, patched) in enumerate(BUNDLE_PATCHES, start=1):
+        found = body.count(patched)
+        if found != 1:
+            problems.append(
+                f"bundle patch {number} occurs {found} times in the vendored bundle, not once, so "
+                "the bundle is not the upstream blob with the recorded patches applied"
+            )
+            continue
+        body = body.replace(patched, upstream)
+    for number, (upstream, _) in enumerate(BUNDLE_PATCHES, start=1):
+        found = body.count(upstream)
+        if found != 1:
+            problems.append(
+                f"bundle patch {number}'s upstream text occurs {found} times once the patches are "
+                "reverted, not once, so which site it patched is ambiguous"
+            )
+    return body, problems
 
 
 def unrecorded_files(root: Path) -> list[str]:
@@ -318,11 +432,15 @@ def digest_mode_summary() -> str:
 
 
 def split_vendoring_header(bundle: bytes) -> bytes:
-    """Return *bundle* with its vendoring header removed, which is the upstream blob.
+    """Return *bundle* with its vendoring header removed: the PATCHED body, not the upstream blob.
+
+    Pass the result to :func:`revert_bundle_patches` to get the upstream blob; digesting this
+    return value directly gives the patched body's digest, which is deliberately not
+    :data:`UPSTREAM_BUNDLE_SHA256`.
 
     Raises :class:`ValueError` when the file does not start with :data:`VENDORING_HEADER`, because
-    then the derivation this record rests on -- body digest equals the upstream blob digest -- is
-    not the thing being measured any more.
+    then the derivation this record rests on -- reverted body digest equals the upstream blob
+    digest -- is not the thing being measured any more.
     """
     if not bundle.startswith(VENDORING_HEADER):
         raise ValueError(
@@ -416,7 +534,8 @@ def build_record(contents: dict[str, bytes]) -> dict[str, Any]:
         (
             "messagefoundry:provenance:ledger-rows",
             "BACKLOG #1381 (vendoring), BACKLOG #1578 (this record), "
-            "BACKLOG #1868 (action.yml runtime changed from upstream)",
+            "BACKLOG #1868 (action.yml runtime changed from upstream), "
+            "BACKLOG #5644 and #5645 (bundle patched)",
         ),
         ("messagefoundry:provenance:generator", "scripts/security/build_cla_action_provenance.py"),
         (
@@ -439,10 +558,23 @@ def build_record(contents: dict[str, bytes]) -> dict[str, Any]:
         ("messagefoundry:upstream:bundle-sha256", UPSTREAM_BUNDLE_SHA256),
         (
             "messagefoundry:upstream:bundle-derivation",
-            "The vendored file is the upstream blob with a "
-            f"{len(VENDORING_HEADER)}-byte two-line header prepended and nothing else changed. "
-            "Strip the first two lines and the SHA-256 of what remains is the upstream digest "
-            "above -- reproducible offline, no network and no Node.",
+            "The vendored file is the upstream blob with "
+            f"{len(BUNDLE_PATCHES)} recorded patches applied and a "
+            f"{len(VENDORING_HEADER)}-byte two-line header prepended, and nothing else changed. "
+            "Strip the first two lines, revert each patch (its patched text occurs once, and its "
+            "upstream text occurs once after reverting), and the SHA-256 of what remains is the "
+            "upstream digest above -- reproducible offline, no network and no Node. The patches "
+            "are BUNDLE_PATCHES in scripts/security/build_cla_action_provenance.py.",
+        ),
+        (
+            "messagefoundry:vendored:bundle-local-change",
+            "dist/index.js is NOT the upstream bundle; it is a patched fork (owner ruling "
+            "2026-11-23). BACKLOG #5644 item 2 anchors checkAllowList's wildcard pattern to the "
+            "whole name. BACKLOG #5645 item 2 makes getCommitters follow GraphQL pagination past "
+            "the first 100 commits, up to GitHub's 250-commit stop; an author first seen past "
+            "commit 250 is not checked. The component's hashes entry is the patched file; the "
+            "upstream bundle-sha256 property is the unpatched body. The component's pedigree "
+            "names the upstream ancestor and lists the patches as unofficial.",
         ),
         (
             "messagefoundry:vendored:action-yml-local-change",
@@ -471,9 +603,9 @@ def build_record(contents: dict[str, bytes]) -> dict[str, Any]:
         "specVersion": "1.6",
         "serialNumber": f"urn:uuid:{serial}",
         # CycloneDX asks for a new version when a BOM with the same serial changes. 2 is BACKLOG
-        # #1868's action.yml change; RECORDED_DATE stays, because the upstream digests were not
-        # re-fetched for it.
-        "version": 2,
+        # #1868's action.yml change, 3 is the bundle patches of BACKLOG #5644 and #5645;
+        # RECORDED_DATE stays, because the upstream digests were not re-fetched for either.
+        "version": 3,
         "metadata": {
             "timestamp": RECORD_TIMESTAMP,
             # `post-build`, NOT `build`. A CycloneDX consumer reads the `build` phase as "this BOM
@@ -498,11 +630,58 @@ def build_record(contents: dict[str, bytes]) -> dict[str, Any]:
                 "version": UPSTREAM_TAG,
                 "description": (
                     "Vendored compiled bundle of the archived "
-                    f"{UPSTREAM_REPO} GitHub Action, run by .github/workflows/cla.yml."
+                    f"{UPSTREAM_REPO} GitHub Action, patched locally, run by "
+                    ".github/workflows/cla.yml."
                 ),
                 "purl": f"pkg:github/{UPSTREAM_REPO}@{UPSTREAM_COMMIT}",
                 "licenses": [{"license": {"id": "Apache-2.0"}}],
                 "hashes": [{"alg": "SHA-256", "content": digests[BUNDLE_PATH]}],
+                # CycloneDX's own record of a modified component, so a tool and not only a reader
+                # of the messagefoundry:* properties sees that this is not the upstream artifact.
+                "pedigree": {
+                    "ancestors": [
+                        {
+                            "type": "application",
+                            "bom-ref": f"upstream:pkg:github/{UPSTREAM_REPO}@{UPSTREAM_COMMIT}",
+                            "name": "cla-assistant-lite",
+                            "version": UPSTREAM_TAG,
+                            "purl": f"pkg:github/{UPSTREAM_REPO}@{UPSTREAM_COMMIT}",
+                            "hashes": [{"alg": "SHA-256", "content": UPSTREAM_BUNDLE_SHA256}],
+                        }
+                    ],
+                    "patches": [
+                        {
+                            "type": "unofficial",
+                            "resolves": [
+                                {
+                                    "type": "security",
+                                    "name": "BACKLOG #5644 item 2",
+                                    "description": (
+                                        "checkAllowList anchors a wildcard allowlist entry to "
+                                        "the whole name."
+                                    ),
+                                }
+                            ],
+                        },
+                        {
+                            "type": "unofficial",
+                            "resolves": [
+                                {
+                                    "type": "security",
+                                    "name": "BACKLOG #5645 item 2",
+                                    "description": (
+                                        "getCommitters follows GraphQL pagination past the "
+                                        "first 100 commits, up to GitHub's 250-commit stop."
+                                    ),
+                                }
+                            ],
+                        },
+                    ],
+                    "notes": (
+                        "Hand edits to the compiled bundle; the exact spans are BUNDLE_PATCHES in "
+                        "scripts/security/build_cla_action_provenance.py."
+                    ),
+                },
                 "externalReferences": [
                     {
                         "type": "vcs",
@@ -551,16 +730,22 @@ def verify_derivation(contents: dict[str, bytes]) -> list[str]:
     problems: list[str] = []
 
     try:
-        body = split_vendoring_header(contents[BUNDLE_PATH])
+        patched_body = split_vendoring_header(contents[BUNDLE_PATH])
     except ValueError as exc:
         problems.append(str(exc))
     else:
+        # Every bad patch is reported, and the digest is compared whatever they found: any bad
+        # patch already fails the gate. The digest names a change outside the patches only when each
+        # bad patch is an exact revert to upstream text; an edited patch mismatches the digest on its
+        # own, so a second change beside it still shows only once that patch is fixed.
+        body, patch_problems = revert_bundle_patches_reporting(patched_body)
+        problems += patch_problems
         body_sha = hashlib.sha256(body).hexdigest()
         if body_sha != UPSTREAM_BUNDLE_SHA256:
             problems.append(
                 "the vendored bundle's body does not reproduce the recorded upstream digest: "
-                f"got {body_sha}, recorded {UPSTREAM_BUNDLE_SHA256}. The bundle was changed, or it "
-                "is no longer the upstream blob at " + UPSTREAM_COMMIT
+                f"got {body_sha}, recorded {UPSTREAM_BUNDLE_SHA256}. The bundle was changed outside "
+                "the recorded patches, or it is no longer the upstream blob at " + UPSTREAM_COMMIT
             )
 
     # Over CRLF-normalized bytes, matching this file's `lf` digest mode: git hashes the BLOB, and a
