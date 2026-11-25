@@ -316,6 +316,17 @@ export function linkEscapeRefusal(key: PathSettingKey, fallback?: string): strin
   );
 }
 
+/** The notice a READER that hands the setting to the CLI gives when cli.ts `readerPathEscapesByLink`
+ *  refuses it: the cause {@link linkEscapeRefusal} names, and `skipped`, what the reader did not do. */
+export function readerLinkEscapeNotice(key: PathSettingKey, skipped: string): string {
+  return (
+    `messagefoundry.${key} names a path inside the workspace folder that may lead out of it, or that ` +
+    "Windows may open as another name or a device: a symbolic link or junction on it leads out, it climbs " +
+    "with '..', a folder or file name on it is a Windows device name or ends in a dot or a space or holds " +
+    `a colon, or its real path cannot be read. ${skipped}`
+  );
+}
+
 /** The scopes of a setting that {@link containedPathSetting} reads: VS Code's `inspect()` answer.
  *  A folder value is not read: these settings are read with no resource, so `get` ignores it too. */
 export interface PathSettingScopes {

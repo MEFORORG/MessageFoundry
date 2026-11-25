@@ -157,8 +157,10 @@ function writerSetting(key: PathSettingKey): ContainedPathSetting | undefined {
 /**
  * The refusal text when the file or folder `s` names leaves the workspace through a link
  * ({@link escapesByLink}), else undefined. Run only in a trusted window, for the reason
- * {@link writerSetting} gives. Exported for the readers that hand the path to the CLI too, the
- * alert list and engine trust's `cert inventory` (BACKLOG #5411, #8237 item 24).
+ * {@link writerSetting} gives. A blank serviceConfig is judged as the fallback file, for a caller
+ * that sends no flag for a blank value; one that sends the value as written uses
+ * {@link readerPathEscapesByLink}. Exported for the offline AI policy too (aiPolicy.ts), which names
+ * that fallback file explicitly (BACKLOG #5411).
  */
 export function pathSettingLinkEscape(key: PathSettingKey, s: ContainedPathSetting): string | undefined {
   // A blank serviceConfig sends no --service-config (connectionServiceConfig), so the CLI opens its
@@ -170,6 +172,17 @@ export function pathSettingLinkEscape(key: PathSettingKey, s: ContainedPathSetti
     return linkEscapeRefusal(key, blank ? checked : undefined);
   }
   return undefined;
+}
+
+/**
+ * Whether the path `s` names, handed to the CLI as written, leaves the workspace through a link
+ * ({@link escapesByLink}), for a reader that passes the value as written, at least the alert list
+ * and engine trust's `cert inventory` (BACKLOG #5411, #8237 item 24). A blank value names no file,
+ * so nothing is checked; the CLI is handed the blank value. Run only in a trusted window, as
+ * {@link writerSetting}'s check is.
+ */
+export function readerPathEscapesByLink(s: ContainedPathSetting): boolean {
+  return s.value.trim() !== "" && !isExecGated() && escapesByLink(workspaceDir(), s.value);
 }
 
 /**

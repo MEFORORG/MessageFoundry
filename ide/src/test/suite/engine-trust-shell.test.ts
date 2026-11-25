@@ -271,13 +271,18 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, undefined);
   });
 
-  test("a workspace serviceConfig that leaves the folder through a link runs no `cert inventory` (BACKLOG #5411)", async () => {
+  test("a workspace serviceConfig that leaves the folder through a link runs no `cert inventory` (BACKLOG #5411)", async function () {
     // The control is the test below: a plain folder at the same spelling IS read.
     stubInventory = inventoryFor(plantCert(path.join("state", "api-cert.pem")), "generated");
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), "mf-engine-trust-out-"));
     try {
       // A junction on Windows, which needs no symlink privilege; a directory symlink elsewhere.
-      fs.symlinkSync(outside, path.join(ws, "conf"), "junction");
+      try {
+        fs.symlinkSync(outside, path.join(ws, "conf"), "junction");
+      } catch {
+        fs.rmSync(outside, { recursive: true, force: true });
+        this.skip();
+      }
       stubWorkspaceValues.serviceConfig = path.join("conf", "svc.toml");
 
       await trust.refreshEngineTrust();
@@ -285,11 +290,14 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
       assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, undefined);
       assert.ok(logged.some((l) => l.includes("`cert inventory` was not run")), logged.join("\n"));
     } finally {
-      // Removes the link itself, never what it points at.
-      try {
-        fs.unlinkSync(path.join(ws, "conf"));
-      } catch {
-        fs.rmdirSync(path.join(ws, "conf"));
+      // Removes the link itself, never what it points at, and only if it was made.
+      const link = path.join(ws, "conf");
+      if (fs.existsSync(link)) {
+        try {
+          fs.unlinkSync(link);
+        } catch {
+          fs.rmdirSync(link);
+        }
       }
       fs.rmSync(outside, { recursive: true, force: true });
     }

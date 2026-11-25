@@ -206,9 +206,10 @@ export function settingIsSet(
   return seen !== undefined && (seen.globalValue !== undefined || seen.workspaceValue !== undefined);
 }
 
-/** Bound with `=`, so a value that starts with `-` stays the flag's value (BACKLOG #5411, #8237
- *  item 24), as Start's own flag is (engineControlModel.ts serviceConfigFlag). */
-function serviceConfigArgs(serviceConfig: string | undefined): string[] {
+/** The `--service-config` argv element for `serviceConfig`, or none when undefined. Bound with `=`,
+ *  so a value that starts with `-` stays the flag's value (BACKLOG #5411, #8237 item 24). The one
+ *  binding every IDE caller of the CLI uses, Start's included (engineControlModel.ts). */
+export function serviceConfigArgs(serviceConfig: string | undefined): string[] {
   return serviceConfig === undefined ? [] : [`--service-config=${serviceConfig}`];
 }
 

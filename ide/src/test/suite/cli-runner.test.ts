@@ -125,7 +125,9 @@ suite("the AI-policy CLI fallback names the configured service settings (BACKLOG
   // A dropped value gives no plan (BACKLOG #5404), so the fallback fails closed to unverified.
   const wired = (entry: string): boolean =>
     /const s = writerCheckSetting\("serviceConfig"\);/.test(entry) &&
-    /s\.dropped === false\s*\?\s*aiPolicyCliPlan\(\s*s\.value,\s*s\.source !== "default",\s*workspaceDir\(\)\s*\)\s*:\s*undefined/.test(entry) &&
+    // A dropped value and one that leaves the workspace through a link give no plan (BACKLOG #5411).
+    /const usable = s\.dropped === false && pathSettingLinkEscape\("serviceConfig", s\) === undefined;/.test(entry) &&
+    /usable\s*\?\s*aiPolicyCliPlan\(\s*s\.value,\s*s\.source !== "default",\s*workspaceDir\(\)\s*\)\s*:\s*undefined/.test(entry) &&
     /plan === undefined\s*\?\s*Promise\.reject\(/.test(entry) &&
     /runJson<AiPolicyWire>\(\s*plan\.args,\s*plan\.cwd\s*\)/.test(entry);
 

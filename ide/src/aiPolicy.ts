@@ -25,7 +25,15 @@ import {
   narrowMode,
   pickOfflinePolicy,
 } from "./aiPolicyModel";
-import { engineTargetIsSet, engineUrl, environments, runJson, workspaceDir, writerCheckSetting } from "./cli";
+import {
+  engineTargetIsSet,
+  engineUrl,
+  environments,
+  pathSettingLinkEscape,
+  runJson,
+  workspaceDir,
+  writerCheckSetting,
+} from "./cli";
 import { aiPolicyCliPlan } from "./engineControlModel";
 import { getJson } from "./engineClient";
 import { ASSIST_GATE_PLAN, resolveEngineStatusTarget } from "./engineStatusModel";
@@ -125,8 +133,11 @@ export const DEFAULT_AI_POLICY_IO: AiPolicyIo = {
     // A value the containment dropped gives no plan, as a writer refuses one (BACKLOG #5404): the
     // policy of the file used in its place is not the one the operator named, so it must not
     // enable assistance. Nothing dropped, the setting is set exactly when it is not the default.
+    // So does one that leaves the workspace through a link (BACKLOG #5411): the CLI would read a
+    // policy file outside it. A blank value is judged as the file the plan then names explicitly.
     const s = writerCheckSetting("serviceConfig");
-    const plan = s.dropped === false ? aiPolicyCliPlan(s.value, s.source !== "default", workspaceDir()) : undefined;
+    const usable = s.dropped === false && pathSettingLinkEscape("serviceConfig", s) === undefined;
+    const plan = usable ? aiPolicyCliPlan(s.value, s.source !== "default", workspaceDir()) : undefined;
     // A rejection is "no CLI answer", which resolveAiPolicy turns into the unverified policy.
     return plan === undefined
       ? Promise.reject(new Error("no usable messagefoundry.serviceConfig for the offline AI policy"))
