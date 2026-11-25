@@ -377,8 +377,6 @@ function Get-LeadingQuote([string]$Block) {
 # not turn a citation into proof of delivery, which the .NOTES block explains at length it is not.
 function Get-Citations([string]$ItemKey) {
     if ($ItemKey -notmatch '^\d+$') { return @() }
-    # Candidates: any subject naming this number at all. Deliberately broader than the old query.
-    $raw = @(& git -C $repo log --format="%h%x09%s" --grep="#$ItemKey([^0-9]|`$)" -E --max-count=40 $mainSha 2>$null)
     # Inside a `(BACKLOG #... )` group, or after a bare `BACKLOG #` token with no parenthetical, and
     # not labelled `PR #N`. The token is `BACKLOG #`, never the bare word: `docs(backlog): file #1754`
     # cites nothing a `BACKLOG #1754` grep can find. scripts/hooks/claim_check.py counts a subject's
@@ -387,16 +385,20 @@ function Get-Citations([string]$ItemKey) {
     $notPr = "(?<!\b(?:PR|pull request)\s*)"
     $inParen = [regex]"(?i)\(\s*BACKLOG\s+(?=#[0-9])[^)]*?$notPr#$ItemKey\b[^)]*\)"
     $afterTok = [regex]"(?i)\bBACKLOG\s+(?=#[0-9])[^()]*?$notPr#$ItemKey\b"
-    $out = @()
-    foreach ($r in $raw) {
-        $p = $r -split "`t", 2
-        if ($p.Count -lt 2) { continue }
-        $subject = $p[1]
-        if (-not ($inParen.IsMatch($subject) -or $afterTok.IsMatch($subject))) { continue }
-        $out += [pscustomobject]@{ commit = $p[0]; subject = $subject }
-        if ($out.Count -ge 5) { break }   # the old cap, applied AFTER filtering rather than before
-    }
-    return $out
+    # Candidates: any message naming this number at all, deliberately broader than the old query.
+    # git's --grep reads the BODY as well as the subject, and a squash suffix `(#N)` names a pull
+    # request, so most candidates are not citations. NO --max-count, then (BACKLOG #7562): a cap of
+    # 40 raw candidates let 40 newer non-citations hide every real delivery. The cap of five is
+    # applied to FILTERED rows, and Select-Object -First stops git once it has them. A display, so a
+    # git that was stopped or failed yields fewer rows, never a throw.
+    $PSNativeCommandUseErrorActionPreference = $false
+    @(& git -C $repo log --format="%h%x09%s" --grep="#$ItemKey([^0-9]|`$)" -E $mainSha 2>$null |
+        ForEach-Object {
+            $p = $_ -split "`t", 2
+            if ($p.Count -eq 2 -and ($inParen.IsMatch($p[1]) -or $afterTok.IsMatch($p[1]))) {
+                [pscustomobject]@{ commit = $p[0]; subject = $p[1] }
+            }
+        } | Select-Object -First 5)
 }
 
 # The REGISTERED worktrees -- a different set from the directories that exist. A claim pointing at a
@@ -408,6 +410,8 @@ foreach ($line in (& git -C $repo worktree list --porcelain)) {
 }
 
 $rows = @()
+# claim.ps1's ConvertTo-KeyFile, restated: the file name a key is written under.
+$keyFile = ($Key.Trim().ToLowerInvariant() -replace '[^a-z0-9._-]+', '-').Trim('-')
 $files = @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA SilentlyContinue | Sort-Object Name)
 foreach ($f in $files) {
     $k = $f.BaseName
@@ -415,7 +419,9 @@ foreach ($f in $files) {
     catch {
         # An unreadable claim belongs to the registry, not to any worktree. claim_check.py reads a
         # malformed claim as UNCLAIMED, so the key is ALREADY ungated -- deleting the file would hide
-        # that rather than fix it.
+        # that rather than fix it. Under -Key only the file name is left to filter on, so it is
+        # compared with the name claim.ps1's ConvertTo-KeyFile gives that key (BACKLOG #7563).
+        if ($Key -and $k -ne $keyFile) { continue }
         $rows += [pscustomobject]@{ key = $k; holder = ""; branch = ""; note = ""; item = ""
             banner = ""; citations = @(); verdict = "UNREADABLE"; why = $_.Exception.Message }
         continue
@@ -503,15 +509,19 @@ foreach ($f in $files) {
             why = "the item's banner on $ledgerAt already protects it ($bannerState)$quote -- that protection travels to every checkout and this machine-local claim does not" }
     }
     else {
+        # BOTH copies of the branch, spelled in full (BACKLOG #7563). Probing the local branch first and
+        # alone let a stale local copy at main read "no commit" while origin held the unmerged work,
+        # and a bare name resolves to a tag of that name first. The count is the UNION of the two
+        # against main, so a diverged pair is not under-counted either.
         $ahead = $null
         if ($branch) {
-            $ref = $null
-            foreach ($cand in @($branch, "origin/$branch")) {
-                if (& git -C $repo rev-parse --verify --quiet $cand) { $ref = $cand; break }
-            }
-            if ($ref) { $ahead = [int](& git -C $repo rev-list --count "$mainSha..$ref") }
+            $refs = @(foreach ($cand in @("refs/heads/$branch", "refs/remotes/origin/$branch")) {
+                    if (& git -C $repo rev-parse --verify --quiet "$cand^{commit}") { $cand }
+                })
+            if ($refs.Count) { $ahead = [int](& git -C $repo rev-list --count "^$mainSha" @refs) }
         }
-        $aheadTxt = if ($null -eq $ahead) { "branch '$branch' is on neither this clone nor origin" }
+        $aheadTxt = if (-not $branch) { "the claim records no branch" }
+                    elseif ($null -eq $ahead) { "branch '$branch' is on neither this clone nor origin" }
                     elseif ($ahead -eq 0) { "'$branch' carries no commit $mainRef lacks" }
                     else { "'$branch' carries $ahead commit(s) $mainRef lacks" }
         $rows += [pscustomobject]@{ key = $k; holder = $holder; branch = $branch; note = $note
@@ -588,7 +598,8 @@ if ($sup.Count) {
     foreach ($r in $sup) {
         Write-Host ("  {0,-18} {1}   [{2}]" -f $r.key, $r.banner, $r.item) -ForegroundColor Green
         Write-Host ("  {0,-18} {1}" -f "", $r.why)
-        Write-Host ("  {0,-18} pwsh -NoProfile -File {1} -Release {2} -Force" -f "", $claimTool, $r.key) -ForegroundColor Cyan
+        # Single-quoted, so a path holding a space, `$` or a backtick pastes as one literal argument.
+        Write-Host ("  {0,-18} pwsh -NoProfile -File '{1}' -Release {2} -Force" -f "", ($claimTool -replace "'", "''"), $r.key) -ForegroundColor Cyan
         Write-Host ""
     }
 }
@@ -597,13 +608,23 @@ if ($blk.Count) {
     Write-Host "-- BLOCKING, grouped by branch: the decision is per BRANCH, not per key ---------" -ForegroundColor Yellow
     # The roll-up is the point. Twenty stranded keys were six branch decisions on 2026-08-18, and a
     # per-key list hides that one "land it or abandon it" call clears nine of them at once.
-    foreach ($grp in ($blk | Group-Object branch | Sort-Object Count -Descending)) {
+    # The why-string's "item reads <state> on <ref> and" lead, stripped from both listings below.
+    $whyLead = '^item reads .+? on \S+ and '
+    # A claim that records no branch has no branch decision, so those keys are never grouped into one
+    # (BACKLOG #7563): each is listed on its own below.
+    foreach ($grp in ($blk | Where-Object branch | Group-Object branch | Sort-Object Count -Descending)) {
         $keys = (@($grp.Group | ForEach-Object { $_.key }) | Sort-Object) -join ', '
         $plural = if ($grp.Count -eq 1) { "" } else { "s" }
         Write-Host ("  {0}" -f $grp.Name) -ForegroundColor Yellow
         Write-Host ("      {0} key{1}: {2}" -f $grp.Count, $plural, $keys)
-        Write-Host ("      {0}" -f ($grp.Group[0].why -replace '^item reads .+? on \S+ and ', ''))
+        Write-Host ("      {0}" -f ($grp.Group[0].why -replace $whyLead, ''))
         Write-Host ("      one decision for the branch -- land it, or abandon it and release all {0}." -f $grp.Count)
+        Write-Host ""
+    }
+    $noBranch = @($blk | Where-Object { -not $_.branch })
+    if ($noBranch.Count) {
+        Write-Host "  (no branch recorded) -- no branch decision applies; adjudicate each key on its own" -ForegroundColor Yellow
+        foreach ($r in $noBranch) { Write-Host ("      {0,-18} {1}" -f $r.key, ($r.why -replace $whyLead, '')) }
         Write-Host ""
     }
 }

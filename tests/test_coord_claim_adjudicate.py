@@ -922,3 +922,76 @@ def test_a_plan_file_named_backlog_is_not_part_of_the_namespace(repo: Path, tmp_
     unmerged_branch(repo, "seat")
     write_claim(repo, "64", tmp_path / "gone", "seat")
     assert verdicts(repo)["64"] == "NO-ITEM"
+
+
+# ===================================================================================================
+# CITATION RECALL AND THE REPORT'S OWN WORDS (BACKLOG #7562, #7563).
+# ===================================================================================================
+
+
+def test_the_citation_cap_is_applied_after_filtering_not_before(repo: Path, tmp_path: Path) -> None:
+    """MUST TRIP on origin/main (BACKLOG #7562). git's `--grep` reads the whole message, so every
+    commit whose squash suffix or body names the number is a candidate, and `--max-count=40` kept
+    only the 40 newest candidates before the subject filter ran. Forty newer non-citations then
+    hid the real delivery commit behind them."""
+    backlog(repo, f"## 47. Delivered long ago\n\n> {PRIORITIZED} open\n\nbody\n")
+    git(repo, "commit", "-q", "--allow-empty", "-m", "the real delivery (BACKLOG #47)")
+    for i in range(41):
+        git(repo, "commit", "-q", "--allow-empty", "-m", f"unrelated change {i} (#47)")
+    git(repo, "push", "-q", "origin", "main")
+    unmerged_branch(repo, "seat")
+    write_claim(repo, "47", tmp_path / "gone", "seat")
+    cites = rows(repo)["47"]["citations"]
+    assert [c["subject"] for c in cites] == ["the real delivery (BACKLOG #47)"], cites
+
+
+def test_an_unreadable_claim_for_another_key_stays_out_of_a_single_key_query(
+    repo: Path, tmp_path: Path
+) -> None:
+    """MUST TRIP on origin/main (BACKLOG #7563 part 2): the UNREADABLE row was appended before the
+    -Key filter ran, so `-Key 23` reported an unrelated corrupt claim as well."""
+    backlog(repo, f"## 23. A\n\n> {SHIPPED} s\n\nb\n")
+    write_claim(repo, "23", tmp_path / "gone", "seat")
+    (claims_dir(repo) / "99.json").write_text("{not json", encoding="utf-8")
+    assert verdicts(repo, "-Key", "23") == {"23": "SUPERSEDED"}
+    # ...and the key's own unreadable file is still reported.
+    assert verdicts(repo, "-Key", "99") == {"99": "UNREADABLE"}
+
+
+def test_a_stale_local_branch_does_not_hide_unmerged_commits_on_origin(
+    repo: Path, tmp_path: Path
+) -> None:
+    """MUST TRIP on origin/main (BACKLOG #7563 part 1): the local branch was probed first and alone,
+    so a local copy left at main read "carries no commit" while origin held the unmerged work."""
+    backlog(repo, f"## 68. Open\n\n> {PRIORITIZED} open\n\nbody\n")
+    unmerged_branch(repo, "seat")
+    git(repo, "push", "-q", "origin", "seat")
+    git(repo, "branch", "-f", "seat", "main")
+    write_claim(repo, "68", tmp_path / "gone", "seat")
+    why = rows(repo)["68"]["why"]
+    assert "'seat' carries 1 commit(s)" in why, why
+
+
+def test_claims_with_no_branch_are_not_rolled_up_as_one_branch_decision(
+    repo: Path, tmp_path: Path
+) -> None:
+    """MUST TRIP on origin/main (BACKLOG #7563 part 3): Group-Object put every claim with an empty
+    branch into one group and offered "release all 2" as one branch decision for unrelated keys."""
+    backlog(
+        repo, f"## 69. A\n\n> {PRIORITIZED} open\n\nb\n\n## 70. B\n\n> {PRIORITIZED} open\n\nb\n"
+    )
+    write_claim(repo, "69", tmp_path / "gone", "")
+    write_claim(repo, "70", tmp_path / "gone", "")
+    proc = adjudicate(repo)
+    assert proc.returncode == 0, proc.stderr
+    assert "release all 2" not in proc.stdout, proc.stdout
+    assert "records no branch" in proc.stdout, proc.stdout
+
+
+def test_the_release_command_quotes_the_script_path(repo: Path, tmp_path: Path) -> None:
+    """MUST TRIP on origin/main (BACKLOG #7563 part 4): the path was printed bare, so a checkout
+    under a directory holding a space printed a command that does not run as pasted."""
+    backlog(repo, f"## 22. A thing\n\n> {SHIPPED} shipped\n\nbody\n")
+    write_claim(repo, "22", tmp_path / "gone", "seat")
+    out = adjudicate(repo).stdout
+    assert re.search(r"-File '[^']+claim\.ps1' -Release 22 -Force", out), out
