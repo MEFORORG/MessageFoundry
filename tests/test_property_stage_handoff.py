@@ -180,9 +180,18 @@ async def test_handoff_rerun_is_a_no_op(
             item = await store.claim_next_fifo(spec.channel, now=_NOW, stage=Stage.ROUTED.value)
             assert item is not None and item.message_id == mid
             assert item.handler_name == handler
-            # The stage guard: a claimed routed row is not an ingress row, so routing it is a no-op.
+            # The stage guard: a claimed routed row is not an ingress row, so routing it, or handing
+            # it straight to outbound with the fused handoff, is a no-op.
             claimed = await _snapshot(store)
             assert not await store.route_handoff(**_route_kwargs(item.id, mid, spec, raw), now=_NOW)
+            assert not await store.handoff(
+                ingress_id=item.id,
+                message_id=mid,
+                channel_id=spec.channel,
+                deliveries=[(d, "FUSED") for d in dests],
+                disposition=MessageStatus.ROUTED,
+                now=_NOW,
+            )
             assert await _snapshot(store) == claimed
             kwargs = {
                 "routed_id": item.id,
