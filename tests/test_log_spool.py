@@ -1399,11 +1399,49 @@ def test_a_spool_turned_off_warns_once_about_segments_it_leaves_and_deletes_none
 
     with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
         assert _open_forward_spool(_forward_to(spool_dir, spool_max_bytes=0)) is None
-    warnings = [r.getMessage() for r in caplog.records if "turned off" in r.getMessage()]
+    warnings = [r.getMessage() for r in caplog.records if "spool segment(s)" in r.getMessage()]
     assert len(warnings) == (1 if leftover else 0)
     if leftover:
         assert str(spool_dir) in warnings[0] and "2 spool segment(s)" in warnings[0]
     assert [(p.name, p.read_bytes()) for p in _segments(spool_dir)] == before
+
+
+@pytest.mark.parametrize("leftover", [2, 0], ids=["segments-left", "nothing-left"])
+def test_a_spool_turned_off_says_once_that_forwarding_runs_without_loss_protection(
+    spool_dir: Path, caplog: pytest.LogCaptureFixture, leftover: int
+) -> None:
+    """Vault BACKLOG #1199, ASVS 16.4.3 gap (iii): a clean spool-off start used to say nothing."""
+    earlier = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=1)
+    earlier.open()
+    for n in range(leftover):
+        earlier.append(_entry(n))
+    earlier.close()
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+        assert _open_forward_spool(_forward_to(spool_dir, spool_max_bytes=0)) is None
+    said = [
+        r
+        for r in caplog.records
+        if "runs without loss protection" in r.getMessage()
+        and r.name == "messagefoundry.logging_setup"
+    ]
+    assert len(said) == 1
+    assert said[0].levelno == logging.WARNING
+    message = said[0].getMessage()
+    assert "siem.example.org:6514 (tcp)" in message
+    assert "forward_spool_max_bytes = 0" in message
+
+
+def test_a_spool_that_opens_does_not_say_it_runs_without_loss_protection(
+    spool_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+        spool = _open_forward_spool(_forward_to(spool_dir))
+    assert spool is not None
+    try:
+        assert "runs without loss protection" not in caplog.text
+    finally:
+        spool.close()
 
 
 def test_records_spooled_at_shutdown_are_reported_once_with_their_count(

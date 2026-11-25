@@ -8356,7 +8356,7 @@ to the forwarded stream as to stdout (see [PHI.md §7](PHI.md#7-logging--phi-red
   it warns. It opens no connection to the collector and resolves no name, so a down collector never
   blocks a start. `forward_hop_attested` does not satisfy it, and neither does a local agent on 127.0.0.1. It
   keys on forwarding, not the spool: `forward_spool_max_bytes = 0` turns off loss protection, not the
-  gate. A host NAME that resolves to loopback does pass, because the check never resolves DNS; that residual belongs to #1199's collector-separation probe.
+  gate; such a start logs a WARNING that it runs without loss protection (vault BACKLOG #1199). A host NAME that resolves to loopback does pass, because the check never resolves DNS; that residual belongs to #1199's collector-separation probe.
   The gate also refuses a `forward_host` that is this host's own OS name, or an IP literal that is
   one of its own addresses (vault BACKLOG #2375). For that it reads the OS host name and asks the
   routing table for a source address; it still sends no packet and resolves no name. If that local

@@ -2123,6 +2123,18 @@ def _open_forward_spool(forward: SyslogForward) -> LogSpool | None:
     if not forward.spool_dir:
         return None
     if forward.spool_max_bytes <= 0:
+        # Said on every such start, not only when segments are left over: a spool turned off by
+        # configuration is a choice to drop what a down collector does not take, and a clean start
+        # that says nothing hides that choice from whoever reads the log (vault BACKLOG #1199,
+        # ASVS 16.4.3 gap (iii)).
+        _log.warning(
+            "off-box log forwarding to %s:%d (%s) runs without loss protection: the on-disk log "
+            "spool is turned off ([logging].forward_spool_max_bytes = 0), so records the "
+            "collector does not take are dropped, not kept for a later send",
+            forward.host,
+            forward.port,
+            forward.protocol,
+        )
         _warn_leftover_segments(
             forward.spool_dir,
             "the on-disk log spool is turned off ([logging].forward_spool_max_bytes = 0)",
