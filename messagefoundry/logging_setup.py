@@ -2468,12 +2468,14 @@ def configure_logging(
             if spool is None and forward.spool_dir and forward.spool_max_bytes <= 0:
                 # Logged once the forwarder is installed, so the line is sent to the collector too
                 # (best effort, like every forwarded line), and only when it is. A start whose
-                # forwarder does not install logs its own WARNING above, which [logging].level
-                # can still filter. A clean spool-off start was otherwise silent (vault BACKLOG
-                # #1199, ASVS 16.4.3 gap (iii)). Through Logger.handle, which skips the logger's
-                # level, so [logging].level does not filter this line. Unlike
-                # __main__._write_start_audit it neither checks logging.disable() nor records the
-                # caller's line.
+                # forwarder does not install says so through the arm above that it takes: at least
+                # a WARNING for a transient connect failure and an ERROR for a permanent one, both
+                # of which [logging].level can still filter, while a refused hop raises. A clean
+                # spool-off start was otherwise silent (vault BACKLOG #1199, ASVS 16.4.3 gap
+                # (iii)). Through Logger.handle, which skips the logger's level, so [logging].level
+                # does not filter this line. Unlike __main__._write_start_audit it does not check
+                # logging.disable() and records no caller location (at least the line number and
+                # function name).
                 _log.handle(
                     _log.makeRecord(
                         _log.name,

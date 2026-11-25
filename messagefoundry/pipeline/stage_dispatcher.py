@@ -355,8 +355,10 @@ class _LaneState:
     # and to log a lease-read fault once. Reset when the record clears.
     stranded_waits: int = 0
     # BACKLOG #5704: this lane's run of pre-claim gate faults (_lane_may_claim), so a gate that keeps
-    # raising for it logs on a backoff (BACKLOG #1844). Per lane: the gate is a per-lane predicate,
-    # so one lane's answer says nothing about another's fault. stop() closes an open one.
+    # raising for it logs on a backoff (BACKLOG #1844). One run per lane, because each lane asks the
+    # gate and re-asks on its own timer: a run shared across lanes let one lane's answer close a run
+    # another lane's fault opened. The runner's gate (_may_claim_internal) reads mostly shared state,
+    # so a fault every lane hits logs once per lane at each backoff step. stop() closes an open one.
     gate_faults: FailureRun = field(default_factory=FailureRun)
 
 
