@@ -2799,6 +2799,27 @@ def _in_directory_sign_in_queue[**P](
     return queued
 
 
+#: How many times a directory sign-in tries its compare-and-set scope write before it fails
+#: (BACKLOG #6887). Each miss means another writer committed a different scope in between, so a
+#: bound this small is reached only by a row other writers keep moving.
+_AD_SCOPE_WRITE_ATTEMPTS: Final = 3
+
+
+class _AdChannelScopeContended(RuntimeError):
+    """A directory sign-in's scope write met a concurrent writer on every attempt (BACKLOG #6887).
+
+    Raised by :meth:`AuthService._sync_ad_channel_scope` and left to propagate, as a store error
+    from that write always has, so the sign-in fails and mints no session. Not a refusal of the
+    account: contention says nothing about it. The message is numeric and PHI-free."""
+
+    def __init__(self, attempts: int) -> None:
+        super().__init__(attempts)
+        self.attempts = attempts
+
+    def __str__(self) -> str:
+        return f"directory scope write contended after {self.attempts} attempts"
+
+
 @dataclass(frozen=True)
 class _Reproof:
     """The outcome of one post-session credential re-proof, checked under the login leg's lockout.
@@ -9187,42 +9208,77 @@ class AuthService:
 
         History worth keeping: before BACKLOG #1927 this path returned early for every no-match
         login, so a user removed from their last scope-mapped group kept the directory's channels
-        for as long as the account existed."""
+        for as long as the account existed.
+
+        **BOTH WRITES ARE COMPARE-AND-SETS ON WHAT THE DECISION READ**: the withdrawal on the scope,
+        the grant on the scope and its source. ``user`` was read several awaits earlier, and the
+        per-process sign-in queue does not order a sign-in on another engine shard, a reconciler
+        pass or an administrator. Before BACKLOG #6887 the grant was written unconditionally, so a
+        sign-in that read the scope before a concurrent one replaced it judged ``changes`` against
+        the replaced value: it revoked the other sign-in's brand-new session and audited the resync
+        a second time. On a miss the grant is NOT taken from the row the other writer left, since
+        that writer may have read older group memberships; the row is read again and decided again
+        from this sign-in's own groups, at most :data:`_AD_SCOPE_WRITE_ATTEMPTS` times, and past
+        that the sign-in fails (:class:`_AdChannelScopeContended`). A withdrawal that misses still
+        returns the row as it now stands (BACKLOG #1927)."""
         administrator = Role.ADMINISTRATOR in roles
-        decision = channel_scope.decide_ad_channel_scope(
-            channel_scope.ScopeInput(
-                stored_scope=user.channel_scope,
-                stored_source=user.channel_scope_source,
-                # An administrator's groups are not read: the decision ignores them.
-                mapped=frozenset() if administrator else await self._ad_channels_for_groups(groups),
-                administrator=administrator,
+        # An administrator's groups are not read: the decision ignores them. Read once: a retry
+        # re-reads the ROW, never the groups, so every attempt decides from this sign-in's answer.
+        mapped = frozenset() if administrator else await self._ad_channels_for_groups(groups)
+        attempt = 0
+        while True:
+            attempt += 1
+            decision = channel_scope.decide_ad_channel_scope(
+                channel_scope.ScopeInput(
+                    stored_scope=user.channel_scope,
+                    stored_source=user.channel_scope_source,
+                    mapped=mapped,
+                    administrator=administrator,
+                )
             )
-        )
-        if not decision.write:
-            return user
-        if decision.scope_json is None:
-            if user.channel_scope is None:
-                # The decision never withdraws a NULL scope, which already denies. This narrows
-                # the type for the compare-and-set below, which needs a stored value to compare.
+            if not decision.write:
                 return user
-            # Compare-and-set against the value read: an administrator or a concurrent login may
-            # have written the scope since ``user`` was read.
-            if not await self._store.withdraw_ad_channel_scope(user.id, user.channel_scope):
+            if decision.scope_json is None:
+                if user.channel_scope is None:
+                    # The decision never withdraws a NULL scope, which already denies. This narrows
+                    # the type for the compare-and-set below, which needs a stored value to compare.
+                    return user
+                # Compare-and-set against the value read: an administrator or a concurrent login
+                # may have written the scope since ``user`` was read.
+                if not await self._store.withdraw_ad_channel_scope(user.id, user.channel_scope):
+                    return await self._load_user(user.id) or user
+                await self._revoke_after_commit(
+                    user.id, change="ad_scope_resynced", actor=user.username, client=client
+                )
+                # ``withdrawn`` keeps the removed grant, which the row itself no longer holds.
+                await self._audit(
+                    AD_SCOPE_RESYNCED_ACTION,
+                    actor=user.username,
+                    detail=_json({"channels": None, "withdrawn": user.channel_scope}),
+                    client=client,
+                )
                 return await self._load_user(user.id) or user
-            await self._revoke_after_commit(
-                user.id, change="ad_scope_resynced", actor=user.username, client=client
-            )
-            # ``withdrawn`` keeps the removed grant, which the row itself no longer holds.
-            await self._audit(
-                AD_SCOPE_RESYNCED_ACTION,
-                actor=user.username,
-                detail=_json({"channels": None, "withdrawn": user.channel_scope}),
-                client=client,
-            )
-            return await self._load_user(user.id) or user
-        await self._store.set_user_channel_scope(
-            user.id, decision.scope_json, source=SCOPE_SOURCE_AD
-        )
+            if await self._store.set_ad_channel_scope_if_unchanged(
+                user.id,
+                decision.scope_json,
+                expected_scope=user.channel_scope,
+                expected_source=user.channel_scope_source,
+            ):
+                break
+            if attempt >= _AD_SCOPE_WRITE_ATTEMPTS:
+                _log.warning(
+                    "auth: the directory scope write for account id %r met a concurrent writer on "
+                    "each of %d attempts; the sign-in fails",
+                    user.id,
+                    attempt,
+                )
+                raise _AdChannelScopeContended(attempt)
+            fresh = await self._load_user(user.id)
+            if fresh is None:
+                # Nothing was written. A row gone, or one failing its seal, is refused by the
+                # caller's re-read before the mint.
+                return user
+            user = fresh
         # Drop stale-scope tokens; the new one is issued after. Skipped when only the provenance
         # moved -- the directory taking over an identical manual scope changes no decision, so
         # there is nothing stale to drop -- but that write is still audited below.

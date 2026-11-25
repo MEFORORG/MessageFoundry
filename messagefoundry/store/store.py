@@ -5488,6 +5488,28 @@ def scope_withdrawal(expected_scope: str, now: float) -> UserChange:
     return apply
 
 
+def ad_scope_replacement(
+    scope_json: str, expected_scope: str | None, expected_source: str | None, now: float
+) -> UserChange:
+    """``set_ad_channel_scope_if_unchanged``'s compare-and-set (BACKLOG #6887): write the
+    directory's scope, marked ``ad``, only while the row still holds ``expected_scope`` AND
+    ``expected_source`` exactly (``None`` matching NULL). Both, because the AD sign-in decides from
+    both: the value decides whether the write changes the scope, which is what triggers its revoke,
+    and the source decides whether an unchanged value still needs taking over. The compare is
+    Python's, so it is byte-exact on every backend, as :func:`scope_withdrawal`'s is."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if r.row.channel_scope != expected_scope:
+            return None
+        if r.row.channel_scope_source != expected_source:
+            return None
+        return r.changed(
+            channel_scope=scope_json, channel_scope_source=SCOPE_SOURCE_AD, updated_at=float(now)
+        )
+
+    return apply
+
+
 def federated_bind(issuer: str, subject: str, *, expect_unbound: bool, now: float) -> UserChange:
     """``set_user_federated_subject``'s write, with the session epoch raised in the same write
     because the caller ends the account's sessions with it. With ``expect_unbound`` (BACKLOG
@@ -22083,6 +22105,23 @@ class MessageStore:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             written = await self._write_user(user_id, scope_withdrawal(expected_scope, now))
+            await self._commit()
+        return written is not None
+
+    async def set_ad_channel_scope_if_unchanged(
+        self,
+        user_id: str,
+        scope_json: str,
+        *,
+        expected_scope: str | None,
+        expected_source: str | None,
+        now: float | None = None,
+    ) -> bool:
+        """The AD sign-in's compare-and-set scope write (BACKLOG #6887); see ``AuthStore``."""
+        now = time.time() if now is None else now
+        change = ad_scope_replacement(scope_json, expected_scope, expected_source, now)
+        async with _writer_guard(self._db, self._lock):
+            written = await self._write_user(user_id, change)
             await self._commit()
         return written is not None
 
