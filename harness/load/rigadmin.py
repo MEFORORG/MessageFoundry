@@ -282,11 +282,11 @@ def rig_admin() -> RigAdmin:
 # --- the second factor -------------------------------------------------------
 
 
-#: The shortest key the rig takes: 26 base32 characters, which decode to 16 bytes, RFC 4226's
-#: 128-bit floor. The shipped enrolment draws 32 (160 bits). The provisioning swap would otherwise
-#: write a shorter one as an Administrator's factor, since the provisioning path does not check a
-#: key's length.
-_MIN_KEY_CHARS = 26
+#: The shortest key the rig takes: the engine's floor, ``totp._MIN_SECRET_BYTES``, in base32
+#: characters (BACKLOG #5340), written out because this module imports nothing from the engine at
+#: module level. The engine's own code computation refuses a shorter key as well, so this is not
+#: the control; it only lets the refusal state the length.
+_MIN_KEY_CHARS = 32
 
 #: How far from each edge of its TOTP step the rig sends a code. The engine judges a code against
 #: its own clock at the shipped ``totp_skew_steps = 0``, so an engine on another host whose clock is
@@ -315,14 +315,14 @@ def _check_key(key: str) -> None:
     from messagefoundry.auth import totp
 
     refusal = RigAdminError(
-        f"{ADMIN_FACTOR_ENV} does not hold a base32 TOTP key of at least 128 bits "
+        f"{ADMIN_FACTOR_ENV} does not hold a base32 TOTP key of at least 160 bits "
         f"({_MIN_KEY_CHARS} characters)"
     )
     if len(key.strip().replace(" ", "").rstrip("=")) < _MIN_KEY_CHARS:
         raise refusal
     try:
         totp.totp(key, now=0.0)  # the engine's own base32 read
-    except ValueError:  # binascii.Error, the engine's base32 refusal, is a ValueError
+    except ValueError:  # totp.RefusedEnrolment: a refused marker, or a short or non-base32 key
         raise refusal from None
 
 

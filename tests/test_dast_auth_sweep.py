@@ -173,7 +173,7 @@ def test_receipt_names_what_it_examined(clean_run: tuple[int, dict[str, Any]]) -
     outcomes = receipt["write_probe_outcomes"]
     assert sum(outcomes.values()) == receipt["write_rows"], outcomes
 
-    # The scan RELAXES five controls to stay deterministic. The receipt must print every relaxation, so
+    # The scan RELAXES controls to stay deterministic. The receipt must print every relaxation, so
     # no reader can mistake the scanned posture for the shipped default.
     posture = receipt["posture"]
     assert posture["auth"] == "ENABLED"
@@ -181,6 +181,7 @@ def test_receipt_names_what_it_examined(clean_run: tuple[int, dict[str, Any]]) -
         "require_mfa",
         "login_rate_limit",
         "phi_read_rate_limit",
+        "monitoring_read_rate_limit",
         "admin_write_rate_limit",
     ):
         assert posture[knob] == "OFF", f"the receipt does not record {knob} as scanned"

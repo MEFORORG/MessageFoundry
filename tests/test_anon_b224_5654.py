@@ -134,7 +134,7 @@ def test_a_whole_component_mr_anywhere_is_a_hit(leak: ModuleType, value: str) ->
 @_SIDES
 def test_anonymize_checked_passes_an_unescaped_modality(anon: ModuleType) -> None:
     text = f"{_HEAD}\rOBR|1|ORD1||70553^PET&MR^C4"
-    assert anon.anonymize_checked(text, salt="b224-5654-salt-0123456789abcdef")
+    assert anon.anonymize_checked(text, salt="b224-5654-salt-0123456789abcdef-0123456789")
 
 
 @_LEAKS
@@ -175,7 +175,8 @@ def test_the_same_mr_subcomponent_beside_component_5_is_no_hit(
 def test_anonymize_checked_refuses_an_mr_subcomponent_in_component_5(anon: ModuleType) -> None:
     with pytest.raises(anon.LeakError, match=r"MRN-typed identifier in OBR-4(?!\d)"):
         anon.anonymize_checked(
-            f"{_HEAD}\r{_CODED_MR_IN_COMPONENT_5}", salt="b224-5654-salt-0123456789abcdef"
+            f"{_HEAD}\r{_CODED_MR_IN_COMPONENT_5}",
+            salt="b224-5654-salt-0123456789abcdef-0123456789",
         )
 
 
@@ -219,7 +220,9 @@ def test_the_word_mr_in_ordinary_escaped_text_is_no_mrn(leak: ModuleType, segmen
 @_SIDES
 @_ORDINARY_MR_TEXT
 def test_anonymize_checked_passes_ordinary_mr_text(anon: ModuleType, segment: str) -> None:
-    assert anon.anonymize_checked(f"{_HEAD}\r{segment}", salt="b224-5654-salt-0123456789abcdef")
+    assert anon.anonymize_checked(
+        f"{_HEAD}\r{segment}", salt="b224-5654-salt-0123456789abcdef-0123456789"
+    )
 
 
 def test_a_message_subcomponent_read_sees_the_type() -> None:
@@ -503,7 +506,160 @@ def test_a_long_hex_run_is_scanned_in_linear_time(leak: ModuleType) -> None:
         return time.perf_counter() - started
 
     # Four times the input takes about four times as long when the scan is linear, sixteen when
-    # it is quadratic, which took seconds at 320 KB. The bound sits between them, with a floor
-    # that keeps a noisy runner's sub-millisecond timings from deciding it.
+    # it is quadratic, which took seconds at 320 KB. The bound sits between them: ``small * 10``
+    # decides it, and the 0.25 s floor only covers a noisy runner's sub-millisecond timings.
     small, large = seconds(5_000), seconds(20_000)
     assert large < max(small * 10, 0.25)
+
+
+# --- #5654 closing steps 3 (c), 7 (c) and 8 (d) ----------------------------------------------------
+
+#: A full-width form of :data:`_GLOBAL`: each ASCII character moved to its fullwidth twin.
+_GLOBAL_FULLWIDTH = "".join(chr(ord(c) + 0xFEE0) for c in _GLOBAL)
+
+
+@_NO_SCANNER
+@_LEAKS
+@pytest.mark.parametrize(
+    "written",
+    [
+        f"fe80::1.{_GLOBAL}",
+        f"fe80::1.2.{_GLOBAL}",
+        f"::1.{_GLOBAL}",
+        f"fe80::1.{_FULL}",
+        f"fd00::5.fe80::1.{_GLOBAL}",
+        f"x.fe80::1.{_GLOBAL}",
+        "fe80::1.2::3",
+        f"x:1.2.{_GLOBAL}",
+        _GLOBAL_FULLWIDTH,
+        _GLOBAL.replace(":", "\uff1a"),
+        "a:b.c.d::1",
+        "fe80::1.bead::",
+        "\uff46e80::1",
+    ],
+    ids=[
+        "after-link-local",
+        "after-link-local-and-a-group",
+        "after-loopback",
+        "full-after-link-local",
+        "after-two-allowed",
+        "label-then-allowed",
+        "reserved-after-link-local",
+        "one-colon-label-and-groups",
+        "fullwidth",
+        "fullwidth-colons",
+        "dot-cut-reserved",
+        "dot-cut-hex-word",
+        "written-reading-of-a-folded-allowed",
+    ],
+)
+def test_an_address_joined_by_a_dot_or_written_fullwidth_is_a_hit(
+    leak: ModuleType, written: str
+) -> None:
+    """Closing steps 3 (c) and 7 (c): the run parsed whole to the allowed address before the dot,
+    so the routable one after it was never read; and the run pattern is ASCII, so a fullwidth
+    address held no run at all. The last three are docs/PHI.md section 9's examples of a piece a
+    dot cuts and of a written reading that refuses though its folded reading is allowed."""
+    report = leak.leak_report(_zpd(written), rules=DEFAULT_RULES)
+    assert f"unmapped {leak.IPV6_REASON} in ZPD-4" in report.structural_hits, report.hits
+
+
+@_NO_SCANNER
+@_LEAKS
+@pytest.mark.parametrize(
+    "written",
+    [
+        "fe80::1.fd00::5",
+        "fe80::1.2",
+        "1.2.3::a",
+        "fe80\uff1a\uff1a1",
+        "::ffff:10.0.0.1",
+        "::\u2460",
+        _GLOBAL.replace(":", "\\XEFBC9A\\"),
+        _GLOBAL.replace(":", "\\MFF1A\\"),
+    ],
+    ids=[
+        "two-allowed",
+        "version-after",
+        "version-before",
+        "fullwidth-allowed",
+        "mapped-private",
+        "circled-loopback",
+        "hex-escaped-fullwidth-colon",
+        "multibyte-escaped-fullwidth-colon",
+    ],
+)
+def test_allowed_addresses_joined_by_a_dot_are_no_hit(leak: ModuleType, written: str) -> None:
+    """Near-miss controls: the pieces are judged as any run is, so allowed ones stay allowed. The
+    last three are docs/PHI.md section 9's passes: a circled digit that folds to loopback, and a
+    fullwidth colon written as a hex or multi-byte escape, which no reading makes a colon."""
+    report = leak.leak_report(_zpd(written), rules=DEFAULT_RULES)
+    assert not any(leak.IPV6_REASON in hit for hit in report.hits), report.hits
+
+
+@_LEAKS
+def test_a_dot_joined_run_is_cut_in_linear_time(leak: ModuleType) -> None:
+    """Each group of a run is visited once, so many dot-joined allowed addresses stay cheap."""
+    import time
+
+    def seconds(repeats: int) -> float:
+        payload = "fe80::1." * repeats
+        started = time.perf_counter()
+        assert not leak._has_routable_ipv6(payload, lambda ip: True)
+        return time.perf_counter() - started
+
+    # Large enough that a quadratic cut, sixteen times slower at four times the input, exceeds
+    # ``small * 10``, which is the bound that decides.
+    small, large = seconds(20_000), seconds(80_000)
+    assert large < max(small * 10, 0.25)
+
+
+_KEPT_SALT = "b224-kept-header-0123456789abcdef"
+_PHONE = "-".join(["202", "555", "0188"])
+_SSN = "-".join(["123", "45", "6789"])
+
+
+def _header_with(field: int, value: str) -> str:
+    fields = ["MSH", "^~\\&", "A", "B", "C", "D", "20260101", "", "ADT^A01", "M1", "P", "2.5.1"]
+    fields[field - 1] = value
+    return "|".join(fields) + "\rPID|1||1^^^H^MR||X^Y"
+
+
+@_NO_SCANNER
+@_SIDES
+@pytest.mark.parametrize(
+    ("field", "kind", "value", "shape"),
+    [
+        (6, "MRN", f"F1^^^{_PHONE}", _PHONE),
+        (4, "ID", f"F1^^^H&{_SSN}&L^PI", _SSN),
+        (5, "SSN", f"987654321^^^SSA^SS^{_PHONE}", _PHONE),
+        (6, "ID", f"F1^^^{_GLOBAL}", _GLOBAL),
+    ],
+    ids=["mrn-phone", "id-ssn-subcomponent", "ssn-phone", "id-ipv6"],
+)
+def test_a_shape_a_rule_keeps_in_a_header_field_is_refused(
+    anon: ModuleType, field: int, kind: str, value: str, shape: str
+) -> None:
+    """Closing step 8 (d): the kept-component scan walked every line but the header, so a shape in
+    a component an identifier rule keeps on a header field passed."""
+    path = f"MSH-{field}"
+    rules = (
+        *(rule for rule in anon.DEFAULT_RULES if rule.path != path),
+        anon.FieldRule(path, getattr(anon.SurrogateKind, kind)),
+    )
+    raw = _header_with(field, value)
+    # The control: the surrogate really keeps the shape, so a pass would emit it.
+    assert shape in anon.anonymize(raw, salt=_KEPT_SALT, rules=rules)
+    with pytest.raises(anon.LeakError) as caught:
+        anon.anonymize_checked(raw, salt=_KEPT_SALT, rules=rules)
+    text = str(caught.value)
+    assert f"{anon.leak.KEPT_COMPONENT} in {path}" in text
+    assert shape not in text
+
+
+@_NO_SCANNER
+@_SIDES
+def test_a_header_field_a_rule_keeps_with_no_shape_passes(anon: ModuleType) -> None:
+    """The near-miss control: a kept header component with no shape in it is no hit."""
+    rules = (*anon.DEFAULT_RULES, anon.FieldRule("MSH-6", anon.SurrogateKind.MRN))
+    anon.anonymize_checked(_header_with(6, "F1^^^HOSP^MR"), salt=_KEPT_SALT, rules=rules)

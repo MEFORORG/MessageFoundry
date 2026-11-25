@@ -178,8 +178,8 @@ async def test_totp_connection_event_alert_roundtrip(tmp_path: Path) -> None:
             now=0,
             audits=(),
         )
-        await store.set_totp_secret("u1", secret="JBSWY3DPEHPK3PXP")
-        assert await store.get_totp_secret("u1") == "JBSWY3DPEHPK3PXP"
+        await store.set_totp_secret("u1", secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
+        assert await store.get_totp_secret("u1") == "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
         await store.record_connection_event(
             connection="IB",
             transport="mllp",

@@ -47,7 +47,8 @@ opt-in and off by default (2026-09-23).
 
 **Classification reads settings keys, not the built connector**, so each rule below mirrors what the
 connector does with those keys: a client certificate counts only with ``tls`` on, HTTP Basic only when
-both halves are set, a WS-Security UsernameToken only with ``ws_security`` on, and a static
+both halves are set, a WS-Security UsernameToken only with ``ws_security`` on and both
+``ws_username`` and ``ws_password`` set (BACKLOG #5526 item 11), and a static
 ``Authorization`` credential not at all when SMART or OAuth2 replaces that header with a minted token.
 An HTTP-family hop's ``headers`` table and ``url`` query are read too (BACKLOG #5510), by the
 redaction screen's header test and the query-credential reader; ``_http_literal_static`` says how.
@@ -79,12 +80,13 @@ redaction screen's header test and the query-credential reader; ``_http_literal_
 Not every function here is pure. At least these do more than read their arguments:
 :func:`apply_static_credential_gate` and the guard :func:`make_static_credential_guard` returns,
 which log, the guard also reading the ``env()`` values the engine sets around it; ``_digest``,
-which logs at debug the ``http_auth`` refusal it absorbs (BACKLOG #5529); ``_is_https``, which logs
-at debug a proxy target that does not parse; and ``_http_literal_static`` (BACKLOG #5510) and
-``_dicomweb_build_refused`` (vault BACKLOG #5359), whose ``env()`` resolution runs an operator
-``cast`` as the build does. A caller inherits its callee's effect: at least
-:func:`static_credential_hops` and :func:`run_static_credential_gate` can run an operator ``cast``
-and log, and :func:`http_hop_credentials` logs through ``_digest`` and resolves no ``env()``.
+which logs at debug the ``http_auth`` refusal it absorbs (BACKLOG #5529) and, like
+``_http_literal_static`` (BACKLOG #5510) and ``_dicomweb_build_refused`` (vault BACKLOG #5359),
+resolves ``env()`` with an operator ``cast`` as the build does (BACKLOG #5526 item 9); and
+``_is_https``, which logs at debug a proxy target that does not parse. A caller inherits its
+callee's effect: at least :func:`static_credential_hops` and :func:`run_static_credential_gate`
+can run an operator ``cast`` and log, and :func:`http_hop_credentials` logs through ``_digest``
+and, through it, resolves an ``env()`` ``http_auth`` to its ``default=``, which is never cast.
 
 **A detail cannot carry a secret, by construction.** Every detail is fixed text chosen from a closed
 set, plus at most one peer label. The peer label (:func:`~messagefoundry.config.wiring._peer_label`) is built from parsed parts, so it holds
@@ -182,35 +184,75 @@ def _oauth2(settings: Mapping[str, Any]) -> bool:
     return oauth2_auth_configured(settings)
 
 
-def _digest(settings: Mapping[str, Any]) -> bool:
+def _digest(
+    settings: Mapping[str, Any], *, token: bool = False, env_values: Mapping[str, Any] | None = None
+) -> bool:
+    """Whether ``http_auth`` selects Digest, read as the REST, SOAP and FHIR destinations read it.
+    DICOMweb and ``FhirLookup`` build no Digest handler, so on them a ``True`` here names a
+    credential the hop does not send; the census lists it all the same.
+
+    BACKLOG #5526 item 9: an ``env()`` ``http_auth`` is read as the build resolves it, against
+    ``env_values``, else its literal ``default=`` (``config.wiring._resolved_setting``), as
+    :func:`_http_literal_static` reads ``headers``. One this reading cannot resolve may resolve to
+    ``digest``, so it reads as Digest, except beside a minted bearer (``token``) whose SMART and
+    OAuth2 flags, and SMART token URL, are not themselves ``env()`` references: the build refuses
+    Digest beside a bearer provider, so none crosses there. Where one of them is an ``env()``
+    reference, the provider may resolve off, so the mode still reads as Digest. An ``env()``
+    OAuth2 token URL is not counted. Beside a written ``oauth2_enabled``, as
+    ``with_oauth2_client_credentials`` writes it, one that resolves blank refuses the build
+    (``http_auth.refuse_oauth2_settings``). With no ``oauth2_enabled`` key, one that resolves to
+    nothing leaves the provider off and Digest can cross, and this reading does not list it: a
+    known gap (BACKLOG #5526 item 9, review round-117c3b9418)."""
     from messagefoundry.transports.http_auth import HttpAuthError, http_digest_selected
 
+    mode = _resolved_setting(settings, "http_auth", None, env_values or {})
+    if mode is _UNRESOLVED:
+        # BACKLOG #5526 item 9: an env() SMART token URL may resolve empty, which leaves that
+        # provider off, so it counts as an env() flag does.
+        keys = ("oauth2_enabled", "smart_enabled", "smart_token_url")
+        return not token or any(isinstance(settings.get(key), EnvRef) for key in keys)
+    if mode is not settings.get("http_auth"):
+        settings = {**settings, "http_auth": mode}
     try:
         return http_digest_selected(settings)
     except HttpAuthError as exc:
-        # An unrecognised mode refuses the connector (#5529), so no Digest credential crosses. The
-        # message names the connection and never the value; the connector's build reports it loudly.
+        # An unrecognised mode refuses the REST, SOAP and FHIR destinations (#5529), so no Digest
+        # credential crosses there. The message names the connection and never the value; the
+        # connector's build reports it loudly.
         logging.getLogger(__name__).debug("static-credential census: %s", exc)
         return False
 
 
 def _static_authorization(settings: Mapping[str, Any]) -> list[str]:
-    """The static credentials the connector writes into its own ``Authorization`` header."""
-    out: list[str] = []
-    if settings.get("bearer_token"):
-        out.append("static bearer token")
+    """The static credential the connector writes into its own ``Authorization`` header. With both
+    a ``bearer_token`` and a Basic pair set, only Basic is listed (BACKLOG #5526 item 2). REST,
+    SOAP, DICOMweb, the FHIR destination and ``FhirLookup`` (BACKLOG #8299 item 8) refuse to build
+    on both when the pair is set, so this listing then describes a hop that does not build: this
+    reader does not take the connector type. Whether it reads resolved or unresolved settings
+    depends on its caller. Read on unresolved settings, a Basic pair whose ``env()`` halves both
+    resolve empty counts as set here; that hop builds and sends the bearer if one is set, otherwise
+    any ``Authorization`` entry in its static ``headers``, otherwise no ``Authorization`` header,
+    and this listing still names Basic. One half resolving empty refuses the build."""
     if settings.get("basic_user") and settings.get("basic_password"):
-        out.append("HTTP Basic")
-    return out
+        return ["HTTP Basic"]
+    if settings.get("bearer_token"):
+        return ["static bearer token"]
+    return []
 
 
-def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool) -> list[str]:
+def _http_static(
+    ctype: ConnectorType,
+    settings: Mapping[str, Any],
+    token: bool,
+    *,
+    env_values: Mapping[str, Any] | None = None,
+) -> list[str]:
     """The static credentials an HTTP-family hop actually puts on the wire.
 
     A minted SMART or OAuth2 bearer replaces the ``Authorization`` header, so a static bearer or
     Basic credential configured beside it never leaves the engine. Basic needs both halves: SOAP
-    and DICOMweb (vault BACKLOG #5359) refuse to build on one, and REST and FHIR send nothing on
-    one. A WS-Security
+    and DICOMweb (vault BACKLOG #5359), REST (BACKLOG #5354) and FHIR (BACKLOG #8299) refuse to
+    build on one. A WS-Security
     UsernameToken rides in the SOAP body, so token auth does not displace it, but it is stamped only
     with ``ws_security`` on. Its user and password are ``ws_username`` and ``ws_password`` alone; they
     stopped falling back to the Basic pair in BACKLOG #5526. ``Soap()`` hoists ``body_secrets`` into
@@ -218,7 +260,7 @@ def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool)
     out = [] if token else _static_authorization(settings)
     # The connector answers a Digest challenge only in http_auth='digest' mode, and refuses to build
     # in that mode with either half missing, so the mode is the predicate, not the credential keys.
-    if _digest(settings):
+    if _digest(settings, token=token, env_values=env_values):
         out.append("HTTP Digest")
     if ctype is ConnectorType.SOAP:
         # With ws_security on the connector refuses to build on one half of the pair (#5526), so
@@ -340,7 +382,7 @@ def _http_hop(
     presents (:func:`_http_literal_static`), so it lists the hop even beside a compliant kind."""
     compliant_kind = ctype is not ConnectorType.DICOMWEB
     token = _http_token(ctype, settings, lookup=lookup)
-    static = _http_static(ctype, settings, token)
+    static = _http_static(ctype, settings, token, env_values=env_values)
     displaced = token or bool(_static_authorization(settings))
     static += _http_literal_static(ctype, settings, displaced=displaced, env_values=env_values)
     if static:

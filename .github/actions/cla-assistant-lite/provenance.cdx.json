@@ -2,7 +2,7 @@
   "bomFormat": "CycloneDX",
   "specVersion": "1.6",
   "serialNumber": "urn:uuid:79d3f7c1-f856-5ae2-a522-2302551ac609",
-  "version": 2,
+  "version": 3,
   "metadata": {
     "timestamp": "2026-09-18T00:00:00Z",
     "lifecycles": [
@@ -24,7 +24,7 @@
       "bom-ref": "pkg:github/contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08",
       "name": "cla-assistant-lite",
       "version": "v2.6.1",
-      "description": "Vendored compiled bundle of the archived contributor-assistant/github-action GitHub Action, run by .github/workflows/cla.yml.",
+      "description": "Vendored compiled bundle of the archived contributor-assistant/github-action GitHub Action, patched locally, run by .github/workflows/cla.yml.",
       "purl": "pkg:github/contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08",
       "licenses": [
         {
@@ -36,9 +36,49 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "2f8271c83b98e86b8b203205c0dda08415fa49c8c300921e481aabf5c9b989f8"
+          "content": "e908b17b82e369ef37d188b4a869c394b55c6be5490100716b487ceee32d13e2"
         }
       ],
+      "pedigree": {
+        "ancestors": [
+          {
+            "type": "application",
+            "bom-ref": "upstream:pkg:github/contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08",
+            "name": "cla-assistant-lite",
+            "version": "v2.6.1",
+            "purl": "pkg:github/contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08",
+            "hashes": [
+              {
+                "alg": "SHA-256",
+                "content": "a44111084c0d4782206c04b4276292f7fec6d1f7a33525512fbeef3242079dfb"
+              }
+            ]
+          }
+        ],
+        "patches": [
+          {
+            "type": "unofficial",
+            "resolves": [
+              {
+                "type": "security",
+                "name": "BACKLOG #5644 item 2",
+                "description": "checkAllowList anchors a wildcard allowlist entry to the whole name."
+              }
+            ]
+          },
+          {
+            "type": "unofficial",
+            "resolves": [
+              {
+                "type": "security",
+                "name": "BACKLOG #5645 item 2",
+                "description": "getCommitters follows GraphQL pagination past the first 100 commits, up to GitHub's 250-commit stop."
+              }
+            ]
+          }
+        ],
+        "notes": "Hand edits to the compiled bundle; the exact spans are BUNDLE_PATCHES in scripts/security/build_cla_action_provenance.py."
+      },
       "externalReferences": [
         {
           "type": "vcs",
@@ -72,7 +112,11 @@
         },
         {
           "name": "messagefoundry:upstream:bundle-derivation",
-          "value": "The vendored file is the upstream blob with a 176-byte two-line header prepended and nothing else changed. Strip the first two lines and the SHA-256 of what remains is the upstream digest above -- reproducible offline, no network and no Node."
+          "value": "The vendored file is the upstream blob with 4 recorded patches applied and a 202-byte two-line header prepended, and nothing else changed. Strip the first two lines, revert each patch (its patched text occurs once, and its upstream text occurs once after reverting), and the SHA-256 of what remains is the upstream digest above -- reproducible offline, no network and no Node. The patches are BUNDLE_PATCHES in scripts/security/build_cla_action_provenance.py."
+        },
+        {
+          "name": "messagefoundry:vendored:bundle-local-change",
+          "value": "dist/index.js is NOT the upstream bundle; it is a patched fork (owner ruling 2026-11-23). BACKLOG #5644 item 2 anchors checkAllowList's wildcard pattern to the whole name. BACKLOG #5645 item 2 makes getCommitters follow GraphQL pagination past the first 100 commits, up to GitHub's 250-commit stop; an author first seen past commit 250 is not checked. The component's hashes entry is the patched file; the upstream bundle-sha256 property is the unpatched body. The component's pedigree names the upstream ancestor and lists the patches as unofficial."
         },
         {
           "name": "messagefoundry:vendored:action-yml-local-change",
@@ -108,7 +152,7 @@
         },
         {
           "name": "messagefoundry:recorded-files:sha256:.github/actions/cla-assistant-lite/dist/index.js",
-          "value": "2f8271c83b98e86b8b203205c0dda08415fa49c8c300921e481aabf5c9b989f8"
+          "value": "e908b17b82e369ef37d188b4a869c394b55c6be5490100716b487ceee32d13e2"
         },
         {
           "name": "messagefoundry:recorded-files:sha256:.github/actions/cla-assistant-lite/upstream-package-lock.json",
@@ -139,7 +183,7 @@
       },
       {
         "name": "messagefoundry:provenance:ledger-rows",
-        "value": "BACKLOG #1381 (vendoring), BACKLOG #1578 (this record), BACKLOG #1868 (action.yml runtime changed from upstream)"
+        "value": "BACKLOG #1381 (vendoring), BACKLOG #1578 (this record), BACKLOG #1868 (action.yml runtime changed from upstream), BACKLOG #5644 and #5645 (bundle patched)"
       },
       {
         "name": "messagefoundry:provenance:generator",

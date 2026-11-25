@@ -28,7 +28,15 @@
   replacement's own open, or after it but before the replacement is tried, names the earlier
   open, the one that checked the account before the key was shown, apart from the replacement's
   own, and names the open's one-time steps, such as the genesis record, for the earlier open
-  alone. Other refusals after an open still say nothing was written,
+  alone. `provision-admin` now also names its pre-check's open apart from its write's own, over
+  an existing store and before its write starts, for a key-resolution, hop, short-schema, key,
+  cipher, keyless-chain, keyless-provision or unauditable-write refusal at or after its write's
+  open, for a SQLite store failure other than an integrity refusal at or after that open, and for
+  that open failing the AES-GCM invocation bound's pass, which no longer says no audit row was
+  written. Since each of its opens resolves the key itself, a keyless or unauditable-write
+  refusal at the write's open does not show the pre-check's open was keyless, so keyed settings
+  still describe that open as a keyed one, which may have bound a salt and written the genesis
+  record. Other refusals after an open still say nothing was written,
   at least a store pin refusal under the host key provider, a refusal about the account itself
   such as a disabled Administrator, and `admin-reset-totp`'s refusals of the replacement itself. (`BACKLOG #5067`)
 - **`provision-admin` would now keep its result when the store fails to close after the grant

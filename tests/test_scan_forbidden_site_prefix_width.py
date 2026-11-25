@@ -22,7 +22,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "securi
 
 import scan_forbidden as sfm  # noqa: E402
 
-pytestmark = pytest.mark.tooling
+# NOT marked `tooling`. The tier is the files tests/tooling_manifest.txt names, and this one imports
+# the toolkit, so tests/test_tooling_partition.py keeps it off that list and on the engine legs. A
+# module-level mark had made it the one file only the tier ran outside the manifest, which the
+# tier's test shards, split from the manifest, would have dropped.
 
 _SECTIONS = "[names]\n\\bZqwidthsynth\\b | synthetic | i\n[estate]\nzqwidthestate\n"
 _BOTH = pytest.mark.parametrize(

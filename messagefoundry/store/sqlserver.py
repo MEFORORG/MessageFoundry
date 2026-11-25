@@ -212,6 +212,7 @@ from messagefoundry.store.row_seal import (
     cipher_call,
     classify_unrotated,
     row_sealer_for_cipher,
+    seal_chunks,
 )
 from messagefoundry.store.schema_verify import IndexShape
 from messagefoundry.store.sealed_cache import (
@@ -260,6 +261,8 @@ from messagefoundry.store.store import (
     REINGRESS_TAG_FAILURE_OUTCOME,
     REINGRESS_TARGET_PREFIX,
     REINGRESS_TOKEN_TAG_FAILED,
+    SESSION_MINT_ATTEMPTS,
+    SESSION_MINT_EPOCH_RAISED,
     TRANSIT_ATTESTATION_COLUMNS,
     USER_READ_SQL,
     VIEWED_EVENT,
@@ -327,6 +330,7 @@ from messagefoundry.store.store import (
     RoleGrant,
     RoleRow,
     SecretRotationMetaRow,
+    SessionMintContended,
     SessionRecord,
     SignCountAnswer,
     Stage,
@@ -437,6 +441,7 @@ from messagefoundry.store.store import (
     seal_role_async,
     seal_session_async,
     seal_user_async,
+    session_epochs_current,
     session_insert_params,
     session_owes_unproven_factor_async,
     session_reseal_params,
@@ -444,6 +449,7 @@ from messagefoundry.store.store import (
     settle_newest_keyed_audit_row,
     settle_transit_bound_attestation,
     should_record_event,
+    sign_in_state_refused,
     stamped_connection_event,
     tee_audits,
     totp_enable,
@@ -3559,21 +3565,6 @@ def _any_grant(answers: str) -> str:
     )
 
 
-def _probed_grant(value: Any) -> bool | None:
-    """Classify one privilege-probe column THREE ways: ``True`` held, ``False`` not held, ``None`` **not
-    read**. A NULL never becomes a boolean here, and that is the whole point (BACKLOG #1234).
-
-    ``IS_SRVROLEMEMBER``, ``IS_ROLEMEMBER`` and ``HAS_PERMS_BY_NAME`` each return **NULL** — not 0 —
-    when the name they are asked about does not resolve *for this caller*: an unknown or renamed role,
-    a principal the caller cannot see, a permission name this server version does not carry. Folding
-    that NULL through ``== 1`` yields ``False``, which reads as *"not a member"* and therefore as
-    clean, so a probe that read NOTHING would render as a clean bill of health — the exact false-clean
-    :meth:`SqlServerStore.probe_principal_privileges` names catalog enumeration to avoid, arriving by
-    the other door. ``True``/``False`` from a driver that returns booleans still read as ``1``/``0``;
-    any other value is not read either, by :func:`~messagefoundry.store.privilege.probed_grant`."""
-    return probed_grant(value)
-
-
 class SqlServerStore:
     """SQL Server-backed durable queue (the :class:`Store` protocol). Open with :meth:`open`."""
 
@@ -4451,9 +4442,10 @@ class SqlServerStore:
         except BaseException as exc:
             # Don't leak the pool if first-open initialization fails (M-6), a cancel included
             # (BACKLOG #5720). The reserved block is forfeited, not settled: see the same except in
-            # PostgresStore.open (postgres.py), which states what a forfeit costs. The executor is released in a finally, same as close() above: wait_closed() cannot
-            # complete while the pool is wedged, so releasing the executor only on the success path
-            # would leak its threads in exactly the case this except exists for.
+            # PostgresStore.open (postgres.py), which states what a forfeit costs. The executor is
+            # released in a finally, same as close() below: wait_closed() cannot complete while the
+            # pool is wedged, so releasing the executor only on the success path would leak its
+            # threads in exactly the case this except exists for.
             async def _release() -> None:
                 try:
                     try:
@@ -4792,23 +4784,20 @@ class SqlServerStore:
                     rows = [dict(zip(names, r)) for r in await cur.fetchall()]  # noqa: B905
                     if not rows:
                         break
-                    for r in rows:
-                        await cur.execute(
-                            f"UPDATE {table} SET [{column}]=? WHERE {where_keys}",
-                            (
-                                (
-                                    await self._aencrypt(
-                                        r["v"],
-                                        aad=(
-                                            aad_of(r)
-                                            if aad_of is not None
-                                            else cell_aad(table, column, *(r[c] for c in aad_cols))
-                                        ),
-                                    )
-                                ),
-                                *(r[c] for c in keys),
-                            ),
-                        )
+                    async for chunk, sealed_values in seal_chunks(
+                        self._cipher,
+                        table,
+                        column,
+                        rows,
+                        aad_cols=aad_cols,
+                        aad_of=aad_of,
+                        local_whole_page=False,
+                    ):
+                        for value, r in zip(sealed_values, chunk, strict=True):
+                            await cur.execute(
+                                f"UPDATE {table} SET [{column}]=? WHERE {where_keys}",
+                                (value, *(r[c] for c in keys)),
+                            )
                     sealed += len(rows)
                 await self._commit(conn)
             except BaseException:
@@ -5195,15 +5184,25 @@ class SqlServerStore:
         SERVER``, ``CONTROL`` on the database), so a principal over-granted by direct ``GRANT`` rather
         than by role membership is still seen.
 
-        **A NULL column is NOT READ, and a read that is not complete is never ``OBSERVED``** (BACKLOG
-        #1234). All three built-ins answer NULL when the name does not resolve for the caller, so the
-        argument above — *an empty enumeration must not render as a clean bill of health* — was
-        defeated by its own replacement until this arm distinguished the three states. Any probed
-        grant that reads NULL makes the whole report :attr:`StorePrivilegeStatus.UNOBSERVABLE`, named
-        grant by grant in the detail, because the documented grant is then genuinely UNVERIFIED: a
-        role that was never read is not a role the principal does not hold. Grants that DID read as
-        held are still reported, since a partial read can only understate an over-grant, never invent
-        one."""
+        **A NULL column is NOT READ, and so is any answer but 0 or 1** (BACKLOG #1234, #6015, by
+        :func:`~messagefoundry.sqlserver_roles.probed_grant`). All three built-ins answer NULL when
+        the name does not resolve for the caller, so the argument above — *an empty enumeration must
+        not render as a clean bill of health* — was defeated by its own replacement until this arm
+        distinguished the three states. A fixed role, ``CONTROL SERVER`` or database ``CONTROL``
+        that is not read is named grant by grant in the detail and in ``unread``: a role that was
+        never read is not a role the principal does not hold. With no over-grant read, that makes
+        the report :attr:`StorePrivilegeStatus.UNOBSERVABLE` (#1234). With one read, such as
+        ``sysadmin``, ``db_owner`` or a ``CONTROL``, the report stays ``OBSERVED`` with it in the
+        excess, so under enforce with no accepted opt-out the start refuses (owner ruling
+        2026-11-23 on #6015 item 1). A partial read can only understate an over-grant, never
+        invent one.
+
+        The grants that count only under ``external`` (``CREATE TABLE``, ``ALTER`` on the default
+        schema, ``VIEW DEFINITION`` on the default schema and ``dbo``, the audit-table rights) are
+        weighed after the excess (#6714): unread with nothing else found, the report is
+        ``UNOBSERVABLE``; unread beside an over-grant that WAS read, it stays ``OBSERVED`` and names
+        them in :attr:`~messagefoundry.store.privilege.StorePrivilegeReport.unread`, so the
+        over-grant is weighed as one (under enforce with no accepted opt-out, the start refuses)."""
         server_cols = [
             f"IS_SRVROLEMEMBER(?) AS srv_{i}" for i in range(len(SQLSERVER_FIXED_SERVER_ROLES))
         ]
@@ -5223,7 +5222,9 @@ class SqlServerStore:
             # counted only under external, where the runtime login must hold none.
             " HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TABLE') AS create_table,"
             " SCHEMA_NAME() AS default_schema,"
-            " HAS_PERMS_BY_NAME(SCHEMA_NAME(), 'SCHEMA', 'ALTER') AS alter_schema,"
+            # QUOTENAME (#6015 item 4), as the VIEW DEFINITION columns below and the proc-deploy
+            # guard pass their schema, so the schema probes quote one way.
+            " HAS_PERMS_BY_NAME(QUOTENAME(SCHEMA_NAME()), N'SCHEMA', N'ALTER') AS alter_schema,"
             # #6714: VIEW DEFINITION on the two schemas a store's tables resolve through. Only
             # provision-admin needs it, so under external the runtime login holding it is excess.
             " HAS_PERMS_BY_NAME(QUOTENAME(SCHEMA_NAME()), N'SCHEMA', N'VIEW DEFINITION')"
@@ -5239,27 +5240,27 @@ class SqlServerStore:
                 detail="the privilege query returned no row",
             )
         database = str(row["db_name"] or self._settings.database or "")
-        # Three-way, never two: held / not held / NOT READ. See _probed_grant for why a NULL folded to
+        # Three-way, never two: held / not held / NOT READ. See probed_grant for why a NULL folded to
         # False is a false-clean rather than a rounding error.
         unread: list[str] = []
         held_server: list[str] = []
         for i, name in enumerate(SQLSERVER_FIXED_SERVER_ROLES):
-            grant = _probed_grant(row[f"srv_{i}"])
+            grant = probed_grant(row[f"srv_{i}"])
             if grant is None:
                 unread.append(f"server role {name}")
             elif grant:
                 held_server.append(name)
         held_database: list[str] = []
         for i, name in enumerate(SQLSERVER_FIXED_DATABASE_ROLES):
-            grant = _probed_grant(row[f"dbr_{i}"])
+            grant = probed_grant(row[f"dbr_{i}"])
             if grant is None:
                 unread.append(f"database role {name}")
             elif grant:
                 held_database.append(name)
-        control_server = _probed_grant(row["control_server"])
+        control_server = probed_grant(row["control_server"])
         if control_server is None:
             unread.append("control server")
-        control_database = _probed_grant(row["control_db"])
+        control_database = probed_grant(row["control_db"])
         if control_database is None:
             unread.append(f"CONTROL on database {database}")
         external = self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
@@ -5267,19 +5268,19 @@ class SqlServerStore:
         # unread one never turns an over-grant that WAS read into an unobserved report: it is
         # weighed after the excess, below (#6714), so a read db_owner still refuses under enforce.
         external_unread: list[str] = []
-        create_table = _probed_grant(row["create_table"])
+        default_schema = str(row["default_schema"] or "") or "(unresolved default schema)"
+        create_table = probed_grant(row["create_table"])
         if create_table is None:
             external_unread.append(f"create table on database {database}")
-        alter_schema = _probed_grant(row["alter_schema"])
+        alter_schema = probed_grant(row["alter_schema"])
         if alter_schema is None:
-            external_unread.append("ALTER on the default schema")
+            external_unread.append(f"ALTER on schema {default_schema}")
         # #6714: one column per distinct schema; when the default schema is dbo the two name one.
-        default_schema = str(row["default_schema"] or "") or "(unresolved default schema)"
         view_def_columns = {default_schema: "view_def_default"}
         view_def_columns.setdefault("dbo", "view_def_dbo")
         view_definition: list[str] = []
         for schema, column in view_def_columns.items():
-            grant = _probed_grant(row[column])
+            grant = probed_grant(row[column])
             if grant is None:
                 external_unread.append(view_definition_grant(schema))
             elif grant:
@@ -5292,25 +5293,59 @@ class SqlServerStore:
             probed = len(SQLSERVER_FIXED_SERVER_ROLES) + len(SQLSERVER_FIXED_DATABASE_ROLES) + 2
             held_labels = [f"server role {r}" for r in server_roles]
             held_labels += [f"database role {r}" for r in database_roles]
+            # A read CONTROL is an over-grant this report may refuse on, so it is named as read.
+            if control_server:
+                held_labels.append("control server")
+            if control_database:
+                held_labels.append(f"CONTROL on database {database}")
             also_unread = ""
             if external:  # owner ruling R16 and #6714: each is a finding there
+                if create_table:
+                    held_labels.append(f"create table on database {database}")
+                if alter_schema:
+                    held_labels.append(f"ALTER on schema {default_schema}")
                 held_labels += list(audit_writes)
                 if view_definition:
                     held_labels.append(view_definition_grant(*view_definition))
                 if external_unread:
                     also_unread = f"; also not read: {', '.join(external_unread)}"
-            # The catalog enumeration below is skipped deliberately: it is additive only, and widening
-            # a report already saying the read was incomplete buys nothing an operator can act on.
+            # Owner ruling 2026-11-23 on #6015 item 1 ("Refuse when read"): an over-grant that WAS
+            # read keeps the report OBSERVED with it in the excess, so it is weighed as one (under
+            # enforce it refuses) rather than demoted to an unobserved warning by a neighbouring
+            # unread column. Unread reads as not held here, which can only understate the excess.
+            read_excess = sqlserver_excess(
+                server_roles=server_roles,
+                database_roles=database_roles,
+                control_server=control_server is True,
+                control_database=control_database is True,
+                database=database,
+                external=external,
+                create_table=create_table is True,
+                alter_schema=(default_schema if alter_schema else None),
+                audit_writes=audit_writes,
+                view_definition=tuple(view_definition),
+            )
+            # The catalog enumeration below is skipped on this path, so a user-defined role is not
+            # weighed here: with no fixed-role over-grant read, a login whose only over-grant is a
+            # user-defined role reads unobserved, which under enforce warns unless
+            # [store].require_least_privilege is declared.
             return StorePrivilegeReport(
                 backend=self.backend,
-                status=StorePrivilegeStatus.UNOBSERVABLE,
+                status=(
+                    StorePrivilegeStatus.OBSERVED
+                    if read_excess
+                    else StorePrivilegeStatus.UNOBSERVABLE
+                ),
                 principal=str(row["login_name"] or ""),
                 database=database,
                 server_roles=server_roles,
                 database_roles=database_roles,
+                excess=read_excess,
+                unread=tuple(unread + (external_unread if external else [])),
                 detail=(
                     f"the privilege query returned NULL, or a value that is not 0 or 1, for"
-                    f" {len(unread)} of {probed} probed grant(s), so they were not read and must not"
+                    f" {len(unread)} of the {probed} role and CONTROL grant(s) probed, so they were"
+                    " not read and must not"
                     f" be reported as absent: {', '.join(unread)}"
                     " (IS_SRVROLEMEMBER / IS_ROLEMEMBER / HAS_PERMS_BY_NAME answer NULL when the name"
                     " does not resolve for this caller); what DID read as held:"
@@ -5347,7 +5382,8 @@ class SqlServerStore:
             database=database,
             external=external,
             create_table=bool(create_table),
-            alter_schema=(str(row["default_schema"] or "") if alter_schema else None),
+            # The unresolved label, never "": an empty name would read as no grant (a false clean).
+            alter_schema=(default_schema if alter_schema else None),
             audit_writes=audit_writes,
             view_definition=tuple(view_definition),
         )
@@ -5368,6 +5404,7 @@ class SqlServerStore:
                     database=database,
                     server_roles=server_roles,
                     database_roles=database_roles,
+                    unread=tuple(external_unread),
                     detail=(
                         f"{note}; [store].schema_management is 'external', which requires INSERT and"
                         " SELECT only on audit_log, no schema DDL right and no view definition on"
@@ -5382,6 +5419,8 @@ class SqlServerStore:
             server_roles=server_roles,
             database_roles=database_roles,
             excess=excess,
+            # #6015 item 2: an unread external grant beside a read over-grant reaches the summary.
+            unread=tuple(external_unread) if external else (),
             detail=(
                 f"database user {str(row['db_user'] or '')!r}; {note}; measured against the "
                 + (
@@ -6091,6 +6130,8 @@ class SqlServerStore:
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
+        # KNOWN GAP (BACKLOG #5720): a cancel in the settle, a write on a keyed store, skips every
+        # close step after it, so the pool and its executor stay open; this close is not cancel-safe.
         try:
             if not self._read_only:  # #1780: a read-only handle reserved nothing to settle
                 await self.checkpoint_cipher_invocations(settle=True)
@@ -16576,8 +16617,8 @@ class SqlServerStore:
         audits: Sequence[AuditAppend],
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
-        calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
-        #1139). Adding that column to this SET list would hand the directory the notification target
+        calls it on an AD/OIDC login whose profile changed — so it deliberately does NOT name
+        ``notify_email`` (BACKLOG #1139). Adding that column to this SET list would hand the directory the notification target
         back and restore the defect the split removes. ``audits``: see
         ``AuthStore.update_user_profile``."""
         now = time.time() if now is None else now
@@ -17547,8 +17588,68 @@ class SqlServerStore:
         auth_mechanism: str | None = None,
         idp_auth_time: float | None = None,
         mfa_verified: bool = False,
+        require_sign_in_eligible: bool = False,
     ) -> bool:
-        now = time.time() if now is None else now
+        # BACKLOG #5653: the seal is made BEFORE the locked transaction opens, as SQLite's
+        # create_session does. Under a Vault Transit sealer it is an HTTP call, and holding the
+        # account's row lock and a pooled connection across it would stall that account's writers
+        # behind Vault. The seal covers the session epochs, so they are read first, unlocked, and
+        # read again under the lock: if a revoke raised either in between, nothing is written and
+        # the record is sealed again over the new values.
+        for _ in range(SESSION_MINT_ATTEMPTS):
+            # Unlocked, so the subquery's snapshot is fine here; the locked read below takes the
+            # global epoch in its own statement (BACKLOG #5091).
+            pre = await self._fetchone(
+                f"SELECT session_epoch, {GLOBAL_SESSION_EPOCH_SQL} AS global_epoch"
+                " FROM users WHERE id=?",
+                (user_id,),
+            )
+            if pre is None:
+                # A deleted account is refused, guarded or not (BACKLOG #2733); the locked read
+                # below refuses one deleted after this read.
+                return False
+            record = await seal_session_async(
+                self._row_sealer,
+                new_session_record(
+                    token_hash=token_hash,
+                    user_id=user_id,
+                    now=time.time() if now is None else now,
+                    expires_at=expires_at,
+                    client=client,
+                    seed_reauth=seed_reauth,
+                    auth_mechanism=auth_mechanism,
+                    idp_auth_time=idp_auth_time,
+                    mfa_verified=mfa_verified,
+                    user_epoch=int(pre["session_epoch"]),
+                    global_epoch=global_epoch_or_refuse(pre["global_epoch"]),
+                ),
+            )
+            inserted = await self._insert_sealed_session(
+                record,
+                now=now,
+                require_federated_subject=require_federated_subject,
+                require_sign_in_eligible=require_sign_in_eligible,
+            )
+            if inserted is not None:
+                return inserted
+        log.warning(
+            "sqlserver: a session insert found the session epochs raised %d times; giving up",
+            SESSION_MINT_ATTEMPTS,
+        )
+        raise SessionMintContended(SESSION_MINT_EPOCH_RAISED, SESSION_MINT_ATTEMPTS)
+
+    async def _insert_sealed_session(
+        self,
+        record: SessionRecord,
+        *,
+        now: float | None,
+        require_federated_subject: tuple[str | None, str | None] | None,
+        require_sign_in_eligible: bool,
+    ) -> bool | None:
+        """``create_session``'s locked transaction: insert ``record``, already sealed, if the
+        account's row still allows it. ``False`` is a refusal. ``None`` means a revoke raised an
+        epoch the seal covers after the seal was made, so nothing was written and the caller seals
+        again. Nothing here seals (BACKLOG #5653)."""
         # BACKLOG #1474 and #2592. UPDLOCK/ROWLOCK, not a plain read: the lock is the guard. Either a
         # concurrent unbind or whole-account revoke committed first, and this read sees the cleared
         # pair (so the insert is refused) and the raised session epoch; or this transaction holds
@@ -17561,47 +17662,53 @@ class SqlServerStore:
                 # An unguarded sign-in takes a shared lock held to the commit (HOLDLOCK): it still
                 # waits behind a revoke's users UPDATE, and parallel sign-ins of one account do not
                 # wait on each other.
+                # BACKLOG #5653: the eligibility columns are read under the same lock. A disable or
+                # a lockout is an UPDATE, which the shared HOLDLOCK lock blocks too, so either
+                # committed first and refuses this insert, or waits behind it.
                 if require_federated_subject is None:
                     await cur.execute(
-                        "SELECT oidc_issuer, oidc_subject, session_epoch FROM users"
-                        " WITH (HOLDLOCK, ROWLOCK) WHERE id=?",
-                        (user_id,),
+                        "SELECT oidc_issuer, oidc_subject, session_epoch, disabled, locked_until,"
+                        " second_step_locked_until FROM users WITH (HOLDLOCK, ROWLOCK) WHERE id=?",
+                        (record.user_id,),
                     )
                 else:
                     await cur.execute(
-                        "SELECT oidc_issuer, oidc_subject, session_epoch FROM users"
-                        " WITH (UPDLOCK, ROWLOCK) WHERE id=?",
-                        (user_id,),
+                        "SELECT oidc_issuer, oidc_subject, session_epoch, disabled, locked_until,"
+                        " second_step_locked_until FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?",
+                        (record.user_id,),
                     )
                 # fetchall drains the SELECT so the same-cursor INSERT below is clean; `_cursor`
                 # closes the cursor before the pooled connection is reused (EF-6).
                 rows = await cur.fetchall()
+                # Read once the lock is held, so a read that waited behind a writer judges a lock's
+                # expiry at the time of the read, not when this sign-in began to wait.
+                judged_at = time.time() if now is None else now
                 # An account deleted under this sign-in is refused, guarded or not (BACKLOG #2733):
                 # the INSERT would otherwise fail fk_sessions_user with a raw 547. A row this read
                 # found stays locked to the commit, so a delete cannot land before the INSERT.
-                if not rows or (
-                    require_federated_subject is not None
-                    and (rows[0][0], rows[0][1]) != require_federated_subject
+                if (
+                    not rows
+                    or (
+                        require_federated_subject is not None
+                        and (rows[0][0], rows[0][1]) != require_federated_subject
+                    )
+                    or (
+                        require_sign_in_eligible
+                        and sign_in_state_refused(rows[0][3], rows[0][4], rows[0][5], judged_at)
+                    )
                 ):
                     await conn.rollback()
                     return False
-                record = new_session_record(
-                    token_hash=token_hash,
-                    user_id=user_id,
-                    now=now,
-                    expires_at=expires_at,
-                    client=client,
-                    seed_reauth=seed_reauth,
-                    auth_mechanism=auth_mechanism,
-                    idp_auth_time=idp_auth_time,
-                    mfa_verified=mfa_verified,
+                if not session_epochs_current(
+                    record,
                     user_epoch=int(rows[0][2]),
                     # BACKLOG #5091: its own statement, after the row lock, for the reason
                     # postgres.py's create_session gives; revoke_all_sessions says why it cannot
                     # close a cycle.
                     global_epoch=await self._global_session_epoch(cur),
-                )
-                record = await seal_session_async(self._row_sealer, record)
+                ):
+                    await conn.rollback()
+                    return None
                 await cur.execute(_SESSION_INSERT, session_insert_params(record))
                 await self._commit(conn)
             except Exception:

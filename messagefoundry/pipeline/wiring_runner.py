@@ -2060,6 +2060,12 @@ class RegistryRunner:
         sandbox_config_source: tuple[str | None, str | None] | None = None,
     ) -> None:
         self.registry = registry
+        # BACKLOG #5892: replaced only at a commit; see committed_graph.
+        self._committed: tuple[int, Registry, dict[str, Any] | None] = (
+            RegistryRunner._take_graph_generation(),
+            registry,
+            None,
+        )
         self.store = store
         #: ADR 0154 D3. One rendezvous per runner: the waiter and the capturing worker are the same
         #: process by construction (under HA the graph runs on the leader only), so process-local is
@@ -2879,6 +2885,111 @@ class RegistryRunner:
     def notify_work(self) -> None:
         """Wake every stage worker now (e.g. after a replay re-queues rows at an unknown stage)."""
         self._wake_all(Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
+
+    #: The longest injected summary stored, in characters (BACKLOG #5707). ``\.inN\`` escapes can
+    #: expand a summary far past its body, and a longer one is stored as ``None``, never cut. Also
+    #: the most escape growth an inject will unescape while building a summary.
+    _INJECT_SUMMARY_MAX_CHARS = 4096
+
+    #: The most raw characters, across the fields a summary is built from, that an inject will
+    #: unescape (BACKLOG #5707). Unescaping costs many times a leaf's length in memory before any
+    #: cap can see the result, so a message over this is stored with no summary.
+    _INJECT_SUMMARY_MAX_SOURCE_CHARS = 16 * 1024
+
+    async def ingress_fields_for(
+        self, channel_id: str, raw: str
+    ) -> tuple[str | None, str | None, str | None]:
+        """``(control_id, message_type, summary)`` for an operator-injected ``raw`` on ``channel_id``
+        (BACKLOG #5707): an HL7 inbound through its own :func:`peek_max_bytes` ceiling, reading the
+        three values :func:`_read_ingress_fields` reads but each behind its own bound, which that
+        helper's eager read could not honour; any other inbound as its content type with no control
+        id or summary.
+
+        This only labels a row and never refuses one, because the API's resubmission guard has
+        already admitted the body. An unknown channel or an ``Exception`` raised here is three
+        ``None`` values. Only the exception's type is logged: its text can carry the body. The peek
+        runs off the event loop, as that guard's does, because the body can be upload-sized.
+
+        What this bounds is the label values, and nothing about the store write that follows, which
+        can still fail for its own reasons. A value is dropped to ``None`` when it is wider than
+        SQL Server's ``NVARCHAR(256)`` control id or ``NVARCHAR(64)`` type, counted in UTF-16 units
+        as it counts them; when it holds a NUL, which a hex escape can decode into a summary after
+        the guard's NUL check and Postgres refuses; or when a summary is over
+        :attr:`_INJECT_SUMMARY_MAX_CHARS`. The widths apply on every backend, so an inject can store
+        ``None`` where a listener on SQLite or Postgres would keep a longer value.
+
+        Those checks see a summary only after it is built, so its memory bound is taken first, from
+        the raw text of the fields it can be built from for any message type. It is not built when
+        a PID, ORC or OBR line is over :attr:`_INJECT_SUMMARY_MAX_SOURCE_CHARS` characters, when
+        those fields total more, or when their counted escapes could add more than
+        :attr:`_INJECT_SUMMARY_MAX_CHARS`. The measure takes whole fields and counts the order
+        fields on every type, so a value the summary would not read can still cost a row its
+        summary."""
+        from messagefoundry.parsing._builtin_hl7 import escape_expansion_estimate
+
+        cap = self._INJECT_SUMMARY_MAX_CHARS
+
+        def storable(value: str | None, limit: int, *, utf16: bool = False) -> str | None:
+            # The plain length first: an oversized value is dropped with no scan or encode.
+            if value is None or len(value) > limit or "\x00" in value:
+                return None
+            # Strict on purpose: a lone surrogate raises here and stores no labels.
+            if utf16 and len(value.encode("utf-16-le")) // 2 > limit:
+                return None
+            return value
+
+        try:
+            ic = self.registry.inbound.get(channel_id)
+            if ic is None:
+                return None, None, None
+            if ic.content_type is not ContentType.HL7V2:
+                return None, ic.content_type.value, None
+            ceiling = peek_max_bytes(ic)
+
+            def read() -> tuple[str | None, str | None, str | None]:
+                peek = Peek.parse(raw, max_bytes=ceiling)
+                # A whole-field read returns the raw text and unescapes nothing, so measuring the
+                # fields summarize() reads costs no expansion. The control id and type are such
+                # reads too, which is why only the summary needs this bound.
+                # Any field read splits its whole segment, at a cost set by the segment's field
+                # count, so a long segment is refused from its unsplit line before that read.
+                limit = self._INJECT_SUMMARY_MAX_SOURCE_CHARS
+                unsplit = peek.message["_lazy"]
+                read_summary = all(
+                    len(unsplit.get(index, "")) <= limit
+                    for index, segment in enumerate(peek.message["segments"])
+                    if segment["id"] in ("PID", "ORC", "OBR")
+                )
+                sources = (
+                    [
+                        value
+                        for path in ("MSH-9", "PID-3", "PID-5", "ORC-2", "ORC-3", "OBR-2", "OBR-3")
+                        if (value := peek.field(path))
+                    ]
+                    if read_summary
+                    else []
+                )
+                read_summary = read_summary and sum(map(len, sources)) <= limit
+                if read_summary:
+                    # The estimate takes the escape character from its text's first line, so the
+                    # probe opens with the message's own MSH encoding characters.
+                    start = peek.raw.find("MSH")
+                    probe = "\r".join([peek.raw[start : start + 8], *sources])
+                    read_summary = escape_expansion_estimate(probe, limit=cap) <= cap
+                return (
+                    storable(peek.control_id, 256, utf16=True),
+                    storable(peek.message_type, 64, utf16=True),
+                    storable(summarize(peek) or None, cap) if read_summary else None,
+                )
+
+            return await asyncio.to_thread(read)
+        except Exception as exc:  # CancelledError is a BaseException, so a cancel still propagates
+            log.warning(
+                "inject on %r: reading the stored fields raised %s; storing none",
+                channel_id,
+                type(exc).__name__,
+            )
+            return None, None, None
 
     @property
     def env_values(self) -> dict[str, Any]:
@@ -9576,6 +9687,35 @@ class RegistryRunner:
             )
         return stranded
 
+    # Process-wide, so a runner that replaces another never reissues a generation a load still holds.
+    _last_graph_generation = 0
+
+    @staticmethod
+    def _take_graph_generation() -> int:
+        RegistryRunner._last_graph_generation += 1
+        return RegistryRunner._last_graph_generation
+
+    def committed_graph(self) -> tuple[int, Registry, dict[str, Any] | None]:
+        """The last committed graph's generation, graph and reload values (BACKLOG #5892).
+
+        The values are ``None`` until a reload commits some, so the holder of the start's values
+        keeps answering until then.
+
+        :attr:`registry` holds a reload's new graph from its swap on, while that reload can still
+        be refused. This answers with the graph it replaced until the reload commits, and the
+        generation advances only at that commit, never during the swap or a rollback."""
+        return self._committed
+
+    def _commit_graph(self, new_values: dict[str, Any] | None) -> None:
+        _, registry, values = self._committed
+        if self.registry is registry and new_values is None:
+            return  # a re-apply of the same graph and values: a load under it is still valid
+        self._committed = (
+            RegistryRunner._take_graph_generation(),
+            self.registry,
+            values if new_values is None else new_values,
+        )
+
     async def reload(
         self,
         new_registry: Registry | None = None,
@@ -9702,6 +9842,7 @@ class RegistryRunner:
                     self._park_outbounds_while_passive()
             if not self._running:
                 self.registry = new_registry
+                self._commit_graph(new_env_values)  # BACKLOG #5892: nothing below can refuse it
                 self._forget_removed_anchor_lanes()
                 return ()
 
@@ -9964,6 +10105,8 @@ class RegistryRunner:
                         log.exception("rollback: could not restart inbound %r", name)
                 raise
 
+            # BACKLOG #5892: the commit point. No await since step 3 returned.
+            self._commit_graph(new_env_values)
             # BACKLOG #5755: the closes of what step 3 retired run on every exit from here. A raise
             # or a cancellation anywhere in the commit tail, synchronous or awaited, hands the ones
             # not yet begun to a detached close rather than leaving them open with nothing holding
@@ -12644,9 +12787,44 @@ class RegistryRunner:
         await self.store.dead_letter_now(item.id, f"handler error: {safe_exc(exc)}")
         return _ItemOutcome.PROCESSED, None
 
+    #: How many times one ingress row may start again because a reload replaced the graph during its
+    #: Router (BACKLOG #5707). Past this the row finishes on the served graph without a recheck, so
+    #: a run of reloads cannot hold it, or the lane behind it, indefinitely.
+    _INGRESS_RELOAD_REPASSES = 3
+
+    def _ingress_row_restarts(
+        self, name: str, item: OutboxItem, read: Registry, repass: int
+    ) -> bool:
+        """Whether an inline row whose Router selected one handler must start again, because a reload
+        replaced ``read``, the graph its inline gates describe (BACKLOG #5707). The restart follows
+        with no await, so the next pass finds the inbound this saw.
+
+        Not when the reload removed this inbound: a restart would reach the missing-inbound STOP, and
+        nothing re-arms a worker that stops while a later reload restores the inbound. That row
+        continues on the served graph, whose ``transform_one`` refuses a handler or an outbound that
+        graph no longer has. A reload landing during that transform is not covered.
+
+        Nor when the engine is stopping or this inbound's log gate has closed: both are checked before
+        a claim, and a restart would otherwise run the Router again past them."""
+        if self.registry is read or name not in self.registry.inbound:
+            return False
+        if self._stop.is_set() or self._inbound_log_halted(name):
+            return False
+        if repass >= self._INGRESS_RELOAD_REPASSES:
+            log.warning(
+                "router worker %r: %s met a reload on %d Router passes; finishing on the served "
+                "graph",
+                name,
+                item.id,
+                repass + 1,
+            )
+            return False
+        log.info("router worker %r: a reload replaced the graph; re-running %s", name, item.id)
+        return True
+
     @_records_worker_death("router")
     async def _process_ingress_item(
-        self, name: str, item: OutboxItem
+        self, name: str, item: OutboxItem, *, repass: int = 0
     ) -> tuple[_ItemOutcome, float | None]:
         """Route one claimed ingress row — the per-item body of :meth:`_router_worker`, extracted
         verbatim (ADR 0066, pure code motion) so the loop and the pooled dispatcher share it. Returns
@@ -12654,8 +12832,9 @@ class RegistryRunner:
         always ``None`` (``(PROCESSED, None)`` where the loop advanced, ``(STOPPED, None)`` on a missing
         inbound or the STOP internal-error policy — the body already ``mark_failed``'d / dead-lettered
         the head per policy). The per_lane loop reads only ``outcome[0]``. Store errors propagate to the
-        caller's backoff."""
-        ic = self.registry.inbound.get(name)
+        caller's backoff. ``repass`` counts restarts after a reload (:meth:`_ingress_row_restarts`)."""
+        registry = self.registry  # the graph `inline` below describes (BACKLOG #5707)
+        ic = registry.inbound.get(name)
         if ic is None:
             # The inbound was removed from the registry but residual ingress rows remain.
             # Revert this just-claimed row to pending and EXIT the worker — there is nothing to
@@ -12714,6 +12893,7 @@ class RegistryRunner:
         # route_only and transform_one have both returned and every per-message gate held. The
         # handoff that commits them runs AFTER the try (ADR 0057 G1 as amended 2026-10-07).
         fused: list[tuple[str, str]] | None = None
+        restart = False
         try:
             # Publish the live graph's run-scoped views (code sets / reference snapshots /
             # active environment) so a call-time code_set(...)/reference(...)/
@@ -12755,7 +12935,11 @@ class RegistryRunner:
             # and as the fused path's handoff_exc does (ADR 0071). Eligible iff the inbound opted in
             # AND the graph has no live lookup AND ack_after=ingest AND not LOOPBACK
             # (graph-level gates, cached in self._inline_ok) — plus the per-message gates here.
-            if inline and len(names) == 1:
+            # BACKLOG #5707: those gates describe `registry`, and a reload may have replaced it
+            # during the Router, so such a row commits nothing here and starts again below.
+            single_inline = inline and len(names) == 1
+            restart = single_inline and self._ingress_row_restarts(name, item, registry, repass)
+            if single_inline and not restart:
                 # M-single held. Run the single handler's transform OFF the loop (G4: keep the
                 # to_thread hop — SEC-013), mirroring _transform_worker. No lookup ExitStack:
                 # self._inline_ok already guaranteed no live lookup runner (INV-7), so a
@@ -12833,6 +13017,12 @@ class RegistryRunner:
             # policy decides (factored into _apply_router_internal_error, the single source of
             # truth shared with the fused route branch; byte-identical).
             return await self._apply_router_internal_error(name, item, exc)
+        if restart:
+            # Outside the try, so a store fault in the next pass reaches the caller's fault arm and
+            # is not read as a Router error. The undecorated body, so a worker death counts once.
+            body: Callable[..., Awaitable[tuple[_ItemOutcome, float | None]]]
+            body = RegistryRunner._process_ingress_item.__wrapped__  # type: ignore[attr-defined]
+            return await body(self, name, item, repass=repass + 1)
         # `inline and` is redundant with how `fused` is set; it keeps the fused commit visibly
         # gated on the inline cache (tests/test_crit2_inline_doc_drift.py reads that link).
         if inline and fused is not None:

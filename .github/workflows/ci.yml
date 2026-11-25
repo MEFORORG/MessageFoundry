@@ -2212,13 +2212,22 @@ jobs:
   #
   # NOT a required context of its own: it rides the `ci-gate` roll-up, exactly as `webconsole` does and
   # for the same reason recorded there -- a new required context needs a branch-protection change, and
-  # until that lands every PR carries a check it can never satisfy.
+  # until that lands every PR carries a check it can never satisfy. Each windows-2025 test shard
+  # below is one more leg of this job, so each rides the roll-up the same way.
+  #
+  # windows-2025 RUNS THE TIER AS 3 TEST SHARDS, ubuntu-latest as one leg, under an owner ruling of
+  # 2026-11-24 in the Manager's session: asked "Approve the split?", the owner answered "Shard into 3
+  # (Recommended)". It reverses the 2026-11-14 ruling quoted below for this leg. The windows-2025
+  # junit of run 45415735678 (job 138521635567) held 11,506 testcases and 15,414 s of test time at
+  # -n 3, about 86 minutes, against 5,457 s on ubuntu; the largest file was about 888 s, so no single
+  # file was the cost. scripts/quality/shard_tests.py `--suite tooling` splits the manifest files by
+  # whole file, and its TOOLING_SALT says how the split was balanced on that junit.
   tooling:
-    name: repo harness tests (${{ matrix.os }})
+    name: repo harness tests (${{ matrix.of == '1' && matrix.os || format('{0}, shard {1} of {2}', matrix.os, matrix.shard, matrix.of) }})
     needs: changes
     strategy:
       fail-fast: false
-      # Both legs on a code PR, ubuntu only on a docs-only one. Computed in `changes` -- see the
+      # Every leg on a code PR, ubuntu only on a docs-only one. Computed in `changes` -- see the
       # `tooling_matrix` output there for the measurement, and for why the path FILTER is untouched.
       matrix: ${{ fromJSON(needs.changes.outputs.tooling_matrix) }}
     # The push arm is the safety net, not redundancy: the PR arm only fires when the harness itself
@@ -2258,10 +2267,8 @@ jobs:
     #   1370.08s  22.8 min  red    run 35114064023  pytest clock (step clock 1376s)
     #   1455.72s  24.3 min  red                     pytest clock, reported
     #
-    # TWO INSTRUMENTS, AND THEY AGREE, which is what licenses pooling them into one column: run
-    # 35114064023 was read BOTH ways and they differ by 6 seconds on 1370, 0.4 percent. "Step clock" is
-    # the runner's own start-to-finish on the `Harness tests (pytest)` step; "pytest clock" is the
-    # figure pytest prints in its own summary line.
+    # "Step clock" is the step's own start-to-finish, "pytest clock" pytest's summary line; run
+    # 35114064023, read both ways, differs by 6 seconds, which is what licenses one column.
     #
     # WALL CLOCK DOES NOT PREDICT THE FAILURE, which is why the old trigger is rewritten and not just
     # renumbered: the 1276.96s GREEN sits ABOVE the 1219.44s red, so the two populations overlap and no
@@ -2269,39 +2276,19 @@ jobs:
     # -- and the mechanism is visible in run 35114064023's log: two tests each burned the gate's
     # 45-second ceiling before failing, so a red clock partly measures the failure rather than the
     # sizing. That is the association; it is not a discriminator, and it is why the trigger below reads
-    # GREEN runs only.
+    # GREEN runs only. That overlap rests on the two reported rows alone; the re-read rows separate.
     #
-    # THAT OVERLAP RESTS ENTIRELY ON THE TWO REPORTED ROWS, so whoever re-checks it should re-read them
-    # first. The three rows re-read here do NOT show it on their own -- one green at 1128 under two reds
-    # at 1341 and 1376 is a clean separation, and a reader with only those would draw the opposite
-    # conclusion. The overlap is real only if 1219.44 red and 1276.96 green are what they were reported
-    # to be.
-    #
-    # ONE OF THE FOUR REDS WAS CHECKED TO BE THE #1304 SIGNATURE, and the other three were not, which is
-    # said plainly because a table of reds invites the reader to assume they are all one failure. Job
+    # ONE OF THE FOUR REDS WAS CHECKED TO BE THE #1304 SIGNATURE, and the other three were not. Job
     # log for run 35114064023: `2 failed, 3209 passed ... in 1370.08s`, both failures `AssertionError:
     # PWSH LAUNCH TIMED OUT after 45s (BACKLOG #1304)`, in test_worktree_gate_escaped_quote.py and
     # test_worktree_gate_control_plane.py. The cap derivation below reads only the GREEN rows, so it
     # does not depend on what the other reds were.
     #
-    # WHY THE CAPS MOVE TO 45/35. Take the WORST green, not the friendliest one -- 1276.96s. Removing a
-    # worker cannot make the tier faster, and the pessimistic case is the CPU-PACKED bound, 4/3 of that:
-    # 1702.6s, 28.4 minutes. Against the old 30-minute step cap that is 97 seconds of margin, 5 percent,
-    # and the paragraph above says in terms that sizing a cap that close to the observed run buys no
-    # detection. 4/3 is not even a hard ceiling here: under `--dist loadfile` the floor is the largest
-    # single FILE, so dropping to 3 workers packs more coarsely and imbalance can cost MORE than 4/3.
-    # 35 minutes puts the same bound at 19 percent margin. The nesting invariant holds: recorded W25
-    # setup maxima are 2:32, ci.yml records provisioning noise alone at 4:30, so 7 + 35 = 42 under 45
-    # (measured setup on run 35113492633 was 68 seconds).
+    # THE CAPS THEN MOVED TO 45/35, on the CPU-packed -n 3 bound: 4/3 of the worst -n 4 green,
+    # 1276.96s, is 1702.6s, 28.4 minutes. That derivation and the reading beside it are superseded,
+    # and in this file's git history.
     #
-    # THE EXPERIMENT'S OWN PREMISE ARGUES THE TRUE COST IS FAR BELOW THAT BOUND, and that is a READING,
-    # not a measurement: 4 workers each carrying the ~1.12 cores of average child occupancy recorded
-    # above is ~8.5 cores of demand on 4 vCPU, so the box is saturated in BOTH arms and the fourth
-    # worker buys queueing rather than throughput. This experiment is what tests it. THE CAPS ARE SIZED
-    # AGAINST THE BOUND, NOT AGAINST THE READING, so they hold even if the reading is wrong.
-    #
-    # THE -n 3 OBSERVATIONS ARE NOW IN, and the paragraph they replace said there were none because
-    # the first had not yet landed. THREE windows-2025 job logs read on 2026-09-19, all at
+    # THE -n 3 OBSERVATIONS. THREE windows-2025 job logs read on 2026-09-19, all at
     # TOOLING_WORKERS=3 (the value is echoed in each job's own step log, so this is not inferred from
     # the file). Two of `main`'s four reds that day, plus one green; the other two reds were reported
     # rather than re-read here:
@@ -2310,15 +2297,9 @@ jobs:
     #   1433.55s  23.9 min  red    run 35465858823  job 105958065037  coord_usage 60s starvation
     #   1457.82s  24.3 min  GREEN  run 35472705438  job 105976506178
     #
-    # THE TWO REDS ARE #1304 BUT NOT THE SIGNATURE SPELLED OUT ABOVE, and the two must not be fused.
-    # That paragraph's signature is `PWSH LAUNCH TIMED OUT after 45s` out of the worktree-gate files,
-    # which take the spawn lock. These two are `subprocess.TimeoutExpired ... timed out after 60
-    # seconds` out of tests/test_coord_usage.py, which did NOT take it until the change carrying this
-    # comment. Same defect -- a launch that never returns -- at a different ceiling, in a different
-    # file, with a different coverage status. Only the coord_usage failure was observed in these runs.
-    #
-    # All three rows are the pytest clock, read from the job log's own summary line, so they are
-    # comparable with the pytest-clock rows above and NOT with the step-clock ones.
+    # THE TWO REDS ARE #1304 BY ANOTHER SIGNATURE: `subprocess.TimeoutExpired ... after 60 seconds`
+    # in tests/test_coord_usage.py, which did not then take the spawn lock, not the 45s pwsh launch
+    # above. All three rows are the pytest clock.
     #
     # READ THE STEP'S DURATION, NOT ONLY ITS CONCLUSION -- a green -n 3 run that costs 7 extra minutes
     # on every harness PR is a different verdict from a green one that costs nothing, and the pass/fail
@@ -2328,11 +2309,8 @@ jobs:
     # It sits well under the 28.4-minute pessimistic bound the caps were sized against and under the
     # 29-minute re-derive trigger, so the caps hold and neither moves.
     #
-    # THAT 3 MINUTES INHERITS AN UNVERIFIED ROW, which is the caveat to carry. The 21.3-minute -n 4
-    # green is one of the two "reported, not re-read" rows the paragraph above warns about. Against
-    # the only RE-READ -n 4 green (1128.00s, 18.8 min) the cost would be 5.5 minutes instead. One
-    # green sample per arm is an order of magnitude, not a mean, and the wider figure is the one to
-    # assume if only one can be.
+    # THAT 3 MINUTES INHERITS AN UNVERIFIED ROW: against the only RE-READ -n 4 green (18.8 min) it is
+    # 5.5 minutes, the figure to assume. One green per arm is an order of magnitude, not a mean.
     #
     # THE VERDICT IS THAT -n 3 DID NOT CLEAR #1304, which is what the experiment existed to test. The
     # hypothesis stated on TOOLING_WORKERS below -- that a 4-vCPU runner oversubscribed by 4 workers is
@@ -2348,7 +2326,7 @@ jobs:
     # BACKLOG #1109's call on #1109's evidence, not a side effect of the #1304 fix. Left running so
     # the reverting change reads a tier whose #1304 noise has been removed.
     #
-    # THE 29-MINUTE TRIGGER BELOW FIRED FOR A WEEK AND NOTHING READ IT, so the caps are re-derived
+    # THE 29-MINUTE TRIGGER FIRED FOR A WEEK AND NOTHING READ IT, so the caps are re-derived
     # again, 2026-10-07, after PR 2112's windows-2025 leg was killed AT the 35-minute step cap with
     # pytest itself green: `5681 passed ... in 2095.07s (0:34:55)`, printed 0.6s before the kill (run
     # 37565565121, job 112612644223). Pool: every ci.yml run created 2026-09-30T19:25:00Z to
@@ -2407,7 +2385,7 @@ jobs:
     # touch it.
     #
     # RE-DERIVED A THIRD TIME, 2026-10-23, FOR windows-2025 ONLY, TO 80/67, because the 36:55 trigger
-    # below fired and the 48-minute cap started killing work that showed no failure. The step was
+    # fired and the 48-minute cap started killing work that showed no failure. The step was
     # killed AT 48:07 to 48:08 four times, with no F or E in the progress line. The last progress
     # each job log printed before the kill:
     #
@@ -2471,7 +2449,7 @@ jobs:
     # RE-DERIVED A FOURTH TIME, 2026-11-14, FOR windows-2025 ONLY, TO 115/100, under an owner ruling
     # of 2026-11-14 in the Lander's session: asked "How should the slow windows harness leg be
     # fixed?", with raising the step timeout or splitting the tier as the options, the owner answered
-    # "Raise the timeout". The 51:32 trigger below had fired and nothing read it, as the "NOTHING
+    # "Raise the timeout". The 51:32 trigger had fired and nothing read it, as the "NOTHING
     # READS THE TRIGGER BELOW FOR YOU" paragraph after this block says will happen. The 67-minute
     # cap then killed the step at least five times on 2026-11-14, on four heads, each with no F or
     # E in the progress line and no FAILED in the job log, and each turned the required `CI gate`
@@ -2522,7 +2500,8 @@ jobs:
     #
     # THE CAP IS STILL NOT THE FIX, and this change names no cause. What is growing the leg is not
     # measured here; the slow-population question and the worker lever above are untouched, and
-    # splitting the tier was the option the owner did not take.
+    # splitting the tier was the option the owner did not take on 2026-11-14. It was taken on
+    # 2026-11-24, in the note above this job.
     #
     # NOTHING READS THE TRIGGER BELOW FOR YOU, and pairing this step with scripts/ci/step_margin.py the
     # way the engine and web console steps are paired is not a few lines: it needs a `--mark` step and
@@ -2530,32 +2509,12 @@ jobs:
     # in scripts/ci/step_margin_baseline.toml with its pool file, and an entry in the per-job tables
     # tests/test_ci_step_margin.py checks. That is its own change, and it is unfiled.
     #
-    # RE-DERIVE IF a GREEN windows-2025 run of this tier is observed above 76:55 -- the 100-minute
-    # cap divided by the 1.30 floor scripts/ci/step_margin.py applies to the steps it gates -- or if
-    # any run is killed at the 100-minute step cap, or if TOOLING_WORKERS changes, and re-measure in
-    # any case after a week, because the leg was still growing when this was written. THE PARAGRAPH
-    # BELOW IS THE TRIGGER THIS REPLACES, kept as its record:
-    #
-    # RE-DERIVE IF a GREEN windows-2025 run of this tier is observed above 51:32 -- the 67-minute cap
-    # divided by the 1.30 floor scripts/ci/step_margin.py applies to the steps it gates -- or if any
-    # run is killed at the 67-minute step cap, or if TOOLING_WORKERS changes, and re-measure in any
-    # case after a week, because the slow population's median was still rising when this was written.
-    # THE PARAGRAPH BELOW IS THE TRIGGER BEFORE THAT, kept as its record:
-    #
-    # RE-DERIVE IF a GREEN windows-2025 run of this tier is observed above 36:55 -- the 48-minute cap
-    # divided by the 1.30 floor scripts/ci/step_margin.py applies to the steps it gates, which do not
-    # include this one, so nothing reads this trigger for you -- or if TOOLING_WORKERS changes, and
-    # re-measure in any case once about a week of runs exists under the 48-minute kill, because the
-    # pool above could not see past 35:00. THE PARAGRAPH BELOW IS THE TRIGGER BEFORE THAT, kept as its
-    # record:
-    #
-    # RE-DERIVE IF a GREEN Windows run of this tier is ever observed above 29 minutes at whatever worker
-    # count it is actually running, or if TOOLING_WORKERS changes. 29, not the old 25, and the reason is
-    # not that 25 was wrong: every one of the six -n 4 rows above is UNDER it, the worst by 44 seconds.
-    # It was sized for -n 4 and does not survive the move. The pessimistic -n 3 bound derived above is
-    # 28.4 minutes, so a 25-minute trigger would fire on the first ordinary run and say nothing; 29
-    # clears that bound and still leaves 6 minutes to the 35-minute cap. Move this WITH the worker count
-    # or it stops meaning anything.
+    # RE-DERIVE IF a GREEN windows-2025 test shard of this tier is observed above 76:55 -- the
+    # 100-minute cap divided by the 1.30 floor scripts/ci/step_margin.py applies to the steps it
+    # gates -- or if any shard is killed at the 100-minute step cap, or if TOOLING_WORKERS or the
+    # shard count changes. Both caps are unchanged by the split and apply per shard; a shard is
+    # predicted to run about a third of the 86 minutes above, so re-sizing them is its own change. The
+    # earlier triggers, at 51:32, 36:55 and 29 minutes, are in this file's git history.
     # `pytest_workers` is NOT this tier's knob and never was -- see the TOOLING_WORKERS note on the
     # step below.
     # Per leg, see "RE-DERIVED A FOURTH TIME" above: windows-2025 115, every other leg 60.
@@ -2582,7 +2541,9 @@ jobs:
       # CI run: 1494 passed, 388 skipped, 4 COLLECTION ERRORS -- deselection does not mean not-imported.
       #
       # That is also why the install line below cannot be trimmed to a harness-only set: collection
-      # imports the whole suite regardless of what this job intends to execute.
+      # imports the whole suite regardless of what this job intends to execute. Since the test
+      # shards, the harness step names only its shard's files; the partition guard, ubuntu only,
+      # is what still collects the whole suite and needs both.
       - name: Install Qt offscreen system libraries
         if: runner.os == 'Linux'
         # BOUNDED AND RETRIED. Unguarded, this step turns an external apt-mirror hiccup into a
@@ -2661,8 +2622,8 @@ jobs:
       #
       # 150 AGAINST THE 120 BELOW, and the ordering is the contract, not the numbers: the per-test bound
       # must be attributed FIRST, so this sits above it, exactly as the engine legs pair 150/120 and
-      # 90/60. Both legs here share one `--timeout=120` (unlike the engine matrix, which varies it per
-      # leg), so one literal covers both and no matrix field is needed. Move one, move the other.
+      # 90/60. Every leg here shares one `--timeout=120` (unlike the engine matrix, which varies it per
+      # leg), so one literal covers all and no matrix field is needed. Move one, move the other.
       #
       # WHAT NEITHER BELT COVERS, stated so nobody reads this as more than it is. Both arm per-ITEM, so a
       # wedge during collection or in a session fixture reaches neither. And under `-n` the xdist
@@ -2671,13 +2632,16 @@ jobs:
       # carry. It was deliberately not ported blind: it is a behaviour change whose zero cost was
       # measured on the engine tier's history and on no sample from this one. See BACKLOG #1304.
       - name: Harness tests (pytest)
+        id: tests
         # Per leg, windows-2025 100 and every other leg 48; see the job cap above for the derivation.
         # Each must stay under its own leg's job cap with setup.
         timeout-minutes: ${{ matrix.os == 'windows-2025' && 100 || 48 }}
         env:
-          # Same reason as the apt step above: collection imports the Qt modules whether or not this
-          # job executes them, and the shipped ones construct QApplication at import on some paths.
+          # Kept from before the file list, which imports only the shard's own files; the guard
+          # below, which collects the whole suite, sets it for itself.
           QT_QPA_PLATFORM: offscreen
+          TOOLING_SHARD: ${{ matrix.shard }}
+          TOOLING_OF: ${{ matrix.of }}
           PYTHONFAULTHANDLER: "1"
           # THE TIER'S xdist WORKER COUNT, AND THE WINDOWS VALUE IS A LIVE EXPERIMENT (BACKLOG #1109,
           # against #1304): 3 on windows-2025, 4 on every other leg. Sizing and the measured baselines
@@ -2697,7 +2661,14 @@ jobs:
           # `changes` job -- and because it is the same shape the engine step already uses for
           # `PYTEST_WORKERS`.
           TOOLING_WORKERS: "${{ matrix.os == 'windows-2025' && '3' || '4' }}"
-        run: pytest -q -n "$TOOLING_WORKERS" --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout=150 --timeout=120 --junitxml=tooling-junit.xml --durations=40
+        # The leg's test shard of the manifest files, as an `@file` argument the way the engine test
+        # shards pass theirs; ubuntu's one shard is the whole tier. `--ignore-glob` prunes nothing
+        # from a named file, and stays so this selection and the guard's below are one.
+        run: |
+          mkdir -p out/tooling-shard
+          python scripts/quality/shard_tests.py --suite tooling --shard "$TOOLING_SHARD" --of "$TOOLING_OF" > out/tooling-shard/files.txt
+          echo "repo harness tier, test shard $TOOLING_SHARD of $TOOLING_OF: $(wc -l < out/tooling-shard/files.txt) test files"
+          pytest -q -n "$TOOLING_WORKERS" --dist loadfile -m tooling --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout=150 --timeout=120 --junitxml=tooling-junit.xml --durations=40 @out/tooling-shard/files.txt
 
       # A marker typo, a manifest rename, or a conftest hook that silently stops firing all produce the
       # same thing: zero selected tests and a GREEN job. Deselection cannot be distinguished from success
@@ -2712,7 +2683,8 @@ jobs:
       # run itself produced, so the number is the number that happened.
       #
       # The floor is deliberately loose (1,000 against ~1,545 executing on ubuntu and ~1,882 on
-      # Windows). It is a DEAD-MARKER backstop, not a coverage assertion: a tight floor would go red
+      # Windows when this was written), and `--shards` divides it by the leg's shard count, rounding
+      # up, so each windows-2025 test shard is held to its third. It is a DEAD-MARKER backstop, not a coverage assertion: a tight floor would go red
       # every time the tier legitimately grows or a platform gate moves, and a gate that cries wolf gets
       # deleted. Coverage drift is tests/test_tooling_partition.py's job, on evidence, not this one's.
       # A SCRIPT, NOT AN INLINE HEREDOC. The logic and its reasoning live in the script, where they can
@@ -2722,16 +2694,31 @@ jobs:
       # kind on the Windows leg; that is not a thing to discover from a red build.
       - name: Prove the tier actually ran
         if: always() # a timeout or a crash is exactly when the receipt matters most
-        run: python scripts/ci/tooling_receipt.py --report tooling-junit.xml
+        env:
+          TOOLING_OF: ${{ matrix.of }}
+        run: python scripts/ci/tooling_receipt.py --report tooling-junit.xml --shards "$TOOLING_OF"
+
+      # THE PARTITION GUARD, the `test-shards` job's for the engine suite applied to this tier. It
+      # runs pytest's own collection under the tier's selection and fails if a collected file is in
+      # no test shard or a file is in two. The split is a pure function of the tree, so the ubuntu
+      # leg answers for the windows-2025 shards, and it runs on docs-only PRs too. Only after a
+      # passing suite, for the job-cap reason the engine guard states.
+      - name: Tooling shards partition pytest's collection
+        if: ${{ !cancelled() && steps.tests.outcome == 'success' && runner.os == 'Linux' }}
+        timeout-minutes: 6
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python scripts/quality/shard_tests.py --suite tooling --of 3 --check-collection -- -m tooling --ignore-glob='*messagefoundry-webconsole*'
 
       # The tier's junit is written, read once by the receipt above, and then discarded. Keeping it
       # is what lets the next change to this tier be sized by MEASURED time rather than by file
       # count -- under `--dist loadfile` no shard finishes faster than its single largest file.
+      # The shard is in the name because upload-artifact refuses two artifacts of one name in a run.
       - name: Upload the tier's junit
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: tooling-junit-${{ matrix.os }}
+          name: tooling-junit-${{ matrix.os }}-shard-${{ matrix.shard }}-of-${{ matrix.of }}
           path: tooling-junit.xml
           if-no-files-found: ignore
 
@@ -3003,11 +2990,11 @@ jobs:
       # 2x-billed VS Code electron leg runs free; ubuntu-only on a fork. Consumed as
       # `matrix: ${{ fromJSON(needs.changes.outputs.ide_matrix) }}` in `ide`.
       ide_matrix: ${{ steps.f.outputs.ide_matrix }}
-      # `tooling_matrix`: the `tooling` job's os matrix. Per-repo like the two above, AND narrowed to
-      # ubuntu on a docs-only PR -- it is a function of `code`, so it is emitted on every arm beside it
-      # rather than once with the others. The windows-2025 leg exists because it is the ONLY leg that
-      # executes the 337 platform-gated tests; a PR that changes no executable file cannot reach them,
-      # so paying 2x-billed minutes for that leg buys a re-run of a result nothing in the diff could
+      # `tooling_matrix`: the `tooling` job's legs, an `include` list of os, shard and shard count.
+      # Per-repo like the two above, AND narrowed to ubuntu on a docs-only PR -- it is a function of
+      # `code`, so it is emitted on every arm beside it rather than once with the others. The
+      # windows-2025 legs are the ONLY ones that execute the 337 platform-gated tests; a PR that
+      # changes no executable file cannot reach them, so paying 2x-billed minutes for them buys a re-run of a result nothing in the diff could
       # have moved. Measured 2026-08-30 over the 252 PRs merged since the tier was split out on
       # 2026-08-17: 98 of them, 39 percent, were docs-only and pulled the full tier anyway, at about
       # 7.1 minutes of wall clock each -- 14.2 hours across 13 days.
@@ -3155,12 +3142,16 @@ jobs:
           # because unlike the two matrices above it depends on `code`, which is not known until the PR
           # arm at the bottom of this step. Every arm that writes `code` also writes this. A fork gets
           # ubuntu only either way, for the same reason the other two matrices do.
+          # A leg's `shard` and `of` go to shard_tests.py `--suite tooling`: windows-2025 in 3 test
+          # shards, ubuntu in 1 (the `tooling` job's note says why).
+          TU='{"os":"ubuntu-latest","shard":"1","of":"1"}'
+          TW='{"os":"windows-2025","of":"3","shard":'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
-            TOOLING_FULL='{"os":["ubuntu-latest","windows-2025"]}'
+            TOOLING_FULL="{\"include\":[$TU,$TW\"1\"},$TW\"2\"},$TW\"3\"}]}"
           else
-            TOOLING_FULL='{"os":["ubuntu-latest"]}'
+            TOOLING_FULL="{\"include\":[$TU]}"
           fi
-          TOOLING_DOCS='{"os":["ubuntu-latest"]}'
+          TOOLING_DOCS="{\"include\":[$TU]}"
           # Manual dispatch = full coverage: force every gate true so the whole workflow runs.
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
@@ -3324,7 +3315,8 @@ jobs:
           # It must also FAIL LOUDLY on a base that is empty or unreachable, because a silent empty
           # diff degrades a path gate into skipping everything while still reading as path-gated,
           # which is the defect this comment exists to stop hiding.
-          changed=$(git diff --name-only "$BASE_SHA...HEAD")
+          # --no-renames: both sides of a rename (BACKLOG #5472)
+          changed=$(git diff --name-only --no-renames "$BASE_SHA...HEAD")
           # NB: the tests/test_(...) alternation MUST list every file the sqlserver-store /
           # postgres-store pytest steps below run (the ADR 0057/0058/0060/0066 throughput levers AND
           # the ADR 0013/0016 RTE capture/re-ingress case); those suites are MEFOR_TEST_SQLSERVER-gated
@@ -3399,10 +3391,10 @@ jobs:
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
           fi
-          # The container image smoke runs on PRs that touch the image, the per-profile locks, packaging,
+          # The container image smoke runs on PRs that touch the image, the per-profile locks, pyproject,
           # this workflow, an engine module on the image's start path, or a rig file its steps run.
           # ci/locks/release-tools.lock is in because the image's builder stage installs from it
-          # (BACKLOG #1193), so a bump to it can break the image build.
+          # (BACKLOG #1193), so a bump to it can break the image build. #5472: root COPY sources.
           #
           # THE START-PATH ARM (vault BACKLOG #3455). The image's ENTRYPOINT is `python -m
           # messagefoundry` (docker/Dockerfile), and this job is the only one that starts `serve` the
@@ -3434,7 +3426,7 @@ jobs:
           # not in ci-gate's needs (see the note above ci-gate). The merge_group and push arms are
           # unchanged (#1830). tests/test_ci_docker_gate.py pins this alternation, and the measured
           # run rate is in that file's docstring.
-          if echo "$changed" | grep -qE '^(docker/|\.dockerignore|ci/locks/release-tools\.lock|pyproject\.toml|requirements\.lock|messagefoundry/(__init__|__main__|serviceenv|terminal_text|api/(__init__|app|models|tls)|auth/(trust_anchors|anchor_path|passwords)|pki|config/(anchor|retention_classification|settings|tls_policy|wiring)|transports/egress|logging_setup|startupcode|remotedebug)\.py$|harness/load/rigadmin\.py$|scripts/ci/make_syslog_ca_crl\.py$|tests/_phi_gate_provisions\.py$|\.github/workflows/ci\.yml)'; then
+          if echo "$changed" | grep -qE '^(docker/|\.dockerignore|ci/locks/release-tools\.lock|pyproject\.toml|requirements\.lock|(README\.md|LICENSE|NOTICE)$|messagefoundry/(__init__|__main__|serviceenv|terminal_text|api/(__init__|app|models|tls)|auth/(trust_anchors|anchor_path|passwords)|pki|config/(anchor|retention_classification|settings|tls_policy|wiring)|transports/egress|logging_setup|startupcode|remotedebug)\.py$|harness/load/rigadmin\.py$|scripts/ci/make_syslog_ca_crl\.py$|tests/_phi_gate_provisions\.py$|\.github/workflows/ci\.yml)'; then
             echo "docker=true" >> "$GITHUB_OUTPUT"
           else
             echo "docker=false" >> "$GITHUB_OUTPUT"
@@ -3452,7 +3444,8 @@ jobs:
           # tests/test_packaged_tree_denylist.py -- so a file ADDED to a packaged tree is caught
           # there without a build.
           # ci/python-version is listed because it is the interpreter the build runs on.
-          if echo "$changed" | grep -qE '^(pyproject\.toml|packaging/|scripts/release/|ci/python-version|\.github/workflows/(ci|release)\.yml)'; then
+          # BACKLOG #5472: tests/test_ci_packaging_gate.py
+          if echo "$changed" | grep -qE '^(pyproject\.toml|packaging/|scripts/release/|ci/python-version|ci/locks/release-tools\.lock$|((README|CHANGELOG)\.md|LICENSE|NOTICE|hatch\.toml|\.gitignore|messagefoundry/_vendor/defusedxml/LICENSE)$|\.github/workflows/(ci|release)\.yml)'; then
             echo "packaging=true" >> "$GITHUB_OUTPUT"
           else
             echo "packaging=false" >> "$GITHUB_OUTPUT"
@@ -3508,9 +3501,9 @@ jobs:
           # this job now fires on essentially every dependency PR. The hole if it is dropped is concrete
           # rather than theoretical: `uv lock --upgrade-package ruff` edits the lockfiles and does NOT
           # edit pyproject.toml, so a lock-only ruff bump past the cap changes exactly what that test
-          # asserts while matching no other arm here. This lock is listed rather than its siblings
-          # because it is the file the test READS -- uv.lock and requirements.lock move with it in one
-          # re-export, but a uv.lock edit that was never exported has not changed the guard's subject.
+          # asserts while matching no other arm here. This lock is listed rather than uv.lock
+          # because it is the file the test READS -- uv.lock moves with it in one re-export, but a
+          # uv.lock edit that was never exported has not changed the guard's subject.
           # `ci/npm-tools/` is the same shape again (vault BACKLOG #2793): a Dependabot bump there
           # touches only that lock, and the manifest tests that read it would otherwise run nowhere.
           # `ci/python-version` is that shape once more: a patch bump edits only the pin, and
@@ -3519,7 +3512,8 @@ jobs:
           # (BACKLOG #5641): tests/test_new_dependency_check.py, a manifest entry, sweeps every
           # packaging pyproject and a hatch.toml beside any swept one, so an edit to one of those
           # alone must still run this tier.
-          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|ci/npm-tools/|ci/python-version|pyproject\.toml|hatch\.toml|packaging/[^/]+/(pyproject|hatch)\.toml|\.gitignore|\.gitattributes|\.pre-commit-config\.yaml|constraints\.lock|tests/(conftest\.py|_tooling_manifest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
+          # BACKLOG #5472: tests/test_ci_tooling_gate.py
+          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|ci/npm-tools/|ci/python-version|(ci|docker|security)/locks/|pyproject\.toml|hatch\.toml|packaging/[^/]+/(pyproject|hatch)\.toml|\.gitignore|\.gitattributes|\.gitleaks\.toml|\.semgrep/|\.codex/|\.pre-commit-config\.yaml|constraints\.lock|requirements\.lock|tests/(conftest\.py|_tooling_manifest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
             || echo "$changed" | grep -qxFf <(grep -vE '^[[:space:]]*(#|$)' tests/tooling_manifest.txt); then
             echo "tooling=true" >> "$GITHUB_OUTPUT"
           else
@@ -5860,18 +5854,27 @@ jobs:
           # the always-TLS change does not touch it. The /messages read below IS an API call and does;
           # it pins the same minted certificate as the previous step.
           #
-          # THE READ IS SIGNED IN (vault BACKLOG #2719). `rigadmin get` first checks that the service
-          # refuses /messages to a request with no session, then signs in ONCE as the Administrator the
-          # install step provisioned and asks again until a message shows, for up to 10 seconds. One
-          # sign-in, because the engine paces sign-ins per client address. It prints the count. It
-          # exits 1 when the count never reached 1, and 4 when the rig could not sign in or the
-          # service answered /messages with no session.
+          # THE READ IS SIGNED IN (vault BACKLOG #2719). #5473: tests/test_ci_windows_smoke_mllp_read.py
+          $PSNativeCommandUseErrorActionPreference = $false
           $cert = "C:\ProgramData\MessageFoundry\api-generated-cert.pem"
-          python samples\send_mllp.py samples\messages\adt_a01.hl7
-          $total = & python -m harness.load.rigadmin get --engine https://127.0.0.1:8765 --cacert $cert --field total --at-least 1 --timeout 10 /messages
-          if ($LASTEXITCODE -eq 4) { throw "the rig could not sign in to the service, or the service answered /messages with no session" }
-          if ($LASTEXITCODE -ne 0) { throw "message was not recorded by the engine (messages.total = '$total')" }
-          "messages.total = $total"
+          $ack = @(& python samples\send_mllp.py samples\messages\adt_a01.hl7)
+          $sent = $LASTEXITCODE
+          $ack
+          if ($sent -ne 0) { throw "send_mllp.py exited $sent" }
+          if (-not @($ack | Where-Object { $_ -match '^MSA\|AA\|' })) { throw "no MSA|AA in the ACK" }
+          $base = "/messages?channel_id=IB_Test_ADT"
+          if ($env:SMOKE_ACCOUNT -eq "localsystem") { $reads = @(, @("processed", 30)) } else { $reads = @(@("processed", 10), @("routed", 10), @("processed", 0)) }
+          foreach ($read in $reads) {
+            $count = & python -m harness.load.rigadmin get --engine https://127.0.0.1:8765 --cacert $cert --field total --at-least 1 --timeout $read[1] "$base&status=$($read[0])"
+            $rc = $LASTEXITCODE
+            if ($rc -eq 0) { $found = $read[0]; break }
+            if ($rc -ne 1 -or "$count" -notmatch '^\d+$') { throw "rigadmin exited $rc with no count (4: could not sign in)" }
+          }
+          if (-not $found) {
+            & python -m harness.load.rigadmin get --engine https://127.0.0.1:8765 --cacert $cert $base
+            throw "no IB_Test_ADT message at the expected status"
+          }
+          "IB_Test_ADT messages $found = $count"
 
       # vault BACKLOG #2701, #2700: install-service.ps1 registers the engine as the Python
       # interpreter with `-I -X disable-remote-debug -m messagefoundry serve ...`, and no longer as

@@ -1091,6 +1091,9 @@ def test_a_clamp_inside_the_margin_whose_two_windows_reach_it_is_refused(tmp_pat
         _load(tmp_path, _SQLSERVER + "lease_renew_timeout_seconds = 5.0\n")
     text = str(caught.value)
     assert "10 s counted as two windows, which reaches the demotion detection margin (9 s)" in text
+    # The message names the hazard the shared deadline leaves, not the one it removed.
+    assert "re-extend the lease it is standing down from" not in text
+    assert "its COMMIT run outside that deadline" in text
     # Set by the operator, and a 1 s clamp would fit, so lowering it is offered.
     assert "Lower lease_renew_timeout_seconds or unset it" in text
 

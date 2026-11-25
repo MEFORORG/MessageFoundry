@@ -290,11 +290,15 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > the identical-output-on-re-run property the staged pipeline leans on (CLAUDE.md §2). Which `Send`s
 > are delivered is unaffected. **Use an ordered container whenever order matters.**
 >
-> A **generator** Handler delivers exactly like a list, but its body runs *after* the execution tracer
-> behind `dryrun --trace` (and the Test Bench that reads it) has detached. That invocation's trace
-> record therefore carries no executed lines and no sends, marked `"lazy_result": true` so the omission
-> is declared rather than read as a handler that did nothing; the run's message-level `sends` are still
-> exact. Return a list or tuple if you want the handler's body traced line-by-line.
+> The execution tracer behind `dryrun --trace` (and the Test Bench that reads it) reports a
+> Handler's per-invocation sends for a single returned value, such as a bare `return Send(...)`, and
+> for an exact `list`, `tuple`, `set` or `frozenset`. Any other iterable return (other than `str`/`bytes`/`bytearray`), such as a generator, a `deque`, a
+> custom iterable or a subclass of one of those four, may be single-pass, so the tracer does not walk
+> it: that invocation's record reports no sends and is marked `"lazy_result": true`, so the omission
+> is declared rather than read as a handler that did nothing (BACKLOG #6823). The run's message-level
+> `sends` are still exact. A **generator** Handler's body also runs *after* the tracer has detached,
+> so its record carries no executed lines either. Return a list or tuple if you want the handler's
+> per-invocation sends and body traced.
 
 > **Transforms & HL7 escaping.** Writing a **component/subcomponent** (`msg["PID-5.1"] = value`)
 > stores `value` as a literal: HL7 delimiters in it (`^ ~ & |`) are **escaped** so they stay data
@@ -1868,6 +1872,19 @@ bytes to misread. An empty chunked or close-framed body labelled with a coding s
 misframed, because its emptiness is known only after the read.
 ADR 0095 Amendment B.1 does not record this case; BACKLOG #5910 added it.
 
+**An `Accept-Encoding` header you set.** It is not overridden, proxy or no proxy, whether in the
+connection's headers or, on a REST or FHIR connection that sets `dynamic_headers = true`, per
+message from a Handler through an `http.header.` metadata key. That holds where the engine sends
+the header at all: on an `https://` hop with `verify_tls = false`, `Accept-Encoding` is off the
+header allowlist that
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)
+states. In the connection's headers it refuses the connection when it is built, and stamped per
+message it refuses that send, and the message dead-letters; neither drops the header. With none
+set, a delivery request asks for `identity`. A partner that honours yours may code its reply, so
+leave `Accept-Encoding` unset; *A 2xx reply body in a content coding*, above, says what happens to
+a coded 2xx delivery reply. A forward proxy must not remove or change the header, whoever set it
+([CONFIGURATION.md](CONFIGURATION.md#a-forward-proxy-must-not-re-frame-what-it-carries), item 4).
+
 **Security.** Redirects are **refused** (a 3xx can't divert PHI to another host — ASVS 15.3.2), the URL
 scheme is constrained to `http`/`https`, and the outbound host is gated by the fail-closed
 `[egress].allowed_http` allowlist (WP-11c). Standard library only (`urllib`) — no new dependency.
@@ -3017,9 +3034,9 @@ follow-on and is **not** built.
 | `soap_action` | — | the `SOAPAction` (1.1 header; 1.2 `action` content-type param) |
 | `soap_version` | `1.1` | `1.1` (`text/xml`) or `1.2` (`application/soap+xml`) |
 | `headers` | `{}` | extra **static** headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine) |
-| `bearer_token` | — | `Authorization: Bearer …` (a **secret** — via `env()`). A Basic pair set beside it wins |
+| `bearer_token` | — | `Authorization: Bearer …` (a **secret** — via `env()`). Beside a Basic pair it is refused at construction, since the two share the header (BACKLOG #5526) |
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`). Set both or neither: one alone is refused at construction (BACKLOG #5526). A configured `bearer_token` or Basic pair replaces a static `Authorization` header of any casing |
-| OAuth2 client credentials | — | wrap the spec: `with_oauth2_client_credentials(Soap(...), token_url=..., client_id=..., client_secret=...)` (from `messagefoundry.transports.http_auth`; keep the secret in `env()`). A static `Authorization` header, a `bearer_token` and a Basic pair are then not sent, and the construction length check does not judge them. |
+| OAuth2 client credentials | — | wrap the spec: `with_oauth2_client_credentials(Soap(...), token_url=..., client_id=..., client_secret=...)` (from `messagefoundry.transports.http_auth`; keep the secret in `env()`). A static `Authorization` header, a `bearer_token` or a Basic pair is then not sent, and the construction length check does not judge it; a `bearer_token` and a Basic pair together are still refused at construction (BACKLOG #5526). |
 | `timeout_seconds` | `30` | per-request timeout, in seconds above zero: zero or a negative is refused when the connection is built |
 | `verify_tls` | `true` | TLS cert verification — the same posture-keyed cell as [REST](#rest--rest): `false` is **refused at construction** off loopback, and the `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the shipped default) |
 | `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert with the chain's signatures + hostname still verified (not the other chain certificates' validity periods; see the MLLP row). **No posture gate and no escape variable covers the setting itself**. It takes one lever away from the revocation gate: a `[tls].crl_file` cannot admit a hop that sets it, so off-box on an enforcing instance only `tls_revocation_attested` with its reason crosses (ADR 0173 §13). It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) — see the [MLLP row](#mllp--mllp) |
@@ -3031,34 +3048,23 @@ follow-on and is **not** built.
 500 **or** an HTTP 200 body). A **Sender/Client** fault → `NegativeAckError` → **dead-letter** (the
 request is rejected; a retry won't help). A **Receiver/Server** fault → `DeliveryError` → **retry**. The
 Sender/Receiver class is read first from the Fault's first child element: SOAP 1.2's `Code`, then the
-`Value` that is that Code's own first child, or SOAP 1.1's `faultcode`. A comment, CDATA section or
-processing instruction before either child is stepped over, with at least these exceptions, each of
-which leaves that read with no code: such markup that has no terminator; a `<!` that opens anything
-else, such as a DOCTYPE or a lowercase `<![cdata[`; and a first `</` inside such markup within the
-`faultcode` or `Value` itself that is not that element's own close tag. Otherwise the code text
-runs to that first `</`, any markup in it included. One shape is read again (BACKLOG #5912): where
-that first `</` is the element's own close tag inside a comment, CDATA section or processing
-instruction the text opens and does not terminate, and the text names no Sender, Client, Receiver
-or Server class, the element is read on to the first tag outside such markup, if that is its own
-close tag, with terminated comments and processing instructions left out and CDATA kept, and
-that reading is used unless it is empty. So
-`<faultcode><!-- </faultcode> -->soap:Server</faultcode>` reads `soap:Server` and retries. Where that read
-yields no code, for
-those shapes, for a first child that is neither element (a SOAP 1.1 `faultstring` before the
-`faultcode`, a SOAP 1.2 `Reason` before the `Code`), or for a code element that holds no code, the
-code falls back to the earlier search's rule, from the Fault start tag to the first `</Fault>`
-after it, or the reply's end: the first `Value` ahead of the Fault's first `faultcode`, else that
-`faultcode`, and an empty one is not passed over for a later one. Like the earlier
-search, the fallback steps over no markup: a `faultcode` or `Value` inside a comment counts, and a
-`</Fault>` inside one ends its range. For example,
+`Value` that is that Code's own first child, or SOAP 1.1's `faultcode`. A terminated comment, CDATA
+section or processing instruction before either child is stepped over. Where that read yields no code,
+for at least a first child that is neither element (a SOAP 1.1 `faultstring` before the `faultcode`, a
+SOAP 1.2 `Reason` before the `Code`), a code element that is empty, self-closing or holds only
+whitespace, and markup the read does not step over, the code falls back to the search the engine ran
+before BACKLOG #5912. That fallback steps over no markup: a `faultcode` or `Value` inside a comment
+can decide the class, and a `</Fault>` inside one ends its range, so
 `<soap:Fault><faultstring>busy</faultstring><!-- </soap:Fault> --><faultcode>soap:Server</faultcode>`
-reads no code and dead-letters, as the earlier search read it. A Fault start tag inside terminated markup is stepped over when
-the Fault is chosen, and a `</Fault>` or `</Code>` inside terminated markup does not end the
-first-child read, except where the Fault was itself taken from inside markup; only where every Fault start tag after the first Body start tag,
-or with none there every one, is inside such markup is the first of them taken as the Fault, so such
-a reply never reads as delivered. A Fault where neither read finds a code reads as a permanent fault.
+reads no code and dead-letters. The read, its fallback and the one shape read again are stated once,
+in the `_fault_code` and `_child_code_text` docstrings in
+[`transports/soap.py`](../messagefoundry/transports/soap.py). The
+Fault is the first Fault start tag after the first Body start tag outside terminated markup, or with
+no Fault after it the first in the reply, the Fault start tag also searched for outside such markup; only where every Fault start tag after that Body start tag (with none there, every
+one) is inside such markup is the first of them taken as the Fault, so such a reply never reads as
+delivered. A Fault where neither read finds a code reads as a permanent fault.
 The WS-Security check is separate: a WS-Security code anywhere from where the Fault search starts (after
-the first Body start tag when a Fault follows it, else the whole reply), inside the Fault or not, still
+the first Body start tag outside terminated markup when a Fault follows it, else the whole reply), inside the Fault or not, still
 dead-letters the reply. An
 unrecognized fault is treated as permanent (so a rejected request can't loop the lane). With no fault, the
 HTTP status decides (2xx delivered, 5xx retry, other 4xx / refused 3xx dead-letter); a connection/timeout
@@ -3121,15 +3127,22 @@ wrapping an HL7 payload) — **not** the full envelope. The transport builds the
 - A WS-Security auth/expiry fault (`FailedAuthentication` / `InvalidSecurityToken` / `MessageExpired`)
   **dead-letters** (a credential/expiry reject won't fix on a retry), with two exceptions. In a 2xx
   body with `capture_response` on, any fault is captured as a rejected reply instead. And on a
-  connection with OAuth2 client credentials whose transport does not stamp a `UsernameToken`
+  connection with a bearer token provider whose transport does not stamp a `UsernameToken`
   (`ws_security` with `ws_username`), the first HTTP `401` carrying `FailedAuthentication` or
-  `InvalidSecurityToken` drops the cached bearer and **retries** with a fresh one. The next such
+  `InvalidSecurityToken` drops the cached bearer and **retries** with a fresh one. The provider is
+  OAuth2 client credentials, or SMART Backend Services: `with_smart_backend` refuses a SOAP spec,
+  but `smart_*` settings written into its settings by hand still build a SMART provider. The next such
   `401` is a **credential fault**: under the default `credential_fault_policy` (`stop`) it stops the lane and keeps the
   queue (ADR 0095), because the credential at fault is one the engine cannot see, at least a
-  `UsernameToken` a Handler writes into its own envelope or a client certificate. Only a 2xx or a
-  `401` that is not a WS-Security fault ends that run; a 5xx, a `407`, any other status or no
-  answer leaves it open. A `401` carrying `MessageExpired` dead-letters on every connection
-  (BACKLOG #5798).
+  `UsernameToken` a Handler writes into its own envelope or a client certificate. A 2xx ends that
+  run unless its body is a WS-Security fault, and so does a `401` that is not a WS-Security fault;
+  a 5xx, a `407`, any other status or no answer leaves it open. A `401` whose fault reads as
+  `MessageExpired` dead-letters on every connection. Where the Fault's first child is a code
+  element with a close tag (SOAP 1.1 `faultcode`, or SOAP 1.2 `Code` with its `Subcode`) that
+  names a WS-Security code, the fault reads as `MessageExpired` only if that element names it.
+  Otherwise it does if `MessageExpired` is anywhere the WS-Security code search looks: after the
+  first Body start tag outside terminated markup when a Fault follows it, else the whole reply (BACKLOG #5798). This bullet is where the rule is stated; the `soap.py`
+  module docstring points here.
 
 ```python
 from messagefoundry import outbound, Soap, env
@@ -3460,18 +3473,18 @@ source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
-| `url` | — (required) | the FHIR service **base** URL (e.g. `https://host/fhir`); `http`/`https` only. Use `env()`. |
+| `url` | — (required) | the FHIR service **base** URL (e.g. `https://host/fhir`); `http`/`https` only. Use `env()`. A url that is not ASCII, or holds whitespace or a `#`, is refused at construction (BACKLOG #5911) |
 | `fhir_version` | `R4B` | `R4B` (default) / `R5` / `STU3` — explicit (no plain-R4 on pydantic-v2 wheels) |
 | `format` | `json` | `json` only; FHIR-XML is deferred to a hardened-`lxml` path |
 | `interaction` | `create` | `create` (`POST {base}/{ResourceType}`) / `update` (`POST {base}` with a one-entry `transaction` `Bundle` whose entry is `PUT {ResourceType}/{id}`; see [the id stays out of the URL](#an-update-keeps-the-resource-id-out-of-the-url)) / `transaction` / `batch` (`POST {base}` with a `Bundle`) |
 | `conditional` | — | opt-in: `if-none-exist` (conditional create) / `conditional-update` (search-based PUT) / `if-match` (version-aware update, sent like `update` with the ETag in the entry, or in an `If-Match` header with `update_url_form="path"`) |
-| `conditional_query` | — | FHIR search params for `if-none-exist` / `conditional-update` (e.g. `identifier=sys\|val`). A `#` is refused at construction under either (percent-encode it as `%23`). With either set, a credential-looking parameter or segment in it is refused at construction on an `https` hop with `verify_tls = false`, loopback included, and on plain `http` to a host off this machine. It is not refused on a verified `https` hop or on plain `http` to this machine, whatever `verify_tls` says, since plain `http` has no certificate to verify. There it is warned about once the connection constructs; a connection that another construction check refuses first logs no warning. The refusal and the warning name each credential-looking parameter of the `&`-split query, never its value. Where that split names none, a credential-looking segment can still be reported, unnamed, as for `identifier=sys\|1;token=...`: the message carries `conditional_query segment with a credential-looking name`. At least some shapes are not counted, such as a segment beside a named parameter, a bare name with no `=` (`api_key;identifier=1`), and a percent-encoded `;` (`%3B`). Nor is a `code` name, which is FHIR's search parameter (BACKLOG #5350, #5353) |
+| `conditional_query` | — | FHIR search params for `if-none-exist` / `conditional-update` (e.g. `identifier=sys\|val`). A `#` is refused at construction under either (percent-encode it as `%23`). With either set, a credential-looking parameter or segment in it is refused at construction on an `https` hop with `verify_tls = false`, loopback included, and on plain `http` to a host off this machine. It is not refused on a verified `https` hop or on plain `http` to this machine, whatever `verify_tls` says, since plain `http` has no certificate to verify. There it is warned about once the connection constructs; a connection that another construction check refuses first logs no warning. The refusal and the warning name each credential-looking parameter of the `&`-split query, never its value. Where that split names none, a credential-looking segment can still be reported, unnamed, as for `identifier=sys\|1;token=...`: the message carries `conditional_query segment with a credential-looking name`. At least some shapes are not counted, such as a segment beside a named parameter, a bare name with no `=` (`api_key;identifier=1`), and a percent-encoded `;` (`%3B`). Nor is a `code` name, which is FHIR's search parameter (BACKLOG #5350, #5353). At least these are refused at construction too, rather than at each send: an all-whitespace value; under `conditional-update`, a value that is not ASCII or holds a space, and one that makes a request URL over the length limit; under `if-none-exist`, a value Latin-1 cannot encode (BACKLOG #5911) |
 | `update_url_form` | `transaction` | how an `update` or `if-match` is sent. `transaction` keeps the id out of the URL. `path` is the plain `PUT {base}/{ResourceType}/{id}` with the ETag in an `If-Match` header, for a server with no `transaction` interaction. `path` is a **listed loosening**; see [vendor compatibility](#vendor-compatibility-and-the-path-form-opt-in) An `env()` value is read by `check` and `GET /security/posture` as [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#update_url_form--path-on-a-fhir-connection--the-resource-id-in-the-request-url) says |
 | `allowed_entry_methods` | — (**required** on `transaction`/`batch`) | (vault BACKLOG #2804) the verbs a Bundle entry may carry, from `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `PATCH`, spelled in upper case. There is no default: a `transaction` or `batch` connection without it does not load, or, where `interaction` is an `env()`, does not build. Refused on any other interaction. Both lists take an `env()` for the whole list: its default is checked at load, and the value it resolves to when the connection is built. A bad item is named by position, never quoted. See [A Bundle connection screens every entry](#a-bundle-connection-screens-every-entry) |
 | `allowed_entry_types` | — (any type) | (vault BACKLOG #2804) `transaction`/`batch` only: the resource types an entry's `request.url` may name, such as `["Patient", "Encounter"]`. Unset means any type. Refused on any other interaction |
-| `headers` | `{}` | extra **static** headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine) |
+| `headers` | `{}` | extra **static** headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine). Refused at construction, among others: a value that is not a table, a header name that is not an RFC 9110 token, and a value holding a control character other than HTAB (BACKLOG #5911, #8299) |
 | `bearer_token` | — | `Authorization: Bearer …` (SMART/OAuth — a **secret**, via `env()`) |
-| `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
+| `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`). Set both or neither, with no `:` in `basic_user`, and not beside `bearer_token`; a FHIR destination or `FhirLookup` that breaks one of these is refused at construction (BACKLOG #8299) |
 | `timeout_seconds` | `30` | per-request timeout, in seconds above zero: zero or a negative is refused when the connection is built |
 | `verify_tls` | `true` | TLS cert verification — the same posture-keyed cell as [REST](#rest--rest): `false` is **refused at construction** off loopback, and the `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the shipped default) |
 | `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert with the chain's signatures + hostname still verified (not the other chain certificates' validity periods; see the MLLP row). **No posture gate and no escape variable covers the setting itself**. It takes one lever away from the revocation gate: a `[tls].crl_file` cannot admit a hop that sets it, so off-box on an enforcing instance only `tls_revocation_attested` with its reason crosses (ADR 0173 §13). It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) — see the [MLLP row](#mllp--mllp) |
@@ -3797,14 +3810,16 @@ ADR 0023), JWKS hosting, `.well-known` discovery, and Bulk Data `$export`.
 A **DICOM** connector (`ConnectorType.DIMSE`) is both an **inbound C-STORE SCP** listener and an
 **outbound C-STORE SCU** sender over DIMSE/`pynetdicom` ([ADR 0025](adr/0025-dicom-codec-store-connectors.md));
 `DICOMweb(...)` (`ConnectorType.DICOMWEB`) is the modern HTTP imaging lane — an **outbound STOW-RS** store/send
-destination. All three carry the object **opaquely** — pair an inbound `DICOM(...)` with `content_type="dicom"`
+destination. All three carry the object **opaquely**, though a DICOMweb 202 reads the object's SOP Instance UIDs (see *DICOMweb*) — pair an inbound `DICOM(...)` with `content_type="dicom"`
 so each received object routes as a `RawMessage` ([ADR 0004](adr/0004-payload-agnostic-ingress.md)); a
 Router/Handler parses it on demand via `messagefoundry.parsing.dicom` (a cheap `DicomPeek` for routing,
 `DicomDataset` + SR→HL7 helpers for transform), and a forwarding Handler re-emits the carried bytes to a SCU
 or STOW-RS destination. The codec is **headers and Structured Report only — no pixel data**. The DIMSE
 connectors need the **`[dicom]` optional extra** (`pip install 'messagefoundry[dicom]'`:
 `pydicom>=3.0.2,<3.1` + `pynetdicom==3.0.4`, pure-Python, no numpy), lazily imported; **DICOMweb needs no
-extra** (it stores the object as opaque bytes over the shared `rest.py` HTTP plumbing). Still out of scope:
+extra** (it stores the object as bytes over the shared `rest.py` HTTP plumbing, and checks a 202
+against its File Meta SOP Instance UID, read by hand, and, with the extra, its data set SOP
+Instance UID). Still out of scope:
 MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 
 | Setting | Default | Meaning |
@@ -4002,7 +4017,14 @@ The modern HTTP imaging lane — a **STOW-RS** `POST {base}/studies` (or `{base}
 **sibling of the REST destination**: it reuses the hardened HTTP plumbing (no-redirect TLS-verifying opener,
 cleartext-credential refusal, the retry/dead-letter classification, the `[egress].allowed_http` gate) and
 adds only the `multipart/related; type="application/dicom"` framing + `application/dicom+json` response
-handling. It needs **no `[dicom]` extra** (the object is opaque bytes).
+handling. It needs **no `[dicom]` extra**: the object rides as bytes. A 202 reply is compared with
+the object's SOP Instance UIDs, as *Status classification* below says; the extra, when installed,
+adds the data set's UID to that comparison. An installed extra that does not load, or whose
+read of an object raises a fault the codec does not wrap, adds no data set UID, with a WARNING; a
+read the codec cannot parse adds none either, with no WARNING, and a `MemoryError` is raised
+before the POST, so the object is not sent. That changes what a 202 is
+compared with, and in one case what confirms it, as *Status classification* below says. So
+on a host running DICOMweb, fix or remove a broken `pydicom`, then restart the engine.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
@@ -4031,11 +4053,52 @@ well-formed FailedSOPSequence with an item); and a
 202 with no **ReferencedSOPSequence** (`00081199`) item whose ReferencedSOPInstanceUID (`00081155`)
 element has `vr` `UI`, carries no key but `vr` and `Value`, and has a `Value` of exactly one string
 in the UID grammar once trailing NUL or space padding is dropped (dot-separated ASCII digits, at
-most 64 characters), an empty 202 included (code
-`unconfirmed-202`). A ReferencedSOPSequence that is not an object, has a `Value` that
+most 64 characters) that equals a SOP Instance UID of the object sent: the **Media Storage SOP
+Instance UID** (`0002,0003`) in its File Meta group, or the **SOP Instance UID** (`0008,0018`) of
+its data set, an empty 202 included (code `unconfirmed-202`). A 202 that none of the rules above
+refuses is also `unconfirmed-202`, whatever its reply names, when the object sent has neither UID
+to compare, and its reason names why the File Meta has none, except where the data set read raised
+a fault the codec does not wrap, as below. At least these leave no File Meta
+UID: no `DICM` magic after the 128-byte preamble, no `(0002,0003)` in the File Meta group, a
+`(0002,0003)` whose VR is not `UI`, any File Meta element up to it whose header or value runs past
+the end of the object, a value that is not ASCII or is not in the UID grammar once its NUL or
+space padding is dropped, and a `(0002,0003)` that does not lie within the first 64 KiB after
+`DICM`, the most the reader reads (BACKLOG #5914, decisions of 2026-11-23). The File Meta group is
+read as Explicit VR Little Endian, as PS3.10 requires, without `pydicom`, up to the first element
+outside group `0002`. The `(0002,0000)` Group Length is not read, as `pydicom` ignores a wrong one
+too. Both UIDs are read on every send **before the POST**, as the DICOM SCU parses before it
+associates, so the connection's build does not check `pydicom`. The data set read puts back the
+SCU's ignores for `pydicom` warnings that would name a value, and holds the lines `pydicom` logs
+while it reads. It writes them, redacted as the DICOM connectors' `pydicom` lines are, only with
+the first read-fault WARNING of the process (below); otherwise it writes none. `pydicom`'s own copy of such a line
+as a Python warning is not held, so it can still reach stderr. An object the codec cannot parse is read as no data set
+UID, and the object is still sent. The codec takes at least the exception classes it lists for a
+malformed object as a parse failure, so one of those raised by a broken `pydicom` reads the same
+way: the object is sent, and a 202 that names only its data set UID is then refused after the
+partner has answered. Before the object is read, the extra is loaded apart from it, as the SCU
+loads it: the `dcmread` reader and the readers the deflate guard replays. A load that raises, for
+example from a `pydicom` that is found but will not import, or that lacks such a reader, is
+taken as no extra: the object is sent, and a 202 is compared with its File Meta UID alone, as on a
+host without the extra. One WARNING per process names the class of what the load raised and says
+to repair or remove the extra. A `pydicom` directory with no `__init__.py`, as an uninstall can
+leave, is taken as no extra too. After fixing or removing `pydicom`, restart the engine: the
+`pydicom` modules an import has already loaded stay loaded until a restart. Any other fault in
+the read of the object itself, such as a `TypeError` from a `pydicom` whose private readers changed,
+or a warning the filters turn into an error, also reads as no data set UID: the object is sent, and
+one WARNING per process names the exception class only, never its text. Where the object also has
+no File Meta UID, nothing can be compared, so a 202 is confirmed as the BACKLOG #5914 reply check did before the UID comparison, by a
+ReferencedSOPSequence item that names any UID (one naming none is still refused); on a host without the extra the same 202 is
+`unconfirmed-202`. A `MemoryError` is not caught there. The data set UID is read
+with the engine's DICOM codec, which needs the optional `[dicom]` extra; without it, or for an
+object the codec cannot parse, only the File Meta UID is compared. So, with the extra installed, an
+object whose data set was given a new SOP Instance UID without its File Meta being rewritten is
+confirmed by a 202 naming either UID; without it, only by one naming the File Meta UID. A server that assigns a new UID of its own on a 202 names neither, and that object is
+dead-lettered on every such 202 although the server may hold it, except in the read-fault case
+above, which also needs no File Meta UID. A ReferencedSOPSequence that is not an object, has a `Value` that
 is not an array, or carries any key but `vr` and `Value` names no instance; its own `vr` is not
 checked. **Not every 2xx that fails to confirm the store is refused.** A 200 is not
-required to carry a ReferencedSOPSequence, so a 200 dataset that confirms nothing and is not
+required to carry a ReferencedSOPSequence, and is not compared with the object sent, so a 200
+dataset that confirms nothing, or names another instance, and is not
 refused above, `{}` included, is delivered; and an empty 2xx other than a 202 (empty, or JSON
 whitespace after any leading BOMs) is delivered, `no_reply` when capturing. **PHI:** the response can
 name patient/study identifiers, so it is never logged — only the HTTP status and a redacted URL are.
@@ -4421,7 +4484,7 @@ outbound(
 |---|---|
 | Does it beat the instance `[tls]` anchor? | Yes. The connection's own CA wins over `internal_ca_file` in every `trust_anchor_mode` ([ADR 0093](adr/0093-pinned-internal-ca-trust-anchor.md)). |
 | Does it turn any check off? | No. Chain, host name and expiry checks stay on. It only chooses which CAs do the verifying. |
-| What about `[tls].crl_file`? | On a hop that reads the `[tls]` block, it still applies and turns on leaf revocation checking. That CRL file must then carry a CRL from this CA too, or every handshake on the hop fails. An inbound `Ftp()` poller reads the `[tls]` block too, since vault BACKLOG #2370, so this applies to it as well. |
+| What about `[tls].crl_file`? | On a hop that reads the `[tls]` block, it still applies and turns on leaf revocation checking, or whole-chain checking under `[tls].crl_check_chain`, where each CA in this file must chain to a self-signed root CA also in it. That CRL file must then carry a CRL from this CA too, and under `[tls].crl_check_chain` one from every CA in the server's chain, or every handshake on the hop fails. An inbound `Ftp()` poller reads the `[tls]` block too, since vault BACKLOG #2370, so this applies to it as well. |
 | Does it reach a token endpoint? | Yes. Where a connection signs in through SMART or OAuth2, the token hop trusts the same file, even when `verify_tls = false`. If the authorization server chains to a different CA, put that CA in the same PEM file. That also widens the data hop to it. No separate token-hop setting exists, by decision for now (vault BACKLOG #2370). |
 | What if `verify_tls = false`? | The data hop ignores it, since a verify-off hop trusts nothing. A token hop would still read it, but a connection that signs in through SMART or OAuth2 with `verify_tls = false` is refused at build, because the minted bearer would cross the unverified data hop ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)). So that pairing now matters only over an `http://` data url. |
 | Does it cover SOAP mutual TLS? | Yes. The client-certificate opener verifies the server against the same file. |
@@ -5194,7 +5257,7 @@ reading this page already applies to a file the scan never opened.
 | AI broker (`[ai].endpoint`) | one POST per assist request; bounded at the API route by the `ai:assist` RBAC gate, the fail-closed `[ai].allowed_endpoints` SSRF allow-list and the 60 s per-request timeout. **There is NO per-actor pacing on `POST /ai/chat`** — it depends on plain `require(Permission.AI_ASSIST)`, not `require_paced`/`require_step_up`, so a holder of `ai:assist` can loop assist POSTs unthrottled | the LLM's own 429/503 surfaces as an `AiBrokerError` → HTTP `502` to the caller | the assist call fails; nothing is queued or retried |
 | DR backup destination (`[backup].destination`, ADR 0049) | **one writer** — leader-gated under `[cluster].enabled`, so exactly one node writes the shared destination; once per `schedule_at` pass plus any on-demand run. No engine-side cap: the OS/SMB redirector queues | a slow or full destination stretches the run; nothing is dropped and the next scheduled pass still fires | a failed or verify-failed run is logged + audited and is **never** counted as a good backup when pruning to `retention_keep` |
 | Vault Transit — store DEK unwrap (`MEFOR_STORE_VAULT_ADDR`, `[store].key_provider = vault`, ADR 0019) | one HTTPS request per DEK unwrap (startup / rotation), not per message | a failure is fail-closed — the store does not open | operator fixes Vault and restarts |
-| Vault Transit — bulk at-rest cipher (`MEFOR_STORE_TRANSIT_KEY`, `[store].cipher_provider = vault_transit`, ADR 0138) | **one synchronous HTTPS round trip per encrypted cell** on store writes and reads, except where the store batches: the cipher-cell walk (`restore-verify --full`, `cipher-audit`) and the SQLite store's at-open `_seal_surface` sweep send up to `BATCH_MAX_ITEMS` cells per request (`store/crypto.py`, vault BACKLOG #6706). `_enc`/`_dec` are sync. At least the SQLite, Postgres and SQL Server message writes and queue claims hand their cell calls to the row-seal Transit pool through `row_seal.cipher_call`, which hands a call over only for a cipher that sets `blocks_on_io`, as `TransitCipher` does (BACKLOG #3929). `get_message` opens its cells off the event loop through `asyncio.to_thread`. On each of the three stores, at least content search, attachment chunk sealing and the TOTP secret reads run their cell calls off it through `asyncio.to_thread`. On the audit chain (stated here once; other documents link here), at least: one `generate_hmac` per audit row appended; one `verify_signed_data` per audit row a chain walk checks, and one of the genesis row at every store open; one `verify_signed_data` per one-row check, such as the Transit-bound attestation's audit row each time that attestation is read and the newest keyed audit row an AD session revocation check reads, both run off the event loop through `to_thread`; per failed `verify_signed_data`, one more `generate_hmac` (the version probe) when hvac raises the failure as `InvalidRequest`, then, unless that probe read it as a refused version or `is_vault_unavailable` reads it as an outage, one `generate_hmac` and one `verify_signed_data` over fixed input and, when those succeed, one more `verify_signed_data` of the row, and when that fails too, the fixed-input pair once more, and when both failures are an HTTP 408 or 504 the chain walk then ends with a `CipherError` while every other check reads the row as not verifying (`TransitCipher._recheck_refused_row`, `_audit_row_mac`, BACKLOG #8222); one `generate_hmac`, in place of the `verify_signed_data`, per row whose stored MAC is malformed; and one `generate_hmac` per range row whose outgoing key is held, for its handover tag, on every walk, and at every open once the genesis row authenticated, in order, stopping at the first range row that fails a check (`settle_audit_ranges`). The append's `generate_hmac`, the chain walk, and at open the genesis-row verify run on that pool through `cipher_call`; at least the handover-tag calls still run **on the event loop**. The row seals (ADR 0217) make Transit `generate_hmac` and `verify_signed_data` calls of their own, on the same pool of `TRANSIT_SEAL_WORKERS` (8) threads (`store/row_seal.py`), so a seal check can wait behind cell and audit calls. A call still on the event loop blocks the loop while it runs, and each `to_thread` call holds a thread of asyncio's default executor | Vault's own rate limit or a slow Transit **stalls the event loop across the whole engine** for each call still made on it. The `to_thread` calls can fill asyncio's default executor, which other off-loop work in the engine shares, and a call past the pool's 8, a row-seal check or a cell or audit call, waits for a free thread with no deadline. A failed cell call raises `CipherError` (a batch decrypt returns it for that cell instead), and a row-seal failure raises the row sealer's own errors (`TransitSealUnavailableError`, `TransitSealUnverifiableError`). An audit-chain call's failure raises `CipherError` too, except where `TransitCipher.verify_audit_hmac` logs it and reads the row as a break: at least the cost-only `generate_hmac` beside a malformed stored MAC, and a row `_recheck_refused_row` reads as refused; and except where a handover-tag `generate_hmac` answered with a non-empty string that is no well-formed MAC (`AuditMacMalformedError`) is logged and read as a tag that does not match in the walk (`_handover_tag_ok`), a break at that range row; the open still refuses on it (unruled, on the owner's queue; listed below), and where the open's check reaches such a row no walk runs to read it. On a stage's cell call the stage errors/dead-letters that row; at least a TOTP judgement reads it as unknown, and a content search or a TOTP secret read raises it to its caller. At open, at least these refuse the open: a `CipherError` from a cell decrypt the open makes, such as the SQLite store's state and reference cache loads; one from the genesis append's `generate_hmac` on a fresh store; one from a range row's handover-tag `generate_hmac`, `AuditMacMalformedError` included; and one the genesis row's check raises other than `AuditKeyVersionRefusedError`; for a both-asks 408 or 504 on the genesis check, that is when the fixed-input verify after the second ask also fails, and when it verifies the open logs a genesis break and opens instead (as before this change, engine PR 2903 at `686c5f7443`; unruled). A refused version, a genesis row `verify_audit_hmac` reads as a break with no raise, and a genesis verify that timed out on both asks (`AuditVerifyTimedOutError`, which `_audit_row_mac` reads there as not verifying), are logged by `settle_audit_ranges` as a break, and the store opens | the store stays open and the row is retried by the normal stage re-claim; after a refused open, the operator fixes Vault and restarts |
+| Vault Transit — bulk at-rest cipher (`MEFOR_STORE_TRANSIT_KEY`, `[store].cipher_provider = vault_transit`, ADR 0138) | **one synchronous HTTPS round trip per encrypted cell** on store writes and reads, except where the store batches: the cipher-cell walk (`restore-verify --full`, `cipher-audit`) and the at-open `_seal_surface` sweep of the SQLite, Postgres and SQL Server stores send up to `BATCH_MAX_ITEMS` cells per request, while the cipher still batches (`store/crypto.py`, vault BACKLOG #6706). `_enc`/`_dec` are sync. At least the SQLite, Postgres and SQL Server message writes and queue claims hand their cell calls to the row-seal Transit pool through `row_seal.cipher_call`, which hands a call over only for a cipher that sets `blocks_on_io`, as `TransitCipher` does (BACKLOG #3929). `get_message` opens its cells off the event loop through `asyncio.to_thread`. On each of the three stores, at least content search, attachment chunk sealing and the TOTP secret reads run their cell calls off it through `asyncio.to_thread`. On the audit chain (stated here once; other documents link here), at least: one `generate_hmac` per audit row appended; one `verify_signed_data` per audit row a chain walk checks, and one of the genesis row at every open that reaches `settle_audit_ranges` holding the genesis row's key (and one more where the host key provider's store-id pin check runs); one `verify_signed_data` per one-row check, such as the Transit-bound attestation's audit row each time that attestation is read and the newest keyed audit row an AD session revocation check reads, both run off the event loop through `to_thread`; per failed `verify_signed_data`, one more `generate_hmac` (the version probe) when hvac raises the failure as `InvalidRequest`, then, unless that probe read it as a refused version or `is_vault_unavailable` reads it as an outage, one `generate_hmac` and one `verify_signed_data` over fixed input and, when those succeed, one more `verify_signed_data` of the row, and when that fails too, the fixed-input pair once more, and when both failures are an HTTP 408 or 504 the chain walk then ends with a `CipherError` while every other check reads the row as not verifying (`TransitCipher._recheck_refused_row`, `_audit_row_mac`, BACKLOG #8222); one `generate_hmac`, in place of the `verify_signed_data`, per row whose stored MAC is malformed; and one `generate_hmac` per range row whose outgoing key is held, for its handover tag, on every walk, and at every open that reaches `settle_audit_ranges` (a chain with a genesis row at seq 1, opened by a handle that holds a keying secret) unless the genesis row failed its check, in order, stopping at the first range row that fails a check (`settle_audit_ranges`). The append's `generate_hmac`, the chain walk, and at open the genesis-row verify and the range rows' handover-tag checks run on that pool through `cipher_call` (BACKLOG #3929). `rotate-key`'s handover tag goes through `cipher_call` too, but the roll reaches it only under an in-heap key, so it runs inline: a handle holding the Transit MAC has the Transit key active, the roll never closes the active key's range, and `rotate-key` refuses `vault_transit` (BACKLOG #2109). The row seals (ADR 0217) make Transit `generate_hmac` and `verify_signed_data` calls of their own, on the same pool of `TRANSIT_SEAL_WORKERS` (8) threads (`store/row_seal.py`), so a seal check can wait behind cell and audit calls. A call still on the event loop blocks the loop while it runs, and each `to_thread` call holds a thread of asyncio's default executor | Vault's own rate limit or a slow Transit **stalls the event loop across the whole engine** for each call still made on it. The `to_thread` calls can fill asyncio's default executor, which other off-loop work in the engine shares, and a call past the pool's 8, a row-seal check or a cell or audit call, waits for a free thread with no deadline. A failed cell call raises `CipherError` (a batch decrypt returns it for that cell instead), and a row-seal failure raises the row sealer's own errors (`TransitSealUnavailableError`, `TransitSealUnverifiableError`). An audit-chain call's failure raises `CipherError` too, except where `TransitCipher.verify_audit_hmac` logs it and reads the row as a break: at least the cost-only `generate_hmac` beside a malformed stored MAC, and a row `_recheck_refused_row` reads as refused; and except where a handover-tag `generate_hmac` answered with a non-empty string that is no well-formed MAC (`AuditMacMalformedError`) is logged and read as a tag that does not match in the walk (`_handover_tag_ok`), a break at that range row; the open still refuses on it (unruled, on the owner's queue; listed below), and where the open's check reaches such a row no walk runs to read it. On a stage's cell call the stage errors/dead-letters that row; at least a TOTP judgement reads it as unknown, and a content search or a TOTP secret read raises it to its caller. At open, at least these refuse the open: a `CipherError` from a cell decrypt the open makes, such as the SQLite store's state and reference cache loads; one from the genesis append's `generate_hmac` on a fresh store; one from a range row's handover-tag `generate_hmac`, `AuditMacMalformedError` included; and one the genesis row's check raises other than `AuditKeyVersionRefusedError`; for a both-asks 408 or 504 on the genesis check, that is when the fixed-input verify after the second ask also fails, and when it verifies the open logs a genesis break and opens instead (as before this change, engine PR 2903 at `686c5f7443`; unruled). A refused version, a genesis row `verify_audit_hmac` reads as a break with no raise, and a genesis verify that timed out on both asks (`AuditVerifyTimedOutError`, which `_audit_row_mac` reads there as not verifying), are logged by `settle_audit_ranges` as a break, and the store opens | the store stays open and the row is retried by the normal stage re-claim; after a refused open, the operator fixes Vault and restarts |
 | Vault KV v2 (`MEFOR_SECRETS_VAULT_ADDR`) | one HTTPS request per secret resolution at config load / connector construction | fail-closed — the connection refuses to build | operator fixes Vault and reloads |
 | Alerts — SMTP sink (`[alerts].email_smtp_host`) | one connection per send, from the notifier's **single** background drain task and bounded 1000-item queue, which the webhook sink shares; the webhook row says how the two sends of one event run | over-cap events are **dropped with a warning** rather than growing the queue | a send failure is swallowed + logged; the alert is not retried |
 | Alerts — per-user security-event email (`[auth].notify_security_events`) | one connection per notification, serialized on a **second, independent** drain task with its **own** bounded 1000-item queue — so the SMTP relay sees up to **two** concurrent sessions from this engine, not one | at cap the event is **dropped with a warning**; the audited `GET /me/security-events` feed still records it when it is the user's own event, but not an administrator's change to their account (`auth/notifications.py` states the rule) | the send failure is swallowed + logged, never propagated onto the login or admin path; recovery is the pull feed, for the events it carries |
@@ -5253,7 +5316,7 @@ reading this page already applies to a file the scan never opened.
 | Syslog forwarder (`[logging].forward_host`) | 5 s pinned on the socket for both `tcp` and `tls` (the TLS handshake runs under it); UDP is connectionless and carries none | a single long-lived socket owned by the logging handler | on timeout the handler drops **that record** and continues | **single-shot** per record — no retry |
 | SNTP clock-sync probe (`[logging].ntp_peer`) | 2 s pinned with `sock.settimeout`, so a silent peer cannot block `serve()` | the datagram socket is closed after the single probe | skew warns loudly, or refuses to start under `time_sync_fail_closed` | **single-shot** — one probe per start |
 | Forward / egress web proxy (`[egress].proxy_url`) | **inherits the destination connector's `timeout_seconds`** — the proxy hop has no separate timeout | released with the destination request; the per-connection `ProxyHandler` never mutates the shared opener | a proxy error surfaces as the destination request's failure | the destination's `RetryPolicy` |
-| Loopback ECH sidecar (`ech_sidecar`) | **inherits the connection's `timeout_seconds`** | released with the destination request | fails closed at config load, and on a connector built directly, on at least a missing or non-loopback sidecar, or one with a credential, a query or a fragment in its URL; at config load also on one not in `[egress].allowed_ech_sidecar` (BACKLOG #5528) | the destination's `RetryPolicy` |
+| Loopback ECH sidecar (`ech_sidecar`) | **inherits the connection's `timeout_seconds`** | released with the destination request | fails closed at config load, and on a connector built directly, on at least a missing or non-loopback sidecar, or one with a credential, a query or a fragment in its URL; on a REST connection, at build, beside HTTP Digest, whose handler cannot answer a challenge through the sidecar (BACKLOG #5529); at config load also on one not in `[egress].allowed_ech_sidecar` (BACKLOG #5528) | the destination's `RetryPolicy` |
 
 ## Competitive parity — full connector catalog
 
@@ -5275,7 +5338,7 @@ Legend: ✅ native · ~ partial / via extension / via another transport · ❌ n
 | **SMB / network share** | ✅ | ✅ | ✅ | ✅ | `File()` on a UNC path, with an optional **alternate Windows credential** (`credential_*`, ADR 0132) |
 | **S3 / cloud blob** | ✅ | ~ | ✅ | ❌ | not built — the one remaining remote-file scheme |
 | **HTTP/HTTPS** listener + sender (REST) | ✅ | ✅ | ✅ | ✅ | `REST-OUT` (`Rest()`) + `REST-IN` (`Http()`, ADR 0023) both shipped, incl. **intake authentication** on the listen socket (`intake_auth` — API key / bearer / mTLS subject, ADR 0154) |
-| **SOAP / Web Services** | ✅ | ✅ | ✅ | ~ | `SOAP-OUT` shipped incl. WS-\* mTLS/WS-Security (ADR 0015); a SOAP body is **received** via `Http()`, and the *synchronous* envelope reply shipped with ADR 0154 (`reply_from`). Still `~` for one reason: a partner **error** is not relayed (`capture_error_responses`). Outside a 2xx body, the fault code decides: a Receiver/Server fault is retried, and any other fault dead-letters, whatever the HTTP status, except an HTTP `401` on a connection with an OAuth2 bearer, which drops the bearer and retries within the WS-Security limits the SOAP section's WS-\* mode notes give. A dead-lettered delivery gets a fixed-JSON `502`. A retried one ends in a reply, a `502` or the `reply_on_timeout` answer (see [the listener section](#http-web-service-listener--http-inbound-only-adr-0023)). A SOAP fault in a 2xx body is captured as a rejection instead, and comes back as a `502` that carries the partner's body |
+| **SOAP / Web Services** | ✅ | ✅ | ✅ | ~ | `SOAP-OUT` shipped incl. WS-\* mTLS/WS-Security (ADR 0015); a SOAP body is **received** via `Http()`, and the *synchronous* envelope reply shipped with ADR 0154 (`reply_from`). Still `~` for one reason: a partner **error** is not relayed (`capture_error_responses`). Outside a 2xx body, the fault code decides: a Receiver/Server fault is retried, and any other fault dead-letters, whatever the HTTP status, except an HTTP `401` on a connection with a bearer token provider, which drops the bearer and retries within the WS-Security limits the SOAP section's WS-\* mode notes give. A dead-lettered delivery gets a fixed-JSON `502`. A retried one ends in a reply, a `502` or the `reply_on_timeout` answer (see [the listener section](#http-web-service-listener--http-inbound-only-adr-0023)). A SOAP fault in a 2xx body is captured as a rejection instead, and comes back as a `502` that carries the partner's body |
 | **Database** reader/writer | ✅ (JDBC) | ✅ | ✅ (JDBC) | ✅ (ODBC) | `DB-OUT` + `DB-IN` shipped (SQL Server preset, production — a live aioodbc round-trip runs in CI); `dialect='generic'` reaches any DB with an OS-installed ODBC driver. **No JDBC** — MF is pure Python, no JVM |
 | **SMTP** (email send) | ✅ | ✅ | ✅ | ✅ | `SMTP-OUT` shipped — `Email()`/`SMTP()` (ADR 0029); **plus** `Direct()`, Direct-Project S/MIME over SMTP (ADR 0085), which none of the three ships natively |
 | **Email reader** (POP3/IMAP) | ~ | ~ | ✅ | ❌ | `MAIL-IN` planned |

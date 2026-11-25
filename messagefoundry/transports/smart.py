@@ -59,6 +59,7 @@ from messagefoundry.config.tls_policy import (
     TrustAnchorPolicy,
     hop_name_prefix,
 )
+from messagefoundry.controlchars import has_lone_surrogate
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -81,7 +82,7 @@ from messagefoundry.transports.rest import (
     ProxyConfig,
     _no_redirect_opener,
     _redact_url,
-    _shared_no_redirect_opener,
+    _verifying_opener,
     auth_challenge_refused,
     digest_proxy_meets_the_token_connect,
     ech_readdressed_request,
@@ -109,6 +110,7 @@ if TYPE_CHECKING:  # only for the with_smart_backend() annotation — avoid impo
 __all__ = [
     "SmartAuthError",
     "SmartBackendTokenProvider",
+    "refuse_unusable_smart_settings",
     "request_token",
     "revocation_attestation_from_settings",
     "token_cache_seconds",
@@ -444,9 +446,9 @@ class _TokenEndpointProvider(abc.ABC):
         ):
             raise self.digest_proxy_refusal(connection)
         # #1660: a PER-PROVIDER opener whenever the token hop needs a handler the shared one lacks (a
-        # forward proxy) OR a trust anchor that ``narrows`` -- read through the one ``narrows``
-        # predicate, exactly as the four HTTP-family destinations do, so the token hop cannot drift
-        # from them. Neither -> the shared opener, unmutated (ADR 0126), byte-identical.
+        # forward proxy) OR a trust anchor that ``narrows`` -- chosen by rest._verifying_opener
+        # (BACKLOG #5527 item 10), on the one ``narrows`` predicate the HTTP-family destinations
+        # read. Neither -> the shared opener, unmutated (ADR 0126), byte-identical.
         #
         # With an ECH sidecar the POST goes to the loopback sidecar, never to the token host, so the
         # opener is the plain one the REST destination's own ECH hop uses: no proxy, and no anchor
@@ -455,13 +457,11 @@ class _TokenEndpointProvider(abc.ABC):
         self._opener: urllib.request.OpenerDirector
         if ech_sidecar is not None:
             self._opener = _no_redirect_opener(urllib.request.ProxyHandler({}))
-        elif token_proxy is not None or trust_anchor.narrows:
-            self._opener = _no_redirect_opener(
+        else:
+            self._opener = _verifying_opener(
                 *(token_proxy.opener_handlers() if token_proxy is not None else ()),
                 trust_anchor=trust_anchor,
             )
-        else:
-            self._opener = _shared_no_redirect_opener()
         # #1498, #2112 (ADR 0173 §4.3): the revocation twin of the cleartext refusal, and the same
         # one-statement call its HTTP-family siblings make. The token hop VERIFIES the authorization
         # server's certificate but stdlib ssl performs no OCSP/CRL, so a revoked-but-unexpired
@@ -636,6 +636,7 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
             raise SmartAuthError(
                 "SMART backend services requires a 'smart_private_key' setting (PEM via env())"
             )
+        _refuse_unencodable_smart_values(scope, private_key, private_key_password)
         self.client_id = client_id
         self.scope = scope or None
         if not audience and request_target_as_sent(token_url) != token_url:
@@ -649,6 +650,14 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
             )
         # SMART: aud = the token endpoint URL unless the server documents another audience.
         self.audience = audience or token_url
+        # ASVS 4.2.5: the token URL is operator-supplied via env(), so a blob-valued env() is a
+        # config error rather than an opaque IdP failure. BACKLOG #5800 added item 1: this ran at
+        # each mint, where its ValueError escaped send and test_connection unclassified. Measured
+        # here, before _open_token_hop's revocation guard can record a crossing for a build this
+        # refuses. The proxy headers that hop adds are measured after it, so an over-length proxy
+        # credential can still follow a recorded crossing. The message names a header and a
+        # length, never a value.
+        self._refuse_over_length(token_url, {})
         # Loads + validates the key/curve for the algorithm — a bad key fails loud here, before the
         # token hop's revocation guard, as it always has.
         self._signer = CompactJwtSigner(
@@ -671,6 +680,20 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
             trust_anchor=trust_anchor,
             connection=connection,
         )
+        # The signed client assertion rides the FORM body (not a header), so with the URL the
+        # proxy credential is all the gate measures; both are fixed once _open_token_hop has run.
+        self._refuse_over_length(token_url, self._proxy_auth)
+
+    @staticmethod
+    def _refuse_over_length(token_url: str, headers: Mapping[str, str]) -> None:
+        """Refuse a token URL or token-request header over the outbound length limit, as
+        :class:`SmartAuthError` naming a header and a length, never a value."""
+        try:
+            enforce_outbound_length_limits(token_url, dict(headers))
+        except ValueError as exc:
+            raise SmartAuthError(
+                f"SMART token request (smart_token_url and the proxy headers): {exc}"
+            ) from exc
 
     def _assertion_claims(self) -> dict[str, object]:
         """The five SMART-mandated client_assertion claims (iss=sub=client_id, aud, exp, jti)."""
@@ -691,11 +714,6 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
         if self.scope:
             form["scope"] = self.scope
         data = urllib.parse.urlencode(form).encode("ascii")
-        # ASVS 4.2.5: the token URL is operator-supplied via env(), and the signed client assertion
-        # rides the FORM body (not a header), so only the URL and the proxy credential are measurable
-        # here -- both are config, so a blob-valued env() surfaces as a config error rather than an
-        # opaque IdP failure on the first mint.
-        enforce_outbound_length_limits(self.token_url, dict(self._proxy_auth))
         return self._post_token(
             data,
             {
@@ -772,6 +790,51 @@ def smart_auth_configured(s: Mapping[str, Any]) -> bool:
     an agreement that decays silently the day anything else populates these settings. Off is the
     conservative reading, so a falsy value is off."""
     return bool(s.get("smart_token_url")) and bool(s.get("smart_enabled", True))
+
+
+def _refuse_unencodable_smart_values(
+    scope: str | None, private_key: str, private_key_password: str | None
+) -> None:
+    """BACKLOG #5800 added item 1: the scope is URL-encoded as strict UTF-8 at each mint, so a
+    lone surrogate raised UnicodeEncodeError out of send or test_connection; an inline PEM key and
+    its password are encoded strictly as UTF-8 while the signer loads them, and that exception's
+    ``object`` is the whole value. Refused by setting name only, as the OAuth2 provider refuses its
+    grant values. The client id, audience and key id ride the JSON assertion, whose encoder
+    escapes a lone surrogate."""
+    unencodable = next(
+        (
+            name
+            for name, value in (
+                ("smart_scope", scope),
+                # Only inline PEM is encoded; a path goes to open(), which takes one.
+                ("smart_private_key", private_key if "-----BEGIN" in private_key else None),
+                ("smart_private_key_password", private_key_password),
+            )
+            if value and has_lone_surrogate(value)
+        ),
+        None,
+    )
+    if unencodable is not None:
+        raise SmartAuthError(f"{unencodable} holds a character UTF-8 cannot encode")
+
+
+def refuse_unusable_smart_settings(s: Mapping[str, Any]) -> None:
+    """Run, on already-``env()``-resolved settings and without building the provider, the BACKLOG
+    #5800 settings refusals :class:`SmartBackendTokenProvider` runs at construction: a lone
+    surrogate in ``smart_scope``, an inline PEM ``smart_private_key`` or
+    ``smart_private_key_password``, and a ``smart_token_url`` over the outbound length limit. It
+    reads no wire and records no crossing, so the ``FhirLookup`` executor runs it for every lookup
+    before any lookup reaches a hop gate. Values are read as :func:`token_provider_from_settings`
+    reads them. Does nothing when SMART auth is off. The proxy headers the token hop adds are not
+    measured here; the provider measures them after its token hop opens."""
+    if not smart_auth_configured(s):
+        return
+    _refuse_unencodable_smart_values(
+        str(s["smart_scope"]) if s.get("smart_scope") else None,
+        str(s.get("smart_private_key") or ""),
+        str(s["smart_private_key_password"]) if s.get("smart_private_key_password") else None,
+    )
+    SmartBackendTokenProvider._refuse_over_length(str(s.get("smart_token_url") or ""), {})
 
 
 def token_provider_from_settings(
