@@ -327,11 +327,27 @@ def test_a_quoted_victim_holding_a_separator_is_read_whole_under_powershell(
     assert "worktree remove" in _reason_tool(rig, cmd, rig.outside)
 
 
-def test_a_quoted_victim_on_a_segment_with_no_scan_map_is_still_read_whole(
+@pytest.mark.parametrize(
+    "template",
+    [
+        'git worktree remove "{tmp}/x;y/../Outside"',
+        "git worktree remove {o}/nope; echo '{tmp}/Primary-wt2'",
+    ],
+)
+def test_a_quoted_separator_control_is_allowed_under_powershell(
+    rig: SimpleNamespace, template: str
+) -> None:
+    cmd = template.format(tmp=rig.tmp.as_posix(), o=rig.outside.as_posix())
+    assert run_gate(shell(cmd, rig.outside, tool="PowerShell"), rig.repos) is None
+
+
+def test_a_quoted_victim_the_added_reading_skips_is_still_read_whole(
     rig: SimpleNamespace,
 ) -> None:
     """The first reading reads the quote-aware victim itself, so it does not depend on the added
-    reading, which needs a git token at command position: here `sudo` stands before it."""
+    reading, which skips an invocation whose git word is not at command position: here `sudo`
+    stands before it. (The added reading's other skip, a scan map that cannot be built, is not
+    reached by this row.)"""
     cmd = f'sudo git worktree remove "{rig.tmp.as_posix()}/x;y/../Primary-wt2"'
     assert "worktree remove" in _reason(rig, cmd, rig.outside)
 

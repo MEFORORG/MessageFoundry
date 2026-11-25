@@ -925,15 +925,23 @@ function Get-ScanRawIndexMap($Seg) {
 function Get-CodeSplitPrefix([string]$Raw, $Quote, [int]$Start, [string]$Split) {
     if ($null -eq $Quote -or $Start -lt 0 -or $Start -gt $Raw.Length) { return "" }
     $q = $Quote
-    foreach ($m in [regex]::Matches($Raw.Substring($Start), $Split)) {
+    $tail = $Raw.Substring($Start)
+    $re = [regex]::new($Split)
+    $from = 0
+    while ($from -le $tail.Length) {
+        $m = $re.Match($tail, $from)
+        if (-not $m.Success) { break }
         $at = $Start + $m.Index
         $code = $true
         for ($k = $at; $k -lt $at + $m.Length; $k++) {
             if ($q[$k] -ne [char]'N') { $code = $false; break }
         }
-        if ($code) { return $Raw.Substring($Start, $m.Index) }
+        if ($code) { return $tail.Substring(0, $m.Index) }
+        # One character on, not past the match: in `\||` only the first `|` is literal, and the
+        # separator after it must still be tried.
+        $from = $m.Index + 1
     }
-    $Raw.Substring($Start)
+    $tail
 }
 
 # ===================================================================================================
@@ -5133,9 +5141,8 @@ What to do instead:
         $oldEnd = $(if ($oldRawMatch.Success) { $oldRawMatch.Index + $oldRawMatch.Length } else { -1 })
         $oldWindow = $null
         $added = @()
-        # One quote map per segment, shared by every quote-aware split below, and none past the
-        # length Get-AddedCommandReadings also stops at ($maxRewrite there), where they add nothing.
-        $segQuote = $(if ($seg.Raw.Length -le 32768) { Get-QuoteStateMap $seg.Raw ([string]$seg.Conv) } else { $null })
+        # One quote map per segment, shared by every quote-aware split below.
+        $segQuote = Get-QuoteStateMap $seg.Raw ([string]$seg.Conv)
         # THE FIRST READING'S VICTIM, QUOTE-AWARE TOO (BACKLOG #5643, review round e8390625a8): its split
         # cuts a quoted victim at a `;`, `&&`, `||` or `|` inside the quotes. The victims read off the
         # text before the first separator the shell reads as code are ADDED to its own, so this runs
@@ -5309,8 +5316,9 @@ What to do instead:
         #     one of those is truncated too. NARROWED 2026-11-25 (BACKLOG #5643), NOT FIXED: the added
         #     reading, and the first reading too, also read the victims before the first separator
         #     Get-QuoteStateMap calls code (Get-CodeSplitPrefix), so `"<tmp>/x;y/../<wt>"` is judged
-        #     whole. Not on a segment longer than 32768 characters, and it shares that quoting
-        #     model's misreadings. The victim TOKENIZER it feeds still misreads at least these, each
+        #     whole. It shares that quoting model's misreadings, at least an interpreter payload's
+        #     escaped quotes (`bash -c "git worktree remove \"<tmp>/x;y/../<wt>\""`, still ALLOWED,
+        #     measured by review round 7f68c804ce), which it reads as escapes. The victim TOKENIZER it feeds still misreads at least these, each
         #     measured ALLOW on 2026-11-25 by review round e8390625a8: a word quoted only in part
         #     (`"<tmp>/x;y"/../<wt>`, `"<tmp>/Primary-"wt2`), which it splits at the quote; a posix
         #     `$'<wt>'`, read as a bare `$`; an unquoted escaped separator (`<tmp>/x\;y/../<wt>`),
