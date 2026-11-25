@@ -563,7 +563,7 @@ from messagefoundry.store.content_search import (
     sends_a_needle,
 )
 from messagefoundry.store.crypto import CipherError, CipherUnavailableError, audit_body_digests
-from messagefoundry.store.metadata import user_metadata
+from messagefoundry.store.metadata import MetadataTooDeepError, user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
 from messagefoundry.store.row_seal import TransitSealUnavailableError, probe_row_sealer_at_start
 from messagefoundry.store.store import (
@@ -3914,6 +3914,21 @@ async def _record_start_audit(
     )
 
 
+def _summary_metadata(d: Mapping[str, Any]) -> str | None:
+    """The user bag :func:`_summary` shows for one row, or ``None`` when the stored cell is too
+    deep to read (BACKLOG #6712). Raising there would fail the whole list, search or uploaded-file
+    page the row is on, so the row shows no metadata and a WARNING names the message, never the
+    cell. Showing ``None`` changes only what is displayed, unlike the delivery reader."""
+    try:
+        return user_metadata(d.get("metadata"), row_id=d["id"])
+    except MetadataTooDeepError:
+        _log.warning(
+            "message %r: its stored metadata is too deeply nested to read; shown as none",
+            str(d["id"])[:12],
+        )
+        return None
+
+
 def _summary(row: Row) -> MessageSummary:
     # dict() so optional columns (last_event on list rows; summary/metadata) read via .get,
     # letting the same builder serve list rows and SELECT * detail rows.
@@ -3931,7 +3946,7 @@ def _summary(row: Row) -> MessageSummary:
         summary=d.get("summary"),
         # Surface ONLY the operator/handler user bag (ADR 0081, #150) — user_metadata strips the
         # engine-internal ADR-0013 correlation-lineage keys so they never leak to the API.
-        metadata=user_metadata(d.get("metadata"), row_id=d["id"]),
+        metadata=_summary_metadata(d),
     )
 
 
