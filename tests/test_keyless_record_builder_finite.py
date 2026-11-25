@@ -22,6 +22,7 @@ from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.store.row_seal import NonFiniteSealValueError
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_PASSWORD, ADMIN_USERNAME, create_admin
 
@@ -62,7 +63,7 @@ async def test_a_new_session_with_a_non_finite_expiry_is_refused(
     store = await MessageStore.open(tmp_path / "k.db")
     try:
         await _user(store, "u-6717")
-        with pytest.raises(ValueError, match="not finite"):
+        with pytest.raises(NonFiniteSealValueError, match="not finite"):
             await store.create_session(
                 token_hash=hash_token(mint_token()), user_id="u-6717", expires_at=value
             )
@@ -80,7 +81,7 @@ async def test_a_session_write_bringing_a_non_finite_value_is_refused(
         await _user(store, "u-6717")
         token_hash = await _session(store, "u-6717")
         before = await store.get_session(token_hash)
-        with pytest.raises(ValueError, match="not finite"):
+        with pytest.raises(NonFiniteSealValueError, match="not finite"):
             await store.mark_session_reauthed(token_hash, now=value)
         assert await store.get_session(token_hash) == before
     finally:
@@ -94,7 +95,7 @@ async def test_a_user_write_bringing_a_non_finite_value_is_refused(
     store = await MessageStore.open(tmp_path / "k.db")
     try:
         await _user(store, "u-6717")
-        with pytest.raises(ValueError, match="not finite"):
+        with pytest.raises(NonFiniteSealValueError, match="not finite"):
             await store.record_login_failure("u-6717", failed_attempts=1, locked_until=value)
     finally:
         await store.close()
@@ -106,7 +107,7 @@ async def test_a_new_approval_with_a_non_finite_expiry_is_refused(
 ) -> None:
     store = await MessageStore.open(tmp_path / "k.db")
     try:
-        with pytest.raises(ValueError, match="not finite"):
+        with pytest.raises(NonFiniteSealValueError, match="not finite"):
             await store.create_pending_approval(
                 approval_id="a-6717",
                 operation="op",

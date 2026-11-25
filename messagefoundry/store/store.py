@@ -214,6 +214,7 @@ from messagefoundry.store.row_seal import (
     SESSION_KIND,
     USER_KIND,
     AnyRowSealer,
+    NonFiniteSealValueError,
     ResealOutcome,
     RevokedRowSealError,
     RowSealer,
@@ -1729,9 +1730,9 @@ def _refuse_new_non_finite(
     fields: Iterable[tuple[str, object]],
     prior: Iterable[tuple[str, object]] = (),
 ) -> None:
-    """On a store with no sealer, raise ``ValueError`` for a NaN or an infinity in ``fields`` that
-    ``prior``, the row as it was read, does not already hold under that name (BACKLOG #6717), for
-    the reason :meth:`RowSealer.seal` refuses one. A value carried forward from the stored row is
+    """On a store with no sealer, raise :class:`NonFiniteSealValueError`, the type
+    :meth:`RowSealer.seal` raises, for a NaN or an infinity in ``fields`` that ``prior``, the row as
+    it was read, does not already hold under that name (BACKLOG #6717); that class says why. A value carried forward from the stored row is
     written as before, so only a new value is refused. A name may repeat (a user's role grants),
     so a value counts as held when any field of that name in ``prior`` holds the same kind."""
     if sealer is not None:
@@ -1740,7 +1741,7 @@ def _refuse_new_non_finite(
     for name, value in fields:
         kind = _non_finite_kind(value)
         if kind is not None and (name, kind) not in held:
-            raise ValueError("a row write refuses a float that is not finite")
+            raise NonFiniteSealValueError("a row write refuses a float that is not finite")
 
 
 def seal_session(sealer: RowSealer | None, record: SessionRecord) -> SessionRecord:
