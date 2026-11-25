@@ -10,6 +10,7 @@ markup.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any, TypedDict
@@ -89,11 +90,18 @@ def missing_eol_style(raw: str) -> str | None:
     """The style to restore a submitted ``raw`` to when its form carried no ``eol`` field, or None
     to keep it as sent.
 
-    The editor leaves the field out only for an original with no line break that is not HL7
-    (:func:`_eol_style`). So a missing field on an HL7 body came from a form the editor did not
-    render, and HL7's own CR terminator applies rather than the browser's CRLF (BACKLOG #5930).
-    Another body keeps its breaks as sent, since nothing says what its original used."""
-    return "cr" if starts_with_msh(raw) else None
+    The editor leaves the field out for an original with no line break that is not HL7
+    (:func:`_eol_style`), and a form it did not render carries none either. Either way, a body
+    submitted as HL7 takes HL7's own CR terminator rather than the browser's CRLF (BACKLOG #5930):
+    one that opens with ``MSH``, or with a ``BHS`` or ``FHS`` batch header, which ends its
+    segments the same way. An operator can edit a one-line non-HL7 original into HL7, and that
+    body takes CR too. This reads the submitted body, not the stored original. Another body keeps
+    its breaks as sent, since nothing says what its original used."""
+    return "cr" if starts_with_msh(raw) or _LEADS_WITH_BATCH_HEADER.match(raw) else None
+
+
+#: A ``BHS`` or ``FHS`` batch header after leading whitespace, as ``starts_with_msh`` reads ``MSH``.
+_LEADS_WITH_BATCH_HEADER = re.compile(r"\s*(?:BHS|FHS)")
 
 
 def restore_eol(raw: str, eol: str) -> str | None:

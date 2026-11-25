@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from _webui_support import (
     ADT,
     EDITED,
@@ -489,6 +490,18 @@ def test_style_for_a_form_with_no_terminator_field() -> None:
 
     assert missing_eol_style("MSH|^~\\&|S\r\nPID|1\r\n") == "cr"
     assert missing_eol_style('{\r\n"id": 1}') is None  # not HL7: kept as sent
+
+
+@pytest.mark.parametrize("head", ["BHS", "FHS", " FHS"])
+def test_a_batch_with_no_terminator_field_goes_out_cr(head: str) -> None:
+    """PR 3068's finding 9 on BACKLOG #5930: a ``BHS``- or ``FHS``-led batch ends its segments in
+    CR as a message does, so a form with no ``eol`` restores CR rather than sending the browser's
+    CRLF. Red on the code before: None, so the batch went out CRLF."""
+    from messagefoundry_webconsole.pages.messages import missing_eol_style, restore_eol
+
+    submitted = f"{head}|^~\\&|S\r\nMSH|^~\\&|S\r\nPID|1\r\nBTS|1\r\n"
+    assert missing_eol_style(submitted) == "cr"
+    assert restore_eol(submitted, "cr") == submitted.replace("\r\n", "\r")
 
 
 def test_terminator_style_chosen_for_each_original() -> None:
