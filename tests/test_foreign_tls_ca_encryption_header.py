@@ -1162,15 +1162,40 @@ def test_a_shell_folder_that_does_not_decode_refuses_the_build(
 _LONG_CONNECTION = "OB_ACME_REGIONAL_LABORATORY_RESULTS_FEED"
 
 
-@pytest.mark.parametrize("shape", ["another host", "home not named", "stat fault"])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "another host",
+        "home not named",
+        "stat fault",
+        pytest.param(
+            "walk unread",
+            marks=pytest.mark.skipif(sys.platform != "win32", reason="the walk runs on Windows"),
+        ),
+    ],
+)
 def test_the_cause_and_remedy_survive_a_40_character_connection_name(
     _no_libpq_root: Path, monkeypatch: pytest.MonkeyPatch, shape: str
 ) -> None:
     """Vault BACKLOG #8153, review round 2, finding 2. Red on the previous head: the setting came
-    first, so a name of about 19 characters or more pushed the remedy past ``safe_exc``'s cut."""
+    first, so a name of about 19 characters or more pushed the remedy past ``safe_exc``'s cut.
+    The walk-unread shape is the review of 525c7df's finding 1: what survives is the cause and
+    :data:`~database._LIBPQ_REMEDY`, and the raised error keeps the second remedy, which
+    ``_LIBPQ_REMEDY``'s comment says a stored failure can lose."""
     assert len(_LONG_CONNECTION) == 40
     named = {"sslmode": "verify-full"}
-    if shape == "another host":
+    if shape == "walk unread":
+        _write(_no_libpq_root, _certificate(), "root.crt")
+        folder = _no_libpq_root.name.lower()
+        real_lstat = os.lstat
+
+        def unreadable(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            if os.path.basename(str(path)).lower() == folder:
+                raise OSError(None, "Windows error 5", None, 5)
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "lstat", unreadable)
+    elif shape == "another host":
         monkeypatch.setenv("PGSSLROOTCERT", "//db.synthetic.test/share/root.crt")
     elif shape == "home not named":
 
@@ -1197,3 +1222,6 @@ def test_the_cause_and_remedy_survive_a_40_character_connection_name(
     rendered = safe_exc(refused.value)
     assert _LONG_CONNECTION in rendered
     assert database._LIBPQ_REMEDY in rendered, rendered
+    if shape == "walk unread":
+        assert f"DATABASE: could not be read; {database._LIBPQ_REMEDY}" in rendered, rendered
+        assert database._LIBPQ_CHECK_FOLDERS in str(refused.value)

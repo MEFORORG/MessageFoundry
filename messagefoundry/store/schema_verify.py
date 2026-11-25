@@ -34,7 +34,7 @@ from types import MappingProxyType
 
 import aiosqlite
 
-from messagefoundry.redaction import safe_exc
+from messagefoundry.redaction import engine_text_only, safe_exc
 
 __all__ = [
     "IndexShape",
@@ -147,6 +147,18 @@ class SchemaMismatchError(sqlite3.DatabaseError):
         super().__init__(message)
         self.differences = differences
         self.cause = cause
+
+
+def _schema_step_text(exc: BaseException) -> object:
+    """The SQLite text a :class:`SchemaMismatchError` quotes: its ``cause``, or None."""
+    return getattr(exc, "cause", None)
+
+
+# Its message is the engine's remedy, which a renderer must keep, and it quotes the SQLite text of
+# a failed schema step, its `cause`, which can name an object another tool wrote; that part is
+# withheld (vault BACKLOG #8153, review of 525c7df, finding 2). The differences are the engine's
+# reading of the live schema, as before.
+engine_text_only(SchemaMismatchError, driver_text=_schema_step_text)
 
 
 @dataclass(frozen=True)

@@ -826,10 +826,15 @@ async def test_AC3_restore_refuses_rather_than_place_a_store_it_could_not_resalt
 
     monkeypatch.setattr(store_module, "forget_store_salt", _cannot)
     dest = tmp_path / "restored" / "store.db"
-    with pytest.raises(BackupError, match="WAL could not be checkpointed"):
+    # Under SQLite's class name either way: the engine's stand-in class is private (review of
+    # 525c7df, finding 8, red there for the engine refusal).
+    with pytest.raises(
+        BackupError, match="OperationalError: simulated: the WAL could not be checkpointed"
+    ) as refused:
         await run_restore(
             result.archive_path, dest_store_path=dest, store_settings=_store_settings(dest, key)
         )
+    assert "_ClosedStoreWriteError" not in str(refused.value)
     assert not dest.exists()
 
 
@@ -960,4 +965,7 @@ def test_a_closed_store_write_refusal_keeps_its_text_through_safe_exc(tmp_path: 
             proof_failed="was not proven",
         )
     assert isinstance(refused.value, store_module._ClosedStoreWriteError)
-    assert "was not proven" in safe_exc(refused.value)
+    rendered = safe_exc(refused.value)
+    assert "was not proven" in rendered
+    # Review of 525c7df, finding 8: rendered by the driver class it stands in for.
+    assert rendered.startswith("OperationalError: "), rendered

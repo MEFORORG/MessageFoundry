@@ -420,41 +420,9 @@ async def test_a_failed_build_records_no_driver_message(
     assert _SYNTHETIC_ID not in line
 
 
-def test_an_engine_subclass_of_a_driver_error_is_not_a_drivers() -> None:
-    """Item 17. Red on the previous head: the class walk met ``sqlite3.DatabaseError`` in
-    ``SchemaMismatchError``'s chain and counted the engine's own error as a driver's, so its
-    remedy would have been withheld. A subclass of the engine class, as a test may write, stays
-    the engine's too."""
-    from messagefoundry.store.schema_verify import SchemaMismatchError
-
-    exc = SchemaMismatchError("the store lacks synthetic_table; run the migration")
-
-    class _Narrower(SchemaMismatchError):
-        pass
-
-    assert raised_by_a_driver(exc) is False
-    assert raised_by_a_driver(_Narrower("synthetic")) is False
-    assert (
-        safe_exc(exc) == "SchemaMismatchError: the store lacks synthetic_table; run the migration"
-    )
-
-
-def test_a_subclass_of_a_driver_error_outside_the_engine_is_still_a_drivers() -> None:
-    """The control for item 17: only a class from the engine's own packages ends the walk."""
-    import sqlite3
-
-    class _Elsewhere(sqlite3.IntegrityError):
-        pass
-
-    assert raised_by_a_driver(_Elsewhere(f"UNIQUE constraint failed: MRN{_SYNTHETIC_ID}")) is True
-
-
-def test_a_traceback_still_withholds_the_driver_text_an_engine_subclass_carries() -> None:
-    """Vault BACKLOG #8153, item 17's regression. ``SchemaMismatchError`` subclasses
-    ``sqlite3.DatabaseError`` and quotes the failed schema step's SQLite text. main withheld its
-    message in a traceback, since the class walk counted it a driver's. Red on 5c90691ab26: item
-    17 made it the engine's everywhere, so ``safe_traceback`` printed the carried text. Its own
-    message still renders through ``safe_exc``."""
+def _schema_mismatch_carrying_sqlite_text() -> BaseException:
+    """A ``SchemaMismatchError`` raised from a schema step whose SQLite text quotes a synthetic
+    value, as ``store.schema_verify`` raises one."""
     import sqlite3
 
     from messagefoundry.store.schema_verify import SchemaMismatchError
@@ -466,8 +434,158 @@ def test_a_traceback_still_withholds_the_driver_text_an_engine_subclass_carries(
         except sqlite3.OperationalError as step:
             raise SchemaMismatchError(f"The schema step failed: {step}.", cause=str(step)) from step
     except SchemaMismatchError as caught:
-        text = _rendered(caught)
-        own = safe_exc(caught)
+        return caught
+    raise AssertionError("unreachable")
+
+
+#: What ``SchemaMismatchError``'s message reads with its quoted SQLite text withheld.
+_WITHHELD_STEP = "SchemaMismatchError: The schema step failed: [driver message withheld]."
+
+
+def test_an_engine_subclass_withholds_the_driver_text_it_quotes() -> None:
+    """Vault BACKLOG #8153, review of 525c7df, finding 2. ``SchemaMismatchError`` subclasses
+    ``sqlite3.DatabaseError`` and quotes the failed schema step's SQLite text. Red on 525c7df:
+    every class from the engine's package counted as the engine's, so ``safe_exc`` printed that
+    text. It is marked ``engine_text_only`` with that text named, so its own words, the store's
+    remedy among them, still print, and the quoted text does not."""
+    caught = _schema_mismatch_carrying_sqlite_text()
+    assert raised_by_a_driver(caught) is False
+    own = safe_exc(caught)
+    assert _SYNTHETIC_ID not in own
+    assert own == _WITHHELD_STEP
+
+
+def test_a_traceback_withholds_the_driver_text_an_engine_subclass_carries() -> None:
+    """Vault BACKLOG #8153, item 17's regression, red on 5c90691ab26: a traceback printed the
+    text ``SchemaMismatchError`` carries, where main withheld it."""
+    text = _rendered(_schema_mismatch_carrying_sqlite_text())
     assert _SYNTHETIC_ID not in text
-    assert "SchemaMismatchError: [driver message withheld]" in text
-    assert own.startswith("SchemaMismatchError: The schema step failed: ")  # the engine's own
+    assert _WITHHELD_STEP in text
+
+
+def test_an_engine_subclass_that_is_not_marked_is_a_drivers() -> None:
+    """Review of 525c7df, finding 2: only a class marked by its exact type keeps its message. A
+    subclass of a marked class, or an unmarked engine class, can carry other text, so its whole
+    message is withheld. Red on 525c7df, which counted every engine class as the engine's."""
+    from messagefoundry.store.schema_verify import SchemaMismatchError
+
+    class _Narrower(SchemaMismatchError):
+        pass
+
+    narrower = _Narrower(f"no such column: MRN{_SYNTHETIC_ID}")
+    assert raised_by_a_driver(narrower) is True
+    assert safe_exc(narrower) == "_Narrower: [driver message withheld]"
+
+
+def test_a_marked_message_that_does_not_hold_its_named_text_is_withheld_whole() -> None:
+    """The fail-closed arm of ``_engine_message``: a ``cause`` the message does not quote
+    verbatim, as a message re-worded around it would, cannot be cut out, so nothing prints."""
+    from messagefoundry.store.schema_verify import SchemaMismatchError
+
+    reworded = SchemaMismatchError(
+        f"The schema step failed: NO SUCH COLUMN: MRN{_SYNTHETIC_ID}.",
+        cause=f"no such column: MRN{_SYNTHETIC_ID}",
+    )
+    assert safe_exc(reworded) == "SchemaMismatchError: [driver message withheld]"
+    two_args = SchemaMismatchError("store remedy")
+    two_args.args = ("store remedy", f"MRN{_SYNTHETIC_ID}")
+    assert safe_exc(two_args) == "SchemaMismatchError: [driver message withheld]"
+
+
+def test_a_marked_class_keeps_its_text_under_its_driver_class_name() -> None:
+    """Review of 525c7df, findings 2 and 8. A class marked ``engine_text_only`` with
+    ``named_as_driver`` prints its message under the driver class it stands in for, in
+    ``safe_exc``; a traceback prints the message too. Red on 525c7df for the name: it printed the
+    engine's private class name. A subclass of a marked class is not marked."""
+    import sqlite3
+
+    from messagefoundry.redaction import engine_text_only, shown_class_name
+
+    class _Marked(sqlite3.OperationalError):
+        pass
+
+    engine_text_only(_Marked, named_as_driver=True)
+
+    class _Unmarked(_Marked):
+        pass
+
+    marked = _raised(_Marked("could not take the synthetic store out of WAL mode"))
+    assert raised_by_a_driver(marked) is False
+    assert shown_class_name(marked) == "OperationalError"
+    assert (
+        safe_exc(marked) == "OperationalError: could not take the synthetic store out of WAL mode"
+    )
+    assert "could not take the synthetic store out of WAL mode" in _rendered(marked)
+    unmarked = _Unmarked(f"MRN{_SYNTHETIC_ID}")
+    assert raised_by_a_driver(unmarked) is True
+    assert _SYNTHETIC_ID not in safe_exc(unmarked)
+
+
+def test_a_subclass_of_a_driver_error_outside_the_engine_is_still_a_drivers() -> None:
+    """The control for the marker: an unmarked subclass of a driver's class is a driver's."""
+    import sqlite3
+
+    class _Elsewhere(sqlite3.IntegrityError):
+        pass
+
+    assert raised_by_a_driver(_Elsewhere(f"UNIQUE constraint failed: MRN{_SYNTHETIC_ID}")) is True
+
+
+def _sqlite_error(statement: str, *args: Any, closed: bool = False) -> BaseException:
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    if closed:
+        conn.close()
+    try:
+        conn.execute(statement, *args)
+    except sqlite3.Error as exc:
+        return exc
+    finally:
+        conn.close()
+    raise AssertionError("the statement did not fail")
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [
+        ("closed", "ProgrammingError: Cannot operate on a closed database."),
+        ("type", "ProgrammingError: Error binding parameter 1: type 'object' is not supported"),
+        (
+            "count",
+            "ProgrammingError: Incorrect number of bindings supplied. The current statement uses"
+            " 1, and there are 2 supplied.",
+        ),
+    ],
+)
+def test_sqlite_texts_that_carry_no_value_keep_their_reason(shape: str, expected: str) -> None:
+    """Review of 525c7df, finding 7. ``sqlite3`` raises these with no ``sqlite_errorname``, so
+    item 23 reduced each to ``[driver message withheld]`` and lost its reason. Red on 525c7df.
+    Each is raised by ``sqlite3`` itself, not built by hand, so a change to its wording shows."""
+    exc = {
+        "closed": lambda: _sqlite_error("SELECT 1", closed=True),
+        "type": lambda: _sqlite_error("SELECT ?", (object(),)),
+        "count": lambda: _sqlite_error("SELECT ?", (1, 2)),
+    }[shape]()
+    assert safe_exc(exc) == expected
+    assert expected in _rendered(_raised(exc))
+
+
+def test_a_sqlite_text_that_only_resembles_a_fixed_reason_is_withheld() -> None:
+    """The control for finding 7's rule: only an exact match of a fixed shape, held as an exact
+    ``str`` in the error's one argument, prints. A value appended, a second argument, a ``str``
+    subclass or a result code each leave the message withheld."""
+    import sqlite3
+
+    class _Text(str):
+        pass
+
+    appended = sqlite3.ProgrammingError(f"Cannot operate on a closed database. MRN{_SYNTHETIC_ID}")
+    two = sqlite3.ProgrammingError("Cannot operate on a closed database.", f"MRN{_SYNTHETIC_ID}")
+    subclass = sqlite3.ProgrammingError(_Text("Cannot operate on a closed database."))
+    typed = sqlite3.ProgrammingError(
+        f"Error binding parameter 1: type 'MRN {_SYNTHETIC_ID}' is not supported"
+    )
+    for exc in (appended, two, typed):
+        assert safe_exc(exc) == "ProgrammingError: [driver message withheld]", exc
+    assert safe_exc(subclass) == "ProgrammingError: [driver message withheld]"

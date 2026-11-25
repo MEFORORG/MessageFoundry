@@ -1588,10 +1588,12 @@ _LIBPQ_COPY_FOLDER = (
 #: The remedy the refusals worded in :func:`_refuse_encrypted_libpq_root_cert` and
 #: :func:`_refuse_libpq_root_cert_file` give, after the connection, ``DATABASE:`` and a cause of a
 #: few words, and before the setting and the full cause, so a stored failure, which keeps about the
-#: first 200 characters (``redaction.safe_exc``), keeps the cause and the remedy for a connection
-#: name of 40 characters (vault BACKLOG #8153, items 6, 24 and 31). The refusals the file's read
-#: and content checks give (:func:`_read_driver_file`, :func:`_refuse_ca_content`) name the
-#: setting first and carry no such remedy.
+#: first 200 characters (``redaction.safe_exc``), keeps the cause and this remedy for a connection
+#: name of 40 characters (vault BACKLOG #8153, items 6, 24 and 31). Where the host refusal adds
+#: :data:`_LIBPQ_CHECK_FOLDERS` after it, that second remedy can be cut from the stored failure for
+#: such a name; the raised error keeps it. The refusals the file's read and content checks give
+#: (:func:`_read_driver_file`, :func:`_refuse_ca_content`) name the setting first and carry no such
+#: remedy.
 _LIBPQ_REMEDY = f"set PGSSLROOTCERT to a copy in {_LIBPQ_COPY_FOLDER}"
 #: The host refusal's second remedy, where the walk read the folders (:data:`_WALKS_BEYOND_SPELLING`).
 _LIBPQ_CHECK_FOLDERS = (
@@ -1772,7 +1774,7 @@ def _refuse_encrypted_libpq_root_cert(
     only its attributes, so libpq may skip a file whose read is denied rather than fail on it, which
     was not measured; the refusal errs on the side of refusing there (vault BACKLOG #8153, items 5
     and 29). The refusals worded here and in :func:`_refuse_libpq_root_cert_file` open with a
-    short cause and the remedy (:data:`_LIBPQ_REMEDY`).
+    short cause and the remedy (:data:`_LIBPQ_REMEDY`), which says what a stored failure keeps.
 
     **It reads the environment of the process that builds the connection**, so ``messagefoundry
     check`` and a dry run judge their own machine's file, not the service's. **It runs when the

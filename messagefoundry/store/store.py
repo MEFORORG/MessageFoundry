@@ -103,7 +103,7 @@ from messagefoundry.credential import constant_time_equal
 from messagefoundry.logging_guard import _last_resort
 from messagefoundry.parsing.binary import doc_ref_addresses_in_hl7 as _doc_ref_addresses_in_hl7
 from messagefoundry.parsing.binary import may_hold_doc_ref as _may_hold_doc_ref
-from messagefoundry.redaction import json_loads_or_refusal, safe_text
+from messagefoundry.redaction import engine_text_only, json_loads_or_refusal, safe_text
 from messagefoundry.service_status import _system_exe
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
@@ -9142,9 +9142,14 @@ def forget_store_salt(path: Path) -> bool:
 
 
 class _ClosedStoreWriteError(sqlite3.OperationalError):
-    """:func:`_write_closed_store`'s own refusal, whose text the engine wrote, so a renderer that
-    withholds a database driver's message keeps it (``redaction.raised_by_a_driver``, vault BACKLOG
-    #8153). Still a ``sqlite3.OperationalError``, so every handler that caught one catches it."""
+    """:func:`_write_closed_store`'s own refusal, whose text the engine wrote: the store's path,
+    the journal mode SQLite reported and a fixed sentence, never a row's value or SQLite's message.
+    Marked :func:`~messagefoundry.redaction.engine_text_only`, so a renderer that withholds a
+    database driver's message keeps it, under the name ``OperationalError`` (vault BACKLOG #8153).
+    Still a ``sqlite3.OperationalError``, so every handler that caught one catches it."""
+
+
+engine_text_only(_ClosedStoreWriteError, named_as_driver=True)
 
 
 def _write_closed_store[T](
