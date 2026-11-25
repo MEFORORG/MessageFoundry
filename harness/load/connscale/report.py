@@ -842,9 +842,11 @@ def herd_floor_readings(
     :func:`monotonic_lane_labeler` as the pairs name it. Grouping on ``(sweep_mode, claim_mode)``
     alone graded the first record at ``base_count`` and dropped its sibling arm's reading unseen, so
     an A/B's second arm was recorded and never graded (BACKLOG #5090). Every axis a profile varies
-    is in the lane, so a lane runs each N once; were two records to share a lane and ``base_count``,
-    the first would still be the one graded. Only ``per_lane`` lanes are graded: the prediction's
-    premise is one worker set per lane per stage, which a pooled dispatcher does not satisfy.
+    is in the lane, but a profile that repeats a count in ``counts`` still puts two records in one
+    lane at that N, since nothing refuses a repeat; at ``base_count`` only the first of them is
+    graded, and the second is recorded and not graded. Only ``per_lane`` lanes are graded: the
+    prediction's premise is one worker set per lane per stage, which a pooled dispatcher does not
+    satisfy.
     """
     name = monotonic_lane_labeler(records)
     by_lane: dict[MonotonicLane, list[ConnScaleRecord]] = {}
