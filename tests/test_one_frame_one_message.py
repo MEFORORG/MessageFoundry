@@ -47,6 +47,7 @@ from messagefoundry.parsing import message as message_module
 from messagefoundry.parsing.dicom.hl7_map import encode_segment
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import starts_with_msh
+from messagefoundry.parsing.x12.delimiters import ELEMENT_SEP_OFFSETS
 from messagefoundry.pipeline import ingress_guards, wiring_runner
 from messagefoundry.pipeline.dryrun import dry_run
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
@@ -865,21 +866,45 @@ def test_an_isa_the_header_read_refuses_still_declares_its_offsets() -> None:
         framing_mod.encode_reply(reply, "ascii", connection="IB_X12_BAD_ISA")
 
 
+def _lined_up(header: str) -> bool:
+    """Whether every element-separator offset of ``header`` holds the character at +3."""
+    return all(header[i] == header[3] for i in ELEMENT_SEP_OFFSETS)
+
+
 @pytest.mark.parametrize(
-    ("element", "component"), [("?", ":"), ("*", "?")], ids=["element-q", "component-q"]
+    ("header", "delimiter"),
+    [
+        (_isa(element="?").replace("SENDER", "AC?MER", 1), "?"),
+        (_isa(component="?").replace("SENDER", "AC*MER", 1), "*"),
+        (_isa(element="?", repetition="?"), "?"),
+        (_isa(element="A", component="?"), "A"),
+    ],
+    ids=["element-in-isa06", "component-q-isa06", "element-is-00501-isa11", "element-in-isa-tag"],
 )
-def test_a_padded_isa_whose_data_holds_its_element_separator_declares_nothing(
-    element: str, component: str
+def test_a_lined_up_isa_with_its_separator_elsewhere_before_isa16_declares_nothing(
+    header: str, delimiter: str
 ) -> None:
-    """Pins a residual the #5799 docstring and changelog name: a padded ISA whose element data
-    holds its own element separator (an ISA06 of ``AC*MER``) is not fixed-width, so it declares
+    """Pins a residual the #5799 docstring and changelog name: a padded ISA whose separators sit
+    at their fixed offsets, but whose element separator also appears before ISA16 elsewhere (in
+    ISA06's data, in a 00501 ISA11, or in the ``ISA`` tag), is not fixed-width, so it declares
     nothing, and a ``?`` delimiter in it gets ``?`` written into its data, as on main. Mutation:
     drop the element-data count from ``_isa_is_fixed_width`` and the call raises."""
-    header = _isa(element=element, component=component).replace("SENDER", f"AC{element}MER", 1)
-    assert len(header) == 106
-    reply = header + element.join(["TA1", "000000001", "260101", "1200", "A", "000中"]) + "~"
-    wire = framing_mod.encode_reply(reply, "ascii", connection="IB_X12_SEP_IN_DATA")
+    assert len(header) == 106 and _lined_up(header) and header[3] == delimiter
+    assert header.count(delimiter, 0, 104) > len(ELEMENT_SEP_OFFSETS)
+    reply = header + header[3].join(["TA1", "000000001", "260101", "1200", "Z", "000中"]) + "~"
+    wire = framing_mod.encode_reply(reply, "ascii", connection="IB_X12_SEP_ELSEWHERE")
     assert wire == reply.replace("中", "?").encode("ascii")
+
+
+def test_an_isa16_equal_to_the_element_separator_still_declares() -> None:
+    """Pins the docstring's claim that an ISA ``discover_delimiters`` refuses for an ISA16 equal
+    to the element separator is still fixed-width: ISA16 is outside the count, so ``?`` is
+    declared and the reply is refused."""
+    header = _isa(element="?", component="?")
+    assert len(header) == 106 and _lined_up(header)
+    reply = header + "TA1?000000001?260101?1200?Z?000中~"
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
+        framing_mod.encode_reply(reply, "ascii", connection="IB_X12_ISA16_SEP")
 
 
 def test_an_isa_whose_separators_are_off_their_offsets_declares_nothing() -> None:
@@ -888,8 +913,9 @@ def test_an_isa_whose_separators_are_off_their_offsets_declares_nothing() -> Non
     fixed offsets, so the ISA is not fixed-width and its ``?`` component separator is not read.
     Mutation: drop ``lined_up`` and the call raises."""
     header = _isa(component="?").replace("SENDER ", "SENDER", 1).replace("RECEIVER", "RECEIVER ", 1)
-    assert len(header) == 106 and header[104] == "?"
-    reply = header + "TA1*000000001*260101*1200*A*000中~"
+    assert len(header) == 106 and header[104] == "?" and not _lined_up(header)
+    assert header.count("*", 0, 104) == len(ELEMENT_SEP_OFFSETS)
+    reply = header + "TA1*000000001*260101*1200*Z*000中~"
     wire = framing_mod.encode_reply(reply, "ascii", connection="IB_X12_OFF_OFFSET")
     assert wire == reply.replace("中", "?").encode("ascii")
 
