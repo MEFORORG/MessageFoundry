@@ -8225,18 +8225,21 @@ same drops give totals one apart by lane.
 when the notice is handed to the relay. It reads `mailed: true` only when the relay queued the
 notice: one its full queue dropped, or one it refused because it had begun to close, reads
 `mailed: false`, so the next lock of the kind mails again (vault BACKLOG #3120). When the relay's queue is full, the relay refuses the notice because it has
-begun to close, or the send fails, the engine writes one more row, with the notice's recipient as
-the actor. A lock
+begun to close, a cut close leaves the notice queued or cuts its send, or the send fails, the
+engine tries to write one more row, with the notice's recipient as the actor; when that write
+can fail is under *Still open* below. A lock
 notice writes `auth.lock_notice_undelivered`, hidden as above. Every other notice kind writes
 `auth.security_notice_undelivered`, which every `audit:read` reader sees. The detail names the
-notice kind and the `reason`, `queue_full`, `closing` or `send_failed`. An issuer's reminder also names the
+notice kind and the `reason`, at least `queue_full`, `closing`, `abandoned`, `interrupted` or
+`send_failed`. An issuer's reminder also names the
 holder. The row never carries the address, the rest of the notice's detail, or the error. The
 source of record is `SecurityEventNotifier._record_undelivered` in
 `messagefoundry/pipeline/security_notify.py`. At least the offline commands `provision-admin` and
 `admin-reset-totp` record it the same way (BACKLOG #5634). `provision-admin` writes it into the
 store it holds open, so a takeover notice whose `auth.first_administrator_provisioned` row reads
 `holder_notice: dispatched` and whose send failed gets its own undelivered row too, except in at
-least these cases: that write fails, or the run is interrupted mid-send. The command's own result
+least these cases: that write fails, or an interrupt ends the run before it lands. An interrupt
+mid-send can instead leave a `reason: interrupted` row (BACKLOG #6832). The command's own result
 says so as well: `holder_notice_send_failed` in `--json`, and a WARNING line in text. Both say
 the notifier requested to record the notice as undelivered, that is, its send raised, so delivery is
 unconfirmed; a send can raise after the relay has queued the mail. That row can
@@ -8245,9 +8248,23 @@ come before the provision row in the chain, because the notice is sent while the
 again for the row, and only when a send failed. **Still open, at least:**
 
 - At shutdown the notifier closes while the store is still open (BACKLOG #3191), so a send that
-  fails in its final drain is recorded. That close is one bounded step of the shutdown. When the
-  step is cut, a notice still queued is neither sent nor recorded, and a send already under way
-  may still go out or fail unrecorded. A lock notice among them keeps its `auth.lock_notice` row
+  fails in its final drain is recorded. That close is one bounded step of the shutdown, and it
+  sets no bound of its own, so the drain mails for the whole of the step's bound. When the step
+  is cut, the close cancels the drain and records the send it cut with `reason: interrupted` and
+  each notice still queued with `reason: abandoned` (BACKLOG #6832). A send still waiting for a
+  worker thread at the cut is skipped, so it never mails, and is recorded `abandoned` too. A send
+  that ended just before the cut reached the drain is read as it ended: a sent notice gets no
+  row, and a failed one gets `reason: send_failed`. A cut send whose thread began runs on to its
+  own timeout, so that notice may still go out. Those writes run one at a time and are not
+  bounded. The shutdown stops waiting for them at the step's bound plus its cut grace; the rest
+  go on beside `engine.stop()`, competing with its writes, until the store closes, and those still
+  to run then fail. Under a full queue that can be most of them. A cut logs at least the
+  teardown's ERROR line for the cut and, from the close, a WARNING line counting the queued
+  notices before their writes, only when a notice other than a lock notice is queued, and,
+  when any of those writes fail,
+  one counting them after; that one does not count the writes a cancel stopped before they ran.
+  Neither count includes a lock notice, and the first does not count the cut send. A lock
+  notice among them keeps its `auth.lock_notice` row
   reading `mailed: true`, so the throttle holds back that account's next lock notice of the kind
   for the rest of its 24 hours.
 - A notice that reaches the notifier once it has begun to close is refused and recorded with
@@ -8265,8 +8282,9 @@ again for the row, and only when a send failed. **Still open, at least:**
   on their own loop in a daemon thread, so the limit covers a synchronous key-provider hop inside
   the open too. A record still running at the time limit is not guaranteed either way: the process
   exit may wait for it, or it may be lost with no log line.
-- Under a long overload only 64 queue-full records are written at a time, and drops past that are
-  not recorded.
+- Under a long overload a queue-full drop, or a notice refused once the close has begun, is
+  recorded only while fewer than 64 record tasks are in flight, a failed send's record among them,
+  and drops past that are not recorded. A cut close's rows run as one such task.
 - A lock notice whose send fails still leaves its `auth.lock_notice` row reading `mailed: true`,
   because the send fails on the relay's own task after that row is written. So the throttle holds
   back the next lock notice of the kind for the rest of its 24 hours. The failure is on the
