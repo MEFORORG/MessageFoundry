@@ -6844,13 +6844,19 @@ class SqlServerStore(ServerCipherWalk):
 
     async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:
         """Run a single write statement (or T-SQL batch) in its own committed transaction, and return
-        the driver's row count (``-1`` when it reports none). Most callers ignore it; the cluster
-        stepdown reads it, through :meth:`_execute_clamped`, to say truthfully whether its
-        owner-scoped release matched a row."""
+        the driver's row count (``-1`` when it reports none). Not a match signal (see
+        :meth:`_exec_terminal` on ``SET NOCOUNT ON``): a caller that must know whether its write
+        matched reads an ``OUTPUT`` rowset, as the cluster stepdown's release does through
+        :meth:`_execute_clamped` (BACKLOG #6795)."""
         return await self._write_rows(sql, params)
 
     async def _execute_clamped(
-        self, sql: str, params: tuple[Any, ...], *, timeout_clamp: float
+        self,
+        sql: str,
+        params: tuple[Any, ...],
+        *,
+        timeout_clamp: float,
+        count_output: bool = False,
     ) -> int:
         """:meth:`_execute` bounded by ``timeout_clamp`` exactly as :meth:`_fetchone_clamped` bounds
         a read, whose docstring says what that leaves unbounded, the COMMIT included, and what a
@@ -6859,14 +6865,25 @@ class SqlServerStore(ServerCipherWalk):
         heartbeat runs in the maintenance loop's side pass, which a statement at
         ``[store].command_timeout`` would hold that long (BACKLOG #6472, #5710), and a stepdown's
         release under ``_leadership_lock``, where it would delay the renew; ``stop()`` passes its
-        own bound instead of the renew clamp."""
-        return await self._write_rows(sql, params, timeout_clamp)
+        own bound instead of the renew clamp.
+
+        ``count_output`` returns the number of rows the statement's ``OUTPUT`` clause returned
+        instead of ``cursor.rowcount`` (BACKLOG #6795; :meth:`_exec_terminal` says why, and
+        :meth:`_execute_output` does the same, #2283). The SQL must carry an ``OUTPUT`` clause, or the drain raises. A write that output no row
+        commits uncounted, as ``empty_is_read`` does there (BACKLOG #5675). The lease release
+        passes it, because it reads whether its owner-scoped UPDATE matched."""
+        return await self._write_rows(sql, params, timeout_clamp, count_output=count_output)
 
     async def _write_rows(
-        self, sql: str, params: tuple[Any, ...], timeout_clamp: float | None = None
+        self,
+        sql: str,
+        params: tuple[Any, ...],
+        timeout_clamp: float | None = None,
+        *,
+        count_output: bool = False,
     ) -> int:
         """The body of :meth:`_execute` and :meth:`_execute_clamped`; :meth:`_clamp_bounds` says
-        what ``timeout_clamp`` sets.
+        what ``timeout_clamp`` sets, and :meth:`_execute_clamped` what ``count_output`` does.
 
         A failure of the pool release alone, after the write committed, is logged and the row count
         returned, as ``cluster._call_within`` does on Postgres: reporting that write as failed would
@@ -6882,11 +6899,19 @@ class SqlServerStore(ServerCipherWalk):
                         self._cursor(conn) as cur,
                     ):
                         await cur.execute(sql, params)
-                        # getattr: some test cursors model no row count, and -1 is the DB-API
-                        # 'unknown'.
-                        count = getattr(cur, "rowcount", -1)
-                        rows = count if isinstance(count, int) else -1
-                        await self._commit(conn)
+                        if count_output:
+                            # Drained before the commit; _cursor frees the handle OUTPUT leaves.
+                            rows = len(await cur.fetchall())
+                            if rows == 0:
+                                await self._commit_read(conn)  # changed nothing (BACKLOG #5675)
+                            else:
+                                await self._commit(conn)
+                        else:
+                            # getattr: some test cursors model no row count, and -1 is the DB-API
+                            # 'unknown'.
+                            count = getattr(cur, "rowcount", -1)
+                            rows = count if isinstance(count, int) else -1
+                            await self._commit(conn)
                 except Exception:
                     # A rollback that fails would otherwise recycle a connection still holding the
                     # write's X locks; _rollback_or_discard discards it instead. After the cursor

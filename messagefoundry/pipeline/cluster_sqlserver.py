@@ -825,12 +825,16 @@ class SqlServerCoordinator:
                 # #1986), and never later than the row's own expiry. DbCoordinator._release_leadership
                 # carries the reasoning. MIN over VALUES, because LEAST needs SQL Server 2022, and a
                 # CASE would read the clock twice, so its test and its result could disagree.
+                # The match is counted from OUTPUT, never cursor.rowcount (BACKLOG #6795;
+                # SqlServerStore._exec_terminal says why).
                 rows = await self._store._execute_clamped(
                     "UPDATE leader_lease SET lease_expires_at ="
                     f" (SELECT MIN(v) FROM (VALUES (lease_expires_at), ({_DB_NOW})) AS x(v))"
+                    " OUTPUT inserted.owner"
                     " WHERE lease_key = ? AND owner = ?",
                     (self._lease_key, self.node_id),
                     timeout_clamp=clamp,
+                    count_output=True,
                 )
         except Exception as exc:
             log.warning(
@@ -841,7 +845,7 @@ class SqlServerCoordinator:
             )
             return (was_leader, released_at, False, False)
         self._lease_release_owed = False
-        # The store's _execute returns the driver's row count; one rule for both backends.
+        # The rows OUTPUT returned, read by the one rule both backends share.
         return (was_leader, released_at, True, rows_affected(rows) != 0)
 
     # --- #145 leadership-transition alerts (never-raise; lockstep with DbCoordinator) ----
