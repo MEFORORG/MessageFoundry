@@ -622,16 +622,25 @@ async def test_a_valid_assertion_beside_a_wrong_password_counts_on_the_second_st
 
 
 @pytest.mark.parametrize(
-    "stored", ["AAAAA", "\u00e9\u00e9\u00e9\u00e9"], ids=["one-past-four", "non-ascii"]
+    ("field", "stored"),
+    [
+        ("public_key", "AAAAA"),
+        ("public_key", "\u00e9\u00e9\u00e9\u00e9"),
+        ("public_key", b"AAAA"),
+        ("credential_id", "AAAAA"),
+    ],
+    ids=["key-one-past-four", "key-non-ascii", "key-bytes", "id-one-past-four"],
 )
 async def test_an_undecodable_stored_key_refuses_the_combined_sign_in(
-    monkeypatch: pytest.MonkeyPatch, stored: str
+    monkeypatch: pytest.MonkeyPatch, field: str, stored: Any
 ) -> None:
-    """BACKLOG #6886, the sign-in leg. RED when: a stored key ``base64.urlsafe_b64decode`` cannot
-    read raises out of :meth:`AuthService.login` (whose assertion check "never raises for bad
-    input") instead of refusing. On this keyless store no digest check reads the key first. The
-    refusal is the ``stored_key_refused`` row the key rule writes, deferred with the sign-in's own
-    refused row; the right password does not sign the account in past it."""
+    """BACKLOG #6886, the sign-in leg. RED when: a stored key or id ``base64.urlsafe_b64decode``
+    cannot read raises out of :meth:`AuthService.login` (whose assertion check "never raises for
+    bad input"), or, for the id, signs in, instead of refusing. The usernameless begin leg names no
+    credential, so a row whose stored id does not decode is still looked up by its hash; the verify
+    refuses it. On this keyless store no digest check reads the row first. The refusal is the
+    ``stored_key_refused`` row, deferred with the sign-in's own refused row; the right password
+    does not sign the account in past it."""
     store = await MessageStore.open(":memory:")
     try:
         service, identity, password, auth = await _passkey_owner(store)
@@ -639,7 +648,7 @@ async def test_an_undecodable_stored_key_refuses_the_combined_sign_in(
 
         async def undecodable(user_id: str) -> list[WebAuthnCredential]:
             return [
-                dataclasses.replace(cred, public_key=stored) for cred in await real_list(user_id)
+                dataclasses.replace(cred, **{field: stored}) for cred in await real_list(user_id)
             ]
 
         monkeypatch.setattr(store, "list_webauthn_credentials", undecodable)
@@ -649,7 +658,15 @@ async def test_an_undecodable_stored_key_refuses_the_combined_sign_in(
         rows = await _audit_rows(store, marker)
         refused = [json.loads(d) for a, d in rows if a == "auth.webauthn_failed"]
         assert refused == [{"reason": "stored_key_refused", "label": "key"}], rows
-        assert stored not in json.dumps(rows)
+        # The stored value must reach no row, read both as stored and decoded: a detail is JSON
+        # with its non-ASCII escaped, so the escaped form is checked as well as the decoded one.
+        # The label, which every refused row carries, is the control that each instrument sees.
+        needle = stored.decode("ascii") if isinstance(stored, bytes) else stored
+        stored_details = [d for _, d in rows if d]
+        decoded_details = json.dumps([json.loads(d) for d in stored_details], ensure_ascii=False)
+        assert '"key"' in decoded_details and '"label": "key"' in "".join(stored_details)
+        assert needle not in decoded_details
+        assert json.dumps(needle)[1:-1] not in "".join(stored_details)
     finally:
         await store.close()
 

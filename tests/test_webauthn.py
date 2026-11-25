@@ -519,6 +519,102 @@ async def test_an_undecodable_stored_key_is_a_refused_key_on_the_second_factor_l
         await store.close()
 
 
+def _with_stored(monkeypatch: pytest.MonkeyPatch, store: MessageStore, **fields: Any) -> None:
+    """Serve every passkey row of ``store`` with ``fields`` replaced, as a row written outside
+    the store might hold. The store is keyless, so no digest check reads the row first."""
+    real_list = store.list_webauthn_credentials
+
+    async def replaced(user_id: str) -> list[WebAuthnCredential]:
+        return [dataclasses.replace(cred, **fields) for cred in await real_list(user_id)]
+
+    monkeypatch.setattr(store, "list_webauthn_credentials", replaced)
+
+
+def _undecodable_id_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == _SERVICE_LOG and "credential id that cannot be decoded" in r.getMessage()
+    ]
+
+
+@pytest.mark.parametrize("stored", _UNDECODABLE_KEYS, ids=["one-past-four", "non-ascii", "bytes"])
+async def test_an_undecodable_stored_credential_id_is_refused_at_the_begin_leg(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, stored: Any
+) -> None:
+    """BACKLOG #6886, the id. RED when: a stored ``credential_id`` that does not decode raises out
+    of :meth:`AuthService.begin_webauthn_assertion`. The passkey is left out of the allow list and
+    refused as a stored key is: the WARNING by label and the ``stored_key_refused`` row. It was
+    the only passkey, so no ceremony is staged, which is the existing "no usable passkey" answer."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        _, token = await _enroll(service, identity, token)
+        # CONTROL: the same row with its own id stages a ceremony.
+        assert await service.begin_webauthn_assertion(token, rp_id=RP) is not None
+        _with_stored(monkeypatch, store, credential_id=stored)
+        with caplog.at_level(logging.WARNING, logger=_SERVICE_LOG):
+            assert await service.begin_webauthn_assertion(token, rp_id=RP) is None
+        warned = _undecodable_id_warnings(caplog)
+        assert len(warned) == 1 and "'test key'" in warned[0], warned
+        assert str(stored) not in caplog.text
+        events = await service.security_events_for(identity.username)
+        failed = [json.loads(e["detail"]) for e in events if e["action"] == "auth.webauthn_failed"]
+        assert failed == [{"reason": "stored_key_refused", "label": "test key"}]
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("stored", _UNDECODABLE_KEYS, ids=["one-past-four", "non-ascii", "bytes"])
+async def test_registration_leaves_out_an_undecodable_stored_credential_id(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, stored: Any
+) -> None:
+    """BACKLOG #6886, the id at registration. RED when: a discoverable passkey whose stored
+    ``credential_id`` does not decode raises out of the registration options instead of being left
+    out of the exclude list. Left out, its holder can register that authenticator again, the
+    remedy the WARNING names. The control shows the same row with its own id is excluded."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        _, token = await _enroll(service, identity, token)
+
+        async def excluded() -> list[Any]:
+            opts = await service.begin_webauthn_registration(
+                identity, token=token, rp_id=RP, rp_name="MessageFoundry"
+            )
+            return list(json.loads(opts).get("excludeCredentials") or [])
+
+        _with_stored(monkeypatch, store, discoverable=True)
+        assert len(await excluded()) == 1, "the control: a discoverable passkey is excluded"
+        _with_stored(monkeypatch, store, discoverable=True, credential_id=stored)
+        with caplog.at_level(logging.WARNING, logger=_SERVICE_LOG):
+            assert await excluded() == []
+        warned = _undecodable_id_warnings(caplog)
+        assert len(warned) == 1 and "'test key'" in warned[0], warned
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("stored", _UNDECODABLE_KEYS, ids=["one-past-four", "non-ascii", "bytes"])
+async def test_the_rehash_pass_counts_an_undecodable_stored_credential_id_as_refused(
+    monkeypatch: pytest.MonkeyPatch, stored: Any
+) -> None:
+    """BACKLOG #6886, the start-up pass. RED when: a stored ``credential_id`` that is not text
+    raises ``TypeError`` out of :meth:`AuthService.rehash_webauthn_credentials`, which caught only
+    ``ValueError``. Every undecodable id is refused and counted, and start-up goes on."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        await _enroll(service, identity, token)
+        _with_stored(monkeypatch, store, credential_id=stored)
+        assert await service.rehash_webauthn_credentials() == (0, 1)
+    finally:
+        await store.close()
+
+
 async def test_a_bad_signature_is_not_audited_as_a_refused_stored_key(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

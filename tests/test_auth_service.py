@@ -8,6 +8,7 @@ Wave 2 (BACKLOG #1136), and their tests went with them. What a fresh store holds
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 import threading
@@ -1628,4 +1629,52 @@ async def test_the_breach_screen_runs_off_the_event_loop(
         assert await service.change_password(identity, NEW_PASSWORD + "-long-enough") == []
         assert seen and loop_thread not in seen, "change_password screened on the event loop"
     finally:
+        await store.close()
+
+
+async def test_a_cancelled_screen_keeps_the_lock_until_its_thread_ends() -> None:
+    """BACKLOG #6881. RED when: ``_screened_violations`` lets the next screen start while a
+    cancelled caller's screen is still running on its worker thread. Released on the caller's
+    cancel, the lock let a corpus on a path that stops answering take one worker thread per
+    cancelled password change, and let a new corpus be loaded more than once. The screen here
+    blocks on an event, as a hung file read would."""
+    gate = threading.Event()
+    running: list[str] = []
+    peak = 0
+
+    class _HungScreen:
+        def violations(self, password: str, *, username: str | None = None) -> list[str]:
+            nonlocal peak
+            running.append(password)
+            peak = max(peak, len(running))
+            try:
+                gate.wait(timeout=30)
+            finally:
+                running.remove(password)
+            return []
+
+    async def until(condition: Any) -> None:
+        for _ in range(500):
+            if condition():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("timed out waiting")
+
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        service._policy = _HungScreen()  # type: ignore[assignment]
+        first = asyncio.ensure_future(service._screened_violations("first", username="u"))
+        await until(lambda: running == ["first"])
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        second = asyncio.ensure_future(service._screened_violations("second", username="u"))
+        await asyncio.sleep(0.2)
+        assert running == ["first"], "the next screen started while the first thread ran on"
+        gate.set()
+        assert await asyncio.wait_for(second, timeout=30) == []
+        assert peak == 1
+    finally:
+        gate.set()
         await store.close()

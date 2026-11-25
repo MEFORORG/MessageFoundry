@@ -5171,9 +5171,10 @@ class AuthService:
             for cred in await self._verified_passkeys(user) or ():
                 try:
                     scheme = credential_id_hash_scheme(cred.credential_id_hash)
-                    # binascii.Error, a ValueError, for a credential_id that is not base64url.
+                    # binascii.Error, a ValueError, for a credential_id that is not base64url; a
+                    # TypeError for one that is not text at all (BACKLOG #6886).
                     new_hash = _credential_id_hash(self._b64url_decode(cred.credential_id))
-                except ValueError:  # CredentialHashSchemeError is one too
+                except (ValueError, TypeError):  # CredentialHashSchemeError is a ValueError too
                     refused += 1
                     continue
                 if constant_time_equal(cred.credential_id_hash, new_hash):
@@ -6951,9 +6952,10 @@ class AuthService:
         runs each audit row: at once on the second-factor leg, deferred into the failure pad on the
         sign-in.
 
-        * A stored key the registration rule refuses (BACKLOG #1963), or one that does not decode
-          (BACKLOG #6886), will never sign in again, so it is logged and audited with a fixed slug,
-          never the refusal text, which can quote the key. The log line says which of the two.
+        * A stored key the registration rule refuses (BACKLOG #1963), or a stored key or id that
+          does not decode (BACKLOG #6886), will never sign in again, so it is logged and audited
+          with a fixed slug, never the refusal text, which can quote the key. The log line says
+          which of the two.
         * py_webauthn's own counter-regression rejection is a clone signal (ADR 0068 decision 4).
         * Any other refusal is audited ``auth.webauthn_failed`` only when ``audit_bad_signature``."""
         refused_key: tuple[str, str | None] = (
@@ -6961,12 +6963,16 @@ class AuthService:
             _json({"reason": "stored_key_refused", "label": cred.label}),
         )
         try:
+            # The id is decoded only to be checked: the begin legs leave out a passkey whose id
+            # does not decode (:meth:`_split_stored_credential_ids`), and this refuses it too, so
+            # such a row signs in nowhere.
+            self._b64url_decode(cred.credential_id)
             public_key = self._b64url_decode(cred.public_key)
         except (ValueError, TypeError):
-            # BACKLOG #6886. A stored key that is not base64url text (a length one past a multiple
-            # of four, non-ASCII text, or not a string at all; ``binascii.Error`` is a
+            # BACKLOG #6886. A stored key or id that is not base64url text (a length one past a
+            # multiple of four, non-ASCII text, or not a string at all; ``binascii.Error`` is a
             # ``ValueError``) escaped as an unhandled error. Decoded apart from the verify, so an
-            # error the verify raises is not read as the stored key's. Only a row written outside
+            # error the verify raises is not read as the stored row's. Only a row written outside
             # the store holds one: on a sealed store the passkey digest refuses such a row first.
             _log.warning(
                 "passkey sign-in refused for %s: stored credential %r cannot be decoded and must "
@@ -15482,15 +15488,30 @@ class AuthService:
         whole by the first call; a broken bundled corpus is re-read the same way. Run on a worker
         thread, none of that blocks the loop. The answer, and any exception, is unchanged.
 
-        One screen at a time, as the loop used to run them. So a corpus that appears is loaded
-        once, not by every screen that missed the cache together. A corpus on a path that stops
-        answering blocks a worker thread only for the screen that is running, while the others
-        wait on the lock, though a screen whose caller gives up still leaves its thread blocked.
-        The screen itself is set lookups, so the queue costs nothing measurable."""
+        One screen at a time, as the loop used to run them, and the lock is held until the
+        screen's THREAD ends, not until its caller stops waiting. So a corpus that appears is
+        loaded once, not by every screen that missed the cache together, and a corpus on a path
+        that stops answering blocks one worker thread in all, however many callers give up on it;
+        the others wait on the lock, which a caller may leave by being cancelled. The screen itself
+        is set lookups, so the queue costs nothing measurable."""
         if self._screen_lock is None:
             self._screen_lock = asyncio.Lock()
-        async with self._screen_lock:
-            return await asyncio.to_thread(self._policy.violations, password, username=username)
+        lock = self._screen_lock
+        await lock.acquire()
+        screen = asyncio.ensure_future(
+            asyncio.to_thread(self._policy.violations, password, username=username)
+        )
+
+        def finished(done: asyncio.Future[list[str]]) -> None:
+            lock.release()
+            if not done.cancelled():
+                done.exception()  # read, so a caller that left does not leave it unretrieved
+
+        screen.add_done_callback(finished)
+        # ``wait``, not ``await screen``: a cancel of the caller then leaves the screen running,
+        # and its callback, not the caller, releases the lock when the thread is done.
+        await asyncio.wait((screen,))
+        return screen.result()
 
     #: Serializes :meth:`_screened_violations`; made on first use, inside the running loop.
     _screen_lock: asyncio.Lock | None = None
@@ -19714,6 +19735,29 @@ class AuthService:
     def _b64url_decode(value: str) -> bytes:
         return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
+    @classmethod
+    def _split_stored_credential_ids(
+        cls, creds: Sequence[WebAuthnCredential], *, username: str
+    ) -> tuple[list[bytes], list[WebAuthnCredential]]:
+        """The raw ids of ``creds`` that decode, in order, and the passkeys whose stored id does
+        not (BACKLOG #6886). Such an id (not base64url, or not text at all) raised out of the
+        ceremony that listed it. Only a row written outside the store holds one: on a sealed store
+        the passkey digest refuses it first. Each is logged by label, never by its value."""
+        ids: list[bytes] = []
+        undecodable: list[WebAuthnCredential] = []
+        for cred in creds:
+            try:
+                ids.append(cls._b64url_decode(cred.credential_id))
+            except (ValueError, TypeError):  # binascii.Error is a ValueError
+                _log.warning(
+                    "passkey %r of %s has a stored credential id that cannot be decoded and must "
+                    "be registered again",
+                    cred.label,
+                    username,
+                )
+                undecodable.append(cred)
+        return ids, undecodable
+
     #: Ceremony-miss message — names the LB-stickiness caveat so a multi-node operator can
     #: self-diagnose intermittent failures (ADR 0068 §2).
     _CEREMONY_EXPIRED = (
@@ -19763,9 +19807,11 @@ class AuthService:
             # Only discoverable passkeys are excluded (ADR 0197 Amendment A, wave 2): a holder may
             # register an authenticator again as a discoverable credential, which is the remedy for
             # a passkey registered before wave 2.
-            exclude_credential_ids=[
-                self._b64url_decode(c.credential_id) for c in existing if c.discoverable
-            ],
+            # BACKLOG #6886: a passkey whose stored id does not decode is left out, so the holder
+            # can register that authenticator again, the remedy its log line names.
+            exclude_credential_ids=self._split_stored_credential_ids(
+                [c for c in existing if c.discoverable], username=user.username
+            )[0],
         )
         self._webauthn_challenges.put((hash_token(token), "register"), user.id, challenge)
         await self._audit("auth.webauthn_enroll_started", actor=identity.username)
@@ -20214,13 +20260,22 @@ class AuthService:
         user = await self._load_user(session.user_id)
         held = None if user is None else await self._verified_passkeys(user)
         creds = [c for c in held or () if c.rp_id == rp_id]
-        if not creds:
+        if not creds or user is None:
+            return None
+        allowed, undecodable = self._split_stored_credential_ids(creds, username=user.username)
+        for cred in undecodable:
+            # BACKLOG #6886: a passkey whose stored id does not decode can never sign in, so it is
+            # refused here as a refused stored key is at the finish leg, row and all.
+            await self._audit(
+                "auth.webauthn_failed",
+                actor=user.username,
+                detail=_json({"reason": "stored_key_refused", "label": cred.label}),
+            )
+        if not allowed:
             return None
         challenge = webauthn.new_challenge()
         options = webauthn.assertion_options(
-            rp_id=rp_id,
-            challenge=challenge,
-            allow_credential_ids=[self._b64url_decode(c.credential_id) for c in creds],
+            rp_id=rp_id, challenge=challenge, allow_credential_ids=allowed
         )
         self._webauthn_challenges.put((hash_token(token), "assert"), session.user_id, challenge)
         return options
@@ -20313,7 +20368,8 @@ class AuthService:
         # BACKLOG #1963: a STORED key that breaks the registration rule (ADR 0068, 2026-09-24
         # amendment) is audited with its own slug, so an admin can see why a passkey-only user is
         # stuck; py_webauthn's own counter-regression rejection is a clone signal (ADR 0068 §4).
-        # The caller gets the same refusal for each. _verify_passkey_signature holds all three.
+        # The caller gets the same refusal for each; _verify_passkey_signature holds that handling,
+        # an undecodable stored row (BACKLOG #6886) among it.
         verified = await self._verify_passkey_signature(
             user,
             cred,
