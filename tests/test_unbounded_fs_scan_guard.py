@@ -1042,14 +1042,31 @@ _ROUNDS = 2
 #: running when the test fails. pytest-timeout's per-test cap still governs the whole test.
 _REQUEST_TIMEOUT_SECONDS = 100
 
-#: The per-test cap of each test that uses the driver, which pytest-timeout charges with the
-#: driver's start as well as the call. THE SUITE'S 60 s CAP CAN CUT A RETAKE OFF. On a 32-core
-#: machine under 32 spinning processes and four workers, the linear check and the control each
-#: crashed their worker in 1 of 10 runs, after setups of 21.58 s and 27.31 s, and a passing control
-#: call in another run read 38.24 s. That the cap killed them is inferred from those numbers, since
-#: the crash left no traceback. A retake exists for exactly that load. So the cap is set above
-#: three requests and the driver's start, which also lets the watchdog above fire first on a hang.
-_TIMING_TEST_TIMEOUT_SECONDS = 3 * _REQUEST_TIMEOUT_SECONDS + 60
+#: The ceiling on one `((` site's CPU cost, in calls of `_REFERENCE_SCRIPT`, which `_site_cost`
+#: reads. THE RATIO CANNOT SEE A GUARD THAT IS SLOWER BY A CONSTANT FACTOR, and one about 17 times
+#: slower would take about 75 s on 6,000 sites, the hook's timeout, past which the command runs.
+#: The test it replaced caught that only through `run_guard`'s 60 s cap. Measured locally on
+#: 2026-11-25: the guard read 0.0139 to 0.0274 unloaded and 0.0118 to 0.0281 under 32 spinning
+#: processes, over 25 readings; a copy given a constant cost per site, about 17 times its own, read
+#: 0.345. The ceiling is five times the highest reading. On that machine it is about 5 ms a site,
+#: so 6,000 sites stay well inside the hook's 75 s.
+_MAX_SITE_COST = 0.14
+
+#: The most requests one test sends: `_site_cost` sends two, and three attempts one each.
+_MOST_REQUESTS = 5
+
+#: The per-test cap of each test that uses the driver. pytest-timeout charges it with the whole
+#: item, setup included. pyproject.toml's 60 s is the cap of a LOCAL run; this module is in
+#: tests/tooling_manifest.txt, so CI runs it in the `tooling` job of .github/workflows/ci.yml,
+#: which passes `--timeout=120` on both its legs. The fixture only starts pwsh, so the start and the
+#: driver's Add-Type land in the first request, inside a test's call and under the watchdog above.
+#: The 60 s cap can still cut a retake off. On a 32-core machine under 32 spinning processes and
+#: four workers, the linear check and the control each crashed their worker in 1 of 10 local runs,
+#: after setups of 21.58 s and 27.31 s that the tests using no driver also showed, and a passing
+#: control call in another run read 38.24 s. That the cap killed them is inferred from those
+#: numbers, since the crash left no traceback. So the cap is set above every request a test sends
+#: and a minute more, which also lets the watchdog fire first on a hung request.
+_TIMING_TEST_TIMEOUT_SECONDS = _MOST_REQUESTS * _REQUEST_TIMEOUT_SECONDS + 60
 
 #: Ends every timed command. Only the refined view denies it, and that view is built last, over
 #: the whole command, so a timed call that denies has read every `((` site through that view.
@@ -1068,12 +1085,23 @@ def _arithmetic_run(sites: int) -> str:
     return json.dumps(bash(_arithmetic_command(sites)))
 
 
+#: The unit `_site_cost` counts in: a fixed loop, read through the same driver on the same clock,
+#: so the ceiling scales with the machine and its load as the guard does.
+_REFERENCE_SCRIPT = r"""
+$null = [Console]::In.ReadToEnd()
+for ($i = 0; $i -lt 1000000; $i++) { $null = $i }
+exit 0
+"""
+
+
 class _TimingDriver:
     """One warm `_TIMING_DRIVER` process. :meth:`run` sends it one request and reads the reply."""
 
     def __init__(self, workdir: Path) -> None:
         script = workdir / "time.ps1"
         script.write_text(_TIMING_DRIVER, encoding="utf-8")
+        self.reference = workdir / "reference.ps1"
+        self.reference.write_text(_REFERENCE_SCRIPT, encoding="utf-8")
         self._stderr = (workdir / "stderr.txt").open("w+", encoding="utf-8")
         self._proc = subprocess.Popen(
             ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script)],
@@ -1207,8 +1235,34 @@ def _denies(output: str) -> bool:
     )
 
 
+def _site_cost(driver: _TimingDriver, script: Path, k: int) -> float:
+    """The CPU cost of one site of ``script`` at ``k`` sites, in calls of `_REFERENCE_SCRIPT`, each
+    side the cheapest of `_ROUNDS` samples after a warm-up, with the baseline's cost per call taken
+    off the timed side. A count of reference calls is the same on any clock and any core speed,
+    which a count of cycles or seconds is not. It reads the small input, so a guard slow enough to
+    fail it fails here in seconds, before its large calls could outlast the request watchdog."""
+    timed = driver.run(script, [_arithmetic_run(k), _EMPTY_PAYLOAD], [0, 1] * _ROUNDS, warm=(0, 1))
+    for reading in timed:
+        if reading["index"] == 0:
+            assert all(_denies(out) for out in reading["outputs"]), reading["outputs"][0]
+    reference = driver.run(driver.reference, [_EMPTY_PAYLOAD], [0] * _ROUNDS)
+    call, base = [
+        min(r["cpu"] / r["calls"] for r in timed if r["index"] == index) for index in (0, 1)
+    ]
+    unit = min(r["cpu"] / r["calls"] for r in reference)
+    return float((call - base) / k / unit)
+
+
 def _in_band(readings: list[float]) -> bool:
     return any(_MIN_WORKING_RATIO <= reading < _MAX_LINEAR_RATIO for reading in readings)
+
+
+def _over_the_line(readings: list[float]) -> bool:
+    """The control's verdict: every readable attempt over the line, and at least one readable. A
+    NaN attempt is one the baseline made unreadable, so it is retaken as the linear check retakes
+    it, and it never fails the control on its own."""
+    readable = [reading for reading in readings if not math.isnan(reading)]
+    return bool(readable) and all(reading >= _MAX_LINEAR_RATIO for reading in readable)
 
 
 def _scaling_ratios(
@@ -1257,7 +1311,12 @@ def test_many_arithmetic_commands_are_read_in_linear_time(timing_driver: _Timing
     through the masker. An earlier cut scanned forward from every `((`, and a long run took about
     98 seconds, past the hook timeout, and a timed-out hook lets the command run. The ratio is of
     in-process CPU times, as `_TIMING_DRIVER` and `_attempt_ratio` say why; `_SITES` and the
-    MEASURED SCALING comment say which forward scans it catches."""
+    MEASURED SCALING comment say which forward scans it catches. A ratio cannot see a guard that
+    is slower by a constant factor, so `_MAX_SITE_COST` bounds the cost per site first."""
+    cost = _site_cost(timing_driver, GUARD, _SITES)
+    assert cost < _MAX_SITE_COST, (
+        f"one `((` site cost {cost:.3f} reference calls, over {_MAX_SITE_COST}"
+    )
     readings, record = _scaling_ratios(timing_driver, GUARD, _SITES, denies=True)
     assert _in_band(readings), (
         f"{_GROWTH}x the sites took {readings[-1]:.2f}x the time, outside {_MIN_WORKING_RATIO}x to"
@@ -1288,16 +1347,15 @@ def test_the_linear_time_check_fails_a_forward_scan_from_every_site(
     timing_driver: _TimingDriver,
 ) -> None:
     """Control: the check must fail a quadratic reader, or its pass above proves nothing. Every
-    attempt must read over the line, at the same sizes. That is stronger than the linear check
-    failing, which a reading under `_MIN_WORKING_RATIO` would also do, because the subject is
-    known to scale and a low reading would mean the instrument missed it."""
+    readable attempt must read over the line, at the same sizes, as :func:`_over_the_line` says.
+    That is stronger than the linear check failing, which a reading under `_MIN_WORKING_RATIO`
+    would also do, because the subject is known to scale and a low reading would mean the
+    instrument missed it."""
     with tempfile.TemporaryDirectory() as tmp:
         stand_in = Path(tmp) / "quadratic.ps1"
         stand_in.write_text(_QUADRATIC_STAND_IN, encoding="utf-8")
         readings, record = _scaling_ratios(timing_driver, stand_in, _SITES, denies=False)
-    assert all(reading >= _MAX_LINEAR_RATIO for reading in readings), (
-        f"a quadratic reader scaled by only {min(readings):.2f}x ({record})"
-    )
+    assert _over_the_line(readings), f"a quadratic reader did not read over the line ({record})"
 
 
 _IN = (_MIN_WORKING_RATIO + _MAX_LINEAR_RATIO) / 2
@@ -1314,8 +1372,19 @@ _UNDER = _MIN_WORKING_RATIO - 1
         ((_OVER, _MAX_LINEAR_RATIO, _OVER), 3, False),
         ((_UNDER, _UNDER, _OVER), 3, False),
         ((_MAX_LINEAR_RATIO, _MIN_WORKING_RATIO), 2, True),
+        ((math.nan, _IN), 2, True),
+        ((math.nan, math.nan, math.nan), 3, False),
     ],
-    ids=["linear", "linear-last", "no-op-then-linear", "every-over", "never-in-band", "edges"],
+    ids=[
+        "linear",
+        "linear-last",
+        "no-op-then-linear",
+        "every-over",
+        "never-in-band",
+        "edges",
+        "unreadable-then-linear",
+        "never-readable",
+    ],
 )
 def test_the_scaling_rule_takes_another_attempt_only_outside_the_band(
     monkeypatch: pytest.MonkeyPatch, attempts: tuple[float, ...], spent: int, in_band: bool
@@ -1334,6 +1403,34 @@ def test_the_scaling_rule_takes_another_attempt_only_outside_the_band(
     readings, _ = _scaling_ratios(cast(_TimingDriver, object()), GUARD, 1, denies=True)
     assert readings == list(attempts[:spent])
     assert _in_band(readings) is in_band
+
+
+@pytest.mark.parametrize(
+    ("attempts", "over"),
+    [
+        ((_OVER, _OVER, _OVER), True),
+        ((_OVER, math.nan, _OVER), True),
+        ((math.nan, math.nan, _OVER), True),
+        ((math.nan, math.nan, math.nan), False),
+        ((_OVER, _IN, _OVER), False),
+        ((_OVER, _MAX_LINEAR_RATIO), True),
+        ((_OVER, _MAX_LINEAR_RATIO - 0.01), False),
+    ],
+    ids=[
+        "every-over",
+        "one-unreadable",
+        "one-readable",
+        "none-readable",
+        "one-in-band",
+        "edge",
+        "under-edge",
+    ],
+)
+def test_the_control_fails_only_on_a_readable_attempt_under_the_line(
+    attempts: tuple[float, ...], over: bool
+) -> None:
+    """Control of the control's verdict: an unreadable attempt never fails it alone."""
+    assert _over_the_line(list(attempts)) is over
 
 
 @pytest.mark.timeout(_TIMING_TEST_TIMEOUT_SECONDS)
