@@ -216,13 +216,16 @@ that fired.
 If your brief carries no address, name the file and the rule in your final message, then stop. Leave
 the worktree in place and untouched either way, so the next session can see what you saw.
 
-### The harness guards refuse the tool call, not the commit
+### The worktree gate refuses the tool call, not the commit
 
 The worktree gate is not a git hook. `scripts/worktree/install-gate.ps1` installs it as a PreToolUse
-hook in user scope. It denies the tool call itself, long before commit time. It also denies two kinds of Bash or PowerShell call.
-One swaps the primary checkout onto another branch. The other points a git command at a worktree
-that is not yours. It fires when
-you try to write inside the primary checkout, so write inside your own worktree, by absolute path.
+hook in user scope, for the checkouts on its allowlist, and where it is installed it denies the
+tool call itself, long before commit time. It refuses at least a Write, Edit, MultiEdit or
+NotebookEdit into the primary's working tree, and some git commands aimed at the primary or at a
+linked worktree, so write inside your own worktree, by absolute path. It does not judge where an
+ordinary shell write, such as a redirect into a file, lands. [WORKTREE-GATE.md](WORKTREE-GATE.md),
+*What it blocks*, lists the rules, and the hook itself,
+[`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1), is the source of record.
 
 ### Stage explicit paths; a guard catches only the common blanket spellings
 
