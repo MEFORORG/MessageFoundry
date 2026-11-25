@@ -15,14 +15,15 @@ and BOTH halves are checked against BOTH the code and the doc in the same run:
 * :func:`test_monitoring_plane_scope_is_measured_against_a_live_app` EXECUTES every route in both
   sets against a channel-scoped operator, with an ALL-CHANNELS operator in the same run as the
   positive control, and asserts the constants describe what the app does.
-* :func:`test_security_doc_states_the_measured_monitoring_scope` asserts the doc's blockquote names
-  those same routes on the correct side.
+* :func:`test_security_doc_states_the_measured_monitoring_scope` asserts, among other things, that
+  each of those same routes appears somewhere in the doc's DLQ-SCOPE blockquote. It does not check
+  which paragraph holds a route or which side of the rule the blockquote puts it on.
 
 So the constants cannot drift from the code without the first test reddening, and the doc cannot
-drift from the constants without the second. A name-presence scan was rejected as the instrument
-after measurement: over the live app it MISSES ``_control_guard`` (the three ``connections:control``
-routes enforce the scope through a helper, so their bodies name no primitive) and it misses the
-per-property rule inside ``/ws/stats``. A scan that cannot see a rule it is checking for is not an
+drop a route the constants name without the second. A name-presence scan was rejected as the
+instrument after measurement: over the live app it MISSES ``_control_guard`` (the three
+``connections:control`` routes enforce the scope through a helper, so their bodies name no
+primitive) and it misses the per-property rule inside ``/ws/stats``. A scan that cannot see a rule it is checking for is not an
 instrument, so the executed request is the measurement here.
 
 ``GET /metrics`` was recorded here as the one monitoring read that was NOT narrowed. It narrows
@@ -307,7 +308,8 @@ def _monitoring_scope_problems(text: str) -> list[str]:
 
 def test_security_doc_states_the_measured_monitoring_scope() -> None:
     """For a documentation requirement the DOCUMENTATION is the control; this guard only keeps it
-    true. Every route the measurement above classifies must appear on the right side of the rule."""
+    true. Among other things, every route the measurement above classifies must appear somewhere in
+    the DLQ-SCOPE blockquote; which side of the rule it sits on is not checked."""
     assert _monitoring_scope_problems(_doc_text()) == []
 
 

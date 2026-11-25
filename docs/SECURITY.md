@@ -2440,10 +2440,13 @@ the same permission set on the same method reds CI until it is listed here.
 > these refusals on the JSON routes. `/ui/audit/export` calls the `GET /audit/export` handler, and
 > `/ui/audit` calls the same core as `GET /audit` through the console seam; no test executes those
 > two refusals.
-> `tests/test_monitoring_scope_doc_drift.py` executes each narrowed and global monitoring read
-> above against a scoped caller with an all-channels caller as the control. On the prose side it
-> checks only that each of those route tokens is present in this paragraph, not which side of the
-> rule the paragraph puts it on. It does not check the refusal sentence.
+> `tests/test_monitoring_scope_doc_drift.py` executes GET /channels, GET /connections,
+> GET /events, GET /graph/edges, GET /alerts/active and GET /metrics as narrowed reads, and
+> GET /stats and GET /metrics/history as global ones, against a scoped caller with an
+> all-channels caller as the control. It does not execute the `/ws/stats` fields or the per-name
+> 403s. On the prose side it checks, among other things, that each of those route tokens appears
+> somewhere in this DLQ-SCOPE blockquote; it does not check which paragraph holds a token or which
+> side of the rule it is on. It does not check the refusal sentence.
 
 > **The per-name connection routes do not tell a scoped caller which names exist (BACKLOG #2551).**
 > This covers at least `GET /connections/{name}/metadata` and `POST /connections/{name}/test`,
