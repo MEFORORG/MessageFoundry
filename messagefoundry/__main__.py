@@ -7823,11 +7823,12 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
         # This Forged arm names the user as typed, so neither this text nor _seal_refusal's WARNING
         # prints a value from the record that failed its seal (BACKLOG #5633 item 7;
-        # tests/test_cli.py pins the text, not the WARNING). An arm below that prints named[0]
-        # prints the username as get_user_by_username returned it, and that read checks no seal.
-        # So a record whose seal was not verified, at least on an Unverifiable answer or a Transit
-        # outage before the verify, has its stored username printed, in the refusal text and in
-        # the WARNING below. Neither answer says the seal failed: either can come from a sound row.
+        # tests/test_cli.py pins the text, not the WARNING). Once the read found the account, an arm
+        # below that prints named[0] prints the username as get_user_by_username returned it, and
+        # that read verifies no seal. So on a refused unlock whose seal was not verified, at least
+        # on an Unverifiable answer or a Transit outage at the verify, the refusal text and the
+        # WARNING below print the stored username of an unverified record. An Unverifiable answer
+        # can come from a sound row or a planted seal; the engine denies it like a forged seal.
         return _emit_error(f"{_seal_refusal(wanted, 'unlock')}. {left}", as_json=args.json)
     if outcome == "open-failed":
         if isinstance(extra, (StoreKeylessError, CipherError)):
@@ -7848,12 +7849,11 @@ def _admin_unlock(args: argparse.Namespace) -> int:
             text=_engine_refusal_text(extra) if whole else None,
         )
     if outcome in ("read-refused", "refused"):
-        # Logged, so the cause can be found: WARNING names the class only, since a driver's
-        # message can quote a stored value (ASVS 16.5.4); the traceback goes to DEBUG. A busy
-        # store is not "could not start", so it keeps exit 1 (ADR 0171 Amendment C). It names
-        # named[0], the stored username once the read found the account, and that read checks no
-        # seal: on a refused unlock whose seal was not verified, at least on an Unverifiable answer
-        # or a Transit outage before the verify, the name comes from an unverified record.
+        # Logged, so the cause can be found: WARNING names the error's class, never its message,
+        # since a driver's message can quote a stored value (ASVS 16.5.4); the traceback goes to
+        # DEBUG. It also names named[0], which can be an unverified record's stored username; the
+        # Forged arm's comment above says when. A busy store is not "could not start", so it keeps
+        # exit 1 (ADR 0171 Amendment C).
         log = logging.getLogger(__name__)
         log.warning(
             "admin-unlock: the store refused the %s for %r (%s)",
