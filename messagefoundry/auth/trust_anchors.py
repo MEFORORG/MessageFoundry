@@ -900,7 +900,9 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     certificate and no CRL, so that file still passes. The throwaway context is discarded. It checks
     that the text loads, not that a certificate in it is a CA; a leaf still loads here. A load that
     stops at a damaged block without an error refuses too (:func:`_reads_to_the_end`, BACKLOG
-    #5229), since ``cafile=`` refuses that file.
+    #5229), since ``cafile=`` refuses that file, and so does text holding the certificate that check
+    appends. Not every damaged block refuses: at least an ``X509 CRL`` block whose base64 decodes
+    to bytes that are no CRL still loads.
 
     **An encryption header name after the first BEGIN refuses, before that load** (BACKLOG
     #2270), whether or not it sits inside a block. A
@@ -1010,8 +1012,9 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             "start of one. Remove that byte, or the -----BEGIN text if that line is a comment",
             scope="non_ascii",
         )
+    trial = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     try:
-        ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=text)
+        trial.load_verify_locations(cadata=text)
     except ssl.SSLError as exc:
         why = _SSL_WHERE.sub("", str(exc))
         raise TrustAnchorError(
@@ -1021,12 +1024,20 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             "that checks revocation reads its CRL from its own CRL setting",
             scope="unloadable",
         ) from exc
-    if not _reads_to_the_end(text):
+    loaded = trial.get_ca_certs(binary_form=True)
+    if _READ_TO_END_PROBE_DER in loaded:  # reaching the probe would then prove nothing
+        raise TrustAnchorError(
+            f"{spec.setting}: the trust anchor {spec.path!r} holds the certificate the engine "
+            "appends to test that the TLS library reads a trust anchor to its end. That "
+            "certificate is never trusted, so remove it",
+            scope="unloadable",
+        )
+    if not _reads_to_the_end(text, len(loaded)):
         raise TrustAnchorError(
             f"{spec.setting}: the TLS library stops reading the trust anchor {spec.path!r} at a PEM "
             "block it cannot use, without an error, so it would trust only the certificates before "
-            "that block, and a load by path refuses the file. Every PEM block in it must be "
-            "well-formed: remove or repair the damaged block",
+            "that block, and a load by path refuses the file. Remove or repair the block at "
+            "which it stops",
             scope="unloadable",
         )
     return text
@@ -1050,7 +1061,7 @@ JTQ7zlQBG0UQeXnz
 _READ_TO_END_PROBE_DER = base64.b64decode("".join(_READ_TO_END_PROBE.splitlines()[1:-1]))
 
 
-def _reads_to_the_end(text: str) -> bool:
+def _reads_to_the_end(text: str, loaded: int) -> bool:
     """Whether OpenSSL's ``cadata=`` load of ``text`` reads to its end (BACKLOG #5229).
 
     At some damaged PEM blocks, at least a block that decodes to no data or holds a header line
@@ -1058,6 +1069,10 @@ def _reads_to_the_end(text: str) -> bool:
     certificates before that block, while ``cafile=`` refuses the whole file with ``PEM lib``. So
     this loads ``text`` with :data:`_READ_TO_END_PROBE` after it into a throwaway context: a load
     that stopped early never reaches the probe. A load that raises here counts as not reaching it.
+    ``loaded`` is how many CA certificates the load of ``text`` alone holds, and the load with the
+    probe must hold exactly one more and hold the probe. The caller refuses ``text`` that already
+    holds the probe, since OpenSSL keeps one copy of a certificate it reads twice, so the probe
+    would show whether or not the load reached the end.
     It does not judge a block's contents once decoded: at least a ``X509 CRL`` block whose base64
     decodes to bytes that are no CRL loads here and refuses under ``cafile=``."""
     probe = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -1065,7 +1080,8 @@ def _reads_to_the_end(text: str) -> bool:
         probe.load_verify_locations(cadata=text + "\n" + _READ_TO_END_PROBE)
     except ssl.SSLError:
         return False
-    return _READ_TO_END_PROBE_DER in probe.get_ca_certs(binary_form=True)
+    reached = probe.get_ca_certs(binary_form=True)
+    return len(reached) == loaded + 1 and _READ_TO_END_PROBE_DER in reached
 
 
 # --- read-only DACL inspection (icacls, verify-only) ---------------------------------------------
