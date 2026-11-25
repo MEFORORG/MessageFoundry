@@ -436,9 +436,10 @@ if ($SkipFetch) { $fetchDetail = 'skipped (-SkipFetch): merge decisions use what
 elseif (-not ($Apply -or $Fetch)) { $fetchDetail = 'skipped (dry run): pass -Fetch to refresh origin/* first' }
 else {
     Write-Note "Fetching origin (--prune)..."
-    # --no-auto-maintenance (BACKLOG #7614): a plain fetch ends with `maintenance run --auto`, whose
-    # `gc --auto` runs `git worktree prune` and expires registrations this pass is about to reason
-    # about -- detached by default, so possibly in the middle of it. Measured on a repo past gc.auto.
+    # --no-auto-maintenance (BACKLOG #7614): a plain fetch ends with `maintenance run --auto`, which
+    # runs `git worktree prune` (git 2.55 measured: on any repo with an expired prunable registration)
+    # and expires registrations this pass is about to reason about -- detached by default, so possibly
+    # in the middle of it.
     & git -C $RepoRoot fetch origin --prune --quiet --no-auto-maintenance 2>$null
     if ($LASTEXITCODE -eq 0) { $fetched = $true; $fetchDetail = 'origin fetched (--prune)' }
     else {
@@ -528,26 +529,30 @@ function Test-Merged {
     #    while) while the receipt still claimed a PR probe was scoped. Keep the commas tight.
     #    `--head` also matches a PR into ANY base and a fork's PR from a branch of the same name, so only
     #    a PR into $mainBase from this repository counts (BACKLOG #7615). A row that does not say fails
-    #    closed. `--base` keeps PRs into other bases from filling `--limit`; the filter below still
-    #    checks the field, since an answer that ignored it must not count.
-    #    $answeredNo: the probe ran, parsed, and found no such PR (it is set before the early return of
-    #    a match, which never reaches step 3). Step 3 reads it.
+    #    closed. No `--base` on the call: it would change which PRs fill `--limit`, and could then find
+    #    a match the unfiltered query never saw, widening what this removes.
+    #    $answeredNo: gh exited 0 with a JSON array holding no such PR. Step 3 reads it. Anything else
+    #    gh says is a FAILED probe: it used to read as an empty answer and was counted as a success.
     $answeredNo = $false
     if ($hasGh) {
         $script:ghAttempts++
-        $raw = & gh pr list --repo $ghSlug --head $Branch --base $mainBase --state merged --json number,headRefOid,baseRefName,isCrossRepository --limit 20 2>&1
+        $raw = & gh pr list --repo $ghSlug --head $Branch --state merged --json number,headRefOid,baseRefName,isCrossRepository --limit 20 2>&1
         $ghExit = $LASTEXITCODE
         # 2>&1 folds stderr in as ErrorRecords; keep them out of the JSON but keep them as the reason.
         $ghText = (@($raw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n").Trim()
-        if ($ghExit -ne 0) {
-            $script:ghFailures++
-            $why = (@($raw) -join ' ').Trim()
-            if (-not $script:ghFirstError) { $script:ghFirstError = if ($why) { $why } else { "gh exited $ghExit" } }
-            $notes += "the merged-PR probe FAILED for this branch (gh exited $ghExit), so only the local merge signals were available"
+        $prs = $null
+        if ($ghExit -eq 0) {
+            try { $prs = ConvertFrom-Json -InputObject $ghText -NoEnumerate } catch [System.ArgumentException] { $prs = $null }
         }
-        if ($ghExit -eq 0 -and $ghText) {
-            $prs = $null
-            try { $prs = @($ghText | ConvertFrom-Json); $answeredNo = $true } catch { $prs = @() }
+        if ($prs -isnot [array]) {
+            $script:ghFailures++
+            $what = if ($ghExit -ne 0) { "gh exited $ghExit" } else { 'gh exited 0 without a JSON array' }
+            $why = if ($ghExit -ne 0) { (@($raw) -join ' ').Trim() } else { '' }
+            if (-not $script:ghFirstError) { $script:ghFirstError = if ($why) { $why } else { $what } }
+            $notes += "the merged-PR probe FAILED for this branch ($what), so only the local merge signals were available"
+        }
+        else {
+            $answeredNo = $true
             $atTip = @($prs | Where-Object { $_.headRefOid -eq $tip })
             $exact = @($atTip | Where-Object { $_.baseRefName -ceq $mainBase -and $_.isCrossRepository -eq $false })
             if ($exact.Count -gt 0) {
@@ -560,7 +565,8 @@ function Test-Merged {
                 $notes += "PR #$($pr.number) merged at this exact tip, but $why -- not a merge signal"
             }
             if ($prs.Count -gt 0 -and $atTip.Count -eq 0) {
-                $notes += "a merged PR (#$($prs[0].number)) exists for the branch NAME '$Branch', but its head was $($prs[0].headRefOid.Substring(0,8)) and this branch is at $($tip.Substring(0,8)) -- the branch moved on after that merge"
+                $head = [string]$prs[0].headRefOid
+                $notes += "a merged PR (#$($prs[0].number)) exists for the branch NAME '$Branch', but its head was $($head.Substring(0, [Math]::Min(8, $head.Length))) and this branch is at $($tip.Substring(0,8)) -- the branch moved on after that merge"
             }
         }
     }
@@ -600,7 +606,9 @@ function Test-Merged {
                 }
                 $notes += "upstream $upShort is gone, but the merged-PR probe found no PR merged into '$mainBase' at this tip, and a closed PR or a deleted remote branch leaves the same shape -- not a merge signal"
             }
-            $notes += "upstream $upShort is gone, but it belongs to ANOTHER branch (this worktree was branched off it) -- not a merge signal"
+            else {
+                $notes += "upstream $upShort is gone, but it belongs to ANOTHER branch (this worktree was branched off it) -- not a merge signal"
+            }
         }
     }
     return @{ Merged = $false; Reason = 'no merge signal'; Unique = $uniq; Notes = $notes; NeverUsed = $false }
