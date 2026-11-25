@@ -8902,13 +8902,16 @@ def _store_key_file_gate(settings: ServiceSettings, *, enforcing: bool) -> bool:
     is what keeps the key from the others. ``protect-key`` creates the file restricted; this
     catches one that was moved, copied or re-granted since. A file that is absent is left to the
     key provider, which fails closed on it at store open and says why."""
+    import os
+
     from messagefoundry.secrets_dpapi import dpapi_available
     from messagefoundry.store.keyprovider import provider_key_file
 
     key_file = provider_key_file(settings.store)
     # Off Windows the file cannot be used at all: the key provider refuses it at store open and says
-    # so, which is the fault the operator needs to hear about.
-    if key_file is None or not dpapi_available() or not Path(key_file).exists():
+    # so, which is the fault the operator needs to hear about. lexists, which does not follow a
+    # link, so a link to a missing file is judged, and refused, as a link (vault BACKLOG #5657).
+    if key_file is None or not dpapi_available() or not os.path.lexists(key_file):
         return True
     return _key_file_access_gate(
         key_file,

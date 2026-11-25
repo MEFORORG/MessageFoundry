@@ -1006,12 +1006,19 @@ def mount_of(path: str, mounts: list[tuple[str, str]]) -> tuple[str, str] | None
     return best
 
 
-def _posix_host_verdict(path: str) -> PathVerdict:
+def read_mounts() -> list[tuple[str, str]] | None:
+    """This process's mounts as ``(mount point, type)``, from ``/proc/self/mountinfo``, or ``None``
+    where that table cannot be read: not Linux, or no ``/proc``."""
     try:
         with open("/proc/self/mountinfo", encoding="utf-8", errors="replace") as fh:
-            mounts: list[tuple[str, str]] | None = _parse_mountinfo(fh.read())
+            return _parse_mountinfo(fh.read())
     except OSError:
-        mounts = None  # not Linux, or no /proc: every object answers indeterminate for its type
+        return None
+
+
+def _posix_host_verdict(path: str) -> PathVerdict:
+    # No table: every object answers indeterminate for its type.
+    mounts = read_mounts()
 
     def lstat_fn(p: str) -> PosixStat:
         st = os.lstat(p)

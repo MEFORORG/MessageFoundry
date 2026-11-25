@@ -1028,6 +1028,76 @@ def test_a_posix_root_that_could_not_be_read_is_refused() -> None:
     assert problem is not None and "could not be read, so no link on it was judged" in problem
 
 
+def _typed_link_problem(path: str, mounts: list[tuple[str, str]]) -> str | None:
+    """:func:`_posix_link_problem` over :data:`_KEY_TREE`, every object root's or the engine's with
+    no group or other write bit, so only the mount type can refuse."""
+
+    def lstat_fn(part: str) -> PosixStat:
+        if part not in _KEY_TREE:
+            raise OSError(errno.ENOENT, "No such file or directory")
+        uid, mode = _KEY_TREE[part]
+        return PosixStat(uid, mode)
+
+    from messagefoundry.auth.anchor_path import mount_of
+
+    return restricted_file._posix_link_problem(
+        path,
+        cwd="/",
+        euid=_ENGINE_UID,
+        lstat_fn=lstat_fn,
+        readlink_fn=lambda _part: "",
+        fstype_fn=lambda part: mount_of(part, mounts),
+    )
+
+
+@pytest.mark.parametrize("fstype", ["nfs4", "nfs", "cifs", "smb3", "9p", "fuse.sshfs", "fuseblk"])
+def test_a_posix_key_on_a_delegated_file_system_is_refused(fstype: str) -> None:
+    """Vault BACKLOG #5657 step 6 (f), #5636: the owner and mode bits of an NFS, CIFS, 9p or FUSE
+    mount are not what decides who may reach the file, so a clean 0600 key under clean folders on
+    one was passed. The refusal names the type and no path."""
+    mounts = [("/", "ext4"), ("/private/tmp", fstype)]
+    problem = _typed_link_problem("/private/tmp/keys/k.key", mounts)
+    assert problem is not None and f"its path is on a {fstype} mount" in problem
+    assert "/private" not in problem
+
+
+@pytest.mark.parametrize("fstype", ["ext4", "xfs", "tmpfs", "overlay", "zfs", "vfat"])
+def test_a_posix_key_on_a_type_not_named_is_not_judged_by_its_type(fstype: str) -> None:
+    """A local type, and any type the rule does not name, is left as before: the negative
+    control for the test above."""
+    mounts = [("/", "ext4"), ("/private/tmp", fstype)]
+    assert _typed_link_problem("/private/tmp/keys/k.key", mounts) is None
+
+
+def test_a_posix_mount_table_that_could_not_be_read_judges_no_type() -> None:
+    """With no mount table (``fstype_fn`` answers ``None``, as off Linux) nothing is refused for
+    its type, and the walk is otherwise unchanged."""
+    assert _typed_link_problem("/private/tmp/keys/k.key", []) is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the POSIX key-file check runs off Windows")
+def test_broad_access_problem_refuses_a_key_the_mount_table_puts_on_nfs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end on this host: a 0600 key in a 0700 folder passes, until the mount table says
+    the folder is an NFS mount (vault BACKLOG #5657 step 6 (f))."""
+    os.chmod(tmp_path, 0o700)
+    key = tmp_path / "k.key"
+    key.write_bytes(b"synthetic")
+    os.chmod(key, 0o600)
+    clean = restricted_file.broad_access_problem(key)
+    if clean is not None:
+        pytest.skip(f"this host's temporary folder is refused already: {clean}")
+    monkeypatch.setattr(
+        restricted_file,
+        "read_mounts",
+        lambda: [("/", "ext4"), (os.path.realpath(tmp_path), "nfs4")],
+        raising=False,
+    )
+    problem = restricted_file.broad_access_problem(key)
+    assert problem is not None and "its path is on a nfs4 mount" in problem
+
+
 def test_a_posix_link_another_account_can_change_is_refused() -> None:
     # A link in a folder a group may write, with no sticky bit: any member may re-point it.
     shared = {
@@ -2996,6 +3066,27 @@ def test_the_store_key_file_check_is_left_to_the_provider_where_dpapi_is_absent(
     assert capsys.readouterr().err == ""
     monkeypatch.setattr(dpapi_mod, "dpapi_available", lambda: True)  # the control
     assert cli._store_key_file_gate(settings, enforcing=True) is False
+
+
+def test_the_store_key_file_gate_judges_a_dangling_link_rather_than_skipping_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #5657 step 10 (g): the gate skipped a path ``Path.exists()`` denied, and that
+    follows a link, so a link to a missing file was never judged. It is refused as a link now."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.config.settings import load_settings
+
+    link = tmp_path / "store.key.dpapi"
+    try:
+        os.symlink(tmp_path / "missing.dpapi", link)
+    except OSError as exc:  # Windows without the symbolic-link privilege
+        pytest.skip(f"no symbolic link could be made here ({exc.strerror})")
+    settings = load_settings(environ={"MEFOR_STORE_ENCRYPTION_KEY_FILE": str(link)})
+    monkeypatch.setattr(dpapi_mod, "dpapi_available", lambda: True)
+    assert cli._store_key_file_gate(settings, enforcing=True) is False
+    assert "is a link" in capsys.readouterr().err
+    link.unlink()  # the control: a name nothing is at is still left to the key provider
+    assert cli._store_key_file_gate(settings, enforcing=True) is True
 
 
 def test_supervise_exits_cleanly_when_the_tls_key_cannot_be_created_restricted(
