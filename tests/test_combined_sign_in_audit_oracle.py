@@ -1409,6 +1409,8 @@ async def test_a_cancel_then_a_failing_write_ends_in_the_cancel_and_logs_the_err
         if r.name == "messagefoundry.auth.service" and r.levelno >= logging.ERROR
     ]
     assert len(errors) == 1, [r.getMessage() for r in errors]
+    # The walk below reads the same capture that just held the service's record, so it saw records.
+    assert len(caplog.records) >= 1
     echoed = [
         r
         for r in caplog.records
