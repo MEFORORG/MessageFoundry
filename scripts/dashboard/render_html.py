@@ -708,7 +708,7 @@ closed ones. As of the vault at run time.</p></section>
 the snapshot and render_html.py drew this page. A value that could not be read shows as no data,
 never as zero, and its reason is printed in its tile. A hollow point or faded bar is a week still in
 progress. The ledger range buttons apply to the two ledger charts; the pull request and CI charts
-cover the window. State metrics (open PRs, alerts, ASVS, ledger rows, release distance) are as of
+cover the window. State metrics (alerts, ASVS, ledger rows, release distance) are as of
 the run, whatever the window says. Times are US Central.</p>
 </footer>
 </main>

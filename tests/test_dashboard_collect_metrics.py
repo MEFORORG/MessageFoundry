@@ -51,11 +51,6 @@ def _no_raw(argv: Sequence[str]) -> bytes:
     raise cm.CollectError("subprocess reached in a test")
 
 
-def _no_stall(cmd: list[str], timeout: float) -> str:
-    REACHED.append(" ".join(cmd))
-    raise cm.CollectError("stall runner reached in a test")
-
-
 def _ctx(
     tmp_path: Path, run: Any, *, weeks: int = 3, through: str = "2026-11-18", today: str = ""
 ) -> Any:
@@ -68,7 +63,6 @@ def _ctx(
         run_tool=run,
         run_raw=_no_raw,
         fetch=_no_fetch,
-        stall_runner=_no_stall,
         today=dt.date.fromisoformat(today or "2026-11-19"),
         gh_backoff=0.0,
     )
@@ -135,11 +129,6 @@ def test_status_thresholds() -> None:
     assert cm.status_merged(0, [5, 5]) == "bad"
     assert cm.status_merged(2, [10, 10]) == "warn"
     assert cm.status_merged(5, [10, 10]) == "good"
-    assert cm.status_flow(7, 0) == "good"
-    assert cm.status_flow(7, 1) == "warn"
-    assert cm.status_flow(7, None) == "warn"  # an unread stall count is not zero stalls
-    assert cm.status_flow(14, 0) == "warn"
-    assert cm.status_flow(14.1, 0) == "bad"
     assert cm.status_ci(90, 0) == "good"
     assert cm.status_ci(90, 1) == "warn"
     assert cm.status_ci(74.9, 0) == "bad"
@@ -393,7 +382,6 @@ def test_snapshot_schema(tmp_path: Path) -> None:
         "backlog_forecast",
         "batch_progress",
         "prs_merged",
-        "flow_health",
         "ci_main",
         "asvs",
         "dependency_vulns",
@@ -571,48 +559,6 @@ def test_ci_main_reads_push_runs_and_skips_ci_red_for_a_past_through(tmp_path: P
     assert not any("ci-red" in a for a in seen)
     assert m.detail["open_ci_red_prs"] is None
     assert "not read" in m.detail["open_ci_red_prs_as_of"]
-
-
-def _flow_run(*, merged_fails: bool) -> Any:
-    def run(argv: Sequence[str], cwd: Path | None) -> str:
-        if "open" in argv:
-            # One day old against the real clock, which c_flow_health reads for open-PR ages.
-            opened = dt.datetime.now(dt.UTC) - dt.timedelta(days=1)
-            return json.dumps([{"number": 1, "createdAt": opened.isoformat()}])
-        if merged_fails:
-            raise cm.CollectError("gh pr list exited 1: HTTP 403: Forbidden")
-        if not argv[argv.index("--search") + 1].startswith("merged:2026-11-09"):
-            return "[]"
-        return json.dumps(
-            [{"number": 2, "createdAt": "2026-11-10T00:00:00Z", "mergedAt": "2026-11-10T06:00:00Z"}]
-        )
-
-    return run
-
-
-def test_flow_health_degrades_only_the_parts_that_failed(tmp_path: Path) -> None:
-    def hung(cmd: list[str], timeout: float) -> str:
-        raise cm.subprocess.TimeoutExpired(cmd, timeout)
-
-    ctx = _ctx(tmp_path, _flow_run(merged_fails=True))
-    ctx.stall_runner = hung
-    m = cm.Metric("flow_health", "", "", "", "")
-    cm.c_flow_health(ctx, m)
-    assert m.value == 1
-    assert m.error is None
-    assert m.detail["median_open_to_merge_hours"] is None
-    assert m.detail["merged_prs_measured"] is None
-    assert m.detail["green_but_unmergeable"] is None
-    assert "merged PRs:" in m.detail["partial_error"]
-    assert "stall count: TimeoutExpired" in m.detail["partial_error"]
-    assert m.status == "warn"  # an unread stall count caps the status at warn
-
-
-def test_flow_health_measures_merges_when_they_read(tmp_path: Path) -> None:
-    m = cm.Metric("flow_health", "", "", "", "")
-    cm.c_flow_health(_ctx(tmp_path, _flow_run(merged_fails=False), weeks=2), m)
-    assert m.detail["median_open_to_merge_hours"] == 6.0
-    assert m.detail["merged_prs_measured"] == 1
 
 
 def test_release_distance_records_an_unreadable_upload_time(tmp_path: Path) -> None:

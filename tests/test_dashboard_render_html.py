@@ -133,8 +133,8 @@ def test_missing_data_renders_as_no_data(data: dict[str, Any]) -> None:
 
 
 def test_null_values_are_no_data_not_zero() -> None:
-    page = rh.render({"weeks": WEEKS, "metrics": [_metric("flow_health", label="Flow")]})
-    tile = page[page.index("<h3>Flow") :]
+    page = rh.render({"weeks": WEEKS, "metrics": [_metric("owner_waiting", label="Owner")]})
+    tile = page[page.index("<h3>Owner") :]
     assert '<span class="big"><span class="nodata">no data</span>' in tile
 
 

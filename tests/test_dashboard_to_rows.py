@@ -167,7 +167,7 @@ def test_metric_rows_contract() -> None:
     assert rows["release_distance.uploaded"]["value"] is None
     assert rows["release_distance.pypi_version"]["value"] is None
     # A metric absent from the snapshot contributes no fact rows.
-    assert "flow_health.oldest_open_days" not in rows
+    assert "batch_progress.rows_closed" not in rows
 
 
 @pytest.mark.parametrize("raw", [None, "", "nan", "inf", "n/a"])

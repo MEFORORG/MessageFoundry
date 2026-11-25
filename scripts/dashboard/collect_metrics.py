@@ -7,8 +7,7 @@ WHAT IT READS, at least: the private vault at its ``origin/main`` (never its wor
 may be dirty or on another branch); GitHub through an already-authenticated ``gh``; the public PyPI
 JSON for the ``messagefoundry`` package; the engine's ``origin/main`` for the release distance, in
 the git checkout ``--engine-repo`` names (default: the checkout this script sits in); and, from the
-tree THIS script sits in, ``scripts/asvs/scorecard.py`` and ``scripts/ci/check_stalled_prs.py``,
-which it runs and imports. That tree need not be a git checkout: the scheduled refresh runs a
+tree THIS script sits in, ``scripts/asvs/scorecard.py``, which it runs. That tree need not be a git checkout: the scheduled refresh runs a
 ``git archive`` copy, and passes ``--archive-ref`` with the commit it archived, because the
 scorecard tool then stamps ``engine=NO-GIT``. It also reads the ``Batch queue`` tab of the
 ``/batch`` runbook workbook (``--runbook``, else ``MEFOR_RUNBOOK``, else
@@ -31,8 +30,8 @@ environment: only the variables whose names match ``_CHILD_ENV_KEEP`` case-insen
 recorded. That is NO SANDBOX, and the environment scrub does not limit what that code can do: the
 child runs with the full power of the user who runs this script. It can run ``gh`` or ``git`` with
 the user's stored credentials (keyring, ``hosts.yml``), read and write any file that user can, and
-so alter the engine files this process runs after it, such as ``scripts/ci/check_stalled_prs.py``,
-``scripts/asvs/scorecard.py``, ``render_html.py`` and this script. Running this script therefore
+so alter the engine files this process runs after it, such as ``scripts/asvs/scorecard.py``,
+``render_html.py`` and this script. Running this script therefore
 trusts vault ``origin/main`` as fully as the engine code itself. Pinning the vault code to a
 reviewed commit would narrow that trust; it is not done here.
 
@@ -48,14 +47,13 @@ WHAT IT WRITES outside ``--out``, at least: unless ``--no-fetch``, two
 ``git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main``, one in the vault and one
 in the engine checkout. Each moves only ``refs/remotes/origin/main``, and also writes
 ``FETCH_HEAD`` and fetched objects, and may start git's own auto-maintenance. No local tag or branch
-is created; the release tag is resolved with ``git ls-remote``. Importing the stalled-PR checker can
-write ``__pycache__`` in the tree this script sits in. Vault files and downloads go to a fresh
+is created; the release tag is resolved with ``git ls-remote``. Vault files and downloads go to a fresh
 ``mf-metrics-*`` directory under ``--work-dir`` (default: Python's temporary directory), removed at
 exit; a removal that fails is an error, and such directories older than two hours are swept at the
 start of the next run, since a run killed by a time limit skips its cleanup.
 
 WINDOWED AND CURRENT METRICS. ``--weeks``/``--through`` bound the weekly series. The state metrics
-(open PRs, open alerts, ASVS counts, open ledger rows, release distance) are read as they stand at
+(open alerts, ASVS counts, open ledger rows, release distance) are read as they stand at
 run time whatever ``--through`` says, and each says so in its detail. The open ``ci-red`` PR count
 is the exception: for a past ``--through`` it is not read at all, so it cannot pass for history.
 The final window week ends at ``--through``, for the ledger counts as for the GitHub ones.
@@ -168,8 +166,6 @@ THRESHOLDS: dict[str, dict[str, float]] = {
     # last full week's merges against the mean of the window's full weeks: warn below half of it,
     # bad at zero merges.
     "prs_merged": {"warn_fraction_of_mean": 0.5},
-    # oldest open PR age in days; any green-but-stalled PR is at least warn.
-    "flow_health": {"good_oldest_days": 7, "warn_oldest_days": 14},
     # main CI pass percent for the last full week; any open ci-red PR is at least warn.
     "ci_main": {"good_pct": 90, "warn_pct": 75},
     # ASVS pass cells over applicable (non-na) cells.
@@ -385,18 +381,6 @@ def status_merged(last: int, full_week_values: Sequence[int]) -> str:
         return "bad"
     mean = statistics.fmean(full_week_values) if full_week_values else 0.0
     return "warn" if last < mean * THRESHOLDS["prs_merged"]["warn_fraction_of_mean"] else "good"
-
-
-def status_flow(oldest_days: float | None, stalled: int | None) -> str:
-    t = THRESHOLDS["flow_health"]
-    if oldest_days is None or oldest_days <= t["good_oldest_days"]:
-        base = "good"
-    elif oldest_days <= t["warn_oldest_days"]:
-        base = "warn"
-    else:
-        base = "bad"
-    # An unread stall count (None) is not zero stalls: it caps the status at warn, like a stall.
-    return "warn" if base == "good" and (stalled is None or stalled) else base
 
 
 def status_ci(pass_pct: float | None, ci_red: int | None) -> str:
@@ -720,8 +704,6 @@ class Context:
     archive_ref: str | None = None
     #: The /batch runbook workbook; None when no path was resolved.
     runbook: Path | None = None
-    #: The stalled-PR checker's runner; None uses its own retrying `gh` runner.
-    stall_runner: Callable[[list[str], float], str] | None = None
     today: dt.date = field(default_factory=lambda: dt.datetime.now(dt.UTC).date())
     gh_backoff: float = GH_BACKOFF_SECONDS
     merged_cache: dict[str, list[dict[str, Any]] | CollectError] = field(default_factory=dict)
@@ -751,16 +733,6 @@ class Context:
         if isinstance(self._vault, CollectError):
             raise self._vault
         return self._vault
-
-
-def _load_module(name: str, path: Path) -> ModuleType:
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise CollectError(f"cannot load {path}")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
 
 
 def _archive_into(ctx: Context, vault: str, sha: str, paths: Sequence[str], root: Path) -> None:
@@ -1011,72 +983,6 @@ def c_prs_merged(ctx: Context, m: Metric) -> None:
     m.status = status_merged(m.value, full_values)
     m.series = total
     m.detail = {"value_week": week, "per_repo": per_repo}
-
-
-def c_flow_health(ctx: Context, m: Metric) -> None:
-    rows = gh_list(
-        ctx, ["pr", "list", "-R", ENGINE_REPO, "--state", "open", "--json", "number,createdAt"]
-    )
-    # Open PRs are today's set, so their ages are measured from now, never from --through: a past
-    # --through would give a PR opened after it a negative age.
-    now = dt.datetime.now(dt.UTC)
-    ages = [(now - parse_stamp(r["createdAt"])).total_seconds() / 86400 for r in rows]
-    oldest_raw = max(ages) if ages else None
-    oldest = None if oldest_raw is None else round(oldest_raw, 1)
-    detail: dict[str, Any] = {
-        "open_prs": len(rows),
-        "oldest_open_days": oldest,
-        "median_open_to_merge_hours": None,
-        "merged_prs_measured": None,
-    }
-
-    # The merged-PR read feeds only the time-to-merge fields, so its failure nulls those alone.
-    try:
-        hours = [
-            (parse_stamp(r["mergedAt"]) - parse_stamp(r["createdAt"])).total_seconds() / 3600
-            for r in merged_prs(ctx, ENGINE_REPO)
-            if r.get("mergedAt") and r.get("createdAt")
-        ]
-        detail["median_open_to_merge_hours"] = round(statistics.median(hours), 1) if hours else None
-        detail["merged_prs_measured"] = len(hours)
-    except (CollectError, ValueError, TypeError, KeyError, AttributeError) as exc:
-        add_partial(detail, f"merged PRs: {type(exc).__name__}: {exc}")
-
-    stalled: int | None = None
-    try:
-        checker = _load_module(
-            "dashboard_check_stalled_prs",
-            ctx.engine_root / "scripts" / "ci" / "check_stalled_prs.py",
-        )
-        # The checker's own `_fetch` (private, but the one definition of the split query and its
-        # fail-closed guards). Its retrying runner is used unless a test injects one.
-        prs = checker._fetch(ENGINE_REPO, None, ctx.stall_runner)
-        stalled = len(checker.scan(prs))
-        detail["green_but_unmergeable"] = stalled
-        detail["green_but_unmergeable_rule"] = (
-            "scripts/ci/check_stalled_prs.py signature: OPEN, BEHIND, no failing or pending check"
-        )
-    except (
-        CollectError,
-        RuntimeError,
-        OSError,
-        ValueError,
-        KeyError,
-        AttributeError,
-        TypeError,
-        ImportError,
-        # The checker's own runner calls subprocess.run with a timeout, so a hung `gh` surfaces
-        # as TimeoutExpired, which is none of the above.
-        subprocess.SubprocessError,
-    ) as exc:
-        # An optional part: the status is capped at warn and the run exits 3, never a quiet null.
-        detail["green_but_unmergeable"] = None
-        add_partial(detail, f"stall count: {type(exc).__name__}: {exc}")
-    detail["state_as_of"] = "run time; --through does not apply to open PRs"
-    m.value = len(rows)
-    # Banded on the raw age, so 7.04 days never rounds into the 7-day band.
-    m.status = status_flow(oldest_raw, stalled)
-    m.detail = detail
 
 
 def c_ci_main(ctx: Context, m: Metric) -> None:
@@ -1640,15 +1546,6 @@ SPECS: tuple[Spec, ...] = (
         "gh pr list -R <repo> --state merged --search merged:<week> --json number,createdAt,mergedAt, "
         f"for {', '.join(MERGED_REPOS)}",
         c_prs_merged,
-    ),
-    Spec(
-        "flow_health",
-        "Engine PR flow",
-        "Are engine pull requests flowing: open count, oldest age, time to merge?",
-        "open PRs",
-        f"gh pr list -R {ENGINE_REPO} --state open|merged --json createdAt,mergedAt; "
-        "scripts/ci/check_stalled_prs.py scan()",
-        c_flow_health,
     ),
     Spec(
         "ci_main",

@@ -206,7 +206,6 @@ def notes(snap: Snapshot) -> dict[str, str]:
     return {
         "backlog_burn": "Counts ledger rows, not items.",
         "prs_merged": f"Engine + vault + korus, week {week}.",
-        "flow_health": "Open engine PRs right now.",
         "ci_main": f"Pass rate of ci.yml push runs on main, week {week}. Cancelled and skipped "
         "runs not counted.",
         "asvs": asvs_note(snap),
@@ -375,14 +374,6 @@ def facts(weeks: int) -> list[Fact]:
         ("backlog_burn", "open_deferred", "Deferred", _key("open_deferred")),
         ("backlog_burn", "filed_window", f"Filed, {weeks} weeks", _key("filed_window")),
         ("backlog_burn", "closed_window", f"Closed, {weeks} weeks", _key("closed_window")),
-        ("flow_health", "oldest_open_days", "Oldest open (days)", _key("oldest_open_days")),
-        (
-            "flow_health",
-            "median_open_to_merge_hours",
-            "Median hours to merge",
-            _key("median_open_to_merge_hours"),
-        ),
-        ("flow_health", "green_but_unmergeable", "Stalled", _key("green_but_unmergeable")),
         ("ci_main", "open_ci_red_prs", "PRs labelled ci-red", _key("open_ci_red_prs")),
         ("asvs", "pass", "Pass", _count("pass")),
         ("asvs", "partial", "Partial", _count("partial")),
