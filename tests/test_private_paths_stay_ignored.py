@@ -75,7 +75,9 @@ _PRIVATE_PATHS: list[tuple[str, str]] = [
 # `.claude/skills/`, an agent definition, anything -- fails here until someone writes it down, and
 # `.claude/worktrees/` reaching this set would publish full nested checkouts.
 _TRACKED_EXCEPTIONS: dict[str, frozenset[str]] = {
-    "/.claude/*": frozenset({".claude/settings.json"}),
+    # .claude/skills/verify/SKILL.md is the second: the shared end-to-end smoke skill. An untracked
+    # skill reaches one checkout only, so it travels by name and every other skill stays ignored.
+    "/.claude/*": frozenset({".claude/settings.json", ".claude/skills/verify/SKILL.md"}),
     # docs/testing/VERIFY.md is OPERATOR material and stays tracked while the rest of the tree does
     # not. It documents `messagefoundry verify`, the wheel-only on-box acceptance check a deployment
     # runs, and docs/README.md lists it as step 6 of "Start here -- a new operator, in order" while
@@ -155,8 +157,8 @@ def test_the_pinned_list_has_not_silently_shrunk() -> None:
     )
 
 
-def test_the_negation_re_includes_exactly_one_file() -> None:
-    """The `!` line is load-bearing on a public repo, and it is one character from being a no-op.
+def test_the_negations_re_include_exactly_their_files() -> None:
+    """The `!` lines are load-bearing on a public repo, and each is one character from a no-op.
 
     Written as `/.claude/` the directory itself would be excluded, and git cannot re-include a file
     whose parent directory is excluded — the negation would parse fine, apply to nothing, and leave
@@ -172,6 +174,11 @@ def test_the_negation_re_includes_exactly_one_file() -> None:
         "`.claude/settings.json` is IGNORED — the `!/.claude/settings.json` negation is not taking "
         "effect. Check that the rule above it is `/.claude/*` and not `/.claude/`: a negation cannot "
         "re-include a file whose parent directory is excluded, and it fails silently when it can't."
+    )
+    skill = _git("check-ignore", "-q", "--no-index", ".claude/skills/verify/SKILL.md")
+    assert skill.returncode != 0, (
+        "`.claude/skills/verify/SKILL.md` is IGNORED -- its negations under `/.claude/skills/` are "
+        "not taking effect. The directory must be re-included before its contents can be."
     )
 
     for sibling in (

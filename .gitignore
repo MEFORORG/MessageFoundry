@@ -180,11 +180,18 @@ scripts/security/scan-tokens.local.txt
 # so 50 ran with no deny-list and no staging guard. `git worktree add` delivers tracked files only.
 /.claude/*
 !/.claude/settings.json
+# The project's one shared skill, `verify` (the end-to-end engine smoke a Builder runs before it
+# commits). A skill left untracked reaches one checkout while looking repo-wide -- the failure this
+# block exists to close -- so it is re-included by name, and every other skill stays ignored.
+# Directory form, then contents form, so the negation below `skills/` can bind.
+!/.claude/skills/
+/.claude/skills/*
+!/.claude/skills/verify/
 # Named explicitly rather than left to `/.claude/*` above. Until this line, the only travelling
 # protection for the session tree was that wildcard -- `.git/info/exclude` carries it too, but that
 # file is per-clone and reaches nobody else. A later edit that narrows the wildcard or adds a second
 # negation would expose full nested checkouts carrying `.venv`, `messagefoundry.db` and the caches.
-# NOTHING under `.claude/` may be negated except `settings.json`; tests/test_private_paths_stay_ignored.py
+# NOTHING under `.claude/` may be negated except `settings.json` and `skills/verify/`; tests/test_private_paths_stay_ignored.py
 # pins the tracked set so widening it fails a required check instead of shipping.
 /.claude/worktrees/
 
