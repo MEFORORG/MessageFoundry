@@ -532,10 +532,11 @@ _VERIFIED_BY_VALUES = frozenset(
 _VERIFIED_BY_ALLOWED = f"code-review <{'|'.join(_CODE_REVIEW_LEVELS)}>, {', '.join(_PLAIN_VALUES)}"
 _VERIFIED_BY_LINE = re.compile(r"Verified-by\s*:(?P<value>.*)", re.IGNORECASE)
 _NOT_REFUSED = "this advisory does not refuse the commit"
-# The squash and revert messages git writes itself. A merge is read from MERGE_HEAD instead, so a
-# human subject that starts "Merge branch" is not skipped.
+# The squash, fixup and revert messages git writes itself. A merge is read from MERGE_HEAD instead,
+# so a human subject that starts "Merge branch" is not skipped.
 _GIT_SQUASH_SUBJECT = "Squashed commit of the following:"
-_GIT_REVERT_SUBJECT = 'Revert "'
+_GIT_AUTOSQUASH_PREFIXES = ("fixup! ", "squash! ", "amend! ")
+_GIT_REVERT_SUBJECTS = ('Revert "', 'Reapply "')
 _GIT_REVERT_LINE = re.compile(r"This reverts commit [0-9a-f]{7,}")
 _SCISSORS_LINE = re.compile(r"# -+ >8 -+\s*$")
 
@@ -544,25 +545,19 @@ def _trailer_lines(message_file: Path) -> list[str] | None:
     """The message's trailers as git reads them, one per line, or None when git cannot answer.
 
     `git interpret-trailers --parse` applies git's own rules: the last paragraph only, comment and
-    scissors lines dropped, continuation lines folded into their trailer. It runs outside a
-    repository too, so the hook's tests need none.
+    scissors lines dropped, continuation lines folded into their trailer. `--no-divider` reads a
+    `---` line as body text, as git does for a commit message, not as a patch divider. It runs
+    outside a repository too, so the hook's tests need none.
     """
     try:
-        proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell, no caller-supplied executable
-            ["git", "interpret-trailers", "--parse", str(message_file)],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError):
+        out = _git("interpret-trailers", "--parse", "--no-divider", str(message_file))
+    except (GitReadError, OSError):
         return None
-    return proc.stdout.split("\n") if proc.returncode == 0 else None
+    return out.split("\n")
 
 
 def _git_generated(message: str, git_dir: Path) -> bool:
-    """True for a merge commit, or a squash or revert message in the shape git generates.
+    """True for a merge commit, or a squash, fixup or revert message in the shape git generates.
 
     *git_dir* is the directory of the message file git hands the hook, which is the per-worktree
     git directory where git keeps MERGE_HEAD. Only the text above a scissors line is read, and
@@ -571,9 +566,9 @@ def _git_generated(message: str, git_dir: Path) -> bool:
     if (git_dir / "MERGE_HEAD").exists():
         return True
     subject = _subject(message)
-    if subject == _GIT_SQUASH_SUBJECT:
+    if subject == _GIT_SQUASH_SUBJECT or subject.startswith(_GIT_AUTOSQUASH_PREFIXES):
         return True
-    if not subject.startswith(_GIT_REVERT_SUBJECT):
+    if not subject.startswith(_GIT_REVERT_SUBJECTS):
         return False
     for line in message.split("\n"):
         if _SCISSORS_LINE.match(line):
@@ -642,13 +637,14 @@ def main() -> int:
 
     # FAIL CLOSED FROM HERE, because from here a wrong answer is a SILENT PASS.
     #
-    # Every exit above this line is reached WITHOUT calling git, so a commit that does not cite a
-    # BACKLOG number is untouched by this. Only a commit that DOES cite one, on a box where git
+    # Every exit above this line is reached WITHOUT a git read that can refuse the commit: the only
+    # git call above is the Verified-by advisory's `interpret-trailers`, and its failure is one more
+    # advisory line. So a commit that does not cite a BACKLOG number is untouched by this. Only a commit that DOES cite one, on a box where git
     # cannot answer, is refused -- and refusing it costs a re-run, while passing it costs the
     # duplicate build this gate exists to stop.
     #
-    # Fail-closed is the right choice HERE specifically because _git has three callers and all of
-    # them are in this file. The sibling case that argued for care -- a board tool with sixty
+    # Fail-closed is the right choice HERE specifically because every caller of _git is in this
+    # file. The sibling case that argued for care -- a board tool with sixty
     # callers written against a function that could not fail -- would trade a silent wrong number
     # for a dead board. A commit hook has no such surface.
     try:

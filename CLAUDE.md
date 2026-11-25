@@ -853,8 +853,8 @@ Manager's watch reached the cloud session 29 seconds after its question.
   first commit usually says `tests`; a fix commit made after a review may name the review, as
   `code-review xhigh`. `verify` means the project's `verify` skill (`.claude/skills/verify`) ran.
   The `commit-msg` hook (`scripts/hooks/claim_check.py`) only advises on this trailer: it prints
-  one line for a missing, unknown or contradictory value, and that advice never refuses the
-  commit. The trailer is the author's own word, so it is **not** proof of code review for the
+  one line, at least for a missing, unknown or contradictory value, and that advice never refuses
+  the commit. The trailer is the author's own word, so it is **not** proof of code review for the
   Lander; what counts as proof is in the merge bullet under *Branch, commit one layer, open the PR*.
 - If the full suite will not finish inside your turn, run the tests covering your change and push.
   Record in your exit report which checks you ran and which you skipped, for the Manager to carry

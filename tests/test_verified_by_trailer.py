@@ -121,6 +121,8 @@ def test_contradictory_trailers_print_one_advisory_line(tmp_path: Path, trailers
         # Below the scissors line `git commit -v` writes, which git drops.
         "docs: a plain subject\n\nBody.\n# ------------------------ >8 ------------------------\n"
         "\nVerified-by: tests\n",
+        # Above a `---` rule with prose below it: git reads no trailer block for the commit.
+        "docs: a plain subject\n\nBody.\n\nVerified-by: tests\n---\nnotes after the rule\n",
     ],
 )
 def test_a_trailer_outside_the_trailer_block_does_not_count(tmp_path: Path, message: str) -> None:
@@ -135,6 +137,8 @@ def test_a_trailer_outside_the_trailer_block_does_not_count(tmp_path: Path, mess
         "docs: a plain subject\n\nBody.\n\nVerified-by: code-review\n  xhigh\n",
         # The comment block an editor commit leaves below the message.
         "docs: a plain subject\n\nBody.\n\nVerified-by: tests\n# Please enter the message.\n#\n",
+        # A `---` rule in the body is body text in a commit message, not a patch divider.
+        "docs: a plain subject\n\nBody.\n\n---\n\nMore body.\n\nVerified-by: tests\n",
     ],
 )
 def test_a_trailer_git_reads_is_counted(tmp_path: Path, message: str) -> None:
@@ -179,6 +183,10 @@ def test_git_that_cannot_answer_prints_one_advisory_line(tmp_path: Path) -> None
         ("Resolve the conflict by hand\n", ("MERGE_HEAD",)),
         ("Squashed commit of the following:\n\ncommit 0123456789abcdef\n", ()),
         ('Revert "docs: a plain subject"\n\nThis reverts commit 0123456789abcdef.\n', ()),
+        ('Reapply "docs: a plain subject"\n\nThis reverts commit 0123456789abcdef.\n', ()),
+        ("fixup! docs: a plain subject\n", ()),
+        ("squash! docs: a plain subject\n", ()),
+        ("amend! docs: a plain subject\n\ndocs: a better subject\n", ()),
     ],
 )
 def test_a_merge_or_git_generated_message_is_skipped(
