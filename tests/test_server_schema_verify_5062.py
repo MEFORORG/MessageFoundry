@@ -802,7 +802,7 @@ def test_a_nested_block_comment_in_plpgsql_raises() -> None:
 
 
 @pytest.mark.parametrize("dialect", _DIALECTS)
-@pytest.mark.parametrize("bad", ["\r", "\x00", "\x85", " "])
+@pytest.mark.parametrize("bad", ["\r", "\x00", "\x85", "\u2028"])
 def test_a_line_comment_holding_a_break_other_than_lf_raises(
     bad: str, dialect: Dialect | None
 ) -> None:
@@ -829,6 +829,17 @@ def test_a_comment_marker_inside_a_bracket_name_still_reads_the_ddl_after_it(nam
     hid the ``CREATE`` after either name, which main reads. The comment reader's bracket handling
     stays main's."""
     statement = f"SELECT 1 {name}; CREATE TABLE v (a INT NOT NULL)"
+    assert set(declared_schema((statement,), "sqlserver").columns) == {"v"}
+
+
+@pytest.mark.xfail(
+    strict=True, reason="known misread, as on main: the comment reader ends [ at its first ]"
+)
+@pytest.mark.parametrize("name", ["AS [x]]--y]", "AS [p]]/*q]"])
+def test_a_comment_marker_after_a_doubled_bracket_is_a_known_misread(name: str) -> None:
+    """SQL Server reads ``]]`` as a ``]`` inside the name, so it builds ``v``; the reader takes the
+    marker for a comment and hides it. Named in the module docstring; strict, so a fix shows here."""
+    statement = f"SELECT 1 {name}; CREATE TABLE v (a INT NOT NULL); SELECT 1 AS [*/];"
     assert set(declared_schema((statement,), "sqlserver").columns) == {"v"}
 
 
