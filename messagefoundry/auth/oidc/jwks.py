@@ -266,11 +266,10 @@ def _require_interval(name: str, value: float) -> float:
     """``value`` as a number of seconds at or above 0, or :class:`ValueError` (BACKLOG #6904).
 
     The type must be an int or a float; a bool, text or any other type is refused. The number is
-    then read by :func:`~messagefoundry.transports.base.float_setting`, which refuses a NaN, an
-    infinity and an int too large for a float. Every comparison against NaN is false, so a NaN floor
-    refuses every refetch after the first and wedges key rotation for good, as an infinite floor
-    does. An int past the float range would build the cache and then raise ``OverflowError`` where
-    the throttled path formats it, ending a sign-in callback in an unaudited 500. A negative is
+    then read by the rule :func:`~messagefoundry.transports.base.float_setting` holds. That matters
+    here because a NaN or infinite floor wedges key rotation for good, and an int past the float
+    range would build the cache and then raise ``OverflowError`` where the throttled path formats
+    it, ending a sign-in callback in an unaudited 500. A negative is
     refused too, the floor the settings load sets for both knobs (``ge=0``, BACKLOG #5318). Zero
     stays legal: ``min_refetch_seconds`` of 0 removes the amplification bound, a choice the
     security-loosening report names. The refusal withholds the value.

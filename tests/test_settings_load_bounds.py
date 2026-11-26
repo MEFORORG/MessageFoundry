@@ -28,14 +28,18 @@ from messagefoundry.config.settings import (
 #: every attempt after a key's first and a negative global count refuses every attempt, a negative
 #: session cap ends every federated session at once, and a cap of 0 pending flows refuses every
 #: federated sign-in.
-_AUTH_REFUSED: list[tuple[str, Any]] = [
+_AUTH_REFUSED: list[Any] = [
     ("password_min_length", -1),
     ("max_sessions_per_user", -1),
     ("oidc_jwks_ttl_seconds", -1),
     ("oidc_jwks_min_refetch_seconds", -1),
     # JwksCache refuses an int past the float range (BACKLOG #6904), so the load refuses it too.
-    ("oidc_jwks_ttl_seconds", 10**400),
-    ("oidc_jwks_min_refetch_seconds", 10**400),
+    pytest.param("oidc_jwks_ttl_seconds", 10**400, id="oidc_jwks_ttl_seconds-past-float-range"),
+    pytest.param(
+        "oidc_jwks_min_refetch_seconds",
+        10**400,
+        id="oidc_jwks_min_refetch_seconds-past-float-range",
+    ),
     ("oidc_flow_cache_max", 0),
     ("oidc_flow_cache_max", -1),
     ("oidc_session_max_hours", 0),
@@ -67,7 +71,7 @@ _AUTH_LOADS: list[tuple[str, Any]] = [
 
 
 @pytest.mark.parametrize(("field", "value"), _AUTH_REFUSED)
-def test_auth_refuses_a_value_below_its_floor(field: str, value: Any) -> None:
+def test_auth_refuses_a_value_outside_its_bounds(field: str, value: Any) -> None:
     with pytest.raises(ValidationError) as info:
         AuthSettings(**{field: value})
     assert field in str(info.value)
