@@ -9240,8 +9240,8 @@ def _sqlite_readonly_uri(path: str) -> str:
 
 #: How :func:`forget_store_salt` names an object holding ``store_salt`` that is not an ordinary
 #: table, keyed by ``lower(sqlite_master.type)``. A ``table`` row there failed the ordinary-table
-#: predicate, so it is normally a virtual table; a hand-edited row (a type in another case, or a
-#: NULL ``sql``) is named as one too.
+#: predicate, so it is normally a virtual table; an ordinary table whose row a hand edit gave a
+#: type in another case is named as one too, and refused.
 _FOREIGN_SALT_KINDS = {"table": "a virtual table", "view": "a view", "index": "an index"}
 
 
@@ -9344,8 +9344,10 @@ def forget_store_salt(path: Path) -> bool:
 
 
 class _ClosedStoreWriteError(sqlite3.OperationalError):
-    """:func:`_write_closed_store`'s own refusal, whose text the engine wrote: the store's path,
-    the journal mode SQLite reported and a fixed sentence, never a row's value or SQLite's message.
+    """:func:`_write_closed_store`'s own refusals, and :func:`forget_store_salt`'s refusal of a
+    ``store_salt`` that is not an ordinary table, whose text the engine wrote: a store or ``-wal``
+    path, the journal mode SQLite reported, a kind word from ``_FOREIGN_SALT_KINDS`` and a fixed
+    sentence, never a row's value or SQLite's message.
     Marked :func:`~messagefoundry.redaction.engine_text_only`, so a renderer that withholds a
     database driver's message keeps it (vault BACKLOG #8153). ``safe_exc`` and the DR reasons show
     it as ``OperationalError``; a traceback names this class itself.

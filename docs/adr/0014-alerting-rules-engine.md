@@ -239,9 +239,15 @@ install. All three shipped defaults are unchanged and byte-identical.
   tamper-evident today, forgery-evident once keyed. **A second residual on lever (A), added 2026-08-04
   ([BACKLOG #328](../BACKLOG.md)):** it is a *bare* walk unless `[integrity].audit_anchor_file` supplies an
   anchor it can use (`docs/CONFIGURATION.md`, `[integrity]`), and a bare walk cannot see a truncated
-  tail (the surviving prefix still chains cleanly), whatever the keying state. The operator lever for
-  an exact seal is `messagefoundry audit-verify --expected-anchor`, run against a quiesced chain. Do
-  not read (A) as covering deletion of the newest rows.
+  tail (the surviving prefix still chains cleanly), whatever the keying state. An anchor is not proof
+  of a true alarm: the parser passes a `vault:v` head through unchecked, so a `vault:v` anchor with a
+  valid count whose head the chain cannot hold, a malformed one or one on a store that is not
+  `vault_transit`, reports a truncated tail on an intact chain (the `_audit_head_shape` docstring in
+  `store/store.py` states the cost). With an anchor, the startup walk compares it as a prefix: the
+  head at the anchor's row position against the recorded one. So it catches deletion of the newest
+  rows that cuts the chain below the anchor's count, and a rewrite at or below it, but not deletion of
+  rows appended after the anchor. The operator lever for an exact seal is `messagefoundry audit-verify
+  --expected-anchor`, run against a quiesced chain.
 
 Each control is **A → Partial (accepted) / B → Pass** — none reaches an unconditional loopback
 (Posture-A) Pass; the exposed-deployment Pass is the instructed configuration above. This ADR does not

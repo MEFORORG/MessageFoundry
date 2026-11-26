@@ -904,7 +904,8 @@ def test_forget_store_salt_converts_an_unreadable_wal_to_a_sqlite_error(
         sqlite3.OperationalError, match="could not be read after leaving WAL mode"
     ) as raised:
         forget_store_salt(copy)
-    # Both callers report it through safe_exc, which withholds a driver's own message.
+    # The DR callers report it through _sqlite_error_reason, which prints it; safe_exc, which a log
+    # or traceback rendering may use, withholds a driver's own message, so pin that it keeps this.
     from messagefoundry.redaction import safe_exc
 
     assert "could not be read after leaving WAL mode" in safe_exc(raised.value)
