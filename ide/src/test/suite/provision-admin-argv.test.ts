@@ -20,10 +20,14 @@ const FIXTURE = JSON.parse(
 ) as { serviceConfig: string; provision: string[]; probe: string[]; probeDefault: string[] };
 const SC = FIXTURE.serviceConfig;
 
-// Built without the `serviceConfig` property in the type, so this file also compiles against the
-// code before the flag existed, where the pins below then fail on the argv itself.
+// Typed as records and handed to the builders `as never`, so no call here names `serviceConfig` in a
+// builder's parameter type, and this file also compiles against the code before the flag existed,
+// where the pins below then fail on the argv itself.
 const provisionOpts: Record<string, string> = { python: "p", username: "alice", email: "alice@example.test", serviceConfig: SC };
 const probeOpts: Record<string, string> = { python: "p", serviceConfig: SC };
+// The call shape statusBar.ts uses with `messagefoundry.serviceConfig` at its default: the property
+// present and undefined.
+const probeDefaultOpts: Record<string, string | undefined> = { python: "p", serviceConfig: undefined };
 
 /** The provision-admin argv the IDE runs for alice with SC set. */
 const PROVISION_ARGV: readonly string[] = FIXTURE.provision;
@@ -33,7 +37,8 @@ const PROBE_ARGV: readonly string[] = FIXTURE.probe;
 
 /**
  * The admin probe's argv with `messagefoundry.serviceConfig` at its default, so no --service-config.
- * tests/test_ide_start_plan_probe_contract.py runs this same list against a real store, and checks it
+ * tests/test_ide_start_plan_probe_contract.py hands this list, minus its first five elements, to the
+ * engine's `main` in-process, in one arm with no store and in others with a seeded one, and checks it
  * against the argv it builds from the TypeScript constants.
  */
 const PROBE_DEFAULT_ARGV: readonly string[] = FIXTURE.probeDefault;
@@ -57,8 +62,7 @@ suite("provision-admin and its probe open the service TOML the guard judged (BAC
   });
 
   test("the probe's whole argv with serviceConfig at its default, no --service-config element", () => {
-    // The call shape statusBar.ts uses: the property present and undefined.
-    const inv = buildAdminProbeInvocation({ python: "p", serviceConfig: undefined });
+    const inv = buildAdminProbeInvocation(probeDefaultOpts as never);
     assert.strictEqual(inv.command, "p");
     pin(inv.args, PROBE_DEFAULT_ARGV);
   });
@@ -78,7 +82,7 @@ suite("provision-admin and its probe open the service TOML the guard judged (BAC
   test("negative control: the two probe pins refuse an element before provision-admin, one appended, and --json missing", () => {
     for (const [good, expected] of [
       [buildAdminProbeInvocation(probeOpts as never).args, PROBE_ARGV],
-      [buildAdminProbeInvocation({ python: "p", serviceConfig: undefined }).args, PROBE_DEFAULT_ARGV],
+      [buildAdminProbeInvocation(probeDefaultOpts as never).args, PROBE_DEFAULT_ARGV],
     ] as const) {
       const before = [...good.slice(0, 5), "--db=other.db", ...good.slice(5)];
       const after = [...good, "--db=other.db"];
