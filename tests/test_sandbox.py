@@ -7,9 +7,10 @@ byte-identical to a direct in-process call) plus the isolation guarantees: a for
 a runaway is capped without wedging intake, a sandboxed ``db_lookup``/``fhir_lookup`` fails closed,
 the marshalled :class:`RunContext` reaches the worker, a ``__reduce__`` gadget returned by a Handler
 never executes in the engine parent, a desynchronized/forged/pre-staged response frame can never
-answer a later dispatch, the engine's code-set tables — not the child's own re-read of
-``codesets/`` — are what a sandboxed Handler resolves against, and a Handler calling XML signature
-``verify()`` fails closed with ``SandboxError`` (vault BACKLOG #6812). Synthetic HL7 only."""
+answer a later dispatch, and the engine's code-set tables — not the child's own re-read of
+``codesets/`` — are what a sandboxed Handler resolves against. It also pins one known limitation,
+not a guarantee: a Handler calling XML signature ``verify()`` in a worker fails closed with
+``SandboxError`` until vault BACKLOG #6812 is fixed. Synthetic HL7 only."""
 
 from __future__ import annotations
 
@@ -376,22 +377,27 @@ def h_verify_catch(msg):
 def test_a_handler_calling_xml_signature_verify_fails_closed_in_a_worker(
     tmp_path: Path, mode: SandboxMode
 ) -> None:
-    """Pins the documented #6812 behaviour for a Handler: ``verify()`` raises ``SandboxError``.
+    """Pins the documented #6812 limitation for a Handler: ``verify()`` raises ``SandboxError``.
 
-    ``docs/CONFIGURATION.md`` ``[sandbox]`` and the ``verify()`` docstring promise that, under the
-    default forbidden-import set and ``mode`` ``subprocess`` or ``isolated``, ``verify()`` reaches the
-    ``cryptography`` import the guard blocks, so the call fails closed with ``SandboxError``: left
-    uncaught it fails the call as an isolation denial, and a Handler catching ``RuntimeError`` catches
-    it. The document is a valid signature over a synthetic body, and the in-process arm is the
-    positive control: it verifies, so the worker arms' failure is the guard and not the payload. Each
-    worker arm gets its own fresh worker, so neither sees an import the other already failed. Only the
-    transform phase is pinned here, not a Router or an ``accepts=`` predicate (vault BACKLOG #6812)."""
+    ``docs/CONFIGURATION.md`` ``[sandbox]`` and the ``verify()`` docstring say that, under the default
+    forbidden-import set and ``mode`` ``subprocess`` or ``isolated``, ``verify()`` fails closed with
+    ``SandboxError`` once it reaches the ``cryptography`` import the guard blocks: left uncaught it
+    fails the call as an isolation denial, and a Handler catching ``RuntimeError`` catches it. Today
+    that import is signxml's own, reached through ``load_signxml()``, so the pin also rests on signxml
+    importing ``cryptography`` eagerly. The document is a valid signature over a synthetic body, and
+    a ``mode=off`` session is the positive control: it verifies, so the worker's failure is the guard
+    and not the payload. Both calls share one worker, as an inbound's calls do, and the first denial
+    must neither kill it nor change the second. Only the transform phase is pinned here, not a Router,
+    an ``accepts=`` predicate or the runner's disposition. This test is inverted when the fix in vault
+    BACKLOG #6812 lets ``verify()`` run in a worker."""
     pytest.importorskip(
         "signxml", reason="the [xml] extra (signxml + cryptography) is not installed"
     )
     from tests.test_xml_signature_coverage import _BODY, _cert_pem, _sign
 
-    denied = r"import of 'cryptography[.\w]*' is forbidden inside the sandbox"
+    # Exactly the top-level package: a denial of only a late submodule would mean ``cryptography``
+    # itself was already loaded past the guard.
+    denied = r"import of 'cryptography' is forbidden inside the sandbox"
 
     source = _VERIFY_GRAPH.replace("__DOC__", repr(_sign(_BODY))).replace(
         "__CERT__", repr(_cert_pem())
@@ -399,23 +405,29 @@ def test_a_handler_calling_xml_signature_verify_fails_closed_in_a_worker(
     (tmp_path / "graph.py").write_text(source, encoding="utf-8")
     registry = load_config(tmp_path)
 
-    # Positive control: in process, both Handlers verify the same document.
-    assert _deliveries(registry, "h_verify") == [("OB_V", "verified=True")]
-    assert _deliveries(registry, "h_verify_catch") == [("OB_V", "verified=True")]
-
-    policy = SandboxPolicy(mode=mode, wall_seconds=15.0)
-    session = _session(str(tmp_path), inbound="IB_V", policy=policy)
+    # Positive control: under mode=off, both Handlers verify the same document.
+    off = _session(str(tmp_path), inbound="IB_V", policy=SandboxPolicy(mode=SandboxMode.OFF))
     try:
-        # Left uncaught, the guard's error fails the message's call as an isolation denial.
-        with pytest.raises(SandboxError, match=rf"^sandbox denied transform 'h_verify': {denied}"):
-            _deliveries(registry, "h_verify", sandbox=session, run_context=RunContext())
+        for hname in ("h_verify_catch", "h_verify"):
+            assert _deliveries(registry, hname, sandbox=off, run_context=RunContext()) == [
+                ("OB_V", "verified=True")
+            ]
     finally:
-        session.close()
+        off.close()
 
-    session = _session(str(tmp_path), inbound="IB_V", policy=policy)
+    session = _session(
+        str(tmp_path), inbound="IB_V", policy=SandboxPolicy(mode=mode, wall_seconds=15.0)
+    )
     try:
         # SandboxError is a RuntimeError, so a Handler catching RuntimeError sees it as one.
         caught = _deliveries(registry, "h_verify_catch", sandbox=session, run_context=RunContext())
+        assert session._proc is not None
+        pid = session._proc.pid
+        # Left uncaught, on the same worker, the guard's error fails the call as an isolation denial.
+        with pytest.raises(SandboxError, match=rf"^sandbox denied transform 'h_verify': {denied}"):
+            _deliveries(registry, "h_verify", sandbox=session, run_context=RunContext())
+        assert session._proc is not None and session._proc.pid == pid
+        assert not session.kill_counts, session.kill_counts
     finally:
         session.close()
     assert len(caught) == 1 and caught[0][0] == "OB_V", caught
