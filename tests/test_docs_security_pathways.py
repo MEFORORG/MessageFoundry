@@ -1147,6 +1147,15 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
         "before the code, through `rotation_comes_first`, whether a must-change session must "
         "change its password first" in " ".join(_doc_text().split())
     ), "the doc no longer states POST /ui/mfa's must-change redirect ahead of the code."
+    # Vault BACKLOG #2964 items 19, 26 and 28: the JSON route has no pre-code ask (pinned above),
+    # GET /ui/mfa renders no gate for a satisfied session, and only a passkey that completes the
+    # pending factor stamps the window (the anchor pin above).
+    for stated in (
+        "`POST /auth/mfa-verify` has no such must-change ask",
+        "`GET /ui/mfa` sends a session that has met its factor to `/ui`",
+        "a user-verified passkey that completes the pending factor, or a step-up",
+    ):
+        assert stated in " ".join(_doc_text().split()), f"the doc no longer states: {stated}"
 
     ceremony = sorted(r for r, fn in routes.items() if _called(fn, "allow_reauth_attempt"))
     assert ceremony == [
