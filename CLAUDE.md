@@ -527,7 +527,8 @@ force-push, stop if the head moved, stop at any refusal, and make only the fixes
 paragraph above names the collision risk that leaves. Every repair head it pushes takes the Lander's
 own independent review the paragraph above requires, before the merge. The procedure is in korus
 `roles/LANDER.md` and `roles/MANAGER.md`. **CHANGED 2026-11-26:** the transfer and the `hold-ack`
-expiry (`HOLD_TTL` and `ACK_TTL` in `scripts/coord/held_pr_turns.py`) were 2 hours.
+expiry were 2 hours; in `scripts/coord/held_pr_turns.py` only `ACK_TTL` was. `HOLD_TTL` is new
+on 2026-11-26: before it, an unacknowledged hold never expired in the script.
 
 **Every seat but Special runs the driver and empower rules.** Each seat except Special applies the
 `driver` and `empower` skills' rules by default, in local and cloud sessions, without the owner
