@@ -826,6 +826,10 @@ def test_an_overlay_anchor_refuses_at_enforce_unless_a_pin_matches(
     assert "could not settle" in str(err.value) and "overlay mount" in str(err.value)
     digest = hashlib.sha256(p.read_bytes()).hexdigest()
     assert ta.enforce_anchor(AnchorSpec("t", "[x]", str(p), digest, "[x].pin"), enforcing=True)
+    # An anchor read again by path, as the store CAs and the outbound CAs are: a pin is no escape.
+    by_path = AnchorSpec("t", "[x]", str(p), digest, "[x].pin", loads_verified_bytes=False)
+    with pytest.raises(TrustAnchorError, match="A pin does not help here"):
+        ta.enforce_anchor(by_path, enforcing=True)
 
 
 def test_posix_unknown_mount_table_is_indeterminate() -> None:
