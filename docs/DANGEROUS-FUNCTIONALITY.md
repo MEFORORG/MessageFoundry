@@ -1168,12 +1168,13 @@ full list. No harness module imports `ctypes`, or an archive or compression libr
 is a claim about imports only. At least `sinks/dimse.py` inflates a compressed data set a peer
 sends it, through the engine's own bounded inflate helper.
 
-**Process starts.** 7 harness modules start a process, each from an argument list:
+**Process starts.** 8 harness modules start a process, each from an argument list:
 
 | Module | What it runs | When | Form |
 |---|---|---|---|
 | `__main__.py` | `git rev-parse HEAD` | Stamping a load report with the commit it ran at | argument list |
 | `acceptance/runner.py` | `pytest`, under the harness's own interpreter | `python -m harness.acceptance`, unless `--no-pytest` is given | argument list |
+| `e2e_smoke.py` | A probe of the harness's own interpreter that asks where it imports `messagefoundry` from, then `messagefoundry serve` | `python -m harness.e2e_smoke`, the end-to-end smoke | argument list |
 | `load/failover.py` | `messagefoundry serve`, once per engine node | A run that starts its own engine, at least the failover and connection-scale runs | argument list |
 | `load/shardcert.py` | `messagefoundry serve --shard`, and the harness again as a sender or a sink | The engine-shard certification runs | argument list |
 | `load/connscale/batchbox.py` | The harness again, as `connscale-remote` | A batch drive split over several sender processes | argument list |
@@ -1190,11 +1191,15 @@ them. At least five things are open:
   Windows may find a copy in the working directory before the one on `PATH`.
 - Each Python child starts as `python -m <module>` with no `-P`. So the child's working directory
   comes first on its import path, unless the caller's environment sets `PYTHONSAFEPATH`. A file
-  there named like a module the child imports would load in its place. One start differs: the
-  provisioning child runs `load/rigadmin.py` by file path with `-P`.
-- No start takes its environment from `messagefoundry/childenv.py`, and
+  there named like a module the child imports would load in its place. At least two starts differ:
+  the provisioning child runs `load/rigadmin.py` by file path with `-P`, and `e2e_smoke.py` starts
+  its probe and its engine with `-P -X disable-remote-debug`, the `CHILD_INTERPRETER_FLAGS` of
+  `messagefoundry/childenv.py`.
+- No start takes its environment from `messagefoundry/childenv.py`'s builders, and
   `tests/test_child_process_environment.py` does not read the harness. So the check that holds
-  every engine start to that module does not reach a harness start. Some harness tests do check
+  every engine start to that module does not reach a harness start. For its engine's environment,
+  `e2e_smoke.py` uses only that module's `outside_engine_namespace`, to drop the caller's engine
+  variables before it adds its own. Some harness tests do check
   what one child is handed, at least `tests/test_rig_admin.py` for the provisioning child and the
   `rigadmin run` child.
 - `rigadmin run` signs in, then starts the command its caller names with `--token=<session>`
@@ -1208,7 +1213,10 @@ node at least these, unless the run sets them itself: `MEFOR_SECURITY_ENFORCEMEN
 passes `--allow-insecure-bind` when the run binds the inbound listener off loopback. Some runs go
 further. `load/multishard.py` and `load/shardcert.py` set `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1`
 and `MEFOR_ALLOW_INSECURE_TLS=1` for their engines on every platform, whatever the run's own
-environment says. These suit a synthetic load graph. An engine started this way would not protect
+environment says. `e2e_smoke.py` sets the same three `MEFOR_SECURITY_*` relaxations,
+`MEFOR_SECURITY_REQUIRE_MFA=false`, and on Windows `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1`, for the
+engine it starts on whatever graph `--config` names, the sample graph by default. It drops every
+`MEFOR_*` variable the caller set, so a run cannot keep the enforcing posture. These suit a synthetic load graph. An engine started this way would not protect
 real messages, so never point one at them.
 
 **Import by name.** 2 harness modules import a module named at run time:

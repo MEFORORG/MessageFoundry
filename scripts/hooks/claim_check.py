@@ -33,6 +33,22 @@ It reads the whole message, fires on every commit, and runs before any git read.
 not start with one of them, such as an indented or backticked quote, passes. It is inert on a box until
 ``scripts/coord/install-git-hooks.ps1`` re-copies this file into the shared ``.git/hooks``.
 
+A fourth check is ADVISORY ONLY (observe mode) and never refuses a commit:
+
+    A `Verified-by:` trailer is the author's own statement of what ran on this commit's content
+    before the commit, one of ``_VERIFIED_BY_ALLOWED``. Several trailers may each name one check
+    that ran, such as `tests` and `code-review xhigh`. A missing or malformed one, or `none` beside
+    any other value, prints one line to stderr, and the commit goes ahead. Only a trailer that
+    `git interpret-trailers --parse` reads from the message counts.
+
+Nothing checks the statement and nothing records the advisory, so the trailer is never proof that a
+review ran (CLAUDE.md section 5 says what is). It only makes the convention visible before anything
+enforces it. It fires wherever this hook is installed, the vault clone included. At least these
+never print it: `--no-verify`; a box whose ``.git/hooks`` copy predates it; a message the
+attribution check refuses, since that check exits first; a merge commit (MERGE_HEAD present); a
+squash or revert message in the shape git generates (``_git_generated``); and any commit git
+writes without running the commit-msg hook, such as a squash merge on GitHub.
+
 Three scoping decisions for the claim rule, each load-bearing:
 
 * **Subject line only.** A body may reference other items freely -- this very repo's commits routinely
@@ -509,6 +525,89 @@ def _refuse_trailers(hits: list[tuple[int, str]]) -> int:
     return 1
 
 
+_CODE_REVIEW_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
+_PLAIN_VALUES = ("e2e-smoke", "tests", "none")
+_VERIFIED_BY_VALUES = frozenset(
+    (*(f"code-review {level}" for level in _CODE_REVIEW_LEVELS), *_PLAIN_VALUES)
+)
+_VERIFIED_BY_ALLOWED = f"code-review <{'|'.join(_CODE_REVIEW_LEVELS)}>, {', '.join(_PLAIN_VALUES)}"
+_VERIFIED_BY_LINE = re.compile(r"Verified-by\s*:(?P<value>.*)", re.IGNORECASE)
+_NOT_REFUSED = "this advisory does not refuse the commit"
+# The squash, fixup and revert messages git writes itself. A merge is read from MERGE_HEAD instead,
+# so a human subject that starts "Merge branch" is not skipped.
+_GIT_SQUASH_SUBJECT = "Squashed commit of the following:"
+_GIT_AUTOSQUASH_PREFIXES = ("fixup! ", "squash! ", "amend! ")
+_GIT_REVERT_SUBJECTS = ('Revert "', 'Reapply "')
+_GIT_REVERT_LINE = re.compile(r"This reverts commit [0-9a-f]{7,}")
+_SCISSORS_LINE = re.compile(r"# -+ >8 -+\s*$")
+
+
+def _trailer_lines(message_file: Path) -> list[str]:
+    """The message's trailers as git reads them, one per line; raises when git cannot answer.
+
+    `git interpret-trailers --parse` applies git's own rules: the last paragraph only, comment and
+    scissors lines dropped, continuation lines folded into their trailer. `--no-divider` reads a
+    `---` line as body text, as git does for a commit message, not as a patch divider. It runs
+    outside a repository too, so the hook's tests need none.
+    """
+    return _git("interpret-trailers", "--parse", "--no-divider", str(message_file)).split("\n")
+
+
+def _git_generated(message: str, git_dir: Path) -> bool:
+    """True for a merge commit, or a squash, fixup or revert message in the shape git generates.
+
+    *git_dir* is the directory of the message file git hands the hook, which is the per-worktree
+    git directory where git keeps MERGE_HEAD. Only the text above a scissors line is read, and
+    comment lines are skipped, so a diff that `git commit -v` appends cannot trigger the skip.
+    """
+    if (git_dir / "MERGE_HEAD").exists():
+        return True
+    subject = _subject(message)
+    if subject == _GIT_SQUASH_SUBJECT or subject.startswith(_GIT_AUTOSQUASH_PREFIXES):
+        return True
+    if not subject.startswith(_GIT_REVERT_SUBJECTS):
+        return False
+    for line in message.split("\n"):
+        if _SCISSORS_LINE.match(line):
+            return False
+        if not _COMMENT_LINE.match(line) and _GIT_REVERT_LINE.match(line):
+            return True
+    return False
+
+
+def _verified_by_advisory(message_file: Path) -> str | None:
+    """The one advisory line for a missing, malformed or contradictory trailer, else None.
+
+    Several valid values are allowed, since each names one check that ran. Only `none` beside any
+    other value contradicts. OBSERVE MODE: main() prints this and carries on. Nothing here may
+    refuse a commit.
+    """
+    try:
+        lines = _trailer_lines(message_file)
+    except (GitReadError, OSError) as exc:
+        return (
+            f"advisory: git could not read the trailers ({_safe_for_message(exc, 160)}), so"
+            f" 'Verified-by:' was not checked; {_NOT_REFUSED}\n"
+        )
+    values = list(
+        dict.fromkeys(
+            " ".join(m.group("value").split()).lower()
+            for line in lines
+            if (m := _VERIFIED_BY_LINE.match(line))
+        )
+    )
+    if not values:
+        return f"advisory: no 'Verified-by:' trailer ({_VERIFIED_BY_ALLOWED}); {_NOT_REFUSED}\n"
+    bad = [value for value in values if value not in _VERIFIED_BY_VALUES]
+    if bad:
+        shown = _safe_for_message(" / ".join(bad), 80)
+        return f"advisory: 'Verified-by: {shown}' is not one of: {_VERIFIED_BY_ALLOWED}; {_NOT_REFUSED}\n"
+    if "none" in values and len(values) > 1:
+        shown = _safe_for_message(" / ".join(values), 120)
+        return f"advisory: 'Verified-by:' trailers disagree, none beside a check ({shown}); {_NOT_REFUSED}\n"
+    return None
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         return 0  # not wired as a commit-msg hook; do nothing rather than guess
@@ -524,6 +623,11 @@ def main() -> int:
     if trailers:
         return _refuse_trailers(trailers)
 
+    if not _git_generated(message, Path(sys.argv[1]).parent):
+        advisory = _verified_by_advisory(Path(sys.argv[1]))
+        if advisory is not None:
+            sys.stderr.write(advisory)
+
     subject = _subject(message)
     items, bare = _citations(subject)
     # BEFORE the docs-only exit, on purpose. A citation check reads a docs commit's subject exactly as
@@ -535,13 +639,14 @@ def main() -> int:
 
     # FAIL CLOSED FROM HERE, because from here a wrong answer is a SILENT PASS.
     #
-    # Every exit above this line is reached WITHOUT calling git, so a commit that does not cite a
-    # BACKLOG number is untouched by this. Only a commit that DOES cite one, on a box where git
+    # Every exit above this line is reached WITHOUT a git read that can refuse the commit: the only
+    # git call above is the Verified-by advisory's `interpret-trailers`, and its failure is one more
+    # advisory line. So a commit that does not cite a BACKLOG number is untouched by this. Only a commit that DOES cite one, on a box where git
     # cannot answer, is refused -- and refusing it costs a re-run, while passing it costs the
     # duplicate build this gate exists to stop.
     #
-    # Fail-closed is the right choice HERE specifically because _git has three callers and all of
-    # them are in this file. The sibling case that argued for care -- a board tool with sixty
+    # Fail-closed is the right choice HERE specifically because every caller of _git is in this
+    # file. The sibling case that argued for care -- a board tool with sixty
     # callers written against a function that could not fail -- would trade a silent wrong number
     # for a dead board. A commit hook has no such surface.
     try:

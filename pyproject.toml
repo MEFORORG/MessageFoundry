@@ -434,6 +434,12 @@ dev = [
     # excludes CVE-2022-29217 (algorithm confusion, fixed in 2.4.0) and CVE-2024-53861 (partial `iss`
     # match, fixed in 2.10.1); the tests need no newer API.
     "pyjwt>=2.10.1",
+    # Property-based tests (tests/test_property_*.py): generated inputs that do not share the test
+    # author's blind spots. HypothesisWorks' `hypothesis` on PyPI (MPL-2.0). Test-only. Its one
+    # dependency, sortedcontainers, was already in uv.lock; requirements.lock and constraints.lock
+    # gain both. The floor is the release uv.lock resolved when this was added, the only one the
+    # tests were run against.
+    "hypothesis>=6.170.17",
     # httpx (the ASGI test client for the API + harness/load polling) is now a BASE dependency, so it
     # is no longer declared here.
 ]

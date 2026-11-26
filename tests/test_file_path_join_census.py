@@ -370,6 +370,10 @@ SITES: dict[str, Site] = {
     "harness/drivers/remotefile.py::RemoteFileDriver._upload": Site(
         2, INTERNAL, "A uuid4 name under the remote directory the operator configured."
     ),
+    "harness/e2e_smoke.py::<module>": Site(3, INTERNAL, _REPO_LITERAL),
+    "harness/e2e_smoke.py::run": Site(
+        4, INTERNAL, "Fixed names in the temp directory the smoke made with mkdtemp."
+    ),
     "harness/fuzz/campaign.py::_Session._write": Site(
         1, INTERNAL, "A name built from the seed, iteration and transport kind, all generated."
     ),

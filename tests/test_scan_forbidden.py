@@ -2532,6 +2532,18 @@ def test_an_untracked_root_inside_a_work_tree_prunes_build_directories_by_name(
     assert sf_main.main(["--path", str(root / "copy")]) == 1
 
 
+def test_the_path_walk_skips_an_untracked_hypothesis_cache(sf_main, tmp_path: Path) -> None:
+    """Hypothesis caches the string literals of imported modules under ``.hypothesis/``, untracked
+    in the checkout, so a ``--path`` walk passes over it as it does the other tool caches."""
+    root = _git_tree(
+        tmp_path / "tree", {"ok.md": "fine\n"}, {".hypothesis/constants/x": "contact ACME\n"}
+    )
+    assert sf_main.main(["--path", str(root)]) == 0
+    # The control: the same file outside the cache is read.
+    (root / "leak.md").write_text("contact ACME\n", encoding="utf-8")
+    assert sf_main.main(["--path", str(root)]) == 1
+
+
 def test_a_named_path_that_is_not_a_file_fails_the_run(
     sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
