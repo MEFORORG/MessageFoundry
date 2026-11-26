@@ -324,8 +324,7 @@ async def test_a_control_character_sign_in_name_reaches_no_store_error(store) ->
     assert getattr(probe.value, "sqlstate", None) == "22021"
 
     # A stored account the control spellings are built around, so a backend that dropped or
-    # ignored a control character in the match would find it. The fixture keeps users rows across
-    # tests, so the name is unique to this run.
+    # ignored a control character in the match would find it.
     head, tail = "pg", uuid4().hex[:8]
     await store.create_user(
         user_id=f"u-{tail}",

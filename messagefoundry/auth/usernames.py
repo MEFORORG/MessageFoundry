@@ -39,10 +39,12 @@ spelling that reads as ``system`` passes, as does a reserved form spelled with a
 lookalike :data:`_DELIMITER_LOOKALIKES` does not list. At least some lookalikes from the same
 script pass too: ``cli:root`` spelled with a dotless i (U+0131), and ``<oidc>`` spelled with the
 modifier low arrowheads U+02F1 and U+02F2. It matches the reserved forms against the key
-:func:`_reserved_form_key` builds, whose docstring lists its steps. Among them it drops combining
-marks (BACKLOG #5519), so ``system`` with an accent on a letter, or ``<oidc>`` followed by a
-combining low line (U+0332) or an enclosing circle (U+20DD), is refused. It folds no other
-confusable letters, in any script.
+:func:`_reserved_form_key` builds, whose docstring lists its steps. Among them it drops the
+combining marks NFKD splits off (BACKLOG #5519), so ``system`` spelled with at least an acute,
+grave or diaeresis on a letter, or ``<oidc>`` followed by a combining low line (U+0332) or an
+enclosing circle (U+20DD), is refused. A letter whose diacritic NFKD does not split off passes:
+at least ``system`` spelled with a t with stroke (U+0167) or a y with hook (U+01B4). It folds no
+other confusable letters, in any script.
 
 This docstring is the one statement of the rule; the request model, the service and
 docs/SECURITY.md point here rather than restate it.
