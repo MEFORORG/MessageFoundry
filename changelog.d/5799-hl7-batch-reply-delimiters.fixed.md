@@ -8,7 +8,7 @@
   reply was read. Not covered, so a `?` can still be written into at least these: an X12 reply
   led by `ISA`, whose delimiters the reply check does not read, so a `?` written there can read
   as an `ISA` delimiter, an HL7 reply whose header lines end at LF but which holds a CR
-  elsewhere, a member header after an LF-only blank line in a CR reply, a `BHS`, `FHS` or later header line in a reply with no CR
-  that is shorter than its MSH-1 and MSH-2 span, and an HL7 v2.7 truncation character declared
-  as `?`.
+  elsewhere, a member header after an LF-only blank line in a CR reply, a `BHS` or `FHS` first
+  line in a reply with no CR that is shorter than its first two fields' span, and an HL7 v2.7
+  truncation character declared as `?`.
   (`BACKLOG #5799`)

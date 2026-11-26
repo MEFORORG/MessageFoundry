@@ -844,14 +844,18 @@ def _reply_outcome(reply: str, encoding: str) -> bytes | str:
 
 def _short_lf_headers() -> list[str]:
     """LF-only ``MSH``-led replies whose first line is 4 to 8 characters long, each followed by a
-    line holding a character ASCII, or ASCII and latin-1, cannot encode, or none; some led by
-    whitespace and a BOM, some with no final LF, and ``BHS``- and ``FHS``-led controls."""
+    line holding a character ASCII, or ASCII and latin-1, cannot encode, or none; then the same
+    with no final LF, and some led by whitespace and a BOM. The ``BHS``- and ``FHS``-led shapes
+    pin a residual, not a wanted outcome: main declared nothing for them and they are sent with
+    ``?`` written in, so a fix that reads a short ``BHS`` or ``FHS`` line past its LF turns them
+    red on purpose."""
+    bar, bom = "\N{BROKEN BAR}", "\N{ZERO WIDTH NO-BREAK SPACE}"
     firsts = {"MSH" + ("|^~" + BS + "&")[: n - 3] for n in range(4, 9)}
     firsts |= {"MSH" + ("|^?" + BS + "&")[: n - 3] for n in range(4, 9)}
-    firsts |= {"MSH|", "MSH|^", "MSH?^", "MSH¦", "MSH|¦"}
-    seconds = ["?SA|AA|中", "MSA|AA|中", "中SA|AA|C", "¦SA|AA|中", "MSA|AA|¦", "MSA|AA|C"]
-    replies = {f + "\n" + s + "\n" for f in firsts for s in seconds}
-    replies |= {" ﻿" + f + "\n" + s for f in firsts for s in seconds[:2]}
+    firsts |= {"MSH?^", "MSH" + bar, "MSH|" + bar}
+    seconds = ["?SA|AA|中", "MSA|AA|中", "中SA|AA|C", bar + "SA|AA|中", "MSA|AA|" + bar, "MSA|AA|C"]
+    replies = {f + "\n" + s + end for f in firsts for s in seconds for end in ("\n", "")}
+    replies |= {" " + bom + f + "\n" + s + "\n" for f in firsts for s in seconds[:2]}
     replies |= {h + "|^\n?SA|AA|中\n" for h in ("BHS", "FHS")}
     return sorted(replies)
 
@@ -864,26 +868,38 @@ def test_a_short_lf_only_header_sends_or_refuses_as_on_main(
     """BACKLOG #5799 differential: where an LF-only reply's first ``MSH`` line is shorter than the
     MSH-1 and MSH-2 span, main's read declares that span across the LF, and a reply it makes unsafe
     is refused. A read stopping at the LF sent such a reply with ``?`` written in. This read must
-    give main's outcome, the refusal's text included."""
+    give main's outcome, the refusal's text included; the shape helper says which cases pin a
+    residual."""
     head = _reply_outcome(reply, encoding)
     monkeypatch.setattr(framing_mod, "_reply_delimiters", _main_reply_delimiters)
     assert head == _reply_outcome(reply, encoding)
 
 
 @pytest.mark.parametrize("reply", ["MSH|^~\n中", "MSH|^\n?SA|AA|中\n"])
-def test_a_short_lf_only_header_that_main_refused_is_refused(reply: str) -> None:
+def test_a_short_lf_only_header_that_main_refused_is_refused(
+    reply: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Two shapes main refused and a read stopping at the LF sent. The refusal chains nothing."""
     with pytest.raises(UnicodeError, match="collide with one of its own delimiters") as ei:
         framing_mod.encode_reply(reply, "ascii", connection="IB_SHORT_LF")
     assert ei.value.__cause__ is None and ei.value.__context__ is None
+    monkeypatch.setattr(framing_mod, "_reply_delimiters", _main_reply_delimiters)
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
+        framing_mod.encode_reply(reply, "ascii", connection="IB_SHORT_LF")
 
 
-def test_control_a_well_formed_lf_only_msh_reads_as_before() -> None:
+def test_control_a_well_formed_lf_only_msh_declares_its_header_and_sends_as_main(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Control for the two tests above: a first line holding all of MSH-1 and MSH-2 declares just
-    those and the LF, and a reply with an unencodable data character is replaced and sent."""
+    those and the LF, and a reply with an unencodable data character is replaced and sent, the
+    same bytes main's read sends."""
     reply = "MSH|^~" + BS + "&|R|RF\nMSA|AA|C|中\n"
     assert framing_mod._reply_delimiters(reply) == frozenset({"|", "^", "~", BS, "&", "\n"})
-    assert framing_mod.encode_reply(reply, "ascii") == reply.replace("中", "?").encode("ascii")
+    sent = reply.replace("中", "?").encode("ascii")
+    assert framing_mod.encode_reply(reply, "ascii") == sent
+    monkeypatch.setattr(framing_mod, "_reply_delimiters", _main_reply_delimiters)
+    assert framing_mod.encode_reply(reply, "ascii") == sent
 
 
 def test_an_lf_inside_a_field_of_a_cr_reply_is_data_not_a_header() -> None:

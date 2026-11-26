@@ -338,13 +338,14 @@ def _reply_delimiters(reply: str) -> frozenset[str]:
     character (the v2.7 truncation character) is not read either. An X12 reply led by ``ISA``
     declares nothing here, so an ``ISA`` delimiter that is ``?`` or that the charset cannot
     encode is not refused, and a ``?`` written for a data character can read as one of the
-    ISA's delimiters. These are at least the residuals; the changelog names more.
+    ISA's delimiters.
 
     An ``MSH``-led reply with no CR has its MSH-1 and MSH-2 read from the reply as a whole as
     well, so where its first line is shorter than the span ``_extract_separators`` reads, the
-    characters after that line's LF are declared too. A ``BHS`` or ``FHS`` first line, or a later
-    header line, that short is read only to its LF, so the characters a receiver splitting only at
-    CR would read as its delimiters are not declared: one more residual.
+    characters after that line's LF are declared too. A ``BHS`` or ``FHS`` first line that short
+    is read only to its LF, so the characters a receiver splitting only at CR would read as its
+    BHS-1 and BHS-2 (or FHS-1 and FHS-2) are not declared. These are at least the residuals; the
+    changelog names more.
 
     Leading whitespace and a BOM are skipped first, as the engine's one definition of tolerated
     leading noise (``sniff._LEADING_WS_STR``) skips them. In a reply with a CR, or after the first
