@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from functools import cache
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -2180,7 +2180,10 @@ def test_a_real_anon_import_names_the_owner_ruling_ahead_of_the_reword_advice(
         (test_no_walked_source_file_looks_like_it_imports_the_anon_package, search.outside, True),
         (test_no_walked_source_file_imports_the_anon_package, search.imports, False),
     ):
-        with pytest.raises(AssertionError) as raised:
+        # Matched on the count prefix, so another assert in the called test is not taken for it.
+        with pytest.raises(
+            AssertionError, match=rf"^{len(hits)} (place\(s\)|import\(s\)) "
+        ) as raised:
             test()
         # The message's own text: pytest's rewrite puts its explanation of the failed `assert`
         # on the lines after it, and neither message holds a newline of its own.
@@ -2223,35 +2226,37 @@ def test_the_anon_view_refuses_a_corpus_whose_view_rule_drifted(
     view = scorecard._pattern_view(PurePosixPath("scripts/stopped.py"), stopped)
     assert view is not None and view[1] is not None and view[0] != stopped, view
 
-    real_corpus = scorecard._absence_corpus
+    # Each drifted corpus is built once, from the real one, before any is patched in.
+    raw_texts, view_texts, _viewed = scorecard._absence_corpus(tmp_path)
+    kept_a_stopped_view = []
+    for path in scorecard._absence_sources(tmp_path):
+        raw = path.read_text(encoding="utf-8")
+        got = scorecard._pattern_view(scorecard._rel(tmp_path, path), raw)
+        kept_a_stopped_view.append(got[0] if got is not None else raw)
+    # One of the two equal texts becomes another file's text, so only the counts differ.
+    same_set_other_counts = list(view_texts)
+    same_set_other_counts[same_set_other_counts.index("import json\n")] = stopped
+    drifts = {
+        "stopped blanking": list(raw_texts),
+        "kept a stopped view": kept_a_stopped_view,
+        "kept the set of texts but not their counts": same_set_other_counts,
+    }
+    # Each is a real drift, and the last one only in its counts.
+    assert all(Counter(drift) != Counter(view_texts) for drift in drifts.values()), drifts
+    assert set(same_set_other_counts) == set(view_texts), same_set_other_counts
 
-    def stopped_blanking(root: Path) -> list[str]:
-        return real_corpus(root)[0]
-
-    def kept_a_stopped_view(root: Path) -> list[str]:
-        return [
-            got[0] if (got := scorecard._pattern_view(scorecard._rel(root, path), raw)) else raw
-            for path, raw in zip(
-                scorecard._absence_sources(root), real_corpus(root)[0], strict=True
-            )
-        ]
-
-    def same_set_other_counts(root: Path) -> list[str]:
-        # One of the two equal texts becomes another file's text, so only the counts differ.
-        view = real_corpus(root)[1]
-        view[view.index("import json\n")] = stopped
-        assert set(view) == set(real_corpus(root)[1]), view
-        return view
-
-    for drift in (stopped_blanking, kept_a_stopped_view, same_set_other_counts):
+    for name, drift in drifts.items():
 
         def drifted(
-            root: Path, drift: Callable[[Path], list[str]] = drift
+            root: Path, drift: list[str] = drift
         ) -> tuple[list[str], list[str], list[str | None]]:
-            raw_texts = real_corpus(root)[0]
             # `None` throughout: the fake names no file as viewed, a claim no test here reads.
-            return raw_texts, drift(root), [None] * len(raw_texts)
+            return raw_texts, drift, [None] * len(raw_texts)
 
         monkeypatch.setattr(scorecard, "_absence_corpus", drifted)
-        with pytest.raises(AssertionError, match="no longer gives the texts `_absence_corpus`"):
+        try:
             _anon_pattern_texts(tmp_path)
+        except AssertionError as exc:
+            assert "no longer gives the texts `_absence_corpus`" in str(exc), (name, exc)
+        else:
+            pytest.fail(f"the drift check did not raise on a corpus that {name}")
