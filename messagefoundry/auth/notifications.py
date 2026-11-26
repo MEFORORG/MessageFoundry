@@ -81,7 +81,9 @@ ACCOUNT_DISABLED = "account_disabled"
 # directory (``directory_object_id_missing``; BACKLOG #2434). Any whole-account reason added later
 # sends it too, so the notice's one wording must be checked against that one as well (vault BACKLOG
 # #3171). ACCOUNT_DISABLED would tell the holder the account is disabled, by an administrator or in
-# the directory, which nothing established. Which reason sends which kind is decided once, in
+# the directory, which nothing established. A role revocation (``roles_changed``) that wrote no role
+# and only ended sessions sends it too, with its own wording, since that pass did read the account
+# (BACKLOG #6034). Which reason sends which kind is decided once, in
 # ``AuthService._apply_reconcile_revocation``.
 DIRECTORY_SESSIONS_ENDED = "directory_sessions_ended"
 MFA_ENABLED = "mfa_enabled"  # 6.3.7 — a second factor (TOTP) was enrolled on the account

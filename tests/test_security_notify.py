@@ -216,7 +216,7 @@ _DIRECTORY_LINE = (
     "This change came from your organization's directory, not from the MessageFoundry console."
 )
 
-#: Every reconcile reason that sends DIRECTORY_SESSIONS_ENDED (vault BACKLOG #2140, #3171): all of
+#: Every whole-account reason that sends DIRECTORY_SESSIONS_ENDED (vault BACKLOG #2140, #3171): all of
 #: ``REVOKE_REASONS`` but the read disabled bit, which sends ACCOUNT_DISABLED. Derived, so a reason
 #: added there reaches the per-reason render test below with no edit here.
 _SESSIONS_ENDED_REASONS = tuple(
@@ -347,24 +347,26 @@ def test_a_role_notice_says_only_what_its_evidence_backs(
         assert "directory" not in body.lower()
 
 
-@pytest.mark.parametrize("revoked", [True, False], ids=["revoked", "revoke-unproven"])
+@pytest.mark.parametrize("count", [2, 0, None], ids=["ended-2", "ended-0", "revoke-unproven"])
 @pytest.mark.parametrize("source", [None, "directory"], ids=["administrator", "directory"])
 def test_a_disable_notice_says_sessions_ended_only_on_evidence(
-    source: str | None, revoked: bool
+    source: str | None, count: int | None
 ) -> None:
     """BACKLOG #6034 (S08-57). The disable itself is confirmed before either sender notifies (the
     administrator's write returned applied; the reconciler read the disabled bit), so that half
-    always prints; the sessions half only on ``sessions_revoked``. The directory notice names no
-    administrator and says nothing was disabled in MessageFoundry (vault BACKLOG #3121)."""
+    always prints; the sessions half only on ``sessions_revoked``. A count of 0 backs "any
+    sessions already open were ended", but not a directory subject saying sessions were ended: the
+    holder may have had none. The directory notice names no administrator and says nothing was
+    disabled in MessageFoundry (vault BACKLOG #3121)."""
     detail: dict[str, Any] = {} if source is None else {"reason": "directory_disabled"}
     if source is not None:
         detail["source"] = source
-    if revoked:
-        detail["sessions_revoked"] = 0
+    if count is not None:
+        detail["sessions_revoked"] = count
     event = SecurityEvent(ACCOUNT_DISABLED, username="jdoe", email="j@example.org", detail=detail)
     body = _build_body(event)
     lines = body.splitlines()
-    sessions = _SESSIONS_ENDED if revoked else _SESSIONS_UNCONFIRMED
+    sessions = _SESSIONS_UNCONFIRMED if count is None else _SESSIONS_ENDED
     assert f"{_DISABLE_WHAT[source]} {sessions}" in lines
     assert "if this was you" not in body.lower()
     assert body.endswith(_DIRECTORY_CLOSING)
@@ -374,8 +376,29 @@ def test_a_disable_notice_says_sessions_ended_only_on_evidence(
         assert "directory" not in body.lower()
     else:
         assert "was disabled" not in subject
-        assert ("sessions were ended" in subject) is revoked
+        assert ("sessions were ended" in subject) is bool(count)
         assert _DIRECTORY_LINE not in lines
+
+
+def test_a_role_revocation_that_wrote_no_role_says_the_groups_were_read() -> None:
+    """BACKLOG #6034. A reconciler role revocation that wrote no role sends
+    ``directory_sessions_ended``. That pass read the account's groups, so the whole-account wording
+    ("could not confirm ... may still sign in") would read as a possible disable; it says what the
+    pass did instead, and claims no role change."""
+    event = SecurityEvent(
+        DIRECTORY_SESSIONS_ENDED,
+        username="jdoe",
+        email="j@example.org",
+        detail={"reason": "roles_changed", "source": "directory", "sessions_revoked": 1},
+    )
+    body = _build_body(event)
+    assert (
+        "MessageFoundry read your groups in your organization's directory and ended your sessions."
+        in body.splitlines()
+    )
+    assert "could not confirm" not in body.lower()
+    assert "roles" not in body.lower()
+    assert _subject(event) == "Your MessageFoundry sessions were ended"
 
 
 @pytest.mark.parametrize("value", [None, True, False, "2", -1.0])

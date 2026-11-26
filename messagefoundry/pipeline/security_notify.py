@@ -151,12 +151,13 @@ _DESCRIPTIONS = {
         "a new password and gave the account the Administrator role, so the password it had before "
         "no longer works."
     ),
-    # vault BACKLOG #2140, #3171. One wording for every reason that sends this kind, with no branch on
-    # ``detail["reason"]``. Which reasons those are is decided in
+    # vault BACKLOG #2140, #3171. One wording for every whole-account reason that sends this kind,
+    # with no branch on which one. Which reasons those are is decided in
     # ``AuthService._apply_reconcile_revocation``, and any reason added later falls here too; the
     # constant's comment in ``auth/notifications.py`` names at least the current ones. For at least
     # one of them no directory lookup ran, so neither this nor the subject may say one did, or that
-    # the account is disabled or deleted. "Could not confirm" stays true whatever the cause.
+    # the account is disabled or deleted. "Could not confirm" stays true whatever the cause. A role
+    # revocation that wrote no role has its own wording (``_ROLE_SESSIONS_ENDED``).
     DIRECTORY_SESSIONS_ENDED: (
         "MessageFoundry ended your sessions. It could not confirm from your organization's "
         "directory that your account may still sign in."
@@ -222,8 +223,9 @@ _EVIDENCED_KINDS = frozenset({ROLES_CHANGED, ACCOUNT_DISABLED})
 
 # BACKLOG #6034 (S08-57). What a role or disable notice says rests on the evidence its sender put on
 # the event, never on the order of the sender's calls, because the directory senders notify on
-# paths where the role write or the revoke raised: the reconciler after a role write that raised
-# past its retry, or a revoke that raised, and the sign-in re-sync with either error held.
+# paths where the role write or the revoke raised, or its commit is unknown. At least: the
+# reconciler after a role write that raised past its retry or was retried at all, or a revoke that
+# raised, and the sign-in re-sync with an error held from either.
 # ``roles_written`` is True only once the role write committed; ``sessions_revoked`` is the revoke's
 # count, set only once the revoke returned. A count of 0 still proves no session was left open, so
 # "any sessions already open were ended" holds for it.
@@ -249,6 +251,15 @@ _ROLES_WORDING = {
         "account's roles to match them. It could not confirm that the change was saved."
     ),
 }
+# BACKLOG #6034. The reconciler's role revocation that wrote no role, because the roles already
+# stood at its target or moved after its read, only ended the sessions, so it sends
+# DIRECTORY_SESSIONS_ENDED. The pass did read the account in the directory, so the whole-account
+# wording, "could not confirm ... may still sign in", would mislead here. ``_ROLE_REVOCATION`` is
+# the reason ``auth/reconcile.py`` gives a role revocation.
+_ROLE_REVOCATION = "roles_changed"
+_ROLE_SESSIONS_ENDED = (
+    "MessageFoundry read your groups in your organization's directory and ended your sessions."
+)
 # Each sender has confirmed the disable before it notifies: the administrator's write returned
 # applied, and the reconciler sends this only on a READ disabled bit (vault BACKLOG #2140).
 _DISABLE_WORDING = {
@@ -272,6 +283,14 @@ def _revoked_count(event: SecurityEvent) -> int | None:
     """The ``sessions_revoked`` count, present only once the sender's revoke returned (BACKLOG
     #6034, vault #2609). A bool or any other shape is no count, through :func:`_count`."""
     return _count(event.detail.get("sessions_revoked"))
+
+
+def _sessions_ended_any(event: SecurityEvent) -> bool:
+    """Whether the sender's revoke returned having ended at least one session. A count of 0 backs
+    "any sessions already open were ended" but not a subject saying sessions were ended, and a
+    retried count can read low, so a 0 claims nothing there (BACKLOG #6034)."""
+    count = _revoked_count(event)
+    return count is not None and count > 0
 
 
 def _evidenced_description(event: SecurityEvent, *, from_directory: bool) -> str:
@@ -302,7 +321,7 @@ def _subject(event: SecurityEvent) -> str:
         return "A change to your MessageFoundry account roles could not be confirmed"
     if event.event_type == ACCOUNT_DISABLED and _from_directory(event):
         # The administrator subject says the MessageFoundry account was disabled, false here.
-        if _revoked_count(event) is not None:
+        if _sessions_ended_any(event):
             return "Your MessageFoundry sessions were ended: your directory account is disabled"
         return "Your directory account is reported as disabled"
     return _SUBJECTS.get(event.event_type, "MessageFoundry security alert")
@@ -451,6 +470,7 @@ def _build_body(event: SecurityEvent) -> str:
         event.event_type == NOTIFY_EMAIL_SET and event.detail.get("set_by") == "administrator"
     )
     from_directory = _from_directory(event)
+    unconfirmed = _roles_unconfirmed(event)  # BACKLOG #6034
     if moved_by_admin:
         description = (
             "An administrator changed the address that receives security notices for your account."
@@ -461,6 +481,11 @@ def _build_body(event: SecurityEvent) -> str:
         )
     elif event.event_type in _EVIDENCED_KINDS:
         description = _evidenced_description(event, from_directory=from_directory)
+    elif (
+        event.event_type == DIRECTORY_SESSIONS_ENDED
+        and event.detail.get("reason") == _ROLE_REVOCATION
+    ):
+        description = _ROLE_SESSIONS_ENDED
     else:
         description = _DESCRIPTIONS.get(
             event.event_type, "A security event occurred on your account."
@@ -479,7 +504,7 @@ def _build_body(event: SecurityEvent) -> str:
         opening = f"A notice for you as a MessageFoundry administrator ({account})."
     elif event.event_type == TEMPORARY_CREDENTIAL_EXPIRING:
         opening = f"A reminder about your MessageFoundry account ({account})."
-    elif _roles_unconfirmed(event):
+    elif unconfirmed:
         # BACKLOG #6034: no change is confirmed (see ``_evidenced_description``).
         opening = f"A notice about your MessageFoundry account ({account})."
     else:
@@ -657,13 +682,13 @@ def _build_body(event: SecurityEvent) -> str:
         # sign-in (``_upsert_ad_user``, and since vault BACKLOG #3121 the role re-sync in
         # ``_complete_ad_login``), but nothing on the event says so, so the line names only the
         # request (BACKLOG #6034). An unconfirmed role write claims no change.
-        what = "sent this notice" if _roles_unconfirmed(event) else "picked up this change"
+        what = "sent this notice" if unconfirmed else "picked up this change"
         lines.append(f"MessageFoundry {what} while handling a request from {client_ip}.")
     elif client_ip:
         lines.append(f"Source IP: {client_ip}")
     if lock_closing is not None:
         closing = lock_closing
-    elif _roles_unconfirmed(event):
+    elif unconfirmed:
         # BACKLOG #6034: "this change" would claim one (see ``_evidenced_description``).
         closing = "If you did not expect this notice, contact your MessageFoundry administrator."
     elif event.event_type == PASSWORD_RESET:

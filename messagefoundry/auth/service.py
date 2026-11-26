@@ -21775,7 +21775,8 @@ class AuthService:
                 username=user.username,
                 email=user.notify_email,
                 detail={
-                    "roles": list(roles),
+                    # Each id once, in the order given: a repeated id in the request is one role.
+                    "roles": list(dict.fromkeys(roles)),
                     "roles_written": True,
                     "sessions_revoked": ended.count,
                 },

@@ -48,6 +48,7 @@ from messagefoundry.auth.service import (
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.pipeline.security_notify import _build_body
 from messagefoundry.store.base import StoreAcquireTimeout
 from messagefoundry.store.store import AdminGrant, MessageStore
 from tests.test_ad_session_reconcile import _GRP_A, _ad_settings, _principal, _scoped_service
@@ -1030,6 +1031,18 @@ async def test_an_administrator_change_whose_revoke_failed_sends_no_notice(
         await store.close()
 
 
+async def test_a_role_change_notice_names_each_role_once() -> None:
+    """A repeated id in the request is one role, so the notice names it once."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _identity, _hashes = await _account(store)
+        notices = _listening(service)
+        await service.set_roles("u1", ["operator", "viewer", "operator"], actor="admin")
+        assert _one(notices, ROLES_CHANGED).detail["roles"] == ["operator", "viewer"]
+    finally:
+        await store.close()
+
+
 class _SyntheticWriteFault(RuntimeError):
     """A role write that raised past its retry, after it may have committed."""
 
@@ -1178,6 +1191,7 @@ async def test_a_reconciler_role_revocation_that_wrote_no_role_says_only_session
             "source": "directory",
             "sessions_revoked": 1,
         }
+        assert "could not confirm" not in _build_body(notices.sent[0]).lower()
     finally:
         await store.close()
 
