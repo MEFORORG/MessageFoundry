@@ -6848,7 +6848,9 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
     verify: a silently-ignored anchor turns the whole control into a gate that reports green while
     checking nothing, which is precisely the failure the anchor exists to close.
 
-    It must ALSO refuse rather than hand a comparator a head the store can never emit. Both comparators
+    It ALSO refuses a hex head of the wrong length and a head of neither shape, rather than hand a
+    comparator a head the store can never emit; a ``vault:v`` head is the exception, passed through
+    unchecked (see the second bullet). Both comparators
     compare the head byte-exactly and report *any* difference as ``truncated or rewritten``, so an
     accepted-but-impossible head becomes a FALSE tamper alarm — a red light on an intact chain,
     indistinguishable from a real detection. A control whose whole value is that a FAIL means something
@@ -6941,12 +6943,12 @@ def _audit_head_shape(head: str, noun: str = "the head") -> tuple[str | None, st
         return None, head.lower()
     if head.startswith(AUDIT_ANCHOR_ISOLATED_MAC_PREFIX):
         # Opaque by construction; never normalise what we do not define. Not held to the Transit MAC's
-        # shape either, as on origin/main: `audit-anchor` prints a tampered `vault:v` head as the store
-        # holds it, and a shape check here made `audit-verify` refuse that anchor (exit 2) instead of
-        # walking the chain (exit 1). The cost is that a truncated or space-bearing `vault:v` anchor
-        # reaches the comparator and can raise a false tamper alarm on an intact chain; vault
-        # BACKLOG #5987 item 1's `vault:v` limb stays open on that. A tampered head of another shape
-        # is still refused before the walk.
+        # shape either: `audit-anchor` prints a tampered `vault:v` head as the store holds it, and
+        # `audit-verify` refuses a malformed anchor (exit 2) before it walks, so a shape check here
+        # would leave such a tamper unwalked. The cost: a truncated or space-bearing `vault:v` anchor
+        # or row pair reaches the comparator and can raise a false tamper alarm on an intact chain
+        # (vault BACKLOG #5987 item 1). A tampered head of another shape is still refused before the
+        # walk.
         return None, head
     return (
         f"{noun} is neither a {AUDIT_ANCHOR_DIGEST_HEX_LEN}-character hex digest nor an "
@@ -6977,9 +6979,10 @@ def parse_audit_row_pair(text: str) -> tuple[int, str]:
     """Parse a ``SEQ:ROW_HASH`` pair, one row the off-box tee witnessed, into the tuple
     ``verify_audit_chain(expected_rows=...)`` takes (vault BACKLOG #2612).
 
-    It applies :func:`parse_audit_anchor`'s head rule, so it refuses a short hex head and a head of
-    neither shape, and passes a ``vault:v`` head through unchecked. Unlike an anchor, a pair names a
-    ROW, so its sequence number is at least 1 and its head is never empty."""
+    It applies :func:`parse_audit_anchor`'s head rule, so it refuses a hex head that is not exactly
+    64 characters and a head of neither shape, and passes a ``vault:v`` head through unchecked.
+    Unlike an anchor, a pair names a ROW, so its sequence number is at least 1 and its head is never
+    empty."""
     seq_text, sep, head = text.strip().partition(":")
     if not sep:
         raise AuditRowPairError("no ':' separator", text)
