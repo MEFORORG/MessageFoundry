@@ -140,16 +140,7 @@ _DESCRIPTIONS = {
         "You gave another account a temporary password, and its holder has not replaced it yet."
     ),
     EMAIL_CHANGED: "Your account's email address was changed.",
-    # BACKLOG #6034 (S08-57). The administrator senders of ROLES_CHANGED and ACCOUNT_DISABLED,
-    # ``AuthService.set_roles`` and the disable in ``AuthService.update_user``, run
-    # ``_revoke_after_commit`` first, and it raises rather than return when the revoke fails, so
-    # each notice is sent only once the sessions are gone. The event carries no evidence of the
-    # revoke, so a new sender of either kind that does not end them first must not take this
-    # wording.
-    ROLES_CHANGED: (
-        "Your account's roles were changed by an administrator, and any sessions already open on "
-        "your account were ended."
-    ),
+    # ROLES_CHANGED and ACCOUNT_DISABLED are worded from their evidence (``_evidenced_description``).
     USERNAME_CHANGED: "Your account's username was changed.",
     FEDERATED_IDENTITY_BOUND: "An administrator linked an external identity provider sign-in to your account, and your sessions were ended. Windows single sign-on no longer signs you in. Sign in through that provider; if it is not offered, ask your administrator.",
     FEDERATED_IDENTITY_UNBOUND: "An administrator removed the external identity provider sign-in from your account, and your sessions were ended. That provider can no longer sign you in.",
@@ -159,10 +150,6 @@ _DESCRIPTIONS = {
         "Someone with access to the MessageFoundry host ran provision-admin on your account. It set "
         "a new password and gave the account the Administrator role, so the password it had before "
         "no longer works."
-    ),
-    ACCOUNT_DISABLED: (
-        "Your account was disabled by an administrator, and any sessions already open on your "
-        "account were ended."
     ),
     # vault BACKLOG #2140, #3171. One wording for every reason that sends this kind, with no branch on
     # ``detail["reason"]``. Which reasons those are is decided in
@@ -224,37 +211,70 @@ _DESCRIPTIONS = {
     ),
 }
 
-# Vault BACKLOG #3121. The reconciler's and the sign-in re-sync's role change and disable name no
-# administrator and close with "If you did not expect this" (the disable "this change", the role
-# notice "this notice", below). Each carries its own source in
-# its words, so neither takes the generic directory line: a re-sync's roles come from the
-# directory's groups through the group-to-role map, which an administrator edits in the console,
-# so "not from the MessageFoundry console" would be false for it. The disable says what the
-# reconciler did, which is end the sessions; no MessageFoundry row was disabled. The reconciler
-# sends the disable only after its revoke returned.
-#
-# BACKLOG #6034. The role notice, its subject, opening and closing included, claims no role change
-# and no ended session, and the event proves neither. The reconciler sends it after a role
-# write that raised past its retry and a revoke that raised, and on its success path for any
-# revocation carrying role ids, also when it wrote no role and only revoked sessions. The sign-in
-# re-sync sends it with the role write's or the revoke's error held. All that holds on every one of
-# those paths is that the account was compared with the directory's groups and acted on.
-_DIRECTORY_DESCRIPTIONS = {
-    ROLES_CHANGED: (
-        "MessageFoundry compared your account with your groups in your organization's directory "
-        "and acted on the result."
+# Vault BACKLOG #3121. A role change or disable the directory drove, from the session reconciler or
+# a directory sign-in's re-sync, names no administrator and carries its source in its own words,
+# so neither takes the generic directory line: a re-sync's roles come from the directory's groups
+# through the group-to-role map, which an administrator edits in the console, so "not from the
+# MessageFoundry console" would be false for it. The directory disable says what the directory
+# reported; no MessageFoundry row was disabled.
+_DIRECTORY_WORDED = frozenset({ROLES_CHANGED, ACCOUNT_DISABLED})
+
+# BACKLOG #6034 (S08-57). What a role or disable notice says rests on the evidence its sender put on
+# the event, never on the order of the sender's calls, because the directory senders notify on
+# paths where the role write or the revoke raised: the reconciler after a role write that raised
+# past its retry, or a revoke that raised, and the sign-in re-sync with either error held.
+# ``roles_written`` is True only once the role write committed; ``sessions_revoked`` is the revoke's
+# count, set only once the revoke returned. A count of 0 still proves no session was left open, so
+# "any sessions already open were ended" holds for it.
+_SESSIONS_ENDED = "Any sessions already open on your account were ended."
+_SESSIONS_UNCONFIRMED = (
+    "MessageFoundry could not confirm that the sessions already open on your account were ended."
+)
+_ROLES_WORDING = {
+    # (from the directory, the write confirmed)
+    (False, True): "Your account's roles were changed by an administrator.",
+    (False, False): (
+        "An administrator asked to change your account's roles. MessageFoundry could not confirm "
+        "that the change was saved."
     ),
-    ACCOUNT_DISABLED: (
-        "Your organization's directory reports your account as disabled, so MessageFoundry ended "
-        "your sessions."
+    (True, True): (
+        "MessageFoundry read your groups in your organization's directory and changed your "
+        "account's roles to match them."
+    ),
+    (True, False): (
+        "MessageFoundry read your groups in your organization's directory and tried to change your "
+        "account's roles to match them. It could not confirm that the change was saved."
     ),
 }
-# The administrator subjects say the account was disabled or its roles changed, which can be false
-# here (the role half is BACKLOG #6034, above).
-_DIRECTORY_SUBJECTS = {
-    ROLES_CHANGED: "MessageFoundry checked your account against your organization's directory",
-    ACCOUNT_DISABLED: "Your MessageFoundry sessions were ended: your directory account is disabled",
+# Each sender has confirmed the disable before it notifies: the administrator's write returned
+# applied, and the reconciler sends this only on a READ disabled bit (vault BACKLOG #2140).
+_DISABLE_WORDING = {
+    False: "Your account was disabled by an administrator.",
+    True: "Your organization's directory reports your account as disabled.",
 }
+
+
+def _roles_written(event: SecurityEvent) -> bool:
+    """Whether a ROLES_CHANGED sender confirmed its role write committed (BACKLOG #6034). Only the
+    literal ``True`` counts."""
+    return event.event_type == ROLES_CHANGED and event.detail.get("roles_written") is True
+
+
+def _sessions_revoked(event: SecurityEvent) -> bool:
+    """Whether the sender's revoke returned, so ``sessions_revoked`` holds its count (BACKLOG
+    #6034). A bool or any other shape is no count, through :func:`_count`."""
+    return _count(event.detail.get("sessions_revoked")) is not None
+
+
+def _evidenced_description(event: SecurityEvent, *, from_directory: bool) -> str:
+    """The ROLES_CHANGED or ACCOUNT_DISABLED description: the change as far as ``roles_written``
+    confirms it, then the sessions sentence ``sessions_revoked`` backs, or the line saying that
+    could not be confirmed (BACKLOG #6034)."""
+    if event.event_type == ROLES_CHANGED:
+        what = _ROLES_WORDING[(from_directory, _roles_written(event))]
+    else:
+        what = _DISABLE_WORDING[from_directory]
+    return f"{what} {_SESSIONS_ENDED if _sessions_revoked(event) else _SESSIONS_UNCONFIRMED}"
 
 
 def _from_directory(event: SecurityEvent) -> bool:
@@ -262,14 +282,20 @@ def _from_directory(event: SecurityEvent) -> bool:
     #2291, vault #3121). Gated on the kind as well as the tag: the reconciler tags every notice it
     sends, and its ``directory_sessions_ended`` must not claim the directory changed anything."""
     return (
-        event.event_type in (EMAIL_CHANGED, USERNAME_CHANGED, *_DIRECTORY_DESCRIPTIONS)
+        event.event_type in (EMAIL_CHANGED, USERNAME_CHANGED, *_DIRECTORY_WORDED)
         and event.detail.get("source") == "directory"
     )
 
 
 def _subject(event: SecurityEvent) -> str:
-    if _from_directory(event) and event.event_type in _DIRECTORY_SUBJECTS:
-        return _DIRECTORY_SUBJECTS[event.event_type]
+    # BACKLOG #6034: each subject claims no more than the body's evidence does.
+    if event.event_type == ROLES_CHANGED and not _roles_written(event):
+        return "A change to your MessageFoundry account roles could not be confirmed"
+    if event.event_type == ACCOUNT_DISABLED and _from_directory(event):
+        # The administrator subject says the MessageFoundry account was disabled, false here.
+        if _sessions_revoked(event):
+            return "Your MessageFoundry sessions were ended: your directory account is disabled"
+        return "Your directory account is reported as disabled"
     return _SUBJECTS.get(event.event_type, "MessageFoundry security alert")
 
 
@@ -424,8 +450,8 @@ def _build_body(event: SecurityEvent) -> str:
         description = (
             "An administrator set this address to receive security notices about your account."
         )
-    elif from_directory and event.event_type in _DIRECTORY_DESCRIPTIONS:
-        description = _DIRECTORY_DESCRIPTIONS[event.event_type]
+    elif event.event_type in _DIRECTORY_WORDED:
+        description = _evidenced_description(event, from_directory=from_directory)
     else:
         description = _DESCRIPTIONS.get(
             event.event_type, "A security event occurred on your account."
@@ -444,8 +470,8 @@ def _build_body(event: SecurityEvent) -> str:
         opening = f"A notice for you as a MessageFoundry administrator ({account})."
     elif event.event_type == TEMPORARY_CREDENTIAL_EXPIRING:
         opening = f"A reminder about your MessageFoundry account ({account})."
-    elif from_directory and event.event_type == ROLES_CHANGED:
-        # BACKLOG #6034: no change is proven on every path (see ``_DIRECTORY_DESCRIPTIONS``).
+    elif event.event_type == ROLES_CHANGED and not _roles_written(event):
+        # BACKLOG #6034: no change is confirmed (see ``_evidenced_description``).
         opening = f"A notice about your MessageFoundry account ({account})."
     else:
         opening = f"A security-relevant change occurred on your MessageFoundry account ({account})."
@@ -539,12 +565,12 @@ def _build_body(event: SecurityEvent) -> str:
                     scrub_log_argument(event.username),
                     key,
                 )
-    if from_directory and event.event_type not in _DIRECTORY_DESCRIPTIONS:
+    if from_directory and event.event_type not in _DIRECTORY_WORDED:
         # BACKLOG #1139. Say WHERE the change came from, because it changes what the reader can do
         # about it: a directory-driven change is not editable in the console, so "contact your
         # administrator" is the only action, and an unexplained change the holder cannot find a
         # cause for reads as a compromise. The vault #3121 kinds name their source in their own
-        # description instead (see ``_DIRECTORY_DESCRIPTIONS``).
+        # description instead (see ``_DIRECTORY_WORDED``).
         lines.append(
             "This change came from your organization's directory, not from the MessageFoundry "
             "console."
@@ -586,13 +612,13 @@ def _build_body(event: SecurityEvent) -> str:
             "MessageFoundry administrator."
         )
     # BACKLOG #6034: each role id goes through ``_shown`` (S08-56), and a custom role prints by its
-    # id, as no display name travels with the event. An administrator's role change carries the
-    # whole set ``set_roles`` wrote (S08-57), so an empty one says the account was left with none;
-    # a creation with none prints nothing, as it did. Not a directory role change: the sign-in
-    # re-sync passes the set it tried to write and notifies even when that write raised, so the
-    # line could name roles the account does not hold.
+    # id, as no display name travels with the event. An administrator's confirmed role change
+    # carries the whole set ``set_roles`` wrote (S08-57), so an empty one says the account was left
+    # with none; a creation with none prints nothing, as it did. Not an unconfirmed write, nor a
+    # directory role change: the sign-in re-sync passes the set it tried to write, so the line
+    # could name roles the account does not hold.
     roles = event.detail.get("roles")
-    if event.event_type == ROLES_CHANGED and not from_directory and isinstance(roles, list):
+    if _roles_written(event) and not from_directory and isinstance(roles, list):
         lines.append(f"Roles now: {_roles_shown(roles) or 'none'}")
     if event.event_type == ACCOUNT_CREATED and isinstance(roles, list) and roles:
         lines.append(f"Roles: {_roles_shown(roles)}")
@@ -613,29 +639,26 @@ def _build_body(event: SecurityEvent) -> str:
                     "That was your last recovery code. Enroll a new authenticator to generate more, "
                     "or you will need an administrator to reset your second factor."
                 )
-    if event.client_ip and from_directory:
+    # BACKLOG #6034: the address prints only as one printable token, as every other value does.
+    client_ip = _shown(event.client_ip, "an address", token=True) if event.client_ip else ""
+    if client_ip and from_directory:
         # BACKLOG #2291. The directory made this change, so the address is not where it was made,
-        # and a bare "Source IP" line would read as the address of whoever made it. Measured
-        # 2026-10-06, the directory notices that pass an address come from ``_upsert_ad_user``, on
-        # a directory sign-in to this account, which copies the change down BEFORE the sign-in is
-        # finished: a later step can still refuse it, or it can still owe a second factor. Since
-        # vault BACKLOG #3121 the role re-sync in ``_complete_ad_login`` is one more such sender,
-        # and it too runs inside a directory sign-in before the session is issued. So the
-        # line says a sign-in was under way, never that one succeeded. Nothing on the event says
-        # the address came from a sign-in, so a new sender passing another kind of address on a
-        # directory event would make this line false; such a sender must change it.
-        # BACKLOG #6034: the role notice proves no change (see ``_DIRECTORY_DESCRIPTIONS``), so it
-        # says only when it was sent.
-        what = "sent this notice" if event.event_type == ROLES_CHANGED else "picked up this change"
-        lines.append(
-            f"MessageFoundry {what} during a sign-in to your account from {event.client_ip}."
-        )
-    elif event.client_ip:
-        lines.append(f"Source IP: {event.client_ip}")
+        # and a bare "Source IP" line would read as the address of whoever made it. The directory
+        # notices that pass an address were measured on 2026-10-06 to come from a directory
+        # sign-in (``_upsert_ad_user``, and since vault BACKLOG #3121 the role re-sync in
+        # ``_complete_ad_login``), but nothing on the event says so, so the line names only the
+        # request (BACKLOG #6034). An unconfirmed role write claims no change.
+        if event.event_type == ROLES_CHANGED and not _roles_written(event):
+            what = "sent this notice"
+        else:
+            what = "picked up this change"
+        lines.append(f"MessageFoundry {what} while handling a request from {client_ip}.")
+    elif client_ip:
+        lines.append(f"Source IP: {client_ip}")
     if lock_closing is not None:
         closing = lock_closing
-    elif from_directory and event.event_type == ROLES_CHANGED:
-        # BACKLOG #6034: "this change" would claim one (see ``_DIRECTORY_DESCRIPTIONS``).
+    elif event.event_type == ROLES_CHANGED and not _roles_written(event):
+        # BACKLOG #6034: "this change" would claim one (see ``_evidenced_description``).
         closing = "If you did not expect this notice, contact your MessageFoundry administrator."
     elif event.event_type == PASSWORD_RESET:
         # An administrator did this, so "if this was you" cannot apply, and "no action is needed"

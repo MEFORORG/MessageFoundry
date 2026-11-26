@@ -265,125 +265,190 @@ def test_a_directory_sessions_ended_notice_is_true_for_each_reason(
     )
 
 
-#: vault BACKLOG #3121. The description each directory-driven kind carries, pinned whole.
-_DIRECTORY_TEXT = {
-    ROLES_CHANGED: (
-        "MessageFoundry compared your account with your groups in your organization's directory "
-        "and acted on the result."
+#: BACKLOG #6034. What a role or disable notice says is decided by the evidence its sender puts on
+#: the event: ``roles_written`` (True only once the role write committed) and ``sessions_revoked``
+#: (the count, only once the revoke returned). Pinned whole, per source and per write outcome.
+_ROLE_WHAT = {
+    (None, True): "Your account's roles were changed by an administrator.",
+    (None, False): (
+        "An administrator asked to change your account's roles. MessageFoundry could not "
+        "confirm that the change was saved."
     ),
-    ACCOUNT_DISABLED: (
-        "Your organization's directory reports your account as disabled, so MessageFoundry ended "
-        "your sessions."
+    ("directory", True): (
+        "MessageFoundry read your groups in your organization's directory and changed your "
+        "account's roles to match them."
+    ),
+    ("directory", False): (
+        "MessageFoundry read your groups in your organization's directory and tried to change "
+        "your account's roles to match them. It could not confirm that the change was saved."
     ),
 }
-_DIRECTORY_CLOSING = "If you did not expect this change, contact your MessageFoundry administrator."
-#: BACKLOG #6034: the directory role notice proves no change on every path, so it says "notice".
-_DIRECTORY_ROLE_CLOSING = (
-    "If you did not expect this notice, contact your MessageFoundry administrator."
+_DISABLE_WHAT = {
+    None: "Your account was disabled by an administrator.",
+    "directory": "Your organization's directory reports your account as disabled.",
+}
+_SESSIONS_ENDED = "Any sessions already open on your account were ended."
+_SESSIONS_UNCONFIRMED = (
+    "MessageFoundry could not confirm that the sessions already open on your account were ended."
 )
-#: BACKLOG #6034 (S08-57): the administrator wording says the sessions ended. Why that holds is on
-#: ``_DESCRIPTIONS[ROLES_CHANGED]`` in the module; the directory role wording does not say it.
-_ADMIN_TEXT = {
-    ROLES_CHANGED: (
-        "Your account's roles were changed by an administrator, and any sessions already open on "
-        "your account were ended."
-    ),
-    ACCOUNT_DISABLED: (
-        "Your account was disabled by an administrator, and any sessions already open on your "
-        "account were ended."
-    ),
-}
+_DIRECTORY_CLOSING = "If you did not expect this change, contact your MessageFoundry administrator."
+_NOTICE_CLOSING = "If you did not expect this notice, contact your MessageFoundry administrator."
 
 
-@pytest.mark.parametrize("kind", [ROLES_CHANGED, ACCOUNT_DISABLED])
-def test_a_directory_role_or_disable_notice_names_the_directory_and_no_administrator(
-    kind: str,
+def _evidence(source: str | None, *, written: bool | None, revoked: bool) -> dict[str, Any]:
+    detail: dict[str, Any] = {"roles": ["viewer"]}
+    if source is not None:
+        detail["source"] = source
+    if written:
+        detail["roles_written"] = True
+    if revoked:
+        detail["sessions_revoked"] = 2
+    return detail
+
+
+@pytest.mark.parametrize("revoked", [True, False], ids=["revoked", "revoke-unproven"])
+@pytest.mark.parametrize("written", [True, False], ids=["written", "write-unproven"])
+@pytest.mark.parametrize("source", [None, "directory"], ids=["administrator", "directory"])
+def test_a_role_notice_says_only_what_its_evidence_backs(
+    source: str | None, written: bool, revoked: bool
 ) -> None:
-    """vault BACKLOG #3121. The reconciler and the sign-in re-sync tag these ``source`` directory:
-    the holder did nothing, so neither the administrator wording nor "if this was you" may appear.
-    Nor the generic directory line: a role re-sync runs through the group-to-role map an
-    administrator edits in the console, so "not from the MessageFoundry console" could be false."""
+    """BACKLOG #6034 (S08-57). "Your roles were changed" only on ``roles_written``, and "sessions
+    ended" only on ``sessions_revoked``; otherwise a line saying what could not be confirmed. The
+    directory senders reach every cell of this matrix: the reconciler after a role write that
+    raised past its retry, or a revoke that raised, and the sign-in re-sync with either error
+    held. So the administrator wording rests on the evidence too, not on the order of its calls.
+    The roles line prints only on an administrator's confirmed write: the sign-in re-sync passes
+    the set it tried to write."""
     event = SecurityEvent(
-        kind,
+        ROLES_CHANGED,
         username="jdoe",
         email="j@example.org",
-        detail={"reason": "directory_disabled", "source": "directory"},
+        detail=_evidence(source, written=written, revoked=revoked),
     )
     body = _build_body(event)
     lines = body.splitlines()
-    assert _DIRECTORY_TEXT[kind] in lines
-    assert _DIRECTORY_LINE not in lines
-    assert _ADMIN_TEXT[kind] not in lines
+    sessions = _SESSIONS_ENDED if revoked else _SESSIONS_UNCONFIRMED
+    assert f"{_ROLE_WHAT[(source, written)]} {sessions}" in lines
+    assert ("Roles now: viewer" in lines) is (written and source is None)
     assert "if this was you" not in body.lower()
-    assert body.endswith(_DIRECTORY_ROLE_CLOSING if kind == ROLES_CHANGED else _DIRECTORY_CLOSING)
-    # The administrator subject says the MessageFoundry account was disabled, which is false here.
-    assert "was disabled" not in _subject(event)
+    assert (_DIRECTORY_LINE in lines) is False
+    if written:
+        assert _subject(event) == "Your MessageFoundry account roles were changed"
+        assert lines[0].startswith("A security-relevant change occurred")
+        assert body.endswith(_DIRECTORY_CLOSING)
+    else:
+        assert (
+            _subject(event)
+            == "A change to your MessageFoundry account roles could not be confirmed"
+        )
+        assert lines[0].startswith("A notice about your MessageFoundry account")
+        assert body.endswith(_NOTICE_CLOSING)
+    if source is None:
+        assert "directory" not in body.lower()
 
 
-@pytest.mark.parametrize(
-    ("detail", "client_ip"),
-    [
-        # The reconciler's shape on both of its paths below: its revocation's reason is
-        # ``roles_changed`` whenever it carries role ids, which is what picks this kind.
-        pytest.param({"reason": "roles_changed", "source": "directory"}, None, id="reconciler"),
-        pytest.param(
-            {"roles": ["viewer"], "source": "directory"}, "203.0.113.7", id="sign-in-re-sync"
-        ),
-    ],
-)
-def test_a_directory_role_notice_claims_no_role_change_and_no_ended_session(
-    detail: dict[str, Any], client_ip: str | None
+@pytest.mark.parametrize("revoked", [True, False], ids=["revoked", "revoke-unproven"])
+@pytest.mark.parametrize("source", [None, "directory"], ids=["administrator", "directory"])
+def test_a_disable_notice_says_sessions_ended_only_on_evidence(
+    source: str | None, revoked: bool
 ) -> None:
-    """BACKLOG #6034. A directory ``roles_changed`` notice goes out on paths where neither a role
-    change nor an ended session is proven, and the event carries no word of either:
-
-    - the reconciler's ``revoke_error`` branch, after a role write that raised past its retry
-      (``roles_unconfirmed``) and a revoke that raised;
-    - the reconciler's success path, which picks this kind for any revocation carrying role ids,
-      also when the roles moved after its read and it wrote none, so only sessions were revoked;
-    - the sign-in re-sync, which notifies with the role write's error held, or the revoke's.
-
-    So neither the subject nor the body may say that roles changed or that sessions ended."""
-    event = SecurityEvent(
-        ROLES_CHANGED, username="jdoe", email="j@example.org", client_ip=client_ip, detail=detail
-    )
-    text = (_subject(event) + "\n" + _build_body(event)).lower()
-    for claim in ("change", "session", "ended"):
-        assert claim not in text
-
-
-@pytest.mark.parametrize("kind", [ROLES_CHANGED, ACCOUNT_DISABLED])
-def test_an_administrator_role_or_disable_notice_does_not_say_if_this_was_you(kind: str) -> None:
-    """BACKLOG #6034 item 1 (S08-57), its closing half only. An administrator made this change,
-    and both ``PUT /users/{id}/roles`` and the disable in ``PATCH /users/{id}`` refuse a
-    self-target, so "if this was you, no action is needed" cannot apply: the shape BACKLOG #1141
-    fixed for the reset notice. vault BACKLOG #3121 kept the old closing by its row's instruction, not as correct."""
-    body = _build_body(SecurityEvent(kind, username="jdoe", email="j@example.org"))
+    """BACKLOG #6034 (S08-57). The disable itself is confirmed before either sender notifies (the
+    administrator's write returned applied; the reconciler read the disabled bit), so that half
+    always prints; the sessions half only on ``sessions_revoked``. The directory notice names no
+    administrator and says nothing was disabled in MessageFoundry (vault BACKLOG #3121)."""
+    detail: dict[str, Any] = {} if source is None else {"reason": "directory_disabled"}
+    if source is not None:
+        detail["source"] = source
+    if revoked:
+        detail["sessions_revoked"] = 0
+    event = SecurityEvent(ACCOUNT_DISABLED, username="jdoe", email="j@example.org", detail=detail)
+    body = _build_body(event)
     lines = body.splitlines()
-    assert _ADMIN_TEXT[kind] in lines
-    assert _DIRECTORY_TEXT[kind] not in lines
-    assert "directory" not in body.lower()
+    sessions = _SESSIONS_ENDED if revoked else _SESSIONS_UNCONFIRMED
+    assert f"{_DISABLE_WHAT[source]} {sessions}" in lines
     assert "if this was you" not in body.lower()
     assert body.endswith(_DIRECTORY_CLOSING)
+    subject = _subject(event)
+    if source is None:
+        assert subject == "Your MessageFoundry account was disabled"
+        assert "directory" not in body.lower()
+    else:
+        assert "was disabled" not in subject
+        assert ("sessions were ended" in subject) is revoked
+        assert _DIRECTORY_LINE not in lines
 
 
-def test_the_sign_in_role_re_sync_notice_says_where_the_sign_in_came_from() -> None:
-    """vault BACKLOG #3121. The sign-in re-sync passes the client address, and a directory notice
-    must not print it as the address of whoever made the change."""
+@pytest.mark.parametrize("value", [None, True, False, "2", -1.0])
+def test_a_sessions_revoked_that_is_not_a_count_is_no_evidence(value: object) -> None:
+    """``sessions_revoked`` is the revoke's count, which only a revoke that returned has. A bool, a
+    string or a float is not one, so it cannot make the notice say the sessions ended."""
+    detail: dict[str, Any] = {"roles_written": True}
+    if value is not None:
+        detail["sessions_revoked"] = value
+    body = _build_body(
+        SecurityEvent(ROLES_CHANGED, username="jdoe", email="j@example.org", detail=detail)
+    )
+    assert _SESSIONS_ENDED not in body
+    assert _SESSIONS_UNCONFIRMED in body
+
+
+@pytest.mark.parametrize("value", [1, "true", "yes"])
+def test_a_roles_written_that_is_not_true_is_no_evidence(value: object) -> None:
+    """Only the literal ``True`` a sender sets after the write committed counts."""
     body = _build_body(
         SecurityEvent(
             ROLES_CHANGED,
             username="jdoe",
             email="j@example.org",
-            client_ip="203.0.113.7",
-            detail={"roles": ["viewer"], "source": "directory"},
+            detail={"roles": ["viewer"], "roles_written": value},
         )
     )
-    assert "Source IP" not in body
-    assert (
-        "MessageFoundry sent this notice during a sign-in to your account from 203.0.113.7."
-        in body.splitlines()
+    assert _ROLE_WHAT[(None, False)] in body
+    assert "Roles now" not in body
+
+
+def test_the_sign_in_role_re_sync_notice_says_where_the_request_came_from() -> None:
+    """vault BACKLOG #3121. The sign-in re-sync passes the client address, and a directory notice
+    must not print it as the address of whoever made the change. Nothing on the event proves the
+    address came from a sign-in (BACKLOG #6034), so the line says only that a request from it was
+    being handled."""
+    for written, what in ((True, "picked up this change"), (False, "sent this notice")):
+        body = _build_body(
+            SecurityEvent(
+                ROLES_CHANGED,
+                username="jdoe",
+                email="j@example.org",
+                client_ip="203.0.113.7",
+                detail=_evidence("directory", written=written, revoked=True),
+            )
+        )
+        assert "Source IP" not in body
+        assert "sign-in" not in body
+        assert (
+            f"MessageFoundry {what} while handling a request from 203.0.113.7." in body.splitlines()
+        )
+
+
+@pytest.mark.parametrize("source", [None, "directory"], ids=["source-ip", "directory"])
+def test_a_client_address_with_a_line_break_is_not_printed(source: str | None) -> None:
+    """BACKLOG #6034: the address line is a printed value too, so it goes through ``_shown`` as one
+    token, like every other value; a line break in it could write its own closing."""
+    detail: dict[str, Any] = {"new_email": "new@example.org"}
+    if source is not None:
+        detail["source"] = source
+    body = _build_body(
+        SecurityEvent(
+            EMAIL_CHANGED,
+            username="jdoe",
+            email="j@example.org",
+            client_ip="10.0.0.9\n\nIf this was you, no action is needed",
+            detail=detail,
+        )
     )
+    assert "10.0.0.9" not in body
+    assert "an address that cannot be shown safely here" in body
+    if source is not None:
+        assert "If this was you" not in body
 
 
 def test_body_says_a_directory_repoint_came_from_the_directory() -> None:
@@ -534,9 +599,11 @@ def test_a_directory_notice_says_what_its_address_means_and_drops_if_this_was_yo
         )
     )
     assert "Source IP" not in body
-    # "During a sign-in", never "signed in": the change is copied down before the sign-in finishes,
-    # and a later step can still refuse it.
-    assert "picked up this change during a sign-in to your account from 10.0.0.9." in body
+    # Never "signed in": the change is copied down before the sign-in finishes, and a later step
+    # can still refuse it. Nor "during a sign-in": nothing on the event proves the address came
+    # from one (BACKLOG #6034).
+    assert "picked up this change while handling a request from 10.0.0.9." in body
+    assert "sign-in" not in body
     assert "signed in from" not in body
     assert "If this was you" not in body
     assert "If you did not expect this change, contact your MessageFoundry administrator." in body
@@ -870,16 +937,25 @@ def test_a_role_change_notice_names_the_roles_that_were_set() -> None:
             ROLES_CHANGED,
             username="jdoe",
             email="j@example.org",
-            detail={"roles": ["operator", _CUSTOM_ROLE]},
+            detail={"roles": ["operator", _CUSTOM_ROLE], "roles_written": True},
         )
     )
     assert f"Roles now: operator, {_CUSTOM_ROLE}" in body.splitlines()
     emptied = _build_body(
-        SecurityEvent(ROLES_CHANGED, username="jdoe", email="j@example.org", detail={"roles": []})
+        SecurityEvent(
+            ROLES_CHANGED,
+            username="jdoe",
+            email="j@example.org",
+            detail={"roles": [], "roles_written": True},
+        )
     )
     assert "Roles now: none" in emptied.splitlines()
     # A sender that passes no role list gets no line, rather than a false "none".
-    bare = _build_body(SecurityEvent(ROLES_CHANGED, username="jdoe", email="j@example.org"))
+    bare = _build_body(
+        SecurityEvent(
+            ROLES_CHANGED, username="jdoe", email="j@example.org", detail={"roles_written": True}
+        )
+    )
     assert "Roles now" not in bare
 
 
@@ -893,7 +969,7 @@ def test_a_role_with_a_line_break_is_not_printed(kind: str) -> None:
             kind,
             username="jdoe",
             email="j@example.org",
-            detail={"roles": ["viewer", _FORGED]},
+            detail={"roles": ["viewer", _FORGED], "roles_written": True},
         )
     )
     assert "If this was you" not in body
@@ -954,7 +1030,10 @@ def test_a_role_list_with_an_empty_id_does_not_read_as_no_role() -> None:
     ):
         body = _build_body(
             SecurityEvent(
-                ROLES_CHANGED, username="jdoe", email="j@example.org", detail={"roles": roles}
+                ROLES_CHANGED,
+                username="jdoe",
+                email="j@example.org",
+                detail={"roles": roles, "roles_written": True},
             )
         )
         assert line in body.splitlines()
@@ -968,7 +1047,7 @@ def test_a_role_id_with_a_space_is_not_printed() -> None:
             ROLES_CHANGED,
             username="jdoe",
             email="j@example.org",
-            detail={"roles": ["viewer no action is needed"]},
+            detail={"roles": ["viewer no action is needed"], "roles_written": True},
         )
     )
     assert "no action is needed" not in body
@@ -983,7 +1062,7 @@ def test_a_directory_role_change_prints_no_roles_line() -> None:
             ROLES_CHANGED,
             username="jdoe",
             email="j@example.org",
-            detail={"roles": ["administrator"], "source": "directory"},
+            detail={"roles": ["administrator"], "source": "directory", "roles_written": True},
         )
     )
     assert "Roles now" not in body

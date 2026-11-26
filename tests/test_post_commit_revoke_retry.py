@@ -24,13 +24,22 @@ import asyncio
 import json
 import sqlite3
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from messagefoundry.auth import reconcile
 from messagefoundry.auth import service as service_module
+from messagefoundry.auth.notifications import (
+    ACCOUNT_DISABLED,
+    DIRECTORY_SESSIONS_ENDED,
+    ROLES_CHANGED,
+    SecurityEvent,
+)
 from messagefoundry.auth.passwords import hash_password
+from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import (
     SESSIONS_REVOKE_FAILED_ACTION,
     AuthService,
@@ -41,7 +50,7 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.base import StoreAcquireTimeout
 from messagefoundry.store.store import AdminGrant, MessageStore
-from tests.test_ad_session_reconcile import _ad_settings, _principal
+from tests.test_ad_session_reconcile import _GRP_A, _ad_settings, _principal, _scoped_service
 from tests.test_b1720_cli_schema_refusal_exit import _PASSWORD as _B1720_PASSWORD
 from tests.test_b1720_cli_schema_refusal_exit import shell as shell  # noqa: F401
 
@@ -936,3 +945,256 @@ def test_the_cli_reports_whether_the_given_up_runs_page_was_delivered(
             # The granted run's WARNING, naming the other Administrators the check found.
             assert "no [alerts] transport confirmed delivery" in captured.out
             assert "Tell the site's other Administrators yourself: 'ops-b'" in captured.out
+
+
+# --- BACKLOG #6034 (S08-57): the evidence each role and disable sender puts on its notice --------
+#
+# The notice says "your roles were changed" only on ``roles_written``, and "sessions ended" only on
+# ``sessions_revoked`` (``pipeline/security_notify.py``, ``_evidenced_description``). Each sender
+# sets them only once its own role write or revoke has returned, and leaves them out where that
+# call raised. One test per sender, and per path that raises.
+
+
+class _Notices:
+    """Collects the security notices a sender hands the notifier."""
+
+    def __init__(self) -> None:
+        self.sent: list[SecurityEvent] = []
+
+    async def notify(self, event: SecurityEvent) -> bool:
+        self.sent.append(event)
+        return True
+
+
+def _listening(service: AuthService) -> _Notices:
+    notices = _Notices()
+    service._security_notifier = notices
+    return notices
+
+
+def _one(notices: _Notices, kind: str) -> SecurityEvent:
+    events = [e for e in notices.sent if e.event_type == kind]
+    assert len(events) == 1, [e.event_type for e in notices.sent]
+    return events[0]
+
+
+@pytest.mark.parametrize(
+    ("caller", "kind", "evidence"),
+    [
+        pytest.param(
+            _set_roles,
+            ROLES_CHANGED,
+            {"roles": ["operator"], "roles_written": True, "sessions_revoked": 2},
+            id="set_roles",
+        ),
+        pytest.param(_disable, ACCOUNT_DISABLED, {"sessions_revoked": 2}, id="disable"),
+    ],
+)
+async def test_an_administrator_notice_carries_its_write_and_its_revoke(
+    caller: Caller, kind: str, evidence: dict[str, Any]
+) -> None:
+    """``set_roles`` and the disable in ``update_user``: the write returned applied and the revoke
+    returned its count, so the notice carries both, the count as the revoke read it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, _hashes = await _account(store)
+        notices = _listening(service)
+        await caller(service, store, identity)
+        assert _one(notices, kind).detail == evidence
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("caller", "kind"),
+    [
+        pytest.param(_set_roles, ROLES_CHANGED, id="set_roles"),
+        pytest.param(_disable, ACCOUNT_DISABLED, id="disable"),
+    ],
+)
+async def test_an_administrator_change_whose_revoke_failed_sends_no_notice(
+    caller: Caller, kind: str
+) -> None:
+    """BACKLOG #6034: ``_revoke_after_commit`` raises once it gives up, before either administrator
+    sender notifies, so a revoke refused on every attempt sends no notice at all, not one without
+    ``sessions_revoked``. The request fails and the miss row records it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, _hashes = await _account(store)
+        notices = _listening(service)
+        _refusing(store, None)
+        with pytest.raises(StoreAcquireTimeout):
+            await caller(service, store, identity)
+        assert [e for e in notices.sent if e.event_type == kind] == []
+    finally:
+        await store.close()
+
+
+class _SyntheticWriteFault(RuntimeError):
+    """A role write that raised past its retry, after it may have committed."""
+
+
+def _role_write_raising(service: AuthService, method: str) -> None:
+    """Make ``method`` run the real role write, then raise: the reply lost after a commit."""
+    real = getattr(service, method)
+
+    async def write(*args: Any, **kwargs: Any) -> Any:
+        await real(*args, **kwargs)
+        raise _SyntheticWriteFault("synthetic: the role write's reply was lost")
+
+    setattr(service, method, write)
+
+
+@pytest.mark.parametrize("write_fails", [False, True], ids=["written", "write-raised"])
+@pytest.mark.parametrize("revoke_fails", [False, True], ids=["revoked", "revoke-raised"])
+async def test_the_sign_in_re_sync_notice_carries_only_what_returned(
+    write_fails: bool, revoke_fails: bool
+) -> None:
+    """The directory sign-in's role re-sync in ``_complete_ad_login`` notifies before it raises a
+    held error, so its notice goes out on all four paths. ``roles_written`` only when the sync held
+    no error from the role write; ``sessions_revoked`` only when the revoke returned."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _identity, _hashes = await _directory_account(store)
+        notices = _listening(service)
+        if write_fails:
+            _role_write_raising(service, "_write_roles_if_held")
+        if revoke_fails:
+            _refusing(store, None)
+        if write_fails or revoke_fails:
+            with pytest.raises((_SyntheticWriteFault, StoreAcquireTimeout)):
+                await _ad_sign_in(service, store, None)
+        else:
+            await _ad_sign_in(service, store, None)
+        expected: dict[str, Any] = {"roles": ["operator"], "source": "directory"}
+        if not write_fails:
+            expected["roles_written"] = True
+        if not revoke_fails:
+            expected["sessions_revoked"] = 2
+        assert _one(notices, ROLES_CHANGED).detail == expected
+    finally:
+        await store.close()
+
+
+async def _reconciled_jdoe() -> tuple[MessageStore, AuthService, Any, tuple[str, ...]]:
+    """A directory account with one live session, and a role target that differs from its roles."""
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        target = () if await store.get_user_role_ids(user.id) else (Role.OPERATOR.value,)
+    except BaseException:
+        await store.close()
+        raise
+    return store, service, user, target
+
+
+async def _apply(service: AuthService, revocation: reconcile.SessionRevocation) -> str:
+    return await service._apply_reconcile_revocation(
+        revocation, watermark=await service._audit_watermark(), maps_held=True
+    )
+
+
+class _SyntheticRevokeFault(RuntimeError):
+    """A revoke with its row that raised."""
+
+
+@pytest.mark.parametrize("write_fails", [False, True], ids=["written", "write-raised"])
+@pytest.mark.parametrize("revoke_fails", [False, True], ids=["revoked", "revoke-raised"])
+async def test_the_reconciler_role_notice_carries_only_what_returned(
+    write_fails: bool, revoke_fails: bool
+) -> None:
+    """``_apply_reconcile_revocation`` on its success path and its ``revoke_error`` branch. A role
+    write that raised counts as changed, so the notice still goes, without ``roles_written``; a
+    revoke that raised goes without ``sessions_revoked``."""
+    store, service, user, target = await _reconciled_jdoe()
+    try:
+        notices = _listening(service)
+        if write_fails:
+            _role_write_raising(service, "_write_reconciled_roles")
+        if revoke_fails:
+
+            async def refused(*_a: Any, **_k: Any) -> Any:
+                raise _SyntheticRevokeFault("synthetic: the revoke raised")
+
+            service._revoke_with_row = refused  # type: ignore[method-assign]
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="roles_changed", role_ids=target
+        )
+        if write_fails or revoke_fails:
+            with pytest.raises((_SyntheticWriteFault, _SyntheticRevokeFault)):
+                await _apply(service, revocation)
+        else:
+            assert await _apply(service, revocation) == "reported"
+        expected: dict[str, Any] = {"reason": "roles_changed", "source": "directory"}
+        if not write_fails:
+            expected["roles_written"] = True
+        if not revoke_fails:
+            expected["sessions_revoked"] = 1
+        assert _one(notices, ROLES_CHANGED).detail == expected
+    finally:
+        await store.close()
+
+
+async def test_a_retried_reconciler_role_write_is_not_confirmed() -> None:
+    """A retried write's first attempt may have committed with its reply lost, whatever the retry
+    read (``roles_unconfirmed``), so its notice carries no ``roles_written``."""
+    store, service, user, target = await _reconciled_jdoe()
+    try:
+        notices = _listening(service)
+        real = service._write_reconciled_roles
+
+        async def retried(*args: Any, **kwargs: Any) -> Any:
+            return replace(await real(*args, **kwargs), retried=True)
+
+        service._write_reconciled_roles = retried  # type: ignore[method-assign]
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="roles_changed", role_ids=target
+        )
+        assert await _apply(service, revocation) == "reported"
+        assert _one(notices, ROLES_CHANGED).detail == {
+            "reason": "roles_changed",
+            "source": "directory",
+            "sessions_revoked": 1,
+        }
+    finally:
+        await store.close()
+
+
+async def test_a_reconciler_role_revocation_that_wrote_no_role_says_only_sessions_ended() -> None:
+    """BACKLOG #6034. A role revocation that finds the roles already at its target writes none and
+    only ends the sessions, so it sends ``directory_sessions_ended``, not ``roles_changed``."""
+    store, service, user, _target = await _reconciled_jdoe()
+    try:
+        notices = _listening(service)
+        current = tuple(await store.get_user_role_ids(user.id))
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="roles_changed", role_ids=current
+        )
+        assert await _apply(service, revocation) == "reported"
+        assert [e.event_type for e in notices.sent] == [DIRECTORY_SESSIONS_ENDED]
+        assert notices.sent[0].detail == {
+            "reason": "roles_changed",
+            "source": "directory",
+            "sessions_revoked": 1,
+        }
+    finally:
+        await store.close()
+
+
+async def test_the_reconciler_disable_notice_carries_the_revoke_count() -> None:
+    """The reconciler's success path puts the revoke's count on every notice it sends."""
+    store, service, user, _target = await _reconciled_jdoe()
+    try:
+        notices = _listening(service)
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="directory_disabled"
+        )
+        assert await _apply(service, revocation) == "reported"
+        assert _one(notices, ACCOUNT_DISABLED).detail == {
+            "reason": "directory_disabled",
+            "source": "directory",
+            "sessions_revoked": 1,
+        }
+    finally:
+        await store.close()

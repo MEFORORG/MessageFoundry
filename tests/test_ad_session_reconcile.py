@@ -6314,7 +6314,10 @@ async def test_each_revocation_reason_sends_its_decided_notice(reason: str) -> N
         assert user is not None
         extra: dict[str, Any] = {}
         if reason == "roles_changed":
-            extra["role_ids"] = ()
+            # A target the account does not hold, so the write counts a change: a role revocation
+            # that writes none sends the neutral notice instead (BACKLOG #6034).
+            held = await store.get_user_role_ids(user.id)
+            extra["role_ids"] = () if held else (Role.OPERATOR.value,)
         if reason == reconcile.SCOPE_CHANGED:
             extra.update(scope_changed=True, scope_from=user.channel_scope, scope_to=None)
         revocation = reconcile.SessionRevocation(user.id, user.username, reason=reason, **extra)
@@ -6328,8 +6331,15 @@ async def test_each_revocation_reason_sends_its_decided_notice(reason: str) -> N
         assert [e.event_type for e in notifier.sent] == ([] if expected is None else [expected])
         if expected is not None:
             # ``source`` words ROLES_CHANGED and ACCOUNT_DISABLED for the directory (vault
-            # BACKLOG #3121); every reconciler notice carries it.
-            assert notifier.sent[0].detail == {"reason": reason, "source": "directory"}
+            # BACKLOG #3121); every reconciler notice carries it, and the revoke's count, which
+            # is what lets a notice say the sessions ended (BACKLOG #6034).
+            written = {"roles_written": True} if reason == "roles_changed" else {}
+            assert notifier.sent[0].detail == {
+                "reason": reason,
+                "source": "directory",
+                "sessions_revoked": 1,
+                **written,
+            }
     finally:
         await store.close()
 
