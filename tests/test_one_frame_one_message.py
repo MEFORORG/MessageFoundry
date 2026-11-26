@@ -843,20 +843,20 @@ def _reply_outcome(reply: str, encoding: str) -> bytes | str:
 
 
 def _short_lf_headers() -> list[str]:
-    """LF-only ``MSH``-led replies whose first line is 4 to 8 characters long, each followed by a
-    line holding a character ASCII, or ASCII and latin-1, cannot encode, or none; then the same
-    with no final LF, and some led by whitespace and a BOM. The ``BHS``- and ``FHS``-led shapes
-    pin a residual, not a wanted outcome: main declared nothing for them and they are sent with
-    ``?`` written in, so a fix that reads a short ``BHS`` or ``FHS`` line past its LF turns them
-    red on purpose."""
+    """LF-only ``MSH``-led replies whose first line is 3 to 8 characters long, ``MSH`` alone
+    included, each followed by a line holding a character ASCII, or ASCII and latin-1, cannot
+    encode, or none; then the same with no final LF, and some led by whitespace and a BOM. The
+    ``BHS``- and ``FHS``-led shapes, the header ID alone among them, pin a residual, not a wanted
+    outcome: main declared nothing for them and they are sent with ``?`` written in, so a fix
+    that reads a short ``BHS`` or ``FHS`` line past its LF turns them red on purpose."""
     bar, bom = "\N{BROKEN BAR}", "\N{ZERO WIDTH NO-BREAK SPACE}"
-    firsts = {"MSH" + ("|^~" + BS + "&")[: n - 3] for n in range(4, 9)}
+    firsts = {"MSH" + ("|^~" + BS + "&")[: n - 3] for n in range(3, 9)}
     firsts |= {"MSH" + ("|^?" + BS + "&")[: n - 3] for n in range(4, 9)}
     firsts |= {"MSH?^", "MSH" + bar, "MSH|" + bar}
     seconds = ["?SA|AA|中", "MSA|AA|中", "中SA|AA|C", bar + "SA|AA|中", "MSA|AA|" + bar, "MSA|AA|C"]
     replies = {f + "\n" + s + end for f in firsts for s in seconds for end in ("\n", "")}
     replies |= {" " + bom + f + "\n" + s + "\n" for f in firsts for s in seconds[:2]}
-    replies |= {h + "|^\n?SA|AA|中\n" for h in ("BHS", "FHS")}
+    replies |= {h + t for h in ("BHS", "FHS") for t in ("|^\n?SA|AA|中\n", "\n?SA|AA|中\n")}
     return sorted(replies)
 
 
@@ -875,11 +875,13 @@ def test_a_short_lf_only_header_sends_or_refuses_as_on_main(
     assert head == _reply_outcome(reply, encoding)
 
 
-@pytest.mark.parametrize("reply", ["MSH|^~\n中", "MSH|^\n?SA|AA|中\n"])
+@pytest.mark.parametrize("reply", ["MSH|^~\n中", "MSH|^\n?SA|AA|中\n", "MSH\n?SA|AA|中\n"])
 def test_a_short_lf_only_header_that_main_refused_is_refused(
     reply: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Two shapes main refused and a read stopping at the LF sent. The refusal chains nothing."""
+    """Shapes main refused and a read stopping at the LF sent; the last, a first line of ``MSH``
+    alone, is also sent by a read that keys on the first line's length. The refusal chains
+    nothing."""
     with pytest.raises(UnicodeError, match="collide with one of its own delimiters") as ei:
         framing_mod.encode_reply(reply, "ascii", connection="IB_SHORT_LF")
     assert ei.value.__cause__ is None and ei.value.__context__ is None
