@@ -929,9 +929,8 @@ def _message_handles(action_list: Element) -> tuple[frozenset[str], frozenset[st
     the wrong answer).
 
     In a Handler, ``msg`` is the message that arrived **and** the message ``Send`` delivers. An
-    inline step 1 send delivers a copy of ``msg`` as it stood at the send, so the content is the
-    same and the object is not; a step 2 send delivers its local uncopied, ``msg`` included. Either
-    way the subject is the list's **input** handle, and only when that same
+    inline step 1 send delivers a copy of ``msg`` as it stood at the send (the render site in
+    :func:`_generate_construct` says which sends copy). Either way the subject is the list's **input** handle, and only when that same
     handle is what the list delivers. A list that builds a *separate* output tree and sends that has
     no equivalent at all: writing its fields onto ``msg`` would mutate the inbound message, which is
     not the message Corepoint was populating. (This is not hypothetical — more lists deliver a

@@ -26,7 +26,7 @@ the step 1 code path has gained on purpose since that tree. There are three. The
 (BACKLOG #5823, ``_COPY_AMENDMENTS``) loads beneath every tree :func:`_load_step1` builds unless
 it is passed ``copy=False``: an inline send of msg renders ``msg.copy()``.
 
-**Three names for the trees, used so throughout this file.** *The file as vendored* is the pinned
+**Three names for the trees.** *The file as vendored* is the pinned
 bytes with no amendment at all; only ``test_the_copy_amendment_changes_only_the_send_line`` loads
 it, with ``copy=False``. *The vendored tree* (``step1_vendored_tree``) is that file with the copy
 amendment alone. Every other tree :func:`_load_step1` builds is the vendored tree plus amendments of
@@ -34,10 +34,14 @@ its own, at least ``step1_scan_skips`` (the fail-closed amendment's scan half), 
 (the fail-closed amendment whole), ``step1`` (both amendments in ``_STEP1_AMENDMENTS``, the
 baseline) and the control mutants. *Main*, in a bound, is the tree that bound compares against: the
 tree it loads on the ``was`` side, whatever its docstring calls it. A bound that compares two such
-trees is blind to the copy line's text, since both carry it. A bound that loads the head is not:
-the head renders the copy itself, and a head that lost it differs from those trees.
+trees is blind to the copy line's text, since both carry it. Of the checks that load the head,
+one that compares its rendered text with a tree sees a head step 1 send that lost its copy, the
+head-equals-baseline check wherever the gate is closed among them. One that reads only the shape
+of the tree, or only whether a list raises, or that compares with ``step1_scan_skips`` by
+execution, does not. Outside this file, at least the unit tests that assert ``msg.copy()`` see it,
+test_a_step1_send_of_msg_is_not_changed_by_a_later_write among them.
 
-The two in ``_STEP1_AMENDMENTS`` load on top of it. The fail-closed amendment (BACKLOG #2526) loads
+The two in ``_STEP1_AMENDMENTS`` load on top of the copy amendment. The fail-closed amendment (BACKLOG #2526) loads
 first: it switches off live code main rendered from switched-off or misplaced source, and
 ``test_the_fail_closed_amendment_adds_no_live_code`` bounds it against the vendored tree. The label
 amendment (BACKLOG #2632) loads on top of it, and
@@ -1628,11 +1632,8 @@ def _observed(message: object, inp: Message | None) -> str:
 
 # The step 1 path sends ``msg.copy()`` (BACKLOG #5823), which is still a send of msg. A bare local,
 # ``msg`` included, also reads as a send of it; a ``<local>.copy()`` of another local does not match.
-# So a head step 1 send that lost its copy reads like a correct one here. What sees that is at
-# least the byte-for-byte comparison of the head with ``step1`` wherever the gate is closed, the
-# bounds that compare the head's render with a loaded tree, and, outside this file, the unit tests
-# that assert ``msg.copy()``, test_a_step1_send_of_msg_is_not_changed_by_a_later_write among them.
-# The copy amendment's own bound never loads the head, so it is not one of them.
+# So a head step 1 send that lost its copy reads like a correct one here. The module docstring
+# says which checks see that.
 _LIVE_SEND = re.compile(
     r'^(\s*)sends\.append\(Send\("([^"]+)", (msg(?=\.copy\(\)\)\))|\w+(?=\)\)))'
 )
@@ -3546,9 +3547,10 @@ def _bound(name: str, xml: str) -> tuple[bool, list[str]]:
 
     The head is held to the same bound, against the same tree, wherever the gate is
     closed. On the battery that is what the head-equals-baseline check already implies. On a list
-    drawn with no grammar this arm compares the head's render with main, and
-    :func:`_structure_moved` compares the shape of its tree. A fully understood list takes
-    the step 2 path, where a refusal may become a delivery the oracle proves."""
+    drawn with no grammar that the gate declines, this arm compares the head's render with main,
+    and :func:`_structure_moved` compares the shape of its tree. A fully understood list takes
+    the step 2 path, and neither reads the head there. On the battery the oracle checks it; on a
+    raw list the gate opens, nothing here compares the head."""
     was, now = _generate(step1_unlabelled, xml), _generate(step1, xml)
     broken = [f"{name}: the amended baseline: {b}" for b in _breaches(xml, was, now)]
     # The head's own output is judged only where it is not the baseline's, which was just judged.
@@ -3652,8 +3654,8 @@ def _adopted(steps: Sequence[Any]) -> int:
 def _structure_moved(name: str, xml: str) -> tuple[int, list[str]]:
     """What the label amendment, or the head, changes about the shape of the tree, against the
     tree it loads onto (``step1_unlabelled``). It must change nothing. A statement off a
-    ``<Line>`` is marked, and a marker is no statement position. So no branch main adopts is orphaned, at any depth, none it
-    orphans is adopted, and no construct appears or goes. The head is held to that wherever the
+    ``<Line>`` is marked, and a marker is no statement position. So no branch main adopts is
+    orphaned, at any depth, none it orphans is adopted, and no construct appears or goes. The head is held to that wherever the
     gate is closed. A fully understood list takes the step 2 path, which builds its own tree.
 
     Also says how many branches main adopts in the list: where it adopts none, or refuses the
@@ -4346,7 +4348,7 @@ def _raises(src: str, where: Path) -> bool:
 
 def test_the_head_goes_to_error_on_exactly_the_lists_the_baseline_does(tmp_path: Path) -> None:
     """The owner's ruling of 2026-11-01, by execution, against the vendored tree with the scan half
-    alone, whose render inlines an orphan as main's does. With no write that can raise in play, it
+    alone, whose render inlines an orphan as the vendored tree's does. With no write that can raise in play, it
     raises on a list exactly where the head does, over a battery that orphans and adopts across
     a step at every depth: never a delivery where it refused, nor an ERROR it did not make. The
     battery holds no wrapper (the next test), call, unmodelled element or stray; the unit tests
