@@ -40,9 +40,10 @@ the other hooks' context is kept, as in Claude Code.
 The bridge does not fail closed on a fault; this is a known gap. At least these
 end the bridge or its launcher with a non-zero exit, and no deny or block
 output, which the registered line delivers to Codex as 1: on any event but
-SessionStart, a hook that exits non-zero other than 2 or times out, when no
-other hook of the event exited 2 or returned a deny, an ask, a block or a
-`"continue": false`; and, on
+SessionStart, a hook that exits non-zero other than 2 or times out, unless
+another hook of the event exited 2, or a deny, an ask, a block or a
+`"continue": false` from another hook still stands once the event's hooks end
+(a PermissionRequest deny a later allow replaced does not); and, on
 any event, unreadable settings, a bad payload or a missing `.venv`. Outside
 SessionStart, a hook that exits non-zero other than 2, times out or prints JSON
 that is not an object does not stop the event's later hooks. They still run

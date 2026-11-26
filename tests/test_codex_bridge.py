@@ -651,6 +651,15 @@ def test_a_stop_stands_over_another_hooks_fault(bridge, tmp_path, order, stop):
     assert "a hook failed" in result["systemMessage"]
 
 
+def test_a_same_object_stop_stands_only_when_merged_before_the_bad_field(bridge, tmp_path):
+    """docs/CODEX.md: merge_output merges systemMessage before continue, hookSpecificOutput after."""
+    settings(tmp_path, [handler(json.dumps({"continue": False, "hookSpecificOutput": 5}))])
+    assert bridge.dispatch(tmp_path, _PAYLOAD)["continue"] is False
+    settings(tmp_path, [handler(json.dumps({"continue": False, "systemMessage": 5}))])
+    with pytest.raises(TypeError):
+        bridge.dispatch(tmp_path, _PAYLOAD)
+
+
 def test_a_later_exit_2_blocks_over_an_earlier_fault(bridge, tmp_path):
     settings(tmp_path, [_EXIT_1, _py("import sys; sys.exit(2)")])
     with pytest.raises(bridge.HookBlocked):

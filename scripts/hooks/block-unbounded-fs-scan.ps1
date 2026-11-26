@@ -16,13 +16,16 @@
 # program); a walk of the segment's own `cd` (`cd /proc && find .`); and a grep long option
 # abbreviation (`grep --rec x /proc`). Recognising the program is required to deny, so each of these
 # is a silent allow. Inverting that, so only provably non-walking programs are allowed, is the
-# deeper fix and is not built. Nor does it catch at least a walk on a line the views blank as
-# heredoc body that bash runs as a command, unless the walk sits in a `$(...)` or backtick
-# substitution in a body whose delimiter is unquoted, which the heredoc pass reads. Such a line
-# follows a delimiter bash finds only by joining a backslash-newline (`E\` then `OF`), or sits in a
-# later heredoc the views open after ending a body early: at a raw delimiter bash joins to the line
-# before it (`x\` then `EOF`), or at a padded copy (` EOF`), since the views compare after .Trim().
-# So `cat <<EOF\nx\\\nEOF\ncat <<B\nEOF\nfind /proc\nB` is allowed, and bash runs the walk.
+# deeper fix and is not built. Nor does it catch at least some walks on a line the views blank as
+# heredoc body that bash runs as a command. Such a line can follow a delimiter bash finds only by
+# joining a backslash-newline (`E\` then `OF`), or sit in a later heredoc the views open after
+# ending a body early, at a raw delimiter bash joins to the line before it (`x\` then `EOF`) or at
+# a padded copy (` EOF`), since the views compare after .Trim(). The heredoc pass reads a `$(...)`
+# or backtick substitution there only where one of its readings puts the line in a body whose
+# delimiter is unquoted, so at least these are missed: a walk outside a substitution, as in
+# `cat <<EOF\nx\\\nEOF\ncat <<B\nEOF\nfind /proc\nB`; a substitution in a later heredoc whose
+# delimiter is quoted; and a line neither reading puts in a body, such as one after a delimiter the
+# views capture only part of (`<<END-X`), or in a heredoc opened after a `((` on its line.
 #
 # ROOTS ARE COMPARED AS PATHS, OPTIONS AS GRAMMAR. Every bypass measured on 2026-09-20 came from
 # comparing a spelling instead of what it names: `/.`, `//`-variants, `/pro'c'`, `/pro\c`,
@@ -97,12 +100,14 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # delimiter, after leading tabs for `<<-`. For an unquoted delimiter, bash compares the line after
 # joining each backslash-newline; the other views compare each line as written, after .Trim().
 # So this pass reads the text twice, and both readings add to $Into, with $Seen dropping a repeat;
-# they share $Spent and $Cap, so near the cap a text only the second reading finds is the first
-# dropped. The first reading ends a body only where the line is the delimiter both as written and
-# as joined, so a raw `EOF` after a continued line (`x\` then `EOF`) stays body, as bash reads it.
-# The second ends a body at the first line that is its delimiter after .Trim(), as the views end
-# it, so the lines after that raw `EOF`, or after a padded ` EOF`, are read as the views read them,
-# and a later opener there is read. That second reading can open a heredoc bash never opens, and
+# they share $Spent and $Cap with every other call, so near the cap a text either reading finds can
+# be dropped. The first reading ends a body only where the line is the delimiter both as written
+# and as joined, so a raw `EOF` after a continued line (`x\` then `EOF`) stays body, as bash reads
+# it. The second ends an unquoted delimiter's body at the first line that is the delimiter after
+# .Trim(), as the views end it, so the lines after that raw `EOF`, or after a padded ` EOF`, are
+# read as the views read them, and a later opener there is read. A quoted delimiter's body it ends
+# as the first reading does, since bash takes every line before that end as data, a heredoc the
+# views open in it included. That second reading can open a heredoc bash never opens, and
 # read lines bash runs as commands as its body, so it adds false denies main did not have, such as
 # `cat <<EOF\nx\\\nEOF\ncat <<B\nEOF\necho '$(find /proc)'\nB`. Neither reading ends a body at a
 # delimiter bash finds only by joining (`E\` then `OF`), so both read the lines after it as body,
@@ -123,7 +128,8 @@ function Add-HeredocSubstitutions([string]$Text, [string]$Masked, $Into, $Seen, 
     Read-HeredocBodies $Text $Masked $Into $Seen $Spent $Cap -AsViews
 }
 
-# One reading of Add-HeredocSubstitutions: as bash ends a body, or with -AsViews as the views do.
+# One reading of Add-HeredocSubstitutions: as bash ends a body, or with -AsViews as the views end
+# an unquoted delimiter's body. $continued is read only without -AsViews.
 function Read-HeredocBodies([string]$Text, [string]$Masked, $Into, $Seen, $Spent, [int]$Cap,
     [switch]$AsViews) {
     $rawLines = $Text.Split([char]10)
@@ -145,7 +151,7 @@ function Read-HeredocBodies([string]$Text, [string]$Masked, $Into, $Seen, $Spent
             $cur = $queue[0]
             $own = if ($cur.Dash) { $raw.TrimStart([char]9) } else { $raw }
             if ($AsViews) {
-                $ends = $raw.Trim() -ceq $cur.T
+                $ends = if ($cur.Bare) { $raw.Trim() -ceq $cur.T } else { $own -ceq $cur.T }
             } elseif ($cur.Bare -and $raw -cmatch '(?<!\\)(?:\\\\)*\\$') {
                 # Bash joins this line to the next before it compares the delimiter.
                 $continued = $continued -or $own -cne '\'

@@ -1124,6 +1124,16 @@ HEREDOC_SUBSTITUTION_ALLOW = [
     # A line that is only `\` joins nothing to the start of the next, so `EOF` after it is the
     # delimiter both as written and as joined, and the body ends there.
     pytest.param("cat <<EOF\n\\\nEOF\necho '$(find /proc)'", id="lone-backslash-then-end"),
+    # A quoted body is data to its real end, so a padded copy of its delimiter opens nothing after
+    # it, as in a commit message quoting the shape the pass's views reading exists for.
+    pytest.param(
+        "git commit -F - <<'EOF'\nExample:\n    cat <<EOF\n     EOF\n    cat <<B\n"
+        "    $(find /proc)\n    B\nEOF",
+        id="quoted-body-with-padded-copy",
+    ),
+    pytest.param(
+        "cat <<'EOF'\nEOF \ncat <<B\n$(find /proc)\nB\nEOF", id="quoted-body-trailing-space"
+    ),
 ]
 
 
@@ -1918,7 +1928,7 @@ EXPECTED_ROW_COUNTS = {
     "SITE_TEXT_DENY": 16,
     "SITE_TEXT_ALLOW": 21,
     "HEREDOC_SUBSTITUTION_DENY": 33,
-    "HEREDOC_SUBSTITUTION_ALLOW": 13,
+    "HEREDOC_SUBSTITUTION_ALLOW": 15,
 }
 
 
