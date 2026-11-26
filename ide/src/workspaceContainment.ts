@@ -222,8 +222,10 @@ export type PathSettingKey = "configDir" | "serviceConfig" | "messageSetsDir";
  * folder under `configDir`, is not caught here. The real-path reads are synchronous, because cli.ts
  * `writerPathSetting` answers synchronously to its many callers, so a workspace on a slow share stalls
  * the extension host for each writer command, and a link inside the folder is followed wherever it
- * leads while its real path is read. Only a trusted window runs the check (cli.ts `writerSetting`),
- * where the repository's own code already runs.
+ * leads while its real path is read. At least the alert list, engine trust's `cert inventory` and
+ * the offline AI policy run it too, so they stall the same way. Only a trusted window runs the check
+ * (cli.ts `pathSettingLinkEscape` and `readerPathEscapesByLink`), where the repository's own code
+ * already runs.
  */
 export function escapesByLink(ws: string | undefined, value: string, win32: boolean = path.sep === "\\"): boolean {
   if (ws === undefined) {
@@ -295,15 +297,20 @@ function escapesUnderCaseVariant(ws: string, value: string, win32: boolean): boo
  * with the two writers that decline one: the New Route wizard writes only inside the workspace
  * folder, and version-control setup commits no hook for a folder outside it. It also says to remove
  * the workspace value, since a value the workspace sets inside the folder wins over the user's. `fallback` names the
- * file checked in place of a blank value, which the CLI opens then (cli.ts `writerSetting`).
+ * file checked in place of a blank value, which the CLI opens then (cli.ts `pathSettingLinkEscape`).
  */
 export function linkEscapeRefusal(key: PathSettingKey, fallback?: string): string {
   const subject =
     fallback === undefined
       ? `messagefoundry.${key} names a path`
       : `messagefoundry.${key} is blank, so the CLI opens ${fallback}, a path`;
+  return `MessageFoundry: nothing was written or started. ${linkEscapeCause(subject)}`;
+}
+
+/** What {@link linkEscapeRefusal} and {@link readerLinkEscapeNotice} share: the cause and the remedy. */
+function linkEscapeCause(subject: string): string {
   return (
-    `MessageFoundry: nothing was written or started. ${subject} inside the workspace folder that may ` +
+    `${subject} inside the workspace folder that may ` +
     "lead out of it, or that Windows may open as another name or a device. At least one of these holds: " +
     "a symbolic link or junction on the path leads out, the path climbs with '..', a folder or file name " +
     "on it is a Windows device name such as nul or com1, a folder or file name on it " +
@@ -314,6 +321,12 @@ export function linkEscapeRefusal(key: PathSettingKey, fallback?: string): strin
     "also take the target of a link, named with an absolute path in user settings, once any value " +
     "for the setting in workspace settings is removed, since a workspace value wins over a user value."
   );
+}
+
+/** The notice a READER that hands the setting to the CLI gives when cli.ts `readerPathEscapesByLink`
+ *  refuses it: the cause {@link linkEscapeRefusal} names, and `skipped`, what the reader did not do. */
+export function readerLinkEscapeNotice(key: PathSettingKey, skipped: string): string {
+  return `${skipped} ${linkEscapeCause(`messagefoundry.${key} names a path`)}`;
 }
 
 /** The scopes of a setting that {@link containedPathSetting} reads: VS Code's `inspect()` answer.

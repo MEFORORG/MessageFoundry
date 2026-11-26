@@ -109,10 +109,12 @@ suite("b532r: writers check the real path of a path setting (BACKLOG #5404 item 
   test("writerSetting refuses a link escape after the spelling check, in a trusted window only", () => {
     const cli = code("cli.ts");
     const writer = body(cli, "function writerSetting(");
+    const escape = body(cli, "export function pathSettingLinkEscape(");
     // Only a trusted window reads a real path, so an untrusted one touches no file before its refusal.
-    assert.ok(writer.includes("if (!isExecGated() && escapesByLink(workspaceDir(), checked))"), writer);
-    assert.ok(writer.includes("linkEscapeRefusal(key, blank ? checked : undefined)"), writer);
-    assert.ok(writer.indexOf("s.dropped !== false") < writer.indexOf("escapesByLink"), writer);
+    assert.ok(escape.includes("if (!isExecGated() && escapesByLink(workspaceDir(), checked))"), escape);
+    assert.ok(escape.includes("return linkEscapeRefusal(key, blank ? checked : undefined)"), escape);
+    assert.ok(writer.includes("const escape = pathSettingLinkEscape(key, s)"), writer);
+    assert.ok(writer.indexOf("s.dropped !== false") < writer.indexOf("pathSettingLinkEscape"), writer);
     // The predicate is the shared one, driven below; cli.ts keeps no copy of it.
     assert.ok(!cli.includes("function escapesByLink("), "cli.ts defines its own escapesByLink");
     // writerPathSetting and writerConfigTarget both go through writerSetting.
@@ -254,7 +256,8 @@ suite("b532r: writers check the real path of a path setting (BACKLOG #5404 item 
   });
 
   test("a blank serviceConfig has the CLI's own fallback file checked, and named", () => {
-    const fn = body(code("cli.ts"), "function writerSetting(");
+    // writerSetting runs this check through pathSettingLinkEscape (asserted in the test above).
+    const fn = body(code("cli.ts"), "export function pathSettingLinkEscape(");
     assert.ok(fn.includes('const blank = key === "serviceConfig" && s.value.trim() === ""'), fn);
     assert.ok(fn.includes("const checked = blank ? PATH_FALLBACK.serviceConfig : s.value"), fn);
     assert.ok(fn.includes("if (!isExecGated() && escapesByLink(workspaceDir(), checked))"), fn);
