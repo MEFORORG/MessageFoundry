@@ -973,9 +973,9 @@ class _FollowerCoordinator(NullCoordinator):
 
 
 async def test_run_once_no_ops_on_follower(store: MessageStore) -> None:
-    """Track B Step 4: retention is a leader-only WRITE singleton. On a follower (is_leader False)
-    run_once returns an all-zero did-nothing pass and performs NO purge — so a delivered message that
-    is past the window stays intact, and no audit row is written."""
+    """Track B Step 4: retention's store phases are a leader-only WRITE singleton. On a follower
+    (is_leader False) run_once performs NO purge — so a delivered message that is past the window
+    stays intact — and, with no app-log phase configured, writes no audit row (BACKLOG #6526)."""
     mid, outbox_id = await _delivered(store, now=0.0)
     runner = RetentionRunner(
         store,
@@ -991,7 +991,7 @@ async def test_run_once_no_ops_on_follower(store: MessageStore) -> None:
     # Nothing purged: the raw body is still present, and no audit row was written.
     fetched = await store.get_message(mid)
     assert fetched is not None
-    assert fetched["raw"] is not None
+    assert fetched["raw"] == "MSH|^~\\&|raw-body"
     assert [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"] == []
 
 
@@ -1096,8 +1096,10 @@ async def test_a_pass_stopped_after_a_purge_still_audits_the_purge(
         store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
     )
     runner.start()
-    await asyncio.wait_for(entered.wait(), 10)
-    await runner.stop()
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+    finally:
+        await runner.stop()
 
     details = await _retention_audit_details(store)
     assert [d["messages_purged"] for d in details] == [1]
@@ -1223,6 +1225,88 @@ async def test_a_standby_pass_that_fails_after_its_sweep_still_audits_the_sweep(
     details = await _retention_audit_details(store)
     assert [d["app_logs_deleted"] for d in details] == [1]
     assert details[0]["interrupted"] is True and details[0]["standby"] is True
+
+
+async def test_a_pass_stopped_while_writing_its_audit_row_still_writes_it(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526, S07-44: a ``stop()`` that lands while the pass's own audit row is being
+    written cancels only the wait for the row, not the write."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_record = store.record_audit
+
+    async def slow_record(*a: Any, **k: Any) -> Any:
+        entered.set()
+        await release.wait()
+        return await real_record(*a, **k)
+
+    monkeypatch.setattr(store, "record_audit", slow_record)
+    runner = RetentionRunner(store, RetentionSettings(messages_days=1), clock=lambda: 10 * DAY)
+    task = asyncio.create_task(runner.run_once())
+    await asyncio.wait_for(entered.wait(), 10)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()
+    for _ in range(50):
+        if await _retention_audit_details(store):
+            break
+        await asyncio.sleep(0.01)
+
+    assert [d["messages_purged"] for d in await _retention_audit_details(store)] == [1]
+
+
+async def test_a_strip_that_raises_partway_is_audited_with_its_phase(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526, S07-44: the embedded-document strip commits batch by batch, so one that
+    raises may have stripped documents its count never reports. The pass writes its row even with
+    nothing else done, naming the phase it ended in."""
+    runner = RetentionRunner(store, RetentionSettings(), clock=lambda: 10 * DAY)
+    monkeypatch.setattr(runner, "_resolve_document_prune", lambda: ({"c1": 1}, {"c1": 1024}, {}))
+
+    async def strip_fails(*_a: object, **_k: object) -> object:
+        raise RuntimeError("cipher ceiling reached")
+
+    monkeypatch.setattr(store, "strip_embedded_documents", strip_fails)
+
+    with pytest.raises(RuntimeError, match="cipher ceiling reached"):
+        await runner.run_once()
+
+    details = await _retention_audit_details(store)
+    assert [d["interrupted_phase"] for d in details] == ["documents_strip"]
+    assert details[0]["interrupted"] is True and details[0]["documents_stripped"] == 0
+
+
+async def test_leadership_lost_during_one_strip_threshold_skips_the_next(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526, S07-45: each prune threshold is its own store call of many batches, so a
+    node demoted during one does not go on to strip the next as a stale ex-leader."""
+    from messagefoundry.store.document_strip import StripResult
+
+    coord = _SwitchableCoordinator()
+    runner = RetentionRunner(store, RetentionSettings(), clock=lambda: 10 * DAY, coordinator=coord)
+    monkeypatch.setattr(
+        runner,
+        "_resolve_document_prune",
+        lambda: ({"c1": 1, "c2": 1}, {"c1": 1024, "c2": 4096}, {}),
+    )
+    calls: list[int] = []
+
+    async def strip_then_demote(*_a: object, min_bytes: int, **_k: object) -> StripResult:
+        calls.append(min_bytes)
+        coord.leader = False
+        return StripResult(messages_stripped=1, documents_stripped=1, bytes_reclaimed=10)
+
+    monkeypatch.setattr(store, "strip_embedded_documents", strip_then_demote)
+
+    result = await runner.run_once()
+
+    assert calls == [1024]
+    assert result.leadership_lost and result.documents_stripped == 1
 
 
 async def test_run_once_no_work_writes_no_audit(store: MessageStore) -> None:

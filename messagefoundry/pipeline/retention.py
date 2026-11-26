@@ -516,15 +516,21 @@ class RetentionPass:
     # the read failed, or on a follower, which never reads the table.
     audit_log_over_warn: bool = False
     # The pass ended on an exception or a cancellation (`stop()`) after at least one phase had
-    # committed (BACKLOG #6526, S07-44). Its audit row records the phases that finished; the counts
-    # are exact for those, and a phase that raised committed nothing. None of these three flags is
-    # part of `did_work`: each only says how a pass that did work ended.
+    # committed, or during a phase that can change part of its set before it raises (BACKLOG #6526,
+    # S07-44). Its audit row records the phases that finished, exactly. A single-transaction purge
+    # that raised committed nothing. None of these flags is part of `did_work`: each only says how a
+    # pass ended.
     interrupted: bool = False
+    # When `interrupted`, the phase that was running if it is one that commits or deletes in steps:
+    # the embedded-document strip (one commit per batch), the `.processed` archive sweep, or the
+    # app-log sweep or compression (one file at a time). That phase may have changed part of its set,
+    # and its count in the row covers none of it. None otherwise.
+    interrupted_phase: str | None = None
     # Leadership was lost during the pass (BACKLOG #6526, S07-45), so the shared-store phases after
     # the one that was running were skipped and left for the new leader.
     leadership_lost: bool = False
     # The pass ran on a cluster standby (BACKLOG #6526, S07-46): only the host-local app-log sweep
-    # and compression ran, and nothing in the shared store was purged.
+    # and compression ran, and nothing in the shared store was read or purged.
     standby: bool = False
 
     @property
@@ -627,9 +633,10 @@ class RetentionRunner:
         # clock never advances, and on a wall clock stepped backward it goes negative and holds the
         # truncate past its cadence; monotonic can't go backwards.
         self._monotonic = monotonic
-        # Retention is a leader-only WRITE singleton (it purges PHI bodies + writes audit rows), so in
-        # a cluster it must run on exactly one node. Default NullCoordinator → always leader → always
-        # runs, so an existing caller/test that passes no coordinator is byte-identical (Track B Step 4).
+        # Retention's store phases are a leader-only WRITE singleton (they purge PHI bodies), so in a
+        # cluster they run on exactly one node; a standby runs only its own host's app-log phases and
+        # audits those (BACKLOG #6526). Default NullCoordinator → always leader → always runs, so an
+        # existing caller/test that passes no coordinator is byte-identical (Track B Step 4).
         self._coordinator: ClusterCoordinator = coordinator or NullCoordinator()
         self._stop = asyncio.Event()
         # Ends the current between-pass sleep early: set by stop(), and by wake() after a config
@@ -820,7 +827,7 @@ class RetentionRunner:
         Leader-gated (Track B Step 4): a non-leader node purges nothing in the shared store, so in a
         cluster exactly one node purges. A standby still runs the app-log sweep and compression (#120,
         #119) on ``[logging].log_dir``, its own host's directory, and audits a pass that deleted or
-        compressed a file, as the leader does (BACKLOG #6526, S07-46). The loop
+        compressed a file, as the leader does (:meth:`_standby_pass`, BACKLOG #6526, S07-46). The loop
         keeps ticking on followers (reactive-by-polling), so when a follower becomes leader the very
         next pass acts. A follower never advances its WAL/VACUUM cadence state, so a newly-promoted
         leader runs any due WAL checkpoint / daily VACUUM on its first acting pass — which is the
@@ -830,32 +837,34 @@ class RetentionRunner:
         Leadership is read again before every shared-store phase, because each phase awaits the store
         and a node can be demoted (a self-fence) during any of those awaits (BACKLOG #6526, S07-45). A
         node that finds itself demoted skips the shared-store phases left, audits what it had already
-        purged, and reports ``leadership_lost``. The read is a cheap cached check, not a fence: a phase
-        already running when the node is demoted runs to its end.
+        purged, and reports ``leadership_lost``. The read is the coordinator's cached flag, not a
+        fence: it is only as current as the coordinator's last lease check, and a phase already running
+        when the node is demoted runs to its end (the embedded-document strip reads it again between
+        its per-threshold calls).
 
         Each purge phase commits in its own store transaction, so a pass that raises or is cancelled
         (``stop()``) partway writes its audit row for the phases that finished, marked
-        ``interrupted``, before the exception goes on (BACKLOG #6526, S07-44). A standby's pass is the
-        same pass with every shared-store phase skipped, so it has the same handler. A process that
-        dies with no chance to run that handler can still leave a committed purge with no row, and
-        app-log files a worker thread deleted after the cancellation are not counted in it.
+        ``interrupted``, before the exception goes on (BACKLOG #6526, S07-44). A pass that ends inside
+        a phase that changes its set in steps writes the row even with nothing else done, naming that
+        phase in ``interrupted_phase``, since its count is lost. The audit writes are shielded from a
+        further cancellation. A row can still be missing at least when the audit write itself fails
+        (the same store fault that ended the pass, say; logged at ERROR) or the process dies first.
 
         The low-disk floor check (BACKLOG #290) runs FIRST, before the leader gate and outside the
         #121 duration cap: it is read-only, it measures this host's own volume, and a pass that ran
         out of time must still say the disk is nearly full."""
         below_disk_floor = await self._check_disk_floor()
         now = self._clock() if now is None else now
+        if not self._coordinator.is_leader():
+            return await self._standby_pass(now, below_disk_floor)
         s = self._settings
-        # A standby (S07-46) runs this same pass with every shared-store phase skipped by `_halt()`,
-        # so only the host-local app-log phases act.
-        standby = not self._coordinator.is_leader()
 
         # The audit-log growth check (BACKLOG #1421) runs after the leader gate, unlike the disk
         # floor: audit_log is the shared store's table, not this host's volume, so in a cluster only
         # the leader warns. (Each engine shard runs its own retention, so each one warns.) It runs
         # before the duration cap, like the floor: it is one index seek, and a pass that ran out of
         # time must still say the table is large.
-        audit_log_over_warn = False if standby else await self._check_audit_growth()
+        audit_log_over_warn = await self._check_audit_growth()
 
         # Between-phase duration cap (#121, ADR 0137): bound the wall time one maintenance pass may spend
         # so a long pass can't run unbounded into the next window. `cap <= 0` (the default) disables it —
@@ -869,27 +878,32 @@ class RetentionRunner:
         pass_cap = _PassCap(self._monotonic, s.max_pass_seconds)
         _deadline_hit = pass_cap.hit
 
-        # The shared-store phases run only while `_halt()` is False: the cap above, a standby, or
-        # leadership lost since the pass began (S07-45), latched like the cap. The host-local app-log
-        # phases take the cap alone, because a standby runs those too. `_halt` is also handed to the
-        # `.processed` archive sweep, which reads it per file on a worker thread; `is_leader()` is a
-        # cached attribute read. A node demoted mid-pass still writes the audit row for the purges it
-        # had already committed: an unaudited purge is the worse outcome, and the row is not a
-        # leader-only write the way a purge is.
+        # The shared-store phases run only while `_halt()` is False: the cap above, or leadership
+        # lost since the gate (S07-45), latched like the cap. The host-local app-log phases take the
+        # cap alone, because a standby runs those too. `_halt` is also handed to the `.processed`
+        # archive sweep, which reads it per file on a worker thread; `is_leader()` is a cached
+        # attribute read. A node demoted mid-pass still writes the audit row for the purges it had
+        # already committed: an unaudited purge is the worse outcome, and the row is not a leader-only
+        # write the way a purge is.
         leadership_lost = False
 
-        def _halt() -> bool:
+        def _demoted() -> bool:
             nonlocal leadership_lost
-            hit = _deadline_hit()
-            if standby:
-                return True
             if not leadership_lost and not self._coordinator.is_leader():
                 leadership_lost = True
                 log.warning(
                     "retention: this node lost cluster leadership during the pass, so the store "
                     "phases left are skipped for the new leader"
                 )
-            return hit or leadership_lost
+            return leadership_lost
+
+        def _halt() -> bool:
+            hit = _deadline_hit()
+            return _demoted() or hit
+
+        # The phase running now, set only around the phases that change their set in steps, so an
+        # interrupted pass can say its count is short (S07-44).
+        partial_phase: str | None = None
 
         # Every count starts at "nothing done", so a pass that ends partway can audit exactly the
         # phases that finished (S07-44).
@@ -945,8 +959,8 @@ class RetentionRunner:
                 wal_left_untruncated=wal_left_untruncated,
                 audit_log_over_warn=audit_log_over_warn,
                 interrupted=interrupted,
+                interrupted_phase=partial_phase if interrupted else None,
                 leadership_lost=leadership_lost,
-                standby=standby,
             )
 
         try:
@@ -982,7 +996,12 @@ class RetentionRunner:
             # The whole embedded-document strip is one phase: skip it (empty threshold set) if the pass
             # halted before it; otherwise strip once per distinct min_bytes threshold.
             doc_thresholds: list[int] = [] if _halt() else sorted(set(doc_min_bytes.values()))
-            for threshold in doc_thresholds:
+            partial_phase = "documents_strip"
+            for i, threshold in enumerate(doc_thresholds):
+                # Each threshold is its own store call of many batches, so leadership is read again
+                # between them (S07-45); the cap stays a whole-phase check.
+                if i and _demoted():
+                    break
                 group = {n: d for n, d in doc_overrides.items() if doc_min_bytes[n] == threshold}
                 part = await self._store.strip_embedded_documents(
                     older_than=_KEEP_FOREVER,  # no global document-prune default → keep-forever ELSE
@@ -1005,6 +1024,7 @@ class RetentionRunner:
                     # BACKLOG #5651: a key-service outage, a failed batch read, or batch writes
                     # failing in a row. End only this phase; the rest of the pass still runs.
                     break
+            partial_phase = None
             if not _halt() and s.state_max_age_days > 0:
                 state_purged = await self._store.purge_state(
                     older_than=now - s.state_max_age_days * _SECONDS_PER_DAY, now=now
@@ -1090,20 +1110,25 @@ class RetentionRunner:
             # Application log files (#120, then #119): host-local, so they take the cap alone and
             # run on a standby and after a demotion too. Each count lands as its phase ends, so an
             # interrupted pass still audits a sweep that finished.
+            partial_phase = "app_log_sweep"
             app_logs_deleted = await self._sweep_app_log_phase(now, _deadline_hit)
+            partial_phase = "app_log_compress"
             (
                 app_logs_compressed,
                 app_log_bytes_reclaimed,
             ) = await self._compress_app_log_phase(now, _deadline_hit)
+            partial_phase = None
 
             # The File source's `.processed` archive (owner ruling A2 of 2026-10-08, BACKLOG #1188): a
             # clear-text copy of every inbound payload, aged out on ARCHIVE time at the body window.
             # Each source does its own blocking I/O off the loop and under its own credential, re-reading
             # `_halt` per file, so a large directory releases the pass like the compressor does.
             if not _halt() and s.processed_archive_days > 0:
+                partial_phase = "processed_archives"
                 processed_archives_deleted = await self._prune_processed_archives(
                     now - s.processed_archive_days * _SECONDS_PER_DAY, _halt
                 )
+                partial_phase = None
 
             # Maintenance phases (WAL-checkpoint, then daily VACUUM). Their cadence markers advance ONLY
             # when the phase actually runs, so a phase SKIPPED by the cap stays due for the next pass
@@ -1140,24 +1165,76 @@ class RetentionRunner:
 
             if not _halt():
                 size_bytes, over_limit = await self._check_size()
-        except BaseException:
-            # S07-44: the phases that finished have committed, so their row is written before the
-            # exception goes on. A cancellation was delivered once, so this await still runs.
-            partial = _tally(interrupted=True)
-            if partial.did_work:
-                try:
-                    await self._audit(partial)
-                except Exception as exc:
-                    log.error(
-                        "retention: the pass ended partway and the audit row for the phases that "
-                        "finished could not be written (%s)",
-                        safe_exc(exc),
-                    )
+        except (Exception, asyncio.CancelledError):
+            await self._audit_interrupted(_tally(interrupted=True))
             raise
 
         result = _tally()
         if result.did_work:
-            await self._audit(result)
+            await self._audit_shielded(result)
+        return result
+
+    async def _audit_shielded(self, result: RetentionPass) -> None:
+        """Write the pass's audit row in its own task, so a cancellation (``stop()``) that lands
+        while the row is being written cancels only the wait for it, never the write."""
+        await asyncio.shield(self._audit(result))
+
+    async def _audit_interrupted(self, partial: RetentionPass) -> None:
+        """Write the row for a pass that ended partway (S07-44), before its exception goes on. A
+        cancellation was delivered once, so this await still runs. Written when the pass did work,
+        or when it ended inside a phase that changes its set in steps and so may have changed part
+        of it. A failed write is logged, so the original exception is the one that propagates."""
+        if not (partial.did_work or partial.interrupted_phase is not None):
+            return
+        try:
+            await self._audit_shielded(partial)
+        except Exception as exc:
+            log.error(
+                "retention: the pass ended partway and the audit row for the phases that finished "
+                "could not be written (%s)",
+                safe_exc(exc),
+            )
+
+    async def _standby_pass(self, now: float, below_disk_floor: bool) -> RetentionPass:
+        """A cluster standby's pass (BACKLOG #6526, S07-46): only the app-log sweep and compression,
+        on this host's own ``[logging].log_dir``. Nothing in the shared store is read or purged, and
+        the audit-log growth check is the leader's. A pass that deleted or compressed a file writes
+        its audit row, as the leader's does, and one that ends partway writes it as
+        :meth:`run_once` does."""
+        pass_cap = _PassCap(self._monotonic, self._settings.max_pass_seconds)
+        deleted = compressed = reclaimed = 0
+        partial_phase = "app_log_sweep"
+
+        def _tally(*, interrupted: bool = False) -> RetentionPass:
+            return RetentionPass(
+                messages_purged=0,
+                dead_purged=0,
+                state_purged=0,
+                conn_events_purged=0,
+                wal_checkpointed=False,
+                vacuumed=False,
+                size_bytes=0,
+                over_limit=False,
+                app_logs_deleted=deleted,
+                app_logs_compressed=compressed,
+                app_log_bytes_reclaimed=reclaimed,
+                capped=pass_cap.capped,
+                below_disk_floor=below_disk_floor,
+                interrupted=interrupted,
+                interrupted_phase=partial_phase if interrupted else None,
+                standby=True,
+            )
+
+        try:
+            deleted = await self._sweep_app_log_phase(now, pass_cap.hit)
+            partial_phase = "app_log_compress"
+            compressed, reclaimed = await self._compress_app_log_phase(now, pass_cap.hit)
+        except (Exception, asyncio.CancelledError):
+            await self._audit_interrupted(_tally(interrupted=True))
+            raise
+        result = _tally()
+        if result.did_work:
+            await self._audit_shielded(result)
         return result
 
     async def _sweep_app_log_phase(self, now: float, deadline_hit: Callable[[], bool]) -> int:
@@ -1188,7 +1265,16 @@ class RetentionRunner:
         # no-op unless the window and a log_dir are both set → byte-identical for a deployment that's off.
         if deadline_hit() or self._settings.app_log_compress_days <= 0 or not self._log_dir:
             return 0, 0
-        return await asyncio.to_thread(self._compress_app_logs, now, deadline_hit)
+        # Set when this task is cancelled, so the worker stops at its next file instead of
+        # compressing on after the engine has stopped, as the `.processed` sweep does.
+        cancelled = threading.Event()
+        try:
+            return await asyncio.to_thread(
+                self._compress_app_logs, now, lambda: cancelled.is_set() or deadline_hit()
+            )
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
 
     async def _prune_processed_archives(
         self, older_than: float, deadline_hit: Callable[[], bool]
@@ -1884,6 +1970,7 @@ class RetentionRunner:
                 # How the pass ended (BACKLOG #6526): partway on an exception or a stop, after a
                 # leadership loss, or on a standby that only touched its own app logs.
                 "interrupted": result.interrupted,
+                "interrupted_phase": result.interrupted_phase,
                 "leadership_lost": result.leadership_lost,
                 "standby": result.standby,
                 "vacuumed": result.vacuumed,
