@@ -220,9 +220,8 @@ spec:
             # on the egress allowlist block_unlisted_outbound requires. Bake the CA and CRL into the
             # config image under /config, root-owned like the config itself, because the engine
             # refuses a CA another account could replace. Rebuild the image with a fresh CRL before
-            # the baked one's nextUpdate. Even so, where / is overlay, as in nearly every pod, an
-            # enforcing PHI start would refuse the CA on first deployment until a follow-up lands;
-            # warn starts (docker/README.md, "Residuals / gotchas").
+            # the baked one's nextUpdate. Then read the overlay note in docker/README.md,
+            # "Residuals / gotchas".
             # - { name: MEFOR_LOGGING_FORWARD_HOST, value: "REPLACE-siem.example.org" }
             # - { name: MEFOR_LOGGING_FORWARD_PORT, value: "6514" }
             # - { name: MEFOR_LOGGING_FORWARD_PROTOCOL, value: "tls" }

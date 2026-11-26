@@ -143,9 +143,8 @@ against one case that matters, described under
   Kubernetes manifests, the `engine` and both `ha` engines carry a block *what an enforcing start
   needs* of commented entries (the alert channel, verified-TLS log forwarding and the retention
   bounds, and for the `ha` engines the store CRL); as shipped `serve --env prod` refuses to start,
-  so uncomment each with your value and put the trust files it names under `./config/pki/`. Even
-  then an enforcing PHI start would refuse on first deployment where `/` is overlay: see
-  [the overlay note under Residuals / gotchas](#residuals--gotchas). Each
+  so uncomment each with your value and put the trust files it names under `./config/pki/`, then
+  read [the overlay note under Residuals / gotchas](#residuals--gotchas). Each
   `ha` engine also mounts its own named log-spool volume, live as shipped.
 - **Kubernetes (single-node):** [`k8s/statefulset.yaml`](k8s/statefulset.yaml) + [`k8s/secret.example.yaml`](k8s/secret.example.yaml)
   — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set every `image:` field (at least `revocation-attestation-check`, `tls-dir`, `copy-tls` and
@@ -153,8 +152,7 @@ against one case that matters, described under
   An enforcing start needs more than the bind, and the manifest's block *what an enforcing start
   needs* names at least the alert channel, verified-TLS log forwarding and the retention bounds as
   commented entries. As shipped the engine refuses to start; uncomment each entry with your value. Bake the syslog CA and CRL it names under `/config/pki/`
-  (an enforcing PHI start would still refuse on first deployment where `/` is overlay: see
-  [the overlay note under Residuals / gotchas](#residuals--gotchas)), and
+  (then read [the overlay note under Residuals / gotchas](#residuals--gotchas)), and
   add the Secret's `tls-revocation-attested` key, without which the pod does not start: the kubelet
   refuses the pod with `CreateContainerConfigError`, at the first container that reads it. The HA manifest below,
   `k8s/ha-postgres.yaml`, requires the same key. Set it only
@@ -293,8 +291,13 @@ certificate (A) and its revocation attestation, or it **refuses to start** — b
 - **An enforcing PHI start would refuse on first deployment where `/` is
   an overlay mount** (vault BACKLOG #8390 item 31), as it is in nearly every Docker or Kubernetes
   container, and on any other host whose `/` mounts as overlay. That holds until a follow-up
-  lands; at `[security].enforcement = warn` the engine starts, and logs a warning for each such
-  anchor. The rest of this bullet is why. The Linux path check reads the file system type of every
+  lands: a follow-up ledger row for judging overlay only above a mount boundary when the anchor's
+  own mount is trusted, not yet numbered. At `[security].enforcement = warn` the engine starts, but that
+  dial is not scoped to this check: it downgrades the serve-gate refusals to warnings, at least
+  the cleartext off-box bind, open-egress and single-factor-at-exposure ones, and honours
+  `--allow-insecure-bind` and `MEFOR_ALLOW_INSECURE_TLS` again (`security_loosenings()`, and
+  `enforcement = warn` in [SECURITY-LOOSENING.md](../docs/SECURITY-LOOSENING.md)), so it is no
+  substitute for the follow-up. The rest of this bullet is why. The Linux path check reads the file system type of every
   directory from `/` down, and does not vouch for overlay (the `POSIX_TRUSTED_FS` comment in
   `messagefoundry/auth/anchor_path.py` says why). So every anchor there answers *could not
   settle*, even one on a bind-mounted ext4 volume, and moving the file does not clear it. `enforce`
@@ -315,4 +318,7 @@ certificate (A) and its revocation attestation, or it **refuses to start** — b
 The `docker-smoke` job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) builds the slim image
 and a baked test image ([`smoke/`](smoke/)), serves it loopback + signed in, sends one synthetic ADT^A01
 over MLLP, asserts it finalizes to **PROCESSED** (not merely RECEIVED), and verifies a graceful
-`docker stop`. It is the engine's first non-Windows runtime gate.
+`docker stop`. It is the engine's first non-Windows runtime gate. Its container's `/` is an
+overlay mount and it starts at `enforce`, so it would read red at the start until the follow-up
+in [the overlay note under Residuals / gotchas](#residuals--gotchas) lands, and its later steps
+check nothing until then.

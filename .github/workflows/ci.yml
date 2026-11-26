@@ -6491,10 +6491,8 @@ jobs:
           # wrong. docker/README.md gives these two commands for a read-only config mount, and the
           # same owner rule applies here: everyone may read, and only root may write. The mode
           # change runs first, while the runner still owns the files. The last line prints the
-          # owner and mode the engine will see. Since vault BACKLOG #8390 item 31 the same check
-          # no longer vouches for an overlay mount, and this container's / is overlay, so this
-          # enforcing start is expected to refuse the CA however it is owned, until a follow-up
-          # lands. docker/README.md, "Residuals / gotchas", says why. The rig is unchanged.
+          # owner and mode the engine will see. Then read the overlay note in docker/README.md,
+          # "Residuals / gotchas" (vault BACKLOG #8390 item 31), and its "CI" section.
           chmod -R a+rX,go-w "$RUNNER_TEMP/syslog-ca"
           sudo chown -R root:root "$RUNNER_TEMP/syslog-ca"
           stat -c '%u:%g %a %n' "$RUNNER_TEMP/syslog-ca" "$RUNNER_TEMP/syslog-ca"/*
