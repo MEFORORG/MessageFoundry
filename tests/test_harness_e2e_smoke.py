@@ -6,7 +6,7 @@ Each test starts a real ``serve`` subprocess, so each costs an engine start (abo
 
 The configs here are written per test with a free MLLP port, so parallel workers and other
 checkouts on the same box never contend for the sample's fixed 2575. The sample config itself is
-what ``.claude/skills/verify/SKILL.md`` runs; its graph is the one mirrored below.
+what ``.claude/skills/e2e-smoke/SKILL.md`` runs; its graph is the one mirrored below.
 
 The controls prove the script can fail, and that it names the step that did:
 
@@ -484,6 +484,32 @@ def test_stop_warns_when_the_engine_outlives_its_kill(
 
     e2e_smoke._stop(_Refusing(), None)  # type: ignore[arg-type]
     assert "WARNING the engine (pid 424242) did not stop" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("error", [RuntimeError("not an OSError"), KeyboardInterrupt()])
+def test_a_resume_that_fails_with_another_error_stops_the_engine_and_re_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: BaseException
+) -> None:
+    """A non-OSError from ``resume_into_job`` would leave the suspended engine outside its job.
+
+    RED when: ``_start`` catches only OSError, so ``_stop`` never runs for this error."""
+    proc = _Proc()
+    stopped: list[tuple[object, object, bool]] = []
+
+    def fake_stop(p: object, job: object, *, never_ran: bool = False) -> bool:
+        stopped.append((p, job, never_ran))
+        return True
+
+    def failing_resume(pid: int, *, who: str) -> int | None:
+        raise error
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: proc)
+    monkeypatch.setattr(e2e_smoke, "resume_into_job", failing_resume)
+    monkeypatch.setattr(e2e_smoke, "_stop", fake_stop)
+    with pytest.raises(type(error)) as raised:
+        e2e_smoke._start(["engine"], work=tmp_path, env={}, log=tmp_path / "engine.log")
+    assert raised.value is error
+    assert stopped == [(proc, None, True)]
 
 
 def test_a_failing_stop_still_removes_the_temp_directory_and_keeps_the_step_failure(

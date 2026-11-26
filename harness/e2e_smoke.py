@@ -453,6 +453,11 @@ def _start(
     except OSError:
         _stop(proc, None, never_ran=True)
         raise StepFailed("serve", "could not resume the engine process") from None
+    except BaseException:
+        # Anything else, a Ctrl+C included, still leaves a suspended engine outside any job; stop
+        # it before the error travels on, so no engine outlives the run.
+        _stop(proc, None, never_ran=True)
+        raise
 
 
 def run(
@@ -583,7 +588,7 @@ def run(
                 code = _send(mllp_port, message, timeout=mllp_timeout)
                 # CA is the enhanced-mode commit accept: an inbound with ack_mode="enhanced" says it.
                 if code not in ("AA", "CA"):
-                    raise StepFailed("mllp", f"MSA-1 was {_shown(str(code))}, expected AA")
+                    raise StepFailed("mllp", f"MSA-1 was {_shown(str(code))}, expected AA or CA")
                 print(f"step mllp: {code} for control id {shown_id}", flush=True)
                 _PROGRESS.step = "disposition"
 
