@@ -303,6 +303,23 @@ def _keep_without(*words: str) -> re.Pattern[str]:
     return re.compile("|".join(re.escape(w) for w in kept), re.IGNORECASE)
 
 
+#: Control shapes whose fuzz original glued its planted value to a kept word where no label may
+#: open (``a1qpwd=``, ``a1qencryption_key=``). Since BACKLOG #8429 the mask keeps such a word only
+#: where a label may open, so it masks those words whatever rule is off, and a control on the
+#: original line no longer sees its rule. Each control below takes the same line with a "_" or a
+#: camelCase capital before the kept word, where the mask keeps it and a later pass reads it. The
+#: originals stay in the differential: the ones the shape tuples above hold, and the scheme-word
+#: control's own line, last here.
+_SHAPES_WITH_A_LABEL_START = (
+    "connect failed;xpass=mfb64:v1:a1q_pwd= tail",
+    "connect failed;xpass=amfb64:v1:b2q_pwd= tail",
+    ";xpass=mfb64:v1:x_mfb64:v1:d4q_pwd= tail",
+    "mfb64:v1:==mfb64:v1:;sslpassword=givenmfb64:v1:mfb64:v1:auth=;Accesstoken=-birthDate\x0c"
+    "Zm9vYmFy+/Zm9vd4qToken=",
+    ";Accesstoken=Bearer <redacted>\na1q_encryption_key={ x%26session=DOE^JOHN",
+    ";Accesstoken=Bearer <redacted>\na1qencryption_key={ x%26session=DOE^JOHN",
+)
+
 #: Each rule of the word mask, switched off, with a shape that then prints a value the baseline hid
 #: on some later redaction. So every rule is there for a measured reason, and a test that passes
 #: with the rule on is evidence. A rule is a pattern, or for the "#" fix and the mask itself a
@@ -346,7 +363,7 @@ _RULE_CONTROLS = (
         "mask no shorter than the word",
         "_masked_word",
         lambda _word, _after=False: "x",
-        _SHAPES_THE_WORD_MASK_PRINTED[3],
+        _SHAPES_WITH_A_LABEL_START[3],
     ),
     (
         "mask keeps a digit a digit",
@@ -364,13 +381,13 @@ _RULE_CONTROLS = (
         "mask keeps where the marker's base64 run ended",
         "_masked_word",
         lambda _word, _after=False: "redacted",
-        _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED[3],
+        _SHAPES_WITH_A_LABEL_START[2],
     ),
     (
         "scheme word before a space",
         "_MEMBER_SPACED_WORD",
         _NEVER,
-        ";Accesstoken=Bearer <redacted>\na1qencryption_key={ x%26session=DOE^JOHN",
+        _SHAPES_WITH_A_LABEL_START[4],
     ),
     (
         "segment ID",
@@ -400,13 +417,13 @@ _RULE_CONTROLS = (
         "bundle marker",
         "_MEMBER_VALUE_UNIT",
         re.compile(_UNIT.replace("|mfb64:v1:", "").replace(_WORD, r"(?:(?!nonnumeric port: )[\w.\-])++")),
-        _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED[0],
+        _SHAPES_WITH_A_LABEL_START[0],
     ),
     (
         "bundle marker after a glued word",
         "_MEMBER_VALUE_UNIT",
         re.compile(_UNIT.replace(_WORD, r"(?:(?!nonnumeric port: )[\w.\-])++")),
-        _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED[1],
+        _SHAPES_WITH_A_LABEL_START[1],
     ),
     (
         "userinfo opener after a glued word",
@@ -436,6 +453,9 @@ _DIFFERENTIAL_PIECES = (
     "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB", "'", '"', "{", "}", ";", ",", "&", "=", " ", ":", "\n",
     "\t", "%7C", "%5E", "%26", "|", "^", "/", "a1q", "b2q", "c3q", "d4q", "e5q", "f6q",
     "[REDACTED]", "<redacted>",
+    # BACKLOG #8429: a label prefix before a kept word, password words that hold a kept word, and
+    # kept words where a reader opens on them.
+    "_pwd=", "Compass=", "Statement:", "Barcode=", "session_state=", "x.name=", ";sslkeypassword=",
 )  # fmt: skip
 
 
@@ -449,6 +469,8 @@ _MEMBER_LED_OPENERS = ("", "", "", '"family": ')
 _MEMBER_LED_PIECES = (
     "mfb64:v1:", "amfb64:v1:", "x_mfb64:v1:", "a1qpwd=", "b2qtoken=", "c3q", "_", ".", "+", "/",
     "=", " ", "\n", '"family": ', "\x0c", "d4q",
+    # BACKLOG #8429: kept words where a label may open, which the mask still keeps.
+    "a1q_pwd=", "b2qToken=",
 )  # fmt: skip
 
 
@@ -546,6 +568,7 @@ def test_a_second_or_third_redaction_prints_nothing_the_baseline_hid(
         *_SHAPES_A_SECOND_PASS_PRINTED,
         *_SHAPES_A_MARKER_OR_JSON_KEY_PRINTED,
         *_SHAPES_THE_WORD_MASK_PRINTED,
+        *_SHAPES_WITH_A_LABEL_START,
         *(shape for *_, shape in _RULE_CONTROLS),
         *(
             "".join(rng.choice(_DIFFERENTIAL_PIECES) for _ in range(rng.randint(3, 14)))
@@ -805,6 +828,8 @@ def test_a_masked_member_is_masked_the_same_on_a_second_pass(source: str) -> Non
         # Many lines, each with a "{" it never closes: a brace walk that crossed lines re-read the
         # rest of the record from every one (a review measured 5 s on 64 KB).
         *("x;sslpwd={\n", "partner said;AccessToken={\n", ";pwd={a\n}"),
+        # BACKLOG #8429: words holding a kept word before a ":" or "=", each read for its opening.
+        *(";xpass=Passage:", ";xpass={b;sslkeypassword=", ";xpass=x_y.session_state="),
     ],
 )
 def test_a_long_semicolon_dense_line_scrubs_in_linear_time(unit: str) -> None:
@@ -876,17 +901,27 @@ def test_the_member_mask_keeps_a_replaced_marker_head(monkeypatch: pytest.Monkey
     """BACKLOG #5378: the PHI pass can replace a marker's ``mfb64`` and leave ``[redacted]:v1:``,
     which the log chain's carriage pass still reads. A mask that took that ``v1`` printed the body
     on the chain where the baseline hid it; the fuzz differential found the line below. With the
-    unit's alternative removed, it prints again."""
-    line = ';PWD="family": .=amfb64:v1:a1qpwd=/"family": '
+    unit's alternative removed, it prints again.
+
+    The fuzz line glued its planted value to ``pwd``. Since BACKLOG #8429 the mask keeps a kept word
+    only where a label may open, so ``a1qpwd`` is masked whatever the unit does, and the control runs
+    on the same line with ``a1q_pwd``, which the mask keeps as a label prefix and a later pass reads.
+    Both lines must print nothing the baseline hid."""
+    lines = (
+        ';PWD="family": .=amfb64:v1:a1qpwd=/"family": ',
+        ';PWD="family": .=amfb64:v1:a1q_pwd=/"family": ',
+    )
     unit = secretscrub._MEMBER_VALUE_UNIT.pattern
     with monkeypatch.context() as patched:
         _without_member_pass(patched)
-        baseline = [_every_redaction_path(line)]
-    assert _printed_where_the_baseline_hid([line], [_every_redaction_path(line)], baseline) == []
+        baseline = [_every_redaction_path(line) for line in lines]
+    paths = [_every_redaction_path(line) for line in lines]
+    assert _printed_where_the_baseline_hid(list(lines), paths, baseline) == []
     stripped = unit.replace(r"(?:<redacted>|\[(?:REDACTED|redacted)\]):v1:|", "")
     assert stripped != unit
     monkeypatch.setattr(secretscrub, "_MEMBER_VALUE_UNIT", re.compile(stripped))
-    assert _printed_where_the_baseline_hid([line], [_every_redaction_path(line)], baseline)
+    line = lines[1]
+    assert _printed_where_the_baseline_hid([line], [_every_redaction_path(line)], baseline[1:])
 
 
 #: A password word that holds a URL query-credential word (at least ``key``, ``sig``, ``auth`` and
