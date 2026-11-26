@@ -189,11 +189,14 @@ function ConvertTo-CoordPlainRoot {
     # fails fast as before, when the rewrite would name another directory or lose the fast probe. At
     # least these: any other device form, such as GLOBALROOT or a volume GUID; a bare \\?\X:, which
     # names the volume; a remainder Win32 would respell (a '/', an empty segment, or a segment ending
-    # in '.' or a space, '.' and '..' included); a plain form of MAX_PATH or more, which Python opens
-    # only with long paths enabled; and a drive Windows reports as Network, since X:\ is never probed.
-    # The Python twin, _plain, applies the same rules.
+    # in '.' or a space, '.' and '..' included); a remainder holding a wildcard character, which
+    # claim.ps1's -Path cmdlets misread in a plain path too; a \\?\UNC\ remainder with no share; a
+    # plain form of MAX_PATH or more, which Python opens only with long paths enabled; and a drive
+    # Windows reports as Network, since X:\ is never probed. The Python twin, _plain, applies the
+    # same rules. NOT covered: a local directory that links to a share is rewritten, and loses the
+    # fast failure its device spelling had.
     param([string]$Path)
-    if (-not $IsWindows) { return $Path }
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return $Path }
     if ($Path -cmatch '(?s)\A[\\/]{2}[?.][\\/]([A-Za-z]:)\\(.*)\z') {
         $drive = $Matches[1]
         $rest = $Matches[2]
@@ -203,11 +206,12 @@ function ConvertTo-CoordPlainRoot {
         $plain = $drive + '\' + $rest
     } elseif ($Path -cmatch '(?s)\A[\\/]{2}[?.][\\/][Uu][Nn][Cc]\\(.*)\z') {
         $rest = $Matches[1]
+        if ($rest -cnotmatch '\A[^\\]+\\[^\\]') { return $Path }
         $plain = '\\' + $rest
     } else {
         return $Path
     }
-    if ($rest -cmatch '/|\\\\|\A\\|[. ](?:\\|\z)' -or $plain.Length -ge 260) { return $Path }
+    if ($rest -cmatch '/|\\\\|\A\\|[. ](?:\\|\z)|[\[\]*?`]' -or $plain.Length -ge 260) { return $Path }
     return $plain
 }
 

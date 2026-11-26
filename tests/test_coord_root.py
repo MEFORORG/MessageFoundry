@@ -521,8 +521,13 @@ _DEVICE_SPELLINGS = {
     r"\\?\UNC\srv\share\x": (r"\\srv\share\x", "srv"),
     r"\\?\unc\srv\share": (r"\\srv\share", "srv"),
     r"\\.\UNC\srv\share\x": (r"\\srv\share\x", "srv"),
-    r"\\?\UNC\srv": (r"\\srv", ""),
-    # Left alone: other device forms, the bare volume, and a remainder Win32 would respell.
+    # Left alone: other device forms, the bare volume, a UNC with no share, a wildcard character
+    # that claim.ps1's -Path cmdlets misread, and a remainder Win32 would respell.
+    r"\\?\UNC\srv": (r"\\?\UNC\srv", "?"),
+    r"\\?\UNC\srv" + "\\": (r"\\?\UNC\srv" + "\\", "?"),
+    rf"\\?\{_SYS}\co[1]rd": (rf"\\?\{_SYS}\co[1]rd", "?"),
+    rf"\\?\{_SYS}\a`b": (rf"\\?\{_SYS}\a`b", "?"),
+    r"\\?\UNC\srv\sh[a]re": (r"\\?\UNC\srv\sh[a]re", "?"),
     r"\\?\GLOBALROOT\Device\Mup\srv\share": (r"\\?\GLOBALROOT\Device\Mup\srv\share", "?"),
     r"\\?\Volume{0}\coord": (r"\\?\Volume{0}\coord", "?"),
     rf"\\?\{_SYS}x": (rf"\\?\{_SYS}x", "?"),
@@ -553,6 +558,16 @@ def test_a_device_path_root_is_rewritten_to_one_plain_spelling_on_both() -> None
     assert [coord_root._plain(p) for p in paths] == plain
     assert _ps_unc_hosts(paths) == hosts
     assert [coord_root.unc_host(coord_root._plain(p)) or "" for p in paths] == hosts
+
+
+def test_pythons_device_rewrite_leaves_a_network_drive_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The PowerShell half needs a real mapped drive (the next test); this half runs on any runner.
+    path = rf"\\?\{_SYS}\coord"
+    assert coord_root._plain(path) == rf"{_SYS}\coord"
+    monkeypatch.setattr(coord_root, "_network_drive", lambda drive: True)
+    assert coord_root._plain(path) == path
 
 
 def _network_drives() -> list[str]:

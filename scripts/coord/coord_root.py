@@ -52,7 +52,8 @@ _ABSOLUTE = re.compile(r"\A(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+|/(?![\\
 # The patterns ConvertTo-CoordPlainRoot carries; its comment says why each exists.
 _DEVICE_DRIVE = re.compile(r"\A[\\/]{2}[?.][\\/]([A-Za-z]:)\\(.*)\Z", re.S)
 _DEVICE_UNC = re.compile(r"\A[\\/]{2}[?.][\\/][Uu][Nn][Cc]\\(.*)\Z", re.S)
-_RESPELLED_REST = re.compile(r"/|\\\\|\A\\|[. ](?:\\|\Z)")
+_RESPELLED_REST = re.compile(r"/|\\\\|\A\\|[. ](?:\\|\Z)|[\[\]*?`]")
+_UNC_SHARE = re.compile(r"\A[^\\]+\\[^\\]")
 _MAX_PATH = 260
 _DRIVE_REMOTE = 4
 _UNC = re.compile(r"\A[\\/]{2}([^\\/]+)[\\/]")
@@ -161,6 +162,8 @@ def _plain(path: str) -> str:
         if not m:
             return path
         rest = m.group(1)
+        if not _UNC_SHARE.match(rest):
+            return path
         plain = "\\\\" + rest
     # UTF-16 code units, as .NET's String.Length counts them.
     if _RESPELLED_REST.search(rest) or len(plain.encode("utf-16-le")) // 2 >= _MAX_PATH:
@@ -169,12 +172,16 @@ def _plain(path: str) -> str:
 
 
 def _network_drive(drive: str) -> bool:
-    """True when Windows reports ``drive`` as a network drive, as DriveInfo.DriveType does."""
-    if sys.platform != "win32":
+    """True when Windows reports ``drive`` as a network drive, as DriveInfo.DriveType does, or when
+    it cannot say, as ConvertTo-CoordPlainRoot leaves the path alone when DriveInfo throws."""
+    if sys.platform != "win32":  # _plain never calls this off Windows; the type checker needs it.
         return True
-    import ctypes
+    try:
+        import ctypes
 
-    return bool(ctypes.windll.kernel32.GetDriveTypeW(drive + "\\") == _DRIVE_REMOTE)
+        return bool(ctypes.windll.kernel32.GetDriveTypeW(drive + "\\") == _DRIVE_REMOTE)
+    except (ImportError, AttributeError, OSError):
+        return True
 
 
 def _absolute(path: str) -> bool:

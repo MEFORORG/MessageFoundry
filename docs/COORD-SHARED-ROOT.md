@@ -208,7 +208,8 @@ PreToolUse hook that waits on it would stall every tool call in every session on
 One shared resolver does the probe: a TCP connect to port 445 with a 1.5 s timeout, then the file
 call. It caches a "down" verdict for 60 s in `<LOCAL>/coord-root-down.json`, keyed by the server
 and read by both the PowerShell and the Python resolver, so a dead share costs one timeout per
-minute per clone, not one per hook process. Both resolvers, and `coord-migrate.ps1 -Target`,
+minute per clone, not one per hook process. Both resolvers, and `coord-migrate.ps1` for its
+`-Source` and `-Target`,
 rewrite a device-path root (`\\?\X:\p`, `\\?\UNC\srv\share\p`, and their `\\.\` forms) to its
 plain spelling, except where the rewrite would name another directory or skip the probe;
 `ConvertTo-CoordPlainRoot` in `scripts/coord/coord-root.ps1` lists at least those cases. A device
