@@ -837,12 +837,52 @@ def test_an_overlay_anchor_refuses_at_enforce_unless_a_pin_matches(
     assert ta.enforce_anchor(AnchorSpec("t", "[x]", str(p), digest, "[x].pin"), enforcing=True)
     # An anchor read again by path, as the store CAs and the outbound CAs are: a pin is no escape.
     by_path = AnchorSpec("t", "[x]", str(p), digest, "[x].pin", loads_verified_bytes=False)
-    with pytest.raises(TrustAnchorError, match="A pin does not help here"):
+    with pytest.raises(TrustAnchorError, match="at enforce it is refused") as err:
         ta.enforce_anchor(by_path, enforcing=True)
+    assert "set [x].pin to" not in str(err.value).lower()
 
 
-_MOUNT_NOTE = "no location below it passes"
 _FOLDER = "/etc/messagefoundry/"
+# The fix under a mount the check cannot vouch for: S1 to S6, in this order, and nothing else.
+_S2 = "The path is also replaceable; fix that first"
+_S2_FILE = "this finding needs the file replaced by a regular file only root can change"
+_S3 = "set [x].pin to"
+_S4 = "At warn the anchor is used with a warning; at enforce it is refused."
+_S6 = "docker/README.md"
+# Sentences earlier passes wrote, each false in some case.
+_GONE = (
+    "no location below it passes",
+    "clears the finding above",
+    "Fixed in place",
+    "Or use a pin",
+    "moving the anchor",
+    "move the anchor",
+    "bind mount",
+    _FOLDER,
+)
+
+
+def _s1(mount: str, kind: str) -> str:
+    return (
+        f"The check cannot vouch for the mount at {mount!r} ({kind}), so it cannot settle any "
+        "anchor below that mount."
+    )
+
+
+def _s5(mount: str) -> str:
+    return f"An anchor on a mount the check trusts, outside {mount!r}, can pass."
+
+
+def _assert_template(text: str, present: list[str], absent: list[str]) -> None:
+    """``present`` appear in this order; ``absent`` and every retired sentence do not. Case is
+    ignored, so a sentence matches whether or not it opens the line."""
+    low = text.lower()
+    for s in [*absent, *_GONE]:
+        assert s.lower() not in low, (s, text)
+    at = [low.find(s.lower()) for s in present]
+    assert -1 not in at and at == sorted(at), (present, text)
+
+
 _MOUNT_TABLE = {
     "/srv": (0, D755),
     "/srv/a.pem": (0, F644),
@@ -885,78 +925,74 @@ def _no_mountinfo(anchor: str) -> ap.PathVerdict:
 
 
 @pytest.mark.parametrize(
-    ("mount", "anchor", "fstype"),
+    ("mount", "kind", "anchor", "fstype"),
     [
-        ("/", "/srv/a.pem", {"/": "overlay"}),
-        ("/etc", "/etc/x/a.pem", {"/etc": "nfs"}),
-        ("/", "/srv/a.pem", None),
-        ("/", _FOLDER + "ca.pem", None),
+        ("/", "overlay", "/srv/a.pem", {"/": "overlay"}),
+        ("/etc", "nfs", "/etc/x/a.pem", {"/etc": "nfs"}),
+        ("/", "unread mount table", "/srv/a.pem", None),
+        ("/", "unread mount table", _FOLDER + "ca.pem", None),
+        ("/srv", "nfs", "/srv/a.pem", {"/srv": "nfs"}),
+        ("/srv", "overlay", "/srv/a.pem", {"/srv": "overlay"}),
     ],
-    ids=["overlay-root", "nfs-etc", "no-mountinfo", "no-mountinfo-in-the-folder"],
+    ids=[
+        "overlay-root",
+        "nfs-etc",
+        "no-mountinfo",
+        "no-mountinfo-folder",
+        "nfs-srv",
+        "overlay-srv",
+    ],
 )
-def test_a_mount_above_the_suggested_folder_leaves_no_folder_to_move_to(
+def test_the_fix_under_an_untrusted_mount_is_the_template(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     mount: str,
+    kind: str,
     anchor: str,
     fstype: dict[str, str] | None,
 ) -> None:
-    """Where the mount the check cannot vouch for also holds /etc/messagefoundry/, as an overlay
-    '/' does, the fix says no location below that mount passes, then the pin for an anchor whose
-    consumer loads the verified bytes, then that a by-path anchor has no fix at enforce, with the
-    README pointer, and never offers that folder. An unread mount table (``fstype`` None) is the
-    same case: the host reader then answers no type for any path, so the folder answers
-    indeterminate too, and the finding names '/'. Red under the fix that led with
-    /etc/messagefoundry/ for each of them."""
+    """An anchor that could not be settled because of a mount: S1, the pin only for an anchor whose
+    consumer loads the verified bytes, S4, S5 only for a read mount other than '/', and the README
+    pointer only for an overlay. Nothing about moving. An unread mount table (``fstype`` None)
+    makes every path answer indeterminate, and its finding names '/'. Red under the earlier text,
+    which said moving did or did not help."""
     v = _no_mountinfo(anchor) if fstype is None else _posix(anchor, _MOUNT_TABLE, fstype=fstype)
     assert v.ok is None and [(f.path, f.mount) for f in v.findings] == [(mount, True)]
+    s5 = [_s5(mount)] if mount != "/" and fstype else []
+    s6 = [_S6] if kind == "overlay" else []
+    tail = [_S4, *s5, *s6]
+    gone = [_s5(mount)] if not s5 else []
+    gone += [_S6] if not s6 else []
     pinned = _refusal(tmp_path, monkeypatch, v, pin_setting="[x].pin")
+    _assert_template(pinned, [_s1(mount, kind), _S3, *tail], [_S2, *gone])
     by_path = _refusal(tmp_path, monkeypatch, v, loads_verified_bytes=False)
-    for text, step in ((pinned, "set [x].pin to"), (by_path, "A pin does not help here")):
-        assert _FOLDER not in text and "move the anchor into" not in text, text
-        assert f"the mount at {mount!r}" in text, text
-        order = [text.index(s) for s in (_MOUNT_NOTE, step, "docker/README.md")]
-        assert order == sorted(order), text
-        # Only '/', or an unread table that names it, leaves nowhere to move to; under '/etc' a
-        # trusted file system outside that mount still passes. Red where '/etc' said moving fails.
-        stuck = "moving the anchor does not help" in text
-        outside = "on a file system the check trusts, outside that mount" in text
-        assert (stuck, outside) == ((True, False) if mount == "/" else (False, True)), text
-    assert "at enforce this check refuses it anywhere below that mount" in by_path
+    no_pin = [_S2, _S3, "pin it to", "A pin does not help here", *gone]
+    _assert_template(by_path, [_s1(mount, kind), *tail], no_pin)
 
 
-def test_an_insecure_path_under_such_a_mount_is_not_told_to_move(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The same rule for an insecure finding: fix it in place, and say why moving cannot help.
-    Red under the fix that led with /etc/messagefoundry/."""
+@pytest.mark.parametrize("by_path", [False, True], ids=["verified-bytes", "by-path"])
+def test_an_insecure_path_under_an_untrusted_mount_is_the_template(by_path: bool) -> None:
+    """An insecure path under an overlay '/': S1, S2 with the anchor's own folder's chmod, S4 and
+    the README pointer. No pin, since a pin never clears a replaceable path, and no digest of
+    bytes that may be substituted. Red under the text that offered a pin and talked of moving."""
     table = {**_MOUNT_TABLE, "/srv": (0, D777)}
     v = _posix("/srv/a.pem", table, fstype={"/": "overlay"})
     assert v.ok is False
-    text = _path_text(v, "/srv/a.pem", pin_setting="[x].pin")
+    text = _path_text(v, "/srv/a.pem", pin_setting="[x].pin", loads_verified_bytes=not by_path)
     # /srv is the anchor's own folder, so dropping its write bits is the anchor's own fix.
-    assert "  chmod go-w /srv" in text and _FOLDER not in text
-    assert "the mount at '/'" in text
-    order = [text.index(s) for s in (_MOUNT_NOTE, "set [x].pin to", "docker/README.md")]
-    assert order == sorted(order), text
-    # The path was found replaceable, so the fix quotes no digest of these bytes.
-    assert _FINGERPRINT not in text
-    # A finding no command fixes leaves no in-place heading with nothing under it.
+    s2 = [_S2 + ":", "  chmod go-w /srv"]
+    present = [_s1("/", "overlay"), *s2, _S4, _S6]
+    _assert_template(text, present, [_S3, _FINGERPRINT, _S2_FILE, "pin it to", "outside '/'"])
+
+
+def test_a_finding_no_command_fixes_names_the_file_to_replace() -> None:
+    """A finding no command fixes, here a path that is not a regular file, gets no command and the
+    sentence saying the file needs replacing. Red under the text that named no remedy."""
     odd = ap.ChainFinding("/srv/a.pem", FILE, True, "it is not a regular file")
-    root = ap.ChainFinding("/", DIRECTORY, False, "it is a overlay mount", mount=True)
+    overlay = _posix("/srv/a.pem", _MOUNT_TABLE, fstype={"/": "overlay"})
+    (root,) = overlay.findings
     text = _path_text(ap.PathVerdict(False, (odd, root), "posix", "uid 7"), "/srv/a.pem")
-    assert "in place" not in text and _MOUNT_NOTE in text and _FOLDER not in text
-
-
-def test_a_mount_below_the_suggested_folder_names_itself_and_keeps_the_folder(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A mount that does not hold /etc/messagefoundry/: moving the anchor can still help, so the
-    fix offers that folder, and its note names the mount."""
-    v = _posix("/srv/a.pem", _MOUNT_TABLE, fstype={"/srv": "nfs"})
-    text = _refusal(tmp_path, monkeypatch, v)
-    assert "The mount at '/srv'" in text and _MOUNT_NOTE in text and _FOLDER in text
-    assert "docker/README.md" in text and "bind mount" in text
+    _assert_template(text, [_s1("/", "overlay"), _S2, _S2_FILE, _S4, _S6], [_S2 + ":", "chmod"])
 
 
 def test_the_mount_note_names_only_a_mount_the_message_lists(
@@ -971,22 +1007,7 @@ def test_the_mount_note_names_only_a_mount_the_message_lists(
     monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: v)
     ta.enforce_anchor(AnchorSpec("t", "[x]", str(_pem(tmp_path)), None), enforcing=False)
     acl = [r.message for r in caplog.records if "could not settle" in r.message]
-    assert len(acl) == 1 and "'/srv'" not in acl[0] and _MOUNT_NOTE not in acl[0], acl
-
-
-def test_a_by_path_anchor_with_an_insecure_path_under_an_overlay_root(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The insecure-path fix for an anchor read again by path: fix it in place, then no location
-    below the mount, no pin, and what enforce does, in that order. Red under the text that said
-    nothing else clears it."""
-    table = {**_MOUNT_TABLE, "/srv": (0, D777)}
-    v = _posix("/srv/a.pem", table, fstype={"/": "overlay"})
-    text = _path_text(v, "/srv/a.pem", pin_setting="[x].pin", loads_verified_bytes=False)
-    assert "  chmod go-w /srv" in text and _FOLDER not in text and "set [x].pin to" not in text
-    steps = (_MOUNT_NOTE, "A pin does not help here", "at enforce this check refuses it")
-    order = [text.index(s) for s in (*steps, "docker/README.md")]
-    assert order == sorted(order), text
+    assert len(acl) == 1 and "'/srv'" not in acl[0] and "the mount at" not in acl[0], acl
 
 
 def test_no_warning_quotes_the_digest_of_a_replaceable_file(
@@ -1006,7 +1027,22 @@ def test_no_warning_quotes_the_digest_of_a_replaceable_file(
     assert len(acl) == 1 and digest not in caplog.text and "set [x].pin to" in acl[0], acl
     # The ACL warning lists no path finding, so it names no mount either. Red under the over-folder
     # text, which named '/'.
-    assert "the mount at" not in acl[0] and _MOUNT_NOTE not in acl[0], acl
+    assert "the mount at" not in acl[0], acl
+
+
+def test_no_digest_of_a_file_a_non_owner_can_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """At warn, a file whose permissions let a non-owner write it, under an overlay '/': the fix
+    quotes no digest of bytes that may be substituted. Red under the digest quoted whenever the
+    path was not found replaceable."""
+    v = _posix("/srv/a.pem", _MOUNT_TABLE, fstype={"/": "overlay"})
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: v)
+    p = _pem(tmp_path)
+    ta.enforce_anchor(AnchorSpec("t", "[x]", str(p), None, "[x].pin"), enforcing=False)
+    assert "could not settle" in caplog.text and _S3 in caplog.text.lower(), caplog.text
+    assert hashlib.sha256(p.read_bytes()).hexdigest() not in caplog.text, caplog.text
 
 
 # A folder another account owns, standing in for a user's home folder.
@@ -1038,10 +1074,9 @@ def test_no_fix_under_an_untrusted_mount_chowns_a_folder(
     table: dict[str, tuple[int, int]],
 ) -> None:
     """Under a mount the check cannot vouch for, fixing the path in place does not make it pass,
-    so the fix never hands a folder such as a user's home to root. Under '/' it says moving the
-    anchor into a folder only root can change clears the finding; under another mount, it says to
-    move it onto a file system the check trusts, outside that mount. A command for the anchor's
-    own file stays. Red under the chown of /data/team (or /srv) the fix offered."""
+    so the fix never hands a folder such as a user's home to root, and it follows the template.
+    A command for the anchor's own file stays. Red under the chown of /data/team (or /srv) the
+    fix offered."""
     full = {**_MOUNT_TABLE, **_USERS, **table}
     if fstype is None:
         v = posix_path_verdict(
@@ -1059,24 +1094,24 @@ def test_no_fix_under_an_untrusted_mount_chowns_a_folder(
     folders = [line for line in text.splitlines() if "chown" in line and "a.pem" not in line]
     assert not folders, text
     mount = next(f.path for f in v.findings if f.mount)
-    if mount == "/":
-        assert "clears the finding above" in text and _MOUNT_NOTE in text, text
-    else:
-        assert f"outside the mount at {mount!r}" in text and "such as ext4" in text, text
+    kind = (fstype or {}).get(mount, "unread mount table")
+    s5 = [_s5(mount)] if mount != "/" and fstype else []
+    _assert_template(text, [_s1(mount, kind), _S2, _S4, *s5], [_S3])
     if anchor == "/srv/x/a.pem":
         assert "  chown -h root /srv/x/a.pem" in text, text  # the anchor's own file
 
 
-def test_a_matching_pin_is_not_offered_again(
+def test_a_pin_is_not_offered_for_a_replaceable_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An insecure path under an overlay root whose pin already matches: the fix does not tell
-    the operator to set the pin they have. Red under the pin offered whatever the pin state."""
+    """An insecure path under an overlay root whose pin already matches: a pin never clears a
+    replaceable path, so the fix offers none, and does not tell the operator to set the pin they
+    have."""
     table = {**_MOUNT_TABLE, "/srv": (0, D777)}
     v = _posix("/srv/a.pem", table, fstype={"/": "overlay"})
     digest = hashlib.sha256(_pem(tmp_path).read_bytes()).hexdigest()
     text = _refusal(tmp_path, monkeypatch, v, pin_setting="[x].pin", pin=digest)
-    assert "set [x].pin to" not in text and "[x].pin already matches" in text, text
+    assert "set [x].pin to" not in text and "already matches" not in text, text
 
 
 def test_posix_unknown_mount_table_is_indeterminate() -> None:

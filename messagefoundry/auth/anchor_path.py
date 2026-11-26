@@ -65,7 +65,7 @@ class ChainFinding:
     ``mount`` marks a POSIX finding that a mount's type is outside :data:`POSIX_TRUSTED_FS`, or
     could not be read, so the fix text can say that no location below it passes. A type that could
     not be read names the first object the walk reached, ``/`` on a host with no mount table, where
-    no path's type can be read."""
+    no path's type can be read. ``fstype`` is the mount's type, empty where it could not be read."""
 
     path: str
     kind: str
@@ -75,6 +75,7 @@ class ChainFinding:
     owner: bool = False
     writable: bool = False
     mount: bool = False
+    fstype: str = ""
 
 
 @dataclass(frozen=True)
@@ -908,6 +909,7 @@ def posix_path_verdict(
                     f"it is a {mounted[1]} mount, whose owners and mode bits this check cannot vouch "
                     "for",
                     mount=True,
+                    fstype=mounted[1],
                 )
             )
 
