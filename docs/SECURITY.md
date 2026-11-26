@@ -6804,7 +6804,7 @@ end, in the same transaction as the revoke. The audit row names that session and
 field, the hash the browser presented.
 
 The link is followed for a bounded time: `[auth].oidc_flow_ttl_seconds` plus 120 seconds, which is
-420 seconds at the default, and the session reaper deletes older links. **At least these cases stay
+420 seconds at the default, and the session reaper deletes a link once it is older than the bound plus the reaper's step tolerance. **At least these cases stay
 open**, and in each the session lives on under the token the elevation handed out, until it expires,
 as before this change:
 
