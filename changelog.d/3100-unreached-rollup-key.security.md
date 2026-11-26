@@ -7,5 +7,9 @@
   `directory-reconciler-unreached-rollup:<key>`, keyed by the accounts entering, so it is its
   own instance, and an INFO line logs the key. A cooldown or suspend reaches only a later
   rollup of the same accounts; a set that differs, even one of accounts paged before, pages.
-  To match every unreachable-account
-  alert, an `[alerts]` rule names `directory-reconciler-unreached*` (vault BACKLOG #3100 item 14).
+  These instances have no inverse, so the notifier drops a rollup's in-memory cooldown and
+  occurrence count once its cooldown has passed with no emit; its escalation count then restarts,
+  as after a restart. At startup the notifier seeds suspends from the live instances suspended
+  past now, so a suspend is no longer lost behind 1000 newer instances. To match every
+  unreachable-account alert, an `[alerts]` rule names `directory-reconciler-unreached*` (vault
+  BACKLOG #3100 item 14).

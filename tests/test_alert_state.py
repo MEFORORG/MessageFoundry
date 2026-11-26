@@ -507,7 +507,7 @@ class _RecordingStore:
         return 1
 
     async def list_active_alert_instances(
-        self, *, limit: int = 1000, allowed_channels: object
+        self, *, limit: int = 1000, allowed_channels: object, suspended_after: float | None = None
     ) -> list[Any]:
         return []
 

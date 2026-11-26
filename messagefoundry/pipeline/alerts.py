@@ -32,6 +32,7 @@ __all__ = [
     "INTAKE_DISK_REASON",
     "REMINDER_SECONDS",
     "STORE_RESTORED_SUBJECT",
+    "UNREACHED_ROLLUP_SOURCE",
     "AlertSink",
     "HELD_COPY_NOTE",
     "LoggingAlertSink",
@@ -53,6 +54,12 @@ log = logging.getLogger(__name__)
 #: ``DEPTH_REASON`` and ``DISK_REASON``.
 INTAKE_DEPTH_REASON = "staged_depth"
 INTAKE_DISK_REASON = "disk_floor"
+
+#: The source label prefix of a rollup of unreachable directory accounts' ``ad_reconcile_aborted``
+#: instance, ``<this>:<key>`` (vault BACKLOG #3100 item 14). The API raises it; why each rollup is
+#: keyed by its accounts is said there, at ``_UNREACHED_ROLLUP_SOURCE``. Defined here so the
+#: notifier, which bounds its in-memory state for these instances, shares the one spelling.
+UNREACHED_ROLLUP_SOURCE = "directory-reconciler-unreached-rollup"
 
 #: How often an emitter raises a condition that persists again: ``queue_buildup``, ``message_stall``
 #: and ``saturation`` in ``wiring_runner``, and ``intake_paused`` in ``intake_bound``. One value, so

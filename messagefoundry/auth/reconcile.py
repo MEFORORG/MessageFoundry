@@ -370,9 +370,9 @@ class ReconcilePlan:
     unreached_window: int = 0
     #: Set by ``AuthService._record_unreached_accounts`` (BACKLOG #3100, #3709), on the rows it
     #: wrote: set when those entering whose row was written are more than ``AuthService``'s
-    #: fixed rollup bound, so the lifespan task pages once for them rather than once per account,
-    #: and no pass pages more than that bound by name. Accounts latched by earlier passes do not
-    #: count (BACKLOG #3100 item 14), so one entering alone pages under its own name. ``None`` on a pass
+    #: fixed rollup bound, so the lifespan task pages once for them rather than once per account.
+    #: Accounts latched by earlier passes do not count, so one entering alone pages under its own
+    #: name. ``None`` on a pass
     #: that does not roll up. Set, it is the key of the accounts entering, which the page's
     #: source carries (BACKLOG #3100 item 14; the API's ``_UNREACHED_ROLLUP_SOURCE`` says why).
     unreached_rollup: str | None = None

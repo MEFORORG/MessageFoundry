@@ -9452,12 +9452,16 @@ class SqlServerStore(ServerCipherWalk):
         *,
         limit: int = 200,
         allowed_channels: Sequence[str] | None,
+        suspended_after: float | None = None,
     ) -> list[AlertInstance]:
         limit = max(1, min(limit, 1000))  # server-side clamp
         where = [_ACTIVE_ALERT_STATUS_SQL]
         params: list[Any] = [limit]  # TOP (?) is the first placeholder
         if allowed_channels is not None:
             _append_channel_scope(where, params, "connection", allowed_channels)
+        if suspended_after is not None:  # vault BACKLOG #3100 item 14: see the SQLite twin
+            where.append("suspended_until > ?")
+            params.append(suspended_after)
         clause = " WHERE " + " AND ".join(where)
         rows = await self._fetchall(
             "SELECT TOP (?) id, event_type, connection, severity, status, first_seen, last_seen,"
