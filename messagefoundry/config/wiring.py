@@ -432,8 +432,11 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     made, and an unreadable one is refused then. ``cast=int`` means a strict whole-number reading
     (vault BACKLOG #1650, :func:`_cast_int`), and ``cast=float`` a strict finite-number reading
     (:func:`_cast_float`). At least ``abs`` and ``round`` among the numeric builtins, and a number
-    type such as ``decimal.Decimal``, refuse a TOML bool before they run
-    (:func:`_is_numeric_builtin_cast` says which); the builtin list is partial, so at least
+    type such as ``decimal.Decimal``, refuse a TOML bool read from the environment
+    (:func:`_is_numeric_builtin_cast` says which). A ``default=`` is neither cast nor checked by
+    that refusal, so ``env("p", cast=Decimal, default=True)`` with the key unset returns ``True``,
+    and a number subclass such as ``class Port(int)`` is refused only a bool, so it still cuts
+    ``2575.9`` to 2575. The builtin list is partial, so at least
     ``math.sqrt`` and ``operator.neg`` still read ``true`` as 1. Any other callable runs as given, on the
     environment value as it arrives, a TOML bool included, so ``cast=lambda v: int(v)`` still
     reads ``true`` as 1; the connector's own check sees only what the cast returned. On a boolean
@@ -6134,9 +6137,11 @@ def _accepts_callees(obj: object) -> list[object]:
     function, a ``__wrapped__`` it carries, and a callable instance's ``__call__``. Empty for a plain
     function with no ``__wrapped__``.
 
-    Every read is static, as ``reachability._function_of`` reads (``type()``, ``__dict__`` and
-    ``inspect.getattr_static``), so no author ``__class__``, ``__getattr__`` or
-    ``__getattribute__`` runs at load. A class-based wrapper that calls ``functools.update_wrapper``
+    The ``__wrapped__`` and ``__call__`` lookups are static, as ``reachability._function_of`` reads
+    (``type()``, ``__dict__`` and ``inspect.getattr_static``), so no author ``__class__``,
+    ``__getattr__`` or ``__getattribute__`` runs for them. The ``func`` read off a
+    ``functools.partial`` is a plain attribute read, so a subclass of ``functools.partial`` that
+    overrides ``func`` runs its own code here. A class-based wrapper that calls ``functools.update_wrapper``
     yields both its own ``__call__`` and the function it wraps, since either may run."""
     kind = type(obj)
     if issubclass(kind, functools.partial):
@@ -6177,8 +6182,12 @@ _LOCAL_LOADS: Final = frozenset({"LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHE
 
 def _first_argument_attributes(code: CodeType) -> set[str]:
     """The attribute names ``code`` loads straight off its first parameter (``self.getter``), read
-    from the bytecode. Empty for code with no parameter. Nested code is not read: there ``self`` is
-    a closure cell, not the first parameter."""
+    from the bytecode, where a plain local load of it comes right before the ``LOAD_ATTR``. Empty
+    for code with no parameter. Nested code is not read: there ``self`` is a closure cell, not the
+    first parameter. It misses at least a ``self`` loaded by Python 3.14's combined
+    ``LOAD_FAST_BORROW_LOAD_FAST_BORROW`` (as in ``return x, self.getter``), by ``LOAD_DEREF``
+    (when a nested function also uses ``self``), or with an ``EXTENDED_ARG`` before the
+    ``LOAD_ATTR``."""
     if not code.co_argcount:
         return set()
     first = code.co_varnames[0]
@@ -6238,21 +6247,30 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
     ``def``), names one, as the earlier one-level check did. A function or instance defined
     elsewhere that carries a ``__wrapped__`` chain, such as a ``functools.lru_cache`` or a library
     decorator around a config helper, is judged by the function at the end of the chain
-    (``reachability._function_of``). The walk's own reads are static (:func:`_accepts_callees`), but
-    ``captured_values`` tests a global with ``isinstance``, which can run an object's ``__class__``;
-    :func:`_check_accepts_predicate` refuses a predicate whose walk raises.
+    (``reachability._function_of``). The walk's attribute lookups by name use
+    ``inspect.getattr_static``, but it is not free of author code: at least the ``func``, ``args``
+    and ``keywords`` it reads off a ``functools.partial`` and the ``__func__`` it reads off a
+    ``staticmethod`` or ``classmethod`` are plain attribute reads, which a subclass can override,
+    and ``captured_values`` tests a global with ``isinstance``, which can run an object's
+    ``__class__``; :func:`_check_accepts_predicate` refuses a predicate whose walk raises.
 
     Engine PR 2997's left list adds these edges (vault BACKLOG #5514): an attribute a function
     reads as ``Name.attr`` off a class or an instance, not only off a module; the items of a
     ``tuple``, ``list``, ``dict`` (keys and values), ``set`` or ``frozenset`` the walk reaches,
     by exact type; a ``staticmethod`` or ``classmethod``'s function, so ``staticmethod(state_get)``
     is caught; any wrapper whose ``__wrapped__`` chain ends at the accessor itself; and
-    the attributes a config method, or a callable instance's ``__call__``, reads straight off its
-    first parameter (``self.getter``), looked up on the bound ``__self__`` or the instance, a method
-    found there bound to it in turn, read with ``inspect.getattr_static``. It does not see at
-    least: a call through ``getattr`` or another computed name, a function in any other module, an attribute read off a local or off an
-    attribute (``self.a.b``), a subclass of a container, an object's methods the walk does not
-    reach by name, or a value the predicate builds while it runs."""
+    the attributes a config bound method, or a callable instance's ``__call__``, reads straight off
+    its first parameter (``self.getter``) in the bytecode forms :func:`_first_argument_attributes`
+    reads, looked up on the bound ``__self__`` or the instance, a method found there bound to it in
+    turn, read with ``inspect.getattr_static``. It does not see at least: a call through
+    ``getattr`` or another computed name, a function in any other module, an attribute read off a
+    local or off an attribute (``self.a.b``), a subclass of a container, an object's methods the
+    walk does not reach by name, a value the predicate builds while it runs, a ``self`` load that
+    :func:`_first_argument_attributes` misses (Python 3.14's combined
+    ``LOAD_FAST_BORROW_LOAD_FAST_BORROW``, ``LOAD_DEREF``, an ``EXTENDED_ARG``), the reads off
+    ``self`` of a method reached as ``Name.attr`` off a module-level instance or class
+    (``FILTER.check(msg)``), since that edge is the plain function with no ``self`` to look them up
+    on, and a classmethod's ``cls.getter``."""
     # Lazy: both accessor modules are imported by handler code, not by the loader, and reachability
     # imports this module at its top level.
     from messagefoundry.config.reachability import (
@@ -6345,6 +6363,9 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
             func = cast("FunctionType", obj)
             edges += [c.value for c in captured_values(func, home) if followed(c.value)]
             # ``Global.attr`` off a class or an instance: captured_values reads it off a module only.
+            # A method found here is never bound (a plain function, or a classmethod whose function
+            # is followed unbound), so self_reads does not run on it: ``FILTER.check``'s reads off
+            # ``self`` and a classmethod's reads off ``cls`` are missed.
             for holder_name, name in code_names(func.__code__)[1]:
                 holder = func.__globals__.get(holder_name)
                 if holder is not None and not issubclass(type(holder), ModuleType):
