@@ -784,8 +784,8 @@ def test_the_separator_sniff_on_operational_text_grows_linearly(
     event loop but is charged almost nothing, so neither bound here reads it. A loaded runner still
     inflates CPU seconds by a factor, through cache and frequency loss, and that factor has the
     16.5 times above locally. The ``-n 12`` run did not oversubscribe the 32 cores, and no hosted
-    CPU reading exists yet; the hosted wall reading bounds hosted CPU only from above. A quadratic
-    cost is the ratio's to catch.
+    CPU reading exists yet; the hosted wall readings are a best single call, a different statistic,
+    so they do not bound it. A quadratic cost is the ratio's to catch.
 
     **The ratio guards every pass ``redact`` makes over this text, not the sniff alone**, for a
     quadratic cost as large as ``_ops_text_growth`` says."""
@@ -2592,22 +2592,22 @@ def test_a_frame_cap_sized_segment_input_costs_what_a_window_of_it_costs(
     was thin; the hosted readings are in the comment on ``_SCAN_BUDGET_SECONDS``.
 
     Measured 2026-11-26 (Central) on a Windows box, over twelve runs: a ratio of 0.85 to 1.6, at
-    least 15 times under the line. Over twelve more on a 32-core Windows box, seven of this arm
-    alone and five inside a ``pytest -n 12`` run of this file, a ratio of 0.85 to 1.55 and 3.28 to
-    3.98 ms of CPU for the frame cap, the slowest under ``-n 12``: at least 0.05 / 0.00398 = 12.5
-    times under ``_SEGMENT_CEILING_SECONDS``.
+    least 15 times under the line. Over twelve more on a 32-core Windows box, against the redactor
+    of engine PR 3329, seven of this arm alone and five inside a ``pytest -n 12`` run of this file:
+    a ratio of 0.93 to 1.40, and 2.94 to 4.23 ms of CPU for the frame cap, the slowest under
+    ``-n 12``, at least 0.05 / 0.00423 = 11.8 times under ``_SEGMENT_CEILING_SECONDS``.
 
     **The ceiling is read on the large side, at the budget's number**, the input and the number the
     budget arm used, on thread CPU time rather than wall time. Thread CPU time does not charge time
     the thread spends blocked, so neither bound here reads a stall of that kind;
     ``test_the_separator_sniff_on_operational_text_grows_linearly`` states that cost and the
-    loaded-runner factor once. The factor has the 12.5 times above locally. The ``-n 12`` run did
-    not oversubscribe the 32 cores, and no hosted CPU reading exists yet; the hosted wall reading
-    bounds hosted CPU only from above, and its worst, 26.6 ms, sits 1.88 times under this ceiling.
+    loaded-runner factor once. The ``-n 12`` run did not oversubscribe the 32 cores, and no hosted
+    CPU reading exists yet. The hosted wall readings are a different statistic, a best single call,
+    so they do not bound this one.
 
-    **What it gives up against the budget:** a change that widens the clamp's window moves both
-    sides of the ratio, since the small side is cut at ``_REDACT_WINDOW``, and the ceiling passes a
-    widening of about 0.05 / 0.00398 = 12.5 times;
+    **A wider window is the ceiling's to read, not the ratio's:** a change that widens the clamp's
+    window moves both sides of the ratio, since the small side is cut at ``_REDACT_WINDOW``, and the
+    ceiling passes a widening of up to the margin above, about 11.8 times;
     ``test_the_redact_window_is_pinned_for_the_frame_cap_ratios`` reads that, with no clock."""
     growth, large, small = _frame_cap_growth("segment-shaped", safe_text)
     _record_reading(
