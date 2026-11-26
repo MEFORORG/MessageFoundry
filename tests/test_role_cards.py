@@ -47,7 +47,8 @@ SEAT_SCRIPT = _REPO / "scripts" / "coord" / "seat.ps1"
 SETTINGS = _REPO / ".claude" / "settings.json"
 
 #: The marker and the injected copy. BOTH MUST STAY GIT-IGNORED, and the ignore rule here is the
-#: INVERSE of korus's: `/.claude/*` covers the directory and one negation re-adds settings.json.
+#: INVERSE of korus's: `/.claude/*` covers the directory, and its negations re-add settings.json
+#: and skills/verify/SKILL.md alone.
 MARKER_RELPATH = ".claude/seat.local.txt"
 ROLE_COPY_RELPATH = ".claude/ROLE.local.md"
 
@@ -586,8 +587,8 @@ class NoCardCitesAPlaybookPathThatDoesNotExistHere(unittest.TestCase):
 class TheMarkerCannotRideIntoACommit(unittest.TestCase):
     """Both are machine-local. Here they are ignored by the `/.claude/*` wildcard.
 
-    DO NOT ADD A NEGATION TO MAKE THIS PASS. `.gitignore` warns, above its one existing negation,
-    that a second would expose nested checkouts carrying `.venv` and the local database.
+    DO NOT ADD A NEGATION TO MAKE THIS PASS. `.gitignore` warns, beside its negations, that a
+    wider one would expose nested checkouts carrying `.venv` and the local database.
     """
 
     def _ignored(self, rel: str) -> bool:
