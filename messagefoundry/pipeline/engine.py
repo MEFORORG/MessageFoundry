@@ -2036,8 +2036,11 @@ class Engine:
         survives restarts while still catching the two things #328 is about — a truncated tail and a
         mid-chain rewrite. A stale anchor therefore stays VALID here; it just witnesses less.
 
-        **Never raises, and never fires the tamper alert for an anchor it cannot use.** A missing or
-        unreadable anchor, or one :func:`~messagefoundry.store.store.parse_audit_anchor` refuses, is a
+        **Never fires the tamper alert for an anchor it cannot use, and does not raise for the faults
+        it catches, but it CAN raise.** The read catches only ``OSError`` and ``UnicodeDecodeError``,
+        so anything else the reader raises escapes: at least a path carrying a NUL character raises
+        ``ValueError`` out of this method, then out of :meth:`start`, and startup fails (pinned by
+        ``test_startup_anchor_nul_path_raises_value_error``). A missing or unreadable anchor, or one :func:`~messagefoundry.store.store.parse_audit_anchor` refuses, is a
         CONFIG fault, and routing it to ``integrity_drift`` would manufacture a tamper alarm out of input
         handling, and worse here than on the CLI, because an alarm that fires on a typo is an alarm
         operators learn to ignore. It logs a WARNING naming the file and the reason, and the caller runs
@@ -2103,7 +2106,9 @@ class Engine:
         fires the AlertSink but NEVER crashes startup — refusing to boot on a tripped tamper alarm would
         be a self-inflicted DoS, and the alarm may itself be a false positive (e.g. keyed store opened
         without the DEK). Reuses the ``integrity_drift`` alert channel (the existing in-place-tamper
-        signal). Swallows every error: the check is defense-in-depth, never a startup gate.
+        signal). It swallows every error the walk raises, but not every error the anchor read raises:
+        :meth:`_load_audit_anchor` runs outside that handler and lets at least a ``ValueError`` from a
+        NUL in the anchor path escape, which fails startup.
 
         With ``[integrity].audit_anchor_file`` set it also passes that anchor as ``expected_prefix``, which
         is what lets the walk see a TRUNCATED TAIL — the walk alone cannot, because deleting the newest
@@ -2284,8 +2289,10 @@ class Engine:
                 Exception
             ) as exc:  # a sweep failure must never block startup (best-effort hygiene)
                 log.warning("startup attachment sweep failed: %s", safe_exc(exc))
-        # #190-E: optional startup audit-chain tamper check. ALERT-ONLY (never crashes startup); runs
-        # after recovery so the chain is walked in its post-recovery state.
+        # #190-E: optional startup audit-chain tamper check. ALERT-ONLY for a failed verdict and for
+        # the anchor faults _load_audit_anchor catches, but at least a NUL in the anchor path still
+        # raises out of here and fails startup; runs after recovery so the chain is walked in its
+        # post-recovery state.
         if self._audit_verify_on_start:
             await self._verify_audit_chain_on_start()
         elif self._audit_anchor_file is not None:

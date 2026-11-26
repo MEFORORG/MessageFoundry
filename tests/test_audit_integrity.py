@@ -1840,6 +1840,30 @@ async def test_startup_anchor_reads_a_utf16_file_without_crashing(tmp_path: Path
     assert "could not be read" in cap.text, cap.records
 
 
+async def test_startup_anchor_nul_path_raises_value_error(tmp_path: Path) -> None:
+    """A PIN OF CURRENT BEHAVIOUR, not a statement of the intended contract.
+
+    `_load_audit_anchor` catches only `OSError` and `UnicodeDecodeError`, so the `ValueError` a path
+    carrying a NUL character raises escapes it, and from there `Engine.start()`: such a path fails
+    startup rather than degrading to a bare walk. Keeping that failure was decided as the safer
+    option; the docstring and docs/CONFIGURATION.md say so. If this ever changes, change both.
+    """
+    db = tmp_path / "nul.db"
+    await _aseed_audit_rows(db, 1)
+    store = await MessageStore.open(db)
+    try:
+        eng = Engine(
+            store,
+            audit_verify_on_start=True,
+            audit_anchor_file=str(tmp_path / "anchor\x00.txt"),
+            egress_settings=EgressSettings(deny_by_default=False),
+        )
+        with pytest.raises(ValueError, match="null"):
+            await eng._load_audit_anchor()
+    finally:
+        await store.close()
+
+
 async def test_startup_anchor_accepts_a_utf8_bom(tmp_path: Path) -> None:
     """`Set-Content -Encoding utf8` on PowerShell 5.1 writes a BOM, and that is the documented way to
     make this file on Windows. It must anchor, not degrade to a bare walk."""
