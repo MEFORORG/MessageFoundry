@@ -226,8 +226,10 @@ _EVIDENCED_KINDS = frozenset({ROLES_CHANGED, ACCOUNT_DISABLED})
 # paths where the role write or the revoke raised, or its commit is unknown. At least: the
 # reconciler after a role write that raised past its retry or was retried at all, or a revoke that
 # raised, and the sign-in re-sync with an error held from either.
-# ``roles_written`` is True only once the role write committed; ``sessions_revoked`` is the revoke's
-# count, set only once the revoke returned. A count of 0 still proves no session was left open, so
+# ``roles_written`` is True only once the sender knows the roles stand committed as it set out to
+# write them: the reconciler's own first write, or a sign-in re-sync whose sync held no error, which
+# includes roles another writer had already set, read back through the seal. ``sessions_revoked``
+# is the revoke's count, set only once the revoke returned. A count of 0 still proves no session was left open, so
 # "any sessions already open were ended" holds for it.
 _SESSIONS_ENDED = "Any sessions already open on your account were ended."
 _SESSIONS_UNCONFIRMED = (
@@ -251,14 +253,17 @@ _ROLES_WORDING = {
         "account's roles to match them. It could not confirm that the change was saved."
     ),
 }
-# BACKLOG #6034. The reconciler's role revocation that wrote no role, because the roles already
-# stood at its target or moved after its read, only ended the sessions, so it sends
-# DIRECTORY_SESSIONS_ENDED. The pass did read the account in the directory, so the whole-account
-# wording, "could not confirm ... may still sign in", would mislead here. ``_ROLE_REVOCATION`` is
-# the reason ``auth/reconcile.py`` gives a role revocation.
+# BACKLOG #6034. A reconciler role revocation that wrote no role only ended the sessions, so it
+# sends DIRECTORY_SESSIONS_ENDED. At least these reach it: the roles already stood at its target,
+# they moved after its read, or a group map did not verify, so no role was written from it (ADR
+# 0217 (b)). The pass did find the account in the directory, so the whole-account wording, "could
+# not confirm ... may still sign in", would mislead here; and the cause may be the engine's own map
+# read, so this names no group as the cause. ``_ROLE_REVOCATION`` is the reason
+# ``auth/reconcile.py`` gives a role revocation; it has no shared constant.
 _ROLE_REVOCATION = "roles_changed"
 _ROLE_SESSIONS_ENDED = (
-    "MessageFoundry read your groups in your organization's directory and ended your sessions."
+    "MessageFoundry ended your sessions while checking your account's roles against your "
+    "organization's directory."
 )
 # Each sender has confirmed the disable before it notifies: the administrator's write returned
 # applied, and the reconciler sends this only on a READ disabled bit (vault BACKLOG #2140).

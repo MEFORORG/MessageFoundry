@@ -7069,8 +7069,10 @@ the email channel sends:
   disable notice says the sessions already open on the account were ended only when its sender's
   revoke returned, and otherwise that this could not be confirmed. The BACKLOG #6034 comment above
   `_SESSIONS_ENDED` in `pipeline/security_notify.py` names at least the sender paths that reach the
-  unconfirmed wording. An administrator's role change or disable whose revoke is given up on sends
-  no notice, since the request fails first. A reconciler role revocation that wrote no role, and
+  unconfirmed wording. An administrator's role change or disable whose revoke raises, given up on
+  after its retries or at once on a defect, sends no notice at all, since the request fails first.
+  The change has committed by then, and at least the same save's email-change notice goes unsent
+  too, so the audit log is the record of it. A reconciler role revocation that wrote no role, and
   only ended sessions, sends `directory_sessions_ended` instead of a role-change notice.
   **CORRECTED 2026-11-26:** this said the directory role notice says the roles were changed to
   match the directory's groups and, *"like the disable notice"*, that the sessions already open on
@@ -7119,12 +7121,12 @@ the email channel sends:
   `directory_absent`, `directory_undetermined` and `directory_object_id_missing` send it. The
   comment on `DIRECTORY_SESSIONS_ENDED` in `auth/notifications.py` says what each one means. For at
   least `directory_object_id_missing` the engine never asks the directory (BACKLOG #2434). So the
-  notice names no directory check. It says only that the engine could not confirm from the
-  directory that the account may still sign in, which is true for each current whole-account
-  reason. A new reason must be checked against that wording (vault BACKLOG #3171). A role
-  revocation (`roles_changed`) that wrote no role and only ended sessions sends it too, saying
-  instead that the engine read the account's groups in the directory and ended its sessions
-  (BACKLOG #6034).
+  whole-account wording names no directory check. It says only that the engine could not confirm
+  from the directory that the account may still sign in, which is true for each current
+  whole-account reason. A new reason must be checked against that wording (vault BACKLOG #3171).
+  A role revocation (`roles_changed`) that wrote no role and only ended sessions sends it too,
+  with its own wording: the engine ended the sessions while checking the account's roles against
+  the directory (BACKLOG #6034).
 - **An account with no notification address sets one at sign-in** (BACKLOG #1139). While a notice
   channel is wired, `require()` and `require_ui` confine such a session to `POST /me/notify-email`
   (console: `/ui/account/notify-address`) plus the escapes of the password and factor gates, in the

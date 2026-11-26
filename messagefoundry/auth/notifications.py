@@ -79,7 +79,7 @@ ACCOUNT_DISABLED = "account_disabled"
 # could not be parsed), its ``userAccountControl`` could not be read (``directory_undetermined``;
 # vault BACKLOG #2140), or the row carries no ``directory_object_id``, so the pass never asked the
 # directory (``directory_object_id_missing``; BACKLOG #2434). Any whole-account reason added later
-# sends it too, so the notice's one wording must be checked against that one as well (vault BACKLOG
+# sends it too, so the whole-account wording must be checked against that one as well (vault BACKLOG
 # #3171). ACCOUNT_DISABLED would tell the holder the account is disabled, by an administrator or in
 # the directory, which nothing established. A role revocation (``roles_changed``) that wrote no role
 # and only ended sessions sends it too, with its own wording, since that pass did read the account

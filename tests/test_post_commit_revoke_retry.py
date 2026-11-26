@@ -1196,6 +1196,32 @@ async def test_a_reconciler_role_revocation_that_wrote_no_role_says_only_session
         await store.close()
 
 
+async def test_a_role_revocation_under_an_unverified_map_names_no_group() -> None:
+    """ADR 0217 (b): on a pass whose map did not verify, no role is written and the sessions still
+    end. The notice is ``directory_sessions_ended``, and it names no group as the cause, since the
+    cause is the engine's own map read (BACKLOG #6034)."""
+    store, service, user, target = await _reconciled_jdoe()
+    try:
+        notices = _listening(service)
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="roles_changed", role_ids=target
+        )
+        assert (
+            await service._apply_reconcile_revocation(
+                revocation, watermark=await service._audit_watermark(), maps_held=False
+            )
+            == "reported"
+        )
+        [event] = notices.sent
+        assert event.event_type == DIRECTORY_SESSIONS_ENDED
+        assert "sessions_revoked" in event.detail and "roles_written" not in event.detail
+        body = _build_body(event).lower()
+        assert "groups" not in body
+        assert "could not confirm" not in body
+    finally:
+        await store.close()
+
+
 async def test_the_reconciler_disable_notice_carries_the_revoke_count() -> None:
     """The reconciler's success path puts the revoke's count on every notice it sends."""
     store, service, user, _target = await _reconciled_jdoe()

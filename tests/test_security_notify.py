@@ -380,11 +380,12 @@ def test_a_disable_notice_says_sessions_ended_only_on_evidence(
         assert _DIRECTORY_LINE not in lines
 
 
-def test_a_role_revocation_that_wrote_no_role_says_the_groups_were_read() -> None:
+def test_a_role_revocation_that_wrote_no_role_says_what_the_pass_did() -> None:
     """BACKLOG #6034. A reconciler role revocation that wrote no role sends
-    ``directory_sessions_ended``. That pass read the account's groups, so the whole-account wording
-    ("could not confirm ... may still sign in") would read as a possible disable; it says what the
-    pass did instead, and claims no role change."""
+    ``directory_sessions_ended``. That pass found the account in the directory, so the
+    whole-account wording ("could not confirm ... may still sign in") would read as a possible
+    disable; it says what the pass did instead, claims no role change, and names no group as the
+    cause, since an unverified map reaches it too."""
     event = SecurityEvent(
         DIRECTORY_SESSIONS_ENDED,
         username="jdoe",
@@ -393,11 +394,12 @@ def test_a_role_revocation_that_wrote_no_role_says_the_groups_were_read() -> Non
     )
     body = _build_body(event)
     assert (
-        "MessageFoundry read your groups in your organization's directory and ended your sessions."
-        in body.splitlines()
+        "MessageFoundry ended your sessions while checking your account's roles against your "
+        "organization's directory." in body.splitlines()
     )
     assert "could not confirm" not in body.lower()
-    assert "roles" not in body.lower()
+    assert "groups" not in body.lower()
+    assert "changed your" not in body.lower()
     assert _subject(event) == "Your MessageFoundry sessions were ended"
 
 
