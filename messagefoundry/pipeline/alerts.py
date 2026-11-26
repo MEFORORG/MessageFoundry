@@ -1043,8 +1043,10 @@ class AlertSink(Protocol):
         ...
 
     def dr_restarted_passive(self, node: str) -> None:
-        """A DR box that was last **activated** came back up **passive** after a restart (BACKLOG
-        #5965, ADR 0048). It serves nothing and never re-activates itself: an operator re-runs
+        """A DR box whose newest own activate or release record is an **activation** started
+        **passive** (BACKLOG #5965, ADR 0048), so it may have been serving when it went down; a
+        store restored from a snapshot taken while it was activated reads the same. It serves
+        nothing and never re-activates itself: an operator re-runs
         ``POST /dr/activate``. Also raised when the start could not read whether the box was
         activated. Page-worthy, and CRITICAL unless a matching rule names its own severity. It
         closes the open ``dr_activated`` instance for ``node``, which no longer describes a box
@@ -1658,9 +1660,9 @@ class LoggingAlertSink:
 
     def dr_restarted_passive(self, node: str) -> None:
         log.critical(
-            "ALERT dr_restarted_passive: DR box %r came back up PASSIVE after a restart and may "
-            "have been serving -- the ERROR line before this says whether it was last activated. It "
-            "serves nothing until POST /dr/activate; POST /dr/release records that it stays passive",
+            "ALERT dr_restarted_passive: DR box %r started PASSIVE and may have been serving when "
+            "it went down -- the ERROR line before this says what its store shows. It serves "
+            "nothing until POST /dr/activate; POST /dr/release records that it stays passive",
             node,
         )
 

@@ -2045,9 +2045,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         self._record_state({"type": "dr_restart_cleared", "connection": node}, "info")
 
     def dr_restarted_passive(self, node: str) -> None:
-        # BACKLOG #5965 (ADR 0048): a box that was last activated came back up passive. The open
-        # dr_activated no longer describes a box that serves, so it is closed through its own
-        # inverse, and the critical instance that replaces it is raised. Node label only, no PHI.
+        # BACKLOG #5965 (ADR 0048): a box whose newest own record is an activation started
+        # passive. The open dr_activated no longer describes a box that serves, so it is closed
+        # through its own inverse, and the critical instance that replaces it is raised. Node
+        # label only, no PHI.
         self._record_state({"type": "dr_released", "connection": node}, "info")
         self._emit({"type": "dr_restarted_passive", "connection": node, "node": node})
 

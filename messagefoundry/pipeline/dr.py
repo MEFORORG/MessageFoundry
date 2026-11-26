@@ -363,9 +363,8 @@ class DrCoordinator:
         and ``POST /dr/activate`` stays the only route back to serving. When the newest
         :data:`_TRANSITIONS` row this process wrote (same host, same identity) is a
         ``dr.activate``, the box may have been serving when it went down, so this logs at ERROR
-        (worded to cover the snapshot case below as well) and raises
-        the critical ``dr_restarted_passive`` alert, which also closes the open ``dr_activated``
-        for the same label. Each engine shard reads only the rows its own identity wrote, so each
+        and raises the critical ``dr_restarted_passive`` alert, which also closes the open
+        ``dr_activated`` for the same label. Each engine shard reads only the rows its own identity wrote, so each
         alerts on its own. A store that cannot be read is the same loud outcome, since the box may
         have been serving. ``POST /dr/release`` on the passive box records that the operator
         leaves it passive, and closes the alert (:meth:`_record_stay_passive`). Returns whether
@@ -392,14 +391,14 @@ class DrCoordinator:
         else:
             if last != _ACTION_ACTIVATE:
                 return False
-            # Worded for both causes: a store rebuilt from this box's own snapshot also ends on a
-            # dr.activate row, even when the box was released after that snapshot was taken.
             log.error(
-                "DR: this box's (%s) newest DR record in its store is an activation: it went "
-                "down while serving, or its store was restored from a snapshot taken while it "
-                "was. It has started PASSIVE, serves nothing and does not re-activate itself; "
-                "re-run POST /dr/activate to serve the priority feeds again, or POST /dr/release "
-                "to record that it stays passive",
+                "DR: the newest activate or release record this process (%s) wrote to its store "
+                "is an activation, so it may have been serving when it went down. A store "
+                "restored from a snapshot taken while it was activated, a release whose record "
+                "was never written, and an earlier start that already came back passive read "
+                "the same way. It has started PASSIVE, serves nothing and does not re-activate "
+                "itself; re-run POST /dr/activate to serve the priority feeds again, or POST "
+                "/dr/release to record that it stays passive",
                 self._label(),
             )
         self._restart_alerted = True
