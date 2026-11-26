@@ -5216,7 +5216,7 @@ class SqlServerStore(ServerCipherWalk):
                         except Exception as exc:  # noqa: BLE001 - the ALTER meets a dead session
                             # A peer's ROLLBACK IMMEDIATE may have killed the session; the cursor
                             # open or the ALTER then fails in the caller's handler.
-                            log.debug("options cursor close failed: %s", _options_error(exc))
+                            log.debug("options cursor close failed (%s)", type(exc).__name__)
                     _bound_one_shot(conn, limit)
                     cur_limit = limit
                     cur = await conn.cursor()
