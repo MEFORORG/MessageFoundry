@@ -72,6 +72,7 @@ _LINKS: dict[str, int | None] = {
     "VaultSecretProvider": None,
     # both dispatches, and both providers' entry points
     "_load_external_provider": 2,
+    "_build_external_provider": 3,
     "build_provider": None,
     # the client build and the guard
     "_build_client": None,
@@ -326,7 +327,15 @@ _CENSUS: list[Row] = sorted(
         # BACKLOG #2903: the startup Vault privilege preflight probes with the serve posture.
         ("api/app.py", "create_managed_app.lifespan", "probe_vault", "_hop_posture"),
         ("api/app.py", "create_managed_app.lifespan", "resolve_secret_provider", "_hop_posture"),
-        ("config/secretprovider.py", "_load_external_provider", "build_provider", "posture"),
+        # vault BACKLOG #6709: the dispatch hands its posture to the step that calls the
+        # provider's build_provider, so a fault in construction is refused by class.
+        ("config/secretprovider.py", "_build_external_provider", "build_provider", "posture"),
+        (
+            "config/secretprovider.py",
+            "_load_external_provider",
+            "_build_external_provider",
+            "posture",
+        ),
         (
             "config/secretprovider.py",
             "resolve_secret_provider",
