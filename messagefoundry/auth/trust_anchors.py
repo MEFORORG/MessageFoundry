@@ -1705,15 +1705,21 @@ def _pin_offer(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
 
 
 def _past_the_mount(spec: AnchorSpec, verdict: AnchorVerdict, mount: str) -> str:
-    """Where :func:`_mount_over_folder` found ``mount``: no folder below it, then what is left, which
-    is a pin (:func:`_pin_offer`), and only for an anchor whose consumer loads the verified bytes."""
-    head = (
-        f"The check cannot vouch for the mount at {mount!r}, so no location below it passes, and "
-        "moving the anchor does not help."
-    )
+    """Where :func:`_mount_over_folder` found ``mount``: no folder below it, then the pin
+    (:func:`_pin_offer`), only for an anchor whose consumer loads the verified bytes. Only ``/``,
+    which an unread mount table also names, leaves no folder to move to."""
+    head = f"The check cannot vouch for the mount at {mount!r}, so no location below it passes"
+    if mount == "/":
+        head, pin = f"{head}, and moving the anchor does not help.", "What is left is a pin"
+    else:
+        head = (
+            f"{head}. Move the anchor to a folder on a file system the check trusts, outside that "
+            "mount."
+        )
+        pin = "Or use a pin"
     if spec.loads_verified_bytes:
         return (
-            f"{head} What is left is a pin: {_pin_offer(spec, verdict)} Where that mount is an overlay '/' in a "
+            f"{head} {pin}: {_pin_offer(spec, verdict)} Where that mount is an overlay '/' in a "
             f"container, {_OVERLAY_NOTE}, says more."
         )
     return (
@@ -1782,7 +1788,10 @@ def _path_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> list[str]:
         tail = "Once the path is fixed, the check still cannot settle the anchor. "
         tail += _past_the_mount(spec, verdict, mount)
         return (["Fix it in place:", *cmds] if cmds else []) + [tail]
-    lead = move + f"can change, such as a root-owned 755 folder like {_POSIX_FOLDER}."
+    lead = (
+        move + f"can change, such as a root-owned 755 folder like {_POSIX_FOLDER} on a file system "
+        "the check trusts."
+    )
     return [lead + " Or, to fix it in place:", *cmds] if cmds else [lead]
 
 
@@ -1819,9 +1828,11 @@ def _indeterminate_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
 
 def _indeterminate_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
     """The two ways out of an indeterminate read: a folder the engine can read, or a pin. Under a
-    mount :func:`_mount_over_folder` finds, no folder is offered. The pin is
+    mount :func:`_mount_over_folder` finds, no folder below it is offered. The pin is
     offered with this file's own digest, and with the warning that goes with it: pinning bytes the
-    engine could not vouch for is only as good as the operator's check of them."""
+    engine could not vouch for is only as good as the operator's check of them. The digest is left
+    out where the path was found replaceable (``path_ok`` False), since those bytes may be
+    substituted (:func:`_pin_offer`)."""
     check = verdict.path_check
     windows = check.platform == "windows" if check is not None else os.name == "nt"
     mount = _mount_over_folder(verdict)

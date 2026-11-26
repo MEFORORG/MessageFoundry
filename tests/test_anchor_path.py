@@ -898,6 +898,11 @@ def test_a_mount_above_the_suggested_folder_leaves_no_folder_to_move_to(
         assert f"the mount at {mount!r}" in text, text
         order = [text.index(s) for s in (_MOUNT_NOTE, step, "docker/README.md")]
         assert order == sorted(order), text
+        # Only '/', or an unread table that names it, leaves nowhere to move to; under '/etc' a
+        # trusted file system outside that mount still passes. Red where '/etc' said moving fails.
+        stuck = "moving the anchor does not help" in text
+        outside = "on a file system the check trusts, outside that mount" in text
+        assert (stuck, outside) == ((True, False) if mount == "/" else (False, True)), text
     assert "at enforce this check refuses it anywhere below that mount" in by_path
 
 
