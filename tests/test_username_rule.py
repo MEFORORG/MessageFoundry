@@ -120,8 +120,11 @@ ACCEPTED = [
     "cli",
     "client",
     "sysadmin",
-    # What the module docstring says the rule admits: a space separator inside the name.
+    # What the module docstring says the rule admits: a space separator inside the name, and
+    # same-script lookalikes, a dotless i and the modifier low arrowheads.
     "a\u3000b",
+    "cl" + chr(0x0131) + ":root",
+    chr(0x02F1) + "oidc" + chr(0x02F2),
     # Controls for LOOKALIKE_DELIMITERS: a lookalike delimiter outside a reserved form.
     "sys\u2236tem",
     "\u2039bob",
