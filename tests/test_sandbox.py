@@ -18,6 +18,7 @@ import logging
 import math
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -337,6 +338,79 @@ def test_forbidden_import_is_denied_and_worker_survives(graph: tuple[Registry, s
         ) == _deliveries(registry, "h_ok")
     finally:
         session.close()
+
+
+_VERIFY_GRAPH = """
+from messagefoundry import inbound, outbound, router, handler, MLLP, Send
+from messagefoundry.parsing.xml import verify
+
+inbound("IB_V", MLLP(port=19317), router="r_v")
+outbound("OB_V", MLLP(host="127.0.0.1", port=19318))
+
+_DOC = __DOC__
+_CERT = __CERT__
+
+
+@router("r_v")
+def r_v(msg):
+    return "h_verify"
+
+
+@handler("h_verify")
+def h_verify(msg):
+    return Send("OB_V", f"verified={verify(_DOC, x509_cert=_CERT).verified}")
+
+
+@handler("h_verify_catch")
+def h_verify_catch(msg):
+    try:
+        result = verify(_DOC, x509_cert=_CERT)
+    except RuntimeError as exc:
+        return Send("OB_V", f"caught {type(exc).__name__}: {exc}")
+    return Send("OB_V", f"verified={result.verified}")
+"""
+
+
+def test_xml_signature_verify_fails_closed_in_a_sandbox_worker(tmp_path: Path) -> None:
+    """Pins the documented #6812 behaviour: ``verify()`` raises ``SandboxError`` in a worker.
+
+    ``docs/CONFIGURATION.md`` ``[sandbox]`` and the ``verify()`` docstring promise that, under the
+    default forbidden-import set, a Handler calling ``verify()`` reaches the ``cryptography`` import the
+    guard blocks, so the call fails closed with ``SandboxError``, which a Handler catching
+    ``RuntimeError`` also catches. The document is a valid signature over a synthetic body, and the
+    in-process arm is the positive control: it verifies, so the worker arm's failure is the guard and
+    not the payload. A change that let ``verify()`` run in a worker, or that changed the error, fails
+    here, and the docs must change with it (vault BACKLOG #6812)."""
+    pytest.importorskip(
+        "signxml", reason="the [xml] extra (signxml + cryptography) is not installed"
+    )
+    from tests.test_xml_signature_coverage import _BODY, _cert_pem, _sign
+
+    denied = r"import of 'cryptography[.\w]*' is forbidden inside the sandbox"
+
+    source = _VERIFY_GRAPH.replace("__DOC__", repr(_sign(_BODY))).replace(
+        "__CERT__", repr(_cert_pem())
+    )
+    (tmp_path / "graph.py").write_text(source, encoding="utf-8")
+    registry = load_config(tmp_path)
+
+    # Positive control: in process, both Handlers verify the same document.
+    assert _deliveries(registry, "h_verify") == [("OB_V", "verified=True")]
+    assert _deliveries(registry, "h_verify_catch") == [("OB_V", "verified=True")]
+
+    session = _session(str(tmp_path), inbound="IB_V")
+    try:
+        # Left uncaught, the guard's error fails the message's call as an isolation denial.
+        with pytest.raises(SandboxError, match=denied):
+            _deliveries(registry, "h_verify", sandbox=session, run_context=RunContext())
+        # SandboxError is a RuntimeError, so a Handler catching RuntimeError sees it as one.
+        [(to, payload)] = _deliveries(
+            registry, "h_verify_catch", sandbox=session, run_context=RunContext()
+        )
+    finally:
+        session.close()
+    assert to == "OB_V"
+    assert re.fullmatch(rf"caught SandboxError: {denied} .*", payload), payload
 
 
 # --- (c) resource cap: a runaway is capped, intake is not wedged --------------
