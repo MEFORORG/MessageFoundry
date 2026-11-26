@@ -792,7 +792,15 @@ Manager's watch reached the cloud session 29 seconds after its question.
   what goes to the owner with it. The owner's instruction of 2026-11-26, quoted in the
   repair-Builder paragraph above, named no finding; the rule was set in the Lander's brief written
   under it, and the owner directed the Manager to follow that brief exactly (2026-11-26, in the
-  Manager's chat).
+  Manager's chat). Register row text, signed or drafted for signing, is outside that safe-direction
+  exception, whichever direction it is false in (decided by the Lander under the owner's delegation
+  of 2026-11-26, record d20261126T225830018-38a483: asked *"Should the safe-direction carve-out
+  exclude register text the owner signs? Reply A or B"*, the owner answered *"/driver"*). A
+  falsehood in signed register text goes to the owner as a void-or-correction question. A falsehood
+  in a draft row is fixed, or disclosed in the signing guide, before the row is put up for
+  signature; it blocks the signing, not the merge. A PR that records an owner signature holds on
+  such a finding. A dated marker stays under the exception, except a marker that reads an
+  acceptance as void or fired, which goes to the owner.
   **Ledger ruling R2 (owner-signed 2026-11-04, in session: *"Sign R1-R9"*) changes how the findings
   are filed, and the Lander reads it as setting when.** A merged PR files at most one row, holding
   its open findings as numbered items. Its deferred scope becomes steps on the row it cites, or is
