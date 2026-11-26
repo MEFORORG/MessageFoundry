@@ -3279,16 +3279,20 @@ def test_the_outside_lines_print_their_value_under_the_denylist_tail(
     """THE POSITIVE CONTROL. With the tail put back to the round-2 denylist, each line prints its
     value in the bundle and on the store path.
 
-    The second line's value is spelled ``vq7_code`` here. Its fuzz spelling, ``vq7code``, glues the
-    planted value to ``code`` where no label may open, and since BACKLOG #8429 the member mask the
-    denylist tail writes with masks such a word, so it no longer prints under that tail either. With
-    a label prefix's "_" before ``code`` the mask keeps the word, as it kept ``vq7code`` before."""
-    _restore_an_earlier_tail(monkeypatch)
+    The second line's value is spelled ``vq7.code`` here. Its fuzz spelling, ``vq7code``, glues the
+    planted value to ``code`` where no reader opens, and since BACKLOG #8429 the member mask the
+    denylist tail writes with masks such a word, so it no longer prints under that tail either.
+    With a "." before ``code``, where the query filter's ``\\b`` opens, the mask keeps the word, as
+    it kept ``vq7code`` before. The shipped reading still hides it, which the pinned test above
+    holds for the fuzz spelling."""
     lines = [
-        (line.replace("vq7code", "vq7_code"), value.replace("vq7code", "vq7_code"), *rest)
+        (line.replace("vq7code", "vq7.code"), value.replace("vq7code", "vq7.code"), *rest)
         for line, value, *rest in _OUTSIDE_THE_ALLOWLIST_LINES
     ]
-    assert lines[1][1] == "vq7_code"
+    assert lines[1][1] == "vq7.code"
+    # With the shipped tail the respelled line is hidden too, so the control below is a control.
+    assert "vq7" not in redact_log_line(lines[1][0]) and "vq7" not in _store_detail(lines[1][0])
+    _restore_an_earlier_tail(monkeypatch)
     for line, value, _, _ in lines:
         for surface, out in (("bundle", redact_log_line(line)), ("store", _store_detail(line))):
             assert value in out, f"{surface}: {line!r} hid -- got {ascii(out)}"

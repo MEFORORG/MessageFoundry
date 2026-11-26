@@ -839,7 +839,7 @@ _UNSCANNABLE_RE_PATTERNS = {
     # walks from two starts never overlap. ``_without_escape``'s compile, the third ``source``, is a shipped pattern with
     # the escape start's three fixed-width lookbehinds removed, which removes start positions only.
     "messagefoundry/secretscrub.py": (
-        "'(?i)\\\\\\\\(?:[bfnrt]|x[0-9a-f]{2}|u[0-9a-f]{4})' + _LABEL_PREFIX + '(?:' + _alternation(_CAMEL_WORDS) + ')\\\\b'",
+        "'(?i)\\\\\\\\(?-i:[bfnrt]|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})' + _LABEL_PREFIX + '(?:' + _alternation(_CAMEL_WORDS) + ')\\\\b'",
         "'(?i)(-----BEGIN (?:(?!PRIVATE )[A-Z0-9]++ )*+PRIVATE KEY-----)(?P<key_body>(?:[ \\\\t]*+' + _KEY_SEPARATOR + _KEY_LINE + '[ \\\\t]*+(?=' + _KEY_SEPARATOR + '|\\\\Z))++)'",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_TOKEN_WORDS) + '))\\\\b(?:[\\'\\\\\"]\\\\s*:|\\\\s*[:=])\\\\s*' + _MARKED_SCHEME_WORDS + _BYTES_PROBE + '(?:' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_VALUE + ')' + _BEARER_TAILS",
         "'(?i)' + _LABEL_START + '(bearer)\\\\s+(?=[\\'\\\\\"]?[^\\\\s\\'\\\\\",;]{4})' + _PLAIN_SCHEME_VALUE",

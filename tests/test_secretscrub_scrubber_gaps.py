@@ -263,6 +263,14 @@ def test_the_escape_start_is_part_of_the_reading_the_union_checks() -> None:
         # read the scheme word and took ``secret:`` as its credential, and the value printed.
         "x\\tBearer secret: Zq7Vw9Kp2",
         ';AccessToken=^"c3q;d4q"\\tBearer secret: mfb64:v1:\\tZq7Vw9Kp2Token=',
+        # Code review: checked against the reading before BACKLOG #5545 alone, an escape label's
+        # value ran over a later camelCase or compound label ``origin/main`` read, and over a
+        # later member key the bundle's member pass reads.
+        "ValueError('bad config:\\ntoken=xyz,accountKey: Zq7Vw9Kp2')",
+        '{"err": "bad\\nsession=abc;userPassword: Zq7Vw9Kp2"}',
+        "x\\ntoken=abc/clientSecret: Zq7Vw9Kp2",
+        "config\\ntoken=abc;Pwd=Zq7 Vw9Kp2",
+        "config\\ntoken=abc;PWD=Zq7 Vw9Kp2;",
     ],
 )
 def test_a_scheme_word_after_an_escape_does_not_take_a_later_label(line: str) -> None:
@@ -287,3 +295,41 @@ def test_no_fragment_prints_on_a_later_redaction(line: str) -> None:
     line the bundle reads back, and store error text. Each line is hidden on all nine."""
     paths = _every_redaction_path(line)
     assert {path: out for path, out in paths.items() if _printed(out)} == {}
+
+
+@pytest.mark.parametrize(
+    ("line", "read"),
+    [
+        # The escape letter is read case-sensitively: ``\N`` is no escape (code review).
+        ("C:\\Temp\\Npassword=Zq7Vw9Kp2", False),
+        # Python's eight-digit escape opens a label too.
+        ("x\\U0001f600password=Zq7Vw9Kp2", True),
+    ],
+)
+def test_the_escape_letter_is_read_as_python_writes_it(line: str, read: bool) -> None:
+    for surface, apply in _SURFACES:
+        assert (not _printed(apply(line))) == read, surface
+
+
+@pytest.mark.parametrize("word", ["SecretName", "UserName", "ZipCode", "x_name", "x_state"])
+@pytest.mark.parametrize(("surface", "apply"), _SURFACES, ids=_SURFACE_IDS)
+def test_a_phi_or_query_word_glued_inside_a_password_word_is_masked(
+    surface: str, apply: Callable[[str], str], word: str
+) -> None:
+    """A query-filter key or a PHI anchor is read only at a word boundary, so a password word that
+    ends in one after a capital or a "_" is masked (code review)."""
+    out = apply(f"DRIVER={{Acme}};sslpassword={word}:Zq7Vw9Kp2;PORT=1")
+    assert word not in out and not _printed(out), f"{surface}: {out!r}"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        '{"conn": "Server=h;sslpassword=\'Zq7;Vw9 Kp2\'"}',
+        'Server=h;sslpassword="Zq7;Vw9 Kp2"\'',
+        "<Server=h;sslpassword='Zq7;Vw9 Kp2'>",
+    ],
+)
+def test_a_quoted_member_value_closed_before_an_outer_quote_is_masked(line: str) -> None:
+    for surface, apply in _SURFACES:
+        assert not _printed(apply(line)), surface
