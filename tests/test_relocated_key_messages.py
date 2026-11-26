@@ -584,11 +584,10 @@ def test_the_two_fixed_refusals_name_the_key_the_loader_accepts() -> None:
     # scaffolder emits a `messagefoundry.toml` as well as a README: a commented
     # `# handles_real_patient_data = true` line under a `[security]` header is an instruction, and
     # uncommenting it fails the next start. That is how two such lines survived the first pass.
-    # It matches the ASSIGNMENT shape (`key =`), as tests/test_docs_cite_no_refused_config_keys.py
-    # does: a bare substring read the venv line `. .venv/bin/activate` as the removed
-    # [dr].activate (BACKLOG #5965).
+    # A match must be a whole word and not a path segment: the venv line `. .venv/bin/activate`
+    # is not the removed [dr].activate (BACKLOG #5965).
     for _section, removed_key in _REMOVED_KEYS:
-        assert not re.search(rf"\b{re.escape(removed_key)}\s*=", scaffold_src), (
+        assert not re.search(rf"(?<![\w/]){re.escape(removed_key)}(?!\w)", scaffold_src), (
             f"the scaffolder emits {removed_key!r}, which the loader REFUSES outright. It was removed "
             "rather than relocated, so there is no replacement spelling to point at -- say what the "
             "operator should do instead."

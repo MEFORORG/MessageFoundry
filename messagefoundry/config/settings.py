@@ -7850,7 +7850,7 @@ class DrSettings(_Section):
     # The one directory a POST /dr/activate request body may name an archive under (vault BACKLOG
     # #2581). "" (the default) = a request may name NO archive, and activation uses seed_archive,
     # which is operator configuration and is not confined. Must be absolute. A URL is
-    # rejected, like seed_archive. With seed_archive also empty, a passive box is refused at load;
+    # rejected, like seed_archive. With seed_archive also empty, an enabled box is refused at load;
     # see seed_archive above (BACKLOG #5965). Whitespace-only is refused too.
     seed_dir: str = ""
     # OPT-IN server-DB DR restore-token (BACKLOG #223, ADR 0102 — option b). A LOCAL/UNC path to a small
