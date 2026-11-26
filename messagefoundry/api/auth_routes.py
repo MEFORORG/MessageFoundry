@@ -307,9 +307,11 @@ async def _service(request: Request) -> AuthService:
 
 
 async def _arrival() -> float:
-    """The wall-clock moment a route's dependencies began to be solved, for ``POST /auth/logout``
-    (BACKLOG #3715). Wall clock, because the store stamps a lineage link with ``time.time()``."""
-    return time.time()
+    """The moment a route's dependencies began to be solved, for ``POST /auth/logout`` (BACKLOG
+    #3715), on the monotonic clock. The sign-out measures only the time since it, and the store
+    measures the window on its own clock (vault BACKLOG #4276), so a wall-clock step between the
+    two readings must not move it."""
+    return time.monotonic()
 
 
 def _current_user(identity: Identity) -> CurrentUser:

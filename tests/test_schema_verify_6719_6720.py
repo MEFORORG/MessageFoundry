@@ -198,6 +198,192 @@ async def test_a_counted_store_whose_salt_is_a_readable_foreign_object_gets_the_
         assert await _counts_under_a_dek(db) is True
 
 
+async def test_a_virtual_outbox_is_not_folded_into_the_queue(tmp_path: Path) -> None:
+    """BACKLOG #6719 item 4: the legacy-outbox fold uses the ordinary-table predicate, so an
+    unloaded virtual table named ``outbox`` is left alone rather than read, which raised."""
+    path = tmp_path / "vt-outbox.db"
+    _sql(path, "CREATE TABLE t (a TEXT)")
+    _plant_unloaded_virtual_table(path, "outbox")
+    async with _connected(path) as db:
+        with pytest.raises(sqlite3.OperationalError, match="no such module"):
+            await db.execute("SELECT COUNT(*) FROM outbox")  # control: reading it raises
+        await MessageStore._migrate_outbox_to_queue(db)  # nothing to fold, and no raise
+    # A case variant another tool left is not the legacy table either: it is neither read nor
+    # dropped, as on origin/main.
+    variant = tmp_path / "variant-outbox.db"
+    _sql(variant, "CREATE TABLE Outbox (a TEXT)", "INSERT INTO Outbox VALUES ('x')")
+    async with _connected(variant) as db:
+        await MessageStore._migrate_outbox_to_queue(db)
+        async with db.execute("SELECT count(*) FROM Outbox") as cur:
+            assert await cur.fetchone() == (1,)
+
+
+def _salt_objects(path: Path) -> list[tuple[str, str]]:
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute(
+            "SELECT type, sql FROM sqlite_master WHERE name = 'store_salt'"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_forget_store_salt_refuses_a_virtual_salt_table_and_leaves_it(tmp_path: Path) -> None:
+    """BACKLOG #6719 item 4: an unloaded virtual ``store_salt`` is not this build's salt table. It
+    is not probed, so the call raises its own refusal naming the type, not "no such module", and
+    the table is left as it was."""
+    from messagefoundry.store.store import forget_store_salt
+
+    path = tmp_path / "vt-salt.db"
+    _sql(path, "CREATE TABLE t (a TEXT)")
+    _plant_unloaded_virtual_table(path, "store_salt")
+    before = _salt_objects(path)
+    with pytest.raises(
+        sqlite3.OperationalError, match="^store_salt is a virtual table, not this build"
+    ):
+        forget_store_salt(path)
+    assert _salt_objects(path) == before
+    # Control: an ordinary salt table holding a row is still dropped.
+    other = tmp_path / "salt.db"
+    _sql(other, "CREATE TABLE store_salt (salt TEXT)", "INSERT INTO store_salt VALUES ('s')")
+    assert forget_store_salt(other) is True
+    # SQLite resolves the name case-blind, so a case variant is the salt the next open reads.
+    variant = tmp_path / "variant.db"
+    _sql(variant, "CREATE TABLE Store_Salt (salt TEXT)", "INSERT INTO Store_Salt VALUES ('s')")
+    assert forget_store_salt(variant) is True
+    conn = sqlite3.connect(variant)
+    try:
+        assert conn.execute("SELECT count(*) FROM store_salt").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+_VIRTUAL_SALT_SQL = "CREATE VIRTUAL TABLE store_salt USING no_such_module(x)"
+_VIEW_SALT_SQL = "CREATE VIEW store_salt AS SELECT 's' AS salt"
+
+
+@pytest.mark.parametrize(
+    ("foreign", "kind", "planted"),
+    [("virtual", "table", _VIRTUAL_SALT_SQL), ("view", "view", _VIEW_SALT_SQL)],
+)
+async def test_forget_store_salt_refuses_a_foreign_salt_object_and_leaves_it(
+    tmp_path: Path, foreign: str, kind: str, planted: str
+) -> None:
+    """A store copy whose salt name is held by another tool's object: nothing is dropped and
+    nothing is proven, so the call fails closed with a refusal naming the object's type, rather
+    than return a False a restore would read as "nothing to forget" and go on to place the copy.
+    The object stays, so the next writable open still refuses the copy."""
+    from messagefoundry.store.store import forget_store_salt
+
+    path = tmp_path / f"{foreign}-copy.db"
+    await _fresh(path)
+    _sql(path, "DROP TABLE store_salt")
+    if foreign == "virtual":
+        _plant_unloaded_virtual_table(path, "store_salt")
+    else:
+        _sql(path, planted)
+    named = "a virtual table" if foreign == "virtual" else "a view"
+    with pytest.raises(sqlite3.OperationalError, match=f"^store_salt is {named}, not this build"):
+        forget_store_salt(path)
+    # The planted object is left in the copy exactly as it was: neither dropped nor replaced.
+    assert _salt_objects(path) == [(kind, planted)]
+    # A read-only open logs the difference and opens; the writable open is the one that refuses.
+    await (await MessageStore.open(path, read_only=True)).close()
+    with pytest.raises(SchemaMismatchError, match="table 'store_salt' is missing"):
+        await _fresh(path)
+
+
+def test_forget_store_salt_refuses_an_index_holding_the_salt_name(tmp_path: Path) -> None:
+    """An index shares the table namespace, so one named ``store_salt`` blocks the table as a view
+    does, and is refused the same way, case-blind on the name."""
+    from messagefoundry.store.store import forget_store_salt
+
+    path = tmp_path / "index-copy.db"
+    _sql(path, "CREATE TABLE t (a TEXT)", "CREATE INDEX Store_Salt ON t (a)")
+    with pytest.raises(sqlite3.OperationalError, match="^store_salt is an index, not this build"):
+        forget_store_salt(path)
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute(
+            "SELECT type FROM sqlite_master WHERE name = 'Store_Salt'"
+        ).fetchall() == [("index",)]
+    finally:
+        conn.close()
+
+
+async def test_forget_store_salt_ignores_a_trigger_named_like_the_salt_table(
+    tmp_path: Path,
+) -> None:
+    """A trigger has a namespace of its own: one named ``store_salt`` does not stop the writable
+    open creating the salt table, so the call does not refuse on it. With no salt table it returns
+    False, and beside an ordinary salt table holding a row it drops the row as usual."""
+    from messagefoundry.store.store import forget_store_salt
+
+    trigger = "CREATE TRIGGER Store_Salt AFTER INSERT ON t BEGIN SELECT 1; END"
+    bare = tmp_path / "trigger-only.db"
+    _sql(bare, "CREATE TABLE t (a TEXT)", trigger)
+    assert forget_store_salt(bare) is False
+    await _fresh(bare)  # the premise: the trigger does not stop the writable open
+    beside = tmp_path / "trigger-beside.db"
+    await _fresh(beside)
+    _sql(
+        beside,
+        "CREATE TABLE t (a TEXT)",
+        trigger,
+        "INSERT INTO store_salt (id, salt, created_at) VALUES (1, 's', 0)",
+    )
+    assert forget_store_salt(beside) is True
+    conn = sqlite3.connect(beside)
+    try:
+        assert conn.execute("SELECT count(*) FROM store_salt").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+async def test_forget_store_salt_true_on_an_ordinary_salt_row_and_the_copy_opens(
+    tmp_path: Path,
+) -> None:
+    """Control for the test above: a store copy whose ordinary ``store_salt`` holds a row has it
+    dropped, and the copy then opens."""
+    from messagefoundry.store.store import forget_store_salt
+
+    path = tmp_path / "ordinary-copy.db"
+    await _fresh(path)
+    _sql(path, "INSERT INTO store_salt (id, salt, created_at) VALUES (1, 's', 0)")
+    assert forget_store_salt(path) is True
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("SELECT count(*) FROM store_salt").fetchone()[0] == 0
+    finally:
+        conn.close()
+    await _fresh(path)
+
+
+async def test_the_census_reads_tables_through_the_schema_checks_predicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6719 item 5: ``table_occupancy`` selects its tables with ``_ORDINARY_TABLE`` itself,
+    not a copy of it that could drift, and still leaves out an unloaded virtual table."""
+    import messagefoundry.store.store as store_mod
+
+    path = tmp_path / "census.db"
+    await _fresh(path)
+    _plant_unloaded_virtual_table(path, "vt")
+    store = await MessageStore.open(path)
+    try:
+        occupancy = await store.table_occupancy()
+        assert "vt" not in occupancy and "messages" in occupancy
+        assert getattr(store_mod, "_ORDINARY_TABLE") is _ORDINARY_TABLE  # noqa: B009 -- not re-exported
+        # The census reads the shared name at call time: narrowing it narrows the census.
+        monkeypatch.setattr(
+            store_mod, "_ORDINARY_TABLE", f"{_ORDINARY_TABLE} AND m.name <> 'users'"
+        )
+        narrowed = await store.table_occupancy()
+    finally:
+        await store.close()
+    assert "users" in occupancy and "users" not in narrowed
+
+
 #: Every table with a flag saying whether it is virtual, so one walk both counts the tables it saw
 #: and finds the virtual ones (a virtual table's ``type`` is ``table`` too). The flag is the module's
 #: own predicate, so the pin and the reads it guards cannot disagree (BACKLOG #6719 item 9).

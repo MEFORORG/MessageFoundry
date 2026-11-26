@@ -215,9 +215,13 @@ and uses your user value or the default instead, until you trust the workspace (
   command, New Route, version-control setup and the security editor. A user value does not lift
   that refusal; to use a path elsewhere, remove the workspace value and set the path in user
   settings. Version-control setup writes no commit hook when either folder lies outside the
-  workspace, because the hook is committed; it still sets up the rest. Readers compare the spelling
-  only. Writers also check the real path, in a trusted window. They refuse a value spelled inside the
-  folder when at least one of these holds:
+  workspace, because the hook is committed; it still sets up the rest. Most readers compare the
+  spelling only. Writers also check the real path, in a trusted window, and so do at least three
+  readers of `serviceConfig` that hand the file to the engine CLI: the alert list, engine trust's
+  `cert inventory` and the offline AI policy. None of them runs the CLI on a refused value. The
+  alert list and `cert inventory` say so; the offline AI policy then has no CLI answer, so it is
+  decided as with no CLI at all, and no notice names the cause. The real-path check refuses a value spelled inside the folder when at least one of these
+  holds:
   - a symbolic link or junction on the named path leads out of the folder;
   - the value climbs with `..`;
   - its real path cannot be read;
@@ -230,8 +234,9 @@ and uses your user value or the default instead, until you trust the workspace (
   The fix is a plain folder or file inside the workspace folder. Commands other than New Route and
   the commit hook also take a link's target as an absolute path in user settings, once any
   workspace value for the setting is removed, since a workspace value wins. For a set but
-  blank `serviceConfig`, the check reads the CLI's own fallback, `messagefoundry.toml` in the
-  workspace folder. The check reads the named path only, so a link below it is still followed, such
+  blank `serviceConfig`, the writers' check and the offline AI policy's read the CLI's own
+  fallback, `messagefoundry.toml` in the workspace folder; the alert list and `cert inventory`
+  check nothing for a blank value. The check reads the named path only, so a link below it is still followed, such
   as a linked folder under `configDir`. The security editor does not run this check. It makes its
   own: it collapses a `..` rather than refusing it, and it refuses a link anywhere on the named
   path below the workspace folder. On Windows it also refuses a name that ends in a dot or a space, holds a colon, or is a device name.
@@ -292,7 +297,7 @@ The engine always serves TLS. When no certificate chain is configured it mints a
 its first run and writes it beside the store database. Nothing trusts that certificate by default, so
 the extension asks the engine where it is and verifies against it:
 
-1. It runs `messagefoundry cert inventory --service-config <your messagefoundry.serviceConfig> --json`,
+1. It runs `messagefoundry cert inventory --service-config=<your messagefoundry.serviceConfig> --json`,
    which reports the scheme the API bind serves and the certificate it presents.
 2. It reads that certificate and uses it as the trust anchor for `messagefoundry.engineUrl`.
 
@@ -304,7 +309,8 @@ This happens at startup and again whenever you change `messagefoundry.engineUrl`
 workspace, or a `serviceConfig` that names nothing, the extension simply trusts nothing extra. A
 workspace `serviceConfig` that names a path outside the workspace folder, or a user value that is not
 text, is not replaced by another file here: the extension runs no `cert inventory`, trusts no engine
-certificate from it, and says so in the MessageFoundry Engine output. A `caFile` pin still applies.
+certificate from it, and says so in the MessageFoundry Engine output. The same holds for a value
+spelled inside the folder that the real-path check above refuses. A `caFile` pin still applies.
 
 If a request reports that it cannot verify the certificate, check two things: that
 `messagefoundry.serviceConfig` names the settings TOML of the engine you are pointing at, and that

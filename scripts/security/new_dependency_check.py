@@ -110,7 +110,8 @@ or ``uv.toml`` beside it, could not be read or parsed; the default sweep's root 
 failed (a transient failure once the retries are spent, any other failure, such as a certificate
 error, a 4xx other than 404 or 429, or a proxy refusal, at once) or got an unreadable reply, which
 includes a JSON object of a shape ``vet`` does not expect (an ``info``, canonical name,
-``releases``, file list, file or upload time of the wrong JSON type); and zero distributions were examined with nothing
+``releases``, file list, file or upload time of the wrong JSON type, or a ``releases`` that is
+absent or null); and zero distributions were examined with nothing
 refused. argparse also exits 2 on a bad command line, by raising SystemExit rather than through
 ``main``'s return. 1: a refusal or a failed check, when none of the exit-2 cases above occurred:
 beside one of them the run exits 2, and a refusal or failed check found before it is not always
@@ -561,8 +562,11 @@ def _first_release_date(payload: dict) -> datetime | None:
     """
     earliest: datetime | None = None
     releases = payload.get("releases")
+    # An absent or null `releases` says nothing about release history, so it is a reply of the
+    # wrong shape, never the "no release history" refusal (BACKLOG #5641). An empty object is
+    # the real "publishes no files" answer.
     if releases is None:
-        releases = {}
+        raise UnreadableReply("PyPI's reply holds no 'releases' object")
     if not isinstance(releases, dict):
         raise UnreadableReply(f"PyPI's 'releases' is a JSON {type(releases).__name__}")
     for files in releases.values():
@@ -890,6 +894,15 @@ def default_pyprojects(root: Path) -> list[Path]:
     return [root / "pyproject.toml", *sorted((root / "packaging").glob("*/pyproject.toml"))]
 
 
+def _same_file_key(path: Path) -> Path:
+    """The key two spellings of one file share: its resolved path, or the spelling itself where
+    resolving fails, so the read below reports that failure rather than this."""
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError):
+        return path
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -903,8 +916,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-age-days", type=int, default=DEFAULT_MIN_AGE_DAYS)
     args = parser.parse_args(argv)
 
-    # dict.fromkeys de-duplicates a repeated --pyproject in order, so no file is reported twice.
-    files: list[Path] = list(dict.fromkeys(args.pyproject or default_pyprojects(_ROOT)))
+    # De-duplicated by the resolved file AND the directory it was named from, in order, keeping the
+    # first spelling, so a --pyproject repeated or reached by two spellings is swept and reported
+    # once (BACKLOG #5641). The directory is part of the key because the hatch.toml and uv.toml
+    # swept beside a file are read from it: a link to one pyproject from another directory still
+    # has that directory's siblings swept, at the cost of the file's refused entries (not its
+    # registry findings, which are keyed by name) being reported twice.
+    by_file: dict[tuple[Path, Path], Path] = {}
+    for candidate in args.pyproject or default_pyprojects(_ROOT):
+        key = (_same_file_key(candidate), _same_file_key(candidate.parent))
+        by_file.setdefault(key, candidate)
+    files: list[Path] = list(by_file.values())
     if not args.pyproject and len(files) == 1:
         print(
             _annotation(
@@ -940,8 +962,8 @@ def main(argv: list[str] | None = None) -> int:
             if not args.pyproject and index == 0:
                 root_runtime = _runtime_names(text)
             reading = uv_toml
-            if uv_toml.is_file() and uv_toml.resolve() not in seen_uv_toml:
-                seen_uv_toml.add(uv_toml.resolve())
+            if uv_toml.is_file() and _same_file_key(uv_toml) not in seen_uv_toml:
+                seen_uv_toml.add(_same_file_key(uv_toml))
                 uv_text = uv_toml.read_text(encoding="utf-8")
                 swept.append((uv_toml, scan_uv_toml(uv_text, source=str(uv_toml))))
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:

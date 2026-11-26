@@ -1,0 +1,344 @@
+# Start the docker/compose.yaml `ha` profile on a Linux runner and check that both clustered
+# engines answer healthy (vault BACKLOG #5827; owner ruling 2026-11-25, decision
+# d20261125T234233536-89cd5d).
+#
+# WHY. The `ha` profile is a shipped template, and until this job nothing recorded it starting:
+# engine PRs 3146 and 3166 changed it and both said no `docker compose --profile ha up` was run.
+# This job is that run. It builds the -postgres image, mints a throwaway CA with a Postgres server
+# certificate and an API certificate, stages the files at the paths compose.yaml names, owned and
+# moded as its comments say, starts Postgres, schema-provision and the engine pair, and asserts:
+#   * both engines report healthy (the image HEALTHCHECK), and neither has restarted 45 seconds
+#     after the other checks pass, past one leader-lease renewal;
+#   * both answer GET /health over https, verified against the throwaway CA from the host;
+#   * both engines joined the cluster (two fresh rows in `nodes`), exactly one of those rows says
+#     it leads, and the live leader lease is owned by a fresh node;
+#   * every store session the two engine containers hold, read once, is encrypted, and each
+#     engine holds at least one.
+#     pg_stat_ssl records encryption only. That the engines verify the server certificate rests on
+#     the shipped MEFOR_STORE_SSL_ROOT_CERT pin and the engine's own refusal; this job does not
+#     measure it.
+#
+# WHAT IT CHANGES FROM THE SHIPPED TEMPLATE, all in an override file written at run time, never in
+# compose.yaml, plus the inputs the template leaves to the adopter. At least these differ:
+#   * the engines run `serve --env dev` instead of `--env prod`;
+#   * the ha services run at [security].enforcement = warn, so this job does not exercise the
+#     enforcing gates. compose.yaml, "what an enforcing start needs", names at least an SMTP relay,
+#     a syslog TLS collector, retention bounds and a store CRL. ci.yml's docker-smoke runs an
+#     enforcing start with config-only values for most of them; this job follows the dev posture
+#     its owner ruling asked for instead;
+#   * the adopter config is the docker/smoke graph, whose MLLP listener is plaintext, so the
+#     inbound bind is loopback inside the container, and its File outbound needs
+#     MEFOR_EGRESS_ALLOWED_FILE_DIRS=/var/lib/mefor on the engines.
+# It sets no MEFOR_ALLOW_INSECURE_TLS.
+#
+# It starts the pair by name, as compose.yaml documents, so the default `engine` service, which
+# has no profile and needs another image, does not start beside it.
+#
+# NOT A REQUIRED CHECK, deliberately. It is paths-filtered, so a required context would never
+# report on a PR that touches neither docker/ nor this file and would wedge it. Do not add it to
+# branch protection or .github/required-contexts.txt unless the owner decides to.
+#
+# Every key and certificate is synthetic, minted in the job and removed at the end. Nothing here is
+# committed, and no step prints a key or the store password.
+
+name: compose ha smoke
+
+on:
+  pull_request:
+    paths:
+      - "docker/**"
+      - ".github/workflows/compose-ha-smoke.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: compose-ha-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ha-dev-start:
+    name: compose ha profile starts (--env dev, linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # One project name, so `down -v` removes this run's volumes and nothing else.
+      COMPOSE_PROJECT_NAME: mefor-ha-ci
+      COMPOSE_PROFILES: ha
+      # The override is written by the staging step below, beside compose.yaml, so compose reads
+      # the project .env from docker/ for every command in this job.
+      COMPOSE_FILE: docker/compose.yaml:docker/ha-dev.ci-override.yaml
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # no step pushes or calls the API (zizmor: artipacked)
+
+      - name: Build the -postgres engine image the ha profile runs
+        # x-ha-engine-image in compose.yaml names this tag.
+        run: docker build -f docker/Dockerfile --target runtime-postgres -t messagefoundry:postgres .
+
+      - name: Mint a throwaway PKI and stage the compose inputs
+        run: |
+          set -euo pipefail
+          pki="$RUNNER_TEMP/ha-pki"
+          rm -rf "$pki"
+          mkdir -m 0700 "$pki"
+
+          # Substitution values compose reads from the project .env, and the secrets the containers
+          # read from secrets.env. The password and the store key are drawn for this run and masked
+          # before anything can echo them. The revocation attestation is for a CA that lives for
+          # this one job and is trusted by nothing outside it.
+          pw="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
+          key="$(python3 -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
+          echo "::add-mask::$pw"
+          echo "::add-mask::$key"
+          (
+            umask 077
+            printf 'MEFOR_TLS_REVOCATION_ATTESTED=1\nMEFOR_STORE_PASSWORD=%s\n' "$pw" > docker/.env
+            printf 'MEFOR_STORE_PASSWORD=%s\nMEFOR_STORE_ENCRYPTION_KEY=%s\n' "$pw" "$key" > docker/secrets.env
+          )
+
+          # The dev-posture override. Compose merges a service's `environment` by key and replaces
+          # its `command`, so the shipped x-ha-engine-env stays in force except for these keys.
+          cat > docker/ha-dev.ci-override.yaml <<'YAML'
+          x-ci-dev-env: &ci-dev-env
+            MEFOR_SECURITY_ENFORCEMENT: "warn"
+            MEFOR_INBOUND_BIND_HOST: "127.0.0.1"
+            MEFOR_EGRESS_ALLOWED_FILE_DIRS: "/var/lib/mefor"
+          services:
+            # The one-shot reads only the dial: under enforce its store open needs the CRL.
+            schema-provision:
+              environment:
+                MEFOR_SECURITY_ENFORCEMENT: "warn"
+            engine-ha:
+              command: ["serve", "--config", "/config", "--env", "dev"]
+              environment: *ci-dev-env
+            engine-standby:
+              command: ["serve", "--config", "/config", "--env", "dev"]
+              environment: *ci-dev-env
+          YAML
+
+          # The images compose will run, and the ids to own the files by, read from compose and
+          # the images rather than copied from a comment. The build step tagged
+          # messagefoundry:postgres; if x-ha-engine-image moves, stop here rather than test a
+          # stale image.
+          images="$(docker compose config --format json | python3 -c 'import json, sys; s = json.load(sys.stdin)["services"]; print(s["postgres"]["image"], s["engine-ha"]["image"], s["engine-standby"]["image"])')"
+          read -r pg_image ha_image standby_image <<< "$images"
+          if [ "$ha_image" != messagefoundry:postgres ] || [ "$standby_image" != messagefoundry:postgres ]; then
+            echo "FAIL: compose runs $ha_image and $standby_image for the pair, but this job built messagefoundry:postgres"
+            exit 1
+          fi
+          pg_ids="$(docker run --rm --entrypoint id "$pg_image" -u postgres):$(docker run --rm --entrypoint id "$pg_image" -g postgres)"
+          engine_ids="$(docker run --rm --entrypoint id messagefoundry:postgres -u):$(docker run --rm --entrypoint id messagefoundry:postgres -g)"
+          echo "postgres image $pg_image runs as $pg_ids; the engine image runs as $engine_ids"
+
+          # One CA signs both leaves. The extensions are what Python's VERIFY_X509_STRICT asks of
+          # a chain, and the CA carries cRLSign as compose.yaml asks of the store CA.
+          cat > "$pki/openssl.cnf" <<'CNF'
+          [req]
+          distinguished_name = dn
+          prompt = no
+          [dn]
+          CN = MessageFoundry CI throwaway CA
+          [ca]
+          basicConstraints = critical, CA:TRUE
+          keyUsage = critical, keyCertSign, cRLSign
+          subjectKeyIdentifier = hash
+          authorityKeyIdentifier = keyid:always
+          [pg]
+          basicConstraints = critical, CA:FALSE
+          keyUsage = critical, digitalSignature
+          extendedKeyUsage = serverAuth
+          subjectAltName = DNS:postgres
+          subjectKeyIdentifier = hash
+          authorityKeyIdentifier = keyid, issuer
+          [api]
+          basicConstraints = critical, CA:FALSE
+          keyUsage = critical, digitalSignature
+          extendedKeyUsage = serverAuth
+          subjectAltName = DNS:localhost, IP:127.0.0.1, DNS:engine-ha, DNS:engine-standby
+          subjectKeyIdentifier = hash
+          authorityKeyIdentifier = keyid, issuer
+          CNF
+          ec=(-newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -noenc)
+          openssl req -x509 -new -config "$pki/openssl.cnf" -extensions ca "${ec[@]}" \
+            -keyout "$pki/ca.key" -out "$pki/ca.crt" -days 2
+          for leaf in pg api; do
+            openssl req -new -config "$pki/openssl.cnf" -subj "/CN=$leaf" "${ec[@]}" \
+              -keyout "$pki/$leaf.key" -out "$pki/$leaf.csr"
+            openssl x509 -req -in "$pki/$leaf.csr" -CA "$pki/ca.crt" -CAkey "$pki/ca.key" \
+              -set_serial "0x$(openssl rand -hex 16)" -days 2 \
+              -extfile "$pki/openssl.cnf" -extensions "$leaf" -out "$pki/$leaf.crt"
+            openssl verify -x509_strict -CAfile "$pki/ca.crt" "$pki/$leaf.crt"
+          done
+          rm -f "$pki/ca.key" "$pki"/*.csr
+
+          # ./pg-tls: owned by the postgres account, the key at 0600 (the postgres service's comment).
+          sudo rm -rf docker/pg-tls docker/tls docker/config
+          mkdir -p docker/pg-tls docker/tls docker/config/pki
+          cp "$pki/pg.crt" docker/pg-tls/server.crt
+          cp "$pki/pg.key" docker/pg-tls/server.key
+          chmod 0755 docker/pg-tls
+          chmod 0644 docker/pg-tls/server.crt
+          chmod 0600 docker/pg-tls/server.key
+          sudo chown -R "$pg_ids" docker/pg-tls
+
+          # ./tls: owned by the engine's uid, every file 0600 and the directory 0700 (the default
+          # engine's ./tls comment; the ha engines mount the same directory).
+          cp "$pki/api.crt" docker/tls/api.crt
+          cp "$pki/api.key" docker/tls/api.key
+          chmod 0600 docker/tls/api.crt docker/tls/api.key
+          chmod 0700 docker/tls
+          sudo chown -R "$engine_ids" docker/tls
+
+          # ./config: the docker/smoke graph plus the store CA pin, readable by all and writable by
+          # root alone, as the engine requires of a config it executes and of a trust anchor.
+          cp docker/smoke/config/*.py docker/config/
+          cp "$pki/ca.crt" docker/config/pki/store-ca.pem
+          chmod -R a+rX,go-w docker/config
+          sudo chown -R root:root docker/config
+          # The owner and mode each file has as the containers will see it. find runs under sudo,
+          # because the runner's account cannot list ./tls once it is 0700 and owned by the engine.
+          sudo find docker/pg-tls docker/tls docker/config -exec stat -c '%u:%g %a %n' {} +
+
+      - name: Start Postgres, schema-provision and the engine pair
+        # `up -d` waits on each depends_on condition: Postgres healthy, then the attestation check
+        # and schema-provision completed successfully, so a refusal there fails this step. Every
+        # image is already local (built, or pulled by the staging step), so nothing is pulled.
+        run: |
+          set -euo pipefail
+          docker compose up -d --pull never postgres schema-provision engine-ha engine-standby
+          docker compose ps -a
+
+      - name: Assert both engines report healthy and answer /health over verified TLS
+        run: |
+          set -euo pipefail
+          # Bounded wait on the image HEALTHCHECK. A restart or an unhealthy verdict fails at
+          # once: the engines restart unless-stopped, so a start refusal would otherwise loop
+          # until the deadline.
+          deadline=$((SECONDS + 300))
+          while :; do
+            ready=0
+            for svc in engine-ha engine-standby; do
+              cid="$(docker compose ps -aq "$svc")"
+              if [ -z "$cid" ]; then
+                echo "FAIL: compose has no $svc container"
+                exit 1
+              fi
+              read -r status restarts health <<< "$(docker inspect -f '{{.State.Status}} {{.RestartCount}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid")"
+              if [ "$restarts" -gt 0 ] || [ "$status" != running ] || [ "$health" = unhealthy ] || [ "$health" = none ]; then
+                echo "FAIL: $svc is $status, health $health, after $restarts restarts"
+                exit 1
+              fi
+              if [ "$health" = healthy ]; then
+                ready=$((ready + 1))
+              fi
+            done
+            if [ "$ready" -eq 2 ]; then
+              break
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "FAIL: both engines were not healthy within 300 seconds"
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "engine-ha and engine-standby report healthy"
+
+          # From the host, through each engine's published API port, verified against the CA
+          # this job minted. Only the API certificate it signed can pass, so the reply comes from
+          # the engine's own TLS listener and not from anything else on the port. /health is a
+          # liveness answer, so a 200 that curl -f accepts is the whole assertion.
+          for port in 8444 8445; do
+            body="$(curl -fsS --max-time 10 --cacert "$RUNNER_TEMP/ha-pki/ca.crt" "https://localhost:$port/health")"
+            echo "port $port: $body"
+          done
+
+      - name: Assert the pair formed a cluster, holds encrypted store sessions, and never restarted
+        run: |
+          set -euo pipefail
+          sql() { docker compose exec -T postgres psql -U mefor -d messagefoundry -XtA -F ' ' -c "$1"; }
+          # Each field is checked on its own: a failed or empty read leaves a non-number, which
+          # must fail the step rather than pass as a zero.
+          numeric() {
+            for v in "$@"; do
+              case "$v" in
+                '' | *[!0-9]*) return 1 ;;
+              esac
+            done
+          }
+          # The two engine containers' addresses on the compose network, so the session counts
+          # below are the engines' own and no other client's.
+          addrs=()
+          for svc in engine-ha engine-standby; do
+            ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$(docker compose ps -aq "$svc")")"
+            read -r ip _ <<< "$ip"
+            case "$ip" in
+              '' | *[!0-9.]*) echo "FAIL: could not read $svc's address (read '$ip')"; exit 1 ;;
+            esac
+            addrs+=("'$ip'")
+          done
+          in_list="$(IFS=,; echo "${addrs[*]}")"
+          echo "engine addresses: $in_list"
+          # Both engines heartbeat a `nodes` row, stamped with wall-clock seconds; the containers
+          # share the host clock. One fresh row may say is_leader, and the lease must be live and
+          # owned by one of the fresh nodes, so a lease held by a node that is gone does not count.
+          fresh="last_seen > extract(epoch from now()) - 60"
+          cluster_q="select (select count(*) from nodes where $fresh), (select count(*) from nodes where $fresh and is_leader), (select count(*) from leader_lease where lease_expires_at > extract(epoch from now()) and owner in (select node_id from nodes where $fresh))"
+          ssl_q="select count(*) filter (where s.ssl), count(*) filter (where not s.ssl), count(distinct a.client_addr) from pg_stat_activity a join pg_stat_ssl s using (pid) where a.usename = 'mefor' and a.client_addr in ($in_list)"
+          ok=0
+          for _ in $(seq 1 12); do
+            nodes='' leaders='' leases='' tls='' plain='' clients=''
+            read -r nodes leaders leases <<< "$(sql "$cluster_q")" || true
+            read -r tls plain clients <<< "$(sql "$ssl_q")" || true
+            if numeric "$nodes" "$leaders" "$leases" "$tls" "$plain" "$clients" \
+              && [ "$nodes" -eq 2 ] && [ "$leaders" -eq 1 ] && [ "$leases" -eq 1 ] \
+              && [ "$tls" -ge 1 ] && [ "$clients" -eq 2 ]; then
+              ok=1
+              break
+            fi
+            sleep 5
+          done
+          echo "cluster: fresh nodes=$nodes fresh leaders=$leaders live leases owned by a fresh node=$leases"
+          echo "engine store sessions: encrypted=$tls plaintext=$plain from $clients engine addresses"
+          if [ "$ok" -ne 1 ]; then
+            echo "FAIL: within 60 seconds the pair did not show two fresh nodes, one leader holding a live lease, and encrypted store sessions from both engines"
+            exit 1
+          fi
+          if [ "$plain" -ne 0 ]; then
+            echo "FAIL: an engine holds a plaintext store session"
+            exit 1
+          fi
+          # The health wait read the restart count only until both were healthy. Hold the pair
+          # past one lease renewal (leader_lease_ttl is 30 seconds, compose.yaml's
+          # stop_grace_period comment) and read it again, so a crash at the leader's first
+          # renewal, or while it starts the graph, cannot pass. A crash after this window can.
+          sleep 45
+          for svc in engine-ha engine-standby; do
+            read -r status restarts <<< "$(docker inspect -f '{{.State.Status}} {{.RestartCount}}' "$(docker compose ps -aq "$svc")")" || true
+            if ! numeric "$restarts" || [ "$restarts" -ne 0 ] || [ "$status" != running ]; then
+              echo "FAIL: by the end $svc is ${status:-unread} after ${restarts:-unread} restarts"
+              exit 1
+            fi
+          done
+          echo "engine-ha and engine-standby are still running with no restart"
+
+      - name: Compose state, health probes and logs (on failure or cancel)
+        if: failure() || cancelled()
+        run: |
+          docker compose ps -a || true
+          # The HEALTHCHECK's own output lives only in docker inspect.
+          for svc in postgres engine-ha engine-standby; do
+            echo "--- $svc health"
+            docker inspect -f '{{json .State.Health}}' "$(docker compose ps -aq "$svc")" || true
+          done
+          docker compose logs --no-color --timestamps || true
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker compose down -v --remove-orphans || true
+          # The staging step left these owned by other uids, so the runner's account cannot delete
+          # them. If RUNNER_TEMP is unset, `:?` ends this step with an error.
+          sudo rm -rf docker/pg-tls docker/tls docker/config docker/.env docker/secrets.env docker/ha-dev.ci-override.yaml "${RUNNER_TEMP:?}/ha-pki" || true

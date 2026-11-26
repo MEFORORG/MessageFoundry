@@ -1079,6 +1079,85 @@ def test_a_copy_whose_destination_is_edited_to_a_whole_field_writes_with_set_dat
     assert 'msg.set("NK1-3.1", msg.field("PID-5.1") or "")' in out
 
 
+@pytest.mark.parametrize(
+    ("line", "params"),
+    [
+        # A leaf source edited to a whole field, into a leaf destination.
+        ('msg.set("NK1-2.1", msg.field("PID-5.1") or "")', {"src": "PID-5"}),
+        ('msg.set_data("NK1-2.1", msg.field("PID-5.1") or "")', {"src": "PID-5"}),
+        # A whole-field destination edited to a leaf, from a whole-field source.
+        ('msg.set("NK1-2", msg.field("PID-5") or "")', {"dst": "NK1-2.1"}),
+        # Spelled as constant expressions rather than plain strings.
+        ('msg.set("NK1-2", msg.field("PID-5") or "")', {"dst": {"expr": '"NK1-2.1"'}}),
+        ('msg.set("NK1-2.1", msg.field("PID-5.1") or "")', {"src": {"expr": '"PID-5"'}}),
+    ],
+)
+def test_a_copy_edit_into_a_whole_field_to_leaf_copy_is_refused(
+    line: str, params: dict[str, object]
+) -> None:
+    # BACKLOG #5821, PR 3036 open finding 3. A native write of a whole field's raw text into a
+    # component escapes its escape sequences a second time, so the edit is refused rather than
+    # written. NEGATIVE CONTROL: on 2af9ed8bed each edit wrote msg.set or msg.set_data
+    # ("NK1-2.1", msg.field("PID-5") or "").
+    source = LENS_SOURCE + f"    {line}\n"
+    row = _copy_rows(source)[0]
+    edit = {"op": "set_params", "line_start": row["line_start"], "line_end": row["line_end"]}
+    with pytest.raises(LensRewriteError, match="escape"):
+        rewrite_source(source, {**edit, "params": params})
+
+
+def test_the_refused_whole_field_to_leaf_copy_inserts_as_the_action_call() -> None:
+    # The refusal's remedy works: the same copy inserted is the copy_field call, which decodes once.
+    source = LENS_SOURCE + '    msg.set("NK1-2", msg.field("PID-5") or "")\n'
+    row = _copy_rows(source)[0]
+    edit = {"op": "set_params", "line_start": row["line_start"], "line_end": row["line_end"]}
+    with pytest.raises(LensRewriteError, match="copy-field row"):
+        rewrite_source(source, {**edit, "params": {"dst": "NK1-2.1"}})
+    assert '    copy_field(msg, "PID-5", "NK1-2.1")\n' in _lens_insert_copy("PID-5", "NK1-2.1")
+
+
+@pytest.mark.parametrize(
+    ("src", "dst"),
+    [({"expr": '"PID-5"'}, "NK1-2.1"), ("PID-5", {"expr": '"NK1-2.1"'})],
+)
+def test_a_constant_expression_whole_field_to_leaf_insert_is_the_action_call(
+    src: str | dict[str, str], dst: str | dict[str, str]
+) -> None:
+    # BACKLOG #5821, PR 3036 open finding 3, "Same for a constant-string {"expr": ...} src/dst".
+    # NEGATIVE CONTROL: on 2af9ed8bed the insert was msg.set("NK1-2.1", msg.field("PID-5") or "").
+    out = _lens_insert_copy(src, dst)  # type: ignore[arg-type]
+    assert "copy_field(msg, " in out
+    assert "msg.set" not in out
+    ast.parse(out)
+    rows = _copy_rows(out)
+    assert len(rows) == 1
+
+
+def test_a_constant_expression_leaf_source_inserts_with_set_data() -> None:
+    # Review round-5745f9d775: a leaf source spelled as a constant expression writes as the plain
+    # string does. NEGATIVE CONTROL: on ba226f46ad it wrote msg.set, so decoded separators in
+    # PID-3.1 became structure in PV1-19.
+    out = _lens_insert_copy({"expr": '"PID-3.1"'}, "PV1-19")
+    assert "msg.set_data(" in out
+
+
+def test_an_over_deep_expression_source_is_a_lens_refusal() -> None:
+    # Review round-5745f9d775: the classifier must not let a parser MemoryError escape, so the
+    # caller still gets its LensRewriteError. NEGATIVE CONTROL: on ba226f46ad MemoryError escaped.
+    with pytest.raises(LensRewriteError):
+        _lens_insert_copy({"expr": "-" * 200000 + "1"}, "NK1-2.1")
+
+
+def test_a_copy_edit_that_keeps_a_whole_field_destination_is_not_refused() -> None:
+    # The refusal is the whole-field-to-leaf case only: a whole field into a whole field is a copy
+    # of the structure as it is.
+    source = LENS_SOURCE + '    msg.set("NK1-2", msg.field("PID-5") or "")\n'
+    row = _copy_rows(source)[0]
+    edit = {"op": "set_params", "line_start": row["line_start"], "line_end": row["line_end"]}
+    out = rewrite_source(source, {**edit, "params": {"dst": "NK1-3"}})
+    assert 'msg.set("NK1-3", msg.field("PID-5") or "")' in out
+
+
 def test_a_copy_re_pick_that_would_pass_the_column_limit_is_refused() -> None:
     # 95 columns as written; set_data would make it 100+, which ruff would re-wrap.
     line = (

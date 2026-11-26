@@ -7,8 +7,11 @@
 *send* image and SR objects to MessageFoundry. ``pynetdicom``'s AE server is **blocking/threaded, not
 asyncio-native**, and its C-STORE callback runs on a foreign (acceptor) thread — so the SCP:
 
-* starts/stops the AE server **off the event loop** (``asyncio.to_thread``), so binding/shutdown never
-  stalls other listeners/workers/API calls;
+* starts/stops the AE server **off the event loop**, in the default executor
+  (:func:`~messagefoundry.threadhop.to_thread_or_loop`), so binding/shutdown does not stall other
+  listeners/workers/API calls; a hop the default executor refuses runs on a thread of its own, and
+  on the loop only when no thread can start, where a start fails, since its accept loop needs a
+  thread, and a stop blocks the loop for as long as it runs;
 * in the C-STORE callback (the foreign thread) re-encodes the received object to its **Part-10 bytes**
   and bridges them back onto the loop-owned ingress via ``asyncio.run_coroutine_threadsafe`` — the same
   loop-bridge pattern as ``db_lookup`` (ADR 0010) — blocking the **worker thread** (never the loop) on
@@ -117,6 +120,7 @@ from messagefoundry.parsing.dicom._inflate import (
 from messagefoundry.parsing.dicom.errors import DicomBombError
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.redaction import _REDACTED, prints_a_codec_error, safe_exc, safe_text
+from messagefoundry.threadhop import to_thread_or_loop
 from messagefoundry.tls_handshake_failures import HUNG_UP, HandshakeFailures, handshake_cause
 from messagefoundry.transports._dicom_log_lines import (
     ALWAYS_REDACTED_KINDS,
@@ -1277,12 +1281,27 @@ def _admitting_server_class() -> type[Any]:
         def start_serving(self) -> None:
             """What ``AE.start_server(block=False)`` does once it has built its server: run the
             accept loop on a daemon thread and record the server on the AE. The base ``shutdown()``
-            removes the server from that list, and raises if it is not there."""
-            threading.Thread(
-                target=make_target(self.serve_forever),
-                name=f"AcceptorServer@{self.ae_title}",
-                daemon=True,
-            ).start()
+            removes the server from that list, and raises if it is not there. Unlike pynetdicom's
+            own, it closes the server's socket when the thread cannot start (BACKLOG #5755)."""
+            try:
+                threading.Thread(
+                    target=make_target(self.serve_forever),
+                    name=f"AcceptorServer@{self.ae_title}",
+                    daemon=True,
+                ).start()
+            except RuntimeError:  # no thread could start, so no accept loop runs on the socket
+                # make_server has bound the port, and nothing else holds this server to close
+                # it, so the failed start would leave the port held.
+                try:
+                    self.server_close()
+                except OSError as exc:
+                    logger.warning(
+                        "DICOM server (SCP) %s: closing the listener after its accept loop could "
+                        "not start failed, so its port may still be held: %s",
+                        self.ae_title,
+                        safe_exc(exc),
+                    )
+                raise
             self.ae._servers.append(self)
 
         def get_request(self) -> tuple[socket.socket, Any]:
@@ -2224,7 +2243,10 @@ class DicomScpSource(SourceConnector):
         self._loop = asyncio.get_running_loop()  # captured ON the loop, before any off-loop work
         _redact_flagged_peer_values()  # again: warnings filters can be put back after the import
         # start_server binds a socket + spawns acceptor threads — do it OFF the loop, then it is live.
-        await asyncio.to_thread(self._start_server)
+        # A default executor that refuses the hop binds it on a thread of its own, so a
+        # reload's rollback can still bring the listener back up (BACKLOG #5755, item 3). When no
+        # thread can start at all, the start fails here: its accept loop needs one.
+        await to_thread_or_loop("DICOM listener start", self._start_server)
 
     def _start_server(self) -> None:
         # Imported lazily (the [dicom] extra); a missing extra surfaces as an internal/connection error
@@ -2806,11 +2828,15 @@ class DicomScpSource(SourceConnector):
         # with them: the loop cannot tell the two apart.
         self._tls_failures.close()
         # Shut the blocking pynetdicom AE server down OFF the loop (it stops accepting new associations,
-        # aborts active ones, and joins its threads) so teardown never stalls the loop. Idempotent.
+        # aborts active ones, and joins its threads) so teardown does not stall the loop. Idempotent.
         server = self._server
         try:
             if server is not None:
-                await asyncio.to_thread(server.shutdown)
+                # A refused hop shuts it down on a thread of its own, so a reload's rollback does
+                # not leave the port held by a server it meant to stop (BACKLOG #5755, item 3).
+                # Not on the loop unless no thread can start: the shutdown joins connection
+                # threads whose commit waits on the loop.
+                await to_thread_or_loop("DICOM listener stop", server.shutdown)
             # Only once the shutdown returned: one that raised or was cancelled keeps the server,
             # so the next stop() shuts it down again.
             self._server = None

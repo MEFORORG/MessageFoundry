@@ -249,10 +249,6 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _RAISED_AFTER_HANDLER,
     ),
     _Allowed(
-        "messagefoundry/store/store.py::parse_audit_anchor::ValueError::AuditAnchorError",
-        _SAFE + "int() quotes the anchor's count text, and the new error carries the whole anchor",
-    ),
-    _Allowed(
         "messagefoundry/transports/base.py::build_source::KeyError::ValueError",
         _SAFE + "registry miss; KeyError carries the connector type, also in the new message",
     ),

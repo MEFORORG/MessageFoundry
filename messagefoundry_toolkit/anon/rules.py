@@ -143,8 +143,8 @@ class FieldRule:
 # The DATE and location rules map these Safe Harbor date and location fields, and that is NOT Safe
 # Harbor de-identification: MSH-7 keeps the full message time, the order and accession numbers
 # (ORC-2/3, OBR-2/3) are left unmapped (BACKLOG #2248). The date fields BACKLOG #2330 listed are
-# mapped: an event date takes DATE, and a date of birth takes DOB like PID-7. A date field outside
-# that list still has no rule, and only the coverage report names it.
+# mapped: an event date takes DATE, and a date of birth takes DOB like PID-7. BACKLOG #5533 mapped
+# more dates below. A date field with no rule below is named only by the coverage report.
 #
 # The ID, MRN and NAME kinds key a surrogate on the dataset salt, the kind and the whole
 # repetition's text (keying.Keyer.seed). So a prior value in MRG gets the same surrogate as that
@@ -152,7 +152,9 @@ class FieldRule:
 # and only when it is written identically in both. The kinds match for MRG-1 and PID-3
 # (MRN), for MRG-2 and PID-4, MRG-5 and PV1-19, and MRG-6 and PV1-50 (ID), and for MRG-7 and PID-5
 # (NAME). They do not match for two pairs. MRG-3, the prior account number, takes MRN, while
-# PID-18 takes ID. MRG-4, the prior patient id, is a CX paired with PID-2, yet takes NAME.
+# PID-18 takes ID. MRG-4, the prior patient id, is a CX paired with PID-2, yet takes NAME. A
+# move to MRN would keep its CX.3 to CX.6, CX.9 and CX.10 as captured, as every MRN field does,
+# where NAME rewrites the whole repetition; BACKLOG #5533 leaves that choice open.
 #
 # BACKLOG #5533 mapped fourteen identifier, name, location and contact fields that were unmapped
 # inside segments this map already scrubs: PID-2/21/23, NK1-13/30/31/32/33/37, GT1-2 and
@@ -160,12 +162,13 @@ class FieldRule:
 # names no one and tests route on it: PID-8 sex, PID-10 race, PID-15 language, PID-16 marital
 # status, PID-17 religion, PID-22 ethnic group, PID-24/25 multiple birth, PID-26 citizenship,
 # PID-27 veteran status, PID-28 nationality, PID-30 death indicator, NK1-3 relationship, NK1-14/15
-# marital status and sex, and PV1-2/4/10 patient class, admission type and hospital service. Any
-# other field of these segments that is neither listed here nor mapped below has no rule yet.
+# marital status and sex, and PV1-2/4/10 patient class, admission type and hospital service.
 # A second pass mapped twenty more fields of the same class: GT1-4/19/21/24/29/42/45/46/51/56,
-# NK1-12/26/38, MRG-2/5/6 and PV1-5/37/50/52. At least these still have no rule: the dates
-# PID-33, NK1-8/9, GT1-13/14/31/32 and PV1-25/30/35, and the job titles NK1-10 and GT1-49. Only
-# the coverage report names such a field, and require_full_coverage refuses it.
+# NK1-12/26/38, MRG-2/5/6 and PV1-5/37/50/52. A third pass mapped the dates PID-33, NK1-8/9,
+# GT1-13/14/31/32 and PV1-25/30/35, and the job titles NK1-10 and GT1-49. At least the job code
+# fields NK1-11 and GT1-50, whose third component is free text, still have no rule. The coverage
+# report names a field with no rule; leak.ALWAYS_DECIDED lists those require_full_coverage can
+# let pass.
 DEFAULT_RULES: tuple[FieldRule, ...] = (
     # PID — patient identity
     FieldRule("PID-2", SurrogateKind.MRN),  # patient id (external), a CX like PID-3
@@ -187,6 +190,7 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("PID-21", SurrogateKind.MRN),  # mother's identifier, a CX
     FieldRule("PID-23", SurrogateKind.FREETEXT),  # birth place, free text that names a place
     FieldRule("PID-29", SurrogateKind.DATE),  # death date/time
+    FieldRule("PID-33", SurrogateKind.DATE),  # last update date/time
     # MRG — merge; the comment above the map says which pairs keep their link
     FieldRule("MRG-1", SurrogateKind.MRN),
     FieldRule("MRG-2", SurrogateKind.ID),  # prior alternate patient id, keyed like PID-4
@@ -201,6 +205,9 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("NK1-5", SurrogateKind.PHONE),
     FieldRule("NK1-6", SurrogateKind.PHONE),
     FieldRule("NK1-7", SurrogateKind.PHONE),
+    FieldRule("NK1-8", SurrogateKind.DATE),  # contact start date
+    FieldRule("NK1-9", SurrogateKind.DATE),  # contact end date
+    FieldRule("NK1-10", SurrogateKind.FREETEXT),  # next of kin's job title
     FieldRule("NK1-12", SurrogateKind.ID),  # next of kin's employee number, a CX
     # NK1-13 is an XON. The name kind would write a person's name into it, and XON.3 is numeric,
     # so the output would fail strict validation; the blunt redact keeps it valid.
@@ -222,6 +229,8 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("GT1-7", SurrogateKind.PHONE),
     FieldRule("GT1-8", SurrogateKind.DOB),  # guarantor's date of birth
     FieldRule("GT1-12", SurrogateKind.SSN),
+    FieldRule("GT1-13", SurrogateKind.DATE),  # guarantor date, begin
+    FieldRule("GT1-14", SurrogateKind.DATE),  # guarantor date, end
     FieldRule("GT1-16", SurrogateKind.NAME),  # guarantor's employer, an XPN
     FieldRule("GT1-17", SurrogateKind.ADDRESS),  # guarantor's employer address
     FieldRule("GT1-18", SurrogateKind.PHONE),  # guarantor's employer phone
@@ -229,9 +238,12 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("GT1-21", SurrogateKind.FREETEXT),  # guarantor organization name, an XON like NK1-13
     FieldRule("GT1-24", SurrogateKind.DATE),  # guarantor's death date/time, like PID-29
     FieldRule("GT1-29", SurrogateKind.ID),  # guarantor's employer id, a CX
+    FieldRule("GT1-31", SurrogateKind.DATE),  # guarantor's hire effective date
+    FieldRule("GT1-32", SurrogateKind.DATE),  # guarantor's employment stop date
     FieldRule("GT1-42", SurrogateKind.NAME),  # guarantor's mother's maiden name
     FieldRule("GT1-45", SurrogateKind.NAME),  # guarantor's contact person's name
     FieldRule("GT1-46", SurrogateKind.PHONE),  # guarantor's contact person's telephone
+    FieldRule("GT1-49", SurrogateKind.FREETEXT),  # guarantor's job title
     FieldRule("GT1-51", SurrogateKind.FREETEXT),  # guarantor's employer organization, an XON
     FieldRule("GT1-56", SurrogateKind.FREETEXT),  # guarantor's birth place, like PID-23
     # IN1/IN2 — insurance (plan/company codes IN1-2/3/4 are KEPT by omission). The company's
@@ -261,6 +273,9 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("PV1-11", SurrogateKind.FREETEXT),  # temporary location, a PL
     FieldRule("PV1-17", SurrogateKind.PROVIDER),
     FieldRule("PV1-19", SurrogateKind.ID),
+    FieldRule("PV1-25", SurrogateKind.DATE),  # contract effective date
+    FieldRule("PV1-30", SurrogateKind.DATE),  # transfer to bad debt date
+    FieldRule("PV1-35", SurrogateKind.DATE),  # delete account date
     # PV1-37 is a DLD: a discharge location and its effective date. The blunt redact removes both.
     FieldRule("PV1-37", SurrogateKind.FREETEXT),  # discharged-to location
     FieldRule("PV1-42", SurrogateKind.FREETEXT),  # pending location, a PL

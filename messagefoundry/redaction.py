@@ -122,6 +122,7 @@ __all__ = [
     "safe_exc",
     "safe_name",
     "safe_text",
+    "redact_bounded_head",
     "safe_text_bound",
     "safe_traceback",
     "shown_class_name",
@@ -2003,15 +2004,16 @@ def _mask_stray_end_tags(text: str, lo: int, hi: int, mask: bool, *, noted: bool
     return "".join(out)
 
 
-def _redact_structured(text: str, *, widened: bool, masks: bool = True) -> str:
+def _redact_structured(text: str, *, widened: bool, masks: bool = True, noted: bool = False) -> str:
     """The structured-shape passes, run on everything but this module's own trailing notes
-    (:data:`_TRAILING_NOTES`); ``masks`` is :func:`_redact_xml_elements`'s."""
+    (:data:`_TRAILING_NOTES`); ``masks`` is :func:`_redact_xml_elements`'s. ``noted`` is
+    :func:`_redact_noted`'s: a bound note the caller appends follows ``text``."""
     body = _without_trailing_note(text)
     tail = text[len(body) :]
     body = _redact_json_fields(body, widened=widened)
     body = _redact_dicom_tags(body, widened=widened)
     body = _redact_dicom_labels(body, widened=widened)
-    return _redact_xml_elements(body, masks=masks, noted=bool(tail)) + tail
+    return _redact_xml_elements(body, masks=masks, noted=bool(tail) or noted) + tail
 
 
 def redact(text: str) -> str:
@@ -2090,16 +2092,35 @@ def redact(text: str) -> str:
     **A JSON value with a mismatched closer makes the whole text redacted (BACKLOG #5814)**: the
     result is the placeholder alone. The JSON pass reads what the passes before it left, so this
     holds for a closer that pass still sees as mismatched."""
+    return _redact_noted(text, noted=False)
+
+
+def _redact_noted(text: str, *, noted: bool) -> str:
+    """:func:`redact`, told whether the caller appends this module's bound note right after
+    ``text`` (BACKLOG #5925). ``noted`` is the out-of-band form of the trailing note the passes find
+    in the text on the clamp route (:func:`_without_trailing_note`): with it, a value that ends
+    ``text`` is judged as one a note follows, so the end-of-text refusals that keep a value a
+    caller's text could be glued onto do not keep it, and it is masked.
+
+    For :func:`safe_text` and ``verify_leaf.safe_detail_text``, which redact a clamped head and
+    append its note after. Out of band, because the note is not in the text the passes read: a
+    stand-in note written into the text changed a whole-text gate in :func:`_redact_unguarded`
+    (a final ``bearer`` then read as a scheme), which the earlier attempt at this fix found. A
+    trailing note already in ``text`` is still the one the passes read, and ``noted`` then changes
+    nothing for the value before it. ``noted`` turns end-of-text refusals off, so a value they kept
+    is masked. A mask can still change what a later pass or round reads (:func:`_masked_only`), so
+    that the answer only hides more is a measurement, not a proof: the differential tests in
+    ``tests/test_redaction_clamp_note_end.py`` measure it on their inputs."""
     try:
-        return _redact_unguarded(text)
+        return _redact_unguarded(text, noted=noted)
     except _MismatchedJsonCloser:
         return _REDACTED
 
 
-def _redact_unguarded(text: str) -> str:
+def _redact_unguarded(text: str, *, noted: bool = False) -> str:
     """:func:`redact` without its mismatched-closer rule, which raises :class:`_MismatchedJsonCloser`
-    out of here."""
-    out = _redact_stages(text)
+    out of here. ``noted`` is :func:`_redact_noted`'s."""
+    out = _redact_stages(text, noted=noted)
     if "%" not in out or _ENCODED_SEPARATOR.search(out) is None:
         return out
     if _HL7_ENCODED_FIELD_RUN.search(out) is None:
@@ -2115,16 +2136,17 @@ def _redact_unguarded(text: str) -> str:
         or _CREDENTIAL_AHEAD.search(out) is not None
     ):
         return out
-    return _redact_stages(_HL7_ENCODED_FIELD_RUN.sub(_REDACTED, out))
+    return _redact_stages(_HL7_ENCODED_FIELD_RUN.sub(_REDACTED, out), noted=noted)
 
 
-def _redact_stages(text: str) -> str:
+def _redact_stages(text: str, *, noted: bool = False) -> str:
     """The two stages of :func:`redact`: the #1711 passes to their fixed point, then the widened ones
-    when :func:`_needs_widened_stage` says a widened rule could match."""
-    first = _redact_rounds(text, widened=False)
+    when :func:`_needs_widened_stage` says a widened rule could match. ``noted`` is
+    :func:`_redact_noted`'s."""
+    first = _redact_rounds(text, widened=False, noted=noted)
     if not _needs_widened_stage(first):
         return first
-    return _redact_rounds(first, widened=True)
+    return _redact_rounds(first, widened=True, noted=noted)
 
 
 #: A JSON key the widened stage reads differently: ``name``/``address`` (the shape rule) and a group
@@ -2165,22 +2187,23 @@ def _needs_widened_stage(text: str) -> bool:
     return "mrn" in text.lower() and _MRN_LABELLED.search(text) is not None
 
 
-def _redact_rounds(text: str, *, widened: bool) -> str:
+def _redact_rounds(text: str, *, widened: bool, noted: bool = False) -> str:
     """One stage of :func:`redact`: the flat and structured passes, repeated until the structured
     passes change nothing but end-tag masks (:func:`_masked_only`), for at most
-    :data:`_STRUCTURED_ROUNDS` rounds; if they run out, the flat passes run once more."""
+    :data:`_STRUCTURED_ROUNDS` rounds; if they run out, the flat passes run once more. ``noted`` is
+    :func:`_redact_noted`'s."""
     credentials = not widened
     for _ in range(_STRUCTURED_ROUNDS):
         if not text:
             return text
-        flat = _redact_flat(text, widened=widened, credentials=credentials)
-        text = _redact_structured(flat, widened=widened)
-        if text == flat or _masked_only(text, flat, widened=widened):
+        flat = _redact_flat(text, widened=widened, credentials=credentials, noted=noted)
+        text = _redact_structured(flat, widened=widened, noted=noted)
+        if text == flat or _masked_only(text, flat, widened=widened, noted=noted):
             return text
-    return _redact_flat(text, widened=widened, credentials=credentials)
+    return _redact_flat(text, widened=widened, credentials=credentials, noted=noted)
 
 
-def _masked_only(text: str, flat: str, *, widened: bool) -> bool:
+def _masked_only(text: str, flat: str, *, widened: bool, noted: bool = False) -> bool:
     """Whether the structured passes turned ``flat`` into ``text`` only by masking end-tag rests in
     place (:func:`_end_tag_rest`, BACKLOG #5925): with every rest kept, they would have changed
     nothing, so the round ends.
@@ -2197,7 +2220,7 @@ def _masked_only(text: str, flat: str, *, widened: bool) -> bool:
     return (
         len(text) == len(flat)
         and text.translate(_SHAPE) == flat.translate(_SHAPE)
-        and _redact_structured(flat, widened=widened, masks=False) == flat
+        and _redact_structured(flat, widened=widened, masks=False, noted=noted) == flat
     )
 
 
@@ -2388,7 +2411,7 @@ _TRAILING_SPACE = re.compile(r"\s*+\Z")
 
 
 def _glued_value(
-    text: str, body: str, run: re.Match[str], field_run: re.Pattern[str]
+    text: str, body: str, run: re.Match[str], field_run: re.Pattern[str], *, noted: bool = False
 ) -> str | None:
     """The rest of a PHI or credential value that the field run ``run`` cut through, when it is safe
     to mask: the text after the token, up to the value's terminator. ``None`` leaves the plain
@@ -2413,10 +2436,15 @@ def _glued_value(
     that ends on a vocabulary end tag's name masks that tag's rest (:func:`_glued_end_tag_rest`,
     BACKLOG #5925); it reads only such a token, which no credential label ends. Only where both
     decline does a credential label at the token's end mask the next word, so the credential arm
-    adds a mask to an answer and never takes one away."""
+    adds a mask to an answer and never takes one away.
+
+    ``noted`` (:func:`_redact_noted`) says the caller appends a note after ``text``. It counts only
+    where ``text`` holds no trailing note of its own, so ``body`` is ``text`` and a value ending it
+    is the one that note follows; a note in the text stays the one the value before it is judged
+    by."""
     token, end = run.group(), run.end()
     # Only a value whose last character ends body sits right before a note's joiner.
-    noted = len(body) < len(text)
+    noted = len(body) < len(text) or noted
     stop = _glued_phi_value_end(text, body, token, end)
     if stop is not None:
         on_body = noted and stop == len(body)
@@ -2596,10 +2624,13 @@ def _maskable_rest(
     return rest
 
 
-def _scrub_field_runs(text: str, field_run: re.Pattern[str] | None = None) -> str:
+def _scrub_field_runs(
+    text: str, field_run: re.Pattern[str] | None = None, *, noted: bool = False
+) -> str:
     """``field_run`` (:data:`_HL7_FIELD_RUN` by default, read at call time) replaced by the
     placeholder, and masked in place after a run: the rest of a PHI or credential value it cut
-    through, and the rest of a vocabulary end tag whose name it took (:func:`_glued_value`)."""
+    through, and the rest of a vocabulary end tag whose name it took (:func:`_glued_value`, which
+    reads ``noted``)."""
     if field_run is None:
         field_run = _HL7_FIELD_RUN
     if _USERINFO_OPENER in text:
@@ -2618,7 +2649,7 @@ def _scrub_field_runs(text: str, field_run: re.Pattern[str] | None = None) -> st
         if candidate:
             if body is None:
                 body = _without_trailing_note(text)
-            rest = _glued_value(text, body, run, field_run)
+            rest = _glued_value(text, body, run, field_run, noted=noted)
         if rest is not None:
             out.append(rest.translate(_SHAPE))
             pos += len(rest)
@@ -2628,7 +2659,7 @@ def _scrub_field_runs(text: str, field_run: re.Pattern[str] | None = None) -> st
     return "".join(out)
 
 
-def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
+def _redact_flat(text: str, *, widened: bool, credentials: bool, noted: bool = False) -> str:
     """Every pass but the structured ones: the credential backstop, the HL7 shapes, a labelled MRN
     (``widened`` only), dates and names. One stage of :func:`redact` is this plus
     :func:`_redact_structured`, repeated to a fixed point.
@@ -2649,11 +2680,13 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     **What is not re-checked, stated because the reason above is easy to over-read.** A credential
     span that only a WIDENED scrub completes (one that removes an escaped line break inside a ``name``
     string, joining an opener's line to its ``@``) is not re-checked: #1711 did not catch that
-    either."""
+    either.
+
+    ``noted`` is :func:`_redact_noted`'s, read by the field-run arms (:func:`_glued_value`)."""
     if credentials:
         text = _INVALID_URL_USERINFO.sub(lambda m: f"{m.group(1)}{_REDACTED}@", text)
     scrubbed = _HL7_SEGMENT.sub(lambda m: f"{m.group(1)}|{_REDACTED}", text)
-    scrubbed = _scrub_field_runs(scrubbed)
+    scrubbed = _scrub_field_runs(scrubbed, noted=noted)
     # BACKLOG #1572. The passes above assume `| ^ ~ &`; MSH DECLARES the real set per message, so a
     # feed using `*` and `$` kept its identifiers. Sniff, and run a separator-aware pass only when the
     # declared set reaches outside the defaults — widening the hardcoded class instead would have been
@@ -2666,7 +2699,7 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     if not declared <= _DEFAULT_DELIMITERS:
         segment, field_run = _delimiter_patterns(declared | _DEFAULT_DELIMITERS)
         scrubbed = segment.sub(lambda m: f"{m.group(1)}{m.group(2)}{_REDACTED}", scrubbed)
-        scrubbed = _scrub_field_runs(scrubbed, field_run)
+        scrubbed = _scrub_field_runs(scrubbed, field_run, noted=noted)
     # Before the name run, which would otherwise take the label of `PATIENT MRN 12345` and leave the
     # number behind (BACKLOG #2079).
     if widened:
@@ -2811,15 +2844,35 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     and loses how much was cut. Before BACKLOG #1797 the limit cut the kept string itself and left it
     unterminated, which a further pass scrubbed the same way.
 
-    **The head is redacted without the note this call appends after it**, so a value the bound
-    left last is judged as ending the text, and a digit-bearing one prints in front of the note
-    (``a|b|mrn: 12345`` cut by the bound). Reading a stand-in note after the head was tried under
-    BACKLOG #5925 and withdrawn: the stand-in's line break let a whole-text gate in
-    :func:`_redact_unguarded` read a final ``bearer`` as a scheme, which switched off a scrub the
-    answer without it made."""
+    **The head is redacted knowing the bound note this call appends after it** (BACKLOG #5925), so
+    a value the bound left last is not judged as ending the text: a digit-bearing one such as
+    ``a|b|mrn: 12345`` cut by the bound is masked, as the clamp route masks it. The note is passed
+    out of band (:func:`_redact_noted`), not written into the head: a stand-in note in the text let
+    a whole-text gate in :func:`_redact_unguarded` read a final ``bearer`` as a scheme, which
+    switched off a scrub the answer without it made. A text that fits the window has no note, and
+    is redacted as before. :func:`redact_bounded_head` holds this part."""
     head, note = safe_text_bound(text)
-    message = _held_back(redact(head).strip(), limit)
-    return f"{message}{note}"
+    return f"{_held_back(redact_bounded_head(head, note), limit)}{note}"
+
+
+def redact_bounded_head(head: str, note: str) -> str:
+    """``head``, the part of a text a bound cut kept, redacted knowing that ``note``, the bound
+    note appended after it, follows (BACKLOG #5925), and stripped. ``note`` is ``""`` when nothing
+    was cut, and ``head`` is then redacted as :func:`redact` redacts any text.
+
+    One place for what :func:`safe_text` and ``verify_leaf.safe_detail_text`` each do with a head
+    they bound, so the two answer alike (the off-box audit tee does not use it; its
+    ``_bounded_detail`` says why):
+    ``_held_back(redact_bounded_head(head, note), limit) + note`` is ``safe_text(text, limit=limit)``
+    for ``(head, note) = safe_text_bound(text)``. With a note, the head's trailing whitespace is
+    dropped first: a cut can leave it after the head's last value, the answer is stripped anyway,
+    and without it that value ends the head and is judged as the note's neighbour. The note goes
+    to the passes out of band (:func:`_redact_noted`); this changes more than the end-of-text
+    refusals, at least a whole-text gate that reads trailing whitespace, such as the one
+    :func:`_redact_unguarded` keeps for a final ``bearer``."""
+    if note:
+        head = head.rstrip()
+    return _redact_noted(head, noted=bool(note)).strip()
 
 
 def safe_text_bound(text: str) -> tuple[str, str]:
@@ -2828,7 +2881,10 @@ def safe_text_bound(text: str) -> tuple[str, str]:
 
     For a caller that scrubs that part itself before :func:`safe_text` bounds it, as the off-box
     audit tee does (BACKLOG #3045). A scrub that lengthens ``head`` past the window makes
-    :func:`safe_text` cut it again and append a second bound note."""
+    :func:`safe_text` cut it again and append a second bound note. ``safe_text(head) + note`` is
+    not ``safe_text(text)``: :func:`safe_text` on the head alone sees no note after it, so a value
+    the cut left last is judged as ending the text (BACKLOG #5925). :func:`redact_bounded_head`
+    gives the head's answer as :func:`safe_text` gives it."""
     head, dropped = _clamp(text, _REDACT_WINDOW)
     return head, (f" {_clamp_marker(dropped)}" if dropped else "")
 

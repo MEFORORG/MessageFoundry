@@ -22,6 +22,7 @@ import os
 import shutil
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -836,6 +837,78 @@ async def test_AC3_restore_refuses_rather_than_place_a_store_it_could_not_resalt
         )
     assert "_ClosedStoreWriteError" not in str(refused.value)
     assert not dest.exists()
+
+
+async def test_AC3_restore_refuses_a_copy_whose_salt_name_a_view_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through the real ``forget_store_salt``: a staged copy whose ``store_salt`` is a
+    view another tool left is refused before it is placed, rather than placed for its first
+    writable open to refuse. The view is planted just before the real call, after the restore's
+    own checks, so this exercises the salt step and not those checks."""
+    from messagefoundry.store import store as store_module
+
+    key = generate_key()
+    db = tmp_path / "live.db"
+    store, _live = await _live_store(db, key)
+    runner = BackupRunner(
+        store,
+        BackupSettings(enabled=True, destination=str(tmp_path / "backups")),
+        store_settings=_store_settings(db, key),
+        config_dir=None,
+        instance="dev",
+    )
+    result = await runner.run_once(now=1000.0)
+    assert result is not None
+    await store.close()
+
+    real = store_module.forget_store_salt
+    planted: list[Path] = []
+
+    def _plant_then_forget(path: Path) -> bool:
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("DROP TABLE store_salt")
+            conn.execute("CREATE VIEW store_salt AS SELECT 's' AS salt")
+            conn.commit()
+        finally:
+            conn.close()
+        planted.append(path)
+        return real(path)
+
+    monkeypatch.setattr(store_module, "forget_store_salt", _plant_then_forget)
+    dest = tmp_path / "restored" / "store.db"
+    with pytest.raises(BackupError, match="store_salt is a view, not this build"):
+        await run_restore(
+            result.archive_path, dest_store_path=dest, store_settings=_store_settings(dest, key)
+        )
+    assert planted, "the restore must have reached the salt step, or this proves nothing"
+    assert not dest.exists()
+
+
+def test_forget_store_salt_converts_an_unreadable_wal_to_a_sqlite_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The callers catch ``sqlite3.Error``, so an ``OSError`` reading the ``-wal`` size must not
+    escape their refusal: it is converted, and the call fails closed."""
+    copy = _wal_only_salt_copy(tmp_path)
+    real_stat = Path.stat
+
+    def _stat(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self.name.endswith("-wal"):
+            raise PermissionError("simulated: the -wal cannot be read")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", _stat)
+    with pytest.raises(
+        sqlite3.OperationalError, match="could not be read after leaving WAL mode"
+    ) as raised:
+        forget_store_salt(copy)
+    # The DR callers report it through _sqlite_error_reason, which prints it; safe_exc, which a log
+    # or traceback rendering may use, withholds a driver's own message, so pin that it keeps this.
+    from messagefoundry.redaction import safe_exc
+
+    assert "could not be read after leaving WAL mode" in safe_exc(raised.value)
 
 
 async def test_AC6_frames_a_cancelled_run_reports_late_are_charged_to_their_own_key(

@@ -5,10 +5,11 @@
 
 Every call sends ``[ai].api_key`` over https that verifies the endpoint's certificate, and stdlib
 ssl checks no OCSP. It checks no CRL unless ``[tls].crl_file`` is set, the ``[tls]`` section
-reaches the app serving ``POST /ai/chat``, and the endpoint is not loopback
-(docs/SECURITY-LOOSENING.md states it in full). So an off-box endpoint is refused under an
-enforcing or unknown posture unless that CRL is checked or ``[ai].endpoint_revocation_attested``
-is set with its reason. Since BACKLOG #5527 the broker resolves the instance ``[tls]`` policy, so
+reaches the app serving ``POST /ai/chat``, and the endpoint host does not read as loopback in
+the reading ``ai_broker._refuse_an_unrevoked_ai_hop`` states (an endpoint URL holding ``[::1]``
+reads as loopback). So such an endpoint is refused under an enforcing or unknown posture
+unless that CRL is checked or ``[ai].endpoint_revocation_attested`` is set with its reason.
+Since BACKLOG #5527 the broker resolves the instance ``[tls]`` policy, so
 ``[tls].internal_ca_file`` under ``augment`` or ``pinned``, and ``[tls].crl_file`` in any mode,
 reach its opener; the section "the [tls] policy reaches the broker's opener" pins that.
 All endpoints, keys, certificates and CRLs here are synthetic.
@@ -704,9 +705,9 @@ def test_a_tls_crl_reaches_the_broker_and_crosses_an_enforcing_posture(
     pki: _Pki, ai_log: list[str]
 ) -> None:
     """The row's own failing case. With ``[tls].crl_file`` set, the broker dials an opener of its
-    own whose context checks that CRL, so an off-box endpoint crosses enforce with no attestation
-    and logs no crossing line. Red on the parent commit: the shared opener carried no CRL, so the
-    broker refused the hop."""
+    own whose context checks that CRL, so a non-loopback endpoint crosses enforce with no
+    attestation and logs no crossing line. Red on the parent commit: the shared opener carried no
+    CRL, so the broker refused the hop."""
     broker = _broker(posture=_ENFORCING, policy=TrustAnchorPolicy(crl_file=pki.crl_file))
     assert broker._opener is not _shared_no_redirect_opener()
     assert _context(broker).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
@@ -772,6 +773,24 @@ def test_a_loopback_endpoint_takes_neither_the_internal_ca_nor_the_crl(pki: _Pki
         policy=policy,
     )
     assert broker._opener is _shared_no_redirect_opener()
+
+
+@pytest.mark.parametrize(
+    ("host", "loopback"),
+    [("[::1]", True), ("localhost", True), ("localhost.", False), ("127.1", False)],
+)
+def test_the_url_host_reading_places_the_trust_anchor(pki: _Pki, host: str, loopback: bool) -> None:
+    """BACKLOG #5527: the docs say the URL host is read as ``hop_url_host`` gives it, so ``[::1]``
+    in a URL reads as loopback and takes neither file, while ``localhost.`` and ``127.1`` read as
+    remote and get the anchored opener with the CRL, which then credits the crossing."""
+    policy = TrustAnchorPolicy(internal_ca_file=pki.ca_file, mode="pinned", crl_file=pki.crl_file)
+    broker = _broker(
+        endpoint=f"https://{host}:8443/v1/messages",
+        allowed=(host,),
+        posture=_ENFORCING,
+        policy=policy,
+    )
+    assert (broker._opener is _shared_no_redirect_opener()) is loopback
 
 
 def test_a_broker_handed_a_tls_policy_offers_the_crl_lever(ai_log: list[str]) -> None:
@@ -893,8 +912,9 @@ def test_the_managed_app_hands_the_broker_the_tls_section_it_was_given(
 ) -> None:
     """Row #5527 item 8, its first half (and items 18, 28, 36): the lifespan of
     ``create_managed_app`` puts the ``[tls]`` section it is handed where the route reads it, so on
-    the ``serve`` path an unattested off-box hop crosses enforce on that CRL. Driven through the
-    lifespan, end to end; the same app with no ``tls_settings`` is the control, and answers 503."""
+    the ``serve`` path an unattested non-loopback hop crosses enforce on that CRL. Driven through
+    the lifespan, end to end; the same app with no ``tls_settings`` is the control, and answers
+    503."""
     from starlette.testclient import TestClient
 
     from messagefoundry.api.app import create_managed_app

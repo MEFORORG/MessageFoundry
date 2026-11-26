@@ -70,7 +70,7 @@ def _main() -> Iterator[None]:
         yield
 
 
-def _never_masked_only(text: str, flat: str, *, widened: bool) -> bool:
+def _never_masked_only(text: str, flat: str, *, widened: bool, noted: bool = False) -> bool:
     """Main's round gate: no change is a mask alone, so only ``text == flat`` ends a round."""
     return False
 

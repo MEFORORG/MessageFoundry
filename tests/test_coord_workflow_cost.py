@@ -1754,3 +1754,43 @@ def test_a_receiver_the_walk_cannot_read_is_not_an_empty_array(
     assert [(u.kind, u.form, u.per_unit) for u in cost.unknowns] == [
         ("dynamic-width", ".map(...): receiver not read", 1)
     ]
+
+
+# BACKLOG #5602, #8251 group J items 38 and 39: an Allman `function (x)` with its `{` on the next
+# line, in an expression, keeps its conditional and its class field; and an `export default`
+# function or class DECLARATION ends a statement, not a value. Each misread priced a real agent
+# call at 0, or a regex's text as a call, and called the total exact.
+@pytest.mark.parametrize(
+    ("source", "agents"),
+    [
+        ("const c = 1, g = 2\nconst h = c ? function (x)\n{ return 1 } : {}\n/agent(1)/g\n", 1),
+        ("const g = 2\nclass A {\n  f = function (x)\n  { return 1 }\n  /agent(1)/g\n}\n", 1),
+        ("export default function main() { }\n/`/.test(s)\nagent(1)\n// `\n", 1),
+        ("export default async function () { }\n/agent(1)/.test(s)\nagent(2)\n", 1),
+        ("export default class X { }\n/agent(1)/.test(s)\nagent(2)\n", 1),
+        # the controls: an export default EXPRESSION still ends a value, so the `/` divides
+        ("const g = 2\nexport default (function () { })\n/agent(1)/g\n", 1),
+        ("const g = 2\nexport default { }\n/agent(1)/g\n", 1),
+        # the entry point's body is still priced where it is written, not as a helper
+        (
+            "export default async function main() {\n"
+            "  await parallel([1, 2, 3].map(r => agent(r)))\n}\n",
+            3,
+        ),
+    ],
+    ids=[
+        "allman-conditional",
+        "allman-class-field",
+        "export-default-function",
+        "export-default-async-function",
+        "export-default-class",
+        "export-default-parenthesized",
+        "export-default-object",
+        "export-default-entry-point",
+    ],
+)
+def test_a_function_ends_a_value_only_where_it_is_one(
+    mod: ModuleType, source: str, agents: int
+) -> None:
+    cost = mod.price_script(source)
+    assert (cost.agents, cost.exact) == (agents, True), (cost.sites, cost.unknowns)

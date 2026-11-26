@@ -2560,8 +2560,9 @@ the same permission set on the same method reds CI until it is listed here.
 > `restart_outbound` rule is withheld from a scoped caller too, whatever the graph holds, since
 > its action names the outbound side. So is every rule whose event type only an outbound raises,
 > a `"*"` rule included: `_ALERT_EVENT_SIDE` in `messagefoundry/api/app.py` records each type's
-> side, and an event type or action with no side recorded is withheld too. A type both sides
-> raise, and `any`, still show on a `"*"` rule, though such a rule also matches outbound events.
+> side, and an event type or action with no side recorded is withheld too. A `"*"` rule of a
+> type both sides raise, or of `any`, is withheld as well, since it also matches outbound events.
+> A rule of such a type that names an in-scope inbound passes this test.
 > The alert-instance routes were left as they were, on
 > purpose. The batch Manager decided this on 2026-11-22. It read the owner's ruling as covering
 > rules and flagging, not instances. What the ack, resolve, suspend and resume routes admit is in their bullet under
@@ -2973,14 +2974,41 @@ included, and released, any error the reload raises that none of the other reaso
 raised by a runner start or swap. A `FileNotFoundError` there is never `not_found`. That reason is
 for the config directory itself: at least one that is missing, and one moved away between the
 reload's target check and its read of the directory. An executor fault is named by its own type,
-at least when a lane's anchor check meets it. The row never
+at least when a worker-thread hop with no fallback meets it. The row never
 carries the error's text. A connector build or build check that the executor refused at submit,
 before a worker took it, or cancelled or failed before it began, runs on the event loop instead,
-with a WARNING in the engine log, so that hop does not fail; a bad config is still refused. Work
-still queued behind a busy or hung pool waits for it and is not run on the loop. Other
-worker-thread hops have no such fallback, at least a lane's anchor check and a reload's reads of
-its config directory, so a pool that stays broken still fails the reload. The row does not claim
-the old graph is still serving: at least a
+with a WARNING in the engine log, so that hop does not fail; a bad config is still refused. The
+refused-executor hop list follows (BACKLOG #5755). At least these hops fall back too, except that
+each runs on a thread of its own rather than on the loop: some trust-anchor reads (at least a
+lane's anchor check, the settings preflight and the registry anchor preflight), a reload's target
+check, its content snapshot and its reload snapshot of the config directory, its approval check, a
+DICOM listener's start and stop, and the sandbox session closes. Only when no thread can be
+started does such a hop run on the event loop, which then blocks while it runs: an anchor read on
+a stalled share for as long as the read takes, and a DICOM stop or a sandbox close for as long as
+it runs, which includes waiting out an in-flight C-STORE or brokered lookup whose own wait on the
+loop then times out and fails it. A C-STORE failed that way can still be committed once the loop
+is free, because the commit it waited on was already scheduled, so a re-send by the sender then
+makes a duplicate. A DICOM listener's start still fails there, because it starts its accept loop
+on a thread of its own. Work still queued behind a busy or hung pool waits for it and is not run
+on the loop. Other worker-thread hops have no such fallback, at least: in a reload, the
+environment value read, the config load, which runs author code, the bundle fingerprint, which
+also reads the config directory, and a connector's own startup check, such as a remote-file
+listing; at a load the engine runs, a reload or a DR activation's profile included, the connection
+key-file check that `serve` runs as the first registry preflight (`config/key_file_access.py`); in
+a DR activation, the cold-seed restore-verify (`pipeline/dr_backup.py`) and the confinement of an
+archive the request names; and at serve start and store open, the SMTP alert CA check and the SQL
+Server store's certificate pin checks. So a pool that stays broken still fails an operator reload
+at the first of these it meets, which comes before either registry preflight. A DR activation on
+such a pool aborts before any VIP step, at the latest at its first step, the cold-seed
+restore-verify. A pool that breaks later in an activation, once the takeover hook has run, meets
+the key-file check under `serve` at the profile's preflight, so the activation aborts there and
+the VIP may already have moved. Nor does a rollback on such a pool bring every inbound back. It
+restarts, one at a time, the inbounds that were listening when the runner took its reload lock,
+which is after the engine has loaded and checked the new config, so an inbound stopped or started
+in between is not put back as it was when the reload was asked for. One whose start meets such a
+hop is recorded `failed` and stays down after the rollback, while the rollback still tries to
+restart the rest. That record alerts once while it stands: a repeat failure of the same class, a
+store fault or not, records and alerts nothing new. The row does not claim the old graph is still serving: at least a
 fault raised after the swap committed leaves the new one live, and `GET /config/provenance` says
 which is. At least these write no such row: a DR activation's reload, and a row whose own write
 fails, which is logged. A cluster convergence reload records such a fault with reason
@@ -4427,7 +4455,9 @@ and answered after another tab met the factor, neither re-anchors nor stamps. Th
 inside the factor write, from the session row that write reads in its own transaction
 (`mark_session_mfa_verified` with an anchor; its docstring says what each store backend does
 between that read and the write). A refused code at `POST /ui/mfa` on a session that had already met its factor lands on
-`/ui`, as the page's GET does, and stages no assertion; a must-change session that must change its
+`/ui`, as the page's GET does, and stages no assertion. It carries a notice that the session needed no code (vault BACKLOG #2964 item 21), except at least on an `oidc` session on an account with TOTP enrolled: a code there within the
+form's length bound is refused unread and lands on a bare `/ui` without it
+([ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md) Amendment F). A must-change session that must change its
 password first is sent to `/ui/account/password` before its code is read. An
 action-bound grant still comes only from the credential leg: the password leg of `POST /ui/reauth`,
 or for an `oidc` session the IdP leg, which shows no password field. Enrollment (`POST /ui/account/webauthn/enroll`) sits behind the **re-proof-only
@@ -4611,9 +4641,13 @@ passkey is then refused with, audited `auth.webauthn_failed`, include at least
 its seal, `reason=session_lost` when the session or the account went with it, and `reason=locked`;
 an MFA reset gives `reason=session_lost` once its revocation has landed, and
 `reason=factor_removed` before. In the passkey set read after the write, on any sign-count answer,
-an exception the read's catch takes is refused with `reason=store_error` and leaves the factor
-unmarked (BACKLOG #3775). Which classes it takes, which it re-raises first, and that every other
-exception raises are in [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md), amendment
+an exception of a class the read's catch refuses is refused as `store_error` with the factor
+unmarked, after a row naming `reason=store_error` is tried; at least some faults in that row's own
+write raise in place of the refusal. Every other exception raises out of the ceremony with the
+factor unmarked, and for at least some of them a row naming `reason=read_raised` is tried first;
+at least some faults in that row's own write raise in place of the read's exception. Either row can
+be missing (BACKLOG #3775). Which classes the read's catch refuses, which raises try the
+`read_raised` row, and when a row is missing or its write raises, are in [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md), amendment
 of 2026-10-17.
 Assertion failures are audited but deliberately do **not** feed the
 account lockout (signatures aren't guessable secrets). Unless a setting turns it off or loosens it (at least
@@ -5615,6 +5649,20 @@ Both kinds of user share one identity model (`users.auth_provider` is `local` or
   this acceptor against a real domain. If it does, every Windows SSO sign-in on a Windows host fails
   closed until a lab run decides how to read it. That is no looser than before, when its directory
   lookup missed.
+  **The realm is bound to the directory entry too (BACKLOG #4846).** The Kerberos lookup asks only
+  what a ticket proves: a person account, `objectCategory=person` and `objectClass=user`, whose own
+  `sAMAccountName` is the ticket's account name, and whose DN's whole trailing run of `DC=` RDNs
+  equals the realm's domain, compared up to ASCII case as the ticket's realm is. So under a forest-wide base or the
+  global catalog, `alice@CORP.EXAMPLE` never resolves to a child domain's `alice`; an entry holding
+  the name only as its UPN answers no ticket; and a machine's ticket (`WS01$`) finds nothing. A
+  name ending in `$` is never looked up, which also covers an interdomain trust account, a
+  person-category `user`. The binding assumes Active Directory's rule that a domain's realm is its
+  DNS name and its naming context that name's `DC=` RDNs. An entry whose trailing `DC=` run is
+  not exactly the realm's labels, one per RDN, matches nothing, and neither does one whose DN the
+  engine's parser refuses; the sign-in is then refused as `not_in_directory`. So does a ticket naming the account by an implicit UPN rather than its
+  `sAMAccountName`, which a client that does not ask the KDC to canonicalize the name may present;
+  that is unverified against a real KDC. The password sign-in and the other name-keyed lookups,
+  `create_directory_account`'s among them, are unchanged.
 
 ### AD-group → role mapping
 
@@ -6790,7 +6838,11 @@ end, in the same transaction as the revoke. The audit row names that session and
 field, the hash the browser presented.
 
 The link is followed for a bounded time: `[auth].oidc_flow_ttl_seconds` plus 120 seconds, which is
-420 seconds at the default, and the session reaper deletes older links. **At least these cases stay
+420 seconds at the default. The session reaper deletes a link only once the link's age on the
+store's clock exceeds the bound plus the reaper's 600-second step tolerance. So it deletes a link
+younger than the bound in real time only after the store's clock has gained more than 600 seconds
+on real time since the link was written; the last case below is one way that happens.
+**At least these cases stay
 open**, and in each the session lives on under the token the elevation handed out, until it expires,
 as before this change:
 
@@ -6798,8 +6850,17 @@ as before this change:
 - a sign-in that runs past the bound, which a slow identity provider or directory can cause, since
   their timeouts bound each call and not the whole sign-in;
 - more than 32 elevations on one session inside the bound;
-- a wall clock that stepped between the elevation and the sign-in, which moves the bound by the
-  size of the step, in either direction.
+- a step of the store's own clock between the elevation and the sign-in, which moves the bound by
+  the size of the step, in either direction. The store stamps each link and measures the bound on
+  that one clock (vault BACKLOG #4276). On PostgreSQL and SQL Server it is the database server's,
+  so a step of an engine host's clock, or skew between engine hosts that share the store, does not
+  move the bound there. **On SQLite it is the engine host's own clock**, which SQLite reads and on
+  which every engine shard runs, so on SQLite a step of that host's clock still moves the bound;
+- on PostgreSQL and SQL Server, a forward step of the database server's clock larger than the
+  session reaper's step tolerance (`_SESSION_REAP_STEP_TOLERANCE`, 600 seconds) while a reaper
+  pass runs. The reaper's step guard reads only the engine's clock, so it cannot see that step, and
+  the purge then deletes links still inside the bound. The deletion stands after the clock is set
+  right.
 
 **A retired token authenticates nothing.** No session read, the validator included, consults the
 links; only a revoke follows them, at a sign-in's supersession or at a sign-out (below). For the
@@ -6809,24 +6870,27 @@ it can only end a session, never open or extend one. Whoever held that token bef
 could already end the session with `POST /auth/logout`; the link lets them do it for the length of
 the bound after the elevation too, through a sign-in whose first credential passes; with MFA
 required, the supersession runs when the password-only session is minted, before the second factor,
-so a password alone is enough. A wall
-clock that stepped forward at the elevation, or back before the sign-in, lengthens that time by the
-step; the reaper's clock-step guard covers its own purge, not this. The links are not under the session integrity seal (BACKLOG #2592): a forged link can only direct a
+so a password alone is enough. A store
+clock that stepped back between the elevation and the sign-in lengthens that time by the step; the
+reaper's clock-step guard does not cover this. The links are not under
+the session integrity seal (BACKLOG #2592): a forged link can only direct a
 revoke, and a revoke needs no key on any backend.
 
 **A sign-out follows the links too, for far less time (BACKLOG #3715).** An elevation in another
 tab can re-key the session while a sign-out is in flight, and the sign-out then ends the session
 under its new token, in the same transaction as the revoke. `POST /auth/logout` follows links
 written up to 5 seconds before its request arrived; the slack covers a link stamped before its
-rotation commits, and clocks that differ between engine processes. Its sign-in check proved the
+rotation commits. The store measures that window back from its own clock, which stamps the link
+too, as the bound plus the time since the request arrived on the engine's monotonic clock, so on
+PostgreSQL and SQL Server clocks that differ between engine hosts do not move it. Its sign-in check proved the
 token live after the request arrived, so any link from it was written after that proof, and the
 route gains no reach. `/ui/logout` carries no credential, so it follows links written up to 5
 seconds before the call. **That is a separate power, credential-free and end-only:** for 5 seconds
 after an elevation, anyone who presents the RETIRED token to `/ui/logout` ends the session it
 became, with no sign-in. It cannot open or extend a session. At least these cases stay open, and
 the session lives on under its new token: an elevation older than the bound, more than 32
-elevations in a row inside it, and a wall clock that stepped between the elevation and the
-sign-out, which moves the bound by the step. The `auth.logout` row names the
+elevations in a row inside it, and a step of the store's own clock between the elevation and the
+sign-out, which moves the bound by the step; on SQLite that clock is the engine host's. The `auth.logout` row names the
 session's owner as actor, its `outcome` is `revoked`, and a `presented` field holds the hash that
 was presented. The `outcome` is `lapsed` instead when the session's own clock checks fail at the
 revoke, or when the session passes them but the owner's admin-issued temporary credential is past
@@ -7882,7 +7946,9 @@ trail is the per-account `auth.login_failed` / `auth.login_locked` / `auth.direc
 `auth.webauthn_failed` for refusals on the factor legs (a lockout hit while proving a second factor
 is audited under those names, not `auth.login_locked`), `auth.reauth` and `auth.password_change_failed`
 for the post-session re-proofs, and the two 6.3.5 events, `auth.account_locked` and
-`auth.login_after_failures`. PHI-read and admin-write
+`auth.login_after_failures`. Not every factor-leg refusal writes a row: `verify_mfa`'s docstring
+names at least the code it refuses before any `auth.mfa_failed` row, for example one on an account
+it finds with TOTP off at its first read. PHI-read and admin-write
 throttles on the JSON API log at WARNING with actor + path; the console's `require_ui` refusals do
 not (see *The console's refusal differs from the JSON floor's* under
 [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
@@ -8419,7 +8485,7 @@ onto keyless rows fails the verify, and is also reported as
 |---|---|
 | `0` | A clean walk, either with the key or, in a shell that holds no key, under settings that allow the store to run keyless. It covers at least one row, unless `--allow-empty` or an expected anchor of `0:` accepted an empty log (see exit `3`). |
 | `1` | The chain did not verify. It covers at least a broken chain, a mismatch with `--expected-anchor`, an expected row (`--expected-row`, `--expected-rows-file`) that is gone or whose hash differs, a chain checked with a key that is not the chain's, and a chain that names a key in a shell that holds no key and whose settings allow the store to run keyless. Those print a `FAIL` line that says which. A key, key-provider or database error that stops the check part way prints one too, such as a Transit outage or a row that is not UTF-8. That line names the error's class and its cause's class, never its text. It says the rest of the chain was not checked. Before vault BACKLOG #3054 these exited 1 or 2 with no `FAIL` line. An error the command does not classify still exits 1 with none. |
-| `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that cannot be read or fail validation (a `--service-config` path that is a directory or unreadable included, which exited 1 before vault BACKLOG #2725), a store key the settings name that cannot be resolved, a store key that is not base64 of 32 bytes (which exited 1 before vault BACKLOG #3054), a malformed expected row, two expected rows giving one `seq` different hashes, or an `--expected-rows-file` that cannot be read, is not UTF-8, is over its bound or holds no pair (vault BACKLOG #2612), and an empty log in a shell that holds no key and whose settings require one. |
+| `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that cannot be read or fail validation (a `--service-config` path that is a directory or unreadable included, which exited 1 before vault BACKLOG #2725), a store key the settings name that cannot be resolved, a store key that is not base64 of 32 bytes (which exited 1 before vault BACKLOG #3054), an expected row the parser refuses as malformed (it passes a `vault:v` head unchecked, so a `vault:v` row or anchor with a valid count and a malformed head exits `1`, not `2`; the `_audit_head_shape` docstring in [`store/store.py`](../messagefoundry/store/store.py) states that cost), two expected rows giving one `seq` different hashes, or an `--expected-rows-file` that cannot be read, is not UTF-8, is over its bound or holds no pair (vault BACKLOG #2612), and an empty log in a shell that holds no key and whose settings require one. |
 | `3` | A clean walk over an **empty** log. |
 | `4` | The chain's first row names a key, this shell holds no key, and its settings do not allow the store to run keyless. No row was checked against its MAC. It prints a `NOT CHECKED` line. This is not a pass. |
 | `5` | The chain is keyless and walked clean as plain SHA-256. This shell holds no key, and its settings require one. So the chain was not checked to their standard. It prints a `NOT CHECKED` line and a `WARNING` on stderr. This is not a pass. Before vault BACKLOG #3054 it exited 0. The paragraph on the setup where this goes wrong, below, says what a move between 4 and 5 means. |

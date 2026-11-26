@@ -37,7 +37,10 @@ is listed in :attr:`ValidationResult.unvalidated_segments`, but only when the co
 which is when no earlier check refused the message (a Z-segment is listed whenever hl7apy parsed
 the message, and nothing is listed for a size, segment-cap or parse refusal). A dropped ID
 the version does not define, and a dropped bare defined ID with no field separator, are still
-refused, and so is a dropped MSH, DSC, MSA, ERR, QAK or MFA line (``_NEVER_EXEMPT`` says why).
+refused, and so is a dropped MSH, DSC, MSA, ERR, QAK or MFA line (``_NEVER_EXEMPT`` says why),
+and a dropped BHS, BTS, FHS or FTS line with a later Z line, or a later defined line that is not
+bare, after it (``_ENVELOPE`` says why; a later bare, unrecognised or undefined line does not
+count).
 The exemption is per structure, not per slot: it does not count against the slot's
 cardinality or position. It holds only where MSH-9.1 names the structure's own message code, so a
 structure borrowed through MSH-9.3 under another message code (``ADT^A01^MFN_M01``) gets none.
@@ -411,10 +414,20 @@ def _structures_and_events(hl7_version: str) -> tuple[frozenset[str], frozenset[
 # (BACKLOG #5920): MSH opens a message, DSC points at a continuation, and MSA, ERR, QAK and MFA
 # answer another message, so none of the six is the data that slot carries. The list is not every
 # header, continuation or acknowledgment segment the standard defines: at least ADD, SFT, UAC,
-# QPD, QRD, QRF and RCP are not on it and keep the exemption. The batch and file envelope (BHS,
-# BTS, FHS, FTS) is not here either: split_batch cuts only at MSH, so a member can carry its
-# batch's trailers or the next batch's header.
+# QPD, QRD, QRF and RCP are not on it and keep the exemption.
 _NEVER_EXEMPT = frozenset({"MSH", "DSC", "MSA", "ERR", "QAK", "MFA"})
+
+# The batch and file envelope. A dropped one is refused in such a structure too, unless it is in
+# the run of envelope lines that ends the message (BACKLOG #5920 step 2). That run is exempt
+# because some intake paths hand a message over with its batch's trailers or the next batch's
+# header still on it: at least a lone file message that one_message_bytes hands over as raw
+# bytes under an encoding that does not write ASCII as itself (utf-8-sig, UTF-16, cp932), a
+# member whose MSH-1 is not ASCII, and an MLLP, TCP or HTTP body, none of which split_batch's
+# trailer cut (BACKLOG #5806) reaches. An envelope line with a later Z line, or a later defined
+# line that is not bare, frames nothing and is refused. A later bare, unrecognised or undefined
+# line does not count, so an envelope line before only such lines is still exempt, even where
+# hl7apy kept a bare line (_trailer_from).
+_ENVELOPE = frozenset({"BHS", "BTS", "FHS", "FTS"})
 
 # Structures whose tree the dropped-segment check could not read, so each is logged once.
 _compare_failures: set[tuple[str, str | None]] = set()
@@ -430,7 +443,7 @@ def _dropped_lines(lines: _Lines, message: Any) -> tuple[list[str], list[tuple[s
     occurrence of a repeated ID was dropped is not knowable from the tree, so the later ones are
     named; the count per ID is exact. In a structure with an "any HL7 segment" slot, a defined ID
     followed by a field separator is not refused, as the module docstring says, unless it is one
-    of :data:`_NEVER_EXEMPT`.
+    of :data:`_NEVER_EXEMPT`, or one of :data:`_ENVELOPE` before :func:`_trailer_from`'s position.
     """
     import hl7apy
 
@@ -444,6 +457,7 @@ def _dropped_lines(lines: _Lines, message: Any) -> tuple[list[str], list[tuple[s
         )
     defined = hl7apy.load_library(message.version).SEGMENTS
     exempts: bool | None = None  # read once, on the first dropped defined segment
+    trailer_from: int | None = None  # read once, on the first dropped envelope segment
     refusals: list[str] = []
     exempted: list[tuple[str, int]] = []
     for name, number in lines.segments:
@@ -454,7 +468,10 @@ def _dropped_lines(lines: _Lines, message: Any) -> tuple[list[str], list[tuple[s
         elif name in defined:
             if exempts is None:
                 exempts = _exempts_defined_segments(message)
-            if exempts and number not in lines.bare and name not in _NEVER_EXEMPT:
+            if name in _ENVELOPE and trailer_from is None:
+                trailer_from = _trailer_from(lines, defined)
+            misplaced = trailer_from is not None and name in _ENVELOPE and number < trailer_from
+            if exempts and number not in lines.bare and name not in _NEVER_EXEMPT and not misplaced:
                 exempted.append((name, number))
             else:
                 refusals.append(
@@ -463,6 +480,23 @@ def _dropped_lines(lines: _Lines, message: Any) -> tuple[list[str], list[tuple[s
         else:
             refusals.append(f"unknown segment at line {number}")
     return refusals, exempted
+
+
+def _trailer_from(lines: _Lines, defined: Any) -> int:
+    """The position where the run of envelope lines that ends the message starts: past every
+    other line, Z lines included. A bare line, an unrecognised one and an ID the version does not
+    define are left out, so such a line after a correct trailer stays the first refusal named. A
+    bare line hl7apy kept is left out too, so an envelope line before only such lines is exempt."""
+    others = [
+        number
+        for name, number in lines.segments
+        if name not in _ENVELOPE
+        and number not in lines.bare
+        and _SEGMENT_ID.fullmatch(name) is not None
+        and name in defined
+    ]
+    others.extend(number for _name, number in lines.z_segments)
+    return 1 + max(others, default=0)
 
 
 @dataclass(frozen=True)

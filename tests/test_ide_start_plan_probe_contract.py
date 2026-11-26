@@ -39,11 +39,26 @@ from scripts.security.js_lexer import blank_js_comments
 from tests.test_provision_first_administrator import _PASSWORD, _key_in_this_shell, _tty
 
 _MODEL = Path(__file__).resolve().parents[1] / "ide" / "src" / "engineControlModel.ts"
+_WIZARD = _MODEL.with_name("connectionWizardModel.ts")
 
 
-def _ts_string_const(name: str) -> str:
-    """The value of ``export const <name> = "...";`` in the IDE's control model."""
-    m = re.search(rf'export const {name} = "([^"]+)";', _MODEL.read_text(encoding="utf-8"))
+def _code_view(text: str) -> str:
+    """TypeScript with its comments blanked and its whitespace collapsed, for the source pins."""
+    return " ".join(blank_js_comments(text).split())
+
+
+# A declaration of ``name`` in the code view: a function, const, let or var of that name.
+_DECLARES = r"\b(?:function|const|let|var)\s+{name}\b"
+
+
+def _ts_string_const(name: str, text: str | None = None) -> str:
+    """The value of ``export const <name> = "...";`` in the IDE's control model (or ``text``), with
+    comments blanked so a comment quoting the constant cannot supply it. Whitespace is NOT
+    collapsed here, unlike ``_code_view``: the value is read byte for byte, so a doubled space or a
+    tab inside the literal changes it."""
+    raw = _MODEL.read_text(encoding="utf-8") if text is None else text
+    code = blank_js_comments(raw)
+    m = re.search(rf'export const {name} = "([^"]+)";', code)
     assert m, f"{name} is not a plain string constant in {_MODEL.name}"
     return m.group(1)
 
@@ -64,17 +79,19 @@ def _probe_argv() -> list[str]:
 
 
 def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
-    """If the TypeScript stops building this argv, the three tests below stop describing the IDE.
+    """If the TypeScript stops building this argv, the tests below that run the probe stop describing the IDE.
 
-    The IDE adds ``--service-config`` only when ``messagefoundry.serviceConfig`` is set and not
-    blank; this file's probe runs with the setting at its default, where ``serviceConfigFlag`` adds
-    nothing. Comments are blanked first, so a comment quoting the argv cannot satisfy the pin, and
-    the pin ends at the array's close, so an element added after the flag reds it. The array is
-    handed to ``cliArgv`` (BACKLOG #5409), so its body is pinned too: the interpreter options,
-    then ``-m messagefoundry``, then this array, and nothing after it.
+    The probe forwards the ``serviceConfig`` it is handed, which the mocha suite pins as undefined
+    with ``messagefoundry.serviceConfig`` at its default; this file's probe runs there, where
+    ``serviceConfigFlag`` (an alias of ``connectionWizardModel.ts``'s ``serviceConfigArgs``) is
+    handed undefined and adds nothing. Comments are blanked first in both files, so a comment
+    quoting the code cannot satisfy a pin (a string literal still could), and the pin ends at the
+    array's close, so an element added after the flag reds it. The array is handed to ``cliArgv``
+    (BACKLOG #5409), so its body is pinned too: the interpreter options, then ``-m messagefoundry``,
+    then this array, and nothing after it.
     """
     raw = _MODEL.read_text(encoding="utf-8")
-    src = " ".join(blank_js_comments(raw).split())
+    src = _code_view(raw)
     # Control: the JSDoc right above the pinned array is in the file and is blanked from the code.
     assert "Each value is bound with" in raw
     assert "Each value is bound with" not in src
@@ -91,11 +108,31 @@ def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
         "function cliArgv(module: string, args: readonly string[]): string[] { "
         'return [...INTERPRETER_OPTIONS, "-m", module, ...args]; }' in src
     )
-    assert (
-        "function serviceConfigFlag(serviceConfig: string | undefined): string[] { "
-        "return serviceConfig === undefined ? [] :" in src
+    assert len(re.findall(_DECLARES.format(name="cliArgv"), src)) == 1, "a second cliArgv"
+    # serviceConfigFlag is an alias of connectionWizardModel's serviceConfigArgs, so follow it there:
+    # the alias and its import here, and the body there, where undefined (this probe) adds nothing.
+    # serviceConfigArgs appears only in the import, unrenamed in either direction, and the alias;
+    # serviceConfigFlag is declared once, by the alias, and is otherwise only called. These catch at
+    # least a const or function shadow, a parameter of that name and a local serviceConfigArgs.
+    assert re.search(
+        r"import \{[^}]*(?<!\bas )\bserviceConfigArgs\b(?! as\b)[^}]*\} "
+        r'from "\./connectionWizardModel";',
+        src,
     )
-    assert "username: PROBE_USERNAME, email: PROBE_EMAIL" in src
+    assert "const serviceConfigFlag = serviceConfigArgs;" in src
+    assert len(re.findall(r"\bserviceConfigArgs\b", src)) == 2, "only the import and the alias"
+    assert len(re.findall(_DECLARES.format(name="serviceConfigFlag"), src)) == 1, "a second one"
+    assert len(re.findall(r"\bserviceConfigFlag\b(?!\()", src)) == 1, "a non-call mention"
+    wizard_raw = _WIZARD.read_text(encoding="utf-8")
+    wizard = _code_view(wizard_raw)
+    # Control: the wizard has comments, and comment blanking removed them from the code view.
+    assert "/**" in wizard_raw
+    assert "/**" not in wizard
+    assert (
+        "export function serviceConfigArgs(serviceConfig: string | undefined): string[] { "
+        "return serviceConfig === undefined ? [] :" in wizard
+    )
+    assert "serviceConfig: opts.serviceConfig, username: PROBE_USERNAME, email: PROBE_EMAIL" in src
     assert '[...inv.args, "--json"]' in src
 
 
@@ -169,3 +206,29 @@ def test_a_store_run_only_by_directory_administrators_answers_with_the_no_termin
     error = json.loads(capsys.readouterr().out)["error"]
     assert _ts_string_const("NO_TERMINAL_REFUSAL") in error
     assert _ts_string_const("ADMIN_EXISTS_REFUSAL") not in error
+
+
+def test_a_whitespace_change_inside_the_fragment_is_read_and_reds_the_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Negative control for the constant reader: a doubled space inside ``NO_TERMINAL_REFUSAL``
+    changes what the IDE matches on, so the reader must return the changed value and the
+    fragment check above must fail against it. A reader that collapsed whitespace would hand back
+    the original value and pass wrongly."""
+    raw = _MODEL.read_text(encoding="utf-8")
+    original = _ts_string_const("NO_TERMINAL_REFUSAL")
+    assert " " in original
+    mutated_value = original.replace(" ", "  ", 1)
+    decl = f'export const NO_TERMINAL_REFUSAL = "{original}";'
+    assert raw.count(decl) == 1
+    mutated = raw.replace(decl, f'export const NO_TERMINAL_REFUSAL = "{mutated_value}";')
+    assert _ts_string_const("NO_TERMINAL_REFUSAL", mutated) == mutated_value
+
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    _no_terminal(monkeypatch)
+    assert main(_probe_argv()) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    # The real fragment is in the answer and the mutated one is not, so the check would red.
+    assert original in error
+    assert mutated_value not in error

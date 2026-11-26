@@ -1929,7 +1929,14 @@ class QueueStore(StoreLifecycle, Protocol):
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
         """Delete transform-state entries (ADR 0005) last written before ``older_than`` (age-based
-        retention). Returns the number purged. Off unless ``[retention].state_max_age_days`` is set."""
+        retention). Returns the number purged. Off unless ``[retention].state_max_age_days`` is set.
+
+        The cutoff premise (BACKLOG #5734): the retention runner passes ``older_than`` at least a whole
+        day back (it calls this only when the integer ``state_max_age_days`` is above zero), so it lies
+        well behind every state write in flight, and such a write's row is newer than the cutoff and
+        survives the DELETE. The PostgreSQL and SQL Server backends rest one thing on that premise:
+        keeping cached a key published while the pass runs. A caller passing a cutoff near the present
+        could leave a cached value whose row the DELETE removed."""
         ...
 
     async def purge_connection_events(self, *, older_than: float, now: float | None = None) -> int:
@@ -3554,9 +3561,7 @@ class AuthStore(Protocol):
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None: ...
 
-    async def rotate_session(
-        self, token_hash: str, *, new_token_hash: str, now: float | None = None
-    ) -> bool:
+    async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session to ``new_token_hash``, in place (ASVS 7.2.4).
 
         A pure re-key: every other column — ``user_id``, ``created_at``, ``expires_at``, ``client``,
@@ -3580,8 +3585,9 @@ class AuthStore(Protocol):
         so it must be able to fail closed if the session died underneath it.
 
         **A re-key that lands also records a lineage link, in the SAME transaction** (vault BACKLOG
-        #3028, ADR 0210): ``token_hash`` retired, replaced by ``new_token_hash``, stamped with
-        ``now`` or, when that is ``None``, the time the re-key landed, after any wait. The
+        #3028, ADR 0210): ``token_hash`` retired, replaced by ``new_token_hash``, stamped with the
+        DATABASE's own clock when the link's statement runs, after any wait, and never with an
+        engine process's clock (vault BACKLOG #4276; ``store/session_lineage.py`` says why). The
         session row itself carries nothing of its old hash, so the old hash still resolves to
         nothing. The link's one reader is :meth:`supersede_session`; ``store/session_lineage.py``
         says why it is unsealed. A re-key that did not land writes no link.
@@ -3621,9 +3627,11 @@ class AuthStore(Protocol):
         not met its factor. The decision is made inside the write's own transaction, on the row the
         write reads. PostgreSQL and SQL Server hold a row lock from that read to the write, and
         SQLite's writer lock orders this process's writers, so a factor another request met first
-        leaves this a plain factor stamp. On SQLite a commit by another process between the read
-        and the write makes the write raise rather than replace anything, which the passkey leg
-        answers by ending the session (fail closed). When
+        leaves this a plain factor stamp. SQLite opens the write with ``BEGIN IMMEDIATE`` (vault
+        BACKLOG #2964 item 23), so another process cannot commit between the read and the write: a
+        writer there waits for the other process's lock under ``busy_timeout``, and one that
+        outlasts it raises before anything is read, which the passkey leg answers by ending the
+        session (fail closed). When
         applied, the anchor moves the session's address to ``anchor.client`` (``None`` keeps it)
         and opens the step-up window (``reauth_at``) when ``anchor.open_window`` is true. When
         ``open_window`` is false it CLEARS ``reauth_at``, whether or not the address moved. The
@@ -3638,7 +3646,7 @@ class AuthStore(Protocol):
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None: ...
 
     async def supersede_session(
-        self, token_hash: str, *, now: float, lineage_since: float | None = None
+        self, token_hash: str, *, now: float, lineage_seconds: float | None = None
     ) -> SessionRecord | None:
         """Revoke the unrevoked session ``token_hash`` names, or the one it became, and return its
         row as revoked.
@@ -3655,16 +3663,18 @@ class AuthStore(Protocol):
         first, the row is revoked and the rotation's ``revoked_at IS NULL`` guard refuses it, so
         the rotation fails closed.
 
-        **A rotation that committed FIRST is followed, when ``lineage_since`` is given (vault
+        **A rotation that committed FIRST is followed, when ``lineage_seconds`` is given (vault
         BACKLOG #3028, ADR 0210).** The presented hash then names no row, so the revoke steps along
         the links :meth:`rotate_session` wrote, up to ``LINEAGE_MAX_HOPS`` of them, and ends the
-        live end, inside one transaction. A link retired before ``lineage_since`` is not followed,
-        so a retired hash leads anywhere only for a bounded time; the caller chooses the bound,
-        because the store reads no settings. On Postgres and SQL Server a rotation can still commit
+        live end, inside one transaction. A link retired more than ``lineage_seconds`` before the
+        database's own clock, read in the walk's own statement, is not followed, so a retired hash
+        leads anywhere only for a bounded time; the caller chooses the bound, because the store
+        reads no settings. The stamp and the test both read the database's clock (vault BACKLOG
+        #4276); ``store/session_lineage.py`` says what that closes and what it leaves open. ``now`` stamps only the revoke. On Postgres and SQL Server a rotation can still commit
         between two steps; it costs the walk one more step, never the revoke, because each step
         revokes before it reads a link. ``store/session_lineage.py`` says why that order is the
         control. With
-        ``lineage_since`` left ``None`` no link is followed, and a rotation that committed first
+        ``lineage_seconds`` left ``None`` no link is followed, and a rotation that committed first
         leaves this returning ``None``, as before. The lineage lookup lives here and nowhere else:
         no session READ follows a link, so a retired hash authenticates nothing.
 
@@ -3821,7 +3831,9 @@ class AuthStore(Protocol):
         validator refuses them on presentation, so keeping them only grows the table.
 
         With ``lineage_seconds`` given, session lineage links retired more than that long before
-        ``now`` are deleted too (vault BACKLOG #3028). The supersession no longer follows them, so
+        the database's own clock are deleted too (vault BACKLOG #3028), never measured from
+        ``now``: the supersession measures its window on that clock (vault BACKLOG #4276), so the
+        two agree whichever engine process runs the purge. The supersession no longer follows them, so
         keeping them only grows the table. They are not counted in the return.
 
         The idle variant scans the table, because its ``OR`` reaches past the expiry index, and that
