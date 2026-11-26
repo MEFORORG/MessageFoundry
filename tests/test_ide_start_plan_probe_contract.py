@@ -19,12 +19,9 @@ the IDE looks for, in the ``--json`` error object on stdout, the only place the 
 from. Each arm that runs the probe sets the IDE's condition, stdin not a terminal, explicitly, so
 the result does not depend on how pytest was started.
 
-Whether ``probeDefault`` is the argv the IDE builds: the mocha suite
-``ide/src/test/suite/provision-admin-argv.test.ts`` compares the builder's whole output with it.
-This file reads no builder output. It compares ``probeDefault`` with the argv built from the
-TypeScript constants and pins the text of the builders' source; the docstring of
-``test_the_shared_fixture_default_probe_is_the_argv_built_from_the_typescript_constants`` names
-what that leaves open.
+Whether ``probeDefault`` is the argv the IDE builds, and what this file leaves to the mocha
+suites there, is in the docstring of
+``test_the_shared_fixture_default_probe_is_the_argv_built_from_the_typescript_constants``.
 """
 
 from __future__ import annotations
@@ -84,8 +81,9 @@ def _ts_string_list(name: str, text: str | None = None) -> list[str]:
     """The elements of ``export const <name>: readonly string[] = [...];`` in the IDE's control model
     (or ``text``), comments blanked. The body must be comma-separated double-quoted string literals
     with no backslash or newline inside, and nothing else. At least a single-quoted or template
-    literal, a spread, an identifier and an escaped literal fail the assertion here instead of being
-    skipped or misread; the parametrized negative control below shows each."""
+    literal, a spread, an identifier and a literal holding an escape such as ``\\u002D`` fail the
+    assertion here instead of being skipped or misread; the parametrized negative control below
+    shows each."""
     raw = _MODEL.read_text(encoding="utf-8") if text is None else text
     m = re.search(
         rf"export const {name}: readonly string\[\] = \[([^\]]*)\];", blank_js_comments(raw)
@@ -116,9 +114,8 @@ def _expected_probe_argv(text: str | None = None) -> list[str]:
 
 def _probe_argv() -> list[str]:
     """The fixture's ``probeDefault``, the argv ``buildAdminProbeInvocation`` builds with
-    ``messagefoundry.serviceConfig`` at its default, after ``python -m messagefoundry``. The mocha
-    suite ``ide/src/test/suite/provision-admin-argv.test.ts`` pins the builder's whole output against
-    the same entry."""
+    ``messagefoundry.serviceConfig`` at its default, minus the interpreter options and
+    ``-m messagefoundry``, which ``_cli_args`` strips against its own hardcoded ``PREFIX``."""
     return _cli_args(ARGV_FIXTURE["probeDefault"])
 
 
@@ -126,18 +123,23 @@ def test_the_shared_fixture_default_probe_is_the_argv_built_from_the_typescript_
     """The fixture's ``probeDefault`` equals, whole, the argv built from the TypeScript constants.
 
     What reds this test includes at least: an ``INTERPRETER_OPTIONS`` element changed, added,
-    removed or reordered, or a changed ``PROBE_USERNAME`` or ``PROBE_EMAIL``, unless the fixture
-    moves with it; an ``INTERPRETER_OPTIONS`` element that is not a double-quoted string literal,
+    removed or reordered, or a changed ``PROBE_USERNAME`` or ``PROBE_EMAIL``, with the fixture
+    left as it is; an ``INTERPRETER_OPTIONS`` element that is not a double-quoted string literal,
     which ``_ts_string_list`` refuses; and the fixture's ``probe`` entry drifting from
-    ``probeDefault``.
+    ``probeDefault``. A deliberate ``INTERPRETER_OPTIONS`` change also reds the copies of today's
+    values hardcoded in this file and ``PREFIX`` in ``tests/test_ide_provision_admin_argv.py``,
+    which move by hand.
 
-    What it leaves open: this file reads no builder output. The source pin below matches text
-    anywhere in ``engineControlModel.ts``, not inside a particular function body, so neither
-    builder's return value is checked here, and an element added to what ``buildProvisionInvocation``
-    or ``buildAdminProbeInvocation`` returns passes every test in this file. The mocha suites that
-    compare the builders' whole output catch it, at least ``provision-admin-argv.test.ts`` and
-    ``engine-control.test.ts``. They run in the ``ide build`` job; that job's header in
-    ``.github/workflows/ci.yml`` says whether it gates a merge."""
+    The one account of what this file leaves to the mocha suites: it reads no builder output. The
+    source pin in ``test_the_probe_argv_here_is_the_one_the_ide_builds`` matches text anywhere in
+    ``engineControlModel.ts``, not inside a particular function body. It reds an element added
+    inside the pinned ``cliArgv`` array or to the probe's ``[...inv.args, "--json"]``. It does not
+    red an element added at a builder's return in another spelling, such as
+    ``args: [...args, "--db=x"]`` or a ``.concat``, or a real body changed while a copy of the
+    pinned text stays elsewhere in the file. The mocha suites that compare the builders' whole
+    output catch those, at least ``provision-admin-argv.test.ts`` and ``engine-control.test.ts``.
+    They run in the ``ide build`` job; that job's header in ``.github/workflows/ci.yml`` says
+    whether it gates a merge."""
     raw = _MODEL.read_text(encoding="utf-8")
     assert ARGV_FIXTURE["probeDefault"] == _expected_probe_argv(raw)
     # Negative control: a moved TypeScript constant reds the comparison, so the expected argv is
@@ -154,11 +156,29 @@ def test_the_shared_fixture_default_probe_is_the_argv_built_from_the_typescript_
         assert ARGV_FIXTURE["probeDefault"] != _expected_probe_argv(raw.replace(decl, moved)), moved
     # The fixture's probe with serviceConfig set is probeDefault with only the flag added, before
     # --json, so the two entries cannot drift apart.
-    with_flag = ARGV_FIXTURE["probe"]
+    probe, default = ARGV_FIXTURE["probe"], ARGV_FIXTURE["probeDefault"]
+    assert _is_default_plus_flag(probe, default)
+    # Negative control: an extra element, the flag after --json, a reordered element and a second
+    # flag each fail the same check.
+    flag_at = probe.index(next(a for a in probe if a.startswith("--service-config=")))
+    for drifted in (
+        [*probe[:-1], "--db=other.db", "--json"],
+        [*probe[:flag_at], "--json", probe[flag_at]],
+        [probe[1], probe[0], *probe[2:]],
+        [*probe[:-1], probe[flag_at], "--json"],
+    ):
+        assert not _is_default_plus_flag(drifted, default), drifted
+
+
+def _is_default_plus_flag(with_flag: list[str], default: list[str]) -> bool:
+    """``with_flag`` is ``default`` with exactly one ``--service-config=`` element added, right
+    before the closing ``--json``."""
     flag = [a for a in with_flag if a.startswith("--service-config=")]
-    assert len(flag) == 1
-    assert [a for a in with_flag if a not in flag] == ARGV_FIXTURE["probeDefault"]
-    assert with_flag[-2:] == [*flag, "--json"]
+    return (
+        len(flag) == 1
+        and [a for a in with_flag if a not in flag] == default
+        and with_flag[-2:] == [*flag, "--json"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -168,7 +188,7 @@ def test_the_shared_fixture_default_probe_is_the_argv_built_from_the_typescript_
         '...EXTRA_OPTIONS, "-P", "-X", "disable-remote-debug"]',
         '"-P", "-X", "disable-remote-debug", `-I`]',
         '"-P", "-X", EXTRA_OPTION, "disable-remote-debug"]',
-        '"-P", "-X", "disable-remote-debug", "-X\\"x"]',
+        '"-P", "-X", "disable-remote-debug", "\\u002DI"]',
     ],
     ids=["single-quoted", "spread", "template", "identifier", "escaped"],
 )

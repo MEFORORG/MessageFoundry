@@ -26,8 +26,9 @@ const SC = FIXTURE.serviceConfig;
 // code built the same argv with no --service-config.
 const provisionOpts: Record<string, string> = { python: "p", username: "alice", email: "alice@example.test", serviceConfig: SC };
 const probeOpts: Record<string, string> = { python: "p", serviceConfig: SC };
-// The call shape statusBar.ts uses with `messagefoundry.serviceConfig` at its default: the property
-// present and undefined.
+// The values statusBar.ts passes with `messagefoundry.serviceConfig` at its default: the property
+// present and undefined. Passed `as never`, so this suite does not type-check that call; statusBar.ts's
+// own compile does.
 const probeDefaultOpts: Record<string, string | undefined> = { python: "p", serviceConfig: undefined };
 
 /** The provision-admin argv the IDE runs for alice with SC set. */

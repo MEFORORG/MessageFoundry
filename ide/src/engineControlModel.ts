@@ -253,9 +253,9 @@ export function buildBootstrapPlan(opts: {
 //
 // The probe and the provisioning terminal run in the workspace, as `serve` does, with no `--db`, and
 // with the same `--service-config` `serve` gets (BACKLOG #5566), so all three read one service TOML.
-// In the default layout that is the store `serve` opens. It is NOT when the service TOML sets
-// `[environments].base_dir`: `serve` anchors a relative `[store].path` under it, and
-// `provision-admin` does not (yet). The probe is advice, never the control: `serve` applies its own gates.
+// A relative `[store].path` is anchored under the `[environments].base_dir` the service TOML or the
+// environment sets by `serve` and, since BACKLOG #5926, by `provision-admin` too; the IDE passes neither
+// `--project-root`. The probe is advice, never the control: `serve` applies its own gates.
 
 /** The username the probe passes. `provision-admin` requires one, and the probe never reaches the step
  *  that would use it: with no terminal, the command refuses before it asks for a password. */
