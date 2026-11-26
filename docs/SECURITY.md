@@ -4454,7 +4454,9 @@ and answered after another tab met the factor, neither re-anchors nor stamps. Th
 inside the factor write, from the session row that write reads in its own transaction
 (`mark_session_mfa_verified` with an anchor; its docstring says what each store backend does
 between that read and the write). A refused code at `POST /ui/mfa` on a session that had already met its factor lands on
-`/ui`, as the page's GET does, and stages no assertion; a must-change session that must change its
+`/ui`, as the page's GET does, and stages no assertion. It carries a notice that the session needed no code (vault BACKLOG #2964 item 21), except at least on an `oidc` session on an account with TOTP enrolled: a code there within the
+form's length bound is refused unread and lands on a bare `/ui` without it
+([ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md) Amendment F). A must-change session that must change its
 password first is sent to `/ui/account/password` before its code is read. An
 action-bound grant still comes only from the credential leg: the password leg of `POST /ui/reauth`,
 or for an `oidc` session the IdP leg, which shows no password field. Enrollment (`POST /ui/account/webauthn/enroll`) sits behind the **re-proof-only
@@ -7941,7 +7943,9 @@ trail is the per-account `auth.login_failed` / `auth.login_locked` / `auth.direc
 `auth.webauthn_failed` for refusals on the factor legs (a lockout hit while proving a second factor
 is audited under those names, not `auth.login_locked`), `auth.reauth` and `auth.password_change_failed`
 for the post-session re-proofs, and the two 6.3.5 events, `auth.account_locked` and
-`auth.login_after_failures`. PHI-read and admin-write
+`auth.login_after_failures`. Not every factor-leg refusal writes a row: `verify_mfa`'s docstring
+names at least the code it refuses before any `auth.mfa_failed` row, for example one on an account
+it finds with TOTP off at its first read. PHI-read and admin-write
 throttles on the JSON API log at WARNING with actor + path; the console's `require_ui` refusals do
 not (see *The console's refusal differs from the JSON floor's* under
 [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
