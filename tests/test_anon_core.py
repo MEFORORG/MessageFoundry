@@ -10,6 +10,7 @@ from __future__ import annotations
 import functools
 import math
 import random
+import re
 import secrets
 import string
 from collections.abc import Callable, Iterator
@@ -36,6 +37,7 @@ from messagefoundry_toolkit.anon import rules as rules_module
 from messagefoundry_toolkit.anon.keying import (
     MAX_SALT_BYTES,
     MIN_SALT_ENTROPY_BITS,
+    MIN_SALT_ENTROPY_BITS_PER_CHAR,
     MIN_SALT_LEN,
     _estimated_entropy_bits,
 )
@@ -158,7 +160,9 @@ def test_keyer_rejects_a_long_salt_with_too_little_entropy() -> None:
         # Whichever message fires, it names the per-character floor, the one that binds.
         with pytest.raises(
             ValueError,
-            match=r"(too predictable|too few distinct characters)[\s\S]*against a floor of 2\.0",
+            match=r"(too predictable|too few distinct characters)[\s\S]*against a floor of "
+            + re.escape(f"{MIN_SALT_ENTROPY_BITS_PER_CHAR:.1f}")
+            + r"\b",
         ):
             Keyer(salt)
 
@@ -969,34 +973,54 @@ def test_the_two_floors_are_independent() -> None:
         Keyer("ab" * MIN_SALT_LEN)
 
 
+_BINDING_FLOOR_TEXT = (
+    "per character, against a floor of 2.0 (64 bits at the 32-character minimum length)."
+)
+
+
 @pytest.mark.parametrize(
     ("salt", "expected"),
     [
         (
             "a" * MIN_SALT_LEN,
-            "anonymizer salt is too predictable: about 0.0 bits of estimated entropy, 0.00 per "
-            "character, against a floor of 2.0 bits per character (64 bits at this length).",
+            "anonymizer salt is too predictable: about 0.00 bits of estimated entropy "
+            + _BINDING_FLOOR_TEXT,
         ),
         (
-            "a" * 40,
-            "anonymizer salt is too predictable: about 0.0 bits of estimated entropy, 0.00 per "
-            "character, against a floor of 2.0 bits per character (80 bits at this length).",
+            "x" * 31 + "y",  # non-zero, so a value in the wrong slot would show
+            "anonymizer salt is too predictable: about 0.20 bits of estimated entropy "
+            + _BINDING_FLOOR_TEXT,
+        ),
+        (
+            "a" * 40,  # longer than the minimum: neither its length nor its total is stated
+            "anonymizer salt is too predictable: about 0.00 bits of estimated entropy "
+            + _BINDING_FLOOR_TEXT,
         ),
     ],
-    ids=["at-the-length-floor", "forty-characters"],
+    ids=["at-the-length-floor", "skewed-non-zero", "forty-characters"],
 )
 def test_too_predictable_names_the_floor_that_binds(salt: str, expected: str) -> None:
     """The too-predictable refusal names the PER-CHARACTER floor, because that is the floor that
-    binds. Every salt that reaches the total check is at least MIN_SALT_LEN characters, so a total
-    under MIN_SALT_ENTROPY_BITS is under 1 bit per character and the per-character floor would
-    refuse it too. Naming the 32-bit total told an operator a floor about half the real one at 32
-    characters (BACKLOG #4652 item 3). The thresholds and the check order are unchanged; this pins
-    only the wording, and that the retired 32-bit figure is gone from it."""
+    binds: every salt that reaches the total check is at least MIN_SALT_LEN characters, so the
+    per-character floor refuses it too (BACKLOG #4652 item 3). The literal pins the wording; the
+    last assertion checks the 32-bit total is not cited anywhere in the message."""
     with pytest.raises(ValueError) as excinfo:
         Keyer(salt)
     message = str(excinfo.value)
     assert message.startswith(expected)
-    assert f"floor of {MIN_SALT_ENTROPY_BITS:.0f}." not in message
+    assert (
+        re.search(
+            rf"\b{MIN_SALT_ENTROPY_BITS:.0f}[- ]bit|floor of {MIN_SALT_ENTROPY_BITS:.0f}\b", message
+        )
+        is None
+    )
+
+
+def test_the_per_character_floor_subsumes_the_total_at_the_length_floor() -> None:
+    """The too-predictable message names the per-character floor, which is true only while that
+    floor refuses every salt the total does at MIN_SALT_LEN. Raising the total, or lowering the
+    length floor, past this point would make the message name a floor the salt clears."""
+    assert MIN_SALT_ENTROPY_BITS <= MIN_SALT_LEN * MIN_SALT_ENTROPY_BITS_PER_CHAR
 
 
 # --- a segment id is untrusted text too (BACKLOG #1710 repair) --------------------------------------
