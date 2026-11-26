@@ -2388,33 +2388,27 @@ files, at file level only; [TEE-RELAY.md, Purge](TEE-RELAY.md#purge) states what
 does and does not reach, and where `VACUUM`'s temp copy may go. On POSIX the `-wal` and `-shm`
 files take the DB file's mode. That mode is `0600` only when the store's `0600` pre-create of a
 new DB, or its best-effort `chmod` on open, succeeds; a failed `chmod` is logged as a warning,
-and a failed pre-create is not reported. On Windows each tee open attempts to give the DB, `-wal`
-and `-shm` a protected access list granting full control to the opening account alone. The attempt
-is made file by file, and it can fail for at least these reasons: the opening account may not
-change that file's list, the volume has no access-list support, or another system error. A failed
-attempt leaves that file's list as it was; for a file created in that open, that is the folder's
-list. Each failure is logged as a WARNING, which a log level above WARNING, for example
-`--log-level ERROR`, hides. Another account's later tee open is refused while that protected list
-holds. An account whose tee open succeeds makes the same attempt for itself, and the account that
-opened before can then be locked out. So run the relay and the tee commands that read its DB under
-one account. On Windows the restriction leaves at least these gaps. It removes the folder's grants
-for later opens only: a handle another account opened earlier, while a file still carried its
-folder's list, keeps its access until it closes. That window opens at least during a tee open,
-between a file's creation and the restriction at the end of the open, and stays open past an open
-that fails before it restricts. SQLite deletes the `-wal` and `-shm` at least on the last
-connection's close and on a switch out of WAL mode. A tee open that completes attempts to restrict
-the ones it re-creates. One re-created any other way, for example by another SQLite client opening
-the DB after the tee's last close, stays on the folder's list until a later tee open restricts it.
-A rollback `-journal`, which SQLite can write while the DB is out of WAL mode, is not restricted by
-the tee. When a file's owner is not the opening account, for example a DB another account created,
-the owner keeps its implicit right to change the list. When the owner is the Administrators group,
-as it can be for a DB an elevated account created, every elevated member of Administrators holds
-that right, not one account. An account holding the backup privilege, an administrator for example,
-can read the files past the list. One holding the take-ownership privilege can make itself the
-files' owner and then change the list. One holding the restore privilege, an administrator for
-example, can write the files and replace their owner and list past the list. Keep every tee DB in a
-folder whose own access list grants no other account, which narrows the gaps above except the
-owner's rights and those three privileges, and on a protected volume regardless.
+and a failed pre-create is not reported. On Windows each tee open attempts to restrict the DB,
+`-wal` and `-shm` to the opening account. The attempt can fail or not take effect, and a failure is
+not always reported, so it is not the only control on who can read those files. Another account's
+later tee open is refused while the restriction holds on all three files. An account whose tee open
+succeeds makes the same attempt for itself, and the account that opened before can then be locked
+out. So run the relay and the tee commands that read its DB under one account. On Windows the
+restriction leaves at least these gaps. It applies to later opens only: a handle another account
+opened earlier, before the restriction, keeps its access until it closes. That window opens at
+least during a tee open, between a file's creation and the restriction at the end of the open, and
+stays open past an open that fails before it restricts. SQLite deletes the `-wal` and `-shm` at
+least on the last connection's close and on a switch out of WAL mode. A tee open that completes
+attempts to restrict the ones it re-creates. One re-created any other way, for example by another
+SQLite client opening the DB after the tee's last close, is not restricted until a later tee open
+restricts it. A rollback `-journal`, which SQLite can write while the DB is out of WAL mode, is not
+restricted by the tee. When a file's owner is not the opening account, for example a DB another
+account created, the owner keeps its implicit right to change the list. When the owner is the
+Administrators group, as it can be for a DB an elevated account created, every elevated member of
+Administrators holds that right, not one account. At least administrators and holders of the
+take-ownership, backup or restore privilege can read or change the files past the list. Keep every
+tee DB in a folder whose own access list grants no other account, which narrows some of the gaps
+above but not the owner's rights or those accounts, and on a protected volume regardless.
 
 The **opt-in ADR 0087 sandbox worker** (`[sandbox].mode = "subprocess"`, default `"off"`) is **not** an
 exclusion, and this paragraph is the single statement of how its output reaches stream 1 — the code
