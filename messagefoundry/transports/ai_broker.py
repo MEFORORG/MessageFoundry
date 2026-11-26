@@ -130,9 +130,10 @@ _AI_ATTESTATION_LEVER = (
     "Set [ai].endpoint_revocation_attested = true with an "
     "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
     "endpoint's certificate, or use an endpoint URL whose host reads as loopback here, such as "
-    "localhost, 127.0.0.1 or [::1], with its host listed in [ai].allowed_endpoints, which is "
-    "verified against the OS trust store alone; at least a spelling with a trailing dot, or a "
-    "shortened IPv4 address such as 127.1, reads as remote."
+    "localhost, 127.0.0.1 or [::1], and list that host in [ai].allowed_endpoints. Such an "
+    "endpoint is verified against the OS trust store alone, with neither [tls] file. The host "
+    "is read as spelled, apart from case and IPv6 brackets: at least a spelling with a "
+    "trailing dot, or a shortened IPv4 address such as 127.1, reads as remote."
 )
 
 #: The ways across that refusal under an enforcing posture, on the terms below:
@@ -150,9 +151,10 @@ _AI_CRL_LEVER = (
     "or its handshake fails), or set [ai].endpoint_revocation_attested = true with an "
     "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
     "endpoint's certificate, or use an endpoint URL whose host reads as loopback here, such as "
-    "localhost, 127.0.0.1 or [::1], with its host listed in [ai].allowed_endpoints, which is "
-    "verified against the OS trust store alone; at least a spelling with a trailing dot, or a "
-    "shortened IPv4 address such as 127.1, reads as remote."
+    "localhost, 127.0.0.1 or [::1], and list that host in [ai].allowed_endpoints. Such an "
+    "endpoint is verified against the OS trust store alone, with neither [tls] file. The host "
+    "is read as spelled, apart from case and IPv6 brackets: at least a spelling with a "
+    "trailing dot, or a shortened IPv4 address such as 127.1, reads as remote."
 )
 
 
@@ -229,8 +231,9 @@ def _ai_endpoint_opener(
 
     The anchor is resolved by ``rest.http_family_trust_anchor``, as for every HTTP-family hop, here
     with no ``tls_ca_file`` of its own: ``[tls].internal_ca_file`` under ``augment`` or ``pinned``,
-    and ``[tls].crl_file`` in any mode, each only for a host that is not loopback. So this is where
-    a CRL reaches this hop. An anchor that narrows gets an anchored opener. One that narrows
+    and ``[tls].crl_file`` in any mode, each only for an endpoint whose host does not read as
+    loopback in the reading :func:`_refuse_an_unrevoked_ai_hop` states, so an endpoint URL holding
+    ``[::1]`` takes neither. So this is where a CRL reaches this hop. An anchor that narrows gets an anchored opener. One that narrows
     nothing gets rest.py's shared opener, which is never mutated: callers compare an opener to it
     by identity to learn that.
 

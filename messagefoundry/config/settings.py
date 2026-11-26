@@ -5045,12 +5045,13 @@ class AiSettings(_Section):
     # Attest that revocation of the AI endpoint's server certificate is covered outside the engine
     # (BACKLOG #2193 slice (e), on the ADR 0173 section 12 pattern). The broker verifies that
     # certificate and checks no OCSP, and no CRL unless [tls].crl_file is set, the [tls] section
-    # reaches the app serving POST /ai/chat, and the endpoint host is not loopback as
-    # config.tls_policy.is_loopback_hop_host reads it (BACKLOG #5527;
-    # docs/SECURITY-LOOSENING.md states it in full). So without that CRL an
-    # endpoint whose host reads as remote there is REFUSED under [security].enforcement = enforce
-    # unless this is set. What
-    # the refusal keys on is stated once, on transports.ai_broker._refuse_an_unrevoked_ai_hop.
+    # reaches the app serving POST /ai/chat, and the endpoint host does not read as loopback
+    # (BACKLOG #5527). That reading is stated once, on
+    # transports.ai_broker._refuse_an_unrevoked_ai_hop: config.tls_policy.is_loopback_hop_host on
+    # the host config.tls_policy.hop_url_host takes from the URL, lowercased and without the
+    # brackets of an IPv6 host, so an endpoint URL holding [::1] reads as loopback. So without
+    # that CRL an endpoint whose host reads as remote there is REFUSED under
+    # [security].enforcement = enforce unless this is set.
     # Setting it adds no check on the wire. The reason is MANDATORY; at least a flag without one, a
     # blank one, a reason without the flag, or a control character in the reason refuses at load.
     # It is a LOOSENING: security_loosenings()
@@ -11552,9 +11553,12 @@ def security_loosenings(
                 "serving POST /ai/chat (messagefoundry serve hands it, an embedder's "
                 "create_managed_app holds none unless it passes tls_settings, and a direct "
                 "create_app none unless it passes tls_settings or sets app.state.tls_settings), "
-                "and the endpoint host is not loopback as config.tls_policy.is_loopback_hop_host "
-                "reads it, under which at least the name localhost with a trailing dot reads as "
-                "remote and gets the CRL, though the bare name localhost reads as loopback. So "
+                "and the endpoint host does not read as loopback, as "
+                "config.tls_policy.is_loopback_hop_host reads the host "
+                "config.tls_policy.hop_url_host takes from the URL, lowercased and without the "
+                "brackets of an IPv6 host. Under that reading an endpoint URL holding [::1] and "
+                "the bare name localhost read as loopback, and at least the name localhost with a "
+                "trailing dot reads as remote and gets the CRL. So "
                 "at least "
                 "a loopback endpoint, and an app the [tls] section never reached, check no CRL "
                 "whatever [tls].crl_file says. The "

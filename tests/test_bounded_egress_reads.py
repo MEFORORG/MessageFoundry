@@ -87,7 +87,8 @@ FHIR_BASE = "https://fhir.example.org/fhir"
 DICOMWEB_BASE = "https://pacs.example.org/dicom-web"
 TOKEN_URL = "https://auth.example.com/token"
 AI_ENDPOINT = "https://ai.internal/v1/messages"
-# BACKLOG #2193 slice (e): the off-box AI endpoint is refused unless its revocation is attested.
+# BACKLOG #2193 slice (e): an AI endpoint whose host does not read as loopback, in the reading
+# ai_broker._refuse_an_unrevoked_ai_hop states, is refused unless its revocation is attested.
 # These tests read the reply, so their brokers carry the pair.
 _AI_ATTESTED_REASON = "synthetic: revocation covered outside the engine for these tests"
 

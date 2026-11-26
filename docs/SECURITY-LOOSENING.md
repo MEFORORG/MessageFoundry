@@ -1691,8 +1691,8 @@ count is above `0` (vault BACKLOG #2613).
   upstream's revocation itself needs no attestation when the endpoint URL spells its host as
   loopback, in the first bullet's reading: a loopback endpoint is not refused. It is verified
   against the OS roots alone, since a loopback endpoint takes neither `[tls]` file. Spelled so
-  that it reads as remote, it is judged like an off-box endpoint, and a proxy that applies can
-  carry it off the box.
+  that it reads as remote, it is judged like any non-loopback endpoint, and a proxy that applies
+  can carry it off the box.
 - **What it cannot do:** it never lifts the broker's other refusals, at least an `http` endpoint,
   an endpoint missing from `[ai].allowed_endpoints`, and credentials in the URL. The process-wide
   `MEFOR_TLS_REVOCATION_ATTESTED` does **not** cross this hop under an enforcing or unknown

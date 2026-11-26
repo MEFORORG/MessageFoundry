@@ -5,9 +5,9 @@
 
 Every call sends ``[ai].api_key`` over https that verifies the endpoint's certificate, and stdlib
 ssl checks no OCSP. It checks no CRL unless ``[tls].crl_file`` is set, the ``[tls]`` section
-reaches the app serving ``POST /ai/chat``, and the endpoint is not loopback
-(docs/SECURITY-LOOSENING.md states it in full). So an off-box endpoint is refused under an
-enforcing or unknown posture unless that CRL is checked or ``[ai].endpoint_revocation_attested``
+reaches the app serving ``POST /ai/chat``, and the endpoint host does not read as loopback in
+the reading ``ai_broker._refuse_an_unrevoked_ai_hop`` states (an endpoint URL holding ``[::1]``
+reads as loopback). So such an endpoint is refused under an enforcing or unknown posture unless that CRL is checked or ``[ai].endpoint_revocation_attested``
 is set with its reason. Since BACKLOG #5527 the broker resolves the instance ``[tls]`` policy, so
 ``[tls].internal_ca_file`` under ``augment`` or ``pinned``, and ``[tls].crl_file`` in any mode,
 reach its opener; the section "the [tls] policy reaches the broker's opener" pins that.
@@ -704,7 +704,7 @@ def test_a_tls_crl_reaches_the_broker_and_crosses_an_enforcing_posture(
     pki: _Pki, ai_log: list[str]
 ) -> None:
     """The row's own failing case. With ``[tls].crl_file`` set, the broker dials an opener of its
-    own whose context checks that CRL, so an off-box endpoint crosses enforce with no attestation
+    own whose context checks that CRL, so a non-loopback endpoint crosses enforce with no attestation
     and logs no crossing line. Red on the parent commit: the shared opener carried no CRL, so the
     broker refused the hop."""
     broker = _broker(posture=_ENFORCING, policy=TrustAnchorPolicy(crl_file=pki.crl_file))
@@ -911,7 +911,7 @@ def test_the_managed_app_hands_the_broker_the_tls_section_it_was_given(
 ) -> None:
     """Row #5527 item 8, its first half (and items 18, 28, 36): the lifespan of
     ``create_managed_app`` puts the ``[tls]`` section it is handed where the route reads it, so on
-    the ``serve`` path an unattested off-box hop crosses enforce on that CRL. Driven through the
+    the ``serve`` path an unattested non-loopback hop crosses enforce on that CRL. Driven through the
     lifespan, end to end; the same app with no ``tls_settings`` is the control, and answers 503."""
     from starlette.testclient import TestClient
 
