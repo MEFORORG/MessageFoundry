@@ -1728,6 +1728,225 @@ async def test_the_drain_error_names_the_time_it_waited(
     assert isinstance(waited, float) and waited < budget - 0.15, record.getMessage()
 
 
+@pytest.mark.parametrize("then", ["stop", "start"])
+async def test_a_loop_that_outlived_its_stop_is_not_released_by_a_later_one(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, then: str
+) -> None:
+    """BACKLOG #6526: a stop cut by its timeout leaves its loop running. A later stop() or start()
+    must not clear the signal that loop reads, or a loop whose cancel was absorbed goes round again
+    and purges after the engine has stopped. Each loop keeps the signal it was started with."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    callers: list[asyncio.Task[Any] | None] = []
+
+    async def absorbs_the_first_cancel(*_a: object, **_k: object) -> int:
+        callers.append(asyncio.current_task())
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if len(callers) > 1:
+                raise
+            await release.wait()
+        return 0
+
+    monkeypatch.setattr(store, "purge_state", absorbs_the_first_cancel)
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    old_loop = runner._task
+    assert old_loop is not None
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        await runner.stop(timeout=0.1)
+        assert not old_loop.done()
+        if then == "stop":
+            await runner.stop(timeout=0.1)
+        else:
+            runner.start()
+        release.set()
+        await asyncio.wait({old_loop}, timeout=5)
+        assert [t for t in callers if t is old_loop] == [old_loop]
+        assert old_loop.done()
+    finally:
+        release.set()
+        old_loop.cancel()
+        await asyncio.gather(old_loop, return_exceptions=True)
+        await runner.stop()
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    ("settings", "method"),
+    [
+        (RetentionSettings(messages_days=1), "purge_message_bodies"),
+        (RetentionSettings(state_max_age_days=1), "purge_state"),
+    ],
+)
+async def test_a_single_transaction_purge_that_fails_writes_no_audit_row(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    settings: RetentionSettings,
+    method: str,
+) -> None:
+    """BACKLOG #6526: a purge that runs in one transaction and raises an error has rolled back,
+    so a pass that ends in it with nothing else done committed nothing. One failing every interval
+    must not add a row of zeros each time, nor hold each pass for the audit write. The error still
+    goes to the caller, which the loop logs."""
+
+    async def fails(*_a: object, **_k: object) -> int:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(store, method, fails)
+    runner = RetentionRunner(store, settings, clock=lambda: 10 * DAY)
+
+    with pytest.raises(sqlite3.OperationalError):
+        await runner.run_once()
+
+    assert await _retention_audit_details(store) == []
+
+
+async def test_an_interrupted_pass_names_no_phase_that_never_ran(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: ``interrupted_phase`` names the phase that was working when the pass ended.
+    A fault between phases, resolving the document windows say, comes after the body purge ended
+    and before the strip began. It must not be blamed on the body purge, which finished, nor on the
+    dead-letter phase, which is off and never ran."""
+    await _delivered(store, now=0.0)
+    runner = RetentionRunner(store, RetentionSettings(messages_days=1), clock=lambda: 10 * DAY)
+
+    def resolve_fails() -> tuple[dict[str, int], dict[str, int], dict[str, str]]:
+        raise RuntimeError("registry read failed")
+
+    monkeypatch.setattr(runner, "_resolve_document_prune", resolve_fails)
+
+    with pytest.raises(RuntimeError, match="registry read failed"):
+        await runner.run_once()
+
+    details = await _retention_audit_details(store)
+    assert [d["interrupted_phase"] for d in details] == [None]
+    assert details[0]["interrupted"] is True and details[0]["messages_purged"] == 1
+
+
+async def test_a_cancelled_stop_that_joined_one_under_way_says_the_pass_may_still_run(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6526: a caller that joins a stop already under way and is cancelled returns
+    within its own timeout like one that is not, and must say so the same way."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    monkeypatch.setattr(store, "purge_state", _hang_on_entry(entered, release))
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    await asyncio.wait_for(entered.wait(), 10)
+    first = asyncio.create_task(runner.stop(timeout=5.0))
+    await asyncio.sleep(0)
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+            joiner = asyncio.create_task(runner.stop(timeout=0.1))
+            await asyncio.sleep(0.02)
+            joiner.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await joiner
+        assert not first.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(first, 10)
+        await asyncio.wait({loop_task}, timeout=10)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert [
+        m
+        for m in messages
+        if "joined a stop already under way" in m
+        and "cancelled" in m
+        and "may still be running" in m
+    ], messages
+
+
+async def test_a_late_demotion_seen_by_the_archive_worker_matches_the_row(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #6526: the `.processed` sweep reads its stop callable on a worker thread, which runs
+    on after the pass is cancelled. A demotion that thread sees once the interrupted row is written
+    must not log the leadership loss that row does not record: the log and the row's
+    ``leadership_lost`` come from one value."""
+    import threading
+
+    from messagefoundry.config.models import ConnectorType, Source
+    from messagefoundry.transports.file import FileSource
+
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    in_worker = asyncio.Event()
+    let_worker_read = threading.Event()
+    worker_done = threading.Event()
+
+    class _WorkerSeesDemotion(_FollowerCoordinator):
+        node_id = "late-demotion"
+
+        def __init__(self) -> None:
+            pass
+
+        def is_leader(self) -> bool:
+            if threading.get_ident() == loop_thread:
+                return True
+            loop.call_soon_threadsafe(in_worker.set)
+            let_worker_read.wait(10)
+            return False
+
+    src = FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path / "in")}))
+
+    async def prune(
+        _older_than: float, *, protected: object, deadline_hit: Callable[[], bool]
+    ) -> int:
+        def work() -> int:
+            try:
+                deadline_hit()
+            finally:
+                worker_done.set()
+            return 0
+
+        return await asyncio.to_thread(work)
+
+    monkeypatch.setattr(src, "prune_processed_archive", prune)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(processed_archive_days=30),
+        clock=lambda: 100 * DAY,
+        coordinator=_WorkerSeesDemotion(),
+        archive_source=lambda: (src,),
+    )
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        pass_task = asyncio.create_task(runner.run_once())
+        try:
+            await asyncio.wait_for(in_worker.wait(), 10)
+            pass_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pass_task
+            await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+        finally:
+            let_worker_read.set()
+            await asyncio.to_thread(worker_done.wait, 10)
+
+    details = await _retention_audit_details(store)
+    assert [d["interrupted_phase"] for d in details] == ["processed_archives"]
+    logged = [r for r in caplog.records if "lost cluster leadership" in r.getMessage()]
+    assert bool(logged) == details[0]["leadership_lost"], (logged, details)
+
+
 async def test_run_once_no_work_writes_no_audit(store: MessageStore) -> None:
     await _delivered(store, now=0.0)
     # Everything off → a pass does nothing and must not spam the audit log.

@@ -18,11 +18,13 @@ from typing import Any
 import pytest
 
 from messagefoundry.api import app as app_module
-from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.settings import EgressSettings, RetentionSettings
 from messagefoundry.pipeline import engine as engine_module
 from messagefoundry.pipeline import remote_debug_watch
+from messagefoundry.pipeline import retention as retention_module
 from messagefoundry.pipeline.crl_reload import CrlReloadRunner
 from messagefoundry.pipeline.engine import Engine
+from messagefoundry.pipeline.retention import RetentionRunner
 
 
 class _DrainRecorder:
@@ -226,6 +228,50 @@ async def test_with_no_budget_the_retention_stop_keeps_its_fixed_bound(tmp_path:
     eng._retention_runner = retention  # type: ignore[assignment]
     await _stop(eng)
     assert retention.timeouts == [retention.stop_timeout_seconds]
+
+
+async def test_a_cancel_during_the_retention_wait_still_closes_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: the retention stop passes a cancel of its caller on once its bounded wait
+    ends. On main it swallowed the cancel, so engine.stop() went on to close the store. It must
+    still reach the close, and raise the cancel after it."""
+    monkeypatch.setattr(retention_module, "_STOP_WAIT_SECONDS", 0.3)
+    eng = await _engine(tmp_path)
+    runner = RetentionRunner(eng.store, RetentionSettings(messages_days=1))
+    entered = asyncio.Event()
+
+    async def pass_hangs(now: float | None = None) -> None:
+        entered.set()
+        await _ignores_one_cancel()
+
+    monkeypatch.setattr(runner, "run_once", pass_hangs)
+    eng._retention_runner = runner
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    closed: list[bool] = []
+    real_close = eng.store.close
+
+    async def _close() -> None:
+        closed.append(True)
+        await real_close()
+
+    monkeypatch.setattr(eng.store, "close", _close)
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        stopping = asyncio.ensure_future(eng.stop())
+        await asyncio.sleep(0.1)
+        assert not stopping.done()
+        stopping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+        assert closed == [True]
+    finally:
+        loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+        if not closed:
+            await real_close()
 
 
 def test_the_time_kept_after_the_retention_wait_fits_the_engine_reserve() -> None:

@@ -547,7 +547,10 @@ can be lost:
   land later or not at all, so a purge that finished can be left with no audit row
   ([PHI.md](PHI.md)). When the budget runs out before the loop has ended, the stop returns anyway:
   the retention pass may still be running when the store closes, and the interrupted audit row it
-  would write for the phases it finished can be lost. An ERROR says so.
+  would write for the phases it finished can be lost. The stop that ran out logs an ERROR saying
+  so; a second stop call that joined it and ran out of its own time, cancelled or not, logs a
+  WARNING. A cancel of the engine's stop during this wait is held until the store has closed,
+  then raised.
 - **A CRL reload pass in flight** gets at most about 1.8 s at the 3 s minimum, or about 0.8 s
   while a config write is still running, and less when an earlier stop step was slow, down to the
   same 0.1 s. When the budget cuts the pass, it is abandoned with a WARNING; a cancel of the stop

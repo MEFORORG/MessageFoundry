@@ -4368,11 +4368,20 @@ class Engine:
             except TimeoutError:
                 # wait_for already cancelled the task on timeout; absorb its cancellation.
                 await asyncio.gather(supervisor, return_exceptions=True)
+        retention_cancelled = False
         if self._retention_runner is not None:
             retention = self._retention_runner
-            await retention.stop(
-                timeout=budget.wait(retention.stop_timeout_seconds, kept=retention_kept)
-            )
+            try:
+                await retention.stop(
+                    timeout=budget.wait(retention.stop_timeout_seconds, kept=retention_kept)
+                )
+            except asyncio.CancelledError:
+                # BACKLOG #6526: the retention stop passes a cancel of this stop on once its own
+                # bounded wait ends; main's swallowed it, so the stop went on to close the store.
+                # Held, as the intake monitor's below is, and raised once the store has closed. A
+                # cancel that lands in a later step before the guarded teardown still leaves at
+                # once, as on main.
+                retention_cancelled = True
         if self._backup_runner is not None:
             await self._backup_runner.stop()
         if self._cert_expiry_runner is not None:
@@ -4423,7 +4432,7 @@ class Engine:
         # The rest of the teardown is guarded (BACKLOG #3269): the store closes even if a later step
         # raises or is cancelled. A pending cancel is raised last, in place of any error a step or the
         # close raised, which is then logged. A SystemExit or KeyboardInterrupt is never replaced.
-        cancelled = monitor_cancelled
+        cancelled = monitor_cancelled or retention_cancelled
         failure: BaseException | None = None
         try:
             # Vault BACKLOG #2613: after the graph, so a clear raised here does not say a graph that is

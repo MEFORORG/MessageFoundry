@@ -29,6 +29,7 @@ console into the engine.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import json
 import logging
@@ -38,7 +39,7 @@ import stat
 import tempfile
 import threading
 import time
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -79,6 +80,17 @@ _STOP_WAIT_SECONDS = 5.0
 # interrupted audit row (BACKLOG #6526): one failing every interval would otherwise add a row of
 # zeros each time. Any phase not named here is treated as one that may have changed data.
 _PHASES_THAT_CHANGE_NO_DATA = frozenset({"wal_checkpoint", "vacuum", "size_check"})
+# Purge phases that run in one store transaction on every backend. One that raises an error is
+# taken to have rolled back, so a pass that ends on an error in one with nothing else done writes no
+# interrupted audit row (BACKLOG #6526): one failing every interval would otherwise add a row of
+# zeros each time and hold each pass for its audit write. The error goes on to the caller, which
+# logs it. A cancellation can land while the COMMIT is in flight, so a pass cancelled in one still
+# writes its row. An error out of the COMMIT itself, a dropped connection say, can leave it unknown
+# whether the COMMIT landed; such a pass writes a row only when it had done other work. The
+# reference-snapshot purge is not named: on Postgres it deletes one set at a time.
+_SINGLE_TRANSACTION_PHASES = frozenset(
+    {"messages", "dead_letters", "state", "connection_events", "alert_instances", "search_presets"}
+)
 _BYTES_PER_MB = 1_000_000
 #: The low-disk floor (`min_free_disk_mb`, BACKLOG #290) counts in MiB, not the decimal MB that
 #: `max_db_mb` uses, so its 1024 default is exactly the 1 GiB the DR-backup preflight already treats
@@ -532,8 +544,8 @@ class RetentionPass:
     # Its audit row records exactly what the phases that finished did. None of these flags is part
     # of `did_work`: each only says how a pass ended.
     interrupted: bool = False
-    # When `interrupted`, the phase that was running when the pass ended; None if it ended before
-    # the first phase. What that running call itself changed is not in the row's counts: a phase
+    # When `interrupted`, the phase that was working when the pass ended; None if it ended outside
+    # any phase's work, before the first or between two. What that running call itself changed is not in the row's counts: a phase
     # that works in steps (the embedded-document strip's batches, the `.processed` sweep, the app-log
     # sweep and compression) may have changed part of its set, and a single-transaction purge
     # cancelled while its COMMIT was in flight may have committed. A strip threshold call that
@@ -592,6 +604,17 @@ def _thread_until_cancelled[R](
             raise
 
     return run()
+
+
+def _log_joined_stop_cut(bound: float, *, cancelled: bool) -> None:
+    """Log that a stop() call which joined a stop already under way returned within its own bound
+    with that stop unfinished (BACKLOG #6526)."""
+    log.warning(
+        "retention: stop() joined a stop already under way%s and returned after its own %gs; the "
+        "retention pass may still be running and its interrupted audit row may not be written",
+        ", was cancelled," if cancelled else "",
+        bound,
+    )
 
 
 def _retrieve_logged_result(task: asyncio.Task[None]) -> None:
@@ -678,6 +701,9 @@ class RetentionRunner:
         # audits those (BACKLOG #6526). Default NullCoordinator → always leader → always runs, so an
         # existing caller/test that passes no coordinator is byte-identical (Track B Step 4).
         self._coordinator: ClusterCoordinator = coordinator or NullCoordinator()
+        # The current loop's stop signal. start() makes a new one and the loop keeps the one it was
+        # started with, so nothing can clear the signal of a loop already told to stop: one that
+        # outlived a stop cut by its timeout still ends at its next check (BACKLOG #6526).
         self._stop = asyncio.Event()
         # Ends the current between-pass sleep early: set by stop(), and by wake() after a config
         # reload. wake() sets it only while the loop is idle, so a window a reload sets is enforced at
@@ -762,10 +788,10 @@ class RetentionRunner:
         if not active and self._registry_source is None:
             log.debug("retention disabled (nothing configured); not starting")
             return
-        self._stop.clear()
+        self._stop = asyncio.Event()
         self._wake.clear()
         self._active = active
-        self._task = asyncio.create_task(self._run())
+        self._task = asyncio.create_task(self._run(self._stop))
         if not active:
             log.debug(
                 "retention idle: nothing configured yet; re-checked every %gs, so a config reload "
@@ -819,7 +845,8 @@ class RetentionRunner:
         stop took the old one stops the new loop as well, and waits for the earlier stop too, within
         its own budget. A cancellation of the caller still waits for the stop, within the same
         bound, before it goes on."""
-        self._stop.set()
+        signal = self._stop
+        signal.set()
         self._wake.set()
         bound = self.stop_timeout_seconds if timeout is None else timeout
         # Taken here, not in the stop's task, so a second call before that task runs cannot take
@@ -833,7 +860,7 @@ class RetentionRunner:
         if stopping is None or task is not None:
             # This stop's own task is bounded by `bound`, so its caller waits for it to end.
             stopping = self._stopping = asyncio.create_task(
-                self._stop_and_drain(task, bound, earlier=stopping)
+                self._stop_and_drain(task, bound, signal, earlier=stopping)
             )
         else:
             deadline = loop.time() + bound
@@ -847,11 +874,11 @@ class RetentionRunner:
             await asyncio.wait({stopping}, timeout=left())
         except asyncio.CancelledError:
             await asyncio.wait({stopping}, timeout=left())
-            if (
-                stopping.done()
-                and not stopping.cancelled()
-                and (exc := stopping.exception()) is not None
-            ):
+            if not stopping.done():
+                # Only a call that joined a stop under way gets here: one that started its own
+                # waits for it, and that stop is bounded by `bound`.
+                _log_joined_stop_cut(bound, cancelled=True)
+            elif not stopping.cancelled() and (exc := stopping.exception()) is not None:
                 log.error(
                     "retention: the loop failed (%s); stop()'s caller was cancelled, so it is "
                     "logged here",
@@ -859,17 +886,16 @@ class RetentionRunner:
                 )
             raise
         if not stopping.done():
-            log.warning(
-                "retention: stop() joined a stop already under way and returned after its own "
-                "%gs; the retention pass may still be running and its interrupted audit row may "
-                "not be written",
-                bound,
-            )
+            _log_joined_stop_cut(bound, cancelled=False)
             return
         stopping.result()  # a loop that failed raises to the caller of stop(), as before
 
     async def _stop_and_drain(
-        self, task: asyncio.Task[None] | None, timeout: float, earlier: asyncio.Task[None] | None
+        self,
+        task: asyncio.Task[None] | None,
+        timeout: float,
+        signal: asyncio.Event,
+        earlier: asyncio.Task[None] | None,
     ) -> None:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -884,10 +910,10 @@ class RetentionRunner:
                 # Within this stop's budget; the earlier stop's outcome is its own callers'.
                 await asyncio.wait({earlier}, timeout=max(0.0, deadline - loop.time()))
         # A loop that has ended no longer needs the signal, so a later run_once() is a normal pass,
-        # waiting for its own interrupted row (BACKLOG #6526). A start() clears it, and an old loop
-        # that outlived its stop then sees it clear and can go round again beside the new loop.
-        if (task is None or task.done()) and self._stopping is asyncio.current_task():
-            self._stop.clear()
+        # waiting for its own interrupted row (BACKLOG #6526). The signal is replaced, never
+        # cleared: a loop that outlived its stop holds this one, and a start() since has its own.
+        if (task is None or task.done()) and self._stop is signal:
+            self._stop = asyncio.Event()
         if task is None:
             return
         if not task.done():
@@ -914,10 +940,11 @@ class RetentionRunner:
                 len(pending),
             )
 
-    async def _run(self) -> None:
+    async def _run(self, stop: asyncio.Event) -> None:
         # One isolated pass per interval; an error in a pass is logged and the loop continues (a
-        # retention hiccup must never take the engine down). Cooperatively cancellable via _stop.
-        while not self._stop.is_set():
+        # retention hiccup must never take the engine down). Cooperatively cancellable via `stop`,
+        # the signal this loop was started with.
+        while not stop.is_set():
             # Cleared here, before this iteration reads `enabled`, so a wake() that landed before
             # this read (say between start() and the first iteration) is answered by this pass and
             # cannot also cut the sleep after it short into a second, back-to-back pass.
@@ -936,7 +963,10 @@ class RetentionRunner:
                 raise
             except Exception:
                 log.exception("retention pass failed; will retry next interval")
-            await self._sleep(self._settings.purge_interval_seconds)
+            # Checked before the sleep as well: a start() since this loop's stop cleared the wake
+            # that stop set, and this loop must not sleep out an interval it should end in.
+            if not stop.is_set():
+                await self._sleep(self._settings.purge_interval_seconds)
 
     def _refresh_active(self) -> bool:
         """Re-read :attr:`enabled` for this interval and log a change, so an operator can see a
@@ -992,7 +1022,10 @@ class RetentionRunner:
         ``interrupted`` (BACKLOG #6526, S07-44). A pass that ends inside a phase that changes its
         set in steps writes the row even with nothing else done, naming that phase in
         ``interrupted_phase``, since its count is lost, unless that phase changes no data
-        (``_PHASES_THAT_CHANGE_NO_DATA``), which is logged instead. The audit writes are shielded
+        (``_PHASES_THAT_CHANGE_NO_DATA``), which is logged instead. A purge that runs in one
+        transaction and raises an error is taken to have rolled back, so a pass that ends on one
+        with nothing else done writes no row (``_SINGLE_TRANSACTION_PHASES``); one cancelled inside
+        it does, since its COMMIT may have been in flight. The audit writes are shielded
         from a further cancellation. A row can still be missing at least when the audit write itself
         fails (the same store fault that ended the pass, say), when it is still unfinished
         ``_AUDIT_WRITE_WAIT_SECONDS`` after the pass ends or once :meth:`stop`'s budget runs out
@@ -1028,16 +1061,17 @@ class RetentionRunner:
 
         # The shared-store phases run only while `_halt()` is False: the cap above, or leadership
         # lost since the gate (S07-45), latched like the cap. The host-local app-log phases take the
-        # cap alone, because a standby runs those too. `_halt` is also handed to the `.processed`
-        # archive sweep, which reads it per file on a worker thread; `is_leader()` is a cached
-        # attribute read. A node demoted mid-pass still writes the audit row for the purges it had
-        # already committed: an unaudited purge is the worse outcome, and the row is not a leader-only
-        # write the way a purge is.
+        # cap alone, because a standby runs those too. A node demoted mid-pass still writes the
+        # audit row for the purges it had already committed: an unaudited purge is the worse
+        # outcome, and the row is not a leader-only write the way a purge is.
         leadership_lost = False
 
-        def _demoted() -> bool:
+        def _demoted(*, seen: bool = False) -> bool:
+            # On the event loop only, the one place the loss is latched and logged, so the log line
+            # and the row's `leadership_lost` are one value. `seen` is a demotion the `.processed`
+            # sweep's worker read.
             nonlocal leadership_lost
-            if not leadership_lost and not self._coordinator.is_leader():
+            if not leadership_lost and (seen or not self._coordinator.is_leader()):
                 leadership_lost = True
                 log.warning(
                     "retention: this node lost cluster leadership during the pass; it starts no "
@@ -1045,18 +1079,33 @@ class RetentionRunner:
                 )
             return leadership_lost
 
-        # The phase now running, recorded by `_halt` as each phase is let through (and by hand for
-        # the app-log phases), so an interrupted pass can name it (S07-44). Every await of a phase
-        # comes after its own `_halt`, so this names the phase an exception came out of.
+        def _halt() -> bool:
+            hit = _deadline_hit()
+            return _demoted() or hit
+
+        # The `.processed` archive sweep reads this per file on a worker thread, which runs on after
+        # a cancel of the pass, so it only reads: a demotion it sees is latched and logged by
+        # `_demoted` once the sweep returns, and a late one cannot log a loss the interrupted row
+        # does not record. `is_leader()` is a cached attribute read.
+        archive_saw_demotion = False
+
+        def _archive_halt() -> bool:
+            nonlocal archive_saw_demotion
+            if not self._coordinator.is_leader():
+                archive_saw_demotion = True
+            return archive_saw_demotion or _deadline_hit()
+
+        # The phase now working, so an interrupted pass can name it (S07-44): set as a phase starts
+        # its work, after its own checks, and cleared when it ends, so a fault between two phases
+        # names none.
         running_phase: str | None = None
 
-        def _halt(phase: str) -> bool:
+        @contextlib.contextmanager
+        def _running(phase: str) -> Iterator[None]:
             nonlocal running_phase
-            hit = _deadline_hit()
-            halted = _demoted() or hit
-            if not halted:
-                running_phase = phase
-            return halted
+            running_phase = phase
+            yield  # an exception out of the phase leaves it named
+            running_phase = None
 
         # Every count starts at "nothing done", so a pass that ends partway can audit exactly the
         # phases that finished (S07-44).
@@ -1126,18 +1175,20 @@ class RetentionRunner:
             # A per-connection purge can run even when the GLOBAL window is off (a connection sets its
             # own window while the global default is keep-forever). Run the purge whenever the global
             # window is set OR any connection overrides it.
-            if not _halt("messages") and (s.messages_days > 0 or msg_days_overrides):
-                messages_purged = await self._store.purge_message_bodies(
-                    older_than=self._global_cutoff(now, s.messages_days),
-                    now=now,
-                    connection_cutoffs=self._cutoff_map(now, msg_days_overrides),
-                )
-            if not _halt("dead_letters") and (s.dead_letter_days > 0 or dead_days_overrides):
-                dead = await self._store.purge_dead_letters(
-                    older_than=self._global_cutoff(now, s.dead_letter_days),
-                    now=now,
-                    connection_cutoffs=self._cutoff_map(now, dead_days_overrides),
-                )
+            if not _halt() and (s.messages_days > 0 or msg_days_overrides):
+                with _running("messages"):
+                    messages_purged = await self._store.purge_message_bodies(
+                        older_than=self._global_cutoff(now, s.messages_days),
+                        now=now,
+                        connection_cutoffs=self._cutoff_map(now, msg_days_overrides),
+                    )
+            if not _halt() and (s.dead_letter_days > 0 or dead_days_overrides):
+                with _running("dead_letters"):
+                    dead = await self._store.purge_dead_letters(
+                        older_than=self._global_cutoff(now, s.dead_letter_days),
+                        now=now,
+                        connection_cutoffs=self._cutoff_map(now, dead_days_overrides),
+                    )
             # Embedded-document pruning (#47, ADR 0042): an in-place strip of bulky base64 attachments
             # on a per-connection window, layered over NO global default (it never runs unless a
             # connection sets prune_documents_after). Driven in the same pass; the cutoff map is the
@@ -1148,24 +1199,23 @@ class RetentionRunner:
             doc_overrides, doc_min_bytes, doc_content_types = self._resolve_document_prune()
             # The whole embedded-document strip is one phase: skip it (empty threshold set) if the pass
             # halted before it; otherwise strip once per distinct min_bytes threshold.
-            doc_thresholds: list[int] = (
-                [] if _halt("documents_strip") else sorted(set(doc_min_bytes.values()))
-            )
+            doc_thresholds: list[int] = [] if _halt() else sorted(set(doc_min_bytes.values()))
             for i, threshold in enumerate(doc_thresholds):
                 # Each threshold is its own store call of many batches, so leadership is read again
                 # between them (S07-45); the cap stays a whole-phase check.
                 if i and _demoted():
                     break
                 group = {n: d for n, d in doc_overrides.items() if doc_min_bytes[n] == threshold}
-                part = await self._store.strip_embedded_documents(
-                    older_than=_KEEP_FOREVER,  # no global document-prune default → keep-forever ELSE
-                    now=now,
-                    connection_cutoffs=self._cutoff_map(now, group),
-                    min_bytes=threshold,
-                    content_types={
-                        n: doc_content_types[n] for n in group if n in doc_content_types
-                    },
-                )
+                with _running("documents_strip"):
+                    part = await self._store.strip_embedded_documents(
+                        older_than=_KEEP_FOREVER,  # no global document-prune default → keep-forever
+                        now=now,
+                        connection_cutoffs=self._cutoff_map(now, group),
+                        min_bytes=threshold,
+                        content_types={
+                            n: doc_content_types[n] for n in group if n in doc_content_types
+                        },
+                    )
                 strip = StripResult(
                     messages_stripped=strip.messages_stripped + part.messages_stripped,
                     documents_stripped=strip.documents_stripped + part.documents_stripped,
@@ -1178,36 +1228,40 @@ class RetentionRunner:
                     # BACKLOG #5651: a key-service outage, a failed batch read, or batch writes
                     # failing in a row. End only this phase; the rest of the pass still runs.
                     break
-            if not _halt("state") and s.state_max_age_days > 0:
-                state_purged = await self._store.purge_state(
-                    older_than=now - s.state_max_age_days * _SECONDS_PER_DAY, now=now
-                )
+            if not _halt() and s.state_max_age_days > 0:
+                with _running("state"):
+                    state_purged = await self._store.purge_state(
+                        older_than=now - s.state_max_age_days * _SECONDS_PER_DAY, now=now
+                    )
             # Connection events (#46): the dedicated `connection_event_retention_hours` window if set,
             # else inherit the message-body window (the ADR 0021 §7.5 default — bound the log alongside
             # the bodies). A positive hours value can keep events longer OR shorter than message bodies.
-            if not _halt("connection_events"):
-                if s.connection_event_retention_hours > 0:
-                    conn_events_purged = await self._store.purge_connection_events(
-                        older_than=now - s.connection_event_retention_hours * 3600.0, now=now
-                    )
-                elif s.messages_days > 0:
-                    conn_events_purged = await self._store.purge_connection_events(
-                        older_than=now - s.messages_days * _SECONDS_PER_DAY, now=now
-                    )
+            event_window = s.connection_event_retention_hours > 0 or s.messages_days > 0
+            if not _halt() and event_window:
+                with _running("connection_events"):
+                    if s.connection_event_retention_hours > 0:
+                        conn_events_purged = await self._store.purge_connection_events(
+                            older_than=now - s.connection_event_retention_hours * 3600.0, now=now
+                        )
+                    else:
+                        conn_events_purged = await self._store.purge_connection_events(
+                            older_than=now - s.messages_days * _SECONDS_PER_DAY, now=now
+                        )
 
             # Resolved operator-alert instances (#56, ADR 0044): pruned on the SAME window as connection
             # events (metadata-only, one pass). Only RESOLVED instances are eligible — an
             # open/acknowledged condition is never aged out from under an operator. No window set ⇒
             # inherit the body window.
-            if not _halt("alert_instances"):
-                if s.connection_event_retention_hours > 0:
-                    alert_instances_purged = await self._store.purge_alert_instances(
-                        older_than=now - s.connection_event_retention_hours * 3600.0, now=now
-                    )
-                elif s.messages_days > 0:
-                    alert_instances_purged = await self._store.purge_alert_instances(
-                        older_than=now - s.messages_days * _SECONDS_PER_DAY, now=now
-                    )
+            if not _halt() and event_window:
+                with _running("alert_instances"):
+                    if s.connection_event_retention_hours > 0:
+                        alert_instances_purged = await self._store.purge_alert_instances(
+                            older_than=now - s.connection_event_retention_hours * 3600.0, now=now
+                        )
+                    else:
+                        alert_instances_purged = await self._store.purge_alert_instances(
+                            older_than=now - s.messages_days * _SECONDS_PER_DAY, now=now
+                        )
 
             # Saved-search presets (ADR 0136, ASVS 14.2.7): the stored `criteria` is a PHI-shaped
             # needle, so it gets a window like every other PHI tier. A PLAIN window with NO inheritance
@@ -1219,10 +1273,11 @@ class RetentionRunner:
             # last_used_at), so a preset merely RECALLED inside the window survives; the argument above
             # still holds for the first pass after upgrade, where every pre-#306 row's `last_used_at` is
             # NULL and the key degrades to `updated_at`.
-            if not _halt("search_presets") and s.search_preset_days > 0:
-                search_presets_purged = await self._store.purge_search_presets(
-                    older_than=now - s.search_preset_days * _SECONDS_PER_DAY, now=now
-                )
+            if not _halt() and s.search_preset_days > 0:
+                with _running("search_presets"):
+                    search_presets_purged = await self._store.purge_search_presets(
+                        older_than=now - s.search_preset_days * _SECONDS_PER_DAY, now=now
+                    )
 
             # Orphaned reference snapshots (ADR 0006, ASVS 14.2.7): `reference.value` is PL-2 and had NO
             # purge path at all — a set dropped from config kept its decryptable rows forever, because
@@ -1243,15 +1298,16 @@ class RetentionRunner:
             # Worse without it: ReferenceSyncRunner deliberately does NOT advance `synced_at` when a
             # source fetch fails, so the rows most likely to look "stale" belong to a still-wired set
             # whose source is merely down — precisely the last-good copy an operator would want kept.
-            if not _halt("reference_snapshots") and s.reference_snapshot_days > 0:
+            if not _halt() and s.reference_snapshot_days > 0:
                 registry = self._registry_source() if self._registry_source is not None else None
                 declared = frozenset(registry.references) if registry is not None else frozenset()
                 if declared:
-                    reference_snapshots_purged = await self._store.purge_reference_snapshots(
-                        older_than=now - s.reference_snapshot_days * _SECONDS_PER_DAY,
-                        declared=declared,
-                        now=now,
-                    )
+                    with _running("reference_snapshots"):
+                        reference_snapshots_purged = await self._store.purge_reference_snapshots(
+                            older_than=now - s.reference_snapshot_days * _SECONDS_PER_DAY,
+                            declared=declared,
+                            now=now,
+                        )
                 else:
                     log.warning(
                         "reference-snapshot retention skipped: the loaded registry declares no "
@@ -1263,35 +1319,40 @@ class RetentionRunner:
             # Application log files (#120, then #119): host-local, so they take the cap alone and
             # run on a standby and after a demotion too. Each count lands as its phase ends, so an
             # interrupted pass still audits a sweep that finished.
-            running_phase = "app_log_sweep"
-            app_logs_deleted = await self._sweep_app_log_phase(now, _deadline_hit)
-            running_phase = "app_log_compress"
-            (
-                app_logs_compressed,
-                app_log_bytes_reclaimed,
-            ) = await self._compress_app_log_phase(now, _deadline_hit)
+            # Each awaits nothing when it is off, so naming it here names no phase that never ran.
+            with _running("app_log_sweep"):
+                app_logs_deleted = await self._sweep_app_log_phase(now, _deadline_hit)
+            with _running("app_log_compress"):
+                (
+                    app_logs_compressed,
+                    app_log_bytes_reclaimed,
+                ) = await self._compress_app_log_phase(now, _deadline_hit)
 
             # The File source's `.processed` archive (owner ruling A2 of 2026-10-08, BACKLOG #1188): a
             # clear-text copy of every inbound payload, aged out on ARCHIVE time at the body window.
             # Each source does its own blocking I/O off the loop and under its own credential, re-reading
-            # `_halt` per file, so a large directory releases the pass like the compressor does.
-            if not _halt("processed_archives") and s.processed_archive_days > 0:
-                processed_archives_deleted = await self._prune_processed_archives(
-                    now - s.processed_archive_days * _SECONDS_PER_DAY,
-                    lambda: _halt("processed_archives"),
-                )
+            # `_archive_halt` per file, so a large directory releases the pass like the compressor
+            # does.
+            if not _halt() and s.processed_archive_days > 0:
+                with _running("processed_archives"):
+                    processed_archives_deleted = await self._prune_processed_archives(
+                        now - s.processed_archive_days * _SECONDS_PER_DAY, _archive_halt
+                    )
+                if archive_saw_demotion:
+                    _demoted(seen=True)
 
             # Maintenance phases (WAL-checkpoint, then daily VACUUM). Their cadence markers advance ONLY
             # when the phase actually runs, so a phase SKIPPED by the cap stays due for the next pass
             # (#121). A running VACUUM is non-interruptible: the deadline is checked only BEFORE it is
             # dispatched.
             # The cadence reads `self._monotonic`, not `now` (see __init__).
-            if not _halt("wal_checkpoint") and self._wal_truncate_applies():
+            if not _halt() and self._wal_truncate_applies():
                 wal_at = self._monotonic()
                 if self._last_wal is None or wal_at - self._last_wal >= s.wal_checkpoint_seconds:
                     # `is False`: None is a backend with no -wal file, which `_wal_truncate_applies`
                     # skips.
-                    wal_left_untruncated = await self._store.wal_checkpoint() is False
+                    with _running("wal_checkpoint"):
+                        wal_left_untruncated = await self._store.wal_checkpoint() is False
                     # The marker advances either way, so a reader that pins the WAL costs writers one
                     # busy timeout per cadence rather than one per pass.
                     self._last_wal = wal_at
@@ -1309,13 +1370,15 @@ class RetentionRunner:
                             s.wal_checkpoint_seconds,
                         )
 
-            if not _halt("vacuum") and self._vacuum_due(now):
-                await self._store.vacuum()
+            if not _halt() and self._vacuum_due(now):
+                with _running("vacuum"):
+                    await self._store.vacuum()
                 self._last_vacuum_day = self._day_key(now)
                 vacuumed = True
 
-            if not _halt("size_check"):
-                size_bytes, over_limit = await self._check_size()
+            if not _halt():
+                with _running("size_check"):
+                    size_bytes, over_limit = await self._check_size()
         except (Exception, asyncio.CancelledError) as exc:
             await self._audit_interrupted(_tally(interrupted=True), exc)
             raise
@@ -1351,7 +1414,9 @@ class RetentionRunner:
         """Write the row for a pass that ended partway (S07-44). A cancellation was delivered once,
         so this await still runs. Written when the pass did work or ended inside a phase that may
         have changed part of its set; a pass that ended in a phase that changes no data, with
-        nothing else done, is logged instead. The wait is bounded by
+        nothing else done, is logged instead, and one that ended on an error in a
+        single-transaction purge (``_SINGLE_TRANSACTION_PHASES``), with nothing else done, writes
+        none, its error going on to the caller. The wait is bounded by
         ``_AUDIT_WRITE_WAIT_SECONDS``, so a store that cannot take the write does not hold up the
         exception, and is skipped once :meth:`stop` has been called, whose own drain waits for the
         row within its one budget. A failed write is logged, so ``cause`` is what propagates."""
@@ -1365,6 +1430,12 @@ class RetentionRunner:
                     safe_exc(cause),
                 )
             return
+        if (
+            not partial.did_work
+            and phase in _SINGLE_TRANSACTION_PHASES
+            and not isinstance(cause, asyncio.CancelledError)
+        ):
+            return  # rolled back; `cause` goes on to the caller, which logs it
         task = self._start_audit(partial)
         if self._stop.is_set():
             return
