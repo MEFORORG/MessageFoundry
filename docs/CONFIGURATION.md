@@ -1222,7 +1222,10 @@ about a missing or failing forwarder two ways (BACKLOG #2612).
 `degraded` means `send_failing` is true, the last spool read failed, or `lost` is above zero.
 `send_failing` is true after a send that hit a network error, and false after one that went out.
 It is also true from a start that could not connect until the first send that works. A record
-dropped as undeliverable leaves `send_failing` as it was.
+dropped as undeliverable leaves `send_failing` as it was. Over TCP or TLS, a collector that
+closes or resets the connection on one frame, one over its size limit for example, is not
+handled: the record can be lost as sent, or, where its own send fails on every retry, held at
+the spool head with every later record behind it (ADR 0200 Amendment B, BACKLOG #5923).
 `lost` never goes down while the forwarder runs, so a loss keeps the state `degraded` for that
 long. If the forwarder then stops, the state reads `not_installed`.
 
