@@ -47,8 +47,7 @@ from messagefoundry.parsing import message as message_module
 from messagefoundry.parsing.dicom.hl7_map import encode_segment
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import starts_with_msh
-from messagefoundry.parsing.x12.delimiters import ELEMENT_SEP_OFFSETS, discover_delimiters
-from messagefoundry.parsing.x12.errors import X12PeekError
+from messagefoundry.parsing.sniff import _LEADING_WS_STR
 from messagefoundry.pipeline import ingress_guards, wiring_runner
 from messagefoundry.pipeline.dryrun import dry_run
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
@@ -770,164 +769,53 @@ def _isa(
     return element.join([*fields, component]) + term
 
 
-@pytest.mark.parametrize(
-    ("header", "term"),
-    [
-        (_isa(component="?"), "~"),
-        (_isa(repetition="?"), "~"),
-        (_isa(element="?"), "~"),
-        (_isa(term="?"), "?"),
-    ],
-    ids=["isa-component", "isa-repetition", "isa-element", "isa-terminator"],
-)
-def test_encode_reply_refuses_a_replacement_that_is_an_x12_replys_delimiter(
-    header: str, term: str
-) -> None:
-    """BACKLOG #5799 item 2: the X12 listener's reply is an interchange, which declares its
-    delimiters in its ISA, and X12 lets a sender pick ``?`` as one. Only an ``MSH``-led reply was
-    read, so a ``?`` written for an unencodable character became structure. Red on the code
-    before: the call returns the replaced reply."""
-    element = header[3]
-    reply = header + element.join(["TA1", "000000001", "260101", "1200", "A", "000中"]) + term
-    with pytest.raises(UnicodeError, match="collide with one of its own delimiters") as ei:
-        framing_mod.encode_reply(reply, "ascii", connection="IB_X12_QDELIM")
-    assert ei.value.__cause__ is None and ei.value.__context__ is None
+def _main_reply_delimiters(reply: str) -> frozenset[str]:
+    """origin/main's ``_reply_delimiters`` at this branch's base, copied as the reference the
+    differential test below compares an ``ISA``-led reply against."""
+    line = reply.lstrip(_LEADING_WS_STR).partition("\r")[0]
+    if not line.startswith("MSH") or len(line) < 4:
+        return frozenset()
+    return frozenset((*_builtin_hl7._extract_separators(line), "\r"))
 
 
-@pytest.mark.parametrize("term", ["~", "\r\n"], ids=["tilde", "crlf"])
-def test_control_an_x12_reply_with_ordinary_delimiters_is_replaced_and_sent(term: str) -> None:
-    """Control for the X12 refusal: with no ``?`` delimiter the data character is replaced, the
-    reply is sent, and a CR+LF terminator reads as the two characters it is."""
-    reply = _isa(term=term) + "TA1*000000001*260101*1200*A*000中" + term
-    body, replaced = framing_mod.encode_reply_reporting(reply, "ascii", connection="IB_X12_OK")
-    assert replaced and body == reply.replace("中", "?").encode("ascii")
-    # A truncated ISA is not fixed-width, so it declares nothing and its data is replaced.
-    short = "ISA*00*中" + "~"
-    assert framing_mod.encode_reply(short, "ascii") == b"ISA*00*?~"
+_TA1 = "TA1*000000001*260101*1200*A*000"
+_GS = "GS*FA*SENDER*RECEIVER*20260101*1200*1*X*005010"
+
+#: ``ISA``-led reply shapes from the sweep the #5799 ISA read was reviewed over: a ``?`` at each
+#: delimiter, ISA16 empty, one or two characters, a CR+LF or pretty-printed terminator, an
+#: unpadded or truncated ISA, a pre-00501 ISA11, a separator in element data, ``ISA`` followed by
+#: a run, and an empty ISA16 then ``~`` then NEL or U+2028, each holding a character ASCII cannot.
+_ISA_SHAPES = [
+    _isa(component="?") + _TA1 + "中~",
+    _isa(repetition="?") + _TA1 + "中~",
+    _isa(element="?") + _TA1.replace("*", "?") + "中~",
+    _isa(term="?") + _TA1 + "中?",
+    _isa(term="\r\n") + _TA1 + "中\r\n",
+    _isa(component="?", term="~\n") + _GS + "中~\n",
+    _isa(component="?", repetition="?") + _TA1 + "中~",
+    _isa(repetition="?").replace("*00501*", "*00401*") + _TA1 + "中~",
+    _isa(component="", term="") + "中" + _TA1 + "~",
+    _isa(component="", term="") + "~\u0085" + _TA1 + "中~",
+    _isa(component="", term="") + "~\u2028" + _TA1 + "中~",
+    _isa(component=":?", term="") + "~" + _TA1 + "中~",
+    _isa(component="?").replace("SENDER", "AC*MER", 1) + _TA1 + "中~",
+    "ISA*00**00**ZZ*SENDER*ZZ*RECEIVER*260101*1200*^*00501*000000001*0*P*:~" + _TA1 + "中~",
+    "ISA*00*中~",
+    "ISA" + "中" * 110,
+    "ISA" + "?" * 110 + "中",
+    "\r\n" + _isa(component="?") + _TA1 + "中~",
+]
 
 
-#: An unpadded ISA: its elements are not at their fixed widths, so offsets 82, 104 and 105 hold
-#: whatever follows rather than ISA11, ISA16 and the terminator.
-_UNPADDED_ISA = "ISA*00**00**ZZ*SENDER*ZZ*RECEIVER*260101*1200*^*00501*000000001*0*P*:~"
-
-
-@pytest.mark.parametrize("offset", [82, 104, 105])
-def test_an_unpadded_isa_declares_nothing_so_its_data_is_replaced_and_sent(offset: int) -> None:
-    """Review of the #5799 X12 read: the ISA offsets were read raw even when the ISA was unpadded,
-    so an unencodable data character at offset 82, 104 or 105 read as a delimiter the charset
-    cannot hold and the reply was refused, where main replaced it and sent it (where a reply is
-    owed, the X12 listener closes on that refusal). An ISA that is not fixed-width declares
-    nothing, as on main. Green on main, red on 1f27b49: the call raised."""
-    filler = list((_UNPADDED_ISA + "TA1*000000001*260101*1200*A*000").ljust(120, "0"))
-    filler[offset] = "中"
-    reply = "".join(filler) + "~"
-    wire = framing_mod.encode_reply(reply, "ascii", connection="IB_X12_UNPADDED")
-    assert wire == reply.replace("中", "?").encode("ascii")
-
-
-@pytest.mark.parametrize("isa11", ["?", "é"], ids=["question-mark", "unencodable"])
-def test_a_pre_00501_isa11_is_data_so_the_reply_is_replaced_and_sent(isa11: str) -> None:
-    """Round-1 review of the fixed-width repair: ISA11 was declared a delimiter in every version,
-    though before 00501 it is data, as ``discover_delimiters`` reads it. A fixed-width 00401 ISA
-    whose ISA11 is ``?`` or a character the charset cannot hold refused a reply main replaced and
-    sent. Green on main, red on 1f27b49."""
-    header = _isa(repetition=isa11).replace("*00501*", "*00401*")
-    reply = header + "TA1*000000001*260101*1200*A*000中~"
-    wire = framing_mod.encode_reply(reply, "ascii", connection="IB_X12_00401")
-    assert wire == reply.encode("ascii", errors="replace")
-
-
-@pytest.mark.parametrize(
-    "run", ["中" * 110, "?" * 110 + "中"], ids=["unencodable", "question-mark"]
-)
-def test_isa_followed_by_a_run_of_one_character_is_not_fixed_width(run: str) -> None:
-    """Round-2 review: ``ISA`` and a run of one character lined up at every element-separator
-    offset, so it read as a fixed-width ISA and was refused, where main replaced it and sent it.
-    X12 keeps the element separator out of element data, so a run is not read as an ISA."""
-    reply = "ISA" + run
-    wire = framing_mod.encode_reply(reply, "ascii", connection="IB_X12_RUN")
-    assert wire == reply.encode("ascii", errors="replace")
-
-
-@pytest.mark.parametrize(
-    ("component", "after"),
-    [
-        ("", "中TA1*000000001*260101*1200*A*000~"),
-        ("", "?TA1*000000001*260101*1200*A*000中~"),
-        (":中", "~TA1*000000001*260101*1200*A*000~"),
-        (":?", "~TA1*000000001*260101*1200*A*000中~"),
-        (":?", "\nTA1*000?00001*260101*1200*A*000中\n"),
-        ("", "\r?TA1*000000001*260101*1200*A*000中?\r"),
-        (":?", "\n中\n"),
-        (":?", ""),
-    ],
-    ids=[
-        "empty-unencodable",
-        "empty-q",
-        "two-unencodable",
-        "two-q",
-        "two-lf",
-        "empty-cr",
-        "two-lf-nonascii-next",
-        "two-isa-only",
-    ],
-)
-def test_an_isa16_that_is_not_one_character_is_not_read_at_104_and_105(
-    component: str, after: str
-) -> None:
-    """Review of #5799 (the repair after 8f987a6): an ISA lined up through ISA15 with an empty or
-    two-character ISA16 was read at offsets 104 and 105, which then hold the terminator or the next
-    segment's data, so a data character there read as a delimiter and the reply was refused, where
-    main replaced it and sent it (where a reply is owed, the X12 listener closes on that refusal).
-    Green on main, red on 8f987a6. ``two-lf`` pins that a line break after offset 105 is not
-    skipped, ``empty-cr`` the whitespace-ISA16 guard, ``two-isa-only`` that a reply ending at
-    offset 105 is not read."""
-    reply = _isa(component=component, term="").replace("SENDER", "SEND中R", 1) + after
-    wire = framing_mod.encode_reply(reply, "ascii", connection="IB_X12_ISA16_WIDTH")
-    assert wire == reply.encode("ascii", errors="replace")
-
-
-_GS = "GS*FA*SENDER*RECEIVER*20260101*1200*1*X*005010中"
-_TA1_Q = "TA1*000000001*260101*1200*A*000中?"
-
-
-@pytest.mark.parametrize(
-    ("header", "after"),
-    [
-        (_isa(element="?", component="", term=""), "?TA1?000000001?260101?1200?A?000中~"),
-        (_isa(component="\x1f", term="?"), _TA1_Q),
-        (_isa(component="?", term="\r\n"), _GS + "\r\nIEA*1*000000001\r\n"),
-        (_isa(component="?"), _GS + "~IEA*1*000000001~"),
-    ],
-    ids=["element-q-isa16-empty", "isa16-control-term-q", "crlf-gs", "gs"],
-)
-def test_a_lined_up_isa_still_declares_what_its_layout_fixes(header: str, after: str) -> None:
-    """Negative controls for the ISA16 width repair: the element separator of an ISA lined up
-    through ISA15 is declared whatever ISA16's width, an information-separator control is read as
-    a one-character ISA16 so its terminator is read too, and a one-character ISA16 is read past a
-    CR+LF terminator. Each reply is refused because ``?`` is one of its delimiters."""
-    with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
-        framing_mod.encode_reply(header + after, "ascii", connection="IB_X12_LINED_UP")
-
-
-@pytest.mark.parametrize(
-    ("header", "after"),
-    [
-        (_isa(component="?", term="?"), "TA1*000000001*260101*1200*A*000中?"),
-        (_isa(component="中", term="*"), "TA1*000000001*260101*1200*A*000~"),
-        (_isa(component="?", term="~\n"), _GS + "~\n"),
-        (_isa(component="?").replace("SENDER", "SEND中R", 1), ""),
-    ],
-    ids=["isa16-equals-term", "term-equals-element", "pretty-lf", "isa-only"],
-)
-def test_a_one_character_isa16_left_unread_is_a_residual(header: str, after: str) -> None:
-    """Pins residuals ``_isa16_and_terminator`` names, not wanted outcomes: a one-character ISA16
-    whose terminator equals it or the element separator, or that is followed by a line break or by
-    nothing, is not read, so ``?`` is written into the reply's data as on main. Each reads the same
-    as an ISA16 that is not one character, which main sent. A fix that closes one turns it red."""
-    reply = header + after
-    wire = framing_mod.encode_reply(reply, "ascii", connection="IB_X12_ISA16_RESIDUAL")
-    assert wire == reply.encode("ascii", errors="replace")
+@pytest.mark.parametrize("reply", _ISA_SHAPES)
+def test_an_isa_led_reply_reads_and_encodes_as_on_main(reply: str) -> None:
+    """The ISA half of BACKLOG #5799 item 2 is withdrawn: after four rounds its read still refused
+    shapes main replaced and sent (an empty ISA16, then ``~``, then NEL or U+2028). An ``ISA``-led
+    reply declares what main's read declares, nothing, so its unencodable characters are replaced
+    and the reply is sent, as on main."""
+    assert framing_mod._reply_delimiters(reply) == _main_reply_delimiters(reply) == frozenset()
+    body, replaced = framing_mod.encode_reply_reporting(reply, "ascii", connection="IB_X12_MAIN")
+    assert replaced and body == reply.encode("ascii", errors="replace")
 
 
 def test_an_lf_inside_a_field_of_a_cr_reply_is_data_not_a_header() -> None:
@@ -937,74 +825,6 @@ def test_an_lf_inside_a_field_of_a_cr_reply_is_data_not_a_header() -> None:
     reply = "MSH|^~" + BS + "&|R" + CR + "MSA|AA|1|ok\nMSH中" + CR
     wire = framing_mod.encode_reply(reply, "latin-1", connection="IB_LF_DATA")
     assert wire == reply.replace("中", "?").encode("latin-1")
-
-
-def test_an_isa_the_header_read_refuses_still_declares_its_offsets() -> None:
-    """Round-1 review: an ISA ``discover_delimiters`` refuses (here ISA11 and ISA16 are both ``?``,
-    so not distinct) declared nothing, and its data was replaced into ``?``. Its offsets are read
-    raw now, so it is refused."""
-    reply = _isa(component="?", repetition="?") + "TA1*000000001*260101*1200*A*000中~"
-    with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
-        framing_mod.encode_reply(reply, "ascii", connection="IB_X12_BAD_ISA")
-
-
-def _lined_up(header: str) -> bool:
-    """Whether every element-separator offset of ``header`` holds the character at +3."""
-    return all(header[i] == header[3] for i in ELEMENT_SEP_OFFSETS)
-
-
-@pytest.mark.parametrize(
-    "header",
-    [
-        _isa(element="?").replace("SENDER", "AC?MER", 1),
-        _isa(component="?").replace("SENDER", "AC*MER", 1),
-        _isa(element="?", repetition="?"),
-        _isa(element="?", repetition="?").replace("*00501*", "*00401*"),
-        _isa(element="A", component="?"),
-    ],
-    ids=["element-in-isa06", "component-q-isa06", "isa11-00501", "isa11-00401", "isa-tag"],
-)
-def test_a_lined_up_isa_with_its_separator_elsewhere_before_isa16_declares_nothing(
-    header: str,
-) -> None:
-    """Pins a residual the #5799 docstring and changelog name, not a wanted outcome: a padded ISA
-    whose separators sit at their fixed offsets, but whose element separator also appears before
-    ISA16 elsewhere (in ISA06's data, in ISA11 in any version, or in the ``ISA`` tag), is not
-    fixed-width, so it declares nothing and a ``?`` delimiter in it gets ``?`` written into its
-    data, as on main. A fix that closes the residual turns this red on purpose. Mutation: drop the
-    element-data count from ``_isa_is_lined_up`` and the call raises."""
-    element = header[3]
-    assert len(header) == 106 and _lined_up(header)
-    assert header.count(element, 0, 104) > len(ELEMENT_SEP_OFFSETS)
-    reply = header + element.join(["TB1", "000000001", "260101", "1200", "Z", "000\u4e2d"]) + "~"
-    wire = framing_mod.encode_reply(reply, "ascii", connection="IB_X12_SEP_ELSEWHERE")
-    assert wire == reply.replace("\u4e2d", "?").encode("ascii")
-
-
-def test_an_isa16_equal_to_the_element_separator_still_declares() -> None:
-    """Pins the docstring's claim that an ISA ``discover_delimiters`` refuses for an ISA16 equal
-    to the element separator is still fixed-width: ISA16 is outside the count, so ``?`` is
-    declared and the reply is refused."""
-    header = _isa(element="?", component="?")
-    assert len(header) == 106 and _lined_up(header)
-    with pytest.raises(X12PeekError, match="not mutually distinct"):
-        discover_delimiters(header)
-    reply = header + "TA1?000000001?260101?1200?Z?000中~"
-    with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
-        framing_mod.encode_reply(reply, "ascii", connection="IB_X12_ISA16_SEP")
-
-
-def test_an_isa_whose_separators_are_off_their_offsets_declares_nothing() -> None:
-    """Pins the ``lined_up`` half of ``_isa_is_lined_up``: ISA06 one short and ISA08 one long
-    keep 106 characters and 16 element separators before ISA16, but two separators sit off their
-    fixed offsets, so the ISA is not fixed-width and its ``?`` component separator is not read.
-    Mutation: drop ``lined_up`` and the call raises."""
-    header = _isa(component="?").replace("SENDER ", "SENDER", 1).replace("RECEIVER", "RECEIVER ", 1)
-    assert len(header) == 106 and header[104] == "?" and not _lined_up(header)
-    assert header.count("*", 0, 104) == len(ELEMENT_SEP_OFFSETS)
-    reply = header + "TA1*000000001*260101*1200*Z*000中~"
-    wire = framing_mod.encode_reply(reply, "ascii", connection="IB_X12_OFF_OFFSET")
-    assert wire == reply.replace("中", "?").encode("ascii")
 
 
 @pytest.mark.parametrize("eol", [CR, "\n", "\r\n"], ids=["cr", "lf", "crlf"])
