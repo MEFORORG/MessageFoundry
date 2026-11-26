@@ -33,8 +33,8 @@ const PROBE_ARGV: readonly string[] = FIXTURE.probe;
 
 /**
  * The admin probe's argv with `messagefoundry.serviceConfig` at its default, so no --service-config.
- * tests/test_ide_start_plan_probe_contract.py runs this same list against a real store, so the two
- * suites read one list rather than each spelling it.
+ * tests/test_ide_start_plan_probe_contract.py runs this same list against a real store, and checks it
+ * against the argv it builds from the TypeScript constants.
  */
 const PROBE_DEFAULT_ARGV: readonly string[] = FIXTURE.probeDefault;
 
@@ -57,7 +57,8 @@ suite("provision-admin and its probe open the service TOML the guard judged (BAC
   });
 
   test("the probe's whole argv with serviceConfig at its default, no --service-config element", () => {
-    const inv = buildAdminProbeInvocation({ python: "p" });
+    // The call shape statusBar.ts uses: the property present and undefined.
+    const inv = buildAdminProbeInvocation({ python: "p", serviceConfig: undefined });
     assert.strictEqual(inv.command, "p");
     pin(inv.args, PROBE_DEFAULT_ARGV);
   });
@@ -77,7 +78,7 @@ suite("provision-admin and its probe open the service TOML the guard judged (BAC
   test("negative control: the two probe pins refuse an element before provision-admin, one appended, and --json missing", () => {
     for (const [good, expected] of [
       [buildAdminProbeInvocation(probeOpts as never).args, PROBE_ARGV],
-      [buildAdminProbeInvocation({ python: "p" }).args, PROBE_DEFAULT_ARGV],
+      [buildAdminProbeInvocation({ python: "p", serviceConfig: undefined }).args, PROBE_DEFAULT_ARGV],
     ] as const) {
       const before = [...good.slice(0, 5), "--db=other.db", ...good.slice(5)];
       const after = [...good, "--db=other.db"];

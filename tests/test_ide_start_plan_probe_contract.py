@@ -25,7 +25,6 @@ import re
 import sys
 import types
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -71,43 +70,61 @@ def _no_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
 
 
-def _expected_probe_argv() -> list[str]:
-    """The probe argv the source pin below reads out of the TypeScript, after ``python -m messagefoundry``."""
+def _ts_string_list(name: str, text: str | None = None) -> list[str]:
+    """The elements of ``export const <name>: readonly string[] = [...];`` in the IDE's control model
+    (or ``text``), comments blanked, each element a plain double-quoted string."""
+    raw = _MODEL.read_text(encoding="utf-8") if text is None else text
+    m = re.search(
+        rf"export const {name}: readonly string\[\] = \[([^\]]*)\];", blank_js_comments(raw)
+    )
+    assert m, f"{name} is not a plain string-array constant in {_MODEL.name}"
+    return re.findall(r'"([^"]*)"', m.group(1))
+
+
+def _expected_probe_argv(text: str | None = None) -> list[str]:
+    """The whole default probe argv, from the TypeScript constants the source pin below says the
+    builder uses: the interpreter options, ``-m messagefoundry``, then the probe account and
+    ``--json``. The email is trimmed, as the builder trims it."""
     return [
+        *_ts_string_list("INTERPRETER_OPTIONS", text),
+        "-m",
+        "messagefoundry",
         "provision-admin",
-        f"--username={_ts_string_const('PROBE_USERNAME')}",
-        f"--email={_ts_string_const('PROBE_EMAIL')}",
+        f"--username={_ts_string_const('PROBE_USERNAME', text)}",
+        f"--email={_ts_string_const('PROBE_EMAIL', text).strip()}",
         "--json",
     ]
 
 
-def _default_probe(fixture: dict[str, Any]) -> list[str]:
-    """``probeDefault`` from the shared argv fixture, after ``python -m messagefoundry``.
-
-    The mocha suite ``ide/src/test/suite/provision-admin-argv.test.ts`` pins
-    ``buildAdminProbeInvocation``'s whole default output against the same entry, so this file
-    runs the list that suite pins rather than a second spelling of it.
-    """
-    argv: list[str] = list(_cli_args(fixture["probeDefault"]))
-    return argv
-
-
 def _probe_argv() -> list[str]:
-    """The argv ``buildAdminProbeInvocation`` builds with ``messagefoundry.serviceConfig`` at its default."""
-    return _default_probe(ARGV_FIXTURE)
+    """The fixture's ``probeDefault``, the argv ``buildAdminProbeInvocation`` builds with
+    ``messagefoundry.serviceConfig`` at its default, after ``python -m messagefoundry``. The mocha
+    suite ``ide/src/test/suite/provision-admin-argv.test.ts`` pins the builder's whole output against
+    the same entry."""
+    return _cli_args(ARGV_FIXTURE["probeDefault"])
 
 
 def test_the_shared_fixture_default_probe_is_the_argv_the_source_pin_reads() -> None:
-    """The fixture's ``probeDefault`` is the argv the TypeScript pin below describes, so the mocha
-    pin (builder against fixture) and this file's pin (source, then fixture) cannot disagree."""
-    assert _probe_argv() == _expected_probe_argv()
-    # Negative control: a fixture whose default probe gained a store override, or lost --json,
-    # does not read as the expected argv.
-    for bad in (
-        [*ARGV_FIXTURE["probeDefault"][:-1], "--db=x.db", "--json"],
-        ARGV_FIXTURE["probeDefault"][:-1],
+    """The fixture's ``probeDefault`` equals, whole, the argv built from the TypeScript constants the
+    source pin below ties to the builder. The mocha pin checks the builder's output against the same
+    entry. These are two checks of one list; neither proves the builder's output by itself."""
+    raw = _MODEL.read_text(encoding="utf-8")
+    assert ARGV_FIXTURE["probeDefault"] == _expected_probe_argv()
+    # Negative control: a moved TypeScript constant reds the comparison, so the expected argv is
+    # read from the TypeScript and not from the fixture.
+    for decl, moved in (
+        ('export const PROBE_USERNAME = "probe";', 'export const PROBE_USERNAME = "probe2";'),
+        ('"-P", "-X", "disable-remote-debug"]', '"-I", "-P", "-X", "disable-remote-debug"]'),
     ):
-        assert _default_probe({"probeDefault": bad}) != _expected_probe_argv(), bad
+        assert raw.count(decl) == 1, decl
+        assert ARGV_FIXTURE["probeDefault"] != _expected_probe_argv(raw.replace(decl, moved)), moved
+    # The fixture's probe with serviceConfig set is probeDefault with only the flag added, before
+    # --json, so the two entries cannot drift apart.
+    with_flag = ARGV_FIXTURE["probe"]
+    flag = [a for a in with_flag if a.startswith("--service-config=")]
+    assert len(flag) == 1
+    assert [a for a in with_flag if a not in flag] == ARGV_FIXTURE["probeDefault"]
+    assert with_flag[-2:] == [*flag, "--json"]
 
 
 def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
