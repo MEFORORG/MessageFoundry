@@ -1368,7 +1368,8 @@ class Engine:
                 # lease without importing the runner.
                 raise DrProfileNotLeading(str(exc)) from exc
             raise
-        if self._backup_runner is not None and self._backup_runner.enabled:
+        runner = self._backup_runner
+        if runner is not None and runner.enabled and runner.scheduled:
             # Once per activation (BACKLOG #5965): the runner itself skips each pass silently.
             log.warning(
                 "DR backup: scheduled passes are paused while this box is activated, so a later "

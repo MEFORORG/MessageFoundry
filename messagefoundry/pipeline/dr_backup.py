@@ -596,6 +596,11 @@ class BackupRunner:
     def enabled(self) -> bool:
         return self._settings.enabled
 
+    @property
+    def scheduled(self) -> bool:
+        """Whether ``[backup]`` sets a daily time, so the loop runs passes of its own."""
+        return self._settings.schedule_time() is not None
+
     # --- lifecycle -----------------------------------------------------------
 
     def start(self) -> None:

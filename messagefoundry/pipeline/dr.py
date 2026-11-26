@@ -89,10 +89,15 @@ _ACTION_ABORTED = "dr_activation_aborted"
 #: #2752). The box stays active and the release can be retried. Kept apart from ``dr.release``, which
 #: only a completed hand-back writes, so a filter on that action still finds only fail-backs.
 _ACTION_RELEASE_FAILED = "dr_release_failed"
-#: How many of the newest ``dr.activate`` and ``dr.release`` rows a start reads to tell whether
-#: this process was last activated (BACKLOG #5965). The engine shards of one DR box share the
-#: store, so the rows of every shard are in the scan; a shard whose own newest row is older than
-#: this many is not found, and raises nothing.
+#: ``POST /dr/release`` on a box that came back passive after an activation (BACKLOG #5965): the
+#: operator leaves it passive. Kept apart from ``dr.release`` for the same reason as
+#: ``dr_release_failed``: no drain ran, so it is not a fail-back.
+_ACTION_STAY_PASSIVE = "dr.stay_passive"
+#: The actions a start reads to tell whether this process was last activated (BACKLOG #5965).
+_TRANSITIONS = (_ACTION_ACTIVATE, _ACTION_RELEASE, _ACTION_STAY_PASSIVE)
+#: How many of the newest :data:`_TRANSITIONS` rows a start reads. The engine shards of one DR
+#: box share the store, so every engine shard's rows are in the scan; an engine shard whose own
+#: newest row is older than this many is not found, and raises nothing.
 _RESTART_SCAN_ROWS = 500
 
 
@@ -254,7 +259,7 @@ class DrCoordinator:
         # The engine's process identity, ``shard:<id>`` or ``node:<id>``, or None for a lone
         # engine (Engine.instance_identity). Read at each use: it is known once the engine holds
         # its graph. It goes on the dr.activate and dr.release rows, so a start finds its own
-        # process's newest transition among its sibling shards' (BACKLOG #5965).
+        # process's newest transition among the other engine shards' (BACKLOG #5965).
         self._instance = instance
         # The instance posture, for the Vault hop the cold-seed verify can dial (vault BACKLOG
         # #2983). The engine passes its own. `None` counts as enforcing on that hop.
@@ -302,6 +307,9 @@ class DrCoordinator:
         # The last completed hand-back, so a retry that finds the box passive answers with that
         # release's outcome (its depth left) rather than with nothing known.
         self._last_release: DrResult | None = None
+        # Whether this process's start raised dr_restarted_passive, so a release can settle it
+        # even where the start could not read the rows (BACKLOG #5965).
+        self._restart_alerted = False
         # The steps the activation that made the box active left unfinished, so a retry that finds
         # it active still names them (Lander hold 6702318430, item A). Set once its profile applies.
         self._activation_failures: tuple[str, ...] = ()
@@ -335,17 +343,15 @@ class DrCoordinator:
         return f"{self._host} {identity}" if identity else self._host
 
     def _whose(self) -> dict[str, object]:
-        """The fields a ``dr.activate`` or ``dr.release`` row carries so a later start can tell
-        whether this process wrote it: the host, and the process identity (BACKLOG #5965). The
-        host keeps a row restored from another box's store from reading as this box's own."""
+        """The fields a transition row carries so a later start can tell whether this process
+        wrote it: the host, and the process identity (BACKLOG #5965). The host keeps a row
+        restored from another box's store from reading as this box's own."""
         return {"host": self._host, "instance": self._identity()}
 
     async def _own_last_transition(self) -> str | None:
-        """``dr.activate`` or ``dr.release``: the action of the newest such row this process
-        wrote, by :meth:`_whose`, or ``None`` when none is found. A store error raises."""
-        rows = await self._store.recent_audit_of(
-            (_ACTION_ACTIVATE, _ACTION_RELEASE), limit=_RESTART_SCAN_ROWS
-        )
+        """The action of the newest :data:`_TRANSITIONS` row this process wrote, by
+        :meth:`_whose`, or ``None`` when none is found. A store error raises."""
+        rows = await self._store.recent_audit_of(_TRANSITIONS, limit=_RESTART_SCAN_ROWS)
         return _last_transition(rows, self._whose())
 
     async def check_restarted_passive(self) -> bool:
@@ -354,27 +360,31 @@ class DrCoordinator:
 
         A box always starts passive, and nothing here changes that: it never re-activates itself,
         and ``POST /dr/activate`` stays the only route back to serving. When the newest
-        ``dr.activate`` or ``dr.release`` row this process wrote (same host, same identity) is a
+        :data:`_TRANSITIONS` row this process wrote (same host, same identity) is a
         ``dr.activate``, the box was serving when it went down, so this logs at ERROR and raises
         the critical ``dr_restarted_passive`` alert, which also closes the open ``dr_activated``
         for the same label. Each engine shard reads only the rows its own identity wrote, so each
         alerts on its own. A store that cannot be read is the same loud outcome, since the box may
-        have been serving. ``POST /dr/release`` on the passive box records the operator's choice
-        to leave it passive, and closes the alert (:meth:`release`). Returns whether it alerted.
+        have been serving. ``POST /dr/release`` on the passive box records that the operator
+        leaves it passive, and closes the alert (:meth:`_record_stay_passive`). Returns whether
+        it alerted.
 
         It misses at least: an activation whose ``dr.activate`` row was never written (the owed
-        row is held in memory only), and a process whose own newest row is older than the
-        :data:`_RESTART_SCAN_ROWS` newest. The other way round, a hand-back whose ``dr.release``
-        row was never written alerts, though the box had handed back. ``[dr]`` is refused with
-        ``[cluster]``, so the identity is a shard's or none."""
+        row is held in memory only); a box whose host name changed between the activation and
+        the start; and a process whose own newest row is older than the
+        :data:`_RESTART_SCAN_ROWS` newest. The other way round, it alerts at least on a hand-back
+        whose ``dr.release`` row was never written, and on a store restored from a snapshot taken
+        while this host was activated. ``[dr]`` is refused with ``[cluster]``, so the identity is
+        an engine shard's or none."""
         if self._settings.enabled is False or self._active:
             return False
         try:
             last = await self._own_last_transition()
         except Exception as exc:
+            # Broad on purpose: whatever stops the read, the box may have been serving.
             log.error(
-                "DR: could not read the dr.activate and dr.release audit rows at start, so this "
-                "box may have been serving when it went down; it stays PASSIVE: %s",
+                "DR: could not read the activation audit rows at start, so this box may have "
+                "been serving when it went down; it stays PASSIVE: %s",
                 safe_exc(exc),
             )
         else:
@@ -387,40 +397,63 @@ class DrCoordinator:
                 "that it stays passive",
                 self._label(),
             )
+        self._restart_alerted = True
         try:
             self._alert_sink.dr_restarted_passive(self._label())
         except Exception:  # pragma: no cover - defensive; a sink must never break DR
             log.warning("DR: dr_restarted_passive alert failed", exc_info=True)
         return True
 
-    async def _record_release_after_restart(self, actor: str, now: float) -> None:
-        """``POST /dr/release`` on a passive box this process last activated: record that the
-        operator leaves it passive, so later starts stop alerting, and close the open
-        ``dr_restarted_passive`` (BACKLOG #5965). It runs no hook and drains nothing: the box
-        binds nothing and delivers nothing already. A store error refuses the release."""
+    async def _record_stay_passive(self, actor: str, now: float) -> DrResult | None:
+        """``POST /dr/release`` on a passive box this process last activated, or whose start
+        raised ``dr_restarted_passive``: record that the operator leaves it passive, so later
+        starts stop alerting, and close the alert (BACKLOG #5965). The release hook runs when
+        one is set, since the takeover hook may have moved the address here. Nothing drains: the
+        box delivers nothing already, so rows the activated box took in and did not deliver stay
+        queued for the operator to reconcile, as after a release. ``None`` when there is nothing
+        to record. A write error refuses the release."""
         try:
-            if await self._own_last_transition() != _ACTION_ACTIVATE:
-                return
-            detail: dict[str, object] = {
-                **_release_detail(False, None),
-                **self._whose(),
-                "after_restart": True,
-            }
+            last = await self._own_last_transition()
+        except Exception:
+            if not self._restart_alerted:
+                log.warning(
+                    "DR: could not read the activation audit rows for a release on a passive box",
+                    exc_info=True,
+                )
+                return None
+            last = _ACTION_ACTIVATE
+        if last != _ACTION_ACTIVATE and not self._restart_alerted:
+            return None
+        hook_ran = await self._run_vip_hook(
+            self._settings.release_hook, phase="release", actor=actor, now=now
+        )
+        detail: dict[str, object] = {"vip_hook_ran": hook_ran, **self._whose()}
+        try:
             await self._store.record_audit(
-                _ACTION_RELEASE, actor=actor, detail=json.dumps(detail, sort_keys=True), now=now
+                _ACTION_STAY_PASSIVE,
+                actor=actor,
+                detail=json.dumps(detail, sort_keys=True),
+                now=now,
             )
         except Exception as exc:
             raise DrActivationError(
                 "audit",
-                "this box restarted passive after an activation, and recording the release that "
-                f"leaves it passive failed; retry once the audit log accepts writes: {safe_exc(exc)}",
+                "recording that this passive box stays passive failed, so its restart alert "
+                f"stays open; retry once the audit log accepts writes: {safe_exc(exc)}",
             ) from exc
+        self._restart_alerted = False
         log.warning(
-            "DR released by %s after a restart: the box was already passive and stays so; no hook "
-            "ran and nothing drained",
+            "DR: %s left this box passive after a restart; nothing drained, and any row the "
+            "activated box took in and did not deliver stays queued to reconcile per the runbook",
             actor,
         )
         self._alert_dr("dr_released")
+        return DrResult(
+            action="release",
+            active=False,
+            threshold=self._settings.priority_threshold.value,
+            vip_hook_ran=hook_ran,
+        )
 
     def note_profile_preflight(self, running: bool) -> None:
         """Record whether the ``activate_profile`` callback is inside its preflight.
@@ -716,7 +749,7 @@ class DrCoordinator:
                     if self._unrecorded_release is not None:
                         await self._record_owed_release()
                     elif self._last_release is None:
-                        await self._record_release_after_restart(actor, now)
+                        self._last_release = await self._record_stay_passive(actor, now)
                 finally:
                     # A release whose row or cleanup was cut short never ran the cleanup, or not
                     # to its end. It is safe to repeat, so a retry finishes it, and does so

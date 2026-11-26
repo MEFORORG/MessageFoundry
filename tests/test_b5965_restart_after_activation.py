@@ -215,14 +215,16 @@ async def test_a_release_on_the_restarted_box_records_that_it_stays_passive(
         assert await restarted.check_restarted_passive()
         result = await restarted.release(actor="bob")
         assert result.active is False and not restarted.active
-        rows = await store.list_audit(action="dr.release", limit=5)
+        # Not a fail-back: no drain ran, so it is its own action and no dr.release row.
+        assert await store.list_audit(action="dr.release", limit=5) == []
+        rows = await store.list_audit(action="dr.stay_passive", limit=5)
         assert len(rows) == 1
         detail = json.loads(rows[0]["detail"])
-        assert detail["after_restart"] is True and detail["vip_hook_ran"] is False
+        assert detail["vip_hook_ran"] is False and detail["host"] == socket.gethostname()
         assert restarted_sink.events[-1] == ("dr_released", socket.gethostname())
         # A second release records nothing more, and the next start raises nothing.
-        await restarted.release(actor="bob")
-        assert len(await store.list_audit(action="dr.release", limit=5)) == 1
+        assert await restarted.release(actor="bob") == result
+        assert len(await store.list_audit(action="dr.stay_passive", limit=5)) == 1
         later = _Sink()
         assert not await _coord(store, ss, archive, later, None).check_restarted_passive()
         assert later.events == []
@@ -237,6 +239,7 @@ async def test_a_never_activated_box_writes_no_release_row(tmp_path: Path) -> No
         sink = _Sink()
         await _coord(store, ss, archive, sink, None).release(actor="bob")
         assert await store.list_audit(action="dr.release", limit=5) == []
+        assert await store.list_audit(action="dr.stay_passive", limit=5) == []
         assert sink.events == []
     finally:
         await store.close()
@@ -267,10 +270,17 @@ async def test_an_unreadable_store_at_start_fails_loud(
         async def refuse(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
             raise OSError("disk I/O error")
 
+        real = store.recent_audit_of
         monkeypatch.setattr(store, "recent_audit_of", refuse)
         sink = _Sink()
-        assert await _coord(store, ss, archive, sink, None).check_restarted_passive()
+        coord = _coord(store, ss, archive, sink, None)
+        assert await coord.check_restarted_passive()
         assert sink.events == [("dr_restarted_passive", socket.gethostname())]
+        # The release still settles the alert it raised, though the box was never activated.
+        monkeypatch.setattr(store, "recent_audit_of", real)
+        await coord.release(actor="bob")
+        assert sink.events[-1] == ("dr_released", socket.gethostname())
+        assert len(await store.list_audit(action="dr.stay_passive", limit=5)) == 1
     finally:
         await store.close()
 

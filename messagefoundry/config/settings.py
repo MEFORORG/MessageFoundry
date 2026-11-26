@@ -6018,7 +6018,7 @@ _ALERT_EVENT_TYPES = frozenset(
         "leadership_acquired",  # #145 (ADR 0014 amendment): a node went non-leader→leader (HA failover / election)
         "dr_activated",  # #145 (ADR 0014 amendment, ADR 0048): a third-tier DR standby was promoted
         # BACKLOG #5965 (ADR 0048): a DR box last recorded as activated came back up passive after a
-        # restart. Critical when no rule sets its severity; the next dr_activated resolves it.
+        # restart. AlertSink.dr_restarted_passive states its severity and what resolves it.
         "dr_restarted_passive",
         # ASVS 6.4.5 (BACKLOG #1141): an admin-issued temporary password is UNCLAIMED and near the
         # instant the login gate stops accepting it (keyed on the holder's username; PHI-free)

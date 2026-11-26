@@ -8,9 +8,9 @@
   restarts comes back passive, logs at ERROR and raises the new `dr_restarted_passive` alert,
   critical unless a matching rule names its own severity, which closes the open `dr_activated`.
   It never re-activates itself: `POST /dr/activate` brings it back, and `POST /dr/release` on
-  the passive box records that it stays passive. Each engine shard reads its own `dr.activate`
-  and `dr.release` rows, which now name the host and the shard, and alerts on its own; the DR
-  alerts' label adds the shard on an engine shard. No DR box runs a scheduled backup pass any
+  the passive box records that it stays passive, as a `dr.stay_passive` audit row. Each engine
+  shard reads its own `dr.activate`, `dr.release` and `dr.stay_passive` rows, which now name the
+  host and the engine shard, and alerts on its own; the DR alerts' label adds the engine shard. No DR box runs a scheduled backup pass any
   more, activated included, so a later re-activation of the same restore still passes the
   `[dr].restore_token` vintage check.
   (`BACKLOG #5965`)

@@ -1658,8 +1658,9 @@ class LoggingAlertSink:
 
     def dr_restarted_passive(self, node: str) -> None:
         log.critical(
-            "ALERT dr_restarted_passive: DR box %r was activated and came back up PASSIVE after a "
-            "restart -- it serves nothing until an operator re-runs POST /dr/activate",
+            "ALERT dr_restarted_passive: DR box %r came back up PASSIVE after a restart and may "
+            "have been serving -- the ERROR line before this says whether it was last activated. It "
+            "serves nothing until POST /dr/activate; POST /dr/release records that it stays passive",
             node,
         )
 
