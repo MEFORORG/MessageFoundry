@@ -4535,20 +4535,28 @@ def _build_store_cipher(
             "(expected 'aesgcm' or 'vault_transit')"
         )
     retired = _split_retired(settings.encryption_keys_retired)
-    # A host key passes the same key check a resolved one does (BACKLOG #5310, #5308), so a
-    # refusal ``make_cipher`` would raise unrecorded, and the build's fixed-text replacement would
-    # print as :data:`_UNTEXTED`, is raised recorded there instead.
-    active = (
-        _checked_active_key(host_key, settings)
-        if host_key is not None
-        else resolve_active_key(settings, posture=posture)
-    )
-    return make_cipher(
-        active,
-        retired,
-        write_v2=settings.aad_bind,
-        allow_unmarked=settings.allow_unmarked_ciphertext,
-    )
+    active: str | None = None
+    try:
+        # A host key passes the same key check a resolved one does (BACKLOG #5310, #5308), so a
+        # refusal ``make_cipher`` would raise unrecorded, and the build's fixed-text replacement
+        # would print as :data:`_UNTEXTED`, is raised recorded there instead.
+        active = (
+            _checked_active_key(host_key, settings)
+            if host_key is not None
+            else resolve_active_key(settings, posture=posture)
+        )
+        return make_cipher(
+            active,
+            retired,
+            write_v2=settings.aad_bind,
+            allow_unmarked=settings.allow_unmarked_ciphertext,
+        )
+    finally:
+        # Vault BACKLOG #8163 item 21: an error leaving here keeps this frame on its traceback, so
+        # the key text it holds is dropped first, whatever raised. Assigned, not deleted, since
+        # the call that raised may have left ``active`` unset.
+        active = host_key = None
+        retired = []
 
 
 class StoreNotFoundError(RuntimeError):

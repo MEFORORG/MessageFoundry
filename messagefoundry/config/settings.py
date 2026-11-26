@@ -837,11 +837,13 @@ class StoreSettings(_Section):
     # + the response/payload bodies; its error/last_error/detail stay plaintext — see sqlserver.py.)
     # Secret — supply via MEFOR_STORE_ENCRYPTION_KEY, never the file.
     # Empty = off (values stored as-is).
-    encryption_key: str | None = None
+    # Out of the repr (vault BACKLOG #8163 item 21): a frame on a store refusal's traceback holds
+    # `settings`, so a renderer that prints locals would print the key. Reads are unchanged.
+    encryption_key: str | None = Field(default=None, repr=False)
     # Comma-separated base64 RETIRED keys, kept available for *decrypt only* during a key rotation
     # (ASVS 11.2.2) until `messagefoundry rotate-key` finishes re-encrypting under the active key.
-    # Secret — env-only (MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). Empty = none.
-    encryption_keys_retired: str = ""
+    # Secret — env-only (MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). Empty = none. Out of the repr too.
+    encryption_keys_retired: str = Field(default="", repr=False)
     # When true, `serve` refuses to start without an encryption key even when the audited opt-out
     # below is set. Off by default. See docs/PHI.md §3.
     require_encryption: bool = False

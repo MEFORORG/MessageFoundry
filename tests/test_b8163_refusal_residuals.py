@@ -151,3 +151,82 @@ def test_restore_and_restore_verify_exit_2_on_a_key_seam_hop_refusal(
     assert rc == 2, (captured.out, captured.err)
     assert "the store key or cipher could not be resolved" in captured.out, captured.out
     assert _HOST not in captured.out + captured.err
+
+
+# --- item 21: the store key in StoreSettings' repr and in the cipher build's frame locals -------
+
+#: A planted active key and retired key, valid base64 of 32 bytes, so a repr that carries either is
+#: found by its exact text.
+_PLANTED_ACTIVE = generate_key()
+_PLANTED_RETIRED = generate_key()
+
+
+def _planted_settings() -> Any:
+    from messagefoundry.config.settings import StoreSettings
+
+    return StoreSettings(encryption_key=_PLANTED_ACTIVE, encryption_keys_retired=_PLANTED_RETIRED)
+
+
+def _assert_no_planted_key(text: str) -> None:
+    assert _PLANTED_ACTIVE not in text, "the active key is in the text"
+    assert _PLANTED_RETIRED not in text, "a retired key is in the text"
+
+
+def test_store_settings_repr_and_str_carry_no_store_key() -> None:
+    """Red before the fix: the repr of a settings object holding a key printed it, and every frame
+    on a refusal's traceback that holds ``settings`` prints it through that repr."""
+    settings = _planted_settings()
+    _assert_no_planted_key(repr(settings))
+    _assert_no_planted_key(str(settings))
+    # Every reader of the key still gets it as it was.
+    assert settings.encryption_key == _PLANTED_ACTIVE
+    assert settings.encryption_keys_retired == _PLANTED_RETIRED
+    assert settings.model_dump()["encryption_key"] == _PLANTED_ACTIVE
+
+
+def _frame_locals_reprs(exc: BaseException, *, only: str | None = None) -> str:
+    """The repr of every local of every frame on ``exc``'s traceback, as a locals renderer prints;
+    with ``only``, of the frames running the function of that name alone."""
+    shown: list[str] = []
+    tb = exc.__traceback__
+    while tb is not None:
+        if only is None or tb.tb_frame.f_code.co_name == only:
+            shown += [f"{name}={value!r}" for name, value in tb.tb_frame.f_locals.items()]
+        tb = tb.tb_next
+    return "\n".join(shown)
+
+
+def test_the_cipher_build_frame_holds_no_store_key_when_the_build_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Red before the fix: ``_build_store_cipher``'s frame kept the resolved active key and the
+    retired keys as locals on the traceback of an error from ``make_cipher``. Only that frame is
+    read: the stand-in's own frame, like the real ``make_cipher``'s, holds the keys it was passed,
+    and ``build_store_cipher`` drops this traceback whole (the next test)."""
+    from messagefoundry.store import base as store_base
+
+    def refuse(*args: object, **kwargs: object) -> Any:
+        raise ValueError("synthetic: make_cipher refused")
+
+    monkeypatch.setattr(store_base, "make_cipher", refuse)
+    escaped = _escaping(lambda: store_base._build_store_cipher(_planted_settings(), None))
+    assert type(escaped) is ValueError, type(escaped)
+    shown = _frame_locals_reprs(escaped, only="_build_store_cipher")
+    assert "active=" in shown, "the frame was not read"
+    _assert_no_planted_key(shown)
+
+
+def test_the_cipher_build_refusal_holds_no_store_key_in_its_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refusal ``build_store_cipher`` raises in a failed build's place: its frames' locals,
+    ``settings`` among them, print no key."""
+    from messagefoundry.store import base as store_base
+
+    def refuse(*args: object, **kwargs: object) -> Any:
+        raise ValueError("synthetic: make_cipher refused")
+
+    monkeypatch.setattr(store_base, "make_cipher", refuse)
+    escaped = _escaping(lambda: store_base.build_store_cipher(_planted_settings()))
+    assert isinstance(escaped, store_base.StoreCipherConfigError), type(escaped)
+    _assert_no_planted_key(_frame_locals_reprs(escaped))
