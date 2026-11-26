@@ -525,8 +525,14 @@ def test_the_processs_own_limits_pass_the_provider_module_import(
 ) -> None:
     # Vault BACKLOG #6709 item 11: the dispatch's import arm refused out of memory or stack as a
     # broken install, which its build arm no longer does.
-    def _import(_name: str) -> ModuleType:
-        raise error()
+    import importlib
+
+    real_import = importlib.import_module
+
+    def _import(name: str, *args: Any) -> ModuleType:
+        if name == "messagefoundry.store.keyprovider_vault":
+            raise error()
+        return real_import(name, *args)
 
     monkeypatch.setattr("messagefoundry.store.keyprovider.importlib.import_module", _import)
     with pytest.raises(error):

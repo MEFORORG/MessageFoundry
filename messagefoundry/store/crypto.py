@@ -1058,7 +1058,7 @@ def gave_no_verdict(error: CipherError) -> bool:
 
 
 #: The most exceptions :func:`detached` clears in one error's graph. Far past any real chain;
-#: reaching it is logged, never silent.
+#: reaching it is logged at WARNING, and a failure to log is reported on stderr where it can be.
 _DETACH_LIMIT = 10_000
 
 
@@ -1071,8 +1071,9 @@ def detached(error: CipherError) -> CipherError:
     that keeps ``error`` itself keeps the cleared error.
 
     Past :data:`_DETACH_LIMIT` exceptions it stops, cuts the graph there and then logs a
-    WARNING, a failure to log reported on stderr by its class and never raised (vault BACKLOG
-    #6706 item 1): a visited error's link to an unvisited one is set to ``None``,
+    WARNING (vault BACKLOG #6706 item 1). A failure to log that raises an ``Exception`` is
+    reported on stderr by its class, where the process has a writable one, and is not raised.
+    The cut: a visited error's link to an unvisited one is set to ``None``,
     and an unvisited member of a visited group, which its group's tuple keeps, has its traceback
     and its own links cleared, down through any group nested in it. The nearest links are visited
     first, so ``error``'s own cause, which :func:`gave_no_verdict` reads, is kept. The cut is made
@@ -1080,23 +1081,13 @@ def detached(error: CipherError) -> CipherError:
     seen: set[int] = set()
     visited: list[BaseException] = []
     pending: collections.deque[BaseException] = collections.deque([error])
+    over_limit = False
     while pending:
         link = pending.popleft()
         if id(link) in seen:
             continue
         if len(seen) >= _DETACH_LIMIT:
-            # Cut first: the WARNING is logged after, guarded, so a failure to log cannot skip
-            # the cut and return the rest of the graph with its tracebacks attached.
-            _cut_unvisited(visited, seen)
-            try:
-                _log.warning(
-                    "an error's exception graph has more than %d links; the rest are cut off it",
-                    _DETACH_LIMIT,
-                )
-            except Exception as fault:  # noqa: BLE001 -- reported below, by class, never raised
-                _last_resort(
-                    f"a detached-error WARNING could not be logged ({type(fault).__name__})"
-                )
+            over_limit = True
             break
         seen.add(id(link))
         visited.append(link)
@@ -1104,7 +1095,30 @@ def detached(error: CipherError) -> CipherError:
         pending.extend(e for e in (link.__cause__, link.__context__) if e is not None)
         if isinstance(link, BaseExceptionGroup):
             pending.extend(link.exceptions)
+    if over_limit:
+        # Cut, then drop this frame's hold on the exceptions the cut unlinked, and only then
+        # log: a failure to log cannot skip the cut, and an error the log step raises carries
+        # this frame, which then reaches no traceback the cut left attached.
+        _cut_unvisited(visited, seen)
+        pending.clear()
+        del link
+        _warn_detach_limit()
     return error
+
+
+def _warn_detach_limit() -> None:
+    """:func:`detached`'s WARNING, with a failure to log reported on stderr by its class
+    (``ascii``-escaped) and not raised."""
+    try:
+        _log.warning(
+            "an error's exception graph has more than %d links; the rest are cut off it",
+            _DETACH_LIMIT,
+        )
+    except Exception as fault:  # noqa: BLE001 -- reported below, by class, not raised
+        with contextlib.suppress(Exception):
+            _last_resort(
+                f"a detached-error WARNING could not be logged ({ascii(type(fault).__name__)})"
+            )
 
 
 def _cut_unvisited(visited: list[BaseException], seen: set[int]) -> None:

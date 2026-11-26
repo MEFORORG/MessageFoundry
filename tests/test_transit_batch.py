@@ -884,7 +884,42 @@ def test_detached_past_its_limit_cuts_when_its_warning_cannot_be_logged(
         crypto._log.removeFilter(raising)
     assert not _frames_reach(error, "value 0")
     assert _graph_nodes(error) == 3
-    assert "could not be logged (ValueError)" in capsys.readouterr().err
+    assert "could not be logged ('ValueError')" in capsys.readouterr().err
+
+
+class _Interrupt(BaseException):
+    """A synthetic non-``Exception`` error, which the WARNING's guard does not catch."""
+
+
+class _InterruptingFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        raise _Interrupt
+
+
+def test_an_error_escaping_detacheds_warning_holds_nothing_the_cut_unlinked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Round 1: detached's own locals still held the unlinked links, tracebacks attached, while it
+    # logged, so an error escaping the log step carried them through detached's frame.
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 3)
+    error = _chain(CipherError("synthetic"), 5)
+    interrupting = _InterruptingFilter()
+    crypto._log.addFilter(interrupting)
+    try:
+        with pytest.raises(_Interrupt) as caught:
+            detached(error)
+    finally:
+        crypto._log.removeFilter(interrupting)
+    tb = caught.value.__traceback__
+    frames = []
+    while tb is not None:
+        frames.append(tb.tb_frame)
+        tb = tb.tb_next
+    (frame,) = [f for f in frames if f.f_code.co_name == "detached"]
+    held = [v for v in frame.f_locals.values() if isinstance(v, BaseException)]
+    held += [e for v in frame.f_locals.values() if isinstance(v, collections.deque) for e in v]
+    assert all(e.__traceback__ is None for e in held)
+    assert not _frames_reach(error, "value 0")
 
 
 class _CountedGroup(ExceptionGroup[Exception]):
@@ -904,7 +939,11 @@ def test_detached_past_its_limit_descends_a_shared_member_once(
     # Repair item 2: the cut's descent into unvisited groups kept no record of what it cleared, so
     # a member shared down a stack of groups was descended into 2**depth times.
     depth = 12
-    shared: Exception = ValueError("leaf")
+    try:
+        raise ValueError("leaf")
+    except ValueError as caught:
+        leaf = caught
+    shared: Exception = leaf
     for _ in range(depth):
         shared = _CountedGroup("level", [shared, shared])
     error = CipherError("synthetic")
@@ -912,7 +951,8 @@ def test_detached_past_its_limit_descends_a_shared_member_once(
     monkeypatch.setattr(crypto, "_DETACH_LIMIT", 3)
     _CountedGroup.reads = 0
     assert detached(error) is error
-    assert _CountedGroup.reads <= depth
+    assert 1 <= _CountedGroup.reads <= depth  # each level read once, by the cut's descent
+    assert leaf.__traceback__ is None
 
 
 def test_detached_past_its_limit_keeps_a_visited_members_links(
