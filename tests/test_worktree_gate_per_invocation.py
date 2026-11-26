@@ -285,6 +285,28 @@ def test_a_quoted_victim_holding_a_closer_character_is_still_judged(
     assert "worktree remove" in _reason(rig, cmd, rig.tmp)
 
 
+@pytest.mark.parametrize(
+    "template",
+    [
+        # A `worktree remove` inside a quoted mention, with a `;` in the mention.
+        'git commit -m "see worktree remove x; -- {tmp}/Primary-wt2" && git worktree remove {o}/nope',
+        # A `#` comment holding a `;`.
+        "git worktree remove {o}/nope # x; echo -- {tmp}/Primary-wt2",
+        # The shell text is `nope\&& echo`: an escaped `&` and then a lone `&` separator.
+        "git worktree remove {o}/nope\\&& echo -- {tmp}/Primary-wt2",
+    ],
+)
+def test_a_separator_outside_the_victim_is_not_a_false_deny(
+    rig: SimpleNamespace, template: str
+) -> None:
+    """ALLOW today. The gate's split ignores quotes and comments and cuts at the `;` or `&` here,
+    so the governed path past it is not read as a victim. A quote-aware victim split once DENIED
+    all three; these pin that a later attempt does not bring those false denies back. The same
+    mention or comment without the `;` is still DENIED today, so these rest on the cut."""
+    cmd = template.format(tmp=rig.tmp.as_posix(), o=rig.outside.as_posix())
+    assert _allowed(rig, cmd, rig.outside)
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="the case-insensitive match is Windows-only")
 def test_a_printed_upper_case_git_is_not_judged_on_windows(rig: SimpleNamespace) -> None:
     """ALLOW on origin/main; the case-insensitive token test caught a word `echo` prints."""

@@ -21,16 +21,19 @@ the vetted network call.
 * **Trust anchor (BACKLOG #5527).** The endpoint is verified under the instance ``[tls]`` policy the
   caller hands in, resolved by ``tls_policy.resolve_trust_anchor`` as for every other HTTP-family
   hop: ``[tls].internal_ca_file`` under ``augment`` or ``pinned``, and ``[tls].crl_file``, for an
-  endpoint that is not loopback. :func:`_ai_endpoint_opener` says which opener that gives.
+  endpoint whose host is not loopback in the reading :func:`_refuse_an_unrevoked_ai_hop`
+  states. :func:`_ai_endpoint_opener` says which opener that gives.
 * **Off the event loop.** :meth:`AiBroker.chat` blocks (a provider POST), and so can construction,
   which builds rest.py's shared opener on first use (BACKLOG #2484), or reads the CA and CRL files
   when it builds an anchored opener (:func:`_ai_endpoint_opener`). The API route runs the build
   and :meth:`AiBroker.chat` each through :func:`asyncio.to_thread`.
 * **Revocation (BACKLOG #2193 slice (e), BACKLOG #5527).** The endpoint's certificate is verified,
   and stdlib ssl checks no OCSP. It checks no CRL unless ``[tls].crl_file`` is set, the ``[tls]``
-  policy is handed in, and the endpoint is not loopback. So an
-  off-box endpoint is refused under an enforcing or unknown posture unless that CRL is checked or
-  ``[ai].endpoint_revocation_attested`` is set with its reason: :func:`_refuse_an_unrevoked_ai_hop`.
+  policy is handed in, and the endpoint host is not loopback in that reading. So an endpoint
+  whose host reads as remote there, on the box or off it, is refused under an enforcing or
+  unknown posture unless that CRL is checked or ``[ai].endpoint_revocation_attested`` is set
+  with its reason:
+  :func:`_refuse_an_unrevoked_ai_hop`.
 * **Secrets / PHI.** The prompt, the reply, and the provider ``api_key`` are NEVER logged. A failure names
   only the redacted endpoint host + HTTP status — never the request or response body (either may echo
   content or the key).
@@ -119,16 +122,22 @@ _AI_HOP_CELL = "[ai] engine AI broker (verified TLS, no revocation check)"
 _AI_HOP_CELL_OTHER = "[ai] engine AI broker (verified TLS)"
 
 #: The ways across that refusal under an enforcing posture where no CRL can reach the hop: the
-#: attestation pair, or an endpoint on this machine. Each remedy is written out in full, with no
-#: text made from another, so a grep for its opening words finds it (BACKLOG #5527 item 13).
+#: attestation pair, or an endpoint the refusal reads as on the box, in the reading
+#: :func:`_refuse_an_unrevoked_ai_hop` states. So the remedy names spellings that read as on the
+#: box rather than "this machine". Each remedy is written out in full, with no text made from
+#: another, so a grep for its opening words finds it (BACKLOG #5527 item 13).
 _AI_ATTESTATION_LEVER = (
     "Set [ai].endpoint_revocation_attested = true with an "
     "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
-    "endpoint's certificate, or use an endpoint on this machine."
+    "endpoint's certificate, or use an endpoint URL whose host reads as loopback here, such as "
+    "localhost, 127.0.0.1 or [::1], and list that host in [ai].allowed_endpoints as the URL "
+    "writes it. Such an endpoint is verified against the OS trust store alone, with neither "
+    "[tls] file. The host is not resolved: at least a spelling with a trailing dot, or a "
+    "shortened IPv4 address such as 127.1, reads as remote."
 )
 
 #: The ways across that refusal under an enforcing posture, on the terms below:
-#: ``[tls].crl_file``, the attestation pair, or an endpoint on this machine.
+#: ``[tls].crl_file``, the attestation pair, or an endpoint whose host reads as loopback.
 #: ``[tls].crl_file`` reaches this hop since BACKLOG #5527, the later CRL lever ADR 0173 section 12
 #: foresaw when the owner ruling of 2026-10-27 built the attestation pair alone. It is offered only
 #: to a broker that was handed a ``[tls]`` policy, on a context whose only reason for no CRL
@@ -141,7 +150,11 @@ _AI_CRL_LEVER = (
     "is instance-wide: every non-loopback hop it reaches then needs its issuer's CRL in that file, "
     "or its handshake fails), or set [ai].endpoint_revocation_attested = true with an "
     "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
-    "endpoint's certificate, or use an endpoint on this machine."
+    "endpoint's certificate, or use an endpoint URL whose host reads as loopback here, such as "
+    "localhost, 127.0.0.1 or [::1], and list that host in [ai].allowed_endpoints as the URL "
+    "writes it. Such an endpoint is verified against the OS trust store alone, with neither "
+    "[tls] file. The host is not resolved: at least a spelling with a trailing dot, or a "
+    "shortened IPv4 address such as 127.1, reads as remote."
 )
 
 
@@ -175,8 +188,9 @@ def _first_crossing(kind: str, host: str) -> bool:
 
 class AiBrokerError(ValueError):
     """The engine broker is mis-configured (at least: missing endpoint/key, an endpoint outside the SSRF
-    allowlist, a cleartext-http endpoint, which always carries the key, or an off-box endpoint the
-    revocation guard refuses) or the provider call failed. Raised with a PHI-/secret-safe
+    allowlist, a cleartext-http endpoint, which always carries the key, or an endpoint the
+    revocation guard refuses; :func:`_refuse_an_unrevoked_ai_hop` says when, and that one on this
+    machine can be among them) or the provider call failed. Raised with a PHI-/secret-safe
     message (redacted host + status only) so it can surface as a clean API error without leaking the
     prompt, the response, or the key."""
 
@@ -217,10 +231,13 @@ def _ai_endpoint_opener(
 
     The anchor is resolved by ``rest.http_family_trust_anchor``, as for every HTTP-family hop, here
     with no ``tls_ca_file`` of its own: ``[tls].internal_ca_file`` under ``augment`` or ``pinned``,
-    and ``[tls].crl_file`` in any mode, each only for a host that is not loopback. So this is where
-    a CRL reaches this hop. An anchor that narrows gets an anchored opener. One that narrows
-    nothing gets rest.py's shared opener, which is never mutated: callers compare an opener to it
-    by identity to learn that.
+    and ``[tls].crl_file`` in any mode, each only for an endpoint whose host does not read as
+    loopback. ``rest.http_family_trust_anchor`` takes the host with ``hop_url_host`` and
+    ``tls_policy.resolve_trust_anchor`` asks ``is_loopback_hop_host`` of it, the same two steps as
+    the reading :func:`_refuse_an_unrevoked_ai_hop` states, so an endpoint URL holding ``[::1]``
+    takes neither file. So this is where a CRL reaches this hop. An anchor that narrows gets an
+    anchored opener. One that narrows nothing gets rest.py's shared opener, which is never
+    mutated: callers compare an opener to it by identity to learn that.
 
     **The anchored opener is held in ``slot``**, though the broker is built for each request: the
     slot holds one, keyed on the resolved anchor. A call whose anchor differs from the one held
@@ -296,7 +313,14 @@ def _refuse_an_unrevoked_ai_hop(
     guard uses, asked through ``RevocationHopGuard.capture(...).disposition()``, with these inputs:
 
     * **On the box** is :func:`~messagefoundry.config.tls_policy.is_loopback_hop_host` on the
-      endpoint's host. Every opener dials a loopback host direct, whatever proxy it has (vault
+      host :func:`~messagefoundry.config.tls_policy.hop_url_host` takes from the endpoint URL,
+      and the refusal and its remedies use this reading. It reads the host as spelled, apart
+      from case and the brackets of an IPv6 host, not where the endpoint runs. So "not on the
+      box" means the host does not read as loopback, not that the endpoint is off this machine:
+      at least a spelling with a trailing dot, such as ``localhost.``, or a shortened IPv4
+      address such as ``127.1`` reads as remote, though it may name this machine. An endpoint
+      URL holding ``[::1]`` reads as on the box, because the host arrives without its brackets.
+      Every opener dials a loopback host direct, whatever proxy it has (vault
       BACKLOG #2579), so a proxy does not move a loopback endpoint off the box.
     * ``revocation_attested`` goes in the per-hop ``attested`` slot. It is
       ``[ai].endpoint_revocation_attested``, which load refuses without a reason. Only the value
@@ -320,9 +344,10 @@ def _refuse_an_unrevoked_ai_hop(
       construction gate, so there is no ambient posture to read.
 
     **The three answers.** REFUSE raises :class:`AiBrokerError`, which the route answers 503.
-    WARN crosses and logs a WARNING that names the pair; that is an off-box, unattested hop on an
-    instance whose ``[security].enforcement`` is ``warn``. ALLOW crosses; a hop that crossed an
-    enforcing or unknown posture on its attestation logs a WARNING through
+    WARN crosses and logs a WARNING that names the pair; that is a hop not on the box, as read
+    above, with no credited CRL and no attestation, on an instance whose
+    ``[security].enforcement`` is ``warn``. ALLOW crosses; a hop that crossed an enforcing or
+    unknown posture on its attestation logs a WARNING through
     ``tls_policy.log_attested_crossing``, with the reason. A hop on the box logs nothing, and
     neither does a hop the process-wide variable crossed on a warn instance. Each line is written
     once per process for each host. Any other answer refuses, so a new one fails closed.

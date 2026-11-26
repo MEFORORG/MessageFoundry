@@ -7,7 +7,15 @@ import * as fs from "node:fs";
 
 import * as vscode from "vscode";
 
-import { engineUrl, environments, isExecGated, runJson, workspaceDir, writerCheckSetting } from "./cli";
+import {
+  engineUrl,
+  environments,
+  isExecGated,
+  readerPathEscapesByLink,
+  runJson,
+  workspaceDir,
+  writerCheckSetting,
+} from "./cli";
 import {
   clearEngineTrustAnchors,
   setEngineTrustAnchor,
@@ -17,7 +25,8 @@ import {
 import { engineLog } from "./engineLog";
 import { isLocalEngine } from "./engineTarget";
 import { foldAsciiCase } from "./pathFold";
-import { droppedSkipped } from "./workspaceContainment";
+import { droppedSkipped, readerLinkEscapeNotice } from "./workspaceContainment";
+import { serviceConfigArgs } from "./connectionWizardModel";
 import {
   engineHostKey,
   hostPinsOf,
@@ -511,15 +520,18 @@ async function askCli(
   // earlier-run branch below, which keeps the old anchor, so a dropped value drops it on that path
   // as well.
   const setting = writerCheckSetting("serviceConfig");
+  const skipped =
+    `\`cert inventory\` was not run and no certificate it would name is trusted for ${url} ` +
+    "(a caFile pin in messagefoundry.environments still applies)";
   if (setting.dropped !== false) {
-    engineLog().warn(
-      droppedSkipped(
-        "serviceConfig",
-        setting.dropped,
-        `\`cert inventory\` was not run and no certificate it would name is trusted for ${url} ` +
-          "(a caFile pin in messagefoundry.environments still applies)",
-      ),
-    );
+    engineLog().warn(droppedSkipped("serviceConfig", setting.dropped, skipped));
+    return;
+  }
+  // A value that leaves the workspace through a link is refused the same way, before the CLI reads
+  // its `[api].tls_cert_file` (BACKLOG #5411, #8237 item 24), judged against the captured folder the
+  // CLI runs in. cli.ts readerPathEscapesByLink states its synchronous-read limit.
+  if (readerPathEscapesByLink(setting, workspace)) {
+    engineLog().warn(readerLinkEscapeNotice("serviceConfig", `${skipped}.`));
     return;
   }
   if (cliRun !== undefined) {
@@ -534,7 +546,7 @@ async function askCli(
     // The path is workspace-relative (like every other messagefoundry.* path setting), so it runs
     // from the workspace the same way alertEditor.ts runs `alert list`.
     const call = runJson<unknown>(
-      ["cert", "inventory", "--service-config", setting.value],
+      ["cert", "inventory", ...serviceConfigArgs(setting.value)],
       workspace,
       { timeoutMs: CERT_INVENTORY_TIMEOUT_MS },
     );
@@ -819,9 +831,11 @@ function cliCouldAnchor(key: string): boolean {
     // askCli's own guard: with no workspace, or an untrusted one, the CLI is never asked.
     !!workspaceDir() &&
     !isExecGated() &&
-    // And its refusal of a dropped serviceConfig (BACKLOG #5404), so a failure does not schedule
-    // refreshes that can only refuse again.
+    // And its refusals of a dropped serviceConfig (BACKLOG #5404) and of one that leaves the folder
+    // through a link (BACKLOG #5411), so a failure does not schedule refreshes that can only refuse
+    // again.
     writerCheckSetting("serviceConfig").dropped === false &&
+    !readerPathEscapesByLink(writerCheckSetting("serviceConfig")) &&
     !claimedKeys.has(key) &&
     // The settings as they are now too: a host claimed since the last refresh is no longer the CLI's.
     !configuredPins().has(key) &&

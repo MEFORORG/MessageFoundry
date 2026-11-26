@@ -50,13 +50,11 @@ export const SERVE_DEFAULT_SERVICE_CONFIG = "messagefoundry.toml";
  * fork guard judges that file.
  */
 export { connectionServiceConfig as startServiceConfigValue } from "./connectionWizardModel";
-import { connectionServiceConfig } from "./connectionWizardModel";
+import { connectionServiceConfig, serviceConfigArgs } from "./connectionWizardModel";
 
 /** The `--service-config` element serve, the probe and provision-admin share, or none when undefined.
  *  Bound with `=`, so a path that starts with a dash stays a value and never becomes a flag. */
-function serviceConfigFlag(serviceConfig: string | undefined): string[] {
-  return serviceConfig === undefined ? [] : [`--service-config=${serviceConfig}`];
-}
+const serviceConfigFlag = serviceConfigArgs;
 
 /**
  * The `messagefoundry ai-policy` argv (sans the `--json` runJson appends) for the IDE's offline

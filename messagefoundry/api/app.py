@@ -3034,7 +3034,8 @@ _LEASE_LOST_RELEASE_DETAIL: Final = (
 _UNREADABLE_DETAIL: Final = "the engine could not read the config directory; see the engine log"
 
 #: The answer's bound on a hop refusal raised BUILDING the ``POST /alerts/test-email`` transport
-#: (BACKLOG #2193). The revocation guard's text runs to about 900 characters and its levers start
+#: (BACKLOG #2193). The revocation guard's text runs to about 900 to 1,150 characters, the longer
+#: for a sink built with no ``[tls]`` policy (BACKLOG #5527), and its levers start
 #: past ``safe_exc``'s default 200, so the default cut answered a refusal with no way across. Not
 #: :data:`_REFUSAL_LOG_LIMIT`: that one bounds a log line whose text the answer withholds, and this
 #: one bounds what the answer carries. 2048 leaves room for any DNS host name in that text.
@@ -5597,12 +5598,15 @@ def create_app(
         # + cleartext-credential checks run in the constructor; a misconfiguration is an operator error.
         # BACKLOG #2193 slice (e): the derived instance posture (the same _phi_read_posture derived at
         # create_app time from ai_settings, which == app.state.ai == `ai` on the managed path) keys
-        # the broker's revocation refusal. An off-box endpoint with no [ai].endpoint_revocation_attested
-        # pair is refused under enforce, and a None posture counts as enforcing there. The cleartext-
-        # http refusal takes no posture: it refuses in every one (vault BACKLOG #3533 item 5).
-        # BACKLOG #5527: the [tls] policy too, the one the alerts test send reads, so the endpoint is
-        # verified against [tls].internal_ca_file under augment or pinned and checked against
-        # [tls].crl_file as the other HTTP-family hops are. A direct create_app stashes its
+        # the broker's revocation refusal. An endpoint whose host does not read as loopback, in the
+        # reading ai_broker._refuse_an_unrevoked_ai_hop states (it can be one on this machine), is
+        # refused under enforce unless a [tls].crl_file is checked on it or the
+        # [ai].endpoint_revocation_attested pair is set, and a None posture counts as enforcing
+        # there. The cleartext-http refusal takes no posture: it refuses in every one (vault
+        # BACKLOG #3533 item 5). BACKLOG #5527: the [tls] policy too, the one the alerts test send
+        # reads, so a non-loopback endpoint in that reading is verified against
+        # [tls].internal_ca_file under augment or pinned and checked against [tls].crl_file as the
+        # other HTTP-family hops are. A direct create_app stashes its
         # tls_settings argument, and its embedder may set the stash itself; create_managed_app's
         # lifespan stashes its own argument at start. With none, None goes down.
         # Off the event loop: the constructor builds rest.py's shared opener on first use, a TLS
