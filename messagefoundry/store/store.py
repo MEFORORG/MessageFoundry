@@ -1660,11 +1660,12 @@ GLOBAL_SESSION_EPOCH_MISSING: Final = (
 )
 
 
-# Vault BACKLOG #4276: the database's own clock as epoch seconds, the unit `session_lineage.retired_at`
-# holds. SQLite reads the host clock through its VFS, not through Python's `time.time`, and holds
-# 'now' fixed for the whole of one statement. postgres.py and sqlserver.py have their own copies.
-# The expression, ((julianday('now') - 2440587.5) * 86400.0), is spelled literally in each statement
-# below rather than interpolated, so test_writer_txn_is_the_only_begin.py can read each as text.
+# Vault BACKLOG #4276: ((julianday('now') - 2440587.5) * 86400.0) is the database's own clock as
+# epoch seconds, the unit `session_lineage.retired_at` holds. SQLite reads the host clock through its
+# VFS, not through Python's `time.time`, and holds 'now' fixed for the whole of one statement.
+# postgres.py and sqlserver.py spell their own clock (`_PG_EPOCH_NOW`, `_MSSQL_EPOCH_NOW`). Here the
+# expression is spelled literally in each statement below rather than interpolated, so
+# test_writer_txn_is_the_only_begin.py can read each as text; keep the three copies identical.
 # Vault BACKLOG #3028, ADR 0210: the session lineage's three statements; postgres.py and sqlserver.py
 # respell them. The INSERT runs only inside rotate_session's own transaction, the SELECT only inside
 # supersede_session's, and the DELETE only from the session purge. No other statement names the
