@@ -869,7 +869,7 @@ correction dated 2026-10-04.
 
 Pinned by `tests/test_token_hop_revocation_guard_with_ech_sidecar.py` for the token hop, and by
 `tests/test_http_destination_revocation_guard_reads_its_opener.py` for the four destinations. The
-cases that carry the ECH claim, that the guard is handed no opener, are
+cases that carry the ECH claim, that the guard is handed no opener, include
 `test_which_opener_the_token_hop_guard_is_handed` and `test_the_rest_ech_arm_hands_the_guard_no_opener`,
 which record the opener the guard is handed. `test_an_ech_sidecar_and_a_crl_still_refuse_the_token_hop` and
 `test_rest_with_an_ech_sidecar_and_a_crl_is_still_refused` pin the refusal, each with a control in

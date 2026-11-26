@@ -1342,7 +1342,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         request: Request,
         service: AuthService = Depends(_service),
         # 7.5.2 (ASVS): terminating a session needs a fresh PASSWORD re-proof BOUND TO THIS ACTION
-        # (BACKLOG #1149) — single-use, so the login-seeded window no longer satisfies it. Still the
+        # (BACKLOG #1149) — single-use, so the login-seeded window no longer satisfies it, except
+        # under [auth].require_action_step_up = false, where _action_step_up_ok takes the session
+        # window (a login-seeded one included; docs/SECURITY.md, this route's row). Still the
         # reauth-only family and NOT the MFA gate, but no pending session passes it: one on an
         # account WITH a factor is refused (#1951), and so is one with NO factor that require_mfa
         # covers, which is told to enrol (#1149). The gate runs before the
@@ -1365,6 +1367,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # 7.5.2 (ASVS): action-bound password re-proof before mass-terminating the user's other
         # sessions (BACKLOG #1149). This is the route the cell turns on — a login-seeded window let a
         # caller sign every other session out with no proof beyond the sign-in they already held.
+        # Under [auth].require_action_step_up = false it still does, as on the route above.
         identity: Identity = Depends(require_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE)),
     ) -> SimpleMessage:
         current = hash_token(bearer_token(request) or "")
