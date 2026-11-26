@@ -181,7 +181,7 @@ foreach ($s in $specs) {
                 sessionId = '00000000-0000-0000-0000-000000000000'
                 cwd       = if ($null -ne $s.fromCwd) { [string]$s.fromCwd } else { 'D:\t\peer-wt' }
                 branch    = if ($null -ne $s.fromBranch) { [string]$s.fromBranch } else { 'claude/other-work' }
-                host      = 'TESTBOX'
+                host      = if ($null -ne $s.fromHost) { [string]$s.fromHost } else { 'TESTBOX' }
             }
             to         = [ordered]@{ cwd = $Cwd; sessionId = [string]$s.toSessionId }
             body       = [string]$s.body
@@ -467,12 +467,12 @@ def test_a_plain_message_is_delivered_end_to_end(repo: Path, tmp_path: Path) -> 
     assert len(box_files(repo, key, "seen")) == 1
 
 
-def _send(repo: Path, body: str) -> subprocess.CompletedProcess[str]:
+def _send(repo: Path, body: str, *extra: str) -> subprocess.CompletedProcess[str]:
     """Drive the REAL sender. The seeder deliberately bypasses these arms, so they need this route."""
     return subprocess.run(
         [
             "pwsh", "-NoProfile", "-NonInteractive", "-File", str(MAIL),
-            "-Send", "-MailRoot", str(mail_root(repo)), "-To", str(repo), "-Body", body,
+            "-Send", "-MailRoot", str(mail_root(repo)), "-To", str(repo), "-Body", body, *extra,
         ],
         cwd=str(repo), capture_output=True, text=True, timeout=TIMEOUT, check=False,
     )  # fmt: skip
@@ -2107,9 +2107,16 @@ def test_a_swept_message_is_still_nameable_LONG_AFTER_the_turn_that_swept_it(rep
     assert row["Expired"] == 1, "two later drains must not erase the record of an expiry"
 
 
-def test_the_Status_TEXT_render_says_nobody_was_told(repo: Path) -> None:
+def test_the_Status_TEXT_render_explains_expiry_without_the_stale_nobody_was_told(
+    repo: Path,
+) -> None:
     """The human path, not just the JSON one. A count with no explanation invites the reader to treat
-    expiry as a routine sweep, when it is the one disposition that reaches neither end."""
+    expiry as a routine sweep, when it is the one disposition that destroys a hand-off.
+
+    CORRECTED (BACKLOG #1386): this test used to pin the text "NOBODY WAS TOLD", which stopped being
+    true when the drain began naming each expired id to the receiver and writing an
+    'expired-unshown' receipt for the sender (BACKLOG #1228). Both arrive only after the loss, which
+    is what the render now says, and it names the receipt a sender reads."""
     seed(repo, repo, [{"body": "live"}])
     proc = subprocess.run(
         [
@@ -2129,7 +2136,8 @@ def test_the_Status_TEXT_render_says_nobody_was_told(repo: Path) -> None:
     )
     assert proc.returncode == 0, proc.stderr
     assert "Expired:" in proc.stdout
-    assert "NOBODY WAS TOLD" in proc.stdout
+    assert "expired-unshown" in proc.stdout
+    assert "NOBODY WAS TOLD" not in proc.stdout
 
 
 # --------------------------------------------------------- BACKLOG #1386, limbs 1 and 2
@@ -2220,6 +2228,104 @@ def test_the_footer_reports_the_BACKLOG_and_not_only_this_pass(repo: Path, tmp_p
     assert "oldest" in text, (
         "the depth alone does not say whether the queue is aging toward its TTL"
     )
+
+
+# --------------------------------------------------------- BACKLOG #1386, limb 3: warn BEFORE expiry
+#
+# The drain names an expired id to the receiver and writes an 'expired-unshown' receipt for the
+# sender, but both arrive only AFTER the message is gone. The warning has to be sender-side: the case
+# that loses mail is an idle recipient, and an idle seat runs no drain, so nothing receiver-side can
+# speak for it. `mail.ps1 -Expiring` lists the caller's own sent mail that no session has been shown
+# and whose TTL falls inside a stated window.
+
+
+def _send_ttl(repo: Path, body: str, ttl_minutes: int) -> str:
+    """Send through the REAL sender with a chosen TTL and return the message id it queued."""
+    proc = _send(repo, body, "-TtlMinutes", str(ttl_minutes), "-Json")
+    assert proc.returncode == 0, f"send failed: {proc.stdout}\n{proc.stderr}"
+    rows = json.loads(proc.stdout)
+    assert len(rows) == 1 and rows[0]["Status"] == "queued", rows
+    return str(rows[0]["Id"])
+
+
+def _near_ids(view: Any) -> list[str]:
+    return [str(r["Id"]) for r in view["Near"]]
+
+
+def test_Expiring_lists_the_senders_unshown_mail_inside_the_window(repo: Path) -> None:
+    """MUST FIRE, with a control on the far side of the window.
+
+    A one-hour TTL is inside a 24-hour window and a three-day TTL is outside it, so a view that
+    listed everything, or nothing, fails one of the two assertions.
+    """
+    soon = _send_ttl(repo, "expires within the hour", 60)
+    later = _send_ttl(repo, "expires in three days", 4320)
+    view = _mail_json(repo, "-Expiring", "-WithinHours", "24")
+    assert _near_ids(view) == [soon], view
+    assert later not in _near_ids(view)
+    assert view["UnshownBeyondWindow"] == 1, view
+    assert view["WithinHours"] == 24, view
+    row = view["Near"][0]
+    assert row["PastTtl"] is False, row
+    assert 0 < row["MinutesLeft"] <= 60, row
+    # The recipient is named, so the sender knows whom to re-send to.
+    assert str(row["ToCwd"]).lower() == str(repo).lower(), row
+
+
+def test_Expiring_drops_a_message_once_a_session_was_shown_it(repo: Path) -> None:
+    """MUST NOT FIRE once the message was rendered. SessionStart shows and HOLDS it in the inbox, so
+    the inbox alone cannot answer "unshown"; the marker and the receipt the drain writes do."""
+    ident = _send_ttl(repo, "shown at session start", 60)
+    assert _near_ids(_mail_json(repo, "-Expiring")) == [ident], "positive control before the drain"
+    text = injection(run_drain(repo, event="SessionStart"))
+    assert "shown at session start" in text, "the drain did not show it, so this proves nothing"
+    assert _near_ids(_mail_json(repo, "-Expiring")) == []
+
+
+def test_Expiring_names_mail_already_past_its_TTL_that_no_drain_has_swept(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The message an idle recipient is about to lose: past its TTL, still in the inbox, and swept
+    unshown by the next drain of that box. It is the case this limb exists for."""
+    host = os.environ.get("COMPUTERNAME", "")
+    info = seed(
+        repo,
+        tmp_path,
+        [
+            {
+                "body": "past its ttl",
+                "fromCwd": str(repo),
+                "fromHost": host,
+                "expiresUtc": "2020-01-01T00:00:00.0000000Z",
+            },
+            # Not this worktree's mail: another worktree, and this path on another PC.
+            {"body": "a peer's mail", "expiresUtc": "2020-01-01T00:00:00.0000000Z"},
+            {
+                "body": "same path, other PC",
+                "fromCwd": str(repo),
+                "fromHost": "NOT-THIS-PC-X",
+                "expiresUtc": "2020-01-01T00:00:00.0000000Z",
+            },
+        ],
+    )
+    view = _mail_json(repo, "-Expiring")
+    assert _near_ids(view) == [str(info["rows"][0]["stem"])], view
+    assert view["Near"][0]["PastTtl"] is True, view
+
+
+def test_the_send_footer_and_the_Status_text_point_the_sender_at_Expiring(repo: Path) -> None:
+    """The view is only a warning if the sender learns it exists, so the two places a sender
+    already reads name it."""
+    send = _send(repo, "probe")
+    assert send.returncode == 0, send.stderr
+    assert "-Expiring" in send.stdout
+    status = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(MAIL),
+         "-MailRoot", str(mail_root(repo))],
+        cwd=str(repo), capture_output=True, text=True, timeout=TIMEOUT, check=False,
+    )  # fmt: skip
+    assert status.returncode == 0, status.stderr
+    assert "-Expiring" in status.stdout
 
 
 # --------------------------------------------------------------------------------------------------

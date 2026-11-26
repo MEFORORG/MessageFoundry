@@ -150,6 +150,9 @@ pwsh -NoProfile -File scripts\coord\mail.ps1 -Send -To all -Body "rebasing main 
 # every box in the repo, and this worktree's own box
 pwsh -NoProfile -File scripts\coord\mail.ps1 -List
 pwsh -NoProfile -File scripts\coord\mail.ps1 -Status
+
+# your own sent mail that no session has been shown yet, expiring within 24 hours
+pwsh -NoProfile -File scripts\coord\mail.ps1 -Expiring -WithinHours 24
 ```
 
 - `-To <path>` -- the recipient **worktree** path. Matched case-insensitively and exactly. `all`
@@ -161,8 +164,18 @@ pwsh -NoProfile -File scripts\coord\mail.ps1 -Status
   target is keyed for this PC.
 - `-ToSessionId <id>` -- optional filter. The message is delivered only if the reading session has that
   id. Use it when the note would be misleading to whoever occupies that worktree next.
-- `-TtlMinutes <n>` -- default 720. Past the TTL the message is swept to `expired/` rather than shown,
-  so a session starting next week is not told to act on something from last Tuesday.
+- `-TtlMinutes <n>` -- default 4320 (72 hours). Past the TTL the message is swept to `expired/` rather
+  than shown, so a session starting next week is not told to act on something from last Tuesday.
+  **CORRECTED (BACKLOG #1386):** this said the default was 720; `mail.ps1` raised it to 4320 on
+  2026-08-11, and its parameter comment says why.
+- `-Expiring [-WithinHours <n>]` -- the warning **before** a TTL fires (BACKLOG #1386). It lists the
+  mail this worktree sent, on this PC, that no session has been shown yet (no shown marker and no
+  receipt) and whose TTL falls within the window, default 24 hours. Mail past its TTL that no drain has
+  swept yet is listed too: the next drain of that box sweeps it unshown. The view is sender-side on
+  purpose. The case that loses mail is an idle recipient, and an idle seat runs no drain, so no
+  receipt or drain footer can warn for it. After the loss the drain names the id to the recipient and
+  writes the sender an `expired-unshown` receipt; this view is the only signal before it. A `from`
+  field is whatever the writer chose, so a row is a claim, not provenance.
 - `-Kind note|handoff|alert|broadcast` -- a label for the reader, nothing more.
 - `-MailRoot <path>` -- point the queue at a fixture. Tests use it; nothing else should.
 
