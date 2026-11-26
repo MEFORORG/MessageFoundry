@@ -121,7 +121,9 @@ x-ha-engine-env: &ha-engine-env
   # owned as ./config is, so no other account can replace it: the store login trusts the file
   # before serve's preflight checks its owner, and `store provision-schema` never checks it. A
   # managed Postgres whose certificate the system trust store already verifies needs no pin:
-  # remove this line.
+  # remove this line. Where / is an overlay mount, as in this container, an enforcing PHI start
+  # would refuse this file on first deployment until a follow-up lands, wherever it sits; warn
+  # starts. README.md, "Residuals / gotchas", says why.
   MEFOR_STORE_SSL_ROOT_CERT: "/config/pki/store-ca.pem"
   # DEV-ONLY: the local Postgres image makes POSTGRES_USER a SUPERUSER, and the engines log in as it.
   # Under the shipped enforce dial an over-granted store login refuses to start (ADR 0199), so this
@@ -143,7 +145,9 @@ x-ha-engine-env: &ha-engine-env
   # Off-box log forwarding: verified TLS to a collector that is not this host (ADR 0200), on
   # the egress allowlist block_unlisted_outbound requires. Put the CA and CRL under
   # ./config/pki/, owned as ./config is, because the engine refuses a CA another account could
-  # replace. Replace the CRL before its nextUpdate.
+  # replace. Replace the CRL before its nextUpdate. Even so, where / is overlay an enforcing PHI
+  # start would refuse the CA on first deployment until a follow-up lands; warn starts (README.md,
+  # "Residuals / gotchas").
   # MEFOR_LOGGING_FORWARD_HOST: "REPLACE-siem.example.org"
   # MEFOR_LOGGING_FORWARD_PORT: "6514"
   # MEFOR_LOGGING_FORWARD_PROTOCOL: "tls"

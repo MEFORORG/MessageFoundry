@@ -6,6 +6,7 @@
   first deployment. An overlay mount now answers *could not settle*, as NFS, CIFS, FUSE and 9p do,
   which `enforce` refuses. A matching pin loads it only where the anchor's consumer loads the bytes
   the check read; for an anchor read again by path, such as an outbound connection's `tls_ca_file`
-  or `[logging].forward_tls_ca_file`, a pin is no escape. **A container whose root file system is
-  overlay now gets that answer for every trust anchor, so an enforcing PHI start there refuses**;
-  see [docker/README.md](../docker/README.md). (vault `BACKLOG #8390` item 31)
+  or `[logging].forward_tls_ca_file`, a pin is no escape. **Where `/` is an overlay mount, as in
+  nearly every container, an enforcing PHI start would refuse on first deployment until a
+  follow-up lands; `warn` starts.** [docker/README.md](../docker/README.md#residuals--gotchas)
+  says why. (vault `BACKLOG #8390` item 31)

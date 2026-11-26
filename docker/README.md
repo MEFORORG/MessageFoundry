@@ -143,14 +143,18 @@ against one case that matters, described under
   Kubernetes manifests, the `engine` and both `ha` engines carry a block *what an enforcing start
   needs* of commented entries (the alert channel, verified-TLS log forwarding and the retention
   bounds, and for the `ha` engines the store CRL); as shipped `serve --env prod` refuses to start,
-  so uncomment each with your value and put the trust files it names under `./config/pki/`. Each
+  so uncomment each with your value and put the trust files it names under `./config/pki/`. Even
+  then an enforcing PHI start would refuse on first deployment where `/` is overlay: see
+  [the overlay note under Residuals / gotchas](#residuals--gotchas). Each
   `ha` engine also mounts its own named log-spool volume, live as shipped.
 - **Kubernetes (single-node):** [`k8s/statefulset.yaml`](k8s/statefulset.yaml) + [`k8s/secret.example.yaml`](k8s/secret.example.yaml)
   — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set every `image:` field (at least `revocation-attestation-check`, `tls-dir`, `copy-tls` and
   `engine`) to your config-baked image.
   An enforcing start needs more than the bind, and the manifest's block *what an enforcing start
   needs* names at least the alert channel, verified-TLS log forwarding and the retention bounds as
-  commented entries. As shipped the engine refuses to start; uncomment each entry with your value. Bake the syslog CA and CRL it names under `/config/pki/`, and
+  commented entries. As shipped the engine refuses to start; uncomment each entry with your value. Bake the syslog CA and CRL it names under `/config/pki/`
+  (an enforcing PHI start would still refuse on first deployment where `/` is overlay: see
+  [the overlay note under Residuals / gotchas](#residuals--gotchas)), and
   add the Secret's `tls-revocation-attested` key, without which the pod does not start: the kubelet
   refuses the pod with `CreateContainerConfigError`, at the first container that reads it. The HA manifest below,
   `k8s/ha-postgres.yaml`, requires the same key. Set it only
@@ -286,19 +290,21 @@ certificate (A) and its revocation attestation, or it **refuses to start** — b
 - **Never bake `MEFOR_ALLOW_INSECURE_TLS`.** It is a dev / trusted-lab switch;
   [the escape hatch](../docs/DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) says what it
   means.
-- **A trust-anchor file is refused at `enforce` where the root file system is overlay** (vault
-  BACKLOG #8390 item 31), as it usually is in a Docker or Kubernetes container, and on any other
-  host whose `/` mounts as overlay. The Linux path check reads the file system type of every
+- **An enforcing PHI start would refuse on first deployment where `/` is
+  an overlay mount** (vault BACKLOG #8390 item 31), as it is in nearly every Docker or Kubernetes
+  container, and on any other host whose `/` mounts as overlay. That holds until a follow-up
+  lands; at `[security].enforcement = warn` the engine starts, and logs a warning for each such
+  anchor. The rest of this bullet is why. The Linux path check reads the file system type of every
   directory from `/` down, and does not vouch for overlay (the `POSIX_TRUSTED_FS` comment in
   `messagefoundry/auth/anchor_path.py` says why). So every anchor there answers *could not
   settle*, even one on a bind-mounted ext4 volume, and moving the file does not clear it. `enforce`
   refuses it, unless the refusal offers a pin, naming the setting and the file's digest, and you
   set that pin; check the digest against the CA first. An anchor the engine reads again by path
   (`loads_verified_bytes=False` in `messagefoundry/auth/trust_anchors.py`) takes no pin escape, so
-  at `enforce` it cannot be used there. **That includes `[logging].forward_tls_ca_file`, so an
-  enforcing PHI start refuses there**: it needs verified-TLS log forwarding, which needs that file.
-  The deployment steps above that put trust files under `/config/pki/` meet this refusal. Derived
-  from the code, not measured on a running container.
+  at `enforce` it cannot be used there. That includes `[logging].forward_tls_ca_file`, and an
+  enforcing PHI start needs verified-TLS log forwarding, which needs that file. The deployment
+  steps above that put trust files under `/config/pki/` meet this refusal. Derived from the code,
+  not measured on a running container.
 - **Cert-expiry monitor skips `env()`-referenced cert paths.** Use literal paths for any cert you want the
   built-in expiry alert to watch (the `[api]` cert is always literal and covered).
 - **In-engine TLS revocation is delegated** (ADR 0002). For enforced revocation use Topology B with an

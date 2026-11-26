@@ -348,7 +348,10 @@ in `forward_tls_ca_file` and a revocation check in `forward_tls_crl_file`) to a 
 on this host, and on the `[egress].allowed_syslog` list.
 The HA manifest names these inputs in its block *what an enforcing start needs*, but ships them
 commented out, so an unedited manifest is refused rather than started with a placeholder collector.
-Uncomment them with your own collector. The `log-spool` emptyDir holds the records the collector has
+Uncomment them with your own collector. Even then, an enforcing PHI start would refuse on first
+deployment in a pod whose `/` is an overlay mount, as nearly every pod's is, until a follow-up lands;
+`warn` starts. The overlay note under *Residuals / gotchas* in
+[`docker/README.md`](../docker/README.md#residuals--gotchas) says why. The `log-spool` emptyDir holds the records the collector has
 not yet taken, as plaintext on the node's disk. Their redaction is best-effort, so they may hold PHI,
 and the engine's at-rest encryption does not cover them ([`PHI.md`](PHI.md) §2, the spool row).
 
