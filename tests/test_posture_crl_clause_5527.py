@@ -15,7 +15,10 @@ The text tests pin the entries, the SMTP bullet of docs/SECURITY-LOOSENING.md, a
 wording of the ``ai_broker`` docstring and the ``AiSettings`` comment. The anchor tests pin,
 through ``resolve_trust_anchor`` alone,
 the loopback reading the text describes; no test here builds the SMTP sink or the AI opener,
-and none pins which callers hand the ``[tls]`` policy over. No message body is involved.
+and none pins which callers hand the ``[tls]`` policy over. Nor do they pin the URL-host step:
+they pass a bare ``::1``, so the "[::1] in a URL" clause rests on
+``test_the_url_host_reading_places_the_trust_anchor`` in tests/test_ai_broker_revocation_guard.py.
+No message body is involved.
 """
 
 from __future__ import annotations
@@ -114,9 +117,9 @@ def test_the_ai_entry_says_how_loopback_is_read() -> None:
         "takes from the URL, lowercased and without the brackets of an IPv6 host" in entry
     )
     assert (
-        "an endpoint URL holding [::1] and the bare name localhost read as loopback, and at least "
-        "the name localhost with a trailing dot reads as remote, so it gets the CRL where the "
-        "other two conditions hold" in entry
+        "at least an endpoint URL holding 127.0.0.1, [::1] or the bare name localhost reads as "
+        "loopback, and at least the name localhost with a trailing dot reads as remote, so it "
+        "gets the CRL where the other two conditions hold" in entry
     )
     assert "the endpoint host is not loopback as" not in entry
 

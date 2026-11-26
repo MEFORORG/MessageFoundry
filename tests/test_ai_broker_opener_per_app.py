@@ -205,7 +205,7 @@ def test_the_on_box_remedy_names_the_hosts_the_code_reads_as_loopback() -> None:
             in lever
         )
         assert "whose host reads as loopback here, such as localhost, 127.0.0.1 or [::1]" in lever
-        assert "and list that host in [ai].allowed_endpoints. Such an endpoint is" in lever
+        assert "and list that host in [ai].allowed_endpoints as the URL writes it" in lever
         assert "verified against the OS trust store alone, with neither [tls] file" in lever
     # Each host the remedy names builds under an enforcing posture, with no CRL or attestation.
     for host in named + also_loopback:

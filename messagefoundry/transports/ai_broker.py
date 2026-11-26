@@ -130,10 +130,10 @@ _AI_ATTESTATION_LEVER = (
     "Set [ai].endpoint_revocation_attested = true with an "
     "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
     "endpoint's certificate, or use an endpoint URL whose host reads as loopback here, such as "
-    "localhost, 127.0.0.1 or [::1], and list that host in [ai].allowed_endpoints. Such an "
-    "endpoint is verified against the OS trust store alone, with neither [tls] file. The host "
-    "is read as spelled, apart from case and IPv6 brackets: at least a spelling with a "
-    "trailing dot, or a shortened IPv4 address such as 127.1, reads as remote."
+    "localhost, 127.0.0.1 or [::1], and list that host in [ai].allowed_endpoints as the URL "
+    "writes it. Such an endpoint is verified against the OS trust store alone, with neither "
+    "[tls] file. The host is not resolved: at least a spelling with a trailing dot, or a "
+    "shortened IPv4 address such as 127.1, reads as remote."
 )
 
 #: The ways across that refusal under an enforcing posture, on the terms below:
@@ -151,10 +151,10 @@ _AI_CRL_LEVER = (
     "or its handshake fails), or set [ai].endpoint_revocation_attested = true with an "
     "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
     "endpoint's certificate, or use an endpoint URL whose host reads as loopback here, such as "
-    "localhost, 127.0.0.1 or [::1], and list that host in [ai].allowed_endpoints. Such an "
-    "endpoint is verified against the OS trust store alone, with neither [tls] file. The host "
-    "is read as spelled, apart from case and IPv6 brackets: at least a spelling with a "
-    "trailing dot, or a shortened IPv4 address such as 127.1, reads as remote."
+    "localhost, 127.0.0.1 or [::1], and list that host in [ai].allowed_endpoints as the URL "
+    "writes it. Such an endpoint is verified against the OS trust store alone, with neither "
+    "[tls] file. The host is not resolved: at least a spelling with a trailing dot, or a "
+    "shortened IPv4 address such as 127.1, reads as remote."
 )
 
 
