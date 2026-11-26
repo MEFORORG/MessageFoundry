@@ -1341,3 +1341,49 @@ def test_the_admin_unlock_cli_clears_a_lock_set_by_reauth(
             await store.close()
 
     assert asyncio.run(sign_in_after_unlock()), "admin-unlock must lift a lock that re-auth set"
+
+
+_FAR_FUTURE = 10 * 365 * 86400.0
+
+
+async def test_the_reapers_purged_sessions_lose_their_counts() -> None:
+    """BACKLOG #5336: the session reaper ends rows without naming them by hash, so its follow-up
+    drops the counts of the sessions it took and keeps a live session's. Without it, many accounts'
+    purged sessions would hold the whole map, which no drop at one account's cap reaches."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        await _local_user(store, "ann")
+        identity, purged = await _signed_in(service, "ann")
+        assert not (await service.reauth(identity, WRONG, token=purged)).ok
+        assert await store.purge_expired_sessions(now=time.time() + _FAR_FUTURE) >= 1
+        await _local_user(store, "ben")
+        identity, live = await _signed_in(service, "ben")
+        assert not (await service.reauth(identity, WRONG, token=live)).ok
+        assert hash_token(purged) in service._reproof_session_failures
+        await service.drop_reaped_reproof_counts()
+        assert hash_token(purged) not in service._reproof_session_failures
+        assert service._session_reproof_failures(hash_token(live)) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_refused_read_keeps_the_reaped_counts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #5336: the drop after a purge is housekeeping, so a store that refuses the read
+    leaves every count in place (fail closed) rather than failing the reaper's pass."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        await _local_user(store, "ann")
+        identity, token = await _signed_in(service, "ann")
+        assert not (await service.reauth(identity, WRONG, token=token)).ok
+        await store.purge_expired_sessions(now=time.time() + _FAR_FUTURE)
+
+        async def refused(*_args: object, **_kwargs: object) -> object:
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(store, "list_sessions", refused)
+        await service.drop_reaped_reproof_counts()
+        assert service._session_reproof_failures(hash_token(token)) == 1
+    finally:
+        await store.close()

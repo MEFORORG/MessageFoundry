@@ -16163,6 +16163,29 @@ class AuthService:
             h for h in self._reproof_counts_of(user_id, keep=keep) if h not in live
         )
 
+    async def drop_reaped_reproof_counts(self) -> None:
+        """After the session reaper's purge, drop the re-proof counts of the sessions it took
+        (BACKLOG #5336). The purge ends rows without naming them by hash, so without this their
+        counts would stay until the age prune, and many accounts' dead counts could fill the whole
+        map, where the drop at an account's own cap never reaches. Each account holding a count is
+        read under its re-proof lock, as :meth:`_drop_unlisted_reproof_counts` requires. The drop
+        is housekeeping: an account whose read the store refuses keeps its counts (fail closed),
+        and the next pass tries again."""
+        holders = sorted({uid for _, _, uid in self._reproof_session_failures.values()})
+        for user_id in holders:
+            try:
+                async with self._account_reproof_lock(user_id):
+                    await self._drop_unlisted_reproof_counts(user_id)
+            except (*store_call_errors(), *store_connect_errors()) as exc:
+                if isinstance(exc, AUDIT_WRITE_DEFECTS):
+                    raise
+                _log.warning(
+                    "the session reaper could not read account id %r's sessions to drop the "
+                    "re-proof counts of purged ones (%s); the counts stay",
+                    user_id,
+                    type(exc).__name__,
+                )
+
     async def _drop_ended_reproof_counts(self, user_id: str, token_hash: str) -> None:
         """At the account's cap, before a re-proof's verify, :meth:`_drop_unlisted_reproof_counts`
         (BACKLOG #5336): the ends this service names by hash drop their own counts, but at least a

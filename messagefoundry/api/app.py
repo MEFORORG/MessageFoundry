@@ -12595,6 +12595,7 @@ async def _session_reaper(
     lineage_seconds: float | None = None,
     wall: Callable[[], float] | None = None,
     mono: Callable[[], float] | None = None,
+    after_purge: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Drop expired session rows, first ``_SESSION_REAP_FIRST_DELAY`` after start and then every
     ``_SESSION_REAP_INTERVAL``, until the task is cancelled. With ``idle_seconds`` given,
@@ -12641,6 +12642,10 @@ async def _session_reaper(
     ``wall`` and ``mono`` default to ``time.time`` and ``time.monotonic``, read at each pass rather
     than bound at import, so a test that patches ``time`` reaches the reaper too.
 
+    ``after_purge``, when given, runs after each purge that committed. The lifespan passes
+    :meth:`AuthService.drop_reaped_reproof_counts`, so the re-proof counts of the sessions the
+    purge took leave with them (BACKLOG #5336). It does not run after a skipped or failed pass.
+
     A transient store error must not kill the reaper for the process lifetime (it would let the
     sessions table grow unbounded, and its stored exception could later abort lifespan shutdown) —
     log and retry next interval (review M-33)."""
@@ -12677,6 +12682,17 @@ async def _session_reaper(
             raise
         except Exception:
             _log.exception("session reaper: purge failed; will retry next interval")
+            continue
+        if after_purge is None:
+            continue
+        try:
+            await after_purge()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _log.exception(
+                "session reaper: the step after the purge failed; will retry next interval"
+            )
 
 
 async def _directory_reconciler(
@@ -14391,6 +14407,7 @@ def create_managed_app(
                         store,
                         idle_seconds=auth.session_idle_seconds,
                         lineage_seconds=auth.supersession_lineage_seconds,
+                        after_purge=auth.drop_reaped_reproof_counts,
                     )
                 )
                 if _initial_credential_warn_lead(auth) is not None:
