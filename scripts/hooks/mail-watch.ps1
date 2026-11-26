@@ -108,11 +108,14 @@ try {
     # mail-claim.ps1 dot-sources mail-key.ps1, so this takes both halves of the contract at once and
     # cannot end up holding only the box key. What is needed from it is the SHOWN-MARKER name shape.
     . "$PSScriptRoot\..\coord\mail-claim.ps1"
-    $key = ConvertTo-BoxKey -Path $cwd
+    # The drain's box: a subdirectory cwd is raised to its worktree root (BACKLOG #7581).
+    $boxPath = Resolve-BoxPath -Path $cwd
+    $key = ConvertTo-BoxKey -Path $boxPath
     $inboxDir = Join-Path $root "box/$key/inbox"
-    # Mail queued under the old path-only key is moved into this box each pass, by the same function
-    # the drain uses, so the pending test below sees it under the one box the drain will read.
-    $legacyKey = ConvertTo-LegacyBoxKey -Path $cwd
+    # Mail queued under an older key (the path-only key, or a subdirectory's own key before #7581) is
+    # moved into this box each pass, by the same function the drain uses, so the pending test below
+    # sees it under the one box the drain will read.
+    $oldKeys = Get-BoxReadKeys -Path $cwd -Resolved $boxPath
     $shownDir = Join-Path $root "box/$key/shown"
     # Validated before any path is built from it, exactly as the drain does; $null means UNMARKABLE.
     $sessionKey = ConvertTo-SessionKey -SessionId ([string]$hook.session_id)
@@ -166,7 +169,7 @@ try {
             if ($owner -and $owner -match '^\d+ [0-9a-fA-F-]{36}$' -and $owner -ne $myToken) { exit 0 }
         }
 
-        Move-LegacyInbox -Root $root -Key $key -LegacyKey $legacyKey
+        foreach ($oldKey in $oldKeys) { Move-LegacyInbox -Root $root -Key $key -LegacyKey $oldKey }
         if (Test-Path -LiteralPath $inboxDir) {
             # "MAIL THIS SESSION HAS NOT BEEN SHOWN", NOT "THE INBOX IS NON-EMPTY". Those were the same
             # question until the drain stopped consuming at SessionStart: mail it shows now STAYS in the

@@ -128,11 +128,63 @@ def credential_id_hash_scheme(stored: str) -> str:
     return scheme
 
 
+def decode_stored_b64url(value: str) -> bytes:
+    """Decode a stored base64url passkey column (``credential_id``, ``public_key``), padding
+    restored. The one decoder the passkey code uses for a stored value. It raises ``ValueError``
+    (``binascii.Error`` is one) for text it cannot decode, and ``TypeError`` for a value that is
+    not text. It skips characters outside the alphabet, so not every malformed value raises."""
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def stored_b64url_decodes(stored: str) -> bool:
+    """Whether a stored passkey column (``credential_id``, ``public_key``) decodes with
+    :func:`decode_stored_b64url` (BACKLOG #6886). The verify refuses a passkey whose key does not;
+    the second-factor begin leg leaves out of its allow list one whose id does not."""
+    try:
+        decode_stored_b64url(stored)
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
+def stored_credential_id_hash_text(stored: object) -> str | None:
+    """A stored ``credential_id_hash`` as the text the sign-in compares it as, or ``None``. The
+    sign-in finds a passkey with :func:`~messagefoundry.credential.constant_time_equal`, which
+    compares bytes, so a BLOB in the TEXT column (it reads back as bytes) holding today's hash as
+    UTF-8 matches as that text does. Bytes that are not UTF-8 never equal a hash this release
+    computes, which is ASCII, and read as ``None``. A value of any other type reads as ``None``
+    here too, though the compare itself would accept a bytes-like one such as a ``memoryview``; no
+    store backend returns one today."""
+    if isinstance(stored, str):
+        return stored
+    if isinstance(stored, (bytes, bytearray)):
+        try:
+            return bytes(stored).decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    return None
+
+
 def credential_id_hash_is_current(stored: str) -> bool:
     """Whether a stored ``credential_id_hash`` is under today's scheme, the only key the sign-in
-    looks a passkey up by (BACKLOG #3423). A bare digest the start-up rehash has not moved, an
-    unknown tag and a malformed value are all ``False``: no sign-in can find that passkey."""
+    looks a passkey up by (BACKLOG #3423), read as :func:`stored_credential_id_hash_text` reads
+    it. A bare digest the start-up rehash has not moved, an unknown tag, a malformed value and a
+    value that text cannot be read from are all ``False``: no sign-in can find that passkey."""
+    text = stored_credential_id_hash_text(stored)
+    if text is None:
+        return False
     try:
-        return credential_id_hash_scheme(stored) == CREDENTIAL_ID_HASH_SCHEME
+        return credential_id_hash_scheme(text) == CREDENTIAL_ID_HASH_SCHEME
     except CredentialHashSchemeError:
         return False
+
+
+def stored_passkey_is_readable(*, credential_id_hash: str, public_key: str) -> bool:
+    """Whether the stored cells a passkey sign-in reads before the signature check read back: the
+    hash it is found by under today's scheme (:func:`credential_id_hash_is_current`), and the key
+    it is verified against decoding (:func:`stored_b64url_decodes`; BACKLOG #6886). The stored
+    ``credential_id`` is not one of them: the sign-in finds the passkey by the hash of the id the
+    browser sends. A passkey that fails either check can never sign in. One that passes may still
+    be refused by the verify, at least for a key the registration rule refuses, so this is a
+    necessary condition and not a sufficient one."""
+    return credential_id_hash_is_current(credential_id_hash) and stored_b64url_decodes(public_key)

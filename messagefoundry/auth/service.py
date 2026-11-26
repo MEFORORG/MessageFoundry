@@ -139,13 +139,16 @@ from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.tokens import (
     CREDENTIAL_ID_HASH_SCHEME,
     ENROLMENT_CODE_MAX,
-    credential_id_hash_is_current,
     credential_id_hash_scheme,
+    decode_stored_b64url,
     enrolment_code_digest,
     enrolment_code_matches,
     hash_token,
     mint_enrolment_code,
     mint_token,
+    stored_b64url_decodes,
+    stored_credential_id_hash_text,
+    stored_passkey_is_readable,
 )
 from messagefoundry.auth.tokens import (
     credential_id_hash as _credential_id_hash,  # locals and parameters here use the bare name
@@ -1688,6 +1691,20 @@ class MfaStatus:
     totp_reenrolment_recommended: bool = False
 
 
+class StoredPasskeysUnreadable(Exception):
+    """Every passkey an account holds under the ceremony's ``rp_id`` has a stored credential id
+    that does not decode (BACKLOG #6886), so this assertion ceremony cannot be staged. Raised by
+    :meth:`AuthService.begin_webauthn_assertion` in place of its ``None``, which means the passkeys
+    were minted under another origin. The holder signs in with another factor where it has one and
+    removes the unreadable passkey. Where it has none, a discoverable passkey may still sign it in
+    through the combined passkey sign-in, which names no credential and does not read the stored
+    id; only where that fails too does it need an administrator's MFA reset. The message names no
+    passkey and no stored value."""
+
+    def __init__(self) -> None:
+        super().__init__("the account's passkeys could not be read")
+
+
 class FirstAdministratorRefused(RuntimeError):
     """:meth:`AuthService.provision_first_administrator` declined. The message is operator-facing."""
 
@@ -2812,6 +2829,50 @@ def _in_directory_sign_in_queue[**P](
     return queued
 
 
+#: How many times a directory sign-in tries its compare-and-set scope write before it fails
+#: (BACKLOG #6887). A miss on a row still there means another writer committed in between; what
+#: counts as a change differs per backend, and ``AuthStore.set_ad_channel_scope_if_unchanged``
+#: states it. A bound this small is reached only by a row other writers keep moving.
+_AD_SCOPE_WRITE_ATTEMPTS: Final = 3
+
+#: The closed-set reason a directory sign-in is refused with when its scope write's compare-and-set
+#: missed on every one of :data:`_AD_SCOPE_WRITE_ATTEMPTS` attempts (BACKLOG #6887). Contention
+#: says nothing about the account, so it is answered as a temporary failure, like
+#: :data:`SESSION_MINT_CONTENDED`.
+SCOPE_SYNC_CONTENDED = "scope_sync_contended"
+
+
+class _AdChannelScopeNotWritten(Exception):
+    """A directory sign-in's scope write was not made, so the sign-in is refused (BACKLOG #6887).
+
+    Raised by :meth:`AuthService._sync_ad_channel_scope` with nothing written, and caught at its
+    one call site in :meth:`AuthService._complete_ad_login`, which audits and answers it as the
+    pre-mint refusals there are answered, so no session is minted. ``reason`` is the closed-set
+    slug the refusal row carries. The message is that slug, which is PHI-free."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class _AdChannelScopeContended(_AdChannelScopeNotWritten):
+    """The scope write met a concurrent writer on every attempt: :data:`SCOPE_SYNC_CONTENDED`.
+    Not a refusal of the account, so the caller answers it as a temporary failure."""
+
+    def __init__(self, attempts: int) -> None:
+        super().__init__(SCOPE_SYNC_CONTENDED)
+        self.attempts = attempts
+
+
+class _AdChannelScopeRefused(_AdChannelScopeNotWritten):
+    """The scope write missed, and the row read again refuses the sign-in. ``reason`` names the
+    row as the caller's pre-mint read would: :data:`ACCOUNT_DELETED` for a row gone (BACKLOG
+    #5624), :data:`ACCOUNT_REFUSED` for one failing its seal, or the reason
+    :func:`_directory_login_refusal` gives for the sign-in's leg (disabled, locked or, off the
+    federated leg, ``FEDERATED_SIGN_IN_REQUIRED``), as the role write's re-read judges it. The role
+    write names a gone row :data:`ACCOUNT_REFUSED`; this one does not."""
+
+
 @dataclass(frozen=True)
 class _Reproof:
     """The outcome of one post-session credential re-proof, checked under the login leg's lockout.
@@ -3507,12 +3568,19 @@ async def lockable_account_census(
 
     def second_factor_counts(cred: WebAuthnCredential) -> bool:
         # A directory account's passkey second factor: offered only under the request's rp_id,
-        # and found at the finish only by a credential-id hash in today's scheme. The rp_id rule
-        # is ``sign_in_counts``'s; the discoverable record is not asked, since the second-factor
-        # ceremony names the credential itself.
+        # found at the finish only by a credential-id hash in today's scheme, and verified only
+        # where its stored key decodes. The rp_id rule is ``sign_in_counts``'s, and the stored-cell
+        # rule is ``passkey_is_way_past``'s; the discoverable record is not asked, since the
+        # second-factor ceremony names the credential itself. That naming is why the stored id
+        # must decode too: the begin leg leaves one that does not out of the allow list
+        # (BACKLOG #6886), so the browser never offers it.
         return (
-            way_past_rp_id is None or cred.rp_id == way_past_rp_id
-        ) and credential_id_hash_is_current(cred.credential_id_hash)
+            (way_past_rp_id is None or cred.rp_id == way_past_rp_id)
+            and stored_passkey_is_readable(
+                credential_id_hash=cred.credential_id_hash, public_key=cred.public_key
+            )
+            and stored_b64url_decodes(cred.credential_id)
+        )
 
     integrity_failed: list[str] = []
     for user in await store.list_users():
@@ -3622,6 +3690,31 @@ async def lockable_account_census(
 
 def _json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True)
+
+
+def _passkey_label(label: object) -> str | None:
+    """A stored passkey label as an audit detail carries it, rendered so that encoding the detail
+    cannot raise (BACKLOG #6886): text as it is, bytes (a BLOB in the TEXT column reads back as
+    bytes) decoded with replacement, and anything else as no label. A raise there would turn a
+    refusal into a server error, which a caller can tell from the refusal."""
+    if isinstance(label, str):
+        return label
+    if isinstance(label, (bytes, bytearray)):
+        return bytes(label).decode("utf-8", "replace")
+    return None
+
+
+def _stored_cell_refused_detail(
+    cred: WebAuthnCredential, reason: Literal["stored_key_refused", "stored_id_unreadable"]
+) -> str:
+    """The one audit detail for a passkey a stored cell refuses (BACKLOG #1963, #6886): a fixed
+    slug and the label, never the refusal text, which can quote the key. The verify writes
+    ``stored_key_refused`` for a stored key it cannot use, which never signs in again. The
+    assertion begin leg writes ``stored_id_unreadable`` for a stored id it cannot list: that
+    ceremony cannot offer the passkey, but it may still sign in through the combined sign-in if it
+    is a discoverable passkey on a local account, and otherwise cannot, so the key's reason would
+    overstate it."""
+    return _json({"reason": reason, "label": _passkey_label(cred.label)})
 
 
 def _is_idp_transport_failure(exc: BaseException) -> bool:
@@ -5170,14 +5263,20 @@ class AuthService:
         it from the raw ``credential_id`` stored beside it, so a hash change does not lose a
         registered passkey. No secret is needed: the raw id is not one.
 
-        Sign-in finds a passkey only by today's hash, so a row this pass has not moved does not sign
-        in. A bare digest (every release before #3423) is today's hash with no tag, and moves. A
-        value whose tag this release does not compile in is REFUSED: left as it is, never matched,
-        and counted. So are a ``credential_id`` that is not base64url, a today-tagged hash its raw
-        id does not give, and a move the store refuses: the account's seal failed between the read
-        and the write, or the new hash is already held. An account or passkey set already failing
-        its seal is left to the checked loaders, which report it. Returns ``(rehashed, refused)``;
-        a refusal never stops start-up."""
+        Sign-in finds a passkey only by today's hash, so a row whose hash is in another scheme does
+        not sign in until this pass moves it. A bare digest (every release before #3423) is today's
+        hash with no tag, and moves. A hash is read as the sign-in's compare reads it
+        (:func:`~messagefoundry.auth.tokens.stored_credential_id_hash_text`), so one that reads back
+        as bytes holding today's hash is left as it is and not counted. A value whose tag this
+        release does not compile in, or that text cannot be read from, is REFUSED: left as it is,
+        never matched, and counted. So are a ``credential_id`` that is not base64url, which the
+        pass cannot hash, a today-tagged hash its raw id does not give, and a move the store
+        refuses: the account's seal failed between the read and the write, or the new hash is
+        already held. A refused row whose hash is in today's scheme is still found by the sign-in
+        when that hash is the genuine credential id's, which the pass cannot check; one whose hash
+        is not matches no id a browser sends. An account or passkey set already failing its seal is left
+        to the checked loaders, which report it. Returns ``(rehashed, refused)``; a refusal never
+        stops start-up."""
         rehashed = refused = 0
         if not await self._store.any_webauthn_credentials():
             return 0, 0
@@ -5185,14 +5284,19 @@ class AuthService:
         # skipped here, since it signs in with no passkey whatever its hash says.
         for user in await self._load_users():
             for cred in await self._verified_passkeys(user) or ():
-                try:
-                    scheme = credential_id_hash_scheme(cred.credential_id_hash)
-                    # binascii.Error, a ValueError, for a credential_id that is not base64url.
-                    new_hash = _credential_id_hash(self._b64url_decode(cred.credential_id))
-                except ValueError:  # CredentialHashSchemeError is one too
+                stored_hash = stored_credential_id_hash_text(cred.credential_id_hash)
+                if stored_hash is None:
                     refused += 1
                     continue
-                if constant_time_equal(cred.credential_id_hash, new_hash):
+                try:
+                    scheme = credential_id_hash_scheme(stored_hash)
+                    # binascii.Error, a ValueError, for a credential_id that is not base64url; a
+                    # TypeError for one that is not text at all (BACKLOG #6886).
+                    new_hash = _credential_id_hash(self._b64url_decode(cred.credential_id))
+                except (ValueError, TypeError):  # CredentialHashSchemeError is a ValueError too
+                    refused += 1
+                    continue
+                if constant_time_equal(stored_hash, new_hash):
                     continue
                 if scheme == CREDENTIAL_ID_HASH_SCHEME:
                     # Today's tag over a digest its own raw id does not give: not a row this
@@ -5220,9 +5324,11 @@ class AuthService:
             )
         if refused:
             _log.warning(
-                "%d passkey(s) were not moved to the current credential-id hash scheme (an unknown"
-                " scheme, a hash its own credential id does not give, or a move the store refused);"
-                " they cannot sign in",
+                "%d passkey(s) were left as stored: each has a credential-id hash in a scheme this"
+                " release does not know or of a malformed shape, a stored credential id that does"
+                " not decode, or today's scheme tag over a digest its own credential id does not"
+                " give, or the store refused its move to today's scheme. One whose hash is not in"
+                " today's scheme cannot sign in",
                 refused,
             )
         return rehashed, refused
@@ -6975,37 +7081,59 @@ class AuthService:
         runs each audit row: at once on the second-factor leg, deferred into the failure pad on the
         sign-in.
 
-        * A stored key the registration rule refuses (BACKLOG #1963) will never sign in again, so it
-          is logged and audited with a fixed slug, never the refusal text, which can quote the key.
+        * A stored key the registration rule refuses (BACKLOG #1963), or a stored key that does not
+          decode (BACKLOG #6886), will never sign in again, so it is logged and audited with a
+          fixed slug, never the refusal text, which can quote the key. The log line says which of
+          the two. The stored ``credential_id`` is not read: the passkey was found by the hash of
+          the id the browser sent, and the signature check does not use the stored one.
         * py_webauthn's own counter-regression rejection is a clone signal (ADR 0068 decision 4).
         * Any other refusal is audited ``auth.webauthn_failed`` only when ``audit_bad_signature``."""
+
+        def refused_key() -> tuple[str, str | None]:
+            # Built only on a refusal, so a good assertion never encodes the label.
+            return "auth.webauthn_failed", _stored_cell_refused_detail(cred, "stored_key_refused")
+
         try:
-            return webauthn.verify_assertion(
-                response_json=response_json,
-                challenge=challenge,
-                rp_id=rp_id,
-                origin=origin,
-                public_key=self._b64url_decode(cred.public_key),
-                current_sign_count=cred.sign_count,
-            )
-        except webauthn.StoredKeyRefusedError:
+            public_key = self._b64url_decode(cred.public_key)
+        except (ValueError, TypeError):
+            # BACKLOG #6886. A stored key that is not base64url text (a length one past a multiple
+            # of four, non-ASCII text, or not a string at all; ``binascii.Error`` is a
+            # ``ValueError``) escaped as an unhandled error. Decoded apart from the verify, so an
+            # error the verify raises is not read as the stored row's. Only a row written outside
+            # the store holds one: on a sealed store the passkey digest refuses such a row first.
             _log.warning(
-                "passkey sign-in refused for %s: stored credential %r fails the registration key "
-                "check and must be registered again",
+                "passkey sign-in refused for %s: stored credential %r cannot be decoded and must "
+                "be registered again",
                 user.username,
                 cred.label,
             )
-            action, detail = (
-                "auth.webauthn_failed",
-                _json({"reason": "stored_key_refused", "label": cred.label}),
-            )
-        except webauthn.WebAuthnVerificationError as exc:
-            if "sign count" in str(exc).lower():
-                action, detail = "auth.webauthn_clone_suspected", _json({"label": cred.label})
-            elif audit_bad_signature:
-                action, detail = "auth.webauthn_failed", None
-            else:
-                return None
+            action, detail = refused_key()
+        else:
+            try:
+                return webauthn.verify_assertion(
+                    response_json=response_json,
+                    challenge=challenge,
+                    rp_id=rp_id,
+                    origin=origin,
+                    public_key=public_key,
+                    current_sign_count=cred.sign_count,
+                )
+            except webauthn.StoredKeyRefusedError:
+                _log.warning(
+                    "passkey sign-in refused for %s: stored credential %r fails the registration "
+                    "key check and must be registered again",
+                    user.username,
+                    cred.label,
+                )
+                action, detail = refused_key()
+            except webauthn.WebAuthnVerificationError as exc:
+                if "sign count" in str(exc).lower():
+                    action = "auth.webauthn_clone_suspected"
+                    detail = _json({"label": _passkey_label(cred.label)})
+                elif audit_bad_signature:
+                    action, detail = "auth.webauthn_failed", None
+                else:
+                    return None
 
         async def refused_row() -> None:
             await self._audit(action, actor=user.username, detail=detail, client=client)
@@ -8959,7 +9087,29 @@ class AuthService:
             raise held
         ad_roles = _roles_from_ids(role_ids)
         ad_custom_permissions = await self._custom_permissions_for_ids(role_ids)
-        user = await self._sync_ad_channel_scope(user, ad_roles, principal.groups, client=client)
+        try:
+            user = await self._sync_ad_channel_scope(
+                user, ad_roles, principal.groups, client=client, federated=federated
+            )
+        except _AdChannelScopeNotWritten as unwritten:
+            # BACKLOG #6887: the scope write was not made, so no session is minted. Answered as the
+            # refusals below are: a row gone on the federated leg as there, contention as the
+            # session insert's, and everything else through the directory row refusal.
+            contended = isinstance(unwritten, _AdChannelScopeContended)
+            if federated and (contended or unwritten.reason == ACCOUNT_DELETED):
+                await self._directory_reject_audit(
+                    principal.username, "oidc", unwritten.reason, client=client, extra=outcome_extra
+                )
+                scope_refused = LoginOutcome(
+                    ok=False, error="federated sign-in failed", reason=unwritten.reason
+                )
+            else:
+                scope_refused = await self._refuse_directory_row(
+                    principal.username, unwritten.reason, client=client, extra=outcome_extra
+                )
+            if contended:
+                scope_refused = replace(scope_refused, error=_SIGN_IN_UNAVAILABLE)
+            return replace(scope_refused, roles_gained=roles_gained)
         identity = Identity.build(
             user_id=user.id,
             username=user.username,
@@ -9219,9 +9369,13 @@ class AuthService:
         groups: Iterable[str],
         *,
         client: str | None = None,
+        federated: bool = False,
     ) -> VerifiedUser:
         """Persist a user's AD-group-derived per-channel scope (C3) so it's durable for later
         requests (mirrors role sync). Returns the (possibly refreshed) user record.
+
+        ``federated`` is the sign-in's leg, passed to the eligibility check on a re-read as the
+        role write passes it. Its default is the Kerberos shape, for direct test callers.
 
         **The rule is** :func:`~messagefoundry.auth.channel_scope.decide_ad_channel_scope` **and is
         stated there once**; this method applies what it decides. The directory reconciler plans its
@@ -9231,42 +9385,126 @@ class AuthService:
 
         History worth keeping: before BACKLOG #1927 this path returned early for every no-match
         login, so a user removed from their last scope-mapped group kept the directory's channels
-        for as long as the account existed."""
+        for as long as the account existed.
+
+        **BOTH WRITES ARE COMPARE-AND-SETS ON WHAT THE DECISION READ**: the withdrawal on the scope,
+        the grant on the scope and its source. How far the compare holds against another process
+        differs per backend, and ``AuthStore.set_ad_channel_scope_if_unchanged`` states it; on a
+        keyless SQLite store it does not. ``user`` was read several awaits earlier, and the
+        per-process sign-in queue orders neither a sign-in on another engine shard nor an
+        administrator's write. Before BACKLOG #6887 the grant was written unconditionally, so a
+        sign-in that read the scope before a concurrent one replaced it judged ``changes`` against
+        the replaced value: it revoked the other sign-in's brand-new session and audited the resync
+        a second time. On a miss, of the grant or of the withdrawal, the scope is NOT taken from
+        the row the other writer left, since that writer may have read older group memberships: a
+        sign-in whose groups map to no channel would otherwise mint on another writer's grant.
+        Nothing tells which read is newer, though: when this sign-in's groups are the older ones,
+        its write replaces the newer scope and revokes, as the role write's compare cannot tell
+        either. The row is read again and decided again from this sign-in's own groups, at most
+        :data:`_AD_SCOPE_WRITE_ATTEMPTS` times, and past that the sign-in fails
+        (:class:`_AdChannelScopeContended`). A re-read that finds this sign-in's target already
+        written revokes, as the role write does on finding its roles already written, and writes
+        no row. A re-read that finds the row gone, failing its seal, or ineligible to sign in
+        (disabled, locked or, off the federated leg, bound) fails the sign-in too, with nothing
+        written (:class:`_AdChannelScopeRefused`); the reasons are the role write's except that a
+        gone row is ``account_deleted``, as the caller's pre-mint read names it. Both are raised,
+        and the caller audits and answers them as refusals.
+
+        **WHAT THE COMPARE-AND-SET DOES NOT CLOSE.** A concurrent sign-in's new session can still
+        be ended, at least three ways. The revoke after a write is a separate transaction, so a
+        sign-in that misses, reads the new scope and mints in the gap between this write and this
+        revoke loses that session to the revoke. A sign-in that finds its target already written
+        revokes deliberately, as above, and so ends a session the other writer minted. And the
+        role write earlier in the same sign-in does the same when it finds its target roles already
+        written (``_SignInRoleSync``). Where the compare holds against another process (not on a
+        keyless SQLite store), what it does stop is a second write and a second
+        ``auth.ad_scope_resynced`` row for a scope already stored."""
         administrator = Role.ADMINISTRATOR in roles
-        decision = channel_scope.decide_ad_channel_scope(
-            channel_scope.ScopeInput(
-                stored_scope=user.channel_scope,
-                stored_source=user.channel_scope_source,
-                # An administrator's groups are not read: the decision ignores them.
-                mapped=frozenset() if administrator else await self._ad_channels_for_groups(groups),
-                administrator=administrator,
+        # An administrator's groups are not read: the decision ignores them. Read once: a retry
+        # re-reads the ROW, never the groups, so every attempt decides from this sign-in's answer.
+        mapped = frozenset() if administrator else await self._ad_channels_for_groups(groups)
+
+        def decide(stored: VerifiedUser) -> channel_scope.ScopeDecision:
+            return channel_scope.decide_ad_channel_scope(
+                channel_scope.ScopeInput(
+                    stored_scope=stored.channel_scope,
+                    stored_source=stored.channel_scope_source,
+                    mapped=mapped,
+                    administrator=administrator,
+                )
             )
-        )
+
+        decision = decide(user)
         if not decision.write:
             return user
-        if decision.scope_json is None:
-            if user.channel_scope is None:
-                # The decision never withdraws a NULL scope, which already denies. This narrows
-                # the type for the compare-and-set below, which needs a stored value to compare.
+        # Whether the scope this sign-in FIRST read differs from its target. It is the revoke
+        # trigger when another writer is found to have written that target already, as the role
+        # write's ``previous`` is the set it first read, so a failed revoke by that writer cannot
+        # leave stale-scope sessions live.
+        first_changes = decision.changes
+        # ``mapped`` is the same on every pass, so every pass decides the same kind of write: a
+        # withdrawal when it is empty, a grant otherwise.
+        attempt = 1
+        while True:
+            if decision.scope_json is None:
+                if user.channel_scope is None:
+                    # The decision never withdraws a NULL scope, which already denies. This narrows
+                    # the type for the compare-and-set below, which needs a stored value to compare.
+                    return user
+                written = await self._store.withdraw_ad_channel_scope(user.id, user.channel_scope)
+            else:
+                written = await self._store.set_ad_channel_scope_if_unchanged(
+                    user.id,
+                    decision.scope_json,
+                    expected_scope=user.channel_scope,
+                    expected_source=user.channel_scope_source,
+                )
+            if written:
+                break
+            # Settled, as the role write's re-read is: a single read can report a row a concurrent
+            # write is moving as refused, and that must not end the loop with nothing written.
+            settled = await self._lookup_user_settled(user.id)
+            fresh = settled.user
+            if fresh is None:
+                # Refused here, not returned: the caller's own re-read before the mint can find the
+                # row readable again, and would then mint on a scope this sign-in neither wrote nor
+                # checked. Nothing was written. The role write names a gone row ACCOUNT_REFUSED;
+                # this names it ACCOUNT_DELETED, as the caller's pre-mint read does (BACKLOG
+                # #5624), and keeps ACCOUNT_REFUSED for a row failing its seal.
+                reason = ACCOUNT_REFUSED if settled.held else ACCOUNT_DELETED
+                _log.error(
+                    "auth: the record of %s is gone or fails its seal, read after the sign-in's "
+                    "scope write found it moved; nothing was written and the sign-in is refused",
+                    scrub_log_argument(user.username),
+                )
+                raise _AdChannelScopeRefused(reason)
+            # The re-read decides eligibility too, as the role write's does, with the same
+            # ``federated``: the account may have been disabled, locked or bound since the read the
+            # sign-in's own gate ran on. Unlogged, as the role write's is; the caller audits it.
+            ineligible = _directory_login_refusal(fresh, time.time(), federated=federated)
+            if ineligible is not None:
+                raise _AdChannelScopeRefused(ineligible)
+            user = fresh
+            decision = decide(user)
+            if not decision.write:
+                # Kept: either this sign-in's target, already written by another writer, or (for a
+                # withdrawal) a scope an administrator set, which a withdrawal never overrides.
+                # Judged before the bound, so a last miss onto either is not contention. At the
+                # target, revoke as the role write does when it finds its roles already written.
+                if first_changes and user.channel_scope_source != SCOPE_SOURCE_MANUAL:
+                    await self._revoke_after_commit(
+                        user.id, change="ad_scope_resynced", actor=user.username, client=client
+                    )
                 return user
-            # Compare-and-set against the value read: an administrator or a concurrent login may
-            # have written the scope since ``user`` was read.
-            if not await self._store.withdraw_ad_channel_scope(user.id, user.channel_scope):
-                return await self._load_user(user.id) or user
-            await self._revoke_after_commit(
-                user.id, change="ad_scope_resynced", actor=user.username, client=client
-            )
-            # ``withdrawn`` keeps the removed grant, which the row itself no longer holds.
-            await self._audit(
-                AD_SCOPE_RESYNCED_ACTION,
-                actor=user.username,
-                detail=_json({"channels": None, "withdrawn": user.channel_scope}),
-                client=client,
-            )
-            return await self._load_user(user.id) or user
-        await self._store.set_user_channel_scope(
-            user.id, decision.scope_json, source=SCOPE_SOURCE_AD
-        )
+            if attempt >= _AD_SCOPE_WRITE_ATTEMPTS:
+                _log.warning(
+                    "auth: the directory scope write for account id %r met a concurrent writer on "
+                    "each of %d attempts; the sign-in fails",
+                    user.id,
+                    attempt,
+                )
+                raise _AdChannelScopeContended(attempt)
+            attempt += 1
         # Drop stale-scope tokens; the new one is issued after. Skipped when only the provenance
         # moved -- the directory taking over an identical manual scope changes no decision, so
         # there is nothing stale to drop -- but that write is still audited below.
@@ -9274,14 +9512,23 @@ class AuthService:
             await self._revoke_after_commit(
                 user.id, change="ad_scope_resynced", actor=user.username, client=client
             )
-        await self._audit(
-            AD_SCOPE_RESYNCED_ACTION,
-            actor=user.username,
-            detail=_json(
-                {"channels": ALL_CHANNELS if decision.wildcard else list(decision.channels)}
-            ),
-            client=client,
-        )
+        if decision.scope_json is None:
+            # ``withdrawn`` keeps the removed grant, which the row itself no longer holds.
+            await self._audit(
+                AD_SCOPE_RESYNCED_ACTION,
+                actor=user.username,
+                detail=_json({"channels": None, "withdrawn": user.channel_scope}),
+                client=client,
+            )
+        else:
+            await self._audit(
+                AD_SCOPE_RESYNCED_ACTION,
+                actor=user.username,
+                detail=_json(
+                    {"channels": ALL_CHANNELS if decision.wildcard else list(decision.channels)}
+                ),
+                client=client,
+            )
         return await self._load_user(user.id) or user
 
     async def _upsert_ad_user(
@@ -15413,8 +15660,12 @@ class AuthService:
         ``keep_token_hash`` names the caller's own session for the revoke to keep, so the
         administrator who ran it is not signed out mid-response where the revoke re-stamps it.
         Returns the count and whether that session was kept. Audited even when the count is zero,
-        because the act itself is the record an investigator looks for. The host command
-        ``admin-revoke-sessions`` keeps nothing and calls the store itself.
+        because the act itself is the record an investigator looks for; the row is appended after
+        the revoke commits, so a store that refuses it raises with the sessions already ended.
+        No ``auth.session_revoked`` row is written when the store's seal report fails after the
+        revoke commits: the call raises before that row is appended, with the sessions already
+        ended.
+        The host command ``admin-revoke-sessions`` keeps nothing and calls the store itself.
 
         A kept session whose seal fails makes the store write nothing. The caller's own session is
         then suspect, so it is ended with the rest, and the audit row's scope says so, as
@@ -19918,7 +20169,41 @@ class AuthService:
 
     @staticmethod
     def _b64url_decode(value: str) -> bytes:
-        return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        return decode_stored_b64url(value)
+
+    def _split_stored_credential_ids(
+        self, creds: Sequence[WebAuthnCredential], *, username: str, leg: str
+    ) -> tuple[list[bytes], list[WebAuthnCredential]]:
+        """The raw ids of ``creds`` that decode, in order, and the passkeys whose stored id does
+        not (BACKLOG #6886): one ``base64.urlsafe_b64decode`` raises on, or one that is not text.
+        That decoder skips characters outside its alphabet, so not every malformed id is caught
+        here. Such an id raised out of the ceremony that listed it. Only a row written outside the
+        store holds one: on a sealed store the passkey digest refuses it first.
+
+        The second list holds only the passkeys due a report, at most once per passkey per
+        :class:`SealFailureThrottle` interval and ``leg``, since a begin leg runs on every page
+        render; keyed by leg, so the registration leg's report does not use up the assertion leg's,
+        which writes the audit row. Each reported one is logged by label, never by its value; the
+        others are left out silently."""
+        ids: list[bytes] = []
+        due: list[WebAuthnCredential] = []
+        for cred in creds:
+            try:
+                ids.append(self._b64url_decode(cred.credential_id))
+            except (ValueError, TypeError):  # binascii.Error is a ValueError
+                if self._seal_failures_reported.due(f"passkey-id:{leg}:{cred.credential_id_hash}"):
+                    # Not "must be registered again": it may still sign in through the combined
+                    # sign-in if it is a discoverable passkey on a local account, and otherwise
+                    # cannot.
+                    _log.warning(
+                        "passkey %r of %s has a stored credential id that cannot be decoded, so "
+                        "it is not listed in this leg's %s",
+                        cred.label,
+                        username,
+                        "allow list" if leg == "assert" else "exclude list",
+                    )
+                    due.append(cred)
+        return ids, due
 
     #: Ceremony-miss message — names the LB-stickiness caveat so a multi-node operator can
     #: self-diagnose intermittent failures (ADR 0068 §2).
@@ -19969,9 +20254,11 @@ class AuthService:
             # Only discoverable passkeys are excluded (ADR 0197 Amendment A, wave 2): a holder may
             # register an authenticator again as a discoverable credential, which is the remedy for
             # a passkey registered before wave 2.
-            exclude_credential_ids=[
-                self._b64url_decode(c.credential_id) for c in existing if c.discoverable
-            ],
+            # BACKLOG #6886: a passkey whose stored id does not decode is left out, so the holder
+            # can register that authenticator again, the remedy its log line names.
+            exclude_credential_ids=self._split_stored_credential_ids(
+                [c for c in existing if c.discoverable], username=user.username, leg="register"
+            )[0],
         )
         self._webauthn_challenges.put((hash_token(token), "register"), user.id, challenge)
         await self._audit("auth.webauthn_enroll_started", actor=identity.username)
@@ -20409,8 +20696,10 @@ class AuthService:
     async def begin_webauthn_assertion(self, token: str | None, *, rp_id: str) -> str | None:
         """Stage an assertion ceremony for the caller's session; returns the browser request-options
         JSON, or ``None`` when the user has no credentials minted under the CURRENT ``rp_id``
-        (an origin migration renders old credentials visibly unusable — ADR 0068 §7). Allowed for
-        MFA-pending sessions: the assertion is exactly what proves the second factor."""
+        (an origin migration renders old credentials visibly unusable — ADR 0068 §7). Raises
+        :class:`StoredPasskeysUnreadable` when it has some there but none whose stored id decodes
+        (BACKLOG #6886). Allowed for MFA-pending sessions: the assertion is exactly what proves the
+        second factor."""
         if not token:
             return None
         session = await self._load_session(hash_token(token))
@@ -20420,13 +20709,29 @@ class AuthService:
         user = await self._load_user(session.user_id)
         held = None if user is None else await self._verified_passkeys(user)
         creds = [c for c in held or () if c.rp_id == rp_id]
-        if not creds:
+        if not creds or user is None:
             return None
+        allowed, due = self._split_stored_credential_ids(
+            creds, username=user.username, leg="assert"
+        )
+        for cred in due:
+            # BACKLOG #6886: a passkey whose stored id does not decode cannot be listed, so this
+            # ceremony cannot offer it, and the row says so with its own reason. It may still sign
+            # in through the combined sign-in if it is a discoverable passkey on a local account,
+            # and otherwise cannot, so the finish leg's ``stored_key_refused`` would overstate it.
+            # The row is throttled with the WARNING, because the web console begins a ceremony on
+            # every render.
+            await self._audit(
+                "auth.webauthn_failed",
+                actor=user.username,
+                detail=_stored_cell_refused_detail(cred, "stored_id_unreadable"),
+            )
+        if not allowed:
+            # Not ``None``: the console reads that as an origin migration, and none happened.
+            raise StoredPasskeysUnreadable
         challenge = webauthn.new_challenge()
         options = webauthn.assertion_options(
-            rp_id=rp_id,
-            challenge=challenge,
-            allow_credential_ids=[self._b64url_decode(c.credential_id) for c in creds],
+            rp_id=rp_id, challenge=challenge, allow_credential_ids=allowed
         )
         self._webauthn_challenges.put((hash_token(token), "assert"), session.user_id, challenge)
         return options
@@ -20520,7 +20825,8 @@ class AuthService:
         # BACKLOG #1963: a STORED key that breaks the registration rule (ADR 0068, 2026-09-24
         # amendment) is audited with its own slug, so an admin can see why a passkey-only user is
         # stuck; py_webauthn's own counter-regression rejection is a clone signal (ADR 0068 §4).
-        # The caller gets the same refusal for each. _verify_passkey_signature holds all three.
+        # The caller gets the same refusal for each; _verify_passkey_signature holds that handling,
+        # an undecodable stored row (BACKLOG #6886) among it.
         verified = await self._verify_passkey_signature(
             user,
             cred,

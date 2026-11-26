@@ -599,9 +599,25 @@ if ($Send) {
     # move that did not happen is reported instead of assumed -- a broadcast that aborted on target 1
     # would hide targets 2..N, and one that swallowed the failure would put the defect back at the
     # reporting layer. Every target gets its own row and its own status.
-    # One row per recipient. A path is keyed through ConvertTo-BoxKey; a seat id already IS the key.
+    # One row per recipient. A path is keyed through Resolve-BoxPath and ConvertTo-BoxKey, the drain's
+    # own two steps, so a subdirectory of a worktree addresses the box its session reads (BACKLOG
+    # #7581); a seat id already IS the key.
     $rows = @()
-    foreach ($t in $targets) { $rows += [pscustomobject]@{ To = $t; Key = (ConvertTo-BoxKey -Path $t); Cwd = $t } }
+    # Two targets in one worktree (a broadcast reaching a root session and a subdirectory session)
+    # share one box, so the second is skipped rather than queue the same message twice.
+    $keysSeen = [System.Collections.Generic.HashSet[string]]::new()
+    # A broadcast never queues into the sender's OWN box: a peer elsewhere in the sender's worktree
+    # shares it, and the sender's own drain would show and consume the copy. The roster's cwd
+    # comparison above cannot see that, since the two cwds differ.
+    if ($To -ieq 'all') { $null = $keysSeen.Add((ConvertTo-BoxKey -Path (Resolve-BoxPath -Path (Get-Location).Path))) }
+    $folded = @()
+    foreach ($t in $targets) {
+        $k = ConvertTo-BoxKey -Path (Resolve-BoxPath -Path $t)
+        if ($keysSeen.Add($k)) { $rows += [pscustomobject]@{ To = $t; Key = $k; Cwd = $t } }
+        else { $folded += "$t (box $k)" }
+    }
+    # Said, so a target that got no copy of its own is not silent.
+    foreach ($f in $folded) { [Console]::Error.WriteLine("mail.ps1: no separate copy for $f, which shares a box already addressed or the sender's own.") }
     foreach ($s in $seatTargets) {
         $label = if ($s.Host) { "$($s.Key) (seat on $($s.Host))" } else { "$($s.Key) (seat)" }
         $cwd = if ($s.Worktree) { $s.Worktree } else { $s.Key }
@@ -703,15 +719,23 @@ if ($List) {
 
 # -Status (default): this worktree's own box.
 $here = (Get-Location).Path
-$key = ConvertTo-BoxKey -Path $here
+# The box the drain reads from here: a subdirectory is raised to its worktree root (BACKLOG #7581).
+$boxPath = Resolve-BoxPath -Path $here
+$key = ConvertTo-BoxKey -Path $boxPath
 # The box under the old path-only key, read only. The drain moves the inbox names this channel
 # minted into $key, so only those are counted as waiting; claiming/ and stranded/ stay where they are,
 # and are counted here because no sweep of this box reaches them.
-$legacyKey = ConvertTo-LegacyBoxKey -Path $here
-$legacyInbox = @(Get-BoxMessages -Root $root -Key $legacyKey -Sub 'inbox' |
-        Where-Object { Split-MailFileName -Name (Split-Path $_.File -Leaf) }).Count
-$legacyClaiming = @(Get-BoxMessages -Root $root -Key $legacyKey -Sub 'claiming').Count
-$legacyStranded = @(Get-BoxMessages -Root $root -Key $legacyKey -Sub 'stranded').Count
+$legacyKey = ConvertTo-LegacyBoxKey -Path $boxPath
+# Every older key the drain reads from here, which for a subdirectory includes its own pre-#7581 key,
+# so a claimed or stranded message left there is still counted.
+$legacyInbox = 0; $legacyClaiming = 0; $legacyStranded = 0
+$oldKeys = @(Get-BoxReadKeys -Path $here -Resolved $boxPath)
+foreach ($oldKey in $oldKeys) {
+    $legacyInbox += @(Get-BoxMessages -Root $root -Key $oldKey -Sub 'inbox' |
+            Where-Object { Split-MailFileName -Name (Split-Path $_.File -Leaf) }).Count
+    $legacyClaiming += @(Get-BoxMessages -Root $root -Key $oldKey -Sub 'claiming').Count
+    $legacyStranded += @(Get-BoxMessages -Root $root -Key $oldKey -Sub 'stranded').Count
+}
 $inbox = @(Get-BoxMessages -Root $root -Key $key -Sub 'inbox')
 $seen = @(Get-BoxMessages -Root $root -Key $key -Sub 'seen')
 $claiming = @(Get-BoxMessages -Root $root -Key $key -Sub 'claiming')
@@ -751,7 +775,7 @@ if ($Json) {
             Claiming = $claiming.Count; Stranded = $stranded.Count
             Expired = $expired.Count
             NextDrainShowsAtLeast = $fits
-            LegacyKey = $legacyKey; LegacyInbox = $legacyInbox
+            LegacyKey = $legacyKey; OldKeys = $oldKeys; LegacyInbox = $legacyInbox
             LegacyClaiming = $legacyClaiming; LegacyStranded = $legacyStranded
             MailRoot = $root; AsOfUtc = [DateTime]::UtcNow.ToString('o')
         } | ConvertTo-Json -Depth 4) | Write-Output
@@ -776,10 +800,11 @@ Write-Host "Expired:       $($expired.Count) swept past their TTL. NOBODY WAS TO
 Write-Host "               the sender and to the recipient, so a non-zero count here is the only place"
 Write-Host "               a message that died unread is named after the turn that swept it."
 if ($legacyInbox + $legacyClaiming + $legacyStranded -gt 0) {
-    Write-Host "Legacy box:    $legacyKey, the old path-only key. $legacyInbox waiting, which each drain"
-    Write-Host "               tries to move into this box; a count that does not fall means a move is"
-    Write-Host "               failing. $legacyClaiming claimed and $legacyStranded stranded there, which"
-    Write-Host "               nothing moves: read them under box\$legacyKey\ by hand."
+    Write-Host "Legacy box:    $($oldKeys -join ', '), the older keys (path-only, or this subdirectory's own)."
+    Write-Host "               $legacyInbox waiting, which each drain tries to move into this box; a count"
+    Write-Host "               that does not fall means a move is failing. $legacyClaiming claimed and"
+    Write-Host "               $legacyStranded stranded there, which nothing moves: read them under"
+    Write-Host "               box\<key>\ by hand."
 }
 Write-Host "As of:         $([DateTime]::UtcNow.ToString('o'))"
 

@@ -49,6 +49,7 @@ from messagefoundry.auth.service import (
     Elevation,
     MfaStatus,
     PasskeyProof,
+    StoredPasskeysUnreadable,
 )
 from messagefoundry.auth.tokens import hash_bytes, hash_token
 from messagefoundry.auth.webauthn import CHALLENGE_TTL_SECONDS
@@ -67,6 +68,7 @@ from .._auth import (
     WEBAUTHN_EXTRA_MISSING_NOTICE,
     WEBAUTHN_RP_CHANGED_NOTICE,
     WEBAUTHN_RP_MISSING_NOTICE,
+    WEBAUTHN_UNREADABLE_NOTICE,
     RepeatRefused,
     allow_reauth_attempt,
     assert_not_cross_site,
@@ -1874,7 +1876,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         rp = webauthn_rp(request)
         if rp is None:
             return None, WEBAUTHN_RP_MISSING_NOTICE
-        options = await auth.begin_webauthn_assertion(token, rp_id=rp[0])
+        try:
+            options = await auth.begin_webauthn_assertion(token, rp_id=rp[0])
+        except StoredPasskeysUnreadable:
+            # BACKLOG #6886: enrolled under this origin, but no stored passkey can be read. Not the
+            # origin-migration notice below, whose cause would be false here.
+            return None, WEBAUTHN_UNREADABLE_NOTICE
         if options is None:
             # Enrolled, but every credential was minted under a DIFFERENT rp_id (the
             # origin-migration case, ADR 0068 §7) — a legible dead-end naming the

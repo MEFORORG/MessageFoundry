@@ -358,6 +358,7 @@ from messagefoundry.store.store import (
     _session_live_params,
     _transit_attestation_row,
     ad_map_write_async,
+    ad_scope_replacement,
     admin_guard_counts,
     append_rename_audits,
     approval_fails_seal_async,
@@ -17341,6 +17342,22 @@ class SqlServerStore(ServerCipherWalk):
         return (
             await self._write_user_txn(user_id, scope_withdrawal(expected_scope, now)) is not None
         )
+
+    async def set_ad_channel_scope_if_unchanged(
+        self,
+        user_id: str,
+        scope_json: str,
+        *,
+        expected_scope: str | None,
+        expected_source: ChannelScopeSource | None,
+        now: float | None = None,
+    ) -> bool:
+        """The AD sign-in's compare-and-set scope write (BACKLOG #6887); see ``AuthStore``. The
+        compare is ``ad_scope_replacement``'s, in Python, so it is byte-exact whatever the column's
+        collation and however long the scope, as the withdrawal's is."""
+        now = time.time() if now is None else now
+        change = ad_scope_replacement(scope_json, expected_scope, expected_source, now)
+        return await self._write_user_txn(user_id, change) is not None
 
     async def set_user_username(
         self,

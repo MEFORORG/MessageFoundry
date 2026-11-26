@@ -32,6 +32,7 @@ from messagefoundry.transports.signing import (
     b64u_encode,
     unverified_jws_header,
     verify_compact_jws,
+    verify_detached_jws,
 )
 
 _RS256 = [SignatureAlgorithm.RS256]
@@ -76,6 +77,17 @@ def _retarget(jws: str, *, header: dict[str, Any] | None, payload: dict[str, Any
     if payload is not None:
         p = b64u_encode(json.dumps(payload).encode())
     return f"{h}.{p}.{s}"
+
+
+def _sign_raw(key: rsa.RSAPrivateKey, header: dict[str, Any], payload: bytes) -> str:
+    """A genuinely RS256-signed JWS over an ARBITRARY header and raw payload bytes, for the cases the
+    shipped signer cannot express. The signature covers the exact segments returned."""
+    from messagefoundry.transports.signing import _sign  # noqa: PLC0415
+
+    h = b64u_encode(json.dumps(header).encode())
+    p = b64u_encode(payload)
+    sig = _sign(key, SignatureAlgorithm.RS256, f"{h}.{p}".encode("ascii"))
+    return f"{h}.{p}.{b64u_encode(sig)}"
 
 
 # --- positive control ------------------------------------------------------------------------------
@@ -215,14 +227,9 @@ def test_non_object_payload_is_refused_after_a_valid_signature(
     rsa_key: rsa.RSAPrivateKey,
 ) -> None:
     """A correctly SIGNED but non-object payload is still refused — signature != well-formed claims."""
-    header = b64u_encode(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
-    payload = b64u_encode(b'"not-an-object"')
-    from messagefoundry.transports.signing import _sign  # noqa: PLC0415
-
-    sig = _sign(rsa_key, SignatureAlgorithm.RS256, f"{header}.{payload}".encode("ascii"))
     with pytest.raises(SigningError, match="payload must be a JSON object"):
         verify_compact_jws(
-            f"{header}.{payload}.{b64u_encode(sig)}",
+            _sign_raw(rsa_key, {"alg": "RS256", "typ": "JWT"}, b'"not-an-object"'),
             rsa_key.public_key(),
             allowed_algorithms=_RS256,
         )
@@ -243,6 +250,52 @@ def test_signature_is_over_the_received_segments_not_a_reencoding(
         pytest.skip("payload needs no padding; the non-canonical variant is identical")
     with pytest.raises((InvalidSignature, SigningError)):
         verify_compact_jws(f"{h}.{padded}.{s}", rsa_key.public_key(), allowed_algorithms=_RS256)
+
+
+@pytest.mark.parametrize("crit", [["exp"], [], ["alg"], "exp", None])
+def test_a_crit_header_is_refused_whatever_the_signature(
+    rsa_key: rsa.RSAPrivateKey, crit: Any
+) -> None:
+    """RFC 7515 section 4.1.11 (BACKLOG #6065). The verifier implements no header extension, so a
+    correctly SIGNED token carrying ``crit``, well-formed or not, is invalid."""
+    jws = _sign_raw(rsa_key, {"alg": "RS256", "crit": crit, "exp": 1}, b'{"sub": "jdoe"}')
+    with pytest.raises(SigningError, match="crit"):
+        verify_compact_jws(jws, rsa_key.public_key(), allowed_algorithms=_RS256)
+
+
+def test_the_detached_verifier_refuses_a_crit_header_too(rsa_key: rsa.RSAPrivateKey) -> None:
+    """``verify_detached_jws`` is the module's other public verifier, so the same rule holds there:
+    a correctly signed detached JWS carrying ``crit`` is refused, and the same one without verifies."""
+    body = b'{"sub": "jdoe"}'
+
+    def detached(header: dict[str, Any]) -> str:
+        h, _payload, sig = _sign_raw(rsa_key, header, body).split(".")
+        return f"{h}..{sig}"
+
+    with pytest.raises(SigningError, match="crit"):
+        verify_detached_jws(
+            detached({"alg": "RS256", "crit": ["exp"], "exp": 1}),
+            body,
+            rsa_key.public_key(),
+            allowed_algorithms=_RS256,
+        )
+    verify_detached_jws(
+        detached({"alg": "RS256", "exp": 1}), body, rsa_key.public_key(), allowed_algorithms=_RS256
+    )
+
+
+def test_the_detached_verifier_refuses_a_non_object_header(rsa_key: rsa.RSAPrivateKey) -> None:
+    """A JSON header that is not an object is a SigningError, not an AttributeError on ``.get``."""
+    jws = f"{b64u_encode(b'[1,2]')}..{b64u_encode(b'x')}"
+    with pytest.raises(SigningError, match="must be a JSON object"):
+        verify_detached_jws(jws, b"{}", rsa_key.public_key(), allowed_algorithms=_RS256)
+
+
+def test_the_crit_positive_control_verifies(rsa_key: rsa.RSAPrivateKey) -> None:
+    """The same header without ``crit`` verifies, so the refusals above come from ``crit``."""
+    jws = _sign_raw(rsa_key, {"alg": "RS256", "exp": 1}, b'{"sub": "jdoe"}')
+    claims = verify_compact_jws(jws, rsa_key.public_key(), allowed_algorithms=_RS256)
+    assert claims["sub"] == "jdoe"
 
 
 # --- the unverified header peek --------------------------------------------------------------------
