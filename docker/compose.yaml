@@ -276,10 +276,12 @@ services:
       # There, mount a named volume at /etc/mefor/tls in place of ./tls (on this service and the
       # `ha` engines), filled and owned inside Docker's Linux VM, for example:
       #   docker volume create mefor-tls
-      #   docker run --rm -v "$PWD/tls:/src:ro" -v mefor-tls:/dst alpine:3.20 sh -c 'find /dst -mindepth 1 -delete && cp -RL /src/. /dst/ && chown -R 10001:10001 /dst && chmod 0700 /dst && find /dst -type f -exec chmod 0600 {} +'
-      # and declare mefor-tls under the top-level volumes: as external: true. -L copies the files a
-      # link names rather than the link, and the first find empties the volume, so a retired key
-      # does not stay in it. Run it again after each rotation. Pin alpine to a digest you trust.
+      #   docker run --rm --network none --user 0 --entrypoint sh --mount type=bind,src="$PWD/tls",dst=/src,readonly -v mefor-tls:/dst messagefoundry:latest -c 'mkdir /tmp/n && cp -RL /src/. /tmp/n/ && find /dst -mindepth 1 -delete && cp -R /tmp/n/. /dst/ && chown -R 10001:10001 /dst && chmod 0700 /dst && find /dst -type f -exec chmod 0600 {} +'
+      # run from the directory that holds ./tls, using the engine image built above, and declare
+      # mefor-tls under the top-level volumes: as external: true. --mount refuses a missing ./tls.
+      # -L copies the file a link names where that file is inside ./tls; a link that leaves ./tls
+      # fails the copy, and the volume is emptied only after the copy succeeds, so a retired key
+      # does not stay in it and a failed copy keeps the old keys. Run it again after each rotation.
       - ./tls:/etc/mefor/tls:ro
       # OPTIONAL secrets directory (vault BACKLOG #2595, ADR 0214), an alternative to env_file for
       # the engine's own secret settings other than the store key, and env() values: one file per
@@ -289,8 +291,8 @@ services:
       # group or other read or write bit, and a bind mount keeps the host's modes, so own it as ./tls
       # is owned, the directory 0700 and each file 0600. On Linux:
       #   sudo chown -R 10001:10001 ./secrets && sudo chmod 0700 ./secrets && sudo find ./secrets -type f -exec chmod 0600 {} +
-      # A Docker Desktop for Mac bind mount of ./secrets is refused for its mount type, as ./tls is;
-      # use a named volume filled the same way there.
+      # A Docker Desktop for Mac bind mount of ./secrets is refused too, at least where it surfaces
+      # as a mount of a type the check refuses, as for ./tls; use a named volume filled the same way.
       # docs/CONFIGURATION.md "The secrets directory" holds the rules.
       # - ./secrets:/run/mefor/secrets:ro
 

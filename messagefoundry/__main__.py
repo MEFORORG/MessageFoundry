@@ -8964,9 +8964,9 @@ def _generated_tls_key_remedy(state_dir: Path) -> str:
             "Where it names a link on its path, keep the store where no link above it, or folder "
             "holding or above one, is owned by an account other than root or the engine's own "
             "or may be written by a group or other without the sticky bit, since a new pair would be "
-            "minted in the same place. Where it names a mount type, the store's directory is on that "
-            "mount: move the store to a local file system, since a new pair would be minted on the "
-            "same mount. "
+            "minted in the same place. Where it names a mount type, a part of the key's path is on that "
+            "mount, and a new pair would be minted on it again: set [api].tls_cert_file and "
+            "[api].tls_key_file to a pair of your own on a local file system. "
         )
     else:
         remedy += (
