@@ -7546,7 +7546,7 @@ class Registry:
     def encoding_problems(self) -> list[str]:
         """Human-readable messages for declared ``encoding`` values naming no usable text codec.
 
-        Caught statically, naming the connection and the offending string, the way
+        Caught statically, naming the connection and withholding the offending string, the way
         :meth:`port_collisions` catches a duplicate port before it becomes a bare bind ``OSError``
         (see the section comment above for the runtime failure this pre-empts).
 
@@ -7622,10 +7622,12 @@ class Registry:
                 )
                 continue
             if not _is_text_codec(value):
+                # The literal is config-module text, which a load error does not quote (BACKLOG
+                # #3765 item 1): the connection names where to look, and the value is withheld.
                 problems.append(
-                    f"{kind} {name!r}: encoding {value!r} is not a Python text codec — every "
-                    f"message would fail at decode/encode; use a codec name such as 'utf-8', "
-                    f"'latin-1' or 'cp1252'"
+                    f"{kind} {name!r}: encoding is not a Python text codec (value withheld) — "
+                    f"every message would fail at decode/encode; use a codec name such as "
+                    f"'utf-8', 'latin-1' or 'cp1252'"
                 )
         return problems
 
