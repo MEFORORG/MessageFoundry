@@ -34,6 +34,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.config.wiring import (
     WiringError,
     _file_and_folder,
+    _windows_link_target,
     assert_trusted_start_paths,
     install_trust_paths,
     untrusted_install_paths,
@@ -520,8 +521,6 @@ def test_a_link_target_the_anchor_walk_refuses_is_refused_by_the_config_walk(tar
     """A link target the anchor walk refuses as a device path (``anchor_path._strip_nt_target``)
     is refused here too, rather than normalized and walked as a local path the open may not reach
     (BACKLOG #5515, engine PR 2999's left list). Pure text, so it runs on every leg."""
-    from messagefoundry.config.wiring import _windows_link_target
-
     with pytest.raises(OSError, match="device path"):
         _windows_link_target(target)
 
@@ -538,8 +537,6 @@ def test_a_link_target_the_anchor_walk_refuses_is_refused_by_the_config_walk(tar
 def test_a_plain_verbatim_link_target_is_still_walked(target: str, plain: str) -> None:
     """The control for the test above: an all-backslash verbatim target naming no ``.`` or ``..``
     is the same object as its stripped spelling, and is walked as before."""
-    from messagefoundry.config.wiring import _windows_link_target
-
     assert _windows_link_target(target) == plain
 
 

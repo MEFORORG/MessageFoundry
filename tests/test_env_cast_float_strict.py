@@ -114,6 +114,6 @@ def test_a_numeric_builtin_cast_still_reads_a_number(cast: Any) -> None:
 
 
 def test_a_numeric_builtin_cast_keeps_two_refs_equal() -> None:
-    """The guard is one object per cast, so two references written alike still compare equal."""
+    """The guard compares equal per cast, so two references written alike still compare equal."""
     assert env("r", cast=abs) == env("r", cast=abs)
-    assert EnvRef(key="r", cast=Decimal).cast is env("r", cast=Decimal).cast
+    assert EnvRef(key="r", cast=Decimal).cast == env("r", cast=Decimal).cast

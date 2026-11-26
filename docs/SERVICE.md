@@ -1041,7 +1041,7 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     the loader reads, and
     **refuses** to load when a broad/low-privilege principal (Everyone, Authenticated Users,
     `BUILTIN\Users`, INTERACTIVE, …) or any non-owner/non-admin principal holds a write-class right
-    (write/append/delete/`WRITE_DAC`/`WRITE_OWNER`/generic-write, and on a folder delete-child). The principals that may hold one
+    (write/append/delete/`WRITE_DAC`/`WRITE_OWNER`/generic-write/delete-child). The principals that may hold one
     are SYSTEM, `BUILTIN\Administrators`, TrustedInstaller, the owner, the run-as account (never
     LocalService or NetworkService, which other services share) and a Domain, Schema or Enterprise
     Admins group the local Administrators lookup resolves. A grant to any other account is refused,
@@ -1130,8 +1130,8 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     checked. It then walks each such link as the `serve` start check walks its own files
     (`_link_chain`), so it also checks the real folder holding each link the walk follows, the
     links in between for a link to a link, and on Windows each link itself, and it refuses the
-    load where that walk cannot run, reaches nothing, or reaches another object than the
-    resolution did, a Windows reparse point other than a symbolic link or a junction among them
+    load where that walk cannot run, reaches nothing, or reaches another object than an open of
+    the link does, a Windows reparse point other than a symbolic link or a junction among them
     (vault BACKLOG #2596 step 4). So the layout also depends on at least these, which it
     does not check: every directory above the config directory, and above each folder a link
     leads to, is writable only by root; no link leads through a folder another account can write;

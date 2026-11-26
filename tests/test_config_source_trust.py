@@ -623,7 +623,8 @@ def test_delete_child_on_the_config_directory_refuses(
     """FILE_DELETE_CHILD on a folder lets its holder delete any file in it, whatever that file's
     own access list says, so an account holding it on the config directory can remove a module
     from the graph the engine runs (BACKLOG #5622, #8251 item 13). The bit means nothing on a
-    file, so a file entry carrying it alone still passes, as the second half pins."""
+    file, and it is refused there too, so no stat has to tell a folder from a file; the second
+    half pins that, and the read-only entry after it is the control."""
     monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
     _write_cfg(tmp_path)
     delete_child = _WinPathSecurity(
@@ -633,8 +634,14 @@ def test_delete_child_on_the_config_directory_refuses(
     with pytest.raises(WiringError) as excinfo:
         load_config(tmp_path)
     assert f"({grantee}) has write access" in str(excinfo.value)
-    # The control: the same entry on the module file alone is no write right there.
     _take_windows_path(monkeypatch, _CLEAN_READ, _SELF, by_name={"cfg.py": delete_child})
+    with pytest.raises(WiringError, match=f"\\({grantee}\\) has write access"):
+        load_config(tmp_path)
+    # The control: a read-and-execute entry for the same grantee passes.
+    read_only = _WinPathSecurity(
+        owner_sid=_SELF, aces=((_ALLOW, _FULL, _SELF), (_ALLOW, _READ_EXEC, grantee))
+    )
+    _take_windows_path(monkeypatch, _CLEAN_READ, _SELF, by_name={tmp_path.name: read_only})
     assert "o" in load_config(tmp_path).outbound
 
 

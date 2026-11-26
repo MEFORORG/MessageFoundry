@@ -5,5 +5,5 @@
   directory, and on Windows each link's own access list went unchecked, so a writer of one could
   re-point the link to other code. The load now also checks what the start check's link walk
   names, and refuses where that walk cannot run, reaches nothing, or reaches another object than
-  the resolution did. The folders above each target's folder stay unchecked, as the folders above
+  an open of the link does. The folders above each target's folder stay unchecked, as the folders above
   the config directory are. (`BACKLOG #2596`)

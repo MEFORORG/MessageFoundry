@@ -41,6 +41,7 @@ import importlib.util
 import inspect
 import io
 import ipaddress
+import itertools
 import json
 import logging
 import math
@@ -577,7 +578,9 @@ _NUMERIC_BUILTIN_FUNCTIONS: Final = (
 )
 
 
-def _is_numeric_builtin_cast(cast: Callable[[Any], Any] | None) -> bool:
+def _is_numeric_builtin_cast(
+    cast: Callable[[Any], Any] | None,
+) -> TypeIs[Callable[[Any], Any]]:
     """Whether ``cast`` is a numeric builtin or a number type, other than the ``int``, ``float`` and
     ``bool`` that :class:`EnvRef` swaps for its own reads. Each reads a TOML ``true`` as 1 (vault
     BACKLOG #1650). Matched by identity, since an author's callable need not be hashable."""
@@ -586,20 +589,26 @@ def _is_numeric_builtin_cast(cast: Callable[[Any], Any] | None) -> bool:
     return any(cast is known for known in _NUMERIC_BUILTIN_FUNCTIONS)
 
 
-@cache
-def _bool_refusing_cast(cast: Callable[[Any], Any]) -> Callable[[Any], Any]:
+class _bool_refusing_cast:  # noqa: N801 -- read as the function it stands in for
     """``cast`` with a bool refused ahead of it, by the rule :func:`_cast_int` holds, value
-    withheld. Cached, so two references written with one cast still compare equal. Only the
-    bounded set :func:`_is_numeric_builtin_cast` matches reaches here."""
+    withheld. Equal when the casts are, so two references written with one cast still compare
+    equal; no cache, which would keep a config module's own number class alive past a reload."""
 
-    def refusing_bool(raw: Any) -> Any:
+    def __init__(self, cast: Callable[[Any], Any]) -> None:
+        self.cast = cast
+        # Named as the cast the author wrote, for the reason ``_cast_bool`` is named "bool".
+        self.__name__ = _cast_name(cast)
+
+    def __call__(self, raw: Any) -> Any:
         if isinstance(raw, bool):
             raise ValueError("a bool is not a number (value withheld)")
-        return cast(raw)
+        return self.cast(raw)
 
-    # Named as the cast the author wrote, for the reason ``_cast_bool`` is named "bool".
-    refusing_bool.__name__ = _cast_name(cast)
-    return refusing_bool
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _bool_refusing_cast) and other.cast is self.cast
+
+    def __hash__(self) -> int:
+        return id(self.cast)
 
 
 #: Named casts a ``connections.toml`` env-ref may request (ADR 0007). A data file/GUI can't author an
@@ -6147,19 +6156,14 @@ def _first_argument_attributes(code: CodeType) -> set[str]:
     if not code.co_argcount:
         return set()
     first = code.co_varnames[0]
-    names: set[str] = set()
-    previous: dis.Instruction | None = None
-    for ins in dis.get_instructions(code):
-        if (
-            ins.opname in ("LOAD_ATTR", "LOAD_METHOD")
-            and isinstance(ins.argval, str)
-            and previous is not None
-            and previous.opname in _LOCAL_LOADS
-            and previous.argval == first
-        ):
-            names.add(ins.argval)
-        previous = ins
-    return names
+    return {
+        ins.argval
+        for previous, ins in itertools.pairwise(dis.get_instructions(code))
+        if ins.opname == "LOAD_ATTR"
+        and isinstance(ins.argval, str)
+        and previous.opname in _LOCAL_LOADS
+        and previous.argval == first
+    }
 
 
 def _accepts_walk(start: object, expand: Callable[[object], Iterable[object]]) -> Iterator[object]:
@@ -6215,8 +6219,8 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
     Engine PR 2997's left list adds these edges (vault BACKLOG #5514): an attribute a function
     reads as ``Name.attr`` off a class or an instance, not only off a module; the items of a
     ``tuple``, ``list``, ``dict`` (keys and values), ``set`` or ``frozenset`` the walk reaches,
-    by exact type; a ``staticmethod`` or ``classmethod``'s function; any wrapper whose
-    ``__wrapped__`` chain ends at the accessor itself, such as ``staticmethod(state_get)``; and
+    by exact type; a ``staticmethod`` or ``classmethod``'s function, so ``staticmethod(state_get)``
+    is caught; any wrapper whose ``__wrapped__`` chain ends at the accessor itself; and
     the attributes a config method, or a callable instance's ``__call__``, reads straight off its
     first parameter (``self.getter``), looked up on the bound ``__self__`` or the instance, a method
     found there bound to it in turn. Every one of those lookups is static
@@ -6259,8 +6263,8 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
         own = cast("FunctionType", value) if issubclass(kind, FunctionType) else None
         if _is_config_module(own.__module__ if own else kind.__module__, home):
             return True
-        # A cache or a library decorator around a config helper, or around an accessor itself
-        # (staticmethod(state_get)): judge the function it wraps.
+        # A cache or a library decorator around a config helper, or a functools.wraps wrapper
+        # around an accessor itself: judge the function it wraps.
         inner = _function_of(value)
         return inner is not None and (
             id(inner) in accessors or _is_config_module(inner.__module__, home)
@@ -6300,11 +6304,12 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
             items = cast("Iterable[object]", obj)
             if kind is dict:
                 table = cast("dict[object, object]", obj)
-                items = [*table.keys(), *table.values()]
+                items = itertools.chain(table.keys(), table.values())
             edges += [item for item in items if followed(item)]
         elif issubclass(kind, (staticmethod, classmethod)):
             inner = cast("staticmethod[..., object]", obj).__func__
-            edges += [inner] if followed(inner) else []
+            if followed(inner):
+                edges.append(inner)
         elif issubclass(kind, functools.partial):
             part = cast("functools.partial[object]", obj)
             edges += [value for value in (*part.args, *part.keywords.values()) if followed(value)]
@@ -6319,9 +6324,10 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
                 holder = func.__globals__.get(holder_name)
                 if holder is not None and not issubclass(type(holder), ModuleType):
                     value = attribute(holder, name)
-                    edges += [value] if followed(value) else []
+                    if followed(value):
+                        edges.append(value)
         elif callable(obj) and not issubclass(kind, type):
-            edges += self_reads(inspect.getattr_static(kind, "__call__", None), obj)
+            edges += self_reads(attribute(kind, "__call__"), obj)
         return edges
 
     found: set[str] = set()
@@ -10239,7 +10245,7 @@ def _with_link_targets(
     (:func:`_member_link_chain`): what :func:`_link_chain` names is listed too, the real folder
     holding each link the walk follows, the folder holding the config directory's own link
     included, each link itself on Windows, and the object it reaches. A walk that cannot run, that
-    reaches nothing, or that reaches another object than the resolve, is refused the same way.
+    reaches nothing, or that reaches another object than an open of the link, is refused the same way.
 
     **Not vetted**, at least: the folders above each target's folder and above each folder
     holding a link, as the folders above the config directory are not. A path already listed is
@@ -10258,7 +10264,7 @@ def _with_link_targets(
         out.append(target)
         if not target.is_dir():
             out.append(target.parent)
-        chain = _member_link_chain(path, target)
+        chain = _member_link_chain(path)
         if isinstance(chain, str):
             if refuse is None:
                 raise OSError(errno.EINVAL, chain, str(path))
@@ -10268,10 +10274,11 @@ def _with_link_targets(
     return list(dict.fromkeys(out))
 
 
-def _member_link_chain(path: Path, target: Path) -> list[Path] | str:
-    """What :func:`_link_chain` names for the trust-list link at ``path``, which resolves to
-    ``target``, or the reason as text where the walk cannot vouch for it: the walk could not run,
-    or reached nothing, or reached another object than ``target`` (vault BACKLOG #2596 step 4).
+def _member_link_chain(path: Path) -> list[Path] | str:
+    """What :func:`_link_chain` names for the trust-list link at ``path``, or the reason as text
+    where the walk cannot vouch for it: the walk could not run, or reached nothing, or reached
+    another object than an open of ``path`` does (``os.path.samefile``, as
+    :func:`_file_and_folder` checks it; vault BACKLOG #2596 step 4).
 
     The walk names the real folder holding each link it follows, each link itself on Windows, and
     the object it reaches, so a link in between, the folder holding it outside the config
@@ -10279,17 +10286,13 @@ def _member_link_chain(path: Path, target: Path) -> list[Path] | str:
     ``serve`` start check vets its own files (:func:`_file_and_folder`)."""
     try:
         chain, end = _link_chain(path)
+        same = end is not None and os.path.samefile(path, end)
     except (OSError, ValueError) as exc:  # ValueError: a link target holding a NUL
-        reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else None
-        return f"its link chain could not be walked ({reason or type(exc).__name__})"
+        return f"its link chain could not be walked ({getattr(exc, 'strerror', None) or type(exc).__name__})"
     if end is None:
         return "the walk of its link chain reaches nothing where the link resolves to an object"
-    try:
-        same = os.path.samefile(end, target)
-    except (OSError, ValueError) as exc:
-        return f"its link chain could not be walked ({type(exc).__name__})"
     if not same:
-        return "the walk of its link chain reaches another object than the link resolves to"
+        return "the walk of its link chain reaches another object than the open of the link"
     return chain
 
 
@@ -11012,11 +11015,12 @@ _WIN_WRITE_MASK = (
     | 0x40000000  # GENERIC_WRITE
 )
 
-# On a FOLDER, FILE_DELETE_CHILD (0x40) lets its holder delete any file in it whatever that file's
-# own access list says, so a holder on the config directory can drop a module from the graph the
-# engine runs (BACKLOG #5622, #8251 item 13). The bit means nothing on a file, so it is added for a
-# folder only, and ``_WIN_WRITE_MASK`` stays equal to ``anchor_path.WIN_FILE_MASK``.
-_WIN_DIRECTORY_WRITE_MASK = _WIN_WRITE_MASK | 0x00000040  # FILE_DELETE_CHILD
+# What the config-source check refuses: the write class above, plus FILE_DELETE_CHILD (0x40). On a
+# folder that bit lets its holder delete any file in it whatever that file's own access list says,
+# so a holder on the config directory can drop a module from the graph the engine runs (BACKLOG
+# #5622, #8251 item 13). On a file it means nothing, so it is checked on every path, with no stat to
+# tell the two apart; ``_WIN_WRITE_MASK`` stays equal to ``anchor_path.WIN_FILE_MASK``.
+_WIN_CONFIG_WRITE_MASK = _WIN_WRITE_MASK | 0x00000040  # FILE_DELETE_CHILD
 
 # Broad/low-privilege well-known SIDs that must never hold a write-class right on executed config.
 _WIN_REJECTED_SIDS = frozenset(
@@ -11151,8 +11155,6 @@ def _evaluate_config_dacl(
     aces: Sequence[tuple[int, int, str]],
     self_sid: str | None,
     owner_in_admins: Callable[[str], bool | None],
-    *,
-    directory: bool = False,
 ) -> str | None:
     """Pure DACL + owner policy: return a refusal reason, or ``None`` if the source is trusted.
 
@@ -11165,8 +11167,8 @@ def _evaluate_config_dacl(
     (Everyone/Authenticated Users/Users/…) holds such a right. Any other granting entry type
     (compound, object, callback) carrying a write-class right refuses too, because its trustee or
     condition cannot be judged here. A LocalService or NetworkService process user is not
-    self-trusted: other services share that SID (BACKLOG #5622). For a ``directory`` the write
-    class also holds FILE_DELETE_CHILD (:data:`_WIN_DIRECTORY_WRITE_MASK`).
+    self-trusted: other services share that SID (BACKLOG #5622). The write class also holds
+    FILE_DELETE_CHILD (:data:`_WIN_CONFIG_WRITE_MASK`).
 
     The **owner** is then vetted in its own right (CONFIG-2), mirroring the POSIX arm's refusal of a
     foreign uid: an owner holds WRITE_DAC implicitly, so a low-privilege owner can rewrite the code
@@ -11197,12 +11199,11 @@ def _evaluate_config_dacl(
     trusted.add(owner_sid)
     if engine_sid is not None:
         trusted.add(engine_sid)
-    write_mask = _WIN_DIRECTORY_WRITE_MASK if directory else _WIN_WRITE_MASK
     unsure: str | None = None  # the first entry that cannot be judged, reported if none is worse
     for ace_type, access_mask, trustee_sid in aces:
         if ace_type not in _WIN_GRANTING_ACE_TYPES:
             continue  # DENY ACEs never grant a right
-        if not access_mask & write_mask:
+        if not access_mask & _WIN_CONFIG_WRITE_MASK:
             continue  # read/execute-only ACE (e.g. Users:RX on a repo checkout) is fine
         if ace_type != _WIN_ACCESS_ALLOWED_ACE_TYPE:
             unsure = unsure or (
@@ -11408,14 +11409,8 @@ def _enforce_windows_paths(
                 f"cannot be shown safe to execute; see docs/SERVICE.md for required permissions"
             )
             continue
-        # Anything but a regular file, one that can no longer be stat'ed included, is judged by the
-        # stricter folder mask, so the doubt fails closed.
         reason = _evaluate_config_dacl(
-            sec.owner_sid,
-            sec.aces,
-            probes.self_sid,
-            probes.owner_in_admins,
-            directory=not os.path.isfile(path),
+            sec.owner_sid, sec.aces, probes.self_sid, probes.owner_in_admins
         )
         if reason is not None:
             refuse(
