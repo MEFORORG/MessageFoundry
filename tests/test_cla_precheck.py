@@ -730,6 +730,7 @@ def test_a_committer_error_under_an_unlinked_author_warns_and_passes(
     out = capsys.readouterr().out
     assert "refused::" not in out, out
     assert "error inside its committer" in out and "not refused" in out
+    assert "key is missing" not in out, out  # no rule reads a key past page one
 
 
 def test_a_committer_error_does_not_shield_the_proven_refusal_beside_it(
@@ -856,9 +857,10 @@ def test_a_committer_error_under_an_unlinked_page_one_author_is_a_fault_not_a_re
     rest: tuple[str, ...], author: object
 ) -> None:
     """W7-R11 on page one: the unlinked author is unproven, so it is a fault, not a refusal, and the
-    commit keys nothing among the first page's keys (the action would key it under the committer's
-    account, which the error hid). A linked page-two author whose login is the author's git name
-    is therefore still judged under rule 2 and refused, not taken as keyed on page one."""
+    commit keys nothing among the first page's keys (the action would key an unlinked author's
+    commit under the committer, which the error hid; a null author has no key, so its fault names
+    none missing). A linked page-two author whose login is the author's git name is therefore
+    still judged under rule 2 and refused, not taken as keyed on page one."""
     unlinked = {"oid": f"{1:040x}", "author": author, "committer": _OCTO}
     page = {
         **_page([_committer_errored(unlinked, *rest)], 2, True),
@@ -871,7 +873,9 @@ def test_a_committer_error_under_an_unlinked_page_one_author_is_a_fault_not_a_re
     assert len(verdict.refusals) == 1 and f"{2:040x}" in verdict.refusals[0], verdict
     assert verdict.fault is not None
     assert "error inside its committer" in verdict.fault and "not refused" in verdict.fault
-    assert "its key is missing from the first page's keys" in verdict.fault
+    assert ("its key is missing from the first page's keys" in verdict.fault) is (
+        author is not None
+    )
 
 
 @pytest.mark.parametrize("node", [None, {"commit": None}, {}])

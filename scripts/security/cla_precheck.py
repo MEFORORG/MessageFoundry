@@ -61,14 +61,17 @@ TWO CASES BACKLOG #5645 item 1 names:
     author there is judged under rule 2 past the first page, since a non-null account is no
     nulled field. An author there that reads as unlinked or null is NOT refused under rule 1 but
     is a fault that warns and passes (owner ruling W7-R11, 2026-11-26: "warn when unproven,
-    refuse only when proven"): the same failure may have nulled it with only the committer's
-    path reported, and this read cannot rule that out. THAT IS A FAIL-OPEN HOLE IN RULE 1: an
-    unlinked author whose git name is allowlisted, or whose committer is a signed account, passes
-    this script on a read that carries such an error, and the vendored action, if its own read is
-    clean, drops or misfiles that commit as rule 1 exists to stop. It is bounded by the action's
-    own read: the bundle's GraphQL client throws ``GraphqlError`` on a reply carrying any
-    ``errors`` (read in ``dist/index.js``, not run), so only an error the action's own read does
-    not also hit gets through. On the first page, such a commit is left out of the first page's
+    refuse only when proven"; vault branch ``w7-owner-rulings-20261126``, file
+    ``docs/security/ASVS-OWNER-RULINGS-2026-11-26-W7.md``): the same failure may have nulled it
+    with only the committer's path reported, and this read cannot rule that out. THAT IS A
+    FAIL-OPEN HOLE IN RULE 1. At least these unlinked authors pass this script on a read that
+    carries such an error and can then pass the vendored action unsigned, if its own read is
+    clean: one whose committer is a signed or allowlisted account, or ``github-actions[bot]``,
+    which the action drops; and one whose git name is allowlisted, under an unlinked committer.
+    Each try is bounded by the action's own read: the bundle's GraphQL client throws
+    ``GraphqlError`` on a reply carrying any ``errors`` (read in ``dist/index.js``, not run), so
+    only an error the action's read does not also hit gets through. That is a chance per run,
+    not a cap: a push or a recheck comment runs both reads again. On the first page, such a commit is left out of the first page's
     keys, with a fault, whether its author is linked or not, as before that item. On any page, a
     commit with a committer-only error that came back with no commit object, or with no readable
     ``oid``, contradicts the premise and is unjudged whole. The other commits on the page are
@@ -263,8 +266,9 @@ class PullRequestRead:
     tainted: frozenset[int] = frozenset()
     #: Indexes, none in ``tainted``, whose errors all point inside the commit's ``committer`` and
     #: whose commit came back with a readable 40-hex ``oid``; ``evaluate`` relies on that oid.
-    #: Their committer is not read. A linked author is judged; an unlinked or null one is a fault,
-    #: not a rule 1 refusal (owner ruling W7-R11).
+    #: Their committer is not read. A linked author is judged under rule 2 past the first page and
+    #: left unkeyed on it; an unlinked or null one is a fault, not a rule 1 refusal (owner ruling
+    #: W7-R11).
     committer_tainted: frozenset[int] = frozenset()
 
 
@@ -617,10 +621,11 @@ def evaluate(
             if index in read.committer_tainted:
                 # Unproven, so a fault that warns and passes (owner ruling W7-R11; module
                 # docstring, partial-error case). It keys nothing: on page one the action would
-                # key it under the committer's account, which the error hid.
+                # key an unlinked author's commit under its committer, which the error hid. A
+                # null author has no key anywhere (below), so none is missing.
                 key = (
                     "; its key is missing from the first page's keys"
-                    if index < read.first_page
+                    if index < read.first_page and commit["author"] is not None
                     else ""
                 )
                 faults.append(
