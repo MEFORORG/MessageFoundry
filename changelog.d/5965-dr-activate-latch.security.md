@@ -4,6 +4,7 @@
   `POST /dr/activate` runs. The key is now refused at load as a removed key, `true` or `false`,
   from the file, the environment (`MEFOR_DR_ACTIVATE`) or code, and its refusal names
   `POST /dr/activate` as the route. The engine and the DR coordinator no longer read any setting
-  to start active. A box with `[dr].enabled` and no `activate` key behaves as before. An
-  activated box that restarts now comes back passive until `POST /dr/activate` runs again.
+  to start active, so under `serve` a DR box always starts passive. A box with `[dr].enabled` and
+  no `activate` key behaves as before. A box that used `activate = true` to come back active after
+  a restart now comes back passive until `POST /dr/activate` runs again.
   (`BACKLOG #5965`)

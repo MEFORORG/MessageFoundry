@@ -70,16 +70,15 @@ operator sequencing, not the delay.
 lease and the graph never drains. An all-non-promotable cluster is a documented misconfiguration (not
 guarded in code — a node cannot see its siblings' flags at config load).
 
-**Rider — `[dr].activate` + `[cluster]` guard.** A cross-section `ServiceSettings` validator **refuses**
+**Rider — `[dr].activate` + `[cluster]` guard.** A cross-section `ServiceSettings` validator **refused**
 `[dr].activate = true` (a key since removed) combined with `[cluster].enabled = true`. The DR
-run-profile gates *connections*,
-not *lease acquisition*; a DR box that also contends for the cluster lease could win leadership and drive
-the primary store cross-WAN. The intended warm-DR posture is a **non-promotable cluster member**
-(`[cluster].enabled = true, promotable = false`), not a lease-contending `[dr]` box. A
-provisioned-but-passive DR box (`enabled = true, activate = false`, a key since removed) may still
-coexist with cluster
-membership. *(That last sentence is superseded: `[dr].enabled` with `[cluster].enabled` is refused
-at load whatever `activate` says. The #3263 amendment of
+run-profile gates *connections*, not *lease acquisition*; a DR box that also contends for the cluster
+lease could win leadership and drive the primary store cross-WAN. The intended warm-DR posture is a
+**non-promotable cluster member** (`[cluster].enabled = true, promotable = false`), not a
+lease-contending `[dr]` box. A provisioned-but-passive DR box
+(`enabled = true, activate = false`; `activate` is a key since removed) may still coexist with
+cluster membership. *(That last sentence is superseded: `[dr].enabled` with `[cluster].enabled` is
+refused at load whatever `activate` says. The #3263 amendment of
 [ADR 0048](0048-third-tier-disaster-recovery-standby.md) says why.)* *(Amended 2026-11-25, BACKLOG
 #5965: `[dr].activate` itself is now a removed key, refused at load whatever its value, so this
 rider is enforced through `[dr].enabled` alone. The #5965 amendment of ADR 0048 says why.)*

@@ -892,7 +892,7 @@ for a clean drain. Always **drain → stop → back up → change → restart
 | **Stuck FIFO lane** (a head retrying toward the cap) | `queue_buildup` alert → inspect `/messages` for the head → fix-and-`replay`, or `dead_letter_now` to unblock the lane (the dead row stays replayable). |
 | **Poison message** | It dead-letters under `CONTINUE` (or stops the lane under `STOP`) → triage via `/dead-letters` → fix the transform → replay. |
 | **Full disk / `storage_threshold`** | Free space / tighten `[retention]` / VACUUM → confirm `/status` disk-free recovers. |
-| **Crash / unexpected restart** | Startup auto-recovers in-flight rows → verify `/health`, the "wiring started" banner, and that backlog drains. |
+| **Crash / unexpected restart** | Startup auto-recovers in-flight rows → verify `/health`, the "wiring started" banner, and that backlog drains. A `[dr]` box that was activated comes back passive and drains nothing until `POST /dr/activate` runs again (BACKLOG #5965). |
 | **Planned maintenance** | Drain-and-stop (graceful), perform the change, restart, verify. |
 
 ---

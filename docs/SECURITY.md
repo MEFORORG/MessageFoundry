@@ -4228,10 +4228,9 @@ The complete set, as enumerated in the [route map](#route--permission-map-engine
 - **Disaster recovery** -- `POST /dr/activate` and `POST /dr/release` (vault BACKLOG #2581). A promotion
   runs the operator's takeover hook and binds the priority listeners; a release runs the release
   hook and unbinds every inbound. Each asks for the same fresh proof as the planned failover above.
-  A DR box always starts passive, and no setting promotes it at start: the former `[dr].activate`
-  startup latch, which skipped the seed verification, the takeover hook (when one is set) and the
-  `dr.activate` audit row, is refused at load as a removed key (BACKLOG #5965). So this route is
-  the only promotion, and a restart of an activated box needs it again.
+  Under `serve` a DR box starts passive and no setting promotes it: `[dr].activate` is a removed
+  key (BACKLOG #5965; the `[dr]` `activate` row of [CONFIGURATION.md](CONFIGURATION.md) says why).
+  So this route is the only promotion, and a restart of an activated box needs it again.
 - **Dual control** -- `POST /approvals/{id}/resolve` (BACKLOG #1562). Approve and reject are not
   step-up gated; this one is, because it closes an approval record on the resolver's word alone.
   So is `POST /approvals/{id}/interrupt`, the step before a resolve for a release stranded in
