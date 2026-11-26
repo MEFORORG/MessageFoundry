@@ -937,7 +937,8 @@ def _advance_watched[S: (_BreakerStanding, _ReferralStanding)](
 # dropped the account's own oldest LIVE count, so round-robin guesses over more sessions than the
 # cap each got a fresh budget.
 _REPROOF_SESSION_MAX = 4096
-# How many refused session reads in a row end a session reaper pass's re-proof count drop
+# How many refused session reads, with no successful read between them, end a session reaper pass's
+# re-proof count drop
 # (:meth:`AuthService.drop_reaped_reproof_counts`), so a store outage costs that many timed-out reads
 # a pass, not one per account (BACKLOG #5336).
 _REAPED_DROP_REFUSALS = 3
@@ -13213,7 +13214,8 @@ class AuthService:
             # here would lose the token the sign-in minted. The set is the read's, wider than
             # _session_write_errors by at least the ValueError aiosqlite raises for a closed
             # connection; a defect still raises. The counts it leaves stay until a later drop
-            # takes them, at least one named on _REPROOF_SESSION_MAX, the session reaper's among them.
+            # takes them, at least one named on _REPROOF_SESSION_MAX, the session reaper's among
+            # them.
             # Read before the lock, so a sign-in on an account holding no count never waits
             # behind a re-proof's verify; _drop_unlisted_reproof_counts reads it again under it.
             try:
@@ -16183,21 +16185,22 @@ class AuthService:
 
     async def drop_reaped_reproof_counts(self) -> None:
         """After the session reaper's purge, drop the re-proof counts of the sessions the store
-        shows as revoked or holds no row for (BACKLOG #5336), at least those the purge took. The
-        purge ends rows without naming them by hash, so without this their counts would stay until
-        the age prune, and many accounts' dead counts could fill the whole map, where the drop at an
-        account's own cap never reaches. Each account holding a count is read under its re-proof
-        lock, as :meth:`_drop_unlisted_reproof_counts` requires.
+        shows as revoked or holds no row for (BACKLOG #5336), for the accounts this pass reaches,
+        which can leave some the purge took. The purge ends rows without naming them by hash, so
+        without this their counts would stay until the age prune, and many accounts' dead counts
+        could fill the whole map, where the drop at an account's own cap never reaches. Each
+        account holding a count is read under its re-proof lock, as
+        :meth:`_drop_unlisted_reproof_counts` requires.
 
-        The drop is housekeeping, and it fails closed: a count it does not reach stays. The
-        accounts are walked from a starting point that moves on by one each pass, so an account
-        whose read keeps failing does not hold back the same accounts every pass. A refused read is logged and the
-        next account is read, until :data:`_REAPED_DROP_REFUSALS` refusals in a row end the pass,
-        so an outage costs that many timed-out reads a pass, not one per account. A defect, an
-        error the store helpers re-raise rather than read as a refusal, is logged for that account
-        and the next is still read; the first is raised when the pass ends, with any later ones
-        named in its notes. An error outside the store's refusal set raises at once and ends the
-        pass. The reaper bounds how long the whole drop may take."""
+        The drop is housekeeping, and it fails closed: a count it does not reach stays. The walk
+        starts one account further on each pass. A pass cut short can therefore miss the same
+        accounts for many passes running, so this bounds no count's stay. A refused read is
+        logged and the next account is read, until :data:`_REAPED_DROP_REFUSALS` refusals with no
+        successful read between them end the pass. A defect, an error the store helpers re-raise
+        rather than read as a refusal, is logged for that account and the next is still read; the
+        first is raised if the pass ends normally, with any later ones named in its notes. An error
+        outside the store's refusal set raises at once and ends the pass, and so does the reaper's
+        bound on the whole drop; a defect held then is not raised."""
         holders = list(dict.fromkeys(uid for _, _, uid in self._reproof_session_failures.values()))
         if holders:
             start = self._reaped_drop_start % len(holders)
@@ -16229,8 +16232,8 @@ class AuthService:
                 )
                 if refused >= _REAPED_DROP_REFUSALS:
                     _log.warning(
-                        "the session reaper's re-proof count drop met %d refused reads in a row; "
-                        "this pass drops no more",
+                        "the session reaper's re-proof count drop met %d refused reads with no "
+                        "successful read between them; this pass drops no more",
                         refused,
                     )
                     break
