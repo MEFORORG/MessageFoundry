@@ -1149,16 +1149,21 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
         "before the code, through `rotation_comes_first`, whether a must-change session must "
         "change its password first" in text
     ), "the doc no longer states POST /ui/mfa's must-change redirect ahead of the code."
-    # Vault BACKLOG #2964 items 19, 26 and 28. These pin the prose only. The code facts behind
-    # them are pinned elsewhere, at least: the JSON route's empty pre-code list and verify_mfa's
-    # no-mfa_verified_at check above (item 19); test_ui_mfa_gate.py's
-    # test_a_satisfied_session_is_bounced_off_the_page (item 26); and test_webauthn.py's
+    # Vault BACKLOG #2964 items 19, 26 and 28. These pin the prose only. Some of the code facts
+    # behind them are pinned elsewhere: test_ui_mfa_gate.py's
+    # test_a_satisfied_session_is_bounced_off_the_page (item 26), and test_webauthn.py's
     # test_a_factor_met_during_the_assertion_is_not_re_anchored (item 28).
     for stated in (
         "`POST /auth/mfa-verify` has no such must-change ask",
-        "`GET /ui/mfa` renders its code form only to a session that has not met its factor",
+        "unless the temporary credential has lapsed, which ends the session instead",
+        "submits a code to `verify_mfa`, through at least `POST /auth/mfa-verify` or `POST /ui/mfa`",
+        "`GET /ui/mfa` renders its code form only to a session that owes a second factor it has "
+        "not met",
+        "or with a user-verified passkey that completes a pending factor, passes the window check",
         "a user-verified passkey that completes the pending factor, or a step-up",
         "a user-verified passkey that completes a pending factor, which does too",
+        "or a user-verified passkey that completes a pending factor, has already stamped a window",
+        "or a user-verified passkey that completes a pending factor, has already stamped one",
     ):
         assert stated in text, f"the doc no longer states: {stated}"
 
@@ -1202,14 +1207,22 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
         # Found by the sweep: POST /ui/mfa counted among the routes that charge nothing.
         "the remaining three charge nothing",
         "limiter 3 on the assertion **finish** leg only",
+    ):
+        assert retired not in text, (
+            f"docs/SECURITY.md says {retired!r} again; the code contradicts it (BACKLOG #1133)."
+        )
+    for retired in (
         # Vault BACKLOG #2964 items 19, 26 and 28, in forms longer than their CORRECTED quotes.
         "until its holder submits a code to the MFA gate, which",
         "outside that must-change case, an account holding a TOTP",
         "a user-verified passkey, or a step-up",
         "a user-verified passkey, which does too",
+        "with a code or a user-verified passkey passes the window check",
+        "or recovery code or a user-verified passkey proved at the MFA gate",
+        "or a user-verified passkey, proved at the MFA gate",
     ):
         assert retired not in text, (
-            f"docs/SECURITY.md says {retired!r} again; the code contradicts it (BACKLOG #1133)."
+            f"docs/SECURITY.md says {retired!r} again; vault BACKLOG #2964 retired that wording."
         )
 
     oidc_row = next(
