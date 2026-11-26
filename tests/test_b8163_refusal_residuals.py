@@ -6,6 +6,11 @@ Item 2: the AD probe named any ``InsecureHopRefused`` whose traceback passed
 ``_refuse_ad_revocation`` as the LDAPS guard's refusal, so one the TLS context factory raised read
 as the guard's, with the guard's remedy. Only the guard's own call counts now.
 
+Items 5 and 6, the probe's ``_why``: it read an error's text by calling ``str()``, which runs the
+error's own code. Item 11: a key-seam hop refusal was none of the CLI's key-unresolved classes, so
+``restore`` and ``restore-verify`` exited 1. Item 21: the store key in ``StoreSettings``' repr and
+in the cipher build's frame locals.
+
 All material is synthetic. No PHI.
 """
 
