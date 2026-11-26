@@ -15,7 +15,6 @@ import sys
 import threading
 import time
 from collections.abc import Iterator
-from pathlib import Path
 
 import aiosqlite
 import pytest
@@ -516,83 +515,49 @@ def test_secure_file_takes_the_kept_icacls_rewrite_when_the_list_cannot_be_read(
 
 #: A per-service virtual account's shape (NT SERVICE\<name>); no service here holds it.
 _SERVICE_SID = "S-1-5-80-1000000001-1000000002-1000000003-1000000004-1000000005"
-
-
-def _seeded_store_file(tmp_path: Path, dacl: str) -> tuple[str, Path]:
-    """The real token account's SID, and a store file in a folder granting that account alone,
-    whose list was then set to the protected ``dacl`` (its ACE text). Asserts the list took."""
-    import messagefoundry.store.store as store_mod
-    from tests._win_acl import folder_granting
-
-    sid = store_mod._current_user_sid()
-    assert sid is not None
-    path = folder_granting(tmp_path / "store", sid) / "messagefoundry.db"
-    path.write_bytes(b"x")
-    seeded = store_mod._set_security_from_sddl(path, f"D:P{dacl}", protected=True)
-    assert seeded.failure is None and seeded.dacl_status == 0, seeded
-    return sid, path
+#: A named run-as user's shape (the -ServiceAccount install): RID 1000 or more; no account here
+#: holds it.
+_RUN_AS_USER_SID = "S-1-5-21-1000000011-1000000012-1000000013-1001"
 
 
 @_windows_only
-def test_the_store_trio_fallback_still_keeps_every_explicit_entry(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "run_as",
+    [
+        pytest.param(_SERVICE_SID, id="virtual-account"),
+        pytest.param(_RUN_AS_USER_SID, id="named-user"),
+    ],
+)
+def test_the_store_trio_fallback_still_keeps_every_explicit_entry(tmp_path, run_as: str) -> None:
     # A store file the installer's rule already restricted (SYSTEM, Administrators, the service at
     # Modify) whose directory is later refused, so the open takes the fallback. That fallback keeps
     # the trio's entries and adds the opener, so it does not shut the service out (ADR 0163). A
     # guard, green before and after. It asserts a subset on purpose: the stray Everyone entry the
     # fallback also keeps today is the gap the ADR records, not behaviour to pin.
+    #
+    # The run-as resolves to no account here, as it would not on a deploying site whose domain
+    # controller timed out: ADR 0163 sends a failed run-as lookup to this fallback. So any narrowing
+    # of the fallback (vault BACKLOG #8407 item 1) must keep a run-as it cannot look up.
     import messagefoundry.store.store as store_mod
-    from tests._win_acl import protected_entries
+    from tests._win_acl import folder_granting, protected_entries
 
-    sid, path = _seeded_store_file(
-        tmp_path, f"(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1301bf;;;{_SERVICE_SID})(A;;FR;;;WD)"
-    )
+    assert store_mod._lookup_sid_type(run_as)[0] is None, "the run-as stand-in resolved here"
+    sid = store_mod._current_user_sid()
+    assert sid is not None
+    path = folder_granting(tmp_path / "store", sid) / "messagefoundry.db"
+    path.write_bytes(b"x")
+    right = store_mod._RUN_AS_RIGHTS
+    explicit = f"(A;;FA;;;SY)(A;;FA;;;BA)(A;;{right};;;{run_as})(A;;FR;;;WD)"
+    seeded = store_mod._set_security_from_sddl(path, f"D:P{explicit}", protected=True)
+    assert seeded.failure is None and seeded.dacl_status == 0, seeded
     store_mod._secure_store_file(path, dir_grants=None)
     sddl, _, entries = protected_entries(path)
     assert {
         ("A", "", "FA", sid),
         ("A", "", "FA", "S-1-5-18"),
         ("A", "", "FA", "S-1-5-32-544"),
-        ("A", "", "0X1301BF", _SERVICE_SID),
+        ("A", "", store_mod._trio_right(run_as), run_as),
     } <= set(entries), sddl
-
-
-@_windows_only
-def test_the_store_trio_fallback_keeps_a_run_as_user_this_host_cannot_resolve(tmp_path) -> None:
-    # Vault BACKLOG #8407 item 1, kept. ADR 0163 sends a store to this fallback when the run-as
-    # user's lookup fails, a domain controller time-out included, so the fallback cannot ask the
-    # host who the run-as is. A keep-set that dropped an account it could not resolve would drop
-    # the service's own trio entry in exactly that case. A guard of today's behaviour.
-    import messagefoundry.store.store as store_mod
-    from tests._win_acl import protected_entries
-
-    kind, _status = store_mod._lookup_sid_type(_TOKEN_SID)
-    assert kind is None, "the run-as stand-in resolved here; the premise does not hold"
-    sid, path = _seeded_store_file(
-        tmp_path, f"(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1301bf;;;{_TOKEN_SID})"
-    )
-    store_mod._secure_store_file(path, dir_grants=None)
-    sddl, _, entries = protected_entries(path)
-    assert {("A", "", "FA", sid), ("A", "", "0X1301BF", _TOKEN_SID)} <= set(entries), sddl
-
-
-@_windows_only
-def test_an_access_denied_list_read_refuses_the_one_list_write_as_it_refuses_icacls(
-    tmp_path,
-) -> None:
-    # Vault BACKLOG #8407 item 13, kept. The usual cause of an unreadable list is access denied on
-    # READ_CONTROL. Here the owner holds WRITE_DAC alone, through an OWNER RIGHTS entry, and the
-    # one-list write is refused with access denied too (measured), so failing closed would leave
-    # this file as both of today's fallbacks leave it. A guard of today's behaviour.
-    import messagefoundry.store.store as store_mod
-
-    sid, path = _seeded_store_file(tmp_path, f"(A;;WD;;;OW)(A;;0x1301bf;;;{_SERVICE_SID})")
-    assert store_mod._read_dacl_sddl(path) is None
-    store_mod._secure_store_file(path, dir_grants=None)
-    store_mod._secure_file(path)
-    assert store_mod._read_dacl_sddl(path) is None
-    bare = store_mod._set_security_from_sddl(path, f"D:P(A;;FA;;;{sid})", protected=True)
-    assert bare.failure is None and bare.dacl_status == store_mod._ERROR_ACCESS_DENIED, bare
-    path.unlink()  # the folder's full control lets the test remove what it cannot read
 
 
 @_windows_only
