@@ -1238,8 +1238,10 @@ def _posix_host_link_problem(path: Path) -> str | None:
     have mount tables this does not read, no type is judged. Where the table is read, at least these
     are not judged either: a part of the path no mount the table lists covers passes, as a table
     read inside a chroot whose root is not a mount can leave; and since the table is read once,
-    before the walk, a mount the walk itself brings up, such as an autofs one, is judged by the
-    entry the table held before it came up. POSIX only."""
+    before the walk, a mount the walk itself brings up, such as an NFS one autofs brings up, is
+    judged by the entry the table held before it came up, so it passes when that entry's type,
+    such as ``autofs``, is not one :func:`_posix_delegated_file_system` names. The full list of
+    what the mount check does not judge is in ``docs/PHI.md``. POSIX only."""
     if sys.platform == "win32":  # pragma: no cover - guard for the type checker on Windows
         raise OSError("a POSIX path is walked on POSIX only")
 
@@ -1269,10 +1271,10 @@ def _posix_host_link_problem(path: Path) -> str | None:
     if mounts is None and sys.platform.startswith("linux"):
         return (
             "/proc/self/mountinfo could not be read, so the file system under its path was "
-            "not judged; this clears once the engine can read /proc/self/mountinfo, for example "
-            "with procfs mounted where it runs, or with its AppArmor or SELinux policy allowing "
-            "the read, and changing the owner or mode of what is refused or of the folders above "
-            "it, or replacing it, does not clear it"
+            "not judged. This refusal clears once the engine can read /proc/self/mountinfo, for "
+            "example with procfs mounted where the engine runs, or with an AppArmor or SELinux "
+            "policy that allows the read. Changing the owner or mode of what is refused or of the "
+            "folders above it, or replacing what is refused, does not clear this refusal"
         )
 
     def fstype_fn(part: str) -> tuple[str, str] | None:
@@ -1422,8 +1424,9 @@ def broad_access_problem(
     read, the walk below also refuses a path on a mount below ``/`` of at least the types
     :func:`_posix_delegated_file_system` names, since those owner and mode bits do not decide who
     reaches the file there; the list is open, so a type it does not name passes. That walk, and
-    with it the mount check, is skipped under ``holder_judged``. What else it does not judge, and
-    its refusal where the table cannot be read, are :func:`_posix_host_link_problem`'s.
+    with it the mount check, is skipped under ``holder_judged``. Its refusal where the table
+    cannot be read is :func:`_posix_host_link_problem`'s; what it does not judge is listed in
+    ``docs/PHI.md``.
 
     On both, the folders above ``path`` are walked too (vault BACKLOG #5656, #5657). A junction or
     link among them is refused when an account the check does not trust can change it: on

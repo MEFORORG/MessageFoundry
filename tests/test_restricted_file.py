@@ -1142,37 +1142,41 @@ def test_broad_access_problem_refuses_where_the_linux_mount_table_cannot_be_read
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """On Linux an unreadable ``/proc/self/mountinfo`` means no type on the path was judged, so it
-    is refused rather than passed as if it had been. Every caller appends a remedy about owner and
-    mode, which does not clear it, so the refusal names its own remedy, says that the other does
-    not clear it, and gives no chmod or chown of its own."""
+    is refused rather than passed as if it had been. At least the key-file, secrets-directory and
+    custody-directory callers append a remedy about owner and mode, which does not clear it, so
+    the refusal names its own remedy, says that changing owner or mode, or replacing what is
+    refused, does not clear it, and gives no chmod or chown of its own."""
     os.chmod(tmp_path, 0o700)
     key = tmp_path / "k.key"
     key.write_bytes(b"synthetic")
     os.chmod(key, 0o600)
-    monkeypatch.setattr(restricted_file, "read_mounts", lambda: None, raising=False)
+    monkeypatch.setattr(restricted_file, "read_mounts", lambda: None)
     problem = restricted_file.broad_access_problem(key)
     assert problem is not None and "/proc/self/mountinfo could not be read" in problem
-    assert "this clears once the engine can read /proc/self/mountinfo" in problem
-    assert "changing the owner or mode of what is refused" in problem
-    assert problem.endswith("or replacing it, does not clear it")
+    assert "This refusal clears once the engine can read /proc/self/mountinfo" in problem
+    assert "Changing the owner or mode of what is refused" in problem
+    assert problem.endswith("or replacing what is refused, does not clear this refusal")
     assert "chmod" not in problem and "chown" not in problem
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux has a mount table to read")
-def test_a_linux_mount_table_that_covers_no_part_of_the_path_judges_no_type(
+def test_a_known_gap_a_linux_mount_table_covering_no_part_of_the_path_passes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A table that reads but lists no mount covering the path, as one read inside a chroot whose
-    root is not a mount can, judges no type and passes, unlike one that cannot be read: a gap
-    :func:`_posix_host_link_problem` names, pinned at the layer that tells the two apart."""
+    """A KNOWN GAP, not a requirement: a table that reads but lists no mount covering the path, as
+    one read inside a chroot whose root is not a mount can, judges no type and passes, unlike one
+    that cannot be read. Pinned at the layer that tells the two apart so a change is seen; a fix
+    that closes the gap should flip this test. The last step is the control that the patched
+    table is the one read."""
     os.chmod(tmp_path, 0o700)
     key = tmp_path / "k.key"
     key.write_bytes(b"synthetic")
     os.chmod(key, 0o600)
-    monkeypatch.setattr(
-        restricted_file, "read_mounts", lambda: [("/no/such/mount", "nfs")], raising=False
-    )
+    monkeypatch.setattr(restricted_file, "read_mounts", lambda: [("/no/such/mount", "nfs")])
     assert restricted_file.broad_access_problem(key) is None
+    covering = [("/no/such/mount", "nfs"), (os.path.realpath(tmp_path), "nfs")]
+    monkeypatch.setattr(restricted_file, "read_mounts", lambda: covering)
+    assert "on a mount of type nfs," in str(restricted_file.broad_access_problem(key))
 
 
 def test_a_posix_link_another_account_can_change_is_refused() -> None:
