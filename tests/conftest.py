@@ -375,8 +375,11 @@ def _pass_the_anchor_path_check_on_windows() -> Iterator[None]:
     So on win32 only, the name ``trust_anchors`` calls answers ``True``. The check itself is not
     stubbed: ``tests/test_anchor_path.py`` calls ``anchor_path.anchor_path_verdict`` directly, and
     its preflight receipts put the real function back. POSIX ``tmp_path`` is a trusted chain (a sticky
-    ``/tmp`` holding the runner's own directory), so the Linux leg runs the real check in every
-    anchor test. The config-source readers above are scoped to win32 the same way."""
+    ``/tmp`` holding the runner's own directory) on a host whose file systems from ``/`` down are on
+    ``POSIX_TRUSTED_FS``, as on the GitHub-hosted Linux runners, so the Linux leg runs the real check
+    in every anchor test. Where ``/`` is overlay, as in most containers, that check answers
+    indeterminate (vault BACKLOG #8390 item 31), and the anchor tests that run it would fail there.
+    The config-source readers above are scoped to win32 the same way."""
     if sys.platform != "win32":
         yield
         return

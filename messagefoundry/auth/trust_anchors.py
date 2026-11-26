@@ -58,7 +58,9 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
    replace the anchor, so ``enforce`` refuses to load it. A configured SHA-256 pin that matches the
    bytes read lets it load anyway, with a warning and the audit row: since item 5 those bytes are the
    bytes the context loads, so the pin already defeats a substitution. ``warn`` warns and loads.
-   The refusal names both fixes: move the anchor, or set the pin.
+   The refusal names both fixes: move the anchor, or set the pin. Under a mount the check cannot
+   vouch for, it names no move, and offers the pin only where the path is not also replaceable and
+   the anchor's consumer loads the verified bytes.
 7. **The per-connection inbound CAs** (BACKLOG #1142, slice 3). Every inbound connection whose server
    context requires a peer certificate (``tls`` and ``tls_ca_file`` set: MLLP, the HTTP listener and
    the DICOM SCP) gets the same checks. The connector loads its CA through
@@ -346,6 +348,7 @@ import hashlib
 import json
 import logging
 import os
+import posixpath
 import re
 import shlex
 import ssl
@@ -1658,7 +1661,74 @@ def _ps_quote(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
-def _path_fix(verdict: AnchorVerdict) -> list[str]:
+#: The folder a POSIX fix suggests moving an anchor into.
+_POSIX_FOLDER = "/etc/messagefoundry/"
+_OVERLAY_NOTE = (
+    "the overlay note under 'Residuals / gotchas' in docker/README.md, in the MessageFoundry source"
+)
+
+
+def _untrusted_mount(verdict: AnchorVerdict) -> ChainFinding | None:
+    """The finding that a mount's type is one the check cannot vouch for, or could not be read.
+    The walk runs from ``/`` down, so the first is the topmost."""
+    return next((f for f in _findings(verdict, insecure=False) if f.mount), None)
+
+
+_NO_PIN = (
+    "A pin does not help here: this anchor is read again by path when it is used, so a pin "
+    "cannot vouch for the bytes loaded"
+)
+
+
+def _pin_verb(spec: AnchorSpec) -> str:
+    return f"set {spec.pin_setting} to" if spec.pin_setting else "pin it to"
+
+
+def _pin_offer(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
+    """The pin to set, with no digest of a file whose path was found replaceable, or that a
+    non-owner can write, since those bytes may be substituted. Never called with a matching pin:
+    :func:`_enforce_verdict` loads such an anchor before it builds a fix, and a replaceable path
+    gets no pin offer."""
+    if verdict.path_ok is False or verdict.acl_ok is False:
+        return (
+            f"{_pin_verb(spec)} the {ANCHOR_DIGESTS[ANCHOR_DIGEST].title} of the CA you mean to "
+            "trust, taken from that CA, since this file could have been replaced."
+        )
+    return (
+        f"{_pin_verb(spec)} the {ANCHOR_DIGESTS[ANCHOR_DIGEST].title} of the CA you mean to trust; "
+        f"this file's is {ANCHOR_DIGEST}:{verdict.fingerprint}. Check it against the CA first. With "
+        "a matching pin the engine loads exactly those bytes, so it may load them without this check."
+    )
+
+
+def _mount_fix(
+    spec: AnchorSpec, verdict: AnchorVerdict, mount: ChainFinding, fixes: list[str]
+) -> list[str]:
+    """The fix under a mount the check cannot vouch for. It says nothing about moving the anchor:
+    each wording that did turned out false for some layout. ``fixes`` is what the path itself
+    needs, for a replaceable path; a pin is offered only where the path is not replaceable."""
+    kind = mount.fstype or "unread mount table"
+    lines = [
+        f"The check cannot vouch for the mount at {mount.path!r} ({kind}), so it cannot settle "
+        "any anchor below that mount.",
+        *fixes,
+    ]
+    if verdict.path_ok is not False and spec.loads_verified_bytes:
+        offer = _pin_offer(spec, verdict)
+        lines.append(offer[0].upper() + offer[1:])
+    elif not spec.loads_verified_bytes and spec.pin:
+        lines.append(f"{_NO_PIN}.")
+    lines.append(
+        "As it stands, at warn the anchor is used with a warning; at enforce it is refused."
+    )
+    if mount.path != "/" and mount.fstype:
+        lines.append(f"An anchor on a mount the check trusts, outside {mount.path!r}, can pass.")
+    if mount.fstype == "overlay":
+        lines.append(f"For an overlay mount, {_OVERLAY_NOTE}, says more.")
+    return lines
+
+
+def _path_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> list[str]:
     """The fix, as commands, for each insecure finding that a command can fix. The message must
     carry its own fix, as the file arm's (:func:`_acl_message`) does: the runbook that message once
     cited ships in neither a checkout nor a wheel.
@@ -1704,15 +1774,32 @@ def _path_fix(verdict: AnchorVerdict) -> list[str]:
     #
     # Always -h: on a link it re-owns the link and not its target, and on anything else it acts
     # the same. The owner the finding names can swap its entry for a link before root runs this.
+    #
+    # Under a mount the check cannot vouch for, a fix in place does not make the anchor pass, so
+    # only the anchor's own file gets its commands, and its own folder the chmod alone: never a
+    # chown of a folder, which may be a user's home folder, nor a command on a folder above them.
+    # Both are the regular file the walk reached, resolved as the kernel resolves the path; a path
+    # that names no regular file has neither.
+    mount = _untrusted_mount(verdict)
+    reached = check.regular_file if check is not None else None
+    own = {reached} if reached else set()
+    own_folders = {posixpath.dirname(reached)} if reached else set()
     cmds: list[str] = []
     for obj in objects:
         q = shlex.quote(obj)
         here = [f for f in bad if f.path == obj]
-        if any(f.owner for f in here):
+        if any(f.owner for f in here) and (mount is None or obj in own):
             cmds.append(f"  chown -h root {q}")
-        if any(f.writable for f in here):
+        if any(f.writable for f in here) and (mount is None or obj in own | own_folders):
             cmds.append(f"  chmod go-w {q}")
-    lead = move + "can change, such as a root-owned 755 folder like /etc/messagefoundry/."
+    if mount is not None:
+        lead = "The path is also replaceable; fix that first"
+        fixes = [lead + ":", *cmds] if cmds else [lead + "."]
+        return _mount_fix(spec, verdict, mount, fixes)
+    lead = (
+        move + f"can change, such as a root-owned 755 folder like {_POSIX_FOLDER} on a file system "
+        "the check trusts."
+    )
     return [lead + " Or, to fix it in place:", *cmds] if cmds else [lead]
 
 
@@ -1728,7 +1815,7 @@ def _path_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
             f"The check trusted the account it ran as ({check.engine}) as the engine's own. Run "
             "it as the account the service runs as, or it can answer differently."
         )
-    return "\n".join(lines + _path_fix(verdict))
+    return "\n".join(lines + _path_fix(spec, verdict))
 
 
 def _indeterminate_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
@@ -1748,29 +1835,34 @@ def _indeterminate_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
 
 
 def _indeterminate_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
-    """The two ways out of an indeterminate read: a folder the engine can read, or a pin. The pin is
+    """The two ways out of an indeterminate read: a folder the engine can read, or a pin. Under a
+    mount :func:`_untrusted_mount` finds, :func:`_mount_fix` says what is left instead. The pin is
     offered with this file's own digest, and with the warning that goes with it: pinning bytes the
-    engine could not vouch for is only as good as the operator's check of them."""
+    engine could not vouch for is only as good as the operator's check of them. The digest is left
+    out where the path was found replaceable or the file is writable by a non-owner, since those
+    bytes may be substituted (:func:`_pin_offer`)."""
     check = verdict.path_check
     windows = check.platform == "windows" if check is not None else os.name == "nt"
+    mount = _untrusted_mount(verdict)
+    if mount is not None and verdict.path_ok is False:
+        # The ACL could not be read beside a replaceable path: the path's own fix, which offers no
+        # pin for a replaceable path and no folder below the mount.
+        return "\n".join(_path_fix(spec, verdict))
+    if mount is not None:
+        return " ".join(_mount_fix(spec, verdict, mount, []))
     folder = (
         "the engine's data folder under C:\\ProgramData"
         if windows
-        else "a root-owned 755 folder like /etc/messagefoundry/"
+        else f"a root-owned 755 folder like {_POSIX_FOLDER} on a file system the check trusts"
     )
     if not spec.loads_verified_bytes:
         return (
             f"Fix: move the anchor into a folder whose permissions the engine can read, such as "
-            f"{folder}. A pin does not help here: this anchor is read again by path when it is "
-            "used, so a pin cannot vouch for the bytes loaded."
+            f"{folder}. {_NO_PIN}."
         )
-    pin = f"set {spec.pin_setting} to" if spec.pin_setting else "pin it to"
     return (
         f"Fix: move the anchor into a folder whose permissions the engine can read, such as "
-        f"{folder}. Or {pin} the {ANCHOR_DIGESTS[ANCHOR_DIGEST].title} of the CA you mean to "
-        f"trust; this file's is {ANCHOR_DIGEST}:{verdict.fingerprint}. Check it against the CA "
-        "first. With a matching pin the engine "
-        "loads exactly those bytes, so it may load them without this check."
+        f"{folder}. Or {_pin_offer(spec, verdict)}"
     )
 
 
@@ -3114,8 +3206,9 @@ def _transient_read_fault(exc: OSError | ValueError) -> bool:
     open whatever the network does. On POSIX a share can read as either, depending on the owners
     and mode bits along its path (:func:`~messagefoundry.auth.anchor_path.anchor_path_verdict`),
     and so can at least a local disk of a type outside
-    :data:`~messagefoundry.auth.anchor_path.POSIX_TRUSTED_FS`, such as ZFS, vfat or exfat, and any
-    host without ``/proc/self/mountinfo``. On Windows a path that reaches a share or a mapped
+    :data:`~messagefoundry.auth.anchor_path.POSIX_TRUSTED_FS`, such as ZFS, vfat or exfat, any
+    overlay mount, whatever its layers (vault BACKLOG #8390 item 31), and any host without
+    ``/proc/self/mountinfo``. On Windows a path that reaches a share or a mapped
     network drive reads as indeterminate, unless the walk already found an object others can
     write, which reads as insecure; so does at least a local volume that is not NTFS or ReFS.
     So at ``enforce`` this exemption
@@ -3141,11 +3234,7 @@ def _transient_read_fault(exc: OSError | ValueError) -> bool:
     such check still refuses the reload. The path verdict does not gate this read at a later
     check: :func:`evaluate_anchor` reads the file before it judges the path, so a pin whose path
     becomes insecure or indeterminate after the open reaches this read, a read fault there is
-    judged here, and the path is not judged at that check. An overlay mount whose lower layer is
-    on a network file system passes the file-system type check, since ``overlay`` is in
-    :data:`~messagefoundry.auth.anchor_path.POSIX_TRUSTED_FS`. So the path check can pass a pin
-    whose owner and mode bits the remote server controls, the store open accepts it at
-    ``enforce``, and a network fault reading it later sets no hold.
+    judged here, and the path is not judged at that check.
 
     What still sets the hold: at least a pipe or device refused as not a regular file, a
     ``BrokenPipeError``, which is how a pipe at the path can fail on Windows, a ``ValueError``

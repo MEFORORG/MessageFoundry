@@ -6469,7 +6469,10 @@ jobs:
           # so loopback + in-container traffic is the correct posture for this smoke — no insecure
           # override.
           # GIVEN 1 (ADR 0148): `dev` now derives PHI, so `serve --env dev` runs the secure PHI posture.
-          # This smoke validates PHI+enforce green (not a synthetic opt-out): provision a runtime-minted
+          # This smoke is written to validate PHI+enforce green (not a synthetic opt-out), but since
+          # vault BACKLOG #8390 item 31 it would refuse at start on its overlay root, so no CI job
+          # exercises an enforcing container start until the follow-up in docker/README.md,
+          # "Residuals / gotchas", lands. It provisions a runtime-minted
           # store key (never a committed literal — gitleaks), bounded PHI-body retention windows, and a
           # locked-down egress allowlisting the smoke config's File archive dir (/var/lib/mefor/out/adt).
           storeKey="$(python3 -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
@@ -6491,7 +6494,8 @@ jobs:
           # wrong. docker/README.md gives these two commands for a read-only config mount, and the
           # same owner rule applies here: everyone may read, and only root may write. The mode
           # change runs first, while the runner still owns the files. The last line prints the
-          # owner and mode the engine will see.
+          # owner and mode the engine will see. Then read the overlay note in docker/README.md,
+          # "Residuals / gotchas" (vault BACKLOG #8390 item 31), and its "CI" section.
           chmod -R a+rX,go-w "$RUNNER_TEMP/syslog-ca"
           sudo chown -R root:root "$RUNNER_TEMP/syslog-ca"
           stat -c '%u:%g %a %n' "$RUNNER_TEMP/syslog-ca" "$RUNNER_TEMP/syslog-ca"/*
