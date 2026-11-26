@@ -9188,39 +9188,45 @@ def _sqlite_readonly_uri(path: str) -> str:
 
 
 def forget_store_salt(path: Path) -> bool:
-    """Drop the store salt from a CLOSED SQLite store file, so its next open mints a new one (ADR 0196).
+    """Drop the salt from a CLOSED SQLite store file, so its next salted open mints one (ADR 0196).
 
     For a store that is a copy of another: what ``restore`` places, and the scratch copy the full
     restore-verify opens. A copy carries the original's salt, so it would seal under the original's
     data sub-key while counting that key's use from the copy's older row -- the rewind ADR 0196
-    closes. With no salt row, the first open mints a salt and so a key nothing has used, before it
-    seals anything; every value already in the file names its own salt and still opens.
+    closes. With no salt row, the first open whose cipher takes a salt (a keyed local AES-GCM open;
+    ``bind_store_salt`` in ``gcm_bound`` names the ciphers that take none) mints a salt and so a key
+    nothing has used, before it seals anything; every value already in the file names its own salt
+    and still opens.
 
-    Synchronous, for the off-loop restore path. The cases:
+    Synchronous, for the off-loop restore path. What it returns or raises, in at least these cases:
 
-    - **True**: an ordinary ``store_salt`` table held at least one row, and the delete is proven in
-      the MAIN FILE (below), so the next open mints a new salt.
-    - **False, with an ordinary table**: the ``store_salt`` table was there and empty, so there was
-      nothing to forget; the next open mints a salt as it would anyway.
+    - **True**: an ordinary ``store_salt`` table held at least one row, the delete removed it, and
+      the proof below found none left in the MAIN FILE.
+    - **False, with an ordinary table**: the ``store_salt`` table was there but the delete removed no
+      row, normally because it was empty, so there was nothing to forget.
     - **False, with no ordinary table of that name**: a file from before ADR 0196 has none, and its
-      first open creates one. But the name may instead be held by an object this build did not
-      make, at least a virtual table or a view another tool left. Such an object is neither read
-      nor dropped, so this False proves nothing about a salt: the object stays in the copy, and the
-      next :meth:`MessageStore.open` of it refuses with :class:`SchemaMismatchError` (``table
-      'store_salt' is missing``). That open, not this call, is what refuses such a copy; a restore
-      has by then placed it.
-    - **Raises** ``sqlite3.OperationalError``, whichever of the above it would have returned, when
-      the file cannot be switched out of WAL mode, for example while another connection holds it,
-      or when a non-empty ``-wal`` remains afterwards; and when the read-only re-read still finds a
-      row in the ordinary table. Other SQLite errors from the reads or the delete propagate too.
+      first writable open creates one. But the name may instead be held by an object this build did
+      not make, at least a view or a virtual table another tool left. Such an object is neither
+      read nor dropped, so this False proves nothing about a salt. The object stays in the copy,
+      and it is the next writable :meth:`MessageStore.open` of it that refuses, with
+      :class:`SchemaMismatchError` (for a view or a virtual table the differences name ``table
+      'store_salt' is missing``); a ``read_only=True`` open logs the difference and opens. A restore
+      has by then placed the copy.
+    - **Raises** ``sqlite3.OperationalError``, on any of the paths above, when the file stays in WAL
+      mode (the switch below fails while another connection holds a WAL file), when a non-empty
+      ``-wal`` remains afterwards, or when the read-only re-read still finds a row in the ordinary
+      table, whether or not the delete reported removing one. Other ``sqlite3.Error`` subclasses
+      from opening or reading the file propagate too.
 
-    **Where it removes a row, it proves the row is gone from the MAIN FILE.** A
-    snapshot can carry WAL mode in its header, and then a plain DELETE commits into ``-wal``. The
+    **On every path it re-reads the MAIN FILE, and raises if an ordinary table still holds a row.**
+    A snapshot can carry WAL mode in its header, and then a plain DELETE commits into ``-wal``. The
     callers place or open only the main file, so a delete left in a WAL that was never checkpointed
     would be silently dropped, and the copy would keep the original's salt. So the file is first
-    switched to ``journal_mode=DELETE``, which checkpoints the WAL and removes it, and which SQLite
-    refuses while another connection holds the file. After the delete, the main file is re-read with
-    no ``-wal`` beside it. A refusal is the caller's to report; it never places an unproven copy."""
+    switched to ``journal_mode=DELETE``, which checkpoints the WAL and removes it; on a file in WAL
+    mode SQLite refuses the switch while another connection holds the file, but on a file already
+    in rollback-journal mode the switch succeeds whoever else holds it. After the delete, the main
+    file is re-read with no ``-wal`` beside it. A refusal is the caller's to report; it never
+    places an unproven copy."""
 
     # The ordinary-table predicate, so a virtual `store_salt` another tool left, whose module may
     # not be loaded here, is not probed and cannot raise "no such module" (BACKLOG #6719 item 4).
