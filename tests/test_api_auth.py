@@ -3746,13 +3746,21 @@ async def test_login_refuses_a_lone_surrogate_before_the_service(
         raise AssertionError("the service was reached")
 
     monkeypatch.setattr(service, "login", _spy)
-    body = {"username": "sup", "password": PW, field: "s\\ud800up"}
-    raw = "{" + ", ".join(f'"{k}": "{v}"' for k, v in body.items()) + "}"
+
+    def _raw(value: str) -> bytes:
+        # json.dumps escapes the backslash, so the escape is spliced in after encoding.
+        body = {"username": "sup", "password": PW, field: "@VALUE@"}
+        return json.dumps(body).replace("@VALUE@", value).encode()
+
+    headers = {"content-type": "application/json"}
     async with _client(engine, service) as c:
-        r = await c.post(
-            "/auth/login", content=raw.encode(), headers={"content-type": "application/json"}
-        )
+        # Control: the same body with an ordinary escape gets past the model to the service.
+        with pytest.raises(AssertionError, match="the service was reached"):
+            await c.post("/auth/login", content=_raw("s\\u0041up"), headers=headers)
+        reached.clear()
+        r = await c.post("/auth/login", content=_raw("s\\ud800up"), headers=headers)
     assert r.status_code == 422, r.text
+    assert [e["loc"][-1] for e in r.json()["detail"]] == [field], r.text
     assert reached == []
 
 

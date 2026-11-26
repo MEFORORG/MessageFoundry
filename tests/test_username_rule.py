@@ -152,8 +152,17 @@ def test_the_rule_refuses_a_reserved_form_with_a_lookalike_delimiter(name: str) 
 
 #: BACKLOG #5519: reserved forms spelled with accented letters. A store or audit column that
 #: compares accent-insensitively finds each as the reserved form, so each is refused. Precomposed
-#: and combining spellings both, and a dotted capital I, whose case fold carries a combining dot.
+#: and combining spellings both, a dotted capital I, a mark case folding turns into a letter
+#: (U+0345), spacing and enclosing marks, a spacing accent NFKC turns into a space and a mark
+#: (U+00A8), and the NOT LESS-THAN and NOT GREATER-THAN signs NFD splits into a bracket and a mark.
 ACCENTED_RESERVED = [
+    "system" + chr(0x0345),  # COMBINING GREEK YPOGEGRAMMENI, which casefold takes to an iota
+    "syste" + chr(0x0345) + "m:x",
+    "system" + chr(0x1715),  # TAGALOG SIGN PAMUDPOD, a spacing mark (Mc)
+    "system" + chr(0x20DD),  # COMBINING ENCLOSING CIRCLE (Me)
+    "<oidc>" + chr(0x20E3),  # COMBINING ENCLOSING KEYCAP (Me)
+    "system" + chr(0x00A8),  # DIAERESIS
+    chr(0x226E) + "oidc" + chr(0x226F),
     "s\xfdst\xe9m",  # precomposed y with acute, e with acute
     "sy\u0301stem",  # y + COMBINING ACUTE ACCENT
     "syst\xe8m:rotate-key",
@@ -162,21 +171,27 @@ ACCENTED_RESERVED = [
     "<oidc>\u0332",  # trailing COMBINING LOW LINE
 ]
 
+#: What username_refusal answers for a reserved form, and for nothing else.
+_RESERVED_REFUSAL = username_refusal("system")
+
 #: Controls for ACCENTED_RESERVED: accented names that are not a reserved form once unaccented.
 ACCENTED_ACCEPTED = ["Jos\xe9", "s\xfdstems", "cl\xedent", "Ren\xe9e"]
 
 
 @pytest.mark.parametrize("name", ACCENTED_RESERVED)
 def test_the_rule_refuses_a_reserved_form_spelled_with_accents(name: str) -> None:
-    """BACKLOG #5519: the accent-insensitive collation case of the reserved-name check."""
-    assert username_refusal(name) is not None
-    with pytest.raises(ValidationError):
+    """BACKLOG #5519: the accent-insensitive collation case of the reserved-name check. The refusal
+    must be the reserved-form one, so a name refused for another reason cannot pass this."""
+    assert username_refusal(name) == _RESERVED_REFUSAL
+    with pytest.raises(ValidationError, match="reserved for the audit trail"):
         UserCreateRequest(username=name, email="x@example.test", roles=[])
 
 
 @pytest.mark.parametrize("name", ACCENTED_ACCEPTED)
 def test_the_rule_accepts_an_accented_name_outside_a_reserved_form(name: str) -> None:
+    """The controls, through the model with the same arguments the refusals use."""
     assert username_refusal(name) is None
+    assert UserCreateRequest(username=name, email="x@example.test", roles=[]).username == name
 
 
 def test_the_directory_marker_is_a_reserved_form() -> None:

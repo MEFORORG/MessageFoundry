@@ -38,11 +38,13 @@ What it admits, at least: a space separator inside the name (U+00A0, U+3000), a 
 spelling that reads as ``system`` passes, as does a reserved form spelled with a delimiter
 lookalike :data:`_DELIMITER_LOOKALIKES` does not list. At least some lookalikes from the same
 script pass too: ``cli:root`` spelled with a dotless i (U+0131), and ``<oidc>`` spelled with the
-modifier low arrowheads U+02F1 and U+02F2. It matches the reserved forms after NFKC,
-with the delimiter lookalikes that table lists taken to ASCII, case folding, and the nonspacing
-marks dropped after NFD (BACKLOG #5519), so ``system`` with an accent on a letter, or ``<oidc>``
-followed by a combining low line (U+0332), is refused; it folds no other confusable letters, in
-any script.
+modifier low arrowheads U+02F1 and U+02F2. It matches the reserved forms against the key
+:func:`_reserved_form_key` builds: NFKC, the delimiter lookalikes that table lists taken to
+ASCII, case folding, and the combining marks (categories Mn, Mc and Me) dropped after NFD
+(BACKLOG #5519). So ``system`` with an accent on a letter, or ``<oidc>`` followed by a combining
+low line (U+0332) or an enclosing circle (U+20DD), is refused, and so is ``oidc`` between NOT
+LESS-THAN and NOT GREATER-THAN (U+226E, U+226F), which NFD splits into an angle bracket and a
+combining slash. It folds no other confusable letters, in any script.
 
 This docstring is the one statement of the rule; the request model, the service and
 docs/SECURITY.md point here rather than restate it.
@@ -59,9 +61,9 @@ from messagefoundry.controlchars import CONTROL_CATEGORIES
 #: The audit trail's synthetic actor forms, which no account may take: ``system`` exactly, any
 #: ``system:`` form (``system:rotate-key``, ``system:cluster-convergence``), any ``cli:`` form (the
 #: host CLI's ``cli:<OS user>``) and any ``<...>`` form (``<oidc>``, ``<kerberos>``,
-#: ``<reconciler>``). Matched against the name's NFKC case fold, since a store whose name column
-#: compares case- or width-insensitively would find ``SYSTEM`` or a fullwidth ``system`` as
-#: ``system``. The literal actor sites are not rewritten to use this; it names their forms, so a
+#: ``<reconciler>``). Matched against :func:`_reserved_form_key`, which folds case, width and
+#: combining marks, since a store whose name column compares case-, width- or accent-insensitively
+#: would find ``SYSTEM``, a fullwidth ``system`` or an accented ``system`` as ``system``. The literal actor sites are not rewritten to use this; it names their forms, so a
 #: new synthetic actor form must be added here too.
 RESERVED_ACTOR_FORMS: Final = re.compile(r"(?s)system(:.*)?|cli:.*|<.*>")
 
@@ -86,19 +88,29 @@ _DELIMITER_LOOKALIKES: Final = str.maketrans(
 )
 
 
+def _drop_marks(text: str) -> str:
+    """``text`` decomposed (NFD), with its combining marks (categories Mn, Mc and Me) dropped."""
+    decomposed = unicodedata.normalize("NFD", text)
+    return "".join(ch for ch in decomposed if not unicodedata.category(ch).startswith("M"))
+
+
 def _reserved_form_key(username: str) -> str:
     """What :data:`RESERVED_ACTOR_FORMS` is matched against: the name's NFKC form, its
-    :data:`_DELIMITER_LOOKALIKES` taken to ASCII, case folded, then decomposed (NFD) with its
-    nonspacing marks (category Mn) dropped (BACKLOG #5519). The last step is for a store or audit
-    column that compares accent-insensitively, which would find ``system`` spelled with a y acute
-    (U+00FD) as ``system``. It strips the accents that decompose into a base letter and nonspacing
-    marks, and a nonspacing mark typed on its own; a letter with no decomposition, such as o with
-    stroke (U+00F8) or the dotless i (U+0131), is left as it is, so a collation that folds one of
-    those still matches a name this rule admits. Case folding runs first, because it turns U+0130 into ``i`` and a combining dot."""
-    folded = unicodedata.normalize("NFKC", username).translate(_DELIMITER_LOOKALIKES).casefold()
-    return "".join(
-        ch for ch in unicodedata.normalize("NFD", folded) if unicodedata.category(ch) != "Mn"
-    )
+    :data:`_DELIMITER_LOOKALIKES` taken to ASCII, then its combining marks dropped
+    (:func:`_drop_marks`) on each side of case folding (BACKLOG #5519).
+
+    The mark step is for a store or audit column that compares accent-insensitively, which would
+    find ``system`` spelled with a y acute (U+00FD) as ``system``. It drops the marks an accented
+    letter decomposes into, and a mark typed on its own. It runs before folding, because folding
+    turns at least one mark into a letter (U+0345 into an iota), and again after it, so a mark that
+    folding adds is dropped too. A letter with no decomposition, such as o with stroke (U+00F8) or
+    the dotless i (U+0131), is left as it is, so a collation that folds one of those still matches
+    a name this rule admits. The delimiter table is applied first, because some of its entries,
+    such as U+0903, are marks. The key is stripped last: NFKC takes a spacing accent, such as the
+    diaeresis U+00A8, to a space and a mark, so ``system`` followed by one keys as ``system``, as
+    it does in the sign-in queue's key (``auth.service._credential_lock_key``)."""
+    nfkc = unicodedata.normalize("NFKC", username).translate(_DELIMITER_LOOKALIKES)
+    return _drop_marks(_drop_marks(nfkc).casefold()).strip()
 
 
 #: Unicode's Default_Ignorable_Code_Point ranges (DerivedCoreProperties.txt), inclusive. Most are

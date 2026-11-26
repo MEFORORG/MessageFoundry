@@ -301,17 +301,19 @@ async def test_ingest4_nul_ingress_persists_error_row(store) -> None:
         assert RawMessage(raw, "hl7v2").raw_bytes == body  # exact bytes recoverable
 
 
-#: Every C0 control but NUL, DEL and every C1 control: the control characters a sign-in name can
-#: carry past ``LoginRequest``, which bounds the name's length only (vault BACKLOG #5342).
+#: Every C0 control but NUL, DEL and every C1 control: control characters ``LoginRequest`` passes
+#: to the service in a sign-in name (vault BACKLOG #5342). The model refuses a lone surrogate
+#: (tests/test_api_auth.py::test_login_refuses_a_lone_surrogate_before_the_service).
 _SIGN_IN_CONTROLS = [chr(c) for c in (*range(0x01, 0x20), 0x7F, *range(0x80, 0xA0))]
 
 
 async def test_a_control_character_sign_in_name_reaches_no_store_error(store) -> None:
     """Vault BACKLOG #5342, the control-characters limb. An unknown sign-in name reaches the store
     twice: ``AuthService.login`` looks it up by name, then writes it as the ``auth.login_failed``
-    actor as typed (``_storable_actor`` escapes a NUL only). PostgreSQL text refuses a NUL and no
-    other character, so each other control character is a miss and a written, read-back actor,
-    with no error to escape the sign-in's failure pad. The NUL control shows the instrument sees
+    actor. A name with no NUL is written as typed (``_storable_actor`` escapes its control
+    characters only when it holds a NUL, and the login refuses a NUL name before the lookup). So
+    each of these controls must be a miss and a written, read-back actor, with no error to escape
+    the sign-in's failure pad. The NUL lookup is the positive control: it shows the instrument sees
     the refusal it is looking for."""
     import asyncpg  # extra-gated; imported inside the (skip-guarded) test, never at module import
 
