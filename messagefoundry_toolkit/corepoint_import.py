@@ -254,7 +254,8 @@ class Control:
                   the export names none, which degrades to a TODO marker rather than a guess).
                   ``refusal`` is non-empty when the statement delivers a handle that is not provably
                   ``msg``; the render then raises at the send site instead of sending (BACKLOG #313).
-                  ``message`` is the local it delivers.
+                  ``message`` is the local a step 2 send delivers; ``""`` is a step 1 send, which
+                  renders ``msg.copy()`` (BACKLOG #5823).
     ``"clone"``   a whole-tree ``MsgTreeCopy`` that binds a handle to a local, and ``"create"`` a
                   ``MsgCreate`` that does: ``args`` is ``(local, expression)``. Only :class:`_Binder`
                   makes either, in a fully understood list (BACKLOG #313 step 2).
@@ -280,8 +281,8 @@ class Control:
     branches: tuple[Control, ...] = field(default_factory=tuple)
     # RAW text (escaped at the render site, like ``detail``). Only ``"send"`` sets it.
     refusal: str = ""
-    # The local a live ``"send"`` delivers: a name this module generated, never export text. Only
-    # the step 2 binder sets it; ``""`` is the step 1 path, which delivers a copy of msg.
+    # The local a live step 2 ``"send"`` delivers: a name this module generated, never export text.
+    # ``""`` is a step 1 send; the render says what it delivers.
     message: str = ""
     # ``"call"`` on a ``"block"`` that would have been one, had its ``@Data`` not been a statement
     # off a ``<Line>`` (BACKLOG #2632). It renders and counts as the label it is. Only the test
@@ -928,7 +929,7 @@ def _message_handles(action_list: Element) -> tuple[frozenset[str], frozenset[st
     the wrong answer).
 
     In a Handler, ``msg`` is the message that arrived **and** the message returned by ``Send`` — the
-    two are the same object. So the subject is the list's **input** handle, and only when that same
+    same message (a step 1 send carries a copy of it as it stood at the send). So the subject is the list's **input** handle, and only when that same
     handle is what the list delivers. A list that builds a *separate* output tree and sends that has
     no equivalent at all: writing its fields onto ``msg`` would mutate the inbound message, which is
     not the message Corepoint was populating. (This is not hypothetical — more lists deliver a

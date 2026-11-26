@@ -336,8 +336,10 @@ where its flow-insensitive scan holds the clone, and a write to the input after 
 lands on `msg`. *Corrected 2026-11-26 (BACKLOG #5823):* this said that only `snapshot_on_send` keeps
 that write out of the message already sent. A live send of `msg` on the step 1 path now renders
 `sends.append(Send(dest, msg.copy()))`, so the message sent is the input as it stood at the send,
-whatever that setting says; the differential guard's step 1 baseline carries the same change as an
-amendment. A send of a step 2 local still delivers the local itself. Step 2 helps only
+whatever that setting says. The differential guard loads that change beneath every step 1 tree it
+builds, the trees this ADR calls "as vendored" included, so each bound compares two trees that
+render that line alike. A step 2 send delivers its local itself, uncopied, the input
+handle's `msg` included; step 2 declines a write after a send instead. Step 2 helps only
 straight-line lists, and the canonical-spelling rule is strict: an export whose labels are wrapped in
 spans, or whose spacing differs at all, gets no help. That is deliberate.
 
@@ -598,7 +600,7 @@ The differential guard compares a gate-declined list with step 1. That step 1 pa
 rule. So the guard runs the vendored step 1 file with one amendment made as it loads. The file
 itself stays as vendored and pinned. The amendment is listed in the guard's `_STEP1_AMENDMENTS`, with
 the rule copied as text, so a later change to the head's rule turns the guard red until the copy is
-amended on purpose. Two more tests run the battery against the file exactly as vendored. They check
+amended on purpose. Two more tests run the battery against the file as vendored. They check
 that the amendment changes only lists that may carry a statement off a `<Line>`, by a wider reading
 written apart from the rule. Where it changes a list it must only narrow: no new live send, no new
 vocabulary call, and one more unmapped step, or else only comment lines and refusals change,

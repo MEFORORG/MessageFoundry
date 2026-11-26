@@ -21,14 +21,16 @@ by the step 1 importer, vendored byte-for-byte from main at ``bca583f2a`` (blob 
 ``tests/fixtures/corepoint/step1_corepoint_import.py.txt``. A vendored copy, not ``git show
 origin/main``, because once step 2 merges ``origin/main`` IS the head, and the comparison would become
 the head against itself; and because a CI checkout need not hold that ref. The vendored file is never
-edited. The baseline the guard runs is that file plus the amendments in ``_STEP1_AMENDMENTS``, made
-as it loads: the changes the step 1 code path has gained on purpose since that tree. There are three.
-The copy amendment (BACKLOG #5823) loads beneath every tree the guard loads, ``step1_as_vendored``
-included: a live send of msg renders ``msg.copy()``, which changes that one line's text and nothing
-the bounds below measure. The fail-closed amendment (BACKLOG #2526) loads next: it switches off live
-code main rendered from switched-off or misplaced source, and
-``test_the_fail_closed_amendment_adds_no_live_code`` bounds it against the file as vendored, with
-only the copy amendment. The label amendment (BACKLOG #2632) loads on top of it, and
+edited. The baseline the guard runs is that file plus the amendments made as it loads: the changes
+the step 1 code path has gained on purpose since that tree. There are three. The copy amendment
+(BACKLOG #5823, ``_COPY_AMENDMENTS``) loads beneath every tree :func:`_load_step1` builds: a live
+send of msg renders ``msg.copy()``. **So wherever this file says "as vendored" or "main" of a tree,
+it means the vendored file with the copy amendment**, ``step1_as_vendored`` included. Each bound
+compares two trees that both carry it, so the bounds stay blind to that one line's text; a tree
+built some other way would not compare like with like. The two in ``_STEP1_AMENDMENTS`` load on
+top. The fail-closed amendment (BACKLOG #2526) loads first: it switches off live code main rendered
+from switched-off or misplaced source, and ``test_the_fail_closed_amendment_adds_no_live_code``
+bounds it against the file as vendored. The label amendment (BACKLOG #2632) loads on top of it, and
 ``test_the_amendment_changes_only_a_list_holding_a_statement_off_a_line`` bounds what that one may
 change against the tree it loads onto (``step1_unlabelled``). That bound is one rule: the amended
 baseline, and the head wherever the gate is closed, are never QUIETER than that tree. No refusal
@@ -662,11 +664,9 @@ _FAIL_CLOSED_AMENDMENTS: tuple[tuple[str, str], ...] = (
     # which no chain renders, is an orphan at the end of the branch it was written in.
     (_HANDLER_STEPS, _HANDLER_STEPS.replace("tuple(", "_unbranch(_off_list(").replace("\n", ")\n")),
 )
-# BACKLOG #5823. A live send of msg renders ``msg.copy()``, so a later write to msg cannot change
-# the message already sent when ``[pipeline].snapshot_on_send`` is off or the handler is called
-# directly. It changes the text of that one rendered line and nothing else in the render or the
-# counts, so it is orthogonal to the rule every other amendment and bound measures: every tree the
-# guard loads carries it (:func:`_load_step1`), and the bounds compare like with like.
+# BACKLOG #5823: a live step 1 send of msg renders ``msg.copy()`` (the head's reason is at its
+# render site). It changes the text of that one rendered line and nothing else in the render or
+# the counts. The module docstring says why every tree carries it.
 _SEND_OF_MSG = (
     '        return [f"{pad}sends.append(Send({ctrl.args[0]}, msg))  '
     '# Corepoint {ctrl.source_verb}"]\n'
@@ -1600,7 +1600,8 @@ def _observed(message: object, inp: Message | None) -> str:
     return f"C{int(match.group(1))}" if match else "OTHER"
 
 
-# The step 1 path sends ``msg.copy()`` (BACKLOG #5823), which is still a send of msg.
+# The step 1 path sends ``msg.copy()`` (BACKLOG #5823), which is still a send of msg. Only that
+# copy is read: a step 2 local is sent uncopied, and a ``<local>.copy()`` send would not match.
 _LIVE_SEND = re.compile(
     r'^(\s*)sends\.append\(Send\("([^"]+)", (msg(?=\.copy\(\)\)\))|\w+(?=\)\)))'
 )
@@ -3459,7 +3460,7 @@ _QUIET_LINE = re.compile(
 
 def _breaches(xml: str, was: _Out, now: _Out) -> list[str]:
     """Every way ``now`` breaks the bound on what BACKLOG #2632 may change, against ``was``, the
-    tree exactly as vendored.
+    tree as vendored.
 
     It changes a list only when an element in it may carry a statement off a ``<Line>``, by a
     reading written apart from the rule and wider than it. And where it changes a list:
@@ -3542,7 +3543,7 @@ def _assert_within_the_bound(shapes: Sequence[tuple[str, str]]) -> None:
 @pytest.mark.parametrize("chunk", range(_CHUNKS))
 def test_the_amendment_changes_only_a_list_holding_a_statement_off_a_line(chunk: int) -> None:
     """The baseline is main's step 1 tree plus one amendment, so this test bounds what the amendment
-    may change, against the tree exactly as vendored: see :func:`_bound`. Over the battery here,
+    may change, against the tree as vendored: see :func:`_bound`. Over the battery here,
     and over the lists drawn with no grammar in ``test_no_raw_list_is_quieter_than_main``."""
     _assert_within_the_bound(
         [(shape.name, _render(shape.nodes, shape.inp)) for shape in _SHAPES[chunk::_CHUNKS]]
@@ -3618,7 +3619,7 @@ def _adopted(steps: Sequence[Any]) -> int:
 
 def _structure_moved(name: str, xml: str) -> tuple[int, list[str]]:
     """What the amendment, or the head, changes about the shape of the tree, against the file
-    exactly as vendored. It must change nothing. A statement off a ``<Line>`` is marked, and a
+    as vendored. It must change nothing. A statement off a ``<Line>`` is marked, and a
     marker is no statement position. So no branch main adopts is orphaned, at any depth, none it
     orphans is adopted, and no construct appears or goes. The head is held to that wherever the
     gate is closed. A fully understood list takes the step 2 path, which builds its own tree.
@@ -3933,7 +3934,7 @@ _SCAN_FLOOR = 32
 
 @pytest.mark.parametrize("chunk", range(_CHUNKS))
 def test_the_fail_closed_amendment_adds_no_live_code(chunk: int) -> None:
-    """The fail-closed amendment switches live code off, against the file exactly as vendored.
+    """The fail-closed amendment switches live code off, against the file as vendored.
 
     Its scan half may change a list only where the list holds a disabled wrapper: the scan skips
     the statements it holds, as it skips a disabled statement, so a switched-off overwrite of

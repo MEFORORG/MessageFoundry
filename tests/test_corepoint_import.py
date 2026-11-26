@@ -1321,6 +1321,25 @@ def test_a_step1_send_of_msg_is_not_changed_by_a_later_write(
     assert '    set_field(msg, "PID-3", "")' in src  # the step 1 path: the write is mapped
 
 
+def test_a_step1_send_of_a_copy_of_msg_stays_typed_in_the_steps_view() -> None:
+    """The ``msg.copy()`` send is still a typed send row, so the typed-only Steps view moves it as
+    it moved ``Send(dest, msg)`` on main (BACKLOG #5823)."""
+    from messagefoundry_toolkit.lens import rewrite_source
+
+    body = (
+        _role_send("input-handle", "%ADT", "OB_A")
+        + '<Line Data="ItemClear %ADT/PID-3"/>'
+        + _role_send("input-handle", "%ADT", "OB_B")
+    )
+    src = _handler_source(body)
+    lines = src.splitlines()
+    send_b = next(i for i, line in enumerate(lines, 1) if 'Send("OB_B", msg.copy())' in line)
+    edit = {"line_start": send_b, "line_end": send_b, "op": "move_row", "direction": "up"}
+    moved = rewrite_source(src, edit, typed_only=True).splitlines()
+    assert 'Send("OB_B", msg.copy())' in moved[send_b - 2]
+    assert 'set_field(msg, "PID-3", "")' in moved[send_b - 1]
+
+
 def test_msgsend_without_a_recoverable_destination_is_a_marker() -> None:
     src = _handler_source('<Line Data="MsgSend $out"/>')
     assert "# TODO: Corepoint MsgSend — hand-finish: no destination named" in src
