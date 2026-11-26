@@ -2043,9 +2043,8 @@ class Engine:
         operators learn to ignore. It logs a WARNING naming the file and the reason, and the caller runs
         the bare walk: the chain is still checked as far as it can be, and the operator is told, in the
         same line, that the truncation half did not run. The parser refuses at least a malformed count,
-        but it passes a ``vault:v`` head through unchecked, so a malformed one is NOT caught here and
-        does reach ``integrity_drift``; that known cost is stated once, at
-        :func:`~messagefoundry.store.store._audit_head_shape`.
+        but passes a ``vault:v`` head through unchecked, so a malformed one is not caught here and is
+        compared; :func:`~messagefoundry.store.store._audit_head_shape` states what that costs.
 
         The read goes through ``asyncio.to_thread`` like every other file the engine touches, so a slow or
         hung filesystem cannot block the loop during startup."""

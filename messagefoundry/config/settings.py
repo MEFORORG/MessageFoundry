@@ -7523,9 +7523,10 @@ class IntegritySettings(_Section):
     # state ever true, and has the chain only GROWN since? It still catches a truncated tail and a
     # mid-chain rewrite. So a stale anchor stays VALID here — it just witnesses less.
     #
-    # ALERT-ONLY, like its partner: a missing, unreadable or malformed anchor logs a WARNING and lets the
-    # bare walk run. It never crashes startup, and it never fires the tamper alert — a config fault must
-    # not manufacture a tamper alarm, or a real one stops meaning anything. `0:`, the anchor of an empty
+    # ALERT-ONLY, like its partner: a missing or unreadable anchor, or one the parser refuses, logs a
+    # WARNING and lets the bare walk run, and never fires the tamper alert — a config fault must not
+    # manufacture a tamper alarm, or a real one stops meaning anything. The parser passes a `vault:v`
+    # head through unchecked; `_audit_head_shape` in store/store.py says what that costs. `0:`, the anchor of an empty
     # log, is refused the same way: it can witness nothing, so it is reported rather than compared.
     #
     # It does nothing on its own: without audit_verify_on_start the engine warns at startup that the
