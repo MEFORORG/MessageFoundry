@@ -12329,8 +12329,9 @@ class AuthService:
 
         It errs toward reporting: no watermark, a keyless chain, a row under a retired key, a row
         that fails its MAC, a newest row with another reason or an older ``ts``, unreadable detail,
-        or any exception (logged at ERROR) all answer False. So does a race in which both
-        reconcilers read before either writes, and a junk row newer than the genuine one.
+        or any ``Exception`` (logged at ERROR) all answer False. So does a race in which both
+        reconcilers read before either writes, and a junk row newer than the genuine one. A
+        cancellation is not an ``Exception``, so it propagates (vault BACKLOG #3750 item 9).
         **Residuals, at least:** a holder of the active audit key can seal a row that verifies.
         A writer without the key can still lower the watermark, by deleting the newest rows and
         restoring them after the read, or on SQLite by planting a row whose ``seq`` is text so the
@@ -12354,7 +12355,11 @@ class AuthService:
                 return False
             if float(ts) < watermark.at - _REVOCATION_EVIDENCE_SKEW_S:
                 return False
-            detail = json.loads(row["detail"] or "{}")
+            raw = row["detail"]
+            # Only a missing detail reads as empty. A falsy non-text one, such as 0 or [], raises
+            # in json.loads and is logged below, not skipped with no log (vault BACKLOG #3750
+            # item 20).
+            detail = {} if raw is None else json.loads(raw)
         except Exception as exc:  # any class: fail toward reporting, see the docstring
             _log.error(
                 "directory reconcile: could not read a verified earlier revocation of %s (%s); "
