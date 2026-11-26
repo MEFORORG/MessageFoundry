@@ -140,6 +140,9 @@ def test_once_the_gates_allowlist_exists_a_legacy_only_root_loses_the_backstop(
     r = run_selfheal(home, cwd=drifted)
     assert r.returncode == 0, r.stderr
     assert head_of(drifted) == "drifted", "the legacy file was read although the gate's file exists"
+    assert r.stdout.strip() == "", (
+        f"the backstop said something about the skipped root:\n{r.stdout}"
+    )
 
 
 def test_no_allowlist_anywhere_is_a_clean_no_op(home: Path, drifted: Path) -> None:

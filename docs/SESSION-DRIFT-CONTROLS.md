@@ -57,7 +57,7 @@ there is no defence in depth between them.
 |---|---|---|
 | 1 | `Write`/`Edit`/`MultiEdit`/`NotebookEdit` targeting the primary's tree | **target path** |
 | 2 | `Task`/`Agent`/`Workflow` dispatch from the primary, except a `Task`/`Agent` call whose `subagent_type` is exactly `web-fetch` or `claude-code-guide` | **session cwd**; the exemption also reads `tool_input.subagent_type` |
-| 3 | 11 git verbs that swap or discard the primary's tree | target path parsed out of the command string |
+| 3 | 11 git verbs that swap or discard the primary's tree | target path parsed out of the command string, falling back to the session cwd |
 | 3b | `checkout`/`switch` moving a *linked worktree* onto an existing branch | ditto |
 | 4 | `EnterWorktree` (relocating a live session) | tool name only |
 
@@ -89,8 +89,9 @@ an href to a missing non-withheld path fails the check, the same href under `.cl
 ### Detection — `SessionStart` hooks
 
 **[`worktree-selfheal.ps1`](../scripts/worktree/worktree-selfheal.ps1)** (user scope) does one mutation —
-auto-`checkout` of a **clean** primary that has drifted off its home branch — and two warnings: a
-ghost-stub cwd, and this worktree's HEAD not matching its recorded home branch.
+auto-`checkout` of a **clean** primary that sits on another branch than its home branch (a detached
+HEAD is left alone) — and one warning, for a ghost-stub cwd. It records this worktree's current
+branch as its home branch and no longer warns when the two differ (owner ruling 2026-08-26).
 
 **[`session-context.ps1`](../scripts/worktree/session-context.ps1)** (project scope) injects the
 coordination banner. It holds at least which worktree this chat owns, the live peers, what they are

@@ -43,8 +43,7 @@ already write *correctly* into a worktree by absolute path, and a cwd-keyed writ
 all 4,010 of them. Both percentages are shares of the same 166 sessions' Edit/Write calls, so the 29%
 and the 44% are two numerators over one denominator rather than two measurements.
 
-This is the one statement of what the cwd decides; the gate's docstring and
-[WORKTREES.md](WORKTREES.md) point here. For a write by absolute path, where a session *sits* is
+This is the one statement of what the cwd decides; other files point here. For a write by absolute path, where a session *sits* is
 irrelevant and only where it *writes* matters. A relative path is rooted at the session's cwd first,
 so for a relative path the cwd does decide the verdict; give the absolute path. Not every rule is keyed
 on a target path: at least rule 2 keys on the cwd, and the git rules fall back to the session's cwd
@@ -173,7 +172,7 @@ outside every checkout, and `install-gate.ps1` is the owner's to run. See "Insta
 
 **Everything else is allowed.** Reads are never gated — asking a question or planning in the primary stays
 frictionless. Writes by absolute path into any worktree, the scratchpad, or any repo the allowlist does
-not govern are allowed
+not govern are allowed by rule 1
 **from a session sitting in the primary**: for such a write there is no need to `cd`, relocate, or
 restart. A dispatch is different (rule 2). Worktrees that git nests *inside*
 the primary's path (`.claude/worktrees/<name>/`, the first-party `claude --worktree` mechanism) are
@@ -299,8 +298,8 @@ Two structural choices worth understanding:
 
 - **A SessionStart self-heal backstop.** Because the gate is a guardrail (it inspects tool arguments,
   so a checkout routed through an indirect script slips past), `worktree-selfheal.ps1` — in each config
-  dir `install-selfheal.ps1` was run for — runs at session start. It repairs a clean primary that has
-  drifted off its home branch. It no longer warns when this session's own linked worktree has moved off
+  dir `install-selfheal.ps1` was run for — runs at session start. It repairs a clean primary that sits
+  on another branch than its home branch; a detached primary is left for `restore-primary.ps1`. It no longer warns when this session's own linked worktree has moved off
   its recorded home branch: under the owner ruling of 2026-08-26 that re-tasking a pooled worktree is
   sanctioned, it records the current branch instead (the script's section 3 comment says why). It never
   switches a linked worktree under the session using it.
@@ -313,7 +312,7 @@ next `Edit` into the primary was denied with no restart. Removing it is the same
 | Level | Command | Effect |
 |---|---|---|
 | **Instant off** | delete `~/.claude/hooks/worktree-gate.repos.txt` | Gate stops firing immediately, **including for sessions already running** — the allowlist is re-read on every invocation, so it does not matter whether Claude Code cached `settings.json` at session start. It is the gate's off switch, not the self-heal backstop's: with this file gone, the backstop reads a legacy `~/.claude-hooks/worktree-gate.repos.txt` where one exists ([SESSION-DRIFT-CONTROLS.md](SESSION-DRIFT-CONTROLS.md), G8). |
-| **Full uninstall** | `install-gate.ps1 -Uninstall` | Removes the gate's hook entries from each config dir it wires, the installed gate and its dispatcher, and the allowlist, and rewrites each `settings.json` it touches. It is not a clean uninstall: depending on what earlier runs did, it leaves backup, receipt and log files, and the backstop can stay armed on a legacy allowlist. [SESSION-DRIFT-CONTROLS.md](SESSION-DRIFT-CONTROLS.md) G8 lists what remains. |
+| **Full uninstall** | `install-gate.ps1 -Uninstall` | Removes the gate's hook entries from each config dir it wires, the installed gate and its dispatcher, and the allowlist, and rewrites each `settings.json` it touches. It is not a clean uninstall: depending on what earlier runs did, it leaves at least backup, receipt and log files, it does not reach gate wiring in a config dir outside its wire set, and the backstop can stay armed on a legacy allowlist. [SESSION-DRIFT-CONTROLS.md](SESSION-DRIFT-CONTROLS.md) G8 lists what remains. |
 | **Safety net** | automatic | Every install writes `settings.json.bak` and validates the JSON before moving it into place, so a botched write cannot break hooks across every session at once. |
 
 Nothing lives in the repo or in `.git`. Merging this branch changes no behaviour by itself — the gate only

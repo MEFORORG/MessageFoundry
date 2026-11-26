@@ -17,8 +17,8 @@
     session whose cwd is an unregistered .claude/worktrees/<name> dir that resolves up to the
     primary -- a case a PROJECT-scoped hook can never see (the stub has no project .claude/).
 
-    For each governed primary (from the shared allowlist), if its HEAD has drifted off the home
-    branch AND `git status --porcelain` printed nothing for it, it runs `git checkout <home branch>`
+    For each governed primary (from the shared allowlist), if its HEAD is on another branch than the
+    home branch (a detached HEAD is left alone) AND `git status --porcelain` printed nothing for it, it runs `git checkout <home branch>`
     on it itself rather than calling restore-primary.ps1 (step 1 below says why). If THIS session is
     sitting in a stub worktree, it injects a heads-up telling the model to spin up a real worktree
     with new.ps1 before editing.
@@ -130,13 +130,10 @@ foreach ($root in $roots) {
     }
 }
 
-# 3) Has THIS session's own LINKED worktree been SWITCHED off its home branch -- the worktree-hijack?
-#    A session with no worktree of its own runs `git checkout <a-branch>` inside somebody else's worktree,
-#    yanking its files onto another branch mid-task (docs/WORKTREES.md). The worktree gate (rule 3b) blocks
-#    that pre-emptively, but ONLY in the config dirs install-gate.ps1 wired; this backstop runs only in the
-#    config dirs install-selfheal.ps1 was run for. It never auto-switches a linked worktree under the
-#    session that is using it, and since the 2026-08-26 ruling below it no longer warns either: it only
-#    records the current branch.
+# 3) Record THIS session's own LINKED worktree's current branch as its home branch. This step once
+#    warned when the branch had been SWITCHED (the worktree hijack, which gate rule 3b blocks); since the
+#    2026-08-26 ruling below it detects nothing and warns about nothing. It never switches a linked
+#    worktree under the session that is using it.
 if ($cwd -and (Test-Path -LiteralPath $cwd)) {
     # A linked worktree's private git dir is <repo>/.git/worktrees/<id>/; the main worktree's is <repo>/.git.
     # Only a linked worktree can be hijacked away from an assigned branch, so act only on those.
