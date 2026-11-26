@@ -21,10 +21,8 @@ import pytest
 
 from messagefoundry.redaction import (
     _JSON_PHI_KEY,
+    _JSON_STRUCTURE,
     _JSON_TOKEN,
-    _NOT_A_BRACKET_TOKEN,
-    _armed_mismatch,
-    _brackets_mismatch,
     _stray_json_closer,
     redact,
     safe_text,
@@ -120,8 +118,7 @@ def test_a_matched_or_out_of_scope_closer_reads_as_before(text: str, expected: s
 
 
 #: A traceback whose frame line leaves a PHI-keyed dict unclosed, and whose later frame holds a
-#: mismatched closer. The open dict keeps the check armed across lines, so the whole text blanks,
-#: where before BACKLOG #5814 every frame was kept and the value scrubbed.
+#: mismatched closer. The key's own container never closes, so the check stays armed to the end.
 TRACEBACK = (
     "Traceback (most recent call last):\n"
     '  File "app.py", line 12, in deliver\n'
@@ -131,15 +128,75 @@ TRACEBACK = (
     "ValueError: bad frame\n"
 )
 
-#: A well-formed PHI value beside a malformed non-PHI sibling: the check is not scoped to the value.
-SIBLINGS = [f'{{"family": "{SECRET}", "note": [1}}}}', f'"family": "{SECRET}", "note": [1}}']
+#: The check is not scoped to the PHI value: a malformed sibling, prose after a top-level key, and
+#: a later key arming the walk again after the first key's container closed.
+KNOWN_COST = [
+    TRACEBACK,
+    f'{{"family": "{SECRET}", "note": [1}}}}',
+    f'"family": "{SECRET}", "note": [1}}',
+    f'"family": "{SECRET}" rejected by peer (see [ref) for details',
+    f'{{"family": "{SECRET}"}} x {{"given": [1}}',
+]
 
 
-@pytest.mark.parametrize("text", [TRACEBACK, *SIBLINGS])
-def test_a_known_cost_blanks_the_whole_text(text: str) -> None:
-    """KNOWN COST, pinned so a change to it is deliberate (``_stray_json_closer``'s docstring and the
-    5814 changelog fragment name it). The direction is safe: more is hidden, never less."""
-    assert redact(text) == PLACEHOLDER
+@pytest.mark.parametrize("scrub", SCRUBBERS)
+@pytest.mark.parametrize("text", KNOWN_COST)
+def test_a_known_cost_blanks_the_whole_text(scrub: Callable[[str], str], text: str) -> None:
+    """KNOWN COST, pinned so a change to it is deliberate (``_stray_json_closer``'s docstring names
+    it). The direction is safe: more is hidden. Before BACKLOG #5814 each kept its text."""
+    assert scrub(text) == PLACEHOLDER
+
+
+def _reference_walk(text: str) -> bool:
+    """The check as it stood before the structure-only step (engine head 79a11bc4f2b): a walk over
+    every :data:`_JSON_TOKEN` token. The shipped walk must give the same verdict."""
+    keys = [match.start() for match in _JSON_PHI_KEY.finditer(text)]
+    if not keys:
+        return False
+    stack: list[str] = []
+    armed: int | None = None
+    next_key = 0
+    pos = 0
+    while pos < len(text):
+        if armed is None and next_key == len(keys):
+            return False
+        match = _JSON_TOKEN.match(text, pos)
+        assert match is not None
+        while next_key < len(keys) and keys[next_key] <= match.start():
+            armed = len(stack) if armed is None else min(armed, len(stack))
+            next_key += 1
+        pos = match.end()
+        punct = match.group("punct")
+        if punct is None:
+            ws = match.group("ws")
+            if armed == 0 and not stack and ws is not None and ("\n" in ws or "\r" in ws):
+                armed = None
+            continue
+        if punct in "{[(":
+            stack.append("}" if punct == "{" else "]" if punct == "[" else ")")
+        elif punct in "}])":
+            if stack and stack[-1] != punct and armed is not None:
+                return True
+            if stack:
+                stack.pop()
+            if armed is not None and len(stack) < armed:
+                armed = None
+    return False
+
+
+def _token_structure(text: str) -> str:
+    """The brackets and whitespace line breaks the reference walk reads, from ``_JSON_TOKEN``."""
+    out = []
+    pos = 0
+    while pos < len(text):
+        match = _JSON_TOKEN.match(text, pos)
+        assert match is not None
+        if (punct := match.group("punct")) is not None and punct in "{}[]()":
+            out.append(punct)
+        elif (ws := match.group("ws")) is not None:
+            out.extend(char for char in ws if char in "\r\n")
+        pos = match.end()
+    return "".join(out)
 
 
 def _redaction_suite_strings() -> list[str]:
@@ -158,44 +215,33 @@ def _redaction_suite_strings() -> list[str]:
 
 
 def _fuzz(count: int) -> list[str]:
-    """Seeded texts drawn from what the walk reads: brackets, both quotes, a backslash, line breaks,
-    a string prefix, PHI keys and filler."""
+    """Seeded texts drawn from what either walk reads: brackets, both quotes, a backslash, line
+    breaks and other whitespace, string prefixes, characters neither treats as structure, PHI keys
+    and filler."""
     rng = random.Random(5814)
-    parts = ["{", "}", "[", "]", "(", ")", '"', "'", "\\", "\n", "\r", " ", ",", ":", "x", "b'"]
-    parts += ['"family": ', "'given': ", '"name":']
+    parts = ["{", "}", "[", "]", "(", ")", '"', "'", "\\", "\n", "\r", " ", "\t", "\x0b", "\x85"]
+    parts += [" ", "　", ",", ":", "x", "b'", 'B"', 'rb"', "`", "<", ">", '"""']
+    parts += ['"family": ', "'given': ", '"name":', '"0010ABCD": ']
     return ["".join(rng.choices(parts, k=rng.randint(1, 40))) for _ in range(count)]
 
 
 def _corpus() -> list[str]:
-    texts = [*STRAY, *MISSED, *(text for text, _ in BALANCED), TRACEBACK, *SIBLINGS]
+    texts = [*STRAY, *MISSED, *(text for text, _ in BALANCED), *KNOWN_COST]
     texts += _redaction_suite_strings()
-    texts += _fuzz(20_000)
+    texts += _fuzz(30_000)
     return texts + [redact(text) for text in texts]
 
 
-def _walk_brackets(text: str) -> str:
-    """The bracket tokens ``_stray_json_closer``'s walk reads, from ``_JSON_TOKEN`` itself."""
-    out = []
-    pos = 0
-    while pos < len(text):
-        match = _JSON_TOKEN.match(text, pos)
-        assert match is not None
-        if (punct := match.group("punct")) is not None and punct in "{}[]()":
-            out.append(punct)
-        pos = match.end()
-    return "".join(out)
-
-
-def test_the_precondition_is_necessary() -> None:
-    """The guard skips the walk only where the walk would not blank. Over the redaction suites'
-    literals, their ``redact`` results, this file's cases and a seeded fuzz, the guarded verdict
-    equals the walk's, and the precondition reads exactly the walk's bracket tokens."""
-    blanked = 0
+def test_the_structure_walk_matches_the_token_walk() -> None:
+    """Over this file's cases, the redaction suites' literals, their ``redact`` results and a seeded
+    fuzz, ``_JSON_STRUCTURE`` captures exactly the brackets and line breaks the token walk reads,
+    and the check gives the token walk's verdict."""
+    verdicts = {True: 0, False: 0}
     for text in _corpus():
-        keys = [match.start() for match in _JSON_PHI_KEY.finditer(text)]
-        walk = bool(keys) and _armed_mismatch(text, keys)
-        assert _stray_json_closer(text) == walk, text
-        assert _NOT_A_BRACKET_TOKEN.sub("", text) == _walk_brackets(text), text
-        assert not walk or _brackets_mismatch(text), text
-        blanked += walk
-    assert blanked > 100  # positive control: the corpus reaches the walk's blanking verdict
+        captured = "".join(m.group("char") or "" for m in _JSON_STRUCTURE.finditer(text))
+        assert captured == _token_structure(text), text
+        verdict = _reference_walk(text)
+        assert _stray_json_closer(text) == verdict, text
+        verdicts[verdict] += 1
+    # Positive controls: the corpus reaches both verdicts often.
+    assert verdicts[True] > 500 and verdicts[False] > 500, verdicts
