@@ -1117,7 +1117,8 @@ def _warn_detach_limit() -> None:
     ``BaseException`` is raised, and nothing is reported where there is no writable stderr."""
     try:
         _log.warning(
-            "an error's exception graph has more than %d links; the rest are cut off it",
+            "an error's exception graph has more than %d links; the rest are cut off it, unless "
+            "the cut raises an error, which then propagates",
             _DETACH_LIMIT,
         )
     except Exception as fault:  # noqa: BLE001 -- an Exception is reported below, not raised

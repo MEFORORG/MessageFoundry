@@ -619,11 +619,12 @@ def test_notifiers_reference_without_provider_fail_closed() -> None:
 
 
 @pytest.mark.parametrize("error", [MemoryError, RecursionError])
-def test_the_processs_own_limits_pass_the_provider_module_import(
+def test_the_processs_own_limits_from_the_provider_module_import_fail_closed(
     monkeypatch: pytest.MonkeyPatch, error: type[BaseException]
 ) -> None:
-    # Vault BACKLOG #6709 item 11: the dispatch's import arm refused out of memory or stack as a
-    # broken install, which its build arm no longer does.
+    # Vault BACKLOG #6709 item 11: out of memory or stack while the provider module imports is
+    # refused like any other broken import, by class and with no chain, rather than escaping raw
+    # past __main__'s provisioning step, which catches only SecretProviderError.
     import importlib
 
     real_import = importlib.import_module
@@ -634,5 +635,6 @@ def test_the_processs_own_limits_pass_the_provider_module_import(
         return real_import(name, *args)
 
     monkeypatch.setattr("messagefoundry.config.secretprovider.importlib.import_module", _import)
-    with pytest.raises(error):
+    with pytest.raises(SecretProviderError, match=f"import failed: {error.__name__}") as caught:
         resolve_secret_provider(SecretsSettings(provider="vault"))
+    assert caught.value.__cause__ is None and caught.value.__context__ is None

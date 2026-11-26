@@ -520,11 +520,11 @@ def test_cross_provider_active_key_id_parity_same_mfenc_v1_fixture(
 
 
 @pytest.mark.parametrize("error", [MemoryError, RecursionError])
-def test_the_processs_own_limits_pass_the_provider_module_import(
+def test_the_processs_own_limits_from_the_provider_module_import_fail_closed(
     monkeypatch: pytest.MonkeyPatch, error: type[BaseException]
 ) -> None:
-    # Vault BACKLOG #6709 item 11: the dispatch's import arm refused out of memory or stack as a
-    # broken install, which its build arm no longer does.
+    # Vault BACKLOG #6709 item 11: out of memory or stack while the provider module imports is
+    # refused like any other broken import, as a chained KeyProviderError.
     import importlib
 
     real_import = importlib.import_module
@@ -535,5 +535,6 @@ def test_the_processs_own_limits_pass_the_provider_module_import(
         return real_import(name, *args)
 
     monkeypatch.setattr("messagefoundry.store.keyprovider.importlib.import_module", _import)
-    with pytest.raises(error):
+    with pytest.raises(KeyProviderError, match=f"import failed: {error.__name__}") as caught:
         resolve_key_provider(StoreSettings(key_provider="vault"))
+    assert isinstance(caught.value.__cause__, error)
