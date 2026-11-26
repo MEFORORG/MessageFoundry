@@ -25,11 +25,12 @@
          subagent_type is exactly web-fetch or claude-code-guide is exempt; the "# Rule 2" comment block
          below says why and names at least its residuals.
 
-    KEYED ON THE TARGET PATH, NEVER ON THE SESSION'S cwd. Over 30 days, 29% of the Edit/Write calls
-    made by sessions sitting in the primary wrote into a sibling worktree by absolute path -- i.e.
-    already correct. A cwd-keyed gate would have denied all 4,010 of them. Only the DESTINATION
-    matters. That 29% is a share of those primary-seated sessions' own calls, NOT of every call in
-    the repo; the counts and the population are in docs/WORKTREE-GATE.md.
+    RULE 1 IS KEYED ON THE TARGET PATH, NOT ON THE SESSION'S cwd. Over 30 days, 29% of the
+    Edit/Write calls made by sessions sitting in the primary wrote into a sibling worktree by absolute
+    path -- i.e. already correct. A cwd-keyed write rule would have denied all 4,010 of them. That 29%
+    is a share of those primary-seated sessions' own calls, NOT of every call in the repo. Other
+    rules, and a relative path, do depend on the cwd: docs/WORKTREE-GATE.md, "Why it exists", states
+    what the cwd decides, with the counts and the population.
 
     FAILS OPEN on error paths such as missing fields and an unreadable allowlist. A guardrail that
     wedges all work gets uninstalled, and then it protects nothing. HOOK INPUT THAT CANNOT BE READ OR
