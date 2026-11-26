@@ -694,7 +694,7 @@ def test_a_direct_check_refuses_a_set_value_its_own_walk_does_not_clear(
     """A check called without the build's verdicts walks the path itself, and refuses a set value
     that walk does not clear, rather than reading nothing and passing."""
     monkeypatch.setattr(database, "_path_verdict", lambda _p: True)
-    with pytest.raises(ValueError, match="not a plain local path"):
+    with pytest.raises(ValueError, match="must be a plain local path on this host"):
         database._refuse_encrypted_driver_ca({"sslca": r"Z:\certs\ca.pem"}, connection=_CONNECTION)
 
 

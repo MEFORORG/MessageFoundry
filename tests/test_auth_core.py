@@ -6,11 +6,14 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import logging
 import sys
 from pathlib import Path
 from types import ModuleType
 
 import pytest
+from argon2 import PasswordHasher
+from argon2.exceptions import HashingError, InvalidHashError, VerificationError
 
 from messagefoundry.auth import (
     AuthProvider,
@@ -22,10 +25,12 @@ from messagefoundry.auth import (
     hash_token,
     mint_token,
     needs_rehash,
+    passwords,
     permissions_for_roles,
     verify_password,
 )
 from messagefoundry.auth.permissions import BUILTIN_ROLE_PERMISSIONS
+from tests._content_free import SECRET_CHAR, escapes
 
 
 def test_administrator_has_every_permission() -> None:
@@ -159,6 +164,167 @@ def test_password_hash_roundtrip_and_rejections() -> None:
     assert verify_password(h, "wrong") is False
     assert verify_password("not-a-valid-hash", "x") is False
     assert needs_rehash(h) is False
+
+
+# --- BACKLOG #6880: argon2-cffi encodes before it parses, so an unencodable input must not raise -----
+
+
+def _password_log_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    records = [r for r in caplog.records if r.name == "messagefoundry.auth.passwords"]
+    # The encode error carries the whole hash or password in ``.object`` and the offending
+    # character's escape in its text, so it must never ride along on the record.
+    assert all(r.exc_info is None and r.exc_text is None for r in records)
+    return records
+
+
+@pytest.mark.parametrize(
+    ("bad_char", "password"),
+    [
+        (SECRET_CHAR, "Str0ng!Passphrase"),
+        ("\ud800", "Str0ng!Passphrase"),
+        (SECRET_CHAR, "Str0ng!\ud800Passphrase"),  # both inputs bad: the hash check wins
+    ],
+)
+def test_verify_password_non_ascii_stored_hash_is_a_logged_non_match(
+    bad_char: str, password: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A corrupted stored hash (the same function verifies recovery-code hashes) used to raise
+    # UnicodeEncodeError out of argon2-cffi's ASCII encode, breaking the docstring's promise.
+    h = hash_password("Str0ng!Passphrase")
+    corrupted = h[:-1] + bad_char
+    with caplog.at_level("DEBUG", logger="messagefoundry.auth.passwords"):
+        assert verify_password(corrupted, password) is False
+    records = _password_log_records(caplog)
+    assert [r.levelname for r in records] == ["WARNING"]
+    # Neither the hash nor the password reaches the log, nor the offending character in any of
+    # the forms an encode error prints it (it prints the escape, never the literal).
+    text = "\n".join(r.getMessage() for r in records)
+    assert h[:-1] not in text and "Str0ng!" not in text and "position" not in text
+    for form in escapes(bad_char):
+        assert form not in text
+    # Positive control: the same scan DOES fire on the encode error's own text, so a change that
+    # logged the exception would fail the loop above.
+    with pytest.raises(UnicodeEncodeError) as leaked:
+        corrupted.encode("ascii")
+    assert any(form in str(leaked.value) for form in escapes(bad_char))
+    assert "position" in str(leaked.value)
+
+
+def test_verify_password_unencodable_password_is_a_quiet_non_match(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A lone surrogate cannot encode as UTF-8. It is caller input, not corruption, so it is an
+    # ordinary mismatch logged at DEBUG only.
+    h = hash_password("Str0ng!Passphrase")
+    with caplog.at_level("DEBUG", logger="messagefoundry.auth.passwords"):
+        assert verify_password(h, "Str0ng!\ud800Passphrase") is False
+    records = _password_log_records(caplog)
+    assert [r.levelname for r in records] == ["DEBUG"]
+    text = records[0].getMessage()
+    assert "Str0ng!" not in text and "position" not in text
+    for form in escapes("\ud800"):
+        assert form not in text
+
+
+class _HasherSpy:
+    """Stands in for the module's slotted ``PasswordHasher``: records each hash and verify, then
+    delegates, or raises the planted failure instead."""
+
+    def __init__(
+        self,
+        real: PasswordHasher,
+        *,
+        hash_fails: Exception | None = None,
+        verify_fails: Exception | None = None,
+    ) -> None:
+        self.real = real
+        self.hashed = 0
+        self.verified: list[str] = []
+        self.hash_fails = hash_fails
+        self.verify_fails = verify_fails
+
+    def hash(self, password: str) -> str:
+        self.hashed += 1
+        if self.hash_fails is not None:
+            raise self.hash_fails
+        return self.real.hash(password)
+
+    def check_needs_rehash(self, stored_hash: str) -> bool:
+        return self.real.check_needs_rehash(stored_hash)
+
+    def verify(self, stored_hash: str, password: str) -> bool:
+        self.verified.append(stored_hash)
+        if self.verify_fails is not None:
+            raise self.verify_fails
+        return self.real.verify(stored_hash, password)
+
+
+def _refused_inputs(refusal: str) -> tuple[str, str, str]:
+    """(the real hash, the stored hash, the password) for one of the two refusals."""
+    h = hash_password("Str0ng!Passphrase")
+    if refusal == "non-ASCII hash":
+        return h, h[:-1] + SECRET_CHAR, "Str0ng!Passphrase"
+    return h, h, "Str0ng!\ud800Passphrase"
+
+
+@pytest.mark.parametrize("refusal", ["non-ASCII hash", "unencodable password"])
+def test_verify_password_refusals_still_pay_one_argon2_verify(
+    refusal: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A refused verify runs exactly one argon2id verify at the pinned parameters, which matches an
+    # ordinary mismatch only against a stored hash at those parameters. While the fixed hash is not
+    # cached, a refusal also pays one hash to make it; verify_password's docstring lists when.
+    h, stored, password = _refused_inputs(refusal)
+    passwords._constant_work_hash.cache_clear()  # this test owns its precondition
+    spy = _HasherSpy(passwords._hasher)
+    monkeypatch.setattr(passwords, "_hasher", spy)
+    try:
+        assert verify_password(stored, password) is False
+        assert (spy.hashed, len(spy.verified)) == (1, 1)  # first refusal: make the hash, verify it
+        assert verify_password(stored, password) is False
+        assert (spy.hashed, len(spy.verified)) == (1, 2)  # later refusals: one verify, no hash
+        worked_on = spy.verified[0]
+        assert spy.verified == [worked_on, worked_on]
+        assert worked_on not in (stored, h)  # the constant-work hash, never the refused input
+        assert needs_rehash(worked_on) is False  # at the pinned parameters, so the same cost
+        # Control: an ordinary mismatch goes through the same spy once, on the stored hash itself.
+        assert verify_password(h, "wrong") is False
+        assert spy.verified[2:] == [h] and spy.hashed == 1
+    finally:
+        passwords._constant_work_hash.cache_clear()  # drop the hash made through the spy
+
+
+@pytest.mark.parametrize("refusal", ["non-ASCII hash", "unencodable password"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param({"hash_fails": HashingError("planted")}, id="hash-fails"),
+        pytest.param({"verify_fails": VerificationError("planted")}, id="verify-fails"),
+        pytest.param({"verify_fails": InvalidHashError("planted")}, id="invalid-hash"),
+    ],
+)
+def test_verify_password_refusal_never_raises_when_the_constant_work_fails(
+    refusal: str,
+    failure: dict[str, Exception],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # "Never raises" covers the constant-work verify too: argon2 failing there (for example a memory
+    # allocation failure) leaves the refusal standing, logged without content.
+    h, stored, password = _refused_inputs(refusal)
+    passwords._constant_work_hash.cache_clear()
+    spy = _HasherSpy(passwords._hasher, **failure)
+    monkeypatch.setattr(passwords, "_hasher", spy)
+    try:
+        with caplog.at_level("DEBUG", logger="messagefoundry.auth.passwords"):
+            assert verify_password(stored, password) is False
+    finally:
+        passwords._constant_work_hash.cache_clear()
+    records = _password_log_records(caplog)
+    failed = [r for r in records if "constant-work" in r.getMessage()]
+    assert [r.levelname for r in failed] == ["WARNING"]
+    text = "\n".join(r.getMessage() for r in records)
+    assert "planted" not in text and h[:-1] not in text and "Str0ng!" not in text
 
 
 def test_tokens_are_unique_and_only_the_hash_is_storable() -> None:

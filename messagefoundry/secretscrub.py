@@ -1201,19 +1201,18 @@ _CAMEL_PLAIN_KEY_VALUE, _CAMEL_KEY_VALUE_CLASSES = _narrowed_value(
 # parameter, an absolute uri or trailing punctuation, and every shape the comparison falls back on.
 # A quoted scheme token after an EARLIER label's plain value, as in
 # ``MEFOR_X=a;authorization:"Basic x=="``, prints too: the earlier value runs on over the label and
-# no tail follows it. ``_BEARER`` still takes no braced value (BACKLOG #2966 step 3). A tail or a
-# key body prints as before in a text the camelCase union returns its reading before for, whole: a
-# text where the shipped reading hid a member key's ";", as in ``userPwd='a;PWD=b' password=b'v w'``,
+# no tail follows it. ``_BEARER`` still takes no braced value (BACKLOG #2966 step 3). A tail
+# prints as before in a text the camelCase union returns its reading before for, whole: a text
+# where the shipped reading hid a member key's ";", as in ``userPwd='a;PWD=b' password=b'v w'``,
 # and an untraceable one. :func:`_pre_camel` leaves the tails and the key-block pass out of that
-# reading, so in such a text none of them runs. The fallback covers the whole text, not one line:
-# through :func:`scrub_credentials` alone, a line where the camelCase reading hides a member key's
-# ";" (``userPwd='a;PWD=b'``) leaves at least a PEM body on another line of that text unmasked,
-# before that line or after it. A plain member key (``Server=x;PWD=b``) does not trigger it.
-# :func:`mask_private_key_blocks_then` over :func:`scrub_credentials` masked the body on both
-# orders when measured, since its key-block mask runs before this pass. Not so
-# ``support.redact.redact_log_text``: it splits the text at line breaks first, so the key-block
-# mask cannot match a block with real line breaks there, and a body line too short for its
-# long-base64 sweep prints, with or without the member key.
+# reading, so in such a text no tail runs, on any line of it. :func:`scrub_credentials` runs the
+# key-block mask once more over the reading it keeps, which writes characters as "x" and nothing
+# else (BACKLOG #5550 added items 14 and 26). It masks only what the pattern reads as a body, so
+# in such a text a body prints at least where a label's value took the BEGIN marker, as in
+# ``secret=-----BEGIN ...``, and wherever the pattern itself stops, such as at a body line ending in
+# a label word. The support bundle and ``GET /logs/tail`` split their text at line breaks, so they
+# mask a block's body lines across them first (``support.redact.mask_key_body_lines``, which says
+# what that leaves).
 
 #: The label words a padded token68 may not end in: every family's, and the query keys
 #: ``logging_setup``'s query filter reads. Case-insensitive, one fixed-width lookbehind per word.
@@ -2294,9 +2293,17 @@ def _keep_key_marker(m: re.Match[str]) -> str:
 
 def mask_private_key_blocks(text: str) -> str:
     """``text`` with the body of every PRIVATE KEY block masked, one character for one (BACKLOG
-    #5550). Where it runs, it runs first: :func:`scrub_credentials` runs it as its first pass, and
-    ``support/redact.py``, ``logging_setup`` and the tray chain run it before the PHI pass, which
-    would rewrite the markers. At least :func:`scrub_credentials_without_tails`, and so the verify
+    #5550). The block pattern is applied at least here and in the places below, not all through
+    this function. ``logging_setup`` and the tray chain run this function before the PHI pass,
+    through :func:`mask_private_key_blocks_then`, since that pass would rewrite the markers.
+    :func:`scrub_credentials` applies the block pattern itself, as the first pattern its ``_run``
+    applies, before its label passes, in each reading that keeps the key-block pass, and then runs
+    this function, last, after those passes, over the reading it keeps, where it masks only a block
+    whose BEGIN marker that reading still holds (the comment above :data:`_NO_LABEL_BEFORE` says
+    why). ``support/redact.py`` applies the pattern itself, in ``redact_log_line`` and across lines
+    in ``mask_key_body_lines``, and reaches this function only through the
+    :func:`scrub_credentials` layer ``redact_log_line`` runs, so a change here reaches it there and
+    not in its own applications of the pattern. At least :func:`scrub_credentials_without_tails`, and so the verify
     details (``verify_leaf.safe_detail_text``) and the audit tee's field scrub
     (``logging_setup.scrub_log_text``), do not run it, by design: they read as the code before it.
     Text holding no ``-----`` returns as the same object."""
@@ -2535,15 +2542,22 @@ def _scrub_credentials(
     """:func:`scrub_credentials` after its gate. With ``tails`` False, the reading without the masked
     tails and the key-block pass (BACKLOG #5546 to #5550), which is what the code before them
     printed. With it True, that reading's output wherever the tailed one is not that output with
-    characters written as "x" (:func:`_mask_only`), and the tailed one otherwise; a line no tail
-    could fire on takes one reading, which the two share there."""
+    characters written as "x" (:func:`_mask_only`), and the tailed one otherwise, either one with
+    the key-block mask run over it once more where a key block's hint is in the text; a line no
+    tail could fire on takes one reading, which the two share there."""
     if not tails:
         return _one_reading(text, placeholder, folded, _without_tails, _without_tails_sub)
     tailed = _one_reading(text, placeholder, folded, _same, None)
     if not _could_take_a_tail(folded):
         return tailed
     before = _one_reading(text, placeholder, folded, _without_tails, _without_tails_sub)
-    return tailed if _mask_only(before, tailed) else before
+    out = tailed if _mask_only(before, tailed) else before
+    # The key-block mask once more, over the reading kept (BACKLOG #5550 added items 14 and 26).
+    # Where that reading is one the key-block pass did not run in, the reading before the tails or
+    # a text the camelCase union returned its reading before for, whole, a key body printed. The
+    # mask writes characters as "x" and nothing else, so the result is the kept reading with
+    # characters written as "x", and a body the first pass masked reads the same again.
+    return mask_private_key_blocks(out) if _admits(folded, _KEY_BLOCK_HINT) else out
 
 
 def _one_reading(

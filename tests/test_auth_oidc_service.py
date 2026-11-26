@@ -940,6 +940,7 @@ async def test_an_administrator_created_directory_account_binds_and_signs_in_wit
         [row] = await _audit_rows(store, "user.created")
         assert row["actor"] == "admin" and row["client"] == "10.0.0.9"
         assert json.loads(row["detail"]) == {
+            "user_id": user_id,
             "username": "jdoe",
             "roles": [],
             "provider": "ad",
@@ -2320,5 +2321,23 @@ async def test_a_refusal_after_the_idp_round_trip_counts_from_its_end(
         else:
             # No round trip ran, so the deadline counts from the call itself.
             assert round_trip_ended == [] and before_call <= started <= time.monotonic()
+    finally:
+        await store.close()
+
+
+async def test_the_configured_flow_ttl_sets_a_staged_flows_deadline(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #6902. RED when: ``oidc_flow_ttl_seconds`` stops reaching the flow cache, which alone
+    sets a flow's deadline, so a configured TTL falls back to the 300 s default. 45 s is not it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key, oidc_flow_ttl_seconds=45, bind=None)
+        flow_id, _url = await service.begin_oidc_login(
+            client="198.51.100.1", public_origin="https://ops.example"
+        )
+        assert service._oidc_flows is not None
+        staged = service._oidc_flows.peek(flow_id)
+        assert staged is not None and staged.deadline - staged.started == pytest.approx(45)
     finally:
         await store.close()

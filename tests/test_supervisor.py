@@ -350,8 +350,8 @@ def test_each_engine_shard_gets_its_store_path_as_one_argv_token(
 def test_supervise_refuses_an_api_port_no_socket_takes_before_the_tls_renewal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """[api].port is now the default base (BACKLOG #5817) and has no range check at load, so
-    supervise refuses a value no socket takes before the TLS renewal can write anything."""
+    """[api].port is now the default base (BACKLOG #5817), and the load refuses a value no socket
+    takes (BACKLOG #5769), so supervise stops before the TLS renewal can write anything."""
     from messagefoundry import __main__ as cli
 
     def _no_renewal(*args: object, **kwargs: object) -> Path:
@@ -366,7 +366,30 @@ def test_supervise_refuses_an_api_port_no_socket_takes_before_the_tls_renewal(
     )
     assert cli._supervise(args) == 2
     err = capsys.readouterr().err
-    assert "[api].port 70000 is not a port from 0 to 65535" in err, err
+    assert "api.port" in err and "65535" in err, err
+
+
+def test_supervise_names_the_base_port_flag_it_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--base-port`` reaches the load as ``[api].port``, so the load's refusal named a key the
+    operator never wrote. The flag is refused under its own name, before the TLS renewal."""
+    from messagefoundry import __main__ as cli
+
+    def _no_renewal(*args: object, **kwargs: object) -> Path:
+        raise AssertionError("the TLS renewal ran before the port refusal")
+
+    monkeypatch.setattr(cli, "_renew_api_tls_before_spawning", _no_renewal)
+    monkeypatch.delenv("MEFOR_API_PORT", raising=False)
+    svc = tmp_path / "messagefoundry.toml"
+    svc.write_text('[store]\npath = "site.db"\n', encoding="utf-8")
+    args = cli._build_parser()[0].parse_args(
+        ["supervise", "--env", "prod", "--service-config", str(svc), "--base-port", "70000"]
+    )
+    assert cli._supervise(args) == 2
+    err = capsys.readouterr().err
+    assert "--base-port 70000 is not a port from 0 to 65535" in err, err
+    assert "api.port" not in err, err
 
 
 class _AtTheRenewal(Exception):

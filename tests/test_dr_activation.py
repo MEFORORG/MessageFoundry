@@ -576,11 +576,12 @@ async def test_a_request_archive_is_refused_while_no_seed_dir_is_configured(
 ) -> None:
     # Deny by default: with no [dr].seed_dir there is nowhere a request may point, so even a good
     # archive is refused untouched. The control is the same archive named in [dr].seed_archive,
-    # which is operator configuration and is not confined.
+    # which is operator configuration and is not confined. An enabled box must name one seed key
+    # (BACKLOG #5965), so the refused box carries seed_archive too; a request archive still wins.
     store, archive, ss = await _seed(tmp_path)
     name = Path(archive).name
     try:
-        coord, _state = _coord(store, ss)
+        coord, _state = _coord(store, ss, seed_archive=archive)
         calls = _fs_spy.install(monkeypatch)
         with pytest.raises(DrActivationError) as exc:
             await coord.activate(archive=archive, actor="alice")

@@ -9,8 +9,8 @@
     Dot-source this; it defines functions and does nothing on its own.
 
         . "$PSScriptRoot\mail-key.ps1"
-        $key = ConvertTo-BoxKey -Path $cwd
-        $old = ConvertTo-LegacyBoxKey -Path $cwd   # READERS ONLY; see that function
+        $key = ConvertTo-BoxKey -Path (Resolve-BoxPath -Path $cwd)
+        foreach ($old in Get-BoxReadKeys -Path $cwd) { ... }   # READERS ONLY; see that function
 
     ONE COPY ON PURPOSE, for the same reason session-registry.ps1 states for the liveness fence. The
     sender (scripts/coord/mail.ps1) and the drain (scripts/hooks/mail-drain.ps1) must compute the SAME
@@ -73,6 +73,123 @@ function ConvertTo-LegacyBoxKey {
     param([Parameter(Mandatory)][string]$Path)
     $norm = ConvertTo-BoxKeyPath -Path $Path
     return (Format-BoxKey -Norm $norm -HashInput $norm)
+}
+
+function Resolve-BoxPath {
+    # THE DIRECTORY A BOX IS KEYED ON, FOR ANY PATH INSIDE A WORKTREE (BACKLOG #7581). The sender,
+    # the drain, the watcher and seat.ps1 each pass a path through this before ConvertTo-BoxKey, so a
+    # session whose cwd is a SUBDIRECTORY of its worktree reads the box its seat record publishes,
+    # the worktree root, and mail sent to a subdirectory path lands there too. Before this, the drain
+    # keyed on the session's cwd and seat.ps1 on `git rev-parse --show-toplevel`, so one worktree
+    # could name two boxes, each one the other end never read.
+    #
+    # Returns the worktree root when $Path is that root (the common case, answered with no git call)
+    # or a folder inside a live worktree that git does not ignore. Returns $Path UNCHANGED, so its
+    # key is exactly what it was before this function, in at least these cases:
+    #   - $Path is not fully qualified, or sits in no checkout: no root is guessed;
+    #   - the nearest `.git` above $Path names no git directory, as a pruned worktree's stale `.git`
+    #     file does: the walk never passes it to reach a checkout further up;
+    #   - git IGNORES $Path in the checkout found above it. A removed worktree's leftover directory
+    #     under the primary's .claude/worktrees/ is such a folder, and raising it would send its mail
+    #     to the PRIMARY checkout's box. An ignored folder of a live worktree keeps its own box for
+    #     the same reason, as it did before this function;
+    #   - git cannot answer the ignore question. A failed probe is not "not ignored".
+    #
+    # Calls git only for a path strictly below a worktree root. Never throws. The walk mirrors
+    # Get-CcxWorktreeRoot in scripts/hooks/_hookinput.ps1, which adds neither guard above and which
+    # this file cannot load (see Test-BoxGitDir).
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        $raw = $Path.Trim()
+        # Fully qualified, not merely rooted: `D:` or `\x` would resolve against a current directory.
+        if (-not $raw -or -not [System.IO.Path]::IsPathFullyQualified($raw)) { return $Path }
+        # GetFullPath collapses `..` and slash direction, so the walk below climbs real parents. A
+        # trailing separator is trimmed except from a drive root, where `D:` would name D's current
+        # directory rather than `D:\`.
+        $full = [System.IO.Path]::GetFullPath($raw)
+        if ($full.Length -gt [System.IO.Path]::GetPathRoot($full).Length) { $full = $full.TrimEnd('\', '/') }
+        $at = $full
+        $root = $null
+        while ($at) {
+            $dotGit = [System.IO.Path]::Combine($at, '.git')
+            if ([System.IO.File]::Exists($dotGit) -or [System.IO.Directory]::Exists($dotGit)) {
+                if (-not (Test-BoxGitDir -DotGit $dotGit)) { return $Path }
+                $root = $at
+                break
+            }
+            $at = [System.IO.Path]::GetDirectoryName($at)
+        }
+        if (-not $root) { return $Path }
+        # The root itself, in GetFullPath's form, so a `..` spelling of it keys as its subdirectories
+        # do. ConvertTo-BoxKeyPath already folds case, slashes and a trailing separator, so a plain
+        # absolute root keys exactly as it did before.
+        if ($full.Length -eq $root.Length) { return $full }
+        # A CHILD of the folder, not the folder with a trailing slash. Measured in a Windows checkout
+        # with core.autocrlf: each CRLF blank line of .gitignore is a lone `\r` pattern, and
+        # check-ignore matched it against every `<untracked dir>/` probe, so an untracked subdirectory
+        # read as ignored. A folder that a pattern does ignore still answers for its children.
+        $rel = ($full.Substring($root.Length).TrimStart('\', '/') -replace '\\', '/') + '/mefor-box-probe'
+        # Local to this function: with the preference on, a caller's EAP Stop turns git's exit 1, the
+        # "raise" answer, into a throw, and the catch below would then keep the subdirectory.
+        $PSNativeCommandUseErrorActionPreference = $false
+        $null = & git -C $root check-ignore -q -- $rel 2>$null
+        # 1 is "not ignored". 0 is ignored, and anything else is git failing to answer.
+        if ($LASTEXITCODE -eq 1) { return $root }
+        return $Path
+    }
+    catch { return $Path }
+}
+
+function Test-BoxGitDir {
+    # Whether the `.git` at $DotGit names a git directory, read the way git reads it and calling no
+    # git: a directory, or a file whose `gitdir:` line names one, that holds HEAD. A weaker rule than
+    # Get-CcxGitCommonDir in scripts/hooks/_hookinput.ps1, which also follows `commondir`; this file
+    # cannot load that one (it is kept byte-identical with korus, and mail.ps1 and seat.ps1 never load
+    # hook code).
+    param([Parameter(Mandatory)][string]$DotGit)
+    $Root = Split-Path -Parent $DotGit
+    try {
+        if (Test-Path -LiteralPath $DotGit -PathType Container) { $gitDir = $DotGit }
+        else {
+            $line = [string](Get-Content -LiteralPath $DotGit -TotalCount 1 -ErrorAction Stop)
+            if ($line -notmatch '^gitdir:\s*(.+?)\s*$') { return $false }
+            $gitDir = $Matches[1]
+            if (-not [System.IO.Path]::IsPathRooted($gitDir)) { $gitDir = Join-Path $Root $gitDir }
+        }
+        return (Test-Path -LiteralPath (Join-Path $gitDir 'HEAD') -PathType Leaf)
+    }
+    catch { return $false }
+}
+
+function Get-BoxReadKeys {
+    # EVERY OLDER KEY A READER OF $Path'S BOX STILL DRAINS, so no message already queued goes unread
+    # when Resolve-BoxPath moves a box. Returns the keys to move mail FROM, never the current one. A
+    # reader (the drain, the watcher) passes each to Move-LegacyInbox; NO WRITER MAY ADDRESS ONE.
+    #   - the legacy path-only key of the resolved directory (the host joining the key, step 4);
+    #   - when $Path is a subdirectory raised to its root: the key it was addressed by before
+    #     Resolve-BoxPath, ConvertTo-BoxKey of $Path itself and that path's legacy key, for $Path as
+    #     spelled (an old drain keyed its cwd so) and in GetFullPath's form (an old sender ran
+    #     Resolve-Path, which collapses `..`).
+    # -Resolved takes the caller's own Resolve-BoxPath answer for $Path, to spare a second git call.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path, [string]$Resolved)
+    $resolved = if ($Resolved) { $Resolved } else { Resolve-BoxPath -Path $Path }
+    $here = ConvertTo-BoxKeyPath -Path $resolved
+    $keys = [System.Collections.Generic.List[string]]::new()
+    $keys.Add((ConvertTo-LegacyBoxKey -Path $resolved))
+    $spellings = @($Path)
+    try {
+        if ([System.IO.Path]::IsPathFullyQualified($Path.Trim())) { $spellings += [System.IO.Path]::GetFullPath($Path.Trim()) }
+    } catch { }
+    foreach ($s in $spellings) {
+        if ((ConvertTo-BoxKeyPath -Path $s) -ceq $here) { continue }
+        foreach ($k in @((ConvertTo-BoxKey -Path $s), (ConvertTo-LegacyBoxKey -Path $s))) {
+            if (-not $keys.Contains($k)) { $keys.Add($k) }
+        }
+    }
+    # Unrolled, so `@(Get-BoxReadKeys ...)` and `foreach ($k in Get-BoxReadKeys ...)` both see keys.
+    return $keys.ToArray()
 }
 
 # Set at load so a StrictMode caller can read it before the first load below.

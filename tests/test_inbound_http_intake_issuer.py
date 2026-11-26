@@ -35,6 +35,7 @@ from cryptography.x509.oid import ExtensionOID, NameOID
 
 from messagefoundry import pki
 from messagefoundry.api.tls import _attach_issuer_index
+from messagefoundry.auth.trust_anchors import TrustAnchorError
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.wiring import Http, WiringError, env
 from messagefoundry.pki import IssuerIndex
@@ -749,13 +750,12 @@ def test_a_block_where_openssl_silently_stops_refuses_the_build(stop: str) -> No
 
 
 def test_a_silent_stop_in_tls_ca_file_refuses_the_listener(tmp_path: Path) -> None:
-    """The refusal reaches the listener's start, naming it and its file (BACKLOG #4948)."""
+    """A refusal reaches the listener's start, naming its file setting (BACKLOG #4948). Since
+    BACKLOG #5229 the anchor check refuses such a file first, as a load by path does."""
     root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
     inter = _ca(_dn((NameOID.COMMON_NAME, "Inter CA")), by=root)
     cadata = _pem(root[0]) + _SILENT_STOPS["empty-foo"] + _pem(inter[0])
-    with pytest.raises(
-        ValueError, match=r"HTTP listener .*: tls_ca_file: .*does not load 1 CA certificate"
-    ):
+    with pytest.raises(TrustAnchorError, match=r"tls_ca_file: the TLS library stops reading"):
         _source(tmp_path, [], {"CN=Inter CA": [SUBJECT]}, cadata=cadata)
 
 

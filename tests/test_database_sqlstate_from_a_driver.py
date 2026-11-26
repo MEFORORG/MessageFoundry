@@ -23,7 +23,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.redaction import safe_exc, safe_traceback
+from messagefoundry.redaction import UNDER_A_DRIVER_ERROR, safe_exc, safe_traceback
 from messagefoundry.transports import database
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from tests._fake_dbapi_driver import DriverError
@@ -324,15 +324,45 @@ def test_the_redacted_copy_keeps_an_exception_groups_members() -> None:
 
 
 def test_a_member_whose_chain_leads_back_to_its_group_does_not_loop() -> None:
-    """A member whose context is its own group closes the cycle rather than recursing."""
+    """A member whose context is its own group closes the cycle rather than recursing.
+
+    The group is reached twice: from the top, and again as the driver member's context, where it
+    is under a driver error. Each gets its own copy (vault BACKLOG #8153, item 8), and the copy
+    under the member closes on its own stand-in."""
     member = DriverError("23000", f"duplicate ({_VALUE})")
     group = ExceptionGroup("synthetic group", [member])
     member.__context__ = group
     copy = database._safe_db_exc_info(group)
     assert isinstance(copy, BaseExceptionGroup)
+    assert copy.message == "ExceptionGroup [message withheld]"
     (copied,) = copy.exceptions
-    assert copied.__context__ is not None
-    assert copied.__context__.args == (copy.message,)
+    under = copied.__context__
+    assert isinstance(under, BaseExceptionGroup)
+    assert under.message == f"ExceptionGroup {UNDER_A_DRIVER_ERROR}"
+    (again,) = under.exceptions
+    assert again.__context__ is not None  # the cycle closes on the group's stand-in under it
+    assert again.__context__.args == (under.message,)
+
+
+def test_a_link_reached_first_outside_a_driver_error_is_withheld_under_one() -> None:
+    """Vault BACKLOG #8153, item 8. Red on the previous head: the copy cache was keyed by the link
+    alone, so a link first copied outside a driver error kept that rendering when a driver error
+    held it too, and printed its text under the driver error.
+
+    The shared link is an ``ImportError``, whose text the poll traceback keeps outside a driver
+    error (BACKLOG #5348) and must withhold under one."""
+    shared = ImportError("cannot import name synthetic_MRN900123456")
+    driver = DriverError("23000", f"duplicate ({_VALUE})")
+    driver.__cause__ = shared
+    outer = RuntimeError("synthetic outer")
+    outer.__context__ = shared
+    group = ExceptionGroup("synthetic group", [outer, driver])
+    copy = database._safe_db_exc_info(group)
+    assert isinstance(copy, BaseExceptionGroup)
+    outside, inside = copy.exceptions
+    assert outside.__context__ is not None and inside.__cause__ is not None
+    assert "synthetic_MRN900123456" in str(outside.__context__)  # the control: kept outside
+    assert str(inside.__cause__) == f"ImportError {UNDER_A_DRIVER_ERROR}"
 
 
 # --- Regressions of this branch's earlier heads ------------------------------------------------

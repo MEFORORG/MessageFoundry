@@ -14,6 +14,7 @@ from __future__ import annotations
 import inspect
 import logging
 import re
+from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -22,6 +23,7 @@ import pytest
 
 from messagefoundry import logging_setup, redaction
 from messagefoundry.redaction import redact, safe_exc, safe_text
+from messagefoundry.verify_leaf import safe_detail_text
 
 _NOTE = redaction._clamp_marker(70_000)
 _JOINERS = {"newline": "\n", "space": " "}
@@ -73,7 +75,12 @@ def _main() -> Iterator[None]:
         return end_tag(*args, **kwargs)
 
     def main_glued_value(
-        text: str, body: str, run: re.Match[str], field_run: re.Pattern[str]
+        text: str,
+        body: str,
+        run: re.Match[str],
+        field_run: re.Pattern[str],
+        *,
+        noted: bool = False,
     ) -> str | None:
         token, end = run.group(), run.end()
         note_follows = len(body) < len(text) and text.startswith("\n", len(body))
@@ -98,12 +105,35 @@ def _main() -> Iterator[None]:
         note = redaction._TRAILING_NOTES.search(text)
         return text if note is None else text[: note.start()]
 
+    def main_bounded_head(head: str, note: str) -> str:
+        # Main's safe_text head: redacted as it stood, no whitespace dropped, no note told.
+        return redact(head).strip()
+
     with pytest.MonkeyPatch.context() as patch:
+        if hasattr(redaction, "redact_bounded_head"):
+            patch.setattr(redaction, "redact_bounded_head", main_bounded_head)
         patch.setattr(redaction, "_without_trailing_note", last_note_only)
         patch.setattr(redaction, "_glued_value", main_glued_value)
         patch.setattr(redaction, "_maskable_rest", maskable_off)
         patch.setattr(redaction, "_end_tag_rest", end_tag_off)
         yield
+
+
+#: Routes whose dropped whitespace at the cut can switch a whole-text gate, such as the final
+#: ``bearer`` one, toward more scrubbing, so their answer is not main's with masks alone.
+_GATE_ROUTES = frozenset({"safe_text tab gap", "verify tab gap"})
+
+
+def _hides_at_least_main(out: str, main: str) -> bool:
+    """Whether every word ``out`` prints is a word ``main`` prints (counted), a shape mask, or holds
+    the placeholder: so ``out`` prints nothing ``main`` hid."""
+    left = Counter(main.split())
+    for word in out.split():
+        if left[word] > 0:
+            left[word] -= 1
+        elif redaction._REDACTED not in word and word.translate(redaction._SHAPE) != word:
+            return False
+    return True
 
 
 def _is_main_masked(out: str, main: str) -> bool:
@@ -138,16 +168,55 @@ def test_the_log_chain_masks_a_value_its_clamp_left_last(text: str, value: str) 
 
 
 @pytest.mark.parametrize(("text", "value"), _FIELD_RUN_VALUES[:4] + _END_TAG_RESTS[:2])
-def test_safe_text_still_judges_its_heads_last_value_as_ending_the_text(
-    text: str, value: str
-) -> None:
-    """A residual the changelog names: :func:`redaction.safe_text` appends its note after it
-    redacts, and its answer is main's. Reading a stand-in note after the head was withdrawn after
-    code review round 3, which found a ``bearer`` gate it flipped (pinned below)."""
+def test_safe_text_masks_a_value_its_bound_left_last(text: str, value: str) -> None:
+    """The root fix on the ``safe_text`` route: it redacts its head told, out of band, that its
+    bound note follows, so a value the bound left last is masked as the clamp route masks it. Red
+    on the code before: the value printed in front of the note. The answer is main's with letters
+    and digits masked, nothing else changed."""
     routed = text + " " + "q" * 70_000
     with _main():
-        main = (safe_text(routed, limit=400), safe_exc(ValueError(routed)))
-    assert (safe_text(routed, limit=400), safe_exc(ValueError(routed))) == main
+        main = safe_text(routed, limit=400)
+    assert value in main  # the premise: main printed it
+    out = safe_text(routed, limit=400)
+    assert value not in out, out
+    assert _is_main_masked(out, main), (out, main)
+
+
+@pytest.mark.parametrize(("text", "value"), _FIELD_RUN_VALUES[:2] + _END_TAG_RESTS[:2])
+def test_verify_detail_masks_a_value_its_clamp_left_last(text: str, value: str) -> None:
+    """The same fix on ``verify_leaf.safe_detail_text``, which clamps and appends the note after its
+    passes. Red on the code before: the value printed in front of the note."""
+    from messagefoundry.verify_leaf import safe_detail_text
+
+    routed = text + " " + "q" * 70_000
+    with _main():
+        main = safe_detail_text(routed, limit=400)
+    assert value in main  # the premise: main printed it
+    assert value not in safe_detail_text(routed, limit=400)
+
+
+@pytest.mark.parametrize("gap", ["\t", " \t", "\t\t", "  "], ids=repr)
+def test_safe_text_masks_a_value_whitespace_left_before_its_cut(gap: str) -> None:
+    """The cut lands on the last whitespace, so a run of it can stay after the head's last value.
+    That whitespace is dropped before the head is read, as the answer drops it anyway, so the value
+    is still the one the note follows. Red on the code before: ``12345`` printed."""
+    routed = "a|b|mrn: 12345" + gap + "q" * 70_000
+    with _main():
+        main = safe_text(routed)
+    assert "12345" in main  # the premise
+    out = safe_text(routed)
+    assert "12345" not in out and _is_main_masked(out, main), (out, main)
+
+
+def test_safe_exc_masks_it_through_safe_text() -> None:
+    """``safe_exc`` renders a message through :func:`safe_text`, so it takes the fix with no change
+    of its own. Red on the code before: the value printed."""
+    routed = "a|b|mrn: 12345 " + "q" * 70_000
+    with _main():
+        main = safe_exc(ValueError(routed))
+    assert "12345" in main  # the premise
+    out = safe_exc(ValueError(routed))
+    assert "12345" not in out and _is_main_masked(out, main), (out, main)
 
 
 @pytest.mark.parametrize(
@@ -187,6 +256,16 @@ _CORPUS = tuple(text for text, _ in _FIELD_RUN_VALUES + _END_TAG_RESTS) + (
     '{"name": "Zqx Doe", "id": 4455}',
     "DOE, JANE 19800505",
     "nonnumeric port: 'Zqx 4455",
+    # The inputs of this row's earlier regressions, so the safe_text fix is measured on them: the
+    # round-3 scheme gate, the reverted PR 3093 rests, and a round main ran that a mask must not.
+    "x%7Cy%7Cz bearer",
+    "PID%7C123%7CDOE bearer",
+    "PID%7C1%7C2 a|b|mrn: 12345 bearer",
+    "a|b|</family Zqxdoe>",
+    "a|b|</family Zqxdoe Vandt",
+    "a|b|</family Li",
+    "</given Doe>&Smith, Jones=PID|x",
+    "user svcadmin Login Password: svcadmin",
 )
 
 
@@ -200,14 +279,34 @@ def test_no_route_unmasks_what_main_masked(text: str, suffix: str) -> None:
         "redact twice": lambda t: redact(redact(t)),
         "safe_text": lambda t: safe_text(t, limit=4096),
         "safe_text padded": lambda t: safe_text(t + " " + "q" * 70_000, limit=4096),
+        "safe_text padded twice": lambda t: safe_text(
+            safe_text(t + " " + "q" * 70_000, limit=4096) + " " + "q" * 70_000, limit=4096
+        ),
         "chain padded": lambda t: _through_the_chain(t + " " + "q" * 70_000),
         "untrusted stacked": lambda t: redaction.redact_untrusted(f"{t}\n{_NOTE} " + "q" * 70_000),
+        # Round-1 review of this fix: whitespace at the cut, which the bounded head drops, and
+        # the verify detail route, which takes the same head rule.
+        "safe_text tab gap": lambda t: safe_text(t + " \t" + "q" * 70_000, limit=4096),
+        "verify padded": lambda t: safe_detail_text(t + " " + "q" * 70_000, limit=4096),
+        "verify tab gap": lambda t: safe_detail_text(t + "\t\t" + "q" * 70_000, limit=4096),
     }
     for route, call in routes.items():
         with _main():
             main = call(text + suffix)
         out = call(text + suffix)
-        assert _is_main_masked(out, main), (route, out, main)
+        check = _hides_at_least_main if route in _GATE_ROUTES else _is_main_masked
+        assert check(out, main), (route, out, main)
+
+
+def test_whitespace_dropped_at_the_cut_switches_the_bearer_gate_toward_scrubbing() -> None:
+    """Round-1 review of the safe_text fix: dropping the head's trailing whitespace changes
+    ``_redact_unguarded``'s final-``bearer`` gate too, the gate a stand-in note once flipped the
+    wrong way. Here it goes the safe way: main printed the encoded run, the bounded head scrubs it."""
+    routed = "x%7Cy%7Cz bearer \t" + "q" * 70_000
+    with _main():
+        main = safe_text(routed)
+    assert "%7C" in main  # the premise
+    assert "%7C" not in safe_text(routed)
 
 
 @pytest.mark.parametrize("joiner", list(_JOINERS.values()), ids=list(_JOINERS))
@@ -269,3 +368,38 @@ def test_the_line_break_rule_after_a_rest_is_pinned() -> None:
     masked, and a last word of two letters or fewer is kept (item 15's over-refusal)."""
     assert redact("<family>Smith</family Zqxdoe\n") == "<family>[redacted]</family Xxxxxx\n"
     assert redact("<family>Smith</family Li\n") == "<family>[redacted]</family Li\n"
+
+
+def test_the_audit_tee_detail_keeps_one_answer_on_both_paths() -> None:
+    """Round-2 review: telling only the tee's unscrubbed bound about its note made it disagree with
+    the C0-scrubbed path, whose head the handler chain read with no note, so the line shipped the
+    whole detail hidden. Both paths keep main's answer, a named residual (``_bounded_detail``).
+    Red on the round-1 head: the shipped detail was the placeholder and the note alone."""
+    import json
+
+    from messagefoundry.store import audit_tee
+
+    lines: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            lines.append(record.getMessage())
+
+    handler = _Capture()
+    logger = logging.getLogger("messagefoundry.audit")
+    logger.addHandler(handler)
+    try:
+        audit_tee.emit_audit_tee(
+            action="message.error",
+            actor="svc",
+            channel_id=None,
+            detail="\x01 a|b|mrn: 12345 " + "q" * 70_000,
+            ts=1.0,
+            row_id=1,
+            seq=1,
+            row_hash="0" * 64,
+        )
+    finally:
+        logger.removeHandler(handler)
+    shipped = json.loads(lines[-1])["detail"]
+    assert shipped.startswith("\x01 [redacted] "), shipped  # scrubbed, not hidden whole

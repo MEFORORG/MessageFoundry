@@ -56,7 +56,7 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
         poll_interval=0.02,
         config_dir=None,
         store_settings=StoreSettings(path=str(tmp_path / "fb.db")),
-        dr_settings=DrSettings(enabled=True, activate=False),
+        dr_settings=DrSettings(enabled=True, activate=False, seed_archive="seed.mfbak"),
         egress_settings=EgressSettings(deny_by_default=False),
     )
     yield eng
@@ -179,7 +179,7 @@ async def test_an_activation_reports_a_connector_its_reload_could_not_close(
         poll_interval=0.02,
         config_dir=None,
         store_settings=StoreSettings(path=str(tmp_path / "fb.db")),
-        dr_settings=DrSettings(enabled=True, activate=False),
+        dr_settings=DrSettings(enabled=True, activate=False, seed_archive="seed.mfbak"),
         egress_settings=EgressSettings(deny_by_default=False),
         claim_mode="per_lane",
     )

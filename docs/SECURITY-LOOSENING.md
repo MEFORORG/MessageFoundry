@@ -226,22 +226,22 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `[auth].admin_new_ip_step_up` | `true` |
 | | `[auth].require_action_step_up` | `true` (`false` lets the action-bound step-up routes accept the session-wide step-up window) |
 | | `[auth].password_check_breached`, `password_check_context`, `password_check_username` | `true` (each `false` turns off one screen of a local password) |
-| | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | `true` / `10` / `60` / `60` s (`false`, a count of `0` or above its default, or a window below `60` s is named, and `0` or a window of `0` or less turns a limit off) |
+| | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | `true` / `10` / `60` / `60` s (`false`, a count of `0` or above its default, or a window below `60` s is named, and `0` or a window of `0` turns a limit off; a negative count or window is refused at load) |
 | | `[auth].lockout_minutes`, `lockout_threshold`, `lockout_max_minutes` | `15` / `5` / `1440` (minutes below `15` or a ceiling below `1440` is named, and so is a threshold above `5`; minutes of `0` or less means no lock ever holds) |
 | | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_window_seconds` | `true` / `120` / `60` s (`false`, a count of `0` or above `120`, or a window below `60` s) |
 | | `[auth].monitoring_read_rate_limit_enabled`, `monitoring_read_rate_limit_per_actor`, `monitoring_read_rate_limit_window_seconds` | `true` / `600` / `60` s (`false`, a count of `0` or above `600`, or a window below `60` s) |
 | | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds`, `admin_write_min_interval_seconds` | `true` / `12` / `15` s / `0.15` s (`false`, a count of `0` or above `12`, a window below `15` s, or a gap below `0.15` s) |
 | | `[auth].mfa_verify_min_elapsed_seconds`, `oidc_callback_min_elapsed_seconds` | `1.0` s / `1.0` s (*conditional* — the second a loosening only with OIDC on; a floor below `1.0` s, and `0` turns it off) |
 | | `[auth].oidc_callback_floor_exempt_amr` | `[]` (*conditional* — a loosening only with OIDC on and the callback floor on; any value listed) |
-| | `[auth].max_sessions_per_user` | `5` (`0` or less means unlimited, and so is named, as is any cap above `5`) |
-| | `[auth].oidc_flow_cache_max` | `512` (*conditional* — a loosening only while OIDC is on; a cap above `512`. `0` or less refuses every flow, which is stricter) |
+| | `[auth].max_sessions_per_user` | `5` (`0` means unlimited, and so is named, as is any cap above `5`; a negative cap is refused at load) |
+| | `[auth].oidc_flow_cache_max` | `512` (*conditional* — a loosening only while OIDC is on; a cap above `512`. The load refuses a cap below `1`, which would refuse every flow) |
 | | `[auth].step_up_max_age_seconds` | `300` s (a window above `300` s is named. `0` or less is stricter: it passes no session, except briefly after the system clock steps back) |
 | | `[auth].totp_skew_steps` | `0` (`1` or `2` is named. The load refuses any other value) |
 | | `[auth].initial_password_expiry_hours` | `72` h (a life above `72` h is named, and `0` or less means a temporary password never expires) |
 | | `[auth].mfa_recovery_code_count` | `10` (more codes is named. `0` mints none, which is stricter. The load refuses a value outside `0` to `50`) |
-| | `[auth].password_min_length` | `15` (a shorter floor is named, and `0` or less sets none) |
+| | `[auth].password_min_length` | `15` (a shorter floor is named, and `0` sets none; a negative floor is refused at load) |
 | | `[auth].oidc_clock_skew_seconds`, `oidc_jwks_ttl_seconds`, `oidc_flow_ttl_seconds`, `oidc_max_age_seconds` | `60` s / `3600` s / `300` s / `43200` s (*conditional* — a loosening only while OIDC is on; a value above its default is named) |
-| | `[auth].oidc_jwks_min_refetch_seconds` | `300` s (*conditional* — a loosening only while OIDC is on; a value below `300` s, or above the default JWKS lifetime of `3600` s, is named, and `0` or less removes the bound) |
+| | `[auth].oidc_jwks_min_refetch_seconds` | `300` s (*conditional* — a loosening only while OIDC is on; a value below `300` s, or above the default JWKS lifetime of `3600` s, is named, and `0` removes the bound; a negative value is refused at load) |
 | | `[approvals].min_dwell_seconds`, `expiry_hours` | `2.0` s / `72` h (*conditional* — a loosening only while `[approvals].enabled` holds at least one operation; a floor below `2.0` s or an expiry above `72` h, and `0` turns either off) |
 | | `[approvals].operations` | `["connection_purge", "dead_letter_replay"]` (*conditional* — a loosening only while `[approvals].enabled` is on; a list that leaves out either default operation is named, and so is an empty list, which holds nothing; named as `approvals.operations`) |
 | | `[api].trusted_proxies` | `[]` (any network covering more than one address is named, once, a `/31` or `/127` included, because every host inside it may set `X-Forwarded-For`. Entries covering every address, such as `0.0.0.0/0` or `::/0`, trust it from every peer, as the refused `*` would, and get their own wording) |
@@ -1102,7 +1102,7 @@ count is above `0` (vault BACKLOG #2613).
 > | Value | What loosens |
 > |---|---|
 > | `login_rate_limit_enabled = false` | Both sign-in limits, per address and across all clients, and the per-user limit on credential ceremonies. None is built. |
-> | `login_rate_limit_window_seconds` of `0` or less | The same three are off. The limiter ages every attempt out before it counts it, while the enable switch still reads as on. |
+> | `login_rate_limit_window_seconds` of `0` | The same three are off. The limiter ages every attempt out before it counts it, while the enable switch still reads as on. |
 > | `login_rate_limit_window_seconds` below `60` | The same three admit their counts once per that window instead of once per minute. A tiny window, such as `1e-6`, admits nearly every attempt. |
 > | `login_rate_limit_per_ip = 0`, or above `10` | The per-address sign-in limit, and the per-user ceremony limit, which reads the same number. `0` turns both off. |
 > | `login_rate_limit_global = 0`, or above `60` | The all-clients sign-in limit. `0` turns it off. |
@@ -1116,12 +1116,14 @@ count is above `0` (vault BACKLOG #2613).
 > The **credential ceremonies** are re-auth, password change, MFA enrolment, and the console's
 > second-factor step at sign-in (`POST /ui/mfa`); [SECURITY.md](SECURITY.md) lists the routes. With the
 > limiter off, a count or window changes nothing, so only `login_rate_limit_enabled` is named, and a
-> window of `0` or less likewise stands in for its counts. A short window is not named when every count
+> window of `0` likewise stands in for its counts. A short window is not named when every count
 > it paces is `0`, since it then paces nothing; each zeroed count is named instead. **The cutoff is the shipped default, not a
 > judged threshold.** Any value looser than the default is named, so a huge count or a tiny window is
 > reported like an off value, with text that says *looser than the default of* rather than *off*. A
-> value at or stricter than the default is not reported. That includes a **negative** count, which
-> refuses *more* attempts, not fewer. A window that is not a number, or is infinite, does not load
+> value at or stricter than the default is not reported. A **negative** count or window does not load
+> (BACKLOG #5318): a negative per-address count refused every attempt after an address's first in a
+> window, a negative all-clients count refused every attempt, the first included, and a negative window aged
+> every attempt out, as `0` does. A window that is not a number, or is infinite, does not load
 > (vault BACKLOG #2466): a `NaN` or `+inf` window never ages an attempt out, so once the count filled
 > the limiter would refuse every sign-in until a restart. A window above `86400` s (one day) does
 > not load either, since a huge finite one does the same in practice. Both rules hold for
@@ -1180,9 +1182,9 @@ count is above `0` (vault BACKLOG #2613).
 
 ### `[auth].phi_read_rate_limit_*` looser than its default — PHI reads go less paced
 > No sign-in condition applies ([BACKLOG #1131](BACKLOG.md), ASVS 2.4.1). Named: `phi_read_rate_limit_enabled
-> = false`; a `phi_read_rate_limit_window_seconds` of `0` or less (off) or below `60` s (looser); a
+> = false`; a `phi_read_rate_limit_window_seconds` of `0` (off) or below `60` s (looser); a
 > `phi_read_rate_limit_per_actor` of `0` (off) or above `120` (looser). The same parts rule applies as for
-> sign-in: with the limiter off, or its window at `0` or less, its count is not named again.
+> sign-in: with the limiter off, or its window at `0`, its count is not named again.
 > `phi_read_rate_limit_global` ships **off** (`0`), so no value of it is looser than the default and it is
 > never named.
 - **What you lose:** the per-account pace on the PHI-read routes and console views
@@ -1283,8 +1285,8 @@ count is above `0` (vault BACKLOG #2613).
 - **Reversible:** yes, immediately — empty the list (or delete the line) and restart.
 
 ### `[auth].max_sessions_per_user` of `0` or above `5` — more live sessions per user
-> No sign-in condition applies ([BACKLOG #1131](BACKLOG.md), ASVS 7.1.2). `0` or less means unlimited, so it
-> is named as off; any cap above `5` is named as looser.
+> No sign-in condition applies ([BACKLOG #1131](BACKLOG.md), ASVS 7.1.2). `0` means unlimited, so it
+> is named as off; any cap above `5` is named as looser. A negative cap does not load (BACKLOG #5318).
 - **What you lose:** a new sign-in beyond the cap revokes the user's oldest live session. With a higher
   cap, or none, a stolen or forgotten session stays live beside the owner's for longer.
 - **When acceptable:** an account used from more devices or console instances than five, where each is
@@ -1295,8 +1297,8 @@ count is above `0` (vault BACKLOG #2613).
 
 ### `[auth].oidc_flow_cache_max` above `512` — more pending federated sign-ins held in memory
 > **Conditional** on `[auth].oidc_enabled`, since the cache is built only with federation on
-> ([BACKLOG #1131](BACKLOG.md)). The cache refuses a new flow once it holds this many, so a cap of `0` or
-> less refuses **every** federated sign-in. That is stricter, not looser, and it is not named. A cap above
+> ([BACKLOG #1131](BACKLOG.md)). The cache refuses a new flow once it holds this many, so a cap of `0`
+> would refuse **every** federated sign-in; the load refuses a cap below `1` (BACKLOG #5318). A cap above
 > `512` is named. A very large one, such as `1e9`, removes the engine-wide bound in practice.
 - **What you lose:** each abandoned login start holds a slot until its time-to-live ends. A higher cap lets
   a flood of starts hold more memory before new ones are refused; the per-address cap still bounds one
@@ -1371,7 +1373,8 @@ count is above `0` (vault BACKLOG #2613).
 
 ### `[auth].password_min_length` below `15` — a shorter local password
 > No other setting gates it: sign-in is always on, and every local account has a password (vault
-> BACKLOG #2600). `0` or less sets no length floor at all, and is named as off. The entry does not
+> BACKLOG #2600). `0` sets no length floor at all, and is named as off; a negative floor does not
+> load (BACKLOG #5318). The entry does not
 > quote the configured value.
 - **What you lose:** the password policy refuses a local password shorter than this when it is set. A
   lower floor leaves a guessing attack fewer candidates to try.

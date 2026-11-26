@@ -164,7 +164,8 @@ def test_rig_sign_in_env_names_real_auth_settings() -> None:
         {_PER_IP: "500"},
         {_PER_IP: "0"},  # no limit
         {_PER_IP: "not-a-number"},  # the engine's loader refuses it
-        {_SESSIONS: "-1"},  # a session cap of 0 or less is no cap
+        # the engine refuses a negative cap at load (BACKLOG #5318); the rig passes it on
+        {_SESSIONS: "-1"},
         {_PER_IP: "3", _ENABLED: "False"},  # the rate limiter is off
         {_GLOBAL: "3", _WINDOW: "0"},  # a window of 0 or less turns it off
     ],
@@ -180,7 +181,8 @@ def test_a_limit_the_operator_sets_and_the_fleet_fits_passes_the_check(
     [
         (_PER_IP, "5"),
         (_PER_IP, "3.0"),  # the engine's loader reads this as 3
-        (_PER_IP, "-1"),  # a negative rate count refuses every sign-in after an address's first
+        # the engine refuses a negative count at load (BACKLOG #5318); the rig names it first
+        (_PER_IP, "-1"),
         (_GLOBAL, "5"),
     ],
 )

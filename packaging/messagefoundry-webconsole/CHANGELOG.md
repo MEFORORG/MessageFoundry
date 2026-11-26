@@ -303,6 +303,32 @@ this line.**
 
 ### Fixed
 
+- **A refused code on a verified session no longer lands as a success does, except at least for a
+  code within the length bound on an `oidc` session with TOTP enrolled (vault BACKLOG #2964 item
+  21).**
+  `POST /ui/mfa` on a session that had already met its second factor sent a refused code to `/ui`,
+  the same landing a success gets, so the refusal showed nothing. It now lands on
+  `/ui?m=mfa_code_refused`, whose banner says the session needed no code and the code was not
+  accepted. An `oidc` session that met its factor, on an account with TOTP enrolled, does not get
+  the notice for a code within the form's length bound: that code is refused unread
+  (`idp_step_up_required`, ADR 0142 Amendment F) and still lands on a bare `/ui`.
+- **A passkey whose stored id cannot be read gets its own notice.** The engine's passkey begin leg
+  now raises `StoredPasskeysUnreadable` for an account whose passkeys under this origin all have a
+  stored credential id that does not decode; before, the decode error escaped as a 500. Every
+  page that stages a passkey ceremony through `_reauth_webauthn_state` in `routes/core.py`
+  catches it and shows the new `WEBAUTHN_UNREADABLE_NOTICE`, exported from the package, in place
+  of the origin-migration notice its `None` would have shown. The notice sends a holder with
+  another factor to sign in with it and remove the unreadable passkey. One with no other factor
+  is sent first to "Sign in with password and passkey", which names no credential and so may
+  still accept a discoverable passkey whose stored id cannot be read, and to an administrator
+  for an MFA reset only if that fails too. The supported engine seam moved with it:
+  `StoredPasskeysUnreadable` is part of it, and `SUPPORTED_ENGINE_SEAMS` names the new digest.
+  (`BACKLOG #6886`)
+- **An uploaded-log resend refused for the operator's own username names that cause.** The engine
+  refuses a resend whose acting username is blank or has spaces around it with a 403 carrying
+  `X-Refusal-Code: username_unusable`. The console now shows its own notice for it, not the
+  channel-denial text, which would send the operator after a scope that is not the problem. No seam
+  changes. (BACKLOG #6589)
 - **The High Availability pages degrade when the store does not answer.** The page, its live
   fragment and both step-down confirm pages read the cluster membership and lease rows with no error
   handling, so a store timeout or outage answered with an error body in place of the page. The page
@@ -333,12 +359,12 @@ this line.**
   that set, an empty one included, is refused with the generic "invalid input". A body that starts
   with a line break keeps it. The seam digest moved because the route's form parser changed, and
   it now hashes the helper that rewrites the breaks. (BACKLOG #5930)
-- **A resubmit with no `eol` field gives a body that starts with MSH CR terminators.** A form
-  the editor did not render, such as a stale page or a hand-built POST, used to resubmit the
-  browser's line breaks. A submitted body that starts with MSH now goes out with CR, whatever the
-  original used, since the parser has no original to read; any other body, an `FHS` or `BHS`
-  batch included, goes out as sent. The seam digest moved again, because
-  the form parser and its new helper changed. (BACKLOG #5930)
+- **A resubmit with no `eol` field gives an HL7 body CR terminators.** A form the editor did not
+  render, such as a stale page or a hand-built POST, used to resubmit the browser's line breaks. A
+  submitted body that starts with MSH, or with a `BHS` or `FHS` batch header in its separator
+  shape, now goes out with CR, whatever the original used, since the parser has no original to
+  read; any other body goes out as sent. The seam digest moved again, because the form parser and
+  its new helper changed. (BACKLOG #5930)
 
 - **TOTP enrolment no longer drops the first code.** Under the default
   `[auth].require_action_step_up`, the enroll page showed a code form whose submit the confirm

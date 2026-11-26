@@ -3006,7 +3006,7 @@ class RestDestination(DestinationConnector):
         # ADR 0013: capture the HTTP response body. Default False → returns None, byte-identical. A 2xx
         # with a body → outcome='accepted'; a 2xx with an empty body → outcome='no_reply' (a successful
         # round-trip, not an error). Non-2xx keeps today's DeliveryError/NegativeAckError classification.
-        self.capture_response: bool = bool(s.get("capture_response", False))
+        self.capture_response: bool = flag_from_settings(s, "capture_response")
         # #154: the allow-list of HTTP response header names to capture into the DeliveryResponse. Empty
         # (the default) → no headers captured, byte-identical. Only meaningful when the reply is captured.
         self.capture_response_headers = normalize_header_allowlist(
@@ -3015,7 +3015,7 @@ class RestDestination(DestinationConnector):
         # #68: opt in to per-message HTTP headers stamped by a Handler into the ADR 0081 metadata bag
         # (http.header.* entries). Default False → the delivery worker skips the metadata read and send
         # is byte-identical. When True, consumes_metadata tells the worker to pass this message's bag.
-        self.consumes_metadata: bool = bool(s.get("dynamic_headers", False))
+        self.consumes_metadata: bool = flag_from_settings(s, "dynamic_headers")
         # #200 (ADR 0092): the per-connection insecure-hop attestation, keying the posture-keyed refusal.
         attested = config.tls_hop_attested
         # ADR 0153 decision 2: the OPPOSITE per-connection declaration — this hop is cleartext, is not

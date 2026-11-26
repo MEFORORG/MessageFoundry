@@ -113,6 +113,7 @@ from messagefoundry.api.message_scope import (
     MessageKeyServiceUnavailableError,
     get_scoped_message,
     read_scoped_message,
+    refuse_a_channel_scoped_reader,
 )
 from messagefoundry.api.message_scope import audit_channel_denied as _audit_channel_denied
 from messagefoundry.api.metrics import (
@@ -573,6 +574,7 @@ from messagefoundry.store.store import (
     OperatorAudit,
     ReingressOutcome,
     ResendOutcome,
+    is_origin_actor,
 )
 from messagefoundry.store.transit_attestation import (
     read_transit_bound_attestation,
@@ -982,10 +984,20 @@ def _read_log_tail(
 
     Returns ``(redacted_lines, total_lines, available)``. ``offset`` counts lines back from the END of the
     newest ``.log``/``.txt`` file (``offset=0`` = the most recent ``limit`` lines); the page is returned in
-    file order (oldest-first within the window). Every line is passed through
-    :func:`~messagefoundry.support.redact.redact_log_line` — the SAME redactor the support bundle uses — so
-    the browser sees identical PHI/secret coverage; the redaction is best-effort (a residual single-token
-    identifier can survive), which is why the route is RBAC-gated + audited. ``available`` is False when no
+    file order (oldest-first within the window). Every line served is passed through
+    :func:`~messagefoundry.support.redact.redact_log_record`, the per-line pass the support bundle's
+    ``redact_log_text`` runs too, after the cross-line key-body mask
+    (:func:`~messagefoundry.support.redact.mask_key_body_lines`) over the page and the lines before it
+    back to where a key block covering it could begin
+    (:func:`~messagefoundry.support.redact.key_body_mask_from`). The two do not mask the same text.
+    At least: they pick their file with different listings, so they can read different files; the
+    bundle masks across its bounded read window, and keeps the audit copies, while this reads the
+    whole file and, with ``audit_copies=False``, drops them before the mask, so a key block an audit
+    copy splits can be masked for one reader and print for another. A BEGIN line with no END marker
+    after it masks the lines after it that read as base64 runs, such as a single word, as
+    :func:`~messagefoundry.support.redact.mask_key_body_lines` says. The redaction is best-effort (a
+    residual single-token identifier can survive), which is why the route is RBAC-gated + audited.
+    ``available`` is False when no
     ``[logging].log_dir`` is configured or no readable log file exists, so ``/logs/tail`` degrades
     gracefully. **Blocking** (a file read + redaction pass) — the caller runs it off the event loop — and
     **never raises** (an unreadable dir/file yields an empty, unavailable page).
@@ -994,6 +1006,7 @@ def _read_log_tail(
     and the page boundaries do not count them either (BACKLOG #1131; see
     :func:`~messagefoundry.auth.audit_visibility.reads_audit_copies_in_the_log`)."""
     from messagefoundry.auth.audit_visibility import is_audit_copy_line
+    from messagefoundry.support import redact
     from messagefoundry.support.redact import redact_log_record, split_log_lines
 
     if not log_dir:
@@ -1017,7 +1030,11 @@ def _read_log_tail(
     total = len(all_lines)
     end = max(0, total - offset)  # exclusive upper bound of this page (from the end)
     start = max(0, end - limit)
-    page = all_lines[start:end]
+    # From where a PRIVATE KEY block covering the page could begin, so a block whose BEGIN line is on
+    # an earlier page still has its body masked on this one, without masking the whole file on each
+    # request (BACKLOG #5550). A file with no "-----" holds no block, so it skips the scan back.
+    first = redact.key_body_mask_from(all_lines, start) if "-----" in text else start
+    page = redact.mask_key_body_lines(all_lines[first:end])[start - first :]
     return [redact_log_record(line) for line in page], total, True
 
 
@@ -3763,7 +3780,11 @@ async def _record_a_restore(store: Store, sink: AlertSink) -> None:
     processes on the same store, such as ``serve --shard`` processes, check sessions too, and may
     start before or after this one; what keeps the archive's sessions from them is the restore
     itself, which ended every session in the file before placing it (``write_restore_marker``).
-    This revoke repeats that for anything minted since, and raises every account's epoch.
+    This revoke repeats that for anything minted since. It also raises the global session epoch,
+    which ends the sessions minted before it unless someone with write access to the database
+    lowers or deletes its row, and the epoch of each account but those
+    ``AuthStore.revoke_all_sessions`` says go without it. docs/SECURITY.md, *Limits of the
+    session sweep*, says what else it may miss.
 
     A store write that fails here raises, so the start fails rather than serving the archive's
     sessions. The alert itself never raises: the record is already committed."""
@@ -4345,6 +4366,11 @@ def _plaintext_columns(backend: str, *, encryption_enabled: bool) -> list[str]:
         return list(_SQLSERVER_PLAINTEXT_RESIDUAL)  # () since H4 — full parity, no residual
     return []
 
+
+#: The ``X-Refusal-Code`` value of the upload resend's 403 for an acting username that cannot label
+#: an injected message (BACKLOG #6589). The channel denial's 403 carries none, so a client tells the
+#: two apart by it; the web console's ``uploaded_logs`` routes read the same value.
+RESEND_USERNAME_REFUSAL_CODE: Final = "username_unusable"
 
 #: The status a refused operator resubmission answers with, by the ingress guard that refused it
 #: (BACKLOG #1911). An oversize body is 413. A body that contradicts the inbound's declared type is 415,
@@ -10128,6 +10154,38 @@ def create_app(
         if not identity.can_access_channel(body.to):
             await _audit_channel_denied(engine, identity, body.to, client_ip(request))
             raise HTTPException(403, f"not authorized to inject into inbound {body.to!r}")
+        # BACKLOG #6589: the inject labels the message with this username, and the store refuses a
+        # blank or padded one. A directory name is not held to the local username rule, so refuse it
+        # here, after the channel check and before the upload is read or anything is injected, as a
+        # 403 rather than the store's TypeError. The step-up proof is already spent by then. The
+        # refusal writes an `upload.resend_reject` row, as the ingress guards' refusal does, so a
+        # resend that main would have audited as `upload.resend` is never refused unrecorded.
+        if not is_origin_actor(identity.username):
+            reason = (
+                "this account's username is blank or has surrounding whitespace, so it cannot"
+                " label an injected message"
+            )
+            await engine.store.record_audit(
+                "upload.resend_reject",
+                actor=identity.username,
+                channel_id=body.to,
+                detail=json.dumps(
+                    {
+                        "file_id": file_id,
+                        "index": body.index,
+                        "to": body.to,
+                        "phase": "origin_actor",
+                        "reason": reason,
+                    }
+                ),
+                client=client_ip(request),
+            )
+            _log.warning("upload.resend_reject: the acting username cannot label an inject")
+            # `X-Refusal-Code` tells this 403 apart from the channel denial above, for a JSON
+            # client and for the web console, which maps a bare 403 to that denial.
+            raise HTTPException(
+                403, reason, headers={"X-Refusal-Code": RESEND_USERNAME_REFUSAL_CODE}
+            )
         rr = engine.registry_runner
         if rr is None or body.to not in rr.registry.inbound:
             raise HTTPException(404, f"no such inbound connection: {body.to}")
@@ -10734,12 +10792,21 @@ def create_app(
     @app.get("/metrics")
     async def metrics_endpoint(
         engine: Engine = Depends(_get_engine),
-        _user: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
+        identity: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
     ) -> Response:
         """Prometheus exposition (text/plain). Gated by monitoring:read like /stats — a scraper
         authenticates with a service token. Contains only aggregate counts/latency keyed by
-        connection name + status — no PHI."""
-        return Response(content=await render_metrics(engine), media_type=METRICS_CONTENT_TYPE)
+        connection name + status — no PHI.
+
+        A channel-scoped caller reads only its own inbounds' series, and no per-destination or
+        latency series at all (BACKLOG #4346, the route build of #1152):
+        :func:`~messagefoundry.api.metrics.scoped_snapshot` says why. A scraper that needs the
+        whole estate is given the all-channels grant."""
+        in_scope = identity.can_access_channel if identity.allowed_channels is not None else None
+        return Response(
+            content=await render_metrics(engine, in_scope=in_scope),
+            media_type=METRICS_CONTENT_TYPE,
+        )
 
     @app.get("/metrics/history", response_model=MetricsHistoryResponse)
     async def metrics_history(
@@ -11359,7 +11426,14 @@ def create_app(
         refuses to emit) + the per-actor anti-automation throttle — under the new ``logs:view`` permission,
         exactly like a message-detail read. Each served page writes a ``logs_view`` audit row counting how
         many lines were exposed (**metadata only, never the content**). Degrades gracefully to an empty,
-        ``available=false`` page when no ``[logging].log_dir`` is configured or the file is unreadable."""
+        ``available=false`` page when no ``[logging].log_dir`` is configured or the file is unreadable.
+
+        A channel-scoped caller is refused 403, with an ``auth.channel_denied`` row (BACKLOG #4346,
+        the route build of #1152). A log line is not attributable to one channel, so there is
+        nothing to narrow the page by; a reader who needs the log is given the all-channels grant."""
+        await refuse_a_channel_scoped_reader(
+            engine.store, identity, Permission.LOGS_VIEW, client_ip(request)
+        )
         log_dir = getattr(request.app.state, "log_dir", None)
         # Blocking file read + redaction pass — off the event loop, like /status app-log metering.
         lines, total, available = await asyncio.to_thread(
