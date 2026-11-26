@@ -145,6 +145,7 @@ from messagefoundry.store.store import (
     read_audit_anchor_file,
 )
 from messagefoundry.store.transit_attestation import enforce_transit_bound_attestation
+from messagefoundry.threadhop import to_thread_or_loop
 from messagefoundry.transports.base import IntakeGate
 
 __all__ = [
@@ -3295,7 +3296,7 @@ class Engine:
         snapshot = await self._content_snapshot(path)
         if snapshot is None:
             raise ConfigDigestUnavailable(None)
-        return await asyncio.to_thread(self._approval_of, snapshot)
+        return await to_thread_or_loop("config approval check", self._approval_of, snapshot)
 
     def _approval_of(self, snapshot: ConfigSnapshot) -> ApprovedConfig:
         """What a hold binds of ``snapshot``: its published content digest, which leaves the value
@@ -3336,7 +3337,9 @@ class Engine:
         cannot be read. An approval binds content, so that failure must not refuse a release. That
         one also stays best-effort, skipping what it cannot read, because it records provenance and
         refuses nothing."""
-        return await asyncio.to_thread(self._content_snapshot_blocking, path, self._value_file())
+        return await to_thread_or_loop(
+            "config directory read", self._content_snapshot_blocking, path, self._value_file()
+        )
 
     @staticmethod
     def _content_snapshot_blocking(
@@ -3387,7 +3390,9 @@ class Engine:
         reload, gated or not, never falls back to reading it from disk for that fault. A config
         directory that cannot be read whole still returns ``None``, as above, and then an ungated
         reload reads the values from disk."""
-        return await asyncio.to_thread(self._reload_snapshot_blocking, path, self._value_file())
+        return await to_thread_or_loop(
+            "config directory read", self._reload_snapshot_blocking, path, self._value_file()
+        )
 
     @staticmethod
     def _reload_snapshot_blocking(
@@ -3446,8 +3451,12 @@ class Engine:
         :class:`ConfigDirUnreadable` when resolving or listing it raises another ``OSError``.
         Off the event loop: the resolve opens the target and each parent, and a slow
         volume would otherwise stall every listener for as long as that takes (vault BACKLOG
-        #2581)."""
-        return await asyncio.to_thread(self._existing_reload_target_blocking, config_dir)
+        #2581). A default executor that refuses the hop runs it on a thread of its own, or on
+        the loop when no thread can start, with a WARNING, rather than failing the reload (BACKLOG
+        #5755, item 5)."""
+        return await to_thread_or_loop(
+            "config reload target check", self._existing_reload_target_blocking, config_dir
+        )
 
     def _existing_reload_target_blocking(self, config_dir: str | Path | None) -> Path:
         """:meth:`_existing_reload_target` on a worker thread, in one hop."""
@@ -3753,7 +3762,9 @@ class Engine:
             # Before load_config, which runs every config module's top-level code, so bytes
             # changed since the request are refused before they run. An edit after this read
             # changes nothing: the load runs this snapshot.
-            await asyncio.to_thread(_require_approved, snapshot, approval, self.store.cipher())
+            await to_thread_or_loop(
+                "config approval check", _require_approved, snapshot, approval, self.store.cipher()
+            )
         # The values this reload resolves env() against. A real reload applies them only at the
         # swap, so a refusal leaves the running graph's values as they were (vault BACKLOG #2596).
         env_values = self._env_values
@@ -3831,7 +3842,8 @@ class Engine:
                 # A provider not handed the snapshot may have read a value file the digest covers
                 # from disk after the check, so the release checks the directory again now, and
                 # refuses an edit made in between rather than apply values nobody approved.
-                await asyncio.to_thread(
+                await to_thread_or_loop(
+                    "config approval check",
                     _require_approved,
                     await self._content_snapshot(path),
                     approval,
