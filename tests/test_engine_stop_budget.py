@@ -188,6 +188,56 @@ def test_the_time_kept_after_the_crl_wait_fits_the_engine_reserve() -> None:
     assert kept + engine_module._STOP_WAIT_FLOOR_SECONDS < app_module._ENGINE_STOP_RESERVE_SECONDS
 
 
+class _RetentionRecorder:
+    stop_timeout_seconds = 5.0
+
+    def __init__(self) -> None:
+        self.timeouts: list[float | None] = []
+
+    async def stop(self, *, timeout: float | None = None) -> None:
+        self.timeouts.append(timeout)
+
+
+async def test_the_retention_stop_is_held_inside_the_budget(tmp_path: Path) -> None:
+    """BACKLOG #6526: the retention runner's stop is the first budgeted wait, so it keeps back
+    the CRL wait's share and everything that wait keeps."""
+    eng = await _engine(tmp_path)
+    _attach(eng)
+    retention = _RetentionRecorder()
+    eng._retention_runner = retention  # type: ignore[assignment]
+    await eng.drain_config_writes(0.0)
+    await _stop(eng, budget_seconds=2.0)
+    [wait] = retention.timeouts
+    kept = (
+        engine_module._STOP_CLOSE_ALLOWANCE_SECONDS
+        + 3 * engine_module._STOP_WAIT_SHARE_SECONDS
+        + remote_debug_watch.STOP_FLOOR_SECONDS
+    )
+    assert wait is not None
+    assert 2.0 - kept - 0.5 <= wait <= 2.0 - kept
+
+
+async def test_with_no_budget_the_retention_stop_keeps_its_fixed_bound(tmp_path: Path) -> None:
+    eng = await _engine(tmp_path)
+    _attach(eng)
+    retention = _RetentionRecorder()
+    eng._retention_runner = retention  # type: ignore[assignment]
+    await _stop(eng)
+    assert retention.timeouts == [retention.stop_timeout_seconds]
+
+
+def test_the_time_kept_after_the_retention_wait_fits_the_engine_reserve() -> None:
+    """The retention wait now comes first, so it keeps back the most: the CRL wait's share on
+    top of what the CRL wait keeps. It must still get more than its floor inside the reserve."""
+    kept = (
+        engine_module._STOP_CLOSE_ALLOWANCE_SECONDS
+        + engine_module._CONFIG_WRITE_LATE_DRAIN_SECONDS
+        + 3 * engine_module._STOP_WAIT_SHARE_SECONDS
+        + remote_debug_watch.STOP_FLOOR_SECONDS
+    )
+    assert kept + engine_module._STOP_WAIT_FLOOR_SECONDS < app_module._ENGINE_STOP_RESERVE_SECONDS
+
+
 async def test_the_managed_lifespan_hands_engine_stop_its_bound() -> None:
     """Before BACKLOG #3191 the step called engine.stop() with nothing, so no wait inside it
     knew the window."""

@@ -518,11 +518,11 @@ restart commands send the same request, so there is no reason to use them.
 **A stop holds some of its waits to a budget, to keep inside NSSM's stop window, and that can cut
 them short** (BACKLOG #3191; the owner ruled on 2026-11-22 that the budget wins over the work it
 cuts). The service's shutdown hands `engine.stop()` what is left of its budget after the floors of
-the steps after it, never less than 3 s. The budget covers at least these waits: a CRL reload pass
-in flight, the remote-debug refusal watch's two waits, for its last audit pass and then for that
-pass's cancel, and the drain of alert-instance writes. A budgeted wait is shortened only when what
-is left of the budget, less the time kept for the stop steps after it, is under that wait's fixed
-bound, and it still gets at least 0.1 s. The graph supervisor's exit is not budgeted: it waits up
+the steps after it, never less than 3 s. The budget covers at least these waits: the retention
+runner's stop, a CRL reload pass in flight, the remote-debug refusal watch's two waits, for its
+last audit pass and then for that pass's cancel, and the drain of alert-instance writes. A
+budgeted wait is shortened only when what is left of the budget, less the time kept for the stop
+steps after it, is under that wait's fixed bound, and it still gets at least 0.1 s. The graph supervisor's exit is not budgeted: it waits up
 to its fixed 10 s, and then, once cancelled, for that cancel to land with no bound. It and the
 other stop steps are not held to the budget, so a slow one can still carry the stop past NSSM's
 window, and it spends budget the waits after it would have had. On a tight stop, at least these
@@ -540,6 +540,12 @@ can be lost:
   to retry is cancelled, and an ERROR counts it. An alert whose clear is lost can still read open
   in the alert list. This drain covers alert records in the store, not the
   sending of alert notifications, which a later shutdown step closes.
+- **The retention runner's stop** waits for its loop to end and then for `retention_purge` audit
+  rows still being written, at most 5 s for both together. Under the budget it gets at most about
+  1.5 s at the 3 s minimum, or about 0.5 s while a config write is still running, and less when an
+  earlier stop step was slow, down to 0.1 s. A row still unwritten then is logged at ERROR and may
+  land later or not at all, so a purge that finished can be left with no audit row
+  ([PHI.md](PHI.md)).
 - **A CRL reload pass in flight** gets at most about 1.8 s at the 3 s minimum, or about 0.8 s
   while a config write is still running, and less when an earlier stop step was slow, down to the
   same 0.1 s. When the budget cuts the pass, it is abandoned with a WARNING; a cancel of the stop

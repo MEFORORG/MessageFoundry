@@ -2536,12 +2536,13 @@ optional between-phase wall-clock cap (`[retention].max_pass_seconds`, default 0
 a running `VACUUM` is never interrupted. **Each pass that does real work writes exactly one
 `retention_purge` `audit_log` entry** with the cutoffs, counts and per-connection overrides — no message
 content, no PHI. Each purge phase commits on its own, so a pass that raises or is stopped partway writes
-that entry for the phases that finished, marked `interrupted`, before it ends, and names the phase it
+that entry for the phases that finished, marked `interrupted`, and names the phase it
 ended in as `interrupted_phase`: what that running call changed is not counted, and a phase that works in
 steps, or a purge cancelled mid-COMMIT, may have changed part of its set. An entry
 can still be missing at least when the audit write itself fails, for example under the store fault
-that ended the pass (logged at ERROR), when the write is still unfinished 5 seconds after the pass ends or
-the engine stops (logged at ERROR), or when the process dies first.
+that ended the pass (logged at ERROR), when the write is still unfinished 5 seconds after the pass ends,
+or when the engine's stop gives up waiting for it, after at most 5 seconds and less under the service's
+stop budget (both logged at ERROR), or when the process dies first.
 
 ### What each pass does, per backend
 
