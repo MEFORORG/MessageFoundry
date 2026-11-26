@@ -563,6 +563,7 @@ async def test_a_wal_sqlite_re_creates_takes_its_folder_list_until_a_later_open(
     re-creates takes its folder's access list until a later open restricts it. Both halves are
     pinned: the re-created siblings carry the folder's inherited entries, Administrators included,
     and a second open, run while the first still holds them, makes each owner-only again."""
+    from messagefoundry.config.atomic_edit import _canonical_sid
     from messagefoundry.restricted_file import _windows_engine_sid
     from messagefoundry.store.store import _parse_sddl_dacl, _read_dacl_sddl
     from tests._win_acl import assert_owner_only, folder_granting
@@ -585,7 +586,12 @@ async def test_a_wal_sqlite_re_creates_takes_its_folder_list_until_a_later_open(
             assert sddl is not None, sibling
             parsed = _parse_sddl_dacl(sddl)
             assert parsed is not None and not parsed.protected, sddl
-            assert "S-1-5-32-544" in sddl or ";;;BA)" in sddl, sddl
+            entries = {
+                (kind, flags, rights, _canonical_sid(sid) or sid)
+                for kind, flags, rights, sid in parsed.aces
+            }
+            # Exactly the folder's two grants, each inherited, and nothing the tee added.
+            assert entries == {("A", "ID", "FA", me), ("A", "ID", "FA", "S-1-5-32-544")}, sddl
         later = await RelayStore.open(str(db_path))
         try:
             for sibling in (db_path, *siblings):
