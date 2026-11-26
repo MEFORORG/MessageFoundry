@@ -7055,15 +7055,37 @@ the email channel sends:
   A notice for a change the directory drove names the directory, not an administrator, as what made
   the change. It closes with "If you did not expect this change, contact your MessageFoundry
   administrator" rather than "If this was you". That covers at least the
-  directory rename, the directory's email change, a role change applied by the session reconciler
-  or by a directory sign-in's re-sync, and the reconciler's `account_disabled` when it read the
-  account disabled (vault BACKLOG #3121). The role notice says the roles were changed to match the
-  directory's groups, not that the console played no part: those groups map to roles through the
-  group-to-role map an administrator edits. Like the disable notice, it says the sessions already
-  open on the account were ended, which both of its senders do first. The notice for an
-  administrator's role change, account disable or MFA reset also closes with "If you did not
-  expect this change, contact your MessageFoundry administrator", since each route refuses a
-  self-target (BACKLOG #6034); it does not say that sessions were ended.
+  directory rename, the directory's email change, a confirmed role change from the session
+  reconciler or a directory sign-in's re-sync, and the reconciler's `account_disabled` when it read
+  the account disabled (vault BACKLOG #3121). The notice for an administrator's confirmed role
+  change, account disable or MFA reset closes that way too, since each route refuses a self-target
+  (BACKLOG #6034). The
+  MFA-reset notice says nothing about sessions.
+  **A role-change or disable notice says only what its sender's evidence backs**, whether an
+  administrator or the directory drove it (BACKLOG #6034). A role-change notice says the roles were
+  changed, for a directory change to match the directory's groups, only when its sender confirmed
+  that the role write committed. Otherwise it says the change could not be confirmed, in its
+  subject too, and closes with "If you did not expect this notice" instead. A role-change or
+  disable notice says the sessions already open on the account were ended only when its sender's
+  revoke returned, and otherwise that this could not be confirmed. The BACKLOG #6034 comment above
+  `_SESSIONS_ENDED` in `pipeline/security_notify.py` names at least the sender paths that reach the
+  unconfirmed wording. An administrator's role change or disable whose revoke raises, given up on
+  after its retries or at once on a defect, sends no notice at all, since the request fails first.
+  The change has committed by then, and at least the same save's email-change notice goes unsent
+  too, so the audit log is the record of it. A reconciler role revocation that wrote no role, and
+  only ended sessions, sends `directory_sessions_ended` instead of a role-change notice.
+  **CORRECTED 2026-11-26:** this said the directory role notice says the roles were changed to
+  match the directory's groups and, *"like the disable notice"*, that the sessions already open on
+  the account were ended, *"which both of its senders do first"*. Both directory senders also
+  send it after a role write or a revoke that raised.
+  A role-change notice from an administrator's confirmed write names the new role set, each role by
+  its id; a directory one names none, since the sign-in re-sync passes the set it tried to write.
+  The federated link and unlink notices name the identity provider when the event carries its
+  issuer. A directory notice that carries a client address names it as the address of the request
+  MessageFoundry was handling, not of a sign-in, since nothing on the event says which kind of
+  request it was. Each of those values is replaced by a placeholder when it holds a character that
+  is not printable, such as a line break, and a role id, an issuer or a client address is also
+  replaced when it holds a space.
   The rename notice, `username_changed`, names the old and the new name, and is sent only when
   the new name was written (BACKLOG #2017). An **unreplaced temporary password** near its deadline
   (ASVS 6.4.5, BACKLOG #2007) sends two reminders, beside the operator's `initial_credential_expiring`
@@ -7099,9 +7121,12 @@ the email channel sends:
   `directory_absent`, `directory_undetermined` and `directory_object_id_missing` send it. The
   comment on `DIRECTORY_SESSIONS_ENDED` in `auth/notifications.py` says what each one means. For at
   least `directory_object_id_missing` the engine never asks the directory (BACKLOG #2434). So the
-  notice names no directory check. It says only that the engine could not confirm from the
-  directory that the account may still sign in, which is true for each current reason. A new
-  reason must be checked against that wording (vault BACKLOG #3171).
+  whole-account wording names no directory check. It says only that the engine could not confirm
+  from the directory that the account may still sign in, which is true for each current
+  whole-account reason. A new reason must be checked against that wording (vault BACKLOG #3171).
+  A role revocation (`roles_changed`) that wrote no role and only ended sessions sends it too,
+  with its own wording: the engine ended the sessions while checking the account's roles against
+  the directory (BACKLOG #6034).
 - **An account with no notification address sets one at sign-in** (BACKLOG #1139). While a notice
   channel is wired, `require()` and `require_ui` confine such a session to `POST /me/notify-email`
   (console: `/ui/account/notify-address`) plus the escapes of the password and factor gates, in the
