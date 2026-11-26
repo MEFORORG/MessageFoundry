@@ -150,6 +150,8 @@ _GUARDS = _GUARD_ROOTS | frozenset(
         "_refuse_idp_revocation",
         "idp_revocation_guards",
         "_refuse_ad_revocation",  # auth/ldap.py, the LDAPS AD bind (BACKLOG #2193)
+        # auth/ldap.py, the guard's own call, which _refuse_ad_revocation makes (vault #8163 item 2)
+        "_enforce_ad_revocation_guard",
         # pipeline/alert_sinks.py, the [alerts] SMTP login and the webhook (BACKLOG #2193)
         "_refuse_alert_smtp_revocation",
         "_refuse_webhook_revocation",

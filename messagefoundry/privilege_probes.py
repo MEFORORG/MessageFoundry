@@ -212,18 +212,19 @@ def _ad_why(exc: BaseException) -> str:
     ``InsecureHopRefused``, whatever its subclass.
 
     The test is an ``InsecureHopRefused`` whose traceback passes through
-    ``auth.ldap._refuse_ad_revocation`` (:func:`raised_through`). So it accepts one raised by
-    anything that function calls, the guard and the TLS context factory included, not only the
-    guard's own. Any other ``InsecureHopRefused`` on this probe, at least one from resolving a
-    Vault-held bind password, takes :func:`_why`'s rule, as on the Vault probe (BACKLOG #3471,
-    #4883)."""
-    from messagefoundry.auth.ldap import _refuse_ad_revocation
+    ``auth.ldap._enforce_ad_revocation_guard`` (:func:`raised_through`), the guard's own call,
+    which ``_refuse_ad_revocation`` makes after it has read the TLS context. So it accepts one
+    raised by the guard's capture or its enforcement, or by what they call, and not one from the
+    TLS context factory (vault BACKLOG #8163 item 2). Any other ``InsecureHopRefused`` on this
+    probe, at least one from resolving a Vault-held bind password, takes :func:`_why`'s rule, as on
+    the Vault probe (BACKLOG #3471, #4883)."""
+    from messagefoundry.auth.ldap import _enforce_ad_revocation_guard
     from messagefoundry.config.tls_policy import InsecureHopRefused
 
     if not issubclass(type(exc), InsecureHopRefused):
         return _why(exc)
     try:
-        through_the_guard = raised_through(exc, _refuse_ad_revocation.__code__)
+        through_the_guard = raised_through(exc, _enforce_ad_revocation_guard.__code__)
     except Exception:  # noqa: BLE001 -- a traceback that cannot be read is not the guard's
         logger.warning("AD probe: a hop refusal's traceback could not be read; named by its type")
         return "InsecureHopRefused"

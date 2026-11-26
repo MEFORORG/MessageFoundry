@@ -125,6 +125,19 @@ def _refuse_ad_revocation(
             "ad_server names no host ldap3 can dial, so the LDAPS bind cannot be judged on or off "
             "this box; name the domain controller in ad_server, an IPv6 address in brackets"
         )
+    # Read before the guard runs, so an error the context raises is not on the guard's own call,
+    # which is how the AD probe tells the guard's refusal from any other (vault BACKLOG #8163 item 2).
+    context = tls.handshake_context()
+    _enforce_ad_revocation_guard(host, context, posture)
+
+
+def _enforce_ad_revocation_guard(
+    host: str, context: ssl.SSLContext | None, posture: HopPosture | None
+) -> None:
+    """The LDAPS revocation guard itself, for :func:`_refuse_ad_revocation`. A function of its
+    own so ``privilege_probes._ad_why`` names a refusal as the guard's only when it was raised
+    while this ran (``exception_origin.raised_through``), never one from the TLS context or from
+    anything else ``_refuse_ad_revocation`` calls."""
     RevocationHopGuard.capture(
         host=host,
         cell="[auth] LDAPS bind to AD (verified TLS, no revocation check)",
@@ -133,7 +146,7 @@ def _refuse_ad_revocation(
             "no certificate revocation checking"
         ),
         attested=False,
-        context=tls.handshake_context(),
+        context=context,
         posture=posture,
         ways_across=_AD_WAYS_ACROSS,
         connection=None,  # the directory bind, not a connection
