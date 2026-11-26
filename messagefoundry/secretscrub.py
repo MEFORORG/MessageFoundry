@@ -1969,8 +1969,9 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # had read zero; :data:`_MEMBER_CARRIAGE_HEAD` is the repair. With one opening switched off in
 # turn, some lines printed for at least the held words, ``session_state``, a ``\b`` start, a "_"
 # prefix, a camelCase capital and the carriage head, and ``tests/test_secretscrub_kept_word.py``
-# holds one for each. The ";" opening found no line; the whole-word, ``%XX`` and non-ASCII keeps
-# were not switched off alone.
+# holds one for each. The ";" opening found no line on those four corpora, but a code review's
+# corpus did (round-7d59d34d6f), so it is load-bearing, and the same file holds that line too. The
+# whole-word, ``%XX``-alone and non-ASCII keeps were not switched off alone and have no control.
 #
 # THE COST, at least these. Every character of the value outside a word prints as it was: its
 # spaces, its punctuation and symbols, ASCII ones such as "@" and "!" and non-ASCII ones such
@@ -2070,8 +2071,10 @@ _CONNECTION_STRING_MEMBER = re.compile(
 #: ``tests/test_connection_string_member_scrub.py`` holds this to those sources.
 #:
 #: :data:`_MEMBER_JSON_WORDS` are the PHI pass's JSON key words, lower case.
-#: ``redaction._JSON_PHI_KEY`` and the passes beside it read each only as a WHOLE quoted key, so
-#: only a word that is one of them stays whole (:func:`_read_as_label`; BACKLOG #8429).
+#: The PHI pass reads each only as a WHOLE key: a quoted JSON key (``redaction._JSON_PHI_KEY`` and
+#: the passes beside it) or, unquoted, an XML element's tag name (``redaction._XML_PHI_ELEMENT``
+#: and ``_XML_PHI_END``), so only a word that is one of them stays whole (:func:`_read_as_label`;
+#: BACKLOG #8429).
 _MEMBER_JSON_WORDS = ("name", "address", "family", "given", "birthdate", "identifier", "telecom")
 _MEMBER_KEEP_WORDS = (
     *_CREDENTIAL_WORDS,
@@ -2229,7 +2232,10 @@ _MEMBER_KEY_WORDS = _CREDENTIAL_WORDS + _MEMBER_EXTRA_WORDS
 #: (``mfb64:v1token=``). A word holding part of one is kept whole, as before BACKLOG #8429: masked to
 #: ``x0xxxxx``, the run ran on, and the bundle reading the chain line back printed text the rule
 #: before hid (code review round-09fccbb450). Spelled literally for the regex scanner;
-#: ``tests/test_secretscrub_kept_word.py`` runs a line through each of its spellings it lists.
+#: ``tests/test_secretscrub_kept_word.py`` holds it to that pass's own run-end head, so a spelling
+#: added there turns the test red. Its line cases show a print only for the ``mfb64:`` and
+#: ``MFB64:`` spellings: the other alternatives are mirrored from that pass, not needed by a
+#: measured line, and keep such words whole as main did.
 _MEMBER_CARRIAGE_HEAD = re.compile(
     r"(?i)(?:mfb64|\[redacted\]|<redacted>)(?::|%3A|\\u003A|\\\\u003A)v1"
 )
@@ -2258,8 +2264,11 @@ def _read_as_label(text: str, word: str, start: int) -> bool:
     open after a label prefix's "_", or at a capital after a lower-case letter or a digit.
 
     THE OPENINGS ARE WRITTEN HERE BY HAND, not derived from the readers, and a reader that gains a
-    start would not move them; the controls in ``tests/test_secretscrub_kept_word.py`` show each is
-    needed, not that they are enough. Not every reader is followed either: at least
+    start would not move them. ``tests/test_secretscrub_kept_word.py`` holds a control line, one
+    that prints with that opening off, for the held words, ``session_state``, a ``\\b`` start, a
+    "_" prefix, a camelCase capital, the carriage head and the ";" opening. At least the
+    whole-word keep, the ``%XX`` start on its own and the non-ASCII keep have none. None of that
+    shows the openings are enough. Not every reader is followed either: at least
     ``_DSN_RUN_STOP``, which stops the wide DSN pass's user segment, and :data:`_NO_LABEL_BEFORE`,
     which ends a token68's padding, read a label word glued anywhere before a ":" or "=", so a word
     masked here no longer stops them there. The seeded differential the comment on
@@ -2270,15 +2279,21 @@ def _read_as_label(text: str, word: str, start: int) -> bool:
     whatever follows it (``Name:``), since the JSON key and query readers need quotes or "=" that
     this rule does not check; a query key at any ``\\b`` or ``%XX`` start whatever follows it
     (``bar-code:``, ``x.state:``, ``%2Fstate=``), though the query filter reads one only before
-    "="; a word after a ";" inside a braced value (``{Zq7;Compass=Vw9}``), which the member pattern
-    has already taken whole, so no member key is read there; and a word holding a character outside
-    ASCII, which keeps the old rule, since the patterns fold case the Unicode way and a
-    lower-cased comparison may not. Such a password word would print whole on first deployment,
-    as it did before. A label
-    word after any "_" (``__secret=``) is kept too: no label pattern opens there, since
+    "="; and a word holding a character outside ASCII, which keeps the old rule, since the
+    patterns fold case the Unicode way and a lower-cased comparison may not. Such a password word
+    would print whole on first deployment, as it did before.
+
+    Two keeps print a password word too, but a reader needs them. A word after a ";" inside a
+    braced value that ends in a member key word before "=" (``{Zq7;Compass=Vw9}``): the member
+    pattern took the braced value whole, but on a later handler the PHI pass may replace the token
+    holding the "{", and the member pass then reads ``;Compass=`` as a key whose value hides what
+    follows; masked, ``|x\\na&b;sslpassword={c d;Compass=e\\nf6q`` printed ``f6q`` there (code
+    review round-7d59d34d6f). And a credential, token or key-label word (:data:`_CAMEL_WORDS`)
+    after any "_" (``__secret=``, ``__token:``): no label pattern opens there, since
     ``_LABEL_PREFIX`` needs a letter or digit before the "_", but a value walk's stop before a
     later quoted label (``_NOT_BEFORE_QUOTED_LABEL``) does, so ``password=abc__secret='v w'``
-    ends the password's value right before ``secret``. :func:`_kept_word`'s scheme-word rule may
+    ends the password's value right before ``secret``. A query key or a JSON key word after a
+    "_" is masked (``x_code=``, ``x_name=``). :func:`_kept_word`'s scheme-word rule may
     keep a word this function refuses; its comment says which."""
     if not word.isascii() or _MEMBER_HELD.search(word) is not None:
         return True

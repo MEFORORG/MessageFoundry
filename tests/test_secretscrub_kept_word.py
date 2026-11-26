@@ -21,7 +21,7 @@ from collections.abc import Callable
 
 import pytest
 
-from messagefoundry import secretscrub
+from messagefoundry import redaction, secretscrub
 from messagefoundry.logging_setup import _install_phi_filters
 from messagefoundry.secretscrub import scrub_credentials
 from messagefoundry.support.redact import redact_log_line
@@ -182,12 +182,14 @@ def test_the_kept_words_print_under_the_rule_before(monkeypatch: pytest.MonkeyPa
             assert word in apply(_member(word, ":")), (surface, word)
 
 
-#: Each opening ``_read_as_label`` keeps a word at, switched off, with a line the seeded
-#: differential against ``origin/main`` found then printing, on a later path, a value the rule
-#: before hid. So each opening is there for a measured reason. In order: ``PatientName`` masked is
-#: no DICOM label for the PHI pass, which took the rest of the line; ``session_state``, ``.code``,
-#: ``_token`` and ``myPassword`` masked are no label for the query filter or the label passes of a
-#: later redaction, which read on past the member's end.
+#: Openings ``_read_as_label`` keeps a word at, each switched off, with a line a seeded differential
+#: against ``main`` at b54e0528 or a code review found then printing, on a later path, a value the
+#: rule before hid. So each of these is there for a measured reason; at least the whole-word keep,
+#: the ``%XX`` start alone and the non-ASCII keep have no control here. In order: ``PatientName``
+#: masked is no DICOM label for the PHI pass, which took the rest of the line; ``session_state``,
+#: ``.code``, ``_token`` and ``myPassword`` masked are no label for the query filter or the label
+#: passes of a later redaction, which read on past the member's end; ``v1token`` masked no longer
+#: ends the carriage pass's run; and ``;Compass=`` masked is no member key on a later handler.
 _OPENING_CONTROLS = (
     (
         "held words anywhere",
@@ -226,6 +228,14 @@ _OPENING_CONTROLS = (
         "_MEMBER_CARRIAGE_HEAD",
         _NEVER,
         "lookup DOE%26a1q;sslpassword=Jane Doemfb64:v1:mfb64:v1token=|x",
+    ),
+    (
+        # Code review round-7d59d34d6f: on a later handler the PHI pass replaces the token holding
+        # the "{", and ";Compass=" becomes a member key whose value hides f6q.
+        "a member key after a semicolon",
+        "_MEMBER_KEY_WORDS",
+        (),
+        "|x\na&b;sslpassword={c d;Compass=e\nf6q",
     ),
 )
 
@@ -268,6 +278,32 @@ def test_each_opening_is_needed(
 #: ``v1``, which it reads with no boundary after the ``v1``, so it reads the ``v1`` at the start of a
 #: member-value word. Each in the spellings the member mask meets as a word start.
 _CARRIAGE_HEADS = ("mfb64:", "[redacted]:", "<redacted>:", "MFB64:", "mfb64%3A", "mfb64\\u003A")
+
+
+def _is_the_carriage_run_end(head: re.Pattern[str], carriage: re.Pattern[str]) -> bool:
+    """Whether ``head`` spells exactly the head ``carriage`` ends a run before: its negative
+    lookahead's body, read with the same case folding."""
+    body = head.pattern.removeprefix("(?i)")
+    return (
+        bool(head.flags & re.IGNORECASE)
+        and bool(carriage.flags & re.IGNORECASE)
+        and f"(?:(?!{body})" in carriage.pattern
+    )
+
+
+def test_the_member_carriage_head_is_the_carriage_pass_run_end() -> None:
+    """``_MEMBER_CARRIAGE_HEAD`` is a copy of ``redaction._BINARY_CARRIAGE``'s run-end head (code
+    review round-7d59d34d6f), so a spelling added to either turns this red. The negative controls:
+    a narrowed member head, and a carriage pass with one more spelling, each fail the check."""
+    carriage = redaction._BINARY_CARRIAGE
+    head = secretscrub._MEMBER_CARRIAGE_HEAD
+    assert _is_the_carriage_run_end(head, carriage)
+    narrowed = re.compile(head.pattern.replace("|%3A", ""), head.flags)
+    assert narrowed.pattern != head.pattern
+    assert not _is_the_carriage_run_end(narrowed, carriage)
+    widened = re.compile(carriage.pattern.replace("(?:(?!(?:mfb64", "(?:(?!(?:mfb65|mfb64"))
+    assert widened.pattern != carriage.pattern
+    assert not _is_the_carriage_run_end(head, widened)
 
 
 @pytest.mark.parametrize("separator", ["=", ":"])

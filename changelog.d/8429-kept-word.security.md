@@ -12,9 +12,12 @@
   carriage-marker head with no colon after its `v1` (`mfb64:v1Passage:`); a word ending in
   `bearer`, `basic`, `digest` or `mrn` before white space, even before a `:` or `=`, such as
   `Hunterbearer :`; a whole label word, such as `Name:`; a query key at a word boundary or a
-  `%XX` escape whatever follows it, such as `bar-code:`, `x.state:` or `%2Fstate=`; a label word
-  after any `_`, such as `__token:`; a word after a `;` inside a braced value, such as the
-  `Compass` of `{Zq7;Compass=Vw9}`; and a word holding a character outside ASCII. A seeded
+  `%XX` escape whatever follows it, such as `bar-code:`, `x.state:` or `%2Fstate=`; a
+  credential, token or key-label word after any `_`, such as `__token:` (a query key or PHI JSON
+  key word there, such as `x_code=` or `x_name=`, is masked); a word after a `;` inside a braced
+  value that ends in a member key word before `=`, such as the `Compass` of `{Zq7;Compass=Vw9}`,
+  which a later handler can read as a member key, so masking it printed a value the code before
+  hid; and a word holding a character outside ASCII. A seeded
   differential against the code before, over nine redaction paths including the bundle reading
   a chain line back, printed no planted value the code before hid, by lines or by occurrences, on
   four corpora: two of 60,006 lines dense with kept-word shapes, 24,006 HL7-prefixed lines, and
