@@ -250,9 +250,9 @@ def _summarize(rows: list[aiosqlite.Row]) -> dict[str, Any]:
 
 
 def _precreate_secure(path: str) -> None:
-    """On POSIX, create the DB file with mode 0600 *before* SQLite opens it, closing the brief
-    window where SQLite would otherwise create it world-readable (POSIX umask). On Windows the
-    file takes its folder's access list until ``_secure_file`` runs. No-op if it exists."""
+    """Create the DB file before SQLite opens it, with mode 0600, which restricts it on POSIX only,
+    closing the brief window where SQLite would otherwise create it world-readable (POSIX umask).
+    On Windows the file takes its folder's access list. No-op if it exists."""
     if os.path.exists(path):
         return
     try:
