@@ -1000,7 +1000,7 @@ class ClusterCoordinator(Protocol):
     async def stop(self) -> None: ...
 
     def is_leader(self) -> bool:
-        """Whether this node runs the leader-only singletons (the wired graph, retention, lease
+        """Whether this node runs the leader-only singletons (the wired graph, lease
         reclaim). Cheap/cached — never an ``await`` or a DB round-trip. Always ``True`` on
         :class:`NullCoordinator` (single-node)."""
         ...

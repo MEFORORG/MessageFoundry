@@ -2527,7 +2527,7 @@ set each window explicitly, because an auto-bounded window is a number nobody de
 **The pass itself.** It is **leader-gated** at entry, and leadership is read again before every
 shared-store phase, so a node demoted mid-pass skips the store phases left for the new leader. The read
 is the coordinator's cached flag, not a fence: it is only as current as the coordinator's last lease
-check, and a phase already running when the demotion lands runs to its end. A
+check. A
 standby purges nothing in the store (BACKLOG #6526). *Corrected 2026-11-26:* this said the pass was "leader-gated
 twice — at entry and again immediately before the purges, so a node demoted mid-pass never nulls PHI
 as a stale ex-leader"; the second read had no await before it, so it could not see a demotion. An

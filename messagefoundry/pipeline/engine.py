@@ -2411,9 +2411,8 @@ class Engine:
         # Retention/purge is independent of the message graph (a store-level maintenance task), so it
         # runs whether or not a graph is wired and survives config reloads. Per-connection windows come
         # from the live graph, so the loop is spawned even when nothing is configured yet, and idles
-        # until a reload sets one (BACKLOG #6804); a pass runs only while something is set. It is a
-        # leader-only WRITE singleton (purges bodies + writes audit rows), so it is gated on the
-        # coordinator: in a cluster a follower's runner ticks but no-ops; single-node always leads.
+        # until a reload sets one (BACKLOG #6804); a pass runs only while something is set. It is
+        # gated on the coordinator: single-node always leads.
         if self._retention_settings is not None:
             engine_dirs, engine_trees = self._engine_owned_dirs()
             self._retention_runner = RetentionRunner(

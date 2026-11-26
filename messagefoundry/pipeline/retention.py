@@ -807,8 +807,7 @@ class RetentionRunner:
         return _STOP_WAIT_SECONDS
 
     async def stop(self, *, timeout: float | None = None) -> None:
-        """Signal the loop, await its exit, and wait for audit rows still being written
-        (idempotent).
+        """Signal the loop, await its exit, and wait for audit rows still being written.
 
         The loop's exit and those rows share one budget, ``timeout`` or
         :attr:`stop_timeout_seconds` when it is None, so a store that cannot take the write does
@@ -885,10 +884,8 @@ class RetentionRunner:
                 # Within this stop's budget; the earlier stop's outcome is its own callers'.
                 await asyncio.wait({earlier}, timeout=max(0.0, deadline - loop.time()))
         # A loop that has ended no longer needs the signal, so a later run_once() is a normal pass,
-        # waiting for its own interrupted row (BACKLOG #6526). Left set while the loop runs on, or
-        # while a later stop is under way, so neither loop goes round again on this stop's account.
-        # A start() clears it, though, and an old loop that outlived its stop then sees it clear and
-        # can go round again beside the new loop.
+        # waiting for its own interrupted row (BACKLOG #6526). A start() clears it, and an old loop
+        # that outlived its stop then sees it clear and can go round again beside the new loop.
         if (task is None or task.done()) and self._stopping is asyncio.current_task():
             self._stop.clear()
         if task is None:
@@ -988,9 +985,7 @@ class RetentionRunner:
         and a node can be demoted (a self-fence) during any of those awaits (BACKLOG #6526, S07-45). A
         node that finds itself demoted skips the shared-store phases left, audits what it had already
         purged, and reports ``leadership_lost``. The read is the coordinator's cached flag, not a
-        fence: it is only as current as the coordinator's last lease check, and a phase already running
-        when the node is demoted runs to its end (the embedded-document strip reads it again between
-        its per-threshold calls).
+        fence: it is only as current as the coordinator's last lease check.
 
         Each purge phase commits in its own store transaction, so a pass that raises or is cancelled
         (``stop()``) partway writes its audit row for the phases that finished, marked
