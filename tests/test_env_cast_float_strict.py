@@ -145,3 +145,61 @@ def test_the_numeric_cast_test_runs_no_metaclass_eq() -> None:
     ref = env("r", cast=_AuthorCast)
     assert _EQ_CALLS == []
     assert ref.cast is _AuthorCast
+
+
+class _UnhashableMeta(type):
+    """A metaclass with ``__eq__`` and no ``__hash__``, so its classes are unhashable."""
+
+    def __eq__(cls, other: object) -> bool:
+        return cls is other
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+class _UnhashableCast(metaclass=_UnhashableMeta):
+    def __init__(self, raw: object) -> None:
+        self.raw = raw
+
+
+def test_an_unhashable_cast_class_still_loads() -> None:
+    """``issubclass(cast, numbers.Number)`` hashed the class into the ABC cache, so ``env()`` raised
+    ``TypeError`` for this cast, which loads on origin/main. The numeric-cast test hashes nothing."""
+    ref = env("r", cast=_UnhashableCast)
+    assert ref.cast is _UnhashableCast
+    out = resolve_env_settings({"x": ref}, {"r": True})
+    assert isinstance(out["x"], _UnhashableCast) and out["x"].raw is True
+
+
+_CLASS_READS: list[object] = []
+
+
+class _ClassPropertyCast:
+    """A callable whose ``__class__`` is an author property, which ``isinstance`` would run."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:
+        _CLASS_READS.append(self)
+        return type
+
+    def __call__(self, raw: object) -> object:
+        return raw
+
+
+def test_the_numeric_cast_test_reads_no_author_class_property() -> None:
+    _CLASS_READS.clear()
+    cast = _ClassPropertyCast()
+    ref = env("r", cast=cast)
+    assert _CLASS_READS == []
+    assert ref.cast is cast
+
+
+class _Port(int):
+    pass
+
+
+def test_a_subclass_of_a_number_type_is_refused_a_bool() -> None:
+    """The documented reading: a class with ``int`` among its bases is refused a bool, as ``int``
+    is, and a number still reads."""
+    with pytest.raises(WiringError, match="value withheld"):
+        resolve_env_settings({"port": env("p", cast=_Port)}, {"p": True})
+    assert resolve_env_settings({"port": env("p", cast=_Port)}, {"p": 2575})["port"] == 2575

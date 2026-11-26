@@ -31,8 +31,10 @@ from __future__ import annotations
 
 import ast
 import builtins
+import decimal
 import dis
 import errno
+import fractions
 import functools
 import hashlib
 import importlib.abc
@@ -362,9 +364,10 @@ class EnvRef:
         # The builtin ``float`` reads a TOML ``true`` as 1.0 the same way.
         elif self.cast is float:
             object.__setattr__(self, "cast", _cast_float)
-        # Some other numeric builtins and every number type (``abs``, ``round``, ``decimal.Decimal``)
-        # read a TOML ``true`` as 1 the same way, so those named in _NUMERIC_BUILTIN_FUNCTIONS, and
-        # number types, get a bool refused ahead of them. The function list is partial.
+        # Some other numeric builtins and number types (``abs``, ``round``, ``decimal.Decimal``) read
+        # a TOML ``true`` as 1 the same way, so those named in _NUMERIC_BUILTIN_FUNCTIONS, and
+        # classes with one of _NUMBER_TYPES in their MRO, get a bool refused ahead of them. Both
+        # lists are partial.
         elif self.cast is not None and _is_numeric_builtin_cast(self.cast):
             object.__setattr__(self, "cast", _bool_refusing_cast(self.cast))
         # A default is never cast at resolve time, so ``default="false"`` would reach the connector
@@ -567,8 +570,7 @@ _cast_float.__name__ = "float"
 
 
 #: Numeric builtins that read a bool as the number 1 or 0. A number TYPE is matched by
-#: :func:`_is_numeric_builtin_cast` instead, so ``decimal.Decimal`` and ``fractions.Fraction`` need
-#: no entry here.
+#: :func:`_is_numeric_builtin_cast` against :data:`_NUMBER_TYPES` instead.
 _NUMERIC_BUILTIN_FUNCTIONS: Final = (
     abs,
     round,
@@ -579,17 +581,30 @@ _NUMERIC_BUILTIN_FUNCTIONS: Final = (
     operator.index,
 )
 
+#: Number types that read a bool as the number 1 or 0. A cast class with one of these in its MRO
+#: counts, so ``class Port(int)`` and ``enum.IntEnum`` are refused a bool. ``numbers.Number`` is
+#: here for a class that inherits it; a type only REGISTERED with it, such as ``numpy.int64``, is
+#: not in its MRO and is not matched.
+_NUMBER_TYPES: Final = (int, float, complex, decimal.Decimal, fractions.Fraction, numbers.Number)
+
+#: ``type``'s own MRO reader. A metaclass cannot replace it, and reading it runs no author code.
+_READ_MRO: Final = type.__dict__["__mro__"].__get__
+
 
 def _is_numeric_builtin_cast(cast: Callable[[Any], Any] | None) -> bool:
     """Whether ``cast`` is a numeric builtin or a number type, other than the ``int``, ``float`` and
     ``bool`` that :class:`EnvRef` swaps for its own reads. Each reads a TOML ``true`` as 1 (vault
-    BACKLOG #1650). Every comparison is by identity, since an author's callable need not be
-    hashable and an equality test would run its metaclass ``__eq__``. Returns ``bool``, not
-    ``TypeIs``: a False result says nothing about whether ``cast`` is None."""
-    if isinstance(cast, type):
-        return not any(cast is own for own in (bool, int, float)) and issubclass(
-            cast, numbers.Number
-        )
+    BACKLOG #1650).
+
+    No author code runs here and nothing is hashed, since an author's cast need not be hashable.
+    ``type(cast)`` reads the object's own type, never an author ``__class__``, and
+    ``issubclass(..., type)`` against the exact ``type`` compares MROs without a hook. Every
+    comparison is by identity, since an equality test would run a metaclass ``__eq__``. Returns
+    ``bool``, not ``TypeIs``: a False result says nothing about whether ``cast`` is None."""
+    if issubclass(type(cast), type):
+        if any(cast is own for own in (bool, int, float)):
+            return False
+        return any(base is known for base in _READ_MRO(cast) for known in _NUMBER_TYPES)
     return any(cast is known for known in _NUMERIC_BUILTIN_FUNCTIONS)
 
 
@@ -6234,9 +6249,8 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
     is caught; any wrapper whose ``__wrapped__`` chain ends at the accessor itself; and
     the attributes a config method, or a callable instance's ``__call__``, reads straight off its
     first parameter (``self.getter``), looked up on the bound ``__self__`` or the instance, a method
-    found there bound to it in turn. Every one of those lookups is static
-    (``inspect.getattr_static``). It does not see at least: a call through ``getattr`` or another
-    computed name, a function in any other module, an attribute read off a local or off an
+    found there bound to it in turn, read with ``inspect.getattr_static``. It does not see at
+    least: a call through ``getattr`` or another computed name, a function in any other module, an attribute read off a local or off an
     attribute (``self.a.b``), a subclass of a container, an object's methods the walk does not
     reach by name, or a value the predicate builds while it runs."""
     # Lazy: both accessor modules are imported by handler code, not by the loader, and reachability
@@ -6284,7 +6298,7 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
     bound: dict[tuple[int, int], MethodType] = {}
 
     def attribute(holder: object, name: str) -> object:
-        # Static, as every other read here: no author __getattr__ or descriptor runs.
+        # Static, so no author __getattr__ runs for this lookup.
         return inspect.getattr_static(holder, name, None)
 
     def self_reads(func: object, owner: object) -> list[object]:

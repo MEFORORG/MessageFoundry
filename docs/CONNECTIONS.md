@@ -171,10 +171,13 @@ transport = "mllp"
   literal `1e-400` in a value file is parsed to `0.0` first, so it reads as zero. A code-first
   `env()` with `cast=int`, `cast=float` or `cast=bool` gets the same strict reading as the named
   cast. At least `abs`, `round`, `math.floor`, `math.ceil`, `math.trunc`, `math.fabs` and
-  `operator.index`, and a number type, such as `decimal.Decimal`, refuse a bool before they run
-  (BACKLOG #1650). That list is partial: at least `operator.abs`, `operator.neg`, `operator.pos`,
-  `math.sqrt`, `math.isqrt`, `math.factorial` and `math.exp` still read `true` as 1. Any other
-  code-first cast runs as given, on the value as it arrives. So `cast=lambda v: int(v)` still
+  `operator.index`, and a number type, refuse a bool before they run (BACKLOG #1650). A number
+  type is `complex`, `decimal.Decimal`, `fractions.Fraction`, or a class whose bases include one
+  of those, `int`, `float` or `numbers.Number`, so a `class Port(int)` you write, or an
+  `enum.IntEnum`, is refused a bool too. That list is partial: at least `operator.abs`,
+  `operator.neg`, `operator.pos`, `math.sqrt`, `math.isqrt`, `math.factorial` and `math.exp`
+  still read `true` as 1, and so does a type only registered with `numbers.Number`, such as
+  `numpy.int64`. Any other code-first cast runs as given, on the value as it arrives. So `cast=lambda v: int(v)` still
   reads `true` as 1, and the port read takes that as port 1. At least `allowed_mllp`, among the
   host-and-port `[egress]` lists that pin a port,
   compares the port as a number before the connector is built, so the text `"06661"` matches a pin
