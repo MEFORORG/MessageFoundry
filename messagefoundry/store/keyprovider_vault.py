@@ -28,12 +28,14 @@ stubs**, so the client is contained as a typed ``Any`` local here — never a re
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sys
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
+from messagefoundry.config.secretprovider import log_import_failure
 from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     assert_hvac_tls_suites,
@@ -47,6 +49,8 @@ from messagefoundry.store.keyprovider import KeyProviderError, _split_retired
 if TYPE_CHECKING:
     from messagefoundry.config.settings import StoreSettings
     from messagefoundry.config.tls_policy import HopPosture
+
+_log = logging.getLogger(__name__)
 
 #: The optional extra that carries ``hvac`` — named in every fail-closed message so the operator knows
 #: exactly what to install.
@@ -113,18 +117,45 @@ def _token_unset(platform: str | None = None) -> str:
 
 def _import_hvac() -> Any:
     """Lazily import ``hvac`` (the optional ``[vault]`` extra), failing closed with a
-    :class:`KeyProviderError` that names the extra — mirrors ``keyprovider.py``'s missing-backend message.
-    ``ImportError`` (not just ``ModuleNotFoundError``) is caught so a partially-broken install also fails
-    closed rather than surfacing a bare import error out of ``open_store``."""
+    :class:`KeyProviderError` that names the extra, as ``secretprovider_vault._import_hvac`` does
+    (vault BACKLOG #6709), except that here a ``MemoryError`` or ``RecursionError`` propagates,
+    where that twin refuses it. Any other ``Exception`` is caught,
+    not only ``ImportError``: importing runs hvac's and its dependencies' top-level code, which can
+    raise an ``OSError`` or another class. Only a ``ModuleNotFoundError`` for ``hvac`` itself reads
+    as a missing extra; anything else is a broken install, refused by class with "reinstall" and
+    logged at WARNING by class. The refusal is raised outside the handler with no chain: an import
+    error's text can carry a filesystem path. The key provider and the Transit cipher both build
+    their client through here, so the text names the store's Vault client, not one setting."""
     try:
         # hvac ships no type stubs; the targeted ignore contains that here (never a repo-wide ignore).
         import hvac  # type: ignore[import-untyped]  # noqa: PLC0415  (lazy — base install pulls no SDK)
-    except ImportError as exc:
-        raise KeyProviderError(
-            f"[store].key_provider={_EXTRA!r} requires the optional {_EXTRA!r} extra (hvac not "
-            f"importable): install 'messagefoundry[{_EXTRA}]'."
-        ) from exc
-    return hvac
+    except (MemoryError, RecursionError):
+        raise  # the process's own limits, not a broken install (vault BACKLOG #6709 item 11)
+    except Exception as exc:  # noqa: BLE001 -- an import runs top-level code that may raise any class; refused below, logged by class
+        if isinstance(exc, ModuleNotFoundError) and exc.name == "hvac":
+            failed = None
+        else:
+            failed = type(exc).__name__
+            log_import_failure(_HVAC_CLIENT, exc, logger=_log)
+    else:
+        return hvac
+    # Recorded (:func:`_recorded_refusal`), so a seam that replaces a provider error with fixed
+    # text keeps these. Each is built from constants and a class name alone.
+    if failed is None:
+        raise _recorded_refusal(
+            f"{_HVAC_CLIENT} requires the optional {_EXTRA!r} extra (hvac not importable): "
+            f"install 'messagefoundry[{_EXTRA}]'."
+        )
+    raise _recorded_refusal(
+        f"{_HVAC_CLIENT}: hvac is installed but did not import "
+        f"({failed if failed.isidentifier() else 'an error'}): "
+        f"reinstall 'messagefoundry[{_EXTRA}]'."
+    )
+
+
+#: Who :func:`_import_hvac`'s refusals and WARNING name: the store's Vault client, which
+#: ``[store].key_provider = "vault"`` and ``[store].cipher_provider = "vault_transit"`` both build.
+_HVAC_CLIENT = "the store's Vault client ([store].key_provider or [store].cipher_provider)"
 
 
 def _vault_ca_kwargs(addr: str | None) -> dict[str, str]:

@@ -12,6 +12,7 @@ a silent degrade to the identity cipher, and never with key material in the mess
 from __future__ import annotations
 
 import base64
+import logging
 import sys
 from typing import Any
 
@@ -140,6 +141,174 @@ def test_missing_hvac_fails_closed_naming_the_extra(monkeypatch: pytest.MonkeyPa
     provider = keyprovider_vault.build_provider(StoreSettings())
     with pytest.raises(KeyProviderError, match="vault"):
         provider.active_key()
+
+
+#: Synthetic text a broken hvac import might carry: a path and a marker. Neither may reach the refusal.
+_BROKEN_HVAC_TEXT = "DLL load failed: C:/synthetic/site-packages/_hvac.pyd marker zz0451"
+
+
+@pytest.mark.parametrize(
+    "make_error",
+    [
+        pytest.param(lambda: ImportError(_BROKEN_HVAC_TEXT), id="broken-c-extension"),
+        pytest.param(
+            lambda: ModuleNotFoundError(_BROKEN_HVAC_TEXT, name="hvac.v1"), id="submodule-missing"
+        ),
+        pytest.param(lambda: OSError(_BROKEN_HVAC_TEXT), id="os-error"),
+        pytest.param(lambda: AttributeError(_BROKEN_HVAC_TEXT), id="attribute-error"),
+        pytest.param(lambda: ValueError(_BROKEN_HVAC_TEXT), id="value-error"),
+    ],
+)
+def test_a_broken_hvac_import_is_refused_by_class_with_no_text(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, make_error: Any
+) -> None:
+    # Vault BACKLOG #6709 item 4: the store-side hvac import caught only ImportError, said
+    # "install" for a broken install, and chained the error, so an OSError's text reached the
+    # client-build refusal. It now refuses as the secrets twin does.
+    import builtins
+    import logging
+
+    _configure_env(monkeypatch)
+    real_import = builtins.__import__
+    type_name = type(make_error()).__name__
+
+    def _import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "hvac":
+            raise make_error()
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _import)
+    caplog.set_level(logging.WARNING)
+    with pytest.raises(KeyProviderError) as caught:
+        keyprovider_vault._import_hvac()
+    text = str(caught.value)
+    assert f"hvac is installed but did not import ({type_name})" in text
+    assert "reinstall 'messagefoundry[vault]'" in text
+    assert "synthetic" not in text and "0451" not in text
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and r.name == "messagefoundry.store.keyprovider_vault"
+    ]
+    assert len(warnings) == 1 and type_name in warnings[0].getMessage()
+    assert "0451" not in warnings[0].getMessage()
+
+
+@pytest.mark.parametrize("error", [MemoryError, RecursionError])
+def test_the_processs_own_limits_are_not_read_as_a_broken_hvac(
+    monkeypatch: pytest.MonkeyPatch, error: type[BaseException]
+) -> None:
+    # Vault BACKLOG #6709 item 11: out of memory or stack is not a broken install.
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "hvac":
+            raise error()
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _import)
+    with pytest.raises(error):
+        keyprovider_vault._import_hvac()
+
+
+class _RaisingFilter(logging.Filter):
+    """A log filter that fails on every record, as a broken redaction filter would."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        raise ValueError("filter fault")
+
+
+def test_a_raising_log_filter_leaves_the_hvac_refusal_whole(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Round 2: the WARNING is logged inside the handler, so a raising filter made a raw
+    # ValueError, chained to the import error and its text.
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "hvac":
+            raise OSError(_BROKEN_HVAC_TEXT)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _import)
+    raising = _RaisingFilter()
+    keyprovider_vault._log.addFilter(raising)
+    try:
+        with pytest.raises(KeyProviderError) as caught:
+            keyprovider_vault._import_hvac()
+    finally:
+        keyprovider_vault._log.removeFilter(raising)
+    assert "did not import (OSError)" in str(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert "could not be logged ('ValueError')" in capsys.readouterr().err
+
+
+def test_the_hvac_refusal_survives_the_key_seams_fixed_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Round 2: unrecorded, the refusal was replaced by "the key source failed" at the seam.
+    from messagefoundry.store.base import resolve_active_key
+
+    _configure_env(monkeypatch)
+    supply_vault_hop(monkeypatch, STORE)
+    monkeypatch.setitem(sys.modules, "hvac", None)
+    with pytest.raises(KeyProviderError) as caught:
+        resolve_active_key(StoreSettings(key_provider="vault"))
+    assert "install 'messagefoundry[vault]'" in str(caught.value)
+
+
+def test_a_missing_hvac_says_install_not_reinstall(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "hvac", None)
+    with pytest.raises(KeyProviderError) as caught:
+        keyprovider_vault._import_hvac()
+    text = str(caught.value)
+    assert "install 'messagefoundry[vault]'" in text and "reinstall" not in text
+
+
+def test_a_value_error_from_the_provider_build_propagates_raw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The build part of vault BACKLOG #6709 was withdrawn to main: the dispatch calls
+    # build_provider bare, so its error reaches store.base unwrapped, which judges it. That is a
+    # known open hazard (a ValueError is read there as a refused key), pinned as main's shape
+    # until that part is built, not as the intended contract.
+    error = ValueError("synthetic build failure")
+
+    def _boom(*_a: Any, **_k: Any) -> Any:
+        raise error
+
+    monkeypatch.setattr(keyprovider_vault, "build_provider", _boom)
+    with pytest.raises(ValueError) as caught:
+        resolve_key_provider(StoreSettings(key_provider="vault"))
+    assert caught.value is error
+
+
+@pytest.mark.parametrize("error", [MemoryError, RecursionError])
+def test_the_processs_own_limits_pass_the_provider_build(
+    monkeypatch: pytest.MonkeyPatch, error: type[BaseException]
+) -> None:
+    def _boom(*_a: Any, **_k: Any) -> Any:
+        raise error()
+
+    monkeypatch.setattr(keyprovider_vault, "build_provider", _boom)
+    with pytest.raises(error):
+        resolve_key_provider(StoreSettings(key_provider="vault"))
+
+
+def test_a_providers_own_refusal_from_its_build_keeps_its_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _refuse(*_a: Any, **_k: Any) -> Any:
+        raise KeyProviderError("the provider's own refusal")
+
+    monkeypatch.setattr(keyprovider_vault, "build_provider", _refuse)
+    with pytest.raises(KeyProviderError, match="^the provider's own refusal$"):
+        resolve_key_provider(StoreSettings(key_provider="vault"))
 
 
 def test_missing_config_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
