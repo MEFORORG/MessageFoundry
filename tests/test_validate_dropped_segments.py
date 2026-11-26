@@ -187,12 +187,39 @@ def test_a_continuation_or_acknowledgment_segment_gets_no_exemption(extra: str) 
     assert result.unvalidated_segments == ()
 
 
-def test_batch_envelope_lines_on_a_split_member_keep_the_exemption() -> None:
-    """split_batch cuts only at MSH, so a member can end with its batch's trailers or the next
-    batch's header; those are not refused here."""
+def test_the_envelope_run_that_ends_a_message_keeps_the_exemption() -> None:
+    """Some intake paths hand a message over with its batch's trailers or the next batch's header
+    still on it (``_ENVELOPE`` names at least three), so that run is not refused."""
     result = validate(_MFN_M01 + "\rBTS|2\rBHS|^~\\&\rFTS|1\rFHS|^~\\&")
     assert result.ok, result.errors
     assert result.unvalidated_segments == (("BTS", 4), ("BHS", 5), ("FTS", 6), ("FHS", 7))
+
+
+@pytest.mark.parametrize(
+    ("tail", "first"), [("^Z", "unrecognised line 5"), ("ORC", "segment ORC at line 5")]
+)
+def test_a_line_refused_on_its_own_does_not_move_a_trailer_ahead_of_it(
+    tail: str, first: str
+) -> None:
+    """Review round-016ec5b937: a junk or bare line after a correct trailer stays the first refusal
+    named, as on origin/main. NEGATIVE CONTROL: on b15c4544f0 errors[0] named the BTS at line 4."""
+    result = validate(_MFN_M01 + "\rBTS|1\r" + tail)
+    assert not result.ok
+    assert result.errors[0].startswith(first), result.errors
+    assert not any("BTS" in error for error in result.errors)
+
+
+@pytest.mark.parametrize("extra", ["BHS|^~\\&", "BTS|2", "FHS|^~\\&", "FTS|1"], ids=lambda s: s[:3])
+@pytest.mark.parametrize("after", ["MFE|MAD|2||LOC2^Loc|CE", "ZLC|1"], ids=["MFE", "Z"])
+def test_an_envelope_line_inside_a_message_gets_no_exemption(extra: str, after: str) -> None:
+    """A batch or file header or trailer with a message line after it frames nothing, and the slot
+    carries master-file or query data, so it is refused (BACKLOG #5920 step 2, its envelope half).
+    NEGATIVE CONTROL: on origin/main 33870a40944 each passed, listed in unvalidated_segments."""
+    result = validate(_MFN_M01 + "\r" + extra + "\r" + after)
+    assert not result.ok
+    assert f"segment {extra[:3]} at line 4 has no place in this message's structure" in (
+        result.errors
+    )
 
 
 @pytest.mark.parametrize(

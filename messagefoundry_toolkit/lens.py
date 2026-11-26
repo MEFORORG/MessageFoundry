@@ -3910,7 +3910,13 @@ def _repick_write(source: str, line_start: int, line_end: int, before: ast.AST) 
     write escaped the value, so it was data, and ``set`` into a whole field would turn its
     separators into structure. Keeping ``set_data`` instead would leave a line the recognizer reads
     as code, so the edit is refused rather than guessed. Whether the value was kept is read from
-    the arguments, not from which parameters the edit named."""
+    the arguments, not from which parameters the edit named.
+
+    A copy edit whose result reads a literal whole field into a literal component or subcomponent,
+    with no other argument on either call, is refused too, whether or not the row had that shape
+    before: either native write escapes the field's escape sequences a second time, and the insert
+    of that copy is the ``copy_field`` call instead (BACKLOG #5821). A copy carrying another
+    argument keeps its native form, as an insert carrying one does."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -3950,6 +3956,15 @@ def _repick_write(source: str, line_start: int, line_end: int, before: ast.AST) 
             )
     else:
         src = getattr(field_call.args[0], "value", None)
+        if _copies_whole_field_into_leaf(call, field_call):
+            # No native write copies a whole field's raw text into a component the way
+            # ``copy_field`` does: both escape its escape sequences a second time (BACKLOG #5821).
+            raise LensRewriteError(
+                "this edit would copy a whole field into a component or subcomponent, which a "
+                "native msg.set or msg.set_data escapes a second time - delete the row and "
+                "insert a Copy Field "
+                "(it is written as the copy_field call), or edit it as text"
+            )
         if not isinstance(src, str) or _is_leaf_literal(getattr(dst, "value", None)):
             return source
         want = _copy_write_method(src)
@@ -3958,6 +3973,22 @@ def _repick_write(source: str, line_start: int, line_end: int, before: ast.AST) 
     data = source.encode("utf-8")
     end = _line_byte_starts(data)[(func.end_lineno or func.lineno) - 1] + func.end_col_offset
     return (data[: end - len(func.attr)] + want.encode("ascii") + data[end:]).decode("utf-8")
+
+
+def _copies_whole_field_into_leaf(call: ast.Call, field_call: ast.Call) -> bool:
+    """Whether a native copy ``call`` writes the read ``field_call`` of a literal whole field into a
+    literal component or subcomponent, with no other argument on either: the copy
+    :func:`_copy_needs_wrapper` inserts as the ``copy_field`` call. Another argument keeps the
+    native form, as an insert carrying one does."""
+    src = getattr(field_call.args[0], "value", None)
+    return (
+        not call.keywords
+        and not field_call.keywords
+        and len(field_call.args) == 1
+        and isinstance(src, str)
+        and _WHOLE_FIELD_PATH_RE.match(src) is not None
+        and _is_leaf_literal(getattr(call.args[0], "value", None))
+    )
 
 
 def _moves_data_off_a_leaf(before: ast.AST, dst: ast.expr, value: ast.expr) -> bool:
@@ -6891,11 +6922,13 @@ def _is_leaf_literal(value: Any) -> bool:
 def _copy_write_method(src: Any) -> str:
     """The ``Message`` write a native Copy Field from ``src`` uses (ADR 0206 rule 1): ``set_data`` for
     a literal component or subcomponent path, whose read is decoded, as ``actions.copy_field`` does;
-    ``set`` otherwise. A ``src`` given as an expression cannot be classified and keeps ``set``; the
-    handler-security lint cannot see that one either. An insert of a literal whole-field ``src``
+    ``set`` otherwise. An ``{"expr": ...}`` holding only a string literal classifies as that string
+    does (:func:`_constant_text`). Any other expression ``src``, a module name included, cannot be
+    classified and keeps ``set``; the handler-security lint cannot see that one either. An insert of
+    a literal whole-field ``src``
     into a literal component or subcomponent ``dst`` with no other parameter writes no native form
     at all (:func:`_copy_needs_wrapper`)."""
-    return "set_data" if _is_leaf_literal(src) else "set"
+    return "set_data" if _is_leaf_literal(_constant_text(src)) else "set"
 
 
 #: A literal HL7 path to a whole field, the grammar of ``parsing.peek.parse_path`` with no component.
@@ -6909,13 +6942,33 @@ def _copy_needs_wrapper(params: dict[str, Any]) -> bool:
     (BACKLOG #5821): ``set`` would escape the field's escape sequences a second time. The call takes
     no other argument, so an insert carrying any other key (``occurrence``, ``repetition``, or one
     neither form reads) keeps the native form, as before the wrapper existed."""
-    src = params.get("src")
+    src = _constant_text(params.get("src"))
     return (
         set(params) <= {"src", "dst"}
         and isinstance(src, str)
         and _WHOLE_FIELD_PATH_RE.match(src) is not None
-        and _is_leaf_literal(params.get("dst"))
+        and _is_leaf_literal(_constant_text(params.get("dst")))
     )
+
+
+def _expr_constant(value: Any) -> ast.Constant | None:
+    """The literal an ``{"expr": ...}`` parameter holds, or None when ``value`` is not one, does
+    not parse, or is not a literal. A parse the parser refuses is None too: the splice or the
+    renderer refuses it with its own message."""
+    if not (isinstance(value, dict) and set(value) == {"expr"} and isinstance(value["expr"], str)):
+        return None
+    try:
+        node = ast.parse(value["expr"].strip(), mode="eval").body
+    except (SyntaxError, *_PARSER_REFUSALS):
+        return None
+    return node if isinstance(node, ast.Constant) else None
+
+
+def _constant_text(value: Any) -> Any:
+    """``value``, or the string an ``{"expr": ...}`` holding only a string literal spells, so
+    ``{"expr": '"PID-5"'}`` classifies as ``"PID-5"`` does (BACKLOG #5821, PR 3036 finding 3)."""
+    node = _expr_constant(value)
+    return node.value if node is not None and isinstance(node.value, str) else value
 
 
 #: The characters that template text carries as structure the author meant: the HL7 component,
@@ -7023,15 +7076,9 @@ def _refuse_non_text_set_params(row: dict[str, Any], params: dict[str, Any]) -> 
             continue
         literal: object = value
         if isinstance(value, dict):
-            expr = value.get("expr") if set(value) == {"expr"} else None
-            if not isinstance(expr, str):
-                continue
-            try:
-                node = ast.parse(expr.strip(), mode="eval").body
-            except (SyntaxError, *_PARSER_REFUSALS):
-                continue  # the splice refuses it with its own message
-            if not isinstance(node, ast.Constant):
-                continue
+            node = _expr_constant(value)
+            if node is None:
+                continue  # the splice refuses any other shape with its own message
             literal = node.value
         if not (literal is None or isinstance(literal, bool | int | float)):
             continue
