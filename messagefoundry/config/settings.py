@@ -4038,8 +4038,9 @@ class AuthSettings(_Section):
     oidc_acr_values: str | None = None
     oidc_prompt: str | None = None  # requested `prompt` authorize param; blank loads as None
     # 0 serves no key as fresh, so each unknown or stale lookup asks for a fetch, still throttled by
-    # the refetch bound below; 0 there removes that bound. A negative is refused for both (BACKLOG
-    # #5318): the consumers read it as 0.
+    # the refetch bound below; 0 there removes that bound. The load refuses for both at least a
+    # negative (BACKLOG #5318) and a value too large for a float (_check_oidc_jwks_interval), and
+    # JwksCache refuses both at construction too.
     oidc_jwks_ttl_seconds: int = Field(default=3600, ge=0)
     oidc_jwks_min_refetch_seconds: int = Field(default=300, ge=0)  # the amplification bound
     oidc_flow_ttl_seconds: int = 300  # single-use flow window; validator-capped 30..1800
@@ -4401,6 +4402,20 @@ class AuthSettings(_Section):
             raise ValueError("oidc_clock_skew_seconds must be between 0 and 300")
         return value
 
+    @field_validator("oidc_jwks_ttl_seconds", "oidc_jwks_min_refetch_seconds")
+    @classmethod
+    def _check_oidc_jwks_interval(cls, value: int, info: ValidationInfo) -> int:
+        # JwksCache reads both as floats and refuses an int past the float range at construction
+        # (BACKLOG #6904), so the load refuses it too: `check` and `verify` then refuse what
+        # `serve` would. The value is withheld.
+        try:
+            float(value)
+        except OverflowError:
+            raise ValueError(
+                f"{info.field_name} is too large for a float (value withheld)"
+            ) from None
+        return value
+
     @field_validator("oidc_flow_ttl_seconds")
     @classmethod
     def _check_oidc_flow_ttl(cls, value: int) -> int:
@@ -4412,8 +4427,7 @@ class AuthSettings(_Section):
         # `oidc_flow_cache_max` slot -- see that field for why the cache rejects rather than evicts.
         #
         # The endpoints are a JUDGMENT with no measured anchor, and no neighbouring field supplies
-        # one: every other lifetime and size in this OIDC block is itself unbounded (verified by
-        # execution -- `oidc_jwks_ttl_seconds` accepts 10_000_000). What is NOT a judgment is that
+        # one. What is NOT a judgment is that
         # an unbounded value is wrong in both directions.
         if not 30 <= value <= 1800:
             raise ValueError("oidc_flow_ttl_seconds must be between 30 and 1800")
@@ -9953,10 +9967,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       test. ``oidc_jwks_ttl_seconds`` above its default keeps a withdrawn signing key verifying for
       longer. ``JwksCache`` also serves a cached key until it may fetch again, so an
       ``oidc_jwks_min_refetch_seconds`` above the DEFAULT TTL is named for the same reason; below
-      its own default it weakens the bound on fetches an unknown key id can force, and 0 or less
+      its own default it weakens the bound on fetches an unknown key id can force, and 0
       removes it. ``oidc_flow_ttl_seconds`` above its default keeps a staged flow redeemable for
       longer, and ``oidc_max_age_seconds`` above its default accepts an older identity-provider
-      sign-in. The load bounds all but the JWKS pair, each above its default.
+      sign-in.
     * ``oidc_session_max_hours`` is never named: the sign-in takes the minimum of it and the
       token's own expiry, so any value only ends a session sooner.
 
