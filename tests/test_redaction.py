@@ -232,6 +232,52 @@ def _best_of(work: Callable[[], object], reps: int = 3) -> float:
     return best
 
 
+#: The type of pytest's ``record_property`` fixture, which every cost arm and control below takes.
+_RecordProperty = Callable[[str, object], None]
+
+#: ``record_property`` warns that ``<properties>`` inside a ``<testcase>`` is outside the xunit2
+#: schema, the default family. pytest writes them there all the same, which is where the readings
+#: are wanted, so every test that records one carries this filter, as
+#: ``tests/test_soap_fault_scan_linear.py`` does.
+_RECORDS_A_READING = pytest.mark.filterwarnings(
+    "ignore:record_property is incompatible:pytest.PytestWarning"
+)
+
+
+def _record_reading(
+    record_property: _RecordProperty,
+    reading: float,
+    line: float,
+    *,
+    over: bool,
+    unit: str,
+    label: str = "",
+    large_cpu_seconds: float | None = None,
+) -> None:
+    """Write one cost reading into the junit XML as test properties, before the test asserts on it
+    (BACKLOG #2958 step 1, #3721 step 1).
+
+    A passing arm prints nothing under ``pytest -q``, so no hosted log held a margin to read. Written
+    before the assertion, a failing reading lands in the junit as well. ``margin`` is how many times
+    the reading clears its line: the line over the reading for an arm held under it, the reading over
+    the line for a control held over it, so a margin under 1 is a red either way. ``label`` prefixes
+    the names when one test reads several inputs. For a CPU-time ratio, ``large_cpu_seconds`` adds
+    both sides' CPU seconds, the small side derived as the large over the ratio, which is how
+    :func:`_interleaved_growth` formed it. Recording changes no reading and no assertion."""
+    prefix = f"{label}." if label else ""
+    above, below = (reading, line) if over else (line, reading)
+    margin = above / below if below > 0 else float("inf")
+    record_property(f"{prefix}reading", reading)
+    record_property(f"{prefix}line", line)
+    record_property(f"{prefix}side", "over" if over else "under")
+    record_property(f"{prefix}margin", margin)
+    record_property(f"{prefix}unit", unit)
+    if large_cpu_seconds is not None:
+        record_property(f"{prefix}large_cpu_seconds", large_cpu_seconds)
+        small = large_cpu_seconds / reading if reading > 0 else float("inf")
+        record_property(f"{prefix}small_cpu_seconds", small)
+
+
 #: The line the CPU-time cost arms share. Each arm divides a large input's CPU time by a small one's,
 #: and the sizes are chosen so the shipped code and the regression it guards land on opposite sides
 #: of 24, each with room. **The number is borrowed, the clock is not:**
@@ -378,7 +424,10 @@ def test_the_hostile_fixture_is_actually_hostile() -> None:
     assert _longest_token("A " * 5000) == 1  # the replaced arm's input, for the record
 
 
-def test_a_delimiter_free_run_stays_inside_the_scan_budget() -> None:
+@_RECORDS_A_READING
+def test_a_delimiter_free_run_stays_inside_the_scan_budget(
+    record_property: _RecordProperty,
+) -> None:
     """A long run carrying no ``| ^ ~ &`` must not cost the field-run scan quadratic time.
 
     ``redact`` is installed as a **logging handler filter** (``messagefoundry.logging_setup``), so it
@@ -402,13 +451,17 @@ def test_a_delimiter_free_run_stays_inside_the_scan_budget() -> None:
     2026-10-13, three runs on an unloaded Windows box: 0.77 to 1.19 ms, at least 42 times under the
     line. The token walk that failed #2896 had about 7 times."""
     seconds = _redact_seconds(5)
+    _record_reading(record_property, seconds, _SCAN_BUDGET_SECONDS, over=False, unit="s")
     assert seconds < _SCAN_BUDGET_SECONDS, (
         f"redacting one {_HOSTILE_RUN_CHARS}-character delimiter-free run cost {seconds:.4f}s of the "
         f"event loop against a {_SCAN_BUDGET_SECONDS}s budget"
     )
 
 
-def test_the_pre_guard_pattern_blows_that_same_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+@_RECORDS_A_READING
+def test_the_pre_guard_pattern_blows_that_same_budget(
+    monkeypatch: pytest.MonkeyPatch, record_property: _RecordProperty
+) -> None:
     """Live positive control: the SAME message and the SAME budget, with the ``(?<![^\\s|^~&])``
     lookbehind removed from the shipping path.
 
@@ -420,6 +473,7 @@ def test_the_pre_guard_pattern_blows_that_same_budget(monkeypatch: pytest.Monkey
     One rep, deliberately. The assertion is that the scan is SLOW, so noise moves it the safe way."""
     monkeypatch.setattr(redaction, "_HL7_FIELD_RUN", _PRE_GUARD_FIELD_RUN)
     seconds = _redact_seconds(1)
+    _record_reading(record_property, seconds, _SCAN_BUDGET_SECONDS, over=True, unit="s")
     assert seconds > _SCAN_BUDGET_SECONDS, (
         f"the pre-guard pattern redacted the hostile run in {seconds:.4f}s, inside the "
         f"{_SCAN_BUDGET_SECONDS}s budget. The budget no longer separates a linear scan from a "
@@ -637,7 +691,10 @@ def test_disabling_the_sniff_restores_the_leak(monkeypatch: pytest.MonkeyPatch) 
     assert redaction.redact(ADT) == _pre_sniff_redact(ADT)
 
 
-def test_the_separator_sniff_stays_inside_the_scan_budget() -> None:
+@_RECORDS_A_READING
+def test_the_separator_sniff_stays_inside_the_scan_budget(
+    record_property: _RecordProperty,
+) -> None:
     """Cost, on the two inputs that matter: a block of ordinary operational text carrying no MSH (the
     sniff runs and finds nothing) and a long fully-custom message (the sniff runs and the extra pass
     fires). Both share the ``_SCAN_BUDGET_SECONDS`` line the #1437 arms use, and best-of-5 for the same
@@ -652,6 +709,14 @@ def test_the_separator_sniff_stays_inside_the_scan_budget() -> None:
 
     for label, text in (("ops text", ops_block), ("300-segment custom message", custom)):
         best = _best_of(lambda text=text: redact(text), 5)  # type: ignore[misc]
+        _record_reading(
+            record_property,
+            best,
+            _SCAN_BUDGET_SECONDS,
+            over=False,
+            unit="s",
+            label=label.split()[0],
+        )
         assert best < _SCAN_BUDGET_SECONDS, (
             f"redacting {len(text)} characters of {label} cost {best:.4f}s of the event loop against "
             f"a {_SCAN_BUDGET_SECONDS}s budget"
@@ -2013,7 +2078,10 @@ def test_one_credential_span_can_cover_a_second_opener_and_both_go() -> None:
     assert _PASSWORD_HEAD not in out and second_head not in out
 
 
-def test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
+@_RECORDS_A_READING
+def test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer(
+    record_property: _RecordProperty,
+) -> None:
     """THE COST HALF, on the argument ``test_the_token_walk_is_bounded_by_the_window_not_by_the_peer``
     makes: the PEER chooses how many passes the walk takes, so each pass has to stay inside the
     region it drops. That arm reads a count now (BACKLOG #2896); this one reads CPU time.
@@ -2052,6 +2120,12 @@ def test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
     batch 255 Manager ruling on #2952 and #2958 (2026-10-13) chose that trade for headroom on a loaded
     runner. The ratio's own margin is smaller, about 2.4 times, so load can still turn it red."""
     growth, large = _credential_walk_growth()
+    _record_reading(
+        record_property, growth, _CPU_GROWTH_LINE, over=False, unit="ratio", large_cpu_seconds=large
+    )
+    _record_reading(
+        record_property, large, _CPU_CEILING_SECONDS, over=False, unit="cpu_s", label="ceiling"
+    )
     assert growth < _CPU_GROWTH_LINE, (
         f"an eight times wider window cost the credential walk {growth:.1f} times the CPU time, over "
         f"the {_CPU_GROWTH_LINE} line -- the walk is no longer linear in the window"
@@ -2062,8 +2136,9 @@ def test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
     )
 
 
+@_RECORDS_A_READING
 def test_a_credential_search_from_index_0_is_quadratic_on_the_same_line(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, record_property: _RecordProperty
 ) -> None:
     """Live positive control for the arm above: the SAME walls, the SAME clock and the SAME line, with
     the search behind the cut started at index 0 instead of one ``_USERINFO_SPAN`` back.
@@ -2096,7 +2171,10 @@ def test_a_credential_search_from_index_0_is_quadratic_on_the_same_line(
         return -1
 
     monkeypatch.setattr(redaction, "_first_truncated_userinfo", search_from_zero)
-    growth, _ = _credential_walk_growth(large_reps=1)
+    growth, large = _credential_walk_growth(large_reps=1)
+    _record_reading(
+        record_property, growth, _CPU_GROWTH_LINE, over=True, unit="ratio", large_cpu_seconds=large
+    )
     assert growth > _CPU_GROWTH_LINE, (
         f"a search from index 0 grew only {growth:.1f} times for an eight times wider window, under "
         f"the {_CPU_GROWTH_LINE} line. The ratio no longer separates a bounded search from an "
@@ -2250,8 +2328,11 @@ _FRAME_CAP_SHAPES = {
 _FRAME_CAP_BUDGET_SHAPES = ("one solid run", "segment-shaped")
 
 
+@_RECORDS_A_READING
 @pytest.mark.parametrize("label", _FRAME_CAP_BUDGET_SHAPES)
-def test_a_frame_cap_sized_input_no_longer_buys_the_event_loop(label: str) -> None:
+def test_a_frame_cap_sized_input_no_longer_buys_the_event_loop(
+    label: str, record_property: _RecordProperty
+) -> None:
     """THE ROW'S ACCEPTANCE ARM: event-loop responsiveness against an input a remote peer sizes.
 
     A negative acknowledgment's MSA-3 runs to the 16 MiB frame cap, and ``safe_text`` scanned all of it
@@ -2271,14 +2352,18 @@ def test_a_frame_cap_sized_input_no_longer_buys_the_event_loop(label: str) -> No
     text = _FRAME_CAP_SHAPES[label]()
     assert len(text) >= 16_000_000
     best = _best_of(lambda: safe_text(text))
+    _record_reading(record_property, best, _SCAN_BUDGET_SECONDS, over=False, unit="s")
     assert best < _SCAN_BUDGET_SECONDS, (
         f"safe_text on {len(text)} characters of {label} cost {best:.4f}s of the event loop against "
         f"a {_SCAN_BUDGET_SECONDS}s budget"
     )
 
 
+@_RECORDS_A_READING
 @pytest.mark.parametrize("label", _FRAME_CAP_BUDGET_SHAPES)
-def test_control_the_budget_shapes_are_expensive_unbounded(label: str) -> None:
+def test_control_the_budget_shapes_are_expensive_unbounded(
+    label: str, record_property: _RecordProperty
+) -> None:
     """Non-vacuity for the budget arm above, on the SAME fixture and the SAME line. Without it, a fast
     ``safe_text`` would be equally consistent with a fixture too cheap to measure anything.
     ``redact`` is called directly, which is what ``safe_text`` did before the bound. Measured
@@ -2286,6 +2371,7 @@ def test_control_the_budget_shapes_are_expensive_unbounded(label: str) -> None:
     the segment shape. One sample, because noise can only make it slower."""
     text = _FRAME_CAP_SHAPES[label]()
     best = _best_of(lambda: redact(text), 1)
+    _record_reading(record_property, best, _SCAN_BUDGET_SECONDS, over=True, unit="s")
     assert best > _SCAN_BUDGET_SECONDS, (
         f"the unbounded scan of {label} cost only {best:.4f}s, under the {_SCAN_BUDGET_SECONDS}s "
         f"budget the bounded arm clears -- this fixture no longer discriminates"
@@ -2306,7 +2392,10 @@ def _frame_cap_prose_growth(
     return _interleaved_growth(lambda: scan(small_text), lambda: scan(large_text), large_reps)
 
 
-def test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs() -> None:
+@_RECORDS_A_READING
+def test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs(
+    record_property: _RecordProperty,
+) -> None:
     """The frame-cap arm's prose shape, on a CPU-time ratio rather than the 0.05 s budget (BACKLOG
     #2958).
 
@@ -2324,6 +2413,12 @@ def test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs() -> None:
     the old line: it passes a scan up to about 69 times today's, on the re-measured 7.25 ms. ``safe_text`` runs the whole clamp on
     this input, the name walk included."""
     growth, large = _frame_cap_prose_growth(safe_text)
+    _record_reading(
+        record_property, growth, _CPU_GROWTH_LINE, over=False, unit="ratio", large_cpu_seconds=large
+    )
+    _record_reading(
+        record_property, large, _CPU_CEILING_SECONDS, over=False, unit="cpu_s", label="ceiling"
+    )
     assert growth < _CPU_GROWTH_LINE, (
         f"safe_text on the frame-cap prose cost {growth:.1f} times one window of it, over the "
         f"{_CPU_GROWTH_LINE} line -- the scan is no longer bounded by the window"
@@ -2334,14 +2429,20 @@ def test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs() -> None:
     )
 
 
-def test_control_the_same_inputs_are_expensive_unbounded() -> None:
+@_RECORDS_A_READING
+def test_control_the_same_inputs_are_expensive_unbounded(
+    record_property: _RecordProperty,
+) -> None:
     """Non-vacuity for the prose arm above, in the shape ``test_the_hostile_fixture_is_actually_hostile``
     established: without it, a cheap ``safe_text`` would be equally consistent with a fixture too
     cheap to measure anything. ``redact`` is called directly, which is what ``safe_text`` did before
     the bound. **The same pair, the same clock and the same line as the arm**, so the line provably
     separates a bounded scan from an unbounded one. One rep for the large input, because a slow
     sample there only helps this assertion."""
-    growth, _ = _frame_cap_prose_growth(redact, large_reps=1)
+    growth, large = _frame_cap_prose_growth(redact, large_reps=1)
+    _record_reading(
+        record_property, growth, _CPU_GROWTH_LINE, over=True, unit="ratio", large_cpu_seconds=large
+    )
     assert growth > _CPU_GROWTH_LINE, (
         f"the unbounded scan cost only {growth:.1f} times one window of it, under the "
         f"{_CPU_GROWTH_LINE} line the bounded arm clears -- this fixture no longer discriminates "
