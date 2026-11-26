@@ -2973,14 +2973,41 @@ included, and released, any error the reload raises that none of the other reaso
 raised by a runner start or swap. A `FileNotFoundError` there is never `not_found`. That reason is
 for the config directory itself: at least one that is missing, and one moved away between the
 reload's target check and its read of the directory. An executor fault is named by its own type,
-at least when a lane's anchor check meets it. The row never
+at least when a worker-thread hop with no fallback meets it. The row never
 carries the error's text. A connector build or build check that the executor refused at submit,
 before a worker took it, or cancelled or failed before it began, runs on the event loop instead,
-with a WARNING in the engine log, so that hop does not fail; a bad config is still refused. Work
-still queued behind a busy or hung pool waits for it and is not run on the loop. Other
-worker-thread hops have no such fallback, at least a lane's anchor check and a reload's reads of
-its config directory, so a pool that stays broken still fails the reload. The row does not claim
-the old graph is still serving: at least a
+with a WARNING in the engine log, so that hop does not fail; a bad config is still refused. The
+refused-executor hop list follows (BACKLOG #5755). At least these hops fall back too, except that
+each runs on a thread of its own rather than on the loop: some trust-anchor reads (at least a
+lane's anchor check, the settings preflight and the registry anchor preflight), a reload's target
+check, its content snapshot and its reload snapshot of the config directory, its approval check, a
+DICOM listener's start and stop, and the sandbox session closes. Only when no thread can be
+started does such a hop run on the event loop, which then blocks while it runs: an anchor read on
+a stalled share for as long as the read takes, and a DICOM stop or a sandbox close for as long as
+it runs, which includes waiting out an in-flight C-STORE or brokered lookup whose own wait on the
+loop then times out and fails it. A C-STORE failed that way can still be committed once the loop
+is free, because the commit it waited on was already scheduled, so a re-send by the sender then
+makes a duplicate. A DICOM listener's start still fails there, because it starts its accept loop
+on a thread of its own. Work still queued behind a busy or hung pool waits for it and is not run
+on the loop. Other worker-thread hops have no such fallback, at least: in a reload, the
+environment value read, the config load, which runs author code, the bundle fingerprint, which
+also reads the config directory, and a connector's own startup check, such as a remote-file
+listing; at a load the engine runs, a reload or a DR activation's profile included, the connection
+key-file check that `serve` runs as the first registry preflight (`config/key_file_access.py`); in
+a DR activation, the cold-seed restore-verify (`pipeline/dr_backup.py`) and the confinement of an
+archive the request names; and at serve start and store open, the SMTP alert CA check and the SQL
+Server store's certificate pin checks. So a pool that stays broken still fails an operator reload
+at the first of these it meets, which comes before either registry preflight. A DR activation on
+such a pool aborts before any VIP step, at the latest at its first step, the cold-seed
+restore-verify. A pool that breaks later in an activation, once the takeover hook has run, meets
+the key-file check under `serve` at the profile's preflight, so the activation aborts there and
+the VIP may already have moved. Nor does a rollback on such a pool bring every inbound back. It
+restarts, one at a time, the inbounds that were listening when the runner took its reload lock,
+which is after the engine has loaded and checked the new config, so an inbound stopped or started
+in between is not put back as it was when the reload was asked for. One whose start meets such a
+hop is recorded `failed` and stays down after the rollback, while the rollback still tries to
+restart the rest. That record alerts once while it stands: a repeat failure of the same class, a
+store fault or not, records and alerts nothing new. The row does not claim the old graph is still serving: at least a
 fault raised after the swap committed leaves the new one live, and `GET /config/provenance` says
 which is. At least these write no such row: a DR activation's reload, and a row whose own write
 fails, which is logged. A cluster convergence reload records such a fault with reason
@@ -4427,7 +4454,9 @@ and answered after another tab met the factor, neither re-anchors nor stamps. Th
 inside the factor write, from the session row that write reads in its own transaction
 (`mark_session_mfa_verified` with an anchor; its docstring says what each store backend does
 between that read and the write). A refused code at `POST /ui/mfa` on a session that had already met its factor lands on
-`/ui`, as the page's GET does, and stages no assertion; a must-change session that must change its
+`/ui`, as the page's GET does, and stages no assertion. It carries a notice that the session needed no code (vault BACKLOG #2964 item 21), except at least on an `oidc` session on an account with TOTP enrolled: a code there within the
+form's length bound is refused unread and lands on a bare `/ui` without it
+([ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md) Amendment F). A must-change session that must change its
 password first is sent to `/ui/account/password` before its code is read. An
 action-bound grant still comes only from the credential leg: the password leg of `POST /ui/reauth`,
 or for an `oidc` session the IdP leg, which shows no password field. Enrollment (`POST /ui/account/webauthn/enroll`) sits behind the **re-proof-only
@@ -4611,9 +4640,13 @@ passkey is then refused with, audited `auth.webauthn_failed`, include at least
 its seal, `reason=session_lost` when the session or the account went with it, and `reason=locked`;
 an MFA reset gives `reason=session_lost` once its revocation has landed, and
 `reason=factor_removed` before. In the passkey set read after the write, on any sign-count answer,
-an exception the read's catch takes is refused with `reason=store_error` and leaves the factor
-unmarked (BACKLOG #3775). Which classes it takes, which it re-raises first, and that every other
-exception raises are in [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md), amendment
+an exception of a class the read's catch refuses is refused as `store_error` with the factor
+unmarked, after a row naming `reason=store_error` is tried; at least some faults in that row's own
+write raise in place of the refusal. Every other exception raises out of the ceremony with the
+factor unmarked, and for at least some of them a row naming `reason=read_raised` is tried first;
+at least some faults in that row's own write raise in place of the read's exception. Either row can
+be missing (BACKLOG #3775). Which classes the read's catch refuses, which raises try the
+`read_raised` row, and when a row is missing or its write raises, are in [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md), amendment
 of 2026-10-17.
 Assertion failures are audited but deliberately do **not** feed the
 account lockout (signatures aren't guessable secrets). Unless a setting turns it off or loosens it (at least
@@ -5615,6 +5648,20 @@ Both kinds of user share one identity model (`users.auth_provider` is `local` or
   this acceptor against a real domain. If it does, every Windows SSO sign-in on a Windows host fails
   closed until a lab run decides how to read it. That is no looser than before, when its directory
   lookup missed.
+  **The realm is bound to the directory entry too (BACKLOG #4846).** The Kerberos lookup asks only
+  what a ticket proves: a person account, `objectCategory=person` and `objectClass=user`, whose own
+  `sAMAccountName` is the ticket's account name, and whose DN's whole trailing run of `DC=` RDNs
+  equals the realm's domain, compared up to ASCII case as the ticket's realm is. So under a forest-wide base or the
+  global catalog, `alice@CORP.EXAMPLE` never resolves to a child domain's `alice`; an entry holding
+  the name only as its UPN answers no ticket; and a machine's ticket (`WS01$`) finds nothing. A
+  name ending in `$` is never looked up, which also covers an interdomain trust account, a
+  person-category `user`. The binding assumes Active Directory's rule that a domain's realm is its
+  DNS name and its naming context that name's `DC=` RDNs. An entry whose trailing `DC=` run is
+  not exactly the realm's labels, one per RDN, matches nothing, and neither does one whose DN the
+  engine's parser refuses; the sign-in is then refused as `not_in_directory`. So does a ticket naming the account by an implicit UPN rather than its
+  `sAMAccountName`, which a client that does not ask the KDC to canonicalize the name may present;
+  that is unverified against a real KDC. The password sign-in and the other name-keyed lookups,
+  `create_directory_account`'s among them, are unchanged.
 
 ### AD-group → role mapping
 
@@ -7468,7 +7515,7 @@ threshold, the switch that disables it, and — the part that matters for "not d
 | 6 | **Pre-auth client-network gate** | reaching the auth surface at all from an unlisted network | membership in `[security].allowed_client_networks` | `[]` = no restriction (the default) | limiters 1–3 |
 | 7 | **Federated pending-flow bound** (`FlowCache.put`, **reject-when-full**) | flooding the OIDC start legs to exhaust engine memory or deny federated sign-in and step-up. The sign-in start is `POST /ui/oidc/start`, and `GET /ui/oidc/start` when its 3.7.3 interstitial is skipped, because that GET then runs the POST leg and stages a flow; with the interstitial shown, the default, the GET stages nothing — see the [Route → limiter map](#route--limiter-map). The step-up start is `POST /ui/reauth/oidc`, whose `begin_oidc_step_up` stages its flow in the **same** cache, so a flood on either start fills it for both | 16 pending flows per client IP, 512 engine-wide, 300 s TTL. It **rejects** rather than evicts — evict-oldest would turn a start-leg flood into a login DoS for legitimate users | **none** — and `oidc_flow_cache_max = 0` is not an opt-out either: `put` refuses at `len(entries) >= global_cap`, so `0` would reject **every** federated sign-in and IdP step-up (`FlowCacheFullError` on the first flow, an OIDC denial of service). The load refuses a cap below `1` (BACKLOG #5318); treat it as a security-relevant value | limiter 2 on the sign-in start, which charges `allow_login_attempt` first; limiter 3 on the step-up start, which charges `allow_reauth_attempt` first |
 | 8 | **WebAuthn pending-ceremony bound** (`ChallengeCache.put`), and the **pre-auth sign-in pool** (`PreAuthChallengePool.put`, ADR 0197 Amendment A wave 2) | flooding passkey registration/assertion ceremonies, and the usernameless passkey sign-in's challenges | 16 pending ceremonies per **user** (evicts that *same* user's oldest, so one principal can never deny another's), 4096 engine-wide (**refuses** with a cause-naming `ChallengeCacheFullError`), 120 s TTL. The pre-auth pool is its own: 4096 challenges, 120 s TTL, keyed by an opaque per-begin handle and never by client address, and a full pool **evicts its oldest** rather than refusing, so a flood can cost the owner a retry but never refuses the ceremony. Its begin leg (`POST /ui/login/passkey`) charges limiter 2 first; with limiter 2 off a fast enough flood can evict an owner's challenge before they finish | none | limiter 3 where the console charges it — `POST /ui/reauth/webauthn` (`ui_reauth_webauthn`, the assertion **finish** leg), plus `POST /ui/reauth` (`ui_reauth`) and `POST /ui/mfa` (`ui_mfa_submit`), whose code and password error re-renders re-stage fresh assertion options, for a session they read as not having met its factor, after the route has already charged `allow_reauth_attempt`. One `POST /ui/reauth` branch is the exception: its passkey-first refusal for a passkey-only session re-stages options **before** the limiter and charges nothing. The routes that *stage* a ceremony — the thing `ChallengeCache.put` actually bounds — charge no **auth-surface** limiter, but they are not unpaced: `POST /ui/account/webauthn/enroll` charges the per-actor **admin-write floor** (`allow_admin_write`, non-GET only, in `require_ui` — see 2.1.3 below). `GET /ui/reauth` and `GET /ui/mfa`, which re-stage fresh assertion options on **every** render for a session they read as not having met its factor, charge nothing at all, because that floor is non-GET only. There this bound plus cookie-holder-only reachability is all there is |
-| 9 | **JWKS min-refetch floor** (`JwksCache.get_key`) | unauthenticated `kid`-driven refetch amplification against the IdP on the OIDC callback leg — the sibling of control 7 on the *other* federated leg | one upstream fetch per **300 s**, globally (`[auth].oidc_jwks_min_refetch_seconds`), plus a `_MAX_JWKS_BYTES` **512 KiB** response-body cap and a 3600 s key TTL. Within the floor an unknown `kid` raises `JwksError` and that login fails (a still-cached key is served even past the soft TTL rather than fail while throttled) | `oidc_jwks_min_refetch_seconds = 0` — the load floors it at `0`, refusing only a negative (BACKLOG #5318), so this **is** a genuine opt-out, and it restores the amplification | limiter 2 and control 7 (the same legs charge `allow_login_attempt` and stage a bounded flow first) |
+| 9 | **JWKS min-refetch floor** (`JwksCache.get_key`) | unauthenticated `kid`-driven refetch amplification against the IdP on the OIDC callback leg — the sibling of control 7 on the *other* federated leg | one upstream fetch per **300 s**, globally (`[auth].oidc_jwks_min_refetch_seconds`), plus a `_MAX_JWKS_BYTES` **512 KiB** response-body cap and a 3600 s key TTL. Within the floor an unknown `kid` raises `JwksError` and that login fails (a still-cached key is served even past the soft TTL rather than fail while throttled). A key within its TTL is served from the cache without waiting on a refresh in progress only while that refresh is younger than 10 s, so a key the refresh withdraws keeps verifying for at most 10 s after the refresh starts, or until it publishes the new set if sooner; after that such a lookup waits like any other. Any other lookup waits at most 10 s for the refresh to release the cache, and is decided normally if it gets it. A lookup whose wait runs out before its key is current is refused, and audited `jwks_refresh_busy` rather than `unknown_kid`, because the IdP was slow and the token's `kid` was never judged; it is refused even if the refresh later fails and leaves the old keys in place. It is not the outage reason either: that lookup made no request, so no transport failure was seen, and ADR 0142 Amendment E lets only a transport failure mark the IdP unavailable. The 10 s bounds that wait, not the refresh, whose fetch is bounded per socket operation only, and not at all while the IdP's host name resolves (BACKLOG #6905) | `oidc_jwks_min_refetch_seconds = 0` — the load floors it at `0`, refusing only a negative (BACKLOG #5318), so this **is** a genuine opt-out, and it restores the amplification | limiter 2 and control 7 (the same legs charge `allow_login_attempt` and stage a bounded flow first) |
 | 10 | **Repeated-credential audit budget** (`allow_repeated_credential_audit`) | an unauthenticated caller growing `audit_log` by sending a repeated `Authorization` header or session cookie, which is refused before any credential is read (BACKLOG #2454) | > 10 `auth.repeated_credential` rows per client IP **or** > 60 across all clients, per 60 s. Its own budget: it never draws on, or exhausts, limiter 2. A flood from many addresses can spend the global 60, and other refusals in that window then get the line and no row | *the same* `[auth].login_rate_limit_enabled` | the refusal is unchanged: every repeat is still a `400` and a WARNING line. Only the row loses its bound, so with the switch off every refusal writes one |
 | 11 | **Step-up return audit budget** (`allow_step_up_return_audit`) | many accounts' live IdP step-up flows, or a page that sends many operators' browsers to `GET /ui/oidc/callback`, growing `audit_log` through the step-up return's refusals that consume nothing and so repeat while the flow lives: a `state` mismatch, on the completion or the abandon leg, and a non-navigation fetch (BACKLOG #3965) | > 10 such rows per **source** per 60 s, where the source is the staged **user**, or, for a flow that names no user, the callback's client **address**. Behind that, a **backstop** of 60 rows across all sources per 60 s: past it each **account** still writes one row a window, and a source with no account writes none. The first row it stops in a window, per audit action, pages `audit_write_failed` keyed `step_up_return:audit_budget:<action>`, with an ERROR line; a row the per-account floor writes pages nothing. Its own budget: it never draws on, or exhausts, limiter 2 or limiter 3, and it gates the **row only**. An over-budget refusal answers exactly as before (a `state` mismatch the step-up page with **403**, a non-navigation fetch a **303** to `/ui/login?e=oidc_failed`), consumes nothing, and writes a WARNING line instead of the row. So one source spending its budget costs no other source a row; a flood across many sources that spends the backstop still leaves each account one row that window, and pages once it stops one; and none of it refuses anyone's step-up return | *the same* `[auth].login_rate_limit_enabled`, among others: `login_rate_limit_global = 0` removes its backstop and with it the page, `login_rate_limit_per_ip = 0` its per-source figure, and a `login_rate_limit_window_seconds` of `0` the whole budget while the switch reads on. A **lower** `login_rate_limit_global` also writes fewer of these rows; a negative one is refused at load (BACKLOG #5318). The startup loosening report names those values for the sign-in and ceremony limits only; [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#authlogin_rate_limit_enabled--false-or-a-limit-looser-than-its-default--sign-in-attempts-go-less-paced) says they loosen this budget too | nothing: the same switch removes limiter 3, whose per-user return key otherwise holds each user's step-up returns, these rows among them, to 10 a window with no ceiling across users. The refusals are unchanged, and with the switch off every one writes its row |
 | 12 | **Sign-out miss-row budget** (`_admit_logout_miss_row`) | an unauthenticated caller growing `audit_log` through `POST /ui/logout` with a cookie that ends no session, each request writing an `auth.logout` row with `outcome` `nothing_to_revoke` (BACKLOG #4735) | For each engine process, per 60 s: > 3 such row writes begun per source **or** > 120 begun across all sources, where the source is the client address and every caller with no address shares one; a miss past either is counted, and at most one `auth.logout` row with `outcome` `unrecorded` is begun to write the count, with a WARNING line once it is written. [Session inventory](#session-inventory--targeted-revocation-wp-10) states its limits | none: it is always on, and `[auth].login_rate_limit_enabled` does not turn it off | nothing to turn off. It gates the row only, so a sign-out is never refused, and each miss still runs one store write transaction that this budget does not bound |
@@ -7882,7 +7929,9 @@ trail is the per-account `auth.login_failed` / `auth.login_locked` / `auth.direc
 `auth.webauthn_failed` for refusals on the factor legs (a lockout hit while proving a second factor
 is audited under those names, not `auth.login_locked`), `auth.reauth` and `auth.password_change_failed`
 for the post-session re-proofs, and the two 6.3.5 events, `auth.account_locked` and
-`auth.login_after_failures`. PHI-read and admin-write
+`auth.login_after_failures`. Not every factor-leg refusal writes a row: `verify_mfa`'s docstring
+names at least the code it refuses before any `auth.mfa_failed` row, for example one on an account
+it finds with TOTP off at its first read. PHI-read and admin-write
 throttles on the JSON API log at WARNING with actor + path; the console's `require_ui` refusals do
 not (see *The console's refusal differs from the JSON floor's* under
 [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).

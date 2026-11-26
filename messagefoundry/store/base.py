@@ -3621,9 +3621,11 @@ class AuthStore(Protocol):
         not met its factor. The decision is made inside the write's own transaction, on the row the
         write reads. PostgreSQL and SQL Server hold a row lock from that read to the write, and
         SQLite's writer lock orders this process's writers, so a factor another request met first
-        leaves this a plain factor stamp. On SQLite a commit by another process between the read
-        and the write makes the write raise rather than replace anything, which the passkey leg
-        answers by ending the session (fail closed). When
+        leaves this a plain factor stamp. SQLite opens the write with ``BEGIN IMMEDIATE`` (vault
+        BACKLOG #2964 item 23), so another process cannot commit between the read and the write: a
+        writer there waits for the other process's lock under ``busy_timeout``, and one that
+        outlasts it raises before anything is read, which the passkey leg answers by ending the
+        session (fail closed). When
         applied, the anchor moves the session's address to ``anchor.client`` (``None`` keeps it)
         and opens the step-up window (``reauth_at``) when ``anchor.open_window`` is true. When
         ``open_window`` is false it CLEARS ``reauth_at``, whether or not the address moved. The

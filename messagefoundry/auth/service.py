@@ -139,13 +139,16 @@ from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.tokens import (
     CREDENTIAL_ID_HASH_SCHEME,
     ENROLMENT_CODE_MAX,
-    credential_id_hash_is_current,
     credential_id_hash_scheme,
+    decode_stored_b64url,
     enrolment_code_digest,
     enrolment_code_matches,
     hash_token,
     mint_enrolment_code,
     mint_token,
+    stored_b64url_decodes,
+    stored_credential_id_hash_text,
+    stored_passkey_is_readable,
 )
 from messagefoundry.auth.tokens import (
     credential_id_hash as _credential_id_hash,  # locals and parameters here use the bare name
@@ -420,13 +423,15 @@ def _passkey_read_errors() -> tuple[type[Exception], ...]:
     :func:`~messagefoundry.store.base.store_call_errors` and
     :func:`~messagefoundry.store.base.store_connect_errors`. Wider than
     :func:`_session_write_errors` by ``ValueError`` and ``RuntimeError``; of the two sets, only the
-    connect set takes pyodbc's ``Error`` root, which pyodbc raises for a deadlock victim. The caller
-    re-raises ``AUDIT_WRITE_DEFECTS`` first, so those classes raise although these sets take them,
-    and so does every other class that reaches the catch, ``sqlite3.InterfaceError`` among them.
-    These classes do not tell a store fault from a bug, so a bug that raises one of them refuses
-    too. Cached, as ``store_call_errors`` is, so a refusal does not run the driver import on the
-    event loop."""
-    return (*store_call_errors(), *store_connect_errors())
+    connect set takes pyodbc's ``Error`` root, which pyodbc raises for a deadlock victim.
+    :meth:`AuthService._passkey_standing` raises ``AUDIT_WRITE_DEFECTS`` although these sets take
+    them, and so does every other class that reaches its catch, ``sqlite3.InterfaceError`` among
+    them; its docstring says what it audits on the way. At least two other sites catch this set
+    too, and audit nothing. These classes do not tell a store fault from a
+    bug, so a bug that raises one of them refuses too. Cached, as ``store_call_errors`` is, so a
+    refusal does not run the driver import on the event loop. Each class once: both sets name
+    ``OSError`` (BACKLOG #3775 added item 19)."""
+    return tuple(dict.fromkeys((*store_call_errors(), *store_connect_errors())))
 
 
 class _RotationStoreError(Exception):
@@ -1686,6 +1691,20 @@ class MfaStatus:
     required: bool
     webauthn_enrolled: bool = False
     totp_reenrolment_recommended: bool = False
+
+
+class StoredPasskeysUnreadable(Exception):
+    """Every passkey an account holds under the ceremony's ``rp_id`` has a stored credential id
+    that does not decode (BACKLOG #6886), so this assertion ceremony cannot be staged. Raised by
+    :meth:`AuthService.begin_webauthn_assertion` in place of its ``None``, which means the passkeys
+    were minted under another origin. The holder signs in with another factor where it has one and
+    removes the unreadable passkey. Where it has none, a discoverable passkey may still sign it in
+    through the combined passkey sign-in, which names no credential and does not read the stored
+    id; only where that fails too does it need an administrator's MFA reset. The message names no
+    passkey and no stored value."""
+
+    def __init__(self) -> None:
+        super().__init__("the account's passkeys could not be read")
 
 
 class FirstAdministratorRefused(RuntimeError):
@@ -3551,12 +3570,19 @@ async def lockable_account_census(
 
     def second_factor_counts(cred: WebAuthnCredential) -> bool:
         # A directory account's passkey second factor: offered only under the request's rp_id,
-        # and found at the finish only by a credential-id hash in today's scheme. The rp_id rule
-        # is ``sign_in_counts``'s; the discoverable record is not asked, since the second-factor
-        # ceremony names the credential itself.
+        # found at the finish only by a credential-id hash in today's scheme, and verified only
+        # where its stored key decodes. The rp_id rule is ``sign_in_counts``'s, and the stored-cell
+        # rule is ``passkey_is_way_past``'s; the discoverable record is not asked, since the
+        # second-factor ceremony names the credential itself. That naming is why the stored id
+        # must decode too: the begin leg leaves one that does not out of the allow list
+        # (BACKLOG #6886), so the browser never offers it.
         return (
-            way_past_rp_id is None or cred.rp_id == way_past_rp_id
-        ) and credential_id_hash_is_current(cred.credential_id_hash)
+            (way_past_rp_id is None or cred.rp_id == way_past_rp_id)
+            and stored_passkey_is_readable(
+                credential_id_hash=cred.credential_id_hash, public_key=cred.public_key
+            )
+            and stored_b64url_decodes(cred.credential_id)
+        )
 
     integrity_failed: list[str] = []
     for user in await store.list_users():
@@ -3666,6 +3692,31 @@ async def lockable_account_census(
 
 def _json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True)
+
+
+def _passkey_label(label: object) -> str | None:
+    """A stored passkey label as an audit detail carries it, rendered so that encoding the detail
+    cannot raise (BACKLOG #6886): text as it is, bytes (a BLOB in the TEXT column reads back as
+    bytes) decoded with replacement, and anything else as no label. A raise there would turn a
+    refusal into a server error, which a caller can tell from the refusal."""
+    if isinstance(label, str):
+        return label
+    if isinstance(label, (bytes, bytearray)):
+        return bytes(label).decode("utf-8", "replace")
+    return None
+
+
+def _stored_cell_refused_detail(
+    cred: WebAuthnCredential, reason: Literal["stored_key_refused", "stored_id_unreadable"]
+) -> str:
+    """The one audit detail for a passkey a stored cell refuses (BACKLOG #1963, #6886): a fixed
+    slug and the label, never the refusal text, which can quote the key. The verify writes
+    ``stored_key_refused`` for a stored key it cannot use, which never signs in again. The
+    assertion begin leg writes ``stored_id_unreadable`` for a stored id it cannot list: that
+    ceremony cannot offer the passkey, but it may still sign in through the combined sign-in if it
+    is a discoverable passkey on a local account, and otherwise cannot, so the key's reason would
+    overstate it."""
+    return _json({"reason": reason, "label": _passkey_label(cred.label)})
 
 
 def _is_idp_transport_failure(exc: BaseException) -> bool:
@@ -4276,9 +4327,13 @@ class _SealCheck:
         return self.user is not None or self.failed
 
 
-#: How many times :meth:`AuthService.checked_user` and :meth:`AuthService.list_checked_users` check
-#: an account by id while each check races a write that deletes or re-keys the row (BACKLOG #5520).
-#: What happens once every pass has raced is :meth:`AuthService._checked_by_id`'s to say.
+#: How many times a checked read of an account by id checks it while each check races a write that
+#: deletes or re-keys the row (BACKLOG #5520). Read by at least :meth:`AuthService.checked_user`,
+#: :meth:`AuthService.list_checked_users` and the directory sign-in's settled read,
+#: ``AuthService._lookup_user_settled`` (vault BACKLOG #3085 item 7), which reads again on a failed
+#: check too. What happens once every pass has raced is each reader's to say: the settled read
+#: answers refused and reports only what each ``_verified`` check reported, while
+#: :meth:`AuthService._checked_by_id` reports a seal failure.
 _CHECKED_READ_PASSES: Final = 3
 
 
@@ -5210,14 +5265,20 @@ class AuthService:
         it from the raw ``credential_id`` stored beside it, so a hash change does not lose a
         registered passkey. No secret is needed: the raw id is not one.
 
-        Sign-in finds a passkey only by today's hash, so a row this pass has not moved does not sign
-        in. A bare digest (every release before #3423) is today's hash with no tag, and moves. A
-        value whose tag this release does not compile in is REFUSED: left as it is, never matched,
-        and counted. So are a ``credential_id`` that is not base64url, a today-tagged hash its raw
-        id does not give, and a move the store refuses: the account's seal failed between the read
-        and the write, or the new hash is already held. An account or passkey set already failing
-        its seal is left to the checked loaders, which report it. Returns ``(rehashed, refused)``;
-        a refusal never stops start-up."""
+        Sign-in finds a passkey only by today's hash, so a row whose hash is in another scheme does
+        not sign in until this pass moves it. A bare digest (every release before #3423) is today's
+        hash with no tag, and moves. A hash is read as the sign-in's compare reads it
+        (:func:`~messagefoundry.auth.tokens.stored_credential_id_hash_text`), so one that reads back
+        as bytes holding today's hash is left as it is and not counted. A value whose tag this
+        release does not compile in, or that text cannot be read from, is REFUSED: left as it is,
+        never matched, and counted. So are a ``credential_id`` that is not base64url, which the
+        pass cannot hash, a today-tagged hash its raw id does not give, and a move the store
+        refuses: the account's seal failed between the read and the write, or the new hash is
+        already held. A refused row whose hash is in today's scheme is still found by the sign-in
+        when that hash is the genuine credential id's, which the pass cannot check; one whose hash
+        is not matches no id a browser sends. An account or passkey set already failing its seal is left
+        to the checked loaders, which report it. Returns ``(rehashed, refused)``; a refusal never
+        stops start-up."""
         rehashed = refused = 0
         if not await self._store.any_webauthn_credentials():
             return 0, 0
@@ -5225,14 +5286,19 @@ class AuthService:
         # skipped here, since it signs in with no passkey whatever its hash says.
         for user in await self._load_users():
             for cred in await self._verified_passkeys(user) or ():
-                try:
-                    scheme = credential_id_hash_scheme(cred.credential_id_hash)
-                    # binascii.Error, a ValueError, for a credential_id that is not base64url.
-                    new_hash = _credential_id_hash(self._b64url_decode(cred.credential_id))
-                except ValueError:  # CredentialHashSchemeError is one too
+                stored_hash = stored_credential_id_hash_text(cred.credential_id_hash)
+                if stored_hash is None:
                     refused += 1
                     continue
-                if constant_time_equal(cred.credential_id_hash, new_hash):
+                try:
+                    scheme = credential_id_hash_scheme(stored_hash)
+                    # binascii.Error, a ValueError, for a credential_id that is not base64url; a
+                    # TypeError for one that is not text at all (BACKLOG #6886).
+                    new_hash = _credential_id_hash(self._b64url_decode(cred.credential_id))
+                except (ValueError, TypeError):  # CredentialHashSchemeError is a ValueError too
+                    refused += 1
+                    continue
+                if constant_time_equal(stored_hash, new_hash):
                     continue
                 if scheme == CREDENTIAL_ID_HASH_SCHEME:
                     # Today's tag over a digest its own raw id does not give: not a row this
@@ -5260,9 +5326,11 @@ class AuthService:
             )
         if refused:
             _log.warning(
-                "%d passkey(s) were not moved to the current credential-id hash scheme (an unknown"
-                " scheme, a hash its own credential id does not give, or a move the store refused);"
-                " they cannot sign in",
+                "%d passkey(s) were left as stored: each has a credential-id hash in a scheme this"
+                " release does not know or of a malformed shape, a stored credential id that does"
+                " not decode, or today's scheme tag over a digest its own credential id does not"
+                " give, or the store refused its move to today's scheme. One whose hash is not in"
+                " today's scheme cannot sign in",
                 refused,
             )
         return rehashed, refused
@@ -7015,37 +7083,59 @@ class AuthService:
         runs each audit row: at once on the second-factor leg, deferred into the failure pad on the
         sign-in.
 
-        * A stored key the registration rule refuses (BACKLOG #1963) will never sign in again, so it
-          is logged and audited with a fixed slug, never the refusal text, which can quote the key.
+        * A stored key the registration rule refuses (BACKLOG #1963), or a stored key that does not
+          decode (BACKLOG #6886), will never sign in again, so it is logged and audited with a
+          fixed slug, never the refusal text, which can quote the key. The log line says which of
+          the two. The stored ``credential_id`` is not read: the passkey was found by the hash of
+          the id the browser sent, and the signature check does not use the stored one.
         * py_webauthn's own counter-regression rejection is a clone signal (ADR 0068 decision 4).
         * Any other refusal is audited ``auth.webauthn_failed`` only when ``audit_bad_signature``."""
+
+        def refused_key() -> tuple[str, str | None]:
+            # Built only on a refusal, so a good assertion never encodes the label.
+            return "auth.webauthn_failed", _stored_cell_refused_detail(cred, "stored_key_refused")
+
         try:
-            return webauthn.verify_assertion(
-                response_json=response_json,
-                challenge=challenge,
-                rp_id=rp_id,
-                origin=origin,
-                public_key=self._b64url_decode(cred.public_key),
-                current_sign_count=cred.sign_count,
-            )
-        except webauthn.StoredKeyRefusedError:
+            public_key = self._b64url_decode(cred.public_key)
+        except (ValueError, TypeError):
+            # BACKLOG #6886. A stored key that is not base64url text (a length one past a multiple
+            # of four, non-ASCII text, or not a string at all; ``binascii.Error`` is a
+            # ``ValueError``) escaped as an unhandled error. Decoded apart from the verify, so an
+            # error the verify raises is not read as the stored row's. Only a row written outside
+            # the store holds one: on a sealed store the passkey digest refuses such a row first.
             _log.warning(
-                "passkey sign-in refused for %s: stored credential %r fails the registration key "
-                "check and must be registered again",
+                "passkey sign-in refused for %s: stored credential %r cannot be decoded and must "
+                "be registered again",
                 user.username,
                 cred.label,
             )
-            action, detail = (
-                "auth.webauthn_failed",
-                _json({"reason": "stored_key_refused", "label": cred.label}),
-            )
-        except webauthn.WebAuthnVerificationError as exc:
-            if "sign count" in str(exc).lower():
-                action, detail = "auth.webauthn_clone_suspected", _json({"label": cred.label})
-            elif audit_bad_signature:
-                action, detail = "auth.webauthn_failed", None
-            else:
-                return None
+            action, detail = refused_key()
+        else:
+            try:
+                return webauthn.verify_assertion(
+                    response_json=response_json,
+                    challenge=challenge,
+                    rp_id=rp_id,
+                    origin=origin,
+                    public_key=public_key,
+                    current_sign_count=cred.sign_count,
+                )
+            except webauthn.StoredKeyRefusedError:
+                _log.warning(
+                    "passkey sign-in refused for %s: stored credential %r fails the registration "
+                    "key check and must be registered again",
+                    user.username,
+                    cred.label,
+                )
+                action, detail = refused_key()
+            except webauthn.WebAuthnVerificationError as exc:
+                if "sign count" in str(exc).lower():
+                    action = "auth.webauthn_clone_suspected"
+                    detail = _json({"label": _passkey_label(cred.label)})
+                elif audit_bad_signature:
+                    action, detail = "auth.webauthn_failed", None
+                else:
+                    return None
 
         async def refused_row() -> None:
             await self._audit(action, actor=user.username, detail=detail, client=client)
@@ -7173,6 +7263,9 @@ class AuthService:
                 self._ldap.resolve_principal,
                 username,
                 tie_break_object_id=await self._stored_directory_object_id(username),
+                # Only what the ticket proves, in the realm kerberos_principal checked it against
+                # (BACKLOG #4846). That call refused an unset realm already; "" would fail closed.
+                kerberos_realm=self._settings.kerberos_realm or "",
             )
         except KerberosTokenRefused as exc:
             # BACKLOG #3196: audited as a failed sign-in, not a directory outage. An acceptor key
@@ -8606,12 +8699,21 @@ class AuthService:
         return synced.result, held
 
     async def _lookup_user_settled(self, user_id: str) -> _UserLookup:
-        """:meth:`_lookup_user`, read once more when the first read is refused: ``_lookup_user``
-        also reads a row deleted or re-keyed between its row and role reads as refused, so the
-        second read decides."""
-        stored = await self._lookup_user(user_id)
-        if stored.refused:
+        """:meth:`_lookup_user`, read again while it is refused, up to
+        :data:`_CHECKED_READ_PASSES` reads in all: ``_lookup_user`` also reads a row deleted or
+        re-keyed between its row and role reads as refused, and two honest role writes committing
+        across one check's reads can fail it, so a later read decides. Refused on every read is
+        refused, which fails closed.
+
+        It backs at least the directory sign-in's role re-read and pre-mint read, and the role
+        read-back the sign-in and the reconciler share (:meth:`_roles_read_back`). Vault BACKLOG
+        #3085 item 7: this read at most twice, so contention on two reads refused the sign-in as a
+        seal failure; :meth:`_checked_by_id`, which the admin reads use, allows
+        :data:`_CHECKED_READ_PASSES` checks. What each read raises still raises."""
+        for _pass in range(_CHECKED_READ_PASSES):
             stored = await self._lookup_user(user_id)
+            if not stored.refused:
+                break
         return stored
 
     async def _roles_read_back(
@@ -18571,8 +18673,12 @@ class AuthService:
     ) -> Elevation:
         """Validate a TOTP code (or a single-use recovery code) for the caller's session and, on
         success, mark the session's second factor satisfied and re-key the session (ASVS 7.2.4).
-        Always audited; the API gates this behind the login rate limiter. Returns a not-``ok``
-        :class:`Elevation` (never raises) for any invalid input.
+        Not every refusal writes an ``auth.mfa_failed`` row: at least a missing token, and at the
+        first read a session or account gone, an account disabled or an account with TOTP off (the
+        ``totp_enabled`` check), return before any such row. The JSON route gates this behind the
+        login rate limiter; the console's code legs draw the per-actor ceremony budget
+        (``allow_reauth_attempt``) instead. Returns a not-``ok`` :class:`Elevation` (never raises)
+        for any invalid input.
 
         This is the leg the 7.2.4 verb is really about: without the rotation, a pre-MFA token captured
         before the second factor would be elevated in place to a fully authenticated session on a
@@ -18608,7 +18714,8 @@ class AuthService:
         #2142, ADR 0142 Amendment F). It still marks a pending factor met and rotates the session,
         but it neither stamps ``reauth_at`` nor re-anchors the session's address: that session steps
         up, and moves its anchor, only at the IdP (:meth:`complete_oidc_step_up`). On such a session
-        that has already met its factor the code would do nothing, so it is refused unread with
+        that has already met its factor, on an account with TOTP on (the ``totp_enabled`` check
+        comes first), the code would do nothing, so it is refused unread with
         ``idp_step_up_required`` (:meth:`_code_owes_nothing_to_oidc_session`). Every other
         session's code opens the window as before.
 
@@ -20067,7 +20174,41 @@ class AuthService:
 
     @staticmethod
     def _b64url_decode(value: str) -> bytes:
-        return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        return decode_stored_b64url(value)
+
+    def _split_stored_credential_ids(
+        self, creds: Sequence[WebAuthnCredential], *, username: str, leg: str
+    ) -> tuple[list[bytes], list[WebAuthnCredential]]:
+        """The raw ids of ``creds`` that decode, in order, and the passkeys whose stored id does
+        not (BACKLOG #6886): one ``base64.urlsafe_b64decode`` raises on, or one that is not text.
+        That decoder skips characters outside its alphabet, so not every malformed id is caught
+        here. Such an id raised out of the ceremony that listed it. Only a row written outside the
+        store holds one: on a sealed store the passkey digest refuses it first.
+
+        The second list holds only the passkeys due a report, at most once per passkey per
+        :class:`SealFailureThrottle` interval and ``leg``, since a begin leg runs on every page
+        render; keyed by leg, so the registration leg's report does not use up the assertion leg's,
+        which writes the audit row. Each reported one is logged by label, never by its value; the
+        others are left out silently."""
+        ids: list[bytes] = []
+        due: list[WebAuthnCredential] = []
+        for cred in creds:
+            try:
+                ids.append(self._b64url_decode(cred.credential_id))
+            except (ValueError, TypeError):  # binascii.Error is a ValueError
+                if self._seal_failures_reported.due(f"passkey-id:{leg}:{cred.credential_id_hash}"):
+                    # Not "must be registered again": it may still sign in through the combined
+                    # sign-in if it is a discoverable passkey on a local account, and otherwise
+                    # cannot.
+                    _log.warning(
+                        "passkey %r of %s has a stored credential id that cannot be decoded, so "
+                        "it is not listed in this leg's %s",
+                        cred.label,
+                        username,
+                        "allow list" if leg == "assert" else "exclude list",
+                    )
+                    due.append(cred)
+        return ids, due
 
     #: Ceremony-miss message — names the LB-stickiness caveat so a multi-node operator can
     #: self-diagnose intermittent failures (ADR 0068 §2).
@@ -20118,9 +20259,11 @@ class AuthService:
             # Only discoverable passkeys are excluded (ADR 0197 Amendment A, wave 2): a holder may
             # register an authenticator again as a discoverable credential, which is the remedy for
             # a passkey registered before wave 2.
-            exclude_credential_ids=[
-                self._b64url_decode(c.credential_id) for c in existing if c.discoverable
-            ],
+            # BACKLOG #6886: a passkey whose stored id does not decode is left out, so the holder
+            # can register that authenticator again, the remedy its log line names.
+            exclude_credential_ids=self._split_stored_credential_ids(
+                [c for c in existing if c.discoverable], username=user.username, leg="register"
+            )[0],
         )
         self._webauthn_challenges.put((hash_token(token), "register"), user.id, challenge)
         await self._audit("auth.webauthn_enroll_started", actor=identity.username)
@@ -20558,8 +20701,10 @@ class AuthService:
     async def begin_webauthn_assertion(self, token: str | None, *, rp_id: str) -> str | None:
         """Stage an assertion ceremony for the caller's session; returns the browser request-options
         JSON, or ``None`` when the user has no credentials minted under the CURRENT ``rp_id``
-        (an origin migration renders old credentials visibly unusable — ADR 0068 §7). Allowed for
-        MFA-pending sessions: the assertion is exactly what proves the second factor."""
+        (an origin migration renders old credentials visibly unusable — ADR 0068 §7). Raises
+        :class:`StoredPasskeysUnreadable` when it has some there but none whose stored id decodes
+        (BACKLOG #6886). Allowed for MFA-pending sessions: the assertion is exactly what proves the
+        second factor."""
         if not token:
             return None
         session = await self._load_session(hash_token(token))
@@ -20569,13 +20714,29 @@ class AuthService:
         user = await self._load_user(session.user_id)
         held = None if user is None else await self._verified_passkeys(user)
         creds = [c for c in held or () if c.rp_id == rp_id]
-        if not creds:
+        if not creds or user is None:
             return None
+        allowed, due = self._split_stored_credential_ids(
+            creds, username=user.username, leg="assert"
+        )
+        for cred in due:
+            # BACKLOG #6886: a passkey whose stored id does not decode cannot be listed, so this
+            # ceremony cannot offer it, and the row says so with its own reason. It may still sign
+            # in through the combined sign-in if it is a discoverable passkey on a local account,
+            # and otherwise cannot, so the finish leg's ``stored_key_refused`` would overstate it.
+            # The row is throttled with the WARNING, because the web console begins a ceremony on
+            # every render.
+            await self._audit(
+                "auth.webauthn_failed",
+                actor=user.username,
+                detail=_stored_cell_refused_detail(cred, "stored_id_unreadable"),
+            )
+        if not allowed:
+            # Not ``None``: the console reads that as an origin migration, and none happened.
+            raise StoredPasskeysUnreadable
         challenge = webauthn.new_challenge()
         options = webauthn.assertion_options(
-            rp_id=rp_id,
-            challenge=challenge,
-            allow_credential_ids=[self._b64url_decode(c.credential_id) for c in creds],
+            rp_id=rp_id, challenge=challenge, allow_credential_ids=allowed
         )
         self._webauthn_challenges.put((hash_token(token), "assert"), session.user_id, challenge)
         return options
@@ -20669,7 +20830,8 @@ class AuthService:
         # BACKLOG #1963: a STORED key that breaks the registration rule (ADR 0068, 2026-09-24
         # amendment) is audited with its own slug, so an admin can see why a passkey-only user is
         # stuck; py_webauthn's own counter-regression rejection is a clone signal (ADR 0068 §4).
-        # The caller gets the same refusal for each. _verify_passkey_signature holds all three.
+        # The caller gets the same refusal for each; _verify_passkey_signature holds that handling,
+        # an undecodable stored row (BACKLOG #6886) among it.
         verified = await self._verify_passkey_signature(
             user,
             cred,
@@ -20811,21 +20973,35 @@ class AuthService:
     ) -> _PasskeyHeld | None:
         """:meth:`_passkey_held`, as :meth:`finish_webauthn_assertion` asks it after the sign-count
         write, or ``None`` when it raised one of :func:`_passkey_read_errors` that is not one of
-        ``AUDIT_WRITE_DEFECTS``. The refusal is then logged by exception type, and audited unless
-        the store refuses that row too."""
+        ``AUDIT_WRITE_DEFECTS``. The refusal is then logged by exception type, and audited
+        ``reason=store_error`` unless the store refuses that row too; an audit write that raises
+        a class outside :func:`~messagefoundry.store.base.audit_write_errors`, or one of
+        ``AUDIT_WRITE_DEFECTS``, raises in its place, at least.
+
+        Any other exception raises. Since BACKLOG #3775 added item 9, an exception from this read
+        other than a ``MemoryError``, a ``RecursionError`` or a ``BaseException`` that is not an
+        ``Exception`` is first logged by type, and a row naming ``reason=read_raised`` is tried; at
+        least ``sqlite3.InterfaceError``, ``CipherError`` and the ``AUDIT_WRITE_DEFECTS`` classes
+        but ``RecursionError`` take that path. That row is soft, so it can be missing: an
+        ``Exception`` its write raises is logged and the read's exception raises, but at least a
+        ``MemoryError``, a ``RecursionError`` or any ``BaseException`` that is not an ``Exception``,
+        a cancel among them, raised during the write raises in its place. The excluded classes from
+        the read itself raise with no row."""
         try:
             return await self._passkey_held(user, cred)
-        except AUDIT_WRITE_DEFECTS:
-            # SQLite's bad statement or bind is a defect, not a store refusal. On PostgreSQL and
-            # SQL Server a bad statement is a driver DatabaseError, so it is refused below.
-            raise
+        except (MemoryError, RecursionError):
+            raise  # nothing more is asked of a process that has run out of memory or stack
+        except AUDIT_WRITE_DEFECTS as exc:
+            # SQLite's bad statement or bind is a defect, never a refusal: audited below, then
+            # raised. On PostgreSQL and SQL Server a bad statement is a driver DatabaseError, so it
+            # is refused below as a store error.
+            fault: Exception | None = exc
         except _passkey_read_errors() as exc:
             # BACKLOG #3775: after the sign-count write, an exception the set takes refuses with an
-            # audit row rather than raising past the ceremony with none; the set's docstring says
-            # what it takes and what still raises. The type only at ERROR, with its module so a
-            # driver's ``Error`` names its driver: a ValueError's message can quote a row's value,
-            # as the directory probe's log line avoids. The traceback, with the message, goes to
-            # DEBUG.
+            # audit row rather than raising past the ceremony with none. The type only at ERROR,
+            # with its module so a driver's ``Error`` names its driver: a ValueError's message can
+            # quote a row's value, as the directory probe's log line avoids. The traceback, with the
+            # message, goes to DEBUG.
             kind = type(exc)
             _log.error(
                 "finish_webauthn_assertion: the passkey re-read raised %s.%s, for %s",
@@ -20834,18 +21010,47 @@ class AuthService:
                 user.username,
             )
             _log.debug("finish_webauthn_assertion: the passkey re-read raised", exc_info=exc)
-        # Outside the except block, so a refused audit write's logged traceback carries no
-        # ``__context__`` naming the read fault and its message. Soft, so a store that refuses that
-        # row too still gets the refusal back: the refusal is the fail-closed control, and the row
-        # only records it.
-        await write_audit_soft(
-            lambda: self._assertion_refused(user, client, "store_error"),
-            log=_log,
-            message="the auth.webauthn_failed store_error audit row could not be written",
-            errors=audit_write_errors(),
-            defects=AUDIT_WRITE_DEFECTS,
-        )
-        return None
+            # Outside the except block, below, so a refused audit write's logged traceback carries
+            # no ``__context__`` naming the read fault and its message.
+            fault = None
+        except Exception as exc:  # outside the refusal set: audited below, then raised
+            fault = exc
+        if fault is None:
+            # Soft, so a store that refuses that row too still gets the refusal back: the refusal
+            # is the fail-closed control, and the row only records it.
+            await write_audit_soft(
+                lambda: self._assertion_refused(user, client, "store_error"),
+                log=_log,
+                message="the auth.webauthn_failed store_error audit row could not be written",
+                errors=audit_write_errors(),
+                defects=AUDIT_WRITE_DEFECTS,
+            )
+            return None
+        try:
+            # BACKLOG #3775 added item 9. The type only at ERROR, as above; the raise carries its
+            # own traceback and message. The row is written outside the except block for the same
+            # reason as above. Only the classes named in ``defects`` here, and any BaseException
+            # that is not an Exception, raise out of the write; otherwise the read's own exception
+            # is what raises, as this method's docstring says.
+            kind = type(fault)
+            _log.error(
+                "finish_webauthn_assertion: the passkey re-read raised %s.%s, for %s; the "
+                "ceremony raises",
+                kind.__module__,
+                kind.__qualname__,
+                user.username,
+            )
+            await write_audit_soft(
+                lambda: self._assertion_refused(user, client, "read_raised"),
+                log=_log,
+                message="the auth.webauthn_failed read_raised audit row could not be written",
+                errors=(Exception,),
+                defects=(MemoryError, RecursionError),
+            )
+            raise fault
+        finally:
+            # The traceback holds this frame, so the name is dropped rather than left as a cycle.
+            del fault
 
     async def _passkey_still_held(self, user_id: str, cred: WebAuthnCredential) -> bool:
         """Whether the account still holds ``cred`` after a conditional delete wrote nothing, which
