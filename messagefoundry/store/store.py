@@ -9187,6 +9187,12 @@ def _sqlite_readonly_uri(path: str) -> str:
     return uri + "?mode=ro"
 
 
+#: How :func:`forget_store_salt` names an object holding ``store_salt`` that is not an ordinary
+#: table, keyed by ``lower(sqlite_master.type)``. A ``table`` row there failed the ordinary-table
+#: predicate, so it is a virtual table.
+_FOREIGN_SALT_KINDS = {"table": "a virtual table", "view": "a view", "index": "an index"}
+
+
 def forget_store_salt(path: Path) -> bool:
     """Drop the salt from a CLOSED SQLite store file, so its next salted open mints one (ADR 0196).
 
@@ -9209,10 +9215,12 @@ def forget_store_salt(path: Path) -> bool:
     - **False, with no object of that name**: a file from before ADR 0196 has no ``store_salt``, and
       its first writable open creates the table. A path with no file is in this case too: the
       connect creates an empty file there.
-    - **Raises** ``sqlite3.OperationalError`` naming the object's type when the name is held by
-      anything other than an ordinary table, at least a view or a virtual table another tool left.
-      Such an object is neither read nor dropped and is left in the file as it was, so nothing
-      about a salt is proven. Before the raise the file has been taken out of WAL mode, as below.
+    - **Raises** ``sqlite3.OperationalError`` naming the object's type when there is no ordinary
+      ``store_salt`` table and the name is held by another object, at least a view, an index or a
+      virtual table another tool left. Such an object is neither read nor dropped and is left in
+      the file as it was, so nothing about a salt is proven. Before the raise the file has been
+      taken out of WAL mode, as below. A trigger of that name is not such an object: it has a
+      namespace of its own, and the call treats the file as if the trigger were not there.
     - **Raises** ``sqlite3.OperationalError`` when the file cannot be written as a closed file or
       the write is not proven: at least when another connection's hold makes the journal-mode switch
       or the delete fail (``database is locked``, or on a WAL file the switch refused), when a
@@ -9225,13 +9233,12 @@ def forget_store_salt(path: Path) -> bool:
       propagate too.
 
     **On each path that returns, it has re-read the MAIN FILE and found no row in an ordinary
-    table, and no other object held the name.** A snapshot can carry WAL mode in its header, and
+    table, and no view, index or virtual table held the name.** A snapshot can carry WAL mode in its header, and
     then a plain DELETE commits into ``-wal``. The callers place or open only the main file, so a
     delete left in a WAL that was never checkpointed would be silently dropped, and the copy would
     keep the original's salt. So the file is first switched to ``journal_mode=DELETE``, which
     checkpoints the WAL and removes it. After the delete, the main file is re-read with no ``-wal``
-    beside it. A raise is the caller's to report: the restore in ``pipeline/dr_backup`` refuses
-    before it places the store, and the full restore-verify fails its open check."""
+    beside it. A raise is the caller's to report."""
 
     # The ordinary-table predicate, so a virtual `store_salt` another tool left, whose module may
     # not be loaded here, is not probed and cannot raise "no such module" (BACKLOG #6719 item 4).
@@ -9254,15 +9261,17 @@ def forget_store_salt(path: Path) -> bool:
             return conn.execute("DELETE FROM store_salt").rowcount > 0
         # Fail closed on a name another tool's object holds: returning False there let a restore
         # place a copy that its first writable open then refuses, with the salt question unasked.
+        # Tables, views and indexes share one namespace, so at most one such object matches. A
+        # trigger has a namespace of its own and does not stop the open creating the table.
         foreign = conn.execute(
-            "SELECT m.type FROM sqlite_master AS m WHERE lower(m.name) = 'store_salt'"
+            "SELECT lower(m.type) FROM sqlite_master AS m"
+            " WHERE lower(m.name) = 'store_salt' AND lower(m.type) <> 'trigger'"
         ).fetchone()
         if foreign is not None:
-            kind = "virtual table" if foreign[0] == "table" else str(foreign[0])
-            article = "an" if kind[0] in "aeiou" else "a"
+            kind = _FOREIGN_SALT_KINDS.get(str(foreign[0]), "an object of another kind")
             raise sqlite3.OperationalError(
-                f"{path} holds {article} {kind} named store_salt, not this build's salt table, so "
-                "its store salt cannot be dropped"
+                f"store_salt is {kind}, not this build's salt table, so the store salt cannot be "
+                f"dropped from {path}"
             )
         return False
 

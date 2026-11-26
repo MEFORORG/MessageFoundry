@@ -238,7 +238,9 @@ def test_forget_store_salt_refuses_a_virtual_salt_table_and_leaves_it(tmp_path: 
     _sql(path, "CREATE TABLE t (a TEXT)")
     _plant_unloaded_virtual_table(path, "store_salt")
     before = _salt_objects(path)
-    with pytest.raises(sqlite3.OperationalError, match="holds a virtual table named store_salt"):
+    with pytest.raises(
+        sqlite3.OperationalError, match="^store_salt is a virtual table, not this build"
+    ):
         forget_store_salt(path)
     assert _salt_objects(path) == before
     # Control: an ordinary salt table holding a row is still dropped.
@@ -281,7 +283,7 @@ async def test_forget_store_salt_refuses_a_foreign_salt_object_and_leaves_it(
     else:
         _sql(path, planted)
     named = "a virtual table" if foreign == "virtual" else "a view"
-    with pytest.raises(sqlite3.OperationalError, match=f"holds {named} named store_salt"):
+    with pytest.raises(sqlite3.OperationalError, match=f"^store_salt is {named}, not this build"):
         forget_store_salt(path)
     # The planted object is left in the copy exactly as it was: neither dropped nor replaced.
     assert _salt_objects(path) == [(kind, planted)]
@@ -289,6 +291,52 @@ async def test_forget_store_salt_refuses_a_foreign_salt_object_and_leaves_it(
     await (await MessageStore.open(path, read_only=True)).close()
     with pytest.raises(SchemaMismatchError, match="table 'store_salt' is missing"):
         await _fresh(path)
+
+
+def test_forget_store_salt_refuses_an_index_holding_the_salt_name(tmp_path: Path) -> None:
+    """An index shares the table namespace, so one named ``store_salt`` blocks the table as a view
+    does, and is refused the same way, case-blind on the name."""
+    from messagefoundry.store.store import forget_store_salt
+
+    path = tmp_path / "index-copy.db"
+    _sql(path, "CREATE TABLE t (a TEXT)", "CREATE INDEX Store_Salt ON t (a)")
+    with pytest.raises(sqlite3.OperationalError, match="^store_salt is an index, not this build"):
+        forget_store_salt(path)
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute(
+            "SELECT type FROM sqlite_master WHERE name = 'Store_Salt'"
+        ).fetchall() == [("index",)]
+    finally:
+        conn.close()
+
+
+async def test_forget_store_salt_ignores_a_trigger_named_like_the_salt_table(
+    tmp_path: Path,
+) -> None:
+    """A trigger has a namespace of its own: one named ``store_salt`` does not stop the writable
+    open creating the salt table, so the call does not refuse on it. With no salt table it returns
+    False, and beside an ordinary salt table holding a row it drops the row as usual."""
+    from messagefoundry.store.store import forget_store_salt
+
+    trigger = "CREATE TRIGGER Store_Salt AFTER INSERT ON t BEGIN SELECT 1; END"
+    bare = tmp_path / "trigger-only.db"
+    _sql(bare, "CREATE TABLE t (a TEXT)", trigger)
+    assert forget_store_salt(bare) is False
+    beside = tmp_path / "trigger-beside.db"
+    await _fresh(beside)
+    _sql(
+        beside,
+        "CREATE TABLE t (a TEXT)",
+        trigger,
+        "INSERT INTO store_salt (id, salt, created_at) VALUES (1, 's', 0)",
+    )
+    assert forget_store_salt(beside) is True
+    conn = sqlite3.connect(beside)
+    try:
+        assert conn.execute("SELECT count(*) FROM store_salt").fetchone()[0] == 0
+    finally:
+        conn.close()
 
 
 async def test_forget_store_salt_true_on_an_ordinary_salt_row_and_the_copy_opens(

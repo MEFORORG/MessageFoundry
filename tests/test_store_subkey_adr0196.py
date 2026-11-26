@@ -867,7 +867,7 @@ async def test_AC3_restore_refuses_a_copy_whose_salt_name_a_view_holds(
 
     monkeypatch.setattr(store_module, "forget_store_salt", _plant_then_forget)
     dest = tmp_path / "restored" / "store.db"
-    with pytest.raises(BackupError, match="holds a view named store_salt"):
+    with pytest.raises(BackupError, match="store_salt is a view, not this build"):
         await run_restore(
             result.archive_path, dest_store_path=dest, store_settings=_store_settings(dest, key)
         )
