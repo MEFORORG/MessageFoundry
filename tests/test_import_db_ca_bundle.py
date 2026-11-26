@@ -662,10 +662,12 @@ def test_a_bundle_holding_a_certificate_that_cannot_sign_certificates_imports_no
     )
     # Each refused certificate is named by its Subject too, not by thumbprint alone (BACKLOG #5561
     # item 27), on its own line under its reason.
-    subjects = [
-        chain[key][0].subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
-        for key, _why in refused
-    ]
+    # The attribute type admits bytes; a CN here is text, so narrow it and format the name itself.
+    subjects: list[str] = []
+    for key, _why in refused:
+        cn = chain[key][0].subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+        assert isinstance(cn, str), cn
+        subjects.append(cn)
     assert list(listed) == [
         line
         for t, (_key, why), cn in zip(thumbs, refused, subjects, strict=True)
