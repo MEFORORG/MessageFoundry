@@ -1069,17 +1069,19 @@ async def test_a_codec_error_on_the_custody_path_is_a_host_custody_refusal_with_
     caplog: pytest.LogCaptureFixture,
     link: str,
 ) -> None:
-    """At the open's custody guard, an error that is a codec error, or has one as its cause or
-    context, is replaced by a ``HostCustodyRefused``, never the cipher build's
-    ``StoreCipherConfigError``, and the byte the codec error quotes stays out of the refusal, its
-    traceback and the log (BACKLOG #4882; vault BACKLOG #8119 item 139)."""
+    """At the open's custody guard, a codec error the custody settings check raises, or a
+    ``ValueError`` it raises with one as its cause or context, is replaced by a
+    ``HostCustodyRefused``, never the cipher build's ``StoreCipherConfigError``, and the byte the
+    codec error quotes stays out of the refusal, its traceback and the log (BACKLOG #4882; vault
+    BACKLOG #8119 item 139)."""
     import traceback
 
     codec = UnicodeDecodeError("utf-8", b"\xfe-SENTINEL-codec", 0, 1, "invalid start byte")
     built = ValueError(f"built from {codec} {codec!r}")
-    # The positive controls: the codec error, and the error built from it, quote the byte.
-    assert "0xfe" in str(codec) and "SENTINEL" in repr(codec)
-    assert "0xfe" in str(built) and "SENTINEL" in str(built)
+    needles = ("0xfe", "\\xfe", "SENTINEL")
+    # The positive controls: the error built from the codec error quotes every needle.
+    for needle in needles:
+        assert needle in str(built)
 
     def _raise(*args: object, **kwargs: object) -> Any:
         if link == "the error itself":
@@ -1102,7 +1104,7 @@ async def test_a_codec_error_on_the_custody_path_is_a_host_custody_refusal_with_
     replaced = "UnicodeDecodeError" if link == "the error itself" else "ValueError"
     assert f"a host custody error was replaced ({replaced})" in caplog.text
     rendered = f"{refusal!r} {''.join(traceback.format_exception(refusal))}"
-    for needle in ("0xfe", "\\xfe", "\xfe", "SENTINEL"):
+    for needle in needles:
         assert needle not in rendered
         assert needle not in caplog.text
 
