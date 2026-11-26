@@ -636,7 +636,7 @@ def test_a_deny_stands_over_another_hooks_fault(bridge, tmp_path, order):
     # The deny is merged before the fault in one order and after it in the other, so the message
     # names neither order.
     assert (
-        "a hook failed; the decision merged from the hooks' output stands"
+        "a hook or its settings failed; the decision merged from the hooks' output stands"
         in result["systemMessage"]
     )
 
@@ -653,7 +653,7 @@ def test_a_stop_stands_over_another_hooks_fault(bridge, tmp_path, order, stop):
     settings(tmp_path, hooks if order == "fault-first" else hooks[::-1])
     result = bridge.dispatch(tmp_path, _PAYLOAD)
     assert all(result[key] == value for key, value in stop.items())
-    assert "a hook failed" in result["systemMessage"]
+    assert "a hook or its settings failed" in result["systemMessage"]
 
 
 def test_a_same_object_stop_stands_only_when_merged_before_the_bad_field(bridge, tmp_path):
@@ -698,7 +698,7 @@ def test_a_later_error_does_not_lose_a_merged_deny(bridge, tmp_path, later):
     settings(tmp_path, [_deny_hook(), *later])
     result = bridge.dispatch(tmp_path, _PAYLOAD)
     assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert "a hook failed" in result["systemMessage"]
+    assert "a hook or its settings failed" in result["systemMessage"]
 
 
 def test_a_later_groups_bad_matcher_does_not_lose_a_recorded_block(bridge, tmp_path):

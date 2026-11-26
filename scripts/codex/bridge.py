@@ -519,7 +519,10 @@ def dispatch(root: Path, payload: dict) -> dict:
     if fault is not None:
         if not blocks(result):
             raise fault
-        message = f"Codex bridge: a hook failed; the decision merged from the hooks' output stands: {fault}"
+        message = (
+            "Codex bridge: a hook or its settings failed; "
+            f"the decision merged from the hooks' output stands: {fault}"
+        )
         print(message, file=sys.stderr)
         merge_output(result, {"systemMessage": message})
     return result
