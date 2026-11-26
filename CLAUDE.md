@@ -783,9 +783,9 @@ Manager's watch reached the cloud session 29 seconds after its question.
   sends more to the owner, and governs where the two differ: false program output, and a false
   control claim in any comment, docstring or doc (the Lander's reading, decision
   d20261110T205706609-38b347). Only a statement of what a control does, what it stores, exposes
-  or retains included, can be false in the safe direction. One that is false only in the safe direction, in a record or as a control claim in
-  any text, does not weaken a control. It is filed under ledger ruling R2
-  below and does not hold the merge. Safe direction means a reader who acts on the text does more
+  or retains included, can be false in the safe direction. One that is false only in the safe
+  direction, in a record or as a control claim in any text, does not weaken a control. It is
+  filed under ledger ruling R2 below and does not hold the merge. Safe direction means a reader who acts on the text does more
   than the control needs, never less. The usual cases are text that overstates what is stored,
   exposed or retained, or understates what a control guarantees, but only where acting on it
   passes that test: where storing or retaining something is itself the guarantee, overstating it
