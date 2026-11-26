@@ -74,11 +74,13 @@ message-detail read. Each page served writes a `logs_view` audit row (actor + ho
 NSSM) or the file is unreadable, the route returns an empty, `available=false` page — it **degrades
 gracefully and never raises**. Redaction is best-effort (a residual single-token identifier can survive),
 which is why the surface is RBAC-gated + audited rather than open: the control is defence-in-depth over
-the redactor, mirroring the "never put PHI in a log line" convention. *(Corrected 2026-11-25. The
-paragraph read that the route "returns each line **through
-`support.redact.redact_log_line`** — the same redactor the support bundle uses, so the browser sees the
-identical PHI/secret coverage", and that coverage claim is retracted; `_read_log_tail` calls `redact_log_record`, which wraps
-`redact_log_line`.)*
+the redactor, mirroring the "never put PHI in a log line" convention. *(Amended 2026-11-25. The
+paragraph's first sentence read, emphasis dropped: "`GET /logs/tail` reads the newest file under
+`[logging].log_dir` (one level, `.log`/`.txt`), pages back from the end (`offset`/`limit`, newest page
+first), and returns each line through `support.redact.redact_log_line` — the same redactor the support
+bundle uses, so the browser sees the identical PHI/secret coverage." The function name is corrected: the
+route already called `redact_log_record`. The identical-coverage claim is withdrawn: it held until the
+BACKLOG #5550 key-body mask, which the two paths run over different spans of text.)*
 
 ### §3 — `set_runtime_level` lands CLEAN for the S7a file-handler work to build on
 
