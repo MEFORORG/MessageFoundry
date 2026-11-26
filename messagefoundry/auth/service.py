@@ -939,8 +939,7 @@ def _advance_watched[S: (_BreakerStanding, _ReferralStanding)](
 _REPROOF_SESSION_MAX = 4096
 # How many refused session reads, with no account between them other than accounts whose read
 # raised a defect, end a session reaper pass's re-proof count drop
-# (:meth:`AuthService.drop_reaped_reproof_counts`), so a store outage costs that many timed-out reads
-# a pass, not one per account (BACKLOG #5336).
+# (:meth:`AuthService.drop_reaped_reproof_counts`) (BACKLOG #5336).
 _REAPED_DROP_REFUSALS = 3
 _REPROOF_SESSION_PER_USER = 64
 
@@ -16200,9 +16199,8 @@ class AuthService:
         a defect, even one whose row does not parse or one not read because its counts left. A
         defect, an error the store helpers re-raise rather than read as a refusal, is logged for
         that account and the next is still read; the first is raised if the pass ends normally,
-        with any later ones named in its notes. An error
-        outside the store's refusal set raises at once and ends the pass, and so does the reaper's
-        bound on the whole drop; a defect held then is not raised."""
+        with any later ones named in its notes. An error the walk's ``except`` does not catch, and
+        the reaper's bound on the whole drop, end the pass; a defect held then is not raised."""
         holders = list(dict.fromkeys(uid for _, _, uid in self._reproof_session_failures.values()))
         if holders:
             start = self._reaped_drop_start % len(holders)
