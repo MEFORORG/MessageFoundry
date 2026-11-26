@@ -1071,6 +1071,28 @@ def test_hl7_bytes_decode_with_the_inbound_charset(entry: str) -> None:
     assert names and set(names) == {"CAF\u00c9^JANE"}
 
 
+@pytest.mark.parametrize("encoding", ["latin-1", "utf-8"])
+def test_transform_one_refuses_hl7_bytes(encoding: str) -> None:
+    """``transform_one`` has no inbound to name an HL7 body's charset, so HL7 bytes are a
+    ``TypeError``, as text bytes are, quoting no byte of the body, and no Handler runs
+    (BACKLOG #6819). It used to hand them to ``Message.parse``, which decodes as UTF-8 with
+    replacement, so a latin-1 name reached the Handler with a U+FFFD where ``route_only`` decodes
+    the same bytes with the inbound's charset."""
+    seen: list[Any] = []
+
+    def handle(msg: Message) -> Send:
+        seen.append(msg)
+        return Send("out", msg)
+
+    reg = _registry(lambda msg: ["h"], {"h": handle})
+    raw = ADT_A01.replace("DOE^JANE", "CAF\u00c9^JANE").encode(encoding)
+    with pytest.raises(TypeError, match="takes a 'hl7v2' body as str") as info:
+        transform_one(reg, "h", raw)
+    assert "CAF" not in str(info.value)
+    assert info.value.__cause__ is None and info.value.__context__ is None
+    assert seen == []
+
+
 # --- BACKLOG #6821: a fault in a peek read is a recorded ERROR, as on the listener --------------
 
 

@@ -256,10 +256,11 @@ _BINARY_CONTENT_TYPE_VALUES = frozenset(ct.value for ct in ContentType if ct.is_
 
 
 def _carry_or_decode(raw: str | bytes, ic: InboundConnection) -> str:
-    """``raw`` as the listener decodes it for ``ic``: base64-carried for a binary type, decoded
-    with the declared charset and run through the post-decode guards otherwise (BACKLOG #1689).
-    Raises :class:`IngressGuardError` for a body those guards refuse. The listener's declared-type
-    sniff (``check_declared_type``) and the HL7 peek are not among them."""
+    """``raw`` carried or decoded for ``ic``: base64-carried for a binary type, otherwise decoded
+    with the declared charset and run through :func:`decode_ingress`'s post-decode checks
+    (BACKLOG #1689). Raises :class:`IngressGuardError` for a body either refuses. These are not
+    all of the listener's guards: at least the declared-type sniff, the HL7 peek, the HL7 size
+    bound, strict validation, the doc-ref marker refusal and document detach do not run here."""
     return carry_binary_ingress(raw, ic) if ic.content_type.is_binary else decode_ingress(raw, ic)
 
 
@@ -276,16 +277,15 @@ def _listener_body(raw: str | bytes, ic: InboundConnection) -> str | bytes:
     return _carry_or_decode(raw, ic)
 
 
-def _handler_body(raw: str | bytes, content_type: str) -> str | bytes:
-    """A ``bytes`` non-HL7 ``raw`` in routed form for :func:`transform_one`, which has no inbound
+def _handler_body(raw: str | bytes, content_type: str) -> str:
+    """A ``bytes`` ``raw`` in routed form for :func:`transform_one`, which has no inbound
     (BACKLOG #6819).
 
     A binary type's bytes need no charset, so they are size-bounded and base64-carried as
-    :func:`carry_binary_ingress` carries them. A non-HL7 text type's bytes need the inbound's
-    charset and post-decode guards, which do not reach this call, so they are refused with a
-    ``TypeError``, the caller's fault rather than the body's, instead of decoded by a guess. HL7
-    ``bytes`` pass through to ``Message.parse``, as before."""
-    if isinstance(raw, str) or content_type == ContentType.HL7V2.value:
+    :func:`carry_binary_ingress` carries them. A text type's bytes, HL7 included, need the
+    inbound's charset, which does not reach this call, so they are refused with a ``TypeError``,
+    the caller's fault rather than the body's, instead of decoded by a guess."""
+    if isinstance(raw, str):
         return raw
     if content_type in _BINARY_CONTENT_TYPE_VALUES:
         check_binary_size(raw)
@@ -584,8 +584,8 @@ def transform_one(
     across handlers (the caller passes ``None`` for HL7 so each handler re-parses its own).
 
     A ``bytes`` ``raw`` is base64-carried for a binary type, an oversize one raising
-    :class:`IngressGuardError`; for a non-HL7 text type it is a ``TypeError``, since no inbound
-    names its charset here (BACKLOG #6819, :func:`_handler_body`).
+    :class:`IngressGuardError`; for a text type, HL7 included, it is a ``TypeError``, since no
+    inbound names its charset here (BACKLOG #6819, :func:`_handler_body`).
 
     ``tracer`` (ADR 0072) is an optional observer: when given, the Handler is invoked **through**
     ``tracer.trace_handler`` (which installs ``sys.settrace`` around the call) instead of called
