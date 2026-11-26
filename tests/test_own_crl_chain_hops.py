@@ -303,24 +303,72 @@ def test_the_verify_revocation_row_says_the_oidc_legs_check_the_whole_chain(
     assert row_detail(chain=False).count("checks the leaf certificate") == 2
 
 
-def test_the_check_revocation_row_says_the_oidc_legs_check_the_whole_chain(
-    two_tier: _TwoTier,
+@pytest.mark.parametrize("crl", ["revokes_nothing", "inter_crl_file"])
+def test_the_check_revocation_row_says_only_that_the_chain_check_is_set(
+    crl: str, two_tier: _TwoTier
 ) -> None:
     """``messagefoundry check`` builds its ``fed.idp_revocation`` opener without the anchor, and so
-    without the chain check. The row must still word the check the engine runs from the setting,
-    not the leaf-only context it built for itself."""
+    without the chain check, its rooted-CA rule and its own-CRL start rule. So the row must not say
+    the legs check every certificate in their chain, which it would say too of a CRL file missing
+    the intermediate's own CRL (``inter_crl_file``), one ``serve`` refuses. It may say the setting
+    is on, and nothing more."""
     from messagefoundry.verify.federation import idp_revocation_result
     from tests.test_verify_federation import _settings
 
     def row_detail(*, chain: bool) -> str:
         settings = _settings(
             oidc_tls_ca_cert_file=str(two_tier.root_file),
-            oidc_tls_crl_file=str(two_tier.revokes_nothing),
+            oidc_tls_crl_file=str(getattr(two_tier, crl)),
             oidc_tls_crl_check_chain=chain,
         )
         return idp_revocation_result(settings).detail
 
     chained = row_detail(chain=True)
+    assert "every certificate" not in chained
     assert "leaf" not in chained
-    assert chained.count("every certificate in its chain") == 2
+    assert chained.count(_OIDC_CHAIN) == 2
     assert row_detail(chain=False).count("checks the leaf certificate") == 2
+
+
+def _idp_tls_detail(settings_over: dict[str, object]) -> str:
+    """``fed.idp_tls``'s refusal text for an IdP opener built as ``verify`` builds it, under warn
+    so the anchor's ACL on a temp file is not what refuses."""
+    from messagefoundry.config.settings import SecurityEnforcement, SecuritySettings
+    from messagefoundry.verify.federation import _idp_opener
+    from messagefoundry.verify.model import CheckResult
+    from tests.test_verify_federation import _settings
+
+    settings = _settings(**settings_over).model_copy(
+        update={"security": SecuritySettings(enforcement=SecurityEnforcement.WARN)}
+    )
+    built = _idp_opener(settings)
+    assert isinstance(built, CheckResult), "the opener built; the test needs a refusal"
+    return built.detail
+
+
+def test_the_idp_tls_row_names_no_chain_check_when_the_setting_is_off(two_tier: _TwoTier) -> None:
+    """With ``[auth].oidc_tls_crl_check_chain`` off there is no chain check to refuse, so a CRL
+    file the engine refuses is blamed on the CRL file alone."""
+    detail = _idp_tls_detail(
+        {
+            "oidc_tls_ca_cert_file": str(two_tier.root_file),
+            # A certificate, not a CRL: harden_crl_check refuses a cert-bearing file.
+            "oidc_tls_crl_file": str(two_tier.root_file),
+        }
+    )
+    assert "the engine refuses this CRL file:" in detail
+    assert "chain check" not in detail
+
+
+def test_the_idp_tls_row_names_the_chain_check_when_the_setting_is_on(two_tier: _TwoTier) -> None:
+    """The control for the test above: with the setting on, the own-CRL start rule's refusal is
+    one the row may blame on the chain check."""
+    detail = _idp_tls_detail(
+        {
+            "oidc_tls_ca_cert_file": str(two_tier.root_file),
+            "oidc_tls_crl_file": str(two_tier.inter_crl_file),
+            "oidc_tls_crl_check_chain": True,
+        }
+    )
+    assert "the engine refuses this CRL file or its chain check:" in detail
+    assert "no CRL of their own" in detail

@@ -179,9 +179,8 @@ def _why(exc: BaseException) -> str:
     #
     # A hop refusal keeps its text only when it is exactly the Vault hop's marked one, built from
     # fixed text (BACKLOG #3471), as `vault_failure_text` reads it, or when it is also one of the
-    # fail-closed types: the key seam's `KeySeamHopRefused` is a `KeyProviderError` too, and keeps
-    # the fixed text the store chose for it (vault BACKLOG #8163 item 11). Any other
-    # `InsecureHopRefused` falls through to its type name: the base type promises no fixed text.
+    # fail-closed types. Any other `InsecureHopRefused` falls through to its type name: the base
+    # type promises no fixed text.
     # `_ad_why` gives the LDAPS guard's a fixed text for the AD probe, read from nothing in it.
     #
     # Each text is read by `_own_text`, which runs none of the error's code (vault BACKLOG #8163
