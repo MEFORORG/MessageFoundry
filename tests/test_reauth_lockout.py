@@ -1408,6 +1408,8 @@ async def test_an_unparseable_account_between_refusals_resets_the_refused_run(
     """BACKLOG #5336: pins one case of the reset as built. An account whose row does not parse
     keeps its counts and still starts the run of refusals again, so refused, unparseable, refused,
     refused is not three in a run while the bound is three, and the account after them is read."""
+    # The walk below discriminates reset from no reset only at a bound of three.
+    assert service_module._REAPED_DROP_REFUSALS == 3
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))

@@ -7348,11 +7348,11 @@ leaves the map in at least these ways (BACKLOG #5336):
 - a session reaper pass whose purge committed: after it, the accounts holding a count have their
   sessions read, starting one account further on each pass, and the counts of those the store
   shows as revoked or holds no row for are dropped, under each account's re-proof lock. An account
-  whose read is refused, raises a defect, or holds a row that does not parse keeps its counts. At
-  least three refused reads with no account between them other than accounts whose read raised a
-  defect end that drop for the pass. So do an error outside the store's refusal set and a drop that
-  runs past five minutes. A pass cut short that way can miss the same accounts for many passes
-  running;
+  whose read is refused, raises a defect, or holds a row that does not parse keeps its counts.
+  Three refused reads, with no account between them other than accounts whose read raised a
+  defect, end that drop for the pass. At least an error outside the store's refusal set, a drop
+  that runs past five minutes, and the task's cancellation at engine stop also end it. A pass cut
+  short that way can miss the same accounts for many passes running;
 - a restart, which forgets every count.
 
 A rotation moves the count to the session's new key. Of these, at least two drop the count of a

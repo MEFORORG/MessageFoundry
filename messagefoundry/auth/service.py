@@ -16235,7 +16235,8 @@ class AuthService:
                 if refused >= _REAPED_DROP_REFUSALS:
                     _log.warning(
                         "the session reaper's re-proof count drop met %d refused reads with no "
-                        "successful read between them; this pass drops no more",
+                        "account between them other than ones whose read raised a defect; this "
+                        "pass drops no more",
                         refused,
                     )
                     break
