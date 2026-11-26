@@ -2,11 +2,14 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """install-usage-statusline.ps1: how it writes a settings file, and how it reads its path arguments.
 
-BACKLOG #7576 and #7577. EVERY PATH HERE IS UNDER ``tmp_path``. The installer writes into a config
-root's settings.json, so a test that let it fall through to its own root resolution would wire the
-real account this suite runs under. Each call pops the ``CLAUDE_CONFIG_DIR`` pin and passes a
-``-HomeDir`` inside ``tmp_path``; all but the relative ``-HomeDir`` test also name ``-SettingsPath``,
-and that one runs with both its ``$PWD`` and its process directory inside ``tmp_path``.
+BACKLOG #7576 and #7577. EVERY PATH WRITTEN HERE IS UNDER ``tmp_path``. The installer writes into a
+config root's settings.json, so a test that let it fall through to its own root resolution would
+wire the real account this suite runs under. Every call starts from an environment with the
+``CLAUDE_CONFIG_DIR`` pin and the swap-fault variables popped, and then names its target, at least
+one of these ways: a ``-SettingsPath`` or ``-ConfigDir`` inside ``tmp_path``; a pin set back to a
+root inside ``tmp_path`` (the gone-drive ``-HomeDir`` test); or a ``-HomeDir`` inside ``tmp_path``,
+or ``.`` with both ``$PWD`` and the process directory inside it (the relative ``-HomeDir`` test). A
+``-HomeDir`` that is not inside ``tmp_path`` names a drive that does not exist.
 """
 
 from __future__ import annotations
@@ -410,6 +413,8 @@ def test_a_security_copy_that_fails_falls_back_to_the_in_place_write(tmp_path: P
         ("no fault directory", FAULT_ROOT, "tmp"),
         # TEMP set, but the root is not inside it.
         ("root outside TEMP", FAULT_ROOT, "other"),
+        # The settings file is below the fault directory, not directly in it.
+        ("nested settings", FAULT_ROOT, "tmp"),
     ],
 )
 def test_the_swap_fault_seam_never_fires_outside_its_fence(
@@ -421,7 +426,9 @@ def test_the_swap_fault_seam_never_fires_outside_its_fence(
     home.mkdir()
     root = home / root_name
     root.mkdir()
-    settings = root / "settings.json"
+    where = root / "sub" if case == "nested settings" else root
+    where.mkdir(exist_ok=True)
+    settings = where / "settings.json"
     settings.write_text(json.dumps({"keep": True}), encoding="utf-8")
     env = {"MEFOR_TEST_STATUSLINE_SWAP_FAULT": "move-fails-target-gone", "USERPROFILE": str(home)}
     if case != "no fault directory":
@@ -448,8 +455,8 @@ def test_the_swap_fault_seam_never_fires_outside_its_fence(
 
 
 def test_the_swap_fault_seam_fires_inside_its_fence(tmp_path: Path) -> None:
-    """THE POSITIVE CONTROL. The same setup as the negative cases, with every condition met, does
-    fault, so their passing is the fence working and not a seam that never fires."""
+    """THE POSITIVE CONTROL. The same setup and the same mode as the negative cases, with every
+    condition met, does fault, so their passing is the fence working and not a seam that never fires."""
     home = tmp_path / "profile"
     home.mkdir()
     root = home / FAULT_ROOT
@@ -461,10 +468,10 @@ def test_the_swap_fault_seam_fires_inside_its_fence(tmp_path: Path) -> None:
         "-SettingsPath",
         str(settings),
         cwd=tmp_path,
-        extra_env={**_fault(home, "move-fails", root), "USERPROFILE": str(home)},
+        extra_env={**_fault(home, "move-fails-target-gone", root), "USERPROFILE": str(home)},
     )
     assert proc.returncode == 1, proc.stdout + proc.stderr
-    assert json.loads(settings.read_text(encoding="utf-8")) == {"keep": True}
+    assert not settings.exists()
 
 
 # --- #7577: -HomeDir is read only where it is used ---------------------------------------------------
@@ -546,6 +553,7 @@ def test_a_write_denied_settings_file_is_not_replaced(tmp_path: Path) -> None:
     try:
         proc = _install(tmp_path, "-SettingsPath", str(settings), cwd=tmp_path)
         assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert "was written in place" not in proc.stdout + proc.stderr
         assert json.loads(settings.read_text(encoding="utf-8")) == {"keep": True}
     finally:
         _spawn([*pw, undo], tmp_path)

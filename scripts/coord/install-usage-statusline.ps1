@@ -223,15 +223,17 @@ function Write-SettingsFile([string]$Path, $Data) {
     #
     # A FILE THIS USER CANNOT WRITE IS WRITTEN IN PLACE TOO, so it fails as the in-place write did. A
     # rename needs only delete access through the directory, so it would replace a settings.json that a
-    # Deny-Write ACE or ReadOnly protects. Opening it for write, and closing it at once, asks the
-    # question the old write asked, without truncating anything.
+    # Deny-Write ACE protects (a ReadOnly one refuses the rename by itself). Opening it for write, and
+    # closing it at once, asks the question the old write asked, without truncating anything. So is an
+    # EFS-encrypted file: the new file would be created unencrypted.
     #
-    # A SHARING VIOLATION, A LOCK VIOLATION OR AN ACCESS DENIAL IS RETRIED, 8 times over about 1.1 s as
-    # Invoke-CoordIoRetry does, because a file just created is often held open for a moment by a
-    # scanner, and a reader holding settings.json open without delete sharing refuses the rename
-    # (measured: a Python reader's plain open() refused most renames in a tight loop). When the retries
-    # run out, the in-place write runs instead, with a warning: that reader never blocked the old write,
-    # so refusing the install there would be worse than it was. A missing directory fails at once.
+    # A SHARING OR LOCK VIOLATION IS RETRIED, 8 times over about 1.1 s as Invoke-CoordIoRetry does, at
+    # the probe and at the move, and the move retries an access denial too: a file just created is often
+    # held open for a moment by a scanner, and a reader holding settings.json open without delete
+    # sharing refuses the rename (measured: a Python reader's plain open() refused most renames in a
+    # tight loop). When the retries run out, the in-place write runs instead, with a warning once it has
+    # worked: that reader never blocked the old write, so refusing the install there would be worse than
+    # it was. A missing directory fails at once.
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
     if ($item -and $item.LinkType) {
         Set-Content -LiteralPath $Path -Value $json -Encoding UTF8
@@ -240,7 +242,7 @@ function Write-SettingsFile([string]$Path, $Data) {
     #
     # A FAILED SWAP MUST NEVER LEAVE NEITHER FILE (BACKLOG #7576). The move itself cannot leave
     # settings.json gone, but a concurrent deleter can, so a COMPLETE temp file is deleted only while
-    # settings.json exists, and the failure report names every copy.
+    # settings.json exists, or once an in-place write has succeeded, and every failure names each copy.
     # A FREE NAME: a file already there may be the new content an earlier failed run's report named.
     $tmp = "$Path.$PID.tmp"
     $n = 1
@@ -248,9 +250,23 @@ function Write-SettingsFile([string]$Path, $Data) {
     $tmpComplete = $false
     $keepTmp = $false
     $inPlaceWhy = $null
-    if ($item) {
-        try { ([System.IO.File]::Open($Path, 'Open', 'Write', 'ReadWrite, Delete')).Dispose() }
-        catch { $inPlaceWhy = "it cannot be opened for writing ($($_.Exception.GetBaseException().Message))" }
+    $delays = @(50, 100, 150, 150, 200, 200, 250)
+    # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+    $busy = @(-2147024864, -2147024863)
+    if ($item -and ($item.Attributes -band [System.IO.FileAttributes]::Encrypted)) {
+        $inPlaceWhy = "it is EFS-encrypted, and a new file would not be"
+    }
+    elseif ($item) {
+        foreach ($attempt in 1..8) {
+            try { ([System.IO.File]::Open($Path, 'Open', 'Write', 'ReadWrite, Delete')).Dispose(); break }
+            catch {
+                if ($attempt -eq 8 -or $_.Exception.GetBaseException().HResult -notin $busy) {
+                    $inPlaceWhy = "it cannot be opened for writing ($($_.Exception.GetBaseException().Message))"
+                    break
+                }
+                Start-Sleep -Milliseconds $delays[$attempt - 1]
+            }
+        }
     }
     try {
         if (-not $inPlaceWhy) {
@@ -259,7 +275,6 @@ function Write-SettingsFile([string]$Path, $Data) {
             if ($item) { $inPlaceWhy = Copy-SettingsSecurity $item $tmp }
         }
         # No move when the probe or the security copy failed: the in-place write below runs instead.
-        $delays = @(50, 100, 150, 150, 200, 200, 250)
         foreach ($attempt in $(if ($inPlaceWhy) { @() } else { 1..8 })) {
             # Untyped catch: a .NET method's exception arrives wrapped in MethodInvocationException.
             try {
@@ -268,8 +283,7 @@ function Write-SettingsFile([string]$Path, $Data) {
             }
             catch {
                 $hr = $_.Exception.GetBaseException().HResult
-                # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION, ERROR_ACCESS_DENIED
-                $transient = $hr -in @(-2147024864, -2147024863, -2147024891)
+                $transient = $hr -in ($busy + @(-2147024891))  # and ERROR_ACCESS_DENIED
                 # A retry, or the in-place write, only while settings.json is still where it was.
                 if (-not $transient -or ($item -and -not (Test-Path -LiteralPath $Path))) { throw }
                 if ($attempt -eq 8) {
@@ -290,12 +304,27 @@ function Write-SettingsFile([string]$Path, $Data) {
     }
     finally {
         # A temp file that was never completely written is never anyone's only copy, and this run's name
-        # was free, so it is never an earlier run's.
-        if (-not $keepTmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        # was free, so it is never an earlier run's. Before an in-place write it is kept until that works.
+        if (-not $keepTmp -and -not $inPlaceWhy) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
     }
     if ($inPlaceWhy) {
-        Write-Warning "${Path} was written in place, not swapped atomically: $inPlaceWhy"
-        Set-Content -LiteralPath $Path -Value $json -Encoding UTF8
+        try {
+            if ($item) { Set-Content -LiteralPath $Path -Value $json -Encoding UTF8 }
+            else {
+                # CreateNew, so a settings.json a concurrent writer created meanwhile is never overwritten.
+                $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($json + [Environment]::NewLine)
+                $fs = [System.IO.File]::Open($Path, 'CreateNew', 'Write', 'Read')
+                try { $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Dispose() }
+            }
+        }
+        catch {
+            $msg = "settings.json could not be written in place ($($_.Exception.GetBaseException().Message)), which ran because $inPlaceWhy"
+            if ($tmpComplete -and (Test-Path -LiteralPath $tmp)) { $msg += ". The new content is in $tmp" }
+            if ($backedTo) { $msg += "; a copy of the previous content is in $backedTo" }
+            throw "$msg."
+        }
+        if ($tmpComplete) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        Write-Warning "${Path} was written in place, not swapped atomically, because $inPlaceWhy"
     }
     return $backedTo
 }
@@ -305,7 +334,8 @@ function Write-SettingsFile([string]$Path, $Data) {
 # as SDDL, so its protection flag goes with it. The owner is set only when it differs, because setting
 # it at all needs WRITE_OWNER, which a user with Modify but not Full Control lacks; an owner other
 # than this user can also need a privilege the run lacks, which is one of the cases that falls back.
-# ReadOnly is not copied: a read-only file never reaches the move (the write probe above).
+# ReadOnly is not copied: a read-only file never reaches the move (the write probe above sends it to
+# the in-place write).
 function Copy-SettingsSecurity([System.IO.FileSystemInfo]$Item, [string]$Tmp) {
     try {
         if (Test-SwapFault $Item.FullName 'security-copy-fails') { throw "simulated security copy failure" }
@@ -365,17 +395,18 @@ function Invoke-SettingsSwap([string]$Tmp, [string]$Path, [bool]$Exists) {
 # paths without opening a log. It never says what settings.json now HOLDS: a concurrent writer can have
 # put anything there.
 function Get-FailedSwapReport([string]$Path, [string]$Tmp, [bool]$Existed, [bool]$Present, [string]$BackedTo, [string]$Why) {
-    $present = $Present
-    $msg = if ($present) { "settings.json was not updated ($Why); the new content was not installed" }
+    $msg = if ($Present) { "settings.json was not updated ($Why); the new content was not installed" }
     elseif ($Existed) { "settings.json is MISSING after a failed swap ($Why)" }
     else { "settings.json was not created ($Why)" }
-    if (-not $present) {
+    if (-not $Present) {
         $msg += $(if (Test-Path -LiteralPath $Tmp) { ". The new content is in $Tmp" } else { ". The new content's temp file $Tmp is gone too" })
     }
     if ($BackedTo) { $msg += "; a copy of the previous content is in $BackedTo" }
     # Re-running first would read the missing file as empty and write a settings.json holding only
-    # the statusLine, so the restore comes first.
-    if (-not $present) { $msg += ". Rename one of them to $Path before running this installer again" }
+    # the statusLine, so the restore comes first. With nothing to rename, there was no previous content.
+    if (-not $Present -and ($BackedTo -or (Test-Path -LiteralPath $Tmp))) {
+        $msg += ". Rename one of them to $Path before running this installer again"
+    }
     return "$msg."
 }
 
