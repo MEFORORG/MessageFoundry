@@ -2,9 +2,9 @@
 
 - **Status:** Accepted (2026-07-17) — DEMAND-GATE-BACKLOG Wave 3 build (lane `dg-s7b`); pushes/PR owner-approved.
   Amended 2026-10-06: a production instance refuses DEBUG at run time (vault BACKLOG #2777; see the end).
-  Amended 2026-11-25: the claim that the log-tail viewer and the support bundle give identical redaction
-  coverage is withdrawn; it held until the vault BACKLOG #5550 cross-line key-body mask
-  (`mask_key_body_lines`); see section 2.
+  Amended 2026-11-25: section 2's claim that the log-tail viewer and the support bundle give identical
+  redaction coverage is withdrawn, since the vault BACKLOG #5550 cross-line key-body mask
+  (`mask_key_body_lines`); the note there gives its scope.
 - **Built:** Yes — additive. `set_runtime_level` / `current_log_level` in
   [`logging_setup.py`](../../messagefoundry/logging_setup.py); three routes on
   [`api/app.py`](../../messagefoundry/api/app.py) — `GET`/`PATCH /logging/level` (gated by
@@ -110,8 +110,9 @@ knob — a runtime level change re-levels whatever handlers exist.
 **Positive** — operators raise/lower verbosity and read the redacted log live, without a restart or a
 bundle pull; the viewer shares the bundle's per-line redactor, though the two need not mask a line the same way
 (section 2), and inherits the existing PHI-read hop guard + audit chain *(amended 2026-11-25: this
-read "the viewer reuses the shared redactor (one PHI-coverage source of truth)", which held until the
-vault BACKLOG #5550 cross-line key-body mask (`mask_key_body_lines`); see section 2)*; additive, off-path when no log dir is configured.
+read "the viewer reuses the shared redactor (one PHI-coverage source of truth)"; the reuse still holds,
+and the source-of-truth half is withdrawn since the vault BACKLOG #5550 cross-line key-body mask
+(`mask_key_body_lines`), as the section 2 note says)*; additive, off-path when no log dir is configured.
 
 **Negative / residual** — the runtime override is invisible after a restart (by design — the config dial
 is the durable setting), and `/config/reload` intentionally does **not** reset it. The viewer's redaction
