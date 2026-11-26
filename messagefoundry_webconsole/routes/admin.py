@@ -500,7 +500,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # BACKLOG #1737 (ASVS 7.5.1): action-bound, matching the JSON twin PATCH /users/{id}. This
         # lane sets display name, email and the DISABLED flag -- the attributes a security notice is
         # delivered to, and the switch that locks an account out -- so a login-seeded window must not
-        # reach it through the console while the JSON plane refuses the same request. Enforced HERE:
+        # reach it through the console while the JSON plane refuses the same request (both planes
+        # admit that window under [auth].require_action_step_up = false; docs/CONFIGURATION.md,
+        # that row). Enforced HERE:
         # the JSON dependency does not run on this path (the handler FUNCTION is called via the seam).
         identity: Identity = Depends(
             require_ui_step_up_action(

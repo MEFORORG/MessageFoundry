@@ -11572,9 +11572,11 @@ def security_loosenings(
                 "require_action_step_up",
                 "the routes that need a fresh proof bound to one action (docs/CONFIGURATION.md "
                 "lists them) accept the session-wide step-up window instead -- a session taken over "
-                "inside that window ([auth].step_up_max_age_seconds, which a sign-in can open) "
-                "can bind an authenticator, inject a message or export bodies in bulk with no "
-                "fresh proof",
+                "inside that window ([auth].step_up_max_age_seconds, which at least some sign-ins "
+                "open) can, with no fresh proof, at least bind an authenticator, disable MFA "
+                "where [security].require_mfa does not refuse it, end "
+                "the account's other sessions, reset another account's password or factor, "
+                "inject a message, export bodies in bulk, purge a queue or reload config",
             )
         )
     # Vault BACKLOG #2600: the three local-password screens ship ON, and no gate refuses one off.

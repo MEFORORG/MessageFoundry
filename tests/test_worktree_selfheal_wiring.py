@@ -110,9 +110,10 @@ def test_the_backstop_reads_the_gates_allowlist(home: Path, drifted: Path) -> No
 def test_the_legacy_allowlist_still_works_when_the_shared_one_is_absent(
     home: Path, drifted: Path
 ) -> None:
-    """This script is installed as a COPY, so an older installed copy can outlive a newer allowlist and
-    vice versa. Falling back keeps a version skew from silently turning the backstop off -- the exact
-    class of failure that left rule 4 inert."""
+    """This script is installed as a COPY, so a box can carry only the legacy allowlist. Falling back
+    keeps that one skew from silently turning the backstop off. It does not cover the reverse skew; the
+    next test measures that. It also means deleting the gate's allowlist leaves the backstop armed
+    while a legacy file lists a root (docs/SESSION-DRIFT-CONTROLS.md, G8)."""
     (home / ".claude-hooks" / "worktree-gate.repos.txt").write_text(
         f"{drifted}\n", encoding="utf-8"
     )
@@ -121,9 +122,34 @@ def test_the_legacy_allowlist_still_works_when_the_shared_one_is_absent(
     assert head_of(drifted) == "main", "the legacy fallback was not read -- no repair happened"
 
 
+def test_once_the_gates_allowlist_exists_a_legacy_only_root_loses_the_backstop(
+    home: Path, drifted: Path
+) -> None:
+    """The reverse skew, which the fallback does not cover (docs/SESSION-DRIFT-CONTROLS.md, G8). Once
+    the gate's file exists, even naming no root, the legacy file is never read, so a root only the
+    legacy file lists is not repaired and nothing says so. An empty gate file, as here, is the state
+    ``install-gate.ps1 -Uninstall -Repo`` leaves when it narrows to zero roots, which is why its
+    warning may not call that the same state as ``-Uninstall``. The previous test is the control: the
+    same legacy file, with no gate file, is read."""
+    (home / ".claude" / "hooks" / "worktree-gate.repos.txt").write_text(
+        "# nothing governed\n", encoding="utf-8"
+    )
+    (home / ".claude-hooks" / "worktree-gate.repos.txt").write_text(
+        f"{drifted}\n", encoding="utf-8"
+    )
+    r = run_selfheal(home, cwd=drifted)
+    assert r.returncode == 0, r.stderr
+    assert head_of(drifted) == "drifted", "the legacy file was read although the gate's file exists"
+    assert r.stdout.strip() == "", (
+        f"the backstop said something about the skipped root:\n{r.stdout}"
+    )
+
+
 def test_no_allowlist_anywhere_is_a_clean_no_op(home: Path, drifted: Path) -> None:
     """The kill switch: no allowlist and the backstop touches nothing, without erroring. This is also the
-    control for the two tests above -- if the repair happened here too, they would prove nothing."""
+    control for the two repair tests, test_the_backstop_reads_the_gates_allowlist and
+    test_the_legacy_allowlist_still_works_when_the_shared_one_is_absent -- if the repair happened here
+    too, they would prove nothing."""
     r = run_selfheal(home, cwd=drifted)
     assert r.returncode == 0, r.stderr
     assert head_of(drifted) == "drifted", "an ungoverned repo was repaired anyway"

@@ -556,9 +556,14 @@ def test_the_count_line_counts_distinct_roots_not_allowlist_lines(tmp_path: Path
 
 
 def test_a_result_with_no_roots_left_warns_that_the_gate_governs_nothing(tmp_path: Path) -> None:
-    """The most important line in the change. Emptying the allowlist IS the kill switch, reached one
+    """The most important line in the change. Emptying the allowlist turns the gate off, reached one
     root at a time -- a narrow act with an unscoped consequence. It warns and proceeds: refusing a
-    deliberate act whose end state is one command away is paternalism."""
+    deliberate act whose end state is one command away is paternalism.
+
+    It is NOT the state -Uninstall leaves (docs/SESSION-DRIFT-CONTROLS.md, G8): the self-heal backstop
+    reads an empty gate allowlist in preference to a legacy one and guards nothing, while -Uninstall
+    deletes the file and lets it fall back. tests/test_worktree_selfheal_wiring.py measures the
+    backstop's read order against a hand-written empty file; no test here runs -Uninstall itself."""
     out = _show(
         tmp_path,
         _result(lines=[HEADER], roots=[], dropped=[MF, VAULT]),
@@ -566,7 +571,9 @@ def test_a_result_with_no_roots_left_warns_that_the_gate_governs_nothing(tmp_pat
     )
     assert "the allowlist now names NO root" in out
     assert "the gate governs NOTHING" in out
-    assert "same state as -Uninstall" in out
+    assert "same state as -Uninstall" not in out, f"the warning repeats the false claim:\n{out}"
+    assert "This is NOT the state -Uninstall leaves" in out
+    assert "fall back to a legacy allowlist" in out
     assert "2 root(s) REMOVED, 0 still governed" in out
 
 

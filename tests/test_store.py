@@ -515,15 +515,32 @@ def test_secure_file_takes_the_kept_icacls_rewrite_when_the_list_cannot_be_read(
 
 #: A per-service virtual account's shape (NT SERVICE\<name>); no service here holds it.
 _SERVICE_SID = "S-1-5-80-1000000001-1000000002-1000000003-1000000004-1000000005"
+#: A named run-as user's shape (the -ServiceAccount install): RID 1000 or more; no account here
+#: holds it.
+_RUN_AS_USER_SID = "S-1-5-21-1000000011-1000000012-1000000013-1001"
+#: The Modify mask install-service.ps1 grants the run-as account, as SDDL writes and reads it.
+_INSTALLER_MODIFY = ("0x1301bf", "0X1301BF")
 
 
 @_windows_only
-def test_the_store_trio_fallback_still_keeps_every_explicit_entry(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "run_as",
+    [
+        pytest.param(_SERVICE_SID, id="virtual-account"),
+        pytest.param(_RUN_AS_USER_SID, id="named-user"),
+    ],
+)
+def test_the_store_trio_fallback_still_keeps_every_explicit_entry(tmp_path, run_as: str) -> None:
     # A store file the installer's rule already restricted (SYSTEM, Administrators, the service at
     # Modify) whose directory is later refused, so the open takes the fallback. That fallback keeps
     # the trio's entries and adds the opener, so it does not shut the service out (ADR 0163). A
-    # guard, green before and after. It asserts a subset on purpose: the stray Everyone entry the
+    # guard of today's behaviour. It asserts a subset on purpose: the stray Everyone entry the
     # fallback also keeps today is the gap the ADR records, not behaviour to pin.
+    #
+    # The named-user case is the one a narrowing of this fallback (vault BACKLOG #8407 item 1)
+    # could miss: ADR 0163 sends a store here when the run-as user's lookup fails, a domain
+    # controller time-out included, so the fallback must keep that user's entry without resolving
+    # it. The fallback makes no lookup, so the stand-in need not resolve anywhere.
     import messagefoundry.store.store as store_mod
     from tests._win_acl import folder_granting, protected_entries
 
@@ -531,7 +548,8 @@ def test_the_store_trio_fallback_still_keeps_every_explicit_entry(tmp_path) -> N
     assert sid is not None
     path = folder_granting(tmp_path / "store", sid) / "messagefoundry.db"
     path.write_bytes(b"x")
-    explicit = f"(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1301bf;;;{_SERVICE_SID})(A;;FR;;;WD)"
+    written, read = _INSTALLER_MODIFY
+    explicit = f"(A;;FA;;;SY)(A;;FA;;;BA)(A;;{written};;;{run_as})(A;;FR;;;WD)"
     seeded = store_mod._set_security_from_sddl(path, f"D:P{explicit}", protected=True)
     assert seeded.failure is None and seeded.dacl_status == 0, seeded
     store_mod._secure_store_file(path, dir_grants=None)
@@ -540,7 +558,7 @@ def test_the_store_trio_fallback_still_keeps_every_explicit_entry(tmp_path) -> N
         ("A", "", "FA", sid),
         ("A", "", "FA", "S-1-5-18"),
         ("A", "", "FA", "S-1-5-32-544"),
-        ("A", "", "0X1301BF", _SERVICE_SID),
+        ("A", "", read, run_as),
     } <= set(entries), sddl
 
 
