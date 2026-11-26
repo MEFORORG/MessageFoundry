@@ -7055,14 +7055,14 @@ the email channel sends:
   A notice for a change the directory drove names the directory, not an administrator, as what made
   the change. It closes with "If you did not expect this change, contact your MessageFoundry
   administrator" rather than "If this was you". That covers at least the
-  directory rename, the directory's email change, a role change applied by the session reconciler
-  or by a directory sign-in's re-sync, and the reconciler's `account_disabled` when it read the
-  account disabled (vault BACKLOG #3121). The role notice says the roles were changed to match the
-  directory's groups, not that the console played no part: those groups map to roles through the
-  group-to-role map an administrator edits. It says nothing about sessions: each of its senders
-  also sends it when the session revoke failed. **CORRECTED 2026-11-26:** it said the sessions
-  already open on the account were ended, and this read *"which both of its senders do first"*
-  (BACKLOG #6034). The notice for an
+  directory rename, the directory's email change, and the reconciler's `account_disabled` when it
+  read the account disabled (vault BACKLOG #3121). The directory role notice, from the session
+  reconciler or a directory sign-in's re-sync, claims neither a role change nor ended sessions,
+  and closes with "If you did not expect this notice"; why is in the comment on
+  `_DIRECTORY_DESCRIPTIONS` in `pipeline/security_notify.py`. **CORRECTED 2026-11-26:** this listed
+  that notice among the "this change" closings, said it reported the roles changed to match the
+  directory's groups, and said it reported the sessions already open on the account ended,
+  *"which both of its senders do first"* (BACKLOG #6034). The notice for an
   administrator's role change, account disable or MFA reset also closes with "If you did not
   expect this change, contact your MessageFoundry administrator", since each route refuses a
   self-target (BACKLOG #6034). The administrator's role-change and disable notices say the sessions already open

@@ -268,8 +268,8 @@ def test_a_directory_sessions_ended_notice_is_true_for_each_reason(
 #: vault BACKLOG #3121. The description each directory-driven kind carries, pinned whole.
 _DIRECTORY_TEXT = {
     ROLES_CHANGED: (
-        "MessageFoundry read your groups in your organization's directory and changed your "
-        "account's roles to match them."
+        "MessageFoundry compared your account with your groups in your organization's directory "
+        "and acted on the result."
     ),
     ACCOUNT_DISABLED: (
         "Your organization's directory reports your account as disabled, so MessageFoundry ended "
@@ -277,6 +277,10 @@ _DIRECTORY_TEXT = {
     ),
 }
 _DIRECTORY_CLOSING = "If you did not expect this change, contact your MessageFoundry administrator."
+#: BACKLOG #6034: the directory role notice proves no change on every path, so it says "notice".
+_DIRECTORY_ROLE_CLOSING = (
+    "If you did not expect this notice, contact your MessageFoundry administrator."
+)
 #: BACKLOG #6034 (S08-57): the administrator wording says the sessions ended. Why that holds is on
 #: ``_DESCRIPTIONS[ROLES_CHANGED]`` in the module; the directory role wording does not say it.
 _ADMIN_TEXT = {
@@ -311,29 +315,41 @@ def test_a_directory_role_or_disable_notice_names_the_directory_and_no_administr
     assert _DIRECTORY_LINE not in lines
     assert _ADMIN_TEXT[kind] not in lines
     assert "if this was you" not in body.lower()
-    assert body.endswith(_DIRECTORY_CLOSING)
+    assert body.endswith(_DIRECTORY_ROLE_CLOSING if kind == ROLES_CHANGED else _DIRECTORY_CLOSING)
     # The administrator subject says the MessageFoundry account was disabled, which is false here.
     assert "was disabled" not in _subject(event)
 
 
 @pytest.mark.parametrize(
-    "detail",
+    ("detail", "client_ip"),
     [
-        pytest.param({"reason": "directory_disabled", "source": "directory"}, id="reconciler"),
-        pytest.param({"roles": ["viewer"], "source": "directory"}, id="sign-in-re-sync"),
+        # The reconciler's shape on both of its paths below: its revocation's reason is
+        # ``roles_changed`` whenever it carries role ids, which is what picks this kind.
+        pytest.param({"reason": "roles_changed", "source": "directory"}, None, id="reconciler"),
+        pytest.param(
+            {"roles": ["viewer"], "source": "directory"}, "203.0.113.7", id="sign-in-re-sync"
+        ),
     ],
 )
-def test_a_directory_role_change_notice_does_not_say_the_sessions_ended(
-    detail: dict[str, Any],
+def test_a_directory_role_notice_claims_no_role_change_and_no_ended_session(
+    detail: dict[str, Any], client_ip: str | None
 ) -> None:
-    """BACKLOG #6034. Both directory senders of ``roles_changed`` send it after a revoke that
-    raised: the reconciler's ``revoke_error`` branch and the sign-in re-sync, which holds the
-    revoke's error and notifies first. The event carries no word of the revoke, so the notice must
-    not say that any session was ended."""
-    event = SecurityEvent(ROLES_CHANGED, username="jdoe", email="j@example.org", detail=detail)
+    """BACKLOG #6034. A directory ``roles_changed`` notice goes out on paths where neither a role
+    change nor an ended session is proven, and the event carries no word of either:
+
+    - the reconciler's ``revoke_error`` branch, after a role write that raised past its retry
+      (``roles_unconfirmed``) and a revoke that raised;
+    - the reconciler's success path, which picks this kind for any revocation carrying role ids,
+      also when the roles moved after its read and it wrote none, so only sessions were revoked;
+    - the sign-in re-sync, which notifies with the role write's error held, or the revoke's.
+
+    So neither the subject nor the body may say that roles changed or that sessions ended."""
+    event = SecurityEvent(
+        ROLES_CHANGED, username="jdoe", email="j@example.org", client_ip=client_ip, detail=detail
+    )
     text = (_subject(event) + "\n" + _build_body(event)).lower()
-    assert "session" not in text
-    assert "ended" not in text
+    for claim in ("change", "session", "ended"):
+        assert claim not in text
 
 
 @pytest.mark.parametrize("kind", [ROLES_CHANGED, ACCOUNT_DISABLED])
@@ -365,7 +381,7 @@ def test_the_sign_in_role_re_sync_notice_says_where_the_sign_in_came_from() -> N
     )
     assert "Source IP" not in body
     assert (
-        "MessageFoundry picked up this change during a sign-in to your account from 203.0.113.7."
+        "MessageFoundry sent this notice during a sign-in to your account from 203.0.113.7."
         in body.splitlines()
     )
 

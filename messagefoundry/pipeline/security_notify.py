@@ -225,26 +225,34 @@ _DESCRIPTIONS = {
 }
 
 # Vault BACKLOG #3121. The reconciler's and the sign-in re-sync's role change and disable name no
-# administrator and close with "If you did not expect this change". Each carries its own source in
+# administrator and close with "If you did not expect this" (the disable "this change", the role
+# notice "this notice", below). Each carries its own source in
 # its words, so neither takes the generic directory line: a re-sync's roles come from the
 # directory's groups through the group-to-role map, which an administrator edits in the console,
 # so "not from the MessageFoundry console" would be false for it. The disable says what the
-# reconciler did, which is end the sessions; no MessageFoundry row was disabled. The role
-# notice says nothing about sessions (BACKLOG #6034): both of its senders, the reconciler's pass
-# and the sign-in re-sync, send it after a revoke that raised as well, and the event carries no
-# word of the revoke. The reconciler sends the disable only after its revoke returned.
+# reconciler did, which is end the sessions; no MessageFoundry row was disabled. The reconciler
+# sends the disable only after its revoke returned.
+#
+# BACKLOG #6034. The role notice, its subject, opening and closing included, claims no role change
+# and no ended session, and the event proves neither. The reconciler sends it after a role
+# write that raised past its retry and a revoke that raised, and on its success path for any
+# revocation carrying role ids, also when it wrote no role and only revoked sessions. The sign-in
+# re-sync sends it with the role write's or the revoke's error held. All that holds on every one of
+# those paths is that the account was compared with the directory's groups and acted on.
 _DIRECTORY_DESCRIPTIONS = {
     ROLES_CHANGED: (
-        "MessageFoundry read your groups in your organization's directory and changed your "
-        "account's roles to match them."
+        "MessageFoundry compared your account with your groups in your organization's directory "
+        "and acted on the result."
     ),
     ACCOUNT_DISABLED: (
         "Your organization's directory reports your account as disabled, so MessageFoundry ended "
         "your sessions."
     ),
 }
-# The administrator subject says the MessageFoundry account was disabled, which is false here.
+# The administrator subjects say the account was disabled or its roles changed, which can be false
+# here (the role half is BACKLOG #6034, above).
 _DIRECTORY_SUBJECTS = {
+    ROLES_CHANGED: "MessageFoundry checked your account against your organization's directory",
     ACCOUNT_DISABLED: "Your MessageFoundry sessions were ended: your directory account is disabled",
 }
 
@@ -436,6 +444,9 @@ def _build_body(event: SecurityEvent) -> str:
         opening = f"A notice for you as a MessageFoundry administrator ({account})."
     elif event.event_type == TEMPORARY_CREDENTIAL_EXPIRING:
         opening = f"A reminder about your MessageFoundry account ({account})."
+    elif from_directory and event.event_type == ROLES_CHANGED:
+        # BACKLOG #6034: no change is proven on every path (see ``_DIRECTORY_DESCRIPTIONS``).
+        opening = f"A notice about your MessageFoundry account ({account})."
     else:
         opening = f"A security-relevant change occurred on your MessageFoundry account ({account})."
     lines = [opening, "", lock_description or description]
@@ -613,14 +624,19 @@ def _build_body(event: SecurityEvent) -> str:
         # line says a sign-in was under way, never that one succeeded. Nothing on the event says
         # the address came from a sign-in, so a new sender passing another kind of address on a
         # directory event would make this line false; such a sender must change it.
+        # BACKLOG #6034: the role notice proves no change (see ``_DIRECTORY_DESCRIPTIONS``), so it
+        # says only when it was sent.
+        what = "sent this notice" if event.event_type == ROLES_CHANGED else "picked up this change"
         lines.append(
-            f"MessageFoundry picked up this change during a sign-in to your account from "
-            f"{event.client_ip}."
+            f"MessageFoundry {what} during a sign-in to your account from {event.client_ip}."
         )
     elif event.client_ip:
         lines.append(f"Source IP: {event.client_ip}")
     if lock_closing is not None:
         closing = lock_closing
+    elif from_directory and event.event_type == ROLES_CHANGED:
+        # BACKLOG #6034: "this change" would claim one (see ``_DIRECTORY_DESCRIPTIONS``).
+        closing = "If you did not expect this notice, contact your MessageFoundry administrator."
     elif event.event_type == PASSWORD_RESET:
         # An administrator did this, so "if this was you" cannot apply, and "no action is needed"
         # would contradict the deadline line above it (BACKLOG #1141).
