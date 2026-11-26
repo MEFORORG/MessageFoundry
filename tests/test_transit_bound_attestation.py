@@ -2988,7 +2988,7 @@ async def _real_rcsi_refusal(monkeypatch: pytest.MonkeyPatch, driver: Exception)
             return (0, 0)  # RCSI off, on every read
 
         async def close(self) -> None:
-            return None  # the open closes its state-read cursor before the ALTERs (#5666)
+            return None  # the open closes a cursor before an ALTER under another limit (#5666)
 
     class Conn:
         async def cursor(self) -> Cursor:

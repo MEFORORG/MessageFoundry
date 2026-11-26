@@ -4499,10 +4499,10 @@ class SqlServerStore(ServerCipherWalk):
                 # build must find a store here before it runs, not after.
                 await cls._refuse_a_database_with_no_store(settings, posture=posture)
             # RCSI must be enabled BEFORE the pool exists: its one-time ALTER ... WITH ROLLBACK
-            # IMMEDIATE takes exclusivity once the sessions it ends have rolled back, and with no
-            # MEFOR pool session open yet it has nothing of ours to terminate (concurrency_fixes (a)). #305: under external schema
-            # management the runtime login issues no ALTER DATABASE, so there is nothing to do before
-            # the pool; _verify_schema_external reads the two options on a pooled connection instead.
+            # IMMEDIATE takes exclusivity once the transactions it ends have rolled back, and with
+            # no MEFOR pool session open yet it has nothing of ours to terminate (concurrency_fixes
+            # (a)). #305: under external schema management the runtime login issues no ALTER
+            # DATABASE, so there is nothing to do before the pool; _verify_schema_external reads the two options on a pooled connection instead.
             # A read-only open issues no ALTER either (#1780).
             await cls._ensure_database_options(settings)
         pool, executor = await cls._create_pool(settings, maxsize=settings.pool_size)
@@ -5166,8 +5166,9 @@ class SqlServerStore(ServerCipherWalk):
                 # BACKLOG #5666: at an open, the state read, the re-read probes and the
                 # ALLOW_SNAPSHOT_ISOLATION ALTER run under [store].command_timeout. The RCSI ALTER
                 # does not, at an open or under provision-schema. ROLLBACK IMMEDIATE ends the peers'
-                # transactions, but the ALTER still waits for their rollback, so it can stall for
-                # as long as a large rollback takes. It stays unbounded anyway: a cancel that lands
+                # transactions, but the ALTER still waits for their rollback and for the database
+                # lock, with no statement limit, so it can stall at least as long as a large
+                # rollback takes. It stays unbounded anyway: a cancel that lands
                 # after the rollback leaves RCSI off, so the retry at every restart rolls the peers
                 # back again. The snapshot ALTER can wait on transactions open when it runs, and it
                 # is only warned about, so a limit there turns a stall into that warning.
