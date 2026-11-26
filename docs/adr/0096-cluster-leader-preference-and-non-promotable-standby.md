@@ -112,8 +112,8 @@ short-circuits, and the added `nodes` columns default to `0`/`TRUE`.
   → `tests/test_cluster_lease.py::test_non_promotable_already_leader_steps_down`
 - **AC-6** — THE SYSTEM SHALL be behaviourally byte-identical at the default `(0.0, True)`.
   → `tests/test_cluster_lease.py::test_default_delay_zero_is_byte_identical_takeover`
-- **AC-7** — IF `[dr].activate` is combined with `[cluster].enabled`, THEN THE SYSTEM SHALL refuse the
-  config at load.
+- **AC-7** — IF `[dr].enabled` is combined with `[cluster].enabled`, THEN THE SYSTEM SHALL refuse the
+  config at load. *(Amended 2026-11-25, BACKLOG #5965: this read `[dr].activate`, a key since removed.)*
   → `tests/test_settings.py::test_dr_enabled_but_not_activated_with_cluster_is_rejected`
   *(Widened by vault BACKLOG #3263 to `[dr].enabled`. The `[dr].activate` test this cited went
   with that key, removed under BACKLOG #5965; the `[dr].enabled` test now carries AC-7.)*

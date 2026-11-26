@@ -222,16 +222,6 @@ engine). The DR profile is a **startup decision**, not a runtime toggle: the thr
 a reload re-evaluates the whole graph, so a connection never flips between bound and filtered mid-run with
 in-flight rows stranded.
 
-> **Amendment (BACKLOG #5965, 2026-11-25): no box starts under the DR run-profile.** The
-> `[dr].activate` startup latch let a box configured with `enabled` and `activate` both true come
-> up under the profile at engine construction, binding the priority feeds without the seed
-> verification, the takeover hook or the `dr.activate` audit row that `POST /dr/activate` runs. By
-> owner ruling of 2026-11-25 the key is removed and refused at load as a removed key, `true` or
-> `false`, and the engine and the DR coordinator start every DR box passive. `POST /dr/activate` is
-> the only activation. "Startup decision" above now holds only of `[dr].enabled`, whether the box is
-> a DR box at all. This narrows the Decision rather than replacing it, so it is an amendment, not a
-> superseding ADR.
-
 > **Amendment (vault BACKLOG #3067): `POST /dr/activate` applies the RUNNING graph, and disk drift is only
 > recorded.** The paragraph above calls the profile a startup decision, but `POST /dr/activate` and
 > `POST /dr/release` turn it on and off on a running engine. That half was broken: the runner took its
@@ -280,6 +270,18 @@ in-flight rows stranded.
 > A purge of a parked lane is allowed, since the lane is paused and nothing is in flight. For an INBOUND, an
 > operator start still overrides the profile, as `tests/test_connection_scheduler.py` pins. An alert
 > rule's restart of a parked inbound does nothing.
+
+> **Amendment (BACKLOG #5965, 2026-11-25): no box starts under the DR run-profile.** The
+> `[dr].activate` startup latch let a box configured with `enabled` and `activate` both true come
+> up under the profile at engine construction, binding the priority feeds without the seed
+> verification, the takeover hook (when one is set) or the `dr.activate` audit row that
+> `POST /dr/activate` runs. By owner ruling of 2026-11-25 the key is removed and refused at load
+> as a removed key, `true` or `false`, and the engine and the DR coordinator start every DR box
+> passive. `POST /dr/activate` is the only activation. The Decision's "startup decision"
+> paragraph, before the #3067 amendment, now holds only of `[dr].enabled`, whether the box is a
+> DR box at all. An activated box that restarts comes back passive until it is activated again.
+> This narrows the Decision rather than replacing it, so it is an amendment, not a superseding
+> ADR.
 
 > **Amendment (vault BACKLOG #3140): a passive DR box binds no inbound listener.** A box with
 > `[dr].enabled = true` that is not activated, at start or after `POST /dr/release`, binds no inbound
