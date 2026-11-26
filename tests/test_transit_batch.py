@@ -10,6 +10,7 @@ whole batch when one item fails. Synthetic data only."""
 
 from __future__ import annotations
 
+import argparse
 import base64
 import collections
 import json
@@ -749,3 +750,390 @@ def test_a_none_key_is_refused_before_any_transit_request() -> None:
     assert isinstance(opened[4], AADComponentError)
     assert transit.decrypt_requests == 1  # one batch for the four; the refusal sent nothing
     assert cipher._batch_alone is False
+
+
+# --- vault BACKLOG #6706 added items 1, 2, 7, 14 and 15 ------------------------------------------
+
+
+def _chain(error: CipherError, links: int) -> CipherError:
+    """``error`` with ``links`` raised exceptions chained under it as contexts, each holding a
+    traceback whose frame reaches a synthetic local."""
+    secret = "value 0"  # a local the links' frames reach until they are cleared
+    tail: BaseException | None = None
+    for i in range(links):
+        try:
+            raise ValueError(f"link {i} {secret[:0]}") from None
+        except ValueError as caught:
+            caught.__context__ = tail
+            tail = caught
+    error.__context__ = tail
+    return error
+
+
+def _graph_nodes(error: BaseException) -> int:
+    """How many exceptions ``error``'s graph holds, walked apart from ``crypto.detached``."""
+    seen: set[int] = set()
+    queue: collections.deque[BaseException] = collections.deque([error])
+    while queue:
+        node = queue.popleft()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        queue.extend(e for e in (node.__cause__, node.__context__) if e is not None)
+        if isinstance(node, BaseExceptionGroup):
+            queue.extend(node.exceptions)
+    return len(seen)
+
+
+def test_detached_past_its_limit_cuts_off_what_it_did_not_clear(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Item 1: past _DETACH_LIMIT the error was returned with the rest of its tracebacks attached.
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 3)
+    caplog.set_level(logging.WARNING)
+    error = _chain(CipherError("synthetic"), 5)
+    assert _frames_reach(error, "value 0")
+    assert detached(error) is error  # in place: a caller that keeps `error` keeps it cleared
+    assert not _frames_reach(error, "value 0")
+    assert _graph_nodes(error) == 3
+    assert any(
+        r.name == "messagefoundry.store.crypto" and "the rest are cut off it" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_detached_at_its_limit_keeps_every_link(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The boundary: a graph of exactly _DETACH_LIMIT exceptions is cleared whole, and one more is
+    # cut off.
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 4)
+    whole = _chain(CipherError("synthetic"), 3)
+    assert detached(whole) is whole and _graph_nodes(whole) == 4
+    assert not _frames_reach(whole, "value 0")
+    over = _chain(CipherError("synthetic"), 4)
+    assert detached(over) is over and _graph_nodes(over) == 4
+    assert not _frames_reach(over, "value 0")
+
+
+def test_detached_past_its_limit_keeps_the_errors_own_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The nearest links are kept, so an outage stays an outage (gave_no_verdict reads the cause).
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 3)
+    error = _chain(CipherError("synthetic"), 5)
+    error.__cause__ = requests.ConnectionError("synthetic unreachable")
+    assert crypto.gave_no_verdict(error)
+    assert detached(error) is error
+    assert crypto.gave_no_verdict(error) and not _frames_reach(error, "value 0")
+
+
+def test_detached_past_its_limit_clears_an_unvisited_group_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raised(exc: Exception) -> Exception:
+        try:
+            raise exc
+        except Exception as caught:  # noqa: BLE001 -- builds a traceback for the test
+            return caught
+
+    secret = "value 0"  # a local the members' frames reach until they are cleared
+    members = [raised(ValueError(f"member {i} {secret[:0]}")) for i in range(4)]
+    for member in members:
+        member.__context__ = raised(KeyError("deeper"))
+    group = raised(ExceptionGroup("group", members))
+    error = CipherError("outer")
+    error.__context__ = group
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 3)
+    assert detached(error) is error
+    assert not _frames_reach(error, "value 0")
+
+
+def test_detached_past_its_limit_clears_a_group_nested_in_an_unvisited_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raised(exc: Exception) -> Exception:
+        try:
+            raise exc
+        except Exception as caught:  # noqa: BLE001 -- builds a traceback for the test
+            return caught
+
+    secret = "value 0"  # a local the members' frames reach until they are cleared
+    inner = raised(
+        ExceptionGroup("inner", [raised(ValueError(f"x {secret[:0]}")) for _ in range(3)])
+    )
+    outer = raised(ExceptionGroup("outer", [raised(KeyError("a")), raised(KeyError("b")), inner]))
+    error = CipherError("synthetic")
+    error.__context__ = outer
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 3)
+    assert _frames_reach(error, "value 0")
+    assert detached(error) is error
+    assert not _frames_reach(error, "value 0")
+
+
+def test_detached_past_its_limit_cuts_when_its_warning_cannot_be_logged(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Repair item 1: the WARNING was logged before the cut and unguarded, so a raising log filter
+    # skipped the cut and returned the rest of the graph with its tracebacks attached.
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 3)
+    error = _chain(CipherError("synthetic"), 5)
+    raising = _RaisingFilter()
+    crypto._log.addFilter(raising)
+    try:
+        assert detached(error) is error
+    finally:
+        crypto._log.removeFilter(raising)
+    assert not _frames_reach(error, "value 0")
+    assert _graph_nodes(error) == 3
+    assert "could not be logged ('ValueError')" in capsys.readouterr().err
+
+
+class _UnnamedMeta(type):
+    @property
+    def __name__(cls) -> str:  # type: ignore[override]
+        raise RuntimeError("no name")
+
+
+class _Unnamed(ValueError, metaclass=_UnnamedMeta):
+    """A synthetic error whose class name cannot be read."""
+
+
+class _UnnamedFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        raise _Unnamed
+
+
+def test_detached_reports_a_log_failure_whose_class_cannot_be_named(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Round 2: building the classed text sat inside the suppress, so it dropped the report whole.
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 3)
+    error = _chain(CipherError("synthetic"), 5)
+    unnamed = _UnnamedFilter()
+    crypto._log.addFilter(unnamed)
+    try:
+        assert detached(error) is error
+    finally:
+        crypto._log.removeFilter(unnamed)
+    assert "a detached-error WARNING could not be logged" in capsys.readouterr().err
+
+
+class _Interrupt(BaseException):
+    """A synthetic non-``Exception`` error, which the WARNING's guard does not catch."""
+
+
+class _InterruptingFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        raise _Interrupt
+
+
+def test_an_error_escaping_detacheds_warning_holds_nothing_the_cut_unlinked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Round 1: detached's own locals still held the unlinked links, tracebacks attached, while it
+    # logged, so an error escaping the log step carried them through detached's frame.
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 3)
+    error = _chain(CipherError("synthetic"), 5)
+    interrupting = _InterruptingFilter()
+    crypto._log.addFilter(interrupting)
+    try:
+        with pytest.raises(_Interrupt) as caught:
+            detached(error)
+    finally:
+        crypto._log.removeFilter(interrupting)
+    tb = caught.value.__traceback__
+    frames = []
+    while tb is not None:
+        frames.append(tb.tb_frame)
+        tb = tb.tb_next
+    (frame,) = [f for f in frames if f.f_code.co_name == "detached"]
+    held = [v for v in frame.f_locals.values() if isinstance(v, BaseException)]
+    held += [
+        e
+        for v in frame.f_locals.values()
+        if isinstance(v, (collections.deque, list, tuple))
+        for e in v
+        if isinstance(e, BaseException)
+    ]
+    assert any(e is error for e in held)  # the floor: the frame's locals were read
+    assert all(e.__traceback__ is None for e in held)
+    assert not _frames_reach(error, "value 0")
+
+
+class _CountedGroup(ExceptionGroup[Exception]):
+    """An exception group that counts reads of its ``exceptions``."""
+
+    reads = 0
+
+    @property
+    def exceptions(self) -> tuple[Exception, ...]:
+        _CountedGroup.reads += 1
+        return super().exceptions
+
+
+def test_detached_past_its_limit_descends_a_shared_member_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Repair item 2: the cut's descent into unvisited groups kept no record of what it cleared, so
+    # a member shared down a stack of groups was descended into 2**depth times.
+    depth = 12
+    try:
+        raise ValueError("leaf")
+    except ValueError as caught:
+        leaf = caught
+    shared: Exception = leaf
+    for _ in range(depth):
+        shared = _CountedGroup("level", [shared, shared])
+    error = CipherError("synthetic")
+    error.__context__ = ExceptionGroup("top", [KeyError("a"), KeyError("b"), shared])
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 3)
+    _CountedGroup.reads = 0
+    assert detached(error) is error
+    assert 1 <= _CountedGroup.reads <= depth  # each level read once, by the cut's descent
+    assert leaf.__traceback__ is None
+
+
+def test_detached_past_its_limit_keeps_a_visited_members_links(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Repair item 2: a visited member reached again through an unvisited group had its links,
+    # which the cut keeps, set to None.
+    kept = ValueError("kept")
+    member = ValueError("member")
+    member.__context__ = kept
+    outer = ExceptionGroup("outer", [member, KeyError("q"), ExceptionGroup("again", [member])])
+    error = CipherError("synthetic")
+    error.__cause__ = kept
+    error.__context__ = outer
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 4)
+    assert detached(error) is error
+    assert member.__context__ is kept
+
+
+def test_detached_past_its_limit_keeps_a_kept_context_visible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Repair item 3: setting __cause__ to None also sets __suppress_context__, so a context the
+    # cut kept was hidden from a rendered traceback.
+    kept = ValueError("the kept context")
+    link = ValueError("link")
+    link.__cause__ = KeyError("cut")
+    link.__context__ = kept
+    link.__suppress_context__ = False
+    error = CipherError("synthetic")
+    error.__cause__ = kept
+    error.__context__ = link
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 3)
+    assert detached(error) is error
+    assert link.__cause__ is None and link.__context__ is kept
+    assert link.__suppress_context__ is False
+    assert "the kept context" in "".join(traceback.format_exception(link))
+
+
+def test_detached_under_its_limit_returns_the_same_error() -> None:
+    error = _chain(CipherError("synthetic"), 3)
+    assert detached(error) is error and not _frames_reach(error, "value 0")
+    assert _graph_nodes(error) == 4
+
+
+def _switch_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "messagefoundry.store.crypto_transit"
+        and "sending each value alone" in r.getMessage()
+    ]
+
+
+def test_the_decrypt_switch_to_sending_alone_warns_once_naming_the_failure_type(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Items 2 and 15: the WARNING named no failure type, and no test asserted it.
+    caplog.set_level(logging.WARNING)
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    items = _sealed(cipher, 3)
+    real = transit.decrypt_data
+
+    def too_large(**kw: Any) -> dict[str, Any]:
+        if kw.get("batch_input") is not None:
+            raise UnexpectedError("413 Request Entity Too Large")
+        return real(**kw)
+
+    transit.decrypt_data = too_large  # type: ignore[method-assign]
+    assert cipher.decrypt_many(items) == ["value 0", "value 1", "value 2"]
+    assert cipher.decrypt_many(items) == ["value 0", "value 1", "value 2"]
+    (message,) = _switch_warnings(caplog)
+    assert "refused a batch decrypt (UnexpectedError)" in message
+    assert "413" not in message
+
+
+def test_the_encrypt_switch_to_sending_alone_warns_naming_the_failure_type(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING)
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    real = transit.encrypt_data
+
+    def too_large(**kw: Any) -> dict[str, Any]:
+        if kw.get("batch_input") is not None:
+            raise UnexpectedError("413 Request Entity Too Large")
+        return real(**kw)
+
+    transit.encrypt_data = too_large  # type: ignore[method-assign]
+    encrypt_many(cipher, [(f"plain {i}", cell_aad("t", "c", i)) for i in range(3)])
+    (message,) = _switch_warnings(caplog)
+    assert "refused a batch encrypt (UnexpectedError)" in message
+
+
+def test_an_unechoed_reply_switch_warns_with_no_failure_type(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING)
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    items = _sealed(cipher, 3)
+    transit.tamper = _without_reference
+    cipher.decrypt_many(items)
+    (message,) = _switch_warnings(caplog)
+    assert "did not echo the reference of a batch decrypt (key=" in message
+
+
+def test_a_faulting_400_check_does_not_discard_an_outage(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Item 7: a fault in is_vault_bad_request discarded True from is_vault_unavailable, so an
+    # outage was handled as a 400 and every value asked for alone.
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    items = _sealed(cipher, 4)
+    real = transit.decrypt_data
+    singles = 0
+
+    def down(**kw: Any) -> dict[str, Any]:
+        nonlocal singles
+        if kw.get("batch_input") is not None:
+            raise requests.ConnectionError("synthetic unreachable")
+        singles += 1
+        return real(**kw)
+
+    def broken(exc: BaseException) -> bool:
+        raise RuntimeError("synthetic classifier fault")
+
+    transit.decrypt_data = down  # type: ignore[method-assign]
+    monkeypatch.setattr(crypto_transit, "is_vault_bad_request", broken)
+    results = cipher.decrypt_many(items)
+    assert all(isinstance(r, CipherUnavailableError) for r in results)
+    assert singles == 0
+    assert cipher._batch_alone is False
+
+
+def test_the_cipher_audit_help_states_the_batch_bound_as_a_number() -> None:
+    # Item 14: the help named BATCH_MAX_ITEMS and a file path rather than the number.
+    from messagefoundry.__main__ import _build_parser
+
+    parser, _ = _build_parser()
+    sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    help_text = next(c.help for c in sub._choices_actions if c.dest == "cipher-audit")
+    assert help_text is not None
+    assert f"batches of up to {crypto.BATCH_MAX_ITEMS} values" in help_text
+    assert f"{crypto.BATCH_MAX_CHARS:,} characters" in help_text
+    assert "BATCH_MAX_ITEMS" not in help_text and "store/crypto.py" not in help_text
