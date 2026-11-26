@@ -448,7 +448,7 @@ async def test_a_dr_activation_judges_the_running_graphs_key_files(
     eng = await _engine(
         tmp_path,
         store_settings=StoreSettings(path=str(tmp_path / "e.db")),
-        dr_settings=DrSettings(enabled=True, activate=False),
+        dr_settings=DrSettings(enabled=True, activate=False, seed_archive="seed.mfbak"),
     )
     try:
         reg = Registry()

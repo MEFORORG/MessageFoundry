@@ -33,7 +33,12 @@ import logging
 import time
 from collections.abc import Callable, Iterator, Mapping
 
-from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.models import (
+    ConnectorType,
+    Destination,
+    Source,
+    flag_from_settings,
+)
 from messagefoundry.parsing.x12.delimiters import (
     DEFAULT_MAX_INTERCHANGE_BYTES,
     ELEMENT_SEP_OFFSETS,
@@ -216,7 +221,7 @@ class X12Destination(DestinationConnector):
         self.expect_reply: bool = bool(s.get("expect_reply", False))
         # ADR 0016: capture the returned interchange (the 271/TA1) as a reply; ta1_required makes a
         # no-reply a retry. capture_response is forced True by reingress_to at wiring time (ADR 0013).
-        self.capture_response: bool = bool(s.get("capture_response", False))
+        self.capture_response: bool = flag_from_settings(s, "capture_response")
         self.ta1_required: bool = bool(s.get("ta1_required", False))
         self.max_interchange_bytes: int | None = positive_cap(
             s.get("max_interchange_bytes", DEFAULT_MAX_INTERCHANGE_BYTES),
@@ -228,7 +233,7 @@ class X12Destination(DestinationConnector):
         # established TCP connection across deliveries (default False = connect-per-send, byte-identical).
         # Same knobs/semantics as MLLP (ADR 0067) minus TLS (X12-over-TCP has none). Key absent → off; the
         # two freshness knobs follow the receive_timeout convention (None/0 in any spelling = disabled).
-        self.persistent: bool = bool(s.get("persistent", False))
+        self.persistent: bool = flag_from_settings(s, "persistent")
         self.idle_timeout_seconds: float | None = positive_cap(
             s.get("idle_timeout_seconds", 60.0),
             float,

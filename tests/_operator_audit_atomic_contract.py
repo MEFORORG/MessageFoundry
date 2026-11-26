@@ -661,15 +661,26 @@ async def _assert_missing_audit_refused(store: Any, tag: str) -> None:
                 origin=origin,
                 origin_actor="contract-op",
             )
+        # BACKLOG #6589: the operator label names its user, so an inject with no actor is refused.
+        with pytest.raises(TypeError, match="needs the origin_actor"):
+            await store.enqueue_ingress(
+                channel_id=inject_ch,
+                raw=_RAW,
+                audit=_builder(f"contract.inject_no_actor.{tag}", inject_ch),
+                origin=origin,
+            )
     with pytest.raises(TypeError, match="BACKLOG #5071"):
         await store.enqueue_ingress(channel_id=inject_ch, raw=_RAW, audit="not-a-callable")
+    with pytest.raises(TypeError, match="was given an origin_actor"):
+        await store.enqueue_ingress(channel_id=inject_ch, raw=_RAW, origin_actor="contract-op")
     assert int(await store.count_messages(channel_id=inject_ch, allowed_channels=None)) == 0
     # Control: a live receipt, the partner default with no audit, is still accepted.
     await store.enqueue_ingress(channel_id=inject_ch, raw=_RAW)
     assert int(await store.count_messages(channel_id=inject_ch, allowed_channels=None)) == 1
 
     # The alert mutations and the connection flag take an AuditAppend, which ``if_applied`` refuses
-    # when it is None; the raise comes inside the write's transaction, so it rolls the change back.
+    # when it is None. Each takes it as its first statement, so the refusal comes before any write
+    # (BACKLOG #6589); ``tests/test_operator_audit_required.py`` pins that order.
     conn = f"OB_NAL{tag}"
     await store.upsert_alert_instance(
         event_type="connection_error", connection=conn, severity="warning"
@@ -679,10 +690,18 @@ async def _assert_missing_audit_refused(store: Any, tag: str) -> None:
         for r in await store.list_active_alert_instances(limit=1000, allowed_channels=None)
         if r.connection == conn
     ]
-    with pytest.raises(TypeError, match="BACKLOG #5069"):
-        await store.ack_alert_instance(alert_id, actor="contract-op", audit=None)
-    got = await store.get_alert_instance(alert_id, allowed_channels=None)
-    assert got is not None and (got.status, got.acked_by) == ("open", None)
+    alert_refused: dict[str, Callable[[], Awaitable[Any]]] = {
+        "ack": lambda: store.ack_alert_instance(alert_id, actor="contract-op", audit=None),
+        "resolve": lambda: store.resolve_alert_instance(alert_id, audit=None),
+        "suspend": lambda: store.suspend_alert_instance(alert_id, until=4.0e9, audit=None),
+        "resume": lambda: store.resume_alert_instance(alert_id, audit=None),
+    }
+    for label, call in alert_refused.items():
+        with pytest.raises(TypeError, match="BACKLOG #5069"):
+            await call()
+        got = await store.get_alert_instance(alert_id, allowed_channels=None)
+        assert got is not None, label
+        assert (got.status, got.acked_by, got.suspended_until) == ("open", None, None), label
     # Leave no open alert behind on a shared server database.
     resolved = AuditAppend(f"contract.alert_cleanup.{tag}", actor="contract-op")
     assert await store.resolve_alert_instance(alert_id, audit=resolved) is True

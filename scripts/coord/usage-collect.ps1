@@ -473,8 +473,12 @@ try {
     # The human-facing line. Keep it short; this is a status bar, not a report.
     $line = "7d {0:0}%" -f $seven.used_percentage
     if ($seven.resets_at_epoch) {
-        $mins = [int](([System.DateTimeOffset]::FromUnixTimeSeconds([long]$seven.resets_at_epoch) - [System.DateTimeOffset]::UtcNow).TotalMinutes)
-        if ($mins -ge 0) { $line += ("  (resets {0}h{1:00}m)" -f [math]::Floor($mins / 60), ($mins % 60)) }
+        # Truncate, never cast to [int]: a cast rounds to the nearest minute (ties to even), so 59m45s
+        # left read as 1h00m and a reset 20 seconds gone read as 0h00m instead of the gone-window line.
+        # The span's integer components truncate for a positive span. -gt, not -ge: usage.ps1 counts a
+        # reset at exactly now as passed (Test-WindowResetPassed), and the two must agree.
+        $left = [System.DateTimeOffset]::FromUnixTimeSeconds([long]$seven.resets_at_epoch) - [System.DateTimeOffset]::UtcNow
+        if ($left -gt [TimeSpan]::Zero) { $line += ("  (resets {0}h{1:00}m)" -f ($left.Days * 24 + $left.Hours), $left.Minutes) }
         # A window that is gone has no number worth showing. usage.ps1 applies the same rule.
         else { $line = "7d reset passed, no current reading" }
     }

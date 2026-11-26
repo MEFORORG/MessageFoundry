@@ -515,8 +515,9 @@ def http_digest_selected(s: Mapping[str, Any]) -> bool:
 def refuse_http_digest_conflicts(s: Mapping[str, Any]) -> bool:
     """Whether Digest is selected, after refusing what cannot stand beside it (BACKLOG #5529).
 
-    The connectors call this at the top of construction, so a connection that will not build logs
-    no insecure-hop crossing or warning first; :func:`digest_handler_from_settings` calls it again.
+    The connectors call this at the top of construction, so a connection this refuses logs no
+    insecure-hop crossing or warning first. A refusal later in construction, after the hop gates
+    have run, still can (#5529). :func:`digest_handler_from_settings` calls it again.
     Refuses an unrecognised ``http_auth`` (:func:`http_digest_selected`), and with Digest selected,
     a static ``bearer_token``, ``basic_user``, ``basic_password`` or ``Authorization`` entry in
     ``headers``: beside Digest, a connection configures exactly one HTTP credential. Where such a

@@ -30,6 +30,7 @@ import pytest
 from messagefoundry.auth.identity import SessionMechanism
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import (
+    _CHECKED_READ_PASSES,
     ACCOUNT_REFUSED,
     NO_ENABLED_ADMINISTRATOR_ACTION,
     ROLE_SYNC_CONTENDED,
@@ -226,8 +227,9 @@ async def test_two_lost_compare_and_sets_refuse_the_sign_in_closed(
 async def test_a_record_that_fails_its_seal_when_read_again_refuses_the_sign_in(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, leg: str
 ) -> None:
-    """After a lost compare-and-set the record is read again, twice since a refused read may be a
-    re-key, and both reads fail the seal. The sign-in is refused as ``account_refused``, not as
+    """After a lost compare-and-set the record is read again, up to ``_CHECKED_READ_PASSES``
+    times since a refused read may be a re-key (vault BACKLOG #3085 item 7), and every read fails
+    the seal. The sign-in is refused as ``account_refused``, not as
     contention, and nothing is written."""
     service, user_id, first = await _signed_in(store, leg)
     await store.set_ad_group_role_map([(_GROUP, VIEWER)])
@@ -246,7 +248,7 @@ async def test_a_record_that_fails_its_seal_when_read_again_refuses_the_sign_in(
     monkeypatch.undo()
     assert not out.ok and out.reason == ACCOUNT_REFUSED
     assert out.error == "invalid credentials", out.error
-    assert len(seen) == 1 and len(reads) == 2
+    assert len(seen) == 1 and len(reads) == _CHECKED_READ_PASSES
     assert await store.get_user_role_ids(user_id) == [ADMIN]
     # The row's shape, pinned per leg (vault BACKLOG #3085 item 20): both legs write it through
     # ``_refuse_directory_row``, so neither carries a ``mech``.

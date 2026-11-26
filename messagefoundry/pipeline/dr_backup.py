@@ -67,7 +67,7 @@ from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.last_resort import run_guarded
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, utc_or_unknown
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
-from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
+from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text, shown_class_name
 from messagefoundry.restore_notice import RESTORE_NOTICE_POINTER, RESTORE_ROLLBACK_NOTICE
 from messagefoundry.store import Store
 from messagefoundry.store.backup_codec import (
@@ -424,7 +424,8 @@ class RestoreResult:
     archive_sha256: str
     archive_created_at: float | None = None
     last_audit_at: float | None = None
-    #: How many open sessions the restore ended in the store it placed (BACKLOG #2614).
+    #: How many unrevoked sessions the restore ended in the store it placed, expired ones never
+    #: purged included (BACKLOG #2614, #5095).
     sessions_revoked: int = 0
 
 
@@ -700,7 +701,7 @@ class BackupRunner:
             raise
         except Exception as exc:  # any unexpected failure → a generic backup_failed (no body leaks)
             await self._record_failure("backup", exc, now)
-            raise BackupError("backup", safe_exc(exc)) from exc
+            raise BackupError("backup", _error_reason(exc)) from exc
         await self._record_success(result, now)
         return result
 
@@ -888,7 +889,7 @@ class BackupRunner:
                 except (OSError, ValueError, FileExistsError, sqlite3.Error) as exc:
                     # sqlite3.Error: since BACKLOG #1937 the copy opens its own read-only connection,
                     # and a failure there is a snapshot failure too, not a generic backup one.
-                    raise BackupError("snapshot", safe_exc(exc)) from exc
+                    raise BackupError("snapshot", _error_reason(exc)) from exc
                 # The snapshot's real size is known now, and it is already on disk, so this asks only
                 # for what is still to come: the tar beside it and the archive at the destination.
                 # Inside the try, so a refusal here still releases the staging directory.
@@ -1590,7 +1591,7 @@ class BackupRunner:
                 log.warning("DR backup: backup_failed alert sink raised", exc_info=True)
 
     async def _record_failure(self, kind: str, exc: BaseException, now: float) -> None:
-        reason = safe_exc(exc) if isinstance(exc, BaseException) else str(exc)
+        reason = _error_reason(exc) if isinstance(exc, BaseException) else str(exc)
         detail = {"outcome": "error", "kind": kind, "error": reason}
         try:
             await self._store.record_audit(
@@ -2010,7 +2011,7 @@ def _verify_failure(exc: BaseException) -> VerifyResult:
     # will not parse as `TarError`, and nothing else in the verify parses JSON (`read_header` raises
     # `BackupCodecError` for its own). A name for a type that cannot arrive reads as a guard and
     # guards nothing.
-    return VerifyResult("FAIL", reason=safe_exc(exc))
+    return VerifyResult("FAIL", reason=_error_reason(exc))
 
 
 #: The pauses between attempts to remove a verify's staging directory (BACKLOG #1721). A refused unlink
@@ -4852,7 +4853,7 @@ def _full_open_check(
             # read) is reported as the FAIL the open's handler gives the same failure. Before the
             # open it is still behind an incompatible snapshot's verdict, so the open runs and the
             # order below decides; after the open it is the verdict.
-            return "FAIL", safe_exc(exc), 0
+            return "FAIL", _error_reason(exc), 0
         walk_read[0] = True
         walk_kind[0] = getattr(result, "kind", None)
         return result
@@ -4866,16 +4867,19 @@ def _full_open_check(
     walked_cells = walk_read[0]
     # ADR 0196 AC-8: the snapshot is a copy of the LIVE store and carries its salt. Opened as it is,
     # anything the open seals (the at-open sweep) would land under the live store's data sub-key and
-    # be counted only in this throwaway copy's row. Dropping the salt makes the open mint a new one,
-    # so whatever it seals is under a key nothing else uses. Every existing value names its own salt,
-    # so neither walk is affected. The copy is discarded afterwards either way.
+    # be counted only in this throwaway copy's row. Where the open binds a salt, dropping it makes
+    # the open mint a new one, so whatever it seals is under a key nothing else uses. An open that
+    # binds none (forget_store_salt names them, at least `[store].aad_bind = false`) is not helped:
+    # the hazard above stays open there. Dropping it does not change how an existing value opens
+    # (forget_store_salt says why), so neither walk is affected. The copy is discarded afterwards
+    # either way.
     from messagefoundry.store.store import forget_store_salt
 
     try:
         forget_store_salt(snap)
     except sqlite3.Error as exc:
         # The walk's verdict, read before this, still leads (the order below).
-        return walked if walked[0] != "PASS" else ("FAIL", safe_exc(exc), 0)
+        return walked if walked[0] != "PASS" else ("FAIL", _sqlite_error_reason(exc), 0)
 
     async def _open() -> tuple[bool, str]:
         # Bind the store BEFORE the try. An open that raises — a keyless or wrong-key open, an
@@ -4943,7 +4947,7 @@ def _full_open_check(
         reason = safe_exc(exc) if walked[0] == "PASS" else f"{safe_exc(exc)}; {walked[1]}"
         return "KEY_MISMATCH", reason, 0
     except Exception as exc:  # a restore that won't even open is the thing we're trying to catch
-        return walked if walked[0] != "PASS" else ("FAIL", safe_exc(exc), 0)
+        return walked if walked[0] != "PASS" else ("FAIL", _error_reason(exc), 0)
     if walked[0] != "PASS":
         return walked
     if not ok:
@@ -5013,10 +5017,18 @@ def _incompatible_snapshot(
 
 def _sqlite_error_reason(exc: sqlite3.Error) -> str:
     """A SQLite error as a FAIL reason that quotes no row. Its decode error quotes the column's
-    bytes (``... with text '...'``), which are a row's content and which ``safe_exc`` keeps, so
-    that tail is cut, as ``cipher-audit``'s report cuts it."""
+    bytes (``... with text '...'``), which are a row's content and which ``safe_text`` keeps, so
+    that tail is cut, as ``cipher-audit``'s report cuts it. ``safe_exc`` would withhold the whole
+    message (vault BACKLOG #8153, item 23); this keeps the rest of SQLite's text. An engine class
+    that stands in for SQLite's error prints SQLite's class name (``shown_class_name``)."""
     text = re.sub(r" with text '.*\Z", " (its text is not shown)", str(exc), flags=re.DOTALL)
-    return safe_text(f"{type(exc).__name__}: {text}")
+    return safe_text(f"{shown_class_name(exc)}: {text}")
+
+
+def _error_reason(exc: BaseException) -> str:
+    """A FAIL or backup reason for ``exc``: :func:`_sqlite_error_reason` for a SQLite error, as the
+    reasons before vault BACKLOG #8153 kept SQLite's text, else ``safe_exc``."""
+    return _sqlite_error_reason(exc) if isinstance(exc, sqlite3.Error) else safe_exc(exc)
 
 
 #: What decided a :func:`_decrypt_check` verdict. ``cell`` is, under a key, at least a sealed value
@@ -5404,9 +5416,10 @@ def restored_accounts_notice(sessions_revoked: int) -> str:
     already did. Worded from the count the restore's own revoke returned, so it never claims more
     than it ended."""
     return (
-        f"{RESTORE_ROLLBACK_NOTICE} The restore ended {sessions_revoked} open session(s) in the "
-        "store it placed, and the first engine start on this store ends every session again and "
-        "records the restore."
+        f"{RESTORE_ROLLBACK_NOTICE} The restore ended {sessions_revoked} unrevoked session(s), "
+        "expired ones included, in the store it placed. The first engine start on this store "
+        "revokes again the sessions it finds and raises the global session epoch, within the "
+        "limits docs/SECURITY.md, Limits of the session sweep, names, and records the restore."
     )
 
 
@@ -5896,7 +5909,7 @@ def _restore_blocking(
             try:
                 last_audit_at = newest_audit_time(snap)
             except sqlite3.Error as exc:
-                raise BackupError("restore", safe_exc(exc)) from exc
+                raise BackupError("restore", _sqlite_error_reason(exc)) from exc
             if max_age_seconds is not None:
                 _refuse_an_old_archive(
                     archive_created_at=archive_created_at,
@@ -5907,13 +5920,16 @@ def _restore_blocking(
             # ADR 0196 (C+): the restored store must not seal a single value under the archive's data
             # sub-key. That key's persisted count is the archive's, which may trail the key's real use
             # -- the primary kept sealing after the backup, and the ADR 0048 cold seed can run beside
-            # it. Dropping the salt here, after the checks and before the store is placed, makes its
-            # first open mint a new salt and so a new key. Old values name their own salt and still
-            # open with the DEK alone, and nothing about the key the DR site must hold changes.
+            # it. Dropping the salt here, after the checks and before the store is placed, makes a
+            # salt-binding first open mint a new salt and so a new key. An open that binds none, at
+            # least under `[store].aad_bind = false`, still seals under the DEK with the archive's
+            # count, so this requirement is not met there. forget_store_salt names those opens and
+            # says why old values open as before; nothing about the key the DR site must hold
+            # changes.
             try:
                 dropped = forget_store_salt(snap)
             except sqlite3.Error as exc:
-                raise BackupError("restore", safe_exc(exc)) from exc
+                raise BackupError("restore", _sqlite_error_reason(exc)) from exc
             if dropped and "store_salt" in row_counts:
                 # The counts were taken to check the archive; the summary reports the placed store.
                 row_counts = {**row_counts, "store_salt": 0}
@@ -5932,7 +5948,7 @@ def _restore_blocking(
                     restored_at=time.time(),
                 )
             except sqlite3.Error as exc:
-                raise BackupError("restore", safe_exc(exc)) from exc
+                raise BackupError("restore", _sqlite_error_reason(exc)) from exc
             row_counts = {**row_counts, "restore_marker": 1}
             # The second read of the store's names, while nothing is placed; its docstring says why
             # and what it misses.

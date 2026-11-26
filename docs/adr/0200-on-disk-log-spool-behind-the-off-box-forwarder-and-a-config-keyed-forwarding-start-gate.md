@@ -248,7 +248,9 @@ its statements no longer match the code; where they disagree, this amendment hol
   as TCP and TLS, so a `sendto` that raises a network error on this host, such as `ENETUNREACH`,
   is now counted as a failed send: spooled with a spool, counted as unsent without one, as on TCP
   and TLS. A datagram too large to send (`EMSGSIZE`) is not one of these; the next bullet covers
-  it. Unlike a stream socket, the UDP socket is kept, not reset. Not every loss on this host is detected:
+  it. Unlike a stream socket, the UDP socket is kept, not reset, after a failed send, unless it is
+  30 seconds old or more and the failure is not a name lookup: then the next send builds a new one
+  (BACKLOG #5923, a change made after this amendment). Not every loss on this host is detected:
   a datagram the kernel drops after `sendto` reported success is not. On Linux that can include a
   full local transmit queue or a neighbour address that never resolves (reasoned from the kernel,
   not measured). Nor is a datagram that leaves this host and never reaches the collector, which
@@ -271,7 +273,13 @@ its statements no longer match the code; where they disagree, this amendment hol
   after which the newest records are dropped and counted. Dropping each record as undeliverable
   instead would turn spool retention into a loss of log evidence for every cause that clears.
   A filter that refuses one record by its content or length with one of these errnos would hold
-  the spool head; that case is not handled (reasoned, not measured).
+  the spool head; that case is not handled (reasoned, not measured). Over TCP or TLS, a collector
+  that closes or resets the connection on one frame, one over its size limit for example, is not
+  handled either (BACKLOG #5923; reasoned, not measured). Where the frame fits the local send
+  buffer, the send succeeds, the entry is marked sent and is lost, and the next entry's send is
+  the one that fails. Where that entry's own send fails on every retry, it holds the spool head
+  for the life of the process: every later entry waits behind it, and once the spool is full
+  the newest records are dropped and counted in `spool_dropped`.
 - **With a spool, a UDP collector whose name lookup fails for a temporary reason at start is now
   deferred**, as a TCP or TLS collector that is not reachable yet is, instead of the process
   running with no forwarder. A name that does not exist is still permanent.

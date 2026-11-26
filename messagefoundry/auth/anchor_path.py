@@ -224,11 +224,20 @@ class WinSecurity:
     """One object's owner and DACL, as the reader recorded them.
 
     ``aces`` holds ``(type, flags, mask, sid)`` per entry, with ``sid`` empty for an entry type the
-    reader does not parse. ``aces is None`` is a NULL DACL. ``error`` is set when the read failed."""
+    reader does not parse, and ``mask`` 0 for a type outside ``_GRANTING_ACE_TYPES``
+    (:func:`dacl_entry_fields`). ``aces is None`` is a NULL DACL. ``error`` is set when the read
+    failed. ``aces`` then holds every entry the reader could read from that entry's own bytes, and
+    leaves out the rest; ``error`` gives the first reason. ``malformed`` holds the index of each
+    granting entry left out because its own bytes are too short for its rights or SID, so it may
+    grant rights to someone the reader cannot name. ``damaged`` is set when the DACL itself was read
+    but its contents could not be, as opposed to a read that was refused (:func:`dacl_entries` and
+    :func:`dacl_aces`)."""
 
     owner: str | None
     aces: tuple[tuple[int, int, int, str], ...] | None
     error: str | None = None
+    malformed: tuple[int, ...] = ()
+    damaged: bool = False
 
 
 @dataclass(frozen=True)
@@ -310,17 +319,31 @@ def evaluate_windows_object(
 ) -> list[ChainFinding]:
     """Every finding for one object in the chain. An empty list means the object is sound.
 
-    The entries are scanned before the owner, and past any entry the reader cannot judge, so a
-    definite insecure entry is never hidden behind an indeterminate one. Deny entries are ignored:
-    that can only make the rule refuse more, never less."""
-    if sec.error is not None:
-        return [ChainFinding(path, kind, False, f"its permissions could not be read: {sec.error}")]
-    if sec.aces is None:
+    A failed read comes first, then the definite findings, then the indeterminate ones. Every entry
+    is scanned, past any entry the reader cannot judge and past a failed read, so a definite
+    insecure entry or owner is never left out. A malformed granting entry is a definite finding:
+    whom it grants rights to cannot be read. Deny entries are ignored: that can only make the rule
+    refuse more, never less."""
+    if sec.aces is None and sec.error is None:
         return [ChainFinding(path, kind, True, "it has a null DACL, so everyone has full control")]
     mask = WIN_DIR_MASK if kind == DIRECTORY else WIN_FILE_MASK
-    insecure: list[ChainFinding] = []
+    failed = (
+        [ChainFinding(path, kind, False, f"its permissions could not be read: {sec.error}")]
+        if sec.error is not None
+        else []
+    )
+    insecure = [
+        ChainFinding(
+            path,
+            kind,
+            True,
+            f"entry {index} of its access list is malformed and may grant rights, and whom it "
+            "grants them to cannot be read",
+        )
+        for index in sec.malformed
+    ]
     unsure: list[ChainFinding] = []
-    for ace_type, flags, access, sid in sec.aces:
+    for ace_type, flags, access, sid in sec.aces or ():
         if ace_type not in _GRANTING_ACE_TYPES or flags & INHERIT_ONLY_ACE:
             continue
         bits = access & mask
@@ -381,7 +404,7 @@ def evaluate_windows_object(
                     owner=True,
                 )
             )
-    return insecure + unsure
+    return failed + insecure + unsure
 
 
 # =================================================================================================
@@ -1070,6 +1093,133 @@ class WinHost:
     drive_target: Callable[[str], str | None]
 
 
+def dacl_entry_fields(entry: bytes) -> tuple[int, int, int] | str:
+    """``(type, flags, mask)`` of one DACL entry, from the bytes it is given, or what those bytes
+    are too short to hold. :func:`dacl_entries` gives an entry only its own bytes: up to its
+    AceSize, or up to the DACL's end where its AceSize runs past it, or its header alone where its
+    AceSize is below 4.
+
+    Only a granting entry's mask is read, and the mask is 0 for any other type. At least
+    :func:`evaluate_windows_object` and ``restricted_file.py``'s link and holder checks read
+    :class:`WinSecurity` entries, and each skips every type that grants nothing; a new reader that
+    needs a deny entry's rights cannot get them here. An entry of a type Windows does not define
+    may be its 4-byte header alone, so reading a mask from it would read the next entry, or past
+    the DACL. Every granting type carries its mask right after the header. An allow entry must also
+    hold its whole SID, which starts at offset 8 and is 8 bytes plus 4 per sub-authority; the SID's
+    second byte, at offset 9, counts them. :func:`dacl_aces` renders that SID once this answers.
+    Kept free of ctypes so every platform tests it."""
+    if len(entry) < 4:
+        return "too short to hold its header"
+    ace_type, flags = entry[0], entry[1]
+    if ace_type not in _GRANTING_ACE_TYPES:
+        return ace_type, flags, 0
+    if len(entry) < 8:
+        return "too short to hold its rights"
+    if ace_type == ACCESS_ALLOWED_ACE_TYPE and (len(entry) < 16 or len(entry) < 16 + 4 * entry[9]):
+        return "too short to hold its SID"
+    return ace_type, flags, int.from_bytes(entry[4:8], "little")
+
+
+#: The ACL revisions Windows defines, ACL_REVISION (2) to ACL_REVISION_DS (4). ``GetAce`` refuses
+#: a DACL of any other revision, and so does :func:`dacl_entries`.
+_ACL_REVISIONS = frozenset({2, 3, 4})
+
+
+@dataclass(frozen=True)
+class DaclWalk:
+    """What :func:`dacl_entries` read of one DACL.
+
+    ``entries`` holds ``(index, type, flags, mask, sid_offset)`` per entry read, where ``index`` is
+    the entry's place in the DACL and ``sid_offset`` is where an allow entry's SID starts in the
+    DACL's bytes, ``None`` for any other type. ``reason`` is the first reason the read is
+    incomplete, or ``None``. ``malformed`` holds the index of each granting entry whose own bytes
+    are too short for its rights or SID."""
+
+    entries: tuple[tuple[int, int, int, int, int | None], ...]
+    reason: str | None = None
+    malformed: tuple[int, ...] = ()
+
+
+def dacl_entries(acl: bytes) -> DaclWalk:
+    """Each entry of one DACL, read from that entry's own bytes only.
+
+    ``acl`` is the DACL's bytes from its start. The walk is bounded by the smaller of ``len(acl)``
+    and the header's own AclSize, so bytes past the DACL are never read as an entry, whatever the
+    caller copied. A revision Windows does not define reads no entry.
+
+    The walk steps from entry to entry by each one's own AceSize, as ``GetAce`` does. An entry is
+    read from its own bytes: up to its AceSize, or up to the bound where its AceSize runs past it,
+    or its header alone where its AceSize is below 4. Bytes after an entry are never read as part
+    of it, so an entry too short for its body never takes its rights or SID from the next entry. A
+    granting entry too short for its rights or SID is left out and recorded as malformed, and the
+    walk goes on. An AceSize that cannot be trusted stops the walk: one below 4 would make every
+    later index read the same entry again, or the next entry from inside this one, and one past the
+    bound gives no next entry. Kept free of ctypes so every platform tests it."""
+    if len(acl) < 8:
+        return DaclWalk((), "its DACL is too short to hold its header")
+    # ACL header: revision, sbz1 (bytes), AclSize, AceCount, sbz2 (words).
+    if acl[0] not in _ACL_REVISIONS:
+        return DaclWalk((), f"its DACL has revision {acl[0]}, which Windows does not define")
+    bound = min(len(acl), int.from_bytes(acl[2:4], "little"))
+    if bound < 8:
+        return DaclWalk((), "its DACL is too short to hold its header")
+    count = int.from_bytes(acl[4:6], "little")
+    entries: list[tuple[int, int, int, int, int | None]] = []
+    malformed: list[int] = []
+    reasons: list[str] = []
+    offset = 8
+    for index in range(count):
+        if offset + 4 > bound:
+            reasons.append(f"entry {index} of its DACL starts past the end of the DACL")
+            break
+        size = int.from_bytes(acl[offset + 2 : offset + 4], "little")
+        if size < 4:
+            reasons.append(f"entry {index} of its DACL is shorter than an entry header")
+            end = offset + 4
+        elif offset + size > bound:
+            reasons.append(f"entry {index} of its DACL runs past the end of the DACL")
+            end = bound
+        else:
+            end = offset + size
+        fields = dacl_entry_fields(acl[offset:end])
+        if isinstance(fields, str):
+            reasons.append(f"entry {index} of its DACL is {fields}")
+            if acl[offset] in _GRANTING_ACE_TYPES:
+                malformed.append(index)
+        else:
+            ace_type, flags, mask = fields
+            sid_offset = offset + 8 if ace_type == ACCESS_ALLOWED_ACE_TYPE else None
+            entries.append((index, ace_type, flags, mask, sid_offset))
+        if end != offset + size:
+            break
+        offset += size
+    return DaclWalk(tuple(entries), reasons[0] if reasons else None, tuple(malformed))
+
+
+def dacl_aces(
+    walk: DaclWalk, render: Callable[[int], str | None]
+) -> tuple[tuple[tuple[int, int, int, str], ...], str | None]:
+    """The :class:`WinSecurity` entries from a :func:`dacl_entries` walk, and the first reason the
+    read is incomplete.
+
+    ``render`` gives the text of the SID at an offset in the DACL, or ``None`` when it will not
+    render. An allow entry whose SID will not render is left out, its reason is kept when the walk
+    gave none, and the entries after it are still kept, so a definite grant after it still counts.
+    Kept free of ctypes so every platform tests it."""
+    aces: list[tuple[int, int, int, str]] = []
+    reason = walk.reason
+    for index, ace_type, flags, mask, sid_offset in walk.entries:
+        sid = ""
+        if sid_offset is not None:
+            parsed = render(sid_offset)
+            if parsed is None:
+                reason = reason or f"the SID in entry {index} of its DACL could not be read"
+                continue
+            sid = parsed
+        aces.append((ace_type, flags, mask, sid))
+    return tuple(aces), reason
+
+
 def windows_host_readers() -> WinHost:
     """Build the in-process Windows readers. Every object, links included, is opened with
     ``FILE_FLAG_OPEN_REPARSE_POINT`` and read with ``GetSecurityInfo``, so a link's own owner and
@@ -1082,8 +1232,10 @@ def windows_host_readers() -> WinHost:
     import ctypes
     from ctypes import wintypes
 
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    from messagefoundry import win32_sid
+
+    # The SID, account and token prototypes this reader uses are shared with config/wiring.py's.
+    advapi32, kernel32 = win32_sid.sid_libraries()
     pvoid_p = ctypes.POINTER(ctypes.c_void_p)
     kernel32.CreateFileW.restype = wintypes.HANDLE
     kernel32.CreateFileW.argtypes = [
@@ -1095,11 +1247,6 @@ def windows_host_readers() -> WinHost:
         wintypes.DWORD,
         wintypes.HANDLE,
     ]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.LocalFree.restype = ctypes.c_void_p
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
     kernel32.GetDriveTypeW.restype = wintypes.UINT
     kernel32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
     kernel32.GetVolumeInformationW.restype = wintypes.BOOL
@@ -1124,50 +1271,10 @@ def windows_host_readers() -> WinHost:
         pvoid_p,
         pvoid_p,
     ]
-    advapi32.GetAce.restype = wintypes.BOOL
-    advapi32.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, pvoid_p]
-    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
-    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
-    advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
-    advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, pvoid_p]
-    advapi32.LookupAccountSidW.restype = wintypes.BOOL
-    advapi32.LookupAccountSidW.argtypes = [
-        wintypes.LPCWSTR,
-        ctypes.c_void_p,
-        wintypes.LPWSTR,
-        ctypes.POINTER(wintypes.DWORD),
-        wintypes.LPWSTR,
-        ctypes.POINTER(wintypes.DWORD),
-        ctypes.POINTER(ctypes.c_int),
-    ]
-    advapi32.OpenProcessToken.restype = wintypes.BOOL
-    advapi32.OpenProcessToken.argtypes = [
-        wintypes.HANDLE,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.HANDLE),
-    ]
-    advapi32.GetTokenInformation.restype = wintypes.BOOL
-    advapi32.GetTokenInformation.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD),
-    ]
-
     invalid_handle = wintypes.HANDLE(-1).value
 
     def sid_text(sid_ptr: int | None) -> str | None:
-        if not sid_ptr:
-            return None
-        out = wintypes.LPWSTR()
-        if not advapi32.ConvertSidToStringSidW(sid_ptr, ctypes.byref(out)):
-            return None
-        try:
-            return out.value
-        finally:
-            if out:
-                kernel32.LocalFree(ctypes.cast(out, ctypes.c_void_p))
+        return win32_sid.sid_text(advapi32, kernel32, sid_ptr)
 
     def win_error(code: int) -> str:
         return f"Win32 error {code} ({ctypes.FormatError(code).strip()})"
@@ -1206,26 +1313,15 @@ def windows_host_readers() -> WinHost:
             owner = sid_text(owner_ptr.value)
             if not dacl_ptr.value:
                 return WinSecurity(owner, None)
-            # ACL header: revision, sbz1 (bytes), size, count, sbz2 (words). Count is at offset 4.
-            count = ctypes.cast(dacl_ptr.value + 4, ctypes.POINTER(wintypes.WORD))[0]
-            aces: list[tuple[int, int, int, str]] = []
-            for index in range(count):
-                ace_ptr = ctypes.c_void_p()
-                if not advapi32.GetAce(dacl_ptr.value, index, ctypes.byref(ace_ptr)):
-                    return WinSecurity(owner, (), f"entry {index} of its DACL could not be read")
-                base = ace_ptr.value or 0
-                ace_type = ctypes.cast(base, ctypes.POINTER(ctypes.c_ubyte))[0]
-                ace_flags = ctypes.cast(base + 1, ctypes.POINTER(ctypes.c_ubyte))[0]
-                # Every granting entry type carries its access mask right after the 4-byte header.
-                ace_mask = ctypes.cast(base + 4, ctypes.POINTER(wintypes.DWORD))[0]
-                sid = ""
-                if ace_type == ACCESS_ALLOWED_ACE_TYPE:
-                    parsed = sid_text(base + 8)
-                    if parsed is None:
-                        return WinSecurity(owner, (), f"the SID in entry {index} could not be read")
-                    sid = parsed
-                aces.append((int(ace_type), int(ace_flags), int(ace_mask), sid))
-            return WinSecurity(owner, tuple(aces))
+            # Copy exactly the DACL's own AclSize bytes, from offset 2, and walk the copy, so no
+            # entry's size can carry a read past the DACL.
+            acl_size = ctypes.cast(dacl_ptr.value + 2, ctypes.POINTER(wintypes.WORD))[0]
+            acl = ctypes.create_string_buffer(ctypes.string_at(dacl_ptr.value, acl_size), acl_size)
+            walk = dacl_entries(acl.raw)
+            # Every entry the reader can read goes back with the first reason, so a definite grant
+            # among them is still judged (evaluate_windows_object).
+            aces, reason = dacl_aces(walk, lambda offset: sid_text(ctypes.addressof(acl) + offset))
+            return WinSecurity(owner, aces, reason, walk.malformed, reason is not None)
         finally:
             if sd_ptr.value:
                 kernel32.LocalFree(sd_ptr)
@@ -1242,27 +1338,6 @@ def windows_host_readers() -> WinHost:
         if fs_name.value.upper() not in ("NTFS", "REFS"):
             return f"it is a {fs_name.value} volume, whose permissions this check does not read"
         return None
-
-    def engine_sid() -> str | None:
-        token = wintypes.HANDLE()
-        if not advapi32.OpenProcessToken(
-            kernel32.GetCurrentProcess(),
-            0x0008,
-            ctypes.byref(token),  # TOKEN_QUERY
-        ):
-            return None
-        try:
-            size = wintypes.DWORD(0)
-            advapi32.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))  # TokenUser
-            if size.value == 0:
-                return None
-            buf = ctypes.create_string_buffer(size.value)
-            if not advapi32.GetTokenInformation(token, 1, buf, size.value, ctypes.byref(size)):
-                return None
-            # TOKEN_USER is SID_AND_ATTRIBUTES; the SID pointer comes first.
-            return sid_text(ctypes.cast(buf, pvoid_p)[0])
-        finally:
-            kernel32.CloseHandle(token)
 
     def administrators_name() -> str | None:
         # NetLocalGroupGetMembers takes a NAME, and the group's name is localized.
@@ -1381,7 +1456,8 @@ def windows_host_readers() -> WinHost:
             return True  # a SID found in a partial read is still a member
         return False if complete else None
 
-    return WinHost(read_security, volume_cause, engine_sid(), admin_member, query_drive_target)
+    engine_sid = win32_sid.process_user_sid(advapi32, kernel32)
+    return WinHost(read_security, volume_cause, engine_sid, admin_member, query_drive_target)
 
 
 def _windows_host_verdict(path: str) -> PathVerdict:

@@ -136,8 +136,10 @@ def test_the_drains_close_their_stream_at_eof(tmp_path: Path) -> None:
     """Each drain owns its stream and closes it when it ends, so nothing else has to."""
     out = io.BytesIO(b"")
     sink: queue.Queue[Any] = queue.Queue()
-    _session(str(tmp_path))._reader_loop(out, sink)
+    eof_at: list[float] = []
+    _session(str(tmp_path))._reader_loop(out, sink, eof_at)
     assert out.closed
+    assert len(eof_at) == 1  # the EOF is stamped as well as closed (vault BACKLOG #3135 step 7)
     err = io.BytesIO(b"partial line")
     sandbox_mod._StderrRelay("IB_T", 1, 1).run(err)
     assert err.closed

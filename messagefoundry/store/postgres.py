@@ -294,6 +294,7 @@ from messagefoundry.store.store import (
     FederatedUnbind,
     FullAuthenticationWrite,
     InboundMetrics,
+    InjectAudit,
     KeptSessionRestamp,
     LatencyHistogram,
     LockoutCounter,
@@ -343,6 +344,7 @@ from messagefoundry.store.store import (
     _session_cap_groups,
     _transit_attestation_row,
     ad_map_write_async,
+    ad_scope_replacement,
     admin_guard_counts,
     append_rename_audits,
     approval_fails_seal_async,
@@ -1625,15 +1627,20 @@ _PG_SESSION_RESEAL: Final = (
     " client=$6, reauth_at=$7, mfa_verified_at=$8, auth_mechanism=$9, idp_auth_time=$10,"
     " user_epoch=$11, global_epoch=$12, seal=$13 WHERE token_hash=$14 AND seal=$15"
 )
-# Vault BACKLOG #3028: store.py's three session lineage statements respelled for `$n`. store.py says
+# Vault BACKLOG #3028: store.py's three session lineage statements respelled for `$n`, stamping and
+# measuring `retired_at` on this server's clock, `_PG_EPOCH_NOW` (vault BACKLOG #4276). store.py says
 # which method runs each, and that no other statement names the table.
 _PG_SESSION_LINEAGE_INSERT: Final = (
-    "INSERT INTO session_lineage (retired_hash, successor_hash, retired_at) VALUES ($1,$2,$3)"
+    "INSERT INTO session_lineage (retired_hash, successor_hash, retired_at)"
+    f" VALUES ($1,$2,{_PG_EPOCH_NOW})"
 )
 _PG_SESSION_LINEAGE_SUCCESSOR: Final = (
-    "SELECT successor_hash FROM session_lineage WHERE retired_hash=$1 AND retired_at >= $2"
+    "SELECT successor_hash FROM session_lineage WHERE retired_hash=$1"
+    f" AND retired_at >= {_PG_EPOCH_NOW} - $2::double precision"
 )
-_PG_SESSION_LINEAGE_PURGE: Final = "DELETE FROM session_lineage WHERE retired_at < $1"
+_PG_SESSION_LINEAGE_PURGE: Final = (
+    f"DELETE FROM session_lineage WHERE retired_at < {_PG_EPOCH_NOW} - $1::double precision"
+)
 #: The whole-account session sweep: revoke and blank the seal (BACKLOG #2592). Each caller raises
 #: the account's session epoch in the same transaction.
 _PG_REVOKE_USER_SESSIONS_SQL: Final = (
@@ -1964,7 +1971,9 @@ def _per_connection_ssl_connect(
     Windows, walks the system certificate store. It is bounded by ``connect_timeout``, since it runs
     before asyncpg's own connect timeout starts. ``asyncpg_module.connect`` is looked up per call,
     which keeps a test's stand-in module usable without a ``connect``."""
-    timeout = settings.connect_timeout or None
+    # At least 1: the load refuses 0, which asyncpg would read as a deadline already past (BACKLOG
+    # #5769), so there is no "no bound" spelling to map to None.
+    timeout = settings.connect_timeout
     files = [
         name
         for name, value in (
@@ -2078,6 +2087,25 @@ def _refuse_store_revocation(
 
 class PostgresStore(ServerCipherWalk):
     """PostgreSQL-backed durable queue (the :class:`Store` protocol). Open with :meth:`open`."""
+
+    #: Keys published to ``_state_cache`` while a :meth:`purge_state` pass runs, from its start to its
+    #: post-release eviction, one set per pass in flight (BACKLOG #5734). Empty, so free, otherwise.
+    #: A tuple, so the class default is never shared mutable state. A converge publish is not noted:
+    #: a converge pass publishes rows it may have read before the DELETE, so it is not evidence that
+    #: the row survived. :meth:`purge_state` says which publishes are.
+    _state_purge_watches: tuple[set[tuple[str, str]], ...] = ()
+
+    def _note_state_published(self, ck: tuple[str, str]) -> None:
+        """Record that ``ck`` was just published to the state cache, for any purge pass in
+        flight."""
+        for touched in self._state_purge_watches:
+            touched.add(ck)
+
+    def _publish_state_cache(self, applied: Sequence[tuple[tuple[str, str], Any]]) -> None:
+        """Publish committed transform-state writes to the read-through cache, after the commit."""
+        for ck, cv in applied:
+            self._state_cache[ck] = cv
+            self._note_state_published(ck)
 
     # Postgres implements the full staged ingress pipeline (enqueue_ingress/route_handoff/
     # transform_handoff), so the engine starts the staged runner on this backend.
@@ -4947,7 +4975,7 @@ class PostgresStore(ServerCipherWalk):
         metadata: str | None = None,
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
-        audit: OperatorAudit[str] | None = None,
+        audit: InjectAudit | None = None,
         origin: MessageOrigin = MessageOrigin.PARTNER,
         origin_actor: str | None = None,
     ) -> str:
@@ -4962,7 +4990,7 @@ class PostgresStore(ServerCipherWalk):
         skeleton row — the two-object commit's second half — AND its ``message_attachment`` linkage row is
         inserted (Phase 3a). A missing ref fails loud → the whole ingress rolls back → no ACK for a body
         we couldn't reference. Empty/None → the byte-identical no-detach path."""
-        audit = require_ingress_audit(audit, origin)  # BACKLOG #5071
+        audit = require_ingress_audit(audit, origin, origin_actor)  # BACKLOG #5071, #6589
         now = time.time() if now is None else now
         mid = uuid4().hex
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
@@ -5315,8 +5343,7 @@ class PostgresStore(ServerCipherWalk):
                 # snapshot. The lock is taken inside this txn, so it auto-releases at commit.
                 await self._maybe_finalize_message(conn, message_id, now)
         # Commit succeeded → publish the committed state writes to the read-through cache.
-        for ck, cv in applied:
-            self._state_cache[ck] = cv
+        self._publish_state_cache(applied)
         # The writer records its own new per-namespace versions so its own converge_state_cache() skips
         # re-reading the namespaces it just wrote (Track B Step 6b).
         self._record_own_state_bumps(bumped)
@@ -7539,6 +7566,7 @@ class PostgresStore(ServerCipherWalk):
         :class:`~messagefoundry.store.base.ConnectionFlagLockTimeout`, and the transaction rolls
         back. Where a non-zero ``command_timeout`` is at or under the bound, that ends the wait
         first, as asyncpg's own timeout, not retried."""
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         now = time.time() if now is None else now
         bound = CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS
         async with (
@@ -7560,28 +7588,33 @@ class PostgresStore(ServerCipherWalk):
                 if driver_sqlstate(exc) == _LOCK_NOT_AVAILABLE:
                     raise ConnectionFlagLockTimeout(self.backend, bound) from exc
                 raise
-            await self._append_operator_audit(conn, written, if_applied(audit), True)
+            await self._append_operator_audit(conn, written, audit_row, True)
 
     async def list_connection_flags(self) -> set[tuple[str, str]]:
         """See :meth:`messagefoundry.store.base.QueueStore.list_connection_flags`."""
         rows = await self._fetchall("SELECT connection, direction FROM connection_flag")
         return {(str(r["connection"]), str(r["direction"])) for r in rows}
 
-    async def _alert_write(self, sql: str, *params: Any, audit: AuditAppend, now: float) -> bool:
+    async def _alert_write(
+        self, sql: str, *params: Any, audit_row: OperatorAudit[bool], now: float
+    ) -> bool:
         """One operator alert UPDATE with its audit row, in one transaction (vault BACKLOG #3217).
-        The row is appended only when the UPDATE matched, so a 404 writes nothing."""
+        The row is appended only when the UPDATE matched, so a 404 writes nothing. ``audit_row`` is
+        the caller's :func:`if_applied`, taken as its first statement, so a missing row was refused
+        before this borrows a connection (BACKLOG #6589)."""
         async with (
             AuditedWrite(now) as written,
             self._timed_acquire(record=False) as conn,
             conn.transaction(),
         ):
             applied = _rowcount(await conn.execute(sql, *params)) > 0
-            await self._append_operator_audit(conn, written, if_applied(audit), applied)
+            await self._append_operator_audit(conn, written, audit_row, applied)
         return applied
 
     async def ack_alert_instance(
         self, alert_id: int, *, actor: str, audit: AuditAppend, now: float | None = None
     ) -> bool:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         now = time.time() if now is None else now
         return await self._alert_write(
             "UPDATE alert_instance SET status='acknowledged', acked_by=$1, acked_at=$2"
@@ -7589,20 +7622,21 @@ class PostgresStore(ServerCipherWalk):
             actor,
             now,
             alert_id,
-            audit=audit,
+            audit_row=audit_row,
             now=now,
         )
 
     async def resolve_alert_instance(
         self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> bool:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         now = time.time() if now is None else now
         return await self._alert_write(
             "UPDATE alert_instance SET status='resolved', resolved_at=$1"
             " WHERE id=$2 AND status<>'resolved'",
             now,
             alert_id,
-            audit=audit,
+            audit_row=audit_row,
             now=now,
         )
 
@@ -7681,13 +7715,14 @@ class PostgresStore(ServerCipherWalk):
     async def suspend_alert_instance(
         self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # #143 windowed suspend (NOTIFICATION-only): set suspended_until on a live instance. Refuses a
         # resolved one; returns the updated row (for the API echo + seeding the sink cache) or None.
         if not await self._alert_write(
             "UPDATE alert_instance SET suspended_until=$1 WHERE id=$2 AND status<>'resolved'",
             until,
             alert_id,
-            audit=audit,
+            audit_row=audit_row,
             now=time.time() if now is None else now,
         ):
             return None
@@ -7696,11 +7731,12 @@ class PostgresStore(ServerCipherWalk):
     async def resume_alert_instance(
         self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # #143: clear a windowed suspend. Idempotent; returns the row or None (unknown/already resolved).
         if not await self._alert_write(
             "UPDATE alert_instance SET suspended_until=NULL WHERE id=$1 AND status<>'resolved'",
             alert_id,
-            audit=audit,
+            audit_row=audit_row,
             now=time.time() if now is None else now,
         ):
             return None
@@ -11793,6 +11829,21 @@ class PostgresStore(ServerCipherWalk):
         change = scope_withdrawal(expected_scope, now)
         return await self._write_user_txn(user_id, change) is not None
 
+    async def set_ad_channel_scope_if_unchanged(
+        self,
+        user_id: str,
+        scope_json: str,
+        *,
+        expected_scope: str | None,
+        expected_source: ChannelScopeSource | None,
+        now: float | None = None,
+    ) -> bool:
+        """The AD sign-in's compare-and-set scope write (BACKLOG #6887); see ``AuthStore``. The
+        compare is ``ad_scope_replacement``'s, in Python, so it is byte-exact."""
+        now = time.time() if now is None else now
+        change = ad_scope_replacement(scope_json, expected_scope, expected_source, now)
+        return await self._write_user_txn(user_id, change) is not None
+
     async def set_user_federated_subject(
         self,
         user_id: str,
@@ -12250,25 +12301,21 @@ class PostgresStore(ServerCipherWalk):
             written = await self._write_session(conn, token_hash, stamp)
         return written is not None and stamp.anchored
 
-    async def rotate_session(
-        self, token_hash: str, *, new_token_hash: str, now: float | None = None
-    ) -> bool:
+    async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
         The token hash is sealed, so the re-key goes through :meth:`_write_session` (BACKLOG
         #2592). The lineage link goes in the same transaction, only when the re-key landed (vault
-        BACKLOG #3028), its time read once the re-key has landed, after any wait for the borrow
-        or the row lock. The answer is read after the transaction has committed. The borrow is
-        :meth:`_after_commit_txn`'s, for the reason it gives."""
+        BACKLOG #3028), its time this server's clock when the link's own statement runs (vault
+        BACKLOG #4276), after any wait for the borrow or the row lock. The answer is read after
+        the transaction has committed. The borrow is :meth:`_after_commit_txn`'s, for the reason
+        it gives."""
         async with self._after_commit_txn() as conn:
             rotated = await self._write_session(
                 conn, token_hash, lambda s: replace(s, token_hash=new_token_hash)
             )
             if rotated is not None:
-                retired_at = time.time() if now is None else now
-                await conn.execute(
-                    _PG_SESSION_LINEAGE_INSERT, token_hash, new_token_hash, retired_at
-                )
+                await conn.execute(_PG_SESSION_LINEAGE_INSERT, token_hash, new_token_hash)
         return rotated is not None
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None:
@@ -12280,7 +12327,7 @@ class PostgresStore(ServerCipherWalk):
         )
 
     async def supersede_session(
-        self, token_hash: str, *, now: float, lineage_since: float | None = None
+        self, token_hash: str, *, now: float, lineage_seconds: float | None = None
     ) -> SessionRecord | None:
         """Revoke and return, one statement per step, in one transaction (BACKLOG #2146, vault
         BACKLOG #3028). See :meth:`AuthStore.supersede_session`.
@@ -12288,6 +12335,7 @@ class PostgresStore(ServerCipherWalk):
         Each step's ``UPDATE ... RETURNING`` locks the row it ends. Under READ COMMITTED each
         statement reads what has committed when it starts, so a rotation that commits while the
         walk runs is seen by the next step's lineage read. The borrow stays bounded, as it was."""
+        started = time.monotonic()  # before the borrow, so its wait cannot shorten the window
         async with self._timed_acquire(record=False) as conn, conn.transaction():
 
             async def _revoke(h: str) -> SessionRecord | None:
@@ -12299,13 +12347,17 @@ class PostgresStore(ServerCipherWalk):
                 )
                 return SessionRecord.from_mapping(dict(d)) if d else None
 
-            async def _successor(h: str, since: float) -> str | None:
-                found = await conn.fetchval(_PG_SESSION_LINEAGE_SUCCESSOR, h, since)
+            async def _successor(h: str, seconds: float) -> str | None:
+                found = await conn.fetchval(_PG_SESSION_LINEAGE_SUCCESSOR, h, seconds)
                 return None if found is None else str(found)
 
             try:
                 return await revoke_through_lineage(
-                    token_hash, lineage_since=lineage_since, revoke=_revoke, successor=_successor
+                    token_hash,
+                    lineage_seconds=lineage_seconds,
+                    started=started,
+                    revoke=_revoke,
+                    successor=_successor,
                 )
             except RowSealError as exc:
                 # BACKLOG #5505: only the read-back refused the row, so the block exits cleanly
@@ -12521,7 +12573,9 @@ class PostgresStore(ServerCipherWalk):
                 float(idle_seconds),
             )
         if lineage_seconds is not None:
-            await self._execute(_PG_SESSION_LINEAGE_PURGE, now - float(lineage_seconds))
+            # Measured back from this server's clock, as the supersession measures its window,
+            # never from ``now`` (vault BACKLOG #4276).
+            await self._execute(_PG_SESSION_LINEAGE_PURGE, float(lineage_seconds))
         return purged
 
     # --- retention / purge + maintenance (PHI.md §8) -------------------------
@@ -12866,21 +12920,41 @@ class PostgresStore(ServerCipherWalk):
 
         One ``DELETE ... RETURNING`` names exactly the rows it removed (BACKLOG #5734). A SELECT of the
         expired keys followed by a separate DELETE would list a key a concurrent ``state_set`` refreshed
-        between the two, so the cache would drop a key whose row survives."""
+        between the two, so the cache would drop a key whose row survives.
+
+        The eviction runs after the connection is released, an await later than the DELETE, so a
+        same-key write that commits and publishes in that window would be evicted while its row
+        survives. So a watched publish of a key, at any point from the start of the pass to its
+        eviction, keeps that key cached (BACKLOG #5734). The watch belongs to this store handle. At
+        least a publish of this handle's own committed writes (``_publish_state_cache``) is watched. A
+        :meth:`converge_state_cache` publish, which is how a sibling engine shard's write reaches this
+        process, is not: a purged key a converge pass republishes in that window is evicted whether
+        or not its row survives. The reverse also holds: a converge that read a purged row before the
+        DELETE and publishes it after the eviction leaves its deleted value cached until a later
+        converge reseeds the namespace; the watch does not close that. Keeping a watched key is sound
+        only under the cutoff premise that :meth:`~messagefoundry.store.base.QueueStore.purge_state`
+        states; a cutoff near the present could keep a cached value whose row the DELETE removed."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn, conn.transaction():
-            rows = await conn.fetch(
-                "DELETE FROM state WHERE set_at < $1 RETURNING namespace, key", older_than
+        touched: set[tuple[str, str]] = set()
+        self._state_purge_watches = (*self._state_purge_watches, touched)
+        try:
+            async with self._timed_acquire() as conn, conn.transaction():
+                rows = await conn.fetch(
+                    "DELETE FROM state WHERE set_at < $1 RETURNING namespace, key", older_than
+                )
+                purged_keys = [(r["namespace"], r["key"]) for r in rows]
+                bumped: list[tuple[str, int]] = []
+                if self._cluster_state_convergence:
+                    bumped = await self._bump_state_versions(conn, (n for n, _ in purged_keys), now)
+            # Commit succeeded → evict the purged keys from the read-through cache.
+            for ck in purged_keys:
+                # `in` + `del`, not pop(): pop would decrypt each purged value just to drop it (#1174).
+                if ck not in touched and ck in self._state_cache:
+                    del self._state_cache[ck]
+        finally:
+            self._state_purge_watches = tuple(
+                w for w in self._state_purge_watches if w is not touched
             )
-            purged_keys = [(r["namespace"], r["key"]) for r in rows]
-            bumped: list[tuple[str, int]] = []
-            if self._cluster_state_convergence:
-                bumped = await self._bump_state_versions(conn, (n for n, _ in purged_keys), now)
-        # Commit succeeded → evict the purged keys from the read-through cache.
-        for ck in purged_keys:
-            # `in` + `del`, not pop(): pop would decrypt each purged value just to drop it (#1174).
-            if ck in self._state_cache:
-                del self._state_cache[ck]
         # Record this node's new per-namespace versions so its own converge skips re-reading them.
         self._record_own_state_bumps(bumped)
         return len(purged_keys)

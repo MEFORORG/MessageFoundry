@@ -94,15 +94,17 @@ from types import (
     TracebackType,
     WrapperDescriptorType,
 )
-from typing import Any, Final, TypeGuard
+from typing import Any, Final, NamedTuple, TypeGuard
 
 __all__ = [
+    "UNDER_A_DRIVER_ERROR",
     "RepeatedKeyError",
     "args_hold_a_message",
     "clamp_untrusted",
     "codec_safe_line",
     "codec_safe_str",
     "driver_sqlstate_of",
+    "engine_text_only",
     "is_a_sqlite_error",
     "known_driver_error",
     "json_loads_or_refusal",
@@ -120,8 +122,10 @@ __all__ = [
     "safe_exc",
     "safe_name",
     "safe_text",
+    "redact_bounded_head",
     "safe_text_bound",
     "safe_traceback",
+    "shown_class_name",
     "sqlite_errorname_of",
     "sqlstate_text",
 ]
@@ -2000,15 +2004,16 @@ def _mask_stray_end_tags(text: str, lo: int, hi: int, mask: bool, *, noted: bool
     return "".join(out)
 
 
-def _redact_structured(text: str, *, widened: bool, masks: bool = True) -> str:
+def _redact_structured(text: str, *, widened: bool, masks: bool = True, noted: bool = False) -> str:
     """The structured-shape passes, run on everything but this module's own trailing notes
-    (:data:`_TRAILING_NOTES`); ``masks`` is :func:`_redact_xml_elements`'s."""
+    (:data:`_TRAILING_NOTES`); ``masks`` is :func:`_redact_xml_elements`'s. ``noted`` is
+    :func:`_redact_noted`'s: a bound note the caller appends follows ``text``."""
     body = _without_trailing_note(text)
     tail = text[len(body) :]
     body = _redact_json_fields(body, widened=widened)
     body = _redact_dicom_tags(body, widened=widened)
     body = _redact_dicom_labels(body, widened=widened)
-    return _redact_xml_elements(body, masks=masks, noted=bool(tail)) + tail
+    return _redact_xml_elements(body, masks=masks, noted=bool(tail) or noted) + tail
 
 
 def redact(text: str) -> str:
@@ -2087,16 +2092,35 @@ def redact(text: str) -> str:
     **A JSON value with a mismatched closer makes the whole text redacted (BACKLOG #5814)**: the
     result is the placeholder alone. The JSON pass reads what the passes before it left, so this
     holds for a closer that pass still sees as mismatched."""
+    return _redact_noted(text, noted=False)
+
+
+def _redact_noted(text: str, *, noted: bool) -> str:
+    """:func:`redact`, told whether the caller appends this module's bound note right after
+    ``text`` (BACKLOG #5925). ``noted`` is the out-of-band form of the trailing note the passes find
+    in the text on the clamp route (:func:`_without_trailing_note`): with it, a value that ends
+    ``text`` is judged as one a note follows, so the end-of-text refusals that keep a value a
+    caller's text could be glued onto do not keep it, and it is masked.
+
+    For :func:`safe_text` and ``verify_leaf.safe_detail_text``, which redact a clamped head and
+    append its note after. Out of band, because the note is not in the text the passes read: a
+    stand-in note written into the text changed a whole-text gate in :func:`_redact_unguarded`
+    (a final ``bearer`` then read as a scheme), which the earlier attempt at this fix found. A
+    trailing note already in ``text`` is still the one the passes read, and ``noted`` then changes
+    nothing for the value before it. ``noted`` turns end-of-text refusals off, so a value they kept
+    is masked. A mask can still change what a later pass or round reads (:func:`_masked_only`), so
+    that the answer only hides more is a measurement, not a proof: the differential tests in
+    ``tests/test_redaction_clamp_note_end.py`` measure it on their inputs."""
     try:
-        return _redact_unguarded(text)
+        return _redact_unguarded(text, noted=noted)
     except _MismatchedJsonCloser:
         return _REDACTED
 
 
-def _redact_unguarded(text: str) -> str:
+def _redact_unguarded(text: str, *, noted: bool = False) -> str:
     """:func:`redact` without its mismatched-closer rule, which raises :class:`_MismatchedJsonCloser`
-    out of here."""
-    out = _redact_stages(text)
+    out of here. ``noted`` is :func:`_redact_noted`'s."""
+    out = _redact_stages(text, noted=noted)
     if "%" not in out or _ENCODED_SEPARATOR.search(out) is None:
         return out
     if _HL7_ENCODED_FIELD_RUN.search(out) is None:
@@ -2112,16 +2136,17 @@ def _redact_unguarded(text: str) -> str:
         or _CREDENTIAL_AHEAD.search(out) is not None
     ):
         return out
-    return _redact_stages(_HL7_ENCODED_FIELD_RUN.sub(_REDACTED, out))
+    return _redact_stages(_HL7_ENCODED_FIELD_RUN.sub(_REDACTED, out), noted=noted)
 
 
-def _redact_stages(text: str) -> str:
+def _redact_stages(text: str, *, noted: bool = False) -> str:
     """The two stages of :func:`redact`: the #1711 passes to their fixed point, then the widened ones
-    when :func:`_needs_widened_stage` says a widened rule could match."""
-    first = _redact_rounds(text, widened=False)
+    when :func:`_needs_widened_stage` says a widened rule could match. ``noted`` is
+    :func:`_redact_noted`'s."""
+    first = _redact_rounds(text, widened=False, noted=noted)
     if not _needs_widened_stage(first):
         return first
-    return _redact_rounds(first, widened=True)
+    return _redact_rounds(first, widened=True, noted=noted)
 
 
 #: A JSON key the widened stage reads differently: ``name``/``address`` (the shape rule) and a group
@@ -2162,22 +2187,23 @@ def _needs_widened_stage(text: str) -> bool:
     return "mrn" in text.lower() and _MRN_LABELLED.search(text) is not None
 
 
-def _redact_rounds(text: str, *, widened: bool) -> str:
+def _redact_rounds(text: str, *, widened: bool, noted: bool = False) -> str:
     """One stage of :func:`redact`: the flat and structured passes, repeated until the structured
     passes change nothing but end-tag masks (:func:`_masked_only`), for at most
-    :data:`_STRUCTURED_ROUNDS` rounds; if they run out, the flat passes run once more."""
+    :data:`_STRUCTURED_ROUNDS` rounds; if they run out, the flat passes run once more. ``noted`` is
+    :func:`_redact_noted`'s."""
     credentials = not widened
     for _ in range(_STRUCTURED_ROUNDS):
         if not text:
             return text
-        flat = _redact_flat(text, widened=widened, credentials=credentials)
-        text = _redact_structured(flat, widened=widened)
-        if text == flat or _masked_only(text, flat, widened=widened):
+        flat = _redact_flat(text, widened=widened, credentials=credentials, noted=noted)
+        text = _redact_structured(flat, widened=widened, noted=noted)
+        if text == flat or _masked_only(text, flat, widened=widened, noted=noted):
             return text
-    return _redact_flat(text, widened=widened, credentials=credentials)
+    return _redact_flat(text, widened=widened, credentials=credentials, noted=noted)
 
 
-def _masked_only(text: str, flat: str, *, widened: bool) -> bool:
+def _masked_only(text: str, flat: str, *, widened: bool, noted: bool = False) -> bool:
     """Whether the structured passes turned ``flat`` into ``text`` only by masking end-tag rests in
     place (:func:`_end_tag_rest`, BACKLOG #5925): with every rest kept, they would have changed
     nothing, so the round ends.
@@ -2194,7 +2220,7 @@ def _masked_only(text: str, flat: str, *, widened: bool) -> bool:
     return (
         len(text) == len(flat)
         and text.translate(_SHAPE) == flat.translate(_SHAPE)
-        and _redact_structured(flat, widened=widened, masks=False) == flat
+        and _redact_structured(flat, widened=widened, masks=False, noted=noted) == flat
     )
 
 
@@ -2385,7 +2411,7 @@ _TRAILING_SPACE = re.compile(r"\s*+\Z")
 
 
 def _glued_value(
-    text: str, body: str, run: re.Match[str], field_run: re.Pattern[str]
+    text: str, body: str, run: re.Match[str], field_run: re.Pattern[str], *, noted: bool = False
 ) -> str | None:
     """The rest of a PHI or credential value that the field run ``run`` cut through, when it is safe
     to mask: the text after the token, up to the value's terminator. ``None`` leaves the plain
@@ -2410,10 +2436,15 @@ def _glued_value(
     that ends on a vocabulary end tag's name masks that tag's rest (:func:`_glued_end_tag_rest`,
     BACKLOG #5925); it reads only such a token, which no credential label ends. Only where both
     decline does a credential label at the token's end mask the next word, so the credential arm
-    adds a mask to an answer and never takes one away."""
+    adds a mask to an answer and never takes one away.
+
+    ``noted`` (:func:`_redact_noted`) says the caller appends a note after ``text``. It counts only
+    where ``text`` holds no trailing note of its own, so ``body`` is ``text`` and a value ending it
+    is the one that note follows; a note in the text stays the one the value before it is judged
+    by."""
     token, end = run.group(), run.end()
     # Only a value whose last character ends body sits right before a note's joiner.
-    noted = len(body) < len(text)
+    noted = len(body) < len(text) or noted
     stop = _glued_phi_value_end(text, body, token, end)
     if stop is not None:
         on_body = noted and stop == len(body)
@@ -2593,10 +2624,13 @@ def _maskable_rest(
     return rest
 
 
-def _scrub_field_runs(text: str, field_run: re.Pattern[str] | None = None) -> str:
+def _scrub_field_runs(
+    text: str, field_run: re.Pattern[str] | None = None, *, noted: bool = False
+) -> str:
     """``field_run`` (:data:`_HL7_FIELD_RUN` by default, read at call time) replaced by the
     placeholder, and masked in place after a run: the rest of a PHI or credential value it cut
-    through, and the rest of a vocabulary end tag whose name it took (:func:`_glued_value`)."""
+    through, and the rest of a vocabulary end tag whose name it took (:func:`_glued_value`, which
+    reads ``noted``)."""
     if field_run is None:
         field_run = _HL7_FIELD_RUN
     if _USERINFO_OPENER in text:
@@ -2615,7 +2649,7 @@ def _scrub_field_runs(text: str, field_run: re.Pattern[str] | None = None) -> st
         if candidate:
             if body is None:
                 body = _without_trailing_note(text)
-            rest = _glued_value(text, body, run, field_run)
+            rest = _glued_value(text, body, run, field_run, noted=noted)
         if rest is not None:
             out.append(rest.translate(_SHAPE))
             pos += len(rest)
@@ -2625,7 +2659,7 @@ def _scrub_field_runs(text: str, field_run: re.Pattern[str] | None = None) -> st
     return "".join(out)
 
 
-def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
+def _redact_flat(text: str, *, widened: bool, credentials: bool, noted: bool = False) -> str:
     """Every pass but the structured ones: the credential backstop, the HL7 shapes, a labelled MRN
     (``widened`` only), dates and names. One stage of :func:`redact` is this plus
     :func:`_redact_structured`, repeated to a fixed point.
@@ -2646,11 +2680,13 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     **What is not re-checked, stated because the reason above is easy to over-read.** A credential
     span that only a WIDENED scrub completes (one that removes an escaped line break inside a ``name``
     string, joining an opener's line to its ``@``) is not re-checked: #1711 did not catch that
-    either."""
+    either.
+
+    ``noted`` is :func:`_redact_noted`'s, read by the field-run arms (:func:`_glued_value`)."""
     if credentials:
         text = _INVALID_URL_USERINFO.sub(lambda m: f"{m.group(1)}{_REDACTED}@", text)
     scrubbed = _HL7_SEGMENT.sub(lambda m: f"{m.group(1)}|{_REDACTED}", text)
-    scrubbed = _scrub_field_runs(scrubbed)
+    scrubbed = _scrub_field_runs(scrubbed, noted=noted)
     # BACKLOG #1572. The passes above assume `| ^ ~ &`; MSH DECLARES the real set per message, so a
     # feed using `*` and `$` kept its identifiers. Sniff, and run a separator-aware pass only when the
     # declared set reaches outside the defaults — widening the hardcoded class instead would have been
@@ -2663,7 +2699,7 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     if not declared <= _DEFAULT_DELIMITERS:
         segment, field_run = _delimiter_patterns(declared | _DEFAULT_DELIMITERS)
         scrubbed = segment.sub(lambda m: f"{m.group(1)}{m.group(2)}{_REDACTED}", scrubbed)
-        scrubbed = _scrub_field_runs(scrubbed, field_run)
+        scrubbed = _scrub_field_runs(scrubbed, field_run, noted=noted)
     # Before the name run, which would otherwise take the label of `PATIENT MRN 12345` and leave the
     # number behind (BACKLOG #2079).
     if widened:
@@ -2808,15 +2844,35 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     and loses how much was cut. Before BACKLOG #1797 the limit cut the kept string itself and left it
     unterminated, which a further pass scrubbed the same way.
 
-    **The head is redacted without the note this call appends after it**, so a value the bound
-    left last is judged as ending the text, and a digit-bearing one prints in front of the note
-    (``a|b|mrn: 12345`` cut by the bound). Reading a stand-in note after the head was tried under
-    BACKLOG #5925 and withdrawn: the stand-in's line break let a whole-text gate in
-    :func:`_redact_unguarded` read a final ``bearer`` as a scheme, which switched off a scrub the
-    answer without it made."""
+    **The head is redacted knowing the bound note this call appends after it** (BACKLOG #5925), so
+    a value the bound left last is not judged as ending the text: a digit-bearing one such as
+    ``a|b|mrn: 12345`` cut by the bound is masked, as the clamp route masks it. The note is passed
+    out of band (:func:`_redact_noted`), not written into the head: a stand-in note in the text let
+    a whole-text gate in :func:`_redact_unguarded` read a final ``bearer`` as a scheme, which
+    switched off a scrub the answer without it made. A text that fits the window has no note, and
+    is redacted as before. :func:`redact_bounded_head` holds this part."""
     head, note = safe_text_bound(text)
-    message = _held_back(redact(head).strip(), limit)
-    return f"{message}{note}"
+    return f"{_held_back(redact_bounded_head(head, note), limit)}{note}"
+
+
+def redact_bounded_head(head: str, note: str) -> str:
+    """``head``, the part of a text a bound cut kept, redacted knowing that ``note``, the bound
+    note appended after it, follows (BACKLOG #5925), and stripped. ``note`` is ``""`` when nothing
+    was cut, and ``head`` is then redacted as :func:`redact` redacts any text.
+
+    One place for what :func:`safe_text` and ``verify_leaf.safe_detail_text`` each do with a head
+    they bound, so the two answer alike (the off-box audit tee does not use it; its
+    ``_bounded_detail`` says why):
+    ``_held_back(redact_bounded_head(head, note), limit) + note`` is ``safe_text(text, limit=limit)``
+    for ``(head, note) = safe_text_bound(text)``. With a note, the head's trailing whitespace is
+    dropped first: a cut can leave it after the head's last value, the answer is stripped anyway,
+    and without it that value ends the head and is judged as the note's neighbour. The note goes
+    to the passes out of band (:func:`_redact_noted`); this changes more than the end-of-text
+    refusals, at least a whole-text gate that reads trailing whitespace, such as the one
+    :func:`_redact_unguarded` keeps for a final ``bearer``."""
+    if note:
+        head = head.rstrip()
+    return _redact_noted(head, noted=bool(note)).strip()
 
 
 def safe_text_bound(text: str) -> tuple[str, str]:
@@ -2825,7 +2881,10 @@ def safe_text_bound(text: str) -> tuple[str, str]:
 
     For a caller that scrubs that part itself before :func:`safe_text` bounds it, as the off-box
     audit tee does (BACKLOG #3045). A scrub that lengthens ``head`` past the window makes
-    :func:`safe_text` cut it again and append a second bound note."""
+    :func:`safe_text` cut it again and append a second bound note. ``safe_text(head) + note`` is
+    not ``safe_text(text)``: :func:`safe_text` on the head alone sees no note after it, so a value
+    the cut left last is judged as ending the text (BACKLOG #5925). :func:`redact_bounded_head`
+    gives the head's answer as :func:`safe_text` gives it."""
     head, dropped = _clamp(text, _REDACT_WINDOW)
     return head, (f" {_clamp_marker(dropped)}" if dropped else "")
 
@@ -2895,7 +2954,8 @@ def safe_exc(
     """A PHI-redacted, length-bounded rendering of ``exc`` for a stored ``last_error``/``detail`` or a
     log line. Always keeps the exception **type** (safe + most useful); the message is redacted
     (:func:`redact`) and truncated — so a Router/Handler that did ``raise ValueError(f"...{raw}")``
-    can't leak the HL7 body into the store or logs.
+    can't leak the HL7 body into the store or logs — except a database driver's own error, whose
+    message is withheld (below).
 
     ``file_name`` is the partner-chosen name the exception is **about**, for a caller that has one. An
     ``OSError`` renders its path INTO its message — Windows gives ``[WinError 32] The process cannot
@@ -2921,13 +2981,30 @@ def safe_exc(
     A different exception that HOLDS one, as ``RuntimeError(exc)`` or ``ValueError("bad", exc)``,
     prints the Unicode error's own ``str()`` or ``repr()`` as its message. It renders as its class
     and a fixed note, never its other arguments (vault BACKLOG #3295;
-    :func:`prints_a_codec_error`)."""
+    :func:`prints_a_codec_error`).
+
+    A database driver's own error (:func:`raised_by_a_driver`), an engine class that inherits one
+    included, renders as its class and the line :func:`safe_traceback` prints for it
+    (:func:`_driver_line`): its SQLSTATE or SQLite's result-code name, or one of ``sqlite3``'s
+    texts that carry no value, and never any other message (vault BACKLOG #8153, item 23). Its
+    message can quote a value the statement carried in a shape no pattern catches, as asyncpg's
+    client-side ``DataError`` quotes the argument it could not encode. That costs the message's
+    diagnostic, such as SQLite's ``database is locked``, at every caller. An engine class marked
+    :func:`engine_text_only` prints its message, with any driver's text it quotes withheld
+    (:func:`_engine_message`), under the name :func:`shown_class_name` gives it. The test is by
+    class alone, so at least a driver's error raised
+    as a builtin type, wrapped in another library's class, or quoted into another error's
+    message, is rendered as any other exception is, its text redacted by pattern only."""
+    driver = _driver_line(exc, under=False)
+    if driver is not None:
+        return f"{type(exc).__name__}: {driver}"
     if isinstance(exc, UnicodeError):
         return safe_text(_unicode_error_text(exc), limit=limit)
-    name = type(exc).__name__
-    if prints_a_codec_error(exc):  # RuntimeError(exc): its str() is the Unicode error's own
+    name = shown_class_name(exc)
+    engine = _engine_message(exc)
+    if engine is None and prints_a_codec_error(exc):  # RuntimeError(exc): the codec error's str()
         return f"{name}: {_HOLDER_TEXT}"
-    raw = str(exc)
+    raw = str(exc) if engine is None else engine
     if file_name and (base := _basename(file_name)):
         label = safe_name(file_name)
         # An OSError quotes its path with repr(), so a name holding a control, a non-printable or a
@@ -3138,19 +3215,112 @@ type ExcInfo = tuple[type[BaseException] | None, BaseException | None, Traceback
 _NON_DBAPI_DRIVERS = frozenset({"asyncpg"})
 
 
+#: How :func:`engine_text_only` marked a class: ``driver_text`` reads the part of its message that
+#: is a driver's text, or is None where none is; ``named_as_driver`` prints it under the driver
+#: class it inherits (:func:`shown_class_name`).
+class _EngineText(NamedTuple):
+    driver_text: Callable[[BaseException], object] | None
+    named_as_driver: bool
+
+
+#: Engine error classes, each by its exact type, that inherit a driver's class but whose message
+#: is the engine's (:func:`engine_text_only`). An engine class that is not listed counts as a
+#: driver's when it inherits one, so its whole message is withheld (vault BACKLOG #8153, review of
+#: item 17).
+_ENGINE_TEXT_ONLY: dict[type[BaseException], _EngineText] = {}
+
+#: What a rendering prints in place of a driver's message, or of the driver's text an engine
+#: message quotes.
+_DRIVER_WITHHELD = "[driver message withheld]"
+
+
+def engine_text_only[E: type[BaseException]](
+    kind: E,
+    *,
+    driver_text: Callable[[BaseException], object] | None = None,
+    named_as_driver: bool = False,
+) -> E:
+    """Mark ``kind``, an engine error class that inherits a driver's, as one whose message the
+    engine wrote, so it is no driver's error (:func:`raised_by_a_driver`). :func:`safe_exc` and a
+    traceback then print its message, except the part ``driver_text`` names: an engine message can
+    quote a driver's text, as ``store.schema_verify.SchemaMismatchError`` quotes the text SQLite
+    gave a failed schema step, and that part prints as ``[driver message withheld]``. ``driver_text``
+    returns that exact text, or None where the message quotes none; a part it names that the
+    message does not hold verbatim withholds the whole message (:func:`_engine_message`).
+    ``named_as_driver`` prints the class under the driver class it stands in for, for a private
+    class (:func:`shown_class_name`). Only ``kind`` itself is marked: a subclass, which can carry
+    other text, is not. Mark a class only where every message it is raised with is the engine's,
+    apart from the part ``driver_text`` names."""
+    _ENGINE_TEXT_ONLY[kind] = _EngineText(driver_text, named_as_driver)
+    return kind
+
+
 def raised_by_a_driver(exc: BaseException) -> bool:
     """Whether ``exc``'s class, or a class it inherits, is a database driver's: from a module, or
     a package above it, that declares the DB-API 2.0 ``apilevel`` (pyodbc, sqlite3, psycopg and
-    ``mysql.connector``, at least), or from a package named in :data:`_NON_DBAPI_DRIVERS`. A
-    builtin exception a driver raises does not count, though :func:`safe_traceback` withholds it
-    under a driver error that holds it (vault BACKLOG #1661). A class whose ``__module__`` is not
-    text is not a driver's. This runs on every link of a logged traceback, so it must not raise:
-    a class or module that raises when read answers ``True``, so its message is withheld rather
-    than printed on a guess that no driver raised it."""
+    ``mysql.connector``, at least), or from a package named in :data:`_NON_DBAPI_DRIVERS`. An
+    engine class that inherits one counts too, unless its exact type is marked
+    :func:`engine_text_only`. A builtin exception a driver raises does not count, though
+    :func:`safe_traceback` withholds it under a driver error that holds it (vault BACKLOG #1661). A
+    class whose ``__module__`` is not text is not a driver's. This runs on every link of a logged
+    traceback, so it must not raise: a class or module that raises when read answers ``True``, so
+    its message is withheld rather than printed on a guess that no driver raised it."""
     try:
-        return any(_a_driver_class(kind) for kind in type(exc).__mro__)
+        return _a_driver_class_in_chain(exc)
     except Exception:  # noqa: BLE001 - fail closed: see the docstring
         return True
+
+
+def _a_driver_class_in_chain(exc: BaseException) -> bool:
+    """:func:`raised_by_a_driver`'s class-chain read, which raises where a class cannot be read."""
+    if type(exc) in _ENGINE_TEXT_ONLY:
+        return False
+    return any(_a_driver_class(kind) for kind in type(exc).__mro__)
+
+
+def _engine_message(exc: BaseException) -> str | None:
+    """The message of a class marked :func:`engine_text_only`, with the driver's text its
+    ``driver_text`` names replaced by ``[driver message withheld]``; None for any other class. The
+    message is the error's one argument, read through ``BaseException``'s own ``args`` and only as
+    an exact ``str``. It fails closed to ``[driver message withheld]`` alone where the message is
+    not one such argument, where the named text is not an exact ``str`` the message holds, or
+    where a read raises, since this runs on every link of a logged traceback."""
+    try:
+        marked = _ENGINE_TEXT_ONLY.get(type(exc))
+        if marked is None:
+            return None
+        args = _EXC_ARGS.__get__(exc)
+        if len(args) != 1 or type(args[0]) is not str:
+            return _DRIVER_WITHHELD
+        message: str = args[0]
+        if marked.driver_text is None:
+            return message
+        carried = marked.driver_text(exc)
+        if carried is None:
+            return message
+        if type(carried) is not str or not carried or carried not in message:
+            return _DRIVER_WITHHELD
+        return message.replace(carried, _DRIVER_WITHHELD)
+    except Exception:  # noqa: BLE001 - fail closed: see the docstring
+        return _DRIVER_WITHHELD
+
+
+def shown_class_name(exc: BaseException) -> str:
+    """The class name a rendering of ``exc`` prints: its own, except that a class marked
+    :func:`engine_text_only` with ``named_as_driver`` prints the name of the first driver class
+    it inherits, such as ``OperationalError``, since it stands in for that driver's error and its
+    own name is the engine's private one (vault BACKLOG #8153). It does not raise: a class that
+    cannot be read prints its own name."""
+    kind = type(exc)
+    try:
+        marked = _ENGINE_TEXT_ONLY.get(kind)
+        if marked is not None and marked.named_as_driver:
+            for base in kind.__mro__[1:]:
+                if _a_driver_class(base):
+                    return base.__name__
+    except Exception:  # noqa: BLE001 - the name only: the class's own is still true
+        pass
+    return kind.__name__
 
 
 def _a_driver_class(kind: type) -> bool:
@@ -3207,7 +3377,7 @@ def known_driver_error(exc: BaseException) -> bool:
     For a caller that would NAME something a driver's error carries, where the safe answer for a
     class that cannot be classed is no (engine PR 3150, finding 1)."""
     try:
-        return any(_a_driver_class(kind) for kind in type(exc).__mro__)
+        return _a_driver_class_in_chain(exc)
     except Exception:  # noqa: BLE001 - fail closed for naming: an unclassable error names nothing
         return False
 
@@ -3288,6 +3458,38 @@ def sqlite_errorname_of(exc: BaseException) -> str | None:
     return name if isinstance(name, str) and _SQLITE_ERRORNAME.fullmatch(name) else None
 
 
+#: The line of a link withheld because a traceback prints it under a driver error, when the link
+#: is no driver's own error (:func:`_driver_line`).
+UNDER_A_DRIVER_ERROR = "[message withheld under a driver error]"
+
+
+#: Texts ``sqlite3`` itself raises with no ``sqlite_errorname``, which carry no value: a fixed
+#: sentence, or one whose only parts that vary are counts, a parameter's position and the name of
+#: the bound value's type, never the value. Read with ``fullmatch`` against the exact ``str`` of
+#: the error's one argument (:func:`_sqlite_fixed_reason`). Not every such text sqlite3 has.
+_SQLITE_FIXED_REASON = re.compile(
+    r"Cannot operate on a closed (?:database|cursor|blob)\."
+    r"|You can only execute one statement at a time\."
+    r"|Error binding parameter \d{1,9}: type '[A-Za-z_][\w.]{0,127}' is not supported"
+    r"|Incorrect number of bindings supplied\. The current statement uses \d{1,9},"
+    r" and there are \d{1,9} supplied\."
+)
+
+
+def _sqlite_fixed_reason(exc: BaseException) -> str | None:
+    """The text of one of ``sqlite3``'s own errors when it is a :data:`_SQLITE_FIXED_REASON`,
+    else None. Its one argument is read through ``BaseException``'s own ``args``, and only an
+    exact ``str`` is matched, so neither an overridden ``args`` nor a ``str`` subclass's
+    ``__str__`` can choose what prints."""
+    if not is_a_sqlite_error(exc):
+        return None
+    args = _EXC_ARGS.__get__(exc)
+    if len(args) != 1 or type(args[0]) is not str:
+        return None
+    text: str = args[0]
+    return text if _SQLITE_FIXED_REASON.fullmatch(text) else None
+
+
 def _driver_line(exc: BaseException, *, under: bool) -> str | None:
     """What a traceback prints after the class name for a database driver's error
     (:func:`raised_by_a_driver`), or for any link a traceback prints under one; None for any other
@@ -3297,26 +3499,30 @@ def _driver_line(exc: BaseException, *, under: bool) -> str | None:
     that is for which drivers; a SQLite error keeps only its result-code name, since its
     ``args[0]`` is its message. A
     link under a driver error is withheld whole, since a driver can raise its error from the
-    builtin one its codec raised, whose text can quote the value too. An attribute that raises
-    when read leaves the bare withheld line, since this runs on every link of a logged traceback."""
-    driver = raised_by_a_driver(exc)
-    if not (driver or under):
-        return None
-    if driver:
-        try:
-            code = _driver_code(exc)
-        except Exception:  # noqa: BLE001 - the message stays withheld; only the code is lost
-            code = None
-        if code is not None:
-            return code
-    return "[driver message withheld]"
+    builtin one its codec raised, whose text can quote the value too. Such a link that is no
+    driver's own is labelled :data:`UNDER_A_DRIVER_ERROR`, not as a driver's message, since it may
+    be an unrelated error the driver error was raised while handling (vault BACKLOG #8153, item
+    21). An attribute that raises when read leaves the bare withheld line, since this runs on
+    every link of a logged traceback. One of ``sqlite3``'s own errors that names no result code
+    keeps its text where that is a :data:`_SQLITE_FIXED_REASON`, which carries no value."""
+    if not raised_by_a_driver(exc):
+        return UNDER_A_DRIVER_ERROR if under else None
+    try:
+        code = _driver_code(exc)
+    except Exception:  # noqa: BLE001 - the message stays withheld; only the code is lost
+        code = None
+    return code if code is not None else "[driver message withheld]"
 
 
 def _driver_code(exc: BaseException) -> str | None:
-    """:func:`_driver_line` for a driver error that names a SQLSTATE or SQLite's result code."""
+    """:func:`_driver_line` for a driver error that names a SQLSTATE or SQLite's result code, or
+    whose text is a :data:`_SQLITE_FIXED_REASON`."""
     name = sqlite_errorname_of(exc)
     if name is not None:
         return f"[driver message withheld {name}]"
+    fixed = _sqlite_fixed_reason(exc)
+    if fixed is not None:
+        return fixed
     state = driver_sqlstate_of(exc)
     return f"[{state}] [driver message withheld]" if state is not None else None
 
@@ -3345,8 +3551,10 @@ def safe_traceback(ei: ExcInfo) -> str:
 
     A database driver's error (:func:`raised_by_a_driver`) prints :func:`_driver_line`'s line in
     place of its message, and so does every link printed under it, with their notes dropped (vault
-    BACKLOG #1661, added item 3). That bound is the class test's: a driver's error raised as a
-    builtin type, or wrapped in another library's, prints as any other link does."""
+    BACKLOG #1661, added item 3). An engine class marked :func:`engine_text_only` prints its own
+    message with any driver's text it quotes withheld (:func:`_engine_message`), and its notes are
+    dropped. That bound is the class test's: a driver's error raised as a builtin type, or wrapped
+    in another library's, prints as any other link does."""
     value, tb = ei[1], ei[2]
     # `type(None)` and None are what the stdlib's own print_exception passes for an empty exc_info.
     te = traceback.TracebackException(type(value), value, tb, compact=True)  # type: ignore[arg-type]
@@ -3362,7 +3570,9 @@ def safe_traceback(ei: ExcInfo) -> str:
         if node is None or exc is None:  # exc is None at the root of an empty exc_info
             continue
         driver = _driver_line(exc, under=under)
-        line = driver if driver is not None else _codec_line(exc, share)
+        # A marked engine class prints its own message, any driver's text it quotes withheld.
+        engine = _engine_message(exc) if driver is None else None
+        line = driver if driver is not None else engine or _codec_line(exc, share)
         below = driver is not None  # every link printed under a driver error is withheld too
         if line is not None:
             # The instance's own attribute, so a class-level default cannot pass; and getattr, so a
@@ -3370,8 +3580,7 @@ def safe_traceback(ei: ExcInfo) -> str:
             if "_str" not in getattr(node, "__dict__", {}):  # renamed: fail closed, no traceback
                 if value is None:
                     return ""
-                root = _driver_line(value, under=False)
-                return f"{type(value).__name__}: {root}" if root is not None else safe_exc(value)
+                return safe_exc(value)
             node._str = line  # the stdlib's private name: see docstring
             if isinstance(exc, SyntaxError):  # printed from these four, never from _str
                 node.msg, node.text, node.filename, node.lineno = line, None, None, None

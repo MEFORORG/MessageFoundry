@@ -665,7 +665,16 @@ def test_a_busy_store_that_refuses_the_audit_row_keeps_exit_1(
             main([_CMD, "--username", _ADMIN, "--email", _ADDRESS, "--db", str(db), "--json"]) == 1
         )
     error = _error(capsys)
-    assert "audit row goes first" in error and str(raised) in error
+    # Both cases say who refused, the engine's own refusal included.
+    assert error.count("the store refused the audit row") == 1, error
+    assert "audit row goes first" in error, error
+    if busy_error == "acquire-timeout":
+        # The engine's own refusal prints whole, so its remedy survives.
+        assert str(raised) in error
+    else:
+        # A driver's error prints its class only: its message can quote a stored value (vault
+        # BACKLOG #5067 added item B).
+        assert type(raised).__name__ in error and str(raised) not in error
     # The append follows a full open, which may have written (BACKLOG #5067).
     assert "this command makes did not land" in error
     assert "nothing was written" not in error.lower(), error

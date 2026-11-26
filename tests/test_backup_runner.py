@@ -1688,3 +1688,30 @@ async def test_start_spawns_loop_and_stop_cancels_cleanly(tmp_path, key_b64) -> 
     on_demand.start()
     assert on_demand._task is None  # on-demand-only → start() is a no-op
     await store.close()
+
+
+async def test_a_snapshot_sqlite_failure_keeps_sqlites_text(tmp_path, key_b64) -> None:
+    """Vault BACKLOG #8153. Red while the snapshot arm rendered a SQLite error through
+    ``safe_exc``, which withholds a driver's message, so a locked store's snapshot failure read
+    ``[driver message withheld]``. SQLite's text is kept, as before #8153."""
+    import sqlite3
+
+    store = await _store_with_rows(tmp_path / "msg.db", key_b64)
+    runner = BackupRunner(
+        store,
+        _settings(tmp_path / "b", key_b64),
+        store_settings=_store_settings(tmp_path / "msg.db", key_b64),
+        config_dir=None,
+    )
+
+    async def _locked(*_a, **_k):
+        raise sqlite3.OperationalError("synthetic: database is locked")
+
+    object.__setattr__(store, "snapshot_to", _locked)
+    try:
+        with pytest.raises(BackupError) as refused:
+            await runner.run_once(now=2000.0)
+    finally:
+        await store.close()
+    assert refused.value.kind == "snapshot"
+    assert "OperationalError: synthetic: database is locked" in str(refused.value), refused.value

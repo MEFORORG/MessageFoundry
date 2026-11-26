@@ -54,8 +54,14 @@ TWO CASES BACKLOG #5645 item 1 names:
   * A GraphQL reply carrying ``errors`` beside its ``data`` (a partial error). An error whose
     ``path`` points inside one commit node leaves that commit unjudged, a fault, because GraphQL
     nulls the field it could not resolve and a nulled ``author.user`` would read as an unlinked
-    author. The other commits on the page are judged, so a refusal they prove stands. An error
-    with no such path still faults the whole page, keeping the pages read before it.
+    author. One whose path stays inside that commit's ``committer`` leaves only the committer
+    unread: the nullable committer stops null propagation there, so rule 1 still judges the
+    author (BACKLOG #5644 added item 1). On the first page, such a commit with a git author is
+    still left out of the first page's keys, with a fault, whether that author is linked or not,
+    as before that item; an unlinked one is also refused under rule 1. On any page, a commit
+    with a committer-only error that came back with no commit object, or with no readable
+    ``oid``, contradicts the premise and is unjudged whole. The other commits on the page are judged, so a refusal they prove stands. An error with
+    no such path still faults the whole page, keeping the pages read before it.
   * A head that lags the push event. When ``CLA_HEAD_SHA`` is set and the first page's
     ``headRefOid`` is another commit, the read stops there and is repeated after each wait in
     ``HEAD_RETRY_DELAYS``. If every first page shows another head, the run is a fault and nothing
@@ -106,7 +112,10 @@ refuse a commit the pull request no longer holds.
 UNMEASURED: that every field a partial error nulled lies on the ``path`` of an error naming its
 commit node. The GraphQL specification implies it: an error's path names the field that raised it,
 and null propagation reaches only that field's ancestors. A nulled ``author.user`` that no error
-path reaches reads as an unlinked author and is refused.
+path reaches reads as an unlinked author and is refused. That includes a commit whose only error
+path is inside its ``committer``: if one failure nulled ``author.user`` too but GitHub reported
+only the committer's path, its author is refused under rule 1, where before BACKLOG #5644 added
+item 1 the commit was a fault that passes.
 
 INPUT COMES ONLY FROM THE ENVIRONMENT, never from the command line or a templated ``run:`` line,
 so a workflow step can pass event data through ``env:`` (zizmor's template-injection rule):
@@ -127,8 +136,9 @@ EXIT CODES: 0 nothing refused and no fault; 1 refused, with a ``CLA pre-check re
 annotation, whatever fault is reported beside it; 3 a fault caught by this script with nothing
 refused, at least: bad input, network, a reply in the wrong shape, a short read, a head still
 stale after the re-reads, a commit list that does not include ``CLA_HEAD_SHA`` or cannot show that
-it does, a commit GraphQL reported an error inside, or an exception raised inside ``run``. At
-least one other path exits 1 with no refusal annotation: an error before ``main`` runs, such as at
+it does, a commit with a GraphQL error inside it (for one inside its ``committer`` alone, the
+partial-error case above says which are faults), or an exception raised inside ``run``. At least
+one other path exits 1 with no refusal annotation: an error before ``main`` runs, such as at
 import. The interpreter itself exits 2 when it cannot open the script. The workflow tells these
 apart by the annotation, not the code alone.
 """
@@ -234,8 +244,13 @@ class PullRequestRead:
     head: str
     #: How many commits the first page held. Rule 2 keys that page, first commit seen per key.
     first_page: int
-    #: Indexes into ``commits`` that a GraphQL error points inside. They are not judged.
+    #: Indexes into ``commits`` that a GraphQL error points inside, other than those in
+    #: ``committer_tainted``. They are not judged.
     tainted: frozenset[int] = frozenset()
+    #: Indexes, none in ``tainted``, whose errors all point inside the commit's ``committer`` and
+    #: whose commit came back with a readable 40-hex ``oid``; ``evaluate`` relies on that oid.
+    #: Their author is judged; their committer is not read.
+    committer_tainted: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -361,7 +376,12 @@ def fetch_commits(
     ``expected_head`` set, a first page of another head raises :class:`_StaleHead` at once.
     """
     commits: list[Mapping[str, Any]] = []
-    state: dict[str, Any] = {"head": None, "first_page": None, "tainted": set()}
+    state: dict[str, Any] = {
+        "head": None,
+        "first_page": None,
+        "tainted": set(),
+        "committer_tainted": set(),
+    }
     try:
         return _fetch_pages(transport, owner, name, number, expected_head, commits, state)
     except PrecheckFault as exc:
@@ -373,13 +393,21 @@ def fetch_commits(
 def _snapshot(
     commits: list[Mapping[str, Any]], total: int, state: Mapping[str, Any]
 ) -> PullRequestRead:
+    tainted = frozenset(state["tainted"])
     return PullRequestRead(
-        commits, total, state["head"], state["first_page"], frozenset(state["tainted"])
+        commits,
+        total,
+        state["head"],
+        state["first_page"],
+        tainted,
+        frozenset(state["committer_tainted"]) - tainted,
     )
 
 
-def _errored_nodes(errors: object) -> set[int]:
-    """The commit-node indexes a GraphQL ``errors`` list points inside.
+def _errored_nodes(errors: object) -> tuple[set[int], set[int]]:
+    """The commit-node indexes a GraphQL ``errors`` list points inside: those an error may have
+    nulled anything in, and those an error points inside the ``committer`` of. An index can be in
+    both; the first set wins.
 
     An error that does not name one node by its ``path`` could have touched anything on the page,
     so it faults the page instead.
@@ -387,6 +415,7 @@ def _errored_nodes(errors: object) -> set[int]:
     if not isinstance(errors, list):
         raise PrecheckFault("GraphQL returned an error")
     indexes: set[int] = set()
+    committer_only: set[int] = set()
     for error in errors:
         path = error.get("path") if isinstance(error, Mapping) else None
         if not isinstance(path, list) or len(path) < 5 or tuple(path[:4]) != _NODES_PATH:
@@ -394,8 +423,10 @@ def _errored_nodes(errors: object) -> set[int]:
         index = path[4]
         if not isinstance(index, int) or isinstance(index, bool) or index < 0:
             raise PrecheckFault("GraphQL returned an error")
-        indexes.add(index)
-    return indexes
+        # `committer` is nullable, so null propagation from inside it stops there (BACKLOG #5644
+        # added item 1), on the same unmeasured premise as every partial error (module docstring).
+        (committer_only if tuple(path[5:7]) == ("commit", "committer") else indexes).add(index)
+    return indexes, committer_only
 
 
 def _fetch_pages(
@@ -420,7 +451,7 @@ def _fetch_pages(
                 raise _StaleHead("the pull request's head is not CLA_HEAD_SHA")
         errors = reply.get("errors")
         # A partial error: the data beside it still holds the commits no error points inside.
-        errored = _errored_nodes(errors) if errors else set()
+        errored, committer_errored = _errored_nodes(errors) if errors else (set(), set())
         try:
             pull_request = reply["data"]["repository"]["pullRequest"]
             page_head = pull_request["headRefOid"]
@@ -436,10 +467,20 @@ def _fetch_pages(
         if head is not None and page_head != head:
             raise PrecheckFault("the pull request's head moved while its commits were being read")
         head = page_head
-        if any(index >= len(nodes) for index in errored):
+        if any(index >= len(nodes) for index in errored | committer_errored):
             raise PrecheckFault(
                 "GraphQL returned an error for a commit node the page does not hold"
             )
+        # A committer-only error on a node that came back with no commit object, or with no
+        # readable oid (non-null, and outside the committer), contradicts the premise the carve-out
+        # rests on, so that node is unjudged whole, as before the carve-out, and its siblings are
+        # still judged.
+        for index in list(committer_errored):
+            node = nodes[index]
+            commit = node.get("commit") if isinstance(node, Mapping) else None
+            if not isinstance(commit, Mapping) or not _SHA.fullmatch(str(commit.get("oid", ""))):
+                committer_errored.discard(index)
+                errored.add(index)
         page: list[Mapping[str, Any]] = []
         for index, node in enumerate(nodes):
             commit = node.get("commit") if isinstance(node, Mapping) else None
@@ -452,6 +493,7 @@ def _fetch_pages(
                 raise PrecheckFault("a commit node holds no commit object")
             page.append(commit)
         state["tainted"].update(len(commits) + index for index in errored)
+        state["committer_tainted"].update(len(commits) + index for index in committer_errored)
         commits.extend(page)  # whole pages only, so a partial read never holds half a page
         if first_page is None:
             first_page = len(nodes)
@@ -564,6 +606,18 @@ def evaluate(
             if index >= read.first_page or commit["author"] is None:
                 slots.append(None)
                 continue
+        if index < read.first_page and index in read.committer_tainted:
+            # Left unkeyed with a fault for a linked author too (PR 3323 hold). An unlinked
+            # author's commit is keyed under its committer's account, which the error may have
+            # hidden. A linked author's key, its login, is not hidden by it; the commit is left
+            # unkeyed so rule 2 judges that author's later-page commits as it did before BACKLOG
+            # #5644 added item 1, when such a commit was unjudged whole.
+            faults.append(
+                f"commit {oid}: GraphQL reported an error inside its committer; its key is "
+                "missing from the first page's keys"
+            )
+            slots.append(None)
+            continue
         try:
             slots.append(attribute(commit))
         except PrecheckFault as exc:

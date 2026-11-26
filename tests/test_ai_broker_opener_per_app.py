@@ -189,6 +189,47 @@ def test_each_attestation_remedy_is_written_as_it_is_logged() -> None:
     assert "Set [ai].endpoint_revocation_attested = true with an " in str(info.value)
 
 
+def test_the_on_box_remedy_names_the_hosts_the_code_reads_as_loopback() -> None:
+    """The refusal's last remedy names endpoint hosts the refusal reads as on-box, and the
+    spellings it reads as remote, so following it crosses the refusal. Red before the fix: it said
+    "use an endpoint on this machine", and a resolver may take ``localhost.`` or ``127.0.0.1.`` as
+    this box, yet each is read as remote and refused with that same remedy."""
+    named = ("localhost", "127.0.0.1", "[::1]")
+    # Not an exhaustive list: other spellings the predicate reads as loopback cross too.
+    also_loopback = ("LOCALHOST", "127.0.0.2", "[0:0:0:0:0:0:0:1]")
+    near_misses = ("localhost.", "127.0.0.1.", "127.1")
+    for lever in (ai_broker_mod._AI_ATTESTATION_LEVER, ai_broker_mod._AI_CRL_LEVER):
+        assert "this machine" not in lever
+        assert (
+            "at least a spelling with a trailing dot, or a shortened IPv4 address such as 127.1"
+            in lever
+        )
+        assert "whose host reads as loopback here, such as localhost, 127.0.0.1 or [::1]" in lever
+        assert "and list that host in [ai].allowed_endpoints as the URL writes it" in lever
+        assert "verified against the OS trust store alone, with neither [tls] file" in lever
+    # Each host the remedy names builds under an enforcing posture, with no CRL or attestation.
+    for host in named + also_loopback:
+        _broker(
+            endpoint=f"https://{host}/v1/messages",
+            allowed=(host,),
+            posture=_ENFORCING,
+        )
+    # Each spelling the remedy says reads as remote is refused, with either remedy text.
+    for host in near_misses:
+        for policy, lever in (
+            (None, ai_broker_mod._AI_ATTESTATION_LEVER),
+            (TrustAnchorPolicy(), ai_broker_mod._AI_CRL_LEVER),
+        ):
+            with pytest.raises(ai_broker_mod.AiBrokerError) as info:
+                _broker(
+                    endpoint=f"https://{host}/v1/messages",
+                    allowed=(host,),
+                    posture=_ENFORCING,
+                    policy=policy,
+                )
+            assert str(info.value).endswith(lever), str(info.value)
+
+
 def test_each_caller_of_the_ai_opener_chooser_is_a_census_site() -> None:
     """Items 22 and 32: the revocation census treats ``_ai_endpoint_opener`` as a builder, so the
     function that calls it is the site, tied to its own guard call, and a new caller fails the

@@ -1297,7 +1297,9 @@ try {
     }
     if ($hookFault) { Write-WriterError -Stage 'hook-input' -Message $hookFault }
 
-    $boxKey = ConvertTo-BoxKey -Path $wt
+    # The mail keyer's own step (BACKLOG #7581); a toplevel comes back unchanged.
+    $boxPath = Resolve-BoxPath -Path $wt
+    $boxKey = ConvertTo-BoxKey -Path $boxPath
 
     # Rule 3. BEFORE any early return, so a no-op invocation still proves the writer ran.
     try {
@@ -1348,7 +1350,7 @@ try {
     # the new key. A legacy record from another host shares this path but is that PC's seat, so it is
     # never adopted.
     $prior = $null
-    $legacyPath = Join-Path (Join-Path $script:SeatsDir (ConvertTo-LegacyBoxKey -Path $wt)) ("$($sk.Key).json")
+    $legacyPath = Join-Path (Join-Path $script:SeatsDir (ConvertTo-LegacyBoxKey -Path $boxPath)) ("$($sk.Key).json")
     $priors = @()
     foreach ($p in @($recPath, $legacyPath)) {
         if (-not (Test-Path -LiteralPath $p)) { continue }

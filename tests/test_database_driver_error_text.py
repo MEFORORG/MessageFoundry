@@ -14,11 +14,12 @@ import logging
 import sys
 import types
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from messagefoundry.redaction import raised_by_a_driver, safe_traceback
+from messagefoundry.redaction import raised_by_a_driver, safe_exc, safe_traceback
 from messagefoundry.transports import database
 from messagefoundry.transports.base import NegativeAckError
 from tests._fake_dbapi_driver import DriverError
@@ -158,7 +159,8 @@ def test_the_log_chain_withholds_every_link_under_a_driver_error() -> None:
     except _DriverError as caught:
         text = _rendered(caught)
     assert _SYNTHETIC_ID not in text
-    assert "ValueError: [driver message withheld]" in text
+    # The cause is no driver's own, so its label does not call it one (vault BACKLOG #8153, 21).
+    assert "ValueError: [message withheld under a driver error]" in text
     assert "_DriverError: [driver message withheld]" in text
 
 
@@ -355,3 +357,233 @@ async def test_finish_stop_logs_no_driver_value(caplog: pytest.LogCaptureFixture
     assert "poll task failed" in caplog.text
     assert "pool close failed" in caplog.text
     assert _SYNTHETIC_ID not in caplog.text
+
+
+# --- Vault BACKLOG #8153, items 23 and 17: safe_exc and the engine's own driver subclasses ------
+
+
+class _AsyncpgDataError(Exception):
+    """asyncpg's client-side ``DataError`` shape: no ``sqlstate``, and a message quoting the
+    argument it could not encode, in no shape a redaction pattern catches."""
+
+    __module__ = "asyncpg.exceptions._base"
+
+
+_QUOTED_ARGUMENT = f"invalid input for query argument $1: 'synthetic{_SYNTHETIC_ID}' (str expected)"
+
+
+@pytest.mark.usefixtures("_dbapi_driver")
+def test_safe_exc_withholds_a_driver_message() -> None:
+    """Item 23. Red on the previous head: ``safe_exc`` printed a driver error's message through
+    the patterns alone, and the quoted argument matched none of them."""
+    assert _SYNTHETIC_ID in safe_exc(ValueError(_QUOTED_ARGUMENT))  # the control: not a pattern's
+    assert safe_exc(_AsyncpgDataError(_QUOTED_ARGUMENT)) == (
+        "_AsyncpgDataError: [driver message withheld]"
+    )
+    assert safe_exc(_DriverError("23000", _DUPLICATE)) == (
+        "_DriverError: [23000] [driver message withheld]"
+    )
+
+
+async def test_a_failed_build_records_no_driver_message(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Item 23 at a call site outside the DATABASE connector (closing step 3): the runner's record
+    of a connection that failed to build, the reason a ``connection_stopped`` alert carries. Red on
+    the previous head: the reason quoted the argument."""
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.config.wiring import Registry
+    from messagefoundry.pipeline.alerts import LoggingAlertSink
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+    from messagefoundry.store import MessageStore
+
+    store = await MessageStore.open(tmp_path / "build-failure.db")
+    try:
+        runner = RegistryRunner(
+            Registry(),
+            store,
+            env_values={},
+            alert_sink=LoggingAlertSink(),
+            egress=EgressSettings(deny_by_default=False),
+        )
+        with caplog.at_level(logging.ERROR):
+            failure = _AsyncpgDataError(_QUOTED_ARGUMENT)
+            runner._record_failed("OB_SYNTHETIC", failure, kind="outbound")
+        reason = runner.outbound_failed("OB_SYNTHETIC")
+    finally:
+        await store.close()
+    assert reason == "_AsyncpgDataError: [driver message withheld]"
+    # The message only: caplog's handler prints the raw traceback, which the configured log
+    # chain renders through safe_traceback (test_the_log_chain_withholds_a_driver_message).
+    (line,) = [r.getMessage() for r in caplog.records if "failed to start" in r.getMessage()]
+    assert "[driver message withheld]" in line
+    assert _SYNTHETIC_ID not in line
+
+
+def _schema_mismatch_carrying_sqlite_text() -> BaseException:
+    """A ``SchemaMismatchError`` raised from a schema step whose SQLite text quotes a synthetic
+    value, as ``store.schema_verify`` raises one."""
+    import sqlite3
+
+    from messagefoundry.store.schema_verify import SchemaMismatchError
+
+    carried = f"no such column: synthetic_MRN{_SYNTHETIC_ID}"
+    try:
+        try:
+            raise sqlite3.OperationalError(carried)
+        except sqlite3.OperationalError as step:
+            raise SchemaMismatchError(f"The schema step failed: {step}.", cause=str(step)) from step
+    except SchemaMismatchError as caught:
+        return caught
+    raise AssertionError("unreachable")
+
+
+#: What ``SchemaMismatchError``'s message reads with its quoted SQLite text withheld.
+_WITHHELD_STEP = "SchemaMismatchError: The schema step failed: [driver message withheld]."
+
+
+def test_an_engine_subclass_withholds_the_driver_text_it_quotes() -> None:
+    """Vault BACKLOG #8153. ``SchemaMismatchError`` subclasses ``sqlite3.DatabaseError`` and
+    quotes the failed schema step's SQLite text. Red while every class from the engine's
+    package counted as the engine's, so ``safe_exc`` printed that text. It is marked ``engine_text_only`` with that text named, so its own words, the store's
+    remedy among them, still print, and the quoted text does not."""
+    caught = _schema_mismatch_carrying_sqlite_text()
+    assert raised_by_a_driver(caught) is False
+    own = safe_exc(caught)
+    assert _SYNTHETIC_ID not in own
+    assert own == _WITHHELD_STEP
+
+
+def test_a_traceback_withholds_the_driver_text_an_engine_subclass_carries() -> None:
+    """Vault BACKLOG #8153, item 17's regression: red while a traceback printed the text
+    ``SchemaMismatchError`` carries, where main withheld it."""
+    text = _rendered(_schema_mismatch_carrying_sqlite_text())
+    assert _SYNTHETIC_ID not in text
+    assert _WITHHELD_STEP in text
+
+
+def test_an_engine_subclass_that_is_not_marked_is_a_drivers() -> None:
+    """Vault BACKLOG #8153: only a class marked by its exact type keeps its message. A subclass
+    of a marked class, or an unmarked engine class, can carry other text, so its whole message
+    is withheld. Red while every engine class counted as the engine's."""
+    from messagefoundry.store.schema_verify import SchemaMismatchError
+
+    class _Narrower(SchemaMismatchError):
+        pass
+
+    narrower = _Narrower(f"no such column: MRN{_SYNTHETIC_ID}")
+    assert raised_by_a_driver(narrower) is True
+    assert safe_exc(narrower) == "_Narrower: [driver message withheld]"
+
+
+def test_a_marked_message_that_does_not_hold_its_named_text_is_withheld_whole() -> None:
+    """The fail-closed arm of ``_engine_message``: a ``cause`` the message does not quote
+    verbatim, as a message re-worded around it would, cannot be cut out, so nothing prints."""
+    from messagefoundry.store.schema_verify import SchemaMismatchError
+
+    reworded = SchemaMismatchError(
+        f"The schema step failed: NO SUCH COLUMN: MRN{_SYNTHETIC_ID}.",
+        cause=f"no such column: MRN{_SYNTHETIC_ID}",
+    )
+    assert safe_exc(reworded) == "SchemaMismatchError: [driver message withheld]"
+    two_args = SchemaMismatchError("store remedy")
+    two_args.args = ("store remedy", f"MRN{_SYNTHETIC_ID}")
+    assert safe_exc(two_args) == "SchemaMismatchError: [driver message withheld]"
+
+
+def test_a_marked_class_keeps_its_text_under_its_driver_class_name() -> None:
+    """Vault BACKLOG #8153. A class marked ``engine_text_only`` with ``named_as_driver`` prints
+    its message under the driver class it stands in for, in ``safe_exc``; a traceback prints the
+    message too. Red for the name while ``safe_exc`` printed the engine's private class name. A subclass of a marked class is not marked."""
+    import sqlite3
+
+    from messagefoundry.redaction import engine_text_only, shown_class_name
+
+    class _Marked(sqlite3.OperationalError):
+        pass
+
+    engine_text_only(_Marked, named_as_driver=True)
+
+    class _Unmarked(_Marked):
+        pass
+
+    marked = _raised(_Marked("could not take the synthetic store out of WAL mode"))
+    assert raised_by_a_driver(marked) is False
+    assert shown_class_name(marked) == "OperationalError"
+    assert (
+        safe_exc(marked) == "OperationalError: could not take the synthetic store out of WAL mode"
+    )
+    assert "could not take the synthetic store out of WAL mode" in _rendered(marked)
+    unmarked = _Unmarked(f"MRN{_SYNTHETIC_ID}")
+    assert raised_by_a_driver(unmarked) is True
+    assert _SYNTHETIC_ID not in safe_exc(unmarked)
+
+
+def test_a_subclass_of_a_driver_error_outside_the_engine_is_still_a_drivers() -> None:
+    """The control for the marker: an unmarked subclass of a driver's class is a driver's."""
+    import sqlite3
+
+    class _Elsewhere(sqlite3.IntegrityError):
+        pass
+
+    assert raised_by_a_driver(_Elsewhere(f"UNIQUE constraint failed: MRN{_SYNTHETIC_ID}")) is True
+
+
+def _sqlite_error(statement: str, *args: Any, closed: bool = False) -> BaseException:
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    if closed:
+        conn.close()
+    try:
+        conn.execute(statement, *args)
+    except sqlite3.Error as exc:
+        return exc
+    finally:
+        conn.close()
+    raise AssertionError("the statement did not fail")
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [
+        ("closed", "ProgrammingError: Cannot operate on a closed database."),
+        ("type", "ProgrammingError: Error binding parameter 1: type 'object' is not supported"),
+        (
+            "count",
+            "ProgrammingError: Incorrect number of bindings supplied. The current statement uses"
+            " 1, and there are 2 supplied.",
+        ),
+    ],
+)
+def test_sqlite_texts_that_carry_no_value_keep_their_reason(shape: str, expected: str) -> None:
+    """Vault BACKLOG #8153. ``sqlite3`` raises these with no ``sqlite_errorname``, so item 23
+    reduced each to ``[driver message withheld]`` and lost its reason; red while it did.
+    Each is raised by ``sqlite3`` itself, not built by hand, so a change to its wording shows."""
+    exc = {
+        "closed": lambda: _sqlite_error("SELECT 1", closed=True),
+        "type": lambda: _sqlite_error("SELECT ?", (object(),)),
+        "count": lambda: _sqlite_error("SELECT ?", (1, 2)),
+    }[shape]()
+    assert safe_exc(exc) == expected
+    assert expected in _rendered(_raised(exc))
+
+
+def test_a_sqlite_text_that_only_resembles_a_fixed_reason_is_withheld() -> None:
+    """The control for finding 7's rule: only an exact match of a fixed shape, held as an exact
+    ``str`` in the error's one argument, prints. A value appended, a second argument, a ``str``
+    subclass or a result code each leave the message withheld."""
+    import sqlite3
+
+    class _Text(str):
+        pass
+
+    appended = sqlite3.ProgrammingError(f"Cannot operate on a closed database. MRN{_SYNTHETIC_ID}")
+    two = sqlite3.ProgrammingError("Cannot operate on a closed database.", f"MRN{_SYNTHETIC_ID}")
+    subclass = sqlite3.ProgrammingError(_Text("Cannot operate on a closed database."))
+    typed = sqlite3.ProgrammingError(
+        f"Error binding parameter 1: type 'MRN {_SYNTHETIC_ID}' is not supported"
+    )
+    for exc in (appended, two, typed):
+        assert safe_exc(exc) == "ProgrammingError: [driver message withheld]", exc
+    assert safe_exc(subclass) == "ProgrammingError: [driver message withheld]"

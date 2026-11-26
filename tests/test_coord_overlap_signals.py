@@ -171,6 +171,52 @@ def test_an_untouched_file_is_not_reported(
     assert query(primary, tmp_path, "beta.txt") == []
 
 
+# A ``-File`` spelled the way a shell tab-completes it (``.\docs\gamma.txt``) or with a ``.`` or ``..``
+# segment names the same file git reports as ``docs/gamma.txt``, and must match it. The -File query once
+# only went through ConvertTo-Norm (slash flip, trim, lowercase), so every dotted spelling below missed,
+# and the gate read a real collision as an all-clear. The query now resolves through GetFullPath against
+# the repo root first; ConvertTo-Norm itself is unchanged and still does not canonicalize.
+def test_a_dotted_or_tab_completed_spelling_matches_gits_path(
+    peer_worktree: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """Every spelling of ``docs/gamma.txt`` matches; a ``..`` that leaves the repo matches nothing.
+
+    One fixture serves every spelling, since only the query string varies. git's own spelling runs
+    first as the control, so an empty answer below cannot come from a fixture that reports nothing.
+    """
+    primary, peer = peer_worktree
+    (peer / "docs").mkdir()
+    (peer / "docs" / "gamma.txt").write_text("theirs\n", encoding="utf-8")
+    git(peer, "add", "docs/gamma.txt")
+    git(peer, "commit", "-qm", "peer adds a nested file")
+
+    matching = [
+        "docs/gamma.txt",  # the control
+        "./docs/gamma.txt",
+        ".\\docs\\gamma.txt",
+        ".//docs//gamma.txt",
+        "docs/./gamma.txt",
+        "docs/../docs/gamma.txt",
+        "./alpha.txt/../docs/gamma.txt",
+        "docs/gamma.txt.",  # Windows trims a trailing dot, so this is the same file
+        f"{primary}\\docs\\..\\.\\docs\\gamma.txt",
+    ]
+    for spelling in matching:
+        assert query(primary, tmp_path, spelling), f"{spelling!r} names docs/gamma.txt; no match"
+
+    # ``..`` resolves the way Windows does: climbing out of the repo, or past the drive root, names a
+    # file that is not this one, so it must not be credited to the peer.
+    drive = Path(primary).drive
+    for spelling in (
+        "../docs/gamma.txt",
+        "docs/../../docs/gamma.txt",
+        f"{primary}\\..\\docs\\gamma.txt",
+        f"{drive}\\..\\docs\\gamma.txt",
+        "\\..\\docs\\gamma.txt",
+    ):
+        assert query(primary, tmp_path, spelling) == [], f"{spelling!r} is outside the repo"
+
+
 # --------------------------------------------- whose commit is it? (attribution of the committed half)
 #
 # Measured 2026-08-22. The gate told a session that ``scripts/coord/handoff.ps1`` had been "CHANGED AND

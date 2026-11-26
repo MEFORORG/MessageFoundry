@@ -2,7 +2,9 @@
   pair.** Every assist call sends `[ai].api_key` over https that verifies the endpoint's
   certificate, but stdlib `ssl` checks no CRL or OCSP, so the shipped code would have accepted a
   revoked endpoint certificate with no refusal and no record. On an instance at `[security].enforcement = enforce`,
-  an `[ai].endpoint` whose host is not loopback is now refused at `POST /ai/chat`, answered 503,
+  an `[ai].endpoint` whose host does not read as loopback (in the reading the
+  `[ai].endpoint_revocation_attested` entry of SECURITY-LOOSENING.md states, under which an
+  endpoint URL holding `[::1]` is loopback) is now refused at `POST /ai/chat`, answered 503,
   unless `[ai].endpoint_revocation_attested = true` is set with an
   `[ai].endpoint_revocation_attested_reason`, or, since BACKLOG #5527, on a set `[tls].crl_file`
   where the `[tls]` section reaches the app (the `[ai].endpoint_revocation_attested` entry of

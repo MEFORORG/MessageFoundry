@@ -473,10 +473,61 @@ def test_a_window_carried_from_another_root_is_no_floor_for_this_one(tmp_path: P
     assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(12.0)
 
 
+GONE = "7d reset passed, no current reading"
+
+
+def countdown(state: Path, pct: float, resets_in_s: int) -> tuple[str, set[str]]:
+    """Run the collector and return the countdown it printed, with every countdown a correct one could.
+
+    The remaining time is not fixed: ``collect`` can wait up to a minute and more on the spawn lock and
+    a starved pwsh start before the collector reads its clock. So the expectation is the set of
+    truncated countdowns over the whole window between the fixture's clock read and the collector's
+    exit. On a fast launch that set holds one value and the test tells truncation from rounding; on a
+    slow one it still never reds a correct collector.
+    """
+    before = time.time()
+    seven = window(pct, resets_in_s)
+    line = collect(state, {"session_id": "A", "rate_limits": {"seven_day": seven}})
+    after = time.time()
+    lo, hi = seven["resets_at"] - after, seven["resets_at"] - before
+    allowed = {GONE} if lo <= 0 else set()
+    if hi > 0:
+        allowed |= {
+            f"resets {m // 60}h{m % 60:02d}m"
+            for m in range(max(0, int(lo // 60)), int(hi // 60) + 1)
+        }
+    shown = re.search(r"resets \d+h\d\dm", line)
+    return (shown.group(0) if shown else line), allowed
+
+
 def test_the_status_line_truncates_hours_rather_than_rounding_them(tmp_path: Path) -> None:
-    """90 minutes rounded to the even hour read as 2h30m."""
-    line = collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(9.0, 5430)}})
-    assert re.search(r"resets 1h30m", line), line
+    """90 minutes rounded to the even hour read as 2h30m. 5459 s truncates to 1h30m; rounds to 1h31m."""
+    shown, allowed = countdown(tmp_path, 9.0, 5459)
+    assert shown in allowed, (shown, allowed)
+
+
+def test_the_status_line_floors_the_minutes_rather_than_rounding_them(tmp_path: Path) -> None:
+    """59m59s left is 0h59m. A cast to [int] rounded the total minutes up to 1h00m (BACKLOG #7597)."""
+    shown, allowed = countdown(tmp_path, 9.0, 59 * 60 + 59)
+    assert shown in allowed, (shown, allowed)
+
+
+def test_a_multi_day_countdown_carries_the_days_into_the_hours(tmp_path: Path) -> None:
+    """A 7-day window prints 77h46m, not the 5h46m that the span's Hours component alone would give."""
+    shown, allowed = countdown(tmp_path, 9.0, 280000)
+    assert shown in allowed, (shown, allowed)
+
+
+def test_a_reset_seconds_ago_is_a_gone_window_not_zero_minutes(tmp_path: Path) -> None:
+    """Rounding -0.3 minutes to 0 printed a 0h00m countdown for a window that had already reset."""
+    line = collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(99.0, -20)}})
+    assert line == GONE, line
+
+
+def test_a_window_in_its_last_minute_still_shows_a_countdown(tmp_path: Path) -> None:
+    """The control for the gone-window test: under a minute left is 0h00m, not the gone line."""
+    shown, allowed = countdown(tmp_path, 9.0, 59)
+    assert shown in allowed, (shown, allowed)
 
 
 @pytest.mark.parametrize("bad", ["", "not json at all", "{truncated", "null"])

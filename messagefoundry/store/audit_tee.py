@@ -306,7 +306,13 @@ def _bounded_detail(kept: str, note: str, old: str) -> str:
     """``kept``, the scrubbed detail, bounded by :func:`~messagefoundry.redaction.safe_text` as
     the value was, with ``note``, the bound note ``safe_text`` gave the value, which the scrub's
     own window cut off. Where ``old``, the detail the line before #3045 shipped, parses as JSON
-    and the bounded result does not, it ships as the JSON string ``"[redacted]"`` instead."""
+    and the bounded result does not, it ships as the JSON string ``"[redacted]"`` instead.
+
+    Neither this nor ``old`` is told that the note follows the head, so a value the cut left
+    last is judged as ending the text and can print, as on the code before BACKLOG #5925's
+    bounded-head rule (:func:`~messagefoundry.redaction.redact_bounded_head`). That is a named
+    residual: ``kept`` is already the handler chain's scrub of the head, which reads no note, so
+    telling only this bound would make the two answers differ and ship the whole detail hidden."""
     shipped = safe_text(kept) + note
     if _parses(old) and not _parses(shipped):
         return json.dumps(_FIELD_REDACTED)
@@ -630,7 +636,10 @@ def emit_audit_tee(
             tee_detail = _withhold_detail(detail)
         except Exception:  # noqa: BLE001 - its fault warning can raise; the row is committed
             tee_detail = _DETAIL_WITHHELD_WHOLE
-    # safe_text(head) + note is safe_text(tee_detail); the note is kept for a scrubbed detail.
+    # safe_text(head) + note, with the note kept apart for a scrubbed detail. This is NOT
+    # safe_text(tee_detail): that is told the note follows its head (BACKLOG #5925), and this is
+    # not, so it matches the scrubbed path, whose head the handler chain read with no note. A value
+    # the cut left last can print here; _bounded_detail names the residual.
     head, note = safe_text_bound(tee_detail) if tee_detail else ("", "")
     old_detail = safe_text(head) + note
     texts: dict[str, str | None] = {

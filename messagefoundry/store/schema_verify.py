@@ -34,7 +34,7 @@ from types import MappingProxyType
 
 import aiosqlite
 
-from messagefoundry.redaction import safe_exc
+from messagefoundry.redaction import engine_text_only, safe_exc
 
 __all__ = [
     "IndexShape",
@@ -97,7 +97,8 @@ _FOREIGN_OBJECTS_SQL = "SELECT type, name FROM sqlite_master WHERE type IN ('vie
 # THIS BUILD CREATES NO VIRTUAL TABLE, NO VIEW AND NO TRIGGER, which
 # tests/test_schema_verify_6719_6720.py pins; the other notes in this module rely on that and point
 # here.
-_ORDINARY_TABLE = "m.type = 'table' AND m.sql NOT LIKE 'CREATE VIRTUAL TABLE%'"
+# Parenthesized here, so every interpolation of it stays one predicate whatever surrounds it.
+_ORDINARY_TABLE = "(m.type = 'table' AND m.sql NOT LIKE 'CREATE VIRTUAL TABLE%')"
 # Each pragma is read through its table-valued form, so one statement reads every table, and the
 # table names travel as bound parameters rather than being spliced into SQL. Only tables the EXPECTED
 # shape names are read for columns. The placeholder list is built from a count, never from a name.
@@ -147,6 +148,21 @@ class SchemaMismatchError(sqlite3.DatabaseError):
         super().__init__(message)
         self.differences = differences
         self.cause = cause
+
+
+def _schema_step_text(exc: BaseException) -> object:
+    """The SQLite text a :class:`SchemaMismatchError` quotes: its ``cause``, or None."""
+    return getattr(exc, "cause", None)
+
+
+# Its message is the engine's remedy, which a renderer must keep, and it quotes the SQLite text of
+# a failed schema step, its `cause`. safe_exc and safe_traceback withhold that part (vault BACKLOG
+# #8153). At least these still print it, as before #8153: the CLI's store-open handler
+# (`_store_error_text` prints a sqlite3.DatabaseError's text whole) and the `backup` subcommand's
+# refusal, neither redacted; and the DR restore-verify reasons, `_incompatible_snapshot` quoting
+# `cause` and `_sqlite_error_reason` printing a SQLite error's message, redacted by pattern only.
+# The differences are the engine's reading of the live schema, printed as before.
+engine_text_only(SchemaMismatchError, driver_text=_schema_step_text)
 
 
 @dataclass(frozen=True)

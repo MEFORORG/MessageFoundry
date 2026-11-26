@@ -103,7 +103,7 @@ from messagefoundry.credential import constant_time_equal
 from messagefoundry.logging_guard import _last_resort
 from messagefoundry.parsing.binary import doc_ref_addresses_in_hl7 as _doc_ref_addresses_in_hl7
 from messagefoundry.parsing.binary import may_hold_doc_ref as _may_hold_doc_ref
-from messagefoundry.redaction import json_loads_or_refusal, safe_text
+from messagefoundry.redaction import engine_text_only, json_loads_or_refusal, safe_text
 from messagefoundry.service_status import _system_exe
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
@@ -233,6 +233,7 @@ from messagefoundry.store.row_seal import (
     transit_seal_refusals,
 )
 from messagefoundry.store.schema_verify import (
+    _ORDINARY_TABLE,
     SchemaMismatchError,
     is_schema_step_error,
     live_schema_differences,
@@ -1662,17 +1663,29 @@ GLOBAL_SESSION_EPOCH_MISSING: Final = (
 )
 
 
-# Vault BACKLOG #3028, ADR 0210: the session lineage's three statements, in `?` form for SQLite and
-# SQL Server; postgres.py respells them for `$n`. The INSERT runs only inside rotate_session's own
-# transaction, the SELECT only inside supersede_session's, and the DELETE only from the session
-# purge. No other statement names the table: a retired hash must authenticate nothing.
+# Vault BACKLOG #4276: ((julianday('now') - 2440587.5) * 86400.0) is the database's own clock as
+# epoch seconds, the unit `session_lineage.retired_at` holds. SQLite reads the host clock through its
+# VFS, not through Python's `time.time`, and holds 'now' fixed for the whole of one statement.
+# postgres.py and sqlserver.py spell their own clock (`_PG_EPOCH_NOW`, `_MSSQL_EPOCH_NOW`). Here the
+# expression is spelled literally in each statement below rather than interpolated, so
+# test_writer_txn_is_the_only_begin.py can read each as text; keep the three copies identical.
+# Vault BACKLOG #3028, ADR 0210: the session lineage's three statements; postgres.py and sqlserver.py
+# respell them. The INSERT runs only inside rotate_session's own transaction, the SELECT only inside
+# supersede_session's, and the DELETE only from the session purge. No other statement names the
+# table: a retired hash must authenticate nothing. Each stamps or measures `retired_at` on the
+# database's clock, never a parameter from an engine process (vault BACKLOG #4276,
+# store/session_lineage.py), so the window is one clock's reading on every engine shard.
 _SESSION_LINEAGE_INSERT: Final = (
-    "INSERT INTO session_lineage (retired_hash, successor_hash, retired_at) VALUES (?,?,?)"
+    "INSERT INTO session_lineage (retired_hash, successor_hash, retired_at)"
+    " VALUES (?,?,((julianday('now') - 2440587.5) * 86400.0))"
 )
 _SESSION_LINEAGE_SUCCESSOR: Final = (
-    "SELECT successor_hash FROM session_lineage WHERE retired_hash=? AND retired_at >= ?"
+    "SELECT successor_hash FROM session_lineage WHERE retired_hash=?"
+    " AND retired_at >= ((julianday('now') - 2440587.5) * 86400.0) - ?"
 )
-_SESSION_LINEAGE_PURGE: Final = "DELETE FROM session_lineage WHERE retired_at < ?"
+_SESSION_LINEAGE_PURGE: Final = (
+    "DELETE FROM session_lineage WHERE retired_at < ((julianday('now') - 2440587.5) * 86400.0) - ?"
+)
 
 
 def session_reseal_params(new: SessionRecord, old: SessionRecord) -> tuple[object, ...]:
@@ -1818,6 +1831,12 @@ def _refusal_key(refusal: _RevokeSealRefusal) -> tuple[object, ...]:
     return ("refusal", refusal.unverifiable, refusal.kind, refusal.ident)
 
 
+#: The note :meth:`RevokeSealOutcome.committing` adds to a failure of the report it runs after the
+#: revoke committed, so a caller can tell a revoke that landed from one that rolled back (BACKLOG
+#: #5093): ``admin-revoke-sessions`` reads it.
+REVOKE_COMMITTED_NOTE = "raised by the report after the revoke committed"
+
+
 @dataclass
 class RevokeSealOutcome:
     """What one revoke's sealed writes met (decision d20261109T200352805-599b24 on ADR 0217, items
@@ -1847,7 +1866,8 @@ class RevokeSealOutcome:
         known, on every exit (decision d20261110T063908944-857965, item 6).
 
         **On a clean exit** the revoke has committed, and :meth:`report` runs here, so no path
-        between the commit and a separate call can skip it.
+        between the commit and a separate call can skip it. A failure of that report carries
+        :data:`REVOKE_COMMITTED_NOTE`, since the revoke it reports on has landed (BACKLOG #5093).
 
         **If the transaction raises**, the report says the revoke failed before its commit was
         confirmed, rather than that it went ahead, and the exception propagates (decision
@@ -1883,7 +1903,11 @@ class RevokeSealOutcome:
         carry = _REVOKE_CARRY.get()
         if carry is not None and not carry.closed:
             carry.covered_by(self)
-        await self.report(record_audit)
+        try:
+            await self.report(record_audit)
+        except Exception as exc:
+            exc.add_note(REVOKE_COMMITTED_NOTE)
+            raise
 
     def refused(self, exc: Exception, *, what: str, kind: str, ident: str) -> None:
         """Take one refusal :func:`revoke_seal_refusals` names, which the revoke goes ahead without.
@@ -2653,6 +2677,13 @@ def new_session_record(
     )
 
 
+def _reanchored(stored: str | None, client: str | None) -> str | None:
+    """A session's address after a proof from ``client``: ``client``, or the stored one when it is
+    ``None`` (WP-L3-13). The one rule both :func:`reauth_stamp` and :func:`mfa_stamp` move the
+    anchor by (vault BACKLOG #2964 item 30)."""
+    return stored if client is None else client
+
+
 def reauth_stamp(
     now: float, client: str | None, idp_auth_time: float | None
 ) -> Callable[[SessionRecord], SessionRecord]:
@@ -2671,7 +2702,7 @@ def reauth_stamp(
         return replace(
             s,
             reauth_at=when,
-            client=s.client if client is None else client,
+            client=_reanchored(s.client, client),
             idp_auth_time=forward,
         )
 
@@ -2707,7 +2738,7 @@ class _MfaStamp:
         return replace(
             s,
             mfa_verified_at=self._when,
-            client=s.client if anchor.client is None else anchor.client,
+            client=_reanchored(s.client, anchor.client),
             reauth_at=self._when if anchor.open_window else None,
         )
 
@@ -4587,18 +4618,26 @@ def passkey_is_way_past(cred: WebAuthnCredential) -> bool:
     """Whether one passkey can be a way past the sign-in lock: recorded as discoverable, AND stored
     under today's credential-id hash scheme, the only key the sign-in looks a passkey up by (BACKLOG
     #3423). A row the start-up rehash has not moved (a bare digest), or one it refused (an unknown
-    tag, a malformed value), can never sign in, so it is no way past however it is recorded. The one
-    statement of the per-passkey way-past rule: at least the store's conditional writes, the census,
-    the service's gates, the sign-in path and the lock notice ask it. The census's reset list asks
-    only its hash-scheme half for a directory account's second factor, which needs no discoverable
-    record (:func:`~messagefoundry.auth.tokens.credential_id_hash_is_current`)."""
+    tag, a malformed value), can never sign in, so it is no way past however it is recorded. Nor is
+    one whose stored ``public_key`` does not decode, which the verify refuses (BACKLOG #6886). A
+    hash that reads back as bytes counts as the text it holds, as the sign-in's compare does. A
+    stored ``credential_id`` is not asked: the combined sign-in names no credential up front and
+    finds the passkey by the hash of the id the browser sends. Those stored-cell checks are
+    :func:`~messagefoundry.auth.tokens.stored_passkey_is_readable`.
+
+    The one statement of the per-passkey way-past rule: at least the store's conditional writes,
+    the census, the service's gates, the sign-in path and the lock notice ask it. The census's reset
+    list asks only its stored-cell half for a directory account's second factor, which needs no
+    discoverable record, and adds that the stored id decodes, which that leg's allow list needs."""
     if not cred.discoverable:
         return False
     # Lazy: a leaf module of the auth package (stdlib only), imported where the rule is asked so
     # the store module takes no import-time dependency on the auth package.
-    from messagefoundry.auth.tokens import credential_id_hash_is_current
+    from messagefoundry.auth.tokens import stored_passkey_is_readable
 
-    return credential_id_hash_is_current(cred.credential_id_hash)
+    return stored_passkey_is_readable(
+        credential_id_hash=cred.credential_id_hash, public_key=cred.public_key
+    )
 
 
 #: The caller's rule for which passkey counts as a way past at a factor-drop gate (BACKLOG #3937):
@@ -5522,6 +5561,31 @@ def scope_withdrawal(expected_scope: str, now: float) -> UserChange:
             return None
         return r.changed(
             channel_scope=None, channel_scope_source=SCOPE_SOURCE_AD, updated_at=float(now)
+        )
+
+    return apply
+
+
+def ad_scope_replacement(
+    scope_json: str,
+    expected_scope: str | None,
+    expected_source: ChannelScopeSource | None,
+    now: float,
+) -> UserChange:
+    """``set_ad_channel_scope_if_unchanged``'s compare-and-set (BACKLOG #6887): write the
+    directory's scope, marked ``ad``, only while the row still holds ``expected_scope`` AND
+    ``expected_source`` exactly (``None`` matching NULL). Both, because the AD sign-in decides from
+    both: the value decides whether the write changes the scope, which is what triggers its revoke,
+    and the source decides whether an unchanged value still needs taking over. The compare is
+    Python's, so it is byte-exact on every backend, as :func:`scope_withdrawal`'s is."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if r.row.channel_scope != expected_scope:
+            return None
+        if r.row.channel_scope_source != expected_source:
+            return None
+        return r.changed(
+            channel_scope=scope_json, channel_scope_source=SCOPE_SOURCE_AD, updated_at=float(now)
         )
 
     return apply
@@ -6734,9 +6798,12 @@ AUDIT_ANCHOR_DIGEST_HEX_LEN = AUDIT_MAC_HEX_LEN
 AUDIT_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
 
 
-#: How much of an anchor file is read before it is refused. An anchor is ONE short line -- the longest
-#: producible form is a count plus a `vault:v1:<base64>` MAC, comfortably under 200 bytes -- so anything
-#: past this is not an anchor file and the excess must never be read, let alone quoted back.
+#: How much of an anchor file is read before it is refused. An anchor is ONE short line -- a count
+#: plus a 64-character hex head, or a shorter `vault:v<N>:<base64>` Transit MAC, comfortably under 200
+#: bytes -- so anything past this is not an anchor file and the excess must never be read, let alone
+#: quoted back. This is the READER's bound, not a parser check: the parser passes a `vault:v` head
+#: through unchecked (:func:`_audit_head_shape` says what that costs), so only this byte bound limits
+#: one read from a file, and nothing limits one given as ``--expected-anchor`` on the command line.
 #:
 #: THE BOUND IS A LOG-DISCLOSURE CONTROL, NOT A PERFORMANCE ONE. ``str(AuditAnchorError)``
 #: interpolates the offending text with ``{text!r}``. Neither file caller prints it now (vault
@@ -6745,6 +6812,23 @@ AUDIT_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
 #: file, or a captured HL7 message would put that line into the service log at WARNING -- which is
 #: the PHI rule in CLAUDE.md section 9.
 AUDIT_ANCHOR_MAX_BYTES = 4096
+
+
+def _ascii_digits(text: str) -> bool:
+    """``text`` is ASCII decimal digits only: the digit rule of :func:`_audit_decimal`, which the
+    anchor's sign check shares."""
+    return text.isascii() and text.isdigit()
+
+
+def _audit_decimal(text: str) -> int | None:
+    """``text`` as an int when it is ASCII digits only, at most 19 of them (the width of the signed
+    64-bit ``seq`` column every backend uses), else ``None``. The one count grammar of
+    :func:`parse_audit_anchor` and :func:`parse_audit_row_pair`: ``int()`` alone would read
+    ``1_0`` as 10, accept a sign or non-ASCII digits, and parse any length up to Python's limit.
+    The caller checks the value against :data:`_AUDIT_SEQ_MAX`."""
+    if not _ascii_digits(text) or len(text) > 19:
+        return None
+    return int(text)
 
 
 class AuditAnchorError(ValueError):
@@ -6775,8 +6859,9 @@ class AuditAnchorError(ValueError):
 
 
 def read_audit_anchor_file(path: str | Path) -> str:
-    """Read an anchor file into the text :func:`parse_audit_anchor` takes. Raises ``OSError`` or
-    ``UnicodeDecodeError``; each caller words its own operator-facing refusal around those.
+    """Read an anchor file into the text :func:`parse_audit_anchor` takes. Raises at least
+    ``OSError``, ``UnicodeDecodeError``, and ``ValueError`` for a path carrying a NUL character;
+    ``Engine._load_audit_anchor`` says what the third does at startup.
 
     ``utf-8-sig`` absorbs a leading BOM: PowerShell 5.1's ``Set-Content -Encoding utf8`` writes UTF-8
     WITH one, and this product deploys as a Windows service, so that is a first-class way an operator
@@ -6830,9 +6915,11 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
     verify: a silently-ignored anchor turns the whole control into a gate that reports green while
     checking nothing, which is precisely the failure the anchor exists to close.
 
-    It must ALSO refuse rather than hand a comparator a head the store can never emit. Both comparators
-    compare the head byte-exactly and report *any* difference as ``truncated or rewritten``, so an
-    accepted-but-impossible head becomes a FALSE tamper alarm — a red light on an intact chain,
+    It ALSO refuses a hex head of the wrong length and a head of neither shape, rather than hand a
+    comparator a head the store can never emit; a ``vault:v`` head is the exception, passed through
+    unchecked (see the second bullet), and :func:`_audit_head_shape` states what that costs.
+    Both comparators compare the head byte-exactly and report *any* difference as
+    ``truncated or rewritten``, so an accepted-but-impossible head becomes a FALSE tamper alarm — a red light on an intact chain,
     indistinguishable from a real detection. A control whose whole value is that a FAIL means something
     cannot be allowed to manufacture FAILs out of its own input handling — the inverse of the
     green-while-checking-nothing hole above, and it costs just as much.
@@ -6866,16 +6953,26 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
     count_text, sep, head = raw.partition(":")
     if not sep:
         raise AuditAnchorError("no ':' separator", text)
-    try:
-        count = int(count_text)
-    except ValueError:
-        # The count is quoted in `str(exc)` via `text`, so the reason stays content-free: a row count
-        # is short and non-secret, but "content-free" has to be a rule, not a judgement per branch.
-        raise AuditAnchorError("the row count is not an integer", text) from None
-    if count < 0:
-        # No value in a reason, not even the count: `--expected-anchor-file` prints the reason, and
-        # the count is that file's content (vault BACKLOG #2612).
+    count_text = count_text.strip()
+    # The row pair's grammar, not `int()`'s, which also takes `+5`, `1_000`, non-ASCII digits and
+    # any length up to Python's digit limit (vault BACKLOG #4790). The count is quoted in `str(exc)`
+    # via `text`; no reason names a value, not even the count: `--expected-anchor-file` prints the
+    # reason, and the count is that file's content (vault BACKLOG #2612).
+    # A minus sign before ASCII digits is judged on the sign before the width, so each reason is
+    # true of its input: "-0" is a signed zero, not a negative count, and a minus before 20 or more
+    # digits is negative whatever its width.
+    unsigned = count_text.removeprefix("-")
+    if unsigned != count_text and _ascii_digits(unsigned):
+        if not unsigned.strip("0"):
+            raise AuditAnchorError("the row count is a signed zero, which no store prints", text)
         raise AuditAnchorError("the row count is negative", text)
+    count = _audit_decimal(count_text)
+    if count is None:
+        raise AuditAnchorError(
+            "the row count is not a plain decimal integer of up to 19 digits", text
+        )
+    if count > _AUDIT_SEQ_MAX:
+        raise AuditAnchorError("the row count is larger than any store can hold", text)
     head = head.strip()
     if not head:
         if count != 0:
@@ -6901,9 +6998,19 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
 
 def _audit_head_shape(head: str, noun: str = "the head") -> tuple[str | None, str]:
     """``(why a non-empty head is refused, or None; the head normalised)``. The one statement of
-    which heads the store can emit, shared by :func:`parse_audit_anchor` and
+    which heads are taken, shared by :func:`parse_audit_anchor` and
     :func:`parse_audit_row_pair`, so a hardening of it reaches both. The reason quotes no part of the
-    head. ``noun`` names the value in the reason."""
+    head. ``noun`` names the value in the reason.
+
+    THE KNOWN COST OF THE ``vault:v`` PASS-THROUGH. A ``vault:v`` anchor or row pair whose count or
+    seq passes, and whose head is malformed (for example truncated, or carrying a space), is not
+    refused: it reaches the comparator, and on an intact chain the walk reports ``truncated or
+    rewritten``. ``audit-verify`` then exits 1, the tamper code, not 2. The engine's
+    ``[integrity].audit_anchor_file`` startup check logs that verdict at WARNING, quoting the
+    anchor's count and the first 12 characters of its head and of the chain's head at that row,
+    and, where an alert sink is configured, fires ``integrity_drift`` with subject
+    ``audit-chain-truncated`` carrying the same text. Vault BACKLOG #5987 item 1 and #4790 items 2
+    and 4 hold it open."""
     if set(head) <= _AUDIT_ANCHOR_HEX:
         if len(head) != AUDIT_ANCHOR_DIGEST_HEX_LEN:
             return (
@@ -6912,7 +7019,13 @@ def _audit_head_shape(head: str, noun: str = "the head") -> tuple[str | None, st
             )
         return None, head.lower()
     if head.startswith(AUDIT_ANCHOR_ISOLATED_MAC_PREFIX):
-        return None, head  # opaque by construction; never normalise what we do not define
+        # Opaque by construction; never normalise what we do not define. Not held to the Transit
+        # MAC's shape either: `audit-anchor` prints a tampered `vault:v` head as the store holds it,
+        # and `audit-verify` exits 2 on an anchor this parser refuses, before it walks, so a shape
+        # check here would leave such a tamper unwalked. A malformed `vault:v` head is therefore
+        # compared against the walked chain, not refused. A tampered head of another shape is still
+        # refused before the walk. The cost is in the docstring.
+        return None, head
     return (
         f"{noun} is neither a {AUDIT_ANCHOR_DIGEST_HEX_LEN}-character hex digest nor an "
         f"isolated-module {AUDIT_ANCHOR_ISOLATED_MAC_PREFIX}… MAC (ADR 0138)",
@@ -6942,20 +7055,20 @@ def parse_audit_row_pair(text: str) -> tuple[int, str]:
     """Parse a ``SEQ:ROW_HASH`` pair, one row the off-box tee witnessed, into the tuple
     ``verify_audit_chain(expected_rows=...)`` takes (vault BACKLOG #2612).
 
-    It refuses, as :func:`parse_audit_anchor` does and for the same reason, any head the store can
-    never emit, since a comparator would report it as tampering. Unlike an anchor, a pair names a
-    ROW, so its sequence number is at least 1 and its head is never empty."""
+    It applies :func:`parse_audit_anchor`'s head rule, so it refuses a hex head that is not exactly
+    64 characters and a head of neither shape, and passes a ``vault:v`` head through unchecked, at
+    the cost :func:`_audit_head_shape` states.
+    Unlike an anchor, a pair names a ROW, so its sequence number is at least 1 and its head is never
+    empty."""
     seq_text, sep, head = text.strip().partition(":")
     if not sep:
         raise AuditRowPairError("no ':' separator", text)
     seq_text = seq_text.strip()  # space either side of the ':' reads alike
-    # ASCII digits only, and no wider than a store's sequence column: `int()` alone would read
-    # '1_0' as 10, accept non-ASCII digits, and admit a seq no store can hold.
-    if not (seq_text.isascii() and seq_text.isdigit()) or len(seq_text) > 19:
+    seq = _audit_decimal(seq_text)
+    if seq is None:
         raise AuditRowPairError(
             "the sequence number is not a plain decimal of up to 19 digits", text
         )
-    seq = int(seq_text)
     if not 1 <= seq <= _AUDIT_SEQ_MAX:
         raise AuditRowPairError(
             "the sequence number is outside 1 to 2**63-1, so it names no row", text
@@ -9137,38 +9250,100 @@ def _sqlite_readonly_uri(path: str) -> str:
     return uri + "?mode=ro"
 
 
+#: How :func:`forget_store_salt` names an object holding ``store_salt`` that is not an ordinary
+#: table, keyed by ``lower(sqlite_master.type)``. A ``table`` row there failed the ordinary-table
+#: predicate, so it is normally a virtual table; an ordinary table whose row a hand edit gave a
+#: type in another case is named as one too, and refused.
+_FOREIGN_SALT_KINDS = {"table": "a virtual table", "view": "a view", "index": "an index"}
+
+
 def forget_store_salt(path: Path) -> bool:
-    """Drop the store salt from a CLOSED SQLite store file, so its next open mints a new one (ADR 0196).
+    """Drop the salt from a CLOSED SQLite store file, so its next salted open mints one (ADR 0196).
 
     For a store that is a copy of another: what ``restore`` places, and the scratch copy the full
     restore-verify opens. A copy carries the original's salt, so it would seal under the original's
     data sub-key while counting that key's use from the copy's older row -- the rewind ADR 0196
-    closes. With no salt row, the first open mints a salt and so a key nothing has used, before it
-    seals anything; every value already in the file names its own salt and still opens.
+    closes. With no salt row, the first open that binds a salt mints one and so a key nothing has
+    used, before it seals anything. Not every open binds one: ``bind_store_salt`` in ``gcm_bound``
+    names those that do not, at least the identity and ``vault_transit`` ciphers and the frozen v1
+    writer (``[store].aad_bind = false``), and for those this call changes no key. It does not change
+    how a value already in the file opens: a v4 value names its own salt in the value, a v1 or v2
+    value is sealed under the DEK itself, and a v3 value is the Transit cipher's, opened by Vault.
 
-    Returns whether a row was removed. A file from before ADR 0196 has no ``store_salt`` table and so
-    nothing to forget; its first open creates one. Synchronous, for the off-loop restore path.
+    Synchronous, for the off-loop restore path. What it returns or raises, in at least these cases:
 
-    **It proves the row is gone from the MAIN FILE, or raises ``sqlite3.OperationalError``.** A
-    snapshot can carry WAL mode in its header, and then a plain DELETE commits into ``-wal``. The
-    callers place or open only the main file, so a delete left in a WAL that was never checkpointed
-    would be silently dropped, and the copy would keep the original's salt. So the file is first
-    switched to ``journal_mode=DELETE``, which checkpoints the WAL and removes it, and which SQLite
-    refuses while another connection holds the file. After the delete, the main file is re-read with
-    no ``-wal`` beside it. A refusal is the caller's to report; it never places an unproven copy."""
+    - **True**: an ordinary ``store_salt`` table held at least one row, the delete removed it, and
+      the re-read below found none left in the MAIN FILE.
+    - **False, with an ordinary table**: the ``store_salt`` table was there but the delete removed no
+      row, normally because it was empty, so there was nothing to forget.
+    - **False, with no object of that name**: a file from before ADR 0196 has no ``store_salt``, and
+      its first writable open creates the table. A path with no file is in this case too: the
+      connect creates an empty file there.
+    - **Raises** ``sqlite3.OperationalError`` naming the kind of object when there is no ordinary
+      ``store_salt`` table and the name is held by another object, at least a view, an index or a
+      virtual table another tool left. Such an object is neither read nor dropped and is left in
+      the file as it was, so nothing about a salt is proven. Before the raise the file has been
+      taken out of WAL mode, as below. A trigger of that name does not make the call raise: it has
+      a namespace of its own and does not stop the writable open creating the table. A trigger
+      defined ON ``store_salt`` still fires inside the delete, so it can change what the call does.
+    - **Raises** ``sqlite3.OperationalError`` when the file cannot be written as a closed file or
+      the write is not proven: at least when another connection's hold makes the journal-mode switch
+      or the delete fail (``database is locked``, or on a WAL file the switch refused), when a
+      non-empty ``-wal`` remains afterwards or its size cannot be read (the ``OSError`` is converted,
+      so a caller that catches ``sqlite3.Error`` refuses the copy), or when the read-only re-read
+      still finds a row in the ordinary table, whether or not the delete reported removing one.
+      SQLite does not refuse every other holder: on a file in rollback-journal mode an idle second
+      connection lets the call write, and on a WAL file so does one opened with ``immutable=1``,
+      which takes no lock. Other ``sqlite3.Error`` subclasses from opening or reading the file
+      propagate too.
+
+    **On each path that returns, it has re-read the MAIN FILE and found no row in an ordinary
+    table.** That re-read does not look for a view, index or virtual table; the check above runs on
+    the writing connection only when it finds no ordinary table. A snapshot can carry WAL mode in
+    its header, and then a plain DELETE commits into ``-wal``. The callers place or open only the main file, so a
+    delete left in a WAL that was never checkpointed would be silently dropped, and the copy would
+    keep the original's salt. So the file is first switched to ``journal_mode=DELETE``, which
+    checkpoints the WAL and removes it. After the delete, the main file is re-read with no ``-wal``
+    beside it. A raise is the caller's to report."""
+
+    # The ordinary-table predicate, so a virtual `store_salt` another tool left, whose module may
+    # not be loaded here, is not probed and cannot raise "no such module" (BACKLOG #6719 item 4).
+    # lower(), as schema_verify's salt read matches it: SQLite resolves the name case-blind, so a
+    # `Store_Salt` table is the one the next open reads. One helper holds the table-exists check that
+    # the drop and its proof both make, so those two checks cannot drift apart; it also means the proof
+    # cannot catch a table that check misses. The statement is spelled at the call rather than held in
+    # a local so tests/test_writer_txn_is_the_only_begin.py can read it.
+
+    def has_salt_table(conn: sqlite3.Connection) -> bool:
+        return bool(
+            conn.execute(
+                "SELECT count(*) FROM sqlite_master AS m"
+                f" WHERE {_ORDINARY_TABLE} AND lower(m.name) = 'store_salt'"
+            ).fetchone()[0]
+        )
 
     def drop(conn: sqlite3.Connection) -> bool:
-        exists = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_salt'"
+        if has_salt_table(conn):
+            return conn.execute("DELETE FROM store_salt").rowcount > 0
+        # Fail closed on a name another tool's object holds: returning False there let a restore
+        # place a copy that its first writable open then refuses, with the salt question unasked.
+        # Tables, views and indexes share one namespace, so at most one such object matches. A
+        # trigger has a namespace of its own and does not stop the open creating the table.
+        foreign = conn.execute(
+            "SELECT lower(m.type) FROM sqlite_master AS m"
+            " WHERE lower(m.name) = 'store_salt' AND lower(m.type) <> 'trigger'"
         ).fetchone()
-        return exists is not None and conn.execute("DELETE FROM store_salt").rowcount > 0
+        if foreign is not None:
+            kind = _FOREIGN_SALT_KINDS.get(str(foreign[0]), "an object of another kind")
+            raise _ClosedStoreWriteError(
+                f"store_salt is {kind}, not this build's salt table, so the store salt cannot be "
+                f"dropped from {path}"
+            )
+        return False
 
     def gone(proof: sqlite3.Connection) -> bool:
         return not (
-            proof.execute(
-                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'store_salt'"
-            ).fetchone()[0]
-            and proof.execute("SELECT count(*) FROM store_salt").fetchone()[0]
+            has_salt_table(proof) and proof.execute("SELECT count(*) FROM store_salt").fetchone()[0]
         )
 
     return _write_closed_store(
@@ -9178,6 +9353,20 @@ def forget_store_salt(path: Path) -> bool:
         what="its store salt cannot be dropped",
         proof_failed="still holds a store salt after it was dropped",
     )
+
+
+class _ClosedStoreWriteError(sqlite3.OperationalError):
+    """:func:`_write_closed_store`'s own refusals, and :func:`forget_store_salt`'s refusal of a
+    ``store_salt`` that is not an ordinary table, whose text the engine wrote: a store or ``-wal``
+    path, the journal mode SQLite reported, a kind word from ``_FOREIGN_SALT_KINDS`` or its fixed
+    fallback, and a fixed sentence, never a row's value or SQLite's message.
+    Marked :func:`~messagefoundry.redaction.engine_text_only`, so a renderer that withholds a
+    database driver's message keeps it (vault BACKLOG #8153). ``safe_exc`` and the DR reasons show
+    it as ``OperationalError``; a traceback names this class itself.
+    Still a ``sqlite3.OperationalError``, so every handler that caught one catches it."""
+
+
+engine_text_only(_ClosedStoreWriteError, named_as_driver=True)
 
 
 def _write_closed_store[T](
@@ -9191,32 +9380,42 @@ def _write_closed_store[T](
     """Run ``write`` on a CLOSED SQLite store file and prove it landed in the MAIN FILE, for
     :func:`forget_store_salt` and :func:`write_restore_marker`.
 
-    The file is first switched to ``journal_mode=DELETE``, which checkpoints a WAL and removes it,
-    and which SQLite refuses while another connection holds the file; ``write`` then runs in
-    autocommit. Afterwards a non-empty ``-wal`` beside it, or a read-only re-read on which ``prove``
-    answers False, raises ``sqlite3.OperationalError``: a caller places or opens only the main
-    file, so a change left in a WAL nobody checkpoints would be silently dropped."""
+    The file is first switched to ``journal_mode=DELETE``, which checkpoints a WAL and removes it;
+    on a WAL file SQLite refuses the switch while another connection holds it through SQLite's
+    locks, but not every other holder is refused (:func:`forget_store_salt` says which). ``write``
+    then runs in autocommit. Afterwards a non-empty ``-wal`` beside it, a ``-wal`` whose size
+    cannot be read, or a read-only re-read on which ``prove`` answers False, raises
+    ``sqlite3.OperationalError``: a caller places or opens only the main file, so a change left in
+    a WAL nobody checkpoints would be silently dropped."""
     wal = path.with_name(path.name + "-wal")
     conn = sqlite3.connect(str(path), isolation_level=None)  # autocommit: each statement commits
     try:
         mode = str(conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]).lower()
         if mode != "delete":
-            raise sqlite3.OperationalError(
+            raise _ClosedStoreWriteError(
                 f"could not take {path} out of WAL mode (it is still {mode!r}); another "
                 f"connection holds it, so {what}"
             )
         result = write(conn)
     finally:
         conn.close()
-    if wal.exists() and wal.stat().st_size:
-        raise sqlite3.OperationalError(f"{wal} still holds changes after leaving WAL mode")
+    try:
+        wal_size = wal.stat().st_size
+    except FileNotFoundError:
+        wal_size = 0
+    except OSError as exc:
+        # The callers catch sqlite3.Error, so an OSError here would escape their refusal; an
+        # unreadable -wal is an unproven write, and fails closed as one.
+        raise _ClosedStoreWriteError(f"{wal} could not be read after leaving WAL mode") from exc
+    if wal_size:
+        raise _ClosedStoreWriteError(f"{wal} still holds changes after leaving WAL mode")
     proof = sqlite3.connect(_sqlite_readonly_uri(str(path.absolute())), uri=True)
     try:
         proven = prove(proof)
     finally:
         proof.close()
     if not proven:
-        raise sqlite3.OperationalError(f"{path} {proof_failed}")
+        raise _ClosedStoreWriteError(f"{path} {proof_failed}")
     return result
 
 
@@ -9267,7 +9466,11 @@ def write_restore_marker(
     The sessions are ended here too, in the same transaction as the marker, because a revoke
     needs no key: so no path that honours a session without consuming the marker, such as an
     older build started on the file, gets the archive's sessions back. The first start still
-    raises every account's session epoch, which needs the key, and adds this count to its own.
+    revokes as :meth:`MessageStore.revoke_all_sessions` does, raising the global session epoch
+    and each account's, the second of which needs the key, and adds this count to its own. An
+    account goes without its own raise where :func:`raise_account_epoch` says, at least on a seal
+    refusal and after a Vault Transit outage trips the revoke; the global epoch still ends its
+    sessions.
 
     It is proven in the main file as :func:`forget_store_salt`'s drop is, through
     :func:`_write_closed_store`: a non-empty ``-wal`` beside it, or a re-read that finds no row
@@ -10394,6 +10597,14 @@ row locks (and on SQLite the writer lock). It runs BEFORE the audit chain's lock
 not read chain state."""
 
 
+type InjectAudit = Callable[[str], AuditAppend]
+"""An operator inject's :data:`OperatorAudit`, built from the new message id (BACKLOG #6589).
+
+It returns a row every time: an inject always writes a message, so it always records one, and
+:func:`require_ingress_audit` refuses a ``None`` row at runtime. Typed apart from
+:data:`OperatorAudit` so mypy refuses, at a typed caller, an inject audit that may build none."""
+
+
 def no_audit_row(_result: object) -> None:
     """An :data:`OperatorAudit` that records nothing, for a write whose caller records it itself.
 
@@ -10882,35 +11093,54 @@ def require_mutation_audit[R](audit: OperatorAudit[R], mutation: str) -> Operato
 OPERATOR_ORIGINS: Final = frozenset({MessageOrigin.OPERATOR_EDIT, MessageOrigin.OPERATOR_UPLOAD})
 
 
-def require_ingress_audit(
-    audit: OperatorAudit[str] | None, origin: MessageOrigin
-) -> OperatorAudit[str] | None:
-    """``enqueue_ingress``'s refusal (BACKLOG #5071), and the audit it then runs.
+def is_origin_actor(value: object) -> TypeGuard[str]:
+    """Whether ``value`` can name the user behind an operator origin (BACKLOG #6589): a non-blank
+    string with no surrounding whitespace. The rule :func:`require_ingress_audit` applies, exposed
+    so a caller can refuse first, as the upload resend route does."""
+    return isinstance(value, str) and bool(value) and value == value.strip()
 
-    Before anything is written, an operator origin with no audit or with one that is not callable,
-    and an audit given with any other origin, raise :class:`TypeError`. The audit must also build
-    a row: an inject always writes a message, so a ``None`` row raises inside the transaction and
-    rolls the inject back. A live receipt keeps the default ``partner`` origin and passes none.
+
+def require_ingress_audit(
+    audit: OperatorAudit[str] | None, origin: MessageOrigin, origin_actor: str | None
+) -> InjectAudit | None:
+    """``enqueue_ingress``'s refusal (BACKLOG #5071, #6589), and the audit it then runs.
+
+    Before anything is written, :class:`TypeError` is raised for an operator origin (one in
+    :data:`OPERATOR_ORIGINS`) with no audit, with one that is not callable, or with no
+    ``origin_actor`` naming the user, which must be non-blank and carry no surrounding whitespace;
+    and for an audit or an ``origin_actor`` given with any other origin. The audit must also build a
+    row: an inject always writes a message, so a ``None`` row raises inside the transaction and
+    rolls the inject back. A live receipt keeps the default ``partner`` origin and passes neither.
 
     It keys on ``origin``, so it cannot see an operator's inject written with the default
-    ``partner`` origin: such a call writes neither the operator label nor an audit row. Nothing at
-    the type level holds a direct caller of the store either, since ``audit`` stays optional there.
-    The engine's inject, :meth:`~messagefoundry.pipeline.Engine.inject_message`, requires its
-    ``audit`` and always writes ``operator_upload``."""
+    ``partner`` origin and nothing else: such a call writes neither the operator label nor an audit
+    row. Nothing at the type level holds a direct caller of the store either, since ``audit`` stays
+    optional there. The engine's inject, :meth:`~messagefoundry.pipeline.Engine.inject_message`,
+    requires its ``audit`` and ``actor`` and always writes ``operator_upload``."""
     operator = origin in OPERATOR_ORIGINS
     if not operator:
+        # An audit or an actor is an operator's inject; with this origin the message would be
+        # labelled as a receipt, so the caller forgot the origin.
         if audit is not None:
-            # An audit is an operator's inject; with this origin the message would be labelled
-            # as a receipt, so the caller forgot the origin.
             raise TypeError(
                 f"enqueue_ingress was given an audit with origin {str(origin)!r}; an operator's"
                 " inject names its operator origin (BACKLOG #5071)"
+            )
+        if origin_actor is not None:
+            raise TypeError(
+                f"enqueue_ingress was given an origin_actor with origin {str(origin)!r}; only an"
+                " operator origin names its user (BACKLOG #6589)"
             )
         return None
     if not callable(audit):
         raise TypeError(
             f"enqueue_ingress with origin {str(origin)!r} needs an operator audit, a callable that"
             f" builds its audit row; got {type(audit).__name__} (BACKLOG #5071)"
+        )
+    if not is_origin_actor(origin_actor):
+        raise TypeError(
+            f"enqueue_ingress with origin {str(origin)!r} needs the origin_actor that names its"
+            f" user; got {origin_actor!r} (BACKLOG #6589)"
         )
     build = audit
 
@@ -10952,7 +11182,8 @@ def if_applied(audit: AuditAppend) -> OperatorAudit[bool]:
 
     Anything but an :class:`AuditAppend`, an explicit ``None`` included, raises :class:`TypeError`
     here, so an alert mutation given no row cannot change the alert and record nothing (BACKLOG
-    #5069)."""
+    #5069). Its callers take it as their first statement, so that refusal comes before any write
+    or lock (BACKLOG #6589)."""
     if not isinstance(audit, AuditAppend):
         raise TypeError(
             f"an operator alert mutation or connection flag needs an AuditAppend; got {type(audit).__name__}"
@@ -12036,7 +12267,8 @@ CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at);
 CREATE TABLE IF NOT EXISTS session_lineage (
     retired_hash   TEXT PRIMARY KEY,           -- the hash the rotation retired
     successor_hash TEXT NOT NULL,              -- the hash the session carried next
-    retired_at     REAL NOT NULL               -- when the re-key landed, in its transaction (wall clock)
+    retired_at     REAL NOT NULL               -- when the re-key landed, in its transaction
+                                               -- (the database's clock)
 );
 CREATE INDEX IF NOT EXISTS ix_session_lineage_retired ON session_lineage(retired_at);
 
@@ -14315,8 +14547,12 @@ class MessageStore:
         open() with an opaque ``FOREIGN KEY constraint failed``: ``queue.message_id`` is FK-enforced
         and this INSERT runs under ``foreign_keys=ON``. A skipped orphan was unreplayable anyway (no
         message to view/route); we log how many were dropped."""
+        # The ordinary-table predicate: a virtual `outbox` is another tool's, and reading it could
+        # raise "no such module" (BACKLOG #6719 item 4).
         cur = await db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='outbox'"
+            # Exact case, unlike the salt probe: nothing but this fold reads `outbox`, and it drops
+            # the table, so a case variant another tool left must be left alone.
+            f"SELECT name FROM sqlite_master AS m WHERE {_ORDINARY_TABLE} AND m.name = 'outbox'"
         )
         if await cur.fetchone() is None:
             return  # already migrated (or a fresh DB) — nothing to fold in
@@ -15013,7 +15249,7 @@ class MessageStore:
         metadata: str | None = None,
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
-        audit: OperatorAudit[str] | None = None,
+        audit: InjectAudit | None = None,
         origin: MessageOrigin = MessageOrigin.PARTNER,
         origin_actor: str | None = None,
     ) -> str:
@@ -15034,7 +15270,7 @@ class MessageStore:
         leaves the attachment at refcount 0 (no ACK → the sender resends; content-addressing dedups the
         resend and the startup ``sweep_orphan_attachments`` reclaims the orphan). Empty/None → the
         byte-identical no-detach path (no incref)."""
-        audit = require_ingress_audit(audit, origin)  # BACKLOG #5071
+        audit = require_ingress_audit(audit, origin, origin_actor)  # BACKLOG #5071, #6589
         now = time.time() if now is None else now
         mid = uuid4().hex
         # Distinct refs only: one skeleton holds a de-duplicated document (two identical OBX-5.5 values
@@ -19339,13 +19575,15 @@ class MessageStore:
         )
 
     async def _commit_alert_change(
-        self, written: AuditedWrite, audit: AuditAppend, applied: bool
+        self, written: AuditedWrite, audit_row: OperatorAudit[bool], applied: bool
     ) -> bool:
         """Append an operator alert mutation's row, when its UPDATE matched, and commit both in the
         one transaction (vault BACKLOG #3217), so a failed append changes nothing and a 404 writes
-        no row. Each caller spells its UPDATE at its own ``execute``, which the transaction-verb
-        guard reads (tests/test_writer_txn_is_the_only_begin.py)."""
-        await self._append_operator_audit(written, if_applied(audit), applied)
+        no row. ``audit_row`` is the caller's :func:`if_applied`, taken as its first statement, so a
+        missing row was refused before the UPDATE (BACKLOG #6589). Each caller spells its UPDATE at
+        its own ``execute``, which the transaction-verb guard reads
+        (tests/test_writer_txn_is_the_only_begin.py)."""
+        await self._append_operator_audit(written, audit_row, applied)
         await self._commit()
         return applied
 
@@ -19359,6 +19597,7 @@ class MessageStore:
         now: float | None = None,
     ) -> None:
         """See :meth:`messagefoundry.store.base.QueueStore.set_connection_flag`."""
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             if flagged:
@@ -19372,7 +19611,7 @@ class MessageStore:
                     "DELETE FROM connection_flag WHERE connection=? AND direction=?",
                     (connection, direction),
                 )
-            await self._append_operator_audit(written, if_applied(audit), True)
+            await self._append_operator_audit(written, audit_row, True)
             await self._commit()
 
     async def list_connection_flags(self) -> set[tuple[str, str]]:
@@ -19385,6 +19624,7 @@ class MessageStore:
     async def ack_alert_instance(
         self, alert_id: int, *, actor: str, audit: AuditAppend, now: float | None = None
     ) -> bool:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # Operator ack: open|acknowledged -> acknowledged, recording acked_by/acked_at. Idempotent (a
         # re-ack is a no-op update). Returns True iff a non-resolved instance with this id existed (so
         # the API can 404 a resolved/unknown id). Acking a resolved instance is refused (no-op, False).
@@ -19395,11 +19635,12 @@ class MessageStore:
                 " WHERE id=? AND status!='resolved'",
                 (actor, now, alert_id),
             )
-            return await self._commit_alert_change(written, audit, cur.rowcount > 0)
+            return await self._commit_alert_change(written, audit_row, cur.rowcount > 0)
 
     async def resolve_alert_instance(
         self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> bool:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # Operator resolve: open|acknowledged -> resolved, recording resolved_at. Returns True iff a
         # non-resolved instance with this id existed.
         now = time.time() if now is None else now
@@ -19409,7 +19650,7 @@ class MessageStore:
                 " WHERE id=? AND status!='resolved'",
                 (now, alert_id),
             )
-            return await self._commit_alert_change(written, audit, cur.rowcount > 0)
+            return await self._commit_alert_change(written, audit_row, cur.rowcount > 0)
 
     async def resolve_alert_instances_for(
         self, *, event_type: str, connection: str, now: float | None = None
@@ -19488,6 +19729,7 @@ class MessageStore:
     async def suspend_alert_instance(
         self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # #143 windowed suspend: mute NOTIFICATIONS for this instance's (event_type, connection) key until
         # `until` (an epoch). NOTIFICATION-only (ADR 0044 AC-3): the instance's status/count/visibility is
         # untouched; only `suspended_until` is set, so it stays open on the dashboard. Refuses a resolved
@@ -19499,7 +19741,7 @@ class MessageStore:
                 "UPDATE alert_instance SET suspended_until=? WHERE id=? AND status!='resolved'",
                 (until, alert_id),
             )
-            applied = await self._commit_alert_change(written, audit, cur.rowcount > 0)
+            applied = await self._commit_alert_change(written, audit_row, cur.rowcount > 0)
         if not applied:
             return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
@@ -19507,6 +19749,7 @@ class MessageStore:
     async def resume_alert_instance(
         self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # #143: clear a windowed suspend (re-alerts resume immediately). Idempotent (clearing an
         # un-suspended instance is a no-op UPDATE). Returns the row, or None if unknown/already resolved.
         now = time.time() if now is None else now
@@ -19515,7 +19758,7 @@ class MessageStore:
                 "UPDATE alert_instance SET suspended_until=NULL WHERE id=? AND status!='resolved'",
                 (alert_id,),
             )
-            applied = await self._commit_alert_change(written, audit, cur.rowcount > 0)
+            applied = await self._commit_alert_change(written, audit_row, cur.rowcount > 0)
         if not applied:
             return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
@@ -22131,6 +22374,23 @@ class MessageStore:
             await self._commit()
         return written is not None
 
+    async def set_ad_channel_scope_if_unchanged(
+        self,
+        user_id: str,
+        scope_json: str,
+        *,
+        expected_scope: str | None,
+        expected_source: ChannelScopeSource | None,
+        now: float | None = None,
+    ) -> bool:
+        """The AD sign-in's compare-and-set scope write (BACKLOG #6887); see ``AuthStore``."""
+        now = time.time() if now is None else now
+        change = ad_scope_replacement(scope_json, expected_scope, expected_source, now)
+        async with _writer_guard(self._db, self._lock):
+            written = await self._write_user(user_id, change)
+            await self._commit()
+        return written is not None
+
     async def set_user_federated_subject(
         self,
         user_id: str,
@@ -22636,33 +22896,36 @@ class MessageStore:
         ``anchor`` on any session but an OIDC one. Session issuance does not call this;
         :meth:`AuthStore.create_session` says how its ``mfa_verified`` stamps the row in the INSERT
         (BACKLOG #5624). See :meth:`AuthStore.mark_session_mfa_verified` for ``anchor`` and the
-        answer."""
+        answer.
+
+        ``BEGIN IMMEDIATE`` (vault BACKLOG #2964 item 23): the stamp reads the row before it writes,
+        and under a deferred ``BEGIN`` the write failed busy at once whenever a writer in another
+        process held SQLite's write lock, since a read transaction's upgrade waits for nobody, so a
+        factor just proved read as a store error. Taking the lock at the ``BEGIN`` waits that writer
+        out under ``busy_timeout`` instead. The lock is then held across the seal check and the
+        re-seal, which under a Vault transit sealer are Vault calls."""
         stamp = mfa_stamp(time.time() if now is None else now, anchor)
-        async with _writer_txn(self._db, self._lock):
+        async with _writer_txn(self._db, self._lock, immediate=True):
             written = await self._write_session(token_hash, stamp)
             await self._commit()
         return written is not None and stamp.anchored
 
-    async def rotate_session(
-        self, token_hash: str, *, new_token_hash: str, now: float | None = None
-    ) -> bool:
+    async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
         ``token_hash`` is the PK, so this is a key update: the row keeps every other column and the
         old hash stops resolving in the same transaction. The token hash is sealed, so the re-key
         re-seals (BACKLOG #2592). Reports whether a row was re-keyed so the caller can fail closed
         when the session was revoked out from under it. The lineage link is written in the same
-        transaction, and only when the re-key landed (vault BACKLOG #3028). Its time is read once
-        the re-key has landed, so a wait for the lock cannot age the link before it exists."""
+        transaction, and only when the re-key landed (vault BACKLOG #3028). Its time is the
+        database's clock when the link's own statement runs (vault BACKLOG #4276), after the re-key
+        has landed, so a wait for the lock cannot age the link before it exists."""
         async with _writer_txn(self._db, self._lock):
             rotated = await self._write_session(
                 token_hash, lambda s: replace(s, token_hash=new_token_hash)
             )
             if rotated is not None:
-                retired_at = time.time() if now is None else now
-                await self._db.execute(
-                    _SESSION_LINEAGE_INSERT, (token_hash, new_token_hash, retired_at)
-                )
+                await self._db.execute(_SESSION_LINEAGE_INSERT, (token_hash, new_token_hash))
             await self._commit()
         return rotated is not None
 
@@ -22676,10 +22939,10 @@ class MessageStore:
             await self._commit()
 
     async def supersede_session(
-        self, token_hash: str, *, now: float, lineage_since: float | None = None
+        self, token_hash: str, *, now: float, lineage_seconds: float | None = None
     ) -> SessionRecord | None:
         """Revoke, then read the row back in the SAME transaction (BACKLOG #2146), following the
-        session lineage when ``lineage_since`` is given (vault BACKLOG #3028). See
+        session lineage when ``lineage_seconds`` is given (vault BACKLOG #3028). See
         :meth:`AuthStore.supersede_session`.
 
         Two statements per step rather than one ``UPDATE ... RETURNING``, because ``RETURNING``
@@ -22687,6 +22950,7 @@ class MessageStore:
         unit: the writer lock orders them against every in-process writer, ``rotate_session``
         included. The first ``UPDATE`` takes SQLite's write lock even when it matches no row, and
         holds it until the commit, so no other process can re-key a row while the walk runs."""
+        started = time.monotonic()  # before the lock, so its wait cannot shorten the window
 
         async def _revoke(h: str) -> SessionRecord | None:
             cur = await self._db.execute(
@@ -22699,8 +22963,8 @@ class MessageStore:
             row = await cur.fetchone()
             return SessionRecord.from_mapping(dict(row)) if row else None
 
-        async def _successor(h: str, since: float) -> str | None:
-            cur = await self._db.execute(_SESSION_LINEAGE_SUCCESSOR, (h, since))
+        async def _successor(h: str, seconds: float) -> str | None:
+            cur = await self._db.execute(_SESSION_LINEAGE_SUCCESSOR, (h, seconds))
             row = await cur.fetchone()
             return str(row[0]) if row else None
 
@@ -22708,7 +22972,11 @@ class MessageStore:
         async with _writer_guard(self._db, self._lock):
             try:
                 ended = await revoke_through_lineage(
-                    token_hash, lineage_since=lineage_since, revoke=_revoke, successor=_successor
+                    token_hash,
+                    lineage_seconds=lineage_seconds,
+                    started=started,
+                    revoke=_revoke,
+                    successor=_successor,
                 )
             except RowSealError as exc:
                 # BACKLOG #5505: only the read-back refused the row; its revoke still commits.
@@ -22836,8 +23104,11 @@ class MessageStore:
     ) -> RevokeResult:
         """The body of :meth:`revoke_all_sessions`, inside the caller's writer transaction.
 
-        The store's global session epoch is raised first (BACKLOG #5091), then every account's
-        epoch, as :meth:`revoke_user_sessions` raises one, then one sweep ends the rows and the kept
+        The store's global session epoch is raised first (BACKLOG #5091), then the epoch of each
+        account its read of the account list returns, as :meth:`revoke_user_sessions` raises one;
+        an account goes without its raise where :func:`raise_account_epoch` says, at least on a
+        seal refusal and after a Vault Transit outage trips the revoke, and the global epoch
+        still ends its sessions. Then one sweep ends the rows and the kept
         row is re-sealed under its own account's new epoch and the new global one, when it carried
         both epochs those raises replaced (:class:`KeptSessionRestamp`, BACKLOG #4975), and is
         otherwise ended and counted (:meth:`_keep_or_end_session`).
@@ -23025,7 +23296,9 @@ class MessageStore:
                 )
             purged = cur.rowcount if cur.rowcount is not None else 0
             if lineage_seconds is not None:
-                await self._db.execute(_SESSION_LINEAGE_PURGE, (now - float(lineage_seconds),))
+                # Measured back from the database's clock, as the supersession measures its window,
+                # never from ``now`` (vault BACKLOG #4276).
+                await self._db.execute(_SESSION_LINEAGE_PURGE, (float(lineage_seconds),))
             await self._commit()
             return purged
 
@@ -23072,10 +23345,12 @@ class MessageStore:
         from messagefoundry.store.base import seed_filter_clause
 
         async with self._read() as db:
+            # schema_verify's own predicate, so the census and the schema reads cannot drift apart
+            # (BACKLOG #6719 item 5). The NULL-sql case the old copy also took is unreachable: SQLite
+            # refuses to load a schema holding a table row with no SQL.
             cur = await db.execute(
-                "SELECT name FROM main.sqlite_master WHERE type = 'table'"
-                " AND (sql IS NULL OR sql NOT LIKE 'CREATE VIRTUAL TABLE%')"
-                " AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
+                f"SELECT m.name FROM main.sqlite_master AS m WHERE {_ORDINARY_TABLE}"
+                " AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
             )
             names = [str(row[0]) for row in await cur.fetchall()]
             occupancy: dict[str, bool] = {}

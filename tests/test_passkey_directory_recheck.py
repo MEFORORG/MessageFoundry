@@ -1249,6 +1249,28 @@ async def _finish_with_the_set_read_failing(
     read_fault: Exception,
     audit_fault: Exception | None,
 ) -> tuple[MessageStore, str, Elevation]:
+    service, token, response = await _arm_the_set_read_fault(
+        store, monkeypatch, read_fault, audit_fault
+    )
+    try:
+        refused = await service.finish_webauthn_assertion(
+            token, response, rp_id=_RP, origin=_ORIGIN
+        )
+    finally:
+        monkeypatch.undo()
+    return store, token, refused
+
+
+async def _arm_the_set_read_fault(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    read_fault: Exception,
+    audit_fault: Exception | None,
+) -> tuple[AuthService, str, str]:
+    """A local passkey assertion staged on ``store``, with its sign-count write patched to answer
+    ``moved`` and then make the passkey set read raise ``read_fault`` and, when given, the audit
+    write raise ``audit_fault``. Returns the service, the token and the response; the caller
+    finishes it and undoes ``monkeypatch``."""
     service, token, response, _user_id = await _local_assertion(store)
     real_update = store.update_webauthn_sign_count
 
@@ -1267,13 +1289,7 @@ async def _finish_with_the_set_read_failing(
         return answer
 
     monkeypatch.setattr(store, "update_webauthn_sign_count", _moved)
-    try:
-        refused = await service.finish_webauthn_assertion(
-            token, response, rp_id=_RP, origin=_ORIGIN
-        )
-    finally:
-        monkeypatch.undo()
-    return store, token, refused
+    return service, token, response
 
 
 @pytest.mark.parametrize(
@@ -1324,16 +1340,55 @@ def _error_log_text(caplog: pytest.LogCaptureFixture) -> str:
     return "\n".join(formatter.format(r) for r in caplog.records if r.levelno >= logging.ERROR)
 
 
+async def _raise_with_the_set_read_failing(
+    monkeypatch: pytest.MonkeyPatch,
+    read_fault: Exception,
+    audit_fault: Exception | None = None,
+) -> tuple[MessageStore, str]:
+    """:func:`_assert_with_the_set_read_failing` for a fault that must raise out of the ceremony:
+    asserts that it does, with ``read_fault`` itself, and returns the store, still open, and the
+    token. The caller closes the store."""
+    store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
+    try:
+        service, token, response = await _arm_the_set_read_fault(
+            store, monkeypatch, read_fault, audit_fault
+        )
+        try:
+            with pytest.raises(type(read_fault)) as raised:
+                await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
+        finally:
+            monkeypatch.undo()
+        assert raised.value is read_fault
+        return store, token
+    except BaseException:
+        await store.close()
+        raise
+
+
+async def _assert_the_raise_left_a_row(store: MessageStore, token: str) -> None:
+    """The raise left exactly one ``auth.webauthn_failed`` row, naming ``read_raised``, no
+    ``store_error`` row, no verified row, and the factor unmarked."""
+    failures = await _audited_assertion_failures(store)
+    assert failures == [{"reason": "read_raised"}]
+    assert await store.list_audit(action="auth.webauthn_verified") == []
+    session = await store.get_session(hash_token(token))
+    assert session is not None and session.mfa_verified_at is None
+
+
 async def test_a_defect_in_the_passkey_re_read_still_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """BACKLOG #3775. ``sqlite3.ProgrammingError`` is a ``DatabaseError`` but a defect (a bad
-    statement or bind, ``AUDIT_WRITE_DEFECTS``), so it is not passed over as a store refusal. RED
-    when: it is answered as a ``store_error`` refusal instead of raising."""
-    with pytest.raises(sqlite3.ProgrammingError, match="synthetic"):
-        await _assert_with_the_set_read_failing(
-            monkeypatch, sqlite3.ProgrammingError("synthetic: a bad bind")
-        )
+    statement or bind, ``AUDIT_WRITE_DEFECTS``), so it is not passed over as a store refusal, and
+    since added item 9 it is audited ``read_raised`` before it raises. RED when: it is answered as
+    a ``store_error`` refusal instead of raising, or it raises with no audit row."""
+    store, token = await _raise_with_the_set_read_failing(
+        monkeypatch, sqlite3.ProgrammingError("synthetic: a bad bind")
+    )
+    try:
+        await _assert_the_raise_left_a_row(store, token)
+    finally:
+        await store.close()
 
 
 class _PyodbcError(Exception):
@@ -1420,16 +1475,97 @@ async def test_a_pyodbc_root_read_fault_takes_the_connect_class_path(
     adds. RED when: the catch drops ``store_connect_errors()`` and the fault raises. CONTROL: the
     call set alone really misses it."""
     assert not isinstance(_PyodbcError(), store_call_errors())
-    await _assert_the_read_fault_refuses(_PyodbcError("40001"), monkeypatch, caplog)
+    # pyodbc puts the SQLSTATE first and the driver message second; neither message is logged.
+    await _assert_the_read_fault_refuses(
+        _PyodbcError("40001", "synthetic: chosen as the deadlock victim"), monkeypatch, caplog
+    )
+    assert "deadlock victim" not in _error_log_text(caplog)
 
 
-async def test_a_sqlite_interface_error_in_the_passkey_re_read_still_raises(
-    monkeypatch: pytest.MonkeyPatch,
+#: Faults outside the refusal set, each built in the test (BACKLOG #3775 added item 9).
+_RAISED_FAULTS: dict[str, Callable[[], Exception]] = {
+    "sqlite-interface": lambda: sqlite3.InterfaceError("synthetic: SQLITE_MISUSE"),
+    "cipher": lambda: CipherError("synthetic: the passkey row did not decrypt"),
+    "type-error": lambda: TypeError("synthetic: a code defect"),
+    "not-implemented": lambda: NotImplementedError("synthetic: an AUDIT_WRITE_DEFECTS class"),
+}
+
+
+@pytest.mark.parametrize("case", list(_RAISED_FAULTS))
+async def test_a_fault_outside_the_refusal_set_raises_after_an_audit_row(
+    case: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #3775. ``sqlite3.InterfaceError`` is outside both sets the catch takes (it is a
-    ``sqlite3.Error``, not a ``DatabaseError``), and ADR 0068 says it still raises there. RED when:
-    a wider catch answers it as a ``store_error`` refusal while the ADR still says otherwise."""
-    with pytest.raises(sqlite3.InterfaceError, match="synthetic"):
-        await _assert_with_the_set_read_failing(
-            monkeypatch, sqlite3.InterfaceError("synthetic: SQLITE_MISUSE")
+    """BACKLOG #3775 added item 9. ``sqlite3.InterfaceError`` is outside both sets the catch takes
+    (it is a ``sqlite3.Error``, not a ``DatabaseError``), and ADR 0068 says it still raises there;
+    so do ``CipherError`` and a plain code defect. The sign count has already moved, so each is
+    audited ``auth.webauthn_failed`` with ``reason=read_raised`` before it raises. RED when: a
+    wider catch answers one as a ``store_error`` refusal, it raises with no audit row, or the ERROR
+    line carries the fault's message."""
+    fault = _RAISED_FAULTS[case]()
+    store, token = await _raise_with_the_set_read_failing(monkeypatch, fault)
+    try:
+        await _assert_the_raise_left_a_row(store, token)
+        error_lines = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any(
+            type(fault).__qualname__ in line and "the ceremony raises" in line
+            for line in error_lines
         )
+        assert not any(str(fault) in line for line in error_lines)
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    "fault_factory",
+    [
+        lambda: RecursionError("synthetic: out of stack"),
+        lambda: MemoryError("synthetic: out of memory"),
+    ],
+    ids=["recursion", "memory"],
+)
+async def test_resource_exhaustion_in_the_passkey_re_read_raises_with_no_row(
+    fault_factory: Callable[[], Exception], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3775 added item 9. A ``RecursionError`` or ``MemoryError`` from the read raises at
+    once, with no audit row: nothing more is asked of a process out of stack or memory. RED when:
+    either is audited ``read_raised`` or refused as ``store_error``."""
+    store, token = await _raise_with_the_set_read_failing(monkeypatch, fault_factory())
+    try:
+        assert await _audited_assertion_failures(store) == []
+        session = await store.get_session(hash_token(token))
+        assert session is not None and session.mfa_verified_at is None
+    finally:
+        await store.close()
+
+
+#: Audit-write faults for the raise path: a refusal, a defect class and an unlisted class.
+_RAISE_PATH_AUDIT_FAULTS: dict[str, Callable[[], Exception]] = {
+    "refused": lambda: sqlite3.OperationalError("synthetic: the audit write was refused"),
+    "defect": lambda: sqlite3.ProgrammingError("synthetic: the audit write misbound"),
+    "unlisted": lambda: TypeError("synthetic: the audit write hit a code defect"),
+}
+
+
+@pytest.mark.parametrize("audit_case", list(_RAISE_PATH_AUDIT_FAULTS))
+async def test_a_raise_whose_audit_row_is_refused_still_raises_the_read_fault(
+    audit_case: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3775 added item 9. The ``read_raised`` row is soft: for each ``Exception`` its
+    write raises here, the read fault is what raises, and the write's failure is logged. RED when: the audit write's
+    exception replaces the read fault (the helper's ``raised.value is read_fault`` check), turns
+    the raise into a return, or goes unlogged; or the logged failure carries the read fault's
+    message. Before added item 9 every case failed the logged-failure check: no row was tried.
+    """
+    store, token = await _raise_with_the_set_read_failing(
+        monkeypatch,
+        sqlite3.InterfaceError("synthetic: SQLITE_MISUSE"),
+        _RAISE_PATH_AUDIT_FAULTS[audit_case](),
+    )
+    try:
+        assert "audit row could not be written" in caplog.text
+        assert "SQLITE_MISUSE" not in _error_log_text(caplog)
+        assert await _audited_assertion_failures(store) == []
+        session = await store.get_session(hash_token(token))
+        assert session is not None and session.mfa_verified_at is None
+    finally:
+        await store.close()
