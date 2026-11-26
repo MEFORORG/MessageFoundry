@@ -698,6 +698,98 @@ def test_a_partial_error_that_nulls_a_whole_node_keeps_the_others() -> None:
     assert "the commit at position 2: GraphQL reported an error" in verdict.fault
 
 
+def _committer_errored(commit: Mapping[str, Any], *rest: str) -> Mapping[str, Any]:
+    """`commit` as GraphQL returns it when resolving its committer failed: the committer's user,
+    or with no `rest` the committer itself, is nulled. The author is intact."""
+    if not rest:
+        return {**commit, "committer": None}
+    return {**commit, "committer": {**commit["committer"], "user": None}}
+
+
+@pytest.mark.parametrize("rest", [("user",), ("user", "login"), ()])
+def test_a_committer_error_lets_rule_one_refuse_from_the_intact_author(
+    rest: tuple[str, ...], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5644 added item 1 and #8335 item 2: an error on `commit.committer` (here past page
+    one) nulls nothing outside the committer, so rule 1 still refuses an unlinked author from the
+    author data. Before the fix the whole commit was unjudged: a fault (exit 3), which passes."""
+    unlinked = {"oid": f"{2:040x}", "author": _UNLINKED, "committer": _OCTO}
+    page = {
+        **_page([_committer_errored(unlinked, *rest)], 2, False),
+        "errors": [_node_error(0, "commit", "committer", *rest)],
+    }
+    assert _run(_ENV, _serve([_linked_page_one(), page])) == EXIT_REFUSED
+    out = capsys.readouterr().out
+    assert "refused::" in out and "'Anon'" in out
+    assert "fault::" not in out, out
+
+
+def test_a_committer_error_under_a_linked_author_is_judged() -> None:
+    """The action never reads the committer of a commit whose author is linked, so a committer
+    error there leaves nothing unjudged, on page one or past it."""
+    octo = {"oid": f"{1:040x}", "author": _OCTO, "committer": _OCTO}
+    page_one = {
+        **_page([_committer_errored(octo, "user")], 2, True),
+        "errors": [_node_error(0, "commit", "committer", "user")],
+    }
+    later = {**octo, "oid": f"{2:040x}"}
+    page_two = {
+        **_page([_committer_errored(later)], 2, False),
+        "errors": [_node_error(0, "commit", "committer")],
+    }
+    read = fetch_commits(_serve([page_one, page_two]), "MEFORORG", "MessageFoundry", 7)
+    assert read.tainted == frozenset()
+    assert evaluate(read, _ALLOWLIST, _no_signatures) == cla_precheck.Verdict(())
+
+
+def test_a_committer_error_under_an_unlinked_page_one_author_refuses_and_faults_its_key() -> None:
+    """On page one the action keys an unlinked author's commit under its committer's account, which
+    the error hid: the refusal stands, and the missing key is a fault, as for a null committer."""
+    unlinked = {"oid": f"{1:040x}", "author": _UNLINKED, "committer": _OCTO}
+    page = {
+        **_page([_committer_errored(unlinked, "user")], 1, False),
+        "errors": [_node_error(0, "commit", "committer", "user")],
+    }
+    verdict = evaluate(fetch_commits(_serve([page]), "MEFORORG", "MessageFoundry", 7), _ALLOWLIST)
+    assert len(verdict.refusals) == 1 and "'Anon'" in verdict.refusals[0]
+    assert verdict.fault is not None
+    assert "error inside its committer" in verdict.fault and "key is missing" in verdict.fault
+
+
+@pytest.mark.parametrize("node", [None, {"commit": None}, {}])
+def test_a_committer_error_on_a_node_with_no_commit_keeps_the_others_judged(
+    node: object, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review round e8390625a8: a committer-only error on a node GraphQL nulled whole must leave
+    that slot unjudged, as origin/main did, not fault the page and lose the refusal beside it."""
+    page = _page([{"oid": f"{1:040x}", "author": _UNLINKED, "committer": _OCTO}], 2, False)
+    page["data"]["repository"]["pullRequest"]["commits"]["nodes"].append(node)
+    page = {**page, "errors": [_node_error(1, "commit", "committer", "user")]}
+    assert _run(_ENV, _serve([page])) == EXIT_REFUSED
+    assert "GraphQL reported an error inside it" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        # Beside the committer error, one that names the author or the whole node still taints it.
+        [("commit", "committer", "user"), ("commit", "author", "user")],
+        [("commit", "committer"), ("commit",)],
+        # A path that only starts like the committer's is not one.
+        [("commit", "committerX")],
+    ],
+)
+def test_an_error_outside_the_committer_still_leaves_the_commit_unjudged(
+    path: list[tuple[str, ...]],
+) -> None:
+    unlinked = {"oid": f"{1:040x}", "author": _UNLINKED, "committer": _OCTO}
+    page = {**_page([unlinked], 1, False), "errors": [_node_error(0, *p) for p in path]}
+    read = fetch_commits(_serve([page]), "MEFORORG", "MessageFoundry", 7)
+    assert read.tainted == frozenset({0})
+    verdict = evaluate(read, _ALLOWLIST)
+    assert verdict.refusals == () and verdict.fault is not None and "not judged" in verdict.fault
+
+
 def test_an_errored_commit_that_repeats_another_still_trips_the_count() -> None:
     page = {
         **_page([_commit(1, "Octo", "octo-contributor", 90000001), _commit(1, "x")], 2, False),
@@ -727,7 +819,8 @@ def test_an_errored_first_page_commit_does_not_claim_the_author_is_absent() -> N
     commits the read could resolve."""
     octo = _commit(1, "Octo", "octo-contributor", 90000001)
     pages = [
-        {**_page([octo], 2, True), "errors": [_node_error(0, "commit", "committer", "user")]},
+        # An author error: one inside the committer alone leaves a linked author keyed (below).
+        {**_page([octo], 2, True), "errors": [_node_error(0, "commit", "author", "user")]},
         _page([_commit(2, "Octo", "octo-contributor", 90000001)], 2, False),
     ]
     read = fetch_commits(_serve(pages), "MEFORORG", "MessageFoundry", 7)
