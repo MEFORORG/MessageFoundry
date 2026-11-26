@@ -14,6 +14,7 @@ senders and ACK writers use too.
 from __future__ import annotations
 
 import logging
+import re
 import time
 
 from messagefoundry.config.wiring import _is_text_codec
@@ -346,36 +347,35 @@ def _reply_delimiters(reply: str) -> frozenset[str]:
     a batch member's own ``MSH`` counts as its envelope does. Its segments end at CR when the reply
     holds one, so an LF inside a field is data, and at LF only in a reply with no CR; that
     terminator, and the LF of a CR+LF end, are declared too. An X12 reply led by ``ISA`` is read
-    at the ISA's fixed delimiter offsets only when :func:`_isa_is_fixed_width` holds for it. Those
-    offsets are read raw, without the distinctness check ``discover_delimiters`` makes and without
-    the terminator half of its element-data check, so a fixed-width ISA that read refuses for one
-    of those still declares what its offsets hold: at least ISA11 and ISA16 both ``?``, and an
-    ISA16 equal to the element separator. ISA11 is declared only from version 00501, as that read
-    takes it as a delimiter. An ISA that is not fixed-width declares nothing, as every
-    ``ISA``-led reply did before this read: in an unpadded ISA, offsets 82, 104 and 105 can hold
-    element data, and reading them would refuse a reply whose data there the charset cannot hold.
-    That leaves a residual, as before: an ISA that is not fixed-width is neither refused where
-    ``?`` is one of its delimiters, so ``?`` is written into its data, nor where a delimiter is a
-    character the charset cannot encode, even where its separators sit at their fixed offsets. At
-    least these are not fixed-width: an ISA whose elements are unpadded, one cut short, one whose
-    ISA16 :func:`_isa16_is_one_character` does not read as one character, and one
-    whose element separator also appears before ISA16 away from its separator offsets, whether in
-    element data (an ISA06 of ``AC*MER``), in ISA11 in any version, or in the ``ISA`` tag itself
-    (an element separator of ``I``, ``S`` or ``A``). A reply with any other lead declares nothing
-    here.
+    only when :func:`_isa_is_lined_up` holds for it: then its element separator is declared, and
+    ISA11 from version 00501, as ``discover_delimiters`` takes it as a delimiter only from there.
+    ISA16 and the segment terminator, at offsets 104 and 105, are declared only where
+    :func:`_isa16_and_terminator` reads them as one; where ISA16 is empty or longer than one
+    character those offsets hold the terminator or the next segment's data, and reading them would
+    refuse a reply main replaced and sent. The offsets are read raw, without the distinctness check
+    ``discover_delimiters`` makes, so a lined-up ISA that read refuses for delimiters that are not
+    distinct still declares what this read takes: at least ISA11 and ISA16 both ``?``, and an
+    ISA16 equal to the element separator. An ISA that is not lined up declares
+    nothing, as every ``ISA``-led reply did before this read: in an unpadded ISA, offsets 82, 104
+    and 105 can hold element data. That leaves a residual, as before: what is not declared is
+    refused neither where it is ``?``, so ``?`` is written into the reply's data, nor where it is a
+    character the charset cannot encode. At least these declare nothing: an ISA whose elements are
+    unpadded, one cut short, and one whose element separator also appears before ISA16 away from
+    its separator offsets, whether in element data (an ISA06 of ``AC*MER``), in ISA11 in any
+    version, or in the ``ISA`` tag itself (an element separator of ``I``, ``S`` or ``A``). The
+    shapes whose ISA16 and terminator are not declared are listed on
+    :func:`_isa16_and_terminator`. A reply with any other lead declares nothing here.
 
     Leading whitespace and a BOM are skipped first, as the engine's one definition of tolerated
     leading noise (``sniff._LEADING_WS_STR``) skips them. A header line of ``MSH`` alone has no
     field separator to read and declares nothing, rather than indexing past its end."""
     body = reply.lstrip(_LEADING_WS_STR)
     if body.startswith("ISA"):
-        if not _isa_is_fixed_width(body):
+        if not _isa_is_lined_up(body):
             return frozenset()
-        isa = {body[i] for i in _ISA_DELIMITER_OFFSETS}
+        isa = {body[ELEMENT_SEP_OFFSETS[0]], *_isa16_and_terminator(body)}
         if body[_VERSION_START:_VERSION_END] >= _REPETITION_MIN_VERSION:
             isa.add(body[_REPETITION_SEP_OFFSET])  # before 00501, ISA11 is data, not a delimiter
-        if body[_SEGMENT_TERM_OFFSET : _SEGMENT_TERM_OFFSET + 2] == "\r\n":
-            isa.add("\n")  # a CR+LF terminator is two characters, and `?` for either breaks it
         return frozenset(isa)
     if not body.startswith(HEADER_IDS):
         return frozenset()
@@ -390,51 +390,68 @@ def _reply_delimiters(reply: str) -> frozenset[str]:
     return frozenset(found)
 
 
-#: The ISA's delimiter offsets read in every version, from ``parsing.x12.delimiters``: the element
-#: separator (+3), ISA16 (the component separator) and the segment terminator. ISA11, the
-#: repetition separator, is read only from 00501, as ``discover_delimiters`` reads it.
-_ISA_DELIMITER_OFFSETS = (ELEMENT_SEP_OFFSETS[0], _COMPONENT_SEP_OFFSET, _SEGMENT_TERM_OFFSET)
-
-
-def _isa_is_fixed_width(body: str) -> bool:
-    """Whether the ``ISA`` that opens ``body`` is laid out at its fixed widths: all
+def _isa_is_lined_up(body: str) -> bool:
+    """Whether the ``ISA`` that opens ``body`` is laid out at its fixed widths through ISA15: all
     ``ISA_SEGMENT_LEN`` characters are present and every element-separator offset holds the
     character at +3, and no other offset before ISA16 holds it, the ``ISA`` tag and ISA11 included,
     as X12 keeps the element separator out of element data. So ``ISA`` followed by a run of one
-    character is not read as one. ISA16 must also be one character, as
-    :func:`_isa16_is_one_character` judges from what follows it."""
+    character is not read as one. ISA16's width is judged apart, by
+    :func:`_isa16_and_terminator`."""
     if len(body) < ISA_SEGMENT_LEN:
         return False
     element = body[ELEMENT_SEP_OFFSETS[0]]
     lined_up = all(body[i] == element for i in ELEMENT_SEP_OFFSETS)
-    return (
-        lined_up
-        and body.count(element, 0, _COMPONENT_SEP_OFFSET) == len(ELEMENT_SEP_OFFSETS)
-        and _isa16_is_one_character(body)
-    )
+    return lined_up and body.count(element, 0, _COMPONENT_SEP_OFFSET) == len(ELEMENT_SEP_OFFSETS)
 
 
-def _isa16_is_one_character(body: str) -> bool:
-    """Whether offset 104 of an ``ISA`` lined up through ISA15 holds a one-character ISA16 and
-    offset 105 its segment terminator (BACKLOG #5799, R10d repair). An empty ISA16 puts the
-    terminator at 104 and the next segment's first character at 105; a two-character one puts its
-    second character at 105 and the terminator at 106. Read as delimiters, those offsets would
-    then name data, and a reply main replaced and sent would be refused. So this holds only where
-    ISA16 is not whitespace, the terminator differs from ISA16 and from the element separator and
-    is not a letter or a digit (a segment ID opens with one), and what follows the terminator, past
-    the LF of a CR+LF end, is nothing, or, past any whitespace, a segment opening with a letter or
-    a digit in a rest that holds the terminator again. This is a reading of the layout, not a
-    parse: at least an empty ISA16 followed by a terminator and a cosmetic line break still passes,
-    and then the true terminator is read as ISA16 and the line break as the terminator, both
-    characters of the reply's own structure. A shape that fails declares nothing, as on main."""
+#: An X12 segment ID: a letter, then one or two letters or digits.
+_X12_SEGMENT_ID = re.compile(r"[A-Z][A-Z0-9]{1,2}")
+
+#: Line breaks: a cosmetic one may follow a segment terminator, but none falls inside a segment.
+_LINE_BREAKS = "\r\n"
+
+
+def _isa16_and_terminator(body: str) -> tuple[str, ...]:
+    """ISA16 and the segment terminator of an ``ISA`` that :func:`_isa_is_lined_up` holds for,
+    with the LF of a CR+LF terminator, where offsets 104 and 105 read as a one-character ISA16 and
+    its terminator; empty otherwise (BACKLOG #5799). An empty ISA16 puts the terminator at 104 and
+    the next segment's first character at 105, and a two-character one puts its second character
+    at 105, so read raw those offsets can name data, and a reply main replaced and sent would be
+    refused. So they are read only where ISA16 is not a space or a line break; the terminator is
+    not a letter or a digit and differs from ISA16 and the element separator; and what follows the
+    terminator, past the LF of a CR+LF end, is nothing, or, past any cosmetic whitespace, a segment
+    ID and the element separator, with the terminator again before any line break.
+
+    This is a reading of the layout, not a parse, and a string can read both ways: at least a
+    two-character ISA16 whose second character recurs, in the next segment, as the character
+    before a line break reads as a one-character ISA16 and that second character as the
+    terminator, and the reply is then refused where that character is ``?`` or one the charset
+    cannot encode. Where the ISA16 is one character, these are not read, so ``?`` is written into
+    its data where one of them is ``?``: an ISA16 that is a space or a line break or equals the
+    terminator, a terminator equal to the element separator, an ``ISA`` followed by whitespace
+    alone, and a reply whose next segment has no terminator before its line break or end."""
+    element = body[ELEMENT_SEP_OFFSETS[0]]
     component = body[_COMPONENT_SEP_OFFSET]
     term = body[_SEGMENT_TERM_OFFSET]
-    if component.isspace() or term in (component, body[ELEMENT_SEP_OFFSETS[0]]) or term.isalnum():
-        return False
-    rest = body[_SEGMENT_TERM_OFFSET + 1 :]
-    if term == "\r" and rest.startswith("\n"):
-        rest = rest[1:]
-    if not rest:
-        return True
-    segment = rest.lstrip(_SEGMENT_WHITESPACE)
-    return bool(segment) and segment[0].isascii() and segment[0].isalnum() and term in rest
+    if component in _SEGMENT_WHITESPACE or term.isalnum() or term in (component, element):
+        return ()
+    found: tuple[str, ...] = (component, term)
+    i = _SEGMENT_TERM_OFFSET + 1
+    if term == "\r" and body.startswith("\n", i):
+        found, i = (component, term, "\n"), i + 1
+    if i == len(body):
+        return found
+    while i < len(body) and body[i] in _SEGMENT_WHITESPACE:
+        i += 1
+    if i == len(body):
+        return ()  # ISA16, then a terminator, then whitespace alone: a two-character ISA16 reads so
+    seg = _X12_SEGMENT_ID.match(body, i)
+    if seg is None:
+        return ()
+    opens = body.startswith(element, seg.end()) or (
+        seg.end() - i == 3 and body.startswith(element, i + 2)
+    )
+    stop = body.find(term, i)
+    if not opens or stop < 0 or any(c in body[i:stop] for c in _LINE_BREAKS):
+        return ()
+    return found

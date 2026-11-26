@@ -859,7 +859,6 @@ def test_isa_followed_by_a_run_of_one_character_is_not_fixed_width(run: str) -> 
         (":?", "\nTA1*000000001*260101*1200*A*000中\n"),
         ("", "\r?TA1*000000001*260101*1200*A*000中\r"),
         (":?", "\n中\n"),
-        ("", "?TA1?000000001?260101?1200?A?000中~"),
     ],
     ids=[
         "empty-unencodable",
@@ -869,18 +868,42 @@ def test_isa_followed_by_a_run_of_one_character_is_not_fixed_width(run: str) -> 
         "two-lf",
         "empty-cr",
         "two-lf-nonascii-next",
-        "empty-term-is-element",
     ],
 )
-def test_an_isa16_that_is_not_one_character_declares_nothing(component: str, after: str) -> None:
-    """Review of #5799 (R10d): an ISA lined up through ISA15 with an empty or two-character ISA16
-    was read at offsets 104 and 105, which then hold the terminator or the next segment's data, so
-    a data character there read as a delimiter and the reply was refused, where main replaced it
-    and sent it (the X12 listener closes on that refusal). Green on main, red on 8f987a6."""
-    element = "?" if after.startswith("?TA1?") else "*"
-    reply = _isa(element=element, component=component, term="") + after
+def test_an_isa16_that_is_not_one_character_is_not_read_at_104_and_105(
+    component: str, after: str
+) -> None:
+    """Review of #5799 (the repair after 8f987a6): an ISA lined up through ISA15 with an empty or
+    two-character ISA16 was read at offsets 104 and 105, which then hold the terminator or the next
+    segment's data, so a data character there read as a delimiter and the reply was refused, where
+    main replaced it and sent it (the X12 listener closes on that refusal). Green on main, red on
+    8f987a6."""
+    reply = _isa(component=component, term="") + after
     wire = framing_mod.encode_reply(reply, "ascii", connection="IB_X12_ISA16_WIDTH")
     assert wire == reply.encode("ascii", errors="replace")
+
+
+_GS = "GS*FA*SENDER*RECEIVER*20260101*1200*1*X*005010中"
+
+
+@pytest.mark.parametrize(
+    ("header", "after"),
+    [
+        (_isa(element="?", component="", term=""), "?TA1?000000001?260101?1200?A?000中~"),
+        (_isa(component="\x1f", repetition="?"), "TA1*000000001*260101*1200*A*000中~"),
+        (_isa(component="?", term="~\n"), _GS + "~\nIEA*1*000000001~\n"),
+        (_isa(component="?", term="\r\n"), _GS + "\r\nIEA*1*000000001\r\n"),
+        (_isa(component="?", term="\r\n").replace("SENDER", "SEND中R", 1), ""),
+    ],
+    ids=["element-q-isa16-empty", "isa16-control", "pretty-lf", "crlf-gs", "isa-only-crlf"],
+)
+def test_a_lined_up_isa_still_declares_what_its_layout_fixes(header: str, after: str) -> None:
+    """Negative controls for the ISA16 width repair: the element separator and (from 00501) ISA11
+    of an ISA lined up through ISA15 are declared whatever ISA16's width, an information-separator
+    control is a valid ISA16, and a one-character ISA16 is read past a CR+LF or a cosmetic line
+    break after its terminator. Each reply is refused because ``?`` is one of its delimiters."""
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
+        framing_mod.encode_reply(header + after, "ascii", connection="IB_X12_LINED_UP")
 
 
 def test_an_lf_inside_a_field_of_a_cr_reply_is_data_not_a_header() -> None:
@@ -925,7 +948,7 @@ def test_a_lined_up_isa_with_its_separator_elsewhere_before_isa16_declares_nothi
     ISA16 elsewhere (in ISA06's data, in ISA11 in any version, or in the ``ISA`` tag), is not
     fixed-width, so it declares nothing and a ``?`` delimiter in it gets ``?`` written into its
     data, as on main. A fix that closes the residual turns this red on purpose. Mutation: drop the
-    element-data count from ``_isa_is_fixed_width`` and the call raises."""
+    element-data count from ``_isa_is_lined_up`` and the call raises."""
     element = header[3]
     assert len(header) == 106 and _lined_up(header)
     assert header.count(element, 0, 104) > len(ELEMENT_SEP_OFFSETS)
@@ -948,7 +971,7 @@ def test_an_isa16_equal_to_the_element_separator_still_declares() -> None:
 
 
 def test_an_isa_whose_separators_are_off_their_offsets_declares_nothing() -> None:
-    """Pins the ``lined_up`` half of ``_isa_is_fixed_width``: ISA06 one short and ISA08 one long
+    """Pins the ``lined_up`` half of ``_isa_is_lined_up``: ISA06 one short and ISA08 one long
     keep 106 characters and 16 element separators before ISA16, but two separators sit off their
     fixed offsets, so the ISA is not fixed-width and its ``?`` component separator is not read.
     Mutation: drop ``lined_up`` and the call raises."""
