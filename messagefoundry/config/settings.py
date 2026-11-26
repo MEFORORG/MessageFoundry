@@ -7503,10 +7503,12 @@ class IntegritySettings(_Section):
     # file cannot say the bytes are clean, and stripping the baseline is easier for the stated
     # adversary than editing a module. An install that declares itself editable is still exempt.
     fail_closed_on_drift: bool = False
-    # When true, the engine re-walks the tamper-evident audit hash-chain once at startup (#190). This is
-    # ALERT-ONLY: a broken chain logs a WARNING + fires the AlertSink but NEVER crashes startup (a
-    # refuse-to-start on a tripped tamper alarm would be a self-inflicted DoS). Default false — opt in;
-    # on a very large audit_log the full re-walk adds startup latency, so it is not on by default.
+    # When true, the engine re-walks the tamper-evident audit hash-chain once at startup (#190).
+    # This is ALERT-ONLY: a broken chain logs a WARNING + fires the AlertSink but NEVER crashes
+    # startup (a refuse-to-start on a tripped tamper alarm would be a self-inflicted DoS). The
+    # audit_anchor_file read it arms can fail startup; `Engine._load_audit_anchor` says when.
+    # Default false — opt in; on a very large audit_log the full re-walk adds startup latency, so it
+    # is not on by default.
     audit_verify_on_start: bool = False
     # Path to a file holding one COUNT:HEAD anchor as printed by `messagefoundry audit-anchor` (BACKLOG
     # #328). Empty (the default) = the startup walk stays the bare walk it is today, byte-identical.
@@ -7523,12 +7525,13 @@ class IntegritySettings(_Section):
     # state ever true, and has the chain only GROWN since? It still catches a truncated tail and a
     # mid-chain rewrite. So a stale anchor stays VALID here — it just witnesses less.
     #
-    # ALERT-ONLY, like its partner: a missing or unreadable anchor, or one the parser refuses, logs a
-    # WARNING and lets the bare walk run, and never fires the tamper alert — a config fault must not
-    # manufacture a tamper alarm, or a real one stops meaning anything. The parser passes a `vault:v`
-    # head through unchecked; `_audit_head_shape` in store/store.py says what that costs. `0:`, the
-    # anchor of an empty log, is refused the same way: it can witness nothing, so it is reported
-    # rather than compared.
+    # Alert-only for the faults it catches: a missing or unreadable anchor, or one the parser
+    # refuses, logs a WARNING and lets the bare walk run, and never fires the tamper alert — a
+    # config fault must not manufacture a tamper alarm, or a real one stops meaning anything. It can
+    # still fail startup; `Engine._load_audit_anchor` says when. The parser passes a
+    # `vault:v` head through unchecked; `_audit_head_shape` in store/store.py says what that costs.
+    # `0:`, the anchor of an empty log, is refused the same way: it can witness nothing, so it is
+    # reported rather than compared.
     #
     # It does nothing on its own: without audit_verify_on_start the engine warns at startup that the
     # anchor is never read.

@@ -1825,9 +1825,11 @@ def test_operator_guidance_survives_the_phi_scrubber() -> None:
 async def test_startup_anchor_reads_a_utf16_file_without_crashing(tmp_path: Path) -> None:
     """PowerShell 5.1's `>` writes UTF-16LE, and this ships as a Windows service.
 
-    `UnicodeDecodeError` subclasses `ValueError`, not `OSError`, so catching only the latter would let
-    it escape `_load_audit_anchor` as an unhandled traceback out of `Engine.start()` -- turning an
-    encoding mistake into a refusal to boot, on a path whose entire contract is alert-only.
+    `UnicodeDecodeError` subclasses `ValueError`, not `OSError`, so catching only the latter would
+    let it escape `_load_audit_anchor` as an unhandled traceback out of `Engine.start()` -- turning
+    an encoding mistake into a refusal to boot, on a path that is alert-only for the faults it
+    catches. A NUL in the path is not one of them; `test_startup_anchor_nul_path_raises_value_error`
+    pins that.
     """
     db = tmp_path / "utf16.db"
     await _aseed_audit_rows(db, 3)
@@ -1844,24 +1846,31 @@ async def test_startup_anchor_nul_path_raises_value_error(tmp_path: Path) -> Non
     """A PIN OF CURRENT BEHAVIOUR, not a statement of the intended contract.
 
     `_load_audit_anchor` catches only `OSError` and `UnicodeDecodeError`, so the `ValueError` a path
-    carrying a NUL character raises escapes it, and from there `Engine.start()`: such a path fails
-    startup rather than degrading to a bare walk. Keeping that failure was decided as the safer
-    option; the docstring and docs/CONFIGURATION.md say so. If this ever changes, change both.
+    carrying a NUL character raises escapes it and `Engine.start()`, before any walk runs and with
+    no alert: such a path fails startup rather than degrading to a bare walk. The Manager kept that
+    failure on the w5/r2-store-maint repair brief (R2d) as the safer option; making it alert-only is
+    open. If it changes, change the `_load_audit_anchor` docstring, which states it once.
     """
     db = tmp_path / "nul.db"
     await _aseed_audit_rows(db, 1)
     store = await MessageStore.open(db)
+    sink = _AnchorRecordingSink()
+    eng = Engine(
+        store,
+        alert_sink=sink,
+        audit_verify_on_start=True,
+        audit_anchor_file=str(tmp_path / "anchor\x00.txt"),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
-        eng = Engine(
-            store,
-            audit_verify_on_start=True,
-            audit_anchor_file=str(tmp_path / "anchor\x00.txt"),
-            egress_settings=EgressSettings(deny_by_default=False),
-        )
         with pytest.raises(ValueError, match="null"):
             await eng._load_audit_anchor()
+        with pytest.raises(ValueError, match="null"):
+            await eng.start()
     finally:
+        await eng.stop()
         await store.close()
+    assert sink.events == []
 
 
 async def test_startup_anchor_accepts_a_utf8_bom(tmp_path: Path) -> None:

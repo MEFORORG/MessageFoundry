@@ -8080,10 +8080,12 @@ or bare `#N` number cites the project's private planning ledger, so it has no pu
   ever true and the chain has only **grown** since, which survives restarts while still catching a
   truncated tail and a mid-chain rewrite. A stale anchor therefore stays valid; it just witnesses less.
   **Alert-only in both directions.** A missing, unreadable or malformed anchor logs a WARNING naming
-  the file, the reason and the coverage lost, then lets the bare walk run — it never blocks startup,
-  and it never fires the tamper alert, because a config fault that raised a tamper alarm would train
-  operators to ignore the real one. `0:`, the anchor of an empty log, is reported rather than compared:
-  it can witness nothing, and passing it on would have alarmed on every start of an intact chain.
+  the file, the reason and the coverage lost, then lets the bare walk run — it does not block
+  startup for those faults (at least a NUL in the path still does; see `docs/CONFIGURATION.md`,
+  `[integrity]`), and it never fires the tamper alert, because a config fault that raised a tamper
+  alarm would train operators to ignore the real one. `0:`, the anchor of an empty log, is reported
+  rather than compared: it can witness nothing, and passing it on would have alarmed on every start
+  of an intact chain.
   A truncated tail and a broken chain fire **different** alert subjects (`audit-chain-truncated` /
   `audit-chain`) so they route and throttle separately — but they are not independent: a chain break is
   reported *before* the anchor comparison runs, so a break should be read as *at least* a break.

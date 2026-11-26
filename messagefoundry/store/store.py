@@ -6959,7 +6959,7 @@ def _audit_head_shape(head: str, noun: str = "the head") -> tuple[str | None, st
         # MAC's shape either: `audit-anchor` prints a tampered `vault:v` head as the store holds it,
         # and `audit-verify` exits 2 on an anchor this parser refuses, before it walks, so a shape
         # check here would leave such a tamper unwalked. A malformed `vault:v` head is therefore
-        # walked, not refused: on an intact chain `audit-verify` exits 1. A tampered head of another shape is still refused
+        # walked, not refused. A tampered head of another shape is still refused
         # before the walk. The cost is in the docstring.
         return None, head
     return (
