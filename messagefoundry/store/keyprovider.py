@@ -323,9 +323,10 @@ def _load_external_provider(
             f"with the optional {extra!r} extra."
         ) from exc
     # The provider module owns its own construction; annotate the local so mypy keeps the contract.
-    # A provider's own KeyProviderError keeps its text. Any other error from its construction is
-    # refused as one by class (vault BACKLOG #6709): left raw, a ValueError would reach store.base,
-    # which reads a ValueError as a refused key. Chained, as the import refusal above is.
+    # A provider's own KeyProviderError keeps its text, and a MemoryError or RecursionError
+    # propagates. Any other Exception from its construction is refused as a KeyProviderError by
+    # class (vault BACKLOG #6709): left raw, a ValueError would reach store.base, which reads a
+    # ValueError as a refused key. Chained, as the import refusal above is.
     try:
         provider: KeyProvider = module.build_provider(settings, posture=posture)
     except (KeyProviderError, MemoryError, RecursionError):
