@@ -2390,12 +2390,12 @@ files take the DB file's mode. That mode is `0600` only when the store's `0600` 
 new DB, or its best-effort `chmod` on open, succeeds; a failed `chmod` is logged as a warning,
 and a failed pre-create is not reported. On Windows each open gives the DB, `-wal` and `-shm` a
 protected access list granting full control to the opening account alone, logged when it fails.
-Another account's later tee open is then refused while that list holds. An account that may
-change the list, for example the owner or an account granted full control, re-restricts the DB,
-`-wal` and `-shm` to itself on its open, and the account that opened before is then locked out.
-Any other account that can still open the DB, for example through a folder's Modify grant after
-an earlier restriction failed, fails to change the list, and that failure is only logged. So run the relay and the tee commands that read its DB
-under one account. On Windows the restriction leaves at least these gaps. It removes the folder's
+Another account's later tee open is then refused while that list holds. An account whose tee open
+succeeds re-restricts to itself, file by file, each of the DB, `-wal` and `-shm` whose list it may
+change, for example as that file's owner or under a full-control grant, and the account that opened
+before can then be locked out. For a file whose list it may not change, the restriction fails and
+is only logged. So run the relay and the tee commands that read its DB under one account. On
+Windows the restriction leaves at least these gaps. It removes the folder's
 grants for later opens only: a handle another account opened earlier, while a file still carried
 its folder's list, keeps its access until it closes. That window opens at least during a tee open,
 between a file's creation and the restriction at the end of the open, and stays open past an open
@@ -2410,7 +2410,8 @@ DB another account created, the owner keeps its implicit right to change the lis
 is the Administrators group, as it can be for a DB an elevated account created, every elevated
 member of Administrators holds that right, not one account. An account holding the backup
 privilege, an administrator for example, can read the files past the list. One holding the
-take-ownership privilege can make itself the files' owner and then change the list. Keep every tee DB in a folder whose own access list grants no other
+take-ownership privilege can make itself the files' owner and then change the list.
+Keep every tee DB in a folder whose own access list grants no other
 account, which narrows the gaps above except the owner's rights and those two privileges, and on a
 protected volume regardless.
 
