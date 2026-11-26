@@ -275,7 +275,11 @@ class SessionRevocation:
 
 @dataclass(frozen=True)
 class ReconcilePlan:
-    """What a pass decided. Nothing here has been applied yet — see the module docstring."""
+    """What a pass decided. As :func:`plan_pass` returns it, nothing here has been applied yet --
+    see the module docstring. The plan :meth:`AuthService.reconcile_directory_sessions` returns
+    after applying it is not that plan: its ``revocations`` hold only the REPORTED ones, the
+    revocations to alert on, so a quiet or skipped revocation it applied or passed over is not in
+    it (vault BACKLOG #3085, #3750 item 5)."""
 
     revocations: tuple[SessionRevocation, ...] = ()
     #: Cached usernames to copy down from the directory (BACKLOG #1532). Empty on an aborted pass,

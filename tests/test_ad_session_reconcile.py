@@ -7696,6 +7696,61 @@ async def test_a_fault_reading_the_evidence_reports_and_still_writes_the_row(
         await store.close()
 
 
+@pytest.mark.parametrize("detail", [0, [], False])
+async def test_a_falsy_non_text_evidence_detail_is_logged_not_skipped(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, detail: object
+) -> None:
+    """Vault BACKLOG #3750 item 20: a verified evidence row whose ``detail`` is a falsy non-text
+    value read as ``{}`` and was skipped with no log. It now answers no evidence with an ERROR
+    naming the defect, as any other unreadable detail does, and the revocation reports."""
+    store, _, service, _ = await _scoped_service(_GRP_A, keyed=True)
+    try:
+        user = await _signed_out(store, "jdoe")
+        watermark = await service._audit_watermark()
+        assert watermark is not None
+        revocation = reconcile.SessionRevocation(user.id, user.username, reason="directory_absent")
+
+        async def odd_row(*_: object, **__: object) -> dict[str, Any] | None:
+            return {"ts": time.time(), "detail": detail}
+
+        monkeypatch.setattr(store, "newest_keyed_audit_row", odd_row)
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+            assert not await service._already_revoked_elsewhere(revocation, watermark=watermark)
+        assert any(
+            "could not read a verified earlier revocation" in r.getMessage()
+            and "TypeError" in r.getMessage()
+            for r in caplog.records
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("detail", [None, "", b""])
+async def test_a_missing_or_empty_text_evidence_detail_reads_as_empty_quietly(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, detail: object
+) -> None:
+    """Vault BACKLOG #3750 item 20 changed only the falsy NON-text case: a missing or empty text
+    detail still reads as no reason, answers no evidence, and logs nothing."""
+    store, _, service, _ = await _scoped_service(_GRP_A, keyed=True)
+    try:
+        user = await _signed_out(store, "jdoe")
+        watermark = await service._audit_watermark()
+        assert watermark is not None
+        revocation = reconcile.SessionRevocation(user.id, user.username, reason="directory_absent")
+
+        async def empty_row(*_: object, **__: object) -> dict[str, Any] | None:
+            return {"ts": time.time(), "detail": detail}
+
+        monkeypatch.setattr(store, "newest_keyed_audit_row", empty_row)
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+            assert not await service._already_revoked_elsewhere(revocation, watermark=watermark)
+        assert not any(
+            "could not read a verified earlier revocation" in r.getMessage() for r in caplog.records
+        )
+    finally:
+        await store.close()
+
+
 @pytest.mark.parametrize("reason", ["directory_undetermined", DIRECTORY_OBJECT_ID_MISSING])
 async def test_an_undetermined_revocation_that_ends_nothing_stays_quiet(reason: str) -> None:
     """The 2026-10-17 ruling names disabled and absent only. An undetermined account's revocation
