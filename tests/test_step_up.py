@@ -434,10 +434,11 @@ async def test_opt_out_lets_a_login_seeded_window_terminate_a_session(
     engine: Engine, action_step_up: bool
 ) -> None:
     """Under ``[auth].require_action_step_up = false`` the terminate gate falls back to the session
-    window, and a local sign-in that owes no further factor, from an address the account has used
-    before, opens that window. So such a sign-in ends another session with no re-proof.
-    docs/SECURITY.md states this as the exception to "a login-seeded window does not unlock a
-    terminate"; this pins it. The ``enforced`` arm is the contrast on the same account and
+    window, and a local sign-in that owes no further factor opens that window (an account's first
+    sign-in included; one from an address its known-address record has not seen in 90 days, on an
+    account with a baseline, opens none). So such a sign-in ends another session with no re-proof.
+    The ``require_action_step_up`` row of docs/CONFIGURATION.md states this, and docs/SECURITY.md
+    points there from "a login-seeded window does not unlock a terminate"; this pins it. The ``enforced`` arm is the contrast on the same account and
     settings: there the same fresh sign-in is refused and told to bind a proof to the action."""
     service = await _service(
         engine, AuthSettings(require_action_step_up=action_step_up, require_mfa=False)

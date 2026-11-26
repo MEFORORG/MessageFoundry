@@ -1199,8 +1199,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         single-use recovery codes (shown **once** — save them). A wrong code is a 400, and a
         directory account the directory could not confirm a 403 (BACKLOG #3061), as is a directory
         account under a second-step lock (BACKLOG #3810 finding 4). Gated by a fresh
-        password step-up BOUND to this confirm action (ADR 0077), independent of the enroll grant;
-        except under ``[auth].require_action_step_up = false`` (docs/CONFIGURATION.md)."""
+        password step-up BOUND to this confirm action (ADR 0077), except under
+        ``[auth].require_action_step_up = false`` (docs/CONFIGURATION.md); the bound proof is
+        independent of the enroll grant."""
         # Post-session ceremony (enrolling a factor while signed in): per-ACTOR budget.
         if not service.allow_reauth_attempt(identity.user_id):
             raise _rate_limited(request, "mfa-confirm")
@@ -1929,7 +1930,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         request: Request,
         service: AuthService = Depends(_service),
         # BACKLOG #1148 (ASVS 7.5.1): the proof must be BOUND TO THIS ACTION and single-use, not
-        # the login-seeded window. require_step_up_ACTION, never the reauth_only variant -- that
+        # the login-seeded window, except under [auth].require_action_step_up = false
+        # (docs/CONFIGURATION.md, that row). require_step_up_ACTION, never the reauth_only variant -- that
         # one carries mfa_gate=False and would DROP the second factor from an admin resetting
         # someone else's credential. The enrolment deadlock that justifies mfa_gate=False does
         # not exist here: the operator's own enrolment has nothing to do with the target's.
