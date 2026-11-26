@@ -2388,27 +2388,11 @@ files, at file level only; [TEE-RELAY.md, Purge](TEE-RELAY.md#purge) states what
 does and does not reach, and where `VACUUM`'s temp copy may go. On POSIX the `-wal` and `-shm`
 files take the DB file's mode. That mode is `0600` only when the store's `0600` pre-create of a
 new DB, or its best-effort `chmod` on open, succeeds; a failed `chmod` is logged as a warning,
-and a failed pre-create is not reported. On Windows each tee open attempts to restrict the DB,
-`-wal` and `-shm` to the opening account. The attempt can fail or not take effect, and a failure is
-not always reported, so do not rely on it alone to limit who can read those files. Another
-account's later tee open is refused while the restriction holds on the DB. An account whose tee
-open succeeds makes the same attempt for itself, and the account that opened before can then be
-locked out. So run the relay and the tee commands that read its DB under one account. On Windows
-the restriction leaves at least these gaps. It applies to later opens only: a handle another
-account opened earlier, before the restriction, keeps its access until it closes. That window opens
-at least during a tee open, between a file's creation and the restriction at the end of the open,
-and stays open past an open that fails before it restricts. SQLite deletes the `-wal` and `-shm` at
-least on the last connection's close and on a switch out of WAL mode. A tee open that completes
-attempts to restrict the ones it re-creates. One re-created any other way, for example by another
-SQLite client opening the DB after the tee's last close, is not restricted until a later tee open
-restricts it. A rollback `-journal`, which SQLite can write while the DB is out of WAL mode, is not
-restricted by the tee. When a file's owner is not the opening account, for example a DB another
-account created, the owner keeps its implicit right to change the list. When the owner is the
-Administrators group, as it can be for a DB an elevated account created, every elevated member of
-Administrators holds that right, not one account. At least administrators and holders of the
-take-ownership, backup or restore privilege can read or change the files past the list. Keep every
-tee DB in a folder whose own access list grants no other account, which narrows some of the gaps
-above but not the owner's rights or those accounts, and on a protected volume regardless.
+and a failed pre-create is not reported. On Windows each open gives the DB, `-wal` and `-shm` a
+protected access list granting full control to the opening account alone, logged when it fails.
+A `-wal` or `-shm` that SQLite deletes and re-creates takes its folder's list again until the next
+open, and the DB is then usable only by the account that opened it last. Place every tee DB on a
+protected volume regardless.
 
 The **opt-in ADR 0087 sandbox worker** (`[sandbox].mode = "subprocess"`, default `"off"`) is **not** an
 exclusion, and this paragraph is the single statement of how its output reaches stream 1 — the code
