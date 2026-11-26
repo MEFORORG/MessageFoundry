@@ -2006,6 +2006,42 @@ def test_a_refused_restore_whose_staging_survives_keeps_its_refusal(tmp_path, ca
     _no_staging_left(tmp_path)
 
 
+def test_a_refused_restore_keeps_its_refusal_when_rmtree_of_its_staging_raises(
+    tmp_path, capsys
+) -> None:
+    """BACKLOG #5617, through a seam the code before engine PR 2982 also used: ``shutil.rmtree``
+    refusing the restore staging directory, as a scanner holding a file in it does on Windows.
+    The refusal in flight is the one reported, and the staging the teardown could not remove
+    holds no plaintext. At 717bb0ef3b, the parent of PR 2982's merge, the refusal already
+    survived this seam, and the leftover still held the decrypted archive."""
+    tar = _undated_config_only_tar(tmp_path)
+    toml = _service_toml(tmp_path, key_b64=None)
+    real_rmtree = shutil.rmtree
+    refused: list[str] = []
+
+    def refuse(path: Any, *args: Any, **kwargs: Any) -> None:
+        if "mefor-restore-" in os.fspath(path):
+            refused.append(os.fspath(path))
+            raise PermissionError(13, "held open by another process", os.fspath(path))
+        real_rmtree(path, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(shutil, "rmtree", refuse)
+        mp.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", (), raising=False)
+        assert main(_config_only_argv(str(tar), toml, tmp_path / "cfg")) == 1
+    assert refused, "the staging teardown never reached rmtree"
+    err = _refusal(capsys)
+    assert "restore failed (age_undated)" in err and "Nothing was written" in err, err
+    assert "Traceback" not in err, err
+    assert not (tmp_path / "cfg").exists()
+    leftovers = list(tmp_path.glob("mefor-restore-*"))
+    assert leftovers, "the refused teardown left no staging directory to check"
+    for leftover in leftovers:
+        for item in leftover.rglob("*"):
+            assert not item.is_file() or item.stat().st_size == 0, item
+        real_rmtree(leftover)
+
+
 def test_a_refusal_names_a_staging_leftover_that_still_holds_plaintext(tmp_path, capsys) -> None:
     # Where a staged file could be neither removed nor emptied, the refusal stands and names the
     # directory after it, rather than being replaced by the teardown's error.
