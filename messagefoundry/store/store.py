@@ -9196,10 +9196,25 @@ def forget_store_salt(path: Path) -> bool:
     closes. With no salt row, the first open mints a salt and so a key nothing has used, before it
     seals anything; every value already in the file names its own salt and still opens.
 
-    Returns whether a row was removed. A file from before ADR 0196 has no ``store_salt`` table and so
-    nothing to forget; its first open creates one. Synchronous, for the off-loop restore path.
+    Synchronous, for the off-loop restore path. The cases:
 
-    **It proves the row is gone from the MAIN FILE, or raises ``sqlite3.OperationalError``.** A
+    - **True**: an ordinary ``store_salt`` table held at least one row, and the delete is proven in
+      the MAIN FILE (below), so the next open mints a new salt.
+    - **False, with an ordinary table**: the ``store_salt`` table was there and empty, so there was
+      nothing to forget; the next open mints a salt as it would anyway.
+    - **False, with no ordinary table of that name**: a file from before ADR 0196 has none, and its
+      first open creates one. But the name may instead be held by an object this build did not
+      make, at least a virtual table or a view another tool left. Such an object is neither read
+      nor dropped, so this False proves nothing about a salt: the object stays in the copy, and the
+      next :meth:`MessageStore.open` of it refuses with :class:`SchemaMismatchError` (``table
+      'store_salt' is missing``). That open, not this call, is what refuses such a copy; a restore
+      has by then placed it.
+    - **Raises** ``sqlite3.OperationalError``, whichever of the above it would have returned, when
+      the file cannot be switched out of WAL mode, for example while another connection holds it,
+      or when a non-empty ``-wal`` remains afterwards; and when the read-only re-read still finds a
+      row in the ordinary table. Other SQLite errors from the reads or the delete propagate too.
+
+    **Where it removes a row, it proves the row is gone from the MAIN FILE.** A
     snapshot can carry WAL mode in its header, and then a plain DELETE commits into ``-wal``. The
     callers place or open only the main file, so a delete left in a WAL that was never checkpointed
     would be silently dropped, and the copy would keep the original's salt. So the file is first

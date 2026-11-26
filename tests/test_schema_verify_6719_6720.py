@@ -242,6 +242,42 @@ def test_forget_store_salt_leaves_a_virtual_salt_table_alone(tmp_path: Path) -> 
         conn.close()
 
 
+@pytest.mark.parametrize("foreign", ["virtual", "view"])
+async def test_forget_store_salt_false_on_a_foreign_salt_object_and_the_next_open_refuses(
+    tmp_path: Path, foreign: str
+) -> None:
+    """``forget_store_salt``'s False case with no ordinary ``store_salt`` table: a store copy whose
+    salt name is held by another tool's object. Nothing is dropped and nothing is proven, so the
+    call returns False without raising, and it is the next open that refuses the copy."""
+    from messagefoundry.store.store import forget_store_salt
+
+    path = tmp_path / f"{foreign}-copy.db"
+    await _fresh(path)
+    _sql(path, "DROP TABLE store_salt")
+    if foreign == "virtual":
+        _plant_unloaded_virtual_table(path, "store_salt")
+    else:
+        _sql(path, "CREATE VIEW store_salt AS SELECT 's' AS salt")
+    assert forget_store_salt(path) is False
+    # The object is left in the copy: neither dropped nor replaced.
+    conn = sqlite3.connect(path)
+    try:
+        kinds = conn.execute(
+            "SELECT type, sql FROM sqlite_master WHERE name = 'store_salt'"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(kinds) == 1 and (kinds[0][0] == "view") == (foreign == "view")
+    with pytest.raises(SchemaMismatchError, match="table 'store_salt' is missing"):
+        await _fresh(path)
+    # Control: the same copy with its own ordinary salt table holding a row is dropped and opens.
+    ordinary = tmp_path / "ordinary-copy.db"
+    await _fresh(ordinary)
+    _sql(ordinary, "INSERT INTO store_salt (id, salt, created_at) VALUES (1, 's', 0)")
+    assert forget_store_salt(ordinary) is True
+    await _fresh(ordinary)
+
+
 async def test_the_census_reads_tables_through_the_schema_checks_predicate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
