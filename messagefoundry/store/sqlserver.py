@@ -4499,8 +4499,8 @@ class SqlServerStore(ServerCipherWalk):
                 # build must find a store here before it runs, not after.
                 await cls._refuse_a_database_with_no_store(settings, posture=posture)
             # RCSI must be enabled BEFORE the pool exists: its one-time ALTER ... WITH ROLLBACK
-            # IMMEDIATE takes momentary exclusivity, and with no MEFOR pool session open yet it has
-            # nothing of ours to terminate (concurrency_fixes (a)). #305: under external schema
+            # IMMEDIATE takes exclusivity once the sessions it ends have rolled back, and with no
+            # MEFOR pool session open yet it has nothing of ours to terminate (concurrency_fixes (a)). #305: under external schema
             # management the runtime login issues no ALTER DATABASE, so there is nothing to do before
             # the pool; _verify_schema_external reads the two options on a pooled connection instead.
             # A read-only open issues no ALTER either (#1780).
@@ -5056,8 +5056,9 @@ class SqlServerStore(ServerCipherWalk):
         """Enable READ_COMMITTED_SNAPSHOT (RCSI) so the staged claim/finalize paths read on a
         row-version snapshot rather than taking shared locks that deadlock writers under concurrent
         load (concurrency_fixes (a)). Runs on its OWN autocommit connection BEFORE the pool is
-        created, so the momentary exclusivity of ``WITH ROLLBACK IMMEDIATE`` has no sibling MEFOR
-        session to terminate; IF-guarded on the live state, so the disruptive ALTER fires at most ONCE
+        created, so the exclusivity of ``WITH ROLLBACK IMMEDIATE`` has no sibling MEFOR session to
+        terminate (how long it can wait, and why it has no statement limit: the comment at the state
+        read); IF-guarded on the live state, so the disruptive ALTER fires at most ONCE
         (greenfield first boot) and every later open()/failover is a detect-and-skip no-op.
 
         **FAILS CLOSED when RCSI is off and cannot be turned on (BACKLOG #1628).** This used to degrade

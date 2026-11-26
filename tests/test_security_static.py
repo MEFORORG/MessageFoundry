@@ -964,11 +964,11 @@ _UNSCANNABLE_RE_PATTERNS = {
     # DDL), and from nowhere else at this pin's writing. The shapes have no nested quantifier. Each
     # pattern is an alternation of literals, ``@`` and the name, joined by single ``\s*`` or
     # ``\s+`` runs. The runs pattern (the first) also holds the optional ``(?:UTE)?``, a group of
-    # literals only, and a closing ``(?!\w)`` lookahead, which consumes nothing. The changes pattern (the second) also holds the operator class
-    # ``[-+*/|&^%]``, optional in one branch and required in the other. No ``\s`` run is followed
+    # literals only, and a closing ``(?![\w@#$])`` lookahead, which consumes nothing. The changes
+    # pattern (the second) also holds the operator class ``[-+*/|&^%]``, optional in one branch and required in the other. No ``\s`` run is followed
     # by a token that can match whitespace, so there is one way to split any prefix.
     "messagefoundry/store/server_schema_verify.py": (
-        "f'\\\\b(?:EXEC(?:UTE)?\\\\s*\\\\(\\\\s*@{name}\\\\s*\\\\)|sp_executesql\\\\s+@{name}(?!\\\\w))'",
+        "f'\\\\b(?:EXEC(?:UTE)?\\\\s*\\\\(\\\\s*@{name}\\\\s*\\\\)|sp_executesql\\\\s+@{name}(?![\\\\w@#$]))'",
         "f'\\\\b(?:SET|SELECT)\\\\s+@{name}\\\\s*[-+*/|&^%]?=|@{name}\\\\s*[-+*/|&^%]='",
     ),
     # a wrapper's parameter. NOTE: register_ui_action's own re.compile(pattern) stays here BY

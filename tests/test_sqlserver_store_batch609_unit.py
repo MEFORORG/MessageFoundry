@@ -232,9 +232,8 @@ async def test_the_open_bounds_its_reads_and_the_snapshot_alter_not_the_rcsi_alt
 ) -> None:
     """Red before #5666: the open's state read and re-read probes kept pyodbc's default of no
     statement limit. They now run under ``[store].command_timeout``, as the snapshot ALTER does
-    (the next test). The RCSI ALTER keeps no limit: a cancel landing after ROLLBACK IMMEDIATE
-    rolled back the peers would leave RCSI off, and the retry at every restart would roll them
-    back again."""
+    (the next test). The RCSI ALTER keeps no limit, for the reason the comment at the state read
+    in ``_ensure_database_options`` gives."""
     timeouts = _install(monkeypatch, alters_fail=False)
     await SqlServerStore._ensure_database_options(_settings())
     assert timeouts == {_STATE_READ: 17, _ALTER_RCSI: 0, _ALTER_SNAPSHOT: 17}, timeouts

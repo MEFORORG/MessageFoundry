@@ -1319,10 +1319,11 @@ def _assigned_and_run(text: str, spans: list[tuple[int, int]], var: str, end: in
     # Escaped although the caller's capture is `\w+` today, which holds no metacharacter: a
     # wider capture later must not turn a name into pattern syntax.
     name = re.escape(var)
-    # `(?!\w)`, not `\b`, after the name: an escaped name ending in a non-word character has no
-    # word boundary after it.
+    # `(?![\w@#$])`, not `\b`, after the name: an escaped name ending in a non-word character has
+    # no word boundary after it, and `$`, `#` and `@` continue a T-SQL name, so `@sql$2` is not
+    # `@sql`.
     runs = re.compile(
-        rf"\b(?:EXEC(?:UTE)?\s*\(\s*@{name}\s*\)|sp_executesql\s+@{name}(?!\w))", re.I
+        rf"\b(?:EXEC(?:UTE)?\s*\(\s*@{name}\s*\)|sp_executesql\s+@{name}(?![\w@#$]))", re.I
     )
     changes = re.compile(rf"\b(?:SET|SELECT)\s+@{name}\s*[-+*/|&^%]?=|@{name}\s*[-+*/|&^%]=", re.I)
     first = next(

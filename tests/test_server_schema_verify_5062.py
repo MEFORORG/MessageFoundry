@@ -879,3 +879,11 @@ def test_a_metacharacter_in_an_exec_variable_matches_only_itself() -> None:
     for run in ("sp_executesql @a+", "sp_executesql @a+;"):  # the second form matches itself too
         assert _assigned_and_run(run, _string_spans(run), "a+", 0), run
     assert not _assigned_and_run("sp_executesql @a+b", _string_spans("sp_executesql @a+b"), "a+", 0)
+    # The changes pattern: `SET @aaa` is not an assignment to `@a+`, so the run still counts.
+    changed = "SET @aaa = 1 EXEC(@a+)"
+    assert _assigned_and_run(changed, _string_spans(changed), "a+", 0)
+    reset = "SET @a+ = 1 EXEC(@a+)"
+    assert not _assigned_and_run(reset, _string_spans(reset), "a+", 0)  # the control
+    # `$`, `#` and `@` continue a T-SQL name, so `@sql$2` is another variable.
+    for other in ("sp_executesql @sql$2", "sp_executesql @sql#x"):
+        assert not _assigned_and_run(other, _string_spans(other), "sql", 0), other
