@@ -937,8 +937,8 @@ def _advance_watched[S: (_BreakerStanding, _ReferralStanding)](
 # dropped the account's own oldest LIVE count, so round-robin guesses over more sessions than the
 # cap each got a fresh budget.
 _REPROOF_SESSION_MAX = 4096
-# How many refused session reads, with no account between them except one whose read raised a
-# defect, end a session reaper pass's re-proof count drop
+# How many refused session reads, with no account between them other than accounts whose read
+# raised a defect, end a session reaper pass's re-proof count drop
 # (:meth:`AuthService.drop_reaped_reproof_counts`), so a store outage costs that many timed-out reads
 # a pass, not one per account (BACKLOG #5336).
 _REAPED_DROP_REFUSALS = 3
@@ -16195,11 +16195,12 @@ class AuthService:
         The drop is housekeeping, and it fails closed: a count it does not reach stays. The walk
         starts one account further on each pass. A pass cut short can therefore miss the same
         accounts for many passes running, so this bounds no count's stay. A refused read is
-        logged and the next account is read, until :data:`_REAPED_DROP_REFUSALS` refusals with no
-        account between them except one whose read raised a defect end the pass. A defect, an
-        error the store helpers re-raise rather than read as a refusal, is logged for that account
-        and the next is still read; the
-        first is raised if the pass ends normally, with any later ones named in its notes. An error
+        logged and the next account is read, until a run of :data:`_REAPED_DROP_REFUSALS` refusals
+        ends the pass. An account between two refusals starts the run again unless its read raised
+        a defect, even one whose row does not parse or one not read because its counts left. A
+        defect, an error the store helpers re-raise rather than read as a refusal, is logged for
+        that account and the next is still read; the first is raised if the pass ends normally,
+        with any later ones named in its notes. An error
         outside the store's refusal set raises at once and ends the pass, and so does the reaper's
         bound on the whole drop; a defect held then is not raised."""
         holders = list(dict.fromkeys(uid for _, _, uid in self._reproof_session_failures.values()))

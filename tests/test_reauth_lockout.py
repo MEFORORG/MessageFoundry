@@ -1405,10 +1405,9 @@ async def test_a_refused_read_keeps_the_reaped_counts(
 async def test_an_unparseable_account_between_refusals_resets_the_refused_run(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #5336: pins the reset as built. Any account between refused reads, except one whose
-    read raised a defect, starts the run of refusals again, even one whose row does not parse and
-    so keeps its counts. Refused, unparseable, refused, refused is therefore not three in a run,
-    and the account after them is still read."""
+    """BACKLOG #5336: pins one case of the reset as built. An account whose row does not parse
+    keeps its counts and still starts the run of refusals again, so refused, unparseable, refused,
+    refused is not three in a run while the bound is three, and the account after them is read."""
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
