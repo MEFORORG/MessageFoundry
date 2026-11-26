@@ -61,7 +61,11 @@ class ChainFinding:
     ``insecure`` is ``True`` for a definite finding and ``False`` for an indeterminate one. ``sids``
     names the Windows principals the finding is about, so the fix text can remove them. ``owner``
     marks a finding about who owns the object rather than about a grant. ``writable`` marks a POSIX
-    finding about group or other write bits, so its fix is the chmod alone and never a chown."""
+    finding about group or other write bits, so its fix is the chmod alone and never a chown.
+    ``mount`` marks a POSIX finding that a mount's type is outside :data:`POSIX_TRUSTED_FS`, or
+    could not be read, so the fix text can say that no location below it passes. A type that could
+    not be read names the first object the walk reached, ``/`` on a host with no mount table, where
+    no path's type can be read. ``fstype`` is the mount's type, empty where it could not be read."""
 
     path: str
     kind: str
@@ -70,6 +74,8 @@ class ChainFinding:
     sids: tuple[str, ...] = ()
     owner: bool = False
     writable: bool = False
+    mount: bool = False
+    fstype: str = ""
 
 
 @dataclass(frozen=True)
@@ -77,12 +83,16 @@ class PathVerdict:
     """The result of checking an anchor's resolution chain. ``platform`` picks the fix text.
 
     ``engine`` names the account the check trusted as the engine's own, for the message: the
-    verdict depends on it, so a check run by another account can answer differently."""
+    verdict depends on it, so a check run by another account can answer differently.
+
+    ``regular_file`` is the physical path of the regular file the POSIX walk reached, with links
+    and ``..`` resolved as the kernel resolves them, or ``None`` where it reached none."""
 
     ok: bool | None
     findings: tuple[ChainFinding, ...] = ()
     platform: str = "posix"
     engine: str | None = field(default=None, compare=False)
+    regular_file: str | None = field(default=None, compare=False)
 
 
 def _combine(findings: Iterable[ChainFinding]) -> bool | None:
@@ -833,8 +843,11 @@ class PosixStat:
 
 
 #: File systems whose owner and mode bits are real. CIFS, NFS, FUSE and 9p can show a clean ``755``
-#: chain while the server lets others replace the file, so they answer indeterminate.
-POSIX_TRUSTED_FS = frozenset({"ext2", "ext3", "ext4", "xfs", "btrfs", "tmpfs", "overlay"})
+#: chain while the server lets others replace the file, so they answer indeterminate. So does
+#: ``overlay`` (vault BACKLOG #8390 item 31): this check reads only a mount's type, not the lower
+#: layers an overlay's mount options list, and a lower layer on NFS or CIFS keeps that server's
+#: owners and modes. docker/README.md says what that means for a container whose root is overlay.
+POSIX_TRUSTED_FS = frozenset({"ext2", "ext3", "ext4", "xfs", "btrfs", "tmpfs"})
 
 
 def posix_path_verdict(
@@ -883,7 +896,11 @@ def posix_path_verdict(
                 fs_seen.add("?")
                 findings.append(
                     ChainFinding(
-                        obj, kind, False, "the type of the file system under it is unknown"
+                        obj,
+                        kind,
+                        False,
+                        "the type of the file system under it is unknown",
+                        mount=True,
                     )
                 )
         elif mounted[1] not in POSIX_TRUSTED_FS and mounted[0] not in fs_seen:
@@ -895,12 +912,15 @@ def posix_path_verdict(
                     False,
                     f"it is a {mounted[1]} mount, whose owners and mode bits this check cannot vouch "
                     "for",
+                    mount=True,
+                    fstype=mounted[1],
                 )
             )
 
     todo = [c for c in path.split("/") if c]
     cur = "/"
     hops = 0
+    regular: str | None = None
     try:
         cur_st = lstat_fn(cur)
     except OSError as exc:
@@ -983,10 +1003,14 @@ def posix_path_verdict(
             findings.append(ChainFinding(child, FILE, False, "the path continues past a file"))
         elif not stat.S_ISREG(child_st.mode):
             findings.append(ChainFinding(child, FILE, True, "it is not a regular file"))
-        elif child_st.mode & 0o022:
-            findings.append(
-                ChainFinding(child, FILE, True, "group or others can write to it", writable=True)
-            )
+        else:
+            regular = child
+            if child_st.mode & 0o022:
+                findings.append(
+                    ChainFinding(
+                        child, FILE, True, "group or others can write to it", writable=True
+                    )
+                )
         break
     else:
         # The components ran out on a directory: the anchor is not a file.
@@ -994,7 +1018,7 @@ def posix_path_verdict(
             ChainFinding(cur, DIRECTORY, True, "the path names a directory, not a file")
         )
     found = _dedupe(findings, fold_case=False)
-    return PathVerdict(_combine(found), found, "posix", engine)
+    return PathVerdict(_combine(found), found, "posix", engine, regular)
 
 
 # =================================================================================================

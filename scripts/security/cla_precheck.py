@@ -34,7 +34,9 @@ EVERY commit it can read, paging on ``hasNextPage``:
      (owner ruling 2026-11-13). Measured before the ruling: every commit on merged PRs 2909 and
      2432 has a linked author, so the rule refuses nothing in current flows. A null author, and an
      author whose ``user`` is null or absent, are refused; an absent ``author`` key, or a value of
-     either that is neither null nor an object, is a reply in the wrong shape and a fault.
+     either that is neither null nor an object, is a reply in the wrong shape and a fault. At
+     least one exception warns and passes instead: a commit GraphQL reported an error inside,
+     its committer included (the partial-error case below).
   2. A linked author first seen past the first page (as many commits as GitHub returned
      first, at most 100) is refused only when
      absent from the signature file the action keeps (below). The first page's keys are built as
@@ -54,14 +56,27 @@ TWO CASES BACKLOG #5645 item 1 names:
   * A GraphQL reply carrying ``errors`` beside its ``data`` (a partial error). An error whose
     ``path`` points inside one commit node leaves that commit unjudged, a fault, because GraphQL
     nulls the field it could not resolve and a nulled ``author.user`` would read as an unlinked
-    author. One whose path stays inside that commit's ``committer`` leaves only the committer
-    unread: the nullable committer stops null propagation there, so rule 1 still judges the
-    author (BACKLOG #5644 added item 1). On the first page, such a commit with a git author is
-    still left out of the first page's keys, with a fault, whether that author is linked or not,
-    as before that item; an unlinked one is also refused under rule 1. On any page, a commit
-    with a committer-only error that came back with no commit object, or with no readable
-    ``oid``, contradicts the premise and is unjudged whole. The other commits on the page are judged, so a refusal they prove stands. An error with
-    no such path still faults the whole page, keeping the pages read before it.
+    author. One whose path stays inside that commit's ``committer`` leaves the author read: the
+    nullable committer stops null propagation there (BACKLOG #5644 added item 1). A linked
+    author there is judged under rule 2 past the first page, since a non-null account is no
+    nulled field. An author there that reads as unlinked or null is NOT refused under rule 1 but
+    is a fault that warns and passes (owner ruling W7-R11, 2026-11-26: "warn when unproven,
+    refuse only when proven"; vault branch ``w7-owner-rulings-20261126``, file
+    ``docs/security/ASVS-OWNER-RULINGS-2026-11-26-W7.md``): the same failure may have nulled it
+    with only the committer's path reported, and this read cannot rule that out. THAT IS A
+    FAIL-OPEN HOLE IN RULE 1. At least these unlinked authors pass this script on a read that
+    carries such an error and can then pass the vendored action unsigned, if its own read is
+    clean: one whose committer is a signed or allowlisted account, or ``github-actions[bot]``,
+    which the action drops; and one whose git name is allowlisted, under an unlinked committer.
+    Each try is bounded by the action's own read: the bundle's GraphQL client throws
+    ``GraphqlError`` on a reply carrying any ``errors`` (read in ``dist/index.js``, not run), so
+    only an error the action's read does not also hit gets through. That is a chance per run,
+    not a cap: a push or a recheck comment runs both reads again. On the first page, such a commit is left out of the first page's
+    keys, with a fault, whether its author is linked or not, as before that item. On any page, a
+    commit with a committer-only error that came back with no commit object, or with no readable
+    ``oid``, contradicts the premise and is unjudged whole. The other commits on the page are
+    judged, so a refusal they prove stands. An error with no such path still faults the whole
+    page, keeping the pages read before it.
   * A head that lags the push event. When ``CLA_HEAD_SHA`` is set and the first page's
     ``headRefOid`` is another commit, the read stops there and is repeated after each wait in
     ``HEAD_RETRY_DELAYS``. If every first page shows another head, the run is a fault and nothing
@@ -112,10 +127,12 @@ refuse a commit the pull request no longer holds.
 UNMEASURED: that every field a partial error nulled lies on the ``path`` of an error naming its
 commit node. The GraphQL specification implies it: an error's path names the field that raised it,
 and null propagation reaches only that field's ancestors. A nulled ``author.user`` that no error
-path reaches reads as an unlinked author and is refused. That includes a commit whose only error
-path is inside its ``committer``: if one failure nulled ``author.user`` too but GitHub reported
-only the committer's path, its author is refused under rule 1, where before BACKLOG #5644 added
-item 1 the commit was a fault that passes.
+path reaches reads as an unlinked author and is refused; that is how a commit no error names is
+judged, beside an errored one or not (the owner's delegated ruling of 2026-11-23, decision
+d20261123T150935451-0e46cc: "a refusal it proves fails"). A commit with an error path inside
+it, its ``committer`` included, is not refused on that premise: there an unlinked or null
+author is a fault that warns and passes (owner ruling W7-R11), as such a commit was before
+BACKLOG #5644 added item 1. Engine PR 3323 had refused the committer case.
 
 INPUT COMES ONLY FROM THE ENVIRONMENT, never from the command line or a templated ``run:`` line,
 so a workflow step can pass event data through ``env:`` (zizmor's template-injection rule):
@@ -249,7 +266,9 @@ class PullRequestRead:
     tainted: frozenset[int] = frozenset()
     #: Indexes, none in ``tainted``, whose errors all point inside the commit's ``committer`` and
     #: whose commit came back with a readable 40-hex ``oid``; ``evaluate`` relies on that oid.
-    #: Their author is judged; their committer is not read.
+    #: Their committer is not read. A linked author is judged under rule 2 past the first page and
+    #: left unkeyed on it; an unlinked or null one is a fault, not a rule 1 refusal (owner ruling
+    #: W7-R11).
     committer_tainted: frozenset[int] = frozenset()
 
 
@@ -291,7 +310,8 @@ def attribute(commit: Mapping[str, Any]) -> Attribution:
     chooses it. The bundle reads ``author.user``, and ``committer.user`` when that is null, so a
     null person there would throw in the action. A null committer there is a fault here; the commit
     keys nothing among the first page's keys. ``evaluate`` never calls this for a null author:
-    rule 1 refuses that commit first, and it is not also a fault.
+    rule 1 refuses that commit first, or, where GraphQL reported an error inside its committer,
+    records it as a fault instead.
     """
     author = _person(commit, "author")
     if author is None:
@@ -598,7 +618,25 @@ def evaluate(
             slots.append(None)
             continue
         if refusal is not None:
-            # Judged before the key below, so a commit whose committer cannot be read is refused.
+            if index in read.committer_tainted:
+                # Unproven, so a fault that warns and passes (owner ruling W7-R11; module
+                # docstring, partial-error case). It keys nothing: on page one the action would
+                # key an unlinked author's commit under its committer, which the error hid. A
+                # null author has no key anywhere (below), so none is missing.
+                key = (
+                    "; its key is missing from the first page's keys"
+                    if index < read.first_page and commit["author"] is not None
+                    else ""
+                )
+                faults.append(
+                    f"commit {oid}: GraphQL reported an error inside its committer, and its "
+                    f"author reads as unlinked or null, which that failure may have caused; not "
+                    f"refused{key}"
+                )
+                slots.append(None)
+                continue
+            # Judged before the key below, so a commit whose committer cannot be read, other than
+            # through a GraphQL error inside it (above), is refused.
             rule_one.append(refusal)
             # Past the first page, rule 2 judges linked authors only, so no rule reads this
             # commit's key, and an unreadable committer here is not a fault. A null author, which
@@ -607,11 +645,10 @@ def evaluate(
                 slots.append(None)
                 continue
         if index < read.first_page and index in read.committer_tainted:
-            # Left unkeyed with a fault for a linked author too (PR 3323 hold). An unlinked
-            # author's commit is keyed under its committer's account, which the error may have
-            # hidden. A linked author's key, its login, is not hidden by it; the commit is left
-            # unkeyed so rule 2 judges that author's later-page commits as it did before BACKLOG
-            # #5644 added item 1, when such a commit was unjudged whole.
+            # Only a linked author gets here (an unlinked or null one is a fault above). Its key,
+            # its login, is not hidden by the error, but the commit is left unkeyed with a fault
+            # (PR 3323 hold) so rule 2 judges that author's later-page commits as it did before
+            # BACKLOG #5644 added item 1, when such a commit was unjudged whole.
             faults.append(
                 f"commit {oid}: GraphQL reported an error inside its committer; its key is "
                 "missing from the first page's keys"

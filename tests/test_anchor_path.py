@@ -793,7 +793,361 @@ def test_posix_root_engine_trusts_only_root() -> None:
 def test_posix_clean_chain_on_a_network_mount_is_indeterminate() -> None:
     table = {"/srv": (0, D755), "/srv/a.pem": (0, F644)}
     for fs in ("nfs", "nfs4", "cifs", "fuse.sshfs", "9p"):
-        assert _posix("/srv/a.pem", table, fstype={"/srv": fs}).ok is None, fs
+        v = _posix("/srv/a.pem", table, fstype={"/srv": fs})
+        assert v.ok is None, fs
+        assert [(f.path, f.mount) for f in v.findings] == [("/srv", True)], fs
+        assert f"{fs} mount" in v.findings[0].reason, fs
+
+
+def test_posix_clean_chain_on_an_overlay_mount_is_indeterminate() -> None:
+    """vault BACKLOG #8390 item 31: an overlay answers as a network mount does (the
+    ``POSIX_TRUSTED_FS`` comment says why). Red under ``overlay`` back in ``POSIX_TRUSTED_FS``."""
+    table = {"/srv": (0, D755), "/srv/a.pem": (0, F644)}
+    v = _posix("/srv/a.pem", table, fstype={"/srv": "overlay"})
+    assert v.ok is None
+    assert [(f.path, f.mount) for f in v.findings] == [("/srv", True)]
+    assert "overlay mount" in v.findings[0].reason
+
+
+def test_posix_an_overlay_root_leaves_a_bind_mounted_anchor_indeterminate() -> None:
+    """An overlay root, as in a container: the walk reads the type under ``/`` too, so an anchor
+    on a bind-mounted ext4 volume still answers indeterminate, and the finding names ``/``."""
+    table = {"/srv": (0, D755), "/srv/a.pem": (0, F644)}
+    v = _posix("/srv/a.pem", table, fstype={"/": "overlay", "/srv": "ext4"})
+    assert v.ok is None
+    assert [f.path for f in v.findings] == ["/"]
+
+
+def test_an_overlay_anchor_refuses_at_enforce_unless_a_pin_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 31's outcome at ``enforce``: an overlay verdict is refused as any indeterminate path
+    is, and a matching pin loads it. Red under ``overlay`` back in ``POSIX_TRUSTED_FS``, where the
+    unpinned anchor was accepted."""
+    p = _pem(tmp_path)
+    table = {"/srv": (0, D755), "/srv/a.pem": (0, F644)}
+    overlay = _posix("/srv/a.pem", table, fstype={"/srv": "overlay"})
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: overlay)
+    spec = AnchorSpec("t", "[x]", str(p), None, "[x].pin")
+    with pytest.raises(TrustAnchorError, match="enforce refuses it") as err:
+        ta.enforce_anchor(spec, enforcing=True)
+    assert "could not settle" in str(err.value) and "overlay mount" in str(err.value)
+    digest = hashlib.sha256(p.read_bytes()).hexdigest()
+    assert ta.enforce_anchor(AnchorSpec("t", "[x]", str(p), digest, "[x].pin"), enforcing=True)
+    # An anchor read again by path, as the store CAs and the outbound CAs are: a pin is no escape.
+    by_path = AnchorSpec("t", "[x]", str(p), digest, "[x].pin", loads_verified_bytes=False)
+    with pytest.raises(TrustAnchorError, match="at enforce it is refused") as err:
+        ta.enforce_anchor(by_path, enforcing=True)
+    assert "set [x].pin to" not in str(err.value).lower()
+
+
+_FOLDER = "/etc/messagefoundry/"
+# The fix under a mount the check cannot vouch for: S1 to S6, in this order, and nothing else.
+_S2 = "The path is also replaceable; fix that first"
+_S2_FILE = "this finding needs the file replaced by a regular file only root can change"
+_S3 = "set [x].pin to"
+_S4 = "At warn the anchor is used with a warning; at enforce it is refused."
+_S6 = "docker/README.md"
+# Sentences earlier passes wrote, each false in some case.
+_GONE = (
+    "no location below it passes",
+    "clears the finding above",
+    "Fixed in place",
+    "Or use a pin",
+    "moving the anchor",
+    "move the anchor",
+    "bind mount",
+    _FOLDER,
+)
+
+
+def _s1(mount: str, kind: str) -> str:
+    return (
+        f"The check cannot vouch for the mount at {mount!r} ({kind}), so it cannot settle any "
+        "anchor below that mount."
+    )
+
+
+def _s5(mount: str) -> str:
+    return f"An anchor on a mount the check trusts, outside {mount!r}, can pass."
+
+
+def _assert_template(text: str, present: list[str], absent: list[str]) -> None:
+    """``present`` appear in this order; ``absent`` and every retired sentence do not. Case is
+    ignored, so a sentence matches whether or not it opens the line."""
+    low = text.lower()
+    for s in [*absent, *_GONE]:
+        assert s.lower() not in low, (s, text)
+    at = [low.find(s.lower()) for s in present]
+    assert -1 not in at and at == sorted(at), (present, text)
+
+
+_MOUNT_TABLE = {
+    "/srv": (0, D755),
+    "/srv/a.pem": (0, F644),
+    "/etc/x": (0, D755),
+    "/etc/x/a.pem": (0, F644),
+    "/etc/messagefoundry": (0, D755),
+    "/etc/messagefoundry/ca.pem": (0, F644),
+}
+
+
+_FINGERPRINT = "ab" * 32
+
+
+def _path_text(
+    verdict: ap.PathVerdict,
+    anchor: str,
+    *,
+    pin_setting: str | None = None,
+    loads_verified_bytes: bool = True,
+) -> str:
+    """The insecure-path message for a POSIX anchor path, so the fix can tell the anchor's own file
+    and folder from a folder above them. ``_refusal`` reads a real file, whose path is this host's."""
+    spec = AnchorSpec(
+        "t", "[x]", anchor, None, pin_setting, loads_verified_bytes=loads_verified_bytes
+    )
+    found = ta.AnchorVerdict(_FINGERPRINT, True, None, verdict.ok, verdict)
+    return ta._path_message(spec, found)
+
+
+def _no_mountinfo(anchor: str) -> ap.PathVerdict:
+    """The host reader with no mount table: it answers no type for any path."""
+    return posix_path_verdict(
+        anchor,
+        cwd="/",
+        euid=10001,
+        lstat_fn=lambda q: PosixStat(*{**_ETC, **_MOUNT_TABLE}[q]),
+        readlink_fn=lambda q: "",
+        fstype_fn=lambda q: None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mount", "kind", "anchor", "fstype"),
+    [
+        ("/", "overlay", "/srv/a.pem", {"/": "overlay"}),
+        ("/etc", "nfs", "/etc/x/a.pem", {"/etc": "nfs"}),
+        ("/", "unread mount table", "/srv/a.pem", None),
+        ("/", "unread mount table", _FOLDER + "ca.pem", None),
+        ("/srv", "nfs", "/srv/a.pem", {"/srv": "nfs"}),
+        ("/srv", "overlay", "/srv/a.pem", {"/srv": "overlay"}),
+    ],
+    ids=[
+        "overlay-root",
+        "nfs-etc",
+        "no-mountinfo",
+        "no-mountinfo-folder",
+        "nfs-srv",
+        "overlay-srv",
+    ],
+)
+def test_the_fix_under_an_untrusted_mount_is_the_template(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mount: str,
+    kind: str,
+    anchor: str,
+    fstype: dict[str, str] | None,
+) -> None:
+    """An anchor that could not be settled because of a mount: S1, the pin only for an anchor whose
+    consumer loads the verified bytes, S4, S5 only for a read mount other than '/', and the README
+    pointer only for an overlay. Nothing about moving. An unread mount table (``fstype`` None)
+    makes every path answer indeterminate, and its finding names '/'. Red under the earlier text,
+    which said moving did or did not help."""
+    v = _no_mountinfo(anchor) if fstype is None else _posix(anchor, _MOUNT_TABLE, fstype=fstype)
+    assert v.ok is None and [(f.path, f.mount) for f in v.findings] == [(mount, True)]
+    s5 = [_s5(mount)] if mount != "/" and fstype else []
+    s6 = [_S6] if kind == "overlay" else []
+    tail = [_S4, *s5, *s6]
+    gone = [_s5(mount)] if not s5 else []
+    gone += [_S6] if not s6 else []
+    pinned = _refusal(tmp_path, monkeypatch, v, pin_setting="[x].pin")
+    _assert_template(pinned, [_s1(mount, kind), _S3, *tail], [_S2, *gone])
+    by_path = _refusal(tmp_path, monkeypatch, v, loads_verified_bytes=False)
+    no_pin = [_S2, _S3, "pin it to", "A pin does not help here", *gone]
+    _assert_template(by_path, [_s1(mount, kind), *tail], no_pin)
+
+
+@pytest.mark.parametrize("by_path", [False, True], ids=["verified-bytes", "by-path"])
+def test_an_insecure_path_under_an_untrusted_mount_is_the_template(by_path: bool) -> None:
+    """An insecure path under an overlay '/': S1, S2 with the anchor's own folder's chmod, S4 and
+    the README pointer. No pin, since a pin never clears a replaceable path, and no digest of
+    bytes that may be substituted. Red under the text that offered a pin and talked of moving."""
+    table = {**_MOUNT_TABLE, "/srv": (0, D777)}
+    v = _posix("/srv/a.pem", table, fstype={"/": "overlay"})
+    assert v.ok is False
+    text = _path_text(v, "/srv/a.pem", pin_setting="[x].pin", loads_verified_bytes=not by_path)
+    # /srv is the anchor's own folder, so dropping its write bits is the anchor's own fix.
+    s2 = [_S2 + ":", "  chmod go-w /srv"]
+    present = [_s1("/", "overlay"), *s2, _S4, _S6]
+    _assert_template(text, present, [_S3, _FINGERPRINT, _S2_FILE, "pin it to", "outside '/'"])
+
+
+def test_a_path_that_is_not_a_regular_file_gets_no_command() -> None:
+    """A path that is not a regular file is named without a command, as a folder above it is."""
+    odd = ap.ChainFinding("/srv/a.pem", FILE, True, "it is not a regular file")
+    overlay = _posix("/srv/a.pem", _MOUNT_TABLE, fstype={"/": "overlay"})
+    (root,) = overlay.findings
+    text = _path_text(ap.PathVerdict(False, (odd, root), "posix", "uid 7"), "/srv/a.pem")
+    _assert_template(text, [_s1("/", "overlay"), _S2 + ".", _S4, _S6], [_S2_FILE, "chmod"])
+
+
+def test_a_directory_named_as_the_anchor_gets_no_command() -> None:
+    """The setting names a directory another account owns, under an overlay '/': no chown of that
+    folder, which may be a user's home folder, and no word of replacing it with a file. Red under
+    the own-file commands the configured path drew whatever it named."""
+    table = {**_MOUNT_TABLE, **_USERS}
+    v = _posix("/data/team", table, fstype={"/": "overlay"})
+    assert v.ok is False
+    text = _path_text(v, "/data/team", pin_setting="[x].pin")
+    _assert_template(text, [_s1("/", "overlay"), _S2 + ".", _S4], [_S2_FILE, "chown", "chmod"])
+
+
+def test_a_link_then_dotdot_draws_no_chmod_above_the_anchor() -> None:
+    """``/data/team/link/../ca.pem`` with ``link`` pointing at ``/etc`` opens ``/ca.pem``, as the
+    kernel resolves it, so the anchor's own folder is ``/``, not ``/data/team``. Red under the
+    lexical folder, which drew ``chmod go-w /data/team``."""
+    table = {
+        **_MOUNT_TABLE,
+        **_USERS,
+        "/data/team": (0, D777),
+        "/data/team/link": (0, LNK),
+        "/ca.pem": (0, F644),
+    }
+    anchor = "/data/team/link/../ca.pem"
+    v = _posix(anchor, table, links={"/data/team/link": "/etc"}, fstype={"/": "overlay"})
+    assert v.ok is False and [f.path for f in v.findings if f.insecure] == ["/data/team"]
+    text = _path_text(v, anchor, pin_setting="[x].pin")
+    _assert_template(text, [_s1("/", "overlay"), _S2 + ".", _S4], ["chmod", "chown"])
+
+
+@pytest.mark.parametrize(
+    ("mount", "kind"), [("/", "overlay"), ("/srv", "nfs")], ids=["overlay-root", "nfs-srv"]
+)
+def test_the_acl_warning_under_an_untrusted_mount_is_the_template(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    mount: str,
+    kind: str,
+) -> None:
+    """At warn, an ACL that could not be read beside a replaceable path under an untrusted mount:
+    the ACL's warning follows the same template as the path's, with no pin for a replaceable path,
+    no digest, and no folder to move to. Red under the text that fell through to the folder and
+    the pin."""
+    table = {**_MOUNT_TABLE, "/srv": (0, D777)}
+    v = _posix("/srv/a.pem", table, fstype={mount: kind})
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: None)
+    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: v)
+    p = _pem(tmp_path)
+    ta.enforce_anchor(AnchorSpec("t", "[x]", str(p), None, "[x].pin"), enforcing=False)
+    acl = [r.message for r in caplog.records if "could not settle" in r.message]
+    assert len(acl) == 1, acl
+    tail = [_S4, _S6] if kind == "overlay" else [_S4, _s5(mount)]
+    digest = hashlib.sha256(p.read_bytes()).hexdigest()
+    _assert_template(acl[0], [_s1(mount, kind), _S2, *tail], [_S3, "pin it to", digest])
+
+
+def test_no_digest_of_a_file_a_non_owner_can_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """At warn, a file whose permissions let a non-owner write it, under an overlay '/': the fix
+    quotes no digest of bytes that may be substituted. Red under the digest quoted whenever the
+    path was not found replaceable."""
+    v = _posix("/srv/a.pem", _MOUNT_TABLE, fstype={"/": "overlay"})
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: v)
+    p = _pem(tmp_path)
+    ta.enforce_anchor(AnchorSpec("t", "[x]", str(p), None, "[x].pin"), enforcing=False)
+    assert "could not settle" in caplog.text and _S3 in caplog.text.lower(), caplog.text
+    assert hashlib.sha256(p.read_bytes()).hexdigest() not in caplog.text, caplog.text
+
+
+# A folder another account owns, standing in for a user's home folder.
+_USERS = {
+    "/data": (0, D755),
+    "/data/team": (1000, D755),
+    "/data/team/ca.pem": (0, F644),
+    "/data/team/pki": (0, D755),
+    "/data/team/pki/ca.pem": (0, F644),
+    "/srv/x": (0, D755),
+    "/srv/x/a.pem": (1000, F644),
+}
+
+
+@pytest.mark.parametrize(
+    ("anchor", "fstype", "table"),
+    [
+        ("/data/team/ca.pem", {"/": "overlay"}, {}),
+        ("/data/team/pki/ca.pem", {"/": "overlay"}, {}),
+        ("/data/team/pki/ca.pem", None, {}),
+        ("/data/team/pki/ca.pem", {"/data": "nfs"}, {}),
+        ("/srv/x/a.pem", {"/srv": "nfs"}, {"/srv": (1000, D755)}),
+    ],
+    ids=["overlay-own-folder", "overlay-ancestor", "no-mountinfo", "nfs-data", "nfs-srv"],
+)
+def test_no_fix_under_an_untrusted_mount_chowns_a_folder(
+    anchor: str,
+    fstype: dict[str, str] | None,
+    table: dict[str, tuple[int, int]],
+) -> None:
+    """Under a mount the check cannot vouch for, fixing the path in place does not make it pass,
+    so the fix never hands a folder such as a user's home to root, and it follows the template.
+    A command for the anchor's own file stays. Red under the chown of /data/team (or /srv) the
+    fix offered."""
+    full = {**_MOUNT_TABLE, **_USERS, **table}
+    if fstype is None:
+        v = posix_path_verdict(
+            anchor,
+            cwd="/",
+            euid=10001,
+            lstat_fn=lambda q: PosixStat(*{**_ETC, **full}[q]),
+            readlink_fn=lambda q: "",
+            fstype_fn=lambda q: None,
+        )
+    else:
+        v = _posix(anchor, full, fstype=fstype)
+    assert v.ok is False
+    text = _path_text(v, anchor, pin_setting="[x].pin")
+    lines = text.splitlines()
+    assert lines, text  # the message the filter reads; v.ok False above proves a finding was made
+    folders = [line for line in lines if "chown" in line and "a.pem" not in line]
+    assert not folders, text
+    mount = next(f.path for f in v.findings if f.mount)
+    kind = (fstype or {}).get(mount, "unread mount table")
+    s5 = [_s5(mount)] if mount != "/" and fstype else []
+    _assert_template(text, [_s1(mount, kind), _S2, _S4, *s5], [_S3])
+    if anchor == "/srv/x/a.pem":
+        assert "  chown -h root /srv/x/a.pem" in text, text  # the anchor's own file
+
+
+def test_a_by_path_anchor_with_a_pin_says_why_the_pin_does_not_help(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A by-path anchor under an overlay '/' whose pin matches: the refusal says why that pin does
+    not help. Red under the template that dropped the sentence."""
+    v = _posix("/srv/a.pem", _MOUNT_TABLE, fstype={"/": "overlay"})
+    digest = hashlib.sha256(_pem(tmp_path).read_bytes()).hexdigest()
+    text = _refusal(
+        tmp_path, monkeypatch, v, pin_setting="[x].pin", loads_verified_bytes=False, pin=digest
+    )
+    no_pin = "A pin does not help here: this anchor is read again by path"
+    _assert_template(text, [_s1("/", "overlay"), no_pin, _S4, _S6], [_S3, _S2])
+
+
+def test_a_pin_is_not_offered_for_a_replaceable_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An insecure path under an overlay root whose pin already matches: a pin never clears a
+    replaceable path, so the fix offers none, and does not tell the operator to set the pin they
+    have."""
+    table = {**_MOUNT_TABLE, "/srv": (0, D777)}
+    v = _posix("/srv/a.pem", table, fstype={"/": "overlay"})
+    digest = hashlib.sha256(_pem(tmp_path).read_bytes()).hexdigest()
+    text = _refusal(tmp_path, monkeypatch, v, pin_setting="[x].pin", pin=digest)
+    assert "set [x].pin to" not in text and "already matches" not in text, text
 
 
 def test_posix_unknown_mount_table_is_indeterminate() -> None:
@@ -1073,11 +1427,27 @@ def test_path_arm_runs_beside_the_file_arm(tmp_path: Path, monkeypatch: pytest.M
         ta.enforce_anchor(spec, enforcing=True)
 
 
-def _refusal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verdict: ap.PathVerdict) -> str:
+def _refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    verdict: ap.PathVerdict,
+    *,
+    pin_setting: str | None = None,
+    loads_verified_bytes: bool = True,
+    pin: str | None = None,
+) -> str:
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: verdict)
+    spec = AnchorSpec(
+        "t",
+        "[x]",
+        str(_pem(tmp_path)),
+        pin,
+        pin_setting,
+        loads_verified_bytes=loads_verified_bytes,
+    )
     with pytest.raises(TrustAnchorError) as err:
-        ta.enforce_anchor(AnchorSpec("t", "[x]", str(_pem(tmp_path)), None), enforcing=True)
+        ta.enforce_anchor(spec, enforcing=True)
     return str(err.value)
 
 

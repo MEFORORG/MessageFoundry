@@ -170,12 +170,12 @@ jobs:
           # It needs the action's FILES on disk, which this checkout still provides.
           persist-credentials: false
 
-      # WHAT THE VENDORED ACTION CANNOT SEE (BACKLOG #5644, #5645). It matches its allowlist on an unlinked
-      # commit's free-text git name. A patched fork since 2026-11-23 (its README): it pages commits, to
-      # GitHub's 250 stop, past which NEITHER step checks an author. scripts/security/cla_precheck.py
-      # refuses unlinked authors the action could pass unsigned; its docstring states its two rules. It runs on the
-      # same events as the action's step; the action's `if:` alone adds `!cancelled()`, so after an
-      # earlier step fails the action still runs and this step does not.
+      # WHAT THE VENDORED ACTION CANNOT SEE (BACKLOG #5644, #5645). It matches its allowlist on an unlinked commit's
+      # free-text git name. A patched fork since 2026-11-23 (its README): it pages commits, to GitHub's 250 stop, past
+      # which NEITHER step checks an author. scripts/security/cla_precheck.py refuses unlinked authors the action could
+      # pass unsigned; its docstring states its two rules and at least one more place an unlinked author warns and passes:
+      # a commit GraphQL reported an error inside, committer included (owner ruling W7-R11). It runs on the same events as
+      # the action's step; the action's `if:` alone adds `!cancelled()`, so after an earlier step fails it still runs and this does not.
       #
       # FAIL-OPEN ON A FAULT, FAIL-CLOSED ON A DETERMINATE REFUSAL (owner ruling 2026-11-13). Exit 1
       # WITH the script's `CLA pre-check refused` annotation is a refusal and fails the required

@@ -79,6 +79,7 @@ tests/test_cla_action_patches.py
 tests/test_cla_action_provenance.py
 tests/test_claim_check.py
 tests/test_claim_shared_registry.py
+tests/test_claude_md_review_standards_from_main.py
 tests/test_claude_md_wiki_state_root.py
 tests/test_codex_bridge.py
 tests/test_codex_bridge_5501.py
@@ -241,6 +242,7 @@ tests/test_fs_scan_escaped_quotes.py
 tests/test_unbounded_fs_scan_guard.py
 tests/test_shell_guard_dispatch.py
 tests/test_api_burn_guard.py
+tests/test_verified_by_trailer.py
 tests/test_vuln_metrics_fetch_failure_5447.py
 tests/test_block_api_burn_loops.py
 tests/test_webconsole_engine_floor.py

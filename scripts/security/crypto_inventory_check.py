@@ -1090,6 +1090,19 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:ssl.create_default_context",
         }
     ),
+    # The end-to-end smoke mints a throwaway loopback API certificate per run (messagefoundry.pki),
+    # provisions the rig Administrator (its password from rigadmin's CSPRNG draw) and signs in
+    # through rigadmin.sign_in (its pinned TLS context, and the TOTP code where a rig supplies a
+    # key). Its MLLP frame goes in the clear to a loopback inbound.
+    "harness/e2e_smoke.py": frozenset(
+        {
+            "csprng:via harness.load.rigadmin",
+            "mac:via harness.load.rigadmin",
+            "tls_context:via harness.load.rigadmin",
+            "key_cert:via messagefoundry.pki",
+            "sign_verify:via messagefoundry.pki",
+        }
+    ),
     # ADR 0201 slice 4: the toolkit's `impact` loads the config graph with load_config, which digests
     # each module it loads (vault BACKLOG #2724). The toolkit computes no digest of its own.
     "messagefoundry_toolkit/__main__.py": frozenset({"hash:via messagefoundry.config.wiring"}),

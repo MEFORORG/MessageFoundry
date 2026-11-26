@@ -23,9 +23,11 @@
 #   * the engines run `serve --env dev` instead of `--env prod`;
 #   * the ha services run at [security].enforcement = warn, so this job does not exercise the
 #     enforcing gates. compose.yaml, "what an enforcing start needs", names at least an SMTP relay,
-#     a syslog TLS collector, retention bounds and a store CRL. ci.yml's docker-smoke runs an
-#     enforcing start with config-only values for most of them; this job follows the dev posture
-#     its owner ruling asked for instead;
+#     a syslog TLS collector, retention bounds and a store CRL. This job follows the dev posture
+#     its owner ruling asked for. ci.yml's docker-smoke starts at enforce, but since vault BACKLOG
+#     #8390 item 31 that start would refuse on an overlay root, so NO CI job exercises an
+#     enforcing container start until the follow-up in docker/README.md, "Residuals / gotchas",
+#     lands;
 #   * the adopter config is the docker/smoke graph, whose MLLP listener is plaintext, so the
 #     inbound bind is loopback inside the container, and its File outbound needs
 #     MEFOR_EGRESS_ALLOWED_FILE_DIRS=/var/lib/mefor on the engines.
