@@ -449,36 +449,39 @@ text moved in wave 2*.
 
 **The Lander may send a repair Builder subagent to a held PR as soon as the hold is posted**
 (owner instruction 2026-11-26, in the Lander's chat: *"Change the rules to allow you and future
-landers to be more proactive"*). All of these must hold: the hold names one determinate fix, such
-as a doc, a comment, a test, or a code change the hold spells out, and not a question of intent,
-of an owner ruling or of behaviour; the PR is not queued and has no armed auto-merge request; the
-PR is not ASVS record content, which stays a Manager's (owner ruling 2026-09-23); and the author
-has not answered the hold in the last 30 minutes, with a `hold-ack` (next paragraph), a comment or
-a commit. If the author has, the Lander waits for that author. The Builder fetches before it
-pushes, never force-pushes, stops if the head moved, stops at any refusal, and makes only the
-fixes the hold names. At most two repairs per PR; a hold after the second goes to the Repair
-Manager (next paragraph). Every other non-trivial fix still goes to a spawned Manager session, as
+landers to be more proactive"*). The instruction named no number: the 30-minute windows here and
+in the next paragraph, and the cap of two repairs, are the dispatching Manager's reading of it.
+All of these must hold: the hold names one determinate fix, such as a doc, a comment, a test, or
+a code change the hold spells out, and not a question of intent, of an owner ruling or of
+behaviour; the hold still names the PR's head, and no author answer since the hold disputes it;
+the PR is not queued and has no armed auto-merge request; the PR is not ASVS record content,
+which stays a Manager's (owner ruling 2026-09-23); and the author has not answered the hold in
+the last 30 minutes, with a `hold-ack` (next paragraph), a comment or a commit. If the author has,
+the Lander still reads that answer on its turn, but sends no repair Builder until 30 minutes
+after it. The Builder fetches before it pushes, never force-pushes, stops if the head moved,
+stops at any refusal, and makes only the fixes the hold names. At most two repairs per PR; a hold
+after the second is not the Lander's to repair, and goes to the Repair Manager when the next
+paragraph transfers it. Every other non-trivial fix still goes to a spawned Manager session, as
 the paragraph above says. The Lander merges only once a code-review fork at `xhigh` that the
 Lander starts itself, on the repair head, covers it, its tag read with `review_tag.py`; the repair
 Builder's own QA does not count. That independent review is what keeps authoring apart from
 landing. The 2026-11-26 instruction left it unchanged, along with the review proof the merge
 bullet below requires and what goes to the owner. **Repairing at once, and the shorter windows
 in the next paragraph, raise at least this risk:** an author's own Builder may already be mid-fix
-on a held PR that looks quiet (fleet wiki lesson 20261103T145659705Z-kqwvhx: 2 of 4 quiet PRs had
-one). The head-moved check that binds repair Builders, which are briefed with it, is the only
-collision control; an author's in-flight Builder is not briefed with it and may have none. No
-control was added for it. **CHANGED 2026-11-26:** this rule read *"whose author has gone quiet"*, decided by the
-Lander under the owner's delegation of 2026-10-29, decision d20261029T165610526-c13ae6, with the
-window cut from 4 hours to 2 by the owner ruling of 2026-11-03 in the next paragraph. It required
-2 hours with no author comment or commit, a mail to the author's seat-record worktree with no
-reply, and an author with no live session or a transcript ending on an unanswered question, and
-it allowed one repair per PR. The instruction dropped those three tests, added the 30-minute
-answer exception, and raised the cap to two.
+on a held PR that looks quiet. Fleet wiki lesson 20261103T145659705Z-kqwvhx found one on 2 of 4
+quiet PRs, measured under the old 2-hour window, so at once is likely worse. The change removed
+at least two checks that also guarded against it, the mail to the author and the live-session
+test, and added none. The head-moved check that binds repair Builders, which are briefed with it,
+is now the only collision control; an author's in-flight Builder is not briefed with it and may
+have none. **CHANGED 2026-11-26:** this rule required 2 hours of author silence, a mail to the
+author with no reply, and an author not live, and allowed one repair per PR (decision
+d20261029T165610526-c13ae6, under the owner's delegation of 2026-10-29; window cut from 4 hours to
+2 by the owner ruling of 2026-11-03 in the next paragraph).
 
 **A held PR whose author has not acknowledged the hold within 30 minutes transfers to the Repair
 Manager** (owner ruling 2026-11-03: asked *"Which tiers do you want to adopt?"* of the Repair
-Manager proposal, the owner answered *"Tiers 1 and 2"*; the window is the owner instruction of
-2026-11-26 in the paragraph above). This covers a hold the paragraph above does not take, so the
+Manager proposal, the owner answered *"Tiers 1 and 2"*; the paragraph above says where the
+30-minute window comes from). This covers a hold the paragraph above does not take, so the
 Repair Manager is the spawned Manager that paragraph sends a non-trivial fix or a hold after its
 second repair to. An acknowledgement is an author comment or commit; the `hold-ack` marker
 `scripts/coord/held_pr_turns.py` reads is its unambiguous form, and since every seat acts as the
@@ -496,8 +499,7 @@ no live session, or the author's transcript ENDS on a question unanswered for mo
 minutes, which counts as no live session whatever its running state. The Lander reads this with
 `list_events` or korus `scripts/board/seatstate.py`, and confirms the question is the
 transcript's last turn rather than an older orphaned ask. The paragraph above's repair takes no
-such test. An author
-commit or ordinary reply hands the turn back to the Lander, and nothing expires then. The author
+such test. An author commit or ordinary reply hands the turn back to the Lander, and nothing expires then. The author
 may also hand the PR over sooner. The PR must not be queued or carry an armed auto-merge request.
 The Lander spawns one Manager for repairs in its own CCD
 instance, so `send_message` can wake it, and keeps it alive, respawning it if it dies. The
@@ -511,13 +513,14 @@ Minimizing the newest marker, and any older one still unminimized, cancels the t
 the PR back to the original author. At least stacks, landing order, author intent and anything
 already waiting on an owner ruling stay with the original author. Like the Lander and the
 Watchdog, the Repair Manager never uses `AskUserQuestion`; an owner question its own repair
-raises goes in a table. It never opens a PR, enqueues or merges. Its Builders follow the paragraph
-above's repair-Builder rules, and that paragraph names the collision risk they leave. Every repair
-head it pushes takes the Lander's own independent review the paragraph above requires, before
-the merge. The procedure is in korus `roles/LANDER.md` and `roles/MANAGER.md`. **CHANGED
-2026-11-26:** the instruction in the paragraph above cut each 2-hour window here to 30 minutes:
-the transfer, the `hold-ack` expiry (`ACK_TTL` in `scripts/coord/held_pr_turns.py`) and the
-unanswered question. The 2026-11-03 record above still quotes the question as it was asked.
+raises goes in a table. It never opens a PR, enqueues or merges. Its Builders fetch before they
+push, never force-push, stop if the head moved, stop at any refusal, and make only the fixes the
+hold names; the paragraph above names the collision risk that leaves. Every repair head it
+pushes takes the Lander's own independent review the paragraph above requires, before the merge.
+The procedure is in korus `roles/LANDER.md` and `roles/MANAGER.md`. **CHANGED 2026-11-26:** each
+window here was 2 hours: the transfer, the `hold-ack` expiry (`ACK_TTL` in
+`scripts/coord/held_pr_turns.py`) and the unanswered question. The 2026-11-03 record above still
+quotes the question as it was asked.
 
 **Every seat but Special runs the driver and empower rules.** Each seat except Special applies the
 `driver` and `empower` skills' rules by default, in local and cloud sessions, without the owner
