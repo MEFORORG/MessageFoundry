@@ -456,6 +456,10 @@ _DIFFERENTIAL_PIECES = (
     # BACKLOG #8429: a label prefix before a kept word, password words that hold a kept word, and
     # kept words where a reader opens on them.
     "_pwd=", "Compass=", "Statement:", "Barcode=", "session_state=", "x.name=", ";sslkeypassword=",
+    # A kept word right after a carriage head with no colon after its v1, which the chain's
+    # carriage pass reads (code review round-09fccbb450).
+    "mfb64:v1token=", "mfb64:v1Passage:", "MFB64:v1code=", "[redacted]:v1state:",
+    "<redacted>:v1secret=", "mfb64%3Av1name=",
 )  # fmt: skip
 
 
@@ -471,6 +475,8 @@ _MEMBER_LED_PIECES = (
     "=", " ", "\n", '"family": ', "\x0c", "d4q",
     # BACKLOG #8429: kept words where a label may open, which the mask still keeps.
     "a1q_pwd=", "b2qToken=",
+    # BACKLOG #8429 code review: a kept word right after a carriage head with no colon after v1.
+    "mfb64:v1token=", "mfb64:v1Passage:", "MFB64:v1code=", "Jane Doe", "%26",
 )  # fmt: skip
 
 
@@ -481,6 +487,36 @@ def _member_led_lines() -> list[str]:
         + rng.choice(_MEMBER_LED_OPENERS)
         + "".join(rng.choice(_MEMBER_LED_PIECES) for _ in range(rng.randint(2, 7)))
         for _ in range(400)
+    ]
+
+
+#: A third seeded block (BACKLOG #8429 code review round-09fccbb450): a member value holding a
+#: carriage head with no colon after its ``v1`` and a kept word glued after the ``v1``, with PHI
+#: shapes before it. The chain's carriage pass reads that ``v1`` with no boundary after it; with the
+#: word masked, a chain line the bundle read back printed text the rule before hid, and the two
+#: blocks above held the shape too rarely to find it.
+_CARRIAGE_HEAD_PRE = ("", "%26a1q", "DOE%26b2q", "lookup DOE%26c3q", "%7Cd4q", "x%5Ee5q", "a1q")
+_CARRIAGE_HEAD_KEYS = (";epwd=", ";sslpassword=", ";PWD=", ";Token=", ";xpass=")
+_CARRIAGE_HEAD_MID = ("Je De", "Jane Doe", "", "a1q", "Xy Zw", "x ")
+_CARRIAGE_HEADS = (
+    "mfb64:v1:", "mfb64:", "[redacted]:", "<redacted>:", "MFB64:", "mfb64%3A", "mfb64:v1:mfb64:",
+)  # fmt: skip
+_CARRIAGE_HEAD_GLUED = (
+    "v1token", "v1code", "v1state", "v1secret", "v1Passage", "v1name", "V1token", "v1_token",
+)  # fmt: skip
+_CARRIAGE_HEAD_TAILS = ("=", ":", "=|", ":|", "=&", "= ", "=|x", ":| b2q")
+
+
+def _carriage_head_lines() -> list[str]:
+    rng = random.Random(8429)
+    return [
+        rng.choice(_CARRIAGE_HEAD_PRE)
+        + rng.choice(_CARRIAGE_HEAD_KEYS)
+        + rng.choice(_CARRIAGE_HEAD_MID)
+        + rng.choice(_CARRIAGE_HEADS)
+        + rng.choice(_CARRIAGE_HEAD_GLUED)
+        + rng.choice(_CARRIAGE_HEAD_TAILS)
+        for _ in range(300)
     ]
 
 
@@ -575,6 +611,7 @@ def test_a_second_or_third_redaction_prints_nothing_the_baseline_hid(
             for _ in range(1500)
         ),
         *_member_led_lines(),
+        *_carriage_head_lines(),
     ]
     with_member = [_every_redaction_path(line) for line in lines]
     with monkeypatch.context() as patched:

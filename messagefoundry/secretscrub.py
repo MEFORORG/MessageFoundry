@@ -1958,13 +1958,19 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # ``sig`` or ``jwt`` word, and only three fixed cases of a hex escape before a segment ID. The
 # word mask before it, ``redacted`` for every word, printed 1 line on a chain line the
 # bundle read back on the first ten seeds, and the "#" rule before its fix printed on five later
-# paths. BACKLOG #8429's narrower kept-word rule (:func:`_read_as_label`) was measured by the same
-# nine paths over 60,006 seeded lines dense with kept-word shapes, against a tree of ``main`` at
-# b54e0528, the rule before: no line printed a planted value that tree hid. With one opening
-# switched off in turn, some lines did for the held words, ``session_state``, a ``\b`` start, a
-# "_" prefix and a camelCase capital, and ``tests/test_secretscrub_kept_word.py`` holds one for
-# each. The ";" opening found no line; the whole-word, ``%XX`` and non-ASCII keeps were not
-# switched off alone.
+# paths. BACKLOG #8429's narrower kept-word rule (:func:`_read_as_label`) was measured against a
+# tree of ``main`` at b54e0528, the rule before, on the same nine paths, the bundle reading a chain
+# line back among them, over four seeded corpora: two of 60,006 lines dense with kept-word shapes,
+# 24,006 lines each opening with an HL7 field run and mixing ";" and "&" members with those shapes,
+# and 6,006 lines putting a kept word right after a carriage head (``mfb64:v1token=``). On those
+# corpora no line printed a planted value that tree hid, counted by lines and by occurrences. That
+# is a fuzz result over those shapes, not a proof. A first form of the rule printed on the fourth
+# corpus, 42 lines on the chain-then-bundle paths, and a code review found it after the first three
+# had read zero; :data:`_MEMBER_CARRIAGE_HEAD` is the repair. With one opening switched off in
+# turn, some lines printed for at least the held words, ``session_state``, a ``\b`` start, a "_"
+# prefix, a camelCase capital and the carriage head, and ``tests/test_secretscrub_kept_word.py``
+# holds one for each. The ";" opening found no line; the whole-word, ``%XX`` and non-ASCII keeps
+# were not switched off alone.
 #
 # THE COST, at least these. Every character of the value outside a word prints as it was: its
 # spaces, its punctuation and symbols, ASCII ones such as "@" and "!" and non-ASCII ones such
@@ -2217,6 +2223,18 @@ _MEMBER_CAMEL_AT = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 #: (``sslkeypassword``): a word right after a ";" ending in one, with "=" right after it, is a member
 #: key, which the member pass and :func:`_union`'s ``_MEMBER_KEY`` read.
 _MEMBER_KEY_WORDS = _CREDENTIAL_WORDS + _MEMBER_EXTRA_WORDS
+#: A carriage-marker head with no colon after its ``v1``, in the spellings
+#: ``redaction._BINARY_CARRIAGE`` reads ignoring case: that pass ends a run before such a head, with
+#: no boundary after the ``v1``, so it reads the ``v1`` at the start of a member-value word
+#: (``mfb64:v1token=``). A word holding part of one is kept whole, as before BACKLOG #8429: masked to
+#: ``x0xxxxx``, the run ran on, and the bundle reading the chain line back printed text the rule
+#: before hid (code review round-09fccbb450). Spelled literally for the regex scanner;
+#: ``tests/test_secretscrub_kept_word.py`` runs a line through each of its spellings it lists.
+_MEMBER_CARRIAGE_HEAD = re.compile(
+    r"(?i)(?:mfb64|\[redacted\]|<redacted>)(?::|%3A|\\u003A|\\\\u003A)v1"
+)
+#: How far before a word such a head may start: its longest spelling.
+_MEMBER_CARRIAGE_HEAD_SPAN = len("<redacted>\\\\u003Av1")
 
 
 def _read_as_label(text: str, word: str, start: int) -> bool:
@@ -2229,7 +2247,9 @@ def _read_as_label(text: str, word: str, start: int) -> bool:
     word glued so: the member pattern's own key lookbehinds and :func:`_union`'s ``_MEMBER_KEY``,
     at the end of a ";" key (the ";" opening below), and the two stops named below. Now a word is
     kept where it holds one of
-    :data:`_MEMBER_HELD`'s words anywhere (that constant says why); where it right follows a ";",
+    :data:`_MEMBER_HELD`'s words anywhere (that constant says why); where it holds part of a
+    carriage-marker head with no colon after its ``v1`` (:data:`_MEMBER_CARRIAGE_HEAD` says why);
+    where it right follows a ";",
     ends in a member key word and "=" follows it, which the member pass reads as a key; or where it
     ENDS in one of :data:`_MEMBER_LABEL_WORDS`, as every label pattern ends its keyword with
     ``\\b``, and that word opens where its reader opens. A JSON key word must be the whole word. Any
@@ -2247,10 +2267,14 @@ def _read_as_label(text: str, word: str, start: int) -> bool:
     from that, which is a fuzz result, not a proof.
 
     It still keeps words no reader opens on, at least: a whole label word whatever its case and
-    whatever follows it (``Name:``, ``x.code:``), since the JSON key and query readers need quotes
-    or "=" that this rule does not check; and a word holding a character outside ASCII, which keeps
-    the old rule, since the patterns fold case the Unicode way and a lower-cased comparison may
-    not. Such a password word would print whole on first deployment, as it did before. A label
+    whatever follows it (``Name:``), since the JSON key and query readers need quotes or "=" that
+    this rule does not check; a query key at any ``\\b`` or ``%XX`` start whatever follows it
+    (``bar-code:``, ``x.state:``, ``%2Fstate=``), though the query filter reads one only before
+    "="; a word after a ";" inside a braced value (``{Zq7;Compass=Vw9}``), which the member pattern
+    has already taken whole, so no member key is read there; and a word holding a character outside
+    ASCII, which keeps the old rule, since the patterns fold case the Unicode way and a
+    lower-cased comparison may not. Such a password word would print whole on first deployment,
+    as it did before. A label
     word after any "_" (``__secret=``) is kept too: no label pattern opens there, since
     ``_LABEL_PREFIX`` needs a letter or digit before the "_", but a value walk's stop before a
     later quoted label (``_NOT_BEFORE_QUOTED_LABEL``) does, so ``password=abc__secret='v w'``
@@ -2258,6 +2282,14 @@ def _read_as_label(text: str, word: str, start: int) -> bool:
     keep a word this function refuses; its comment says which."""
     if not word.isascii() or _MEMBER_HELD.search(word) is not None:
         return True
+    end = start + len(word)
+    for head in _MEMBER_CARRIAGE_HEAD.finditer(
+        text,
+        max(0, start - _MEMBER_CARRIAGE_HEAD_SPAN),
+        min(end, start + _MEMBER_CARRIAGE_HEAD_SPAN),
+    ):
+        if head.end() > start:
+            return True
     folded = word.lower()
     if (
         start > 0

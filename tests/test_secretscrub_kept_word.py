@@ -221,6 +221,12 @@ _OPENING_CONTROLS = (
         _NEVER,
         ";KeyStorepwd=myPassword:\n^e5qa1qpwdBearer ",
     ),
+    (
+        "a carriage head",
+        "_MEMBER_CARRIAGE_HEAD",
+        _NEVER,
+        "lookup DOE%26a1q;sslpassword=Jane Doemfb64:v1:mfb64:v1token=|x",
+    ),
 )
 
 _PLANTED = re.compile(r"[a-f][1-6]q|Zq7Vw9")
@@ -256,6 +262,32 @@ def test_each_opening_is_needed(
     assert getattr(secretscrub, attr) != off  # the switch is not a no-op
     monkeypatch.setattr(secretscrub, attr, off)
     assert _printed_where_the_rule_before_hid(line, before)
+
+
+#: The heads ``redaction._BINARY_CARRIAGE`` ends a run before: a marker head with no colon after its
+#: ``v1``, which it reads with no boundary after the ``v1``, so it reads the ``v1`` at the start of a
+#: member-value word. Each in the spellings the member mask meets as a word start.
+_CARRIAGE_HEADS = ("mfb64:", "[redacted]:", "<redacted>:", "MFB64:", "mfb64%3A", "mfb64\\u003A")
+
+
+@pytest.mark.parametrize("separator", ["=", ":"])
+@pytest.mark.parametrize("word", ["token", "code", "state", "secret", "name", "Passage"])
+@pytest.mark.parametrize("head", _CARRIAGE_HEADS)
+def test_a_word_after_a_carriage_head_prints_nothing_the_rule_before_hid(
+    monkeypatch: pytest.MonkeyPatch, head: str, word: str, separator: str
+) -> None:
+    """Code review (round-09fccbb450): with ``v1<kept word>=`` masked to ``x0...``, the chain's
+    carriage pass no longer ended its run at that head, took the body, and the bundle reading the
+    chain line back (the support bundle and ``GET /logs/tail``) printed ``DOE`` and ``a1q``, which
+    the rule before hid. A word holding part of such a head is kept as before."""
+    line = f"lookup DOE%26a1q;sslpassword=Jane Doemfb64:v1:{head}v1{word}{separator}|x"
+    with monkeypatch.context() as patched:
+        patched.setattr(secretscrub, "_read_as_label", lambda _text, _word, _start: True)
+        before = _every_redaction_path(line)
+    assert _printed_where_the_rule_before_hid(line, before) == []
+    assert "DOE" not in _every_redaction_path(line)["chain, then bundle"] or (
+        "DOE" in before["chain, then bundle"]
+    )
 
 
 # --- Shapes the member mask does not reach yet, pinned as strict expected failures --------------
