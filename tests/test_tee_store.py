@@ -556,13 +556,15 @@ async def test_the_db_and_its_wal_and_shm_get_an_owner_only_dacl_on_windows(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="the owner-only DACL is the Windows half of #5637")
-async def test_a_wal_sqlite_re_creates_takes_its_folder_list_until_a_later_open(
+async def test_a_re_created_wal_takes_its_folder_list_until_a_later_open(
     tmp_path: Path,
 ) -> None:
-    """BACKLOG #5637: ``_secure_file``'s docstring states that a -wal or -shm SQLite deletes and
-    re-creates takes its folder's access list until a later open restricts it. Both halves are
-    pinned: the re-created siblings carry the folder's inherited entries, Administrators included,
-    and a second open, run while the first still holds them, makes each owner-only again."""
+    """BACKLOG #5637: ``_secure_file``'s docstring states that a -wal or -shm SQLite re-creates
+    while the store is open takes its folder's access list until a later open restricts it. The
+    re-creation here is a journal-mode switch, which the tee itself never makes: the re-created
+    siblings carry exactly the folder's inherited entries, Administrators included, and a second
+    open, run while the first still holds them, makes each owner-only again. That a handle opened
+    in between keeps its access is not tested."""
     from messagefoundry.config.atomic_edit import _canonical_sid
     from messagefoundry.restricted_file import _windows_engine_sid
     from messagefoundry.store.store import _parse_sddl_dacl, _read_dacl_sddl
@@ -598,6 +600,53 @@ async def test_a_wal_sqlite_re_creates_takes_its_folder_list_until_a_later_open(
                 assert_owner_only(sibling, me)
         finally:
             await later.close()
+    finally:
+        await store.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the owner-only DACL is the Windows half of #5637")
+async def test_the_open_restricts_a_missing_wal_and_shm_before_sqlite_creates_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5637: the tee's last close lets SQLite delete the -wal, so each open used to have
+    SQLite create the siblings with the folder's list and keep them so through its own writes,
+    until the restriction at the end of the open. The open now makes and restricts them first.
+    Every restriction made after SQLite connects is turned off here, so the siblings are
+    owner-only only if they were restricted before SQLite opened them and SQLite kept that list."""
+    from messagefoundry.restricted_file import _windows_engine_sid
+    from tests._win_acl import assert_owner_only, folder_granting
+
+    me = _windows_engine_sid()
+    assert me
+    folder = folder_granting(tmp_path / "acl", me, "S-1-5-32-544")
+    db_path = folder / "tee.db"
+    siblings = (Path(f"{db_path}-wal"), Path(f"{db_path}-shm"))
+    first = await RelayStore.open(str(db_path))
+    await first.close()
+    assert not siblings[0].exists(), "the last close is expected to delete the -wal"
+    real_secure = tee_store._secure_file  # noqa: SLF001 - the helper under test
+    import aiosqlite
+
+    real_connect = aiosqlite.connect
+    connected: list[bool] = []
+
+    def before_connect_only(path: str) -> None:
+        if not connected:
+            real_secure(path)
+
+    def connect(*args: Any, **kwargs: Any) -> Any:
+        connected.append(True)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(tee_store, "_secure_file", before_connect_only)
+    monkeypatch.setattr(aiosqlite, "connect", connect)
+    store = await RelayStore.open(str(db_path))
+    try:
+        await store.record_capture(direction="corepoint_copy", control_id="C", raw=b"MSH|x")
+        assert connected
+        for sibling in siblings:
+            assert sibling.exists(), sibling
+            assert_owner_only(sibling, me)
     finally:
         await store.close()
 

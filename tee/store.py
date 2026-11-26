@@ -263,6 +263,22 @@ def _precreate_secure(path: str) -> None:
         pass
 
 
+def _prerestrict_siblings(path: str) -> None:
+    """Windows: create a missing -wal and -shm empty and restrict all three files before SQLite
+    opens the DB. SQLite opens an existing sibling as it is, so it keeps that access list, rather
+    than creating it with its folder's list and holding it so through the open's own writes until
+    ``_secure_file`` runs at the end (BACKLOG #5637). A sibling that cannot be created is left to
+    SQLite and to that later restriction; one that cannot be restricted is logged."""
+    for sibling in (path + "-wal", path + "-shm"):
+        try:
+            os.close(os.open(sibling, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            _log.warning("could not pre-create %s before the open (%s)", sibling, exc)
+    _secure_file(path)
+
+
 def _owner_only_dacl(paths: list[str]) -> dict[str, str]:
     """Each of ``paths`` that could not be given an owner-only DACL, with the reason; empty when
     every one was. See ``_apply_owner_only_dacl``. An unexpected ctypes error is a failure too."""
@@ -399,9 +415,12 @@ def _secure_file(path: str) -> None:
     goes on: the protected-volume advice in the module docstring is the backstop.
 
     On Windows each file gets a protected DACL granting full control to this process's own user and
-    nobody else (``_owner_only_dacl``); chmod there sets only the read-only bit. A sibling that
-    SQLite deletes and later re-creates, on the last connection's close or a journal-mode switch,
-    takes its folder's access list again until a later open restricts it. Each open restricts the
+    nobody else (``_owner_only_dacl``); chmod there sets only the read-only bit. Each open also
+    restricts a -wal and -shm before SQLite opens the DB (``_prerestrict_siblings``), so the open's
+    own writes never meet a sibling with its folder's list. A sibling that SQLite deletes and
+    re-creates while the store is open, at least on a journal-mode switch, or that a program other
+    than the tee re-creates, takes its folder's access list until a later open restricts it, and a
+    handle opened meanwhile keeps the access it was granted. Each open restricts the
     files to the account opening them, so a DB is usable only by the account that opened it last:
     run the relay and the tee commands that read its DB under one account.
 
@@ -444,6 +463,9 @@ class RelayStore:
             _precreate_secure(
                 path
             )  # create 0600 before SQLite opens it (closes the readable window)
+            if os.name == "nt" and os.path.exists(path):
+                # Off the loop for the same reason as the restriction after the open below.
+                await asyncio.to_thread(_prerestrict_siblings, path)
         db = await aiosqlite.connect(path)
         db.row_factory = aiosqlite.Row
         await db.execute("PRAGMA journal_mode=WAL")
