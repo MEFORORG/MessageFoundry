@@ -118,7 +118,8 @@ def _token_unset(platform: str | None = None) -> str:
 def _import_hvac() -> Any:
     """Lazily import ``hvac`` (the optional ``[vault]`` extra), failing closed with a
     :class:`KeyProviderError` that names the extra, as ``secretprovider_vault._import_hvac`` does
-    (vault BACKLOG #6709). Any ``Exception`` but ``MemoryError`` and ``RecursionError`` is caught,
+    (vault BACKLOG #6709), except that here a ``MemoryError`` or ``RecursionError`` propagates,
+    where that twin refuses it. Any other ``Exception`` is caught,
     not only ``ImportError``: importing runs hvac's and its dependencies' top-level code, which can
     raise an ``OSError`` or another class. Only a ``ModuleNotFoundError`` for ``hvac`` itself reads
     as a missing extra; anything else is a broken install, refused by class with "reinstall" and

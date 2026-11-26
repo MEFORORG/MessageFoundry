@@ -367,7 +367,9 @@ def test_the_processs_own_limits_from_the_lazy_hvac_import_fail_closed(
 
     monkeypatch.setattr(builtins, "__import__", _import)
     provider = secretprovider_vault.build_provider(SecretsSettings())
-    with pytest.raises(SecretProviderError, match=f"did not import \({error.__name__}\)") as caught:
+    with pytest.raises(
+        SecretProviderError, match=rf"did not import \({error.__name__}\)"
+    ) as caught:
         provider.resolve("mefor/ad")
     assert caught.value.__cause__ is None and caught.value.__context__ is None
 

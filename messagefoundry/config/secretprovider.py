@@ -138,7 +138,8 @@ def log_import_failure(
     source line. An ``ImportError``'s module name is logged when it is a plain dotted name.
     ``logger`` is the caller's own module logger, so the line names the module that refused; this
     module's logger when ``None``. A failure to log that raises an ``Exception`` is reported on
-    stderr by its class and not raised: a caller logs this inside its own handler, where a raised
+    stderr, by its class where that can be read and not at all where there is no writable stderr,
+    and is not raised: a caller logs this inside its own handler, where a raised
     error would replace its refusal and chain the import error, text and all. Any other
     ``BaseException`` from the log step, such as a ``KeyboardInterrupt``, propagates."""
     module = getattr(exc, "name", None) if isinstance(exc, ImportError) else None
