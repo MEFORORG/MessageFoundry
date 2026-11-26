@@ -260,8 +260,8 @@ services:
       # The robust production alternative is to BAKE config into a derived image (see docker/README.md);
       # a Docker-Desktop-on-Windows bind mount surfaces as 0o777 and will be refused. A Docker Desktop
       # for Mac bind mount reports an owner and mode the Mac does not enforce, and the config check
-      # reads those bits, so a pass there does not show the config is protected. Bake it there too;
-      # docker/README.md says which mount types the key-file check refuses.
+      # reads those bits, so a pass there does not show the config is protected. Bake it there too
+      # (docker/README.md).
       - ./config:/config:ro
       # TLS material, read-only. The MLLP key must be UNENCRYPTED unless the MLLP() sets tls_key_password
       # (env-sourced); the API key may be encrypted (MEFOR_API_TLS_KEY_PASSWORD).

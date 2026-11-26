@@ -1265,6 +1265,7 @@ def test_an_unread_linux_mount_table_still_reports_a_link_another_account_can_ch
     finally:
         os.chmod(base, 0o700)
     assert problem is not None
+    assert "can be changed by an account this check does not trust" in problem
     assert not isinstance(problem, restricted_file.UncheckedProblem)
 
 

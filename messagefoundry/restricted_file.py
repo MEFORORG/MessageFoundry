@@ -1156,13 +1156,15 @@ class UncheckedProblem(str):
 
 
 #: What :func:`broad_access_problem` answers, as an :class:`UncheckedProblem`, on Linux where
-#: ``/proc/self/mountinfo`` cannot be read. It is worded for a refusal under ``enforce`` and a
-#: warning under ``warn`` alike.
+#: ``/proc/self/mountinfo`` cannot be read and the rest of its POSIX check, the path walk and the
+#: holding folder's owner and mode, finds nothing; a finding there is answered in its place, and
+#: under ``holder_judged`` the walk, and so this answer, does not run. It is worded for a refusal
+#: and a warning alike, since a caller may give either.
 MOUNT_TABLE_UNREAD: Final = (
     "/proc/self/mountinfo could not be read, so the type of the file system under the checked "
-    "path, and of the folders its path runs through, was not judged. This clears once the engine can read /proc/self/mountinfo, for "
-    "example with procfs mounted where the engine runs, or with an AppArmor or SELinux policy that "
-    "allows the read. Changing the owner or mode of the checked path or of the folders above it, "
+    "path, and of the folders its path runs through, was not judged. This clears once the engine "
+    "can read /proc/self/mountinfo, for example with procfs mounted where the engine runs, or "
+    "with an AppArmor or SELinux policy that allows the read. Changing the owner or mode of the checked path or of the folders above it, "
     "or replacing what is at that path, does not clear it"
 )
 
@@ -1263,8 +1265,8 @@ def _posix_host_link_problem(path: Path) -> str | None:
     read. On Linux, where ``/proc/self/mountinfo`` itself cannot be read, the walk still runs with
     no type judged and its findings are answered; where it finds nothing, ``path`` is refused,
     since no type on it was judged, and the refusal says how to clear that, which no change to the
-    owner or mode of ``path`` or its folders does. Elsewhere, for example on macOS and the BSDs, which
-    have mount tables this does not read, no type is judged. Where the table is read, at least these
+    owner or mode of ``path`` or its folders does. Elsewhere, for example on macOS and the BSDs,
+    which have mount tables this does not read, no type is judged. Where the table is read, at least these
     are not judged either: a part of the path no mount the table lists covers passes, as a table
     read inside a chroot whose root is not a mount can leave; and since the table is read once,
     before the walk, a mount an automounter has not made by then, such as an autofs mount point a
