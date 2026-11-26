@@ -274,8 +274,10 @@ def test_a_value_error_from_the_provider_build_propagates_raw(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The build part of vault BACKLOG #6709 was withdrawn to main: the dispatch calls
-    # build_provider bare, so its error reaches store.base unwrapped, which judges it.
-    error = ValueError(_BROKEN_HVAC_TEXT)
+    # build_provider bare, so its error reaches store.base unwrapped, which judges it. That is a
+    # known open hazard (a ValueError is read there as a refused key), pinned as main's shape
+    # until that part is built, not as the intended contract.
+    error = ValueError("synthetic build failure")
 
     def _boom(*_a: Any, **_k: Any) -> Any:
         raise error

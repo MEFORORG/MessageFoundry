@@ -541,17 +541,21 @@ def test_the_processs_own_limits_from_the_provider_module_import_fail_closed(
 
 
 def _plant_build_provider(
-    monkeypatch: pytest.MonkeyPatch, make_error: Callable[[], Exception]
+    monkeypatch: pytest.MonkeyPatch, raise_error: Callable[[], object]
 ) -> list[Exception]:
-    """Plant a provider module whose ``build_provider`` raises a fresh ``make_error()``; the
-    list it returns holds each error raised, in order."""
+    """Plant a provider module whose ``build_provider`` runs ``raise_error()``, which raises; the
+    list it returns holds each error raised, in order. The error is re-raised bare, so its
+    ``__context__`` is the one ``raise_error`` gave it."""
     raised: list[Exception] = []
     fake = ModuleType("messagefoundry.store.keyprovider_vault")
 
     def _build(settings: StoreSettings, *, posture: object = None) -> KeyProvider:
-        error = make_error()
-        raised.append(error)
-        raise error
+        try:
+            raise_error()
+        except Exception as error:
+            raised.append(error)
+            raise
+        raise AssertionError("raise_error returned")
 
     fake.build_provider = _build  # type: ignore[attr-defined]
     monkeypatch.setattr(
@@ -563,14 +567,21 @@ def _plant_build_provider(
 def _mains_build_step(
     name: str, settings: StoreSettings, posture: HopPosture | None
 ) -> KeyProvider:
-    """Main's ``_load_external_provider`` past its import arm: ``build_provider`` is called bare,
-    so whatever it raises propagates raw to ``store.base`` (vault BACKLOG #6709's build part was
-    withdrawn to this shape)."""
+    """A copy of origin/main's ``_load_external_provider`` past its import arm (at 181411d1294):
+    ``build_provider`` is called bare, so whatever it raises propagates raw to ``store.base``.
+    The module comes through the patched ``importlib.import_module``, so it is the planted one."""
     import importlib
 
     module = importlib.import_module(f"messagefoundry.store.keyprovider_{name}")
     provider: KeyProvider = module.build_provider(settings, posture=posture)
     return provider
+
+
+def _raises(make: Callable[[], Exception]) -> Callable[[], object]:
+    def _raise() -> object:
+        raise make()
+
+    return _raise
 
 
 def _dpapi_error() -> Exception:
@@ -601,20 +612,40 @@ def _caused_by_codec() -> Exception:
     return error
 
 
-def _context_is_codec() -> Exception:
-    # An implicit codec __context__, as a ValueError raised inside a codec handler carries.
+def _caused_by_vault_hop() -> Exception:
+    strict_requests = pytest.importorskip("messagefoundry.transports.strict_requests")
+    error = RuntimeError("synthetic")
+    error.__cause__ = strict_requests.VaultHopRefused("Vault test hop: fixed text")
+    return error
+
+
+def _raise_in_codec_context() -> object:
+    # A ValueError raised inside a codec handler carries the codec error as its implicit
+    # __context__, which a re-raise while the caller handles another error would replace.
     try:
         raise _codec_error()
     except UnicodeDecodeError:
-        try:
-            raise ValueError("synthetic")
-        except ValueError as error:
-            return error
+        raise ValueError("synthetic")  # noqa: B904 -- the implicit context is the point
+
+
+class _UnreadableChain(ValueError):
+    """A ValueError whose ``__cause__`` raises on its first read, so a chain walk does not finish."""
+
+    reads = 0
+
+    @property
+    def __cause__(self) -> BaseException | None:  # type: ignore[override]
+        type(self).reads += 1
+        if type(self).reads == 1:
+            raise RuntimeError("synthetic")
+        return None
 
 
 def _outcome(call: Callable[[], object]) -> list[tuple[type[BaseException], str]]:
     """The class and text ``call`` raises, read once bare and once while an unrelated error is
-    being handled, since a re-raise in the dispatch would take that error as its context there."""
+    being handled. A re-raise in the dispatch while the caller handles an error replaces the
+    raised error's ``__context__`` with that error, so the second reading tells an implicit codec
+    context kept, as on main, from one replaced."""
     seen: list[tuple[type[BaseException], str]] = []
     with pytest.raises(Exception) as caught:
         call()
@@ -629,30 +660,33 @@ def _outcome(call: Callable[[], object]) -> list[tuple[type[BaseException], str]
 
 
 @pytest.mark.parametrize(
-    "make_error",
+    "raise_error",
     [
-        pytest.param(lambda: InsecureHopRefused("synthetic"), id="hop-refused"),
-        pytest.param(_dpapi_error, id="dpapi-error"),
-        pytest.param(_dpapi_unavailable, id="dpapi-unavailable"),
-        pytest.param(_recorded_refusal, id="recorded"),
-        pytest.param(_codec_error, id="codec-error"),
-        pytest.param(_caused_by_codec, id="value-error-caused-by-codec"),
-        pytest.param(_context_is_codec, id="value-error-in-codec-context"),
-        pytest.param(lambda: ValueError("synthetic"), id="plain-value-error"),
-        pytest.param(lambda: RuntimeError("synthetic"), id="runtime-error"),
+        pytest.param(_raises(lambda: InsecureHopRefused("synthetic")), id="hop-refused"),
+        pytest.param(_raises(_dpapi_error), id="dpapi-error"),
+        pytest.param(_raises(_dpapi_unavailable), id="dpapi-unavailable"),
+        pytest.param(_raises(_recorded_refusal), id="recorded"),
+        pytest.param(_raises(_codec_error), id="codec-error"),
+        pytest.param(_raises(_caused_by_codec), id="value-error-caused-by-codec"),
+        pytest.param(_raise_in_codec_context, id="value-error-in-codec-context"),
+        pytest.param(_raises(_caused_by_vault_hop), id="caused-by-vault-hop"),
+        pytest.param(_raises(_UnreadableChain), id="unreadable-chain"),
+        pytest.param(_raises(lambda: ValueError("synthetic")), id="plain-value-error"),
+        pytest.param(_raises(lambda: RuntimeError("synthetic")), id="runtime-error"),
     ],
 )
 def test_an_error_from_build_provider_reaches_the_caller_as_on_main(
-    monkeypatch: pytest.MonkeyPatch, make_error: Callable[[], Exception]
+    monkeypatch: pytest.MonkeyPatch, raise_error: Callable[[], object]
 ) -> None:
     # Differential pin: the dispatch adds no build arm, so an error build_provider raises reaches
-    # resolve_key_provider raw and store.base's key seam and cipher build with the class and text
-    # main's dispatch gives them (the build part of vault BACKLOG #6709 was withdrawn to main).
+    # resolve_key_provider raw and store.base's key seam, decrypt-key seam and cipher build with
+    # the class and text main's dispatch gives them. The build part of vault BACKLOG #6709 was
+    # withdrawn to main, so a plain ValueError here is still read as a refused key (open).
     from messagefoundry.store import keyprovider
     from messagefoundry.store.base import build_store_cipher
 
     settings = StoreSettings(key_provider="vault")
-    raised = _plant_build_provider(monkeypatch, make_error)
+    raised = _plant_build_provider(monkeypatch, raise_error)
     with pytest.raises(Exception) as direct:
         resolve_key_provider(settings)
     assert direct.value is raised[-1]
@@ -661,7 +695,9 @@ def test_an_error_from_build_provider_reaches_the_caller_as_on_main(
         lambda: resolve_decrypt_keys(settings),
         lambda: build_store_cipher(settings),
     ]
+    _UnreadableChain.reads = 0
     head = [_outcome(call) for call in calls]
     monkeypatch.setattr(keyprovider, "_load_external_provider", _mains_build_step)
+    _UnreadableChain.reads = 0
     main = [_outcome(call) for call in calls]
     assert head == main

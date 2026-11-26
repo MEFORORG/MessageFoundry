@@ -315,7 +315,9 @@ def _load_external_provider(
         # chained, not swallowed. This seam's own text does not reach an operator through
         # resolve_active_key or resolve_decrypt_keys, which replace any error with a fixed text of
         # their own. An error raised later, inside build_provider or a provider's lazy SDK import,
-        # is not caught here.
+        # is not caught here. So a ValueError from build_provider still reaches store.base raw and
+        # is read there as a refused key, as on main: the build part of vault BACKLOG #6709 is not
+        # built (its build arm was withdrawn, 2026-11-25).
         raise KeyProviderError(
             f"[store].key_provider={name!r} could not load its provider module or backend (an "
             f"import failed: {type(exc).__name__}, chained below) — reinstall MessageFoundry "
