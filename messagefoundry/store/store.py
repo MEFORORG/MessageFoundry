@@ -1662,17 +1662,29 @@ GLOBAL_SESSION_EPOCH_MISSING: Final = (
 )
 
 
-# Vault BACKLOG #3028, ADR 0210: the session lineage's three statements, in `?` form for SQLite and
-# SQL Server; postgres.py respells them for `$n`. The INSERT runs only inside rotate_session's own
-# transaction, the SELECT only inside supersede_session's, and the DELETE only from the session
-# purge. No other statement names the table: a retired hash must authenticate nothing.
+# Vault BACKLOG #4276: ((julianday('now') - 2440587.5) * 86400.0) is the database's own clock as
+# epoch seconds, the unit `session_lineage.retired_at` holds. SQLite reads the host clock through its
+# VFS, not through Python's `time.time`, and holds 'now' fixed for the whole of one statement.
+# postgres.py and sqlserver.py spell their own clock (`_PG_EPOCH_NOW`, `_MSSQL_EPOCH_NOW`). Here the
+# expression is spelled literally in each statement below rather than interpolated, so
+# test_writer_txn_is_the_only_begin.py can read each as text; keep the three copies identical.
+# Vault BACKLOG #3028, ADR 0210: the session lineage's three statements; postgres.py and sqlserver.py
+# respell them. The INSERT runs only inside rotate_session's own transaction, the SELECT only inside
+# supersede_session's, and the DELETE only from the session purge. No other statement names the
+# table: a retired hash must authenticate nothing. Each stamps or measures `retired_at` on the
+# database's clock, never a parameter from an engine process (vault BACKLOG #4276,
+# store/session_lineage.py), so the window is one clock's reading on every engine shard.
 _SESSION_LINEAGE_INSERT: Final = (
-    "INSERT INTO session_lineage (retired_hash, successor_hash, retired_at) VALUES (?,?,?)"
+    "INSERT INTO session_lineage (retired_hash, successor_hash, retired_at)"
+    " VALUES (?,?,((julianday('now') - 2440587.5) * 86400.0))"
 )
 _SESSION_LINEAGE_SUCCESSOR: Final = (
-    "SELECT successor_hash FROM session_lineage WHERE retired_hash=? AND retired_at >= ?"
+    "SELECT successor_hash FROM session_lineage WHERE retired_hash=?"
+    " AND retired_at >= ((julianday('now') - 2440587.5) * 86400.0) - ?"
 )
-_SESSION_LINEAGE_PURGE: Final = "DELETE FROM session_lineage WHERE retired_at < ?"
+_SESSION_LINEAGE_PURGE: Final = (
+    "DELETE FROM session_lineage WHERE retired_at < ((julianday('now') - 2440587.5) * 86400.0) - ?"
+)
 
 
 def session_reseal_params(new: SessionRecord, old: SessionRecord) -> tuple[object, ...]:
@@ -12131,7 +12143,8 @@ CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at);
 CREATE TABLE IF NOT EXISTS session_lineage (
     retired_hash   TEXT PRIMARY KEY,           -- the hash the rotation retired
     successor_hash TEXT NOT NULL,              -- the hash the session carried next
-    retired_at     REAL NOT NULL               -- when the re-key landed, in its transaction (wall clock)
+    retired_at     REAL NOT NULL               -- when the re-key landed, in its transaction
+                                               -- (the database's clock)
 );
 CREATE INDEX IF NOT EXISTS ix_session_lineage_retired ON session_lineage(retired_at);
 
@@ -22769,26 +22782,22 @@ class MessageStore:
             await self._commit()
         return written is not None and stamp.anchored
 
-    async def rotate_session(
-        self, token_hash: str, *, new_token_hash: str, now: float | None = None
-    ) -> bool:
+    async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
         ``token_hash`` is the PK, so this is a key update: the row keeps every other column and the
         old hash stops resolving in the same transaction. The token hash is sealed, so the re-key
         re-seals (BACKLOG #2592). Reports whether a row was re-keyed so the caller can fail closed
         when the session was revoked out from under it. The lineage link is written in the same
-        transaction, and only when the re-key landed (vault BACKLOG #3028). Its time is read once
-        the re-key has landed, so a wait for the lock cannot age the link before it exists."""
+        transaction, and only when the re-key landed (vault BACKLOG #3028). Its time is the
+        database's clock when the link's own statement runs (vault BACKLOG #4276), after the re-key
+        has landed, so a wait for the lock cannot age the link before it exists."""
         async with _writer_txn(self._db, self._lock):
             rotated = await self._write_session(
                 token_hash, lambda s: replace(s, token_hash=new_token_hash)
             )
             if rotated is not None:
-                retired_at = time.time() if now is None else now
-                await self._db.execute(
-                    _SESSION_LINEAGE_INSERT, (token_hash, new_token_hash, retired_at)
-                )
+                await self._db.execute(_SESSION_LINEAGE_INSERT, (token_hash, new_token_hash))
             await self._commit()
         return rotated is not None
 
@@ -22802,10 +22811,10 @@ class MessageStore:
             await self._commit()
 
     async def supersede_session(
-        self, token_hash: str, *, now: float, lineage_since: float | None = None
+        self, token_hash: str, *, now: float, lineage_seconds: float | None = None
     ) -> SessionRecord | None:
         """Revoke, then read the row back in the SAME transaction (BACKLOG #2146), following the
-        session lineage when ``lineage_since`` is given (vault BACKLOG #3028). See
+        session lineage when ``lineage_seconds`` is given (vault BACKLOG #3028). See
         :meth:`AuthStore.supersede_session`.
 
         Two statements per step rather than one ``UPDATE ... RETURNING``, because ``RETURNING``
@@ -22813,6 +22822,7 @@ class MessageStore:
         unit: the writer lock orders them against every in-process writer, ``rotate_session``
         included. The first ``UPDATE`` takes SQLite's write lock even when it matches no row, and
         holds it until the commit, so no other process can re-key a row while the walk runs."""
+        started = time.monotonic()  # before the lock, so its wait cannot shorten the window
 
         async def _revoke(h: str) -> SessionRecord | None:
             cur = await self._db.execute(
@@ -22825,8 +22835,8 @@ class MessageStore:
             row = await cur.fetchone()
             return SessionRecord.from_mapping(dict(row)) if row else None
 
-        async def _successor(h: str, since: float) -> str | None:
-            cur = await self._db.execute(_SESSION_LINEAGE_SUCCESSOR, (h, since))
+        async def _successor(h: str, seconds: float) -> str | None:
+            cur = await self._db.execute(_SESSION_LINEAGE_SUCCESSOR, (h, seconds))
             row = await cur.fetchone()
             return str(row[0]) if row else None
 
@@ -22834,7 +22844,11 @@ class MessageStore:
         async with _writer_guard(self._db, self._lock):
             try:
                 ended = await revoke_through_lineage(
-                    token_hash, lineage_since=lineage_since, revoke=_revoke, successor=_successor
+                    token_hash,
+                    lineage_seconds=lineage_seconds,
+                    started=started,
+                    revoke=_revoke,
+                    successor=_successor,
                 )
             except RowSealError as exc:
                 # BACKLOG #5505: only the read-back refused the row; its revoke still commits.
@@ -23154,7 +23168,9 @@ class MessageStore:
                 )
             purged = cur.rowcount if cur.rowcount is not None else 0
             if lineage_seconds is not None:
-                await self._db.execute(_SESSION_LINEAGE_PURGE, (now - float(lineage_seconds),))
+                # Measured back from the database's clock, as the supersession measures its window,
+                # never from ``now`` (vault BACKLOG #4276).
+                await self._db.execute(_SESSION_LINEAGE_PURGE, (float(lineage_seconds),))
             await self._commit()
             return purged
 

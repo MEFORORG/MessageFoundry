@@ -91,7 +91,7 @@ async def test_a_blob_seal_row_still_writes_through_on_a_keyless_store(tmp_path:
 
         _raw(path, "UPDATE sessions SET seal=? WHERE token_hash=?", (blob, token_hash))
         new_hash = hash_token(mint_token())
-        assert await store.rotate_session(token_hash, new_token_hash=new_hash, now=12347.0)
+        assert await store.rotate_session(token_hash, new_token_hash=new_hash)
         assert await store.get_session(new_hash) is not None
     finally:
         await store.close()
@@ -116,7 +116,7 @@ async def test_an_empty_blob_seal_row_is_not_written_on_a_keyless_store(tmp_path
         )
         _raw(path, "UPDATE sessions SET seal=? WHERE token_hash=?", (b"", token_hash))
         new_hash = hash_token(mint_token())
-        assert not await store.rotate_session(token_hash, new_token_hash=new_hash, now=1.0)
+        assert not await store.rotate_session(token_hash, new_token_hash=new_hash)
         assert await store.get_session(new_hash) is None
     finally:
         await store.close()

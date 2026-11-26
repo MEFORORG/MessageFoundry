@@ -239,9 +239,6 @@ from messagefoundry.store.store import (
     _SESSION_CAP_ORDER_SQL,
     _SESSION_CAP_RANK_NOT_AHEAD_SQL,
     _SESSION_INSERT,
-    _SESSION_LINEAGE_INSERT,
-    _SESSION_LINEAGE_PURGE,
-    _SESSION_LINEAGE_SUCCESSOR,
     _SESSION_LIVE_SQL,
     _SESSION_NOT_AHEAD_SQL,
     _SQL_ADMIN_GUARD_HOLDERS,
@@ -502,6 +499,20 @@ _RELEASE_CHUNK = 500
 _MSSQL_EPOCH_NOW = (
     "(CAST(DATEDIFF_BIG(MICROSECOND, CAST('1970-01-01' AS DATETIME2), SYSUTCDATETIME()) AS FLOAT)"
     " / 1000000.0)"
+)
+# Vault BACKLOG #3028, ADR 0210: store.py's three session lineage statements, respelled to stamp and
+# measure `retired_at` on this server's clock (vault BACKLOG #4276). store.py says which method runs
+# each, and that no other statement names the table. Each names the clock once, as above.
+_MSSQL_SESSION_LINEAGE_INSERT: Final = (
+    "INSERT INTO session_lineage (retired_hash, successor_hash, retired_at)"
+    f" VALUES (?,?,{_MSSQL_EPOCH_NOW})"
+)
+_MSSQL_SESSION_LINEAGE_SUCCESSOR: Final = (
+    "SELECT successor_hash FROM session_lineage WHERE retired_hash=?"
+    f" AND retired_at >= {_MSSQL_EPOCH_NOW} - ?"
+)
+_MSSQL_SESSION_LINEAGE_PURGE: Final = (
+    f"DELETE FROM session_lineage WHERE retired_at < {_MSSQL_EPOCH_NOW} - ?"
 )
 # BACKLOG #1169: rows per batch for the `attachment_chunk` at-rest migration. Every OTHER cipher pass
 # batches 500 because its rows are kilobyte-shaped; one attachment_chunk row is a whole
@@ -17986,17 +17997,16 @@ class SqlServerStore(ServerCipherWalk):
         written = await self._write_session_txn(token_hash, stamp)
         return written is not None and stamp.anchored
 
-    async def rotate_session(
-        self, token_hash: str, *, new_token_hash: str, now: float | None = None
-    ) -> bool:
+    async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
         The token hash is sealed, so the re-key goes through :meth:`_write_session` (BACKLOG
         #2592), whose write reads an ``OUTPUT`` rowset and never ``cursor.rowcount`` (BACKLOG
         #2283). ``token_hash`` is ``NVARCHAR(64)`` and a hex digest is exactly 64 chars, so the
         clustered-PK row move is width-safe. The lineage link goes in the same transaction, only
-        when the re-key landed (vault BACKLOG #3028), its time read then, after any wait for the
-        borrow or the row lock. The borrow is :meth:`_acquire_after_commit`'s, for the reason it
+        when the re-key landed (vault BACKLOG #3028), its time this server's clock when the link's
+        own statement runs (vault BACKLOG #4276), after any wait for the borrow or the row lock.
+        The borrow is :meth:`_acquire_after_commit`'s, for the reason it
         gives (BACKLOG #3023).
 
         LOCK ORDER (BACKLOG #4974). The re-key takes its account's ``users`` row under ``UPDLOCK,
@@ -18016,8 +18026,7 @@ class SqlServerStore(ServerCipherWalk):
         against store calls only, and not against a TOTP re-enrolment."""
 
         async def _link(cur: Any) -> None:
-            retired_at = time.time() if now is None else now
-            await cur.execute(_SESSION_LINEAGE_INSERT, (token_hash, new_token_hash, retired_at))
+            await cur.execute(_MSSQL_SESSION_LINEAGE_INSERT, (token_hash, new_token_hash))
 
         rotated = await self._write_session_txn(
             token_hash,
@@ -18035,7 +18044,7 @@ class SqlServerStore(ServerCipherWalk):
         )
 
     async def supersede_session(
-        self, token_hash: str, *, now: float, lineage_since: float | None = None
+        self, token_hash: str, *, now: float, lineage_seconds: float | None = None
     ) -> SessionRecord | None:
         """Revoke and return, one statement per step, in one transaction (BACKLOG #2146, vault
         BACKLOG #3028). See :meth:`AuthStore.supersede_session`.
@@ -18044,6 +18053,7 @@ class SqlServerStore(ServerCipherWalk):
         which a session-wide ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283). Each statement reads
         what has committed when it runs, so a rotation that commits while the walk runs is seen by
         the next step's lineage read. Committed as a durable write, never as a READ."""
+        started = time.monotonic()  # before the borrow, so its wait cannot shorten the window
         async with self._acquire() as conn, self._cursor(conn) as cur:
 
             async def _revoke(h: str) -> SessionRecord | None:
@@ -18055,8 +18065,8 @@ class SqlServerStore(ServerCipherWalk):
                 rows = await self._fetch_dicts(cur)
                 return SessionRecord.from_mapping(rows[0]) if rows else None
 
-            async def _successor(h: str, since: float) -> str | None:
-                await cur.execute(_SESSION_LINEAGE_SUCCESSOR, (h, since))
+            async def _successor(h: str, seconds: float) -> str | None:
+                await cur.execute(_MSSQL_SESSION_LINEAGE_SUCCESSOR, (h, seconds))
                 rows = await cur.fetchall()
                 return str(rows[0][0]) if rows else None
 
@@ -18065,7 +18075,8 @@ class SqlServerStore(ServerCipherWalk):
                 try:
                     ended = await revoke_through_lineage(
                         token_hash,
-                        lineage_since=lineage_since,
+                        lineage_seconds=lineage_seconds,
+                        started=started,
                         revoke=_revoke,
                         successor=_successor,
                     )
@@ -18356,8 +18367,9 @@ class SqlServerStore(ServerCipherWalk):
         purged = await self._execute(sql, params)
         if lineage_seconds is not None:
             # Its own statement and transaction, as on Postgres: a link is table hygiene, and the
-            # supersession stops following one at its window whether or not this has run.
-            await self._execute(_SESSION_LINEAGE_PURGE, (now - float(lineage_seconds),))
+            # supersession stops following one at its window whether or not this has run. Measured
+            # back from this server's clock, as the supersession measures (vault BACKLOG #4276).
+            await self._execute(_MSSQL_SESSION_LINEAGE_PURGE, (float(lineage_seconds),))
         return purged
 
     async def stats(self) -> dict[str, int]:

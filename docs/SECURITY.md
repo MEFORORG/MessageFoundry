@@ -6837,7 +6837,11 @@ end, in the same transaction as the revoke. The audit row names that session and
 field, the hash the browser presented.
 
 The link is followed for a bounded time: `[auth].oidc_flow_ttl_seconds` plus 120 seconds, which is
-420 seconds at the default, and the session reaper deletes older links. **At least these cases stay
+420 seconds at the default. The session reaper deletes a link only once the link's age on the
+store's clock exceeds the bound plus the reaper's 600-second step tolerance. So it deletes a link
+younger than the bound in real time only after the store's clock has gained more than 600 seconds
+on real time since the link was written; the last case below is one way that happens.
+**At least these cases stay
 open**, and in each the session lives on under the token the elevation handed out, until it expires,
 as before this change:
 
@@ -6845,8 +6849,17 @@ as before this change:
 - a sign-in that runs past the bound, which a slow identity provider or directory can cause, since
   their timeouts bound each call and not the whole sign-in;
 - more than 32 elevations on one session inside the bound;
-- a wall clock that stepped between the elevation and the sign-in, which moves the bound by the
-  size of the step, in either direction.
+- a step of the store's own clock between the elevation and the sign-in, which moves the bound by
+  the size of the step, in either direction. The store stamps each link and measures the bound on
+  that one clock (vault BACKLOG #4276). On PostgreSQL and SQL Server it is the database server's,
+  so a step of an engine host's clock, or skew between engine hosts that share the store, does not
+  move the bound there. **On SQLite it is the engine host's own clock**, which SQLite reads and on
+  which every engine shard runs, so on SQLite a step of that host's clock still moves the bound;
+- on PostgreSQL and SQL Server, a forward step of the database server's clock larger than the
+  session reaper's step tolerance (`_SESSION_REAP_STEP_TOLERANCE`, 600 seconds) while a reaper
+  pass runs. The reaper's step guard reads only the engine's clock, so it cannot see that step, and
+  the purge then deletes links still inside the bound. The deletion stands after the clock is set
+  right.
 
 **A retired token authenticates nothing.** No session read, the validator included, consults the
 links; only a revoke follows them, at a sign-in's supersession or at a sign-out (below). For the
@@ -6856,24 +6869,27 @@ it can only end a session, never open or extend one. Whoever held that token bef
 could already end the session with `POST /auth/logout`; the link lets them do it for the length of
 the bound after the elevation too, through a sign-in whose first credential passes; with MFA
 required, the supersession runs when the password-only session is minted, before the second factor,
-so a password alone is enough. A wall
-clock that stepped forward at the elevation, or back before the sign-in, lengthens that time by the
-step; the reaper's clock-step guard covers its own purge, not this. The links are not under the session integrity seal (BACKLOG #2592): a forged link can only direct a
+so a password alone is enough. A store
+clock that stepped back between the elevation and the sign-in lengthens that time by the step; the
+reaper's clock-step guard does not cover this. The links are not under
+the session integrity seal (BACKLOG #2592): a forged link can only direct a
 revoke, and a revoke needs no key on any backend.
 
 **A sign-out follows the links too, for far less time (BACKLOG #3715).** An elevation in another
 tab can re-key the session while a sign-out is in flight, and the sign-out then ends the session
 under its new token, in the same transaction as the revoke. `POST /auth/logout` follows links
 written up to 5 seconds before its request arrived; the slack covers a link stamped before its
-rotation commits, and clocks that differ between engine processes. Its sign-in check proved the
+rotation commits. The store measures that window back from its own clock, which stamps the link
+too, as the bound plus the time since the request arrived on the engine's monotonic clock, so on
+PostgreSQL and SQL Server clocks that differ between engine hosts do not move it. Its sign-in check proved the
 token live after the request arrived, so any link from it was written after that proof, and the
 route gains no reach. `/ui/logout` carries no credential, so it follows links written up to 5
 seconds before the call. **That is a separate power, credential-free and end-only:** for 5 seconds
 after an elevation, anyone who presents the RETIRED token to `/ui/logout` ends the session it
 became, with no sign-in. It cannot open or extend a session. At least these cases stay open, and
 the session lives on under its new token: an elevation older than the bound, more than 32
-elevations in a row inside it, and a wall clock that stepped between the elevation and the
-sign-out, which moves the bound by the step. The `auth.logout` row names the
+elevations in a row inside it, and a step of the store's own clock between the elevation and the
+sign-out, which moves the bound by the step; on SQLite that clock is the engine host's. The `auth.logout` row names the
 session's owner as actor, its `outcome` is `revoked`, and a `presented` field holds the hash that
 was presented. The `outcome` is `lapsed` instead when the session's own clock checks fail at the
 revoke, or when the session passes them but the owner's admin-issued temporary credential is past

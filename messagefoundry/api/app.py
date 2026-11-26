@@ -12537,9 +12537,14 @@ async def _session_reaper(
     """Drop expired session rows, first ``_SESSION_REAP_FIRST_DELAY`` after start and then every
     ``_SESSION_REAP_INTERVAL``, until the task is cancelled. With ``idle_seconds`` given,
     idle-expired rows go too (BACKLOG #2096); the lifespan passes the idle timeout the validator
-    uses. With ``lineage_seconds`` given, session lineage links older than that go too (vault
-    BACKLOG #3028); the lifespan passes the window the supersession follows them for. Purging as of
-    the earlier instant below only keeps a link longer, never shortens that window.
+    uses. With ``lineage_seconds`` given, session lineage links go too (vault
+    BACKLOG #3028); the lifespan passes the window the supersession follows them for. The store
+    measures a link's age on its own clock, the one the supersession measures its window on (vault
+    BACKLOG #4276), never from the ``now`` passed below. So the reaper asks for that window plus
+    ``_SESSION_REAP_STEP_TOLERANCE``: the purge then deletes a link younger than ``lineage_seconds``
+    in real time only after the store's clock has gained more than ``_SESSION_REAP_STEP_TOLERANCE``
+    on real time since the link was written. The guard below reads only the engine host's clock.
+    The cost is that a link can be kept longer.
 
     **The reaper skips a pass when the wall clock has jumped forward (BACKLOG #2283).** The purge
     judges expiry and idleness by the wall clock, and its deletes cannot be undone. Run just after
@@ -12600,7 +12605,11 @@ async def _session_reaper(
             await store.purge_expired_sessions(
                 now=now - _SESSION_REAP_STEP_TOLERANCE,
                 idle_seconds=idle_seconds,
-                lineage_seconds=lineage_seconds,
+                lineage_seconds=(
+                    None
+                    if lineage_seconds is None
+                    else lineage_seconds + _SESSION_REAP_STEP_TOLERANCE
+                ),
             )
         except asyncio.CancelledError:
             raise
