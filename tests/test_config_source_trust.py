@@ -613,6 +613,31 @@ def test_windows_read_failure_downgraded_by_escape(
     )
 
 
+_FILE_DELETE_CHILD = 0x00000040
+
+
+@pytest.mark.parametrize("grantee", [_USERS, _FOREIGN])
+def test_delete_child_on_the_config_directory_refuses(
+    grantee: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FILE_DELETE_CHILD on a folder lets its holder delete any file in it, whatever that file's
+    own access list says, so an account holding it on the config directory can remove a module
+    from the graph the engine runs (BACKLOG #5622, #8251 item 13). The bit means nothing on a
+    file, so a file entry carrying it alone still passes, as the second half pins."""
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    _write_cfg(tmp_path)
+    delete_child = _WinPathSecurity(
+        owner_sid=_SELF, aces=((_ALLOW, _FULL, _SELF), (_ALLOW, _FILE_DELETE_CHILD, grantee))
+    )
+    _take_windows_path(monkeypatch, _CLEAN_READ, _SELF, by_name={tmp_path.name: delete_child})
+    with pytest.raises(WiringError) as excinfo:
+        load_config(tmp_path)
+    assert f"({grantee}) has write access" in str(excinfo.value)
+    # The control: the same entry on the module file alone is no write right there.
+    _take_windows_path(monkeypatch, _CLEAN_READ, _SELF, by_name={"cfg.py": delete_child})
+    assert "o" in load_config(tmp_path).outbound
+
+
 _EVERYONE_WRITE_READ = _WinPathSecurity(owner_sid=_SELF, aces=((_ALLOW, _MODIFY, _EVERYONE),))
 
 

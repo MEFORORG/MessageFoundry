@@ -10834,6 +10834,12 @@ _WIN_WRITE_MASK = (
     | 0x40000000  # GENERIC_WRITE
 )
 
+# On a FOLDER, FILE_DELETE_CHILD (0x40) lets its holder delete any file in it whatever that file's
+# own access list says, so a holder on the config directory can drop a module from the graph the
+# engine runs (BACKLOG #5622, #8251 item 13). The bit means nothing on a file, so it is added for a
+# folder only, and ``_WIN_WRITE_MASK`` stays equal to ``anchor_path.WIN_FILE_MASK``.
+_WIN_DIRECTORY_WRITE_MASK = _WIN_WRITE_MASK | 0x00000040  # FILE_DELETE_CHILD
+
 # Broad/low-privilege well-known SIDs that must never hold a write-class right on executed config.
 _WIN_REJECTED_SIDS = frozenset(
     {
@@ -10967,6 +10973,8 @@ def _evaluate_config_dacl(
     aces: Sequence[tuple[int, int, str]],
     self_sid: str | None,
     owner_in_admins: Callable[[str], bool | None],
+    *,
+    directory: bool = False,
 ) -> str | None:
     """Pure DACL + owner policy: return a refusal reason, or ``None`` if the source is trusted.
 
@@ -10979,7 +10987,8 @@ def _evaluate_config_dacl(
     (Everyone/Authenticated Users/Users/…) holds such a right. Any other granting entry type
     (compound, object, callback) carrying a write-class right refuses too, because its trustee or
     condition cannot be judged here. A LocalService or NetworkService process user is not
-    self-trusted: other services share that SID (BACKLOG #5622).
+    self-trusted: other services share that SID (BACKLOG #5622). For a ``directory`` the write
+    class also holds FILE_DELETE_CHILD (:data:`_WIN_DIRECTORY_WRITE_MASK`).
 
     The **owner** is then vetted in its own right (CONFIG-2), mirroring the POSIX arm's refusal of a
     foreign uid: an owner holds WRITE_DAC implicitly, so a low-privilege owner can rewrite the code
@@ -11010,11 +11019,12 @@ def _evaluate_config_dacl(
     trusted.add(owner_sid)
     if engine_sid is not None:
         trusted.add(engine_sid)
+    write_mask = _WIN_DIRECTORY_WRITE_MASK if directory else _WIN_WRITE_MASK
     unsure: str | None = None  # the first entry that cannot be judged, reported if none is worse
     for ace_type, access_mask, trustee_sid in aces:
         if ace_type not in _WIN_GRANTING_ACE_TYPES:
             continue  # DENY ACEs never grant a right
-        if not access_mask & _WIN_WRITE_MASK:
+        if not access_mask & write_mask:
             continue  # read/execute-only ACE (e.g. Users:RX on a repo checkout) is fine
         if ace_type != _WIN_ACCESS_ALLOWED_ACE_TYPE:
             unsure = unsure or (
@@ -11220,8 +11230,14 @@ def _enforce_windows_paths(
                 f"cannot be shown safe to execute; see docs/SERVICE.md for required permissions"
             )
             continue
+        # Anything but a regular file, one that can no longer be stat'ed included, is judged by the
+        # stricter folder mask, so the doubt fails closed.
         reason = _evaluate_config_dacl(
-            sec.owner_sid, sec.aces, probes.self_sid, probes.owner_in_admins
+            sec.owner_sid,
+            sec.aces,
+            probes.self_sid,
+            probes.owner_in_admins,
+            directory=not os.path.isfile(path),
         )
         if reason is not None:
             refuse(

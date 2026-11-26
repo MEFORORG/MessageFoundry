@@ -1041,7 +1041,7 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     the loader reads, and
     **refuses** to load when a broad/low-privilege principal (Everyone, Authenticated Users,
     `BUILTIN\Users`, INTERACTIVE, …) or any non-owner/non-admin principal holds a write-class right
-    (write/append/delete/`WRITE_DAC`/`WRITE_OWNER`/generic-write). The principals that may hold one
+    (write/append/delete/`WRITE_DAC`/`WRITE_OWNER`/generic-write, and on a folder delete-child). The principals that may hold one
     are SYSTEM, `BUILTIN\Administrators`, TrustedInstaller, the owner, the run-as account (never
     LocalService or NetworkService, which other services share) and a Domain, Schema or Enterprise
     Admins group the local Administrators lookup resolves. A grant to any other account is refused,
