@@ -29,7 +29,7 @@ from messagefoundry.framing import (
     FramePayloadError,
     codec_for,
 )
-from messagefoundry.parsing._builtin_hl7 import _extract_separators
+from messagefoundry.parsing._builtin_hl7 import HEADER_IDS, _extract_separators
 from messagefoundry.parsing.sniff import _LEADING_WS_STR
 from messagefoundry.parsing.split import _sends_more_than_one_message
 from messagefoundry.transports.base import NegativeAckError, encode_wire_body
@@ -272,13 +272,14 @@ def _encode_replacing(reply: str, encoding: str, connection: str) -> bytes:
     ``UnicodeError``, outside the handler, so neither error's text or ``object`` rides the chain.
     The warning names the connection, never the reply or the setting.
 
-    The ``replace`` handler writes ``?`` on encode. An ``MSH``-led reply declares its own
-    delimiters in MSH-1 and MSH-2, and HL7 lets a sender pick ``?`` as one, so where it is a
-    delimiter or the segment terminator a replaced data character would become structure (ADR
-    0206). That reply is refused with the same fixed error instead. So is one with a delimiter the
+    The ``replace`` handler writes ``?`` on encode. An HL7 reply declares its own delimiters in
+    MSH-1 and MSH-2 (or a ``BHS`` or ``FHS`` header's same fields), and HL7 lets a sender pick
+    ``?`` as one, so where it is a delimiter or the segment terminator a replaced data character
+    would become structure (ADR 0206). Where :func:`_reply_delimiters` reads that delimiter, the
+    reply is refused with the same fixed error instead. So is one with a delimiter it reads that the
     charset cannot hold: the delimiter itself would become ``?`` beside replaced data characters,
-    and both would read as one delimiter. A reply not led by ``MSH`` has no declared delimiters to
-    collide with."""
+    and both would read as one delimiter. That function says which headers and fields are read, and
+    which replies declare nothing."""
     delimiters = _reply_delimiters(reply)
     if _REPLACEMENT in delimiters or not all(_encodes(d, encoding) for d in delimiters):
         raise UnicodeError(
@@ -324,14 +325,50 @@ def _encodes(delimiter: str, encoding: str) -> bool:
 
 
 def _reply_delimiters(reply: str) -> frozenset[str]:
-    """The delimiters an ``MSH``-led ``reply`` declares, read as the parser reads them, plus the
-    segment terminator; empty for any other reply. Read only: nothing here changes the reply.
+    """The delimiters an HL7 ``reply`` declares, plus its segment terminator; empty for any other
+    reply. Read only: nothing here changes the reply.
+
+    An HL7 reply led by one of ``HEADER_IDS`` (``MSH``, ``BHS``, ``FHS``) is read on every segment
+    that starts with one of them, each in the MSH-1/MSH-2 layout ``_extract_separators`` reads, so
+    a batch member's own ``MSH`` counts as its envelope does (BACKLOG #5799: before, only the first
+    line of an ``MSH``-led reply was read). Its segments end at CR when the reply holds one, and
+    at LF only in a reply with no CR; that terminator, and the LF of a CR+LF end, are declared too.
+    An ``MSH``-led reply with no CR has its MSH-1 and MSH-2 read from the reply as a whole as
+    well, so where its first line is shorter than the span ``_extract_separators`` reads, the
+    characters after that line's LF are declared too.
+
+    Not read, in at least these shapes, so a delimiter there that is ``?``, or that the charset
+    cannot encode, is not refused, and a ``?`` written for a data character can land on a
+    delimiter a receiver reads:
+
+    - an X12 reply led by ``ISA``, which declares nothing here;
+    - in a CR reply, a header that follows a lone LF rather than a CR, such as a member header
+      after an LF-only blank line, or a later header in a reply whose header lines end at LF,
+      though a receiver that reads every LF as a segment break, as ``parsing.peek.normalize``
+      does, reads it as one;
+    - a ``BHS`` or ``FHS`` first line, in a reply with no CR, shorter than the MSH-1 and MSH-2
+      span ``_extract_separators`` reads: it is read only to its LF, so of the span a receiver
+      splitting only at CR reads as its BHS-1 and BHS-2 (or FHS-1 and FHS-2), the characters
+      after the LF are not declared;
+    - the fifth MSH-2 character (the v2.7 truncation character).
 
     Leading whitespace and a BOM are skipped first, as the engine's one definition of tolerated
-    leading noise (``sniff._LEADING_WS_STR``) skips them. The first line is measured, not the whole
-    reply, so a first line of ``MSH`` alone has no field separator to read and declares nothing,
+    leading noise (``sniff._LEADING_WS_STR``) skips them. In a reply with a CR, or after the first
+    line, a header line of ``MSH`` alone has no field separator to read and declares nothing,
     rather than indexing past its end."""
-    line = reply.lstrip(_LEADING_WS_STR).partition("\r")[0]
-    if not line.startswith("MSH") or len(line) < 4:
+    body = reply.lstrip(_LEADING_WS_STR)
+    if not body.startswith(HEADER_IDS):
         return frozenset()
-    return frozenset((*_extract_separators(line), "\r"))
+    terminator = "\r" if "\r" in body else "\n"
+    found = {terminator}
+    for segment in body.split(terminator):
+        if terminator == "\r" and segment.startswith("\n"):
+            found.add("\n")  # a CR+LF end: the LF opens the next piece
+            segment = segment[1:]
+        if segment.startswith(HEADER_IDS) and len(segment) >= 4:
+            found.update(_extract_separators(segment))
+    if terminator == "\n" and body.startswith("MSH") and len(body) >= 4:
+        # A receiver splitting only at CR reads this whole reply as one MSH line, so a first
+        # line shorter than the MSH-1 and MSH-2 span has that span declared past its LF.
+        found.update(_extract_separators(body))
+    return frozenset(found)

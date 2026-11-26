@@ -61,7 +61,7 @@ _CALLS: dict[str, Callable[[Any], Awaitable[Any]]] = {
     "supersede_session": lambda s: s.supersede_session(_HASH, now=_NOW),
     # Vault BACKLOG #3028: nothing is revoked, so the walk reads the lineage once and stops.
     "supersede_session_lineage": lambda s: s.supersede_session(
-        _HASH, now=_NOW, lineage_since=_NOW - 360
+        _HASH, now=_NOW, lineage_seconds=360
     ),
     "revoke_user_sessions": lambda s: s.revoke_user_sessions("u", now=_NOW, audit=no_audit_row),
     "revoke_user_sessions_except": lambda s: s.revoke_user_sessions(

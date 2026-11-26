@@ -238,11 +238,12 @@ function Read-CaBundle {
     # Every piece of DER, the whole file or one PEM block, must be a certificate or a PKCS#7 chain,
     # so a .pfx is refused wherever it sits, before it is parsed.
     $importDer = {
-        param([byte[]]$Der)
+        # $Header is the caller's Read-DerHeader of $Der, when it has one, so it is not read twice.
+        param([byte[]]$Der, $Header = $null)
         # A certificate, a PKCS#7 and a PKCS#12 are each one ASN.1 SEQUENCE, which opens with 0x30.
         $type = 'Unknown'
         if ($Der.Length -gt 0 -and $Der[0] -eq 0x30) {
-            $header = Read-DerHeader -Bytes $Der
+            $header = if ($Header) { $Header } else { Read-DerHeader -Bytes $Der }
             if (-not $header -or $header.End -ne $Der.Length) {
                 throw ("The file holds DER that does not end where its bytes end: trailing bytes, " +
                     "several values run together, or an indefinite length. That DER is not read " +
@@ -266,7 +267,7 @@ function Read-CaBundle {
     # happens to start with '0' (also 0x30) is not.
     $top = if ($Bytes[0] -eq 0x30) { Read-DerHeader -Bytes $Bytes } else { $null }
     if ($top -and $top.End -eq $Bytes.Length) {
-        & $importDer $Bytes
+        & $importDer $Bytes $top
     } elseif ($text.Contains('-----BEGIN ')) {
         # Any armour makes a file that is not one DER value PEM, so the DER reader, which would
         # take its first certificate only, never sees a private-key block after it.
@@ -491,7 +492,11 @@ $entries = @(foreach ($cert in $bundle) {
     if ($check.Outside) {
         Write-Warning "$($cert.Thumbprint) is outside its validity period; a chain through it will not validate."
     }
-    if ($why) { $refusals.Add([pscustomobject]@{ Thumbprint = $cert.Thumbprint; Why = $why }) }
+    if ($why) {
+        $refusals.Add([pscustomobject]@{
+            Thumbprint = $cert.Thumbprint; Why = $why; Subject = "$(ConvertTo-PrintableText $cert.Subject)"
+        })
+    }
     @{ Certificate = $cert; Target = $target }
 })
 if ($refusals.Count -gt 0) {
@@ -501,7 +506,10 @@ if ($refusals.Count -gt 0) {
     # only the error stream; the error view may still rewrap it.
     Write-Host ""
     Write-Host "Refused:"
-    foreach ($refusal in $refusals) { Write-Host "  $($refusal.Thumbprint): $($refusal.Why)" }
+    foreach ($refusal in $refusals) {
+        Write-Host "  $($refusal.Thumbprint): $($refusal.Why)"
+        Write-Host "    Subject: $($refusal.Subject)"
+    }
     throw ("Nothing was imported. Every certificate in the file must be a CA that may sign " +
         "certificates, carries no private key, and chains to a self-signed root in the file " +
         "that is within its validity period. Refused: " +
@@ -526,14 +534,20 @@ if ($approved.Count -gt 0) {
     # Each store keys on thumbprint, so re-importing the same CA is a no-op (idempotent).
     $added = 0
     try {
-        foreach ($entry in $approved) {
-            $entry.Target.Store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-            try {
+        # A store is opened when the first certificate for it comes up and closed once all have
+        # been added, so the order shown is kept and each store is opened once.
+        $opened = [System.Collections.Generic.List[object]]::new()
+        try {
+            foreach ($entry in $approved) {
+                if (-not $opened.Contains($entry.Target.Store)) {
+                    $entry.Target.Store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+                    $opened.Add($entry.Target.Store)
+                }
                 $entry.Target.Store.Add($entry.Certificate)
-            } finally {
-                $entry.Target.Store.Close()
+                $added++
             }
-            $added++
+        } finally {
+            foreach ($store in $opened) { $store.Close() }
         }
     } catch {
         throw ("Added $added of $($approved.Count) certificate(s), in the order shown, before this " +

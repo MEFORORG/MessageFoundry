@@ -1408,7 +1408,7 @@ def test_a_redaction_that_raises_logs_a_placeholder_not_an_exception(
     monkeypatch.setattr(logging_setup, "redact_log_value", _boom)
     monkeypatch.setattr(logging_setup, "_UNLOGGABLE_REPORTED", set())
     with caplog.at_level(logging.ERROR, logger="messagefoundry.logging_setup"):
-        got = redacted_log_field("/users/SECRETVALUE", _NEW_IP_LOG_FIELD_MAX)
+        got = redacted_log_field("/users/SECRETVALUE", _NEW_IP_LOG_FIELD_MAX, before="", checks=())
     assert got == '"unloggable-RuntimeError"'
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
     assert errors and all("RuntimeError" in m and "SECRETVALUE" not in m for m in errors)
@@ -1925,11 +1925,16 @@ def test_a_rewritten_context_logs_a_placeholder() -> None:
     assert _UNREADABLE not in ("<redacted>", "[redacted]")
     assert redact_log_value("/x/password:", after=" seen_ip=0.0.0.0") is None
     after = " seen_ip=0.0.0.0"
-    assert redacted_log_field("/x/password:", 64, after=after) == _UNREADABLE_FIELD
-    assert redacted_log_field("/a", 64) == '"/a"'
+    assert redacted_log_field("/x/password:", 64, before="", after=after, checks=()) == (
+        _UNREADABLE_FIELD
+    )
+    assert redacted_log_field("/a", 64, before="", checks=()) == '"/a"'
     # The placeholder is bounded like any value.
     for limit in range(16, 24):
-        assert len(redacted_log_field("/x/password:", limit, after=after)) <= limit + 2
+        assert (
+            len(redacted_log_field("/x/password:", limit, before="", after=after, checks=()))
+            <= limit + 2
+        )
     assert _new_ip_path_field("/x/password:", "10.0.0.1") == _UNREADABLE_FIELD
     assert _new_ip_path_field("/x/password=", "10.0.0.1") == _UNREADABLE_FIELD
     assert _new_ip_path_field("/x/password:") == '"/x/password_u003A_"'
@@ -2073,7 +2078,9 @@ def test_a_cut_checksum_is_never_read_as_a_date() -> None:
     try:
         hits = 0
         for n in range(20000):
-            token = redacted_log_field(f"/users/{'a' * 300}{n}", _NEW_IP_LOG_FIELD_MAX)
+            token = redacted_log_field(
+                f"/users/{'a' * 300}{n}", _NEW_IP_LOG_FIELD_MAX, before="", checks=()
+            )
             if not re.search(r"_%crc32x(?:19|20)[0-9]{6}\"", token):
                 continue
             hits += 1

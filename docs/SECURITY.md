@@ -2560,8 +2560,9 @@ the same permission set on the same method reds CI until it is listed here.
 > `restart_outbound` rule is withheld from a scoped caller too, whatever the graph holds, since
 > its action names the outbound side. So is every rule whose event type only an outbound raises,
 > a `"*"` rule included: `_ALERT_EVENT_SIDE` in `messagefoundry/api/app.py` records each type's
-> side, and an event type or action with no side recorded is withheld too. A type both sides
-> raise, and `any`, still show on a `"*"` rule, though such a rule also matches outbound events.
+> side, and an event type or action with no side recorded is withheld too. A `"*"` rule of a
+> type both sides raise, or of `any`, is withheld as well, since it also matches outbound events.
+> A rule of such a type that names an in-scope inbound passes this test.
 > The alert-instance routes were left as they were, on
 > purpose. The batch Manager decided this on 2026-11-22. It read the owner's ruling as covering
 > rules and flagging, not instances. What the ack, resolve, suspend and resume routes admit is in their bullet under
@@ -6837,7 +6838,11 @@ end, in the same transaction as the revoke. The audit row names that session and
 field, the hash the browser presented.
 
 The link is followed for a bounded time: `[auth].oidc_flow_ttl_seconds` plus 120 seconds, which is
-420 seconds at the default, and the session reaper deletes older links. **At least these cases stay
+420 seconds at the default. The session reaper deletes a link only once the link's age on the
+store's clock exceeds the bound plus the reaper's 600-second step tolerance. So it deletes a link
+younger than the bound in real time only after the store's clock has gained more than 600 seconds
+on real time since the link was written; the last case below is one way that happens.
+**At least these cases stay
 open**, and in each the session lives on under the token the elevation handed out, until it expires,
 as before this change:
 
@@ -6845,8 +6850,17 @@ as before this change:
 - a sign-in that runs past the bound, which a slow identity provider or directory can cause, since
   their timeouts bound each call and not the whole sign-in;
 - more than 32 elevations on one session inside the bound;
-- a wall clock that stepped between the elevation and the sign-in, which moves the bound by the
-  size of the step, in either direction.
+- a step of the store's own clock between the elevation and the sign-in, which moves the bound by
+  the size of the step, in either direction. The store stamps each link and measures the bound on
+  that one clock (vault BACKLOG #4276). On PostgreSQL and SQL Server it is the database server's,
+  so a step of an engine host's clock, or skew between engine hosts that share the store, does not
+  move the bound there. **On SQLite it is the engine host's own clock**, which SQLite reads and on
+  which every engine shard runs, so on SQLite a step of that host's clock still moves the bound;
+- on PostgreSQL and SQL Server, a forward step of the database server's clock larger than the
+  session reaper's step tolerance (`_SESSION_REAP_STEP_TOLERANCE`, 600 seconds) while a reaper
+  pass runs. The reaper's step guard reads only the engine's clock, so it cannot see that step, and
+  the purge then deletes links still inside the bound. The deletion stands after the clock is set
+  right.
 
 **A retired token authenticates nothing.** No session read, the validator included, consults the
 links; only a revoke follows them, at a sign-in's supersession or at a sign-out (below). For the
@@ -6856,24 +6870,27 @@ it can only end a session, never open or extend one. Whoever held that token bef
 could already end the session with `POST /auth/logout`; the link lets them do it for the length of
 the bound after the elevation too, through a sign-in whose first credential passes; with MFA
 required, the supersession runs when the password-only session is minted, before the second factor,
-so a password alone is enough. A wall
-clock that stepped forward at the elevation, or back before the sign-in, lengthens that time by the
-step; the reaper's clock-step guard covers its own purge, not this. The links are not under the session integrity seal (BACKLOG #2592): a forged link can only direct a
+so a password alone is enough. A store
+clock that stepped back between the elevation and the sign-in lengthens that time by the step; the
+reaper's clock-step guard does not cover this. The links are not under
+the session integrity seal (BACKLOG #2592): a forged link can only direct a
 revoke, and a revoke needs no key on any backend.
 
 **A sign-out follows the links too, for far less time (BACKLOG #3715).** An elevation in another
 tab can re-key the session while a sign-out is in flight, and the sign-out then ends the session
 under its new token, in the same transaction as the revoke. `POST /auth/logout` follows links
 written up to 5 seconds before its request arrived; the slack covers a link stamped before its
-rotation commits, and clocks that differ between engine processes. Its sign-in check proved the
+rotation commits. The store measures that window back from its own clock, which stamps the link
+too, as the bound plus the time since the request arrived on the engine's monotonic clock, so on
+PostgreSQL and SQL Server clocks that differ between engine hosts do not move it. Its sign-in check proved the
 token live after the request arrived, so any link from it was written after that proof, and the
 route gains no reach. `/ui/logout` carries no credential, so it follows links written up to 5
 seconds before the call. **That is a separate power, credential-free and end-only:** for 5 seconds
 after an elevation, anyone who presents the RETIRED token to `/ui/logout` ends the session it
 became, with no sign-in. It cannot open or extend a session. At least these cases stay open, and
 the session lives on under its new token: an elevation older than the bound, more than 32
-elevations in a row inside it, and a wall clock that stepped between the elevation and the
-sign-out, which moves the bound by the step. The `auth.logout` row names the
+elevations in a row inside it, and a step of the store's own clock between the elevation and the
+sign-out, which moves the bound by the step; on SQLite that clock is the engine host's. The `auth.logout` row names the
 session's owner as actor, its `outcome` is `revoked`, and a `presented` field holds the hash that
 was presented. The `outcome` is `lapsed` instead when the session's own clock checks fail at the
 revoke, or when the session passes them but the owner's admin-issued temporary credential is past
@@ -8468,7 +8485,7 @@ onto keyless rows fails the verify, and is also reported as
 |---|---|
 | `0` | A clean walk, either with the key or, in a shell that holds no key, under settings that allow the store to run keyless. It covers at least one row, unless `--allow-empty` or an expected anchor of `0:` accepted an empty log (see exit `3`). |
 | `1` | The chain did not verify. It covers at least a broken chain, a mismatch with `--expected-anchor`, an expected row (`--expected-row`, `--expected-rows-file`) that is gone or whose hash differs, a chain checked with a key that is not the chain's, and a chain that names a key in a shell that holds no key and whose settings allow the store to run keyless. Those print a `FAIL` line that says which. A key, key-provider or database error that stops the check part way prints one too, such as a Transit outage or a row that is not UTF-8. That line names the error's class and its cause's class, never its text. It says the rest of the chain was not checked. Before vault BACKLOG #3054 these exited 1 or 2 with no `FAIL` line. An error the command does not classify still exits 1 with none. |
-| `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that cannot be read or fail validation (a `--service-config` path that is a directory or unreadable included, which exited 1 before vault BACKLOG #2725), a store key the settings name that cannot be resolved, a store key that is not base64 of 32 bytes (which exited 1 before vault BACKLOG #3054), a malformed expected row, two expected rows giving one `seq` different hashes, or an `--expected-rows-file` that cannot be read, is not UTF-8, is over its bound or holds no pair (vault BACKLOG #2612), and an empty log in a shell that holds no key and whose settings require one. |
+| `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that cannot be read or fail validation (a `--service-config` path that is a directory or unreadable included, which exited 1 before vault BACKLOG #2725), a store key the settings name that cannot be resolved, a store key that is not base64 of 32 bytes (which exited 1 before vault BACKLOG #3054), an expected row the parser refuses as malformed (it passes a `vault:v` head unchecked, so a `vault:v` row or anchor with a valid count and a malformed head exits `1`, not `2`; the `_audit_head_shape` docstring in [`store/store.py`](../messagefoundry/store/store.py) states that cost), two expected rows giving one `seq` different hashes, or an `--expected-rows-file` that cannot be read, is not UTF-8, is over its bound or holds no pair (vault BACKLOG #2612), and an empty log in a shell that holds no key and whose settings require one. |
 | `3` | A clean walk over an **empty** log. |
 | `4` | The chain's first row names a key, this shell holds no key, and its settings do not allow the store to run keyless. No row was checked against its MAC. It prints a `NOT CHECKED` line. This is not a pass. |
 | `5` | The chain is keyless and walked clean as plain SHA-256. This shell holds no key, and its settings require one. So the chain was not checked to their standard. It prints a `NOT CHECKED` line and a `WARNING` on stderr. This is not a pass. Before vault BACKLOG #3054 it exited 0. The paragraph on the setup where this goes wrong, below, says what a move between 4 and 5 means. |

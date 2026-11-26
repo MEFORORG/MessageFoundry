@@ -3023,10 +3023,11 @@ class RevocationHopGuard:
     #: cannot be performed, which is the SDS-3.7 false-premise defect wearing a helpful voice. A
     #: non-connection hop passes the setting that actually closes its own gate. Not every
     #: non-connection hop is outside ``[tls]``: the alerts SMTP sink and the security notifier
-    #: resolve the policy, so ``[tls].crl_file`` does reach their contexts on a verifying,
-    #: non-loopback hop. Their login is guarded (BACKLOG #2193), by
-    #: ``alert_sinks._refuse_alert_smtp_revocation``, which passes its own sentence naming both
-    #: ``[tls].crl_file`` and the ``[alerts]`` pair; the alert webhook's guard,
+    #: resolve the policy their caller hands them, so ``[tls].crl_file`` does reach their contexts
+    #: on a verifying, non-loopback hop where a caller handed one. Their login is guarded (BACKLOG
+    #: #2193), by ``alert_sinks._refuse_alert_smtp_revocation``, which passes its own sentence
+    #: naming ``[tls].crl_file`` and the ``[alerts]`` pair, and with no policy handed a sentence
+    #: saying the file does not reach the hop (BACKLOG #5527); the alert webhook's guard,
     #: ``alert_sinks._refuse_webhook_revocation``, passes one naming its ``[alerts]`` pair only.
     #: The field is not always what the caller passed: :meth:`capture` fills a ``None`` from
     #: :attr:`no_credit`, with :data:`PEER_NOT_VERIFIED_WAYS_ACROSS` or :data:`EXPIRY_RELAXED_WAYS_ACROSS`

@@ -381,7 +381,9 @@ def date_diff_field(
     component path reads only the component it names, with no code. A whole field raises
     :class:`ValueError` when component 2 holds anything but a degree-of-precision code no finer than
     its time, or a later component is not empty (``20260101^S`` and a range ``20260101^20260201``
-    both raise); trailing empty components are ignored. Once both fields are present, either path
+    both raise); trailing empty components, and trailing empty subcomponents after the time's own
+    component, are ignored, so ``20260101^&`` reads as ``20260101`` (a subcomponent separator in
+    the time's own component, ``20260101&``, still raises). Once both fields are present, either path
     raises when its field holds more than one repetition, ignoring trailing ones that hold nothing
     but component or subcomponent separators, so
     ``~20270101`` and ``20260101~~20270101`` raise and ``20260101~`` reads as ``20260101``: a
@@ -515,7 +517,8 @@ def _check_ts_field(
     code states them. The caller has refused a second repetition already.
 
     A whole field may hold only its time plus, in component 2, a degree-of-precision code, with any
-    trailing empty components dropped (``20260101^`` reads as ``20260101``, BACKLOG #5822). A range
+    trailing empty components, and trailing empty subcomponents after component 1, dropped
+    (``20260101^`` and ``20260101^&`` read as ``20260101``, BACKLOG #5822). A range
     (``start^end``) raises, and so does a code finer than the stamp (``20260101^S``). A code
     coarser than the stamp is the precision HL7 v2.3 says the stamp holds, so ``198807050000^D`` is
     read as the date ``19880705``. A component path is returned as it is."""
@@ -524,9 +527,14 @@ def _check_ts_field(
     # The raw text must be exactly the time, or the time, one separator and the code: nothing in a
     # later component, and no escape sequence, which decoding would otherwise hide (main parsed the
     # raw field, so it refused both).
-    raw = (msg.field(path, repetition=1) or "").rstrip(_seps(msg)[1])
+    seps = _seps(msg)
+    # Trailing empty subcomponents hold nothing, as trailing empty components do, so "20260101^&"
+    # and "20260101^D&" drop them (BACKLOG #5822 added item 3).
+    raw = (msg.field(path, repetition=1) or "").rstrip(seps[1] + seps[3])
     stamp = msg.field(f"{path}.1") or ""
     degree = msg.field(f"{path}.2")
+    if degree is not None:
+        degree = degree.rstrip(seps[3]) or None
     exact = (
         raw == stamp
         if degree is None

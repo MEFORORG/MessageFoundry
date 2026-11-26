@@ -751,8 +751,10 @@ class Engine:
         # [diagnostics] Corepoint-style event log (#46); every runner inherits these master switches.
         self._connection_events = connection_events
         self._response_sent_default = response_sent_default
-        # [integrity].audit_verify_on_start (#190): re-walk the tamper-evident audit chain once at start.
-        # ALERT-ONLY — a break logs WARNING + fires the AlertSink but NEVER crashes startup.
+        # [integrity].audit_verify_on_start (#190): re-walk the tamper-evident audit chain once at
+        # start. ALERT-ONLY — a break logs WARNING + fires the AlertSink, where one is configured,
+        # but NEVER crashes startup.
+        # The anchor read it arms can (see _load_audit_anchor).
         self._audit_verify_on_start = audit_verify_on_start
         # [integrity].audit_anchor_file (#328): the COUNT:HEAD anchor the startup walk compares against,
         # as a PREFIX (`audit_prefix_verdict`) rather than as the CLI's exact seal — see
@@ -2038,13 +2040,24 @@ class Engine:
         survives restarts while still catching the two things #328 is about — a truncated tail and a
         mid-chain rewrite. A stale anchor therefore stays VALID here; it just witnesses less.
 
-        **Never raises, and never fires the tamper alert.** A missing, unreadable or malformed anchor is a
-        CONFIG fault, and routing it to ``integrity_drift`` would manufacture a tamper alarm out of input
-        handling — the same defect :func:`~messagefoundry.store.store.parse_audit_anchor` refuses on the
-        CLI side, and worse here, because an alarm that fires on a typo is an alarm operators learn to
-        ignore. It logs a WARNING naming the file and the reason, and the caller runs the bare walk: the
-        chain is still checked as far as it can be, and the operator is told, in the same line, that the
-        truncation half did not run.
+        **It CAN raise, and so fail startup.** The read catches only ``OSError`` and
+        ``UnicodeDecodeError``, so anything else the reader raises escapes: at least a path carrying
+        a NUL character raises ``ValueError`` out of this method and out of :meth:`start`, before
+        any walk runs, so no audit check runs and the engine does not start (pinned by
+        ``test_startup_anchor_nul_path_raises_value_error``). This docstring states it for the
+        code, and the other code comments point here; the ``audit_anchor_file`` row in
+        docs/CONFIGURATION.md states it for operators. Change the two together.
+
+        For the faults it does catch it never fires the tamper alert. A missing or unreadable
+        anchor, or one :func:`~messagefoundry.store.store.parse_audit_anchor` refuses, is a CONFIG
+        fault, and routing it to ``integrity_drift`` would manufacture a tamper alarm out of input
+        handling, and worse here than on the CLI, because an alarm that fires on a typo is an alarm
+        operators learn to ignore. It logs a WARNING naming the file and the reason, and the caller
+        runs the bare walk: the chain is still checked as far as it can be, and the operator is
+        told, in the same line, that the truncation half did not run. The parser refuses at least a
+        malformed count, but passes a ``vault:v`` head through unchecked, so a malformed one is not
+        caught here and is compared; :func:`~messagefoundry.store.store._audit_head_shape` states
+        what that costs.
 
         The read goes through ``asyncio.to_thread`` like every other file the engine touches, so a slow or
         hung filesystem cannot block the loop during startup."""
@@ -2100,10 +2113,11 @@ class Engine:
 
     async def _verify_audit_chain_on_start(self) -> None:
         """Startup audit-chain tamper check (#190-E), ALERT-ONLY: a broken chain logs a WARNING and
-        fires the AlertSink but NEVER crashes startup — refusing to boot on a tripped tamper alarm would
-        be a self-inflicted DoS, and the alarm may itself be a false positive (e.g. keyed store opened
-        without the DEK). Reuses the ``integrity_drift`` alert channel (the existing in-place-tamper
-        signal). Swallows every error: the check is defense-in-depth, never a startup gate.
+        fires the AlertSink, where one is configured, but NEVER crashes startup — refusing to boot
+        on a tripped tamper alarm would be a self-inflicted DoS, and the alarm may itself be a false
+        positive (e.g. keyed store opened without the DEK). Reuses the ``integrity_drift`` alert
+        channel (the existing in-place-tamper signal). It swallows every error the walk raises.
+        :meth:`_load_audit_anchor` runs outside that handler and can raise; its docstring says what.
 
         With ``[integrity].audit_anchor_file`` set it also passes that anchor as ``expected_prefix``, which
         is what lets the walk see a TRUNCATED TAIL — the walk alone cannot, because deleting the newest
@@ -2284,8 +2298,9 @@ class Engine:
                 Exception
             ) as exc:  # a sweep failure must never block startup (best-effort hygiene)
                 log.warning("startup attachment sweep failed: %s", safe_exc(exc))
-        # #190-E: optional startup audit-chain tamper check. ALERT-ONLY (never crashes startup); runs
-        # after recovery so the chain is walked in its post-recovery state.
+        # #190-E: optional startup audit-chain tamper check. ALERT-ONLY for a failed verdict, but
+        # the anchor read can still fail startup (see _load_audit_anchor); runs after recovery so
+        # the chain is walked in its post-recovery state.
         if self._audit_verify_on_start:
             await self._verify_audit_chain_on_start()
         elif self._audit_anchor_file is not None:

@@ -233,6 +233,7 @@ from messagefoundry.store.row_seal import (
     transit_seal_refusals,
 )
 from messagefoundry.store.schema_verify import (
+    _ORDINARY_TABLE,
     SchemaMismatchError,
     is_schema_step_error,
     live_schema_differences,
@@ -1662,17 +1663,29 @@ GLOBAL_SESSION_EPOCH_MISSING: Final = (
 )
 
 
-# Vault BACKLOG #3028, ADR 0210: the session lineage's three statements, in `?` form for SQLite and
-# SQL Server; postgres.py respells them for `$n`. The INSERT runs only inside rotate_session's own
-# transaction, the SELECT only inside supersede_session's, and the DELETE only from the session
-# purge. No other statement names the table: a retired hash must authenticate nothing.
+# Vault BACKLOG #4276: ((julianday('now') - 2440587.5) * 86400.0) is the database's own clock as
+# epoch seconds, the unit `session_lineage.retired_at` holds. SQLite reads the host clock through its
+# VFS, not through Python's `time.time`, and holds 'now' fixed for the whole of one statement.
+# postgres.py and sqlserver.py spell their own clock (`_PG_EPOCH_NOW`, `_MSSQL_EPOCH_NOW`). Here the
+# expression is spelled literally in each statement below rather than interpolated, so
+# test_writer_txn_is_the_only_begin.py can read each as text; keep the three copies identical.
+# Vault BACKLOG #3028, ADR 0210: the session lineage's three statements; postgres.py and sqlserver.py
+# respell them. The INSERT runs only inside rotate_session's own transaction, the SELECT only inside
+# supersede_session's, and the DELETE only from the session purge. No other statement names the
+# table: a retired hash must authenticate nothing. Each stamps or measures `retired_at` on the
+# database's clock, never a parameter from an engine process (vault BACKLOG #4276,
+# store/session_lineage.py), so the window is one clock's reading on every engine shard.
 _SESSION_LINEAGE_INSERT: Final = (
-    "INSERT INTO session_lineage (retired_hash, successor_hash, retired_at) VALUES (?,?,?)"
+    "INSERT INTO session_lineage (retired_hash, successor_hash, retired_at)"
+    " VALUES (?,?,((julianday('now') - 2440587.5) * 86400.0))"
 )
 _SESSION_LINEAGE_SUCCESSOR: Final = (
-    "SELECT successor_hash FROM session_lineage WHERE retired_hash=? AND retired_at >= ?"
+    "SELECT successor_hash FROM session_lineage WHERE retired_hash=?"
+    " AND retired_at >= ((julianday('now') - 2440587.5) * 86400.0) - ?"
 )
-_SESSION_LINEAGE_PURGE: Final = "DELETE FROM session_lineage WHERE retired_at < ?"
+_SESSION_LINEAGE_PURGE: Final = (
+    "DELETE FROM session_lineage WHERE retired_at < ((julianday('now') - 2440587.5) * 86400.0) - ?"
+)
 
 
 def session_reseal_params(new: SessionRecord, old: SessionRecord) -> tuple[object, ...]:
@@ -6785,9 +6798,12 @@ AUDIT_ANCHOR_DIGEST_HEX_LEN = AUDIT_MAC_HEX_LEN
 AUDIT_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
 
 
-#: How much of an anchor file is read before it is refused. An anchor is ONE short line -- the longest
-#: producible form is a count plus a `vault:v1:<base64>` MAC, comfortably under 200 bytes -- so anything
-#: past this is not an anchor file and the excess must never be read, let alone quoted back.
+#: How much of an anchor file is read before it is refused. An anchor is ONE short line -- a count
+#: plus a 64-character hex head, or a shorter `vault:v<N>:<base64>` Transit MAC, comfortably under 200
+#: bytes -- so anything past this is not an anchor file and the excess must never be read, let alone
+#: quoted back. This is the READER's bound, not a parser check: the parser passes a `vault:v` head
+#: through unchecked (:func:`_audit_head_shape` says what that costs), so only this byte bound limits
+#: one read from a file, and nothing limits one given as ``--expected-anchor`` on the command line.
 #:
 #: THE BOUND IS A LOG-DISCLOSURE CONTROL, NOT A PERFORMANCE ONE. ``str(AuditAnchorError)``
 #: interpolates the offending text with ``{text!r}``. Neither file caller prints it now (vault
@@ -6796,6 +6812,23 @@ AUDIT_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
 #: file, or a captured HL7 message would put that line into the service log at WARNING -- which is
 #: the PHI rule in CLAUDE.md section 9.
 AUDIT_ANCHOR_MAX_BYTES = 4096
+
+
+def _ascii_digits(text: str) -> bool:
+    """``text`` is ASCII decimal digits only: the digit rule of :func:`_audit_decimal`, which the
+    anchor's sign check shares."""
+    return text.isascii() and text.isdigit()
+
+
+def _audit_decimal(text: str) -> int | None:
+    """``text`` as an int when it is ASCII digits only, at most 19 of them (the width of the signed
+    64-bit ``seq`` column every backend uses), else ``None``. The one count grammar of
+    :func:`parse_audit_anchor` and :func:`parse_audit_row_pair`: ``int()`` alone would read
+    ``1_0`` as 10, accept a sign or non-ASCII digits, and parse any length up to Python's limit.
+    The caller checks the value against :data:`_AUDIT_SEQ_MAX`."""
+    if not _ascii_digits(text) or len(text) > 19:
+        return None
+    return int(text)
 
 
 class AuditAnchorError(ValueError):
@@ -6826,8 +6859,9 @@ class AuditAnchorError(ValueError):
 
 
 def read_audit_anchor_file(path: str | Path) -> str:
-    """Read an anchor file into the text :func:`parse_audit_anchor` takes. Raises ``OSError`` or
-    ``UnicodeDecodeError``; each caller words its own operator-facing refusal around those.
+    """Read an anchor file into the text :func:`parse_audit_anchor` takes. Raises at least
+    ``OSError``, ``UnicodeDecodeError``, and ``ValueError`` for a path carrying a NUL character;
+    ``Engine._load_audit_anchor`` says what the third does at startup.
 
     ``utf-8-sig`` absorbs a leading BOM: PowerShell 5.1's ``Set-Content -Encoding utf8`` writes UTF-8
     WITH one, and this product deploys as a Windows service, so that is a first-class way an operator
@@ -6881,9 +6915,11 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
     verify: a silently-ignored anchor turns the whole control into a gate that reports green while
     checking nothing, which is precisely the failure the anchor exists to close.
 
-    It must ALSO refuse rather than hand a comparator a head the store can never emit. Both comparators
-    compare the head byte-exactly and report *any* difference as ``truncated or rewritten``, so an
-    accepted-but-impossible head becomes a FALSE tamper alarm — a red light on an intact chain,
+    It ALSO refuses a hex head of the wrong length and a head of neither shape, rather than hand a
+    comparator a head the store can never emit; a ``vault:v`` head is the exception, passed through
+    unchecked (see the second bullet), and :func:`_audit_head_shape` states what that costs.
+    Both comparators compare the head byte-exactly and report *any* difference as
+    ``truncated or rewritten``, so an accepted-but-impossible head becomes a FALSE tamper alarm — a red light on an intact chain,
     indistinguishable from a real detection. A control whose whole value is that a FAIL means something
     cannot be allowed to manufacture FAILs out of its own input handling — the inverse of the
     green-while-checking-nothing hole above, and it costs just as much.
@@ -6917,16 +6953,26 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
     count_text, sep, head = raw.partition(":")
     if not sep:
         raise AuditAnchorError("no ':' separator", text)
-    try:
-        count = int(count_text)
-    except ValueError:
-        # The count is quoted in `str(exc)` via `text`, so the reason stays content-free: a row count
-        # is short and non-secret, but "content-free" has to be a rule, not a judgement per branch.
-        raise AuditAnchorError("the row count is not an integer", text) from None
-    if count < 0:
-        # No value in a reason, not even the count: `--expected-anchor-file` prints the reason, and
-        # the count is that file's content (vault BACKLOG #2612).
+    count_text = count_text.strip()
+    # The row pair's grammar, not `int()`'s, which also takes `+5`, `1_000`, non-ASCII digits and
+    # any length up to Python's digit limit (vault BACKLOG #4790). The count is quoted in `str(exc)`
+    # via `text`; no reason names a value, not even the count: `--expected-anchor-file` prints the
+    # reason, and the count is that file's content (vault BACKLOG #2612).
+    # A minus sign before ASCII digits is judged on the sign before the width, so each reason is
+    # true of its input: "-0" is a signed zero, not a negative count, and a minus before 20 or more
+    # digits is negative whatever its width.
+    unsigned = count_text.removeprefix("-")
+    if unsigned != count_text and _ascii_digits(unsigned):
+        if not unsigned.strip("0"):
+            raise AuditAnchorError("the row count is a signed zero, which no store prints", text)
         raise AuditAnchorError("the row count is negative", text)
+    count = _audit_decimal(count_text)
+    if count is None:
+        raise AuditAnchorError(
+            "the row count is not a plain decimal integer of up to 19 digits", text
+        )
+    if count > _AUDIT_SEQ_MAX:
+        raise AuditAnchorError("the row count is larger than any store can hold", text)
     head = head.strip()
     if not head:
         if count != 0:
@@ -6952,9 +6998,19 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
 
 def _audit_head_shape(head: str, noun: str = "the head") -> tuple[str | None, str]:
     """``(why a non-empty head is refused, or None; the head normalised)``. The one statement of
-    which heads the store can emit, shared by :func:`parse_audit_anchor` and
+    which heads are taken, shared by :func:`parse_audit_anchor` and
     :func:`parse_audit_row_pair`, so a hardening of it reaches both. The reason quotes no part of the
-    head. ``noun`` names the value in the reason."""
+    head. ``noun`` names the value in the reason.
+
+    THE KNOWN COST OF THE ``vault:v`` PASS-THROUGH. A ``vault:v`` anchor or row pair whose count or
+    seq passes, and whose head is malformed (for example truncated, or carrying a space), is not
+    refused: it reaches the comparator, and on an intact chain the walk reports ``truncated or
+    rewritten``. ``audit-verify`` then exits 1, the tamper code, not 2. The engine's
+    ``[integrity].audit_anchor_file`` startup check logs that verdict at WARNING, quoting the
+    anchor's count and the first 12 characters of its head and of the chain's head at that row,
+    and, where an alert sink is configured, fires ``integrity_drift`` with subject
+    ``audit-chain-truncated`` carrying the same text. Vault BACKLOG #5987 item 1 and #4790 items 2
+    and 4 hold it open."""
     if set(head) <= _AUDIT_ANCHOR_HEX:
         if len(head) != AUDIT_ANCHOR_DIGEST_HEX_LEN:
             return (
@@ -6963,7 +7019,13 @@ def _audit_head_shape(head: str, noun: str = "the head") -> tuple[str | None, st
             )
         return None, head.lower()
     if head.startswith(AUDIT_ANCHOR_ISOLATED_MAC_PREFIX):
-        return None, head  # opaque by construction; never normalise what we do not define
+        # Opaque by construction; never normalise what we do not define. Not held to the Transit
+        # MAC's shape either: `audit-anchor` prints a tampered `vault:v` head as the store holds it,
+        # and `audit-verify` exits 2 on an anchor this parser refuses, before it walks, so a shape
+        # check here would leave such a tamper unwalked. A malformed `vault:v` head is therefore
+        # compared against the walked chain, not refused. A tampered head of another shape is still
+        # refused before the walk. The cost is in the docstring.
+        return None, head
     return (
         f"{noun} is neither a {AUDIT_ANCHOR_DIGEST_HEX_LEN}-character hex digest nor an "
         f"isolated-module {AUDIT_ANCHOR_ISOLATED_MAC_PREFIX}… MAC (ADR 0138)",
@@ -6993,20 +7055,20 @@ def parse_audit_row_pair(text: str) -> tuple[int, str]:
     """Parse a ``SEQ:ROW_HASH`` pair, one row the off-box tee witnessed, into the tuple
     ``verify_audit_chain(expected_rows=...)`` takes (vault BACKLOG #2612).
 
-    It refuses, as :func:`parse_audit_anchor` does and for the same reason, any head the store can
-    never emit, since a comparator would report it as tampering. Unlike an anchor, a pair names a
-    ROW, so its sequence number is at least 1 and its head is never empty."""
+    It applies :func:`parse_audit_anchor`'s head rule, so it refuses a hex head that is not exactly
+    64 characters and a head of neither shape, and passes a ``vault:v`` head through unchecked, at
+    the cost :func:`_audit_head_shape` states.
+    Unlike an anchor, a pair names a ROW, so its sequence number is at least 1 and its head is never
+    empty."""
     seq_text, sep, head = text.strip().partition(":")
     if not sep:
         raise AuditRowPairError("no ':' separator", text)
     seq_text = seq_text.strip()  # space either side of the ':' reads alike
-    # ASCII digits only, and no wider than a store's sequence column: `int()` alone would read
-    # '1_0' as 10, accept non-ASCII digits, and admit a seq no store can hold.
-    if not (seq_text.isascii() and seq_text.isdigit()) or len(seq_text) > 19:
+    seq = _audit_decimal(seq_text)
+    if seq is None:
         raise AuditRowPairError(
             "the sequence number is not a plain decimal of up to 19 digits", text
         )
-    seq = int(seq_text)
     if not 1 <= seq <= _AUDIT_SEQ_MAX:
         raise AuditRowPairError(
             "the sequence number is outside 1 to 2**63-1, so it names no row", text
@@ -9188,38 +9250,100 @@ def _sqlite_readonly_uri(path: str) -> str:
     return uri + "?mode=ro"
 
 
+#: How :func:`forget_store_salt` names an object holding ``store_salt`` that is not an ordinary
+#: table, keyed by ``lower(sqlite_master.type)``. A ``table`` row there failed the ordinary-table
+#: predicate, so it is normally a virtual table; an ordinary table whose row a hand edit gave a
+#: type in another case is named as one too, and refused.
+_FOREIGN_SALT_KINDS = {"table": "a virtual table", "view": "a view", "index": "an index"}
+
+
 def forget_store_salt(path: Path) -> bool:
-    """Drop the store salt from a CLOSED SQLite store file, so its next open mints a new one (ADR 0196).
+    """Drop the salt from a CLOSED SQLite store file, so its next salted open mints one (ADR 0196).
 
     For a store that is a copy of another: what ``restore`` places, and the scratch copy the full
     restore-verify opens. A copy carries the original's salt, so it would seal under the original's
     data sub-key while counting that key's use from the copy's older row -- the rewind ADR 0196
-    closes. With no salt row, the first open mints a salt and so a key nothing has used, before it
-    seals anything; every value already in the file names its own salt and still opens.
+    closes. With no salt row, the first open that binds a salt mints one and so a key nothing has
+    used, before it seals anything. Not every open binds one: ``bind_store_salt`` in ``gcm_bound``
+    names those that do not, at least the identity and ``vault_transit`` ciphers and the frozen v1
+    writer (``[store].aad_bind = false``), and for those this call changes no key. It does not change
+    how a value already in the file opens: a v4 value names its own salt in the value, a v1 or v2
+    value is sealed under the DEK itself, and a v3 value is the Transit cipher's, opened by Vault.
 
-    Returns whether a row was removed. A file from before ADR 0196 has no ``store_salt`` table and so
-    nothing to forget; its first open creates one. Synchronous, for the off-loop restore path.
+    Synchronous, for the off-loop restore path. What it returns or raises, in at least these cases:
 
-    **It proves the row is gone from the MAIN FILE, or raises ``sqlite3.OperationalError``.** A
-    snapshot can carry WAL mode in its header, and then a plain DELETE commits into ``-wal``. The
-    callers place or open only the main file, so a delete left in a WAL that was never checkpointed
-    would be silently dropped, and the copy would keep the original's salt. So the file is first
-    switched to ``journal_mode=DELETE``, which checkpoints the WAL and removes it, and which SQLite
-    refuses while another connection holds the file. After the delete, the main file is re-read with
-    no ``-wal`` beside it. A refusal is the caller's to report; it never places an unproven copy."""
+    - **True**: an ordinary ``store_salt`` table held at least one row, the delete removed it, and
+      the re-read below found none left in the MAIN FILE.
+    - **False, with an ordinary table**: the ``store_salt`` table was there but the delete removed no
+      row, normally because it was empty, so there was nothing to forget.
+    - **False, with no object of that name**: a file from before ADR 0196 has no ``store_salt``, and
+      its first writable open creates the table. A path with no file is in this case too: the
+      connect creates an empty file there.
+    - **Raises** ``sqlite3.OperationalError`` naming the kind of object when there is no ordinary
+      ``store_salt`` table and the name is held by another object, at least a view, an index or a
+      virtual table another tool left. Such an object is neither read nor dropped and is left in
+      the file as it was, so nothing about a salt is proven. Before the raise the file has been
+      taken out of WAL mode, as below. A trigger of that name does not make the call raise: it has
+      a namespace of its own and does not stop the writable open creating the table. A trigger
+      defined ON ``store_salt`` still fires inside the delete, so it can change what the call does.
+    - **Raises** ``sqlite3.OperationalError`` when the file cannot be written as a closed file or
+      the write is not proven: at least when another connection's hold makes the journal-mode switch
+      or the delete fail (``database is locked``, or on a WAL file the switch refused), when a
+      non-empty ``-wal`` remains afterwards or its size cannot be read (the ``OSError`` is converted,
+      so a caller that catches ``sqlite3.Error`` refuses the copy), or when the read-only re-read
+      still finds a row in the ordinary table, whether or not the delete reported removing one.
+      SQLite does not refuse every other holder: on a file in rollback-journal mode an idle second
+      connection lets the call write, and on a WAL file so does one opened with ``immutable=1``,
+      which takes no lock. Other ``sqlite3.Error`` subclasses from opening or reading the file
+      propagate too.
+
+    **On each path that returns, it has re-read the MAIN FILE and found no row in an ordinary
+    table.** That re-read does not look for a view, index or virtual table; the check above runs on
+    the writing connection only when it finds no ordinary table. A snapshot can carry WAL mode in
+    its header, and then a plain DELETE commits into ``-wal``. The callers place or open only the main file, so a
+    delete left in a WAL that was never checkpointed would be silently dropped, and the copy would
+    keep the original's salt. So the file is first switched to ``journal_mode=DELETE``, which
+    checkpoints the WAL and removes it. After the delete, the main file is re-read with no ``-wal``
+    beside it. A raise is the caller's to report."""
+
+    # The ordinary-table predicate, so a virtual `store_salt` another tool left, whose module may
+    # not be loaded here, is not probed and cannot raise "no such module" (BACKLOG #6719 item 4).
+    # lower(), as schema_verify's salt read matches it: SQLite resolves the name case-blind, so a
+    # `Store_Salt` table is the one the next open reads. One helper holds the table-exists check that
+    # the drop and its proof both make, so those two checks cannot drift apart; it also means the proof
+    # cannot catch a table that check misses. The statement is spelled at the call rather than held in
+    # a local so tests/test_writer_txn_is_the_only_begin.py can read it.
+
+    def has_salt_table(conn: sqlite3.Connection) -> bool:
+        return bool(
+            conn.execute(
+                "SELECT count(*) FROM sqlite_master AS m"
+                f" WHERE {_ORDINARY_TABLE} AND lower(m.name) = 'store_salt'"
+            ).fetchone()[0]
+        )
 
     def drop(conn: sqlite3.Connection) -> bool:
-        exists = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_salt'"
+        if has_salt_table(conn):
+            return conn.execute("DELETE FROM store_salt").rowcount > 0
+        # Fail closed on a name another tool's object holds: returning False there let a restore
+        # place a copy that its first writable open then refuses, with the salt question unasked.
+        # Tables, views and indexes share one namespace, so at most one such object matches. A
+        # trigger has a namespace of its own and does not stop the open creating the table.
+        foreign = conn.execute(
+            "SELECT lower(m.type) FROM sqlite_master AS m"
+            " WHERE lower(m.name) = 'store_salt' AND lower(m.type) <> 'trigger'"
         ).fetchone()
-        return exists is not None and conn.execute("DELETE FROM store_salt").rowcount > 0
+        if foreign is not None:
+            kind = _FOREIGN_SALT_KINDS.get(str(foreign[0]), "an object of another kind")
+            raise _ClosedStoreWriteError(
+                f"store_salt is {kind}, not this build's salt table, so the store salt cannot be "
+                f"dropped from {path}"
+            )
+        return False
 
     def gone(proof: sqlite3.Connection) -> bool:
         return not (
-            proof.execute(
-                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'store_salt'"
-            ).fetchone()[0]
-            and proof.execute("SELECT count(*) FROM store_salt").fetchone()[0]
+            has_salt_table(proof) and proof.execute("SELECT count(*) FROM store_salt").fetchone()[0]
         )
 
     return _write_closed_store(
@@ -9232,8 +9356,10 @@ def forget_store_salt(path: Path) -> bool:
 
 
 class _ClosedStoreWriteError(sqlite3.OperationalError):
-    """:func:`_write_closed_store`'s own refusal, whose text the engine wrote: the store's path,
-    the journal mode SQLite reported and a fixed sentence, never a row's value or SQLite's message.
+    """:func:`_write_closed_store`'s own refusals, and :func:`forget_store_salt`'s refusal of a
+    ``store_salt`` that is not an ordinary table, whose text the engine wrote: a store or ``-wal``
+    path, the journal mode SQLite reported, a kind word from ``_FOREIGN_SALT_KINDS`` or its fixed
+    fallback, and a fixed sentence, never a row's value or SQLite's message.
     Marked :func:`~messagefoundry.redaction.engine_text_only`, so a renderer that withholds a
     database driver's message keeps it (vault BACKLOG #8153). ``safe_exc`` and the DR reasons show
     it as ``OperationalError``; a traceback names this class itself.
@@ -9254,11 +9380,13 @@ def _write_closed_store[T](
     """Run ``write`` on a CLOSED SQLite store file and prove it landed in the MAIN FILE, for
     :func:`forget_store_salt` and :func:`write_restore_marker`.
 
-    The file is first switched to ``journal_mode=DELETE``, which checkpoints a WAL and removes it,
-    and which SQLite refuses while another connection holds the file; ``write`` then runs in
-    autocommit. Afterwards a non-empty ``-wal`` beside it, or a read-only re-read on which ``prove``
-    answers False, raises ``sqlite3.OperationalError``: a caller places or opens only the main
-    file, so a change left in a WAL nobody checkpoints would be silently dropped."""
+    The file is first switched to ``journal_mode=DELETE``, which checkpoints a WAL and removes it;
+    on a WAL file SQLite refuses the switch while another connection holds it through SQLite's
+    locks, but not every other holder is refused (:func:`forget_store_salt` says which). ``write``
+    then runs in autocommit. Afterwards a non-empty ``-wal`` beside it, a ``-wal`` whose size
+    cannot be read, or a read-only re-read on which ``prove`` answers False, raises
+    ``sqlite3.OperationalError``: a caller places or opens only the main file, so a change left in
+    a WAL nobody checkpoints would be silently dropped."""
     wal = path.with_name(path.name + "-wal")
     conn = sqlite3.connect(str(path), isolation_level=None)  # autocommit: each statement commits
     try:
@@ -9271,7 +9399,15 @@ def _write_closed_store[T](
         result = write(conn)
     finally:
         conn.close()
-    if wal.exists() and wal.stat().st_size:
+    try:
+        wal_size = wal.stat().st_size
+    except FileNotFoundError:
+        wal_size = 0
+    except OSError as exc:
+        # The callers catch sqlite3.Error, so an OSError here would escape their refusal; an
+        # unreadable -wal is an unproven write, and fails closed as one.
+        raise _ClosedStoreWriteError(f"{wal} could not be read after leaving WAL mode") from exc
+    if wal_size:
         raise _ClosedStoreWriteError(f"{wal} still holds changes after leaving WAL mode")
     proof = sqlite3.connect(_sqlite_readonly_uri(str(path.absolute())), uri=True)
     try:
@@ -12131,7 +12267,8 @@ CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at);
 CREATE TABLE IF NOT EXISTS session_lineage (
     retired_hash   TEXT PRIMARY KEY,           -- the hash the rotation retired
     successor_hash TEXT NOT NULL,              -- the hash the session carried next
-    retired_at     REAL NOT NULL               -- when the re-key landed, in its transaction (wall clock)
+    retired_at     REAL NOT NULL               -- when the re-key landed, in its transaction
+                                               -- (the database's clock)
 );
 CREATE INDEX IF NOT EXISTS ix_session_lineage_retired ON session_lineage(retired_at);
 
@@ -14410,8 +14547,12 @@ class MessageStore:
         open() with an opaque ``FOREIGN KEY constraint failed``: ``queue.message_id`` is FK-enforced
         and this INSERT runs under ``foreign_keys=ON``. A skipped orphan was unreplayable anyway (no
         message to view/route); we log how many were dropped."""
+        # The ordinary-table predicate: a virtual `outbox` is another tool's, and reading it could
+        # raise "no such module" (BACKLOG #6719 item 4).
         cur = await db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='outbox'"
+            # Exact case, unlike the salt probe: nothing but this fold reads `outbox`, and it drops
+            # the table, so a case variant another tool left must be left alone.
+            f"SELECT name FROM sqlite_master AS m WHERE {_ORDINARY_TABLE} AND m.name = 'outbox'"
         )
         if await cur.fetchone() is None:
             return  # already migrated (or a fresh DB) — nothing to fold in
@@ -22769,26 +22910,22 @@ class MessageStore:
             await self._commit()
         return written is not None and stamp.anchored
 
-    async def rotate_session(
-        self, token_hash: str, *, new_token_hash: str, now: float | None = None
-    ) -> bool:
+    async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
         ``token_hash`` is the PK, so this is a key update: the row keeps every other column and the
         old hash stops resolving in the same transaction. The token hash is sealed, so the re-key
         re-seals (BACKLOG #2592). Reports whether a row was re-keyed so the caller can fail closed
         when the session was revoked out from under it. The lineage link is written in the same
-        transaction, and only when the re-key landed (vault BACKLOG #3028). Its time is read once
-        the re-key has landed, so a wait for the lock cannot age the link before it exists."""
+        transaction, and only when the re-key landed (vault BACKLOG #3028). Its time is the
+        database's clock when the link's own statement runs (vault BACKLOG #4276), after the re-key
+        has landed, so a wait for the lock cannot age the link before it exists."""
         async with _writer_txn(self._db, self._lock):
             rotated = await self._write_session(
                 token_hash, lambda s: replace(s, token_hash=new_token_hash)
             )
             if rotated is not None:
-                retired_at = time.time() if now is None else now
-                await self._db.execute(
-                    _SESSION_LINEAGE_INSERT, (token_hash, new_token_hash, retired_at)
-                )
+                await self._db.execute(_SESSION_LINEAGE_INSERT, (token_hash, new_token_hash))
             await self._commit()
         return rotated is not None
 
@@ -22802,10 +22939,10 @@ class MessageStore:
             await self._commit()
 
     async def supersede_session(
-        self, token_hash: str, *, now: float, lineage_since: float | None = None
+        self, token_hash: str, *, now: float, lineage_seconds: float | None = None
     ) -> SessionRecord | None:
         """Revoke, then read the row back in the SAME transaction (BACKLOG #2146), following the
-        session lineage when ``lineage_since`` is given (vault BACKLOG #3028). See
+        session lineage when ``lineage_seconds`` is given (vault BACKLOG #3028). See
         :meth:`AuthStore.supersede_session`.
 
         Two statements per step rather than one ``UPDATE ... RETURNING``, because ``RETURNING``
@@ -22813,6 +22950,7 @@ class MessageStore:
         unit: the writer lock orders them against every in-process writer, ``rotate_session``
         included. The first ``UPDATE`` takes SQLite's write lock even when it matches no row, and
         holds it until the commit, so no other process can re-key a row while the walk runs."""
+        started = time.monotonic()  # before the lock, so its wait cannot shorten the window
 
         async def _revoke(h: str) -> SessionRecord | None:
             cur = await self._db.execute(
@@ -22825,8 +22963,8 @@ class MessageStore:
             row = await cur.fetchone()
             return SessionRecord.from_mapping(dict(row)) if row else None
 
-        async def _successor(h: str, since: float) -> str | None:
-            cur = await self._db.execute(_SESSION_LINEAGE_SUCCESSOR, (h, since))
+        async def _successor(h: str, seconds: float) -> str | None:
+            cur = await self._db.execute(_SESSION_LINEAGE_SUCCESSOR, (h, seconds))
             row = await cur.fetchone()
             return str(row[0]) if row else None
 
@@ -22834,7 +22972,11 @@ class MessageStore:
         async with _writer_guard(self._db, self._lock):
             try:
                 ended = await revoke_through_lineage(
-                    token_hash, lineage_since=lineage_since, revoke=_revoke, successor=_successor
+                    token_hash,
+                    lineage_seconds=lineage_seconds,
+                    started=started,
+                    revoke=_revoke,
+                    successor=_successor,
                 )
             except RowSealError as exc:
                 # BACKLOG #5505: only the read-back refused the row; its revoke still commits.
@@ -23154,7 +23296,9 @@ class MessageStore:
                 )
             purged = cur.rowcount if cur.rowcount is not None else 0
             if lineage_seconds is not None:
-                await self._db.execute(_SESSION_LINEAGE_PURGE, (now - float(lineage_seconds),))
+                # Measured back from the database's clock, as the supersession measures its window,
+                # never from ``now`` (vault BACKLOG #4276).
+                await self._db.execute(_SESSION_LINEAGE_PURGE, (float(lineage_seconds),))
             await self._commit()
             return purged
 
@@ -23201,10 +23345,12 @@ class MessageStore:
         from messagefoundry.store.base import seed_filter_clause
 
         async with self._read() as db:
+            # schema_verify's own predicate, so the census and the schema reads cannot drift apart
+            # (BACKLOG #6719 item 5). The NULL-sql case the old copy also took is unreachable: SQLite
+            # refuses to load a schema holding a table row with no SQL.
             cur = await db.execute(
-                "SELECT name FROM main.sqlite_master WHERE type = 'table'"
-                " AND (sql IS NULL OR sql NOT LIKE 'CREATE VIRTUAL TABLE%')"
-                " AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
+                f"SELECT m.name FROM main.sqlite_master AS m WHERE {_ORDINARY_TABLE}"
+                " AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
             )
             names = [str(row[0]) for row in await cur.fetchall()]
             occupancy: dict[str, bool] = {}

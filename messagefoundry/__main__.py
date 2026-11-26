@@ -6357,6 +6357,7 @@ def _validate(args: argparse.Namespace) -> int:
 
 def _graph(args: argparse.Namespace) -> int:
     from messagefoundry.config.graph import build_wiring_graph
+    from messagefoundry.config.snapshot import ConfigDirMissing
     from messagefoundry.config.wiring import WiringError, display_settings, load_config
 
     # The missing-value-file refusal (exit 2) is the pre-check graph ran before --env read values:
@@ -6382,7 +6383,9 @@ def _graph(args: argparse.Namespace) -> int:
         # come from Routers and Handlers, which a connection-less config still has. Refusing here
         # would make the reporting surface go dark on the config an operator most wants to look at.
         reg = load_config(config_dir, allow_empty=True)
-    except WiringError as exc:
+    except (WiringError, ConfigDirMissing) as exc:
+        # ConfigDirMissing is a FileNotFoundError, not a WiringError: uncaught, a missing --config
+        # directory reached the last-resort CRITICAL floor instead of this envelope (BACKLOG #7107).
         return _emit_error(str(exc), as_json=args.json)
     # For the same reason an env() reference that does not resolve is reported beside the graph,
     # never instead of it. Keys only, never values.
@@ -6559,6 +6562,7 @@ def _dryrun_loop_error(exc: ValueError | KeyError) -> str:
 
 def _dryrun(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import SectionNameEnvError
+    from messagefoundry.config.snapshot import ConfigDirMissing
     from messagefoundry.config.wiring import WiringError, load_config
     from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_messages
     from messagefoundry.redaction import safe_error
@@ -6572,7 +6576,8 @@ def _dryrun(args: argparse.Namespace) -> int:
         return env_values
     try:
         reg = load_config(config_dir)
-    except WiringError as exc:
+    except (WiringError, ConfigDirMissing) as exc:
+        # As in _graph: a missing --config directory is not a WiringError (BACKLOG #7107).
         return _emit_error(str(exc), as_json=args.json)
     if env_values is not None and (problems := reg.env_resolution_problems(env_values)):
         # A preview in an environment the graph does not resolve in is refused. Keys only.
@@ -7477,10 +7482,14 @@ def _resolve_expected_rows(args: argparse.Namespace) -> list[tuple[int, str]] | 
     """The ``(seq, row_hash)`` pairs for ``audit-verify``, or the exit code 2 if one is unusable
     (vault BACKLOG #2612). An empty list when neither flag was given.
 
-    Each pair is parsed by :func:`parse_audit_row_pair`, which shares the anchor parser's rule for
-    which heads the store can emit. A refusal for a ``--expected-row`` value quotes it, since the
-    operator typed it; one for a file line names the line number and a reason that quotes nothing,
-    so a path typo'd onto another file does not put that file's content on the job's output.
+    Each pair is parsed by :func:`parse_audit_row_pair`, which shares the anchor parser's count
+    grammar and head rule: it refuses at least a malformed seq and a hex head that is not 64
+    characters, and passes a
+    ``vault:v`` head through unchecked, at the cost
+    :func:`~messagefoundry.store.store._audit_head_shape` states. A refusal for a ``--expected-row``
+    value quotes it, since the operator typed it; one for a file line names the line number and a
+    reason that quotes nothing, so a path typo'd onto another file does not put that file's content
+    on the job's output.
     """
     from messagefoundry.redaction import codec_safe_str
     from messagefoundry.store.store import (
@@ -7716,8 +7725,12 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         KeylessAuditChainRefused,
         StoreNotFoundError,
         _UnauditableWrite,
-        _StoreOpenRefused,  # the OPEN only: a refused hop (#2532), a key, a short schema (#1720)
-        *_key_unresolved(),
+        # The OPEN only: a refused hop (#2532), a key, a short schema (#1720). A key that does not
+        # resolve arrives here as this class, never bare: _open_store_or_refuse converts it, and
+        # after the open every _key_unresolved() class is a RuntimeError or ValueError, which
+        # call_errors below takes as a refusal, exit 1. So the bare classes are not listed
+        # (BACKLOG #5633 item 11).
+        _StoreOpenRefused,
     )
     # A refused store call on every backend (BACKLOG #1983, store_call_errors), and what a store
     # raises when it cannot reach its database (vault BACKLOG #3054, item 10).
@@ -7735,8 +7748,8 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         *reach_errors,
     )
 
-    # The name every refusal after the read uses: the stored username once the account is found,
-    # as the output and the audit row name it (BACKLOG #5633 item 7).
+    # The stored username once the account is found, as the output and the audit row name it
+    # (BACKLOG #5633 item 7). The Forged arm below does not use it.
     named = [wanted]
 
     async def run() -> tuple[str, Any]:
@@ -7818,6 +7831,14 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         # BACKLOG #3510: the store's write helper refused the clear, which wrote nothing; the open
         # before it may have (BACKLOG #5067).
         left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
+        # This Forged arm names the user as typed, so neither this text nor _seal_refusal's WARNING
+        # prints a value from the record that failed its seal (BACKLOG #5633 item 7;
+        # tests/test_cli.py pins the text, not the WARNING). Once the read found the account, an arm
+        # below that prints named[0] prints the username as get_user_by_username returned it, and
+        # that read verifies no seal. So on a refused unlock whose seal was not verified, at least
+        # on an Unverifiable answer or a Transit outage at the verify, the refusal text and the
+        # WARNING below print the stored username of an unverified record. An Unverifiable answer
+        # can come from a sound row or a planted seal; the engine denies it like a forged seal.
         return _emit_error(f"{_seal_refusal(wanted, 'unlock')}. {left}", as_json=args.json)
     if outcome == "open-failed":
         if isinstance(extra, (StoreKeylessError, CipherError)):
@@ -7838,9 +7859,11 @@ def _admin_unlock(args: argparse.Namespace) -> int:
             text=_engine_refusal_text(extra) if whole else None,
         )
     if outcome in ("read-refused", "refused"):
-        # Logged, so the cause can be found: WARNING names the class only, since a driver's
-        # message can quote a stored value (ASVS 16.5.4); the traceback goes to DEBUG. A busy
-        # store is not "could not start", so it keeps exit 1 (ADR 0171 Amendment C).
+        # Logged, so the cause can be found: WARNING names the error's class, never its message,
+        # since a driver's message can quote a stored value (ASVS 16.5.4); the traceback goes to
+        # DEBUG. It also names named[0], which can be an unverified record's stored username; the
+        # Forged arm's comment above says when. A busy store is not "could not start", so it keeps
+        # exit 1 (ADR 0171 Amendment C).
         log = logging.getLogger(__name__)
         log.warning(
             "admin-unlock: the store refused the %s for %r (%s)",
@@ -11881,8 +11904,26 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
                 # or a pool acquire that timed out. A busy store is not "could not start", so it
                 # keeps exit 1. The command has written nothing yet, but the open may have, so the
                 # text names it (BACKLOG #5067).
+                # A refusal the engine wrote, such as an acquire timeout, prints whole, since its
+                # text names its fix. Any other error prints its class only: a driver's message can
+                # quote a stored value (ASVS 16.5.4; vault BACKLOG #5067 added item B). The WARNING
+                # names the class and the traceback goes to DEBUG, as admin-unlock logs a refusal.
+                log = logging.getLogger(__name__)
+                log.warning(
+                    "admin-set-notify-email: the store refused the audit row for %r (%s)",
+                    user.username,
+                    type(exc).__name__,
+                )
+                log.debug("admin-set-notify-email: the refusal's traceback", exc_info=exc)
                 left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
-                return ("audit-refused", user.username, f"{_sentence(str(exc))} {left}")
+                # A blank engine refusal falls back to the class, so the text never ends empty.
+                whole = _engine_refusal_text(exc) if _is_engine_refusal(exc) else ""
+                refused = (
+                    f"the store refused the audit row: {whole}"
+                    if whole
+                    else f"the store refused the audit row ({type(exc).__name__})"
+                )
+                return ("audit-refused", user.username, f"{_sentence(refused)} {left}")
             try:
                 await store.set_user_notify_email(user.id, email=address)
             except BaseException as exc:
@@ -11963,8 +12004,8 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         "--username <name> --email <address>` creates one",
         "has-address": f"the account {username!r} already has a notification address; this command "
         "only fills a missing one -- change it from the web console, which notifies the old address",
-        "audit-refused": f"{extra}. The audit row goes first, and the store refused it, so the "
-        "address is not set. If the engine is running, stop it and re-run",
+        "audit-refused": f"{extra}. The audit row goes first, so the address is not set. If the "
+        "engine is running, stop it and re-run",
         "write-failed": f"the audit row for {username!r} was written, but setting the address "
         f"failed ({extra}); the address is NOT set. Stop the engine and re-run",
     }
@@ -12267,7 +12308,9 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                 )
             return _ResetTarget(user.id, user.username, user.totp_enrolled_at, pin.digest)
         finally:
-            await store.close()
+            # A close that fails warns and never replaces the check's result (vault BACKLOG #5067
+            # added item C), as admin-unlock closes.
+            await _close_store_quietly(store)
 
     try:
         checked = run_guarded(check())
@@ -15722,7 +15765,8 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
 async def _close_store_quietly(store: Store) -> None:
     """Close ``store`` once a command has its result, at least ``audit-verify``,
     ``audit-anchor``, ``admin-unlock``, ``cipher-audit``, ``store attest-transit-bound``,
-    ``store withdraw-transit-bound``, ``provision-admin`` and ``admin-set-notify-email``. A close that fails prints a warning naming its
+    ``store withdraw-transit-bound``, ``provision-admin``, ``admin-set-notify-email`` and
+    ``admin-reset-totp``'s pre-write check. A close that fails prints a warning naming its
     class, and never replaces that result (vault BACKLOG #3054; BACKLOG #2337)."""
     try:
         await store.close()
