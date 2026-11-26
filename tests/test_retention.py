@@ -1781,6 +1781,137 @@ async def test_a_loop_that_outlived_its_stop_is_not_released_by_a_later_one(
         await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
 
 
+async def test_a_pass_that_absorbed_its_cancel_starts_no_further_phase(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: a stop cut by its timeout returns while the pass runs on. A pass whose store
+    call swallowed the cancel must not go on to start the phases after it once the stop may have
+    returned and the store may be closing."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    later: list[str] = []
+
+    async def absorbs_the_cancel(*_a: object, **_k: object) -> int:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()
+        return 0
+
+    async def records(*_a: object, **_k: object) -> int:
+        later.append("connection_events")
+        return 0
+
+    monkeypatch.setattr(store, "purge_state", absorbs_the_cancel)
+    monkeypatch.setattr(store, "purge_connection_events", records)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(
+            messages_days=1, state_max_age_days=1, connection_event_retention_hours=1
+        ),
+        clock=lambda: 10 * DAY,
+    )
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        await runner.stop(timeout=0.1)
+        release.set()
+        await asyncio.wait({loop_task}, timeout=5)
+        assert later == []
+        assert loop_task.done()
+    finally:
+        release.set()
+        loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+    details = await _retention_audit_details(store)
+    assert [(d["interrupted"], d["messages_purged"]) for d in details] == [(True, 1)]
+
+
+async def test_a_stop_that_cannot_wait_out_an_earlier_stop_says_so(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6526: stop, start, stop. The second stop waits for the first only within its own
+    timeout; when it returns with the first still under way, it says the pass may still run."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    monkeypatch.setattr(store, "purge_state", _hang_on_entry(entered, release))
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    old_loop = runner._task
+    assert old_loop is not None
+    await asyncio.wait_for(entered.wait(), 10)
+    first = asyncio.create_task(runner.stop(timeout=5.0))
+    await asyncio.sleep(0)
+    assert runner._task is None  # the first stop has taken the old loop
+    runner.start()
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+            await runner.stop(timeout=0.1)
+        assert not first.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(first, 10)
+        await asyncio.wait({old_loop}, timeout=10)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert [
+        m
+        for m in messages
+        if "joined a stop already under way" in m and "may still be running" in m
+    ], messages
+
+
+async def test_run_once_after_a_cut_stop_waits_for_its_interrupted_row(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: a stop cut by its timeout leaves its own loop told to stop. A pass that
+    run_once() runs outside that loop is not that loop's, so it waits for its own row."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    monkeypatch.setattr(store, "purge_state", _hang_on_entry(entered, release))
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    written: list[str] = []
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        await runner.stop(timeout=0.1)
+        await _delivered(store, now=0.0, control="CID-AGAIN")
+        real_record = store.record_audit
+
+        async def slow_record(*a: Any, **k: Any) -> None:
+            await asyncio.sleep(0.05)
+            await real_record(*a, **k)
+            written.append("row")
+
+        async def state_purge_fails(*_a: object, **_k: object) -> int:
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(store, "purge_state", state_purge_fails)
+        monkeypatch.setattr(store, "record_audit", slow_record)
+        with pytest.raises(sqlite3.OperationalError):
+            await runner.run_once()
+        assert written == ["row"]
+    finally:
+        release.set()
+        await asyncio.wait({loop_task}, timeout=10)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+
 @pytest.mark.parametrize(
     ("settings", "method"),
     [

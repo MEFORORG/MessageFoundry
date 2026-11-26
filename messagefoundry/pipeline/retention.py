@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import functools
 import json
 import logging
@@ -606,6 +607,28 @@ def _thread_until_cancelled[R](
     return run()
 
 
+# The stop signal of the loop running the current pass, which `_run` sets in its own task's
+# context (BACKLOG #6526). A pass that run_once() runs outside the loop has none: no stop() ends it,
+# and it always waits for its own interrupted row.
+_LOOP_STOP: contextvars.ContextVar[asyncio.Event | None] = contextvars.ContextVar(
+    "retention_loop_stop", default=None
+)
+
+
+def _loop_stopped() -> bool:
+    """Whether the loop running this pass has been told to stop."""
+    stop = _LOOP_STOP.get()
+    return stop is not None and stop.is_set()
+
+
+def _raise_if_stopped() -> None:
+    """Re-deliver a stop to a pass that absorbed its cancellation (a store call that swallowed
+    it, say), so it starts no further phase once :meth:`RetentionRunner.stop` may have returned
+    and the store may be closing (BACKLOG #6526)."""
+    if _loop_stopped():
+        raise asyncio.CancelledError
+
+
 def _log_joined_stop_cut(bound: float, *, cancelled: bool) -> None:
     """Log that a stop() call which joined a stop already under way returned within its own bound
     with that stop unfinished (BACKLOG #6526)."""
@@ -713,8 +736,8 @@ class RetentionRunner:
         # Audit row writes in flight, each its own task so a cancellation cannot abort one; stop()
         # waits for them, bounded (BACKLOG #6526).
         self._audit_tasks: set[asyncio.Task[None]] = set()
-        # The stop in progress, shared by concurrent stop() calls so a second one cannot return
-        # before the first's interrupted audit row exists (BACKLOG #6526).
+        # The stop in progress, shared by concurrent stop() calls: a second one waits for it,
+        # within its own timeout, rather than taking no loop and returning at once (BACKLOG #6526).
         self._stopping: asyncio.Task[None] | None = None
         # Whether the last check of `enabled` found something to do; the loop logs when it flips.
         self._active = False
@@ -845,8 +868,7 @@ class RetentionRunner:
         stop took the old one stops the new loop as well, and waits for the earlier stop too, within
         its own budget. A cancellation of the caller still waits for the stop, within the same
         bound, before it goes on."""
-        signal = self._stop
-        signal.set()
+        self._stop.set()
         self._wake.set()
         bound = self.stop_timeout_seconds if timeout is None else timeout
         # Taken here, not in the stop's task, so a second call before that task runs cannot take
@@ -860,7 +882,7 @@ class RetentionRunner:
         if stopping is None or task is not None:
             # This stop's own task is bounded by `bound`, so its caller waits for it to end.
             stopping = self._stopping = asyncio.create_task(
-                self._stop_and_drain(task, bound, signal, earlier=stopping)
+                self._stop_and_drain(task, bound, earlier=stopping)
             )
         else:
             deadline = loop.time() + bound
@@ -894,7 +916,6 @@ class RetentionRunner:
         self,
         task: asyncio.Task[None] | None,
         timeout: float,
-        signal: asyncio.Event,
         earlier: asyncio.Task[None] | None,
     ) -> None:
         loop = asyncio.get_running_loop()
@@ -909,11 +930,8 @@ class RetentionRunner:
             if earlier is not None:
                 # Within this stop's budget; the earlier stop's outcome is its own callers'.
                 await asyncio.wait({earlier}, timeout=max(0.0, deadline - loop.time()))
-        # A loop that has ended no longer needs the signal, so a later run_once() is a normal pass,
-        # waiting for its own interrupted row (BACKLOG #6526). The signal is replaced, never
-        # cleared: a loop that outlived its stop holds this one, and a start() since has its own.
-        if (task is None or task.done()) and self._stop is signal:
-            self._stop = asyncio.Event()
+                if not earlier.done():
+                    _log_joined_stop_cut(timeout, cancelled=False)
         if task is None:
             return
         if not task.done():
@@ -943,7 +961,8 @@ class RetentionRunner:
     async def _run(self, stop: asyncio.Event) -> None:
         # One isolated pass per interval; an error in a pass is logged and the loop continues (a
         # retention hiccup must never take the engine down). Cooperatively cancellable via `stop`,
-        # the signal this loop was started with.
+        # the signal this loop was started with, which its passes read through `_LOOP_STOP`.
+        _LOOP_STOP.set(stop)
         while not stop.is_set():
             # Cleared here, before this iteration reads `enabled`, so a wake() that landed before
             # this read (say between start() and the first iteration) is answered by this pass and
@@ -1093,7 +1112,7 @@ class RetentionRunner:
             nonlocal archive_saw_demotion
             if not archive_saw_demotion and not self._coordinator.is_leader():
                 archive_saw_demotion = True
-            return archive_saw_demotion or _deadline_hit()
+            return archive_saw_demotion or _loop_stopped() or _deadline_hit()
 
         # The phase now working, so an interrupted pass can name it (S07-44): set as a phase starts
         # its work, after its own checks, and cleared when it ends, so a fault between two phases
@@ -1103,6 +1122,7 @@ class RetentionRunner:
         @contextlib.contextmanager
         def _running(phase: str) -> Iterator[None]:
             nonlocal running_phase
+            _raise_if_stopped()
             running_phase = phase
             yield  # an exception out of the phase leaves it named
             running_phase = None
@@ -1410,10 +1430,10 @@ class RetentionRunner:
         so this await still runs. Written when the pass did work or ended inside a phase that may
         have changed part of its set; a pass that ended in a phase that changes no data, with
         nothing else done, is logged instead, and one ``_SINGLE_TRANSACTION_PHASES`` exempts
-        writes none. The wait is bounded by
-        ``_AUDIT_WRITE_WAIT_SECONDS``, so a store that cannot take the write does not hold up the
-        exception, and is skipped once :meth:`stop` has been called, whose own drain waits for the
-        row within its one budget. A failed write is logged, so ``cause`` is what propagates."""
+        writes none. The wait is bounded by ``_AUDIT_WRITE_WAIT_SECONDS``, so a store that cannot
+        take the write does not hold up the exception, and is skipped once :meth:`stop` has told
+        the loop running the pass to stop, since that stop's own drain waits for the row within
+        its one budget. A failed write is logged, so ``cause`` is what propagates."""
         phase = partial.interrupted_phase
         if not partial.did_work:
             if phase is None:
@@ -1431,7 +1451,7 @@ class RetentionRunner:
             ):
                 return  # rolled back; `cause` goes on to the caller, which logs it
         task = self._start_audit(partial)
-        if self._stop.is_set():
+        if _loop_stopped():
             return
         try:
             done, _pending = await asyncio.wait({task}, timeout=_AUDIT_WRITE_WAIT_SECONDS)
@@ -1459,7 +1479,7 @@ class RetentionRunner:
         writes it as :meth:`run_once` does."""
         pass_cap = _PassCap(self._monotonic, self._settings.max_pass_seconds)
         deleted = compressed = reclaimed = 0
-        running_phase = "app_log_sweep"
+        running_phase: str | None = "app_log_sweep"
 
         def _tally(*, interrupted: bool = False) -> RetentionPass:
             return RetentionPass(
@@ -1483,6 +1503,8 @@ class RetentionRunner:
 
         try:
             deleted = await self._sweep_app_log_phase(now, pass_cap.hit)
+            running_phase = None
+            _raise_if_stopped()
             running_phase = "app_log_compress"
             compressed, reclaimed = await self._compress_app_log_phase(now, pass_cap.hit)
         except (Exception, asyncio.CancelledError) as exc:
