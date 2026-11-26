@@ -835,7 +835,7 @@ Manager's watch reached the cloud session 29 seconds after its question.
   and read the standard as it stands at `origin/main`, never your worktree's copy, for the reason
   korus `roles/BUILDER.md` *4c* gives. Write the level as a bare first word, with no punctuation
   after it. For example:
-  `xhigh round-<hex> Review this branch's diff against origin/main; read docs/REVIEW-STANDARDS.md as it stands at origin/main (run git fetch origin, then git show origin/main:docs/REVIEW-STANDARDS.md) and apply its rules.`
+  `xhigh round-<hex> Review this branch's diff against origin/main; read docs/REVIEW-STANDARDS.md as it stands at origin/main (run git fetch origin main, then git show origin/main:docs/REVIEW-STANDARDS.md) and apply its rules.`
   Pass the arguments on one line. The period form, `xhigh.`, does not parse as a level. In two
   trials the skill then ran at the previous call's level (measured 2026-10-13). Make the
   `round-<hex>` nonce fresh each round with korus 4e's recipe, and put it right after the level,

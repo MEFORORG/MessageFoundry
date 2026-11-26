@@ -18,7 +18,7 @@ CLAUDE_MD = Path(__file__).resolve().parents[1] / "CLAUDE.md"
 # The instruction sentence the example must carry, verbatim, ending the argument.
 _INSTRUCTION = re.compile(
     r"; read docs/REVIEW-STANDARDS\.md as it stands at origin/main "
-    r"\(run git fetch origin, then git show origin/main:docs/REVIEW-STANDARDS\.md\) "
+    r"\(run git fetch origin main, then git show origin/main:docs/REVIEW-STANDARDS\.md\) "
     r"and apply its rules\.$"
 )
 
@@ -37,6 +37,12 @@ _NO_FETCH = (
     "xhigh round-<hex> Review this branch's diff against origin/main; "
     "read docs/REVIEW-STANDARDS.md as it stands at origin/main "
     "(git show origin/main:docs/REVIEW-STANDARDS.md) and apply its rules."
+)
+# A bare fetch updates every remote-tracking ref, which disarms a later --force-with-lease.
+_BARE_FETCH = (
+    "xhigh round-<hex> Review this branch's diff against origin/main; "
+    "read docs/REVIEW-STANDARDS.md as it stands at origin/main "
+    "(run git fetch origin, then git show origin/main:docs/REVIEW-STANDARDS.md) and apply its rules."
 )
 
 
@@ -58,10 +64,10 @@ def test_the_example_reads_the_standard_from_origin_main() -> None:
         assert _reads_standard_from_main(example), example
 
 
-def test_the_check_rejects_the_worktree_copy_a_mention_and_a_missing_fetch() -> None:
+def test_the_check_rejects_the_worktree_copy_a_mention_and_a_missing_or_bare_fetch() -> None:
     """Positive controls: each wrong form must be found as an example and then fail the check."""
     other_level = "high Review this diff; read docs/REVIEW-STANDARDS.md and apply its rules."
-    for wrong in (_OLD_EXAMPLE, _MENTION_ONLY, _NO_FETCH, other_level):
+    for wrong in (_OLD_EXAMPLE, _MENTION_ONLY, _NO_FETCH, _BARE_FETCH, other_level):
         examples = _example_arguments(f"`{wrong}`")
         assert examples == [wrong]
         assert not _reads_standard_from_main(examples[0]), wrong
