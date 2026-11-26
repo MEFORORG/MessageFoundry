@@ -2979,25 +2979,27 @@ before a worker took it, or cancelled or failed before it began, runs on the eve
 with a WARNING in the engine log, so that hop does not fail; a bad config is still refused. The
 refused-executor hop list follows (BACKLOG #5755). These hops fall back too, except that each runs
 on a thread of its own rather than on the loop: some trust-anchor reads (at least a lane's anchor
-check, the settings preflight, and the registry anchor preflight where no key-file check runs
-ahead of it, though under `serve` one does), a reload's target check, its content snapshot and
+check, the settings preflight, and the registry anchor preflight, which a pool broken from the
+start of a reload does not reach under `serve`, where the key-file check runs first), a reload's target check, its content snapshot and
 its reload snapshot of the config directory, its approval check, a DICOM listener's start and
 stop, and the sandbox session closes. Only when no thread can be started does it run on the event
 loop, which then blocks while it runs: an anchor read on a stalled share for as long as the read
 takes, and a DICOM stop or a sandbox close for as long as it runs, which includes waiting out an
 in-flight C-STORE or brokered lookup whose own wait on the loop then times out and fails it. A
+C-STORE failed that way can still be committed once the loop is free, because the commit it waited
+on was already scheduled, so a re-send by the sender then makes a duplicate. A
 DICOM listener's start still fails there, because it starts its accept loop on a thread of its
 own. Work still queued behind a busy or hung pool waits for it and is not run on the loop. Other
 worker-thread hops have no such fallback, at least the config load, which runs author code, the
 environment value read, the bundle fingerprint, which also reads the config directory, the
 connection key-file check that `serve` runs as the first registry preflight
-(`config/key_file_access.py`), and a connector's own startup check, such as a remote-file listing.
-So a pool that stays broken still fails an operator reload at the first of these it meets. Under
-`serve` it also fails a DR activation before its reload: the activation's registry preflight runs
-the key-file check first, so the activation aborts with nothing applied, and is rolled back as a
-refused preflight is. Where no key-file check is wired, the activation's reload instead records an
-outbound lane leaving the park whose startup check meets one as failed, and goes on, but an
-inbound whose start meets one still fails the activation. Nor does a rollback on such a pool bring
+(`config/key_file_access.py`), a DR activation's cold-seed restore-verify
+(`pipeline/dr_backup.py`), and a connector's own startup check, such as a remote-file listing.
+Outside a reload, at least the SMTP alert CA check at serve start and the SQL Server store's
+certificate pin checks at store open have no fallback either. So a pool that stays broken still
+fails an operator reload at the first of these it meets. It also fails a DR activation before any
+VIP step, preflight or reload runs: at the latest the activation's first step, the cold-seed
+restore-verify, aborts it with a `dr_activation_aborted` row for the `seed` step. Nor does a rollback on such a pool bring
 every inbound back. It restarts, one at a time, the inbounds that were listening when the runner
 took its reload lock, which is after the engine has loaded and checked the new config, so an
 inbound stopped or started in between is not put back as it was when the reload was asked for. One
