@@ -674,23 +674,27 @@ Everything `_passkey_held` awaits runs under one catch: at least the set read wi
 re-load and seal-failure report it can make, and the account-row check made when the set does not
 hold the passkey. The catch never refuses the classes in `AUDIT_WRITE_DEFECTS`
 (`messagefoundry/audit_write.py`), at least `NotImplementedError`, `RecursionError` and
-`sqlite3.ProgrammingError`: they raise, after the `reason=read_raised` row the sentences below
-describe is tried. It refuses with `store_error` every other exception in `store_call_errors()` or `store_connect_errors()`
-(`messagefoundry/store/base.py`), logs the account and the exception's type, and audits the
-refusal unless the store refuses that row too. Those sets take at
-least every other `RuntimeError`, `OSError` and `ValueError`, SQLite's `DatabaseError`, asyncpg's
+`sqlite3.ProgrammingError`: they raise, and all of them but `RecursionError` first try the
+`reason=read_raised` row the sentences below describe. It refuses with `store_error` every other
+exception in `store_call_errors()` or `store_connect_errors()` (`messagefoundry/store/base.py`),
+logs the account and the exception's type, and tries a row auditing the refusal. The store can
+refuse that row too, and at least a defect in `AUDIT_WRITE_DEFECTS`, a class outside
+`audit_write_errors()` or a cancel raised by that write raises in place of the refusal. Those sets
+take at least every other `RuntimeError`, `OSError` and `ValueError`, SQLite's `DatabaseError`, asyncpg's
 roots and pyodbc's `Error` root where those drivers are installed, and `StoreAcquireTimeout`; the
 `RuntimeError` and `ValueError` halves are vault BACKLOG #4728 finding 3, and a closed SQLite
 connection raises `ValueError`. These classes do not tell a store fault from a bug, so a bug that
 raises one of them is refused as `store_error` too. Every other exception that reaches the catch
 raises out of the ceremony, `sqlite3.InterfaceError` among them: it is a `sqlite3.Error` but not a
-`DatabaseError`. Since 2026-11-25 such a raise from this read is first logged by type, and a row
-auditing `auth.webauthn_failed` with `reason=read_raised` is tried (BACKLOG #3775 added item 9),
-because until then it left the attempt with no audit row. At least `sqlite3.InterfaceError`, `CipherError`
+`DatabaseError`. Since 2026-11-25 such a raise from this read, other than a `MemoryError` or a
+`RecursionError`, is first logged by type, and a row auditing `auth.webauthn_failed` with
+`reason=read_raised` is tried (BACKLOG #3775 added item 9), because until then it left the attempt
+with no audit row. At least `sqlite3.InterfaceError`, `CipherError`
 and the `AUDIT_WRITE_DEFECTS` classes other than `RecursionError` take that path; a
 `MemoryError`, a `RecursionError` and a cancel from the read write no row. That row is soft: a
-store that refuses it, or whose audit write raises another `Exception`, can leave no row, and
-the read's exception raises, but at least a `MemoryError`, a `RecursionError` or a cancel during the
+store that refuses it, or whose audit write raises an `Exception` other than a `MemoryError` or
+a `RecursionError`, can leave no row, and the read's exception raises, but at least a
+`MemoryError`, a `RecursionError` or a cancel during the
 write raises in its place. `AuthService._passkey_standing`'s docstring is the source of record. The session, account and lock re-read, which since 2026-11-05 follows that set read
 rather than preceding it (BACKLOG #3068), is outside this catch, so an exception there raises.
 
