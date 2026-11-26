@@ -849,6 +849,40 @@ def test_isa_followed_by_a_run_of_one_character_is_not_fixed_width(run: str) -> 
     assert wire == reply.encode("ascii", errors="replace")
 
 
+@pytest.mark.parametrize(
+    ("component", "after"),
+    [
+        ("", "中TA1*000000001*260101*1200*A*000~"),
+        ("", "?TA1*000000001*260101*1200*A*000中~"),
+        (":中", "~TA1*000000001*260101*1200*A*000~"),
+        (":?", "~TA1*000000001*260101*1200*A*000中~"),
+        (":?", "\nTA1*000000001*260101*1200*A*000中\n"),
+        ("", "\r?TA1*000000001*260101*1200*A*000中\r"),
+        (":?", "\n中\n"),
+        ("", "?TA1?000000001?260101?1200?A?000中~"),
+    ],
+    ids=[
+        "empty-unencodable",
+        "empty-q",
+        "two-unencodable",
+        "two-q",
+        "two-lf",
+        "empty-cr",
+        "two-lf-nonascii-next",
+        "empty-term-is-element",
+    ],
+)
+def test_an_isa16_that_is_not_one_character_declares_nothing(component: str, after: str) -> None:
+    """Review of #5799 (R10d): an ISA lined up through ISA15 with an empty or two-character ISA16
+    was read at offsets 104 and 105, which then hold the terminator or the next segment's data, so
+    a data character there read as a delimiter and the reply was refused, where main replaced it
+    and sent it (the X12 listener closes on that refusal). Green on main, red on 8f987a6."""
+    element = "?" if after.startswith("?TA1?") else "*"
+    reply = _isa(element=element, component=component, term="") + after
+    wire = framing_mod.encode_reply(reply, "ascii", connection="IB_X12_ISA16_WIDTH")
+    assert wire == reply.encode("ascii", errors="replace")
+
+
 def test_an_lf_inside_a_field_of_a_cr_reply_is_data_not_a_header() -> None:
     """Round-2 review: lines were split at LF too, so ``MSH`` after an LF inside a field was read
     as a header and its characters as delimiters, and a reply main replaced and sent was refused.

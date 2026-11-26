@@ -10,6 +10,7 @@
   the first `ISA`, and an HL7 v2.7 truncation character declared as `?`. An `ISA` that is not
   fixed-width declares nothing, as before, so it is refused neither where `?` is one of its
   delimiters nor where a delimiter is a character the charset cannot encode; at least these are
-  not fixed-width: one with unpadded elements, one cut short, and one whose element separator also
+  not fixed-width: one with unpadded elements, one cut short, one whose ISA16 does not read as one
+  character followed by its segment terminator, and one whose element separator also
   appears before ISA16 away from its separator offsets, such as in an ISA06 of `AC*MER`, in ISA11
   or in the `ISA` tag. (`BACKLOG #5799`)
