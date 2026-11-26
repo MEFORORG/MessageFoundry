@@ -14,6 +14,7 @@ call, so this module asks for it back.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import sys
@@ -214,11 +215,71 @@ def test_posix_refuses_a_module_linked_into_a_group_writable_folder(
     assert str(target.resolve().parent) in str(excinfo.value)
 
 
+def _link_module_through_a_link(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """``cfg/cfg.py`` -> ``mid/cfg.py`` -> ``shared/cfg.py``: a link to a link. Returns the
+    config directory, the folder holding the link in between, and the real module."""
+    cfg, mid = tmp_path / "cfg", tmp_path / "mid"
+    target = _link_module_into(cfg, tmp_path / "shared")
+    mid.mkdir()
+    (cfg / "cfg.py").unlink()
+    try:
+        (mid / "cfg.py").symlink_to(target)
+        (cfg / "cfg.py").symlink_to(mid / "cfg.py")
+    except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
+        pytest.skip(f"cannot create a symlink here: {exc}")
+    return cfg, mid, target
+
+
+def test_a_link_to_a_link_lists_the_folder_holding_the_link_in_between(tmp_path: Path) -> None:
+    """Whoever can write ``mid`` can re-point the link in between, so it is vetted (vault BACKLOG
+    #2596, step 4: the full link walk). A resolve() of the member skipped it."""
+    cfg, mid, target = _link_module_through_a_link(tmp_path)
+    listed = config_source_trust_paths(cfg)
+    assert mid.resolve() in listed
+    assert target.resolve() in listed and target.resolve().parent in listed
+    if sys.platform == "win32":  # GetNamedSecurityInfoW reads a link's own list there
+        assert mid.resolve() / "cfg.py" in listed
+
+
+def test_windows_refuses_a_module_whose_link_in_between_sits_in_a_writable_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_windows_readers: FakeReaders
+) -> None:
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    cfg, mid, _target = _link_module_through_a_link(tmp_path)
+    writable = mid.resolve()
+    fake_windows_readers(lambda path: path == writable)
+    with pytest.raises(WiringError, match="writable-by-others path") as excinfo:
+        load_config(cfg)
+    assert str(writable) in str(excinfo.value)
+
+
+def test_a_member_link_the_walk_cannot_follow_refuses_the_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_windows_readers: FakeReaders
+) -> None:
+    """A layout the link walk refuses, here one it cannot stat, refuses the load, and the dev/test
+    escape does not downgrade it: nothing past that link was vetted."""
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    cfg, _mid, _target = _link_module_through_a_link(tmp_path)
+    fake_windows_readers(lambda _path: False)
+
+    def unwalkable(path: Path) -> tuple[list[Path], Path | None]:
+        raise OSError(errno.EIO, "synthetic: a name in the path could not be read")
+
+    monkeypatch.setattr(wiring, "_link_chain", unwalkable)
+    with pytest.raises(WiringError, match="could not be walked"):
+        load_config(cfg)
+
+
 def test_a_linked_config_directory_lists_the_real_directory(tmp_path: Path) -> None:
-    real = tmp_path / "real"
-    real.mkdir()
+    """The real directory, and the folder holding the link to it, whose writer could re-point the
+    link (vault BACKLOG #2596 step 4: the full link walk). The folder holding the real directory is
+    not added, as the folders above the config directory are not."""
+    real = tmp_path / "elsewhere" / "real"
+    real.mkdir(parents=True)
     (real / "cfg.py").write_text("", encoding="utf-8")
-    link = tmp_path / "cfg"
+    home = tmp_path / "home"
+    home.mkdir()
+    link = home / "cfg"
     try:
         link.symlink_to(real, target_is_directory=True)
     except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
@@ -226,7 +287,7 @@ def test_a_linked_config_directory_lists_the_real_directory(tmp_path: Path) -> N
     listed = config_source_trust_paths(link)
     assert listed[0] == link
     assert real.resolve() in listed
-    # A folder's own parent is not added, as the folders above the config directory are not.
+    assert home.resolve() in listed
     assert real.resolve().parent not in listed
 
 

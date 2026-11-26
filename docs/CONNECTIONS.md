@@ -170,8 +170,17 @@ transport = "mllp"
   infinity, and text that reads as zero but is not zero in plain digits, such as `"1e-400"` or `"0e0"`. A TOML
   literal `1e-400` in a value file is parsed to `0.0` first, so it reads as zero. A code-first
   `env()` with `cast=int`, `cast=float` or `cast=bool` gets the same strict reading as the named
-  cast. Any other code-first cast runs as given, on the value as it arrives. That includes a
-  builtin such as `abs` and a type such as `decimal.Decimal`. So `cast=lambda v: int(v)` still
+  cast. At least `abs`, `round`, `math.floor`, `math.ceil`, `math.trunc`, `math.fabs` and
+  `operator.index`, and a number type, refuse a bool read from the environment (BACKLOG #1650).
+  A `default=` is neither cast nor checked by that refusal, so `env("p", cast=Decimal,
+  default=True)` with the key unset returns `True`. A number
+  type is `complex`, `decimal.Decimal`, `fractions.Fraction`, or a class whose bases include one
+  of those, `int`, `float` or `numbers.Number`, so a `class Port(int)` you write, or an
+  `enum.IntEnum`, is refused a bool too. Such a class is refused only a bool: any other value
+  is passed to it unchecked, so `class Port(int)` still cuts `2575.9` to 2575. That list is partial: at least `operator.abs`,
+  `operator.neg`, `operator.pos`, `math.sqrt`, `math.isqrt`, `math.factorial` and `math.exp`
+  still read `true` as 1, and so does a type only registered with `numbers.Number`, such as
+  `numpy.int64`. Any other code-first cast runs as given, on the value as it arrives. So `cast=lambda v: int(v)` still
   reads `true` as 1, and the port read takes that as port 1. At least `allowed_mllp`, among the
   host-and-port `[egress]` lists that pin a port,
   compares the port as a number before the connector is built, so the text `"06661"` matches a pin

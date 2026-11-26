@@ -10,7 +10,10 @@ bool cases are red there; the rest are controls the builtin already met."""
 from __future__ import annotations
 
 import math
+import operator
 from decimal import Decimal
+from fractions import Fraction
+from typing import Any
 
 import pytest
 
@@ -75,3 +78,128 @@ def test_a_cast_of_the_authors_own_runs_as_given() -> None:
     """The documented limit: an author's cast is not swapped, so it still reads a TOML ``true``."""
     out = resolve_env_settings({"port": env("p", cast=lambda v: int(v))}, {"p": True})
     assert out["port"] == 1
+
+
+_NUMERIC_BUILTIN_CASTS = [
+    abs,
+    round,
+    Decimal,
+    Fraction,
+    complex,
+    math.floor,
+    math.ceil,
+    math.trunc,
+    math.fabs,
+    operator.index,
+]
+
+
+@pytest.mark.parametrize("cast", _NUMERIC_BUILTIN_CASTS, ids=lambda c: c.__name__)
+@pytest.mark.parametrize("raw", [True, False])
+def test_a_numeric_builtin_cast_refuses_a_bool(cast: Any, raw: bool) -> None:
+    """Each of these read a TOML ``true`` as 1 (``abs(True) == 1``, ``Decimal(True) == 1``), the
+    remainder engine PR 3163 named. A bool is refused before the cast runs, value withheld."""
+    with pytest.raises(WiringError) as ei:
+        resolve_env_settings({"rate": env("acme_rate", cast=cast)}, {"acme_rate": raw})
+    msg = str(ei.value)
+    assert "'rate'" in msg and "'acme_rate'" in msg
+    assert f"not a valid {cast.__name__}" in msg and "value withheld" in msg
+
+
+@pytest.mark.parametrize("cast", _NUMERIC_BUILTIN_CASTS, ids=lambda c: c.__name__)
+def test_a_numeric_builtin_cast_still_reads_a_number(cast: Any) -> None:
+    """The control: the same casts on a number give what the builtin gives."""
+    out = resolve_env_settings({"rate": env("r", cast=cast)}, {"r": 3})
+    assert out["rate"] == cast(3)
+
+
+def test_a_numeric_builtin_cast_keeps_two_refs_equal() -> None:
+    """The guard compares equal per cast, so two references written alike still compare equal."""
+    assert env("r", cast=abs) == env("r", cast=abs)
+    assert EnvRef(key="r", cast=Decimal).cast == env("r", cast=Decimal).cast
+
+
+_EQ_CALLS: list[object] = []
+
+
+class _ComparingMeta(type):
+    """A metaclass whose ``__eq__`` is author code: the numeric-cast test must never run it."""
+
+    def __eq__(cls, other: object) -> bool:
+        _EQ_CALLS.append(other)
+        return False
+
+    __hash__ = type.__hash__
+
+
+class _AuthorCast(metaclass=_ComparingMeta):
+    def __init__(self, raw: object) -> None:
+        self.raw = raw
+
+
+def test_the_numeric_cast_test_runs_no_metaclass_eq() -> None:
+    """The cast is matched against ``bool``, ``int`` and ``float`` by identity, as the docstring
+    says, so an author cast's metaclass ``__eq__`` never runs. A type that is not a number is left
+    as given (vault BACKLOG #1650)."""
+    _EQ_CALLS.clear()
+    ref = env("r", cast=_AuthorCast)
+    assert _EQ_CALLS == []
+    assert ref.cast is _AuthorCast
+
+
+class _UnhashableMeta(type):
+    """A metaclass with ``__eq__`` and no ``__hash__``, so its classes are unhashable."""
+
+    def __eq__(cls, other: object) -> bool:
+        return cls is other
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+class _UnhashableCast(metaclass=_UnhashableMeta):
+    def __init__(self, raw: object) -> None:
+        self.raw = raw
+
+
+def test_an_unhashable_cast_class_still_loads() -> None:
+    """``issubclass(cast, numbers.Number)`` hashed the class into the ABC cache, so ``env()`` raised
+    ``TypeError`` for this cast, which loads on origin/main. The numeric-cast test hashes nothing."""
+    ref = env("r", cast=_UnhashableCast)
+    assert ref.cast is _UnhashableCast
+    out = resolve_env_settings({"x": ref}, {"r": True})
+    assert isinstance(out["x"], _UnhashableCast) and out["x"].raw is True
+
+
+_CLASS_READS: list[object] = []
+
+
+class _ClassPropertyCast:
+    """A callable whose ``__class__`` is an author property, which ``isinstance`` would run."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:
+        _CLASS_READS.append(self)
+        return type
+
+    def __call__(self, raw: object) -> object:
+        return raw
+
+
+def test_the_numeric_cast_test_reads_no_author_class_property() -> None:
+    _CLASS_READS.clear()
+    cast = _ClassPropertyCast()
+    ref = env("r", cast=cast)
+    assert _CLASS_READS == []
+    assert ref.cast is cast
+
+
+class _Port(int):
+    pass
+
+
+def test_a_subclass_of_a_number_type_is_refused_a_bool() -> None:
+    """The documented reading: a class with ``int`` among its bases is refused a bool, as ``int``
+    is, and a number still reads."""
+    with pytest.raises(WiringError, match="value withheld"):
+        resolve_env_settings({"port": env("p", cast=_Port)}, {"p": True})
+    assert resolve_env_settings({"port": env("p", cast=_Port)}, {"p": 2575})["port"] == 2575
