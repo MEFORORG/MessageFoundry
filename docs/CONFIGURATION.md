@@ -3209,7 +3209,7 @@ the next tick):
 - **`[retention]` store purges and VACUUM** — run on the leader only. Retention's host-local
   phases are the exception: a standby runs the `app_log_days` sweep and `app_log_compress_days`
   compression on its own `[logging].log_dir`, and writes the `retention_purge` audit row on the
-  leader's rule, so at least for a pass that deleted or compressed a file (BACKLOG #6526).
+  leader's rule, at least for a pass that deleted or compressed a file (BACKLOG #6526).
 - **the lease-reclaim sweep** — the leader periodically calls `reclaim_expired_leases` (cadence
   `reclaim_interval_seconds`) to recover **crashed** nodes' in-flight rows (only rows whose lease has
   *expired*, never a live sibling's). In clustered mode the engine therefore **skips** the

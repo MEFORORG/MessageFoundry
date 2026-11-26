@@ -16,6 +16,7 @@ import os
 import sqlite3
 import stat
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -1054,6 +1055,17 @@ async def _retention_audit_details(store: MessageStore) -> list[dict[str, Any]]:
     return [json.loads(r["detail"]) for r in await store.list_audit(action="retention_purge")]
 
 
+def _hang_on_entry(entered: asyncio.Event) -> Callable[..., Awaitable[int]]:
+    """A store call that sets ``entered`` and never returns, so a test can stop a pass in it."""
+
+    async def hangs(*_a: object, **_k: object) -> int:
+        entered.set()
+        await asyncio.Event().wait()
+        return 0
+
+    return hangs
+
+
 async def test_a_pass_that_fails_after_a_purge_still_audits_the_purge(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1086,12 +1098,7 @@ async def test_a_pass_stopped_after_a_purge_still_audits_the_purge(
     await _delivered(store, now=0.0)
     entered = asyncio.Event()
 
-    async def state_purge_hangs(*_a: object, **_k: object) -> int:
-        entered.set()
-        await asyncio.Event().wait()
-        return 0
-
-    monkeypatch.setattr(store, "purge_state", state_purge_hangs)
+    monkeypatch.setattr(store, "purge_state", _hang_on_entry(entered))
     runner = RetentionRunner(
         store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
     )
@@ -1267,12 +1274,7 @@ async def test_a_pass_stopped_inside_a_purge_names_the_phase(
     await _delivered(store, now=0.0)
     entered = asyncio.Event()
 
-    async def purge_hangs(*_a: object, **_k: object) -> int:
-        entered.set()
-        await asyncio.Event().wait()
-        return 0
-
-    monkeypatch.setattr(store, "purge_message_bodies", purge_hangs)
+    monkeypatch.setattr(store, "purge_message_bodies", _hang_on_entry(entered))
     runner = RetentionRunner(store, RetentionSettings(messages_days=1), clock=lambda: 10 * DAY)
     runner.start()
     try:
@@ -1334,6 +1336,141 @@ async def test_leadership_lost_during_one_strip_threshold_skips_the_next(
 
     assert calls == [1024]
     assert result.leadership_lost and result.documents_stripped == 1
+
+
+@pytest.mark.parametrize(
+    ("settings", "method", "phase"),
+    [
+        (RetentionSettings(max_db_mb=1), "db_status", "size_check"),
+        (RetentionSettings(vacuum_at="00:00"), "vacuum", "vacuum"),
+    ],
+)
+async def test_a_read_only_phase_that_fails_writes_no_audit_row(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    settings: RetentionSettings,
+    method: str,
+    phase: str,
+) -> None:
+    """BACKLOG #6526: a size check or VACUUM changes no data, so one that keeps failing must not
+    add an interrupted row with zero counts every interval. The failure is logged instead."""
+
+    async def fails(*_a: object, **_k: object) -> object:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(store, method, fails)
+    runner = RetentionRunner(store, settings, clock=lambda: 10 * DAY)
+
+    with (
+        caplog.at_level(logging.WARNING, logger=retention_mod.__name__),
+        pytest.raises(sqlite3.OperationalError),
+    ):
+        await runner.run_once()
+
+    assert await _retention_audit_details(store) == []
+    assert [r for r in caplog.records if f"in its {phase} phase" in r.getMessage()]
+
+
+async def test_stop_bounds_its_wait_for_a_hung_audit_write_to_one_budget(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: on a store that cannot take the audit write, ``stop()`` waits for the
+    interrupted pass's row once, within one budget, not once inside the pass and again in the drain,
+    so engine.stop() stays well inside NSSM's stop timeout."""
+    budget = 0.3
+    monkeypatch.setattr(retention_mod, "_AUDIT_WRITE_WAIT_SECONDS", budget)
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def record_hangs(*_a: object, **_k: object) -> None:
+        await release.wait()
+
+    monkeypatch.setattr(store, "purge_state", _hang_on_entry(entered))
+    monkeypatch.setattr(store, "record_audit", record_hangs)
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        started = time.monotonic()
+        await runner.stop()
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+    assert elapsed < budget * 1.7
+
+
+async def test_a_cancelled_stop_caller_still_drains_the_audit_row(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: a cancellation of the task awaiting ``stop()`` must not skip the wait for an
+    audit row still being written; the drain runs, within its budget, before the cancellation goes
+    on."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_record = store.record_audit
+
+    async def slow_record(*a: Any, **k: Any) -> Any:
+        entered.set()
+        await release.wait()
+        return await real_record(*a, **k)
+
+    monkeypatch.setattr(store, "record_audit", slow_record)
+    runner = RetentionRunner(store, RetentionSettings(messages_days=1), clock=lambda: 10 * DAY)
+    runner.start()
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        stopping = asyncio.create_task(runner.stop())
+        await asyncio.sleep(0)
+        asyncio.get_running_loop().call_later(0.05, release.set)
+        stopping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+        # The row is written by the time the cancellation reaches the caller.
+        assert [d["messages_purged"] for d in await _retention_audit_details(store)] == [1]
+    finally:
+        release.set()
+        await runner.stop()
+
+
+async def test_a_second_concurrent_stop_waits_for_the_interrupted_audit_row(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: two ``stop()`` calls at once share one stop, so the second does not return
+    before the cancelled pass has even started its interrupted audit row."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    written: list[str] = []
+    real_record = store.record_audit
+
+    async def slow_record(*a: Any, **k: Any) -> None:
+        await asyncio.sleep(0.05)
+        await real_record(*a, **k)
+        written.append("row")
+
+    monkeypatch.setattr(store, "purge_state", _hang_on_entry(entered))
+    monkeypatch.setattr(store, "record_audit", slow_record)
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    await asyncio.wait_for(entered.wait(), 10)
+    first = asyncio.create_task(runner.stop())
+    second = asyncio.create_task(runner.stop())
+    try:
+        await second
+        # Read before anything else awaits: the second stop waited for the row to be written.
+        assert written == ["row"]
+    finally:
+        await asyncio.wait_for(first, 10)
+    details = await _retention_audit_details(store)
+    assert [d["interrupted"] for d in details] == [True]
 
 
 async def test_run_once_no_work_writes_no_audit(store: MessageStore) -> None:

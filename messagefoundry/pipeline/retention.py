@@ -67,10 +67,15 @@ __all__ = [
 log = logging.getLogger(__name__)
 
 _SECONDS_PER_DAY = 86_400
-# How long a pass that ended partway, and stop(), wait for a retention_purge audit row still being
-# written (BACKLOG #6526). Shutdown must not hang on a store that cannot take the write; a row
-# still unwritten after this is logged at ERROR.
+# How long a pass that ended partway waits for a retention_purge audit row still being written, and
+# the one budget stop() spends in all on the loop's exit and those rows (BACKLOG #6526). Shutdown
+# must not hang on a store that cannot take the write, and engine.stop() must stay well inside
+# NSSM's stop timeout; a row still unwritten after this is logged at ERROR.
 _AUDIT_WRITE_WAIT_SECONDS = 5.0
+# Phases that change no data. A pass that ends in one of these with nothing else done writes no
+# interrupted audit row (BACKLOG #6526): one failing every interval would otherwise add a row of
+# zeros each time. Any phase not named here is treated as one that may have changed data.
+_PHASES_THAT_CHANGE_NO_DATA = frozenset({"wal_checkpoint", "vacuum", "size_check"})
 _BYTES_PER_MB = 1_000_000
 #: The low-disk floor (`min_free_disk_mb`, BACKLOG #290) counts in MiB, not the decimal MB that
 #: `max_db_mb` uses, so its 1024 default is exactly the 1 GiB the DR-backup preflight already treats
@@ -586,6 +591,13 @@ def _thread_until_cancelled[R](
     return run()
 
 
+def _retrieve_logged_result(task: asyncio.Task[None]) -> None:
+    """Mark an audit task's failure retrieved: ``_audit_logged`` has already logged it, and a
+    writer that stopped waiting would otherwise leave asyncio to report it as never retrieved."""
+    if not task.cancelled():
+        task.exception()
+
+
 class _PassCap:
     """The #121 between-phase duration cap of one pass. :meth:`hit` reads the monotonic clock and
     LATCHES :attr:`capped` the first time the elapsed pass time reaches ``cap``; ``cap <= 0`` never
@@ -672,6 +684,9 @@ class RetentionRunner:
         # Audit row writes in flight, each its own task so a cancellation cannot abort one; stop()
         # waits for them, bounded (BACKLOG #6526).
         self._audit_tasks: set[asyncio.Task[None]] = set()
+        # The stop in progress, shared by concurrent stop() calls so a second one cannot return
+        # before the first's interrupted audit row exists (BACKLOG #6526).
+        self._stopping: asyncio.Task[None] | None = None
         # Whether the last check of `enabled` found something to do; the loop logs when it flips.
         self._active = False
         # Maintenance cadence state (loop-driven; only read/written on the single task). The WAL
@@ -783,29 +798,52 @@ class RetentionRunner:
             self._wake.set()
 
     async def stop(self) -> None:
-        """Signal the loop and await its exit (idempotent)."""
+        """Signal the loop, await its exit, and wait for audit rows still being written
+        (idempotent).
+
+        The loop's exit and those rows share one ``_AUDIT_WRITE_WAIT_SECONDS`` budget, so a store
+        that cannot take the write does not hold up shutdown (BACKLOG #6526). Concurrent calls share
+        one stop, so none returns before the cancelled pass's audit row has been started. A
+        cancellation of the caller still waits for that stop, which is bounded, before it goes on."""
         self._stop.set()
         self._wake.set()
+        stopping = self._stopping
+        if stopping is None or stopping.done():
+            stopping = self._stopping = asyncio.create_task(self._stop_and_drain())
+        try:
+            await asyncio.shield(stopping)
+        except asyncio.CancelledError:
+            await asyncio.wait({stopping})
+            raise
+
+    async def _stop_and_drain(self) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _AUDIT_WRITE_WAIT_SECONDS
         task = self._task
         self._task = None
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                # The loop's own cancellation ends here; one aimed at the caller of stop() goes on.
-                current = asyncio.current_task()
-                if current is not None and current.cancelling():
-                    raise
-        await self._drain_audits()
+        try:
+            if task is not None:
+                task.cancel()
+                await asyncio.wait({task}, timeout=_AUDIT_WRITE_WAIT_SECONDS)
+        finally:
+            # In a finally so a cancellation of this stop still tries the drain.
+            await self._drain_audits(max(0.0, deadline - loop.time()))
+        if task is None:
+            return
+        if not task.done():
+            log.error(
+                "retention: the loop had not ended %gs after stop(); a pass it was running may "
+                "write its audit row later or not at all",
+                _AUDIT_WRITE_WAIT_SECONDS,
+            )
+        elif not task.cancelled():
+            task.result()  # a loop that failed raises to the caller of stop(), as before
 
-    async def _drain_audits(self) -> None:
-        """Wait, bounded, for audit rows still being written (BACKLOG #6526)."""
+    async def _drain_audits(self, timeout: float) -> None:
+        """Wait up to ``timeout`` for audit rows still being written (BACKLOG #6526)."""
         if not self._audit_tasks:
             return
-        _done, pending = await asyncio.wait(
-            set(self._audit_tasks), timeout=_AUDIT_WRITE_WAIT_SECONDS
-        )
+        _done, pending = await asyncio.wait(set(self._audit_tasks), timeout=timeout)
         if pending:
             log.error(
                 "retention: %d retention_purge audit row write(s) had not finished %gs after "
@@ -893,9 +931,10 @@ class RetentionRunner:
         (``stop()``) partway writes its audit row for the phases that finished, marked
         ``interrupted``, before the exception goes on (BACKLOG #6526, S07-44). A pass that ends inside
         a phase that changes its set in steps writes the row even with nothing else done, naming that
-        phase in ``interrupted_phase``, since its count is lost. The audit writes are shielded from a
-        further cancellation. A row can still be missing at least when the audit write itself fails
-        (the same store fault that ended the pass, say), when it is still unfinished
+        phase in ``interrupted_phase``, since its count is lost, unless that phase changes no data
+        (``_PHASES_THAT_CHANGE_NO_DATA``), which is logged instead. The audit writes are shielded
+        from a further cancellation. A row can still be missing at least when the audit write itself
+        fails (the same store fault that ended the pass, say), when it is still unfinished
         ``_AUDIT_WRITE_WAIT_SECONDS`` after the pass ends or :meth:`stop` is called (both logged at
         ERROR), or when the process dies first.
 
@@ -1232,6 +1271,7 @@ class RetentionRunner:
         task = asyncio.create_task(self._audit_logged(result))
         self._audit_tasks.add(task)
         task.add_done_callback(self._audit_tasks.discard)
+        task.add_done_callback(_retrieve_logged_result)
         return task
 
     async def _audit_logged(self, result: RetentionPass) -> None:
@@ -1250,12 +1290,24 @@ class RetentionRunner:
     async def _audit_interrupted(self, partial: RetentionPass, cause: BaseException) -> None:
         """Write the row for a pass that ended partway (S07-44), before its exception goes on. A
         cancellation was delivered once, so this await still runs. Written when the pass did work
-        or ended inside a phase, which may have changed part of its set. The wait is bounded by
+        or ended inside a phase that may have changed part of its set; a pass that ended in a phase
+        that changes no data, with nothing else done, is logged instead. The wait is bounded by
         ``_AUDIT_WRITE_WAIT_SECONDS``, so a store that cannot take the write does not hold up the
-        exception; a failed write is logged, so ``cause`` is what propagates."""
-        if not (partial.did_work or partial.interrupted_phase is not None):
+        exception, and is skipped once :meth:`stop` has been called, whose own drain waits for the
+        row within its one budget. A failed write is logged, so ``cause`` is what propagates."""
+        phase = partial.interrupted_phase
+        if not partial.did_work and (phase is None or phase in _PHASES_THAT_CHANGE_NO_DATA):
+            if phase is not None:
+                log.warning(
+                    "retention: a pass ended in its %s phase, which changes no data, with nothing "
+                    "else done (%s); no audit row written",
+                    phase,
+                    safe_exc(cause),
+                )
             return
         task = self._start_audit(partial)
+        if self._stop.is_set():
+            return
         try:
             done, _pending = await asyncio.wait({task}, timeout=_AUDIT_WRITE_WAIT_SECONDS)
         except asyncio.CancelledError:
@@ -1273,8 +1325,6 @@ class RetentionRunner:
                 "%gs; it may land later or not at all",
                 _AUDIT_WRITE_WAIT_SECONDS,
             )
-        elif not task.cancelled():
-            task.exception()  # already logged by _audit_logged
 
     async def _standby_pass(self, now: float, below_disk_floor: bool) -> RetentionPass:
         """A cluster standby's pass (BACKLOG #6526, S07-46): only the app-log sweep and compression,
