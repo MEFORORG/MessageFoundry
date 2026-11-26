@@ -1015,6 +1015,158 @@ def test_a_per_site_text_adds_no_deny_for_data(command: str) -> None:
     assert_allowed(run_guard(bash(command)))
 
 
+# BACKLOG #5607: A SUBSTITUTION IN THE BODY OF A HEREDOC WHOSE DELIMITER IS UNQUOTED RUNS. Bash
+# expands `$(...)` and backticks in such a body, so each of these walks runs; every view before the
+# heredoc pass blanked the body as data, and each row was allowed on origin/main.
+HEREDOC_SUBSTITUTION_DENY = [
+    pytest.param("cat <<EOF\n$(find /proc)\nEOF", id="dollar-paren-in-a-bare-body"),
+    pytest.param("cat <<EOF\nmsg `grep -r x /`\nEOF", id="backtick-in-a-bare-body"),
+    pytest.param("cat <<-EOF\n\t$(find / -name x)\n\tEOF", id="dash-heredoc-with-tabs"),
+    pytest.param(
+        'git commit -F - <<EOF\nsee "$(find /proc)"\nEOF', id="double-quotes-in-a-bare-body"
+    ),
+    pytest.param('echo "$(cat <<EOF\nsee $(find /proc)\nEOF\n)"', id="bare-body-in-a-quoted-sub"),
+    pytest.param("cat <<EOF\nnested $(echo $(find /proc))\nEOF", id="nested-in-a-bare-body"),
+    pytest.param("cat <<EOF > f\n$((find /proc) )\nEOF", id="subshell-site-in-a-bare-body"),
+    pytest.param("cat <<EOF\nnever closed $(find /proc)", id="unterminated-bare-body"),
+    # Each allowed by the first cut of this pass: a quoted or backticked `)`, and a case pattern's
+    # `)`, ended the substitution early; only a line's first opener was read; a body ended at an
+    # indented copy of its delimiter; and deep nesting spent the budget before a later walk.
+    pytest.param('cat <<EOF\n$(echo ")"; find /proc)\nEOF', id="double-quoted-paren"),
+    pytest.param("cat <<EOF\n$(echo ')'; find /proc)\nEOF", id="single-quoted-paren"),
+    pytest.param("cat <<EOF\n$(case x in x) find /proc;; esac)\nEOF", id="case-pattern-paren"),
+    pytest.param("cat <<EOF\n$(echo `echo )`; find /proc)\nEOF", id="backticked-paren"),
+    pytest.param("cat <<'A' <<B\nx\nA\nit's $(find /proc)\nB", id="second-opener-on-a-line"),
+    pytest.param("cat <<EOF\n  EOF\nit's $(find /proc)\nEOF", id="indented-delimiter-copy"),
+    pytest.param(
+        "cat <<EOF\n" + "$(" * 300 + "echo" + ")" * 300 + " $(find /proc)\nEOF",
+        id="walk-after-deep-nesting",
+    ),
+    # Each allowed by the second cut: openers were read off the raw text by a pattern that needed
+    # a space before `<<`, so a glued, a `-` or a fd-prefixed opener, a second opener glued to the
+    # first, and a heredoc opened inside a substitution were missed; a backslash-newline between
+    # `$` and `(` was not joined.
+    pytest.param("cat<<EOF\nit's $(find /proc)\nEOF", id="glued-opener"),
+    pytest.param("git commit -F -<<EOF\nDon't break `grep -r x /`\nEOF", id="dash-glued-opener"),
+    pytest.param("cat 0<<EOF\nit's $(find /proc)\nEOF", id="fd-prefixed-opener"),
+    pytest.param("cat <<A<<B\nx\nA\nit's $(find /proc)\nB", id="two-glued-openers"),
+    pytest.param("cat <<EOF\n$(cat <<X\n$(find /proc)\nX\n)\nEOF", id="heredoc-in-a-sub"),
+    pytest.param("cat <<EOF\n$\\\n(find /proc)\nEOF", id="backslash-newline-joined"),
+    # Bash joins a backslash-newline before it compares the delimiter, so the raw `EOF` line after
+    # `x\` is still body and the walk after it runs; the pass had ended the body there.
+    pytest.param("cat <<EOF\nx\\\nEOF\nit's $(find /proc)\nEOF", id="delimiter-after-continuation"),
+    pytest.param(
+        "cat <<-EOF\n\tx\\\n\tEOF\nit's $(find /proc)\n\tEOF",
+        id="dash-delimiter-after-continuation",
+    ),
+    # A delimiter bash joins (`E\` then `OF`) ends the body in bash, but not as written, which is
+    # how the other views compare it; the pass reads on, so its later lines are judged as body.
+    pytest.param("cat <<EOF\nE\\\nOF\necho $(find /proc)", id="joined-delimiter"),
+    pytest.param("cat <<EOF\nE\\\nOF\necho `find /proc`", id="joined-delimiter-backtick"),
+    pytest.param("cat <<EOF\nEOF\\\n\necho $(find /proc)", id="delimiter-joined-to-empty"),
+    pytest.param("cat <<-EOF\n\tE\\\nOF\necho $(find /proc)", id="dash-joined-delimiter"),
+    pytest.param(
+        "echo 'hi'\ncat <<EOF\nE\\\nOF\ncat <<B\n$(find /proc)\nB", id="joined-delimiter-quoted"
+    ),
+    # The views end the first body at the raw `EOF` after `x\`, so they read `<<B` as an opener and
+    # blank the walk as B's body; bash reads the walk as a command. The pass must read the lines
+    # after that `EOF` as the views do too, or nothing reads the substitution.
+    pytest.param(
+        "cat <<EOF\nx\\\nEOF\ncat <<B\nEOF\n$(find /proc)\nB", id="views-end-at-raw-delimiter"
+    ),
+    pytest.param(
+        "cat <<-EOF\n\tx\\\n\tEOF\ncat <<-B\n\tEOF\n$(find /proc)\n\tB",
+        id="dash-views-end-at-raw-delimiter",
+    ),
+    pytest.param(
+        'echo "$(cat <<EOF\nx\\\nEOF\ncat <<B\nEOF\n$(find /proc)\nB\n)"',
+        id="nested-views-end-at-raw-delimiter",
+    ),
+    # The views also end a body at a padded copy of its delimiter, as they compare after .Trim().
+    pytest.param(
+        "cat <<EOF\n EOF\ncat <<B\nEOF\n$(find /proc)\nB", id="views-end-at-padded-delimiter"
+    ),
+    # A quoted delimiter's body joins no line, so it ends at `EOF` and the next opener is read.
+    pytest.param(
+        "cat <<'EOF'\nx\\\nEOF\ncat <<B\nit's $(find /proc)\nB", id="quoted-delimiter-joins-none"
+    ),
+]
+
+
+@pytest.mark.parametrize("command", HEREDOC_SUBSTITUTION_DENY)
+def test_a_substitution_in_an_unquoted_heredoc_body_is_denied(command: str) -> None:
+    assert_denied(run_guard(bash(command)))
+
+
+# THE CONTROLS: a body whose delimiter is quoted takes no substitution, an escaped `$(` is text, the
+# rest of a bare body is data, and a single-quoted substitution after the terminator stays data.
+HEREDOC_SUBSTITUTION_ALLOW = [
+    pytest.param("cat <<'EOF'\n$(find /proc)\nEOF", id="single-quoted-delimiter"),
+    pytest.param('cat <<"EOF"\n$(find /proc)\nEOF', id="double-quoted-delimiter"),
+    pytest.param("cat <<EOF\n\\$(find /proc)\nEOF", id="escaped-dollar-paren"),
+    pytest.param("cat <<EOF\nfind /proc and `echo hi`\nEOF", id="prose-beside-a-bounded-sub"),
+    pytest.param("cat <<EOF\n$(echo hi)\nEOF\necho '$(find /proc)'", id="data-after-the-end"),
+    pytest.param("echo '<<EOF $(find /proc)'", id="opener-in-single-quotes"),
+    # False-deny controls for the second cut: a shift is not an opener, nor is `<<` in a comment or
+    # in quotes, and a delimiter with a quote anywhere in it is quoted.
+    pytest.param("echo $((x << y))\necho '$(find /proc)'", id="shift-in-arithmetic"),
+    pytest.param("echo hi # then cat <<EOF\necho '$(find /proc)'", id="opener-in-a-comment"),
+    pytest.param(
+        "(( m = 1 << n ))\ncat > s.sh <<'EOF'\nfor f in $(find /proc -maxdepth 1); do :; done\nEOF",
+        id="shift-then-quoted-body",
+    ),
+    pytest.param('cat <<E"O"F\nUse $(find /proc)\nEOF', id="part-quoted-delimiter"),
+    pytest.param(
+        "echo It\\'s 'see <<EOF' and\\'s\necho '$(find /proc)'", id="opener-in-split-quotes"
+    ),
+    # An escaped backslash before the newline continues nothing, so the body ends at `EOF`.
+    pytest.param("cat <<EOF\nx\\\\\nEOF\necho '$(find /proc)'", id="escaped-backslash-then-end"),
+    # A line that is only `\` joins nothing to the start of the next, so `EOF` after it is the
+    # delimiter both as written and as joined, and the body ends there.
+    pytest.param("cat <<EOF\n\\\nEOF\necho '$(find /proc)'", id="lone-backslash-then-end"),
+    # A quoted body is data to its real end, so a padded copy of its delimiter opens nothing after
+    # it, as in a commit message quoting the shape the pass's views reading exists for.
+    pytest.param(
+        "git commit -F - <<'EOF'\nExample:\n    cat <<EOF\n     EOF\n    cat <<B\n"
+        "    $(find /proc)\n    B\nEOF",
+        id="quoted-body-with-padded-copy",
+    ),
+    pytest.param(
+        "cat <<'EOF'\nEOF \ncat <<B\n$(find /proc)\nB\nEOF", id="quoted-body-trailing-space"
+    ),
+]
+
+
+@pytest.mark.parametrize("command", HEREDOC_SUBSTITUTION_ALLOW)
+def test_the_heredoc_pass_adds_no_deny_for_data(command: str) -> None:
+    assert_allowed(run_guard(bash(command)))
+
+
+# KNOWN GAPS, PINNED AS THEY ARE: bash runs the walk in each of these, and the guard allows it. The
+# guard's header names each shape. A fix that starts denying one fails this test on purpose: move
+# the row to a deny corpus then, move both counts in EXPECTED_ROW_COUNTS, and drop the shape from
+# the header.
+HEREDOC_KNOWN_GAP_ALLOW = [
+    pytest.param(
+        "cat <<'EOF'\n EOF\ncat <<B\nEOF\n$(find /proc)\nB",
+        id="known-gap-padded-copy-of-a-quoted-delimiter",
+    ),
+    # The substitution form reaches the heredoc pass; the bare walk is the views' half alone.
+    pytest.param(
+        "cat <<A <<B\nA\ncat <<C\nB\n$(find /proc)\nC",
+        id="known-gap-second-opener-on-a-line-substitution",
+    ),
+    pytest.param(
+        "cat <<A <<B\nA\ncat <<C\nB\nfind /proc\nC", id="known-gap-second-opener-on-a-line-walk"
+    ),
+]
+
+
+@pytest.mark.parametrize("command", HEREDOC_KNOWN_GAP_ALLOW)
+def test_known_gap_a_walk_bash_runs_after_a_misread_heredoc_is_allowed(command: str) -> None:
+    assert_allowed(run_guard(bash(command)))
+
+
 def _guard_seconds(command: str) -> float:
     started = time.monotonic()
     run_guard(bash(command))
@@ -1800,6 +1952,9 @@ EXPECTED_ROW_COUNTS = {
     "REFINED_FALSE_DENY_ALLOW": 14,
     "SITE_TEXT_DENY": 16,
     "SITE_TEXT_ALLOW": 21,
+    "HEREDOC_SUBSTITUTION_DENY": 33,
+    "HEREDOC_SUBSTITUTION_ALLOW": 15,
+    "HEREDOC_KNOWN_GAP_ALLOW": 3,
 }
 
 
