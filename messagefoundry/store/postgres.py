@@ -110,11 +110,13 @@ from messagefoundry.store.base import (
     SchemaLockTimeout,
     SchemaNotProvisionedError,
     SchemaProvisionResult,
+    ServerCipherWalk,
     StoreGrantsMissingError,
     StoreNotFoundError,
     _codec_chain_reading,
     _flush_unjudged,
     acquire_pooled,
+    check_walk_identifiers,
     driver_sqlstate,
     seed_filter_clause,
     warm_pool_connections,
@@ -217,6 +219,7 @@ from messagefoundry.store.row_seal import (
     cipher_call,
     classify_unrotated,
     row_sealer_for_cipher,
+    seal_chunks,
 )
 from messagefoundry.store.schema_verify import IndexShape
 from messagefoundry.store.sealed_cache import (
@@ -291,6 +294,7 @@ from messagefoundry.store.store import (
     FederatedUnbind,
     FullAuthenticationWrite,
     InboundMetrics,
+    InjectAudit,
     KeptSessionRestamp,
     LatencyHistogram,
     LockoutCounter,
@@ -340,6 +344,7 @@ from messagefoundry.store.store import (
     _session_cap_groups,
     _transit_attestation_row,
     ad_map_write_async,
+    ad_scope_replacement,
     admin_guard_counts,
     append_rename_audits,
     approval_fails_seal_async,
@@ -476,14 +481,6 @@ _PG_EPOCH_NOW = "EXTRACT(EPOCH FROM statement_timestamp())::double precision"
 # which is the memory budget the 500-row passes actually spend; 500 here would be ~650 MiB held in a
 # single transaction while the store is still opening.
 _ATTACHMENT_CHUNK_BATCH = 16
-
-
-def _check_walk_identifiers(*names: str) -> None:
-    """Refuse a cipher-walk identifier that is not a plain ASCII name. The walk's names are declared
-    constants (BACKLOG #1719), so this only stops a caller that passed something else."""
-    for name in names:
-        if not (name.isascii() and name.isidentifier()):
-            raise ValueError(f"not a plain identifier for the cipher walk: {name!r}")
 
 
 # BACKLOG #3383: write a surface's `keyed_surface` marker unless it exists. RETURNING yields a row
@@ -1974,7 +1971,9 @@ def _per_connection_ssl_connect(
     Windows, walks the system certificate store. It is bounded by ``connect_timeout``, since it runs
     before asyncpg's own connect timeout starts. ``asyncpg_module.connect`` is looked up per call,
     which keeps a test's stand-in module usable without a ``connect``."""
-    timeout = settings.connect_timeout or None
+    # At least 1: the load refuses 0, which asyncpg would read as a deadline already past (BACKLOG
+    # #5769), so there is no "no bound" spelling to map to None.
+    timeout = settings.connect_timeout
     files = [
         name
         for name, value in (
@@ -2086,7 +2085,7 @@ def _refuse_store_revocation(
     ).enforce_construction()
 
 
-class PostgresStore:
+class PostgresStore(ServerCipherWalk):
     """PostgreSQL-backed durable queue (the :class:`Store` protocol). Open with :meth:`open`."""
 
     # Postgres implements the full staged ingress pipeline (enqueue_ingress/route_handoff/
@@ -3147,6 +3146,7 @@ class PostgresStore:
                 status=StorePrivilegeStatus.UNOBSERVABLE,
                 principal=str(scalar["principal"] or ""),
                 database=database,
+                unread=("CREATE on the store's schema",),
                 detail=(
                     "current_schema() resolved to NULL, so CREATE on the store's schema was not read; "
                     "[store].schema_management is 'external', which requires the runtime role to hold "
@@ -3173,7 +3173,8 @@ class PostgresStore:
             # read unobserved rather than clean. With an over-grant already found it stays OBSERVED,
             # so the start still refuses on what WAS read: a partial read only understates.
             unread_note = (
-                f"the audit-table grants read NULL for {', '.join(audit_unread)}, so whether this "
+                "the audit-table grants read NULL, or a value that is not true or false, for "
+                f"{', '.join(audit_unread)}, so whether this "
                 "role can change audit rows was not read; [store].schema_management is "
                 "'external', which requires INSERT and SELECT only on audit_log"
             )
@@ -3183,6 +3184,7 @@ class PostgresStore:
                     status=StorePrivilegeStatus.UNOBSERVABLE,
                     principal=str(scalar["principal"] or ""),
                     database=database,
+                    unread=audit_unread,
                     detail=unread_note,
                 )
             unread_note = "; " + unread_note
@@ -3197,6 +3199,8 @@ class PostgresStore:
             server_roles=(),
             database_roles=tuple(f.name for f in facts if not f.is_self),
             excess=excess,
+            # #6015 item 2: an unread audit grant beside a read over-grant reaches the summary.
+            unread=audit_unread if external else (),
             detail=(
                 "roles are every role this principal may assume (pg_has_role MEMBER, so roles reached by "
                 "inheritance and by the set-role command alike); role ATTRIBUTES (SUPERUSER/CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS) "
@@ -3980,21 +3984,21 @@ class PostgresStore:
                 )
                 if not rows:
                     break
-                for r in rows:
-                    await conn.execute(
-                        f"UPDATE {table} SET {column}=$1 WHERE {where_keys}",
-                        (
-                            await self._aencrypt(
-                                r["v"],
-                                aad=(
-                                    aad_of(r)
-                                    if aad_of is not None
-                                    else cell_aad(table, column, *(r[c] for c in aad_cols))
-                                ),
-                            )
-                        ),
-                        *(r[c] for c in keys),
-                    )
+                async for chunk, sealed_values in seal_chunks(
+                    self._cipher,
+                    table,
+                    column,
+                    rows,
+                    aad_cols=aad_cols,
+                    aad_of=aad_of,
+                    local_whole_page=False,
+                ):
+                    for value, r in zip(sealed_values, chunk, strict=True):
+                        await conn.execute(
+                            f"UPDATE {table} SET {column}=$1 WHERE {where_keys}",
+                            value,
+                            *(r[c] for c in keys),
+                        )
                 sealed += len(rows)
         # Top the reserve back up for whatever follows; the burst itself was reserved above.
         await self._charge_bound_batch()
@@ -4017,9 +4021,8 @@ class PostgresStore:
         return row is not None
 
     # --- the read-only cipher-cell walk (BACKLOG #1719) ----------------------
-    # The source `cipher_cells.read_server_cipher_cells` reads, for `messagefoundry cipher-audit`.
-    # Each call is one SELECT on its own bounded borrow, so no read transaction spans chunks. Every
-    # identifier is a declared constant from `cipher_cells`; only values are parameters.
+    # This dialect's reads; `store/base.py` says what the walk's reads share, and holds the one
+    # read that is not dialect, `cipher_walk_surface_sealed`.
 
     async def cipher_walk_columns(self, tables: Sequence[str]) -> dict[str, frozenset[str]]:
         """The columns of each of ``tables`` this store's schema holds; an absent table is left out."""
@@ -4040,14 +4043,6 @@ class PostgresStore:
         )
         return None if row is None else (str(row[0]), str(row[1]))
 
-    async def cipher_walk_surface_sealed(self, table: str, column: str, *, keyed: bool) -> bool:
-        """Whether the store has sealed ``table.column``, by the rule its at-open sweep applies
-        (BACKLOG #3383); ``keyed`` says the ``keyed_surface`` table exists to be asked."""
-        _check_walk_identifiers(table, column)
-        if keyed and await self._surface_keyed(table, column):
-            return True
-        return await self._surface_holds_ciphertext(table, column, f"{_ENC_MARKER_PREFIX}%")
-
     async def cipher_walk_chunk(
         self,
         table: str,
@@ -4063,7 +4058,7 @@ class PostgresStore:
         ``after`` (``None`` for the first chunk), in ``order``. Each row is the ``select`` values,
         then ``column``'s. ``sealed_only`` keeps a value only when it starts with the marker in any
         ASCII case, as ``cipher_cells._sealed_test`` reads one."""
-        _check_walk_identifiers(table, column, *select, *order)
+        check_walk_identifiers(table, column, *select, *order)
         params: list[Any] = []
 
         def bind(value: Any) -> str:
@@ -4961,7 +4956,7 @@ class PostgresStore:
         metadata: str | None = None,
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
-        audit: OperatorAudit[str] | None = None,
+        audit: InjectAudit | None = None,
         origin: MessageOrigin = MessageOrigin.PARTNER,
         origin_actor: str | None = None,
     ) -> str:
@@ -4976,7 +4971,7 @@ class PostgresStore:
         skeleton row — the two-object commit's second half — AND its ``message_attachment`` linkage row is
         inserted (Phase 3a). A missing ref fails loud → the whole ingress rolls back → no ACK for a body
         we couldn't reference. Empty/None → the byte-identical no-detach path."""
-        audit = require_ingress_audit(audit, origin)  # BACKLOG #5071
+        audit = require_ingress_audit(audit, origin, origin_actor)  # BACKLOG #5071, #6589
         now = time.time() if now is None else now
         mid = uuid4().hex
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
@@ -7553,6 +7548,7 @@ class PostgresStore:
         :class:`~messagefoundry.store.base.ConnectionFlagLockTimeout`, and the transaction rolls
         back. Where a non-zero ``command_timeout`` is at or under the bound, that ends the wait
         first, as asyncpg's own timeout, not retried."""
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         now = time.time() if now is None else now
         bound = CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS
         async with (
@@ -7574,28 +7570,33 @@ class PostgresStore:
                 if driver_sqlstate(exc) == _LOCK_NOT_AVAILABLE:
                     raise ConnectionFlagLockTimeout(self.backend, bound) from exc
                 raise
-            await self._append_operator_audit(conn, written, if_applied(audit), True)
+            await self._append_operator_audit(conn, written, audit_row, True)
 
     async def list_connection_flags(self) -> set[tuple[str, str]]:
         """See :meth:`messagefoundry.store.base.QueueStore.list_connection_flags`."""
         rows = await self._fetchall("SELECT connection, direction FROM connection_flag")
         return {(str(r["connection"]), str(r["direction"])) for r in rows}
 
-    async def _alert_write(self, sql: str, *params: Any, audit: AuditAppend, now: float) -> bool:
+    async def _alert_write(
+        self, sql: str, *params: Any, audit_row: OperatorAudit[bool], now: float
+    ) -> bool:
         """One operator alert UPDATE with its audit row, in one transaction (vault BACKLOG #3217).
-        The row is appended only when the UPDATE matched, so a 404 writes nothing."""
+        The row is appended only when the UPDATE matched, so a 404 writes nothing. ``audit_row`` is
+        the caller's :func:`if_applied`, taken as its first statement, so a missing row was refused
+        before this borrows a connection (BACKLOG #6589)."""
         async with (
             AuditedWrite(now) as written,
             self._timed_acquire(record=False) as conn,
             conn.transaction(),
         ):
             applied = _rowcount(await conn.execute(sql, *params)) > 0
-            await self._append_operator_audit(conn, written, if_applied(audit), applied)
+            await self._append_operator_audit(conn, written, audit_row, applied)
         return applied
 
     async def ack_alert_instance(
         self, alert_id: int, *, actor: str, audit: AuditAppend, now: float | None = None
     ) -> bool:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         now = time.time() if now is None else now
         return await self._alert_write(
             "UPDATE alert_instance SET status='acknowledged', acked_by=$1, acked_at=$2"
@@ -7603,20 +7604,21 @@ class PostgresStore:
             actor,
             now,
             alert_id,
-            audit=audit,
+            audit_row=audit_row,
             now=now,
         )
 
     async def resolve_alert_instance(
         self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> bool:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         now = time.time() if now is None else now
         return await self._alert_write(
             "UPDATE alert_instance SET status='resolved', resolved_at=$1"
             " WHERE id=$2 AND status<>'resolved'",
             now,
             alert_id,
-            audit=audit,
+            audit_row=audit_row,
             now=now,
         )
 
@@ -7695,13 +7697,14 @@ class PostgresStore:
     async def suspend_alert_instance(
         self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # #143 windowed suspend (NOTIFICATION-only): set suspended_until on a live instance. Refuses a
         # resolved one; returns the updated row (for the API echo + seeding the sink cache) or None.
         if not await self._alert_write(
             "UPDATE alert_instance SET suspended_until=$1 WHERE id=$2 AND status<>'resolved'",
             until,
             alert_id,
-            audit=audit,
+            audit_row=audit_row,
             now=time.time() if now is None else now,
         ):
             return None
@@ -7710,11 +7713,12 @@ class PostgresStore:
     async def resume_alert_instance(
         self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # #143: clear a windowed suspend. Idempotent; returns the row or None (unknown/already resolved).
         if not await self._alert_write(
             "UPDATE alert_instance SET suspended_until=NULL WHERE id=$1 AND status<>'resolved'",
             alert_id,
-            audit=audit,
+            audit_row=audit_row,
             now=time.time() if now is None else now,
         ):
             return None
@@ -11805,6 +11809,21 @@ class PostgresStore:
         now = time.time() if now is None else now
         # Through _timed_acquire like _execute (BACKLOG #1052): this runs on the sign-in path.
         change = scope_withdrawal(expected_scope, now)
+        return await self._write_user_txn(user_id, change) is not None
+
+    async def set_ad_channel_scope_if_unchanged(
+        self,
+        user_id: str,
+        scope_json: str,
+        *,
+        expected_scope: str | None,
+        expected_source: ChannelScopeSource | None,
+        now: float | None = None,
+    ) -> bool:
+        """The AD sign-in's compare-and-set scope write (BACKLOG #6887); see ``AuthStore``. The
+        compare is ``ad_scope_replacement``'s, in Python, so it is byte-exact."""
+        now = time.time() if now is None else now
+        change = ad_scope_replacement(scope_json, expected_scope, expected_source, now)
         return await self._write_user_txn(user_id, change) is not None
 
     async def set_user_federated_subject(

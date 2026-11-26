@@ -1205,10 +1205,39 @@ async def test_webauthn_store_contract(store) -> None:
 
 
 async def test_a_session_for_a_missing_account_is_refused(store) -> None:
-    """BACKLOG #2733 on Postgres: the session's user foreign key, as on SQLite and SQL Server."""
+    """BACKLOG #2733 on Postgres: ``create_session``'s own missing-account refusal, as on SQLite and
+    SQL Server. It answers before the INSERT, so this does not reach the session's user foreign key
+    (vault BACKLOG #2733 item 10)."""
     from tests._webauthn_store_contract import assert_a_session_for_a_missing_account_is_refused
 
     await assert_a_session_for_a_missing_account_is_refused(store)
+
+
+async def test_the_sessions_user_key_refuses_an_orphan(store) -> None:
+    """Vault BACKLOG #2733 item 6: the test above no longer reaches the ``sessions.user_id``
+    foreign key, so this reaches it directly. A session row moved onto an account that does not
+    exist is refused."""
+    import asyncpg
+
+    user_id = f"fk-{uuid4().hex}"
+    token_hash = uuid4().hex * 2
+    await store.create_user(
+        user_id=user_id,
+        username=f"fk-{uuid4().hex}",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+        audits=(),
+    )
+    assert await store.create_session(token_hash=token_hash, user_id=user_id, expires_at=9e9)
+    async with store._pool.acquire() as conn:
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
+            await conn.execute(
+                "UPDATE sessions SET user_id=$1 WHERE token_hash=$2",
+                f"no-such-{uuid4().hex}",
+                token_hash,
+            )
 
 
 async def test_webauthn_conditional_bind_contract(store) -> None:
@@ -1633,6 +1662,37 @@ async def test_the_scope_write_compare_and_sets_on_its_source(store) -> None:
     got = await store.get_user("cas-src")
     assert (got.channel_scope, got.channel_scope_source) == ('["IB_C"]', SCOPE_SOURCE_MANUAL)
     assert await cas("cas-nobody", None, source=SCOPE_SOURCE_MANUAL, expected_source=None) is False
+
+
+async def test_the_ad_scope_write_compare_and_sets_on_scope_and_source(store) -> None:
+    """BACKLOG #6887 on Postgres: ``set_ad_channel_scope_if_unchanged`` writes only while the row
+    holds both the expected scope and source (``None`` matching NULL), marked ``ad``. Each refusal
+    is paired with the write that does go through."""
+    from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL
+
+    await store.create_user(
+        user_id="adcas",
+        username="adcas",
+        auth_provider="ad",
+        now=1.0,
+        password_generated=False,
+        audits=(),
+    )
+    cas = store.set_ad_channel_scope_if_unchanged
+    assert await cas("adcas", '["IB_A"]', expected_scope="[]", expected_source=None) is False
+    assert await cas("adcas", '["IB_A"]', expected_scope=None, expected_source="ad") is False
+    assert await cas("adcas", '["IB_A"]', expected_scope=None, expected_source=None) is True
+    got = await store.get_user("adcas")
+    assert (got.channel_scope, got.channel_scope_source) == ('["IB_A"]', SCOPE_SOURCE_AD)
+    await store.set_user_channel_scope("adcas", '["IB_A"]', source=SCOPE_SOURCE_MANUAL)
+    assert await cas("adcas", '["IB_B"]', expected_scope='["IB_A"]', expected_source="ad") is False
+    assert (await store.get_user("adcas")).channel_scope == '["IB_A"]'
+    assert (
+        await cas("adcas", '["IB_B"]', expected_scope='["IB_A"]', expected_source="manual") is True
+    )
+    got = await store.get_user("adcas")
+    assert (got.channel_scope, got.channel_scope_source) == ('["IB_B"]', SCOPE_SOURCE_AD)
+    assert await cas("adcas-nobody", "[]", expected_scope=None, expected_source=None) is False
 
 
 async def test_directory_object_id_column_upgrade_is_idempotent(store) -> None:

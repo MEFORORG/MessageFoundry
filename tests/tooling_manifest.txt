@@ -24,6 +24,7 @@
 # lands in neither this list nor its explicit stay-list.
 tests/test_adr0071_crossing_count.py
 tests/test_adr_0019_0173_revert_guard.py
+tests/test_adr_0019_status_names_every_amendment.py
 tests/test_adr_index_coverage.py
 tests/test_afk_decision_log.py
 tests/test_afk_digest.py
@@ -61,6 +62,7 @@ tests/test_ci_gate_annotation.py
 tests/test_ci_leg_data_class.py
 tests/test_ci_merge_group_gate.py
 tests/test_ci_odbc_installer_pipefail.py
+tests/test_ci_packaging_gate.py
 tests/test_ci_postgres_windows_leg.py
 tests/test_ci_red_clearer.py
 tests/test_ci_red_reader.py
@@ -71,7 +73,9 @@ tests/test_ci_step_margin.py
 tests/test_ci_tool_and_image_pins.py
 tests/test_ci_tooling_gate.py
 tests/test_ci_venv_pinning.py
+tests/test_ci_windows_smoke_mllp_read.py
 tests/test_cla_action_advisory_gate.py
+tests/test_cla_action_patches.py
 tests/test_cla_action_provenance.py
 tests/test_claim_check.py
 tests/test_claim_shared_registry.py
@@ -83,6 +87,7 @@ tests/test_coord_alloc_reentrancy.py
 tests/test_coord_alloc_retired_tombstone.py
 tests/test_coord_fleet_fetch_clock.py
 tests/test_coord_host_box_key.py
+tests/test_coord_owner_log_create_and_age.py
 tests/test_coord_owner_log_pipes.py
 tests/test_coord_root.py
 tests/test_coord_shared_root_claims.py
@@ -219,6 +224,7 @@ tests/test_semgrep_install_retry.py
 tests/test_session_context_presence.py
 tests/test_session_mail_held.py
 tests/test_session_mail.py
+tests/test_session_mail_toplevel.py
 tests/test_session_mail_watch_standdown.py
 tests/test_install_coordination_retired.py
 tests/test_session_registry.py
@@ -286,6 +292,7 @@ tests/test_zizmor_config_hygiene.py
 tests/test_worktree_gate_per_invocation.py
 tests/test_cla_precheck.py
 tests/test_worktree_gate_quoted_and_every_invocation.py
+tests/test_worktree_gate_added_command_readings.py
 tests/test_coord_fleet_live_fence.py
 tests/test_coord_seat_record_facts.py
 tests/test_dashboard_collect_metrics.py

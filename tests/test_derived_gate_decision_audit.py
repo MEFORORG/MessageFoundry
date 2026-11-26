@@ -32,6 +32,7 @@ from messagefoundry.api.security import (
     _record_route_refusal,
     _recorded_decision,
     refuse_unless_step_up_window_live,
+    require_monitoring_read,
     require_paced,
     require_phi_read,
     require_reauth_only,
@@ -73,7 +74,7 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 
 
 async def _service(engine: Engine, **overrides: Any) -> AuthService:
-    """One administrator; one paced write and one PHI read per window; the new-address check on.
+    """One administrator; one paced write, one PHI read and one monitoring read per window; the new-address check on.
 
     ``require_mfa`` is off so the base gate's factor refusal does not answer first, and the minimum
     write interval is off so the second write is refused by the count alone. ``overrides`` replace
@@ -84,6 +85,7 @@ async def _service(engine: Engine, **overrides: Any) -> AuthService:
         "admin_write_min_interval_seconds": 0,
         "admin_write_rate_limit_per_actor": 1,
         "phi_read_rate_limit_per_actor": 1,
+        "monitoring_read_rate_limit_per_actor": 1,
     }
     service = AuthService(engine.store, AuthSettings(**(settings | overrides)))
     await service.initialize()
@@ -187,6 +189,9 @@ _CASES = {
     "require_paced, new address": _Case(_PACED, _CONTROL, "POST", "step_up", _AWAY),
     "require_phi_read, throttled": _Case(_PHI_READ, _READ, "GET", "throttled"),
     "require_phi_read, new address": _Case(_PHI_READ, _READ, "GET", "step_up", _AWAY),
+    "require_monitoring_read, throttled": _Case(
+        require_monitoring_read, Permission.MONITORING_READ, "GET", "throttled"
+    ),
     "require_step_up, throttled": _Case(_STEP_UP, _MANAGE, "POST", "throttled"),
     "require_step_up, new address": _Case(_STEP_UP, _MANAGE, "POST", "step_up", _AWAY),
     "require_reauth_only, new address": _Case(
@@ -295,12 +300,15 @@ async def test_require_step_up_action_records_its_throttle_too(engine: Engine) -
     assert reasons == [(_REFUSED, "step_up"), (_REFUSED, "throttled")]
 
 
-#: The calls in a derived gate that can refuse a request or spend something on it. Each must run
-#: inside the gate's ``_recorded_decision`` block, or the grant row is written before it decides.
+#: At least the calls in a derived gate that can refuse a request or spend something on it. Each
+#: must run inside the gate's ``_recorded_decision`` block, or the grant row is written before it
+#: decides. ``_charge_monitoring_read`` is left out on purpose: it runs outside the block on
+#: ``require_monitoring_read``'s deferred-``reveal`` branch (see the test below).
 _GATE_CHECKS = frozenset(
     {
         "_enforce_admin_write_pacing",
         "enforce_phi_read_pacing",
+        "enforce_monitoring_read_pacing",
         "refuse_from_new_address",
         "_step_up_refusal",
         "_mfa_refusal",
@@ -320,8 +328,10 @@ def _names_called(node: ast.AST) -> list[str]:
 def test_every_gate_that_runs_admit_decides_inside_its_decision_block() -> None:
     """RED when: a gate factory calls ``_admit`` with no ``_recorded_decision`` block, so it writes
     no grant row for the requests it admits, or makes one of its own checks outside that block, so
-    the grant row is written before that check decides. ``require`` is the one factory that writes
-    its grant directly. The counts are the positive control: the walk found the six gates, and a
+    the grant row is written before that check decides. ``require`` writes its grant directly, and
+    so does ``require_monitoring_read`` on its deferred-``reveal`` branch, whose charge
+    (``_charge_monitoring_read``) is not in ``_GATE_CHECKS``, so this walk does not check that
+    branch's order. The counts are the positive control: the walk found the seven gates, and a
     check in each."""
     from messagefoundry.api import security
 
@@ -333,7 +343,7 @@ def test_every_gate_that_runs_admit_decides_inside_its_decision_block() -> None:
         and node.name not in {"_admit", "require"}
         and "_admit" in _names_called(node)
     ]
-    assert len(gates) == 6, sorted(g.name for g in gates)
+    assert len(gates) == 7, sorted(g.name for g in gates)
     for gate in gates:
         blocks = [
             node
@@ -365,6 +375,10 @@ class _Recorder:
 
     async def audit_gate_refused(self, *_: object, **__: object) -> None:
         self.calls.append(_REFUSED)
+
+    async def factor_binding_is_blocked(self, *_: object, **__: object) -> bool:
+        # _mfa_refusal asks it to word its detail (BACKLOG #1149); it writes no row.
+        return True
 
 
 def _post_request() -> Request:

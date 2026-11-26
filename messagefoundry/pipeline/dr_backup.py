@@ -57,7 +57,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, BinaryIO, Literal, NamedTuple, cast
+from typing import Any, BinaryIO, Literal, NamedTuple, Protocol, cast
 
 from messagefoundry import file_lock
 from messagefoundry.config import atomic_edit
@@ -67,13 +67,14 @@ from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.last_resort import run_guarded
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, utc_or_unknown
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
-from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
+from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text, shown_class_name
 from messagefoundry.restore_notice import RESTORE_NOTICE_POINTER, RESTORE_ROLLBACK_NOTICE
 from messagefoundry.store import Store
 from messagefoundry.store.backup_codec import (
     FORMAT_VERSION,
     BackupCodecError,
     BackupKeyMismatch,
+    _read_once,
     archive_key_id,
     decrypt_stream,
     encrypt_stream,
@@ -208,9 +209,10 @@ _MAX_RESTORE_MEMBER_BYTES = 16 * 1024 * 1024 * 1024  # 16 GiB
 #: which the decrypt has already written to that same temp dir in full. So the member cap is reached
 #: only after the disk it protects is spent. This moves the bound to the first write — on the restore
 #: path, both limbs of it. :func:`_verify_archive_blocking`'s own plaintext limb is still uncounted,
-#: though since BACKLOG #1174 it too stages beside a SQLite store. Its copy is no larger than the
-#: archive file it reads, and giving it this bound means adding an escape arm to that function's
-#: ordered ``except`` block, which is a wider change than the one this constant documents.
+#: though since BACKLOG #1174 it too stages beside a SQLite store. That limb has no byte cap of its
+#: own: what it copies is whatever the archive path yields, which a device or a growing file does
+#: not bound. Nothing here gives it this bound yet; that is a change of its own, not one this
+#: constant documents.
 #:
 #: **Why twice the member cap, and why a multiple rather than a literal.** A conforming archive is one
 #: ``store.db`` — admitted up to :data:`_MAX_RESTORE_MEMBER_BYTES`, above which the verify FAILs at the
@@ -422,7 +424,8 @@ class RestoreResult:
     archive_sha256: str
     archive_created_at: float | None = None
     last_audit_at: float | None = None
-    #: How many open sessions the restore ended in the store it placed (BACKLOG #2614).
+    #: How many unrevoked sessions the restore ended in the store it placed, expired ones never
+    #: purged included (BACKLOG #2614, #5095).
     sessions_revoked: int = 0
 
 
@@ -438,16 +441,72 @@ class _HashingReader:
         self._raw = raw
         self.digest = hashlib.sha256()
 
-    def read(self, size: int = -1) -> bytes:
+    def read(self, size: int = -1) -> bytes | None:
         data = self._raw.read(size)
         # A read that is not bytes-like (None from a non-blocking source with nothing ready, or a
         # str) passes through unhashed. On the keyed branch the codec's own refusal then names it,
         # rather than a TypeError from the digest escaping the BackupCodecError arm. The no-key
-        # copy loop has no such refusal, but its only source is the archive path opened 'rb', a
-        # blocking buffered reader whose reads return bytes.
+        # restore copy reads this class through `_read_chunks`, and the pass-through is what lets
+        # `_NoneRefusingReader` refuse such a read there rather than the digest (BACKLOG #6687).
         if isinstance(data, (bytes, bytearray, memoryview)):
             self.digest.update(data)
         return data
+
+
+class _ChunkSource(Protocol):
+    """What :func:`_read_chunks` reads from: a binary ``read(n)`` that may answer ``None``."""
+
+    def read(self, size: int, /) -> bytes | None: ...
+
+
+#: The read size of :func:`_read_chunks`, the 1 MiB the copy loops it replaced read.
+_COPY_CHUNK_BYTES = 1024 * 1024
+
+
+def _read_chunks(src: _ChunkSource, what: str) -> Iterator[bytes]:
+    """Yield ``src``'s bytes, one ``read`` of up to :data:`_COPY_CHUNK_BYTES` at a time, until an
+    empty read, which is the end of the stream.
+
+    Each read goes through :class:`_NoneRefusingReader`, which says what a single read is refused
+    for and how. It authenticates nothing and caps no total. ``what`` names the copy in the refusal.
+    A blocking binary file answers each read with at most ``n`` bytes and never ``None``, so for
+    one this yields the same reads the old loops wrote."""
+    reader = _NoneRefusingReader(src, what)
+    while buf := reader.read(_COPY_CHUNK_BYTES):
+        yield buf
+
+
+class _NoneRefusingReader:
+    """A ``read`` over ``src`` held to the codec's ``_read_once`` checks, at least the ones the keyed
+    copies apply to each read. :func:`_read_chunks` reads through it, and so can a reader such as
+    ``shutil.copyfileobj`` that drives its own loop. A ``None`` read, a read that is not bytes-like
+    and a read over the size asked for are refused (BACKLOG #6687); a ``bytearray`` or
+    ``memoryview`` read is returned as ``bytes``. A ``None`` read comes from a non-blocking source
+    with no data ready, and a bare ``if not buf: break`` loop, or ``copyfileobj``, reads it as the
+    end of the stream and finishes the copy short.
+
+    The refusal is raised as an ``OSError`` (``EIO``) with the codec's error chained to it, so each
+    caller handles it as it handles any ``OSError`` from that copy, which the callers' own ``except``
+    arms define. A ``BackupCodecError`` would instead be reported as an encrypt or decrypt failure,
+    and a no-key copy does neither.
+
+    ``size`` must be positive. A negative size, the io convention for "read all", including the
+    no-argument ``read()``, is refused as a ``ValueError`` before any read, so a caller that expects
+    the whole stream from one call fails loudly rather than getting one chunk."""
+
+    def __init__(self, src: _ChunkSource, what: str) -> None:
+        self._src = src
+        self._what = what
+        # Kept for a reader that names its source, as a test seam on `copyfileobj` does.
+        self.name: object = getattr(src, "name", "")
+
+    def read(self, size: int = -1, /) -> bytes:
+        if size < 0:
+            raise ValueError(f"the {self._what} is read in chunks: read(n) takes a positive n")
+        try:
+            return _read_once(cast(BinaryIO, self._src), size, self._what)
+        except BackupCodecError as exc:
+            raise OSError(errno.EIO, str(exc)) from exc
 
 
 def _manifest_time(manifest: dict[str, object]) -> float | None:
@@ -642,7 +701,7 @@ class BackupRunner:
             raise
         except Exception as exc:  # any unexpected failure → a generic backup_failed (no body leaks)
             await self._record_failure("backup", exc, now)
-            raise BackupError("backup", safe_exc(exc)) from exc
+            raise BackupError("backup", _error_reason(exc)) from exc
         await self._record_success(result, now)
         return result
 
@@ -830,7 +889,7 @@ class BackupRunner:
                 except (OSError, ValueError, FileExistsError, sqlite3.Error) as exc:
                     # sqlite3.Error: since BACKLOG #1937 the copy opens its own read-only connection,
                     # and a failure there is a snapshot failure too, not a generic backup one.
-                    raise BackupError("snapshot", safe_exc(exc)) from exc
+                    raise BackupError("snapshot", _error_reason(exc)) from exc
                 # The snapshot's real size is known now, and it is already on disk, so this asks only
                 # for what is still to come: the tar beside it and the archive at the destination.
                 # Inside the try, so a refusal here still releases the staging directory.
@@ -1285,10 +1344,7 @@ class BackupRunner:
             else:
                 # No key + allow_unencrypted: write the plaintext tar verbatim. It can hold PHI: no
                 # instance is synthetic since BACKLOG #1279 (ADR 0186).
-                while True:
-                    buf = src.read(1024 * 1024)
-                    if not buf:
-                        break
+                for buf in _read_chunks(src, "plaintext tar"):
                     dst.write(buf)
             dst.flush()
             os.fsync(dst.fileno())
@@ -1535,7 +1591,7 @@ class BackupRunner:
                 log.warning("DR backup: backup_failed alert sink raised", exc_info=True)
 
     async def _record_failure(self, kind: str, exc: BaseException, now: float) -> None:
-        reason = safe_exc(exc) if isinstance(exc, BaseException) else str(exc)
+        reason = _error_reason(exc) if isinstance(exc, BaseException) else str(exc)
         detail = {"outcome": "error", "kind": kind, "error": reason}
         try:
             await self._store.record_audit(
@@ -1955,7 +2011,7 @@ def _verify_failure(exc: BaseException) -> VerifyResult:
     # will not parse as `TarError`, and nothing else in the verify parses JSON (`read_header` raises
     # `BackupCodecError` for its own). A name for a type that cannot arrive reads as a guard and
     # guards nothing.
-    return VerifyResult("FAIL", reason=safe_exc(exc))
+    return VerifyResult("FAIL", reason=_error_reason(exc))
 
 
 #: The pauses between attempts to remove a verify's staging directory (BACKLOG #1721). A refused unlink
@@ -2813,8 +2869,8 @@ def _discard_verify_staging(
 #
 # * A SQLite store stages in its own DATA DIRECTORY, beside the store, and applies the store's
 #   best-effort `_secure_file` to each staged tar and extracted store before its first byte, the way
-#   `mefor-restore-*` does. The snapshot file gets it from `snapshot_to` once its copy completes. What
-#   `_secure_file` leaves inside a temp directory's own DACL is not always owner-only (ADR 0163).
+#   `mefor-restore-*` does. The snapshot file gets it from `snapshot_to` once its copy completes.
+#   What `_secure_file` leaves on Windows is stated once, in its docstring (ADR 0163).
 # * A server-DB store has no data directory, so it stages in `.mefor-staging` under the backup
 #   destination, secured the same way: an owner-only per-run directory and `_secure_file` on each
 #   staged file. A share that will not keep the directory owner-only refuses the run (see
@@ -4413,10 +4469,7 @@ def _verify_in_staging(
             # teardown discards the partial tar on the way out.
             decrypt_stream(src, dst, match_key, max_plaintext_bytes=_MAX_RESTORE_PLAINTEXT_BYTES)
         else:
-            while True:
-                buf = src.read(1024 * 1024)
-                if not buf:
-                    break
+            for buf in _read_chunks(src, "plaintext archive"):
                 dst.write(buf)
     manifest = _read_manifest_from_tar(tar_path)
     if manifest.get("config_only"):
@@ -4800,7 +4853,7 @@ def _full_open_check(
             # read) is reported as the FAIL the open's handler gives the same failure. Before the
             # open it is still behind an incompatible snapshot's verdict, so the open runs and the
             # order below decides; after the open it is the verdict.
-            return "FAIL", safe_exc(exc), 0
+            return "FAIL", _error_reason(exc), 0
         walk_read[0] = True
         walk_kind[0] = getattr(result, "kind", None)
         return result
@@ -4823,7 +4876,7 @@ def _full_open_check(
         forget_store_salt(snap)
     except sqlite3.Error as exc:
         # The walk's verdict, read before this, still leads (the order below).
-        return walked if walked[0] != "PASS" else ("FAIL", safe_exc(exc), 0)
+        return walked if walked[0] != "PASS" else ("FAIL", _sqlite_error_reason(exc), 0)
 
     async def _open() -> tuple[bool, str]:
         # Bind the store BEFORE the try. An open that raises — a keyless or wrong-key open, an
@@ -4891,7 +4944,7 @@ def _full_open_check(
         reason = safe_exc(exc) if walked[0] == "PASS" else f"{safe_exc(exc)}; {walked[1]}"
         return "KEY_MISMATCH", reason, 0
     except Exception as exc:  # a restore that won't even open is the thing we're trying to catch
-        return walked if walked[0] != "PASS" else ("FAIL", safe_exc(exc), 0)
+        return walked if walked[0] != "PASS" else ("FAIL", _error_reason(exc), 0)
     if walked[0] != "PASS":
         return walked
     if not ok:
@@ -4961,10 +5014,18 @@ def _incompatible_snapshot(
 
 def _sqlite_error_reason(exc: sqlite3.Error) -> str:
     """A SQLite error as a FAIL reason that quotes no row. Its decode error quotes the column's
-    bytes (``... with text '...'``), which are a row's content and which ``safe_exc`` keeps, so
-    that tail is cut, as ``cipher-audit``'s report cuts it."""
+    bytes (``... with text '...'``), which are a row's content and which ``safe_text`` keeps, so
+    that tail is cut, as ``cipher-audit``'s report cuts it. ``safe_exc`` would withhold the whole
+    message (vault BACKLOG #8153, item 23); this keeps the rest of SQLite's text. An engine class
+    that stands in for SQLite's error prints SQLite's class name (``shown_class_name``)."""
     text = re.sub(r" with text '.*\Z", " (its text is not shown)", str(exc), flags=re.DOTALL)
-    return safe_text(f"{type(exc).__name__}: {text}")
+    return safe_text(f"{shown_class_name(exc)}: {text}")
+
+
+def _error_reason(exc: BaseException) -> str:
+    """A FAIL or backup reason for ``exc``: :func:`_sqlite_error_reason` for a SQLite error, as the
+    reasons before vault BACKLOG #8153 kept SQLite's text, else ``safe_exc``."""
+    return _sqlite_error_reason(exc) if isinstance(exc, sqlite3.Error) else safe_exc(exc)
 
 
 #: What decided a :func:`_decrypt_check` verdict. ``cell`` is, under a key, at least a sealed value
@@ -5225,7 +5286,7 @@ def _extract_member(
     """Extract a single archive member to ``dest_dir`` and return its path, or ``None`` when absent.
 
     ``secure`` hands the output file to the store's own best-effort ``_secure_file`` the moment it
-    exists, BEFORE the first byte is streamed into it; what that leaves is not always owner-only on
+    exists, BEFORE the first byte is streamed into it; its docstring states what that leaves on
     Windows (ADR 0163). The restore path passes it: its staging directory sits on the destination
     volume, and the file is the whole decrypted store. Securing it after the stream, the way
     :func:`_place_restored_store` secures the file it publishes, would leave a multi-GB write of PHI
@@ -5269,10 +5330,10 @@ def _extract_member(
             # Reuse the store's own PHI-at-rest primitive, on the empty file, before any of the
             # member's bytes reach it.
             _secure_staged(out, secure)
-            while True:
-                buf = src.read(1024 * 1024)
-                if not buf:
-                    break
+            # `_read_chunks` refuses a None read as an OSError, which each caller reports as it
+            # reports any OSError from this copy, rather than reading it as the member's end and
+            # checking a truncated store (BACKLOG #6687).
+            for buf in _read_chunks(src, f"{name} member"):
                 streamed += len(buf)
                 if streamed > max_member_bytes:
                     raise tarfile.TarError(
@@ -5352,9 +5413,10 @@ def restored_accounts_notice(sessions_revoked: int) -> str:
     already did. Worded from the count the restore's own revoke returned, so it never claims more
     than it ended."""
     return (
-        f"{RESTORE_ROLLBACK_NOTICE} The restore ended {sessions_revoked} open session(s) in the "
-        "store it placed, and the first engine start on this store ends every session again and "
-        "records the restore."
+        f"{RESTORE_ROLLBACK_NOTICE} The restore ended {sessions_revoked} unrevoked session(s), "
+        "expired ones included, in the store it placed. The first engine start on this store "
+        "revokes again the sessions it finds and raises the global session epoch, within the "
+        "limits docs/SECURITY.md, Limits of the session sweep, names, and records the restore."
     )
 
 
@@ -5655,10 +5717,8 @@ def _restore_blocking(
         # moment it exists and before its first byte is written. Best-effort and non-fatal, per that
         # primitive's contract.
         # The file `_place_restored_store` PUBLISHES gets the store-trio rule instead (ADR 0183 Wave 0b).
-        # archive.tar and extracted_store.db keep what `_secure_file` leaves, which is NOT owner-only when
-        # a file carries the temp directory's entries explicitly (it removes inherited entries only;
-        # measured on the hosted runners, CI run 36039014999). A hard-linked placement then shares the
-        # published DACL. A follow-up recorded in ADR 0163.
+        # archive.tar and extracted_store.db keep what `_secure_file` leaves; its docstring states
+        # what that is on Windows (ADR 0163). A hard-linked placement then shares the published DACL. ADR 0163 records it.
         #
         # Staged under the backup's and verify's lock-and-sweep, not in a `TemporaryDirectory`
         # (BACKLOG #5617). That `__exit__` raised when one unlink was refused (on Windows, a scanner
@@ -5727,12 +5787,10 @@ def _restore_blocking(
                     # because it has no AEAD tag to fail on first -- a forged archive is simply copied.
                     # Counting the streamed bytes IS the enforcement (a file's size on disk is not a
                     # bound an attacker who supplies the file is subject to), so this cannot become
-                    # `copyfileobj`.
+                    # `copyfileobj`. `_read_chunks` refuses a None read as an OSError rather than
+                    # ending the copy short there (BACKLOG #6687).
                     streamed = 0
-                    while True:
-                        buf = src.read(1024 * 1024)
-                        if not buf:
-                            break
+                    for buf in _read_chunks(src, "plaintext archive"):
                         streamed += len(buf)
                         if streamed > _MAX_RESTORE_PLAINTEXT_BYTES:
                             raise BackupError(
@@ -5848,7 +5906,7 @@ def _restore_blocking(
             try:
                 last_audit_at = newest_audit_time(snap)
             except sqlite3.Error as exc:
-                raise BackupError("restore", safe_exc(exc)) from exc
+                raise BackupError("restore", _sqlite_error_reason(exc)) from exc
             if max_age_seconds is not None:
                 _refuse_an_old_archive(
                     archive_created_at=archive_created_at,
@@ -5865,7 +5923,7 @@ def _restore_blocking(
             try:
                 dropped = forget_store_salt(snap)
             except sqlite3.Error as exc:
-                raise BackupError("restore", safe_exc(exc)) from exc
+                raise BackupError("restore", _sqlite_error_reason(exc)) from exc
             if dropped and "store_salt" in row_counts:
                 # The counts were taken to check the archive; the summary reports the placed store.
                 row_counts = {**row_counts, "store_salt": 0}
@@ -5884,7 +5942,7 @@ def _restore_blocking(
                     restored_at=time.time(),
                 )
             except sqlite3.Error as exc:
-                raise BackupError("restore", safe_exc(exc)) from exc
+                raise BackupError("restore", _sqlite_error_reason(exc)) from exc
             row_counts = {**row_counts, "restore_marker": 1}
             # The second read of the store's names, while nothing is placed; its docstring says why
             # and what it misses.
@@ -6891,7 +6949,10 @@ def _place_restored_store(
         placed = False
         try:
             with out, open(src, "rb") as fh:
-                shutil.copyfileobj(fh, out, 1024 * 1024)
+                # `copyfileobj` reads a None read as the end and would place a truncated store as
+                # placed, so it reads through `_NoneRefusingReader`, which refuses one as an
+                # OSError that the cleanup below handles as it does any failed read (BACKLOG #6687).
+                shutil.copyfileobj(_NoneRefusingReader(fh, "staged store"), out, _COPY_CHUNK_BYTES)
                 out.flush()
                 os.fsync(out.fileno())
             placed = True
@@ -7121,10 +7182,7 @@ def _extract_config_members(
                 # secrets (connections.toml), and securing it after the stream would leave the write
                 # under the directory's inherited ACL on Windows for as long as the write takes.
                 _secure_file(out)
-                while True:
-                    buf = src.read(1024 * 1024)
-                    if not buf:
-                        break
+                for buf in _read_chunks(src, "config member"):
                     # Counting the streamed bytes IS the cap enforcement here (a lying header declares a
                     # small size and streams an unbounded one), so this loop cannot become copyfileobj.
                     streamed += len(buf)

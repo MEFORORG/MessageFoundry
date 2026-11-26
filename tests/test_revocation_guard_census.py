@@ -93,6 +93,11 @@ _BUILDERS = frozenset(
         # The shared-or-own choice over the two openers (BACKLOG #5527 item 10), so the hops that
         # call it stay the sites, as for the IdP wrapper below.
         "_verifying_opener",
+        # transports/ai_broker.py: the AI endpoint's shared-or-anchored choice (BACKLOG #5527 item
+        # 22), so each caller of it is a site, and a new caller fails the census until it is listed
+        # with its guard. Listed as the site itself, it was tied to one named caller's guard only.
+        # Named for its hop, since a builder name matches a def of that name in any module.
+        "_ai_endpoint_opener",
         "_expiry_relaxed_opener",
         "_client_cert_opener",
         "_client_ssl_context",
@@ -240,10 +245,9 @@ _CENSUS: dict[str, Guarded | Exempt] = {
         note="the SMART and OAuth2 token hops"
     ),
     "messagefoundry/transports/soap.py::SoapDestination.__init__": Guarded(),
-    "messagefoundry/transports/ai_broker.py::_endpoint_opener": Guarded(
-        by="messagefoundry/transports/ai_broker.py::AiBroker.__init__",
-        note="the AI endpoint's opener, chosen under the [tls] policy since BACKLOG #5527; "
-        "AiBroker.__init__ hands it to _refuse_an_unrevoked_ai_hop (BACKLOG #2193 slice (e)). Off "
+    "messagefoundry/transports/ai_broker.py::AiBroker.__init__": Guarded(
+        note="the AI endpoint's opener, which _ai_endpoint_opener chooses under the [tls] policy since "
+        "BACKLOG #5527, handed to _refuse_an_unrevoked_ai_hop (BACKLOG #2193 slice (e)). Off "
         "the box it crosses an enforcing posture only on a [tls].crl_file that reaches its opener "
         "(BACKLOG #5527) or on its [ai].endpoint_revocation_attested pair; an unknown posture "
         "counts as enforcing",
@@ -310,6 +314,10 @@ _CENSUS: dict[str, Guarded | Exempt] = {
     "messagefoundry/auth/trust_anchors.py::anchor_cadata": Exempt(
         "loads a PEM into a scratch context to prove OpenSSL parses it; never handshakes"
     ),
+    "messagefoundry/auth/trust_anchors.py::_reads_to_the_end": Exempt(
+        "loads a PEM and a probe certificate into a scratch context to ask whether OpenSSL reads "
+        "to the end (BACKLOG #5229); never handshakes"
+    ),
     "messagefoundry/pki.py::_refuse_unless_openssl_loads": Exempt(
         "loads a client CA file into a scratch context to compare what OpenSSL took with the mTLS "
         "issuer index (BACKLOG #4948); never handshakes"
@@ -339,6 +347,7 @@ _EXEMPT_SITES = frozenset(
     {
         "messagefoundry/apiclient/client.py::_build_verify_context",
         "messagefoundry/auth/trust_anchors.py::anchor_cadata",
+        "messagefoundry/auth/trust_anchors.py::_reads_to_the_end",
         "messagefoundry/config/tls_policy.py::<module>",
         "messagefoundry/config/tls_policy.py::crl_scratch_context",
         "messagefoundry/config/tls_probe.py::_offer_context",

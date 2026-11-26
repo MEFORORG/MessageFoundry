@@ -147,6 +147,16 @@ close the class: the unquoting does not match the shell in every form, and at le
 and some invocations are still allowed. The ADDED READINGS note in the hook lists some of what the
 added reading misses and some of its false refusals.
 
+**Rules 3c, 3d, 3 and 3b also judge rewritten spellings of the command.** Under BACKLOG #5655
+step 3, once the command as given is allowed, the hook judges a few rewrites of it as well, such as
+`\git` spelled `git` and a Bash backtick substitution spelled `$( )`. A rewrite can only add a
+refusal, because the command as given has already been judged. One visible effect: inside double
+quotes Bash runs a backtick, so `` git commit -m "... `git reset --hard` ..." `` in the primary is now
+refused, while the same message in single quotes is not. The `Get-AddedCommandReadings` note in the
+hook is the source of record for what the rewrites are, what they read and what they miss;
+[`tests/test_worktree_gate_added_command_readings.py`](../tests/test_worktree_gate_added_command_readings.py)
+holds the measured rows and a differential test against a fixed baseline commit.
+
 This list is not the whole rule set. The hook itself,
 [`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1), is the source of record.
 
@@ -238,6 +248,20 @@ position, so a checkout many commits behind with an unchanged gate still passes.
 | `UNVERIFIED` | The installed gate matches this checkout's gate, but `origin/main` could not be read. |
 
 `-UpstreamRef` names a different yardstick.
+
+Every install leaves `worktree_gate.ps1.receipt.json` beside the installed gate, with the hash it wrote,
+and keeps the replaced gate as `worktree_gate.ps1.bak`. The installer **refuses to overwrite an
+installed gate that does not match its own receipt** (BACKLOG #1247): one whose content hash differs
+from the receipt's, one whose receipt cannot be read or records no hash, and one with no receipt at all.
+Each means something other than the installer may have written it. The refusal names the file and both
+hashes, and runs before any write, so it changes nothing. (The separate refusal for a gate that
+changed between that check and the copy throws later, after the allowlist write: the allowlist and its
+`.bak` are already written, the gate is not.) A missing receipt refuses too, because the receipt is not protected by
+the gate and deleting it must not silence the check; a box with no installed gate installs as before.
+Find out who wrote the gate, then pass `-OverwriteUnexplained`; the new receipt records the
+overwritten hash under `overwroteUnexplained`, and its bytes are kept as
+`worktree_gate.ps1.unexplained-<sha12>`. `-Status` reports the same check. The receipt is a
+convenience record, never attestation, and the gate does not protect it from an edit.
 
 Two structural choices worth understanding:
 

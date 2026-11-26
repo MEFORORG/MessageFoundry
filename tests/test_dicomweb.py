@@ -4,8 +4,10 @@
 ``multipart/related; type="application/dicom"`` framing, the dicom+json FailedSOPSequence / HTTP-status
 classification (transient retry vs permanent dead-letter), response capture, and the egress arm.
 
-The opener is faked so nothing hits the network — and because the destination treats the object as
-**opaque bytes** (no pydicom parse), these tests need **no** ``[dicom]`` extra and run on every CI leg."""
+The opener is faked so nothing hits the network. On a 202 the destination reads the Part-10 File
+Meta group by hand, and reads the data set's SOP Instance UID with pydicom only when the ``[dicom]``
+extra is installed, so most of these tests need **no** extra and run on every CI leg. The tests that
+build an object with pydicom's own writer skip without it."""
 
 from __future__ import annotations
 
@@ -15,8 +17,11 @@ import http.client
 import io
 import json
 import logging
+import struct
 import urllib.error
 import urllib.request
+import warnings
+from pathlib import Path
 
 import pytest
 
@@ -25,6 +30,9 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import DICOMweb
 from messagefoundry.parsing import RawMessage
+from messagefoundry.parsing.dicom.errors import DicomPeekError
+from messagefoundry.parsing.dicom.peek import DicomPeek
+from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, DeliveryResponse, NegativeAckError
 from messagefoundry.transports.dicomweb import DicomWebDestination
@@ -32,8 +40,44 @@ from messagefoundry.transports.rest import HttpAuthError
 from tests._malformed_reply import MALFORMED_REPLIES, RefusedAndMalformed
 
 BASE = "https://pacs.example.org/dicom-web"
-# An opaque "DICOM object" — the destination never parses it, so any bytes exercise the carriage + framing.
-OBJECT = b"\x00" * 128 + b"DICM" + b"synthetic-part10-bytes"
+
+
+def _meta_element(element: int, vr: bytes, value: bytes) -> bytes:
+    """One File Meta element, Explicit VR Little Endian (PS3.10 section 7.1): OB takes the long form."""
+    head = struct.pack("<HH", 0x0002, element) + vr
+    if vr == b"OB":
+        return head + b"\0\0" + struct.pack("<I", len(value)) + value
+    return head + struct.pack("<H", len(value)) + value
+
+
+def _ui(uid: str) -> bytes:
+    raw = uid.encode("ascii")
+    return raw + b"\0" if len(raw) % 2 else raw  # PS3.5: a UI value pads to even length with NUL
+
+
+def _part10(uid: str | None, *, vr: bytes = b"UI", value: bytes | None = None) -> bytes:
+    """A synthetic Part-10 object whose File Meta (0002,0003) is ``uid``, or absent when ``None``.
+    ``vr`` and ``value`` override that element's VR and raw value bytes. The data set is opaque."""
+    elements = [
+        _meta_element(0x0001, b"OB", b"\0\1"),
+        _meta_element(0x0002, b"UI", _ui("1.2.840.10008.5.1.4.1.1.88.11")),
+    ]
+    if uid is not None:
+        elements.append(_meta_element(0x0003, vr, _ui(uid) if value is None else value))
+    elements.append(_meta_element(0x0010, b"UI", _ui("1.2.840.10008.1.2.1")))
+    meta = b"".join(elements)
+    group_length = struct.pack("<HH", 0x0002, 0x0000) + b"UL" + struct.pack("<HI", 4, len(meta))
+    return b"\x00" * 128 + b"DICM" + group_length + meta + b"synthetic-dataset-bytes"
+
+
+def _carried(obj: bytes) -> str:
+    return RawMessage.from_bytes(obj, "dicom").encode()
+
+
+# The instance STORED_OK confirms (BACKLOG #5914: a 202 is compared with the File Meta UID).
+SENT_UID = "1.2.3.4.5"
+# A synthetic Part-10 object whose opaque data set carries no SOP Instance UID pydicom can read.
+OBJECT = _part10(SENT_UID)
 PAYLOAD = RawMessage.from_bytes(
     OBJECT, "dicom"
 ).encode()  # the mfb64:v1: carriage a Handler hands over
@@ -42,7 +86,7 @@ PAYLOAD = RawMessage.from_bytes(
 STORED_OK = json.dumps(
     {
         "00081190": {"vr": "UR", "Value": [f"{BASE}/studies/1.2.3"]},
-        "00081199": {"vr": "SQ", "Value": [{"00081155": {"vr": "UI", "Value": ["1.2.3.4.5"]}}]},
+        "00081199": {"vr": "SQ", "Value": [{"00081155": {"vr": "UI", "Value": [SENT_UID]}}]},
     }
 )
 # A dicom+json body carrying a non-empty FailedSOPSequence (00081198) → an instance was rejected.
@@ -451,7 +495,7 @@ async def test_dicomweb_capture_empty_response_is_no_reply() -> None:
     assert resp.detail == "HTTP 200"
 
 
-# --- BACKLOG #5914: a 2xx reply that does not confirm the store is not a delivery ---------------
+# --- BACKLOG #5914: 2xx replies that do not confirm the store; most are refused, not all -------
 
 # Nested arrays past json's recursion limit: json.loads raises RecursionError, not ValueError.
 _TOO_DEEP = "[" * 100_000 + "]" * 100_000
@@ -493,7 +537,9 @@ def _uid_body(uid: object) -> str:
 
 
 # ReferencedSOPSequence bodies that name no stored instance, so confirm no 202 store (BACKLOG #5914):
-# first by a malformed ReferencedSOPInstanceUID element, then by a malformed sequence element.
+# first by a malformed ReferencedSOPInstanceUID element, then by a malformed sequence element. The
+# element-shape cases from two-values on carry SENT_UID, so the comparison alone cannot refuse them;
+# the blank and grammar cases name no instance, since a value outside the UID grammar names none.
 _UNCONFIRMING_BODIES = [
     pytest.param(_uid_body(uid), id=f"uid-{name}")
     for name, uid in [
@@ -508,21 +554,29 @@ _UNCONFIRMING_BODIES = [
         ("not-a-uid", {"vr": "UI", "Value": ["N/A"]}),
         ("empty-component", {"vr": "UI", "Value": ["1..2"]}),
         ("over-64", {"vr": "UI", "Value": ["1." * 32 + "1"]}),
-        ("two-values", {"vr": "UI", "Value": ["1.2", "3.4"]}),
-        ("one-blank-of-two", {"vr": "UI", "Value": ["1.2.3", ""]}),
+        ("two-values", {"vr": "UI", "Value": [SENT_UID, "3.4"]}),
+        ("one-blank-of-two", {"vr": "UI", "Value": [SENT_UID, ""]}),
         ("non-string", {"vr": "UI", "Value": [42]}),
-        ("value-not-array", {"vr": "UI", "Value": "1.2.3.4.5"}),
-        ("element-not-object", "1.2.3.4.5"),
-        ("bulk-uri", {"vr": "UI", "Value": ["1.2"], "BulkDataURI": "x"}),
-        ("misspelt-value", {"vr": "UI", "value": ["1.2"]}),
-        ("wrong-vr", {"vr": "SQ", "Value": ["1.2"]}),
-        ("no-vr", {"Value": ["1.2"]}),
+        ("value-not-array", {"vr": "UI", "Value": SENT_UID}),
+        ("element-not-object", SENT_UID),
+        ("bulk-uri", {"vr": "UI", "Value": [SENT_UID], "BulkDataURI": "x"}),
+        ("misspelt-value", {"vr": "UI", "value": [SENT_UID]}),
+        ("wrong-vr", {"vr": "SQ", "Value": [SENT_UID]}),
+        ("no-vr", {"Value": [SENT_UID]}),
     ]
 ] + [
     pytest.param(json.dumps({"00081199": seq}), id=f"seq-{name}")
     for name, seq in [
         ("bulk-uri", {"vr": "SQ", "BulkDataURI": "https://pacs.example.test/bulk/1"}),
         ("inline-binary", {"vr": "SQ", "InlineBinary": "AAAA"}),
+        (
+            "value-and-inline-binary",
+            {
+                "vr": "SQ",
+                "Value": [{"00081155": {"vr": "UI", "Value": [SENT_UID]}}],
+                "InlineBinary": "AAAA",
+            },
+        ),
     ]
 ]
 
@@ -593,7 +647,7 @@ async def test_dicomweb_202_confirms_by_a_uid_at_the_grammar_boundary(uid: str) 
     body = _uid_body({"vr": "UI", "Value": [uid]})
     dest = _dest()
     dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
-    assert await dest.send(PAYLOAD) is None
+    assert await dest.send(_carried(_part10(uid.rstrip("\0 ")))) is None
 
 
 async def test_dicomweb_202_confirms_when_one_item_of_several_names_an_instance() -> None:
@@ -601,7 +655,7 @@ async def test_dicomweb_202_confirms_when_one_item_of_several_names_an_instance(
         {
             "00081199": {
                 "vr": "SQ",
-                "Value": [{}, {"00081155": {"vr": "UI", "Value": ["1.2.3.4.5"]}}],
+                "Value": [{}, {"00081155": {"vr": "UI", "Value": [SENT_UID]}}],
             }
         }
     )
@@ -621,6 +675,822 @@ async def test_dicomweb_202_with_a_referenced_sop_delivers() -> None:
     assert isinstance(resp, DeliveryResponse)
     assert resp.outcome == "accepted"
     assert resp.detail == "HTTP 202"
+
+
+# --- BACKLOG #5914 step 1: a 202 is compared with the File Meta UID (0002,0003) of the instance sent ---
+
+# A UID other than SENT_UID, and two that differ from it only at an edge a prefix or suffix test would miss.
+_OTHER_UIDS = [
+    pytest.param("1.2.3.4.6", id="other"),
+    pytest.param("1.2.3", id="prefix-of-sent"),
+    pytest.param("1.2.3.4.55", id="sent-is-prefix"),
+]
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("other", _OTHER_UIDS)
+async def test_dicomweb_202_naming_another_instance_is_unconfirmed(
+    other: str, capture: bool
+) -> None:
+    # The decision of 2026-11-23: a 202 whose ReferencedSOPSequence names a well-formed UID that is
+    # not the instance sent confirms nothing.
+    dest = _dest(capture_response=capture)
+    body = _uid_body({"vr": "UI", "Value": [other]})
+    dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert exc.value.permanent is True
+    assert exc.value.code == "unconfirmed-202"
+    assert "before a replay" in str(exc.value)
+    # Content-free: neither UID reaches the refusal text.
+    assert other not in str(exc.value) and SENT_UID not in str(exc.value)
+
+
+async def test_dicomweb_202_confirms_when_a_later_item_names_the_instance_sent() -> None:
+    items = [
+        {"00081155": {"vr": "UI", "Value": ["1.2.3.4.6"]}},
+        {"00081155": {"vr": "UI", "Value": [SENT_UID]}},
+    ]
+    body = json.dumps({"00081199": {"vr": "SQ", "Value": items}})
+    dest = _dest()
+    dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
+    assert await dest.send(PAYLOAD) is None
+
+
+_TRUNCATED = OBJECT[: OBJECT.index(_ui(SENT_UID)) + 3]  # cut inside the (0002,0003) value
+# Objects with no File Meta group at all; the 200 test below uses these too.
+_NO_FILE_META = [
+    pytest.param(b"\x00" * 128 + b"DICM" + b"synthetic-part10-bytes", id="no-file-meta"),
+    pytest.param(b"synthetic-bytes-with-no-preamble", id="no-preamble"),
+]
+# The cause each no-comparable-UID refusal names (BACKLOG #5914, round 3 review finding 4).
+_NO_MAGIC = "no Part-10 preamble and DICM magic"
+_NO_0003 = "no (0002,0003) in the file meta group"
+_WRONG_VR = "a (0002,0003) whose VR is not UI"
+_NOT_A_UID = "a (0002,0003) value that is not a UID"
+_OVERRUN = "a file meta element past the object end"
+_TOO_LONG = "a file meta group past the read cap"
+_FILE_META_CAP = 64 * 1024  # the reader's fixed cap on the File Meta group, in bytes
+
+
+def _with_group_length(obj: bytes, group_length: int) -> bytes:
+    """``obj`` with its (0002,0000) File Meta Group Length value replaced."""
+    return obj[:140] + struct.pack("<I", group_length) + obj[144:]
+
+
+def _long_zero_length_run(count: int) -> bytes:
+    """OBJECT with ``count`` zero-length (0002,0004) UI elements before (0002,0003), and a group
+    length that covers them all. Only the reader's fixed cap stops the walk short of (0002,0003)."""
+    at = OBJECT.index(struct.pack("<HH", 0x0002, 0x0003))
+    run = (struct.pack("<HH", 0x0002, 0x0004) + b"UI" + struct.pack("<H", 0)) * count
+    obj = OBJECT[:at] + run + OBJECT[at:]
+    return _with_group_length(obj, obj.index(b"synthetic-dataset-bytes") - 144)
+
+
+# A group length that ends where (0002,0003) starts: too short, since (0002,0003) follows it.
+_BEFORE_0003 = OBJECT.index(struct.pack("<HH", 0x0002, 0x0003)) - 144
+_NO_COMPARABLE_UID = [
+    pytest.param(*_NO_FILE_META[0].values, _NO_0003, id="no-file-meta"),
+    pytest.param(*_NO_FILE_META[1].values, _NO_MAGIC, id="no-preamble"),
+    pytest.param(b"\x00" * 128 + b"DICX" + OBJECT[132:], _NO_MAGIC, id="no-dicm-magic"),
+    pytest.param(_part10(None), _NO_0003, id="no-0002-0003"),
+    pytest.param(_part10(SENT_UID, vr=b"LO"), _WRONG_VR, id="wrong-vr"),
+    pytest.param(_part10(SENT_UID, value=b""), _NOT_A_UID, id="empty-value"),
+    pytest.param(_part10(SENT_UID, value=b"N/A\0"), _NOT_A_UID, id="not-a-uid"),
+    pytest.param(_part10(SENT_UID, value=b"1.2.3.4.5\xff"), _NOT_A_UID, id="non-ascii"),
+    pytest.param(_part10(SENT_UID, value=b"1." * 32 + b"12"), _NOT_A_UID, id="over-64"),
+    pytest.param(_TRUNCATED, _OVERRUN, id="truncated"),
+    # An earlier File Meta element whose declared length runs past the end of the object.
+    pytest.param(
+        OBJECT[:144] + _meta_element(0x0001, b"OB", b"\0\1")[:8] + struct.pack("<I", 1 << 20),
+        _OVERRUN,
+        id="earlier-element-overruns",
+    ),
+    # A long-form header cut between its 8th and 12th byte.
+    pytest.param(
+        OBJECT[:144] + _meta_element(0x0001, b"OB", b"\0\1")[:10], _OVERRUN, id="cut-header"
+    ),
+    # Bounded by a fixed cap: a long run of zero-length group-2 elements is walked only to the cap.
+    pytest.param(_long_zero_length_run(_FILE_META_CAP // 8 + 1), _TOO_LONG, id="past-the-cap"),
+    # The same with no (0002,0000) at all.
+    pytest.param(
+        OBJECT[:132] + _long_zero_length_run(_FILE_META_CAP // 8 + 1)[144:],
+        _TOO_LONG,
+        id="past-the-cap-no-group-length",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "obj",
+    [
+        pytest.param(OBJECT[:132] + OBJECT[144:], id="absent"),
+        pytest.param(_with_group_length(OBJECT, 0), id="zero"),
+        pytest.param(_with_group_length(OBJECT, _BEFORE_0003), id="too-short"),
+        pytest.param(_with_group_length(OBJECT, _FILE_META_CAP + 1), id="over-the-cap"),
+        pytest.param(_with_group_length(OBJECT, 0xFFFFFFFF), id="undefined"),
+    ],
+)
+async def test_dicomweb_a_wrong_file_meta_group_length_falls_back_to_the_capped_walk(
+    obj: bytes,
+) -> None:
+    # Manager decision of 2026-11-23: pydicom ignores a wrong (0002,0000), so the reader does too and
+    # walks the group, to the cap, until the first element outside group 0002.
+    dest = _dest()
+    dest._opener = _FakeOpener(body=STORED_OK.encode(), status=202)  # type: ignore[assignment]
+    assert await dest.send(_carried(obj)) is None
+
+
+@pytest.mark.parametrize("pad", [b"\0", b" "], ids=["nul", "space"])
+async def test_dicomweb_an_over_padded_file_meta_uid_is_read(pad: bytes) -> None:
+    # The padding is stripped before the 64-character check, so a valid UID padded past 64 bytes
+    # still confirms a 202 that names it.
+    value = SENT_UID.encode() + pad * (66 - len(SENT_UID))
+    dest = _dest()
+    dest._opener = _FakeOpener(body=STORED_OK.encode(), status=202)  # type: ignore[assignment]
+    assert await dest.send(_carried(_part10(SENT_UID, value=value))) is None
+
+
+def _with_meta_element_before_0003(vr: bytes, value: bytes) -> bytes:
+    """OBJECT with one more File Meta element, (0002,0002) in ``vr``'s long form, before (0002,0003)."""
+    at = OBJECT.index(struct.pack("<HH", 0x0002, 0x0003))
+    extra = (
+        struct.pack("<HH", 0x0002, 0x0002) + vr + b"\0\0" + struct.pack("<I", len(value)) + value
+    )
+    return OBJECT[:at] + extra + OBJECT[at:]
+
+
+@pytest.mark.parametrize("vr", [b"UV", b"ZZ"], ids=["newer-long-form", "unknown"])
+async def test_dicomweb_file_meta_reader_takes_any_vr_it_does_not_know_as_long_form(
+    vr: bytes,
+) -> None:
+    # PS3.5: a reader assumes the long form for a VR it does not know. A 2-byte read would land the
+    # walk inside the value and miss (0002,0003), refusing a 202 that names the instance sent.
+    obj = _with_meta_element_before_0003(vr, b"\x01\x02\x03\x04\x05\x06\x07\x08")
+    dest = _dest()
+    dest._opener = _FakeOpener(body=STORED_OK.encode(), status=202)  # type: ignore[assignment]
+    assert await dest.send(_carried(obj)) is None
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(STORED_OK, id="reply-names-an-instance"),
+        pytest.param(json.dumps({"00081199": {"vr": "SQ", "Value": [{}]}}), id="reply-names-none"),
+        pytest.param("", id="empty-reply"),
+    ],
+)
+@pytest.mark.parametrize(("obj", "cause"), _NO_COMPARABLE_UID)
+async def test_dicomweb_202_with_no_comparable_sent_uid_is_unconfirmed(
+    obj: bytes, cause: str, body: str, capture: bool
+) -> None:
+    # The decision of 2026-11-23: with no File Meta UID to compare, and no data set SOP Instance
+    # UID read (these synthetic data sets carry none), the 202 confirms nothing, whether the reply
+    # names a well-formed instance -- the one SENT_UID names -- or none.
+    dest = _dest(capture_response=capture)
+    dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(_carried(obj))
+    assert exc.value.permanent is True
+    assert exc.value.code == "unconfirmed-202"
+    # Its own reason, naming the cause truthfully, with the replay advice, and naming no UID.
+    text = str(exc.value)
+    assert cause in text
+    assert "refused again" not in text
+    assert "before a replay" in text
+    assert SENT_UID not in text
+    # What the dead letter stores is safe_exc's redacted, 200-character text, not str(): the
+    # cause and the replay advice must both survive it (PR 3243 delta review).
+    stored = safe_exc(exc.value)
+    assert cause in stored
+    assert "before a replay" in stored
+    # The store cuts again at 200 after the "NegativeAckError: " prefix (dead_letter_now's
+    # safe_text). The replay advice still survives, as on main; the cause may be cut part-way.
+    assert "before a replay" in safe_text(stored)
+
+
+def _pydicom_part10(meta_uid: str, dataset_uid: str) -> bytes:
+    """A Part-10 object written by pydicom whose File Meta (0002,0003) is ``meta_uid`` and whose
+    data set SOP Instance UID (0008,0018) is ``dataset_uid``: a stale File Meta when they differ,
+    as a re-UID written without the File Meta being rewritten leaves it."""
+    pydicom = pytest.importorskip("pydicom")
+    from pydicom.dataset import FileMetaDataset
+    from pydicom.uid import UID, ExplicitVRLittleEndian
+
+    meta = FileMetaDataset()
+    meta.MediaStorageSOPClassUID = UID("1.2.840.10008.5.1.4.1.1.88.11")
+    meta.MediaStorageSOPInstanceUID = UID(meta_uid)
+    meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    ds = pydicom.Dataset()
+    ds.file_meta = meta
+    ds.preamble = b"\0" * 128
+    ds.SOPClassUID = UID("1.2.840.10008.5.1.4.1.1.88.11")
+    with warnings.catch_warnings():  # a test may write a deliberately invalid UID here
+        warnings.simplefilter("ignore")
+        ds.SOPInstanceUID = UID(dataset_uid)
+    buf = io.BytesIO()
+    pydicom.dcmwrite(buf, ds, enforce_file_format=False)
+    return buf.getvalue()
+
+
+_DATASET_UID = "1.2.826.0.1.3680043.8.498.77"
+
+
+@pytest.mark.parametrize("capture", [False, True])
+async def test_dicomweb_202_naming_the_data_set_uid_of_a_stale_file_meta_delivers(
+    capture: bool,
+) -> None:
+    # Manager decision of 2026-11-23 on this branch: a 202 also confirms when it names the data
+    # set's SOP Instance UID (0008,0018), which a server builds its reply from.
+    obj = _pydicom_part10(SENT_UID, _DATASET_UID)
+    assert _ui(SENT_UID) in obj and _DATASET_UID.encode() in obj  # control: the two UIDs differ
+    dest = _dest(capture_response=capture)
+    body = _uid_body({"vr": "UI", "Value": [_DATASET_UID]})
+    dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
+    resp = await dest.send(_carried(obj))
+    assert (resp is None) if not capture else isinstance(resp, DeliveryResponse)
+
+
+async def test_dicomweb_202_naming_neither_uid_of_a_stale_file_meta_is_unconfirmed() -> None:
+    obj = _pydicom_part10(SENT_UID, _DATASET_UID)
+    dest = _dest()
+    body = _uid_body({"vr": "UI", "Value": ["1.2.3.4.6"]})
+    dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(_carried(obj))
+    assert exc.value.code == "unconfirmed-202"
+    assert _DATASET_UID not in str(exc.value) and SENT_UID not in str(exc.value)
+
+
+async def test_dicomweb_202_naming_the_data_set_uid_confirms_with_no_file_meta_uid() -> None:
+    # The File Meta (0002,0003) is not a UID, but the data set's (0008,0018) is read and named.
+    obj = _pydicom_part10(SENT_UID, _DATASET_UID)
+    obj = obj.replace(_ui(SENT_UID), b"N/A\0" + b"\0" * (len(_ui(SENT_UID)) - 4), 1)
+    dest = _dest()
+    body = _uid_body({"vr": "UI", "Value": [_DATASET_UID]})
+    dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
+    assert await dest.send(_carried(obj)) is None
+
+
+async def test_dicomweb_the_data_set_read_lets_no_value_warning_escape() -> None:
+    # Manager decision of 2026-11-23 (R5): pydicom's "Invalid value for VR UI: '<value>'" warning
+    # names the value, so the data set read puts the SCU's ignores back first. The "always" filter
+    # below stands for anything that reset the filters after import.
+    obj = _pydicom_part10(SENT_UID, "1.2.3.Canary^Value")
+    dest = _dest()
+    body = _uid_body({"vr": "UI", "Value": ["1.2.3.4.6"]})
+    dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always")
+        with pytest.raises(NegativeAckError) as exc:
+            await dest.send(_carried(obj))
+    assert exc.value.code == "unconfirmed-202"  # the File Meta UID alone already refuses it
+    assert not [w for w in seen if "Canary" in str(w.message)]
+
+
+async def test_dicomweb_the_data_set_is_read_once_before_the_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Manager decision of 2026-11-23 (the reviewer's altitude fix): both comparable UIDs are read
+    # before a byte is sent, as the SCU parses before it associates, whatever the reply then says.
+    pytest.importorskip("pydicom")
+    opener = _FakeOpener(body=STORED_OK.encode(), status=202)
+    reads: list[int] = []
+    real = DicomPeek.parse
+
+    def parse(data: bytes) -> object:
+        reads.append(len(opener.requests))  # how many requests had been sent at the read
+        return real(data)
+
+    monkeypatch.setattr(DicomPeek, "parse", staticmethod(parse))
+    dest = _dest()
+    dest._opener = opener  # type: ignore[assignment]
+    carried = _carried(_pydicom_part10(SENT_UID, _DATASET_UID))
+    opener.body = b""  # a reply naming no instance
+    with pytest.raises(NegativeAckError, match="unconfirmed-202"):
+        await dest.send(carried)
+    opener.body = STORED_OK.encode()  # a reply naming the instance sent
+    assert await dest.send(carried) is None
+    assert reads == [0, 1]  # one read per send, each before that send's POST
+
+
+class _AWarningAsError(UserWarning):
+    """What a pydicom warning becomes when the filters turn warnings into errors."""
+
+
+@pytest.mark.parametrize("status", [200, 202])
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        pytest.param(TypeError("a value: 1.2.3.Canary"), id="TypeError"),
+        pytest.param(_AWarningAsError("Invalid value for VR UI: 1.2.3.Canary"), id="warning"),
+        pytest.param(RuntimeError("a value: 1.2.3.Canary"), id="RuntimeError"),
+    ],
+)
+async def test_dicomweb_a_pydicom_fault_of_any_class_reads_as_no_data_set_uid(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fault: Exception,
+    capture: bool,
+    status: int,
+) -> None:
+    # Manager decision of 2026-11-24 (parity with the code before this PR): a fault in the data set read, of
+    # any class but MemoryError, reads as no data set UID. The object is sent; a 200 delivers, and
+    # a 202 is compared with the File Meta UID alone, here naming another instance. One WARNING
+    # per process names the class, never the fault's text, which can carry a value.
+    pytest.importorskip("pydicom")
+    from messagefoundry.transports import dicomweb
+
+    def parse(data: bytes) -> object:
+        raise fault
+
+    monkeypatch.setattr(dicomweb, "_pre_read_warned", set())
+    monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: True)
+    monkeypatch.setattr(DicomPeek, "parse", staticmethod(parse))
+    dest = _dest(capture_response=capture)
+    body = _uid_body({"vr": "UI", "Value": ["1.2.3.4.6"]}).encode()
+    opener = _FakeOpener(body=body, status=status)
+    dest._opener = opener  # type: ignore[assignment]
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        if status == 200:
+            await dest.send(PAYLOAD)
+            await dest.send(PAYLOAD)
+        else:
+            for _ in range(2):
+                with pytest.raises(NegativeAckError) as exc:
+                    await dest.send(PAYLOAD)
+                assert exc.value.code == "unconfirmed-202"
+    assert len(opener.requests) == 2  # both sent
+    warned = _read_fault_warnings(caplog)
+    assert len(warned) == 1  # once per process, not per send
+    assert type(fault).__name__ in warned[0]
+    assert "Canary" not in caplog.text  # the fault's text is written at no level
+
+
+def _read_fault_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+        and "data set SOP Instance UID is not compared" in r.getMessage()
+    ]
+
+
+async def test_dicomweb_a_loading_pydicom_whose_reader_raises_delivers(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A pydicom that loads but whose private File Meta reader has another signature (a version
+    # skew): the codec's read raises TypeError, which it does not wrap. The object is still sent:
+    # a 200 delivers, a 202 naming the File Meta UID confirms it, and one naming only the data set
+    # UID does not, as with no extra (BACKLOG #5914; before this PR every such row was delivered).
+    pytest.importorskip("pydicom")
+    from pydicom import filereader
+
+    from messagefoundry.transports import dicomweb
+
+    def skewed(a: object, b: object, c: object, d: object) -> object:
+        raise AssertionError("not reached: the call has the wrong arity")
+
+    monkeypatch.setattr(dicomweb, "_pre_read_warned", set())
+    obj = _pydicom_part10(SENT_UID, _DATASET_UID)
+    monkeypatch.setattr(filereader, "_read_file_meta_info", skewed)
+    assert dicomweb._dicom_extra_fault() is None  # control: the extra loads
+    dest = _dest()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        ok = _FakeOpener(body=STORED_OK.encode(), status=200)
+        dest._opener = ok  # type: ignore[assignment]
+        assert await dest.send(_carried(obj)) is None
+        by_meta = _FakeOpener(
+            body=_uid_body({"vr": "UI", "Value": [SENT_UID]}).encode(), status=202
+        )
+        dest._opener = by_meta  # type: ignore[assignment]
+        assert await dest.send(_carried(obj)) is None
+        by_data_set = _FakeOpener(
+            body=_uid_body({"vr": "UI", "Value": [_DATASET_UID]}).encode(), status=202
+        )
+        dest._opener = by_data_set  # type: ignore[assignment]
+        with pytest.raises(NegativeAckError) as exc:
+            await dest.send(_carried(obj))
+    assert exc.value.code == "unconfirmed-202"
+    assert [len(o.requests) for o in (ok, by_meta, by_data_set)] == [1, 1, 1]
+    warned = _read_fault_warnings(caplog)
+    assert len(warned) == 1 and "TypeError" in warned[0]
+
+
+@pytest.mark.parametrize(("named", "delivered"), [("1.2.3.4.6", True), (None, False)])
+async def test_dicomweb_a_read_fault_with_no_file_meta_uid_confirms_by_any_named_uid(
+    monkeypatch: pytest.MonkeyPatch, named: str | None, delivered: bool
+) -> None:
+    # Nothing can be compared: no File Meta UID, and the data set read raised. A 202 is then
+    # confirmed as the BACKLOG #5914 reply check did before the UID comparison, by an item naming any UID (Manager decision of
+    # 2026-11-24); one naming none is still refused.
+    pytest.importorskip("pydicom")
+    from messagefoundry.transports import dicomweb
+
+    def parse(data: bytes) -> object:
+        raise TypeError("a value")
+
+    monkeypatch.setattr(dicomweb, "_pre_read_warned", set())
+    monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: True)
+    monkeypatch.setattr(DicomPeek, "parse", staticmethod(parse))
+    no_meta = _carried(b"\x00" * 128 + b"DICM" + b"PAYLOAD-MARKER-5914")
+    item = {"vr": "UI", "Value": [named]} if named else {"vr": "UI", "Value": []}
+    dest = _dest()
+    opener = _FakeOpener(body=_uid_body(item).encode(), status=202)
+    dest._opener = opener  # type: ignore[assignment]
+    if delivered:
+        assert await dest.send(no_meta) is None
+    else:
+        with pytest.raises(NegativeAckError) as exc:
+            await dest.send(no_meta)
+        assert exc.value.code == "unconfirmed-202"
+    assert len(opener.requests) == 1
+
+
+async def test_dicomweb_a_memory_error_in_the_read_escapes_before_the_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A MemoryError is not a verdict on the object, so it is not a permanent refusal.
+    pytest.importorskip("pydicom")
+    from messagefoundry.transports import dicomweb
+
+    def parse(data: bytes) -> object:
+        raise MemoryError
+
+    monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: True)
+    monkeypatch.setattr(DicomPeek, "parse", staticmethod(parse))
+    dest = _dest()
+    opener = _FakeOpener(body=STORED_OK.encode(), status=202)
+    dest._opener = opener  # type: ignore[assignment]
+    with pytest.raises(MemoryError):
+        await dest.send(PAYLOAD)
+    assert opener.requests == []
+
+
+async def test_dicomweb_a_parse_failure_in_the_read_still_sends() -> None:
+    # An object the codec cannot parse (a DicomError) is no data set UID, and the object is still
+    # sent; unlike a fault the codec does not wrap, it writes no WARNING.
+    pytest.importorskip("pydicom")
+    from messagefoundry.parsing.dicom.errors import DicomError
+
+    obj = b"not a DICOM object at all"
+    with pytest.raises(DicomError):  # control: the codec refuses it
+        DicomPeek.parse(obj)
+    dest = _dest(capture_response=True)
+    opener = _FakeOpener(body=STORED_OK.encode(), status=200)
+    dest._opener = opener  # type: ignore[assignment]
+    assert isinstance(await dest.send(_carried(obj)), DeliveryResponse)
+    assert len(opener.requests) == 1
+
+
+def _extra_unusable_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "installed but does not load" in r.getMessage()
+    ]
+
+
+async def test_dicomweb_a_broken_dicom_extra_compares_the_file_meta_uid_alone(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A pydicom missing a reader the deflate guard replays does not load, so it is taken as absent
+    # (BACKLOG #5914, Manager decision of 2026-11-24): no lane stop and no refusal before the POST.
+    # The object is sent; a 202 naming the File Meta UID confirms it, and one naming only the data
+    # set UID does not, as with no extra installed (before this PR, any UID confirmed it).
+    pytest.importorskip("pydicom")
+    from pydicom import filereader
+
+    from messagefoundry.transports import dicomweb
+
+    monkeypatch.setattr(dicomweb, "_pre_read_warned", set())
+    obj = _pydicom_part10(SENT_UID, _DATASET_UID)
+    monkeypatch.delattr(filereader, "_read_file_meta_info")
+    dest = _dest()
+    by_meta = _FakeOpener(body=_uid_body({"vr": "UI", "Value": [SENT_UID]}).encode(), status=202)
+    dest._opener = by_meta  # type: ignore[assignment]
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert await dest.send(_carried(obj)) is None
+    assert len(by_meta.requests) == 1
+    warned = _extra_unusable_warnings(caplog)
+    assert len(warned) == 1 and "RuntimeError" in warned[0]  # the operator is told
+    by_data_set = _FakeOpener(
+        body=_uid_body({"vr": "UI", "Value": [_DATASET_UID]}).encode(), status=202
+    )
+    dest._opener = by_data_set  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(_carried(obj))
+    assert exc.value.code == "unconfirmed-202"
+    assert exc.value.config_fault is False
+    assert len(by_data_set.requests) == 1  # sent; refused on the partner's reply, not before
+
+
+def test_dicomweb_a_broken_dicom_extra_does_not_fail_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The build no longer probes pydicom: a DICOMweb destination that never needs it builds.
+    # A regression pin: the build refused this before (BACKLOG #5914, the reviewer's altitude fix).
+    pytest.importorskip("pydicom")
+    from pydicom import filereader
+
+    monkeypatch.delattr(filereader, "_read_file_meta_info")
+    assert isinstance(_dest(), DicomWebDestination)
+
+
+@pytest.mark.parametrize("fault", [RuntimeError, SyntaxError, AttributeError, TypeError])
+async def test_dicomweb_an_extra_that_does_not_load_delivers_and_warns_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, fault: type[Exception]
+) -> None:
+    # A pydicom found on disk whose load raises (an import can raise any class; load_dcmread
+    # turns an ImportError into a RuntimeError) is taken as absent: each send is delivered, and
+    # one WARNING per process names the load's class and the remedy, never its text. The patches
+    # stand for that host.
+    from messagefoundry.transports import dicomweb
+
+    def load() -> object:
+        raise fault("1.2.3.Canary")
+
+    monkeypatch.setattr(dicomweb, "_pre_read_warned", set())
+    monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: True)
+    monkeypatch.setattr(dicomweb, "load_dcmread", load)
+    dest = _dest()
+    opener = _FakeOpener(body=STORED_OK.encode(), status=200)
+    dest._opener = opener  # type: ignore[assignment]
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert await dest.send(PAYLOAD) is None
+        assert await dest.send(PAYLOAD) is None
+    assert len(opener.requests) == 2
+    warned = _extra_unusable_warnings(caplog)
+    assert len(warned) == 1  # once per process, not per send
+    assert fault.__name__ in warned[0] and "repair or remove" in warned[0]
+    assert "restart" in warned[0]
+    assert "Canary" not in caplog.text
+
+
+async def test_dicomweb_a_pydicom_blocked_in_sys_modules_delivers(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A pydicom in sys.modules with no usable module: find_spec answers None for a None entry, so
+    # the extra is forced found here; load_dcmread's import then fails for real, and the extra is
+    # taken as absent.
+    import sys
+
+    from messagefoundry.transports import dicomweb
+
+    monkeypatch.setattr(dicomweb, "_pre_read_warned", set())
+    monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: True)
+    monkeypatch.setitem(sys.modules, "pydicom", None)
+    dest = _dest()
+    opener = _FakeOpener(body=STORED_OK.encode(), status=200)
+    dest._opener = opener  # type: ignore[assignment]
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert await dest.send(PAYLOAD) is None
+    assert len(opener.requests) == 1
+    assert len(_extra_unusable_warnings(caplog)) == 1
+
+
+def _search_only(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
+    """Hold an import search to ``root``, for the test alone: no imported ``pydicom``, the path
+    finder alone on ``sys.meta_path`` (an editable install's finder would find the real one), and a
+    fresh ``sys.path_importer_cache``, so no finder for ``root`` is left behind."""
+    import importlib.machinery
+    import sys
+
+    monkeypatch.delitem(sys.modules, "pydicom", raising=False)
+    monkeypatch.setattr(sys, "meta_path", [importlib.machinery.PathFinder])
+    monkeypatch.setattr(sys, "path_importer_cache", {})
+    monkeypatch.setattr(sys, "path", [str(root)])
+
+
+def test_dicomweb_a_namespace_pydicom_directory_is_no_extra(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A pydicom directory with no __init__.py, as an uninstall can leave behind, is a namespace
+    # package: find_spec finds it, but it holds nothing to load, so it is taken as no extra
+    # (BACKLOG #5914 review). The search is held to that directory alone.
+    import importlib.util
+
+    from messagefoundry.transports import dicomweb
+
+    root = tmp_path
+    (root / "pydicom").mkdir()
+    _search_only(monkeypatch, root)
+    spec = importlib.util.find_spec("pydicom")
+    assert spec is not None and spec.origin is None  # control: found, and a namespace package
+    assert dicomweb._dicom_extra_installed() is False
+
+
+def test_dicomweb_a_regular_pydicom_package_is_the_extra(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Negative control for the namespace case: the same directory with an __init__.py counts.
+    from messagefoundry.transports import dicomweb
+
+    root = tmp_path
+    (root / "pydicom").mkdir()
+    (root / "pydicom" / "__init__.py").write_text("", encoding="ascii")
+    _search_only(monkeypatch, root)
+    assert dicomweb._dicom_extra_installed() is True
+
+
+async def test_dicomweb_the_data_set_pre_read_logs_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # An object pydicom reads with a WARNING ("Expected implicit VR, but found explicit VR"): the
+    # pre-read holds pydicom's lines and writes none, as the object rides as bytes and the line
+    # says nothing of the send (BACKLOG #5914 review). The hold is the one the SCP uses for its reads.
+    pytest.importorskip("pydicom")
+    obj = b"\x00" * 128 + b"DICM" + b"PAYLOAD-MARKER-5914"
+    dest = _dest()
+    opener = _FakeOpener(body=STORED_OK.encode(), status=200)
+    dest._opener = opener  # type: ignore[assignment]
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert await dest.send(_carried(obj)) is None
+    assert caplog.records == []
+    assert len(opener.requests) == 1
+
+
+async def test_dicomweb_the_pre_read_writes_its_held_lines_with_the_first_read_fault_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Where the read raises a fault the codec does not wrap, the lines pydicom logged on the way
+    # are written with the first WARNING, so it has its reason in the log; they pass the same
+    # default-deny filter, so a line no template pins is written withheld. A later read's lines
+    # are dropped, as its WARNING is.
+    pytest.importorskip("pydicom")
+    from messagefoundry.transports import dicomweb
+
+    def parse(data: bytes) -> object:
+        logging.getLogger("pydicom").warning("synthetic pydicom line before the fault")
+        raise TypeError("a value")
+
+    monkeypatch.setattr(dicomweb, "_pre_read_warned", set())
+    monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: True)
+    monkeypatch.setattr(DicomPeek, "parse", staticmethod(parse))
+    dest = _dest()
+    opener = _FakeOpener(body=STORED_OK.encode(), status=200)
+    dest._opener = opener  # type: ignore[assignment]
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert await dest.send(PAYLOAD) is None
+        assert await dest.send(PAYLOAD) is None
+    assert [r.getMessage() for r in caplog.records if r.name == "pydicom"] == [
+        "pydicom WARNING line withheld: it matches no pinned template"
+    ]
+    assert len(opener.requests) == 2
+
+
+@pytest.mark.parametrize("fault", [DicomPeekError("synthetic parse failure"), MemoryError()])
+async def test_dicomweb_the_pre_read_drops_its_held_lines_on_the_other_exits(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, fault: Exception
+) -> None:
+    # The other two exits from the hold write nothing: a parse failure, after which the object is
+    # still sent, and a MemoryError, which escapes (BACKLOG #5914 review).
+    pytest.importorskip("pydicom")
+    from messagefoundry.transports import dicomweb
+
+    def parse(data: bytes) -> object:
+        logging.getLogger("pydicom").warning("synthetic pydicom line before the fault")
+        raise fault
+
+    monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: True)
+    monkeypatch.setattr(DicomPeek, "parse", staticmethod(parse))
+    dest = _dest()
+    opener = _FakeOpener(body=STORED_OK.encode(), status=200)
+    dest._opener = opener  # type: ignore[assignment]
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        if isinstance(fault, MemoryError):
+            with pytest.raises(MemoryError):
+                await dest.send(PAYLOAD)
+        else:
+            assert await dest.send(PAYLOAD) is None
+    assert caplog.records == []
+
+
+async def test_dicomweb_the_pre_read_puts_a_replaced_record_factory_back(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A host that replaced the log record factory after the import has it put back before the
+    # DICOMweb read, over the host's own, as the SCP start, each C-STORE and each SCU association
+    # do, so a pydicom logger with no filter on it is screened during the read too (BACKLOG #6637).
+    pytest.importorskip("pydicom")
+    from messagefoundry.transports import dicom as dicom_module
+    from messagefoundry.transports import dicomweb
+
+    in_force: list[object] = []
+    unlisted = "pydicom.unlisted_probe_6637"
+    assert dicom_module._PEER_VALUE_FILTER not in logging.getLogger(unlisted).filters  # control
+
+    def host(*args: object, **kwargs: object) -> logging.LogRecord:
+        return logging.LogRecord(*args, **kwargs)  # type: ignore[arg-type]
+
+    def parse(data: bytes) -> object:
+        in_force.append(logging.getLogRecordFactory())
+        logging.getLogger(unlisted).warning("synthetic unlisted line PAYLOAD-MARKER-6637")
+        raise DicomPeekError("synthetic parse failure")
+
+    monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: True)
+    monkeypatch.setattr(DicomPeek, "parse", staticmethod(parse))
+    dest = _dest()
+    dest._opener = _FakeOpener(body=STORED_OK.encode(), status=200)  # type: ignore[assignment]
+    original = logging.getLogRecordFactory()
+    caplog.clear()
+    try:
+        logging.setLogRecordFactory(host)
+        with caplog.at_level(logging.WARNING):
+            assert await dest.send(PAYLOAD) is None
+    finally:
+        logging.setLogRecordFactory(original)
+        logging.Logger.manager.loggerDict.pop(unlisted, None)  # the probe logger is the test's own
+    assert len(in_force) == 1  # control: the read ran
+    factory = in_force[0]
+    assert isinstance(factory, dicom_module._ScreeningRecordFactory)
+    assert factory._previous is host  # the host's factory is wrapped, not dropped
+    assert [r.getMessage() for r in caplog.records if r.name == unlisted] == [
+        f"{unlisted} WARNING {dicom_module._LINE_WITHHELD}"
+    ]
+
+
+def test_dicomweb_the_pre_read_object_does_warn_through_pydicom(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Control for the test above: the same object, read outside the hold, does log a pydicom
+    # WARNING, so an empty capture there is the hold's doing.
+    pytest.importorskip("pydicom")
+    obj = b"\x00" * 128 + b"DICM" + b"PAYLOAD-MARKER-5914"
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        DicomPeek.parse(obj)
+    assert [r for r in caplog.records if r.name == "pydicom" and r.levelno == logging.WARNING]
+
+
+async def test_dicomweb_an_absent_dicom_extra_compares_the_file_meta_uid_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The extra is optional: without it the data set read is skipped, not an error.
+    from messagefoundry.transports import dicomweb
+
+    monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: False)
+    obj = _pydicom_part10(SENT_UID, _DATASET_UID)
+    dest = _dest()
+    dest._opener = _FakeOpener(
+        body=_uid_body({"vr": "UI", "Value": [_DATASET_UID]}).encode(), status=202
+    )  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(_carried(obj))
+    assert exc.value.code == "unconfirmed-202"
+    dest._opener = _FakeOpener(body=STORED_OK.encode(), status=202)  # type: ignore[assignment]
+    assert await dest.send(_carried(obj)) is None
+
+
+@pytest.mark.parametrize(
+    "obj",
+    [pytest.param(OBJECT, id="other-uid"), *_NO_FILE_META],
+)
+async def test_dicomweb_200_is_not_compared_with_the_instance_sent(obj: bytes) -> None:
+    # The decision covers the 202 only; a 200 keeps its ruling and is not held to the comparison.
+    dest = _dest()
+    body = _uid_body({"vr": "UI", "Value": ["1.2.3.4.6"]})
+    dest._opener = _FakeOpener(body=body.encode(), status=200)  # type: ignore[assignment]
+    assert await dest.send(_carried(obj)) is None
+
+
+async def test_dicomweb_file_meta_reader_agrees_with_pydicoms_writer() -> None:
+    # A control on the synthetic builder above: a Part-10 object written by pydicom itself, with an
+    # odd-length UID that its writer pads, confirms a 202 that names the UID and no other.
+    pydicom = pytest.importorskip("pydicom")
+    from pydicom.dataset import FileMetaDataset
+    from pydicom.uid import UID, ExplicitVRLittleEndian
+
+    uid = "1.2.826.0.1.3680043.8.498.12345"  # odd length: the writer pads it with a NUL
+    meta = FileMetaDataset()
+    meta.MediaStorageSOPClassUID = UID("1.2.840.10008.5.1.4.1.1.88.11")
+    meta.MediaStorageSOPInstanceUID = UID(uid)
+    meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    ds = pydicom.Dataset()
+    ds.file_meta = meta
+    ds.SOPInstanceUID = uid
+    ds.PatientName = "Synthetic^Test"
+    buf = io.BytesIO()
+    pydicom.dcmwrite(buf, ds, enforce_file_format=True)
+    written = buf.getvalue()
+    assert len(uid) % 2 == 1 and uid.encode() + b"\0" in written  # control: the pad is on the wire
+    dest = _dest()
+    dest._opener = _FakeOpener(body=_uid_body({"vr": "UI", "Value": [uid]}).encode(), status=202)  # type: ignore[assignment]
+    assert await dest.send(_carried(written)) is None
+    dest._opener = _FakeOpener(body=STORED_OK.encode(), status=202)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(_carried(written))
+    assert exc.value.code == "unconfirmed-202"
 
 
 @pytest.mark.parametrize("status", [200, 202])

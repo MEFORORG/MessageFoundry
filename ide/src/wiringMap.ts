@@ -12,7 +12,7 @@
 // posted map payload, so config-supplied names are never string-interpolated into markup.
 import * as vscode from "vscode";
 import type { ElementKind } from "./graphModel";
-import { wiringMapPayload, type MapFocus } from "./wiringMapModel";
+import { handleOpenRequest, wiringMapPayload, type MapFocus } from "./wiringMapModel";
 import type { GraphProvider } from "./graphTree";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { wiringMapScript } from "./wiringMapWebview";
@@ -21,7 +21,9 @@ type Incoming =
   | { command: "ready" }
   | { command: "setFocus"; kind: ElementKind; name: string }
   | { command: "refresh" }
-  | { command: "open"; file: string; line: number }
+  // Typed unknown because the file reaches openSource as a path: handleOpenRequest checks it
+  // against the graph (BACKLOG #4277). Host-side shape checks on the other variants are #2418.
+  | { command: "open"; file: unknown; line: unknown }
   | { command: "reveal"; kind: ElementKind; name: string };
 
 export class WiringMapPanel {
@@ -76,7 +78,11 @@ export class WiringMapPanel {
     } else if (m.command === "refresh") {
       await this.graph.refresh(); // fires onDidChangeTreeData -> post()
     } else if (m.command === "open") {
-      await vscode.commands.executeCommand("messagefoundry.openSource", m.file, m.line);
+      // A page script names the file, so open only a file the current graph reports (BACKLOG #4277).
+      await handleOpenRequest(this.graph.getGraph(), m.file, m.line, {
+        execute: (command, ...args) => vscode.commands.executeCommand(command, ...args),
+        warn: (message) => void vscode.window.showWarningMessage(message),
+      });
     } else if (m.command === "reveal") {
       await vscode.commands.executeCommand("messagefoundry.revealElement", m.kind, m.name);
     }

@@ -58,8 +58,12 @@
        new name.
 
     2. A WRITER THAT DIES MUST NOT DIE SILENTLY. Every failure appends one line to
-       seats/.writer-errors.txt and the script still exits 0. Exiting non-zero from a Stop hook is
-       its own hazard; leaving no trace is worse than either. A -Record hook input refused under
+       seats/.writer-errors.txt, and the hook paths (-Record, -Prompt) still exit 0. Exiting
+       non-zero from a Stop hook is its own hazard; leaving no trace is worse than either. The CLI
+       verbs (-Declare, -Close, -BumpEpoch, -ClearHandoff) exit non-zero when the worktree or the
+       shared root does not resolve and when an error reaches the main catch, because a caller
+       waits on each (BACKLOG #7593). A failure caught and recorded part-way through a write, such
+       as an unresolved handoff pointer, still lets the verb finish and exit 0. A -Record hook input refused under
        scripts/hooks/_hookinput.ps1's rules is NOT a failure, so it never goes there. It goes to
        stderr and to seats/.writer-refusals.txt in the registry of the checkout this script started
        in, where that checkout and its registry resolve, at most one line per session key and host
@@ -165,6 +169,16 @@ if ($env:CLAUDE_CODE_REMOTE -eq 'true' -and $PSCmdlet.ParameterSetName -notin 'R
     exit 3
 }
 
+# The pool epoch marks a CLAUDE account switch. docs/CODEX.md: "Do not use Claude's account-switch or
+# pool-epoch commands for a Codex account." bridge.py refuses the literal argument; this also
+# refuses any other spelling that reaches seat.ps1 under the bridge (BACKLOG #7594). It keys on
+# KORUS_AGENT, which the bridge sets only for its child processes (docs/CODEX.md), so a run from a
+# Codex shell outside the bridge is not recognized here. Nothing is read or written.
+if ($env:KORUS_AGENT -eq 'codex' -and $BumpEpoch) {
+    [Console]::Error.WriteLine('seat.ps1 -BumpEpoch: REFUSED for a Codex session (KORUS_AGENT=codex). The pool epoch marks a Claude account switch; docs/CODEX.md says not to use it for a Codex account. Nothing was read or written.')
+    exit 1
+}
+
 $SCHEMA = 1
 $WRITER = 'seat.ps1/1.0.0'
 
@@ -181,13 +195,17 @@ $script:SharedRoot = $null
 
 function Write-WriterError {
     param([string]$Stage, [string]$Message)
-    # Best-effort by construction: if we cannot even record the failure we must still exit 0, or a
-    # broken writer takes the seat's Stop hook down with it.
+    # Best-effort by construction: if we cannot even record the failure a hook path must still exit
+    # 0, or a broken writer takes the seat's Stop hook down with it.
     try {
         if (-not $script:SeatsDir) { return }
         $f = Join-Path $script:SeatsDir '.writer-errors.txt'
-        $line = "{0}`t{1}`t{2}`t{3}" -f ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')), $env:COMPUTERNAME, $Stage, ($Message -replace '\s+', ' ')
-        Add-Content -Path $f -Value $line -Encoding utf8 -EA SilentlyContinue
+        # Get-CoordHost, the name every shared record carries, not the inherited $env:COMPUTERNAME;
+        # -LiteralPath, so a '[' in a shared-root path is not read as a wildcard (BACKLOG #7593).
+        # MachineName can throw (mail-claim.ps1 says so); the line must still be written then.
+        $hostName = try { Get-CoordHost } catch { $env:COMPUTERNAME }
+        $line = "{0}`t{1}`t{2}`t{3}" -f ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')), $hostName, $Stage, ($Message -replace '\s+', ' ')
+        Add-Content -LiteralPath $f -Value $line -Encoding utf8 -EA SilentlyContinue
     } catch { }
 }
 
@@ -489,14 +507,75 @@ function Get-ConfigRootLabel {
 }
 
 function Get-PoolEpoch {
-    param([string]$SeatsDir)
+    # An absent file is epoch 1. A file that is present but unreadable or not an integer is ALSO 1
+    # here, because the record paths stamp poolEpoch on every write, -Record included, and rule 2
+    # forbids a hook path dying over it. -Strict is for -BumpEpoch, which must throw instead: a bump
+    # from a silent 1 would write 2 over an epoch that may be far higher, and every record after it
+    # would read as written before a switch it followed (BACKLOG #7594).
+    param([string]$SeatsDir, [switch]$Strict)
     $f = Join-Path $SeatsDir '.pool-epoch'
-    if (-not (Test-Path -LiteralPath $f)) { return 1 }
+    # Test-Path answers false on an I/O or permission error too, so -Strict decides absence only from
+    # the read's own FileNotFoundException.
+    if (-not $Strict -and -not (Test-Path -LiteralPath $f)) { return 1 }
+    $why = 'it holds no whole number; write the correct epoch into it by hand'
     try {
-        $v = (Read-CoordText $f).Trim()
+        # The expansion, not a [string] cast: an empty file emits nothing, and the cast keeps that null.
+        $v = "$(Read-CoordText $f)".Trim()
         if ($v -match '\A[0-9]+\z') { return [int]$v }
-    } catch { }
+    } catch {
+        if ((Get-CoordInnerException $_.Exception) -is [System.IO.FileNotFoundException]) { return 1 }
+        $why = $_.Exception.Message
+    }
+    if ($Strict) { throw "the pool epoch file $f could not be read, so it was not bumped: $why" }
     return 1
+}
+
+function Invoke-PoolEpochBump {
+    # One read-modify-write under a mutex, replaced atomically. Without the mutex two bumps that read
+    # the same N both write N+1 and one switch is lost (BACKLOG #7594). The mutex is a file created
+    # exclusively BESIDE .pool-epoch, on the shared root, so it serializes bumps from either PC;
+    # lock.ps1's Enter-CoordLock anchors to this checkout's own git dir and would not. Like that one,
+    # it retries a taken name and never steals: on timeout it names the lock and its holder line.
+    # Access denied (a name still pending deletion, or a real denial) fails at once, loudly.
+    param([string]$SeatsDir, [int]$TimeoutSeconds = 10)
+    $f = Join-Path $SeatsDir '.pool-epoch'
+    $lock = "$f.lock"
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        try {
+            $fs = [System.IO.File]::Open($lock, [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            break
+        } catch [System.IO.IOException] {
+            # Only a name that is taken is contention (lock.ps1's rule): a full disk or a bad path
+            # fails at once rather than being reported, after the wait, as a wedged holder.
+            $io = if ($_.Exception.InnerException) { $_.Exception.InnerException } else { $_.Exception }
+            if ($env:OS -eq 'Windows_NT' -and ($io.HResult -band 0xFFFF) -notin 0x50, 0x20) { throw }
+            if ($clock.Elapsed.TotalSeconds -gt $TimeoutSeconds) {
+                $held = '(unreadable)'
+                try { $held = "$(Read-CoordText $lock)".Trim() } catch { }
+                throw "timed out after ${TimeoutSeconds}s waiting for $lock (held by: $held), so the pool epoch was not bumped. Not stealing it; if that bump is not running, delete it by hand."
+            }
+            Start-Sleep -Milliseconds 200
+        }
+    }
+    $tmp = $null
+    try {
+        $who = [System.Text.Encoding]::UTF8.GetBytes("pid=$PID host=$([Environment]::MachineName) at=$([DateTime]::UtcNow.ToString('o'))")
+        $fs.Write($who, 0, $who.Length)
+        $fs.Dispose()
+        $next = (Get-PoolEpoch -SeatsDir $SeatsDir -Strict) + 1
+        $tmp = Join-Path $SeatsDir ('.pool-epoch.' + [guid]::NewGuid().ToString('n') + '.tmp')
+        Set-Content -LiteralPath $tmp -Value ([string]$next) -Encoding utf8 -EA Stop
+        Move-CoordFileReplace -Source $tmp -Destination $f -ReplaceReadOnly
+        $tmp = $null
+        return $next
+    } finally {
+        try { $fs.Dispose() } catch { }
+        if ($tmp) { Remove-Item -LiteralPath $tmp -Force -EA SilentlyContinue }
+        try { Remove-Item -LiteralPath $lock -Force -EA Stop }
+        catch { [System.Console]::Error.WriteLine("seat.ps1 -BumpEpoch: WARNING: could not remove the mutex $lock, so every later bump will wait on it and time out. Delete it by hand: $($_.Exception.Message)") }
+    }
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1113,7 +1192,7 @@ function Invoke-SeatWorktreeLock {
 }
 
 # ---------------------------------------------------------------------------------------------
-# Main. Everything is wrapped: rule 2 says this exits 0 whatever happens.
+# Main. Everything is wrapped: rule 2 says a hook path exits 0 whatever happens.
 # ---------------------------------------------------------------------------------------------
 
 $exit = 0
@@ -1179,10 +1258,11 @@ try {
 
     if (-not $wt) {
         # Rule 1: no worktree, no key, NO WRITE. There is nowhere legitimate to record this, so it
-        # goes to stderr and the script still exits 0.
+        # goes to stderr, and a hook path still exits 0.
         Write-Error "seat.ps1: could not resolve a rooted existing worktree; nothing written." -EA Continue
-        # -ClearHandoff is a CLI act, not a hook, so its caller is told it did nothing.
-        exit ([int][bool]$ClearHandoff)
+        # Every CLI verb (-Declare, -Close, -BumpEpoch, -ClearHandoff) is a writer its caller waits
+        # on, so it is told it did nothing (BACKLOG #7593). Only the hook paths exit 0.
+        exit ([int]($PSCmdlet.ParameterSetName -notin 'Record', 'Prompt'))
     }
 
     # ONE git call and ONE probe of the shared root. seats/, claims/, alloc/ and handoffs/ all sit on
@@ -1217,20 +1297,27 @@ try {
     }
     if ($hookFault) { Write-WriterError -Stage 'hook-input' -Message $hookFault }
 
-    $boxKey = ConvertTo-BoxKey -Path $wt
+    # The mail keyer's own step (BACKLOG #7581); a toplevel comes back unchanged.
+    $boxPath = Resolve-BoxPath -Path $wt
+    $boxKey = ConvertTo-BoxKey -Path $boxPath
 
     # Rule 3. BEFORE any early return, so a no-op invocation still proves the writer ran.
     try {
         $aliveDir = Join-Path $script:SeatsDir '.writer-alive'
         if (-not (Test-Path -LiteralPath $aliveDir)) { New-Item -ItemType Directory -Path $aliveDir -Force | Out-Null }
-        Set-Content -LiteralPath (Join-Path $aliveDir "$boxKey.txt") `
-            -Value ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) -Encoding utf8 -EA Stop
+        # Temp then rename (BACKLOG #7594): Set-Content in place truncates first, so a reader could
+        # find the heartbeat empty. A failure is still only recorded, never fatal (rule 2).
+        $alive = Join-Path $aliveDir "$boxKey.txt"
+        $aliveTmp = Join-Path $aliveDir (".$boxKey.txt." + [guid]::NewGuid().ToString('n') + '.tmp')
+        try {
+            Set-Content -LiteralPath $aliveTmp -Value ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) -Encoding utf8 -EA Stop
+            Move-CoordFileReplace -Source $aliveTmp -Destination $alive -ReplaceReadOnly
+        } catch { Remove-Item -LiteralPath $aliveTmp -Force -EA SilentlyContinue; throw }
     } catch { Write-WriterError -Stage 'writer-alive' -Message $_.Exception.Message }
 
     if ($BumpEpoch) {
-        $f = Join-Path $script:SeatsDir '.pool-epoch'
-        $next = (Get-PoolEpoch -SeatsDir $script:SeatsDir) + 1
-        Set-Content -LiteralPath $f -Value ([string]$next) -Encoding utf8
+        # A throw here reaches the catch below, which exits non-zero for this CLI verb.
+        $next = Invoke-PoolEpochBump -SeatsDir $script:SeatsDir
         Write-Host "pool epoch is now $next"
         exit 0
     }
@@ -1263,7 +1350,7 @@ try {
     # the new key. A legacy record from another host shares this path but is that PC's seat, so it is
     # never adopted.
     $prior = $null
-    $legacyPath = Join-Path (Join-Path $script:SeatsDir (ConvertTo-LegacyBoxKey -Path $wt)) ("$($sk.Key).json")
+    $legacyPath = Join-Path (Join-Path $script:SeatsDir (ConvertTo-LegacyBoxKey -Path $boxPath)) ("$($sk.Key).json")
     $priors = @()
     foreach ($p in @($recPath, $legacyPath)) {
         if (-not (Test-Path -LiteralPath $p)) { continue }
@@ -1538,8 +1625,9 @@ try {
 } catch {
     Write-WriterError -Stage 'main' -Message $_.Exception.Message
     Write-Error "seat.ps1: $($_.Exception.Message)" -EA Continue
-    # Rule 2 protects the HOOK paths. -ClearHandoff is a CLI act whose caller must hear a failure.
-    $exit = [int][bool]$ClearHandoff
+    # Rule 2 protects the HOOK paths, -Record and -Prompt. Every CLI verb is an act whose caller must
+    # hear a failure (BACKLOG #7593).
+    $exit = [int]($PSCmdlet.ParameterSetName -notin 'Record', 'Prompt')
 }
 
 exit $exit

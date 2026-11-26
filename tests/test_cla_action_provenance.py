@@ -139,15 +139,20 @@ def _property(section: str, name: str) -> str:
 
 
 def test_the_vendored_bundle_still_derives_from_the_pinned_upstream_commit() -> None:
-    """Strip the two-line vendoring header and the rest is the upstream blob, byte for byte.
+    """Strip the two-line vendoring header, revert the recorded patches, and the rest is the
+    upstream blob, byte for byte.
 
     This is the whole provenance claim, and it is checkable with no network and no Node: the
     recorded upstream digest is reproduced from the file on disk rather than merely asserted.
+    Since BACKLOG #5644 and #5645 the bundle is a patched fork, so the unreverted body must NOT
+    reproduce it -- that half is the control proving the reversal is doing work.
     """
     bundle = (REPO_ROOT / provenance.BUNDLE_PATH).read_bytes()
     body = provenance.split_vendoring_header(bundle)
 
-    assert hashlib.sha256(body).hexdigest() == provenance.UPSTREAM_BUNDLE_SHA256
+    assert hashlib.sha256(body).hexdigest() != provenance.UPSTREAM_BUNDLE_SHA256
+    upstream = provenance.revert_bundle_patches(body)
+    assert hashlib.sha256(upstream).hexdigest() == provenance.UPSTREAM_BUNDLE_SHA256
     assert _property("component", "messagefoundry:upstream:bundle-sha256") == (
         provenance.UPSTREAM_BUNDLE_SHA256
     )
@@ -342,6 +347,80 @@ def test_the_gate_sees_a_stripped_vendoring_header(tree: Path) -> None:
 
     problems = provenance.check(tree)
     assert any("does not start with the recorded vendoring header" in p for p in problems)
+
+
+@pytest.mark.parametrize("index", range(len(provenance.BUNDLE_PATCHES)))
+def test_the_gate_sees_an_edited_patch(tree: Path, index: int) -> None:
+    """A recorded patch whose text was changed in the bundle reds the check, and so does --write.
+
+    A patch is reviewed text, so an edit inside one is the same event as an edit anywhere else.
+    """
+    bundle = tree / provenance.BUNDLE_PATH
+    patched = provenance.BUNDLE_PATCHES[index][1]
+    data = bundle.read_bytes()
+    assert data.count(patched) == 1
+    middle = len(patched) // 2
+    bundle.write_bytes(data.replace(patched, patched[:middle] + b"X" + patched[middle:]))
+    before = (tree / provenance.RECORD_PATH).read_bytes()
+
+    problems = provenance.check(tree)
+    assert any(f"bundle patch {index + 1} occurs 0 times" in p for p in problems), problems
+    assert provenance.main(["--write", "--root", str(tree)]) == 2
+    assert (tree / provenance.RECORD_PATH).read_bytes() == before
+
+
+def test_the_gate_sees_a_patch_applied_twice(tree: Path) -> None:
+    """A second copy of a patched span is not the reviewed fork, even though each copy is."""
+    bundle = tree / provenance.BUNDLE_PATH
+    patched = provenance.BUNDLE_PATCHES[0][1]
+    bundle.write_bytes(bundle.read_bytes() + patched)
+
+    problems = provenance.check(tree)
+    assert any("bundle patch 1 occurs 2 times" in p for p in problems), problems
+
+
+@pytest.mark.parametrize("index", range(len(provenance.BUNDLE_PATCHES)))
+def test_the_gate_sees_a_reverted_patch(tree: Path, index: int) -> None:
+    """Undoing a patch -- restoring upstream's unanchored pattern, say -- reds the check too."""
+    bundle = tree / provenance.BUNDLE_PATH
+    upstream, patched = provenance.BUNDLE_PATCHES[index]
+    bundle.write_bytes(bundle.read_bytes().replace(patched, upstream))
+
+    problems = provenance.check(tree)
+    assert any(f"bundle patch {index + 1} occurs 0 times" in p for p in problems), problems
+
+
+def test_a_bad_patch_does_not_hide_a_second_change(tree: Path) -> None:
+    """Two bad patches AND an edit outside every patch are all reported in one run.
+
+    Before, the first bad patch raised, the digest comparison was skipped, and both the second bad
+    patch and the injected line went unreported until the first was fixed.
+    """
+    bundle = tree / provenance.BUNDLE_PATH
+    data = bundle.read_bytes()
+    for index in (0, 2):
+        upstream, patched = provenance.BUNDLE_PATCHES[index]
+        data = data.replace(patched, upstream)
+    bundle.write_bytes(data + b"\n// injected\n")
+
+    problems = provenance.check(tree)
+    assert any("bundle patch 1 occurs 0 times" in p for p in problems), problems
+    assert any("bundle patch 3 occurs 0 times" in p for p in problems), problems
+    assert any("does not reproduce the recorded upstream digest" in p for p in problems), problems
+
+
+def test_a_patch_moved_to_another_site_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The post-revert uniqueness check, which is what refuses a patch applied at a second site.
+
+    Synthetic, because the real upstream spans each occur once: an upstream span ``U`` that occurs
+    twice once reverted means the body could carry the patch at either site and revert to the same
+    bytes, so the derivation alone could not say which site was reviewed.
+    """
+    monkeypatch.setattr(provenance, "BUNDLE_PATCHES", ((b"<U>", b"<P>"),))
+    assert provenance.revert_bundle_patches(b"a <P> b") == b"a <U> b"
+
+    with pytest.raises(ValueError, match="upstream text occurs 2 times"):
+        provenance.revert_bundle_patches(b"a <U> b <P> c")
 
 
 def test_the_gate_sees_an_edited_record(tree: Path) -> None:

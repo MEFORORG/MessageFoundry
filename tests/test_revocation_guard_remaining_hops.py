@@ -1156,7 +1156,7 @@ def direct_material(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
     """The S/MIME files DirectDestination loads before it reaches its TLS arms. Synthetic."""
     directory = tmp_path_factory.mktemp("direct2193")
     ca_key, ca_cert = _mint_ca()
-    signer_key, signer_cert = _mint_leaf("Sender Direct", ca_key, ca_cert)
+    signer_key, signer_cert = _mint_leaf("sender@hisp.example", ca_key, ca_cert)
     _recipient_key, recipient_cert = _mint_leaf("recipient@hisp.example", ca_key, ca_cert)
     _write_pem(directory / "signer.crt", signer_cert)
     _write_key(directory / "signer.key", signer_key)

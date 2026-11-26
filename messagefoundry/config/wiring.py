@@ -11268,8 +11268,11 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
     import ctypes
     from ctypes import wintypes
 
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    from messagefoundry import win32_sid
+
+    # The SID, entry, account and token prototypes come from the leaf win32_sid, which
+    # auth/anchor_path.py's reader also uses.
+    advapi32, kernel32 = win32_sid.sid_libraries()
 
     # Declare prototypes so 64-bit pointers aren't truncated to a default c_int arg (which raises an
     # OverflowError on a high address). PVOID = c_void_p; PSID/PACL/PSECURITY_DESCRIPTOR are pointers.
@@ -11284,45 +11287,6 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
         ctypes.POINTER(ctypes.c_void_p),  # ppSacl
         ctypes.POINTER(ctypes.c_void_p),  # ppSecurityDescriptor
     ]
-    advapi32.GetAce.restype = wintypes.BOOL
-    advapi32.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
-    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
-    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
-    advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
-    advapi32.ConvertStringSidToSidW.argtypes = [
-        wintypes.LPCWSTR,
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    advapi32.LookupAccountSidW.restype = wintypes.BOOL
-    advapi32.LookupAccountSidW.argtypes = [
-        wintypes.LPCWSTR,  # lpSystemName (NULL = this machine)
-        ctypes.c_void_p,  # Sid
-        wintypes.LPWSTR,  # Name
-        ctypes.POINTER(wintypes.DWORD),  # cchName
-        wintypes.LPWSTR,  # ReferencedDomainName
-        ctypes.POINTER(wintypes.DWORD),  # cchReferencedDomainName
-        ctypes.POINTER(ctypes.c_int),  # peUse (SID_NAME_USE)
-    ]
-    advapi32.OpenProcessToken.restype = wintypes.BOOL
-    advapi32.OpenProcessToken.argtypes = [
-        wintypes.HANDLE,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.HANDLE),
-    ]
-    advapi32.GetTokenInformation.restype = wintypes.BOOL
-    advapi32.GetTokenInformation.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_int,  # TOKEN_INFORMATION_CLASS
-        ctypes.c_void_p,  # TokenInformation (buffer)
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD),
-    ]
-    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-    kernel32.LocalFree.restype = ctypes.c_void_p
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-
     # GetNamedSecurityInfoW(pObjectName, SE_FILE_OBJECT=1, SecurityInfo, ppOwner, ppGroup, ppDacl,
     # ppSacl, ppSecurityDescriptor). We request OWNER (0x1) | DACL (0x4). The SD is allocated by the
     # API and must be LocalFree'd; the owner/DACL pointers point INTO that buffer (do not free them).
@@ -11355,40 +11319,7 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
         )
 
     def _sid_to_str(sid_ptr: int) -> str | None:
-        out = wintypes.LPWSTR()
-        if not advapi32.ConvertSidToStringSidW(sid_ptr, ctypes.byref(out)):
-            return None
-        try:
-            return out.value
-        finally:
-            # ConvertSidToStringSidW allocates the string with LocalAlloc; free its address.
-            if out:
-                kernel32.LocalFree(ctypes.cast(out, ctypes.c_void_p))
-
-    def _self_sid() -> str | None:
-        # Current process user SID, so a config dir the service account itself owns/controls passes.
-        token = wintypes.HANDLE()
-        _TOKEN_QUERY = 0x0008
-        _TokenUser = 1
-        if not advapi32.OpenProcessToken(
-            kernel32.GetCurrentProcess(), _TOKEN_QUERY, ctypes.byref(token)
-        ):
-            return None
-        try:
-            size = wintypes.DWORD(0)
-            advapi32.GetTokenInformation(token, _TokenUser, None, 0, ctypes.byref(size))
-            if size.value == 0:
-                return None
-            buf = ctypes.create_string_buffer(size.value)
-            if not advapi32.GetTokenInformation(
-                token, _TokenUser, buf, size.value, ctypes.byref(size)
-            ):
-                return None
-            # TOKEN_USER = SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes; }; Sid is the first pointer.
-            sid_ptr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
-            return _sid_to_str(sid_ptr) if sid_ptr else None
-        finally:
-            kernel32.CloseHandle(token)
+        return win32_sid.sid_text(advapi32, kernel32, sid_ptr)
 
     # LOCALGROUP_MEMBERS_INFO_0 — level 0 of NetLocalGroupGetMembers returns member SIDs only. Levels
     # 1..3 return NAMES, and translating a domain member's SID to a name is what reaches out to a domain
@@ -11589,9 +11520,11 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
                 if not advapi32.GetAce(dacl_ptr, i, ctypes.byref(ace_ptr)):
                     return _WinPathSecurity(owner_sid=owner_sid, aces=None)
                 header = ctypes.cast(ace_ptr, ctypes.POINTER(_ACE_HEADER)).contents
-                # Every ACE type carries its access mask right after the 4-byte header, so the mask
-                # is read for all of them: the policy refuses a callback or object entry granting a
-                # write-class right, and recording it as 0 would hide that (BACKLOG #5622).
+                # Every ACE type Windows defines carries its access mask right after the 4-byte
+                # header, so the mask is read for all of them: the policy refuses a callback or
+                # object entry granting a write-class right, and recording it as 0 would hide that
+                # (BACKLOG #5622). An entry of an undefined type may be its header alone, and this
+                # read does not check AceSize first, unlike anchor_path's (BACKLOG #6281).
                 allowed = ctypes.cast(ace_ptr, ctypes.POINTER(_ACCESS_ALLOWED_ACE)).contents
                 trustee = ""  # parsed for type 0x00 only
                 if header.AceType == _WIN_ACCESS_ALLOWED_ACE_TYPE:
@@ -11609,7 +11542,10 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
                 kernel32.LocalFree(sd_ptr)
 
     return _WinConfigSourceProbes(
-        self_sid=_self_sid(), read_path=_read_path, owner_in_admins=_owner_in_admins
+        # The run-as account's SID, so a config dir the service account itself owns passes.
+        self_sid=win32_sid.process_user_sid(advapi32, kernel32),
+        read_path=_read_path,
+        owner_in_admins=_owner_in_admins,
     )
 
 
@@ -12126,13 +12062,18 @@ _CONFIG_MODULE_SUFFIX_LEN: Final = 13
 #: Why the loader's diagnostic for author code carries no exception text.
 _WITHHELD: Final = "its message is withheld: it can carry a value the module held"
 
+#: What :func:`_failure_detail` adds when a folder :func:`_in_dir` could not resolve may make the
+#: location short; its docstring says when.
+_FOLDER_UNRESOLVED: Final = ", and the folder of at least one source file could not be resolved"
+
 
 def _module_failure(
     path: Path, exc: BaseException, source_of: Callable[[str], bytes | None]
 ) -> str:
     """The loader's diagnostic for author code that failed: the exception TYPE, the config-directory
-    file and line it was raised from, and each identifier :func:`_failure_detail` can vouch for, but
-    never the exception's text (vault BACKLOG #3249).
+    file and line it was raised from, each identifier :func:`_failure_detail` can vouch for, and
+    its fixed note when a folder it could not resolve may make that location short, but never the
+    exception's text (vault BACKLOG #3249).
 
     The text is author code's, or a library's quoting author data, and can carry any value the module
     held -- an inline credential, a row it read. It reached ``messagefoundry validate`` and ``check``
@@ -12191,7 +12132,8 @@ def _is_a_signal(exc: BaseException, path: Path) -> bool:
 
 def _raised_in_the_config_dir(exc: BaseException, path: Path) -> bool:
     file = raise_statement_file(exc)
-    return file is not None and _in_dir(file, path.parent.resolve())
+    # A raise in a folder that could not be resolved cannot prove a config file raised it.
+    return file is not None and _in_dir(file, path.parent.resolve()) is True
 
 
 def _read_fault(path: Path, fault: BaseException) -> None:
@@ -12243,25 +12185,40 @@ def _failure_detail(
     is not ``own_file``), and each identifier the exception claims that the source line spells.
 
     The file is the deepest frame in the config directory, so a failing helper is named rather than
-    the config module's import of it. A file name and a line number are layout, not data."""
+    the config module's import of it. A file name and a line number are layout, not data.
+
+    A file whose folder could not be resolved (:func:`_in_dir`) is not named. When one is a frame
+    deeper than the last config-directory frame, is any frame when no frame is in the config
+    directory, or is the file a SyntaxError names, the detail ends with :data:`_FOLDER_UNRESOLVED`,
+    because the location may then be short (vault BACKLOG #3765, LF10)."""
     located: tuple[str, int] | None = None
     filename = getattr(exc, "filename", None) if isinstance(exc, SyntaxError) else None
     lineno = getattr(exc, "lineno", None)
-    if isinstance(filename, str) and isinstance(lineno, int) and _in_dir(filename, config_dir):
-        located = (filename, lineno)
-    else:
+    # A SyntaxError's own file is not a frame, so no config-directory frame outweighs it.
+    syntax_file_unresolved = False
+    if isinstance(filename, str):
+        in_dir = _in_dir(filename, config_dir)
+        syntax_file_unresolved = in_dir is None
+        if in_dir is True and isinstance(lineno, int):
+            located = (filename, lineno)
+    deeper_unresolved = False
+    if located is None:
         # One resolve per distinct file: a RecursionError walks about a thousand frames of one file.
-        seen: dict[str, bool] = {}
+        seen: dict[str, bool | None] = {}
         for frame, frame_line in traceback.walk_tb(exc.__traceback__):
             name = frame.f_code.co_filename
             if name not in seen:
                 seen[name] = _in_dir(name, config_dir)
-            if seen[name]:
+            if seen[name] is True:
                 located = (name, frame_line)
+                deeper_unresolved = False
+            elif seen[name] is None:
+                deeper_unresolved = True
+    note = _FOLDER_UNRESOLVED if syntax_file_unresolved or deeper_unresolved else ""
     detail = _type_name(exc)
     # A frame's line can be None (a code object with no line table): no line, and nothing vouched.
     if located is None or not isinstance(located[1], int):
-        return detail
+        return detail + note
     source_file, line = located
     if Path(source_file).name != own_file:
         detail += f" in {Path(source_file).name}"
@@ -12277,7 +12234,7 @@ def _failure_detail(
         ]
         if idents:
             detail += " naming " + ", ".join(repr(ident) for ident in idents)
-    return detail
+    return detail + note
 
 
 def _claimed_identifiers(exc: BaseException) -> tuple[object, ...]:
@@ -12352,9 +12309,14 @@ def _source_name(name: object) -> str | None:
     return name
 
 
-def _in_dir(filename: str, directory: Path) -> bool:
+def _in_dir(filename: str, directory: Path) -> bool | None:
     """Whether ``filename`` sits directly in ``directory`` -- config modules and their helpers are
-    siblings -- compared resolved.
+    siblings -- compared resolved, or ``None`` when its folder could not be resolved.
+
+    ``None`` is not a match, and the names are not compared as text in its place. Nothing is logged
+    here: this runs while an interrupt is judged (:func:`_is_a_signal`), where a log call would run
+    a handler a module added. :func:`_failure_detail` says it in its diagnostic when it may make the
+    location short; the interrupt verdict records nothing of it.
 
     Only an absolute filename counts. The loader's modules record one (the import machinery makes the
     spec's path absolute, even for a config directory given as a relative path), while ``<string>``,
@@ -12368,7 +12330,7 @@ def _in_dir(filename: str, directory: Path) -> bool:
         # (the Kubernetes ConfigMap layout, or one shared helper), and still sits in this one.
         return candidate.parent.resolve() == directory
     except (OSError, ValueError):
-        return False
+        return None
 
 
 def _textless_import_error(exc: ImportError) -> ImportError:

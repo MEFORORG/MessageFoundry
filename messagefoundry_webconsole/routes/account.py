@@ -166,8 +166,9 @@ register_ui_action(
 # --- L6b: self-service session TERMINATE (ASVS 7.5.2) — password re-proof before revoke ---
 # Both terminate POSTs are body-less (all params in the PATH), so they register as auto_retry
 # continuations /ui/reauth may re-POST after a stale-window re-auth. step_up=False (password-
-# only, mirrors require_ui_reauth_only): a required-but-unenrolled MFA session must still be
-# able to revoke — require_ui_step_up would deadlock it (WP-14). permission=None (self-scoped).
+# only, mirrors require_ui_reauth_only). A pending session does not pass the gate, with a factor
+# (#1951) or without one under require_mfa, which is sent to enrol (#1149); /ui/reauth sends it
+# to enrol too, keyed on the action rather than on step_up. permission=None.
 # The two patterns do not overlap: the per-session pattern requires two more segments after
 # sessions/ (<id>/revoke), so /ui/account/sessions/revoke-others (one segment) matches only itself.
 # BACKLOG #1149 (ASVS 7.5.2): both now carry an action= tag, the same treatment the factor lanes got
@@ -739,8 +740,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # --- L6b: self-service session management (#75 parity — desktop sessions.py twin) ---
     # LISTING one's OWN sessions is plain cookie-authenticated self-service (require_ui). TERMINATING
     # one (revoke one / revoke-others) additionally requires a fresh PASSWORD re-proof
-    # (require_ui_reauth_only_action — ASVS 7.5.2), NOT the full MFA step-up: a no-factor user must
-    # still be able to revoke, and require_ui_step_up would deadlock them (WP-14). BACKLOG #1149
+    # (require_ui_reauth_only_action — ASVS 7.5.2), NOT the full MFA step-up. No pending session
+    # passes it: one with no factor under require_mfa is sent to enrol first. BACKLOG #1149
     # CORRECTED THE SENTENCE THAT STOOD HERE: it read "a fresh login seeds the step-up window, so an
     # immediate post-login revoke is unaffected", which was true of the code and was the defect --
     # 7.5.2 wants an authentication event AFTER the one that established the session. The proof is

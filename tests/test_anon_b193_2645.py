@@ -23,7 +23,7 @@ from tee.anon import anonymize as tee_anonymize
 from tee.anon import rules as tee_rules
 
 _OVERLAY = Path(__file__).resolve().parent / "fixtures" / "anon" / "batch_18.anon.toml"
-_SALT = "b193-salt-0123456789abcdef"
+_SALT = "b193-salt-0123456789abcdef-0123456789"
 _EACH_RULES = pytest.mark.parametrize("module", (engine_rules, tee_rules), ids=("engine", "tee"))
 _EACH_ADAPTER = pytest.mark.parametrize(
     "adapter", (engine_anonymize, tee_anonymize), ids=("engine", "tee")

@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import tracemalloc
 from collections.abc import AsyncIterator, Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +40,11 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
 )
-from messagefoundry.pipeline import Engine
+from messagefoundry.content_type import ContentType
+from messagefoundry.parsing.peek import Peek
+from messagefoundry.parsing.summary import summarize
+from messagefoundry.pipeline import Engine, wiring_runner
+from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus
 from messagefoundry.store.crypto import AesGcmCipher, IdentityCipher, generate_key, make_cipher
 from messagefoundry.store.store import AuditAppend
@@ -776,6 +782,53 @@ async def test_resend_injects_via_enqueue_ingress(engine: Engine, tmp_path: Path
     assert detail["origin"] == "operator_upload" and detail["body_digest"] is None
 
 
+async def test_resend_by_a_padded_username_is_refused_403_with_nothing_injected(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #6589. A directory may hand back a name with surrounding whitespace, which the
+    local username rule never sees, and the store refuses such an ``origin_actor``. The route
+    refuses first, as a 403, so the resend is not a 500 and nothing is injected. The name is
+    padded by a store write after sign-in, as a directory rename would do it. Control: the same
+    resend before the rename injects."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    service = await _make_user(engine, Role.OPERATOR, name="pad")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = reproving_transport(PW, app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "pad")
+        fid = (
+            await c.post("/uploads", files={"file": ("b.hl7", BATCH, "text/plain")}, headers=h)
+        ).json()["file_id"]
+        ok = await c.post(f"/uploads/{fid}/resend", json={"index": 0, "to": "in1"}, headers=h)
+        assert ok.status_code == 200, ok.text
+        user = await engine.store.get_user_by_username("pad")
+        assert user is not None
+        assert await engine.store.set_user_username(
+            user.id, "pad ", expected_username="pad", audits=()
+        )
+        before = int(await engine.store.count_messages(channel_id="in1", allowed_channels=None))
+        r = await c.post(f"/uploads/{fid}/resend", json={"index": 1, "to": "in1"}, headers=h)
+        assert r.status_code == 403, r.text
+        assert "surrounding whitespace" in r.json()["detail"]
+        # Told apart from the channel denial's 403, which carries no code.
+        assert r.headers["X-Refusal-Code"] == "username_unusable"
+    after = int(await engine.store.count_messages(channel_id="in1", allowed_channels=None))
+    assert after == before
+    # The refusal is audited, as main audits the resend it refuses (BACKLOG #6589): exactly one
+    # reject row naming the acting user and the reason, and no second resend row.
+    [reject] = await engine.store.list_audit(action="upload.resend_reject")
+    assert reject["actor"] == "pad "
+    assert reject["channel_id"] == "in1"
+    detail = json.loads(str(reject["detail"]))
+    assert (detail["phase"], detail["file_id"], detail["index"]) == ("origin_actor", fid, 1)
+    assert "surrounding whitespace" in detail["reason"]
+    assert len(await engine.store.list_audit(action="upload.resend")) == 1
+
+
 async def test_resend_unknown_and_not_running_inbound(engine: Engine, tmp_path: Path) -> None:
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
@@ -817,6 +870,296 @@ async def test_engine_inject_message_creates_received(engine: Engine) -> None:
     assert row["source_type"] == "upload"
     [audit] = await engine.store.list_audit(action="upload.resend")
     assert (audit["actor"], audit["detail"]) == ("op", mid)
+
+
+async def _inject_fields(
+    engine: Engine, raw: str, *, channel_id: str = "in1"
+) -> tuple[object, object, object]:
+    """Inject ``raw`` and read back the three peek columns of its stored row (BACKLOG #5707)."""
+    mid = await engine.inject_message(
+        channel_id=channel_id,
+        raw=raw,
+        source_type="upload",
+        audit=lambda new_mid: AuditAppend("upload.resend", actor="op", detail=new_mid),
+        actor="op",
+    )
+    row = await engine.store.get_message(mid)
+    assert row is not None
+    return row["control_id"], row["message_type"], row["summary"]
+
+
+#: Peak traced allocation the inject label read may reach on the bodies below (BACKLOG #5707).
+_INJECT_READ_PEAK_BOUND = 4_000_000
+
+
+async def _peak_of_field_read(engine: Engine, raw: str) -> int:
+    """Peak bytes traced while the runner reads the labels for ``raw`` on ``in1``."""
+    runner = engine.registry_runner
+    assert runner is not None
+    tracemalloc.start()
+    try:
+        await runner.ingress_fields_for("in1", raw)
+        return tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+async def test_inject_records_hl7_fields(engine: Engine, tmp_path: Path) -> None:
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    control_id, message_type, summary = await _inject_fields(engine, ADT)
+    assert (control_id, message_type) == ("MSG1", "ADT^A01")
+    # The listener's own summary, so an injected row reads as a received one does.
+    assert summary == summarize(Peek.parse(ADT))
+    assert summary
+
+
+async def test_inject_of_malformed_hl7_still_stores_with_no_fields(
+    engine: Engine, tmp_path: Path
+) -> None:
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    assert await _inject_fields(engine, "this is not HL7") == (None, None, None)
+
+
+async def test_inject_on_a_non_hl7_inbound_records_its_content_type(
+    engine: Engine, tmp_path: Path
+) -> None:
+    reg = _running_registry(tmp_path)
+    reg.inbound["in1"] = replace(reg.inbound["in1"], content_type=ContentType.JSON)
+    engine.add_registry(reg)
+    await engine.start()
+    # HL7-shaped on purpose: a JSON inbound must not peek it, so no control id or summary appears.
+    assert await _inject_fields(engine, ADT) == (None, "json", None)
+
+
+async def test_inject_peek_honours_the_inbounds_own_ceiling(engine: Engine, tmp_path: Path) -> None:
+    # peek_max_bytes, not the parser's default: at the default this body would yield all three.
+    reg = _running_registry(tmp_path)
+    reg.inbound["in1"] = replace(reg.inbound["in1"], max_message_bytes=len(ADT) - 1)
+    engine.add_registry(reg)
+    await engine.start()
+    assert await _inject_fields(engine, ADT) == (None, None, None)
+
+
+async def test_inject_to_an_unknown_channel_still_stores(engine: Engine, tmp_path: Path) -> None:
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    assert await _inject_fields(engine, ADT, channel_id="nope") == (None, None, None)
+
+
+async def test_inject_with_no_runner_still_stores(engine: Engine) -> None:
+    assert engine.registry_runner is None
+    assert await _inject_fields(engine, ADT) == (None, None, None)
+
+
+@pytest.mark.parametrize(
+    ("control_id", "message_type", "expected"),
+    [
+        ("C" * 256, "ADT^A01", ("C" * 256, "ADT^A01")),
+        ("C" * 257, "ADT^A01", (None, "ADT^A01")),
+        ("MSG1", "A" * 64, ("MSG1", "A" * 64)),
+        ("MSG1", "A" * 65, ("MSG1", None)),
+        # SQL Server counts UTF-16 units: 128 astral characters are 256 units, 129 are 258.
+        ("\U0001f600" * 128, "ADT^A01", ("\U0001f600" * 128, "ADT^A01")),
+        ("\U0001f600" * 129, "ADT^A01", (None, "ADT^A01")),
+    ],
+)
+async def test_inject_drops_a_label_too_wide_for_the_narrowest_store_column(
+    engine: Engine,
+    tmp_path: Path,
+    control_id: str,
+    message_type: str,
+    expected: tuple[str | None, str | None],
+) -> None:
+    # NVARCHAR(256) and NVARCHAR(64) on SQL Server: a wider label would fail the whole insert there.
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    body = f"MSH|^~\\&|S|F|R|RF|20260101||{message_type}|{control_id}|P|2.5.1\rPID|1||MRN1\r"
+    stored_control, stored_type, _ = await _inject_fields(engine, body)
+    assert (stored_control, stored_type) == expected
+
+
+async def test_inject_drops_a_summary_an_escape_decoded_to_nul(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # The body holds no NUL, so the guard admits it; the summary's unescape makes one, which a
+    # keyless Postgres store would refuse at bind.
+    body = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||AB\\X00\\CD^^^H^MR\r"
+    assert "\x00" in summarize(Peek.parse(body))
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    assert await _inject_fields(engine, body) == ("MSG1", "ADT^A01", None)
+
+
+async def test_inject_drops_a_summary_escapes_expanded_and_keeps_the_other_labels(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # A 64 KB body whose \.in512\ escapes would expand its summary to about 16 million characters,
+    # held four bytes wide by the one astral character. The cost is what this pins: a cap applied
+    # after the summary is built stores the same None at a peak near 132 MB.
+    body = (
+        "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\r"
+        f"PID|1||\U0001f600{'\\.in512\\' * 8000}^^^H^MR\r"
+    )
+    assert len(body) == 64_065
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    assert await _peak_of_field_read(engine, body) < _INJECT_READ_PEAK_BOUND
+    assert await _inject_fields(engine, body) == ("MSG1", "ADT^A01", None)
+
+
+async def test_inject_reads_an_escaped_control_id_raw_as_the_listener_does(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # A whole-field read unescapes nothing, so escapes here cost no memory and lose no label.
+    control_id = "A\\.in512\\B"
+    body = f"MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|{control_id}|P|2.5.1\rPID|1||MRN1\r"
+    assert Peek.parse(body).control_id == control_id
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    assert await _inject_fields(engine, body) == (control_id, "ADT^A01", "MRN MRN1")
+
+
+async def test_inject_of_an_expanding_control_id_costs_no_expansion(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # Too wide for its column, so it is dropped; the type and summary do not depend on it.
+    body = (
+        f"MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|\U0001f600{'\\.in512\\' * 8000}|P|2.5.1\r"
+        "PID|1||MRN1\r"
+    )
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    assert await _peak_of_field_read(engine, body) < _INJECT_READ_PEAK_BOUND
+    assert await _inject_fields(engine, body) == (None, "ADT^A01", "MRN MRN1")
+
+
+async def test_inject_bound_reads_the_messages_own_escape_character(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # MSH-2 names # as the escape: a bound that assumed a backslash would see no escape here.
+    body = (
+        "MSH|^~#&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\r"
+        f"PID|1||\U0001f600{'#.in512#' * 2000}^^^H^MR\r"
+    )
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    assert await _peak_of_field_read(engine, body) < _INJECT_READ_PEAK_BOUND
+    assert await _inject_fields(engine, body) == ("MSG1", "ADT^A01", None)
+
+
+async def test_inject_does_not_split_a_segment_of_very_many_fields(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # A field read splits its whole segment, so this PID must be refused from its unsplit line.
+    body = f"MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID{'|' * 500_000}\r"
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    assert await _peak_of_field_read(engine, body) < _INJECT_READ_PEAK_BOUND
+    assert await _inject_fields(engine, body) == ("MSG1", "ADT^A01", None)
+
+
+@pytest.mark.parametrize("filler", ["X", "中", "\U0001f600"], ids=["latin", "cjk", "astral"])
+async def test_inject_at_the_largest_summarized_source_stays_within_the_bound(
+    engine: Engine, tmp_path: Path, filler: str
+) -> None:
+    # The dearest read the gate admits: one escaped leaf filling the limit. Above Latin-1, unescape
+    # holds a separate string per character. The summary is over the cap and is dropped.
+    limit = RegistryRunner._INJECT_SUMMARY_MAX_SOURCE_CHARS
+    pid3 = "\\H\\" + filler * (limit - len("ADT^A01") - len("\\H\\") - len("^^^H^MR")) + "^^^H^MR"
+    assert len("ADT^A01") + len(pid3) == limit
+    body = f"MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||{pid3}\r"
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    assert await _peak_of_field_read(engine, body) < _INJECT_READ_PEAK_BOUND
+    assert await _inject_fields(engine, body) == ("MSG1", "ADT^A01", None)
+
+
+@pytest.mark.parametrize(("over", "kept"), [(0, True), (1, False)])
+async def test_inject_summary_source_limit_is_exact(
+    engine: Engine, tmp_path: Path, over: int, kept: bool
+) -> None:
+    # The padding is a component the summary does not read, so only the limit can drop it.
+    limit = RegistryRunner._INJECT_SUMMARY_MAX_SOURCE_CHARS
+    pid3 = "MRN1^" + "Z" * (limit + over - len("ADT^A01") - len("MRN1^"))
+    body = f"MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||{pid3}\r"
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    expected = "MRN MRN1" if kept else None
+    assert await _inject_fields(engine, body) == ("MSG1", "ADT^A01", expected)
+
+
+@pytest.mark.parametrize(
+    ("escapes", "kept"),
+    [
+        ("\\.in512\\\\.in512\\", True),  # 2 x 512 x 4 = 4096 added: exactly the cap
+        ("\\.in512\\\\.in512\\\\.sk1\\", False),  # one character more
+    ],
+)
+async def test_inject_summary_escape_growth_limit_is_exact(
+    engine: Engine, tmp_path: Path, escapes: str, kept: bool
+) -> None:
+    # In a PID-3 component the summary does not read, so the value alone cannot drop it.
+    body = f"MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN1^{escapes}\r"
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    expected = "MRN MRN1" if kept else None
+    assert await _inject_fields(engine, body) == ("MSG1", "ADT^A01", expected)
+
+
+async def test_inject_keeps_the_summary_of_a_large_body_with_escapes_elsewhere(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # An embedded-document ORU: size and escapes outside the summary's fields must not cost it.
+    body = (
+        "MSH|^~\\&|S|F|R|RF|20260101||ORU^R01|MSG1|P|2.5.1\r"
+        "PID|1||MRN1||TESTPATIENT^ALPHA\rORC|RE|ORD1\rOBR|1|ORD1|ACC1\r"
+        f"NTE|1||{'\\.in512\\' * 100}\rOBX|1|ED|DOC||^^^Base64^{'QUJD' * 100_000}\r"
+    )
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    assert await _inject_fields(engine, body) == (
+        "MSG1",
+        "ORU^R01",
+        summarize(Peek.parse(body)),
+    )
+    assert summarize(Peek.parse(body)).startswith("MRN MRN1")
+
+
+@pytest.mark.parametrize(("mrn_chars", "kept"), [(4092, True), (4093, False)])
+async def test_inject_summary_cap_is_exact(
+    engine: Engine, tmp_path: Path, mrn_chars: int, kept: bool
+) -> None:
+    # "MRN " plus the value, so 4092 characters make a summary of exactly the 4096 cap.
+    body = f"MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||{'X' * mrn_chars}^^^H^MR\r"
+    derived = summarize(Peek.parse(body))
+    assert len(derived) == mrn_chars + 4
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    expected = derived if kept else None
+    assert await _inject_fields(engine, body) == ("MSG1", "ADT^A01", expected)
+
+
+async def test_inject_survives_a_peek_fault_and_logs_no_body(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # RuntimeError is outside PEEK_READ_FAULTS, and its text carries the body, as a fault's may.
+    def fault(peek: Peek) -> str:
+        raise RuntimeError(f"fault over {ADT}")
+
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    monkeypatch.setattr(wiring_runner, "summarize", fault)
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry"):
+        assert await _inject_fields(engine, ADT) == (None, None, None)
+    # The positive control: the capture did see this fault's line, by its type name alone.
+    assert "RuntimeError" in caplog.text
+    assert "fault over" not in caplog.text
+    assert "MRN123" not in caplog.text
 
 
 async def test_browse_requires_step_up_and_audits_shape(engine: Engine, tmp_path: Path) -> None:

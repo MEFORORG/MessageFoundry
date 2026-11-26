@@ -110,6 +110,7 @@ if TYPE_CHECKING:  # only for the with_smart_backend() annotation — avoid impo
 __all__ = [
     "SmartAuthError",
     "SmartBackendTokenProvider",
+    "refuse_unusable_smart_settings",
     "request_token",
     "revocation_attestation_from_settings",
     "token_cache_seconds",
@@ -635,27 +636,7 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
             raise SmartAuthError(
                 "SMART backend services requires a 'smart_private_key' setting (PEM via env())"
             )
-        # BACKLOG #5800 added item 1: the scope is URL-encoded as strict UTF-8 at each mint, so a
-        # lone surrogate raised UnicodeEncodeError out of send or test_connection; an inline PEM key
-        # and its password are encoded strictly as UTF-8 while the signer loads them below, and
-        # that exception's `object` is the whole value. Refused here, by setting name only, as the
-        # OAuth2 provider refuses its grant values. The client id, audience and key id ride the
-        # JSON assertion, whose encoder escapes a lone surrogate.
-        unencodable = next(
-            (
-                name
-                for name, value in (
-                    ("smart_scope", scope),
-                    # Only inline PEM is encoded; a path goes to open(), which takes one.
-                    ("smart_private_key", private_key if "-----BEGIN" in private_key else None),
-                    ("smart_private_key_password", private_key_password),
-                )
-                if value and has_lone_surrogate(value)
-            ),
-            None,
-        )
-        if unencodable is not None:
-            raise SmartAuthError(f"{unencodable} holds a character UTF-8 cannot encode")
+        _refuse_unencodable_smart_values(scope, private_key, private_key_password)
         self.client_id = client_id
         self.scope = scope or None
         if not audience and request_target_as_sent(token_url) != token_url:
@@ -809,6 +790,51 @@ def smart_auth_configured(s: Mapping[str, Any]) -> bool:
     an agreement that decays silently the day anything else populates these settings. Off is the
     conservative reading, so a falsy value is off."""
     return bool(s.get("smart_token_url")) and bool(s.get("smart_enabled", True))
+
+
+def _refuse_unencodable_smart_values(
+    scope: str | None, private_key: str, private_key_password: str | None
+) -> None:
+    """BACKLOG #5800 added item 1: the scope is URL-encoded as strict UTF-8 at each mint, so a
+    lone surrogate raised UnicodeEncodeError out of send or test_connection; an inline PEM key and
+    its password are encoded strictly as UTF-8 while the signer loads them, and that exception's
+    ``object`` is the whole value. Refused by setting name only, as the OAuth2 provider refuses its
+    grant values. The client id, audience and key id ride the JSON assertion, whose encoder
+    escapes a lone surrogate."""
+    unencodable = next(
+        (
+            name
+            for name, value in (
+                ("smart_scope", scope),
+                # Only inline PEM is encoded; a path goes to open(), which takes one.
+                ("smart_private_key", private_key if "-----BEGIN" in private_key else None),
+                ("smart_private_key_password", private_key_password),
+            )
+            if value and has_lone_surrogate(value)
+        ),
+        None,
+    )
+    if unencodable is not None:
+        raise SmartAuthError(f"{unencodable} holds a character UTF-8 cannot encode")
+
+
+def refuse_unusable_smart_settings(s: Mapping[str, Any]) -> None:
+    """Run, on already-``env()``-resolved settings and without building the provider, the BACKLOG
+    #5800 settings refusals :class:`SmartBackendTokenProvider` runs at construction: a lone
+    surrogate in ``smart_scope``, an inline PEM ``smart_private_key`` or
+    ``smart_private_key_password``, and a ``smart_token_url`` over the outbound length limit. It
+    reads no wire and records no crossing, so the ``FhirLookup`` executor runs it for every lookup
+    before any lookup reaches a hop gate. Values are read as :func:`token_provider_from_settings`
+    reads them. Does nothing when SMART auth is off. The proxy headers the token hop adds are not
+    measured here; the provider measures them after its token hop opens."""
+    if not smart_auth_configured(s):
+        return
+    _refuse_unencodable_smart_values(
+        str(s["smart_scope"]) if s.get("smart_scope") else None,
+        str(s.get("smart_private_key") or ""),
+        str(s["smart_private_key_password"]) if s.get("smart_private_key_password") else None,
+    )
+    SmartBackendTokenProvider._refuse_over_length(str(s.get("smart_token_url") or ""), {})
 
 
 def token_provider_from_settings(

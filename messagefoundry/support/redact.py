@@ -58,6 +58,7 @@ from messagefoundry.secretscrub import (
     _BYTES_PROBE,
     _CONNECTION_STRING_MEMBER,
     _KV_TAILS,
+    _MEFOR_GLUED_BRANCH,
     _MEFOR_TAILS,
     _SHIPPED_TAILS,
     _braced_tail,
@@ -394,7 +395,8 @@ _MEFOR_SECRET = re.compile(
     + rf"(?![^{_PLAIN_TERMINATORS}])"
     + r"['\"]?|"
     + _GUARDED_BRACED_VALUE
-    + rf"(?![^{_PLAIN_TERMINATORS}])"
+    + rf"(?![^{_PLAIN_TERMINATORS}])|"
+    + _MEFOR_GLUED_BRANCH
     # A non-empty quoted value with no space in it, closer and all: the span the old plain class took.
     + r"|(?="
     + _GUARDED_QUOTED_VALUE
@@ -432,8 +434,10 @@ _MEFOR_SECRET = re.compile(
 #
 # THE OTHER LABEL PATTERNS TAKE GUARDED FORMS OF THESE (BACKLOG #1685's remainder), each by a rule
 # that keeps it from printing anything its plain class used to hide. ``_MEFOR_SECRET`` and
-# ``_KEY_MATERIAL`` take a quoted value whole, and a braced one whole only when the closing "}" ends the
-# value: without that guard ``MEFOR_X={a}bc`` would redact ``{a}`` and print "bc". ``_BEARER`` takes a
+# ``_KEY_MATERIAL`` take a quoted value whole, and a braced one whole when the closing "}" ends the
+# value: without that guard ``MEFOR_X={a}bc`` would redact ``{a}`` and print "bc". ``_MEFOR_SECRET``
+# also takes a braced value holding a space with lower case text glued after its closer, in one narrow
+# shape (secretscrub's ``_MEFOR_GLUED_BRANCH``, imported; BACKLOG #2966 step 1). ``_BEARER`` takes a
 # quoted value and no braced one, because ``session=`` and ``token=`` carry dict and JSON reprs in this
 # engine's log text. Anything a guarded form refuses -- an unclosed quote, a closer that may belong to
 # a later label -- falls back to the plain class, which carries the stop and is otherwise the old one.
@@ -444,10 +448,12 @@ _MEFOR_SECRET = re.compile(
 # shared fragment or case fold; the widened one is built from secretscrub's query keys and label
 # words under its global fold, so a word added there reaches the bundle's last DSN pass too. This
 # module DOES call ``secretscrub`` now, as a second layer after this copy (BACKLOG
-# #2694), but it does not build this copy from that one's fragments. Doing so would change this
-# copy's case fold, and that change is what the comment above ``redact_log_line`` records as
-# printing values. The fragments themselves sit above ``_BEARER``, because every label pattern uses
-# them.
+# #2694), and it builds this copy from that one's fragments in only a few places: at least the masked
+# tails, the bytes probe and ``_MEFOR_GLUED_BRANCH`` (BACKLOG #2966), which carries secretscrub's
+# ``_PLAIN_TERMINATORS`` and ``_NO_QUOTED_LABEL_AFTER``; a test holds those two equal to this
+# copy's. The label fragments stay restated: importing them would change this copy's case fold,
+# and that change is what the comment above ``redact_log_line`` records as printing values. The
+# fragments themselves sit above ``_BEARER``, because every label pattern uses them.
 _CREDENTIAL_KV = re.compile(
     _LABEL_START + r"(" + _LABEL_PREFIX + r"(?i:pass(?:word|wd|phrase)?|pwd|secret|credential))\b"
     r"['\"]?\s*[:=]\s*"

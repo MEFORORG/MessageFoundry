@@ -103,7 +103,7 @@ from messagefoundry.credential import constant_time_equal
 from messagefoundry.logging_guard import _last_resort
 from messagefoundry.parsing.binary import doc_ref_addresses_in_hl7 as _doc_ref_addresses_in_hl7
 from messagefoundry.parsing.binary import may_hold_doc_ref as _may_hold_doc_ref
-from messagefoundry.redaction import json_loads_or_refusal, safe_text
+from messagefoundry.redaction import engine_text_only, json_loads_or_refusal, safe_text
 from messagefoundry.service_status import _system_exe
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
@@ -139,6 +139,7 @@ from messagefoundry.store.crypto import (
     AADComponentError,
     AesGcmCipher,
     AuditKeyVersionRefusedError,
+    AuditKeyVersionUnverifiedError,
     AuditMacFn,
     AuditMacMalformedError,
     AuditMacVerifier,
@@ -155,7 +156,6 @@ from messagefoundry.store.crypto import (
     cipher_info,
     cipher_meta_key,
     decrypt_json_cell,
-    encrypt_many,
     report_sealed_surface,
     reseal_rotation_fingerprints,
     rotation_fingerprint_cipher,
@@ -214,6 +214,7 @@ from messagefoundry.store.row_seal import (
     SESSION_KIND,
     USER_KIND,
     AnyRowSealer,
+    NonFiniteSealValueError,
     ResealOutcome,
     RevokedRowSealError,
     RowSealer,
@@ -227,6 +228,7 @@ from messagefoundry.store.row_seal import (
     revoke_seal_refusals,
     row_sealer_for_cipher,
     seal_bytes,
+    seal_chunks,
     seal_row_ref,
     transit_seal_refusals,
 )
@@ -1703,7 +1705,9 @@ def session_reseal_params(new: SessionRecord, old: SessionRecord) -> tuple[objec
         new.global_epoch,
         new.seal,
         old.token_hash,
-        old.seal,
+        # The seal cell as read, so a non-empty BLOB cell still matches and an empty one does not,
+        # each as on main (SessionRecord.from_mapping).
+        getattr(old, "_seal_cell", old.seal),
     )
 
 
@@ -1724,6 +1728,35 @@ def session_insert_params(record: SessionRecord) -> tuple[object, ...]:
         record.global_epoch,
         record.seal,
     )
+
+
+def _non_finite_kind(value: object) -> str | None:
+    """``"nan"``, ``"inf"`` or ``"-inf"`` for a float that is not finite, else ``None``."""
+    if not isinstance(value, float) or math.isfinite(value):
+        return None
+    return "nan" if math.isnan(value) else repr(value)
+
+
+def _refuse_new_non_finite(
+    sealer: AnyRowSealer | None,
+    fields: Iterable[tuple[str, object]],
+    prior: Iterable[tuple[str, object]] = (),
+) -> None:
+    """On a store with no sealer, raise :class:`NonFiniteSealValueError`, the type
+    :meth:`RowSealer.seal` raises, for a NaN or an infinity in ``fields`` that ``prior``, the row
+    as it was read, does not already hold under that name (BACKLOG #6717). No seal is made here:
+    SQLite stores a NaN as ``NULL``, so a nullable column would change silently and a ``NOT NULL``
+    one would refuse the write, and no sealed field means anything by an infinity, as that class
+    says. A value carried forward from the stored row is
+    written as before, so only a new value is refused. A name may repeat (a user's role grants),
+    so a value counts as held when any field of that name in ``prior`` holds the same kind."""
+    if sealer is not None:
+        return
+    held = {(n, k) for n, v in prior if (k := _non_finite_kind(v)) is not None}
+    for name, value in fields:
+        kind = _non_finite_kind(value)
+        if kind is not None and (name, kind) not in held:
+            raise NonFiniteSealValueError("a row write refuses a float that is not finite")
 
 
 def seal_session(sealer: RowSealer | None, record: SessionRecord) -> SessionRecord:
@@ -1797,6 +1830,12 @@ def _refusal_key(refusal: _RevokeSealRefusal) -> tuple[object, ...]:
     return ("refusal", refusal.unverifiable, refusal.kind, refusal.ident)
 
 
+#: The note :meth:`RevokeSealOutcome.committing` adds to a failure of the report it runs after the
+#: revoke committed, so a caller can tell a revoke that landed from one that rolled back (BACKLOG
+#: #5093): ``admin-revoke-sessions`` reads it.
+REVOKE_COMMITTED_NOTE = "raised by the report after the revoke committed"
+
+
 @dataclass
 class RevokeSealOutcome:
     """What one revoke's sealed writes met (decision d20261109T200352805-599b24 on ADR 0217, items
@@ -1826,7 +1865,8 @@ class RevokeSealOutcome:
         known, on every exit (decision d20261110T063908944-857965, item 6).
 
         **On a clean exit** the revoke has committed, and :meth:`report` runs here, so no path
-        between the commit and a separate call can skip it.
+        between the commit and a separate call can skip it. A failure of that report carries
+        :data:`REVOKE_COMMITTED_NOTE`, since the revoke it reports on has landed (BACKLOG #5093).
 
         **If the transaction raises**, the report says the revoke failed before its commit was
         confirmed, rather than that it went ahead, and the exception propagates (decision
@@ -1862,7 +1902,11 @@ class RevokeSealOutcome:
         carry = _REVOKE_CARRY.get()
         if carry is not None and not carry.closed:
             carry.covered_by(self)
-        await self.report(record_audit)
+        try:
+            await self.report(record_audit)
+        except Exception as exc:
+            exc.add_note(REVOKE_COMMITTED_NOTE)
+            raise
 
     def refused(self, exc: Exception, *, what: str, kind: str, ident: str) -> None:
         """Take one refusal :func:`revoke_seal_refusals` names, which the revoke goes ahead without.
@@ -3655,7 +3699,14 @@ class SessionRecord:
     def from_mapping(cls, d: Mapping[str, Any]) -> SessionRecord:
         """The session ``d`` holds; a cell that does not parse raises :class:`RowSealError`, as
         :func:`decode_or_refuse` says, and a missing column still raises ``KeyError``."""
-        return decode_or_refuse(SESSION_KIND, _cell_text(d, "token_hash"), lambda: cls._decode(d))
+        record = decode_or_refuse(SESSION_KIND, _cell_text(d, "token_hash"), lambda: cls._decode(d))
+        if isinstance(d["seal"], bytes) and d["seal"]:
+            # ``seal`` reads a non-empty BLOB as text, which fails a seal check as malformed; the
+            # compare-and-set binds the cell itself (:func:`session_reseal_params`), so a keyless
+            # write still matches the row it read, as on main. An empty BLOB reads as ``""`` and
+            # binds as text, which does not match it, as on main (BACKLOG #6718).
+            object.__setattr__(record, "_seal_cell", d["seal"])
+        return record
 
     @classmethod
     def _decode(cls, d: Mapping[str, Any]) -> SessionRecord:
@@ -3674,7 +3725,7 @@ class SessionRecord:
             # Hard subscripts: every reader is a SELECT *, so a mapping without them is a defect.
             user_epoch=int(d["user_epoch"]),
             global_epoch=int(d["global_epoch"]),
-            seal=d["seal"] or "",
+            seal=str(d["seal"] or ""),
         )
 
     def seal_fields(self) -> tuple[tuple[str, object], ...]:
@@ -4559,18 +4610,26 @@ def passkey_is_way_past(cred: WebAuthnCredential) -> bool:
     """Whether one passkey can be a way past the sign-in lock: recorded as discoverable, AND stored
     under today's credential-id hash scheme, the only key the sign-in looks a passkey up by (BACKLOG
     #3423). A row the start-up rehash has not moved (a bare digest), or one it refused (an unknown
-    tag, a malformed value), can never sign in, so it is no way past however it is recorded. The one
-    statement of the per-passkey way-past rule: at least the store's conditional writes, the census,
-    the service's gates, the sign-in path and the lock notice ask it. The census's reset list asks
-    only its hash-scheme half for a directory account's second factor, which needs no discoverable
-    record (:func:`~messagefoundry.auth.tokens.credential_id_hash_is_current`)."""
+    tag, a malformed value), can never sign in, so it is no way past however it is recorded. Nor is
+    one whose stored ``public_key`` does not decode, which the verify refuses (BACKLOG #6886). A
+    hash that reads back as bytes counts as the text it holds, as the sign-in's compare does. A
+    stored ``credential_id`` is not asked: the combined sign-in names no credential up front and
+    finds the passkey by the hash of the id the browser sends. Those stored-cell checks are
+    :func:`~messagefoundry.auth.tokens.stored_passkey_is_readable`.
+
+    The one statement of the per-passkey way-past rule: at least the store's conditional writes,
+    the census, the service's gates, the sign-in path and the lock notice ask it. The census's reset
+    list asks only its stored-cell half for a directory account's second factor, which needs no
+    discoverable record, and adds that the stored id decodes, which that leg's allow list needs."""
     if not cred.discoverable:
         return False
     # Lazy: a leaf module of the auth package (stdlib only), imported where the rule is asked so
     # the store module takes no import-time dependency on the auth package.
-    from messagefoundry.auth.tokens import credential_id_hash_is_current
+    from messagefoundry.auth.tokens import stored_passkey_is_readable
 
-    return credential_id_hash_is_current(cred.credential_id_hash)
+    return stored_passkey_is_readable(
+        credential_id_hash=cred.credential_id_hash, public_key=cred.public_key
+    )
 
 
 #: The caller's rule for which passkey counts as a way past at a factor-drop gate (BACKLOG #3937):
@@ -4953,10 +5012,10 @@ async def way_past_passkeys(
     Where the write keeps the TOTP (not ``drop_totp``) and ``totp_counts`` counts it on ``record``,
     the rule passes on the TOTP alone, so no passkey is read for it: a set that cannot be read
     must not refuse a write the TOTP already allows. A write that reads the set for its own sake
-    still does (the passkey delete re-seals over the new set). A TOTP judged before the lock that no longer counts
-    under it (:meth:`TotpJudgement.moved`) falls back to the read. Where the write removes the TOTP
-    (``drop_totp``) it is the other way round: the passkeys matter only while that TOTP counts
-    (:func:`totp_removal`), so only then are they read. A set that cannot be read
+    still does (the passkey delete re-seals over the new set). A TOTP judged before the lock that
+    no longer counts under it (:meth:`TotpJudgement.moved`) falls back to the read. Where the write
+    removes the TOTP (``drop_totp``) it is the other way round: the passkeys matter only while that
+    TOTP counts (:func:`totp_removal`), so only then are they read. A set that cannot be read
     (:func:`passkeys_or_none`) is empty here, so it counts as no way past, whatever the seal."""
     if record is None or bool(_totp_is_way_past(record, totp_counts)) != bool(drop_totp):
         return []
@@ -5494,6 +5553,31 @@ def scope_withdrawal(expected_scope: str, now: float) -> UserChange:
             return None
         return r.changed(
             channel_scope=None, channel_scope_source=SCOPE_SOURCE_AD, updated_at=float(now)
+        )
+
+    return apply
+
+
+def ad_scope_replacement(
+    scope_json: str,
+    expected_scope: str | None,
+    expected_source: ChannelScopeSource | None,
+    now: float,
+) -> UserChange:
+    """``set_ad_channel_scope_if_unchanged``'s compare-and-set (BACKLOG #6887): write the
+    directory's scope, marked ``ad``, only while the row still holds ``expected_scope`` AND
+    ``expected_source`` exactly (``None`` matching NULL). Both, because the AD sign-in decides from
+    both: the value decides whether the write changes the scope, which is what triggers its revoke,
+    and the source decides whether an unchanged value still needs taking over. The compare is
+    Python's, so it is byte-exact on every backend, as :func:`scope_withdrawal`'s is."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if r.row.channel_scope != expected_scope:
+            return None
+        if r.row.channel_scope_source != expected_source:
+            return None
+        return r.changed(
+            channel_scope=scope_json, channel_scope_source=SCOPE_SOURCE_AD, updated_at=float(now)
         )
 
     return apply
@@ -9152,6 +9236,18 @@ def forget_store_salt(path: Path) -> bool:
     )
 
 
+class _ClosedStoreWriteError(sqlite3.OperationalError):
+    """:func:`_write_closed_store`'s own refusal, whose text the engine wrote: the store's path,
+    the journal mode SQLite reported and a fixed sentence, never a row's value or SQLite's message.
+    Marked :func:`~messagefoundry.redaction.engine_text_only`, so a renderer that withholds a
+    database driver's message keeps it (vault BACKLOG #8153). ``safe_exc`` and the DR reasons show
+    it as ``OperationalError``; a traceback names this class itself.
+    Still a ``sqlite3.OperationalError``, so every handler that caught one catches it."""
+
+
+engine_text_only(_ClosedStoreWriteError, named_as_driver=True)
+
+
 def _write_closed_store[T](
     path: Path,
     write: Callable[[sqlite3.Connection], T],
@@ -9173,7 +9269,7 @@ def _write_closed_store[T](
     try:
         mode = str(conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]).lower()
         if mode != "delete":
-            raise sqlite3.OperationalError(
+            raise _ClosedStoreWriteError(
                 f"could not take {path} out of WAL mode (it is still {mode!r}); another "
                 f"connection holds it, so {what}"
             )
@@ -9181,14 +9277,14 @@ def _write_closed_store[T](
     finally:
         conn.close()
     if wal.exists() and wal.stat().st_size:
-        raise sqlite3.OperationalError(f"{wal} still holds changes after leaving WAL mode")
+        raise _ClosedStoreWriteError(f"{wal} still holds changes after leaving WAL mode")
     proof = sqlite3.connect(_sqlite_readonly_uri(str(path.absolute())), uri=True)
     try:
         proven = prove(proof)
     finally:
         proof.close()
     if not proven:
-        raise sqlite3.OperationalError(f"{path} {proof_failed}")
+        raise _ClosedStoreWriteError(f"{path} {proof_failed}")
     return result
 
 
@@ -9239,7 +9335,11 @@ def write_restore_marker(
     The sessions are ended here too, in the same transaction as the marker, because a revoke
     needs no key: so no path that honours a session without consuming the marker, such as an
     older build started on the file, gets the archive's sessions back. The first start still
-    raises every account's session epoch, which needs the key, and adds this count to its own.
+    revokes as :meth:`MessageStore.revoke_all_sessions` does, raising the global session epoch
+    and each account's, the second of which needs the key, and adds this count to its own. An
+    account goes without its own raise where :func:`raise_account_epoch` says, at least on a seal
+    refusal and after a Vault Transit outage trips the revoke; the global epoch still ends its
+    sessions.
 
     It is proven in the main file as :func:`forget_store_salt`'s drop is, through
     :func:`_write_closed_store`: a non-empty ``-wal`` beside it, or a re-read that finds no row
@@ -9283,14 +9383,51 @@ def write_restore_marker(
     )
 
 
-def _secure_file(path: Path) -> None:
-    """Restrict a store file to its owner — it holds PHI at rest.
+def _secure_file(path: Path, *, keep_explicit_entries: bool = False) -> None:
+    """Restrict a file to the account this process runs as — a store file holds PHI at rest.
 
     Best-effort and non-fatal: failing to tighten permissions must never stop the engine from
     starting (``docs/PHI.md``'s ops checklist covers directory-level ACLs as the backstop). On
-    POSIX this is ``chmod 0600``; on Windows ``os.chmod`` only toggles the read-only bit, so we set
-    an owner-only DACL via ``icacls`` (inheritance disabled) instead. A skipped or failed
-    restriction is **logged** (STORE-2) so it isn't silently world-readable.
+    POSIX this is ``chmod 0600``; on Windows ``os.chmod`` only toggles the read-only bit, so it
+    writes one protected DACL whole instead, granting full control to the account read from this
+    process's token. Written whole, the list replaces the entries the file carried: inherited ones,
+    and explicit allows (an explicit grant on a moved-in file, or the entries a temp directory hands
+    a file). The owner is not changed.
+
+    **What the one list carries over** (this is the one statement of the rule; ADR 0163 and the
+    helpers point here). Explicit entries only, never inherited ones, their SDDL text copied as
+    written, and ``icacls /grant:r`` kept each of them:
+
+    - every deny, placed first;
+    - the explicit OWNER RIGHTS entries, decided as a set: they are all dropped only when no deny
+      is carried and each is a plain allow (``A``) with no flags holding both READ_CONTROL and
+      WRITE_DAC; otherwise every one is carried.
+
+    Any OWNER RIGHTS entry turns off the READ_CONTROL and WRITE_DAC Windows otherwise gives an
+    owner beyond the list, and those implicit rights are granted before any deny is read, so the
+    entries are decided together and against the carried denies. When they are carried, they stay
+    as that rewrite left them. When they are dropped, the owner gets its implicit READ_CONTROL and
+    WRITE_DAC, which each dropped entry already granted, and no deny was there to withhold them.
+    An object allow (``OA``) is always carried, as ``icacls /grant:r`` kept it: one carrying an
+    ObjectType GUID grants the owner nothing on a file yet still turns off the implicit rights
+    (measured). Either way an owner other than this account can end with less than
+    ``icacls /grant:r`` left it, since the one list drops every other principal's allow, one for
+    the owner's own account or groups included: a narrowing, not a loosening. A null DACL carries
+    nothing.
+
+    Where the current list cannot be read or parsed, or the write fails other than by access
+    denied, the kept icacls rewrite below runs instead, and it keeps every explicit entry, other
+    principals' allows included. For an unreadable list that is a deliberate choice: it is what
+    the code before this one-list write did, and the bare list, the other option, would drop a
+    deny or a narrowing OWNER RIGHTS entry it cannot see, so neither is strictly safer. Each of
+    these is **logged** (STORE-2). A restriction that is skipped, or refused with access denied,
+    leaves the file's access list as it was.
+
+    ``keep_explicit_entries`` is the store trio's fallback (:func:`_secure_store_file`), unchanged,
+    and it is NOT owner-only: ``icacls /inheritance:r /grant:r``, which removes only INHERITED
+    entries and replaces only this account's own grant, so every explicit entry the file carries
+    stays. ADR 0163 relies on that: an existing store file keeps the service account's trio entry
+    when an open falls back.
 
     **NOT FOR A FILE THAT HOLDS A KEY** (vault BACKLOG #2601). This tightens a file that already
     exists, and only logs when it cannot, so a key written and then passed here would sit under the
@@ -9309,38 +9446,150 @@ def _secure_file(path: Path) -> None:
                     path,
                 )
                 return
-            # The principal is the token's SID in icacls's ``*S-...`` form, never a name, so no
-            # environment variable or name lookup chooses who is granted (vault BACKLOG #5612).
-            # icacls is pinned to its absolute System32 path and invoked without a shell; the
-            # principal is a single argv token, never a shell word, so it can't inject a flag
-            # (low-27/STORE-5). The pin is what makes "fixed system tool" true:
-            # CreateProcess resolves an unqualified name through a search path that reaches the
-            # caller's working directory, and because this call only logs on a non-zero exit, a
-            # planted icacls.exe that exits 0 would leave this PHI-adjacent file its inherited
-            # (possibly broad) ACL while reporting nothing (BACKLOG #1769).
-            result = subprocess.run(  # nosec B603 B607
-                [_system_exe("icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"*{sid}:F"],
-                check=False,
-                env=system_tool_environment(),  # the platform's start-up names only (#2716)
-                capture_output=True,
-                text=True,
-                # icacls echoes the path in the OEM code page. Neither the cp1252 locale default nor
-                # UTF-8 decodes every OEM byte (cp437 0x81, u-umlaut, is undefined in both), and a
-                # failed decode loses the output this warning logs. Only logged, so replace.
-                encoding="oem",
-                errors="replace",
-            )
-            if result.returncode != 0:
+            # The principal is the token's SID, never a name, so no environment variable or name
+            # lookup chooses who is granted (vault BACKLOG #5612).
+            if keep_explicit_entries:
+                _icacls_grant_keeping_explicit_entries(path, sid)
+                return
+            current = _read_dacl_sddl(path)
+            kept = None if current is None else _entries_the_one_list_keeps(current)
+            if kept is None:
+                if current is not None:
+                    log.warning(
+                        "could not parse the access list of %s; restricting it with icacls, which "
+                        "keeps its explicit entries",
+                        path,
+                    )
+                _icacls_grant_keeping_explicit_entries(path, sid)
+                return
+            denies, owner_rights = kept
+            # One SetNamedSecurityInfoW call, as _write_trio_dacl makes: icacls cannot drop an
+            # unnamed principal's explicit entry while granting. Denies first, the canonical order.
+            sddl = "D:P" + "".join(denies) + f"(A;;FA;;;{sid})" + "".join(owner_rights)
+            result = _set_security_from_sddl(path, sddl, protected=True)
+            if result.failure is not None or result.dacl_status != 0:
                 log.warning(
-                    "icacls could not restrict %s (exit %s): %s",
+                    "could not restrict %s to this account: %s",
                     path,
-                    result.returncode,
-                    (result.stderr or result.stdout or "").strip(),
+                    result.failure or f"Win32 status {result.dacl_status}",
                 )
+                if result.dacl_status != _ERROR_ACCESS_DENIED:
+                    # The list may be what failed (a carried entry that does not convert, say);
+                    # icacls needs no list text. It needs the same WRITE_DAC, so not after a denial.
+                    log.warning(
+                        "restricting %s with icacls instead, which keeps its explicit entries", path
+                    )
+                    _icacls_grant_keeping_explicit_entries(path, sid)
         else:
             os.chmod(path, _OWNER_ONLY)
     except OSError as exc:
         log.warning("could not restrict permissions on %s: %s", path, exc)
+
+
+#: An SDDL right that includes WRITE_DAC: file all, generic all, key all (the renderer may pick
+#: it for a file's mask), or WRITE_DAC itself.
+_SDDL_RIGHTS_WITH_WRITE_DAC = frozenset({"FA", "GA", "KA", "WD"})
+#: An SDDL right that includes READ_CONTROL: READ_CONTROL itself, and each file or generic right,
+#: since a file's generic mapping and each FILE_GENERIC_* right hold it (and key all).
+_SDDL_RIGHTS_WITH_READ_CONTROL = frozenset(
+    {"RC", "FA", "FR", "FW", "FX", "GA", "GR", "GW", "GX", "KA"}
+)
+_WRITE_DAC = 0x40000
+_READ_CONTROL = 0x20000
+_GENERIC_ALL = 0x10000000
+#: GENERIC_ALL, GENERIC_EXECUTE, GENERIC_WRITE and GENERIC_READ: each maps to READ_CONTROL on a
+#: file.
+_GENERIC_ANY = 0xF0000000
+#: OWNER RIGHTS, as an SDDL alias and as a SID.
+_OWNER_RIGHTS = frozenset({"OW", "S-1-3-4"})
+_ERROR_ACCESS_DENIED = 5
+
+
+def _grants_owner_implicit_rights(rights: str) -> bool:
+    """Does the upper-cased SDDL ``rights`` field include both READ_CONTROL and WRITE_DAC, the
+    access Windows gives an owner when no OWNER RIGHTS entry applies? A field this cannot read
+    answers ``False``, so the OWNER RIGHTS entries are carried, as ``icacls /grant:r`` kept them."""
+    if rights.startswith("0X"):
+        try:
+            mask = int(rights, 16)
+        except ValueError:
+            return False
+        return bool(mask & (_WRITE_DAC | _GENERIC_ALL)) and bool(
+            mask & (_READ_CONTROL | _GENERIC_ANY)
+        )
+    tokens = {rights[i : i + 2] for i in range(0, len(rights), 2)}
+    return bool(tokens & _SDDL_RIGHTS_WITH_WRITE_DAC) and bool(
+        tokens & _SDDL_RIGHTS_WITH_READ_CONTROL
+    )
+
+
+def _entries_the_one_list_keeps(sddl: str) -> tuple[list[str], list[str]] | None:
+    """The explicit entries of ``sddl`` that :func:`_secure_file`'s one list carries over, as SDDL
+    ACE text: ``(denies, owner_rights)``. ``None`` when the list is not plainly parseable.
+
+    The rule, and what the owner ends with, is stated once in :func:`_secure_file`'s docstring,
+    under *What the one list carries over*."""
+    start = sddl.find("D:")
+    body = sddl[start + 2 :] if start >= 0 else ""
+    end = body.find("S:")
+    if end >= 0:
+        body = body[:end]
+    first = body.find("(")
+    if start >= 0 and "NO_ACCESS_CONTROL" in (body if first < 0 else body[:first]):
+        return [], []
+    dacl = _parse_sddl_dacl(sddl)
+    if dacl is None:
+        return None
+    texts = _SDDL_ACE.findall(body)
+    if len(texts) != len(dacl.aces):
+        return None
+    denies: list[str] = []
+    owner_rights: list[str] = []
+    all_full = True
+    for text, (kind, flags, rights, ace_sid) in zip(texts, dacl.aces, strict=True):
+        flag_set = _sddl_flag_set(flags)
+        if "ID" in flag_set:
+            continue
+        if kind in _SDDL_DENY_TYPES:
+            denies.append(f"({text})")
+        elif ace_sid in _OWNER_RIGHTS:
+            owner_rights.append(f"({text})")
+            all_full = all_full and (
+                kind == "A" and not flag_set and _grants_owner_implicit_rights(rights)
+            )
+    # A carried deny can withhold the owner's implicit READ_CONTROL and WRITE_DAC only while an
+    # OWNER RIGHTS entry stays: with none left, those two are granted before any deny is read.
+    return denies, ([] if all_full and not denies else owner_rights)
+
+
+def _icacls_grant_keeping_explicit_entries(path: Path, sid: str) -> None:
+    """:func:`_secure_file`'s ``keep_explicit_entries`` rewrite. Windows only; logs, never raises
+    except ``OSError``, which the caller logs."""
+    # icacls is pinned to its absolute System32 path and invoked without a shell; the principal is
+    # a single argv token in icacls's ``*S-...`` form, never a shell word, so it can't inject a
+    # flag (low-27/STORE-5). The pin is what makes "fixed system tool" true: CreateProcess resolves
+    # an unqualified name through a search path that reaches the caller's working directory, and
+    # because this call only logs on a non-zero exit, a planted icacls.exe that exits 0 would leave
+    # this PHI-adjacent file its inherited (possibly broad) ACL while reporting nothing (#1769).
+    result = subprocess.run(  # nosec B603 B607
+        [_system_exe("icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"*{sid}:F"],
+        check=False,
+        env=system_tool_environment(),  # the platform's start-up names only (#2716)
+        capture_output=True,
+        text=True,
+        # icacls echoes the path in the OEM code page. Neither the cp1252 locale default nor
+        # UTF-8 decodes every OEM byte (cp437 0x81, u-umlaut, is undefined in both), and a
+        # failed decode loses the output this warning logs. Only logged, so replace.
+        encoding="oem",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        log.warning(
+            "icacls could not restrict %s (exit %s): %s",
+            path,
+            result.returncode,
+            (result.stderr or result.stdout or "").strip(),
+        )
 
 
 def _grant_read(path: Path, principal: str) -> None:
@@ -9362,7 +9611,10 @@ def _grant_read(path: Path, principal: str) -> None:
             env=system_tool_environment(),  # the platform's start-up names only (#2716)
             capture_output=True,
             text=True,
-            encoding="oem",  # icacls's piped output; see _secure_file for why "replace"
+            # icacls echoes the path in the OEM code page. Neither the cp1252 locale default nor
+            # UTF-8 decodes every OEM byte (cp437 0x81, u-umlaut, is undefined in both), and a
+            # failed decode loses the output this warning logs. Only logged, so replace.
+            encoding="oem",
             errors="replace",
         )
     except OSError as exc:
@@ -9380,8 +9632,10 @@ def _grant_read(path: Path, principal: str) -> None:
 async def _secure_file_async(path: Path) -> None:
     """:func:`_secure_file` dispatched off the event loop, for a caller that runs ON one.
 
-    On Windows the restriction is an ``icacls`` subprocess, measured at 21 to 28 ms per file. Called
-    straight from a coroutine, that span is dead time for every other task on the loop: a deploying
+    On Windows the restriction was an ``icacls`` subprocess, measured at 21 to 28 ms per file. It is
+    now a blocking security-descriptor read and write, unmeasured, still file I/O, and that
+    subprocess again on the fallbacks :func:`_secure_file` names. Called straight from a
+    coroutine, that span is dead time for every other task on the loop: a deploying
     site would see one such stall per secured file of every in-flight ACK, claim and delivery on each
     DR backup, because ``snapshot_to`` runs on the SERVING loop by design (see
     ``pipeline/dr_backup.py``, which keeps the consistent snapshot there and moves only the tar+AEAD
@@ -9476,8 +9730,11 @@ def _parse_sddl_dacl(sddl: str) -> _SddlDacl | None:
     """The owner and ``D:`` section of an SDDL string, or ``None`` when the DACL is absent or not
     plainly parseable.
 
-    ``None`` is the fail-closed answer: every caller treats it as "not hardened", so a shape this does
-    not understand (a callback ACE, a resource attribute, a null DACL) gets the owner-only rewrite."""
+    For the store-trio callers ``None`` is the fail-closed answer: they treat it as "not hardened",
+    so a shape this does not understand (a callback ACE, a resource attribute, a null DACL) gets the
+    owner-only rewrite. :func:`_secure_file` checks for a null DACL first, and for any other
+    ``None`` it cannot tell what a whole list would drop, so it runs the kept icacls rewrite, which
+    keeps every explicit entry."""
     owner_match = _SDDL_OWNER.search(sddl)
     owner = _resolve_sid(owner_match.group(1)) if owner_match else None
     start = sddl.find("D:")
@@ -9657,7 +9914,8 @@ def _read_dacl_sddl(path: Path, *, owner: bool = False) -> str | None:
 
     GetNamedSecurityInfoW asks for the DACL and owner alone, so it needs only READ_CONTROL, and SDDL
     names principals by SID, so the answer does not depend on the display language. A failure is
-    logged with its Win32 status, because the caller then falls back to the owner-only rewrite."""
+    logged with its Win32 status, because the caller then falls back: a store-trio caller to the
+    owner-only rewrite, :func:`_secure_file` to the kept icacls rewrite."""
     if sys.platform != "win32":
         return None
     import ctypes
@@ -9800,7 +10058,9 @@ def _reaches_through_a_link(path: Path) -> bool:
             return True
         if attributes & reparse:
             log.warning(
-                "%s is reached through a link, so the store there is restricted owner-only", path
+                "%s is reached through a link, so the store there gets this account's grant and "
+                "keeps its explicit entries",
+                path,
             )
             return True
     return False
@@ -9828,7 +10088,8 @@ def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
         # (a developer checkout) is the expected fallback. Both keep the reason at DEBUG.
         if parsed.protected and not any(sid == "OW" for _t, _f, _r, sid in parsed.aces):
             log.warning(
-                "%s is locked down but %s, so the store there is restricted owner-only; the service "
+                "%s is locked down but %s, so the store there gets the opener's grant and keeps its "
+                "explicit entries; the service "
                 "account and an operator's provision-admin cannot then both open it (ADR 0163 notes "
                 "of 2026-09-24 and 2026-11-05)",
                 directory,
@@ -9982,7 +10243,9 @@ def _secure_store_file(path: Path, *, dir_grants: Sequence[str] | None) -> None:
     """Restrict one file of the SQLite store trio, or a restored store.
 
     ``dir_grants`` is :func:`_store_dir_grants` of the file's directory. ``None`` -- off Windows, or
-    outside a hardened directory -- is :func:`_secure_file`, owner-only, exactly as before. Otherwise
+    outside a hardened directory -- is :func:`_secure_file` with ``keep_explicit_entries``, the
+    icacls rewrite, exactly as before: it grants the opener and keeps every explicit entry.
+    Otherwise
     the file gets an explicit, protected DACL naming exactly those principals, which is the same
     whoever opens, and which drops any entry for anyone else (a moved-in or restored file can carry
     one). An owner outside those principals is moved to Administrators where the opener may do that,
@@ -9991,7 +10254,7 @@ def _secure_store_file(path: Path, *, dir_grants: Sequence[str] | None) -> None:
     fail and warn on every start. A file that is itself a link gets the old owner-only rewrite, as
     before this change. Best-effort, like :func:`_secure_file`: it logs rather than raises."""
     if dir_grants is None or not _is_windows() or _reaches_through_a_link(path):
-        _secure_file(path)
+        _secure_file(path, keep_explicit_entries=True)
         return
     current = _read_dacl_sddl(path, owner=True)
     parsed = _parse_sddl_dacl(current) if current is not None else None
@@ -10203,6 +10466,14 @@ row locks (and on SQLite the writer lock). It runs BEFORE the audit chain's lock
 not read chain state."""
 
 
+type InjectAudit = Callable[[str], AuditAppend]
+"""An operator inject's :data:`OperatorAudit`, built from the new message id (BACKLOG #6589).
+
+It returns a row every time: an inject always writes a message, so it always records one, and
+:func:`require_ingress_audit` refuses a ``None`` row at runtime. Typed apart from
+:data:`OperatorAudit` so mypy refuses, at a typed caller, an inject audit that may build none."""
+
+
 def no_audit_row(_result: object) -> None:
     """An :data:`OperatorAudit` that records nothing, for a write whose caller records it itself.
 
@@ -10385,19 +10656,31 @@ async def settle_transit_bound_attestation(
     ``None`` when no row is recorded. The check reuses the chain's own pieces: the row MAC
     (:func:`_audit_row_mac`, under the key of the row's range, by Transit's own ``verify`` for a
     Transit MAC) and the constant-time compare. It walks no chain, so it costs one MAC. A MAC
-    provider runs off the event loop, because it is a blocking Vault call. A Transit refusal of
-    that call, such as a key version a forged hash names that does not exist, reads as a gap, not
-    an error, so a row anyone with DML wrote cannot stop a ``warn`` start."""
+    provider runs off the event loop, because it is a blocking Vault call. A cipher failure of
+    that call reads as a gap, not an error, so a row anyone with DML wrote cannot stop a ``warn``
+    start. A 400 whose reply's wording reads as a version refusal, while the probe under the
+    latest version answers a well-formed MAC naming another version, such as one for a version a
+    forged hash names, says
+    Transit refused the check; the code reads only that wording, which a proxy can imitate. At
+    least a 400 not read as a version refusal, a 400 whose probe answers no well-formed MAC, and
+    an outage that raises :class:`CipherError` say the MAC could not be checked (vault BACKLOG
+    #6707 items 24 and 73). A timeout
+    on both asks is not raised here: :func:`_audit_row_mac` reads it as a MAC that does not
+    verify."""
     attestation = read.attestation
     if attestation is None or read.mac_check is None:
         return attestation
     seq = read.mac_check[0]["seq"]
     try:
         verified = await _audit_row_mac_verifies(*read.mac_check)
-    except CipherError as exc:
+    except AuditKeyVersionUnverifiedError as exc:  # no verdict on the MAC, so not "does not verify"
+        return replace(attestation, audit_gap=f"audit row {seq}'s MAC could not be checked: {exc}")
+    except AuditKeyVersionRefusedError as exc:  # the reply's wording read as a version refusal
         return replace(
             attestation, audit_gap=f"Transit refused to check audit row {seq}'s MAC: {exc}"
         )
+    except CipherError as exc:
+        return replace(attestation, audit_gap=f"audit row {seq}'s MAC could not be checked: {exc}")
     if not verified:
         return replace(
             attestation, audit_gap=f"audit row {seq}'s MAC does not verify under the audit key"
@@ -10679,35 +10962,54 @@ def require_mutation_audit[R](audit: OperatorAudit[R], mutation: str) -> Operato
 OPERATOR_ORIGINS: Final = frozenset({MessageOrigin.OPERATOR_EDIT, MessageOrigin.OPERATOR_UPLOAD})
 
 
-def require_ingress_audit(
-    audit: OperatorAudit[str] | None, origin: MessageOrigin
-) -> OperatorAudit[str] | None:
-    """``enqueue_ingress``'s refusal (BACKLOG #5071), and the audit it then runs.
+def is_origin_actor(value: object) -> TypeGuard[str]:
+    """Whether ``value`` can name the user behind an operator origin (BACKLOG #6589): a non-blank
+    string with no surrounding whitespace. The rule :func:`require_ingress_audit` applies, exposed
+    so a caller can refuse first, as the upload resend route does."""
+    return isinstance(value, str) and bool(value) and value == value.strip()
 
-    Before anything is written, an operator origin with no audit or with one that is not callable,
-    and an audit given with any other origin, raise :class:`TypeError`. The audit must also build
-    a row: an inject always writes a message, so a ``None`` row raises inside the transaction and
-    rolls the inject back. A live receipt keeps the default ``partner`` origin and passes none.
+
+def require_ingress_audit(
+    audit: OperatorAudit[str] | None, origin: MessageOrigin, origin_actor: str | None
+) -> InjectAudit | None:
+    """``enqueue_ingress``'s refusal (BACKLOG #5071, #6589), and the audit it then runs.
+
+    Before anything is written, :class:`TypeError` is raised for an operator origin (one in
+    :data:`OPERATOR_ORIGINS`) with no audit, with one that is not callable, or with no
+    ``origin_actor`` naming the user, which must be non-blank and carry no surrounding whitespace;
+    and for an audit or an ``origin_actor`` given with any other origin. The audit must also build a
+    row: an inject always writes a message, so a ``None`` row raises inside the transaction and
+    rolls the inject back. A live receipt keeps the default ``partner`` origin and passes neither.
 
     It keys on ``origin``, so it cannot see an operator's inject written with the default
-    ``partner`` origin: such a call writes neither the operator label nor an audit row. Nothing at
-    the type level holds a direct caller of the store either, since ``audit`` stays optional there.
-    The engine's inject, :meth:`~messagefoundry.pipeline.Engine.inject_message`, requires its
-    ``audit`` and always writes ``operator_upload``."""
+    ``partner`` origin and nothing else: such a call writes neither the operator label nor an audit
+    row. Nothing at the type level holds a direct caller of the store either, since ``audit`` stays
+    optional there. The engine's inject, :meth:`~messagefoundry.pipeline.Engine.inject_message`,
+    requires its ``audit`` and ``actor`` and always writes ``operator_upload``."""
     operator = origin in OPERATOR_ORIGINS
     if not operator:
+        # An audit or an actor is an operator's inject; with this origin the message would be
+        # labelled as a receipt, so the caller forgot the origin.
         if audit is not None:
-            # An audit is an operator's inject; with this origin the message would be labelled
-            # as a receipt, so the caller forgot the origin.
             raise TypeError(
                 f"enqueue_ingress was given an audit with origin {str(origin)!r}; an operator's"
                 " inject names its operator origin (BACKLOG #5071)"
+            )
+        if origin_actor is not None:
+            raise TypeError(
+                f"enqueue_ingress was given an origin_actor with origin {str(origin)!r}; only an"
+                " operator origin names its user (BACKLOG #6589)"
             )
         return None
     if not callable(audit):
         raise TypeError(
             f"enqueue_ingress with origin {str(origin)!r} needs an operator audit, a callable that"
             f" builds its audit row; got {type(audit).__name__} (BACKLOG #5071)"
+        )
+    if not is_origin_actor(origin_actor):
+        raise TypeError(
+            f"enqueue_ingress with origin {str(origin)!r} needs the origin_actor that names its"
+            f" user; got {origin_actor!r} (BACKLOG #6589)"
         )
     build = audit
 
@@ -10749,7 +11051,8 @@ def if_applied(audit: AuditAppend) -> OperatorAudit[bool]:
 
     Anything but an :class:`AuditAppend`, an explicit ``None`` included, raises :class:`TypeError`
     here, so an alert mutation given no row cannot change the alert and record nothing (BACKLOG
-    #5069)."""
+    #5069). Its callers take it as their first statement, so that refusal comes before any write
+    or lock (BACKLOG #6589)."""
     if not isinstance(audit, AuditAppend):
         raise TypeError(
             f"an operator alert mutation or connection flag needs an AuditAppend; got {type(audit).__name__}"
@@ -12530,7 +12833,8 @@ class MessageStore:
             )
             await db.commit()
         # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
-        # Off the loop (BACKLOG #1634): three files, each an icacls subprocess on Windows. Open
+        # Off the loop (BACKLOG #1634): three files, each an ACL write on Windows, and outside a
+        # hardened directory an icacls subprocess (21 to 28 ms each, measured). Open
         # completes before anything is serving, so this one is consistency rather than a fix.
         if str(path) != ":memory:":
             main = Path(path)
@@ -13148,30 +13452,24 @@ class MessageStore:
                 rows = list(await cur.fetchall())
                 if not rows:
                     break
-                # One batch per page, so a Transit cipher seals it in few requests (BACKLOG #6706).
-                sealed_values = await cipher_call(
+                async for chunk, sealed_values in seal_chunks(
                     self._cipher,
-                    encrypt_many,
-                    self._cipher,
-                    [
-                        (
-                            r["v"],
-                            aad_of(r)
-                            if aad_of is not None
-                            else cell_aad(table, column, *(r[c] for c in aad_cols)),
-                        )
-                        for r in rows
-                    ],
-                )
-                await self._update_every_row(
-                    f"UPDATE {table} SET {column}=? WHERE {where_keys}",
-                    [
-                        (value, *(r[c] for c in keys))
-                        for value, r in zip(sealed_values, rows, strict=True)
-                    ],
-                    f"{table}.{column}",
-                    exact=True,
-                )
+                    table,
+                    column,
+                    rows,
+                    aad_cols=aad_cols,
+                    aad_of=aad_of,
+                    local_whole_page=True,
+                ):
+                    await self._update_every_row(
+                        f"UPDATE {table} SET {column}=? WHERE {where_keys}",
+                        [
+                            (value, *(r[c] for c in keys))
+                            for value, r in zip(sealed_values, chunk, strict=True)
+                        ],
+                        f"{table}.{column}",
+                        exact=True,
+                    )
                 sealed += len(rows)
             await self._commit()
         except BaseException as exc:
@@ -14815,7 +15113,7 @@ class MessageStore:
         metadata: str | None = None,
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
-        audit: OperatorAudit[str] | None = None,
+        audit: InjectAudit | None = None,
         origin: MessageOrigin = MessageOrigin.PARTNER,
         origin_actor: str | None = None,
     ) -> str:
@@ -14836,7 +15134,7 @@ class MessageStore:
         leaves the attachment at refcount 0 (no ACK → the sender resends; content-addressing dedups the
         resend and the startup ``sweep_orphan_attachments`` reclaims the orphan). Empty/None → the
         byte-identical no-detach path (no incref)."""
-        audit = require_ingress_audit(audit, origin)  # BACKLOG #5071
+        audit = require_ingress_audit(audit, origin, origin_actor)  # BACKLOG #5071, #6589
         now = time.time() if now is None else now
         mid = uuid4().hex
         # Distinct refs only: one skeleton holds a de-duplicated document (two identical OBX-5.5 values
@@ -19141,13 +19439,15 @@ class MessageStore:
         )
 
     async def _commit_alert_change(
-        self, written: AuditedWrite, audit: AuditAppend, applied: bool
+        self, written: AuditedWrite, audit_row: OperatorAudit[bool], applied: bool
     ) -> bool:
         """Append an operator alert mutation's row, when its UPDATE matched, and commit both in the
         one transaction (vault BACKLOG #3217), so a failed append changes nothing and a 404 writes
-        no row. Each caller spells its UPDATE at its own ``execute``, which the transaction-verb
-        guard reads (tests/test_writer_txn_is_the_only_begin.py)."""
-        await self._append_operator_audit(written, if_applied(audit), applied)
+        no row. ``audit_row`` is the caller's :func:`if_applied`, taken as its first statement, so a
+        missing row was refused before the UPDATE (BACKLOG #6589). Each caller spells its UPDATE at
+        its own ``execute``, which the transaction-verb guard reads
+        (tests/test_writer_txn_is_the_only_begin.py)."""
+        await self._append_operator_audit(written, audit_row, applied)
         await self._commit()
         return applied
 
@@ -19161,6 +19461,7 @@ class MessageStore:
         now: float | None = None,
     ) -> None:
         """See :meth:`messagefoundry.store.base.QueueStore.set_connection_flag`."""
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             if flagged:
@@ -19174,7 +19475,7 @@ class MessageStore:
                     "DELETE FROM connection_flag WHERE connection=? AND direction=?",
                     (connection, direction),
                 )
-            await self._append_operator_audit(written, if_applied(audit), True)
+            await self._append_operator_audit(written, audit_row, True)
             await self._commit()
 
     async def list_connection_flags(self) -> set[tuple[str, str]]:
@@ -19187,6 +19488,7 @@ class MessageStore:
     async def ack_alert_instance(
         self, alert_id: int, *, actor: str, audit: AuditAppend, now: float | None = None
     ) -> bool:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # Operator ack: open|acknowledged -> acknowledged, recording acked_by/acked_at. Idempotent (a
         # re-ack is a no-op update). Returns True iff a non-resolved instance with this id existed (so
         # the API can 404 a resolved/unknown id). Acking a resolved instance is refused (no-op, False).
@@ -19197,11 +19499,12 @@ class MessageStore:
                 " WHERE id=? AND status!='resolved'",
                 (actor, now, alert_id),
             )
-            return await self._commit_alert_change(written, audit, cur.rowcount > 0)
+            return await self._commit_alert_change(written, audit_row, cur.rowcount > 0)
 
     async def resolve_alert_instance(
         self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> bool:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # Operator resolve: open|acknowledged -> resolved, recording resolved_at. Returns True iff a
         # non-resolved instance with this id existed.
         now = time.time() if now is None else now
@@ -19211,7 +19514,7 @@ class MessageStore:
                 " WHERE id=? AND status!='resolved'",
                 (now, alert_id),
             )
-            return await self._commit_alert_change(written, audit, cur.rowcount > 0)
+            return await self._commit_alert_change(written, audit_row, cur.rowcount > 0)
 
     async def resolve_alert_instances_for(
         self, *, event_type: str, connection: str, now: float | None = None
@@ -19290,6 +19593,7 @@ class MessageStore:
     async def suspend_alert_instance(
         self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # #143 windowed suspend: mute NOTIFICATIONS for this instance's (event_type, connection) key until
         # `until` (an epoch). NOTIFICATION-only (ADR 0044 AC-3): the instance's status/count/visibility is
         # untouched; only `suspended_until` is set, so it stays open on the dashboard. Refuses a resolved
@@ -19301,7 +19605,7 @@ class MessageStore:
                 "UPDATE alert_instance SET suspended_until=? WHERE id=? AND status!='resolved'",
                 (until, alert_id),
             )
-            applied = await self._commit_alert_change(written, audit, cur.rowcount > 0)
+            applied = await self._commit_alert_change(written, audit_row, cur.rowcount > 0)
         if not applied:
             return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
@@ -19309,6 +19613,7 @@ class MessageStore:
     async def resume_alert_instance(
         self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # #143: clear a windowed suspend (re-alerts resume immediately). Idempotent (clearing an
         # un-suspended instance is a no-op UPDATE). Returns the row, or None if unknown/already resolved.
         now = time.time() if now is None else now
@@ -19317,7 +19622,7 @@ class MessageStore:
                 "UPDATE alert_instance SET suspended_until=NULL WHERE id=? AND status!='resolved'",
                 (alert_id,),
             )
-            applied = await self._commit_alert_change(written, audit, cur.rowcount > 0)
+            applied = await self._commit_alert_change(written, audit_row, cur.rowcount > 0)
         if not applied:
             return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
@@ -19772,6 +20077,9 @@ class MessageStore:
         ``current`` that fails its seal, writing nothing, and the UPDATE lands only while the row
         is still in ``current``'s status and carries its seal."""
         sealer = self._row_sealer
+        _refuse_new_non_finite(
+            sealer, new.seal_fields(), () if current is None else current.seal_fields()
+        )
         if current is not None:
             cur = await self._db.execute(
                 _SQLITE_APPROVAL_UPDATE,
@@ -20436,6 +20744,7 @@ class MessageStore:
         )
         # Sealed before the writer lock: the seal depends on the record alone, and under a Transit
         # sealer it is a Vault round trip that ingress would otherwise wait behind.
+        _refuse_new_non_finite(self._row_sealer, record.seal_fields())
         sealed = await seal_user_async(self._row_sealer, record)
         async with _writer_guard(self._db, self._lock):
             # BACKLOG #2592: the whole row, sealed, in one INSERT.
@@ -20494,6 +20803,7 @@ class MessageStore:
             return None
         if changed.roles != current.roles:
             raise ValueError("a presealed user write may not change the account's role rows")
+        _refuse_new_non_finite(self._row_sealer, changed.seal_fields(), current.seal_fields())
         return _PresealedUserWrite(current, await seal_user_async(self._row_sealer, changed))
 
     async def _write_user(
@@ -20542,6 +20852,7 @@ class MessageStore:
                 changed = existing_roles_only(
                     current, changed, [str(r["id"]) for r in await cur.fetchall()]
                 )
+            _refuse_new_non_finite(self._row_sealer, changed.seal_fields(), current.seal_fields())
             updated = await seal_user_async(self._row_sealer, changed)
         cur = await self._db.execute(_USER_RESEAL, user_reseal_params(updated, current))
         if cur.rowcount != 1:
@@ -21927,6 +22238,23 @@ class MessageStore:
             await self._commit()
         return written is not None
 
+    async def set_ad_channel_scope_if_unchanged(
+        self,
+        user_id: str,
+        scope_json: str,
+        *,
+        expected_scope: str | None,
+        expected_source: ChannelScopeSource | None,
+        now: float | None = None,
+    ) -> bool:
+        """The AD sign-in's compare-and-set scope write (BACKLOG #6887); see ``AuthStore``."""
+        now = time.time() if now is None else now
+        change = ad_scope_replacement(scope_json, expected_scope, expected_source, now)
+        async with _writer_guard(self._db, self._lock):
+            written = await self._write_user(user_id, change)
+            await self._commit()
+        return written is not None
+
     async def set_user_federated_subject(
         self,
         user_id: str,
@@ -22185,22 +22513,21 @@ class MessageStore:
                 # A deleted account is refused, guarded or not (BACKLOG #2733), not left to the
                 # INSERT's foreign-key error. The locked read refuses one deleted after this read.
                 return False
-            record = await seal_session_async(
-                self._row_sealer,
-                new_session_record(
-                    token_hash=token_hash,
-                    user_id=user_id,
-                    now=time.time() if now is None else now,
-                    expires_at=expires_at,
-                    client=client,
-                    seed_reauth=seed_reauth,
-                    auth_mechanism=auth_mechanism,
-                    idp_auth_time=idp_auth_time,
-                    mfa_verified=mfa_verified,
-                    user_epoch=epochs[0],
-                    global_epoch=epochs[1],
-                ),
+            minted = new_session_record(
+                token_hash=token_hash,
+                user_id=user_id,
+                now=time.time() if now is None else now,
+                expires_at=expires_at,
+                client=client,
+                seed_reauth=seed_reauth,
+                auth_mechanism=auth_mechanism,
+                idp_auth_time=idp_auth_time,
+                mfa_verified=mfa_verified,
+                user_epoch=epochs[0],
+                global_epoch=epochs[1],
             )
+            _refuse_new_non_finite(self._row_sealer, minted.seal_fields())
+            record = await seal_session_async(self._row_sealer, minted)
             try:
                 inserted = await self._insert_sealed_session(
                     record,
@@ -22358,7 +22685,9 @@ class MessageStore:
         if current.revoked_at is not None:
             return None
         await session_writer_seal_check(self._row_sealer, current)
-        updated = await seal_session_async(self._row_sealer, change(current))
+        changed = change(current)
+        _refuse_new_non_finite(self._row_sealer, changed.seal_fields(), current.seal_fields())
+        updated = await seal_session_async(self._row_sealer, changed)
         cur = await self._db.execute(_SESSION_RESEAL, session_reseal_params(updated, current))
         return updated if cur.rowcount == 1 else None
 
@@ -22632,8 +22961,11 @@ class MessageStore:
     ) -> RevokeResult:
         """The body of :meth:`revoke_all_sessions`, inside the caller's writer transaction.
 
-        The store's global session epoch is raised first (BACKLOG #5091), then every account's
-        epoch, as :meth:`revoke_user_sessions` raises one, then one sweep ends the rows and the kept
+        The store's global session epoch is raised first (BACKLOG #5091), then the epoch of each
+        account its read of the account list returns, as :meth:`revoke_user_sessions` raises one;
+        an account goes without its raise where :func:`raise_account_epoch` says, at least on a
+        seal refusal and after a Vault Transit outage trips the revoke, and the global epoch
+        still ends its sessions. Then one sweep ends the rows and the kept
         row is re-sealed under its own account's new epoch and the new global one, when it carried
         both epochs those raises replaced (:class:`KeptSessionRestamp`, BACKLOG #4975), and is
         otherwise ended and counted (:meth:`_keep_or_end_session`).
@@ -23512,7 +23844,7 @@ class MessageStore:
         # encrypted .mfbak the BackupRunner wraps it in is the at-rest protection, but the transient
         # plaintext snapshot must not be world-readable either.
         # Off the loop (BACKLOG #1634): this is the call that matters. A DR backup runs on the SERVING
-        # loop, so a synchronous icacls here stalls every in-flight ACK, claim and delivery with it.
+        # loop, so a synchronous ACL write here stalls every in-flight ACK, claim and delivery with it.
         await _secure_file_async(dest)
 
     async def _copy_snapshot(self, dest: Path, method: str) -> None:

@@ -89,7 +89,8 @@ def anonymize(
     overlay path, so a run reads, checks and warns about its overlay once (BACKLOG #3493).
 
     ``blanked``, when given, collects the address of every field the ``date`` kind scrubbed to empty
-    because its value was not a timestamp it could keep.
+    because its value was not a timestamp it could keep. When the addresses are added is stated
+    once, on :func:`.hl7.anonymize_message`.
     """
     keyer = Keyer(salt)
     if rules is None:

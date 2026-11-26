@@ -482,3 +482,96 @@ def test_the_installed_announce_shim_is_inert_outside_a_git_repo(
     proc = _run_shim(_extract_shim(settings, tmp_path), outside)
     assert proc.returncode == 0
     assert proc.stdout.strip() == ""
+
+
+# --------------------------------------------------------------------------------------------------
+# The NOTICE shim on the Stop rows -- BACKLOG #7575. Why it emits a systemMessage is stated once, in
+# the installer's comment above New-NoticeShimCommand.
+# --------------------------------------------------------------------------------------------------
+
+# Every Shim = "notice" row of $WIRING, parsed from the installer so an added or renamed row is
+# exercised rather than silently skipped: (event, script, marker, notice text).
+_NOTICE_ROW_RE = re.compile(
+    r'@\{ Event = "(\w+)";[^\n]*?Script = "([^"]+)";[^\n]*?Marker = \$(\w+); Shim = "notice"'
+    r'\s*\n\s*Notice = "([^"]*)"'
+)
+_NOTICE_ROWS_SRC = _NOTICE_ROW_RE.findall(_SRC)
+_NOTICE_ROWS = [(_marker(var), script) for _event, script, var, _notice in _NOTICE_ROWS_SRC]
+
+
+def test_the_notice_rows_were_parsed_and_are_all_stop_rows_with_ascii_notices() -> None:
+    """The systemMessage form is the right one only on Stop: on SessionStart or UserPromptSubmit
+    plain stdout reaches the model and a systemMessage would not. ASCII, because the shim sets no
+    output encoding, so a non-ASCII notice would reach the harness in the console code page."""
+    assert len(_NOTICE_ROWS_SRC) >= 2, f"notice rows not parsed from {INSTALLER}"
+    rows = len(re.findall(r'Marker = \$\w+; Shim = "notice"', _SRC))
+    assert len(_NOTICE_ROWS_SRC) == rows, "a notice row did not parse"
+    for event, script, _var, notice in _NOTICE_ROWS_SRC:
+        assert event == "Stop", f"{script}: a notice row on {event} needs a different notice form"
+        assert notice.isascii(), f"{script}: non-ASCII notice"
+
+
+def _stop_notice_shim(settings: Path, tmp_path: Path, marker: str) -> Path:
+    hits = [c for c in _cmds(load(settings), "Stop") if c.startswith(f"# {marker}\n")]
+    assert len(hits) == 1, f"expected exactly one Stop entry for {marker}, got {len(hits)}"
+    p = tmp_path / f"{marker}-shim.ps1"
+    p.write_text(hits[0], encoding="utf-8")
+    return p
+
+
+def _run_stop_shim(shim: Path, cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(shim)],
+        cwd=str(cwd),
+        input=json.dumps({"session_id": "x", "hook_event_name": "Stop"}),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(("marker", "script"), _NOTICE_ROWS)
+def test_a_stop_notice_shim_says_so_as_a_system_message(
+    settings: Path, tmp_path: Path, marker: str, script: str
+) -> None:
+    """Red before #7575: stdout was the bare notice text, which a Stop hook shows nobody."""
+    primary = _fixture_primary(tmp_path, with_announce=False)
+    wt = _linked_worktree(primary, tmp_path)
+    run_installer(settings)
+    proc = _run_stop_shim(_stop_notice_shim(settings, tmp_path, marker), wt)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert set(out) == {"systemMessage"}, out
+    assert f"{script} is missing from this checkout" in out["systemMessage"]
+
+
+@pytest.mark.parametrize("marker", [m for m, _s in _NOTICE_ROWS])
+@pytest.mark.parametrize("where", ["foreign-repo", "not-a-repo"])
+def test_a_stop_notice_shim_is_silent_outside_a_messagefoundry_checkout(
+    settings: Path, tmp_path: Path, marker: str, where: str
+) -> None:
+    if where == "foreign-repo":
+        cwd = _fixture_primary(tmp_path, with_announce=False, with_presence=False)
+    else:
+        cwd = tmp_path / "not-a-repo"
+        cwd.mkdir()
+    run_installer(settings)
+    proc = _run_stop_shim(_stop_notice_shim(settings, tmp_path, marker), cwd)
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == "", f"notice leaked outside MessageFoundry: {proc.stdout!r}"
+
+
+@pytest.mark.parametrize(("marker", "script"), _NOTICE_ROWS)
+def test_a_stop_notice_shim_runs_the_resolved_script_and_prints_no_notice(
+    settings: Path, tmp_path: Path, marker: str, script: str
+) -> None:
+    primary = _fixture_primary(tmp_path, with_announce=False)
+    target = primary / script
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("Write-Output 'PRIMARY-STOP-HOOK-RAN'\n", encoding="utf-8")
+    wt = _linked_worktree(primary, tmp_path)
+    run_installer(settings)
+    proc = _run_stop_shim(_stop_notice_shim(settings, tmp_path, marker), wt)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "PRIMARY-STOP-HOOK-RAN", proc.stdout

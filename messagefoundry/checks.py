@@ -18,7 +18,9 @@ checks). Two checks are **required** (they can block a commit):
   ``[pipeline].snapshot_on_send`` (copy-on-Send, ADR 0104) resolved best-effort from this instance's
   ``messagefoundry.toml`` (same resolution as the posture check); when no settings load it falls back
   to the setting's own default (ON) — so the gate previews what the default engine actually delivers,
-  never a silent OFF (#230).
+  never a silent OFF (#230). The section-name refusal
+  (:class:`~messagefoundry.config.settings.SectionNameEnvError`, whose docstring says when) can
+  fail the leg instead.
 
   **THAT PREVIEW GUARANTEE IS SCOPED TO ``snapshot_on_send``, AND ONE OTHER SETTING BREAKS IT.** The
   dry run ALWAYS executes Routers/Handlers **in-process**: :func:`messagefoundry.pipeline.dryrun.dry_run`
@@ -330,7 +332,8 @@ def run_checks(
     results = [
         _check_validate(config_dir, allow_empty=allow_empty_config),
         # Not tagged. Several of its arms read no settings, and its preview falls back to the model
-        # default when a load fails, so a tag here would claim a source the line may not rest on.
+        # default when most loads fail, so a tag here would claim a source the line may not rest
+        # on. Its section-name refusal line does rest on one and is untagged all the same.
         _check_dryrun(
             config_dir,
             messages_dir,
@@ -1917,8 +1920,10 @@ def _resolve_snapshot_on_send(
     loaded flag. When no settings resolve (no toml, or one that won't parse/validate), fall back to the
     **Settings-model default (True)** — the posture of exactly the default, un-overridden engine —
     never a hardcoded ``False``, which would preview the wrong posture for the engine this gate exists
-    to mirror (ADR 0104 §8.1)."""
-    from messagefoundry.config.settings import PipelineSettings
+    to mirror (ADR 0104 §8.1). The exception is
+    :class:`~messagefoundry.config.settings.SectionNameEnvError`, which is raised for
+    :func:`_check_dryrun` to fail its leg with rather than fall back on."""
+    from messagefoundry.config.settings import PipelineSettings, SectionNameEnvError
 
     toml, env_only = _settings_source(
         config_dir, service_config=service_config, suppress_search=suppress_search, env=env
@@ -1929,6 +1934,8 @@ def _resolve_snapshot_on_send(
         # An instance declared in the environment alone previews its own MEFOR_PIPELINE_* value
         # (vault BACKLOG #2355), exactly as the settings legs read it.
         return _load_check_settings(toml, env=env).pipeline.snapshot_on_send
+    except SectionNameEnvError:
+        raise  # why: SectionNameEnvError's docstring
     except _SETTINGS_LOAD_ERRORS:
         return PipelineSettings().snapshot_on_send
 
@@ -1941,9 +1948,15 @@ def _check_dryrun(
     suppress_search: bool = False,
     env: str | None = None,
 ) -> CheckResult:
+    from messagefoundry.config.settings import SectionNameEnvError
     from messagefoundry.config.snapshot import ConfigDirMissing
     from messagefoundry.config.wiring import WiringError, load_config
-    from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_message_sets
+    from messagefoundry.pipeline.dryrun import (
+        dry_run,
+        dry_run_reference_view,
+        fixture_cap,
+        read_message_sets,
+    )
     from messagefoundry.redaction import safe_error
     from messagefoundry.store import MessageStatus
 
@@ -2017,15 +2030,32 @@ def _check_dryrun(
         return CheckResult("dryrun", ok=False, required=True, detail=str(exc))
     # #230 P4 (ADR 0104): preview under the engine's copy-on-Send posture (best-effort; fallback = the
     # Settings-model default, ON) so the gate exercises the fixtures exactly as the engine would run them.
-    snapshot_on_send = _resolve_snapshot_on_send(
-        config_dir, service_config=service_config, suppress_search=suppress_search, env=env
-    )
+    try:
+        snapshot_on_send = _resolve_snapshot_on_send(
+            config_dir, service_config=service_config, suppress_search=suppress_search, env=env
+        )
+    except SectionNameEnvError as exc:
+        return _settings_refused("dryrun", required=True, exc=exc)
     errors: list[str] = []
     total = 0
     pinned = 0
     asserted = (
         0  # runs checked against a declared .expect disposition (executable acceptance criteria)
     )
+    # Built once for the whole run, so each file-backed reference set is read once rather than once
+    # per fixture per inbound (BACKLOG #6820). Every fixture reads the same snapshot, and each read
+    # of a value decodes its own copy, as a read of the live engine's cache does. A loader fault the
+    # builder does not turn into a skipped set fails this leg, naming its type alone, rather than
+    # ending the report: per fixture it was an ERROR, through dry_run's own guard.
+    try:
+        reference_view = dry_run_reference_view(reg)
+    except Exception as exc:  # noqa: BLE001 - the type alone reaches the detail
+        return CheckResult(
+            "dryrun",
+            ok=False,
+            required=True,
+            detail=f"reference sets did not load for the preview ({type(exc).__name__})",
+        )
     for label, path, raw, target in message_sets:
         try:
             expected = _expected_disposition(path, cap=cap)
@@ -2037,7 +2067,13 @@ def _check_dryrun(
             pinned += 1
         for ic_name in targets:
             total += 1
-            result = dry_run(reg, raw, inbound=ic_name, snapshot_on_send=snapshot_on_send)
+            result = dry_run(
+                reg,
+                raw,
+                inbound=ic_name,
+                snapshot_on_send=snapshot_on_send,
+                reference_view=reference_view,
+            )
             # A Router/Handler's own `raise` can quote field values, so its text goes through
             # `safe_error` before it enters the detail string (BACKLOG #1668). **No `show_phi=` keyword,
             # and this surface must never grow one:** `check` is the commit/CI gate, its stdout lands in

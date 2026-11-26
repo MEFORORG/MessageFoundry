@@ -66,6 +66,13 @@ class JwkAlgMismatch(JwksError):
     than the one the token names (BACKLOG #5517). A refusal of the key, not a missing ``kid``."""
 
 
+class JwksAmbiguousKid(JwksError):
+    """The JWKS document gives two usable keys the same ``kid``, so the set is refused whole. A fault
+    in the IdP's key set, not in the token. Raised by :func:`parse_jwks`, and by a
+    :class:`JwksCache` lookup whose own fetch returned such a set; ``claims.py`` records that
+    lookup's refusal as ``ambiguous_kid``."""
+
+
 @dataclass(frozen=True, slots=True)
 class _BoundKey:
     """One JWKS key and the algorithm its JWK ``alg`` restricts it to, ``None`` when it names none
@@ -216,7 +223,7 @@ def _parse_bound(body: bytes) -> dict[str, _BoundKey]:
         # key order: a skipped key (an encryption key sharing a signing key's kid, say) is never a
         # second candidate, before or after the usable one (BACKLOG #5517).
         if kid in keys:
-            raise JwksError(f"JWKS contains two keys with kid {kid!r} (ambiguous; refused)")
+            raise JwksAmbiguousKid(f"JWKS contains two keys with kid {kid!r} (ambiguous; refused)")
         keys[kid] = bound
     if not keys:
         raise JwksError(f"JWKS yielded no usable signing keys ({skipped} skipped)")
@@ -290,8 +297,10 @@ class JwksCache:
         raises :class:`JwkAlgMismatch` (BACKLOG #5517). A key whose JWK names none is returned, and
         the caller still checks that it fits ``alg``.
 
-        Raises :class:`JwksError` if the key is unknown and the min-refetch floor has not elapsed, or
-        if a forced refetch still does not yield the ``kid``.
+        Raises :class:`JwksError` in at least these cases: the key is unknown and the min-refetch
+        floor has not elapsed; a forced refetch still does not yield the ``kid``; or a refetch, for
+        an unknown ``kid`` or a cached one past its TTL, returns a body the parse refuses. That last
+        is :class:`JwksAmbiguousKid` when the set gives two usable keys one ``kid``.
         """
         bound = self._lookup(kid)
         if bound.alg is not None and bound.alg != alg:

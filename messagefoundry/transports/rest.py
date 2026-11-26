@@ -74,6 +74,7 @@ from messagefoundry.config.tls_policy import (
     insecure_hop_disposition,
     is_loopback_hop_host,
     narrow_to_approved_suites,
+    refuse_chain_check_on_os_roots,
     relax_verify_expiry,
     resolve_trust_anchor,
     urllib_handler_context,
@@ -2930,31 +2931,36 @@ def egress_route_from_settings(
     )
 
 
-def _refuse_unsendable_static_auth(s: Mapping[str, Any], *, connection: str | None) -> None:
-    """Refuse at construction a static REST credential :meth:`RestDestination._build_headers`
-    could not send as configured (BACKLOG #5354). Read on the resolved settings, since the
+def _refuse_unsendable_static_auth(
+    s: Mapping[str, Any], *, connection: str | None, transport: str = "REST destination"
+) -> None:
+    """Refuse at construction a static HTTP credential the connector's ``_build_headers`` could
+    not send as configured (BACKLOG #5354; the FHIR destination and ``FhirLookup`` since BACKLOG
+    #8299 item 8, with ``transport`` naming them). Read on the resolved settings, since the
     factory sees ``env()`` references and cannot tell one that resolves empty from a set value.
 
     One Basic half without the other, or a half that resolves empty, would send no Authorization
     at all. A ``:`` in ``basic_user`` would move the rest of the user into the password, since RFC
     7617 splits the pair at the first colon. ``bearer_token`` beside a Basic pair would be replaced
-    by it without a word. Each refusal names settings, never a value. Digest beside either was
-    already refused by ``refuse_http_digest_conflicts``."""
+    by it without a word. Each refusal names settings, never a value. On the REST and FHIR
+    destinations, Digest beside either was already refused by ``refuse_http_digest_conflicts``,
+    which they call first. ``FhirLookup`` does not call that function and builds no Digest
+    handler."""
     prefix = hop_name_prefix(connection)
     user, password = s.get("basic_user"), s.get("basic_password")
     if bool(user) != bool(password):
         raise HttpAuthError(
-            f"{prefix}REST destination basic_user and basic_password must be set together; one "
+            f"{prefix}{transport} basic_user and basic_password must be set together; one "
             "without the other, or one that resolves empty, would send no HTTP Basic credential"
         )
     if user and ":" in str(user):
         raise HttpAuthError(
-            f"{prefix}REST destination basic_user must not contain ':'; HTTP Basic splits the "
+            f"{prefix}{transport} basic_user must not contain ':'; HTTP Basic splits the "
             "user from the password at the first colon (RFC 7617)"
         )
     if user and s.get("bearer_token"):
         raise HttpAuthError(
-            f"{prefix}REST destination sets both bearer_token and basic_user/basic_password; "
+            f"{prefix}{transport} sets both bearer_token and basic_user/basic_password; "
             "they share the Authorization header, so configure exactly one"
         )
 
@@ -3000,7 +3006,7 @@ class RestDestination(DestinationConnector):
         # ADR 0013: capture the HTTP response body. Default False → returns None, byte-identical. A 2xx
         # with a body → outcome='accepted'; a 2xx with an empty body → outcome='no_reply' (a successful
         # round-trip, not an error). Non-2xx keeps today's DeliveryError/NegativeAckError classification.
-        self.capture_response: bool = bool(s.get("capture_response", False))
+        self.capture_response: bool = flag_from_settings(s, "capture_response")
         # #154: the allow-list of HTTP response header names to capture into the DeliveryResponse. Empty
         # (the default) → no headers captured, byte-identical. Only meaningful when the reply is captured.
         self.capture_response_headers = normalize_header_allowlist(
@@ -3009,7 +3015,7 @@ class RestDestination(DestinationConnector):
         # #68: opt in to per-message HTTP headers stamped by a Handler into the ADR 0081 metadata bag
         # (http.header.* entries). Default False → the delivery worker skips the metadata read and send
         # is byte-identical. When True, consumes_metadata tells the worker to pass this message's bag.
-        self.consumes_metadata: bool = bool(s.get("dynamic_headers", False))
+        self.consumes_metadata: bool = flag_from_settings(s, "dynamic_headers")
         # #200 (ADR 0092): the per-connection insecure-hop attestation, keying the posture-keyed refusal.
         attested = config.tls_hop_attested
         # ADR 0153 decision 2: the OPPOSITE per-connection declaration — this hop is cleartext, is not
@@ -3017,10 +3023,10 @@ class RestDestination(DestinationConnector):
         accepted, accept_reason = config.cleartext_accepted, config.cleartext_reason
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
-        # BACKLOG #5529: an http_auth this connection cannot honour is refused first, so a connection
-        # that never builds logs no insecure-hop crossing or warning below. Lazy: http_auth imports rest.
+        # BACKLOG #5529: an http_auth this connection cannot honour is refused first, so a build
+        # this refuses logs no insecure-hop crossing or warning below. Lazy: http_auth imports rest.
         from messagefoundry.transports.http_auth import (
-            refuse_authorization_signer_beside_digest,
+            refuse_authorization_signer_beside_credential,
             refuse_http_digest_conflicts,
         )
 
@@ -3039,7 +3045,7 @@ class RestDestination(DestinationConnector):
         # destination, so verify_tls=false turns off no verification the engine does. It used to skip
         # the revocation guard below, which runs only on the verify-ON branch. Refused here, above
         # refuse_verify_off, so that gate logs no attested crossing and no DISABLED warning for a
-        # connection that never builds. No attestation crosses it, as with proxy_url above.
+        # connection this refuses. No attestation crosses it, as with proxy_url above.
         verify = bool_setting(s, "verify_tls", default=True)
         if self._ech_sidecar is not None and not verify:
             raise ValueError(
@@ -3121,8 +3127,11 @@ class RestDestination(DestinationConnector):
         # identical). Built here so a bad key/algorithm fails loud at connector construction (check/
         # dry-run/start), like a bad TLS cert; the per-request signature is minted in _post (off-loop).
         self._signer: MessageSigner | None = signer_from_destination(config)
-        refuse_authorization_signer_beside_digest(
+        # BACKLOG #5526 item 6: under the Authorization name the signature would replace the
+        # configured or minted credential _post writes before it.
+        refuse_authorization_signer_beside_credential(
             None if self._signer is None else self._signer.header_name,
+            s,
             digest=digest_selected,
             connection=config.name,
         )
@@ -3173,6 +3182,16 @@ class RestDestination(DestinationConnector):
             anchor = http_family_trust_anchor(
                 s, url=self.url, trust_anchor_policy=config.trust_anchor_policy
             )
+            if self._ech_sidecar is not None:
+                # Vault BACKLOG #5511: the opener built below is replaced by the sidecar's, so the
+                # whole-chain refusal is worded for an ECH hop before the generic one can fire.
+                refuse_chain_check_on_os_roots(anchor, ech_sidecar=True)
+            elif scheme == "http":
+                # The same refusal for an http url (admitted by the cleartext egress gate above),
+                # worded so it does not say the hop verifies its server: the opener makes no TLS
+                # connection to the partner. Its https handler can still serve a TLS leg to an
+                # https forward proxy, where one is set.
+                refuse_chain_check_on_os_roots(anchor, cleartext=True)
             if allow_expired:
                 self._opener = _expiry_relaxed_opener(
                     urllib.parse.urlsplit(self.url).hostname or "",

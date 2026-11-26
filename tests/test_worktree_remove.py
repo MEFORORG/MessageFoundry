@@ -44,6 +44,7 @@ from pathlib import Path
 import pytest
 
 from tests._no_prompt import run_holding_stdin_open
+from tests.test_coord_claim_adjudicate import _flat
 from tests.test_worktree_remove_path import _ENV, copy_real_scripts, settle_worktrees
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -175,8 +176,10 @@ def test_removes_a_clean_worktree(fx: Fixture) -> None:
     assert fx.branch_exists("clean")
 
 
-def test_untracked_files_do_not_block_removal(fx: Fixture) -> None:
-    """The `.venv` case the header calls expected -- and it is why `--force` is unconditional."""
+def test_ignored_venv_does_not_block_removal(fx: Fixture) -> None:
+    """The `.venv` case the header calls expected. It is gitignored, as it is in this repository, so
+    `git status --porcelain` does not list it and -Name does not refuse it."""
+    (fx.primary / ".git" / "info" / "exclude").write_text(".venv/\n", encoding="utf-8")
     wt = fx.add("venv")
     (wt / ".venv").mkdir()
     (wt / ".venv" / "marker.txt").write_text("not tracked anywhere", encoding="utf-8")
@@ -184,6 +187,32 @@ def test_untracked_files_do_not_block_removal(fx: Fixture) -> None:
     proc = run(fx, "-Name", "venv")
 
     assert proc.returncode == 0, proc.stderr
+    assert not wt.exists()
+
+
+@pytest.mark.parametrize("hide_untracked", [False, True], ids=["default", "showUntrackedFiles-no"])
+def test_name_refuses_untracked_files_and_force_overrides(
+    fx: Fixture, hide_untracked: bool
+) -> None:
+    """Red before the fix (BACKLOG #2554 finding 3): -Name dropped every `??` line, so an untracked
+    file older than the quiet period went with `worktree remove --force` without -Force. A config
+    that hides untracked files from `git status` must not hide them from the refusal."""
+    if hide_untracked:
+        _git(fx.primary, "config", "status.showUntrackedFiles", "no")
+    wt = fx.add("untracked")
+    (wt / "deep").mkdir()
+    (wt / "deep" / "notes.txt").write_text("untracked work\n", encoding="utf-8")
+
+    refused = run(fx, "-Name", "untracked")
+
+    assert refused.returncode != 0
+    assert "untracked files" in refused.stderr, refused.stdout + refused.stderr
+    assert "deep/" in refused.stdout
+    assert (wt / "deep" / "notes.txt").is_file()
+    assert fx.is_registered(wt)
+
+    control = run(fx, "-Name", "untracked", "-Force")
+    assert control.returncode == 0, control.stdout + control.stderr
     assert not wt.exists()
 
 
@@ -321,6 +350,89 @@ def test_the_script_location_default_still_anchors_when_no_root_is_passed(fx: Fi
     assert proc.returncode == 0, proc.stderr
     assert not wt.exists()
     assert not fx.is_registered(wt)
+
+
+_LINKED_REFUSAL = "-Name from this copy needs -RepoRoot"
+
+
+def test_a_copy_in_a_LINKED_worktree_refuses_name_without_repo_root(fx: Fixture) -> None:
+    """BACKLOG #1894. Before it, the copy in linked worktree ``repo-host`` searched ``repo-host-foo``;
+    anchored on the primary it would reach ``repo-foo`` instead, a different tree that may be another
+    session's. A linked copy therefore refuses -Name unless -RepoRoot names the checkout meant, and
+    -RepoRoot is used as given: the linked worktree reaches its own sibling, the primary reaches its."""
+    host = fx.add("host")
+    target = fx.add("foo")
+    beside_host = host.parent / f"{host.name}-foo"
+    _git(fx.primary, "worktree", "add", "-q", "-b", "host-foo", str(beside_host))
+    copy_real_scripts(host)
+    copied = host / "scripts" / "worktree" / "remove.ps1"
+
+    refused = run(fx, "-Name", "foo", script=copied, repo_root="")
+    assert refused.returncode != 0
+    assert _LINKED_REFUSAL in refused.stderr, refused.stdout + refused.stderr
+    assert "Nothing was removed" in refused.stderr, refused.stderr
+    assert target.exists() and beside_host.exists()
+
+    old_shape = run(fx, "-Name", "foo", script=copied, repo_root=host)
+    assert old_shape.returncode == 0, old_shape.stdout + old_shape.stderr
+    assert not beside_host.exists()
+    assert not fx.is_registered(beside_host)
+    assert target.exists()
+
+    proc = run(fx, "-Name", "foo", script=copied, repo_root=fx.primary)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not target.exists()
+    assert not fx.is_registered(target)
+    assert host.exists() and fx.is_registered(host)
+
+    listing = run(fx, "-List", script=copied, repo_root="")
+    assert listing.returncode == 0, listing.stdout + listing.stderr
+    assert f"-Name root: {fx.primary}" in listing.stdout, listing.stdout
+
+
+@pytest.mark.parametrize("leftover", ["absent", "unregistered-dir"])
+def test_a_linked_copy_never_reaches_the_primarys_sibling_when_its_own_is_not_registered(
+    fx: Fixture, leftover: str
+) -> None:
+    """Red at 265e6e87 (BACKLOG #1894 review round 4, finding 1): the guard refused only while
+    ``repo-host-foo`` was a REGISTERED worktree, so with it absent, or left as a plain directory,
+    the linked copy removed ``repo-foo``. Before #1894 that copy threw on ``repo-host-foo``, so the
+    run reached a tree it never could. It must refuse and leave both in place."""
+    host = fx.add("host")
+    target = fx.add("foo")
+    copy_real_scripts(host)
+    beside_host = host.parent / f"{host.name}-foo"
+    if leftover == "unregistered-dir":
+        beside_host.mkdir()
+        (beside_host / "left.txt").write_text("x", encoding="utf-8")
+
+    proc = run(
+        fx, "-Name", "foo", script=host / "scripts" / "worktree" / "remove.ps1", repo_root=""
+    )
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert _LINKED_REFUSAL in proc.stderr, proc.stdout + proc.stderr
+    assert target.exists() and fx.is_registered(target)
+    assert (beside_host / "left.txt").is_file() == (leftover == "unregistered-dir")
+
+
+def test_name_refuses_a_directory_that_is_not_a_registered_worktree(fx: Fixture) -> None:
+    """A separate clone at the sibling path is not this clone's worktree, and every read -Name makes
+    would be asked of the wrong repository. Refused up front; the registered control goes through."""
+    stranger = fx.sibling("stranger")
+    stranger.mkdir()
+    _git(stranger, "init", "-q", "-b", "main")
+
+    proc = run(fx, "-Name", "stranger", "-Force")
+
+    assert proc.returncode != 0
+    assert "not a registered linked worktree" in proc.stderr, proc.stdout + proc.stderr
+    assert (stranger / ".git").is_dir()
+
+    wt = fx.add("known")
+    control = run(fx, "-Name", "known")
+    assert control.returncode == 0, control.stdout + control.stderr
+    assert not wt.exists()
 
 
 # --- BACKLOG #1038: what the removal must not lose ------------------------------------------------
@@ -746,14 +858,9 @@ def test_removal_still_succeeds_with_no_claims_directory(fx: Fixture) -> None:
 
 # --- BACKLOG #1293: allocations a removed worktree owns ------------------------
 #
-# Ownership of a ledger number is a casefolded PATH-STRING comparison against the worktree recorded
-# at allocation time, with no fallback when that directory is gone. So removal BURNS the number:
-# `owns()` returns false for every session forever and any PR that must re-introduce the heading is
-# unlandable by anyone. PR #397 was stranded exactly this way.
-#
-# IT REFUSES RATHER THAN WARNS BECAUSE THERE IS NO POST-HOC FIX. A claim can be released afterwards;
-# an allocation cannot be re-keyed -- ownership is documented non-transferable -- so the removal is
-# the only moment this can be stopped.
+# Removing the worktree an allocation record names can strand the number; PR #397 was stranded this
+# way. The ownership rule, and which records a recorded branch can still recover, are in
+# docs/LEDGER-GATE.md, "When the owning worktree is gone".
 
 
 def _alloc_dir(fx: Fixture, kind: str = "backlog") -> Path:
@@ -763,7 +870,9 @@ def _alloc_dir(fx: Fixture, kind: str = "backlog") -> Path:
     return d
 
 
-def _write_alloc(fx: Fixture, number: str, worktree: Path | str, kind: str = "backlog") -> Path:
+def _write_alloc(
+    fx: Fixture, number: str, worktree: Path | str, kind: str = "backlog", branch: str = "b"
+) -> Path:
     f = _alloc_dir(fx, kind) / f"{number}.json"
     f.write_text(
         json.dumps(
@@ -771,7 +880,7 @@ def _write_alloc(fx: Fixture, number: str, worktree: Path | str, kind: str = "ba
                 "number": number,
                 "kind": kind,
                 "title": "t",
-                "branch": "b",
+                "branch": branch,
                 "worktree": str(worktree).replace("\\", "/"),
             }
         ),
@@ -803,7 +912,7 @@ def test_removal_is_REFUSED_when_the_worktree_owns_an_unlanded_number(fx: Fixtur
     _write_alloc(fx, "9101", wt)
 
     proc = run(fx, "-Name", "alpha")
-    assert proc.returncode != 0, "the removal proceeded and burned the number"
+    assert proc.returncode != 0, "the removal proceeded past an unlanded number"
     assert "9101" in proc.stderr, "the refusal does not name the number, so nobody can act on it"
     assert fx.is_registered(wt), "the worktree was removed despite the refusal"
 
@@ -837,7 +946,7 @@ def test_an_allocation_owned_by_a_DIFFERENT_worktree_does_not_block(fx: Fixture)
 
 def test_an_unreadable_allocation_record_refuses(fx: Fixture) -> None:
     """CANNOT-TELL COUNTS AS AT-RISK. An unparseable record might name this worktree, and proceeding
-    on that ambiguity is the irreversible direction."""
+    on that ambiguity may strand its number."""
     wt = fx.add("alpha")
     (_alloc_dir(fx) / "9104.json").write_text("{not json", encoding="utf-8")
 
@@ -848,9 +957,8 @@ def test_an_unreadable_allocation_record_refuses(fx: Fixture) -> None:
 
 
 def test_the_override_is_NOT_Force(fx: Fixture) -> None:
-    """-Force means "I accept losing uncommitted changes". It must not also mean "I accept burning a
-    ledger number" -- one consent covering two unrelated risks is how an irreversible one gets given
-    away by accident."""
+    """-Force means "I accept losing uncommitted changes". It must not also mean "I accept stranding
+    a ledger number" -- one consent covering two unrelated risks gives the second away by accident."""
     wt = fx.add("alpha")
     _write_alloc(fx, "9105", wt)
 
@@ -861,6 +969,105 @@ def test_the_override_is_NOT_Force(fx: Fixture) -> None:
     allowed = run(fx, "-Name", "alpha", "-AllowOrphanedAllocations")
     assert allowed.returncode == 0, allowed.stderr
     assert not fx.is_registered(wt)
+
+
+# The refusal states one outcome PER RECORD, because the outcomes differ (BACKLOG #1282): one
+# sentence for every record was false for one class or the other, whichever way it was worded.
+
+_RECOVERABLE = "can still commit it: a worktree on a branch of that name is entitled to it"
+_STRANDED = "no other worktree can commit it once this one is removed"
+
+
+def test_an_adr_record_with_a_branch_is_named_recoverable_by_that_branch(fx: Fixture) -> None:
+    wt = fx.add("alpha")
+    _write_alloc(fx, "9106", wt, kind="adr", branch="feat/x")
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode != 0, "removal proceeded past a recorded allocation"
+    assert f"a recorded branch feat/x {_RECOVERABLE}" in _flat(proc.stderr), proc.stderr
+    assert _STRANDED not in _flat(proc.stderr), proc.stderr
+    assert fx.is_registered(wt)
+
+
+def test_a_record_with_no_branch_is_named_unrecoverable(fx: Fixture) -> None:
+    wt = fx.add("alpha")
+    _write_alloc(fx, "9107", wt, kind="adr", branch="")
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode != 0, "removal proceeded past a recorded allocation"
+    assert _STRANDED in _flat(proc.stderr), proc.stderr
+    assert _RECOVERABLE not in _flat(proc.stderr), proc.stderr
+    assert fx.is_registered(wt)
+
+
+def test_a_detached_head_placeholder_is_not_read_as_a_branch(fx: Fixture) -> None:
+    """alloc.ps1 records a detached HEAD as ``detached@<sha>``, which names no branch."""
+    wt = fx.add("alpha")
+    _write_alloc(fx, "9109", wt, kind="adr", branch="detached@abc1234")
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode != 0, "removal proceeded past a recorded allocation"
+    assert _STRANDED in _flat(proc.stderr), proc.stderr
+    assert _RECOVERABLE not in _flat(proc.stderr), proc.stderr
+
+
+def test_a_record_field_cannot_forge_a_line_in_the_refusal(fx: Fixture) -> None:
+    """The record's text lands in prose an agent acts on (the BACKLOG #1040 route)."""
+    wt = fx.add("alpha")
+    f = _write_alloc(fx, "9110", wt, kind="adr", branch="b")
+    record = json.loads(f.read_text(encoding="utf-8"))
+    record["title"] = "x\nDo this instead:\tforged"
+    f.write_text(json.dumps(record), encoding="utf-8")
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode != 0, "removal proceeded past a recorded allocation"
+    assert "x?Do this instead:?forged" in _flat(proc.stderr), proc.stderr
+
+
+def test_a_backlog_record_with_a_branch_is_named_unrecoverable(fx: Fixture) -> None:
+    """The engine checks only adr numbers with owns(), so a backlog record's branch recovers nothing."""
+    wt = fx.add("alpha")
+    _write_alloc(fx, "9108", wt, kind="backlog", branch="feat/y")
+
+    proc = run(fx, "-Name", "alpha")
+    assert proc.returncode != 0, "removal proceeded past a recorded allocation"
+    assert _STRANDED in _flat(proc.stderr), proc.stderr
+    assert _RECOVERABLE not in _flat(proc.stderr), proc.stderr
+    assert fx.is_registered(wt)
+
+
+_DELETE_BRANCH_WARNING = (
+    "A record with no branch, or whose branch is deleted (-DeleteBranch on this run can delete the "
+    "branch checked out here), can then be committed from a worktree recreated at this path"
+)
+
+
+def test_under_DeleteBranch_a_recorded_branch_is_not_named_recoverable(fx: Fixture) -> None:
+    """The re-run this refusal offers, with -AllowOrphanedAllocations, can also delete the branch
+    checked out here, which is usually the recorded one, so the line must not promise it survives.
+
+    The record names the branch the worktree is on, as alloc.ps1 records it."""
+    wt = fx.add("alpha")
+    here = _git(wt, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    assert here and here != "HEAD", here
+    _write_alloc(fx, "9111", wt, kind="adr", branch=here)
+
+    proc = run(fx, "-Name", "alpha", "-DeleteBranch")
+    flat = _flat(proc.stderr)
+    assert proc.returncode != 0, "removal proceeded past a recorded allocation"
+    assert _RECOVERABLE not in flat, proc.stderr
+    assert (
+        f"if that is the recorded branch {here}, the number then rests on a worktree recreated"
+        in flat
+    ), proc.stderr
+    assert _DELETE_BRANCH_WARNING in flat, proc.stderr
+    assert fx.is_registered(wt)
+
+    # The control: without the flag, the same record is named recoverable and no warning prints.
+    plain = run(fx, "-Name", "alpha")
+    assert plain.returncode != 0, "removal proceeded past a recorded allocation"
+    assert _RECOVERABLE in _flat(plain.stderr), plain.stderr
+    assert "-DeleteBranch" not in _flat(plain.stderr), plain.stderr
 
 
 # --- BACKLOG #1829: the retired-allocator tombstone ------------------------------------------------
@@ -984,3 +1191,178 @@ def test_a_call_without_a_target_refuses_instead_of_prompting(
     assert "-Name" in err, err
     assert fx.is_registered(wt)
     assert fx.branch_exists("alpha")
+
+
+def test_name_through_a_junction_alias_of_the_primary_refuses_and_names_the_remedy(
+    fx: Fixture,
+) -> None:
+    """Reached through a junction of its parent, the primary's own copy spells its pre-#1894 target
+    differently from the primary's sibling. Since review round 5 (BACKLOG #1894) that refuses, fail
+    closed, rather than judge whether two spellings name one directory; the real-path copy removes
+    it. An alias -RepoRoot is refused since review round 3: -Name builds its target from the
+    spelling given, so the spelling must be the checkout's top as git resolves it."""
+    alias = fx.root / "alias"
+    _junction(alias, fx.primary.parent)
+    try:
+        copy_real_scripts(fx.primary)
+        via_alias = alias / fx.primary.name / "scripts" / "worktree" / "remove.ps1"
+
+        first = fx.add("viaalias")
+        proc = run(fx, "-Name", "viaalias", script=via_alias, repo_root="")
+        assert proc.returncode != 0, proc.stdout + proc.stderr
+        assert _LINKED_REFUSAL in proc.stderr, proc.stdout + proc.stderr
+        assert f'-RepoRoot "{fx.primary}"' in proc.stdout, proc.stdout
+        assert first.exists() and fx.is_registered(first)
+        real = fx.primary / "scripts" / "worktree" / "remove.ps1"
+        proc = run(fx, "-Name", "viaalias", script=real, repo_root="")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert not first.exists() and not fx.is_registered(first)
+
+        second = fx.add("viaroot")
+        proc = run(fx, "-Name", "viaroot", repo_root=alias / fx.primary.name)
+        assert proc.returncode != 0, proc.stdout + proc.stderr
+        assert "not the top of a checkout" in proc.stderr, proc.stdout + proc.stderr
+        assert second.exists() and fx.is_registered(second)
+    finally:
+        os.rmdir(alias)
+
+
+@pytest.mark.parametrize("how", ["explicit", "positional-dot"])
+def test_name_refuses_a_repo_root_below_the_checkout_top(fx: Fixture, how: str) -> None:
+    """Red in review round 3 (BACKLOG #1894): an explicit -RepoRoot was re-read through
+    ``--show-toplevel``, so a subdirectory of the primary re-anchored on the primary and removed
+    ``<primary>-<Name>``, a tree the caller never named. Before #1894 it built ``<subdir>-<Name>`` and
+    threw "No such worktree". A removal script must never reach further than it did."""
+    target = fx.add("foo")
+    sub = fx.primary / "sub"
+    sub.mkdir()
+
+    if how == "explicit":
+        proc = run(fx, "-Name", "foo", repo_root=sub)
+    else:
+        proc = run(fx, "-Name", "foo", ".", repo_root="", cwd=sub)
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "Nothing was removed" in proc.stderr, proc.stdout + proc.stderr
+    assert target.exists() and fx.is_registered(target)
+
+    control = run(fx, "-Name", "foo", repo_root=fx.primary)
+    assert control.returncode == 0, control.stdout + control.stderr
+    assert not target.exists()
+
+
+def test_a_linked_copy_run_through_a_junction_still_refuses(fx: Fixture) -> None:
+    """Red in review round 3 (BACKLOG #1894): the ambiguity guard built the copy's old sibling from the
+    junction spelling it was invoked through, which git's list never matches, so it removed
+    ``repo-foo`` while ``repo-host-foo``, the tree the copy's older command meant, was registered.
+    The linked-copy refusal reads git's own record of the copy's checkout, so no spelling skips it."""
+    host = fx.add("host")
+    target = fx.add("foo")
+    beside_host = host.parent / f"{host.name}-foo"
+    _git(fx.primary, "worktree", "add", "-q", "-b", "host-foo", str(beside_host))
+    copy_real_scripts(host)
+    alias = fx.root / "hostalias"
+    _junction(alias, host)
+    try:
+        proc = run(
+            fx, "-Name", "foo", script=alias / "scripts" / "worktree" / "remove.ps1", repo_root=""
+        )
+    finally:
+        os.rmdir(alias)
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert _LINKED_REFUSAL in proc.stderr, proc.stdout + proc.stderr
+    assert target.exists() and fx.is_registered(target)
+    assert beside_host.exists() and fx.is_registered(beside_host)
+
+
+def test_a_linked_copy_through_a_junction_of_its_parent_refuses_with_its_sibling_absent(
+    fx: Fixture,
+) -> None:
+    """Red at 265e6e87 (BACKLOG #1894 review round 4, finding 4, the double-alias family): with the
+    copy's parent reached through a junction and its own old sibling absent, nothing matched the
+    guard, so the run removed ``repo-foo``. The refusal does not depend on any spelling."""
+    host = fx.add("host")
+    target = fx.add("foo")
+    copy_real_scripts(host)
+    alias = fx.root / "parentalias"
+    _junction(alias, host.parent)
+    try:
+        proc = run(
+            fx,
+            "-Name",
+            "foo",
+            script=alias / host.name / "scripts" / "worktree" / "remove.ps1",
+            repo_root="",
+        )
+    finally:
+        os.rmdir(alias)
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert _LINKED_REFUSAL in proc.stderr, proc.stdout + proc.stderr
+    assert target.exists() and fx.is_registered(target)
+
+
+@pytest.mark.parametrize("extra", ["​", "­"])
+def test_a_linked_copy_differing_from_the_primary_by_an_ignorable_character_refuses(
+    fx: Fixture, extra: str
+) -> None:
+    """Red at 5648f0f8 (BACKLOG #1894 review round 6): the spelling guard compared with PowerShell's
+    culture-aware ``-ne``, which ignores a zero-width space or soft hyphen, so a linked worktree at
+    ``repo`` plus one such character read as the primary and removed ``repo-foo``. origin/main
+    targeted ``repo<char>-foo``, absent here, and threw."""
+    target = fx.add("foo")
+    host = fx.primary.parent / f"{fx.primary.name}{extra}"
+    _git(fx.primary, "worktree", "add", "-q", "-b", "host", str(host))
+    copy_real_scripts(host)
+
+    proc = run(
+        fx, "-Name", "foo", script=host / "scripts" / "worktree" / "remove.ps1", repo_root=""
+    )
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert _LINKED_REFUSAL in proc.stderr, proc.stdout + proc.stderr
+    assert target.exists() and fx.is_registered(target)
+
+
+def test_a_copy_below_the_primarys_top_refuses_name(fx: Fixture) -> None:
+    """A copy at ``<primary>/sub/scripts/worktree`` used to search ``<primary>/sub-<Name>`` and throw
+    "No such worktree". Re-anchored on the primary it would reach ``<primary>-<Name>``, a tree it
+    never could, so -Name refuses unless the copy's root is its checkout's top."""
+    target = fx.add("foo")
+    sub = fx.primary / "sub"
+    sub.mkdir()
+    copy_real_scripts(sub)
+
+    proc = run(fx, "-Name", "foo", script=sub / "scripts" / "worktree" / "remove.ps1", repo_root="")
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert _LINKED_REFUSAL in proc.stderr, proc.stdout + proc.stderr
+    assert target.exists() and fx.is_registered(target)
+
+
+@pytest.mark.parametrize("old_sibling", ["absent", "registered"])
+def test_the_primarys_copy_through_a_junction_to_the_checkout_refuses(
+    fx: Fixture, old_sibling: str
+) -> None:
+    """Red at 4a486c9c (BACKLOG #1894 review round 5): the primary's own copy reached through a
+    junction to the checkout passed the linked and below-top tests, so the run moved from
+    ``alias-foo``, which origin/main targeted, to ``repo-foo``. Both must survive the refusal."""
+    target = fx.add("foo")
+    copy_real_scripts(fx.primary)
+    alias = fx.root / "alias"
+    old = fx.root / "alias-foo"
+    if old_sibling == "registered":
+        _git(fx.primary, "worktree", "add", "-q", "-b", "alias-foo", str(old))
+    _junction(alias, fx.primary)
+    try:
+        proc = run(
+            fx, "-Name", "foo", script=alias / "scripts" / "worktree" / "remove.ps1", repo_root=""
+        )
+    finally:
+        os.rmdir(alias)
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert _LINKED_REFUSAL in proc.stderr, proc.stdout + proc.stderr
+    assert target.exists() and fx.is_registered(target)
+    assert old.exists() == (old_sibling == "registered")

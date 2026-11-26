@@ -32,6 +32,7 @@ from messagefoundry.pipeline.sandbox import (
     SandboxMode,
     SandboxPolicy,
     SandboxSession,
+    SandboxWorkerRefused,
     graph_differences,
     graph_shape,
 )
@@ -295,6 +296,69 @@ def test_a_refused_worker_is_not_started_again_for_the_same_graph(
         serving[0] = graph_shape(load_config(config_dir))
         session._spawn()
         assert session._generation == 2
+    finally:
+        session.close()
+
+
+def test_an_equal_engine_graph_is_refused_from_the_cache(
+    config_dir: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cache means "the same graph", so a graph callable that builds an equal but distinct
+    shape at each call still hits it (BACKLOG #6830): no second worker, and the second refusal is
+    not the first, so the runner does not raise its alert again."""
+    monkeypatch.setenv(_VARIABLE, "3")
+    registry = load_config(config_dir)
+    session = SandboxSession(
+        SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=30.0),
+        inbound="IB_PARITY",
+        config_dir=config_dir,
+        env=None,
+        graph=lambda: graph_shape(registry),  # unmemoized: a new, equal object at each call
+    )
+    try:
+        assert session._graph is not None and session._graph() is not session._graph()
+        with pytest.raises(SandboxWorkerRefused) as first:
+            session._spawn()
+        assert first.value.first
+        with pytest.raises(SandboxWorkerRefused) as second:
+            session._spawn()
+        assert session._generation == 1  # no second worker was started
+        assert not second.value.first
+        assert str(second.value) == str(first.value)
+        # A hit reports the graph the worker was compared with, not the equal one just read.
+        assert second.value.graph is first.value.graph
+    finally:
+        session.close()
+
+
+def test_no_worker_is_kept_against_a_graph_the_cache_does_not_match(
+    config_dir: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The by-value cache only ever refuses (BACKLOG #6830): a graph unequal to the cached one is
+    a miss, so a fresh worker is started and compared, and refused again when it differs. At no
+    point does a worker come up for a graph it does not match."""
+    monkeypatch.setenv(_VARIABLE, "3")
+    registry = load_config(config_dir)
+    other = graph_shape(Registry(code_digest="1" * 64))
+    serving = [graph_shape(registry)]
+    session = SandboxSession(
+        SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=30.0),
+        inbound="IB_PARITY",
+        config_dir=config_dir,
+        env=None,
+        graph=lambda: serving[0],
+    )
+    try:
+        for generation, shape in ((1, serving[0]), (2, other), (3, graph_shape(registry))):
+            serving[0] = shape
+            with pytest.raises(SandboxWorkerRefused) as refused:
+                session._spawn()
+            assert refused.value.first and refused.value.graph is shape
+            assert session._generation == generation  # a miss: a fresh worker was compared
+            assert session._proc is None  # and it was not kept
+        with pytest.raises(SandboxWorkerRefused) as cached:
+            session._spawn()
+        assert not cached.value.first and session._generation == 3 and session._proc is None
     finally:
         session.close()
 

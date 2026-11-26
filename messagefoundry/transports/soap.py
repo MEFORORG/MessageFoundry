@@ -75,12 +75,14 @@ from messagefoundry.config.models import (
     flag_from_settings,
 )
 from messagefoundry.config.tls_policy import (
+    MIRRORED_CONNECTION_SETTING,
     SYSTEM_TRUST_ANCHOR,
     TrustAnchor,
     build_verifying_client_context,
     harden_cipher_suites,
     hop_name_prefix,
     narrow_to_approved_suites,
+    refuse_chain_check_on_os_roots,
     relax_verify_expiry,
 )
 from messagefoundry.keywrap import load_checked_cert_chain
@@ -153,8 +155,8 @@ logger = logging.getLogger(__name__)
 # not a cosmetic miss. Kept identical to _HEADER_EL_RE below, which already had it right.
 _FAULT_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Fault[\s/>]", re.IGNORECASE)
 # The SOAP Body start tag. BACKLOG #2827: a SOAP 1.1 or 1.2 fault is a Body child, so _classify_soap
-# searches for the Fault, and for a WS-Security code, from the first one; _find_fault says when it
-# searches the whole reply instead.
+# searches for the Fault, and for a WS-Security code, from the first one outside markup
+# (_BODY_OUTSIDE_MARKUP_RE); _find_fault says when it searches the whole reply instead.
 _BODY_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Body[\s/>]", re.IGNORECASE)
 _SENDER_RE = re.compile(r"client|sender", re.IGNORECASE)
 _RECEIVER_RE = re.compile(r"server|receiver", re.IGNORECASE)
@@ -169,14 +171,8 @@ _WSSE_EXPIRED_RE = re.compile(r"MessageExpired", re.IGNORECASE)
 # from every start tag lacking a close, so a partner reply of repeated start tags cost the square of
 # its length. _code_text finds the `>` and `</` with str.find, once per read, at most twice (the
 # first-child read's, then the fallback's, which may be the same element), and only inside the
-# Fault _find_fault took, up to that Fault's close tag or the reply's end. BACKLOG #5912: the code
-# element is the Fault's first child, a faultcode or a Code (_CODE_RE), and for a Code the Value
-# that is its own first child, up to its close tag (_CODE_END_RE);
-# _fault_code says why, and when it falls back to the earlier search (_searched_code). For the
-# first-child read the Fault and Code close tags are searched for outside markup, with
-# _FAULT_END_OUTSIDE_MARKUP_RE and _CODE_END_OUTSIDE_MARKUP_RE, which hold _FAULT_END_RE and
-# _CODE_END_RE; the fallback's range ends at the first plain _FAULT_END_RE match, markup not
-# stepped over.
+# Fault _find_fault took. BACKLOG #5912: which element is read, over what range, and when the read
+# falls back to the earlier search (_searched_code), is stated once, in _fault_code's docstring.
 _FAULTCODE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?faultcode\b", re.IGNORECASE)
 _CODE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Code(?=[\s/>])", re.IGNORECASE)
 _CODEVALUE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Value\b", re.IGNORECASE)
@@ -196,6 +192,9 @@ _MARKUP_CLOSER = dict(_NON_ELEMENT_MARKUP)
 # instruction that holds a Fault start tag or a Fault or Code close tag. The openers stay
 # case-sensitive, as XML has them; only each tag is matched in any case.
 _FAULT_OUTSIDE_MARKUP_RE = re.compile(r"<!--|<!\[CDATA\[|<\?|(?i:<\s*(?:[\w.\-]+:)?Fault[\s/>])")
+# BACKLOG #5912 closing step 6: _BODY_RE among those openers, so the Body anchor steps over a Body
+# start tag inside such markup, as the Fault search does.
+_BODY_OUTSIDE_MARKUP_RE = re.compile(r"<!--|<!\[CDATA\[|<\?|(?i:<\s*(?:[\w.\-]+:)?Body[\s/>])")
 _FAULT_END_OUTSIDE_MARKUP_RE = re.compile(r"<!--|<!\[CDATA\[|<\?|(?i:</\s*(?:[\w.\-]+:)?Fault\s*>)")
 _CODE_END_OUTSIDE_MARKUP_RE = re.compile(r"<!--|<!\[CDATA\[|<\?|(?i:</\s*(?:[\w.\-]+:)?Code\s*>)")
 # _TAG_OPEN_RE among those openers: the first tag outside that markup (_child_code_text).
@@ -285,32 +284,48 @@ def _search_outside_markup(
     and this reads it as text, as it reads every later opener of its kind, since none of them can
     have a terminator either. So the search resumes after each step and stays linear in the
     reply."""
+    return _scan_outside_markup(pattern, body, pos, end, first)[0]
+
+
+def _scan_outside_markup(
+    pattern: re.Pattern[str], body: str, pos: int, end: int, first: int = 0
+) -> tuple[re.Match[str] | None, bool]:
+    """:func:`_search_outside_markup`'s match, and whether the scan stepped over any terminated
+    markup before it. Where it stepped over none, the match is also the first plain match of the
+    pattern's tag from ``pos``, and where it found none there is no plain match either, since no
+    opener can overlap a tag; :func:`_fault_code` relies on that (BACKLOG #5912 closing step
+    11)."""
     unterminated: set[str] = set()
+    stepped = False
     while (m := pattern.search(body, pos, end)) is not None:
         opener = m.group()
         closer = _MARKUP_CLOSER.get(opener)
         pos = m.end()
         if closer is None:
             if m.start() >= first:
-                return m
+                return m, stepped
             continue
         close = -1 if opener in unterminated else body.find(closer, pos, end)
         if close < 0:
             unterminated.add(opener)
         else:
             pos = close + len(closer)
-    return None
+            stepped = True
+    return None, stepped
 
 
 def _find_fault(body: str) -> tuple[re.Match[str] | None, int]:
     """The first Fault start tag from where the fault searches start, and that start: the end of
-    the first ``_BODY_RE`` match where a Fault follows it, else ``0``, the whole reply.
+    the first Body start tag outside markup where a Fault follows it, else ``0``, the whole reply.
 
     BACKLOG #2827: so a Fault-named element before the Body, in the Header say, does not decide the
-    class of the Body's fault. The first Body start tag is taken even when it sits in a comment, a
-    CDATA section or the Header. With no Body start tag, or no Fault after it, the reply is searched
-    whole, as it was before the anchor: a Fault reply with no envelope may carry a Body-named
-    element in its detail, and a Fault found only before the Body still reads as one.
+    class of the Body's fault. The first Body start tag is taken even when it sits in the Header.
+    BACKLOG #5912 closing step 6: a Body start tag inside a terminated comment, CDATA section or
+    processing instruction is stepped over (:func:`_search_outside_markup`), so one there, ahead
+    of the Header, no longer lets the Header decide. With no Body start tag outside such markup,
+    or no Fault after it, the reply is searched whole, as it was before the anchor: a Fault reply
+    with no envelope may carry a Body-named element in its detail, and a Fault found only before
+    the Body still reads as one.
 
     BACKLOG #5912: on each side of the Body start tag, a Fault start tag inside a comment, a CDATA
     section or a processing instruction is stepped over (:func:`_search_outside_markup`), so the
@@ -325,6 +340,16 @@ def _find_fault(body: str) -> tuple[re.Match[str] | None, int]:
     # One scan from 0, so markup opened before the Body start tag is known after it.
     outside = _search_outside_markup(_FAULT_OUTSIDE_MARKUP_RE, body, 0, len(body))
     m = _BODY_RE.search(body)
+    if m is not None:
+        # Closing step 6: only markup opened ahead of the first plain Body start tag can hide it,
+        # so the Python-level step-over runs only then. A leading XML declaration that ends before
+        # that tag hides nothing, so it alone does not count (most replies open with one).
+        head = 0
+        if body.startswith("<?xml"):
+            decl_end = body.find("?>", 0, m.start())
+            head = 0 if decl_end < 0 else decl_end + 2
+        if body.find("<!", head, m.start()) >= 0 or body.find("<?", head, m.start()) >= 0:
+            m = _search_outside_markup(_BODY_OUTSIDE_MARKUP_RE, body, 0, len(body))
     if m is None:
         return outside or plain, 0
     after = outside
@@ -353,15 +378,19 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     code is the ``Value`` that is the Code's own first child, read only up to the Code's close tag.
     A ``Value`` anywhere else in the Fault, in a Subcode, Reason, Node, Role or Detail, never
     decides permanent versus retryable when the first child yields a code. For the first-child
-    read, a Fault or Code close tag inside a comment, a CDATA section or a processing instruction
-    does not end either element (:func:`_search_outside_markup`); the fallback below does not step
-    over markup.
+    read, a Fault or Code close tag inside a terminated comment, CDATA section or processing
+    instruction does not end either element (:func:`_search_outside_markup`), except where the
+    Fault start tag was itself taken from inside markup, when a close tag later in that markup
+    does; the fallback below does not step over markup. This docstring is where the read and its
+    fallback are stated; the module's other comments and docstrings point here (closing step 17).
 
     One shape is read again: :func:`_child_code_text` says exactly when (BACKLOG #5912, closing
     step 21).
 
     Where the first-child read yields no code, because the first child is neither element, it
-    cannot hold a code, or a ``<!`` the read does not step over (a DOCTYPE, a lowercase
+    cannot hold a code (at least where it is empty or self-closing, or, closing step 9, holds
+    only whitespace),
+    or a ``<!`` the read does not step over (a DOCTYPE, a lowercase
     ``<![cdata[``, an unterminated comment) stops it, the code falls back to the earlier search
     (:func:`_searched_code`), by that search's rule for its range: from the Fault start tag
     :func:`_find_fault` took to the first plain Fault close tag, or the reply's end, markup not
@@ -384,13 +413,17 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     gt = _start_tag_gt(body, start - 1, len(body))
     if gt < 0:
         return ""
-    fault_end = _search_outside_markup(_FAULT_END_OUTSIDE_MARKUP_RE, body, gt + 1, len(body))
+    fault_end, stepped = _scan_outside_markup(_FAULT_END_OUTSIDE_MARKUP_RE, body, gt + 1, len(body))
     end = len(body) if fault_end is None else fault_end.start()
     code = _first_child_code(body, gt + 1, end)
-    if code:
+    if code.strip():
         return code
-    # The earlier search's rule for its range's end: the first plain Fault close tag.
-    plain_end = _FAULT_END_RE.search(body, start)
+    # The earlier search's rule for its range's end: the first plain Fault close tag from where
+    # the Fault's name ends. Where the scan above stepped over no markup, its match is that tag,
+    # unless one ends the start tag itself, so the reply is not scanned again (closing step 11).
+    plain_end = _FAULT_END_RE.search(body, start, gt + 1)
+    if plain_end is None:
+        plain_end = _FAULT_END_RE.search(body, gt + 1) if stepped else fault_end
     return _searched_code(body, start, len(body) if plain_end is None else plain_end.start())
 
 
@@ -472,12 +505,11 @@ def _scan_markup(text: str) -> tuple[str, bool]:
 
 def _searched_code(body: str, start: int, end: int) -> str:
     """The code the earlier search finds in ``body[start:end]``, or ``""``: :func:`_fault_code`'s
-    fallback, the search the code ran before BACKLOG #5912, over a range that ends by that search's
-    rule, at the first plain Fault close tag after the Fault start tag :func:`_find_fault` took. The
-    first ``faultcode`` or ``Value`` start tag
-    there is the code element, a ``Value`` taken only before the first ``faultcode``, and only that
-    first tag is read: SOAP 1.2's Code/Value and SOAP 1.1's faultcode come before a Detail that may
-    carry an element of the other name. Markup is not stepped over, as it was not before."""
+    fallback, the search the code ran before BACKLOG #5912, over the range :func:`_fault_code`
+    gives it. The first ``faultcode`` or ``Value`` start tag there is the code element, a ``Value``
+    taken only before the first ``faultcode``, and only that first tag is read: SOAP 1.2's
+    Code/Value and SOAP 1.1's faultcode come before a Detail that may carry an element of the other
+    name."""
     faultcode = _FAULTCODE_RE.search(body, start, end)
     value = _CODEVALUE_RE.search(body, start, end if faultcode is None else faultcode.start())
     if value is not None:
@@ -700,7 +732,8 @@ def _drop_authorization(headers: dict[str, str]) -> None:
     ``Authorization``. A leading space or tab made ``http.client`` refuse the request instead. The
     REST, FHIR and DICOMweb header builders do not purge. A signing header named ``Authorization``
     is not in this table: ``_post`` writes it per request, after the configured or minted
-    credential, which it can replace or sit beside. It is refused only beside Digest."""
+    credential, so beside any such credential it is refused at build
+    (``http_auth.refuse_authorization_signer_beside_credential``, BACKLOG #5526 item 6)."""
     from messagefoundry.transports.http_auth import is_authorization_header_name
 
     for key in [k for k in headers if is_authorization_header_name(k)]:
@@ -740,6 +773,11 @@ class SoapDestination(DestinationConnector):
 
     def __init__(self, config: Destination) -> None:
         s = config.settings
+        if MIRRORED_CONNECTION_SETTING not in s:
+            # BACKLOG #5526 item 5: the shared refusals in http_auth and rest name the connection
+            # the runner mirrors into the settings, and this build names config.name. A
+            # destination built without the runner has no mirror, so give them the same name.
+            s = {**s, MIRRORED_CONNECTION_SETTING: config.name}
         # Read strictly, and first: on every branch, and before a hop guard can log a crossing for
         # a build this refuses. bool("false") is True (vault BACKLOG #3234 added step 8).
         allow_expired = flag_from_settings(s, "tls_allow_expired")
@@ -766,7 +804,7 @@ class SoapDestination(DestinationConnector):
         # The action is the single source of truth: the 1.2 Content-Type action param AND wsa:Action.
         self.soap_action: str = str(s.get("soap_action") or "")
         # ADR 0013: capture the SOAP response envelope. Default False → returns None, byte-identical.
-        self.capture_response: bool = bool(s.get("capture_response", False))
+        self.capture_response: bool = flag_from_settings(s, "capture_response")
         # #154: allow-list of HTTP response headers to capture into the DeliveryResponse (empty default →
         # byte-identical). Shared parser/filter with REST (SOAP reuses REST's HTTP plumbing).
         self.capture_response_headers = normalize_header_allowlist(
@@ -814,7 +852,7 @@ class SoapDestination(DestinationConnector):
         # BACKLOG #5529: refused before any hop gate logs a crossing for a connection that never builds,
         # and before the half-pair check, so a lone basic_user beside Digest hears the Digest rule.
         from messagefoundry.transports.http_auth import (
-            refuse_authorization_signer_beside_digest,
+            refuse_authorization_signer_beside_credential,
             refuse_http_digest_conflicts,
         )
 
@@ -890,8 +928,9 @@ class SoapDestination(DestinationConnector):
         # (byte-identical). Built here so a bad key/algorithm fails loud at connector construction; the
         # signature is minted in _post over the FINAL wire bytes (the WS-* wrapped envelope, ADR 0015).
         self._signer: MessageSigner | None = signer_from_destination(config)
-        refuse_authorization_signer_beside_digest(
+        refuse_authorization_signer_beside_credential(
             None if self._signer is None else self._signer.header_name,
+            s,
             digest=digest_selected,
             connection=config.name,
         )
@@ -905,6 +944,12 @@ class SoapDestination(DestinationConnector):
             s, url=self.url, trust_anchor_policy=config.trust_anchor_policy
         )
         verify = bool_setting(s, "verify_tls", default=True)
+        if scheme == "http" and (verify or (self.client_cert_file and self.client_key_file)):
+            # The same refusal for an http url, worded so it does not say the hop verifies its
+            # server: the opener makes no TLS connection to the partner (vault BACKLOG #5511).
+            refuse_chain_check_on_os_roots(
+                anchor, cleartext=True, connection_kind="SOAP connection"
+            )
         if self.client_cert_file and self.client_key_file:  # NEW — mutual TLS, takes precedence
             self._opener: urllib.request.OpenerDirector = _client_cert_opener(
                 self.client_cert_file,
@@ -1127,12 +1172,20 @@ class SoapDestination(DestinationConnector):
         settings, because the ``Soap()`` factory sees ``env()`` references and cannot tell one that
         resolves empty from a set value. One Basic half alone would send no HTTP Basic header; a
         token user alone would stamp a UsernameToken with an empty password, and a token password
-        alone would stamp none. The message names keys, never a value."""
+        alone would stamp none. A ``bearer_token`` beside a whole Basic pair is refused too, since
+        the two share the ``Authorization`` header. The message names keys, never a value."""
         prefix = hop_name_prefix(self._connection_name)
         if bool(s.get("basic_user")) != bool(s.get("basic_password")):
             raise HttpAuthError(
                 f"{prefix}SOAP destination basic_user and basic_password must be set together; "
                 "one without the other would send no HTTP Basic credential"
+            )
+        if s.get("basic_user") and s.get("bearer_token"):
+            # Item 2: the Basic pair used to win and the bearer_token was dropped without a word,
+            # as REST and DICOMweb already refuse.
+            raise HttpAuthError(
+                f"{prefix}SOAP destination sets both bearer_token and basic_user/basic_password; "
+                "they share the Authorization header, so configure exactly one"
             )
         # The token is stamped only with ws_security on, so the pair binds only then. With neither
         # half, ws_security stamps the Timestamp alone, a profile a mutual-TLS service may ask for.
@@ -1219,7 +1272,7 @@ class SoapDestination(DestinationConnector):
         token = s.get("bearer_token")
         user, password = s.get("basic_user"), s.get("basic_password")
         auth: str | None = None
-        if user and password:  # Basic wins over a static bearer_token, as it always has
+        if user and password:  # bearer_token beside it is refused in _refuse_half_credential_pairs
             auth = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
         elif token:
             auth = f"Bearer {token}"
@@ -1440,8 +1493,9 @@ class SoapDestination(DestinationConnector):
         Code close-tag search. The name scans still run, in :func:`_searched_code`, wherever that
         first-child read yields no code, as it does on a ``<Fault>`` followed by a run of ``<``; the PR 2936 repair moved the Fault start-tag search and the Fault
         and Code close-tag searches into :func:`_search_outside_markup`'s Python-level loop, which
-        a reply of many markup runs makes several times slower. So they are not a reading of this
-        code."""
+        a reply of many markup runs makes several times slower, and BACKLOG #5912 closing step 6
+        moved the Body start-tag search there too wherever a ``<!`` or ``<?`` precedes the first
+        plain Body start tag. So they are not a reading of this code."""
         # WS-* mode: the Handler returned only the <Body> fragment; wrap + stamp here (post-queue
         # boundary), so the per-call MessageID and Timestamp never live in a pure transform.
         if self._ws_mode:

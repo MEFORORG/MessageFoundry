@@ -133,6 +133,7 @@ from messagefoundry.store.store import (
     ConnectionMetrics,
     DestinationMetrics,
     InboundMetrics,
+    InjectAudit,
     MessageOrigin,
     OperatorAudit,
     OwnedLanes,
@@ -1885,19 +1886,23 @@ class Engine:
         reload's swapped declarations, and a value it adds or rotates, are picked up without
         rebuilding it (vault BACKLOG #5698).
 
-        The values are the engine's applied ones, set only once a reload has committed, never the
-        registry runner's, which hold a reload's values before it can still be refused. A sync
-        during a reload can still pair the specs of one graph with the other graph's values, and
-        fail that set; the sync after the reload corrects it."""
+        The specs and values are the last COMMITTED graph's, with its generation, so a pass during
+        a reload never loads a graph or values that reload can still refuse, and never pairs one
+        graph's specs with the other's values (BACKLOG #5892)."""
         return ReferenceSyncRunner(
             self.store,
             lambda: (
-                self._registry_runner.registry.references.values()
+                self._registry_runner.committed_graph()[1].references.values()
                 if self._registry_runner is not None
                 else []
             ),
             self._reference_settings or ReferenceSettings(),
-            env_values=lambda: self._env_values,
+            graph_generation=lambda: (
+                self._registry_runner.committed_graph()[0]
+                if self._registry_runner is not None
+                else None
+            ),
+            env_values=self._committed_reference_values,
             egress=self._egress_settings,
             alert_sink=self._alert_sink,
             # Track B Step 6: gate materialize-from-source on the leader; every node still converges its
@@ -1908,6 +1913,12 @@ class Engine:
             # #3533 item 2 none of them reads it: the weakened-TLS refusal holds at every posture.
             hop_posture=self._hop_posture,
         )
+
+    def _committed_reference_values(self) -> Mapping[str, Any]:
+        # A committed reload's values, which reach self._env_values only once reload returns.
+        runner = self._registry_runner
+        values = None if runner is None else runner.committed_graph()[2]
+        return self._env_values if values is None else values
 
     async def _reconcile_reference_sync(self, *, startup: bool) -> None:
         """Ensure the reference runner exists, materialize the declared sets, and (re-)arm the loop.
@@ -2380,8 +2391,9 @@ class Engine:
                     self._reference_runner = self._make_reference_runner()
                 self._reference_runner.start()
         # Retention/purge is independent of the message graph (a store-level maintenance task), so it
-        # runs whether or not a graph is wired and survives config reloads. The runner is a no-op when
-        # nothing is configured, so this only spawns a task when [retention] is actually set. It is a
+        # runs whether or not a graph is wired and survives config reloads. Per-connection windows come
+        # from the live graph, so the loop is spawned even when nothing is configured yet, and idles
+        # until a reload sets one (BACKLOG #6804); a pass runs only while something is set. It is a
         # leader-only WRITE singleton (purges bodies + writes audit rows), so it is gated on the
         # coordinator: in a cluster a follower's runner ticks but no-ops; single-node always leads.
         if self._retention_settings is not None:
@@ -3925,10 +3937,15 @@ class Engine:
         # an operator may still have to finish, not a failed reload (engine PR 2815).
         if close_failures:
             failures.append(_outbound_close_failure(close_failures))
+        # The retention loop re-reads the live graph each interval. wake() ends its sleep only when
+        # it is idle, so a window this reload set is enforced at once if the loop was idle, and
+        # otherwise on its next scheduled pass (BACKLOG #6804). It only sets an event.
+        if self._retention_runner is not None:
+            self._retention_runner.wake()
         # Reference sets (ADR 0006): re-arm + materialize after the swap, so a reference set added by
         # this reload syncs immediately (resolves on the next message, not only after the refresh
         # interval) and a 0->N change actually starts the loop. Idempotent when nothing changed.
-        # CANNOT move before the swap: the runner reads its specs LIVE off _registry_runner.registry
+        # CANNOT move before the swap: the runner reads its specs off the committed graph
         # (see _make_reference_runner), so pre-swap it would materialize the OLD graph's sets and a
         # reload that ADDS a set would leave it unarmed.
         try:
@@ -4114,7 +4131,7 @@ class Engine:
         raw: str,
         source_type: str = "upload",
         metadata: str | None = None,
-        audit: OperatorAudit[str],
+        audit: InjectAudit,
         actor: str,
     ) -> str:
         """Inject a fresh ``RECEIVED`` message onto ``channel_id``'s **ingress** stage — the DISTINCT
@@ -4127,11 +4144,24 @@ class Engine:
         has none of. ``enqueue_ingress`` takes the target inbound channel **directly**. Target
         validation (registered/running), RBAC and the target inbound's ingress guards (BACKLOG
         #1911) are the API's job. The API also builds the ``audit`` row that commits with the message
-        (BACKLOG #2624). Returns the new message id. The message's origin is ``operator_upload`` with
-        ``actor`` as its acting user (vault BACKLOG #2615)."""
+        (BACKLOG #2624). It is an :data:`~messagefoundry.store.store.InjectAudit`, which always
+        builds a row, as the store requires of an inject (BACKLOG #6589). Returns the new message
+        id. The message's origin is ``operator_upload`` with ``actor`` as its acting user (vault
+        BACKLOG #2615). The row records the control id, type and summary, less any value over the
+        bounds of :meth:`RegistryRunner.ingress_fields_for`, which apply the narrowest backend's
+        column widths on every backend (BACKLOG #5707). With no runner they stay ``None``."""
+        runner = self._registry_runner
+        control_id, message_type, summary = (
+            (None, None, None)
+            if runner is None
+            else await runner.ingress_fields_for(channel_id, raw)
+        )
         mid = await self.store.enqueue_ingress(
             channel_id=channel_id,
             raw=raw,
+            control_id=control_id,
+            message_type=message_type,
+            summary=summary,
             source_type=source_type,
             metadata=metadata,
             audit=audit,

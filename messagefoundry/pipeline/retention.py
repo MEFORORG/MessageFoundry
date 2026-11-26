@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -78,6 +79,10 @@ _APP_LOG_SUFFIXES = (".log", ".txt")
 #: so a crash mid-write can't leave a half-file that a later pass mistakes for a finished archive).
 _GZ_SUFFIX = ".gz"
 _GZ_TMP_SUFFIX = ".gz.mftmp"
+#: Suffix of an archive claimed for removal, ``<name>.gz.<pid>-<ns>.mfclaim`` (#6805,
+#: :func:`_drop_redundant_archive`). It holds a whole archive, so log content; which sweep removes it
+#: is stated once, on :func:`_is_app_log_name`.
+_CLAIM_SUFFIX = ".mfclaim"
 #: Prefix of the staging file. The rest of the name is RANDOM (:func:`tempfile.mkstemp`), never derived
 #: from the source: a predictable staging path in a directory a second process (or an attacker) can write
 #: is an arbitrary-file-overwrite / log-destruction primitive — see :meth:`RetentionRunner._stage_archive`.
@@ -102,12 +107,27 @@ def _is_app_log_name(name: str, *, include_archives: bool) -> bool:
     """Is ``name`` an application-log file this runner owns? ``.log``/``.txt`` always; the ``.log.gz``/
     ``.txt.gz`` archives the #119 compressor produces only when ``include_archives`` (so an unrelated
     ``.gz`` parked in the log directory is never swept, and neither is any ``.gz`` at all on a deployment
-    that has not enabled compression)."""
-    stem, ext = os.path.splitext(name.lower())
+    that has not enabled compression).
+
+    Under the same ``include_archives`` gate it also owns a claimed archive,
+    ``<archive>.<pid>-<ns>`` plus :data:`_CLAIM_SUFFIX`, where ``<archive>`` is one of those archive
+    names (#6805). A claim keeps the mtime of the archive it was renamed from (inherited from the
+    source), so the sweep removes a claim only when it would remove that archive."""
+    lowered = name.lower()
+    stem, ext = os.path.splitext(lowered)
     if ext in _APP_LOG_SUFFIXES:
         return True
     if include_archives and ext == _GZ_SUFFIX:
         return os.path.splitext(stem)[1] in _APP_LOG_SUFFIXES
+    if include_archives and ext == _CLAIM_SUFFIX:
+        archive, tag = os.path.splitext(stem)
+        pid, sep, ns = tag[1:].partition("-")
+        return (
+            sep == "-"
+            and all(part.isascii() and part.isdigit() for part in (pid, ns))
+            and archive.endswith(_GZ_SUFFIX)
+            and _is_app_log_name(archive, include_archives=True)
+        )
     return False
 
 
@@ -146,6 +166,181 @@ def _verify_archive(path: str, original: bytes, *, name: str) -> bool:
         )
         return False
     return True
+
+
+# Opening a log to read or re-check it does not follow a symlink, or block on a FIFO, swapped in at
+# the path, where the platform has O_NOFOLLOW and O_NONBLOCK. Windows has neither, so there the open
+# does follow a symlink; the flags a platform lacks are simply absent.
+_SOURCE_OPEN_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_BINARY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+)
+
+
+def _same_file_state(a: os.stat_result, b: os.stat_result) -> bool:
+    """Whether two ``fstat`` results describe one unchanged file: the same device and file id
+    (:func:`os.path.samestat`), size, mtime and ctime (ns). ctime is the change time on both POSIX and,
+    through ``fstat``, Windows, and ``os.utime`` cannot set it back. Both sides must come from
+    ``fstat``: on Windows ``os.stat`` reports the creation time as ctime, so a mixed pair never agrees."""
+    return os.path.samestat(a, b) and (a.st_size, a.st_mtime_ns, a.st_ctime_ns) == (
+        b.st_size,
+        b.st_mtime_ns,
+        b.st_ctime_ns,
+    )
+
+
+def _source_change(source: str, read_st: os.stat_result) -> str | None:
+    """``None`` when ``source`` is still the file described by ``read_st`` (the ``fstat`` taken on the
+    handle its bytes were read through), else why not: ``"vanished"`` or ``"changed"``, or the error a
+    re-open raised. Every non-``None`` answer blocks the act it gates, so it fails closed. The path is
+    re-opened and ``fstat``-ed (:data:`_SOURCE_OPEN_FLAGS`) so both sides of the compare are alike.
+
+    This does not make the check and the act atomic: at least a change landing between this check and
+    the ``remove`` or rename that follows it, and an in-place same-size rewrite with the mtime put back
+    inside one ctime tick of the file's last change, still pass it (#6805)."""
+    try:
+        fd = os.open(source, _SOURCE_OPEN_FLAGS)
+    except FileNotFoundError:
+        return "vanished"
+    except OSError as exc:
+        return f"could not be re-read ({type(exc).__name__})"
+    try:
+        now_st = os.fstat(fd)
+    except OSError as exc:
+        return f"could not be re-read ({type(exc).__name__})"
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            log.debug("could not close a re-check descriptor", exc_info=True)
+    return None if _same_file_state(now_st, read_st) else "changed"
+
+
+def _source_still_holds(source: str, read_st: os.stat_result, data: bytes) -> bool:
+    """Whether ``source`` is still the same regular file as ``read_st`` (device and file id) and its
+    content still starts with ``data``, so an archive of ``data`` is redundant beside it. Any error is
+    False: the answer gates removing an archive, so it fails closed and keeps the archive."""
+    try:
+        fd = os.open(source, _SOURCE_OPEN_FLAGS)
+    except OSError:
+        return False
+    try:
+        now_st = os.fstat(fd)
+        if not stat.S_ISREG(now_st.st_mode) or not os.path.samestat(now_st, read_st):
+            return False
+        if hasattr(os, "O_NONBLOCK"):
+            os.set_blocking(fd, True)
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            return fh.read(len(data)) == data
+    except OSError:
+        return False
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            log.debug("could not close a re-check descriptor", exc_info=True)
+
+
+def _drop_redundant_archive(
+    source: str, read_st: os.stat_result, data: bytes, dest: str, *, name: str
+) -> bool:
+    """Remove the archive of ``data`` at ``dest`` when the kept ``source`` still holds every byte of it.
+    Returns True only once the claim was removed. A failed removal is logged and returns False,
+    leaving the ``.mfclaim`` file in place (#6805). A claim already gone (removed by a peer's
+    ``app_log_days`` sweep, say) counts as removed.
+
+    ``dest`` is first CLAIMED by renaming it to a unique sibling name, so a peer compressor cannot act
+    on it, and only then are the claimed bytes re-validated and the source re-checked. If either fails
+    (the source went or changed meanwhile, or the claimed file is a peer's different archive), the
+    claim is linked back to ``dest``, which never replaces a file that appeared there; if that fails
+    too, the claim is kept under its name and a WARNING names it, unless the claim is already gone
+    (a WARNING says so). A claim name ends
+    :data:`_CLAIM_SUFFIX`, which no compression pass touches; :func:`_is_app_log_name` says when the
+    ``app_log_days`` sweep removes one.
+
+    What this closes: a source removed between the first check and the claim. What it does NOT
+    close, so a copy can still be lost: at least a source truncated or removed after the post-claim
+    re-check and before the claim is removed. Two windows in the caller remain open as well: a
+    peer's archive placed between its ``exists(dest)`` check and ``os.replace`` is renamed over, and
+    an append or rotation between its last :func:`_source_change` and ``os.remove(source)`` is
+    deleted."""
+    if not (_source_still_holds(source, read_st, data) and _verify_archive(dest, data, name=name)):
+        return False
+    claim = f"{dest}.{os.getpid()}-{time.monotonic_ns()}{_CLAIM_SUFFIX}"
+    try:
+        os.rename(dest, claim)
+    except OSError as exc:
+        if isinstance(exc, FileNotFoundError) and not os.path.lexists(dest):
+            # Gone since it was validated (a peer's `app_log_days` sweep, say), so nothing is kept.
+            # Returns False, the value an archive already gone at the read above returns: no claim was
+            # taken, and a peer compressor holding it under its own claim may yet put it back.
+            # `lexists` because Windows also raises FileNotFoundError for a claim path too long, with
+            # `dest` still there; an `lstat` that fails too (a lost share, say) still reads as gone.
+            log.debug(
+                "app-log %r: the archive %r could not be found when it was to be claimed (already "
+                "gone, or its directory unreachable); this pass does not remove it",
+                name,
+                os.path.basename(dest),
+            )
+            return False
+        log.warning(
+            "app-log %r: the redundant archive %r could not be claimed for removal; it is kept",
+            name,
+            os.path.basename(dest),
+        )
+        return False
+    if _verify_archive(claim, data, name=name) and _source_still_holds(source, read_st, data):
+        try:
+            os.remove(claim)
+        except FileNotFoundError:
+            # Already gone (a peer's `app_log_days` sweep, say), so removed: nothing is left under
+            # the claim name, and the source still holds every archived byte.
+            log.debug("app-log %r: the claim %r was already gone", name, os.path.basename(claim))
+        except OSError:
+            log.warning(
+                "app-log %r: the redundant archive, claimed as %r, could not be removed",
+                name,
+                os.path.basename(claim),
+            )
+            return False
+        return True
+    try:
+        os.link(claim, dest)
+    except FileNotFoundError:
+        log.warning(
+            "app-log %r: the claimed archive %r could not be found to put it back (removed "
+            "meanwhile by a peer's app_log_days sweep, say, or its directory unreachable); if it "
+            "remains, it is KEPT under that name until an operator acts or, while app_log_days is "
+            "set and compression is on, its sweep ages it out",
+            name,
+            os.path.basename(claim),
+        )
+        return False
+    except OSError:
+        log.warning(
+            "app-log %r: the source or the claimed archive changed while the archive was being "
+            "removed, and the archive could not be put back; it is KEPT as %r until an operator acts "
+            "or, while app_log_days is set and compression is on, its sweep ages it out",
+            name,
+            os.path.basename(claim),
+        )
+        return False
+    try:
+        os.remove(claim)
+    except FileNotFoundError:
+        # Already gone; the linked-back `dest` holds the archive.
+        log.debug("app-log %r: the claim %r was already gone", name, os.path.basename(claim))
+    except OSError:
+        log.warning(
+            "app-log %r: the claimed archive %r was linked back but could not be removed; it is KEPT "
+            "until an operator acts or, while app_log_days is set and compression is on, its sweep "
+            "ages it out",
+            name,
+            os.path.basename(claim),
+        )
+    return False
 
 
 def _unlink_quietly(path: str) -> None:
@@ -398,34 +593,48 @@ class RetentionRunner:
         # Default to the logging sink so an over-limit store is at least visible without a notifier.
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
         self._clock = clock
-        # A monotonic clock for the #121 between-phase duration cap — SEPARATE from `clock` (which is the
-        # wall clock feeding the retention *window* cutoffs and is often frozen in tests). Measuring
-        # elapsed pass time against a frozen window clock would never advance; monotonic can't go backwards.
+        # A monotonic clock for the #121 between-phase duration cap and the WAL truncate cadence
+        # (BACKLOG #6526) — SEPARATE from `clock` (which is the wall clock feeding the retention
+        # *window* cutoffs and is often frozen in tests). Elapsed time measured on a frozen window
+        # clock never advances, and on a wall clock stepped backward it goes negative and holds the
+        # truncate past its cadence; monotonic can't go backwards.
         self._monotonic = monotonic
         # Retention is a leader-only WRITE singleton (it purges PHI bodies + writes audit rows), so in
         # a cluster it must run on exactly one node. Default NullCoordinator → always leader → always
         # runs, so an existing caller/test that passes no coordinator is byte-identical (Track B Step 4).
         self._coordinator: ClusterCoordinator = coordinator or NullCoordinator()
         self._stop = asyncio.Event()
+        # Ends the current between-pass sleep early: set by stop(), and by wake() after a config
+        # reload. wake() sets it only while the loop is idle, so a window a reload sets is enforced at
+        # once only when the loop was idle; on an active loop it waits for the next scheduled pass.
+        self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
-        # Maintenance cadence state (loop-driven; only read/written on the single task).
-        self._last_wal = 0.0
+        # Whether the last check of `enabled` found something to do; the loop logs when it flips.
+        self._active = False
+        # Maintenance cadence state (loop-driven; only read/written on the single task). The WAL
+        # marker is a `monotonic` reading. It starts as None, not 0.0, so the first pass truncates
+        # whatever the monotonic clock reads, which can be under the cadence just after boot.
+        self._last_wal: float | None = None
         self._last_vacuum_day: str | None = None
 
     @property
     def enabled(self) -> bool:
-        """True when any window/threshold/maintenance knob is configured. When False, :meth:`start`
-        spawns no task. Every purge window is off by default, but the low-disk floor
-        (``min_free_disk_mb``, BACKLOG #290) and the hourly WAL truncate (``wal_checkpoint_seconds``,
-        vault BACKLOG #2619) ship ON, so on a file-backed SQLite store the runner starts on stock
-        settings to run those two. The audit-log growth warning (``audit_log_warn_rows``, BACKLOG
-        #1421) ships ON as well and applies to every backend, so stock settings start the runner on
-        SQL Server and Postgres too. It purges nothing unless a window is set.
+        """True when any window/threshold/maintenance knob is configured. When False, a pass does
+        nothing worth running, so the loop skips it (and :meth:`start` spawns no loop at all when no
+        registry is wired, since nothing can change the answer then). Every purge window is off by
+        default, but the low-disk floor (``min_free_disk_mb``, BACKLOG #290) and the hourly WAL
+        truncate (``wal_checkpoint_seconds``, vault BACKLOG #2619) ship ON, so on a file-backed
+        SQLite store stock settings give the runner passes to run for those two. The audit-log
+        growth warning (``audit_log_warn_rows``, BACKLOG #1421) ships ON as well and applies to every
+        backend, so stock settings give it passes on SQL Server and Postgres too. It purges nothing
+        unless a window is set.
 
         Embedded-document pruning (#47, ADR 0042) has no ``[retention]`` setting — it is a purely
-        per-connection knob — so the runner must also start when any inbound sets ``prune_documents_after``
-        even if no global window is configured. The registry is consulted via ``_registry_source`` (None
-        when no registry is wired)."""
+        per-connection knob — so this is also True when any inbound sets ``prune_documents_after``
+        even if no global window is configured. So must a per-connection ``messages_days`` or
+        ``dead_letter_days`` window above 0 (0 keeps forever, which no pass acts on). The registry is
+        consulted via ``_registry_source`` (None when no registry is wired) and read live, because a
+        config reload can set or clear these (BACKLOG #6804)."""
         s = self._settings
         if (
             s.messages_days
@@ -443,28 +652,46 @@ class RetentionRunner:
         ):
             return True
         # Application log-file retention (#120 delete, #119 compress) needs BOTH a window and a log_dir
-        # to do anything, so only start the runner for it when both are present (avoids a no-op task for
-        # a configured window on a stdout-only deployment).
+        # to do anything, so it counts only when both are present (avoids a no-op pass for a configured
+        # window on a stdout-only deployment).
         if (s.app_log_days > 0 or s.app_log_compress_days > 0) and self._log_dir:
             return True
         registry = self._registry_source() if self._registry_source is not None else None
-        if registry is not None and any(  # noqa: SIM103
-            ic.prune_documents_after is not None for ic in registry.inbound.values()
-        ):
-            return True
-        return False
+        if registry is None:
+            return False
+        # A connection's own window gives a pass something to do even with every global knob off.
+        return any(
+            ic.prune_documents_after is not None or (ic.messages_days or 0) > 0
+            for ic in registry.inbound.values()
+        ) or any((oc.dead_letter_days or 0) > 0 for oc in registry.outbound.values())
 
     # --- lifecycle -----------------------------------------------------------
 
     def start(self) -> None:
-        """Spawn the supervised purge/maintenance loop (no-op when nothing is configured)."""
+        """Spawn the supervised purge/maintenance loop (idempotent).
+
+        With a registry wired the loop is spawned even when nothing is configured yet, and idles:
+        each interval it re-reads :attr:`enabled` and runs a pass only when that is True. A config
+        reload can set a per-connection window on a graph that started with none, and a loop decided
+        once here would leave that window unenforced until a restart (BACKLOG #6804). With no
+        registry nothing can change :attr:`enabled`, so a disabled runner spawns no loop."""
         if self._task is not None:
             return
-        if not self.enabled:
-            log.debug("retention disabled (no [retention] windows configured); not starting")
+        active = self.enabled
+        if not active and self._registry_source is None:
+            log.debug("retention disabled (nothing configured); not starting")
             return
         self._stop.clear()
+        self._wake.clear()
+        self._active = active
         self._task = asyncio.create_task(self._run())
+        if not active:
+            log.debug(
+                "retention idle: nothing configured yet; re-checked every %gs, so a config reload "
+                "that sets a per-connection window takes effect without a restart",
+                self._settings.purge_interval_seconds,
+            )
+            return
         log.info(
             "retention enabled: messages_days=%d dead_letter_days=%d max_db_mb=%d "
             "min_free_disk_mb=%d audit_log_warn_rows=%d wal_checkpoint_seconds=%g vacuum_at=%r "
@@ -484,9 +711,18 @@ class RetentionRunner:
             self._settings.purge_interval_seconds,
         )
 
+    def wake(self) -> None:
+        """End an IDLE loop's sleep, so it re-reads :attr:`enabled` now and runs a pass if a config
+        reload just gave it something to do (BACKLOG #6804). The engine calls this after every
+        reload. An active loop keeps its interval: waking it would add a pass per reload, each with
+        its own alerts and audit row, for a change that it picks up on its next pass anyway."""
+        if not self._active:
+            self._wake.set()
+
     async def stop(self) -> None:
         """Signal the loop and await its exit (idempotent)."""
         self._stop.set()
+        self._wake.set()
         task = self._task
         self._task = None
         if task is not None:
@@ -500,18 +736,47 @@ class RetentionRunner:
         # One isolated pass per interval; an error in a pass is logged and the loop continues (a
         # retention hiccup must never take the engine down). Cooperatively cancellable via _stop.
         while not self._stop.is_set():
+            # Cleared here, before this iteration reads `enabled`, so a wake() that landed before
+            # this read (say between start() and the first iteration) is answered by this pass and
+            # cannot also cut the sleep after it short into a second, back-to-back pass.
+            self._wake.clear()
             try:
-                await self.run_once()
+                active = self._refresh_active()
+            except Exception:
+                log.exception(
+                    "retention could not read its configuration; will retry next interval"
+                )
+                active = False
+            try:
+                if active:
+                    await self.run_once()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("retention pass failed; will retry next interval")
             await self._sleep(self._settings.purge_interval_seconds)
 
+    def _refresh_active(self) -> bool:
+        """Re-read :attr:`enabled` for this interval and log a change, so an operator can see a
+        reload turn retention on or off (BACKLOG #6804)."""
+        active = self.enabled
+        if active != self._active:
+            self._active = active
+            if active:
+                log.info(
+                    "retention active: the configuration now sets something for it to do "
+                    "(a pass every %gs)",
+                    self._settings.purge_interval_seconds,
+                )
+            else:
+                log.info("retention idle: the configuration no longer sets anything for it to do")
+        return active
+
     async def _sleep(self, delay: float) -> None:
-        """Sleep up to ``delay``, waking immediately on stop (so shutdown isn't held by the interval)."""
+        """Sleep up to ``delay``, waking immediately on stop (so shutdown isn't held by the interval)
+        or on :meth:`wake`."""
         try:  # noqa: SIM105
-            await asyncio.wait_for(self._stop.wait(), delay)
+            await asyncio.wait_for(self._wake.wait(), delay)
         except TimeoutError:
             pass
 
@@ -521,6 +786,8 @@ class RetentionRunner:
         """Run a full retention pass for ``now`` (default: the injected clock): purge bodies past the
         configured windows, checkpoint the WAL / VACUUM if due, check the size threshold, and write a
         single ``audit_log`` entry when the pass did real work. Returns a :class:`RetentionPass`.
+        ``now`` does not decide whether the WAL truncate is due: that cadence reads the injected
+        ``monotonic`` clock (BACKLOG #6526).
 
         Leader-gated (Track B Step 4): a non-leader node returns a did-nothing pass without touching the
         store, so in a cluster exactly one node purges. The loop keeps ticking on followers
@@ -777,29 +1044,29 @@ class RetentionRunner:
         # running VACUUM is non-interruptible: the deadline is checked only BEFORE it is dispatched.
         wal_checkpointed = False
         wal_left_untruncated = False
-        if (
-            not _deadline_hit()
-            and self._wal_truncate_applies()
-            and now - self._last_wal >= s.wal_checkpoint_seconds
-        ):
-            # `is False`: None is a backend with no -wal file, which `_wal_truncate_applies` skips.
-            wal_left_untruncated = await self._store.wal_checkpoint() is False
-            # The marker advances either way, so a reader that pins the WAL costs writers one busy
-            # timeout per cadence rather than one per pass.
-            self._last_wal = now
-            wal_checkpointed = True
-            if wal_left_untruncated:
-                # Vault BACKLOG #2619: a purged body can still sit in the -wal frames. Names the file
-                # and the cause only; no message content reaches this line.
-                log.warning(
-                    "retention: the WAL truncate did not finish -- another connection (one of the "
-                    "engine's own reads, a DR snapshot copy, or another process on this store) "
-                    "still held %s-wal, so frames written before this pass, purged bodies among "
-                    "them, stay in that file until a later truncate (the first retention pass at "
-                    "least %gs from now)",
-                    self._floor_path,
-                    s.wal_checkpoint_seconds,
-                )
+        # The cadence reads `self._monotonic`, not `now` (see __init__).
+        if not _deadline_hit() and self._wal_truncate_applies():
+            wal_at = self._monotonic()
+            if self._last_wal is None or wal_at - self._last_wal >= s.wal_checkpoint_seconds:
+                # `is False`: None is a backend with no -wal file, which `_wal_truncate_applies`
+                # skips.
+                wal_left_untruncated = await self._store.wal_checkpoint() is False
+                # The marker advances either way, so a reader that pins the WAL costs writers one
+                # busy timeout per cadence rather than one per pass.
+                self._last_wal = wal_at
+                wal_checkpointed = True
+                if wal_left_untruncated:
+                    # Vault BACKLOG #2619: a purged body can still sit in the -wal frames. Names the
+                    # file and the cause only; no message content reaches this line.
+                    log.warning(
+                        "retention: the WAL truncate did not finish -- another connection (one of "
+                        "the engine's own reads, a DR snapshot copy, or another process on this "
+                        "store) still held %s-wal, so frames written before this pass, purged "
+                        "bodies among them, stay in that file until a later truncate (the first "
+                        "retention pass at least %gs from now)",
+                        self._floor_path,
+                        s.wal_checkpoint_seconds,
+                    )
 
         vacuumed = False
         if not _deadline_hit() and self._vacuum_due(now):
@@ -1114,6 +1381,8 @@ class RetentionRunner:
         When (and ONLY when) compression is enabled (#119) the sweep also covers the archives it
         produces — ``*.log.gz``/``*.txt.gz`` — on the same window, so compressing a file does not make
         it immortal (the archive inherits the source's mtime, so it ages out on the original's clock).
+        It covers a claimed archive left behind by :func:`_drop_redundant_archive` too (#6805; the
+        names and the clock are on :func:`_is_app_log_name`).
         With ``app_log_compress_days = 0`` the eligible set is exactly the pre-#119 one, so a deployment
         that hasn't opted into compression is byte-identical."""
         days = self._settings.app_log_days
@@ -1154,8 +1423,10 @@ class RetentionRunner:
            is re-read **before every file**, so the phase releases the pass between files instead of
            running the whole directory in one uninterruptible call. Whatever is left is untouched and is
            simply picked up by the next pass — nothing is dropped, only deferred.
-        1. **Never clobber.** An existing ``<name>.gz`` means the file is already archived (or a crash
-           landed the archive but not the unlink); it is skipped, and the delete window cleans up.
+        1. **Never clobber.** An existing ``<name>.gz`` means the file is already archived, or at least
+           that a crash landed the archive but not the unlink, or that the source changed after its
+           archive was placed (#6805); it is skipped, and only an ``app_log_days`` delete window, where
+           one is set, cleans up.
         2. **Free-space precheck.** ``shutil.disk_usage`` must show room for the source *plus* its
            archive plus a margin, else the file is skipped and logged — a maintenance pass must never be
            what fills the volume. Re-read per file, since each compression changes what is free.
@@ -1163,9 +1434,12 @@ class RetentionRunner:
            log) is discarded and the original left alone — compressing must not cost disk.
         4. **Integrity validation before deletion.** The archive is staged to an exclusively created,
            unpredictably named temp file (:meth:`_stage_archive`), ``fsync``ed, validated, renamed into
-           place, and then **re-validated at ``dest``** — that last check, on the bytes actually sitting
-           where the log used to be, is the only thing that authorizes removing the original. Any failure
-           leaves the original **untouched** and is logged (:meth:`_compress_one`).
+           place, and then **re-validated at ``dest``**. Removing the original takes that check, on the
+           bytes actually sitting at ``dest``, and a re-check that the source path is still the same
+           file (device, file id, size, mtime, ctime) it was read from, so a log appended to or rotated
+           during compression is kept in most cases (#6805; :func:`_source_change` names at least the
+           window that remains). Any failure leaves the original **untouched** and is logged
+           (:meth:`_compress_one`).
 
         The archive inherits the source's mtime so the ``app_log_days`` delete window keeps applying to
         it. Blocking I/O throughout, so the caller runs it off the event loop. Never raises — a
@@ -1216,7 +1490,9 @@ class RetentionRunner:
                     continue
                 saved = self._compress_one(entry.path, dest, atime=st.st_atime, mtime=st.st_mtime)
                 if saved is None:
-                    continue  # skipped or failed validation — the original is still in place
+                    # Not compressed by this call. The source path may still hold the original, or
+                    # may now hold changed content or nothing at all (see `_compress_one`).
+                    continue
                 compressed += 1
                 reclaimed += saved
             except OSError:
@@ -1260,8 +1536,9 @@ class RetentionRunner:
     def _compress_one(self, source: str, dest: str, *, atime: float, mtime: float) -> int | None:
         """Gzip ``source`` → ``dest``, **validating the bytes at ``dest`` before removing the original**.
 
-        Returns the bytes reclaimed, or ``None`` when the original was left in place (read/codec/write
-        failure, a failed integrity check, or an archive that would not be SMALLER than the source).
+        Returns the bytes reclaimed, or ``None`` when this call did not remove the original (read/codec/
+        write failure, a failed integrity check, an archive that would not be SMALLER than the source, or
+        a source that changed or vanished during compression; in the vanished case it is already gone).
 
         **What authorizes the unlink** is a read-back of ``dest`` *after* the rename — never a check
         against the staging path. Validating the staged file and then renaming "whatever is at that
@@ -1270,13 +1547,52 @@ class RetentionRunner:
         reports it as a success. Both checks are kept — the staged one so an unvalidated artifact is never
         placed at ``dest`` at all, the ``dest`` one because it is the only one that describes the bytes
         the delete is traded for. (The staging file itself is unpredictable and exclusively created, see
-        :meth:`_stage_archive`, so that window is closed from the other side too.)"""
+        :meth:`_stage_archive`, so that window is closed from the other side too.)
+
+        The ``dest`` read-back proves the archive holds the bytes read at the START; it says nothing
+        about the source since. So the source is pinned at the read (two ``fstat`` calls on the read
+        handle must agree with each other, with the bytes read and with the scan's mtime), and
+        :func:`_source_change` is checked again before the archive is placed and before the unlink. A
+        source appended to, truncated or replaced at the same path during compression is kept (#6805);
+        :func:`_source_change` names what that still misses."""
         name = os.path.basename(source)
         try:
-            with open(source, "rb") as fh:
-                data = fh.read()
+            fd = os.open(source, _SOURCE_OPEN_FLAGS)
         except OSError:
             log.warning("app-log compression skipped %r: unreadable", name)
+            return None
+        try:
+            # The identity of the file these bytes come from, taken on the SAME descriptor before and
+            # after the read, so a change during the read is caught here and the checks below can
+            # refuse a path that no longer holds exactly these bytes (#6805). Checked on the raw
+            # descriptor first: `os.fdopen` raises on a directory without closing the descriptor.
+            try:
+                before_st = os.fstat(fd)
+                aged_file = stat.S_ISREG(before_st.st_mode) and before_st.st_mtime == mtime
+                if aged_file and hasattr(os, "O_NONBLOCK"):
+                    # Opened O_NONBLOCK only so the open cannot hang; a buffered read of a
+                    # non-blocking descriptor may return None, so blocking mode is restored first.
+                    os.set_blocking(fd, True)
+            except OSError:
+                os.close(fd)
+                raise
+            if not aged_file:
+                # Not the regular file the scan aged: rotated in after the scan, or (Windows) the
+                # directory entry's mtime is stale because a writer still has it open. Read nothing.
+                os.close(fd)
+                log.debug("app-log compression skipped %r: not the file the scan aged", name)
+                return None
+            with os.fdopen(fd, "rb") as fh:
+                # Bounded by the size pinned above: a longer read is a change and is refused below.
+                data = fh.read(before_st.st_size + 1)
+                read_st = os.fstat(fh.fileno())
+        except OSError:
+            log.warning("app-log compression skipped %r: unreadable", name)
+            return None
+        if not _same_file_state(before_st, read_st) or read_st.st_size != len(data):
+            # Changed during the read. Nothing is staged, so nothing is left behind; the next pass
+            # looks again.
+            log.warning("app-log compression skipped %r: it changed while being read", name)
             return None
         try:
             blob = gzip_compress(data)
@@ -1297,6 +1613,25 @@ class RetentionRunner:
         if not _verify_archive(tmp, data, name=name):
             _unlink_quietly(tmp)
             return None
+        change = _source_change(source, read_st)
+        if change is not None:
+            # Checked before placing too, so a source that changed while it was compressed leaves no
+            # stale partial archive at `dest` to block its later compression, and a source a peer
+            # compressor already archived AND removed is not followed by a rename over that archive.
+            log.warning(
+                "app-log compression skipped %r: the source %s during compression; nothing placed",
+                name,
+                change,
+            )
+            _unlink_quietly(tmp)
+            return None
+        if os.path.exists(dest):
+            # A peer compressor placed `<name>.gz` since the scan. Never rename over it: it may be the
+            # only copy of a longer read whose source the peer is about to remove. This narrows, and
+            # does not close, the window before the rename below.
+            log.warning("app-log compression skipped %r: an archive appeared meanwhile", name)
+            _unlink_quietly(tmp)
+            return None
         try:
             # Inherit the source's timestamps so the `app_log_days` delete window still ages the archive
             # out on the ORIGINAL file's clock (compressing a log must not reset its retention clock).
@@ -1309,16 +1644,46 @@ class RetentionRunner:
             _unlink_quietly(tmp)
             return None
         if not _verify_archive(dest, data, name=name):
-            # The ONLY gate on the unlink below, and it did not pass: whatever is at `dest` is not this
-            # log. Keep the original (it is still the only good copy) and do not count it as compressed.
+            # One of the two gates on the unlink below (with `_source_change`), and it did not pass:
+            # whatever is at `dest` is not this log. Keep the original (it is still the only good
+            # copy) and do not count it as compressed.
             # The artifact at `dest` is deliberately NOT removed: under a concurrent compressor it may be
             # a VALID archive of a longer read of the same log whose source is already gone, and deleting
             # that would be the very data loss this check exists to prevent. It is inert (the next pass
-            # skips a source whose `<name>.gz` exists) and the `app_log_days` window still ages it out.
+            # skips a source whose `<name>.gz` exists), and only an `app_log_days` window, where one
+            # is set, ages it out.
             log.warning(
                 "app-log %r: the archive did not validate AFTER being renamed into place; the original "
                 "is kept and NOT counted as compressed. The unvalidated %r needs an operator's review.",
                 name,
+                os.path.basename(dest),
+            )
+            return None
+        change = _source_change(source, read_st)
+        if change is not None:
+            # The archive validates against the bytes read at the START; the source path no longer
+            # matches them (appended to, a metadata-only change, truncated, replaced by a rotation, or
+            # gone). Removing it would destroy whatever was written since, so the path is left alone.
+            # Not counted as compressed. A `<name>.gz` left here would make every later pass skip this
+            # path silently, forever with no `app_log_days` window, so the archive THIS pass placed is
+            # removed whenever the kept source still holds every archived byte (same file, `data` as
+            # its prefix): it is then redundant and the next pass retries. Otherwise it is kept,
+            # because under a replace it may be the only copy of the old content.
+            if _drop_redundant_archive(source, read_st, data, dest, name=name):
+                log.warning(
+                    "app-log %r: the source %s after its archive was placed; the source is kept "
+                    "and holds every archived byte, so the archive is redundant and was removed or "
+                    "could not be found to remove; the next pass retries",
+                    name,
+                    change,
+                )
+                return None
+            log.warning(
+                "app-log %r: the source %s after its archive was placed; the source path is left "
+                "alone and NOT counted as compressed. The bytes read before that may remain in the "
+                "source, at %r, or under a claim name logged above.",
+                name,
+                change,
                 os.path.basename(dest),
             )
             return None
@@ -1327,11 +1692,10 @@ class RetentionRunner:
         except OSError:
             # The VALIDATED archive is in place but the original could not be removed (locked). Not
             # counted as compressed — the next pass sees `dest` and skips, and the delete window (or the
-            # operator) clears the leftover. Nothing is lost either way.
+            # operator) clears the leftover. Both the archive and the original remain here.
             log.warning("app-log %r archived but the original could not be removed", name)
             return None
-        # Measured against the bytes actually archived, not the earlier `stat` — the two differ if the
-        # file grew between the scan and the read, and the reclaim figure must describe what happened.
+        # Measured against the bytes actually archived, the figure that describes what happened.
         return len(data) - len(blob)
 
     @staticmethod

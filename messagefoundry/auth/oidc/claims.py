@@ -11,9 +11,9 @@ gate (``amr``/``acr``), which is BACKLOG #99(g)'s real control.
 Every rejection is a :class:`ClaimsError` carrying a **closed-set reason slug** (:data:`REASONS`) — the
 browser layer maps that slug to an allow-listed error code and audits it, never reflecting IdP text.
 The engine verifies what the IdP **asserts**, cryptographically; it does not and cannot prove the IdP
-*enforced* MFA. The success value is a :class:`FederatedPrincipal` carrying the resolved username,
-``sub``, the evidence recorded in the audit, and the verified ``exp`` and ``auth_time`` the engine
-session is capped by.
+*enforced* MFA. The success value is a :class:`FederatedPrincipal` carrying the username
+(which selects no account), ``sub``, the evidence recorded in the audit, and the verified ``exp``
+and ``auth_time`` the engine session is capped by.
 """
 
 from __future__ import annotations
@@ -24,11 +24,12 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
-from messagefoundry.auth.oidc.jwks import JwkAlgMismatch, JwksCache, JwksError
+from messagefoundry.auth.oidc.jwks import JwkAlgMismatch, JwksAmbiguousKid, JwksCache, JwksError
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.domainshape import upn_suffix_key
 from messagefoundry.transports.signing import (
     SigningError,
+    refuse_critical_extensions,
     require_public_key_for_alg,
     unverified_jws_header,
     verify_compact_jws,
@@ -43,6 +44,9 @@ REASONS: frozenset[str] = frozenset(
         "claim_not_numeric",
         "claim_sub_missing",
         "wrong_token_type",
+        # RFC 7515 section 4.1.11: a header carrying ``crit``, which names an extension the engine
+        # does not implement (it implements none) or is malformed. Refused at key selection.
+        "unsupported_crit",
         "unexpected_events_claim",
         "unknown_kid",
         "ambiguous_kid",
@@ -112,20 +116,29 @@ class OidcClaimPolicy:
 
 @dataclass(frozen=True, slots=True)
 class FederatedPrincipal:
-    """The verified outcome of a federated login — the username to resolve against on-prem AD, the
-    evidence folded into the ``auth.login_success`` audit detail, and the verified ``exp`` and
-    ``auth_time``."""
+    """The verified outcome of a federated login: the ``(issuer, sub)`` pair that selects the local
+    account, the username, the evidence folded into the ``auth.login_success`` audit detail, and the
+    verified ``exp`` and ``auth_time``.
+
+    ``username`` is the username claim with its UPN suffix removed while ``username_strip_domain``
+    is on (the default), so ``jdoe@corp.example`` becomes ``jdoe``; with stripping off it is the
+    claim verbatim.
+
+    ``username`` selects no account. The relying party selects the account by the non-reassignable
+    ``(issuer, subject)`` pair alone (ADR 0184), refuses a pair no account is bound to (only the
+    administrative binding surface binds one), and carries this ``username`` into that refusal's
+    audit row as a hint. The ladder still refuses at least a token whose username claim is missing.
+    Only while ``username_strip_domain`` is on does it also refuse at least a claim with no suffix,
+    an empty local part, or a suffix off the allow-list; with it off the claim is used verbatim and
+    no suffix is checked (:func:`_resolve_username` holds the full rule). A username is
+    reassignable, so selecting by it would hand a reassigned name the prior holder's account."""
 
     username: str
     subject: str
     # The pinned issuer this assertion was verified against (``policy.issuer``, which ``_check_core_claims``
-    # already proved the token's ``iss`` equals). Carried alongside ``subject`` so the relying party can
-    # PIN the local federated account's identity to the non-reassignable ``(issuer, sub)`` tuple (BACKLOG
-    # #1015): the AD-backed account is still resolved BY its username (ADR 0142 keeps roles LDAP-sourced),
-    # but a login whose reassignable username resolves to an account already bound to a DIFFERENT
-    # ``(issuer, sub)`` is refused — so a reassigned username cannot take over the prior holder's account.
-    # A ``sub`` is only guaranteed stable WITHIN one issuer, so the binding needs both halves even though
-    # a single issuer is pinned today.
+    # already proved the token's ``iss`` equals): half of the ``(issuer, sub)`` selection key the class
+    # docstring describes (BACKLOG #1015). A ``sub`` is only guaranteed stable WITHIN one issuer, so the
+    # selection needs both halves even though a single issuer is pinned today.
     issuer: str
     amr: tuple[str, ...]
     acr: str | None
@@ -179,6 +192,12 @@ def _select_key_and_alg(
     except SigningError as exc:
         raise ClaimsError("malformed_token", str(exc)) from exc
     _assert_id_token_typ(header)
+    # Before the kid lookup, so a token the engine must refuse whatever its key never spends the JWKS
+    # refetch budget. ``verify_compact_jws`` refuses it too; this one names the rung in the audit.
+    try:
+        refuse_critical_extensions(header)
+    except SigningError as exc:
+        raise ClaimsError("unsupported_crit", str(exc)) from exc
     kid = header.get("kid")
     if not isinstance(kid, str) or kid == "":
         raise ClaimsError("unknown_kid", "id_token header carries no kid")
@@ -193,6 +212,13 @@ def _select_key_and_alg(
     except JwkAlgMismatch as exc:
         # The kid names a key, but its JWK restricts it to another alg (BACKLOG #5517).
         raise ClaimsError("key_rejected", str(exc)) from exc
+    except JwksAmbiguousKid as exc:
+        # The JWKS this lookup just fetched gives two usable keys one kid, whichever kid that is, so
+        # that fetched set is refused and the cache keeps any keys it held before. The IdP's key set
+        # is at fault, not necessarily this token's kid. Only the lookup that made the fetch sees
+        # it: a lookup inside the min-refetch floor after it is served a key the cache still holds
+        # for its kid, or gets the throttled JwksError, recorded as unknown_kid below.
+        raise ClaimsError("ambiguous_kid", str(exc)) from exc
     except JwksError as exc:
         raise ClaimsError("unknown_kid", str(exc)) from exc
     try:
@@ -474,9 +500,11 @@ def validate_id_token(
     """Verify an ``id_token`` end to end and return the :class:`FederatedPrincipal`, or raise
     :class:`ClaimsError` with a closed-set ``reason``.
 
-    Order is deliberate: signature first (nothing downstream trusts an unverified claim), then the
-    core OIDC claims, then the MFA gate, then username resolution. ``clock`` is wall-clock ``time.time``
-    (token lifetimes are wall-clock, unlike the monotonic caches) and injectable for tests.
+    Order is deliberate: key selection first, whose ``typ`` and ``crit`` refusals read the
+    unverified protected header before the signature is checked, and can only refuse, never accept;
+    then the signature (nothing downstream trusts an unverified claim), then the core OIDC claims,
+    then the MFA gate, then the username claim. ``clock`` is wall-clock ``time.time`` (token
+    lifetimes are wall-clock, unlike the monotonic caches) and injectable for tests.
     """
     key, _alg = _select_key_and_alg(id_token, policy, jwks)
     claims = _verify_signature(id_token, key, policy)

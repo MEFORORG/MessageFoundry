@@ -5,9 +5,13 @@
 Launched by :class:`messagefoundry.pipeline.sandbox.SandboxSession` through
 :func:`messagefoundry.childenv.python_child_argv`, which runs this module the way ``python -m``
 would. It speaks the length-prefixed **MFW2** codec
-(:mod:`messagefoundry.pipeline._sandbox_codec`) on stdin/stdout — a closed-tag JSON+segment wire whose
-decode path cannot name a type, import a module, or reach ``__reduce__``. Nothing is pickled in either
-direction, in either process.
+(:mod:`messagefoundry.pipeline._sandbox_codec`), a closed-tag JSON+segment wire whose decode path
+cannot name a type, import a module, or reach ``__reduce__``. Nothing is pickled in either
+direction, in either process. The engine starts the worker with the request pipe on fd 0 and the
+response pipe on fd 1. Before it reads anything, :func:`_detach_request_pipe` moves the request
+pipe to a private, non-inheritable descriptor and points fd 0 at the null device (vault BACKLOG
+#3135 step 8), so the worker reads its frames from that private copy, never from fd 0 or
+``sys.stdin``, and writes its replies to fd 1.
 
 1. **Bootstrap** — reads one ``boot`` frame ``{snapshot, forbidden, mem_mb, code_sets, broker}``, loads
    the message :class:`~messagefoundry.config.wiring.Registry` from the engine's config snapshot
@@ -42,8 +46,11 @@ this process never needs its own watchdog.
 from __future__ import annotations
 
 import contextlib
+import gc
+import io
 import logging
 import os
+import re
 import sys
 import threading
 from dataclasses import replace
@@ -67,7 +74,7 @@ log = logging.getLogger("messagefoundry.sandbox.worker")
 #: reference, ``TextIOWrapper.__del__`` closes its buffer, and admin config -- which runs after the
 #: rebind -- may assign ``sys.__stdout__``. A one-line ``sys.__stdout__ = None`` in a config module
 #: would otherwise close fd 1 and make the next frame write raise ``ValueError``, which none of
-#: :func:`main`'s ``except (OSError, SandboxError)`` clauses catch.
+#: :func:`main`'s ``OSError`` or ``SandboxError`` clauses catch.
 _ORIGINAL_STDOUT: Any = None
 
 
@@ -90,6 +97,95 @@ def _redirect_stdout_to_stderr() -> None:
     global _ORIGINAL_STDOUT
     _ORIGINAL_STDOUT = sys.stdout
     sys.stdout = sys.stderr
+
+
+def _detach_request_pipe() -> io.BufferedReader:
+    """Move the request pipe off fd 0 and return a reader on the private copy (vault BACKLOG #3135
+    step 8).
+
+    A process a Handler spawns inherits fd 0 unless it is told otherwise, and with it the worker's
+    request pipe, from which it could read a later request's id and forge that request's answer.
+    The pipe moves to a descriptor :func:`os.dup` makes non-inheritable (PEP 446), and fd 0 is
+    pointed at the null device, so such a process finds no pipe on fd 0, with its descriptors
+    inherited or not. On Windows, when a Handler redirects at least one of a child's standard
+    streams, :mod:`subprocess` hands the child this process's standard input handle for any
+    stream it does not redirect, rather than fd 0; with none redirected it passes no standard
+    handles. ``os.dup2`` repoints that handle only in a console-subsystem interpreter, so the
+    handle is read back and the worker refuses to boot when it does not name the null device.
+    The old pipe handle is closed by the ``dup2``.
+
+    A failure here is a bootstrap failure. Once the pipe is duplicated, it raises
+    :class:`_RequestPipeRefused` with a reader on the private copy, which the caller owns: it
+    drains the boot frame from it and closes it, so the parent's boot write completes and the
+    parent reads the refusal's reason. An :class:`OSError` from the ``os.dup`` itself carries no
+    reader.
+
+    This closes inheritance across a new program through fd 0 only. Code running in the worker
+    can still read the private descriptor, a child made by a POSIX ``fork`` with no ``exec`` keeps
+    it, and a same-UID process can still reach the pipe by other routes, at least
+    ``/proc/<pid>/fd`` on Linux and handle duplication on Windows (ADR 0087 AC-10). On Windows,
+    when the worker is started through a virtual environment's ``python.exe`` launcher, the
+    launcher hands the worker a second, inheritable handle to the request pipe that this does not
+    close, so a process the worker starts with handle inheritance can still read the pipe; that
+    is unfixed, and ADR 0087's step 8 note on AC-10 records it. Called before the boot frame is
+    read, so no byte has been buffered from fd 0 yet."""
+    private = os.dup(0)
+    try:
+        null = os.open(os.devnull, os.O_RDONLY)
+        try:
+            os.dup2(null, 0, inheritable=True)
+        finally:
+            os.close(null)
+        if sys.platform == "win32":
+            import _winapi
+            import msvcrt
+
+            if _winapi.GetStdHandle(_winapi.STD_INPUT_HANDLE) != msvcrt.get_osfhandle(0):
+                raise OSError(
+                    "the standard input handle does not name the null device fd 0 now holds"
+                )
+        return os.fdopen(private, "rb")
+    except OSError as exc:
+        try:
+            reader = os.fdopen(private, "rb")
+        except OSError as fdopen_exc:
+            # No reader to hand back: close the copy and raise the detach's own failure, so the
+            # bootfail reply names it rather than this one.
+            log.error(
+                "sandbox worker could not reopen its request pipe: %s", type(fdopen_exc).__name__
+            )
+            try:
+                os.close(private)
+            except OSError as close_exc:
+                log.error(
+                    "sandbox worker could not close its request pipe copy: %s",
+                    type(close_exc).__name__,
+                )
+            raise exc  # noqa: B904 - the detach's failure is the one to report, chained to this
+        raise _RequestPipeRefused(str(exc), reader=reader) from exc
+
+
+def _drain_boot_frame(reader: Any) -> None:
+    """Read and discard the boot frame from a refused detach's private copy, then close it (see
+    :func:`_detach_request_pipe`). A helper rather than inline in :func:`main`, so main's first
+    ``_read_frame_bytes`` call stays the real boot read that the source-order guard in
+    ``tests/test_sandbox_worker_logging.py`` measures."""
+    from messagefoundry.pipeline.sandbox import _read_frame_bytes
+
+    try:
+        with reader:
+            _read_frame_bytes(reader)
+    except OSError as exc:
+        log.error("sandbox worker could not drain its boot frame: %s", type(exc).__name__)
+
+
+class _RequestPipeRefused(OSError):
+    """:func:`_detach_request_pipe` failed once it had duplicated the request pipe. ``reader`` is a
+    reader on that private copy, which the caller drains and closes."""
+
+    def __init__(self, message: str, *, reader: Any) -> None:
+        super().__init__(message)
+        self.reader = reader
 
 
 class _ForbiddenImportFinder:
@@ -132,13 +228,21 @@ def _proc_status_kib(field: str) -> int | None:
 def _rlimit_data_counts_mmap() -> bool:
     """Whether this kernel counts private writable ``mmap`` memory against ``RLIMIT_DATA``. Linux
     4.7 and later do; earlier kernels count only the ``brk`` heap, which would leave most large
-    allocations outside the cap, so the caller falls back to ``RLIMIT_AS`` there."""
+    allocations outside the cap, so the caller falls back to ``RLIMIT_AS`` there. Only the leading
+    ``major.minor`` digits are read, so a suffix on the minor, as in ``6.12-rc4`` or ``5.15-aws``,
+    does not make a new kernel read as unknown (BACKLOG #6811)."""
     try:
-        release = os.uname().release  # type: ignore[attr-defined,unused-ignore]
-        major, minor = (int(part) for part in release.split(".")[:2])
-    except (AttributeError, ValueError):
+        uname = os.uname()  # type: ignore[attr-defined,unused-ignore]
+    except AttributeError:
         return False
-    return (major, minor) >= (4, 7)
+    if uname.sysname != "Linux":
+        return False  # another kernel's numbering says nothing about Linux 4.7 semantics
+    # Bounded ASCII digit runs, so int() never meets a string too long to convert; a longer run reads
+    # as unparseable rather than as its first nine digits.
+    match = re.match(r"([0-9]{1,9})\.([0-9]{1,9})(?![0-9])", uname.release)
+    if match is None:
+        return False
+    return (int(match[1]), int(match[2])) >= (4, 7)
 
 
 def _apply_resource_caps(mem_mb: int | None) -> str:
@@ -147,7 +251,8 @@ def _apply_resource_caps(mem_mb: int | None) -> str:
     platform. There is deliberately no ``RLIMIT_CPU``, so CPU spent outside a call has no bound (ADR
     0087, amendment of 2026-10-07).
 
-    Where ``/proc/self/status`` gives a ``VmData`` (Linux), ``mem_mb`` is HEADROOM above what the
+    Where ``/proc/self/status`` gives a ``VmData`` and ``uname`` reads Linux 4.7 or later,
+    ``mem_mb`` is HEADROOM above what the
     worker holds once its graph is loaded: the cap is ``RLIMIT_DATA`` at that ``VmData`` plus
     ``mem_mb`` (vault BACKLOG #3133 part 2, owner ruling 2026-10-11). Called right after
     ``load_snapshot``, so a graph larger than ``mem_mb`` does not start the worker over its cap.
@@ -157,7 +262,10 @@ def _apply_resource_caps(mem_mb: int | None) -> str:
     writable size does count after its threads exit, which is why the parent also starts this
     process with ``MALLOC_ARENA_MAX=2``. A live thread's stack counts too, and glibc keeps up to
     about 40 MiB of exited threads' stacks mapped for reuse.
-    Elsewhere on POSIX ``mem_mb`` stays an absolute ``RLIMIT_AS`` cap, and a log line says so."""
+    In at least these cases ``mem_mb`` stays an absolute ``RLIMIT_AS`` cap, and a log line says so:
+    a ``uname`` that does not name Linux, Linux before 4.7, a release with no readable
+    ``major.minor``, and no ``VmData``. A ``setrlimit`` that fails is logged and sets no cap of this
+    worker's own; a limit it inherited still applies."""
     try:
         import resource
     except ImportError:
@@ -177,7 +285,8 @@ def _apply_resource_caps(mem_mb: int | None) -> str:
         rlimit, name = resource.RLIMIT_AS, "RLIMIT_AS"  # type: ignore[attr-defined,unused-ignore]
         baseline = 0
         log.warning(
-            "sandbox worker: no VmData in /proc/self/status, or a kernel older than Linux 4.7, so "
+            "sandbox worker: no VmData in /proc/self/status, or no Linux 4.7 or later read from the "
+            "kernel release, so "
             "[sandbox].mem_mb is an absolute RLIMIT_AS cap of %d MiB here, not headroom above the "
             "loaded graph",
             mem_mb,
@@ -492,6 +601,22 @@ def _encode_sends(result: object) -> object:
     return encoded_items if isinstance(result, list) else encoded_items[0]
 
 
+#: The builtin setter of ``__context__``/``__cause__``, read off ``BaseException`` so a Handler's own
+#: ``MemoryError`` subclass cannot run code of its own when :func:`_without_frames` clears them.
+_SET_CONTEXT = BaseException.__dict__["__context__"].__set__
+_SET_CAUSE = BaseException.__dict__["__cause__"].__set__
+
+
+def _without_frames(exc: BaseException) -> BaseException:
+    """``exc`` with its traceback and chain cleared, so it no longer keeps the frames of the call
+    that raised it, or the memory their locals hold, alive (BACKLOG #6813). Through the builtin
+    methods, never the exception's own, which a subclass from user code may override."""
+    BaseException.with_traceback(exc, None)
+    _SET_CONTEXT(exc, None)
+    _SET_CAUSE(exc, None)
+    return exc
+
+
 def _error_text(exc: BaseException) -> str:
     """``Type: message`` for an error reported across the process boundary. A Unicode error's str()
     names the character or byte it failed on (vault BACKLOG #3185), and mode=off renders it from its
@@ -558,8 +683,27 @@ def main() -> int:
     from messagefoundry.pipeline._sandbox_codec import SandboxError
     from messagefoundry.pipeline.sandbox import _read_frame_bytes, _write_frame, graph_shape
 
-    stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
+    try:
+        stdin = _detach_request_pipe()
+    except OSError as exc:
+        # Read the boot frame first, from the private copy the refusal hands back, so the parent's
+        # boot write completes and it reads this reply as the boot reply, naming the reason. At
+        # least a failed os.dup and a failed reopen of the copy after it leave no copy, and then
+        # nothing is read. The parent's boot write can then fail first: when the boot frame is
+        # larger than the pipe's buffer, and, after a dup2 that moved fd 0 off the pipe, at once
+        # on POSIX, where no reader is left. It then records a failed boot write, and only the
+        # lines below, relayed at DEBUG, name the refusal.
+        log.error("sandbox worker refused to boot: the request pipe could not be detached")
+        if isinstance(exc, _RequestPipeRefused):
+            _drain_boot_frame(exc.reader)
+        try:
+            _write_frame(stdout, codec.encode_bootfail(_error_text(exc)))
+        except (OSError, SandboxError) as write_exc:
+            log.error(
+                "sandbox worker could not report its boot refusal: %s", type(write_exc).__name__
+            )
+        return 1
     # Sequenced deliberately: AFTER the frame writer captures its raw handle (at module scope the
     # capture above would resolve to fd 2 and send every frame to the wrong pipe) and BEFORE the boot
     # frame read below, whose reply path runs ``load_snapshot()`` -- the earliest untrusted code.
@@ -624,10 +768,10 @@ def main() -> int:
             resp: bytes | None = _respond(registry, req, boot.code_sets, broker)
         except MemoryError as exc:
             # Caught here rather than around the Handler alone, so a result too big to encode is
-            # answered the same way. Only the text is kept: the reply is built AFTER this block,
-            # because until it ends the traceback keeps the Handler's frames, and the memory their
-            # locals hold, alive.
-            resp, detail = None, _error_text(exc)
+            # answered the same way. The error is kept without its traceback or chain, which hold
+            # the Handler's frames and the memory their locals hold, and is formatted only once
+            # those are gone, below (BACKLOG #6813).
+            resp, oom = None, _without_frames(exc)
         if broker is not None:
             broker.end()  # before the answer: no lookup frame may follow it
             if broker.broken:
@@ -638,25 +782,40 @@ def main() -> int:
         if resp is None:
             # A call that ran out of memory may leave memory held (a module global, a cache, a
             # fragmented heap), and the next innocent message would pay for it. Answer, then exit so
-            # the parent starts a fresh worker (vault BACKLOG #3133 part 2).
+            # the parent starts a fresh worker (vault BACKLOG #3133 part 2). This loop's raw frame and
+            # decoded request are let go first, and a collection frees what only a cycle still held,
+            # so the reply is not built beside them (BACKLOG #6813). That cannot free all the call
+            # left held: at least a global, a cache, a thread, or an error held in the MemoryError's
+            # own args. So the reply can still fail for want of memory.
+            request_id, phase, name = req.request_id, req.phase, req.name
+            del frame, req
             with contextlib.suppress(OSError, SandboxError, MemoryError):
+                gc.collect()
                 _write_frame(
                     stdout,
                     codec.encode_fail(
-                        request_id=req.request_id,
-                        phase=req.phase,
-                        name=req.name,
+                        request_id=request_id,
+                        phase=phase,
+                        name=name,
                         kind=codec.FAIL_MEMORY,
-                        error=f"{detail}; {memory_cap}",
+                        error=f"{_error_text(oom)}; {memory_cap}",
                     ),
                 )
             return 1  # with no reply sent, the parent reads EOF and reports a crash instead
         try:
             _write_frame(stdout, resp)
-        except (OSError, SandboxError) as exc:
-            # An over-cap response frame (a huge fan-out) raises in _write_frame, not at describe time —
-            # report it instead of dying so the child's "survives for the next message" contract holds,
-            # rather than the parent reading EOF and paying a full config-reload respawn.
+        except OSError as exc:
+            # Part of the frame may be on the pipe already, so another frame after it would put the
+            # stream out of step with the parent. Exit without writing one (BACKLOG #6813). The parent
+            # then reads EOF, or takes the whole frame where the flush at interpreter exit completes
+            # it and finds the worker gone at a later message.
+            log.error("sandbox worker: could not write a reply frame (%s)", type(exc).__name__)
+            return 1
+        except SandboxError as exc:
+            # An over-cap response frame (a huge fan-out) raises in _write_frame, not at describe time,
+            # and before any byte is written. Report it instead of dying so the child's "survives for
+            # the next message" contract holds, rather than the parent reading EOF and paying a full
+            # config-reload respawn.
             try:
                 _write_frame(
                     stdout,

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -12,15 +13,27 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
 
 from messagefoundry.api import create_app
+from messagefoundry.auth.identity import SessionMechanism
+from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import (
+    _AD_SCOPE_WRITE_ATTEMPTS,
+    _SIGN_IN_UNAVAILABLE,
+    ACCOUNT_DELETED,
+    ACCOUNT_REFUSED,
     CHANNEL_SCOPE_CHANGE_REFUSED_ACTION,
+    SCOPE_SYNC_CONTENDED,
     AuthService,
+    LoginOutcome,
+    _AdChannelScopeContended,
+    _AdChannelScopeRefused,
     _allowed_channels,
 )
 from messagefoundry.config.settings import AuthSettings, EgressSettings
@@ -339,12 +352,17 @@ async def test_an_admin_scope_set_during_the_login_is_not_withdrawn(tmp_path: Pa
         await store.close()
 
 
-async def test_the_withdrawal_is_bound_to_the_scope_it_was_decided_on(tmp_path: Path) -> None:
-    """A concurrent login's fresh directory grant is not withdrawn by a login that read the old one.
+async def test_a_withdrawal_that_misses_decides_again_and_never_adopts_the_other_grant(
+    tmp_path: Path,
+) -> None:
+    """A withdrawal is bound to the scope it decided on, and a miss does not adopt what replaced it.
 
     Login A reads ``["IB_A"]`` and finds no mapped group. Before A writes, login B finds the user in
-    a mapped group and writes ``["IB_B"]``, also marked ``"ad"``. A's withdrawal must miss, because
-    the value it decided on is gone."""
+    a mapped group and writes ``["IB_B"]``, also marked ``"ad"``. A's withdrawal misses, because
+    the value it decided on is gone. A then reads the row again and decides again from its own
+    groups, which map to no channel, so it withdraws ``["IB_B"]`` too: a sign-in whose groups grant
+    nothing must not mint on another writer's grant, which may come from an older group read
+    (BACKLOG #6887). Before that, the miss returned B's row and A signed in holding ``IB_B``."""
     store = await MessageStore.open(tmp_path / "svc11.db")
     try:
         service = AuthService(store, AuthSettings())
@@ -355,10 +373,49 @@ async def test_the_withdrawal_is_bound_to_the_scope_it_was_decided_on(tmp_path: 
             await store.get_user("ada"), frozenset(), ["grp-a"]
         )
         await service._sync_ad_channel_scope(stale, frozenset(), ["grp-b"])  # login B
+        await _session_for(store, "ada", "h-ada-6887-w")
 
         out = await service._sync_ad_channel_scope(stale, frozenset(), [])  # login A, late
 
-        assert json.loads(out.channel_scope) == ["IB_B"], "a stale login withdrew a fresh grant"
+        assert out.channel_scope is None, "a login whose groups grant nothing adopted a grant"
+        assert _allowed_channels(out, frozenset()) == frozenset()
+        assert await store.list_sessions("ada") == [], "a session on the withdrawn grant survived"
+        rows = await store.list_audit(action="auth.ad_scope_resynced")
+        assert json.loads(rows[0]["detail"]) == {"channels": None, "withdrawn": '["IB_B"]'}
+    finally:
+        await store.close()
+
+
+async def test_a_withdrawal_that_misses_onto_a_scope_already_withdrawn_revokes_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another writer withdraws the scope between this sign-in's read and its write. The miss
+    finds the target already stored, so this sign-in writes no row, and revokes as the role write
+    does when it finds its roles already written, in case the other writer's revoke failed."""
+    store = await MessageStore.open(tmp_path / "svc6887w2.db")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await store.set_ad_group_scope_map([("grp-a", "IB_A")])
+        await _ad_user(store, "ada")
+        stale = await service._sync_ad_channel_scope(
+            await store.get_user("ada"), frozenset(), ["grp-a"]
+        )
+        real_withdraw = store.withdraw_ad_channel_scope
+
+        async def other_writer_first(user_id: str, expected: str, **kw: Any) -> bool:
+            await real_withdraw(user_id, expected)  # the other writer's withdrawal
+            await _session_for(store, "ada", "h-ada-6887-w2")  # left live by its failed revoke
+            return await real_withdraw(user_id, expected, **kw)
+
+        monkeypatch.setattr(store, "withdraw_ad_channel_scope", other_writer_first)
+        before = len(await store.list_audit(action="auth.ad_scope_resynced"))
+
+        out = await service._sync_ad_channel_scope(stale, frozenset(), [])
+
+        assert out.channel_scope is None
+        assert await store.list_sessions("ada") == [], "a stale-scope session survived"
+        assert len(await store.list_audit(action="auth.ad_scope_resynced")) == before
     finally:
         await store.close()
 
@@ -972,5 +1029,462 @@ async def test_editing_an_ad_map_revokes_directory_sessions(
             "the audit row must record how many sessions the edit revoked, so an operator can see "
             "the blast radius of a map change without reconstructing it"
         )
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #6887: the AD scope write is bound to the scope it was decided on ---------------
+
+_OPS = "cn=mf-ops,dc=x"
+
+
+def _ops_principal() -> AdPrincipal:
+    return AdPrincipal(
+        username="jdoe",
+        display_name="J Doe",
+        email=None,
+        dn="CN=jdoe,DC=x",
+        groups=frozenset({_OPS}),
+        directory_object_id=str(uuid.uuid5(uuid.NAMESPACE_URL, "jdoe")),
+    )
+
+
+async def _directory_service(engine: Engine) -> AuthService:
+    """A directory-enabled service whose one mapped group grants Operator and channel ``IB_A``."""
+    settings = AuthSettings(
+        ad_enabled=True,
+        kerberos_enabled=True,
+        kerberos_realm="EXAMPLE.COM",
+        ad_server="ldaps://x",
+        ad_user_search_base="DC=x",
+        ad_bind_dn="CN=svc,DC=x",
+        ad_bind_password="x",
+        login_rate_limit_enabled=False,
+        require_mfa=False,
+    )
+    service = AuthService(engine.store, settings)
+    await service.initialize()
+    await engine.store.set_ad_group_role_map([(_OPS, Role.OPERATOR.value)])
+    await engine.store.set_ad_group_scope_map([(_OPS, "IB_A")])
+    return service
+
+
+async def _unqueued_sign_in(service: AuthService, principal: AdPrincipal) -> Any:
+    """The directory completion OUTSIDE the per-process queue (BACKLOG #5653's ``__wrapped__``).
+
+    The queue orders sign-ins of one account inside one API process only. Each engine shard serves
+    its own API over one shared store, so two sign-ins of one account can still interleave there;
+    bypassing the queue is how a single-process test reproduces that."""
+    complete = AuthService._complete_ad_login.__wrapped__  # type: ignore[attr-defined]
+    return await complete(
+        service, principal, None, mfa_verified=False, session_mechanism=SessionMechanism.KERBEROS
+    )
+
+
+async def test_two_unqueued_sign_ins_after_a_scope_change_write_and_audit_the_scope_once(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both sign-ins read the account before either writes the new scope. Sign-in A writes it,
+    revokes the stale-scope sessions and mints. Before the fix, sign-in B then wrote the same scope
+    over A's, judged ``changes`` against the value it had read, and audited the resync a second
+    time. The write is now a compare-and-set on the scope B decided from: it misses, B reads the
+    row again, finds its target already stored, and writes and audits nothing. It still revokes,
+    deliberately, as the role write does on finding its roles already written, so a failed revoke
+    by A cannot leave stale-scope sessions live: A's new session is ended by that revoke.
+
+    A is whichever sign-in finishes reading first, not whichever task was created first: the two
+    reads race, and a role fixed by task order deadlocks when the second task reads first."""
+    service = await _directory_service(engine)
+    assert (await _unqueued_sign_in(service, _ops_principal())).ok  # stores ["IB_A"]
+    await engine.store.set_ad_group_scope_map([(_OPS, "IB_B")])
+    b_read = asyncio.Event()
+    leader: asyncio.Task[Any] | None = None
+    calls = 0
+    original = service._upsert_ad_user
+
+    async def upsert(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls, leader
+        result = await original(*args, **kwargs)
+        calls += 1
+        if leader is None:
+            leader = asyncio.current_task()
+            await asyncio.wait_for(b_read.wait(), timeout=60.0)  # A holds until B has read
+        else:
+            b_read.set()
+            # B resumes once A has minted, or failed: either way A is done.
+            await asyncio.wait({leader}, timeout=60.0)
+        return result
+
+    monkeypatch.setattr(service, "_upsert_ad_user", upsert)
+    tasks = [asyncio.create_task(_unqueued_sign_in(service, _ops_principal())) for _ in range(2)]
+    try:
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=120.0)
+    finally:
+        # A failing task must not leave the other one waiting past the test.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    assert calls == 2 and leader is not None, (
+        "the interleave did not run -- the test proves nothing"
+    )
+    first = leader.result()
+    second = next(task for task in tasks if task is not leader).result()
+    assert first.ok and second.ok
+    user = await engine.store.get_user_by_username("jdoe")
+    assert user is not None and json.loads(user.channel_scope) == ["IB_B"]
+    assert await service.identity_for_token(first.token, activity=False) is None, (
+        "the late sign-in found its target written and did not revoke"
+    )
+    assert await service.identity_for_token(second.token, activity=False) is not None
+    rows = await engine.store.list_audit(action="auth.ad_scope_resynced")
+    assert len(rows) == 2, "the first sign-in's grant and A's resync; B's write duplicated A's"
+
+
+async def test_a_grant_already_written_by_a_concurrent_sign_in_is_not_written_again(
+    tmp_path: Path,
+) -> None:
+    """The deterministic half of the race above, on the sync alone: the snapshot is read, another
+    writer stores this sign-in's target, and the late sync writes and audits nothing. It revokes,
+    as the role write does on finding its roles already written, so a session the other writer's
+    failed revoke left live on the old scope is ended (BACKLOG #6887)."""
+    store = await MessageStore.open(tmp_path / "svc6887a.db")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await store.set_ad_group_scope_map([("grp-a", "IB_A"), ("grp-b", "IB_B")])
+        await _ad_user(store, "ada")
+        stale = await service._sync_ad_channel_scope(
+            await store.get_user("ada"), frozenset(), ["grp-a"]
+        )
+        await service._sync_ad_channel_scope(stale, frozenset(), ["grp-b"])  # the other sign-in
+        await _session_for(store, "ada", "h-ada-6887-a")
+        action = "auth.ad_scope_resynced"
+        before = len(await store.list_audit(action=action))
+
+        out = await service._sync_ad_channel_scope(stale, frozenset(), ["grp-b"])  # late
+
+        assert json.loads(out.channel_scope) == ["IB_B"]
+        assert await store.list_sessions("ada") == [], "a found-at-target sync kept a session"
+        assert len(await store.list_audit(action=action)) == before
+    finally:
+        await store.close()
+
+
+async def test_a_miss_decides_again_from_this_sign_ins_own_groups(tmp_path: Path) -> None:
+    """On a miss the late sign-in does not take the other writer's scope: that writer may have read
+    older group memberships. It reads the row again, decides from its own groups, writes its own
+    grant, and revokes the sessions that carry the other writer's."""
+    store = await MessageStore.open(tmp_path / "svc6887b.db")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await store.set_ad_group_scope_map(
+            [("grp-a", "IB_A"), ("grp-b", "IB_B"), ("grp-c", "IB_C")]
+        )
+        await _ad_user(store, "ada")
+        stale = await service._sync_ad_channel_scope(
+            await store.get_user("ada"), frozenset(), ["grp-a"]
+        )
+        await service._sync_ad_channel_scope(stale, frozenset(), ["grp-c"])  # the other writer
+        await _session_for(store, "ada", "h-ada-6887-b")
+        assert await store.list_sessions("ada"), "no session to revoke -- test proves nothing"
+
+        out = await service._sync_ad_channel_scope(stale, frozenset(), ["grp-b"])
+
+        assert json.loads(out.channel_scope) == ["IB_B"], "the late sign-in adopted another scope"
+        assert out.channel_scope_source == SCOPE_SOURCE_AD
+        assert await store.list_sessions("ada") == [], "a session on the other scope survived"
+    finally:
+        await store.close()
+
+
+async def test_a_scope_write_that_misses_on_every_attempt_fails_the_sign_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past the bound the sync raises, so a write that keeps missing mints no session under a
+    scope another writer chose; a miss inside the bound decides again instead. Nothing is revoked
+    or audited."""
+    store = await MessageStore.open(tmp_path / "svc6887c.db")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await store.set_ad_group_scope_map([("grp-a", "IB_A")])
+        user = await _ad_user(store, "ada")
+        await _session_for(store, "ada", "h-ada-6887-c")
+        tries = 0
+
+        async def always_moved(*args: Any, **kwargs: Any) -> bool:
+            nonlocal tries
+            tries += 1
+            return False
+
+        monkeypatch.setattr(store, "set_ad_channel_scope_if_unchanged", always_moved)
+        with pytest.raises(_AdChannelScopeContended):
+            await service._sync_ad_channel_scope(user, frozenset(), ["grp-a"])
+
+        assert tries == _AD_SCOPE_WRITE_ATTEMPTS
+        assert await store.list_sessions("ada"), "a write that never happened revoked"
+        assert await store.list_audit(action="auth.ad_scope_resynced") == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("held", "reason"), [(False, ACCOUNT_DELETED), (True, ACCOUNT_REFUSED)], ids=["gone", "sealed"]
+)
+@pytest.mark.parametrize("on_try", [1, _AD_SCOPE_WRITE_ATTEMPTS])
+async def test_a_miss_whose_re_read_finds_no_row_refuses_the_sign_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, on_try: int, held: bool, reason: str
+) -> None:
+    """A miss whose settled re-read returns no user refuses the sign-in, with nothing written, on
+    the first attempt and the last. A row gone is ``account_deleted``, as the caller's pre-mint
+    read names it (BACKLOG #5624); a row failing its seal is ``account_refused``. It is not
+    returned for the caller to judge: the caller's own re-read could find the row readable again
+    and mint on a scope this sign-in neither wrote nor checked. Nor is it reported as contention."""
+    store = await MessageStore.open(tmp_path / f"svc6887d{on_try}{held}.db")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await store.set_ad_group_scope_map([("grp-a", "IB_A")])
+        user = await _ad_user(store, "ada")
+        await _session_for(store, "ada", f"h-ada-6887-d{on_try}")
+        tries = 0
+        real_lookup = service._lookup_user_settled
+
+        async def always_moved(*args: Any, **kwargs: Any) -> bool:
+            nonlocal tries
+            tries += 1
+            return False
+
+        async def gone_on_try(user_id: str) -> Any:
+            if tries >= on_try:
+                return SimpleNamespace(user=None, held=held)
+            return await real_lookup(user_id)
+
+        monkeypatch.setattr(store, "set_ad_channel_scope_if_unchanged", always_moved)
+        monkeypatch.setattr(service, "_lookup_user_settled", gone_on_try)
+
+        with pytest.raises(_AdChannelScopeRefused) as refused:
+            await service._sync_ad_channel_scope(user, frozenset(), ["grp-a"])
+
+        assert refused.value.reason == reason
+        assert tries == on_try  # positive control: the refusing attempt ran, and no later one
+        assert (await store.get_user("ada")).channel_scope is None  # nothing written
+        assert await store.list_sessions("ada"), "a refused sync revoked"
+        assert await store.list_audit(action="auth.ad_scope_resynced") == []
+    finally:
+        await store.close()
+
+
+async def test_a_miss_whose_re_read_finds_the_account_disabled_refuses_the_sign_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The re-read decides eligibility as the role write's does: an account disabled since the
+    sign-in's own gate is refused with ``disabled``, and its scope is not written."""
+    store = await MessageStore.open(tmp_path / "svc6887f.db")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await store.set_ad_group_scope_map([("grp-a", "IB_A")])
+        user = await _ad_user(store, "ada")
+        await _session_for(store, "ada", "h-ada-6887-f")
+        real_cas = store.set_ad_channel_scope_if_unchanged
+
+        async def disabled_first(*args: Any, **kwargs: Any) -> bool:
+            # An administrator sets a scope and disables the account between the sign-in's read
+            # and its write, so the write misses and the re-read finds the account disabled.
+            await store.set_user_channel_scope("ada", '["IB_X"]', source=SCOPE_SOURCE_MANUAL)
+            await store.set_user_disabled("ada", disabled=True)
+            return await real_cas(*args, **kwargs)
+
+        monkeypatch.setattr(store, "set_ad_channel_scope_if_unchanged", disabled_first)
+
+        with pytest.raises(_AdChannelScopeRefused) as refused:
+            await service._sync_ad_channel_scope(user, frozenset(), ["grp-a"])
+
+        assert refused.value.reason == "disabled"
+        got = await store.get_user("ada")
+        assert got.disabled  # positive control
+        assert got.channel_scope == '["IB_X"]', "the sync wrote over a refused row"
+        assert await store.list_audit(action="auth.ad_scope_resynced") == []
+    finally:
+        await store.close()
+
+
+async def test_a_last_miss_onto_this_sign_ins_own_scope_is_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The last attempt misses because another writer has just stored exactly this sign-in's
+    scope. The re-read is decided before the bound is checked, so the sync returns that row
+    rather than failing a sign-in whose scope is already right."""
+    store = await MessageStore.open(tmp_path / "svc6887e.db")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await store.set_ad_group_scope_map([("grp-a", "IB_A")])
+        user = await _ad_user(store, "ada")
+        tries = 0
+
+        async def lands_on_last(*args: Any, **kwargs: Any) -> bool:
+            nonlocal tries
+            tries += 1
+            if tries == _AD_SCOPE_WRITE_ATTEMPTS:  # the other writer stores this target
+                await store.set_user_channel_scope("ada", '["IB_A"]', source=SCOPE_SOURCE_AD)
+            return False
+
+        monkeypatch.setattr(store, "set_ad_channel_scope_if_unchanged", lands_on_last)
+
+        out = await service._sync_ad_channel_scope(user, frozenset(), ["grp-a"])
+
+        assert tries == _AD_SCOPE_WRITE_ATTEMPTS  # positive control: the last attempt ran
+        assert (out.channel_scope, out.channel_scope_source) == ('["IB_A"]', SCOPE_SOURCE_AD)
+    finally:
+        await store.close()
+
+
+async def test_the_ad_scope_write_compare_and_sets_on_scope_and_source(tmp_path: Path) -> None:
+    """``set_ad_channel_scope_if_unchanged`` writes only while the row holds both the expected
+    scope and the expected source (``None`` matching NULL), and marks what it writes ``ad``. Each
+    refusal is paired with the write that does go through."""
+    s = await MessageStore.open(tmp_path / "cas6887.db")
+    try:
+        await s.create_user(
+            user_id="u", username="u", auth_provider="ad", password_generated=False, audits=()
+        )
+        cas = s.set_ad_channel_scope_if_unchanged
+        assert await cas("u", '["IB_A"]', expected_scope="[]", expected_source=None) is False
+        assert await cas("u", '["IB_A"]', expected_scope=None, expected_source="ad") is False
+        assert await cas("u", '["IB_A"]', expected_scope=None, expected_source=None) is True
+        got = await s.get_user("u")
+        assert (got.channel_scope, got.channel_scope_source) == ('["IB_A"]', SCOPE_SOURCE_AD)
+        # The same value under another source is not the row the decision read.
+        await s.set_user_channel_scope("u", '["IB_A"]', source=SCOPE_SOURCE_MANUAL)
+        assert await cas("u", '["IB_B"]', expected_scope='["IB_A"]', expected_source="ad") is False
+        assert (await s.get_user("u")).channel_scope == '["IB_A"]'
+        assert (
+            await cas("u", '["IB_B"]', expected_scope='["IB_A"]', expected_source="manual") is True
+        )
+        got = await s.get_user("u")
+        assert (got.channel_scope, got.channel_scope_source) == ('["IB_B"]', SCOPE_SOURCE_AD)
+        assert await cas("nobody", "[]", expected_scope=None, expected_source=None) is False
+    finally:
+        await s.close()
+
+
+# --- BACKLOG #6887: an unwritten scope is an audited refusal of the sign-in ------------------
+
+_SCOPE_PAIR = ("https://idp.example/tenant", "S-1-scope-sync-6887")
+_SCOPE_LEGS = ("kerberos", "oidc")
+
+
+async def _scope_sign_in(service: AuthService, leg: str) -> LoginOutcome:
+    """The completion both directory legs call; the OIDC leg presents the bound pair."""
+    if leg == "kerberos":
+        return await service._complete_ad_login(_ops_principal(), None, mfa_verified=True)
+    return await service._complete_ad_login(
+        _ops_principal(),
+        None,
+        mfa_verified=True,
+        mech="oidc",
+        session_mechanism=SessionMechanism.OIDC,
+        federated_subject=_SCOPE_PAIR,
+        idp_auth_time=time.time(),
+    )
+
+
+async def _scope_signed_in(store: MessageStore, leg: str) -> tuple[AuthService, str, str]:
+    """jdoe signed in once on ``leg`` with scope ``IB_A``, bound to :data:`_SCOPE_PAIR` on the
+    OIDC leg; the scope map then moves to ``IB_B``, so the next sign-in writes the scope. Returns
+    the service, the account id and that first sign-in's live token."""
+    service = AuthService(
+        store,
+        AuthSettings(
+            ad_enabled=True,
+            ad_server="ldaps://x",
+            ad_user_search_base="DC=x",
+            ad_bind_dn="CN=svc,DC=x",
+            ad_bind_password="x",
+        ),
+    )
+    await service.initialize()
+    await store.set_ad_group_role_map([(_OPS, Role.OPERATOR.value)])
+    await store.set_ad_group_scope_map([(_OPS, "IB_A")])
+    first = await _scope_sign_in(service, "kerberos")
+    user = await store.get_user_by_username("jdoe")
+    assert user is not None
+    if leg == "oidc":
+        assert await store.set_user_federated_subject(user.id, *_SCOPE_PAIR) is not None
+        first = await _scope_sign_in(service, leg)
+    assert first.ok and first.token is not None
+    await store.set_ad_group_scope_map([(_OPS, "IB_B")])
+    return service, user.id, first.token
+
+
+async def _refusal_rows(store: MessageStore, reason: str) -> list[dict[str, Any]]:
+    rows = [json.loads(r["detail"] or "{}") for r in await store.list_audit()]
+    return [r for r in rows if r.get("reason") == reason]
+
+
+@pytest.mark.parametrize("leg", _SCOPE_LEGS)
+async def test_an_account_deleted_before_the_scope_write_is_an_audited_account_deleted_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, leg: str
+) -> None:
+    """The account is deleted between the sign-in's read and its scope write. The write misses,
+    the re-read finds no row, and the sign-in is refused as ``account_deleted`` with its audit row
+    (BACKLOG #5624), as the pre-mint read refused it before the compare-and-set. No session is
+    minted. Before this was rendered at the call site the refusal raised out of the sign-in."""
+    store = await MessageStore.open(tmp_path / f"del6887{leg}.db")
+    try:
+        service, user_id, _ = await _scope_signed_in(store, leg)
+        real_cas = store.set_ad_channel_scope_if_unchanged
+
+        async def deleted_first(*args: Any, **kwargs: Any) -> bool:
+            await store.delete_user(user_id)
+            return await real_cas(*args, **kwargs)
+
+        monkeypatch.setattr(store, "set_ad_channel_scope_if_unchanged", deleted_first)
+
+        out = await _scope_sign_in(service, leg)
+
+        assert not out.ok and out.token is None
+        assert out.reason == ACCOUNT_DELETED
+        assert await store.get_user(user_id) is None  # positive control: the delete ran
+        assert await store.list_sessions(user_id) == [], "a refused sign-in minted a session"
+        assert len(await _refusal_rows(store, ACCOUNT_DELETED)) == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("leg", _SCOPE_LEGS)
+async def test_a_scope_write_contended_past_the_bound_is_an_audited_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, leg: str
+) -> None:
+    """Every compare-and-set misses. The sign-in is refused as ``scope_sync_contended``, answered
+    as a temporary failure like the session insert's contention, with one audit row naming it. No
+    session is minted, and the first sign-in's session stands: nothing was written to revoke for."""
+    store = await MessageStore.open(tmp_path / f"cont6887{leg}.db")
+    try:
+        service, user_id, first = await _scope_signed_in(store, leg)
+        tries = 0
+
+        async def always_moved(*args: Any, **kwargs: Any) -> bool:
+            nonlocal tries
+            tries += 1
+            return False
+
+        monkeypatch.setattr(store, "set_ad_channel_scope_if_unchanged", always_moved)
+
+        out = await _scope_sign_in(service, leg)
+
+        assert tries == _AD_SCOPE_WRITE_ATTEMPTS  # positive control: the bound was reached
+        assert not out.ok and out.token is None
+        assert out.reason == SCOPE_SYNC_CONTENDED
+        assert out.error == _SIGN_IN_UNAVAILABLE
+        rows = await _refusal_rows(store, SCOPE_SYNC_CONTENDED)
+        assert len(rows) == 1 and rows[0].get("provider") == "ad"
+        if leg == "oidc":
+            assert rows[0].get("mech") == "oidc"
+        assert len(await store.list_sessions(user_id)) == 1, "a refused sign-in minted a session"
+        assert await service.identity_for_token(first) is not None, "a refusal ended a session"
     finally:
         await store.close()

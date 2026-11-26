@@ -182,7 +182,7 @@ nothing prompts.
 
 | Route | Reaches | Refuses, before it removes anything |
 |---|---|---|
-| `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Without `-Force`: uncommitted tracked changes (which `-Discard` parks instead), files flagged skip-worktree or assume-unchanged, and the git repositories inside the tree listed in the next section. Unless `-AllowOrphanedAllocations`: an unlanded ledger number. Whatever `-Force` says: a detached HEAD no ref holds, a commit only the tree's HEAD reflog or its own per-worktree refs hold (on `-Name` without `-DeleteBranch`, one the kept branch's reflog holds does not count), `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` set, `GIT_CONFIG` or a `GIT_CONFIG_<anything>` variable set, a caller standing in the tree or running a copy of the script that lives in it (a junction or 8.3 alias included), a held claim, git or working-tree activity in six hours, uncommitted work written in six hours at any depth, and a nested worktree. |
+| `-Name <dir>` | The registered `<repo>-<dir>` sibling of the primary checkout, run from the primary's copy; another checkout's sibling with `-RepoRoot <that checkout>`. A linked worktree's copy refuses `-Name` without `-RepoRoot` (BACKLOG #1894) | Without `-Force`: uncommitted tracked changes and untracked files no exclude rule covers (which `-Discard` parks instead), files flagged skip-worktree or assume-unchanged, and the git repositories inside the tree listed in the next section. Unless `-AllowOrphanedAllocations`: an unlanded ledger number. Whatever `-Force` says: a detached HEAD no ref holds, a commit only the tree's HEAD reflog or its own per-worktree refs hold (on `-Name` without `-DeleteBranch`, one the kept branch's reflog holds does not count), `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` set, `GIT_CONFIG` or a `GIT_CONFIG_<anything>` variable set, a caller standing in the tree or running a copy of the script that lives in it (a junction or 8.3 alias included), a held claim, git or working-tree activity in six hours, uncommitted work written in six hours at any depth, and a nested worktree. |
 | `-Path <path>` | Any registered linked worktree that is not under `.claude/worktrees` (one above the primary does not count; see below) | Everything `-Name` refuses, and the list in the next section. |
 | `-List` | Nothing. It is read-only. | It prints each worktree, its class, and which route reaches it. |
 
@@ -325,10 +325,11 @@ that lies *above* the primary checkout does not count, so a clone made inside an
 harness folder still reaches its own trees (vault BACKLOG #2985, item 3); the worktree gate's own
 classifier still counts that segment, so its deny text offers no `-Path` line for them.
 
-One layout overlaps. `new.ps1` run from a linked worktree makes its sibling **beside that
-worktree**, and for a harness-made worktree that is also under `.claude/worktrees`. `-Path`
-refuses it like the rest. The copy of `remove.ps1` in that linked worktree still removes it by
-`-Name`.
+One layout overlaps. Before BACKLOG #1894, `new.ps1` run from a linked worktree made its sibling
+**beside that worktree**, and for a harness-made worktree that is also under `.claude/worktrees`.
+`-Path` refuses it like the rest. `remove.ps1 -RepoRoot <that worktree> -Name <n>` still removes
+it. A linked worktree's copy run with `-Name` and no `-RepoRoot` refuses, whatever stands beside
+it, and names both candidates, so it never reaches the primary's sibling instead.
 
 **The session registry does not see where a session works, so other signals are read.** The
 registry records a launch directory. A subagent Builder is recorded under its parent's directory,
@@ -350,35 +351,38 @@ proof that a tree is free:
 - The six hours are a judgement. A test run still in progress has not yet written its cache, so it
   can outlast them.
 - A tree that passes all four still goes through the route's own content rules above. On `-Name`,
-  older untracked files and ignored files go with it.
+  ignored files go with it.
 
 **The occupancy check is on `-Path` only.** `-Name` has none. Neither route runs a blanket
 `git worktree prune`: `git worktree remove` already drops the target's own registration, and a
 prune also drops other worktrees' registrations whose directories are missing for the moment, with
 their HEAD reflogs. `-Name` ran one until BACKLOG #5648.
 
-### `-Name` removes the sibling this copy made
+### `-Name` removes the sibling of the primary
 
-**Which copy you run decides which checkout `-Name` searches.** `remove.ps1` anchors on its own location,
-not on your cwd, so run the copy that lives in the checkout the worktree was created **from** — which
-is not necessarily the primary, because `new.ps1` anchors the same way and creates its worktree
-beside *itself*. Invoked by absolute path it works from any cwd outside the worktree being removed
-(git can't remove the worktree you're standing in). This page used to say "run from the main
-checkout"; that was false for every worktree created from a linked one, and `new.ps1` now prints the
-exact command with the root already filled in. (BACKLOG #1078.)
+**Run the primary's copy.** `remove.ps1 -Name <n>` reaches `<repo-parent>\<repo-name>-<n>`, where the
+repo is the clone's **primary** checkout, the first entry of `git worktree list`, from any cwd outside
+the worktree being removed (git can't remove the worktree you're standing in). Any other copy, such
+as one in a linked worktree, one below a checkout's top, or one reached through a junction, subst
+or 8.3 alias, refuses `-Name` unless `-RepoRoot` names the checkout, because re-anchored it would
+reach a tree its own older run never could. `new.ps1` creates its sibling
+beside the primary from every copy. Until BACKLOG #1894 both
+anchored on the copy's own checkout, so a copy in a linked worktree made and searched
+`<that worktree>-<n>`; `-RepoRoot <that worktree> -Name <n>` still reaches a tree made that way.
+`new.ps1` prints the exact command with the root filled in. (BACKLOG #1078.)
 
 ```powershell
-scripts\worktree\remove.ps1 -Name alerts            # refuses if there are uncommitted tracked changes
+scripts\worktree\remove.ps1 -Name alerts            # refuses on uncommitted tracked changes or untracked files
 scripts\worktree\remove.ps1 -Name alerts -DeleteBranch
-scripts\worktree\remove.ps1 -Name alerts -Force     # discard uncommitted tracked changes older than six hours too
-pwsh -NoProfile -File <that-checkout>\scripts\worktree\remove.ps1 -Name alerts   # from any cwd
+scripts\worktree\remove.ps1 -Name alerts -Force     # discard those too, once older than six hours
+pwsh -NoProfile -File <primary>\scripts\worktree\remove.ps1 -Name alerts   # from any cwd
 ```
 
-The untracked `.venv` / `node_modules` are expected and removed automatically. Without `-Force`,
-uncommitted **tracked** changes, a file flagged skip-worktree or assume-unchanged, and a git
+The gitignored `.venv` / `node_modules` are expected and removed automatically. Without `-Force`,
+uncommitted **tracked** changes, untracked files no exclude rule covers (BACKLOG #2554), a file flagged skip-worktree or assume-unchanged, and a git
 repository inside the tree block removal. With `-Force` the run names the flagged files it lets
 go. `-Discard`
-parks the tracked changes instead, as described above. Uncommitted work
+parks the tracked changes and untracked files instead, as described above. Uncommitted work
 written in the last six hours blocks it whatever `-Force` says, as do the other in-use refusals in
 the table above.
 
@@ -393,7 +397,8 @@ destructive script in this directory can be **execution-tested**
 ([`tests/test_worktree_remove.py`](../tests/test_worktree_remove.py) drives `-Name` against a synthetic
 repo, and [`tests/test_worktree_remove_path.py`](../tests/test_worktree_remove_path.py) drives `-Path`
 and `-List`); without it the only repository a test could reach was this one, so the branch-delete
-path was covered by review alone. (BACKLOG #1037.)
+path was covered by review alone. (BACKLOG #1037.) With `-Name` it must be the checkout's own top
+as git resolves it: a subdirectory, or a junction spelling of the top, is refused (BACKLOG #1894).
 
 ## "Will be permanently discarded" is an INDEX test, not a LOSS test — `recoverable.ps1`
 
@@ -541,7 +546,10 @@ description blames.
 
 **Liveness may only ever VETO, never PERMIT.** There is no heartbeat anywhere on this host, so nothing
 can *prove* a session is gone — a `DEAD`/`STALE`/absent verdict is the absence of a veto, not a
-permission. And **if the fence cannot look at all, nothing is pruned**: an empty roster and an
+permission. A `DEAD` or `STALE` record inside a candidate still keeps that candidate, for another
+reason: removing the tree would leave a record the fence cannot place, and every later run would
+refuse. The script leaves both the record and the tree, and `-Name` does not lift this.
+And **if the fence cannot look at all, nothing is pruned**: an empty roster and an
 unreadable one produce the same empty answer, so availability is asserted explicitly — at least one
 config root with a registry, at least one readable record, **and no record that cannot be placed**.
 That last one matters more than it sounds. Three shapes qualify — a file that will not parse, a
@@ -609,11 +617,15 @@ it is no longer in `git worktree list`, so it drops out of the candidate set and
 print a green all-clear over a directory this script had broken. Orphans are now recorded in
 `<git-common-dir>/prune-merged-orphans.json` and re-reported with the recipe on every later run until
 the directory is gone or re-registered — as is any unregistered `<repo>-*` directory whose `.git`
-pointer still names this repo.
+pointer still names this repo. An entry whose directory is gone stays in the ledger while a
+coordination claim still names that tree: the run names the claim's key, file and host, releases
+none, and points at `claim.ps1 -List` to see whether the claim can be released.
 
 Exit codes, **highest severity wins**: `0` nothing wrong; `1` something was attempted and failed
-without destroying anything; `2` **refused** — something you asked for was not attempted, because
-safety could not be established; `3` **orphaned** — a directory is broken on disk right now. `3`
+without destroying anything, or git exited `0` on a tree it still lists whose end state could not be
+read; `2` **refused** — something you asked for was not attempted, because safety could not be
+established; `3` **orphaned** — a directory is broken on disk right now, or git exited non-zero on a
+tree it still lists whose end state could not be read. `3`
 outranks `2` because damage on disk outranks a refusal to act. In the JSON receipt `counts.orphaned`
 is a *subset* of `counts.failed` (`failedNonOrphan` is spelled out alongside it); `removed + failed +
 skipped` covers every candidate exactly once.
@@ -1988,6 +2000,16 @@ blocked.
 > is the thing that was missing when ten sessions were stranded and the rule was first designed. Ship the
 > cure, then decide whether you still want the prohibition.
 
+**The gate's write rule (rule 1) keys on the write's resolved target path, not on where the session
+sits.** A relative path is resolved against the session's cwd first, so for a relative path the cwd
+does decide the verdict; give the absolute path into your worktree. Not every rule is path-keyed: rule 2 keys on the cwd.
+In the 30-day window measured above, **29% of the writes made by those same 166 primary-seated
+sessions landed inside a sibling worktree by absolute path** — already correct. A cwd-keyed write rule
+would have denied every one of them. So for writes, a session may stay where it is and write into its
+worktree by absolute path, with no need to `cd`, relocate, or restart. A fan-out is different: rule 2
+denies a dispatch made while the session's cwd is the primary. Whether the session must then be
+started in a worktree depends on rule 3, as the blockquote above says.
+
 ### Recovering a relocated session — `sessions.ps1`
 
 If a session was relocated into a worktree before rule 3 existed (or by a plain terminal, which the gate
@@ -2008,10 +2030,14 @@ pwsh -NoProfile -File scripts\worktree\sessions.ps1 -Rehome <prefix>          # 
 it never moves anything — and `-Rehome` refuses on a session that still looks live (written within
 `-MinIdleMinutes`, default 10; override with `-Force`) and honours `-WhatIf` for a no-op preview.
 
-**It keys on the write's target path, never on the session's cwd.** In that same 30-day window, **29% of
-the writes made by those same 166 primary-seated sessions landed inside a sibling worktree by absolute
-path** — already correct. A cwd-keyed gate would have denied every one of them. So a session may stay
-where it is and simply write into its worktree; there is no need to `cd`, relocate, or restart.
+It also refuses at least these cases (BACKLOG #7622, #7623). A session registry file that does not
+parse and was written in the last 24h, has vanished, or carries a future stamp: it may be this session's
+own record mid-write. `-Force` overrides this one. A file at the destination that is not a title stub,
+meaning not only `custom-title`/`ai-title` records: it may be a real transcript, and `-Force` does not
+override it. Where a title stub is at the destination, an existing `<id>.jsonl.stub.bak`, which is
+never overwritten; with no stub there, a stale backup does not refuse. If a sidecar dir already
+exists at the destination, the transcript still moves, the source sidecar stays where it is, and a
+warning names it.
 
 Already dirty in the primary when the gate stops you? Don't redo the work — move it:
 

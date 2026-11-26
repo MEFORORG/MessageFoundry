@@ -60,6 +60,60 @@ COLLAPSE_INCONCLUSIVE = "INCONCLUSIVE"  # per_lane idle-poll below the noise flo
 COLLAPSE_MISSING = "MISSING"  # no pooled arm to compare
 
 
+def _sandbox_arm(r: ConnScaleRecord) -> str:
+    """The arm one record asked for, and, where it differs, the arm its env parses as.
+
+    Both come from the record's :class:`SandboxReading`: the mode the profile asked for, and the
+    mode the engine's settings parser reads from the env the harness gave the step. Neither is
+    reported by the running engine. A record with no reading, a batch-box record at least, reads as
+    ``not recorded``: its arm was never read, so no arm is named for it.
+    """
+    sb = r.sandbox
+    if sb is None:
+        return "not recorded"
+    if sb.effective == sb.requested:
+        return r.sandbox_mode
+    if sb.effective is None:
+        return f"{sb.requested} (its env did not parse)"
+    return f"{sb.requested} (its env parses as {sb.effective})"
+
+
+def _sandbox_arms(records: Iterable[ConnScaleRecord]) -> tuple[str, ...]:
+    """The ``[sandbox]`` arms ``records`` name, sorted (BACKLOG #5090), as :func:`_sandbox_arm`
+    reads them: from the harness-parsed env, not from what the engine reports.
+
+    No comparison here keys a cell on the sandbox arm: ``profile._validate`` refuses a sandbox A/B
+    beside any other A/B, so one run's records carry one arm. Records from two arms would pool into
+    one cell, so a comparison handed them fails rather than grade the mixture, and every comparison
+    names the arm its records name, which its table did not. A record whose env parses as another
+    arm than it asked for counts as its own arm, so the mixed-arm FAIL catches records whose
+    env-parsed arms differ from one another; a run whose every record parses as the same other arm
+    is named in the label but not failed. It does not detect an engine that ran another mode than
+    its env names;
+    the ``sandbox_workers`` SLO's process walk is the runtime evidence, and only for a subprocess arm.
+    """
+    return tuple(sorted({_sandbox_arm(r) for r in records}))
+
+
+def _sandbox_line(arms: tuple[str, ...]) -> str:
+    """The table line naming the sandbox arm, or saying the arms were mixed and the A/B fails."""
+    if len(arms) > 1:
+        return (
+            f"SANDBOX ARMS MIXED ({', '.join(arms)}) -> the A/B FAILS: each cell pools records "
+            "from more than one [sandbox] arm"
+        )
+    return f"sandbox: {arms[0] if arms else 'no records'}"
+
+
+def _sandbox_note(arms: tuple[str, ...]) -> list[str]:
+    if len(arms) < 2:
+        return []
+    return [
+        f"the records span {len(arms)} [sandbox] arms ({', '.join(arms)}); no cell is keyed on "
+        "the arm, so each would pool them -- the A/B fails rather than grade the mixture."
+    ]
+
+
 @dataclass(frozen=True)
 class _ArmMetrics:
     """One arm's read-off for a ``(sweep_mode, count)`` cell (all from the tagged record)."""
@@ -222,11 +276,20 @@ class ClaimModeComparison:
     # ``(sweep_mode, count)`` cells the CANDIDATE produced that the baseline never did (BACKLOG #5429).
     # They have no row to fail, so the verdict fails on them directly rather than skipping them.
     orphan_candidate_cells: list[tuple[str, int]] = field(default_factory=list)
+    # The [sandbox] arms the records name (:func:`_sandbox_arms`); more than one fails the A/B.
+    sandbox_arms: tuple[str, ...] = ()
+
+    @property
+    def sandbox_arms_mixed(self) -> bool:
+        return len(self.sandbox_arms) > 1
 
     @property
     def ok(self) -> bool:
         return (
-            all(row.ok for row in self.rows) and bool(self.rows) and not self.orphan_candidate_cells
+            all(row.ok for row in self.rows)
+            and bool(self.rows)
+            and not self.orphan_candidate_cells
+            and not self.sandbox_arms_mixed
         )
 
     @property
@@ -292,6 +355,7 @@ class ClaimModeComparison:
             "baseline": self.baseline_mode,
             "candidate": self.candidate_mode,
             "rate_window": self.rate_window,
+            "sandbox_arms": list(self.sandbox_arms),
             "guards": {
                 "throughput_tolerance": self.throughput_tolerance,
                 "collapse_material_ratio": self.collapse_material_ratio,
@@ -326,6 +390,7 @@ class ClaimModeComparison:
             f"(pooled <= per_lane * {self.collapse_material_ratio:.2f} where per_lane > "
             f"{self.idle_floor_per_s:.1f}/s)"
         )
+        lines.append(_sandbox_line(self.sandbox_arms))
         overall = "PASS" if self.ok else "FAIL"
         lines.append(
             f"overall: {overall}  (candidate_zero_loss_ok={self.candidate_zero_loss_ok}, "
@@ -505,6 +570,8 @@ def build_comparison(
             f"{len(orphans)} pooled cell(s) with NO per_lane baseline to compare against: "
             f"{', '.join(f'[{sm}] N={n}' for sm, n in orphans)} -- the A/B fails rather than skip them."
         )
+    sandbox_arms = _sandbox_arms(records)
+    notes.extend(_sandbox_note(sandbox_arms))
     return ClaimModeComparison(
         baseline_mode=baseline_mode,
         candidate_mode=candidate_mode,
@@ -515,6 +582,7 @@ def build_comparison(
         notes=notes,
         rate_window=records_rate_window(records),
         orphan_candidate_cells=orphans,
+        sandbox_arms=sandbox_arms,
     )
 
 
@@ -927,9 +995,10 @@ class FuseModeComparison:
     in_pipeline_tolerance: float
     rows: list[FuseComparisonRow] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
-    # Axis labelling (defaulted to the fusion axis so a pre-existing fuse run's JSON/table is byte-
-    # identical). The statement-batching A/B (ADR 0075) reuses this SAME class + verdict path via
-    # build_batch_comparison(), only overriding these labels — there is no second comparator.
+    # Axis labelling (defaulted to the fusion axis so a pre-existing fuse run's labels are
+    # unchanged; BACKLOG #5090 added a sandbox line and key). The statement-batching A/B (ADR 0075)
+    # reuses this SAME class + verdict path via build_batch_comparison(), only overriding these
+    # labels — there is no second comparator.
     axis_kind: str = FUSE_AXIS_KIND
     title: str = FUSE_TITLE
     guards_ref: str = FUSE_GUARDS_REF
@@ -946,16 +1015,23 @@ class FuseModeComparison:
     # have no row and no baseline gap, so without this a GO on the other counts would mask them
     # (BACKLOG #5430).
     unrun_cells: list[tuple[str, str, int]] = field(default_factory=list)
+    # The [sandbox] arms the records name (:func:`_sandbox_arms`); more than one is a NO-GO.
+    sandbox_arms: tuple[str, ...] = ()
+
+    @property
+    def sandbox_arms_mixed(self) -> bool:
+        return len(self.sandbox_arms) > 1
 
     @property
     def overall_verdict(self) -> str:
-        """GO only if EVERY present cell is GO and no cell went unrun; NO-GO if any cell is NO-GO, a
-        B0 baseline or B1 arm is missing, or a cell has no record in either arm; otherwise
-        INCONCLUSIVE (some cell could not clear the noise bar, none failed outright)."""
+        """GO only if EVERY present cell is GO and no cell went unrun; NO-GO at least if any cell is
+        NO-GO, a B0 baseline or B1 arm is missing, a cell has no record in either arm, or the records
+        span more than one sandbox arm; otherwise INCONCLUSIVE (some cell could not clear the noise
+        bar, none failed outright)."""
         verdicts = [row.verdict for row in self.rows]
         # A swallowed B0 baseline or an unrun cell is a run gap, never a GO. Checked before the
         # empty-rows branch, because every cell unrun is not INCONCLUSIVE.
-        if self.baseline_missing or self.unrun_cells:
+        if self.baseline_missing or self.unrun_cells or self.sandbox_arms_mixed:
             return FUSE_NO_GO
         if not verdicts:
             return FUSE_INCONCLUSIVE
@@ -968,14 +1044,15 @@ class FuseModeComparison:
     @property
     def ok(self) -> bool:
         """The correctness fold for the run's exit code: every present B1 arm held zero-loss, none
-        is missing, and no cell went unrun in both arms. The GO/NO-GO throughput decision is
-        reported separately and does NOT fail the run (a null/negative fusion result banks nothing
-        but is not an error, ADR 0071 §6.4b)."""
+        is missing, no cell went unrun in both arms, and the records name one sandbox arm.
+        The GO/NO-GO throughput decision is reported separately and does NOT fail the run (a
+        null/negative fusion result banks nothing but is not an error, ADR 0071 §6.4b)."""
         return (
             bool(self.rows)
             and all(row.ok for row in self.rows)
             and not self.baseline_missing
             and not self.unrun_cells
+            and not self.sandbox_arms_mixed
         )
 
     @property
@@ -1004,6 +1081,7 @@ class FuseModeComparison:
             "baseline": self.baseline_label,
             "candidate": self.candidate_label,
             "rate_window": self.rate_window,
+            "sandbox_arms": list(self.sandbox_arms),
             "guards": {
                 "min_lift_pct": self.min_lift_pct,
                 "sigma_multiple": self.sigma_multiple,
@@ -1038,6 +1116,7 @@ class FuseModeComparison:
             f"sigma | in_pipeline flat-or-lower | delivered/offered >= {self.min_delivered_offered:.2f}"
             f" | zero-loss held  (SQL Server is the valid leg; SQLite is NOT a throughput proxy)"
         )
+        lines.append(_sandbox_line(self.sandbox_arms))
         lines.append(
             f"overall: {self.overall_verdict}  (GO={self.go_cells}, NO-GO={self.no_go_cells}, "
             f"INCONCLUSIVE={self.inconclusive_cells}, missing={self.missing_arms}, "
@@ -1242,6 +1321,8 @@ def build_fuse_comparison(
             + " -- both arms failed to start there, so nothing was compared. This FAILS the run "
             "(overall NO-GO) so a GO on other counts can never mask it."
         )
+    sandbox_arms = _sandbox_arms(records)
+    notes.extend(_sandbox_note(sandbox_arms))
     return FuseModeComparison(
         min_lift_pct=min_lift_pct,
         sigma_multiple=sigma_multiple,
@@ -1257,6 +1338,7 @@ def build_fuse_comparison(
         baseline_label=baseline_label,
         candidate_label=candidate_label,
         rate_window=records_rate_window(records),
+        sandbox_arms=sandbox_arms,
     )
 
 

@@ -9,10 +9,12 @@ Two entry points, and both fail closed (vault BACKLOG #2601):
   that could not be created that way is never left behind, and there is no fallback to writing the
   file first and tightening it afterwards.
 * :func:`broad_access_problem` answers, before a key file is used, whether a known broad group or
-  an application package can read it or change it, whether it is a link, whether a link above it
-  is one another account can change, and whether the directory holding it lets another account
-  replace it. On POSIX it also asks whether another account owns the file, and on Windows whether
-  a broad group does.
+  an application package (Windows), or a group or other mode bit (POSIX), lets an account read it
+  or change it, whether it is a link, whether a link above it is one an account the check does
+  not trust can change, and whether the directory holding it lets
+  such a group or package (Windows) or a group or other account (POSIX) replace it. On POSIX it
+  also asks whether an account other than the engine's own or root owns the file, and on Windows
+  whether a broad group does. Its own docstring is the record of the rest.
 
 :func:`key_file_handle_problem` is the stricter Windows read check the key custody reads use: the
 owner and the exact list, read through the open handle.
@@ -54,7 +56,7 @@ import stat
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -568,6 +570,25 @@ def _windows_access_problem(
     return None
 
 
+def _holder_read_problem(holder: WinSecurity) -> str | None:
+    """Why the access list of the directory that holds a key file could not be judged, with the fix
+    that fits, or ``None`` when it was read. A list that was read but is malformed needs replacing;
+    granting the right to read it would change nothing. Kept free of ctypes so every platform tests
+    it."""
+    if holder.error is None:
+        return None
+    if holder.damaged:
+        return (
+            f"the access list of the directory that holds it is malformed ({holder.error}); "
+            "replace that folder's access list with one that grants only the engine's account, "
+            "SYSTEM and Administrators"
+        )
+    return (
+        f"the permissions of the directory that holds it could not be read ({holder.error}); "
+        "give the account the engine runs as the right to read that folder's permissions"
+    )
+
+
 def _windows_holder_problem(security: WinSecurity) -> str | None:
     """Why the directory this owner and access list belong to lets a broad group or an application
     package replace a key file in it (:data:`_HOLDER_REPLACE_MASK`), or ``None`` (vault BACKLOG
@@ -654,8 +675,8 @@ def _link_finding_problem(finding: ChainFinding) -> str:
     if not finding.insecure:
         return f"{subject} could not be judged: {finding.reason}"
     return (
-        f"{subject} can be changed by an account other than the engine's own and the host's "
-        f"administrators, so where the file is depends on it: {finding.reason}"
+        f"{subject} can be changed by an account this check does not trust, so where the file is "
+        f"depends on it: {finding.reason}"
     )
 
 
@@ -664,13 +685,14 @@ def _windows_link_problem(
     read_security: Callable[[str, str], WinSecurity],
     trust: WinTrust,
 ) -> str | None:
-    """Why a junction or link in a walked ``chain`` lets another account move the key file, or
-    ``None`` (vault BACKLOG #5657). A link is judged by who can change it: its own owner and access
+    """Why a junction or link in a walked ``chain`` lets an account this check does not trust move
+    the key file, or ``None`` (vault BACKLOG #5657). A link is judged by who can change it: its own owner and access
     list, and every folder above it up to the volume root, any of which could delete, rename or
     re-point what lies below, each by the trust-anchor rule
     (:func:`~messagefoundry.auth.anchor_path.evaluate_windows_object`, whose ``WinTrust`` trusts at
-    least SYSTEM, Administrators, TrustedInstaller, the local Administrators group's direct members
-    and the engine's own account). So a junction only those can change passes, such as
+    least SYSTEM, Administrators, TrustedInstaller and the local Administrators group's direct
+    members, and the engine's own account unless it is LOCAL SERVICE or NETWORK SERVICE). So a
+    junction only those can change passes, such as
     ``C:\\Users\\All Users`` or a folder an administrator mounted a volume on. A finding that could
     not be settled is refused too. A volume root cannot be renamed, so ``DELETE`` on one is not
     counted. Kept free of ctypes so the decision is testable everywhere."""
@@ -690,10 +712,9 @@ def _windows_link_problem(
         for target, as_kind in targets:
             security = read_security(target, as_kind)
             if ntpath.dirname(target) == target and security.aces is not None:
-                security = WinSecurity(
-                    security.owner,
-                    tuple((t, f, m & ~DELETE_ACCESS, s) for t, f, m, s in security.aces),
-                    security.error,
+                security = replace(
+                    security,
+                    aces=tuple((t, f, m & ~DELETE_ACCESS, s) for t, f, m, s in security.aces),
                 )
             findings = evaluate_windows_object(target, as_kind, security, trust)
             if findings:
@@ -790,10 +811,11 @@ def _route_source(addr: Any) -> Any:
 
 
 def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
-    """Why the folders on ``path`` let another account move or replace it, or ``None``: at least a
-    walk that did not finish (:func:`_windows_cause_problem`), a share that may be this host itself
-    (:func:`_loopback_share_problem`), a junction or link above it that another account can change
-    (:func:`_windows_link_problem`), then the directory that holds it
+    """Why the folders on ``path`` let an account this check does not trust move or replace it, or
+    ``None``: at least a walk that did not finish (:func:`_windows_cause_problem`), a share that
+    may be this host itself (:func:`_loopback_share_problem`), a junction or link above it that an
+    account this check does not trust can change (:func:`_windows_link_problem`), then the
+    directory that holds it
     (:func:`_windows_holder_problem`). Windows only.
 
     The folder holding ``path`` is walked, or ``path`` itself when it is a drive root, so a
@@ -934,11 +956,8 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     except OSError as exc:  # a reader that could not be run
         reason = exc.strerror or type(exc).__name__
         return f"the folders on its path could not be judged ({reason})"
-    if holder.error is not None:
-        return (
-            f"the permissions of the directory that holds it could not be read ({holder.error}); "
-            "give the account the engine runs as the right to read that folder's permissions"
-        )
+    if (unread := _holder_read_problem(holder)) is not None:
+        return unread
     problem = _windows_holder_problem(holder)
     return None if problem is None else f"the directory that holds it is not restricted: {problem}"
 
@@ -1317,8 +1336,8 @@ def broad_access_problem(
     or that a group or other may write with no sticky bit.
 
     On both, the folders above ``path`` are walked too (vault BACKLOG #5656, #5657). A junction or
-    link among them is refused when an account other than the engine's own and the host's
-    administrators can change it: on Windows by its own access list or that of any folder above it
+    link among them is refused when an account the check does not trust can change it: on
+    Windows by its own access list or that of any folder above it
     (:func:`_windows_link_problem`), on POSIX by the owner or mode of the folder that holds it or of
     any folder above it (:func:`_posix_link_problem`). Those folders are judged that way only
     where a link is (:func:`_windows_surroundings_problem`). On Windows a directory holding

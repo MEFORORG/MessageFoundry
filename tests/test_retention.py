@@ -8,12 +8,15 @@ for determinism."""
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import json
 import logging
 import os
 import sqlite3
+import stat
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -23,6 +26,14 @@ from messagefoundry.config.settings import (
     RetentionSettings,
     StoreBackend,
     StoreSettings,
+)
+from messagefoundry.config.wiring import (
+    MLLP,
+    File,
+    Registry,
+    build_inbound_connection,
+    build_outbound_connection,
+    load_config,
 )
 from messagefoundry.pipeline import retention as retention_mod
 from messagefoundry.pipeline.alerts import LoggingAlertSink
@@ -830,6 +841,69 @@ async def test_a_purge_pass_with_no_truncate_records_null_not_false(store: Messa
     assert [json.loads(r["detail"])["wal_left_untruncated"] for r in audit] == [None]
 
 
+async def test_wal_cadence_survives_a_backward_wall_clock_step(store: MessageStore) -> None:
+    """BACKLOG #6526: the wall clock steps back a day after the first truncate, then both clocks
+    run forward a full cadence, and the third pass still truncates. Only the step makes the wall
+    clock read the cadence as unelapsed, so this fails on a wall-clock cadence for that reason
+    alone. The control is the second pass, one second short of the cadence, which does not."""
+    wall = {"t": 30 * DAY}
+    mono = {"t": 500.0}
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(wal_checkpoint_seconds=3600),
+        clock=lambda: wall["t"],
+        monotonic=lambda: mono["t"],
+    )
+    assert (await runner.run_once()).wal_checkpointed is True  # never run yet, so due at once
+    wall["t"] -= DAY
+    wall["t"] += 3599.0
+    mono["t"] += 3599.0
+    assert (await runner.run_once()).wal_checkpointed is False  # the control: not yet due
+    wall["t"] += 1.0
+    mono["t"] += 1.0
+    assert (await runner.run_once()).wal_checkpointed is True
+
+
+async def test_wal_cadence_ignores_an_explicit_now(store: MessageStore) -> None:
+    """``run_once(now=...)`` sets the retention windows, not the WAL cadence: two passes at the same
+    monotonic instant truncate once, whatever ``now`` each is handed."""
+    runner = RetentionRunner(
+        store, RetentionSettings(wal_checkpoint_seconds=3600), monotonic=lambda: 10.0
+    )
+    assert (await runner.run_once(now=30 * DAY)).wal_checkpointed is True
+    assert (await runner.run_once(now=40 * DAY)).wal_checkpointed is False
+
+
+async def test_a_capped_pass_leaves_the_wal_marker_unadvanced(store: MessageStore) -> None:
+    """A WAL truncate the #121 cap skips keeps the marker its last truncate set, so it stays due.
+    Pass 1 truncates at monotonic 0. Pass 2 is past the cadence but capped before the WAL phase,
+    and the marker stays 0. Pass 3 is uncapped and truncates, which it could not do had the skip
+    moved the marker to pass 2's reading."""
+    clock = {"start": 0.0, "later": 0.0, "first": True}
+
+    def mono() -> float:
+        # The pass reads `start` once as its start time; every later read is `later`.
+        if clock["first"]:
+            clock["first"] = False
+            return float(clock["start"])
+        return float(clock["later"])
+
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(max_pass_seconds=1, wal_checkpoint_seconds=3600),
+        monotonic=mono,
+    )
+    assert (await runner.run_once()).wal_checkpointed is True
+    assert runner._last_wal == 0.0
+    clock.update(start=5000.0, later=1e9, first=True)
+    result = await runner.run_once()
+    assert result.capped is True and result.wal_checkpointed is False
+    assert runner._last_wal == 0.0
+    clock.update(start=9000.0, later=9000.0, first=True)
+    result = await runner.run_once()
+    assert result.capped is False and result.wal_checkpointed is True
+
+
 # --- RetentionRunner ----------------------------------------------------------
 
 
@@ -1074,7 +1148,7 @@ async def test_run_once_cap_skips_phase_after_deadline(store: MessageStore, monk
     result = await runner.run_once()
 
     assert result.wal_checkpointed is True  # ran before the deadline was hit
-    assert runner._last_wal == now  # the phase that RAN advanced its marker
+    assert runner._last_wal == 0.0  # the phase that RAN advanced its (monotonic) marker
     assert result.capped is True  # the pass hit the cap after WAL
     assert result.vacuumed is False  # the DUE vacuum was skipped by the cap
     assert vacuum_calls == 0  # ...and never even started
@@ -1754,6 +1828,576 @@ async def test_app_log_compression_survives_a_racing_rewrite_of_the_staging_file
     assert result.app_logs_compressed == 0  # and it is not reported as compressed
 
 
+_CHANGES = [
+    "append",
+    "replace",
+    "replace_same_size",
+    "rewrite_same_size",
+    "rewrite_same_size_same_mtime",
+    "metadata_only",
+]
+
+
+def _mutate_source(old_log: Path, change: str, *, old: float, late: bytes) -> bytes:
+    """Change ``old_log`` the way ``change`` names and return what it should then hold. Every case but
+    ``rewrite_same_size`` puts the old mtime back, so the size, the file id or the ctime must betray it;
+    the ``*_same_size`` cases keep the size, so only the file id (replace), the mtime (rewrite) or the
+    ctime alone (rewrite with the mtime put back) can."""
+    body = old_log.read_bytes()
+    if change == "metadata_only":
+        # Only the ctime moves (an attribute flip, as backup software clears the archive bit): the
+        # content and the mtime are untouched. Past a coarse ctime tick first, as below.
+        time.sleep(0.05)
+        os.chmod(old_log, stat.S_IREAD)
+        os.chmod(old_log, stat.S_IREAD | stat.S_IWRITE)
+        return body
+    if change == "append":
+        with open(old_log, "ab") as fh:
+            fh.write(late)
+        expected = body + late
+    elif change in ("replace", "replace_same_size"):
+        expected = late if change == "replace" else b"R" * len(body)
+        rotated = old_log.with_name("rotated.tmp")
+        rotated.write_bytes(expected)
+        os.replace(rotated, old_log)
+    else:
+        # Past a coarse ctime tick (Linux stamps ctime from a jiffy clock), so the rewrite's ctime is new.
+        time.sleep(0.05)
+        expected = b"W" * len(body)
+        with open(old_log, "r+b") as fh:
+            fh.write(expected)
+        if change == "rewrite_same_size":
+            os.utime(old_log, (old + 1, old + 1))
+            return expected
+    os.utime(old_log, (old, old))
+    return expected
+
+
+@pytest.mark.parametrize("change", _CHANGES)
+async def test_app_log_compression_keeps_a_source_that_changed_after_placement(
+    store: MessageStore, tmp_path, monkeypatch, caplog, change: str
+) -> None:
+    """A log appended to, rewritten, or replaced (rotated) at the same path after its archive was placed
+    must NOT be unlinked: the validated archive describes only the bytes read at the START, so removing
+    the path would destroy whatever was written into it since. BACKLOG #6805.
+
+    RULE: the read-back at ``dest`` proves the archive matches ``data``; it says nothing about whether
+    ``source`` still holds only ``data``. The unlink must also check that the path is still the same
+    file (device + file id) with the same size and times as when it was read."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old = now - 10 * DAY
+    old_log = logs / "old.log"
+    body = b"engine started\n" * 500
+    old_log.write_bytes(body)
+    os.utime(old_log, (old, old))
+    expected: list[bytes] = []
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_mutate(path, original, *, name):
+        ok = real_verify(path, original, name=name)
+        if not path.endswith(".mftmp") and not expected:
+            # The window between the dest read-back and the unlink: a writer touches the source path
+            # (once; the code may read `dest` back again before removing a redundant archive).
+            expected.append(_mutate_source(old_log, change, old=old, late=b"late line\n"))
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_mutate)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert (
+        old_log.exists() and old_log.read_bytes() == expected[0]
+    )  # nothing written mid-pass is lost
+    archive = logs / "old.log.gz"
+    if change in ("append", "metadata_only"):
+        # The kept source still holds every archived byte, so the archive this pass placed is removed:
+        # left beside the source it would make every later pass skip this path, forever when no
+        # `app_log_days` window is set. The next pass retries.
+        assert not archive.exists()
+    else:
+        # The source no longer holds the archived bytes: under a replace the archive may be the only
+        # copy of the old content, so it is kept.
+        assert gzip.decompress(archive.read_bytes()) == body
+    assert result.app_logs_compressed == 0 and result.app_log_bytes_reclaimed == 0
+    assert "changed after its archive was placed" in caplog.text
+
+
+@pytest.mark.parametrize("change", _CHANGES)
+async def test_app_log_compression_places_nothing_for_a_source_that_changed_before_placement(
+    store: MessageStore, tmp_path, monkeypatch, caplog, change: str
+) -> None:
+    """A source that changed between the read and the rename gets no archive at all: a stale partial
+    ``<name>.gz`` would block every later compression of that path (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old = now - 10 * DAY
+    old_log = logs / "old.log"
+    old_log.write_bytes(b"engine started\n" * 500)
+    os.utime(old_log, (old, old))
+    expected: list[bytes] = []
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_mutate(path, original, *, name):
+        ok = real_verify(path, original, name=name)
+        if path.endswith(".mftmp"):
+            expected.append(_mutate_source(old_log, change, old=old, late=b"late line\n"))
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_mutate)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert old_log.read_bytes() == expected[0]
+    assert not (logs / "old.log.gz").exists()
+    assert not list(logs.glob("*.mftmp"))
+    assert result.app_logs_compressed == 0
+    assert "changed during compression; nothing placed" in caplog.text
+
+
+async def test_app_log_compression_skips_a_file_rotated_in_between_scan_and_read(
+    store: MessageStore, tmp_path, monkeypatch, caplog
+) -> None:
+    """A fresh file rotated into an aged path after the scan, and before the read, is not compressed:
+    the scan's age no longer describes it (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old_log = logs / "old.log"
+    old_log.write_bytes(b"engine started\n" * 500)
+    os.utime(old_log, (now - 10 * DAY, now - 10 * DAY))
+    fresh = b"fresh rotated content\n" * 200
+
+    def rotate_then_allow(self, size, *, name):
+        rotated = logs / "rotated.tmp"
+        rotated.write_bytes(fresh)
+        os.utime(rotated, (now, now))
+        os.replace(rotated, old_log)
+        return True
+
+    monkeypatch.setattr(RetentionRunner, "_has_free_space", rotate_then_allow)
+
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert old_log.read_bytes() == fresh
+    assert not (logs / "old.log.gz").exists()
+    assert not list(logs.glob("*.mftmp"))  # rejected before anything was staged
+    assert result.app_logs_compressed == 0
+    assert "not the file the scan aged" in caplog.text
+
+
+async def test_app_log_compression_never_renames_over_an_archive_that_appeared_meanwhile(
+    store: MessageStore, tmp_path, monkeypatch, caplog
+) -> None:
+    """A ``<name>.gz`` a peer compressor placed after the scan is never renamed over: it may be the
+    only copy of a longer read whose source the peer is about to remove (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old_log = logs / "old.log"
+    body = b"engine started\n" * 500
+    old_log.write_bytes(body)
+    os.utime(old_log, (now - 10 * DAY, now - 10 * DAY))
+    peer = gzip.compress(body + b"a longer read by a peer\n")
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_peer_places(path, original, *, name):
+        ok = real_verify(path, original, name=name)
+        if path.endswith(".mftmp"):
+            (logs / "old.log.gz").write_bytes(peer)
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_peer_places)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert (logs / "old.log.gz").read_bytes() == peer
+    assert old_log.read_bytes() == body
+    assert not list(logs.glob("*.mftmp"))
+    assert result.app_logs_compressed == 0
+    assert "an archive appeared meanwhile" in caplog.text
+
+
+async def test_app_log_compression_keeps_the_archive_when_the_source_goes_before_its_removal(
+    store: MessageStore, tmp_path, monkeypatch
+) -> None:
+    """Removing a redundant archive must not lose the last copy: if the source is removed (by a peer
+    compressor, say) between the check that it still holds every archived byte and the archive's
+    removal, the archive survives (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old = now - 10 * DAY
+    old_log = logs / "old.log"
+    body = b"engine started\n" * 500
+    old_log.write_bytes(body)
+    os.utime(old_log, (old, old))
+    mutated: list[bytes] = []
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_append(path, original, *, name):
+        ok = real_verify(path, original, name=name)
+        if not path.endswith(".mftmp") and not mutated:
+            mutated.append(_mutate_source(old_log, "append", old=old, late=b"late line\n"))
+        return ok
+
+    real_holds = retention_mod._source_still_holds
+    calls: list[bool] = []
+
+    def holds_then_peer_removes(source, read_st, data):
+        ok = real_holds(source, read_st, data)
+        if not calls:
+            old_log.unlink()  # the peer archived the longer read elsewhere and removed the source
+        calls.append(ok)
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_append)
+    monkeypatch.setattr(retention_mod, "_source_still_holds", holds_then_peer_removes)
+
+    result = await RetentionRunner(
+        store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+    ).run_once()
+
+    assert calls and calls[0] is True  # the branch that removes a redundant archive was reached
+    assert not old_log.exists()
+    assert gzip.decompress((logs / "old.log.gz").read_bytes()) == body  # the last copy survives
+    assert not list(logs.glob("*.mfclaim"))
+    assert result.app_logs_compressed == 0
+
+
+async def test_app_log_compression_reports_a_source_that_vanished_after_placement(
+    store: MessageStore, tmp_path, monkeypatch, caplog
+) -> None:
+    """A source removed (by a peer compressor, say) after the archive was placed keeps the archive and
+    is reported as vanished, not as kept (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old_log = logs / "old.log"
+    body = b"engine started\n" * 500
+    old_log.write_bytes(body)
+    os.utime(old_log, (now - 10 * DAY, now - 10 * DAY))
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_remove(path, original, *, name):
+        ok = real_verify(path, original, name=name)
+        if not path.endswith(".mftmp") and old_log.exists():
+            old_log.unlink()
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_remove)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert gzip.decompress((logs / "old.log.gz").read_bytes()) == body
+    assert result.app_logs_compressed == 0
+    assert "vanished after its archive was placed" in caplog.text
+
+
+async def test_app_log_sweep_ages_out_claimed_archives_with_the_archives(
+    store: MessageStore, tmp_path
+) -> None:
+    """A claimed archive (``<name>.gz.<pid>-<ns>.mfclaim``) holds log content, so the
+    ``app_log_days`` sweep ages it out on its own mtime, under the same gate as the ``.gz``
+    archives: only while compression is on, and only for a name the compressor produces
+    (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old_claim = logs / "old.log.gz.4242-123456789.mfclaim"
+    old_txt_claim = logs / "OLD.TXT.GZ.1-2.MFCLAIM"
+    fresh_claim = logs / "fresh.log.gz.4242-987654321.mfclaim"
+    foreign = [
+        logs / "old.log.4242-1.mfclaim",  # not claimed from an archive
+        logs / "bundle.gz.4242-1.mfclaim",  # not an app-log archive
+        logs / "old.log.gz.x-1.mfclaim",  # not a pid
+        logs / "old.log.gz.4242.mfclaim",  # no time tag
+        logs / "old.log.gz.1-2.mfclaim.3-4.mfclaim",  # a claim of a claim is never produced
+    ]
+    for p in (old_claim, old_txt_claim, fresh_claim, *foreign):
+        p.write_bytes(b"x")
+        os.utime(p, (now - 10 * DAY, now - 10 * DAY))
+    os.utime(fresh_claim, (now - 1 * DAY, now - 1 * DAY))
+
+    # Compression off: no archive is swept, and neither is a claim.
+    result = await RetentionRunner(
+        store, RetentionSettings(app_log_days=7), clock=lambda: now, log_dir=str(logs)
+    ).run_once()
+    assert result.app_logs_deleted == 0 and old_claim.exists() and old_txt_claim.exists()
+
+    result = await RetentionRunner(
+        store,
+        RetentionSettings(app_log_days=7, app_log_compress_days=1),
+        clock=lambda: now,
+        log_dir=str(logs),
+    ).run_once()
+    assert result.app_logs_deleted == 2
+    assert not old_claim.exists() and not old_txt_claim.exists()
+    assert fresh_claim.exists()
+    assert all(p.exists() for p in foreign)
+
+
+def _claim_fixture(tmp_path: Path) -> tuple[Path, Path, os.stat_result, bytes]:
+    """A source log and a valid archive of it at ``dest``, with the ``fstat`` read through it."""
+    source = tmp_path / "old.log"
+    data = b"engine started\n" * 50
+    source.write_bytes(data)
+    dest = tmp_path / "old.log.gz"
+    dest.write_bytes(gzip.compress(data))
+    with open(source, "rb") as fh:
+        read_st = os.fstat(fh.fileno())
+    return source, dest, read_st, data
+
+
+def _remove_failing_on_claims(monkeypatch, error: OSError) -> None:
+    """Make ``os.remove`` raise ``error`` for a claim name and behave normally for anything else."""
+    real_remove = os.remove
+
+    def remove(path, *args, **kwargs):
+        if str(path).lower().endswith(".mfclaim"):
+            raise error
+        real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "remove", remove)
+
+
+def _peer_removes_claims_first(monkeypatch) -> None:
+    """Make a peer's sweep win the race for every claim: the claim is gone when ``os.remove`` runs,
+    so it raises ``FileNotFoundError`` for real."""
+    real_remove = os.remove
+
+    def remove(path, *args, **kwargs):
+        if str(path).lower().endswith(".mfclaim"):
+            real_remove(path)
+        real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "remove", remove)
+
+
+def test_drop_redundant_archive_is_false_when_the_claim_cannot_be_removed(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """A claim whose removal fails is NOT reported as removed: the archive's bytes are still on disk
+    under the claim name, a WARNING names it, and the sweep recognises the name the producer made
+    (BACKLOG #6805)."""
+    source, dest, read_st, data = _claim_fixture(tmp_path)
+    _remove_failing_on_claims(monkeypatch, PermissionError("locked"))
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        dropped = retention_mod._drop_redundant_archive(
+            str(source), read_st, data, str(dest), name="old.log"
+        )
+
+    assert dropped is False
+    claims = list(tmp_path.glob("*.mfclaim"))
+    assert len(claims) == 1 and gzip.decompress(claims[0].read_bytes()) == data
+    assert "could not be removed" in caplog.text
+    assert retention_mod._is_app_log_name(claims[0].name, include_archives=True)
+
+
+def test_drop_redundant_archive_counts_a_claim_a_peer_already_removed(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """A claim already gone when its removal runs (a peer's ``app_log_days`` sweep took it) is
+    counted as removed, not logged as a failure (BACKLOG #6805)."""
+    source, dest, read_st, data = _claim_fixture(tmp_path)
+    _peer_removes_claims_first(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        assert_capture_sees(caplog, retention_mod.__name__)
+        dropped = retention_mod._drop_redundant_archive(
+            str(source), read_st, data, str(dest), name="old.log"
+        )
+
+    assert dropped is True
+    assert not list(tmp_path.glob("*.mfclaim")) and not dest.exists()
+    assert "could not be removed" not in caplog.text
+
+
+@pytest.mark.parametrize("dest_gone", [True, False])
+def test_drop_redundant_archive_reports_an_archive_gone_before_its_claim(
+    tmp_path, monkeypatch, caplog, dest_gone: bool
+) -> None:
+    """An archive removed (by a peer engine shard's ``app_log_days`` sweep, say) after it was
+    validated and before it could be claimed is reported as already gone, never as kept: no file
+    remains to keep. A FileNotFoundError with the archive still there (Windows raises it for a claim
+    path too long, say) is still reported as kept (BACKLOG #6805)."""
+    source, dest, read_st, data = _claim_fixture(tmp_path)
+    real_rename = os.rename
+
+    def peer_sweeps_then_rename(src, dst, *args, **kwargs):
+        if str(src) == str(dest):
+            if not dest_gone:
+                raise FileNotFoundError("the claim path is too long")
+            dest.unlink()  # the peer wins the race; the rename below raises FileNotFoundError
+        real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", peer_sweeps_then_rename)
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.pipeline.retention"):
+        assert_capture_sees(caplog, retention_mod.__name__)
+        dropped = retention_mod._drop_redundant_archive(
+            str(source), read_st, data, str(dest), name="old.log"
+        )
+
+    assert dropped is False
+    assert not list(tmp_path.glob("*.mfclaim"))
+    gone_line = (
+        "the archive 'old.log.gz' could not be found when it was to be claimed (already gone, or "
+        "its directory unreachable); this pass does not remove it"
+    )
+    if dest_gone:
+        assert not dest.exists()
+        assert gone_line in caplog.text
+        assert "it is kept" not in caplog.text and "could not be claimed" not in caplog.text
+    else:
+        assert gzip.decompress(dest.read_bytes()) == data
+        assert gone_line not in caplog.text
+        assert "could not be claimed for removal; it is kept" in caplog.text
+
+
+async def test_app_log_compression_does_not_say_a_gone_archive_holds_the_bytes(
+    store: MessageStore, tmp_path, monkeypatch, caplog
+) -> None:
+    """When the source changed after its archive was placed and the archive is gone (a peer engine
+    shard's ``app_log_days`` sweep, say) before the redundant-archive removal reads it, the WARNING
+    must not say the archive holds the bytes read: nothing is there, and the kept source holds them
+    (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old = now - 10 * DAY
+    old_log = logs / "old.log"
+    old_log.write_bytes(b"engine started\n" * 500)
+    os.utime(old_log, (old, old))
+    archive = logs / "old.log.gz"
+    expected: list[bytes] = []
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_mutate_then_sweep(path, original, *, name):
+        if not path.endswith(".mftmp") and expected and archive.exists():
+            archive.unlink()  # the peer's sweep, before the removal's first read of `dest`
+        ok = real_verify(path, original, name=name)
+        if not path.endswith(".mftmp") and not expected:
+            expected.append(_mutate_source(old_log, "append", old=old, late=b"late line\n"))
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_mutate_then_sweep)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert old_log.read_bytes() == expected[0]  # the source is kept
+    assert not archive.exists() and not list(logs.glob("*.mfclaim"))
+    assert result.app_logs_compressed == 0
+    assert "changed after its archive was placed" in caplog.text
+    assert "holds the bytes" not in caplog.text
+    assert "may remain in the source" in caplog.text
+
+
+def test_drop_redundant_archive_reports_a_claim_gone_before_its_put_back(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """A claim removed (by a peer's ``app_log_days`` sweep, say) before it could be put back is
+    reported as gone, not as KEPT under a name that no longer exists (BACKLOG #6805)."""
+    source, dest, read_st, data = _claim_fixture(tmp_path)
+    answers = iter([True, False])  # holds before the claim, changed after it
+
+    def holds_then_peer_sweeps(*args):
+        answer = next(answers)
+        if not answer:
+            for claim in tmp_path.glob("*.mfclaim"):
+                claim.unlink()
+        return answer
+
+    monkeypatch.setattr(retention_mod, "_source_still_holds", holds_then_peer_sweeps)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        dropped = retention_mod._drop_redundant_archive(
+            str(source), read_st, data, str(dest), name="old.log"
+        )
+
+    assert dropped is False
+    assert not list(tmp_path.glob("*.mfclaim")) and not dest.exists()
+    assert "could not be found to put it back" in caplog.text
+    assert "KEPT as" not in caplog.text
+
+
+@pytest.mark.parametrize("fail", ["link", "remove"])
+def test_drop_redundant_archive_warns_when_a_put_back_leaves_the_claim(
+    tmp_path, monkeypatch, caplog, fail: str
+) -> None:
+    """When the post-claim re-check fails, the archive is put back. A put-back that cannot link, or
+    that links but cannot then remove the claim, leaves the claim and says so at WARNING, never at
+    DEBUG only (BACKLOG #6805)."""
+    source, dest, read_st, data = _claim_fixture(tmp_path)
+    answers = iter([True, False])  # holds before the claim, changed after it
+    monkeypatch.setattr(retention_mod, "_source_still_holds", lambda *a: next(answers))
+
+    def refuse_link(*args, **kwargs):
+        raise OSError("no hard links here")
+
+    if fail == "link":
+        monkeypatch.setattr(os, "link", refuse_link)
+    else:
+        _remove_failing_on_claims(monkeypatch, PermissionError("locked"))
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        dropped = retention_mod._drop_redundant_archive(
+            str(source), read_st, data, str(dest), name="old.log"
+        )
+
+    assert dropped is False
+    assert len(list(tmp_path.glob("*.mfclaim"))) == 1
+    if fail == "link":
+        assert not dest.exists()
+        assert "the source or the claimed archive changed" in caplog.text
+    else:
+        assert gzip.decompress(dest.read_bytes()) == data
+        assert "was linked back but could not be removed" in caplog.text
+
+
+def test_drop_redundant_archive_put_back_counts_a_claim_a_peer_already_removed(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """After a put-back links the archive back to ``dest``, a claim a peer already removed is not
+    a failure: ``dest`` holds the archive and no WARNING says the claim was kept (BACKLOG #6805)."""
+    source, dest, read_st, data = _claim_fixture(tmp_path)
+    answers = iter([True, False])  # holds before the claim, changed after it
+    monkeypatch.setattr(retention_mod, "_source_still_holds", lambda *a: next(answers))
+    _peer_removes_claims_first(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        assert_capture_sees(caplog, retention_mod.__name__)
+        dropped = retention_mod._drop_redundant_archive(
+            str(source), read_st, data, str(dest), name="old.log"
+        )
+
+    assert dropped is False
+    assert gzip.decompress(dest.read_bytes()) == data
+    assert not list(tmp_path.glob("*.mfclaim"))
+    assert "could not be removed" not in caplog.text
+
+
 async def test_app_log_compression_stages_through_an_unpredictable_exclusive_temp_file(
     store: MessageStore, tmp_path, monkeypatch
 ) -> None:
@@ -1950,3 +2594,221 @@ async def test_engine_without_retention_settings_has_no_runner(tmp_path) -> None
         assert engine._retention_runner is None
     finally:
         await engine.stop()
+
+
+# --- a reload that first sets a per-connection window starts passes (BACKLOG #6804) -------------
+
+# Every default-ON knob off, so only the graph can give the runner something to do.
+_ALL_OFF = {"min_free_disk_mb": 0, "wal_checkpoint_seconds": 0, "audit_log_warn_rows": 0}
+
+
+def _write_retention_graph(cfg: Path, inbox: Path, outdir: Path, *, window: str = "") -> None:
+    """One file inbound -> router -> handler -> file outbound; ``window`` adds keyword arguments to
+    the inbound (a leading ``i:``) or the outbound (``o:``), such as a per-connection window."""
+    cfg.mkdir(parents=True, exist_ok=True)
+    inbox.mkdir(parents=True, exist_ok=True)
+    outdir.mkdir(parents=True, exist_ok=True)
+    ib_kw = f", {window[2:]}" if window.startswith("i:") else ""
+    ob_kw = f", {window[2:]}" if window.startswith("o:") else ""
+    (cfg / "cfg.py").write_text(
+        "from messagefoundry import inbound, outbound, router, handler, Send, File\n"
+        f"inbound('IB_RET', File(directory={str(inbox)!r}, pattern='*.hl7', poll_seconds=0.05), "
+        f"router='r'{ib_kw})\n"
+        f"outbound('OB_RET', File(directory={str(outdir)!r}, filename='{{MSH-10}}.hl7'){ob_kw})\n"
+        "@router('r')\n"
+        "def route(msg):\n"
+        "    return ['h']\n"
+        "@handler('h')\n"
+        "def handle(msg):\n"
+        "    return Send('OB_RET', msg)\n",
+        encoding="utf-8",
+    )
+
+
+def test_enabled_by_a_per_connection_window(store: MessageStore) -> None:
+    """A per-connection messages_days or dead_letter_days above 0 purges with the global window
+    off, so it gives the runner something to do on its own; 0 keeps forever and does not."""
+    off = RetentionSettings.model_validate(_ALL_OFF)
+
+    def enabled(*, messages_days: int | None = None, dead_letter_days: int | None = None) -> bool:
+        reg = Registry()
+        reg.add_inbound(
+            build_inbound_connection("IB", MLLP(port=2610), router="r", messages_days=messages_days)
+        )
+        reg.add_outbound(
+            build_outbound_connection(
+                "OB", File(directory="./out"), dead_letter_days=dead_letter_days
+            )
+        )
+        return RetentionRunner(store, off, registry_source=lambda: reg).enabled
+
+    assert enabled() is False
+    assert enabled(messages_days=3) is True
+    assert enabled(dead_letter_days=3) is True
+    assert enabled(messages_days=0, dead_letter_days=0) is False
+
+
+async def test_a_disabled_runner_with_a_registry_idles(store: MessageStore) -> None:
+    """With a registry wired, the loop runs even when nothing is set, and runs no pass until the
+    live graph sets a window; with no registry a disabled runner spawns no loop."""
+    passes: list[None] = []
+    settings = RetentionSettings.model_validate({**_ALL_OFF, "purge_interval_seconds": 0.01})
+    holder: dict[str, Registry] = {"reg": Registry()}
+    runner = RetentionRunner(store, settings, registry_source=lambda: holder["reg"])
+
+    async def _counting(now: float | None = None) -> Any:
+        passes.append(None)
+
+    runner.run_once = _counting  # type: ignore[method-assign]
+    runner.start()
+    try:
+        assert runner._task is not None
+        await asyncio.sleep(0.1)
+        assert passes == [], "an idle runner ran a pass with nothing configured"
+        reg = Registry()
+        reg.add_inbound(
+            build_inbound_connection("IB", MLLP(port=2611), router="r", messages_days=1)
+        )
+        holder["reg"] = reg
+        for _ in range(200):
+            if passes:
+                break
+            await asyncio.sleep(0.01)
+        assert passes, "the loop did not pick up a window the live graph set"
+        holder["reg"] = Registry()
+        await asyncio.sleep(0.05)
+        settled = len(passes)
+        await asyncio.sleep(0.1)
+        assert len(passes) == settled, "the loop kept running passes after the window was cleared"
+    finally:
+        await runner.stop()
+    assert runner._task is None
+
+    bare = RetentionRunner(store, settings)
+    bare.start()
+    assert bare._task is None
+
+
+async def test_wake_runs_a_pass_only_when_it_makes_the_loop_active(store: MessageStore) -> None:
+    """A reload's wake() on an active loop adds no pass; one that gives an idle loop a window runs
+    one at once. The 3600 s interval means no pass below can come from the timer."""
+    passes: list[None] = []
+    settings = RetentionSettings.model_validate({**_ALL_OFF, "purge_interval_seconds": 3600})
+    window = Registry()
+    window.add_inbound(build_inbound_connection("IB", MLLP(port=2612), router="r", messages_days=1))
+    holder: dict[str, Registry] = {"reg": window}
+    runner = RetentionRunner(store, settings, registry_source=lambda: holder["reg"])
+
+    async def _counting(now: float | None = None) -> Any:
+        passes.append(None)
+
+    runner.run_once = _counting  # type: ignore[method-assign]
+    runner.start()
+    try:
+        for _ in range(200):
+            if passes:
+                break
+            await asyncio.sleep(0.01)
+        assert len(passes) == 1
+        runner.wake()  # a reload while active
+        await asyncio.sleep(0.1)
+        assert len(passes) == 1, "a reload added a pass to an already-active loop"
+    finally:
+        await runner.stop()
+
+    holder["reg"] = Registry()
+    passes.clear()
+    runner.start()
+    try:
+        await asyncio.sleep(0.1)
+        assert passes == [], "a restarted idle loop ran a pass (a stale wake was left set)"
+        holder["reg"] = window
+        runner.wake()  # the reload that makes it active
+        for _ in range(200):
+            if passes:
+                break
+            await asyncio.sleep(0.01)
+        assert len(passes) == 1, "the reload that gave the idle loop a window ran no pass"
+    finally:
+        await runner.stop()
+
+
+async def test_a_wake_before_the_first_iteration_runs_one_pass(store: MessageStore) -> None:
+    """A reload that wakes the loop between start() and its first iteration gets one pass, not
+    two back to back: the 3600 s interval means a second pass could only come from a stale wake."""
+    passes: list[None] = []
+    settings = RetentionSettings.model_validate({**_ALL_OFF, "purge_interval_seconds": 3600})
+    holder: dict[str, Registry] = {"reg": Registry()}
+    runner = RetentionRunner(store, settings, registry_source=lambda: holder["reg"])
+
+    async def _counting(now: float | None = None) -> Any:
+        passes.append(None)
+
+    runner.run_once = _counting  # type: ignore[method-assign]
+    runner.start()  # idle: the task exists but has not run yet
+    try:
+        window = Registry()
+        window.add_inbound(
+            build_inbound_connection("IB", MLLP(port=2613), router="r", messages_days=1)
+        )
+        holder["reg"] = window
+        runner.wake()  # the reload, before the loop's first iteration
+        await asyncio.sleep(0.15)
+        assert len(passes) == 1, f"expected one pass, got {len(passes)}"
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize(
+    "window",
+    ["i:messages_days=1", "i:prune_documents_after=1", "o:dead_letter_days=1"],
+    ids=["messages_days", "prune", "dead_letter_days"],
+)
+async def test_reload_that_sets_a_window_runs_a_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, window: str
+) -> None:
+    """BACKLOG #6804: the engine started with nothing for retention to do, then a reload set a
+    per-connection window. A pass must run without a restart, on the same single loop."""
+    passes: list[None] = []
+    real_run_once = RetentionRunner.run_once
+
+    async def _counting_run_once(self: RetentionRunner, now: float | None = None) -> Any:
+        passes.append(None)
+        return await real_run_once(self, now)
+
+    monkeypatch.setattr(RetentionRunner, "run_once", _counting_run_once)
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    idle_cfg, window_cfg = tmp_path / "idle", tmp_path / "window"
+    _write_retention_graph(idle_cfg, inbox, outdir)
+    _write_retention_graph(window_cfg, inbox, outdir, window=window)
+
+    engine = await Engine.create(
+        tmp_path / "engine.db",
+        retention_settings=RetentionSettings.model_validate(
+            # An interval no test waits out: only the reload's wake can run the pass in time.
+            {**_ALL_OFF, "purge_interval_seconds": 3600}
+        ),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    engine.add_registry(load_config(idle_cfg))
+    await engine.start()
+    try:
+        runner = engine._retention_runner
+        assert runner is not None
+        task = runner._task
+        assert task is not None
+        await asyncio.sleep(0.1)
+        assert runner.enabled is False and passes == []
+
+        outcome = await engine.reload_detail(window_cfg)
+        assert outcome.applied is True and outcome.failures == ()
+        assert runner.enabled is True
+        for _ in range(200):
+            if passes:
+                break
+            await asyncio.sleep(0.01)
+        assert passes, "a reload that set a per-connection window left retention off"
+        assert runner._task is task, "the reload started a second retention loop"
+    finally:
+        await engine.stop()
+    assert runner._task is None and task.done()

@@ -81,6 +81,10 @@ this line.**
 
 ### Security
 
+- **A pending session with no second factor is sent to enrol before it can end sessions.** Under
+  `[security].require_mfa`, the two session-terminate POSTs refuse such a session and redirect it
+  to `/ui/account?m=enroll_first`, where it was sent to `/ui/reauth`; the enrolment that binds its
+  first factor satisfies the session. The supported engine seam moved with it. (`BACKLOG #1149`)
 - **A step-up request refused for a new client address spends no budget.** The step-up gates
   (`require_ui_step_up` and its action, re-auth-only and own-sessions variants) asked the
   new-address question after their `require_ui` base had already charged the admin-write budget,
@@ -144,6 +148,16 @@ this line.**
   the page, and the one re-auth then mints its grant. The bulk purge confirm page also keeps its
   destination and scope selection across the re-auth, up to the 512-character cap on `next`.
   (vault BACKLOG #3241, added item 2 and step 1)
+- **A console channel denial that names no channel says which operation it refused.** The bulk
+  start, stop and restart, the bulk purge and its confirm page write the `auth.channel_denied`
+  rows that name no channel with `"operation"` in their detail (`connection_control` or
+  `connection_purge`). A row the engine writes for a well-formed name it refuses names that
+  channel and carries no operation. A channel-scoped actor's bulk selection whose name fails the
+  connection-name rule writes a row with no channel, marked `"malformed_name": true`, so it is
+  told apart from the confirm page's refusal; an all-channels actor's writes none. A failed write still lets the batch go on. Needs an engine whose `audit_channel_denied` takes
+  `operation`, which no published engine does yet. As for BACKLOG #3378 below, the release that
+  carries this raises the `messagefoundry` floor to the engine release that adds it: the seam
+  digest does not cover that callback's signature. (vault BACKLOG #3748 item 7)
 - **A channel-scoped caller's bad flag direction gets the audited 403.** `POST
   /ui/connections/{name}/flag` answered 404 for a direction other than `inbound` or `outbound`
   before the engine handler's scope check, so on a first deployment such a caller's probe there
@@ -289,6 +303,23 @@ this line.**
 
 ### Fixed
 
+- **A passkey whose stored id cannot be read gets its own notice.** The engine's passkey begin leg
+  now raises `StoredPasskeysUnreadable` for an account whose passkeys under this origin all have a
+  stored credential id that does not decode; before, the decode error escaped as a 500. Every
+  page that stages a passkey ceremony through `_reauth_webauthn_state` in `routes/core.py`
+  catches it and shows the new `WEBAUTHN_UNREADABLE_NOTICE`, exported from the package, in place
+  of the origin-migration notice its `None` would have shown. The notice sends a holder with
+  another factor to sign in with it and remove the unreadable passkey. One with no other factor
+  is sent first to "Sign in with password and passkey", which names no credential and so may
+  still accept a discoverable passkey whose stored id cannot be read, and to an administrator
+  for an MFA reset only if that fails too. The supported engine seam moved with it:
+  `StoredPasskeysUnreadable` is part of it, and `SUPPORTED_ENGINE_SEAMS` names the new digest.
+  (`BACKLOG #6886`)
+- **An uploaded-log resend refused for the operator's own username names that cause.** The engine
+  refuses a resend whose acting username is blank or has spaces around it with a 403 carrying
+  `X-Refusal-Code: username_unusable`. The console now shows its own notice for it, not the
+  channel-denial text, which would send the operator after a scope that is not the problem. No seam
+  changes. (BACKLOG #6589)
 - **The High Availability pages degrade when the store does not answer.** The page, its live
   fragment and both step-down confirm pages read the cluster membership and lease rows with no error
   handling, so a store timeout or outage answered with an error body in place of the page. The page

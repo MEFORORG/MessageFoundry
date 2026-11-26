@@ -473,10 +473,61 @@ def test_a_window_carried_from_another_root_is_no_floor_for_this_one(tmp_path: P
     assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(12.0)
 
 
+GONE = "7d reset passed, no current reading"
+
+
+def countdown(state: Path, pct: float, resets_in_s: int) -> tuple[str, set[str]]:
+    """Run the collector and return the countdown it printed, with every countdown a correct one could.
+
+    The remaining time is not fixed: ``collect`` can wait up to a minute and more on the spawn lock and
+    a starved pwsh start before the collector reads its clock. So the expectation is the set of
+    truncated countdowns over the whole window between the fixture's clock read and the collector's
+    exit. On a fast launch that set holds one value and the test tells truncation from rounding; on a
+    slow one it still never reds a correct collector.
+    """
+    before = time.time()
+    seven = window(pct, resets_in_s)
+    line = collect(state, {"session_id": "A", "rate_limits": {"seven_day": seven}})
+    after = time.time()
+    lo, hi = seven["resets_at"] - after, seven["resets_at"] - before
+    allowed = {GONE} if lo <= 0 else set()
+    if hi > 0:
+        allowed |= {
+            f"resets {m // 60}h{m % 60:02d}m"
+            for m in range(max(0, int(lo // 60)), int(hi // 60) + 1)
+        }
+    shown = re.search(r"resets \d+h\d\dm", line)
+    return (shown.group(0) if shown else line), allowed
+
+
 def test_the_status_line_truncates_hours_rather_than_rounding_them(tmp_path: Path) -> None:
-    """90 minutes rounded to the even hour read as 2h30m."""
-    line = collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(9.0, 5430)}})
-    assert re.search(r"resets 1h30m", line), line
+    """90 minutes rounded to the even hour read as 2h30m. 5459 s truncates to 1h30m; rounds to 1h31m."""
+    shown, allowed = countdown(tmp_path, 9.0, 5459)
+    assert shown in allowed, (shown, allowed)
+
+
+def test_the_status_line_floors_the_minutes_rather_than_rounding_them(tmp_path: Path) -> None:
+    """59m59s left is 0h59m. A cast to [int] rounded the total minutes up to 1h00m (BACKLOG #7597)."""
+    shown, allowed = countdown(tmp_path, 9.0, 59 * 60 + 59)
+    assert shown in allowed, (shown, allowed)
+
+
+def test_a_multi_day_countdown_carries_the_days_into_the_hours(tmp_path: Path) -> None:
+    """A 7-day window prints 77h46m, not the 5h46m that the span's Hours component alone would give."""
+    shown, allowed = countdown(tmp_path, 9.0, 280000)
+    assert shown in allowed, (shown, allowed)
+
+
+def test_a_reset_seconds_ago_is_a_gone_window_not_zero_minutes(tmp_path: Path) -> None:
+    """Rounding -0.3 minutes to 0 printed a 0h00m countdown for a window that had already reset."""
+    line = collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(99.0, -20)}})
+    assert line == GONE, line
+
+
+def test_a_window_in_its_last_minute_still_shows_a_countdown(tmp_path: Path) -> None:
+    """The control for the gone-window test: under a minute left is 0h00m, not the gone line."""
+    shown, allowed = countdown(tmp_path, 9.0, 59)
+    assert shown in allowed, (shown, allowed)
 
 
 @pytest.mark.parametrize("bad", ["", "not json at all", "{truncated", "null"])
@@ -4153,6 +4204,185 @@ def test_marking_is_reversible_and_clearing_nothing_is_not_an_error(tmp_path: Pa
     again = avail("-Clear", "-ConfigDir", str(root))
     assert again.returncode == 0, again.stdout
     assert "NOTHING TO CLEAR" in again.stdout
+
+
+_ISO_UTC = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
+
+
+def avail_in_culture(culture: str, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run the script with the current culture set to ``culture`` in the same process.
+
+    The culture line is printed first, with its calendar, so the test can prove the culture TOOK: a
+    host that silently ignored it would run the Gregorian arm and pass for the wrong reason.
+    """
+    # A parameter name stays bare: quoted, '-Mark' binds as a positional string.
+    quoted = " ".join(
+        a if a.startswith("-") else "'" + a.replace("'", "''") + "'" for a in (str(AVAIL), *args)
+    )
+    command = (
+        f"[cultureinfo]::CurrentCulture = '{culture}'; "
+        "$c = [cultureinfo]::CurrentCulture; "
+        "Write-Output ('CULTURE ' + $c.Name + ' ' + $c.Calendar.GetType().Name); "
+        f"& {quoted}; if (-not $?) {{ exit 1 }}; exit $LASTEXITCODE"
+    )
+    return run_single(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=_env(None),
+    )
+
+
+@pytest.mark.parametrize(
+    ("culture", "calendar"),
+    [
+        ("th-TH", "ThaiBuddhistCalendar"),
+        ("fa-IR", "PersianCalendar"),
+        ("ar-SA", "UmAlQuraCalendar"),
+        ("fi-FI", "GregorianCalendar"),
+    ],
+)
+def test_a_marker_written_under_any_culture_is_iso_utc_text(
+    tmp_path: Path, culture: str, calendar: str
+) -> None:
+    """BACKLOG #7557. The stamps were formatted with the CURRENT culture. Under th-TH that wrote
+    marked_at in Buddhist year 2569, so an account marked dead NOW read PENDING for 543 years; fi-FI
+    wrote '.' for ':'; ar-SA refused the documented ``-EffectiveFrom 2026-10-01`` outright.
+    """
+    root = tmp_path / ".claude-account-9"
+    root.mkdir()
+    state = root / "mefor-usage"
+    state.mkdir()
+    tempting(state)
+    marker = state / "unavailable.json"
+
+    now = avail_in_culture(culture, "-Mark", "-ConfigDir", str(root), "-Reason", "cancelled")
+    assert f"CULTURE {culture} {calendar}" in now.stdout, now.stdout + now.stderr
+    assert now.returncode == 0, now.stdout + now.stderr
+    doc = json.loads(marker.read_text(encoding="utf-8-sig"))
+    year = datetime.now(UTC).year
+    for key in ("marked_at", "effective_from"):
+        assert _ISO_UTC.match(doc[key]), (key, doc[key])
+        assert abs(int(doc[key][:4]) - year) <= 1, (key, doc[key])
+    # The reader, in the default culture, must take a mark made NOW as live now, not PENDING.
+    assert read(state)[0] == UNAVAILABLE
+
+    # The same culture reads it back: -Status formatted the stamps with the current calendar too,
+    # and under ar-SA a year past 2077 threw.
+    status = avail_in_culture(culture, "-Status", "-ConfigDir", str(root))
+    assert status.returncode == 0, status.stdout + status.stderr
+    assert re.search(rf"marked {year}-\d\d-\d\dT\d\d:\d\d:\d\dZ", status.stdout), status.stdout
+
+    # The documented ISO forms parse under every culture; the date-only one was refused under ar-SA.
+    for given, written in (
+        ("2099-01-01T00:00:00Z", "2099-01-01T00:00:00Z"),
+        ("2099-01-01", None),
+    ):
+        later = avail_in_culture(
+            culture,
+            "-Mark",
+            "-ConfigDir",
+            str(root),
+            "-Reason",
+            "cancelled",
+            "-EffectiveFrom",
+            given,
+        )
+        assert later.returncode == 0, later.stdout + later.stderr
+        doc = json.loads(marker.read_text(encoding="utf-8-sig"))
+        assert _ISO_UTC.match(doc["effective_from"]), doc["effective_from"]
+        assert doc["effective_from"][:4] in ("2098", "2099"), doc["effective_from"]
+        if written is not None:
+            assert doc["effective_from"] == written
+        status = avail_in_culture(culture, "-Status", "-ConfigDir", str(root))
+        assert status.returncode == 0, status.stdout + status.stderr
+        assert "effective from 209" in status.stdout, status.stdout
+
+
+@pytest.mark.parametrize("given", ["Jan 5", "01/10/2026", "10/1/2026 3pm", "", "next Tuesday"])
+def test_an_effective_from_that_is_not_iso_is_refused(tmp_path: Path, given: str) -> None:
+    """BACKLOG #7557 review. A lenient parse read 'Jan 5' as a date already past and '01/10/2026' by
+    US order, marking a live account dead now; an explicit '' was read as omitted, so as "now"."""
+    root = tmp_path / ".claude-account-9"
+    root.mkdir()
+    out = avail("-Mark", "-ConfigDir", str(root), "-Reason", "x", "-EffectiveFrom", given)
+    assert out.returncode == 1, out.stdout
+    assert "REFUSED" in out.stdout
+    assert not (root / "mefor-usage" / "unavailable.json").exists()
+
+
+@pytest.mark.skipif(
+    os.name != "nt", reason="a read-only target blocks an overwrite only on Windows"
+)
+def test_a_failed_marker_write_leaves_no_temp_file_behind(tmp_path: Path) -> None:
+    """BACKLOG #7557. A throw from the rename left ``unavailable.json.<pid>.tmp`` beside the marker.
+    A read-only marker makes the overwriting File.Move throw, after the temp file is written."""
+    root = tmp_path / ".claude-account-9"
+    state = root / "mefor-usage"
+    state.mkdir(parents=True)
+    marker = state / "unavailable.json"
+    marker.write_text('{"unavailable": false}', encoding="utf-8")
+    marker.chmod(stat.S_IREAD)
+    try:
+        out = avail("-Mark", "-ConfigDir", str(root), "-Reason", "cancelled")
+    finally:
+        marker.chmod(stat.S_IREAD | stat.S_IWRITE)
+    assert out.returncode != 0, out.stdout
+    assert json.loads(marker.read_text(encoding="utf-8")) == {"unavailable": False}
+    assert not list(state.glob("*.tmp"))
+
+
+def test_a_root_whose_name_holds_wildcard_characters_is_marked_literally(tmp_path: Path) -> None:
+    """Pins the reviewed not-a-bug half of BACKLOG #7557: ``New-Item -Path`` was said to expand
+    wildcards. Measured, it does not; a sibling the pattern would match stays untouched."""
+    root = tmp_path / "acct[1]"
+    root.mkdir()
+    (tmp_path / "acct1").mkdir()
+    assert avail("-Mark", "-ConfigDir", str(root), "-Reason", "cancelled").returncode == 0
+    assert (root / "mefor-usage" / "unavailable.json").is_file()
+    assert not (tmp_path / "acct1" / "mefor-usage").exists()
+
+
+@pytest.mark.parametrize("action", ["-Clear", "-Status"])
+def test_clear_and_status_refuse_a_config_root_that_does_not_exist(
+    tmp_path: Path, action: str
+) -> None:
+    """BACKLOG #7558. Only -Mark refused a typo'd root. -Clear reported NOTHING TO CLEAR and -Status
+    reported AVAILABLE, both exit 0, for an account that does not exist, while the real root's marker
+    stayed in force. Neither may create the root it refuses."""
+    ghost = tmp_path / ".claude-account-99"
+    out = avail(action, "-ConfigDir", str(ghost))
+    assert out.returncode == 1, out.stdout
+    assert "REFUSED" in out.stdout
+    assert "AVAILABLE" not in out.stdout
+    assert "NOTHING TO CLEAR" not in out.stdout
+    assert not ghost.exists(), "the refusal created the root it refused"
+
+    # CONTROL: the same action on a root that exists still succeeds.
+    real = tmp_path / ".claude-account-9"
+    real.mkdir()
+    ok = avail(action, "-ConfigDir", str(real))
+    assert ok.returncode == 0, ok.stdout
+
+
+@pytest.mark.parametrize("action", ["-Clear", "-Mark"])
+def test_a_directory_at_the_marker_path_is_refused_by_name(tmp_path: Path, action: str) -> None:
+    """BACKLOG #7558 added items 1 and 2. The reader takes a directory at the marker path as MALFORMED
+    and the account as UNAVAILABLE, yet -Clear printed NOTHING TO CLEAR and -Mark died in File.Move.
+    Both now refuse and say to remove it by hand; neither removes it."""
+    root = tmp_path / ".claude-account-9"
+    marker = root / "mefor-usage" / "unavailable.json"
+    marker.mkdir(parents=True)
+    args = [action, "-ConfigDir", str(root)]
+    if action == "-Mark":
+        args += ["-Reason", "cancelled"]
+    out = avail(*args)
+    assert out.returncode == 1, out.stdout
+    assert "REFUSED" in out.stdout and "is a directory" in out.stdout, out.stdout
+    assert "NOTHING TO CLEAR" not in out.stdout
+    assert marker.is_dir()
 
 
 def test_an_unmarked_root_is_untouched_by_any_of_this(tmp_path: Path) -> None:

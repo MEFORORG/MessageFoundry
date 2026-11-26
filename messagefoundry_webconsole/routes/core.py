@@ -49,6 +49,7 @@ from messagefoundry.auth.service import (
     Elevation,
     MfaStatus,
     PasskeyProof,
+    StoredPasskeysUnreadable,
 )
 from messagefoundry.auth.tokens import hash_bytes, hash_token
 from messagefoundry.auth.webauthn import CHALLENGE_TTL_SECONDS
@@ -60,12 +61,14 @@ from messagefoundry.redaction import json_loads_or_refusal
 from .. import pages
 from .._auth import (
     _REAUTH_NEXT_MAX,
+    _SESSION_ENDING_UI_ACTIONS,
     CLEAR_SITE_DATA_HEADER,
     CLEAR_SITE_DATA_VALUE,
     ENROL_FIRST_PAGE,
     WEBAUTHN_EXTRA_MISSING_NOTICE,
     WEBAUTHN_RP_CHANGED_NOTICE,
     WEBAUTHN_RP_MISSING_NOTICE,
+    WEBAUTHN_UNREADABLE_NOTICE,
     RepeatRefused,
     allow_reauth_attempt,
     assert_not_cross_site,
@@ -262,7 +265,9 @@ def _refusal_error(elevation: Elevation, fallback: str) -> str:
     return fallback
 
 
-def _enrol_before_step_up(mfa: MfaStatus, *, satisfied: bool, step_up: bool) -> bool:
+def _enrol_before_step_up(
+    mfa: MfaStatus, *, satisfied: bool, step_up: bool, ends_sessions: bool = False
+) -> bool:
     """Whether the password ``/ui/reauth`` sends this session to enrol instead of rendering its form.
 
     True for a full-step-up action when the account holds no factor of EITHER kind (ADR 0068
@@ -270,8 +275,16 @@ def _enrol_before_step_up(mfa: MfaStatus, *, satisfied: bool, step_up: bool) -> 
     deadlock guard: such a session can never pass the step-up, so the form would loop straight back
     (BACKLOG #3116). The account-rule half (``mfa.required``) is policy, not a deadlock: it sends a
     required-but-unenrolled account to enrol even when a stamp leaves its session satisfied. ``AuthService._unverified_session_owes_factor`` says when a session owes a factor
-    the account rule does not. Enrolment itself is ``step_up=False``, so it never bounces here."""
-    if not step_up or mfa.enabled or mfa.webauthn_enrolled:
+    the account rule does not. Enrolment itself is ``step_up=False``, so it never bounces here.
+
+    ``ends_sessions`` is a session-ending action (BACKLOG #1149). It is ``step_up=False``, but a
+    pending session with no factor is refused it, and a re-proof would mint it nothing, so that
+    session too is sent to enrol rather than shown a form."""
+    if mfa.enabled or mfa.webauthn_enrolled:
+        return False
+    if ends_sessions and not satisfied:
+        return True
+    if not step_up:
         return False
     return mfa.required or not satisfied
 
@@ -1863,7 +1876,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         rp = webauthn_rp(request)
         if rp is None:
             return None, WEBAUTHN_RP_MISSING_NOTICE
-        options = await auth.begin_webauthn_assertion(token, rp_id=rp[0])
+        try:
+            options = await auth.begin_webauthn_assertion(token, rp_id=rp[0])
+        except StoredPasskeysUnreadable:
+            # BACKLOG #6886: enrolled under this origin, but no stored passkey can be read. Not the
+            # origin-migration notice below, whose cause would be false here.
+            return None, WEBAUTHN_UNREADABLE_NOTICE
         if options is None:
             # Enrolled, but every credential was minted under a DIFFERENT rp_id (the
             # origin-migration case, ADR 0068 §7) — a legible dead-end naming the
@@ -2068,9 +2086,23 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # the IdP, so this page renders NO password field at all. Decided by the SESSION's
             # mechanism, not the account: a Kerberos session keeps the password form below.
             # Ahead of the enroll-first bounce; _reauth_idp_page says why.
-            return await _reauth_idp_page(auth, token, mfa, next_, action.step_up, continues)
+            # A session-ending action counts as a full step-up here, for the reason
+            # _enrol_before_step_up gives (BACKLOG #1149).
+            return await _reauth_idp_page(
+                auth,
+                token,
+                mfa,
+                next_,
+                action.step_up or action.action in _SESSION_ENDING_UI_ACTIONS,
+                continues,
+            )
         satisfied = await auth.mfa_satisfied(token)
-        if _enrol_before_step_up(mfa, satisfied=satisfied, step_up=action.step_up):
+        if _enrol_before_step_up(
+            mfa,
+            satisfied=satisfied,
+            step_up=action.step_up,
+            ends_sessions=action.action in _SESSION_ENDING_UI_ACTIONS,
+        ):
             return RedirectResponse(ENROL_FIRST_PAGE, status_code=303)
         # The rendering splits BY FACTOR (decision 1(b)): the TOTP code field renders iff
         # TOTP is enrolled (a required-but-unenrolled account can never produce a code —
@@ -2121,7 +2153,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # continues_after_reauth is asked of `token` at each use, not once here: the code leg below
         # rotates it and re-keys the issued continuation onto the new token.
         satisfied = await auth.mfa_satisfied(token)
-        if _enrol_before_step_up(mfa, satisfied=satisfied, step_up=action.step_up):
+        if _enrol_before_step_up(
+            mfa,
+            satisfied=satisfied,
+            step_up=action.step_up,
+            ends_sessions=action.action in _SESSION_ENDING_UI_ACTIONS,
+        ):
             # Checked BEFORE the rate limiter so a correct password isn't burned into a 429 (the
             # review's silent-loop finding). test_ui_mfa_gate.py pins the order for the session half
             # with the budget denied.

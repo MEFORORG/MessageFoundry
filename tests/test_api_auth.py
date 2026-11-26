@@ -2505,9 +2505,11 @@ async def test_revoke_other_sessions_requires_reauth_when_stale(engine: Engine) 
         assert (await c.get("/auth/me", headers=_auth(t2))).status_code == 200  # current kept
 
 
-async def test_revoke_no_mfa_user_gate_is_password_only(engine: Engine) -> None:
-    # TRAP guard: even a require_mfa session that has NOT enrolled a factor gets a password-only gate
-    # on terminate (X-Step-Up-Required, never X-MFA-Required) — never deadlocked out of revoking.
+async def test_revoke_no_mfa_user_is_sent_to_enrol(engine: Engine) -> None:
+    # BACKLOG #1149 (ASVS 7.5.2): a require_mfa session that has NOT enrolled a factor is
+    # MFA-pending, so the terminate routes refuse it with X-MFA-Required and a detail naming
+    # enrolment, before and after a password re-proof. It is not deadlocked: enrolment stays open,
+    # and tests/test_mfa_access_gate.py pins that it terminates once enrolled.
     service = await _service(engine, AuthSettings(require_mfa=True, login_rate_limit_enabled=False))
     await _add(service, "u", Role.VIEWER)
     async with _client(engine, service) as c:
@@ -2515,11 +2517,12 @@ async def test_revoke_no_mfa_user_gate_is_password_only(engine: Engine) -> None:
         await service.store.mark_session_reauthed(hash_token(t), now=0.0)
         stale = await c.delete("/me/sessions", headers=_auth(t))
         assert stale.status_code == 403
-        assert stale.headers.get("X-Step-Up-Required") == "1"
-        assert stale.headers.get("X-MFA-Required") is None  # NOT the MFA gate
+        assert stale.headers.get("X-MFA-Required") == "1"
+        assert stale.headers.get("X-Step-Up-Required") is None
+        assert "enrol one first" in stale.json()["detail"]
         _r, t = await _reauth(c, t, purpose="session_terminate")
         assert _r.status_code == 200
-        assert (await c.delete("/me/sessions", headers=_auth(t))).status_code == 200
+        assert (await c.delete("/me/sessions", headers=_auth(t))).status_code == 403
 
 
 async def test_revoke_ownership_404_survives_reauth(engine: Engine) -> None:

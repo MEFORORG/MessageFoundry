@@ -305,7 +305,14 @@ the retry/dead-letter classification, the `[egress].allowed_http` gate) and adds
 (with a per-request collision-checked random boundary) + `application/dicom+json` response handling (a per-instance
 `FailedSOPSequence` → permanent dead-letter, as are some other 2xx replies that do not confirm the
 store, though not all; which ones is CONNECTIONS.md *DICOMweb*, *Status classification*). **No new dependency** and **no `[dicom]` extra** — the object rides
-as opaque bytes. This **exceeds** both incumbents (neither Mirth nor Corepoint ships DICOMweb send out of the box).
+as bytes, and a 202 reply is checked against the object's File Meta SOP Instance UID, read by hand,
+and, with the `[dicom]` extra, its data set SOP Instance UID (CONNECTIONS.md *DICOMweb*). The extra
+is optional for DICOMweb, but an installed extra that is broken now matters to it: DICOMweb loads
+and uses it on each send where it is found. One that does not load, or whose read of an object
+raises a fault the codec does not wrap, adds no data set UID to the comparison, with a WARNING; a
+`MemoryError` stops the send before the POST. Such a read fault, on an object with no File Meta
+UID, lets a 202 naming any UID confirm it; CONNECTIONS.md *DICOMweb*, *Status classification*,
+says which. This **exceeds** both incumbents (neither Mirth nor Corepoint ships DICOMweb send out of the box).
 
 ---
 
@@ -334,57 +341,89 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
 - **Count-and-log.** Every received object is persisted with a disposition — never accepted-and-dropped; a
   malformed/non-DICOM body dead-letters as `ERROR` (fail-loud).
 - **PHI.** A DICOM object is PHI (header + pixel data). It is stored through the encrypting store, **never logged
-  at INFO+**, and egress-allowlisted. Every log/error line carries only **routing-safe identifiers** (SOP
-  class/instance UID, AE title, peer host) or a redacted URL — never the dataset, an element value, or pixel data.
-  The rule holds for pynetdicom's and pydicom's own loggers too (owner ruling 2026-11-03, BACKLOG #5081). A
-  UID or AE title a peer sent that either library refuses or flags as non-conformant is not a routing-safe
-  identifier. The DICOM transport applies that rule through a log filter on those libraries' loggers, which
-  meets it only for the line shapes the filter knows. The filter is installed when the transport is imported
-  and again at each SCP start, so it reads the SCU's lines as well as the SCP's. It redacts the value from at
-  least these lines, which stay with the element's name and the reason while the value reads `[redacted]`:
-  pynetdicom's non-conformant and refused value lines; its non-conformant transfer syntax and related SOP
-  class lines, and its line naming a transfer syntax under the DICOM root that is no transfer syntax; the
-  refusal in an exception logged by any pynetdicom module that logs one, such as its DUL when a received PDU
-  does not decode or its DIMSE provider when a received message does not convert, in the record's message
-  and in each link of its traceback's chain; pydicom's invalid value, Specific Character Set, VR IS and
-  DS, and invalid private creator lines, as lines and as refusals inside such an exception; pynetdicom's `No presentation context for`
-  line, which keeps its SOP class and transfer syntax only when both are conformant or named in pydicom's
-  UID dictionary; its `No supported service class` line, which keeps a SOP class on the same terms; the
-  UID and AE title fields of pynetdicom's DEBUG dumps of an association request, an
-  association acceptance and a DIMSE message; and the username and password of a user identity and the
-  hex of an extended negotiation item's application information in those dumps, which are never kept. A
-  dump field otherwise keeps at
-  least these values: an empty one; a
-  conformant UID; a name in pydicom's UID dictionary, on a field that is no instance UID; and, on the AE title
-  fields and on Their Implementation Version Name, a value that passes pynetdicom's AE title check, which an
-  empty or all-space value does. `_kept` in `messagefoundry/transports/dicom.py` is the source of record.
-  pynetdicom runs no AE title check on the two titles of an association acceptance, only `decode_bytes` on
-  their bytes, and the filter applies the title check to them anyway. The dump's `unknown` for a missing implementation class
-  UID is redacted too, since a peer can send that word itself. The lines are a list of the known pynetdicom
-  3.0.4 and pydicom 3.0.2 shapes. A line of another shape, or on another logger, passes whole, so a new shape
-  that a library upgrade adds reaches the log until it is added to the list. The pin tests in
+  at INFO+**, and egress-allowlisted. A UID or AE title a peer sent that either library refuses or flags as
+  non-conformant is not a routing-safe identifier. The DICOM transport applies default-deny on every
+  `pynetdicom.*` and `pydicom` logger, at every level (BACKLOG #6637).
+
+  **The rule, stated once here.** Where the screen applies, a library log line is written only if it is one of the
+  value-free lines or fully matches one of the templates, both pinned in
+  `messagefoundry/transports/_dicom_log_lines.py`, and is withheld otherwise. A withheld line is replaced by its
+  logger name, its level, a fixed note and, where the record carries an exception, that exception's class name,
+  and none of its message or arguments. A screened record's traceback may be written, with each exception's
+  message screened by the same rule; notes and group members are not written. The rule's limits, at least:
+  those under *How far it reaches* and *The screen assumes a library exception's class behaves as ordinary
+  Python* below, and the known limits listed beside the pin tests. On a pinned line
+  the fixed text stays and the value reads `[redacted]` where the library is refusing or flagging it. The UID and AE
+  title fields of pynetdicom's DEBUG dumps stay only where they pass `_kept` in
+  `messagefoundry/transports/dicom.py`, the source of record: at least an empty value; a conformant UID; a name in
+  pydicom's UID dictionary, on a field that is no instance UID; and, on the AE title fields and on Their
+  Implementation Version Name, a value that passes pynetdicom's AE title check, which an empty or all-space value
+  does. pynetdicom runs no AE title check on the two titles of an association acceptance, and the screen applies
+  it to them anyway. The dump's `unknown` for a missing implementation class UID is redacted, since a peer can
+  send that word itself. A user identity's username and password, and the hex of an extended negotiation item's
+  application information, are never kept.
+
+  **What an operator still reads and what is lost.** Association requested, accepted, rejected with its result
+  and reason, released and aborted, the send and receive lines for C-STORE and C-ECHO with their status, and the
+  library's fixed protocol error lines stay, at least those for a malformed PDU or association field. Lost, at least: the C-FIND, C-GET and C-MOVE progress lines and
+  identifier dumps, which this engine does not serve; the text of a library exception that matches no template,
+  including an operating system's socket error text; and every note and group member of an exception.
+
+  Where the engine quotes such an exception, in its own C-STORE line or a delivery error, it keeps the class
+  and reads `[message withheld]` with the file, line and function that raised it. pynetdicom's own
+  `TCP Initialisation Error: {exc}` line is different. It has no `exc_info`, so its withheld line keeps
+  neither the class nor the raising place, and an operator cannot tell a refused connection from a timeout or
+  a DNS failure from the log.
+
+  **How far it reaches.** A filter on each logger the libraries create, and a log record factory for any other
+  logger under those names, so a logger created later, one that does not propagate, and a host with no
+  `logging_setup` handler are all covered. A host that replaces the record factory without calling the one it
+  found leaves a logger outside the named list unscreened until the next SCP start, C-STORE, SCU association or
+  DICOMweb data set pre-read puts the factory back. A record built by hand and given straight to a handler passes neither. Neither library sets
+  `propagate = False` on a logger of its own. An `Exception` raised while the screen reads a line withholds that line, and one raised while it
+  renders the traceback withholds the traceback. Matching is linear in the line's length.
+
+  A delivery error raised while the SCU stores an object holds, on its chain, at most an engine exception that
+  names the library exception's class, with none of its text.
+
+  **A failed association release does not change the outcome.** The peer's status decides it. After a C-STORE, a
+  Success or Warning stays delivered and is not sent again, any other status keeps its own outcome, and a send
+  with no status stays a failure. After a C-ECHO, the test passes only on Success. The release failure is logged
+  through the screen and the association is aborted. If the abort raises too, that is logged the same way and
+  the engine makes no further attempt to end the association.
+
+  **The screen assumes a library exception's class behaves as ordinary Python.** A class with hostile attribute,
+  `__str__` or metaclass code is outside it and can still get text past it, and an ordinary class's name is
+  written, so a name carrying a value would be written too.
+
+  **A library exception the SCU does not wrap keeps its text.** At least one raised while the SCU opens the
+  association does. The delivery worker logs only its class, but the text would reach the row's `last_error`
+  through `safe_exc`, which does not recognise a refused UID. If the worker's write of that error to the store
+  then fails with an error that is not a database driver's, its fault log prints the text as well. Test
+  Connection has the same limit: an exception raised while it opens the association or sends the C-ECHO would
+  reach the result's detail through `safe_exc`.
+
+  `tests/_dicom_log_census.py` scans both installed libraries' log and `warn_and_log` calls against a pinned
+  census, so a call it can read that a library adds or rewords fails a test until it is read: at least a
+  literal, an f-string, and text assigned to a local variable it then logs. A line built some other way, such as
+  a dataset dump's loop variable, is in the census only by that variable's name. The pin tests in
   `tests/test_dicom_peer_value_logs.py` fail when either library's version changes in the environment they
-  run in, and when a line they read changes, so a change to the lock has to re-read the shapes. They do not
-  reach a site's own install: the `[dicom]` extra pins pynetdicom exactly but lets pydicom resolve to any
-  release from 3.0.2 below 3.1, and the tests run only the release the lock names. Known shapes not covered
-  yet, at least: a flagged UID that spells a name in pydicom's UID dictionary, which a dump field, the
-  `No presentation context for` line and the `No supported service class` line keep; and pydicom's
-  `Unknown VR` line, which names two bytes of an object and is written only with pydicom's own debug
-  switched on. The SCP reads each association
-  request and command set once before pynetdicom does. What that read writes on the loggers the SCP filters is
+  run in. They do not reach a site's own install: the `[dicom]` extra pins pynetdicom exactly but lets pydicom
+  resolve to any release from 3.0.2 below 3.1. Known limits, at least: a flagged UID that spells a name in pydicom's UID
+  dictionary is kept by a dump field, the `No presentation context for` line and the `No supported service
+  class` line. The SCP reads each association
+  request and command set once before pynetdicom does. What that read writes on the named loggers is
   written only where the command set itself ends the association. Where a later PDU ends it, before
   pynetdicom reads the message, that read's lines are written nowhere. A line on any other logger is written
-  twice. pydicom also raises each of its lines above as a `UserWarning`, which would carry the value to
-  stderr. A warnings filter, installed at import, at each SCP start, at each C-STORE the SCP serves and
-  before each SCU read and association, ignores those copies and no other pydicom warning; a host that resets
-  the process's warnings filters between those points brings the copy back until the next one, and the SCP's
-  pre-read of a command set is not one of them. Under context-aware warnings, the free-threaded default, the
-  filter is installed at every one of those points, which also repeats another library's once-per-location
-  warning. The filter also renders a codec error on these loggers
-  without the byte it failed on, for a host whose handlers lack the engine's log chain. The engine's
-  own C-STORE lines name an object's SOP class and instance UIDs only when they are conformant, and `[redacted]`
-  otherwise, and redact a refused value of a shape the filter knows from a library error they quote; a
-  library error of another shape is quoted through `safe_exc` alone.
+  twice, screened. pydicom also raises each of its lines as a warning, which would carry the value to
+  stderr. One warnings filter, scoped to pydicom's modules so that no other library's warning is silenced, is
+  installed at import, at each SCP start, at each C-STORE the SCP serves and before each SCU read and
+  association. A host that resets the process's warnings filters between those points brings the copy back
+  until the next one, and the SCP's pre-read of a command set is not one of them. Under context-aware warnings,
+  the free-threaded default, the filter is installed at every one of those points, which also repeats another
+  library's once-per-location warning. The engine's own C-STORE lines name an object's SOP class and instance
+  UIDs only when they are conformant, and `[redacted]` otherwise, and quote a library error only through the
+  same screen.
 - **Egress is fail-closed.** A DIMSE destination is gated by `[egress].allowed_tcp`; a DICOMweb destination by
   `[egress].allowed_http` — both enforced at load/reload/start.
 
