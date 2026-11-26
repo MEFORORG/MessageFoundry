@@ -3024,7 +3024,11 @@ def safe_exc(
     the name anyway: a control that reports success while the hole stays open. The basename is
     replaced as written and in at least the forms one level of ``repr()``, ``ascii()``, a bytes
     ``repr()`` or a JSON string renders it as (:func:`_name_forms`), so a full path is
-    covered; the directory part is operator configuration, not partner-chosen, and stays. A name
+    covered. The part after the last ``/`` is replaced as well, since a backslash is an ordinary
+    character in a POSIX or SFTP name; a Windows path passed whole then loses its directory too. The
+    directory part otherwise stays, and it is not always operator configuration: a subdirectory a
+    partner made under a recursive File source stays in the message, since its callers pass the
+    basename alone. A name
     escaped twice, as ``repr(str(oserror))`` renders it, or encoded any other way, is NOT replaced,
     and only :func:`safe_text`'s patterns stand between it and the output.
 
@@ -3067,8 +3071,11 @@ def safe_exc(
         label = safe_name(file_name)
         # An OSError quotes its path with repr(), so a name holding a control, a non-printable or a
         # quote character appears escaped and the raw name alone matches nothing (BACKLOG #5815).
-        for form in _name_forms(base):
-            raw = raw.replace(form, label)
+        # A backslash is an ordinary character in a POSIX or SFTP name, so the part after the last
+        # `/` is swapped too. One pass over every form, so no form matches across a label it wrote.
+        forms = set(_name_forms(base)) | set(_name_forms(file_name.rsplit("/", 1)[-1]))
+        alternation = "|".join(map(re.escape, sorted(forms, key=lambda form: (-len(form), form))))
+        raw = re.sub(alternation, lambda _: label, raw)
     message = safe_text(raw, limit=limit)
     return f"{name}: {message}" if message else name
 
@@ -3082,10 +3089,12 @@ def _name_forms(text: str) -> list[str]:
     repr picks its quote from the WHOLE string, a path whose directory the name does not decide: it
     quotes with ``'`` and escapes it, unless the string holds ``'`` and no ``"``, when it quotes with
     ``"`` and escapes neither. Appending ``"`` forces the first choice, so both forms are read off the
-    interpreter itself rather than reimplemented. The bytes come from each encoding a path can take:
-    the filesystem encoding, and UTF-8 with either surrogate handler, since Windows passes a lone
-    surrogate through and POSIX escapes it. One a name cannot be encoded in is skipped, never raised:
-    this runs on an error arm, and a lone surrogate is a name a partner can choose."""
+    interpreter itself rather than reimplemented. The bytes come from these encodings, not every one
+    a path can take: the filesystem encoding, UTF-8 with either surrogate handler, since Windows
+    passes a lone surrogate through and POSIX escapes it, and cp1252, the Windows ANSI code page. One
+    a name cannot be encoded in is skipped, never raised: this runs on an error arm, and a lone
+    surrogate is a name a partner can choose. Each escaped form is also kept with its hex digits in
+    upper case."""
     forms = {
         text,
         repr(text)[1:-1],
@@ -3096,9 +3105,11 @@ def _name_forms(text: str) -> list[str]:
         json.dumps(text, ensure_ascii=False)[1:-1],
     }
     encoders: list[Callable[[str], bytes]] = [
+        # The same as one UTF-8 encoder below, except under Windows' legacy filesystem encoding.
         os.fsencode,
         lambda s: s.encode("utf-8", "surrogatepass"),
         lambda s: s.encode("utf-8", "surrogateescape"),
+        lambda s: s.encode("cp1252"),
     ]
     for encode in encoders:
         try:
@@ -3106,7 +3117,19 @@ def _name_forms(text: str) -> list[str]:
         except UnicodeEncodeError:
             continue
         forms.update((repr(encoded)[2:-1], repr(encoded + b'"')[2:-2]))
+    # Another renderer may write an escape's hex digits in upper case, as some JSON encoders do.
+    forms.update([_HEX_ESCAPE.sub(_upper_hex, form) for form in forms])
     return sorted(forms, key=lambda form: (-len(form), form))
+
+
+#: A ``\x``, ``\u`` or ``\U`` escape with lowercase hex digits, as repr, ascii and json write one.
+_HEX_ESCAPE = re.compile(r"\\(x[0-9a-f]{2}|u[0-9a-f]{4}|U[0-9a-f]{8})")
+
+
+def _upper_hex(match: re.Match[str]) -> str:
+    """The escape ``match`` read, its hex digits in upper case and its letter as it was."""
+    escape = match.group(1)
+    return "\\" + escape[0] + escape[1:].upper()
 
 
 #: ``encodings`` modules that are no text codec: the alias table, the bytes-to-bytes and str-to-str
