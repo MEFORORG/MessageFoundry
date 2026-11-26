@@ -10,8 +10,9 @@ PHI posture: the log stores message **identifiers** (MSH-10 control id, MSH-9 ty
 (size, outcome, ACK code) — never message bodies. Its ``detail`` column, though, can carry at least
 the partner's MSA-3 ACK text or a transport error string, and either can name a patient, so **every**
 tee DB holds PHI at rest, capture on or off, and must live on a protected volume (on open the file
-and its -wal and -shm are restricted to their owner, best-effort and logged when it fails: chmod
-0600 on POSIX, an owner-only DACL on Windows; ``_secure_file`` says what that leaves). The optional body capture (``--capture-bodies``) adds raw HL7
+and its -wal and -shm are restricted, best-effort and logged when it fails: chmod 0600 on POSIX, a
+DACL granting the opening account alone on Windows; ``_secure_file`` says where what that leaves
+is stated). The optional body capture (``--capture-bodies``) adds raw HL7
 in a separate table and is **off by default**.
 """
 
@@ -251,7 +252,8 @@ def _summarize(rows: list[aiosqlite.Row]) -> dict[str, Any]:
 
 def _precreate_secure(path: str) -> None:
     """Create the DB file with owner-only permissions *before* SQLite opens it, closing the brief
-    window where SQLite would otherwise create it world-readable (POSIX umask). No-op if it exists."""
+    window where SQLite would otherwise create it world-readable (POSIX umask). On Windows the
+    file takes its folder's access list until ``_secure_file`` runs. No-op if it exists."""
     if os.path.exists(path):
         return
     try:
@@ -399,11 +401,9 @@ def _secure_file(path: str) -> None:
     goes on: the protected-volume advice in the module docstring is the backstop.
 
     On Windows each file gets a protected DACL granting full control to this process's own user and
-    nobody else (``_owner_only_dacl``); chmod there sets only the read-only bit. A sibling that
-    SQLite deletes and later re-creates, on the last connection's close or a journal-mode switch,
-    takes its folder's access list again until a later open restricts it. Each open restricts the
-    files to the account opening them, so a DB is usable only by the account that opened it last:
-    run the relay and the tee commands that read its DB under one account.
+    nobody else (``_owner_only_dacl``); a 0600 mode means nothing there. What the DACL
+    leaves open on Windows is stated once, in the tee relay paragraph of docs/PHI.md, *Logging
+    inventory*.
 
     On POSIX each file is chmod 0600. A sibling SQLite re-creates later takes the main file's mode
     whatever the umask (the unix VFS copies it), so it is 0600 whenever the main file is.
@@ -441,9 +441,9 @@ class RelayStore:
     @classmethod
     async def open(cls, path: str) -> RelayStore:
         if path != ":memory:":
-            _precreate_secure(
-                path
-            )  # create 0600 before SQLite opens it (closes the readable window)
+            # Create 0600 before SQLite opens it, which closes the readable window on POSIX only;
+            # on Windows the mode means nothing, and _secure_file restricts the file later.
+            _precreate_secure(path)
         db = await aiosqlite.connect(path)
         db.row_factory = aiosqlite.Row
         await db.execute("PRAGMA journal_mode=WAL")

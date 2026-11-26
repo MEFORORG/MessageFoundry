@@ -559,12 +559,15 @@ async def test_the_db_and_its_wal_and_shm_get_an_owner_only_dacl_on_windows(
 async def test_a_re_created_wal_takes_its_folder_list_until_a_later_open(
     tmp_path: Path,
 ) -> None:
-    """BACKLOG #5637: ``_secure_file``'s docstring states that a sibling SQLite deletes and later
-    re-creates takes its folder's access list again until a later open restricts it. The
-    re-creation here is a journal-mode switch, which the tee itself never makes: the re-created
-    siblings carry exactly the folder's inherited entries, Administrators included, and a second
-    open, run while the first still holds them, makes each owner-only again. That a handle opened
-    in between keeps its access is not tested."""
+    """BACKLOG #5637: docs/PHI.md, the tee relay paragraph of *Logging inventory*, states that a
+    sibling re-created other than by a tee open stays on its folder's access list until a later tee
+    open restricts it. The re-creation here is a journal-mode switch the test makes itself, out of
+    WAL mode and back. The tee's own open runs ``PRAGMA journal_mode=WAL``, which switches only a DB
+    that is not already in WAL mode. The re-created siblings carry exactly the folder's inherited
+    entries, Administrators included, and a second open, run while the first still holds them,
+    makes each owner-only again. This test does not pin re-creation after the last connection's
+    close, or the access a handle opened before a restriction keeps; when this was written no other
+    test pinned them either."""
     from messagefoundry.config.atomic_edit import _canonical_sid
     from messagefoundry.restricted_file import _windows_engine_sid
     from messagefoundry.store.store import _parse_sddl_dacl, _read_dacl_sddl
