@@ -9,9 +9,10 @@ the message ROW** (the Mirth Data-Pruner pattern — counts, disposition, and th
 intact; the row survives, its PHI columns — ``metadata`` included, ASVS 14.2.7 — do not). Tiers that
 carry nothing BUT PHI and back no count (transform state, connection events, saved-search presets) are
 DELETEd outright rather than blanked. It also checkpoints the WAL and ``VACUUM``s on a daily off-peak
-schedule. Each
-pass that does real work writes **one** ``audit_log`` entry recording the cutoffs + counts (never any
-message content). When the store outgrows ``max_db_mb`` it raises an advisory ``storage_threshold``
+schedule. A
+pass writes a ``retention_purge`` ``audit_log`` entry recording the cutoffs + counts (never any
+message content); which passes write one, and when one can still be missing, is stated once, in
+:meth:`RetentionRunner.run_once`. When the store outgrows ``max_db_mb`` it raises an advisory ``storage_threshold``
 alert. On a SQLite store it also logs a WARNING each pass while free space on the store's volume is
 below ``min_free_disk_mb`` (BACKLOG #290); ``serve`` refuses to start below that same floor, through
 :func:`read_disk_floor`. On every backend it logs a WARNING each pass while ``audit_log`` holds more
@@ -1112,7 +1113,7 @@ class RetentionRunner:
             nonlocal archive_saw_demotion
             if not archive_saw_demotion and not self._coordinator.is_leader():
                 archive_saw_demotion = True
-            return archive_saw_demotion or _loop_stopped() or _deadline_hit()
+            return archive_saw_demotion or _deadline_hit()
 
         # The phase now working, so an interrupted pass can name it (S07-44): set as a phase starts
         # its work, after its own checks, and cleared when it ends, so a fault between two phases
