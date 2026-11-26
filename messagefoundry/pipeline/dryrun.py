@@ -256,21 +256,22 @@ _BINARY_CONTENT_TYPE_VALUES = frozenset(ct.value for ct in ContentType if ct.is_
 
 
 def _carry_or_decode(raw: str | bytes, ic: InboundConnection) -> str:
-    """``raw`` as the listener commits it for a non-HL7 ``ic``: base64-carried for a binary type,
-    decoded with the declared charset and guarded otherwise (BACKLOG #1689). Raises
-    :class:`IngressGuardError` for a body those decode, carriage and size guards refuse. The
-    listener's declared-type sniff (``check_declared_type``) is not among them."""
+    """``raw`` as the listener decodes it for ``ic``: base64-carried for a binary type, decoded
+    with the declared charset and run through the post-decode guards otherwise (BACKLOG #1689).
+    Raises :class:`IngressGuardError` for a body those guards refuse. The listener's declared-type
+    sniff (``check_declared_type``) and the HL7 peek are not among them."""
     return carry_binary_ingress(raw, ic) if ic.content_type.is_binary else decode_ingress(raw, ic)
 
 
 def _listener_body(raw: str | bytes, ic: InboundConnection) -> str | bytes:
-    """A ``bytes`` non-HL7 ``raw`` in the form the listener hands ``ic``'s Router (BACKLOG #6819).
+    """A ``bytes`` ``raw`` in the form the listener hands ``ic``'s Router (BACKLOG #6819).
 
-    The live engine routes only a ``str``, and :func:`build_payload` decodes ``bytes`` as UTF-8, so
-    without this a DICOM or latin-1 body raised ``UnicodeDecodeError`` and a binary body that was
-    valid UTF-8 reached the Handler uncarried. A ``str`` and an HL7 body pass through unchanged:
-    a ``str`` is taken to be in routed form already, and HL7 ``bytes`` are ``Message.parse``'s."""
-    if isinstance(raw, str) or ic.content_type is ContentType.HL7V2:
+    The live engine routes only a ``str``, and :func:`build_payload` decodes ``bytes`` as UTF-8
+    (``Message.parse`` with replacement for HL7), so without this a DICOM or latin-1 body raised
+    ``UnicodeDecodeError``, a binary body that was valid UTF-8 reached the Handler uncarried, and a
+    latin-1 HL7 body reached it with its accented letters replaced. A ``str`` passes through
+    unchanged, taken to be in routed form already."""
+    if isinstance(raw, str):
         return raw
     return _carry_or_decode(raw, ic)
 
@@ -473,9 +474,8 @@ def route_only(
     for the payload being a faithful, *isolated-where-mutable* view of ``raw``; ``None`` (the default)
     keeps the self-parsing behavior, so every existing call site is byte-identical.
 
-    A ``bytes`` non-HL7 ``raw`` is self-parsed carried or decoded as the listener commits it, and
-    a body those guards refuse raises :class:`IngressGuardError` (BACKLOG #6819,
-    :func:`_listener_body`).
+    A ``bytes`` ``raw`` is self-parsed carried or decoded as the listener decodes it, and a body
+    those guards refuse raises :class:`IngressGuardError` (BACKLOG #6819, :func:`_listener_body`).
 
     ``tracer`` (ADR 0072) is an optional observer: when given, the Router is invoked **through**
     ``tracer.trace_router`` (which installs ``sys.settrace`` around the call) instead of called directly.
@@ -824,9 +824,9 @@ def route_message(
     :func:`transform_one`). Router/Handler exceptions propagate to the caller, a ``SystemExit`` as
     :class:`UserCodeCalledSysExit`.
 
-    A ``bytes`` non-HL7 ``raw`` reaches the Router and every Handler carried or decoded as the
-    listener commits it, and a body those guards refuse raises :class:`IngressGuardError` before
-    any runs or any reference file is read (BACKLOG #6819, :func:`_listener_body`).
+    A ``bytes`` ``raw`` reaches the Router and every Handler carried or decoded as the listener
+    decodes it, and a body those guards refuse raises :class:`IngressGuardError` before any runs
+    or any reference file is read (BACKLOG #6819, :func:`_listener_body`).
 
     ``tracer`` (ADR 0072) is threaded to :func:`route_only` / :func:`transform_one` so the traced
     dry-run can observe each Router/Handler call; it is a pure observer, so the outcome is byte-identical.

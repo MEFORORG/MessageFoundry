@@ -1033,12 +1033,42 @@ def test_an_oversize_binary_body_is_the_size_refusal(monkeypatch: pytest.MonkeyP
     from messagefoundry.pipeline import ingress_guards
     from messagefoundry.pipeline.ingress_guards import IngressTooLarge
 
-    monkeypatch.setattr(ingress_guards, "ingress_size_error", lambda size: "too large")
+    # Refuses only the RAW length, 1 byte: a check on the carried text, which is longer, passes.
+    monkeypatch.setattr(
+        ingress_guards, "ingress_size_error", lambda size: "too large" if size == 1 else None
+    )
     for entry in ("route_message", "route_only", "transform_one"):
         seen: list[Any] = []
         with pytest.raises(IngressTooLarge):
             _run_entry(entry, _bytes_registry(seen, content_type=ContentType.BINARY), b"\x00")
         assert seen == [], entry
+        _run_entry(entry, _bytes_registry(seen, content_type=ContentType.BINARY), b"\x00\x00")
+        assert seen, f"{entry}: the control body was refused too"
+
+
+@pytest.mark.parametrize("entry", ["route_message", "route_only"])
+def test_hl7_bytes_decode_with_the_inbound_charset(entry: str) -> None:
+    """HL7 bytes are decoded with the charset the inbound declares, as ``dry_run`` and the
+    listener decode them (BACKLOG #6819). ``Message.parse`` used to decode them as UTF-8 with
+    replacement, so a latin-1 name reached the Router and Handler with a U+FFFD in it."""
+    names: list[str | None] = []
+
+    def route(msg: Message) -> list[str]:
+        names.append(msg["PID-5"])
+        return ["h"]
+
+    def handle(msg: Message) -> Send:
+        names.append(msg["PID-5"])
+        return Send("out", msg)
+
+    reg = _registry(route, {"h": handle})
+    reg.inbound["in"].spec.settings["encoding"] = "latin-1"
+    raw = ADT_A01.replace("DOE^JANE", "CAF\u00c9^JANE").encode("latin-1")
+    if entry == "route_message":
+        route_message(reg, reg.inbound["in"], raw)
+    else:
+        route_only(reg, reg.inbound["in"], raw)
+    assert names and set(names) == {"CAF\u00c9^JANE"}
 
 
 # --- BACKLOG #6821: a fault in a peek read is a recorded ERROR, as on the listener --------------
