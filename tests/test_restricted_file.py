@@ -18,6 +18,7 @@ import errno
 import os
 import stat
 import sys
+import types
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -1158,12 +1159,66 @@ def test_broad_access_problem_refuses_where_the_linux_mount_table_cannot_be_read
     # Typed, so a caller says the file could not be checked rather than that it is not restricted.
     assert isinstance(problem, restricted_file.UncheckedProblem)
     assert "This clears once the engine can read /proc/self/mountinfo" in problem
-    assert "the owner and mode of the folder that holds it" in problem
+    assert "the folders above the folder that holds it" in problem
     assert "Changing the owner or mode of the checked path" in problem
     assert problem.endswith("or replacing what is at that path, does not clear it")
     # Worded for a warning as well as a refusal, since warn prints it and the start goes on.
     assert "refus" not in problem
     assert "chmod" not in problem and "chown" not in problem
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux has a mount table to read")
+def test_an_unread_linux_mount_table_still_reports_a_broad_holding_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The holding folder's owner and mode are one stat, read whether or not the mount table can
+    be: a folder others may write is a finding, so a caller that only warns prints it rather than
+    the not-fully-checked answer (vault BACKLOG #5657). The control is the same key in a 0700
+    folder, which is answered as not fully checked."""
+    holder = tmp_path / "holder"
+    holder.mkdir()
+    key = holder / "k.key"
+    key.write_bytes(b"synthetic")
+    os.chmod(key, 0o600)
+    monkeypatch.setattr(restricted_file, "read_mounts", lambda: None)
+    os.chmod(holder, 0o700)
+    assert isinstance(restricted_file.broad_access_problem(key), restricted_file.UncheckedProblem)
+    os.chmod(holder, 0o777)
+    try:
+        problem = restricted_file.broad_access_problem(key)
+    finally:
+        os.chmod(holder, 0o700)
+    assert problem is not None and "the directory that holds it has mode 0777" in problem
+    assert not isinstance(problem, restricted_file.UncheckedProblem)
+
+
+def test_an_unread_mount_table_still_reports_a_broad_holding_folder_on_every_platform(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The POSIX branch of :func:`broad_access_problem`, run on every platform with the host's
+    platform, stats and mount table faked: the Linux test above, where no Linux host runs. A 0777
+    holder is answered as a finding; a 0700 one, the control, as not fully checked."""
+    euid = 1000
+    holder_mode = {"mode": stat.S_IFDIR | 0o777}
+
+    def fake_lstat(_path: object) -> os.stat_result:
+        return os.stat_result((stat.S_IFREG | 0o600, 0, 0, 1, euid, euid, 9, 0, 0, 0))
+
+    def fake_stat(_path: object) -> os.stat_result:
+        return os.stat_result((holder_mode["mode"], 0, 0, 2, euid, euid, 0, 0, 0, 0))
+
+    fake_os = types.SimpleNamespace(lstat=fake_lstat, stat=fake_stat, geteuid=lambda: euid)
+    monkeypatch.setattr(restricted_file, "os", fake_os)
+    monkeypatch.setattr(restricted_file, "sys", types.SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(restricted_file, "read_mounts", lambda: None)
+    key = Path("/srv/keys/k.key")
+    problem = restricted_file.broad_access_problem(key)
+    assert problem is not None and "the directory that holds it has mode 0777" in problem
+    assert not isinstance(problem, restricted_file.UncheckedProblem)
+    holder_mode["mode"] = stat.S_IFDIR | 0o700
+    unchecked = restricted_file.broad_access_problem(key)
+    assert isinstance(unchecked, restricted_file.UncheckedProblem)
+    assert unchecked == restricted_file.MOUNT_TABLE_UNREAD
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux has a mount table to read")

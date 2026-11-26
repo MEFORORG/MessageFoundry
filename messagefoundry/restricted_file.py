@@ -1160,8 +1160,8 @@ class UncheckedProblem(str):
 #: warning under ``warn`` alike.
 MOUNT_TABLE_UNREAD: Final = (
     "/proc/self/mountinfo could not be read, so at least these were not judged for the checked "
-    "path: the type of the file system under it, the folders above it, and the owner and mode of "
-    "the folder that holds it. This clears once the engine can read /proc/self/mountinfo, for "
+    "path: the type of the file system under it, and the folders above the folder that holds it. "
+    "This clears once the engine can read /proc/self/mountinfo, for "
     "example with procfs mounted where the engine runs, or with an AppArmor or SELinux policy that "
     "allows the read. Changing the owner or mode of the checked path or of the folders above it, "
     "or replacing what is at that path, does not clear it"
@@ -1450,10 +1450,18 @@ def broad_access_problem(
     reaches the file there; the list is open, so a type it does not name passes. That walk, and
     with it the mount check, is skipped under ``holder_judged``. Its refusal where the table
     cannot be read, and at least some of what it does not judge, are
-    :func:`_posix_host_link_problem`'s, and ``docs/PHI.md`` lists at least those too. That answer,
-    which a caller turns into a refusal under ``enforce`` and a warning under ``warn``, is an
-    :class:`UncheckedProblem`, told apart by its type: the check was not completed, though the
-    file's own owner and mode were judged first, and the text carries its own remedy.
+    :func:`_posix_host_link_problem`'s, and ``docs/PHI.md`` lists at least those too. That answer
+    is an :class:`UncheckedProblem`, told apart by its type: the check was not completed, though the
+    file's own owner and mode were judged first, and the text carries its own remedy. The holding
+    folder's owner and mode are still read then, and a finding there is answered in its place.
+    What a caller does with the answer is the caller's: at least
+    :func:`~messagefoundry.config.key_file_access.key_file_problem`'s callers in ``__main__``
+    refuse under ``enforce`` and warn under ``warn``, while
+    :func:`messagefoundry.engine_secrets._check` and
+    :func:`messagefoundry.store.custody_host._own_directory_refusal` refuse whatever the
+    ``[security].enforcement`` setting, and
+    :func:`messagefoundry.secrets_dpapi.load_protected_key`, on Windows only, warns and does not
+    test the type.
 
     On both, the folders above ``path`` are walked too (vault BACKLOG #5656, #5657). A junction or
     link among them is refused when an account the check does not trust can change it: on
@@ -1500,20 +1508,25 @@ def broad_access_problem(
     # The holder's owner and mode are one stat, so they are read again even when holder_judged:
     # a directory widened since its own check is still caught at the read.
     problem = None if holder_judged else _posix_host_link_problem(path)
-    if problem is not None:
+    if problem is not None and not isinstance(problem, UncheckedProblem):
         return problem
+    # An unread mount table stops the walk, not the holder's stat: a holder that a broad account
+    # may write is still a finding, so it is answered rather than the UncheckedProblem, which a
+    # caller that warns would otherwise print in its place (vault BACKLOG #5657).
     try:
         # stat, following a link, so the directory judged is the one the file is actually in. A
-        # link on the way was judged by the walk above, unless holder_judged skipped it.
+        # link on the way was judged by the walk above, unless holder_judged skipped it or the
+        # mount table could not be read.
         parent = os.stat(_posix_parent(path))
     except OSError as exc:
         return (
             "the directory that holds it could not be examined "
             f"({exc.strerror or type(exc).__name__})"
         )
-    return _posix_holder_problem(
+    holder = _posix_holder_problem(
         parent_mode=parent.st_mode, parent_uid=parent.st_uid, euid=os.geteuid()
     )
+    return holder if holder is not None else problem
 
 
 # --- the exact check, through an open handle (Windows) --------------------------------------------
