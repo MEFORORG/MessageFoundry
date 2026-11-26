@@ -912,6 +912,145 @@ def _reads_a_proxy(msg: Any) -> bool:
     return bool(_PROXY.enabled)
 
 
+# --- BACKLOG #5514, engine PR 2997's left list: edges the walk did not follow ---
+
+
+class _Readers:
+    """A config class holding the accessor, and a helper that reads it, as class attributes."""
+
+    getter = staticmethod(state_get)
+    helper = staticmethod(_helper_reads_state)
+    harmless = staticmethod(_sync_pred)
+
+
+class _Holder:
+    reader: Any
+
+
+_held = _Holder()
+_held.reader = _helper_reads_state
+_harmless_held = _Holder()
+_harmless_held.reader = _sync_pred
+
+
+def _reads_a_class_attribute(msg: Any) -> bool:
+    return _Readers.getter("ns", "k", default=None) is not None
+
+
+def _calls_a_class_attribute(msg: Any) -> bool:
+    return bool(_Readers.helper(msg))
+
+
+def _calls_an_instance_attribute(msg: Any) -> bool:
+    return bool(_held.reader(msg))
+
+
+def _calls_a_harmless_attribute(msg: Any) -> bool:
+    return bool(_Readers.harmless(msg)) and bool(_harmless_held.reader(msg))
+
+
+class _Service:
+    """A bound method whose accessor is on ``self``, not in the method's own code."""
+
+    def __init__(self, getter: Any) -> None:
+        self.getter = getter
+
+    def accepts(self, msg: Any) -> bool:
+        return self.getter("ns", "k", default=None) is not None
+
+
+class _CallableService(_Service):
+    def __call__(self, msg: Any) -> bool:
+        return self.accepts(msg)
+
+
+class _SelfReferencing:
+    """A method that reads itself off ``self``: the walk must end, not bind it again forever."""
+
+    def accepts(self, msg: Any) -> bool:
+        return self.accepts is not None
+
+
+_GETTERS = (state_get,)
+_BY_NAME = {"state": _helper_reads_state}
+_HARMLESS: list[Any] = [_sync_pred]
+_HARMLESS.append(_HARMLESS)  # a container holding itself must end the walk too
+
+
+def _calls_from_a_tuple(msg: Any) -> bool:
+    return _GETTERS[0]("ns", "k", default=None) is not None
+
+
+def _calls_from_a_dict(msg: Any) -> bool:
+    return bool(_BY_NAME["state"](msg))
+
+
+def _calls_from_a_harmless_list(msg: Any) -> bool:
+    return bool(_HARMLESS[0](msg))
+
+
+_static_alias = staticmethod(state_get)
+
+
+def _calls_a_staticmethod_alias(msg: Any) -> bool:
+    return _static_alias("ns", "k", default=None) is not None
+
+
+@pytest.mark.parametrize(
+    ("pred", "accessor"),
+    [
+        (_reads_a_class_attribute, "state_get"),
+        (_calls_a_class_attribute, "state_get"),
+        (_calls_an_instance_attribute, "state_get"),
+        (_Service(state_get).accepts, "state_get"),
+        (_Service(response_get).accepts, "response_get"),
+        (_CallableService(state_get), "state_get"),
+        (_calls_from_a_tuple, "state_get"),
+        (_calls_from_a_dict, "state_get"),
+        (_calls_a_staticmethod_alias, "state_get"),
+    ],
+    ids=[
+        "class_attribute",
+        "class_attribute_helper",
+        "instance_attribute",
+        "bound_method_self",
+        "bound_method_self_response",
+        "callable_instance_self",
+        "tuple",
+        "dict",
+        "staticmethod_alias",
+    ],
+)
+def test_a_run_scoped_read_behind_an_attribute_container_or_self_fails_validate(
+    tmp_path: Path, pred: Any, accessor: str
+) -> None:
+    """Engine PR 2997 left these edges unfollowed: class and instance attributes, a bound method's
+    ``__self__``, module-level containers, and a ``staticmethod`` whose ``__wrapped__`` ends at
+    the accessor itself. Each now refuses at validate."""
+    reg = _reg(tmp_path)
+    reg.handler_accepts["h"] = pred
+    with pytest.raises(WiringError, match="run-scoped state") as exc:
+        reg.validate()
+    assert accessor in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        _calls_a_harmless_attribute,
+        _Service(lambda *a, **k: None).accepts,
+        _calls_from_a_harmless_list,
+        _SelfReferencing().accepts,
+    ],
+    ids=["harmless_attributes", "harmless_self", "harmless_list", "self_referencing"],
+)
+def test_a_harmless_attribute_container_or_self_still_validates(tmp_path: Path, pred: Any) -> None:
+    """The control for the test above: the same shapes reaching no accessor still validate."""
+    reg = _reg(tmp_path)
+    reg.handler_accepts["h"] = pred
+    reg.validate()
+
+
 @pytest.mark.parametrize(
     "pred",
     [

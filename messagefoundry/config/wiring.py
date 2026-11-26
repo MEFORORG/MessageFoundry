@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import dis
 import errno
 import functools
 import hashlib
@@ -6128,6 +6129,39 @@ def _accepts_callees(obj: object) -> list[object]:
     return out
 
 
+#: Objects the run-scoped walk always follows, then judges their targets (BACKLOG #5514).
+_ACCEPTS_ALWAYS_FOLLOWED: Final = (functools.partial, MethodType, staticmethod, classmethod)
+
+#: Containers the run-scoped walk reads the items of, by EXACT type: a subclass could run author
+#: code from its ``__iter__`` (BACKLOG #5514, engine PR 2997's left list).
+_ACCEPTS_CONTAINER_TYPES: Final = (tuple, list, dict, set, frozenset)
+
+#: The instructions that load a local, the first parameter included.
+_LOCAL_LOADS: Final = frozenset({"LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK"})
+
+
+def _first_argument_attributes(code: CodeType) -> set[str]:
+    """The attribute names ``code`` loads straight off its first parameter (``self.getter``), read
+    from the bytecode. Empty for code with no parameter. Nested code is not read: there ``self`` is
+    a closure cell, not the first parameter."""
+    if not code.co_argcount:
+        return set()
+    first = code.co_varnames[0]
+    names: set[str] = set()
+    previous: dis.Instruction | None = None
+    for ins in dis.get_instructions(code):
+        if (
+            ins.opname in ("LOAD_ATTR", "LOAD_METHOD")
+            and isinstance(ins.argval, str)
+            and previous is not None
+            and previous.opname in _LOCAL_LOADS
+            and previous.argval == first
+        ):
+            names.add(ins.argval)
+        previous = ins
+    return names
+
+
 def _accepts_walk(start: object, expand: Callable[[object], Iterable[object]]) -> Iterator[object]:
     """Every object reachable from ``start`` through ``expand``, each once, depth first."""
     stack: list[object] = [start]
@@ -6176,15 +6210,27 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
     decorator around a config helper, is judged by the function at the end of the chain
     (``reachability._function_of``). The walk's own reads are static (:func:`_accepts_callees`), but
     ``captured_values`` tests a global with ``isinstance``, which can run an object's ``__class__``;
-    :func:`_check_accepts_predicate` refuses a predicate whose walk raises. It does not see at
-    least: a call through ``getattr`` or another computed name, a function in any other module, an
-    object's other methods, or a value the predicate builds while it runs."""
+    :func:`_check_accepts_predicate` refuses a predicate whose walk raises.
+
+    Engine PR 2997's left list adds these edges (vault BACKLOG #5514): an attribute a function
+    reads as ``Name.attr`` off a class or an instance, not only off a module; the items of a
+    ``tuple``, ``list``, ``dict`` (keys and values), ``set`` or ``frozenset`` the walk reaches,
+    by exact type; a ``staticmethod`` or ``classmethod``'s function; any wrapper whose
+    ``__wrapped__`` chain ends at the accessor itself, such as ``staticmethod(state_get)``; and
+    the attributes a config method, or a callable instance's ``__call__``, reads straight off its
+    first parameter (``self.getter``), looked up on the bound ``__self__`` or the instance, a method
+    found there bound to it in turn. Every one of those lookups is static
+    (``inspect.getattr_static``). It does not see at least: a call through ``getattr`` or another
+    computed name, a function in any other module, an attribute read off a local or off an
+    attribute (``self.a.b``), a subclass of a container, an object's methods the walk does not
+    reach by name, or a value the predicate builds while it runs."""
     # Lazy: both accessor modules are imported by handler code, not by the loader, and reachability
     # imports this module at its top level.
     from messagefoundry.config.reachability import (
         _function_of,
         _is_config_module,
         captured_values,
+        code_names,
     )
     from messagefoundry.config.response import response_get
     from messagefoundry.config.state import state_get
@@ -6204,27 +6250,78 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
 
     def followed(value: object) -> bool:
         kind = type(value)
-        if id(value) in accessors or issubclass(kind, (functools.partial, MethodType)):
+        if id(value) in accessors or issubclass(kind, _ACCEPTS_ALWAYS_FOLLOWED):
+            return True
+        if kind in _ACCEPTS_CONTAINER_TYPES:  # exact types, so no author __iter__ runs
             return True
         if issubclass(kind, type) or not callable(value):
             return False
         own = cast("FunctionType", value) if issubclass(kind, FunctionType) else None
         if _is_config_module(own.__module__ if own else kind.__module__, home):
             return True
-        # A cache or a library decorator around a config helper: judge the function it wraps.
+        # A cache or a library decorator around a config helper, or around an accessor itself
+        # (staticmethod(state_get)): judge the function it wraps.
         inner = _function_of(value)
-        return inner is not None and _is_config_module(inner.__module__, home)
+        return inner is not None and (
+            id(inner) in accessors or _is_config_module(inner.__module__, home)
+        )
+
+    bound: dict[tuple[int, int], MethodType] = {}
+
+    def attribute(holder: object, name: str) -> object:
+        # Static, as every other read here: no author __getattr__ or descriptor runs.
+        return inspect.getattr_static(holder, name, None)
+
+    def self_reads(func: object, owner: object) -> list[object]:
+        # What ``func``, a config function, reads off its first parameter, looked up on ``owner``.
+        # A followed plain function found there is bound to ``owner``, so its own reads off
+        # ``self`` are followed too. Engine and library code is not read, as elsewhere here.
+        if not (issubclass(type(func), FunctionType) and followed(func)):
+            return []
+        edges: list[object] = []
+        for name in _first_argument_attributes(cast("FunctionType", func).__code__):
+            value = attribute(owner, name)
+            if not followed(value):
+                continue
+            if issubclass(type(value), FunctionType):
+                # One bound object per pair, kept alive here, so the walk's seen-by-id set ends
+                # a method that reads itself off ``self`` rather than looping on fresh bindings.
+                key = (id(value), id(owner))
+                value = bound.setdefault(key, MethodType(cast("FunctionType", value), owner))
+            edges.append(value)
+        return edges
 
     def expand(obj: object) -> list[object]:
         if id(obj) in accessors:
             return []
+        kind = type(obj)
         edges = [edge for edge in _accepts_callees(obj) if obj is pred or followed(edge)]
-        if issubclass(type(obj), functools.partial):
+        if kind in _ACCEPTS_CONTAINER_TYPES:
+            items = cast("Iterable[object]", obj)
+            if kind is dict:
+                table = cast("dict[object, object]", obj)
+                items = [*table.keys(), *table.values()]
+            edges += [item for item in items if followed(item)]
+        elif issubclass(kind, (staticmethod, classmethod)):
+            inner = cast("staticmethod[..., object]", obj).__func__
+            edges += [inner] if followed(inner) else []
+        elif issubclass(kind, functools.partial):
             part = cast("functools.partial[object]", obj)
             edges += [value for value in (*part.args, *part.keywords.values()) if followed(value)]
-        if issubclass(type(obj), FunctionType):
+        elif issubclass(kind, MethodType):
+            method = cast("MethodType", obj)
+            edges += self_reads(method.__func__, method.__self__)
+        elif issubclass(kind, FunctionType):
             func = cast("FunctionType", obj)
             edges += [c.value for c in captured_values(func, home) if followed(c.value)]
+            # ``Global.attr`` off a class or an instance: captured_values reads it off a module only.
+            for holder_name, name in code_names(func.__code__)[1]:
+                holder = func.__globals__.get(holder_name)
+                if holder is not None and not issubclass(type(holder), ModuleType):
+                    value = attribute(holder, name)
+                    edges += [value] if followed(value) else []
+        elif callable(obj) and not issubclass(kind, type):
+            edges += self_reads(inspect.getattr_static(kind, "__call__", None), obj)
         return edges
 
     found: set[str] = set()
