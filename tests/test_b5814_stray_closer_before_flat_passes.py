@@ -129,13 +129,15 @@ TRACEBACK = (
 )
 
 #: The check is not scoped to the PHI value: a malformed sibling, prose after a top-level key, and
-#: a later key arming the walk again after the first key's container closed.
+#: a later key arming the walk again after the first key's container closed, then a malformed
+#: sibling of that key; and a U+2028 line separator, which does not disarm a top-level key.
 KNOWN_COST = [
     TRACEBACK,
     f'{{"family": "{SECRET}", "note": [1}}}}',
     f'"family": "{SECRET}", "note": [1}}',
     f'"family": "{SECRET}" rejected by peer (see [ref) for details',
-    f'{{"family": "{SECRET}"}} x {{"given": [1}}',
+    f'{{"family": "x"}} x {{"given": "{SECRET}", "note": [1}}',
+    f'"family": "{SECRET}"\u2028(see [ref)',
 ]
 
 
@@ -148,8 +150,9 @@ def test_a_known_cost_blanks_the_whole_text(scrub: Callable[[str], str], text: s
 
 
 def _reference_walk(text: str) -> bool:
-    """The check as it stood before the structure-only step (engine head 79a11bc4f2b): a walk over
-    every :data:`_JSON_TOKEN` token. The shipped walk must give the same verdict."""
+    """The check's walk as it stood before the structure-only step (engine head 79a11bc4f2b), over
+    every ``_JSON_TOKEN`` token. It reads the live ``_JSON_TOKEN`` and ``_JSON_PHI_KEY``, so it is
+    that walk only while those two are unchanged. The shipped walk must give the same verdict."""
     keys = [match.start() for match in _JSON_PHI_KEY.finditer(text)]
     if not keys:
         return False
@@ -219,17 +222,18 @@ def _fuzz(count: int) -> list[str]:
     breaks and other whitespace, string prefixes, characters neither treats as structure, PHI keys
     and filler."""
     rng = random.Random(5814)
-    parts = ["{", "}", "[", "]", "(", ")", '"', "'", "\\", "\n", "\r", " ", "\t", "\x0b", "\x85"]
-    parts += [" ", "　", ",", ":", "x", "b'", 'B"', 'rb"', "`", "<", ">", '"""']
+    parts = ["{", "}", "[", "]", "(", ")", '"', "'", "\\", "\n", "\r", " ", "\t", "\x0b", "\x0c"]
+    parts += ["\x1c", "\x1f", "\x85", "\u2028", "\u2029", "\u3000", ",", ":", "x", "b'", 'B"']
+    parts += ['rb"', "`", "<", ">", '"""']
     parts += ['"family": ', "'given': ", '"name":', '"0010ABCD": ']
     return ["".join(rng.choices(parts, k=rng.randint(1, 40))) for _ in range(count)]
 
 
 def _corpus() -> list[str]:
+    """This file's cases and the suites' literals with their ``redact`` results, then the fuzz."""
     texts = [*STRAY, *MISSED, *(text for text, _ in BALANCED), *KNOWN_COST]
     texts += _redaction_suite_strings()
-    texts += _fuzz(30_000)
-    return texts + [redact(text) for text in texts]
+    return texts + [redact(text) for text in texts] + _fuzz(30_000)
 
 
 def test_the_structure_walk_matches_the_token_walk() -> None:
