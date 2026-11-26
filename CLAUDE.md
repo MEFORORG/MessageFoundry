@@ -777,24 +777,25 @@ Manager's watch reached the cloud session 29 seconds after its question.
   question*, carries the same ruling. A factual error in prose is a filed row, except a false
   statement in a security or assurance record about what a control does, a score or an anchor:
   that weakens a control, so it goes to the owner under the 2026-10-12 ruling, and the PR waits
-  for that ruling, unless it is false only in the safe direction (below). A finding the Lander
-  cannot classify goes to the owner (decision d20261029T165623191-578690).
+  for that ruling; only the statement of what a control does has the exception below. A finding
+  the Lander cannot classify goes to the owner (decision d20261029T165623191-578690).
   Korus `roles/LANDER.md` *4a-quinquies*
   sends more to the owner, and governs where the two differ: false program output, and a false
   control claim in any comment, docstring or doc (the Lander's reading, decision
-  d20261110T205706609-38b347). A false statement in a record, or a false control claim, that is
-  false only in the safe direction does not weaken a control. It is filed under ledger ruling R2
+  d20261110T205706609-38b347). Only a statement of what a control does can be false in the safe
+  direction. One that is false only in the safe direction, in a record or as a control claim in
+  any text, does not weaken a control. It is filed under ledger ruling R2
   below and does not hold the merge. Safe direction means a reader who acts on the text does more
   than the control needs, never less. The usual cases are text that overstates what is stored,
   exposed or retained, or understates what a control guarantees, but only where acting on it
   passes that test: where storing or retaining something is itself the guarantee, overstating it
   is the unsafe direction, and understating a guarantee that leads a reader to drop or bypass the
   control is unsafe too. What still goes to the owner includes at least false program output,
-  which changes behaviour, a false score or anchor, and a present-tense claim of a live exposure,
-  which section 0 forbids. This narrows the owner's 2026-10-12 ruling, and what goes to the owner
-  with it. The owner's instruction of 2026-11-26, quoted in the repair-Builder paragraph above,
-  named no finding; the rule was set in the Lander's brief written under it, and the owner
-  directed the Manager to follow that brief exactly (2026-11-26, in the Manager's chat).
+  which changes behaviour, a false score or a false anchor, always, and a present-tense claim of a
+  live exposure, which section 0 forbids. This narrows the owner's 2026-10-12 ruling, and what
+  goes to the owner with it. The owner's instruction of 2026-11-26, quoted in the repair-Builder
+  paragraph above, named no finding; the rule was set in the Lander's brief written under it, and
+  the owner directed the Manager to follow that brief exactly (2026-11-26, in the Manager's chat).
   **Ledger ruling R2 (owner-signed 2026-11-04, in session: *"Sign R1-R9"*) changes how the findings
   are filed, and the Lander reads it as setting when.** A merged PR files at most one row, holding
   its open findings as numbered items. Its deferred scope becomes steps on the row it cites, or is
