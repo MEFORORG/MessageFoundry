@@ -38,7 +38,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from email.message import EmailMessage
 from typing import Any, Generic, Protocol, TypeVar, cast
 
@@ -307,6 +307,9 @@ _AUTO_RESOLVE: dict[str, str] = {
     # instance; a DR fail-back resolves the open dr_activated. The open set then tracks the live leaders.
     "leadership_lost": "leadership_acquired",
     "dr_released": "dr_activated",
+    # BACKLOG #5965: an activation resolves the open critical dr_restarted_passive for the same box
+    # label, because the box serves again. dr_activated emits this inverse before it raises.
+    "dr_reactivated": "dr_restarted_passive",
     # #305: a start that OBSERVED a clean store principal resolves the open over-grant warning.
     "store_privilege_clean": "store_privilege_warning",
     # #2903 (ADR 0216): a start that read a Vault token and found it clean can resolve the open
@@ -1211,6 +1214,14 @@ _DEFAULT_DECISION = _RuleDecision(
 )
 
 
+#: The severity an event type carries when no rule matches it, where that is not warning. A
+#: matching rule still sets its own. BACKLOG #5965: an activated DR box that came back up passive
+#: serves nothing, and the owner's ruling of 2026-11-25 makes that page critical.
+_DEFAULT_SEVERITY: dict[str, str] = {
+    "dr_restarted_passive": AlertSeverity.CRITICAL.value,
+}
+
+
 class AlertRuleSet:
     """Evaluate operator alert rules (ADR 0014) against an event, returning the **first** matching
     rule's :class:`_RuleDecision` (severity / transports / cooldown) or the default. Pure and
@@ -1993,12 +2004,21 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def dr_activated(self, node: str, *, role: str) -> None:
         # #145 (ADR 0048): a third-tier DR standby was promoted. The DR box label stands in for
         # "connection"; the payload carries only node/role (no PHI). dr_released is the auto-resolving inverse.
+        # BACKLOG #5965: the box serves again, so the critical restart alert for it closes first.
+        self._record_state({"type": "dr_reactivated", "connection": node}, "info")
         self._emit({"type": "dr_activated", "connection": node, "node": node, "role": role})
 
     def dr_released(self, node: str, *, role: str) -> None:
         # #145 (ADR 0048): the INVERSE — a clean fail-back needs no page; auto-resolves the open
         # dr_activated instance via _AUTO_RESOLVE (ADR 0044).
         self._record_state({"type": "dr_released", "connection": node}, "info")
+
+    def dr_restarted_passive(self, node: str) -> None:
+        # BACKLOG #5965 (ADR 0048): a box that was last activated came back up passive. The open
+        # dr_activated no longer describes a box that serves, so it is closed through its own
+        # inverse, and the critical instance that replaces it is raised. Node label only, no PHI.
+        self._record_state({"type": "dr_released", "connection": node}, "info")
+        self._emit({"type": "dr_restarted_passive", "connection": node, "node": node})
 
     def security_signal(self, name: str, *, signal: str, count: int, detail: str) -> None:
         # vault BACKLOG #2613: one detector of the audit-stream rule layer fired. `signal` is the
@@ -2236,6 +2256,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         now_wall = time.time()
         # #81: schedule-aware decide is time-dependent, so pass the wall clock.
         decision = self._rules.decide(event, now_wall)
+        if decision is _DEFAULT_DECISION and event["type"] in _DEFAULT_SEVERITY:
+            decision = replace(decision, severity=_DEFAULT_SEVERITY[event["type"]])
         key = f"{_instance_type(event)}:{event['connection']}"
         # #81 (ADR 0133): occurrence-driven escalation. The in-memory occurrence count mirrors the store's
         # `count` (both bump once per emit); apply the highest tier the count has crossed. tier is persisted

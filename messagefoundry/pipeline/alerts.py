@@ -1042,6 +1042,16 @@ class AlertSink(Protocol):
         ``"primary"`` (leadership handed back). No PHI."""
         ...
 
+    def dr_restarted_passive(self, node: str) -> None:
+        """A DR box that was last **activated** came back up **passive** after a restart (BACKLOG
+        #5965, ADR 0048). It serves nothing and never re-activates itself: an operator re-runs
+        ``POST /dr/activate``. Page-worthy, and CRITICAL when no rule sets its severity. It closes
+        the open ``dr_activated`` instance for ``node``, which no longer describes a box that
+        serves; the next ``dr_activated`` for ``node`` closes this one. ``node`` is the label the
+        coordinator's ``dr_activated`` carries: the host, and on an engine shard or a cluster node
+        the process too. No PHI."""
+        ...
+
     # --- vault BACKLOG #2613: the security-signal rule layer -----------------------------------
 
     def security_signal(self, name: str, *, signal: str, count: int, detail: str) -> None:
@@ -1644,6 +1654,13 @@ class LoggingAlertSink:
     def dr_released(self, node: str, *, role: str) -> None:
         # The inverse (auto-resolve) event; a clean fail-back — logged at INFO, no page.
         log.info("ALERT dr_released: DR box %r released, handed back to %s", node, role)
+
+    def dr_restarted_passive(self, node: str) -> None:
+        log.critical(
+            "ALERT dr_restarted_passive: DR box %r was activated and came back up PASSIVE after a "
+            "restart -- it serves nothing until an operator re-runs POST /dr/activate",
+            node,
+        )
 
     # --- vault BACKLOG #2613: the security-signal rule layer -----------------------------------
 

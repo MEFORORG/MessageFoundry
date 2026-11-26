@@ -1110,6 +1110,7 @@ _ALERT_EVENT_SIDE: Final[Mapping[str, str]] = MappingProxyType(
                 "vault_privilege_warning",
                 "leadership_acquired",
                 "dr_activated",
+                "dr_restarted_passive",
                 "initial_credential_expiring",
                 "log_write_failed",
                 "log_forward_failed",
