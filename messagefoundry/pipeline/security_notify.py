@@ -143,8 +143,9 @@ _DESCRIPTIONS = {
     # BACKLOG #6034 (S08-57). The administrator senders of ROLES_CHANGED and ACCOUNT_DISABLED,
     # ``AuthService.set_roles`` and the disable in ``AuthService.update_user``, run
     # ``_revoke_after_commit`` first, and it raises rather than return when the revoke fails, so
-    # each notice is sent only once the sessions are gone. A new sender of either kind that does
-    # not end them first must tag its own wording, as the directory senders do with ``source``.
+    # each notice is sent only once the sessions are gone. The event carries no evidence of the
+    # revoke, so a new sender of either kind that does not end them first must not take this
+    # wording.
     ROLES_CHANGED: (
         "Your account's roles were changed by an administrator, and any sessions already open on "
         "your account were ended."
@@ -371,10 +372,12 @@ def _shown(text: str, what: str, *, token: bool = False) -> str:
 
 
 def _roles_shown(roles: list[object]) -> str:
-    """The role ids, comma-separated, each through :func:`_shown` (BACKLOG #6034). An empty id is
-    named as one, so it cannot print as a stray comma or make a list read as no role at all."""
+    """The role ids, comma-separated, each through :func:`_shown` as one token (BACKLOG #6034): no
+    role id holds a space, so one that does cannot carry words into the list. An empty id is named
+    as one, so it cannot print as a stray comma or make a list read as no role at all."""
     return ", ".join(
-        _shown(text, "a role") if (text := str(role)) else "a role with no id" for role in roles
+        _shown(text, "a role", token=True) if (text := str(role)) else "a role with no id"
+        for role in roles
     )
 
 

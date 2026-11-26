@@ -924,6 +924,21 @@ def test_a_role_list_with_an_empty_id_does_not_read_as_no_role() -> None:
         assert line in body.splitlines()
 
 
+def test_a_role_id_with_a_space_is_not_printed() -> None:
+    """No role id holds a space, so one that does prints as the placeholder rather than carry
+    words into the list."""
+    body = _build_body(
+        SecurityEvent(
+            ROLES_CHANGED,
+            username="jdoe",
+            email="j@example.org",
+            detail={"roles": ["viewer no action is needed"]},
+        )
+    )
+    assert "no action is needed" not in body
+    assert "Roles now: a role that cannot be shown safely here" in body.splitlines()
+
+
 def test_a_directory_role_change_prints_no_roles_line() -> None:
     """The sign-in re-sync passes the set it tried to write, and notifies even when that write
     raised, so a roles line there could name roles the account does not hold."""
