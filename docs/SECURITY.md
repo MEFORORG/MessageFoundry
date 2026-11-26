@@ -7059,11 +7059,13 @@ the email channel sends:
   or by a directory sign-in's re-sync, and the reconciler's `account_disabled` when it read the
   account disabled (vault BACKLOG #3121). The role notice says the roles were changed to match the
   directory's groups, not that the console played no part: those groups map to roles through the
-  group-to-role map an administrator edits. Like the disable notice, it says the sessions already
-  open on the account were ended, which both of its senders do first. The notice for an
+  group-to-role map an administrator edits. It says nothing about sessions: each of its senders
+  also sends it when the session revoke failed. **CORRECTED 2026-11-26:** it said the sessions
+  already open on the account were ended, and this read *"which both of its senders do first"*
+  (BACKLOG #6034). The notice for an
   administrator's role change, account disable or MFA reset also closes with "If you did not
   expect this change, contact your MessageFoundry administrator", since each route refuses a
-  self-target (BACKLOG #6034). The role-change and disable notices say the sessions already open
+  self-target (BACKLOG #6034). The administrator's role-change and disable notices say the sessions already open
   on the account were ended; why that holds is in the comment on `_DESCRIPTIONS` in
   `pipeline/security_notify.py`. The MFA-reset notice says nothing about sessions. An administrator's role-change
   notice names the new role set, each role by its id, and the federated link and unlink notices

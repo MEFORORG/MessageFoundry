@@ -268,8 +268,8 @@ def test_a_directory_sessions_ended_notice_is_true_for_each_reason(
 #: vault BACKLOG #3121. The description each directory-driven kind carries, pinned whole.
 _DIRECTORY_TEXT = {
     ROLES_CHANGED: (
-        "MessageFoundry read your groups in your organization's directory, changed your "
-        "account's roles to match them, and ended any sessions already open on your account."
+        "MessageFoundry read your groups in your organization's directory and changed your "
+        "account's roles to match them."
     ),
     ACCOUNT_DISABLED: (
         "Your organization's directory reports your account as disabled, so MessageFoundry ended "
@@ -277,8 +277,8 @@ _DIRECTORY_TEXT = {
     ),
 }
 _DIRECTORY_CLOSING = "If you did not expect this change, contact your MessageFoundry administrator."
-#: BACKLOG #6034 (S08-57): the administrator wording says the sessions ended, as the directory
-#: wording already did. Why that holds is on ``_DESCRIPTIONS[ROLES_CHANGED]`` in the module.
+#: BACKLOG #6034 (S08-57): the administrator wording says the sessions ended. Why that holds is on
+#: ``_DESCRIPTIONS[ROLES_CHANGED]`` in the module; the directory role wording does not say it.
 _ADMIN_TEXT = {
     ROLES_CHANGED: (
         "Your account's roles were changed by an administrator, and any sessions already open on "
@@ -314,6 +314,26 @@ def test_a_directory_role_or_disable_notice_names_the_directory_and_no_administr
     assert body.endswith(_DIRECTORY_CLOSING)
     # The administrator subject says the MessageFoundry account was disabled, which is false here.
     assert "was disabled" not in _subject(event)
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        pytest.param({"reason": "directory_disabled", "source": "directory"}, id="reconciler"),
+        pytest.param({"roles": ["viewer"], "source": "directory"}, id="sign-in-re-sync"),
+    ],
+)
+def test_a_directory_role_change_notice_does_not_say_the_sessions_ended(
+    detail: dict[str, Any],
+) -> None:
+    """BACKLOG #6034. Both directory senders of ``roles_changed`` send it after a revoke that
+    raised: the reconciler's ``revoke_error`` branch and the sign-in re-sync, which holds the
+    revoke's error and notifies first. The event carries no word of the revoke, so the notice must
+    not say that any session was ended."""
+    event = SecurityEvent(ROLES_CHANGED, username="jdoe", email="j@example.org", detail=detail)
+    text = (_subject(event) + "\n" + _build_body(event)).lower()
+    assert "session" not in text
+    assert "ended" not in text
 
 
 @pytest.mark.parametrize("kind", [ROLES_CHANGED, ACCOUNT_DISABLED])
