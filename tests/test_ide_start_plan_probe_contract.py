@@ -39,6 +39,7 @@ from scripts.security.js_lexer import blank_js_comments
 from tests.test_provision_first_administrator import _PASSWORD, _key_in_this_shell, _tty
 
 _MODEL = Path(__file__).resolve().parents[1] / "ide" / "src" / "engineControlModel.ts"
+_WIZARD = _MODEL.with_name("connectionWizardModel.ts")
 
 
 def _ts_string_const(name: str) -> str:
@@ -67,11 +68,12 @@ def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
     """If the TypeScript stops building this argv, the three tests below stop describing the IDE.
 
     The IDE adds ``--service-config`` only when ``messagefoundry.serviceConfig`` is set and not
-    blank; this file's probe runs with the setting at its default, where ``serviceConfigFlag`` adds
-    nothing. Comments are blanked first, so a comment quoting the argv cannot satisfy the pin, and
-    the pin ends at the array's close, so an element added after the flag reds it. The array is
-    handed to ``cliArgv`` (BACKLOG #5409), so its body is pinned too: the interpreter options,
-    then ``-m messagefoundry``, then this array, and nothing after it.
+    blank; this file's probe runs with the setting at its default, where ``serviceConfigFlag`` (an
+    alias of ``connectionWizardModel.ts``'s ``serviceConfigArgs``) adds nothing. Comments are
+    blanked first, so a comment quoting the argv cannot satisfy the pin, and the pin ends at the
+    array's close, so an element added after the flag reds it. The array is handed to ``cliArgv``
+    (BACKLOG #5409), so its body is pinned too: the interpreter options, then ``-m messagefoundry``,
+    then this array, and nothing after it.
     """
     raw = _MODEL.read_text(encoding="utf-8")
     src = " ".join(blank_js_comments(raw).split())
@@ -91,9 +93,17 @@ def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
         "function cliArgv(module: string, args: readonly string[]): string[] { "
         'return [...INTERPRETER_OPTIONS, "-m", module, ...args]; }' in src
     )
+    # serviceConfigFlag is an alias of connectionWizardModel's serviceConfigArgs, so follow it there:
+    # the alias and its import here, and the body there, where undefined (this probe) adds nothing.
+    assert "const serviceConfigFlag = serviceConfigArgs;" in src
+    assert re.search(
+        r'import \{[^}]*\bserviceConfigArgs\b[^}]*\} from "\./connectionWizardModel";', src
+    )
+    assert "function serviceConfigFlag" not in src, "a second serviceConfigFlag shadows the alias"
+    wizard = " ".join(blank_js_comments(_WIZARD.read_text(encoding="utf-8")).split())
     assert (
-        "function serviceConfigFlag(serviceConfig: string | undefined): string[] { "
-        "return serviceConfig === undefined ? [] :" in src
+        "export function serviceConfigArgs(serviceConfig: string | undefined): string[] { "
+        "return serviceConfig === undefined ? [] :" in wizard
     )
     assert "username: PROBE_USERNAME, email: PROBE_EMAIL" in src
     assert '[...inv.args, "--json"]' in src
