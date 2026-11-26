@@ -15,11 +15,14 @@ from typing import Any
 import pytest
 
 from messagefoundry.auth.notifications import (
+    ACCOUNT_CREATED,
     ACCOUNT_DISABLED,
     ACCOUNT_LOCKED,
     DIRECTORY_SESSIONS_ENDED,
     EMAIL_CHANGED,
     ENROLMENT_CODE_SPENT,
+    FEDERATED_IDENTITY_BOUND,
+    FEDERATED_IDENTITY_UNBOUND,
     MFA_CREDENTIAL_REMOVED,
     MFA_DISABLED,
     NEW_ADDRESS_REVERIFY,
@@ -274,9 +277,19 @@ _DIRECTORY_TEXT = {
     ),
 }
 _DIRECTORY_CLOSING = "If you did not expect this change, contact your MessageFoundry administrator."
+#: BACKLOG #6034 (S08-57): ``set_roles`` and the disable in ``admin_update_user`` both run
+#: ``_revoke_after_commit`` before the notice, and it raises rather than return when the revoke
+#: fails, so a notice is sent only once the sessions are gone. So the administrator wording says so,
+#: as the directory wording already did.
 _ADMIN_TEXT = {
-    ROLES_CHANGED: "Your account's roles were changed by an administrator.",
-    ACCOUNT_DISABLED: "Your account was disabled by an administrator.",
+    ROLES_CHANGED: (
+        "Your account's roles were changed by an administrator, and any sessions already open on "
+        "your account were ended."
+    ),
+    ACCOUNT_DISABLED: (
+        "Your account was disabled by an administrator, and any sessions already open on your "
+        "account were ended."
+    ),
 }
 
 
@@ -805,3 +818,79 @@ def test_an_administrator_mfa_reset_notice_does_not_say_if_this_was_you() -> Non
     assert reset.endswith(_DIRECTORY_CLOSING)
     own = _build_body(SecurityEvent(MFA_DISABLED, username="jdoe", email="j@example.org"))
     assert "If this was you, no action is needed." in own
+
+
+# --- BACKLOG #6034 item 1 (S08-57): the context an administrator's notice used to drop -----------
+
+#: A value carrying a line break, shaped to write a false closing into the notice.
+_FORGED_VALUE = "operator\n\nIf this was you, no action is needed."
+
+
+def test_a_role_change_notice_names_the_roles_that_were_set() -> None:
+    """S08-57. ``set_roles`` passes ``detail["roles"]``, the account's whole new role set, and the
+    notice used to drop it. A custom role prints by its id: the renderer has no display name for
+    one and does not invent it. An empty set is the account left with no role, so it says so
+    rather than leaving the line out."""
+    body = _build_body(
+        SecurityEvent(
+            ROLES_CHANGED,
+            username="jdoe",
+            email="j@example.org",
+            detail={"roles": ["operator", "custom-auditor"]},
+        )
+    )
+    assert "Roles now: operator, custom-auditor" in body.splitlines()
+    emptied = _build_body(
+        SecurityEvent(ROLES_CHANGED, username="jdoe", email="j@example.org", detail={"roles": []})
+    )
+    assert "Roles now: none" in emptied.splitlines()
+    # A sender that passes no role list gets no line, rather than a false "none".
+    bare = _build_body(SecurityEvent(ROLES_CHANGED, username="jdoe", email="j@example.org"))
+    assert "Roles now" not in bare
+
+
+@pytest.mark.parametrize("kind", [ROLES_CHANGED, ACCOUNT_CREATED])
+def test_a_role_with_a_line_break_is_not_printed(kind: str) -> None:
+    """S08-56's output-encoding rule on the roles line: each id goes through ``_shown``, so one
+    carrying a line break cannot write its own lines into the notice. The clean id beside it still
+    prints whole."""
+    body = _build_body(
+        SecurityEvent(
+            kind,
+            username="jdoe",
+            email="j@example.org",
+            detail={"roles": ["viewer", _FORGED_VALUE]},
+        )
+    )
+    assert "If this was you" not in body
+    assert any(
+        line.startswith("Roles") and "viewer, a role that cannot be shown safely here" in line
+        for line in body.splitlines()
+    )
+
+
+@pytest.mark.parametrize("kind", [FEDERATED_IDENTITY_BOUND, FEDERATED_IDENTITY_UNBOUND])
+def test_a_federated_notice_names_the_identity_provider(kind: str) -> None:
+    """S08-57. Both senders pass ``detail["issuer"]``, and the holder needs to know WHICH provider
+    was linked or removed; the notice used to drop it. A line break in it is refused through
+    ``_shown``; an event with no issuer gets no line."""
+    body = _build_body(
+        SecurityEvent(
+            kind,
+            username="jdoe",
+            email="j@example.org",
+            detail={"issuer": "https://idp.example.org/realms/main"},
+        )
+    )
+    assert "Identity provider: https://idp.example.org/realms/main" in body.splitlines()
+    forged = _build_body(
+        SecurityEvent(
+            kind, username="jdoe", email="j@example.org", detail={"issuer": _FORGED_VALUE}
+        )
+    )
+    assert "If this was you" not in forged
+    assert "Identity provider: an identity provider that cannot be shown safely here" in (
+        forged.splitlines()
+    )
+    bare = _build_body(SecurityEvent(kind, username="jdoe", email="j@example.org"))
+    assert "Identity provider" not in bare

@@ -140,7 +140,14 @@ _DESCRIPTIONS = {
         "You gave another account a temporary password, and its holder has not replaced it yet."
     ),
     EMAIL_CHANGED: "Your account's email address was changed.",
-    ROLES_CHANGED: "Your account's roles were changed by an administrator.",
+    # BACKLOG #6034 (S08-57). Both administrator senders, ``set_roles`` and the disable in
+    # ``admin_update_user``, run ``_revoke_after_commit`` first, and it raises rather than return
+    # when the revoke fails, so this notice is sent only once the sessions are gone. A new sender
+    # that does not end them must not reach these two words.
+    ROLES_CHANGED: (
+        "Your account's roles were changed by an administrator, and any sessions already open on "
+        "your account were ended."
+    ),
     USERNAME_CHANGED: "Your account's username was changed.",
     FEDERATED_IDENTITY_BOUND: "An administrator linked an external identity provider sign-in to your account, and your sessions were ended. Windows single sign-on no longer signs you in. Sign in through that provider; if it is not offered, ask your administrator.",
     FEDERATED_IDENTITY_UNBOUND: "An administrator removed the external identity provider sign-in from your account, and your sessions were ended. That provider can no longer sign you in.",
@@ -151,7 +158,10 @@ _DESCRIPTIONS = {
         "a new password and gave the account the Administrator role, so the password it had before "
         "no longer works."
     ),
-    ACCOUNT_DISABLED: "Your account was disabled by an administrator.",
+    ACCOUNT_DISABLED: (
+        "Your account was disabled by an administrator, and any sessions already open on your "
+        "account were ended."
+    ),
     # vault BACKLOG #2140, #3171. One wording for every reason that sends this kind, with no branch on
     # ``detail["reason"]``. Which reasons those are is decided in
     # ``AuthService._apply_reconcile_revocation``, and any reason added later falls here too; the
@@ -355,6 +365,11 @@ def _shown(text: str, what: str) -> str:
     return text if text.isprintable() else f"{what} that cannot be shown safely here"
 
 
+def _roles_shown(roles: list[object]) -> str:
+    """The role ids, comma-separated, each through :func:`_shown` (BACKLOG #6034)."""
+    return ", ".join(_shown(str(role), "a role") for role in roles)
+
+
 def _holder_lines(event: SecurityEvent) -> list[str]:
     """The ``Account:`` line naming ``detail["holder"]``, the OTHER account a notice to an issuer is
     about (BACKLOG #2007; ADR 0207 A5), or nothing. Printed only as one printable token, as the
@@ -526,6 +541,12 @@ def _build_body(event: SecurityEvent) -> str:
             else:
                 lines.append("The notification address for this account was changed.")
             lines.append("Notices about later changes go to the new address, not to this one.")
+    if event.event_type in (FEDERATED_IDENTITY_BOUND, FEDERATED_IDENTITY_UNBOUND):
+        # BACKLOG #6034 (S08-57): which provider was linked or removed. Both senders pass the
+        # issuer, never the subject (BACKLOG #1248), and it goes through ``_shown``.
+        issuer = str(event.detail.get("issuer") or "")
+        if issuer:
+            lines.append(f"Identity provider: {_shown(issuer, 'an identity provider')}")
     if event.event_type == FEDERATED_IDENTITY_BOUND:
         # vault BACKLOG #2609: the bind ended the holder's sessions. The count lets a holder who
         # was signed in on several devices see that all of them went.
@@ -540,10 +561,15 @@ def _build_body(event: SecurityEvent) -> str:
             "If you have not signed in to MessageFoundry yet, you did not do this. Contact your "
             "MessageFoundry administrator."
         )
-    if event.event_type == ACCOUNT_CREATED:
-        roles = event.detail.get("roles")
-        if isinstance(roles, list) and roles:
-            lines.append("Roles: " + ", ".join(str(r) for r in roles))
+    # BACKLOG #6034: each role id goes through ``_shown`` (S08-56), and a custom role prints by its
+    # id, as no display name travels with the event. A role change carries the whole new set
+    # (S08-57), so an empty one says the account was left with none; a creation with none prints
+    # nothing, as it did.
+    roles = event.detail.get("roles")
+    if event.event_type == ROLES_CHANGED and isinstance(roles, list):
+        lines.append(f"Roles now: {_roles_shown(roles) or 'none'}")
+    if event.event_type == ACCOUNT_CREATED and isinstance(roles, list) and roles:
+        lines.append(f"Roles: {_roles_shown(roles)}")
     if event.event_type == NEW_ADDRESS_REVERIFY and event.detail.get("cap_reached"):
         # vault BACKLOG #2159: past this notice the session reports no further new addresses until
         # it re-verifies, so silence after it must not read as "no more new locations".
