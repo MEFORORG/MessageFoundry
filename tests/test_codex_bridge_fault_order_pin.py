@@ -13,7 +13,7 @@ have to update the exit-code assertion here, deliberately.
 A withdrawn change for BACKLOG #5496 (engine commit 6a8c02a9b2a, never merged; it may be reachable
 only from that branch's pull-request head ref) ran the later hooks and exited 0 on each case here,
 the first two emitting the allow. To re-run the negative control, put that commit's
-scripts/codex/bridge.py in place: every case below fails with 0 == 1.
+scripts/codex/bridge.py in place: the three pin cases fail with 0 == 1.
 """
 
 from __future__ import annotations
@@ -130,7 +130,8 @@ _CASES: dict[str, tuple[str, list[dict[str, object]], list[dict[str, object]]]] 
         [_prints(_PRE, decision={"behavior": "deny"})],
         [_prints(_PRE, permissionDecision="allow")],
     ),
-    # A permissionDecision deny and no allow: 6a8c02a exited 0 here, so the fault went unreported.
+    # A permissionDecision deny and no allow: 6a8c02a reported the fault in a systemMessage, but
+    # its exit code was 0.
     "post-tool-use": (_POST, [_prints(_POST, permissionDecision="deny")], []),
 }
 _WITH_ALLOW = [name for name, (_, _, after) in _CASES.items() if after]

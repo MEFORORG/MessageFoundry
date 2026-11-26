@@ -81,6 +81,7 @@ tests/test_claim_check.py
 tests/test_claim_shared_registry.py
 tests/test_claude_md_wiki_state_root.py
 tests/test_codex_bridge.py
+tests/test_codex_bridge_5501.py
 tests/test_codex_bridge_fault_order_pin.py
 tests/test_connscale_harvest.py
 tests/test_coord_alloc_floor.py
