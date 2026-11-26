@@ -9967,7 +9967,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       test. ``oidc_jwks_ttl_seconds`` above its default keeps a withdrawn signing key verifying for
       longer. ``JwksCache`` also serves a cached key until it may fetch again, so an
       ``oidc_jwks_min_refetch_seconds`` above the DEFAULT TTL is named for the same reason; below
-      its own default it weakens the bound on fetches an unknown key id can force, and 0 or less
+      its own default it weakens the bound on fetches an unknown key id can force, and 0
       removes it. ``oidc_flow_ttl_seconds`` above its default keeps a staged flow redeemable for
       longer, and ``oidc_max_age_seconds`` above its default accepts an older identity-provider
       sign-in.

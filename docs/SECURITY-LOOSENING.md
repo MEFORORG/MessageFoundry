@@ -1387,7 +1387,7 @@ count is above `0` (vault BACKLOG #2613).
 
 ### `[auth].oidc_*` lifetimes and skew looser than their defaults **with OIDC on** — federated sign-in accepts more
 > **Conditional** on `[auth].oidc_enabled` (vault BACKLOG #2600). With it off nothing reads these.
-> Each is named alone. Every entry but the `0`-or-less refetch one quotes the configured value and a
+> Each is named alone. Every entry but the `0` refetch one quotes the configured value and a
 > default.
 - **What you lose:**
   - `oidc_clock_skew_seconds` above `60` s accepts an expired id_token for that much longer, and lets
