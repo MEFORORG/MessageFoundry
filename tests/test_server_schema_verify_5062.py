@@ -863,3 +863,16 @@ def test_an_exec_after_a_plain_block_comment_still_runs(dialect: Dialect | None)
 def test_an_exec_in_a_line_comment_is_not_a_run(dialect: Dialect | None) -> None:
     with pytest.raises(ValueError, match="sees no EXEC run"):
         declared_schema((f"{_RUN_DDL} -- EXEC(@sql)\n",), dialect)
+
+
+def test_a_metacharacter_in_an_exec_variable_matches_only_itself() -> None:
+    """Red before #5062 item 15: the variable name went into the EXEC and assignment patterns
+    unescaped, so a name holding a metacharacter, such as ``a+``, matched other variables. The
+    caller's capture is ``\\w+`` today; the escape keeps a wider one later from widening the read."""
+    from messagefoundry.store.server_schema_verify import _assigned_and_run, _string_spans
+
+    text = "EXEC(@aaa)"
+    spans = _string_spans(text)
+    assert not _assigned_and_run(text, spans, "a+", 0)
+    assert _assigned_and_run("EXEC(@a+)", _string_spans("EXEC(@a+)"), "a+", 0)  # the control
+    assert _assigned_and_run(text, spans, "aaa", 0)  # the control: a plain name still matches
