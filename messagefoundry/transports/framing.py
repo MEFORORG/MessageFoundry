@@ -334,7 +334,10 @@ def _reply_delimiters(reply: str) -> frozenset[str]:
     line of an ``MSH``-led reply was read). Its segments end at CR when the reply holds one, and
     at LF only in a reply with no CR; that terminator, and the LF of a CR+LF end, are declared too.
     So a header after a lone LF in a CR reply is not read, though a receiver that reads every LF
-    as a segment break, as ``parsing.peek.normalize`` does, reads it as one. The fifth MSH-2
+    as a segment break, as ``parsing.peek.normalize`` does, reads it as one. In an ``MSH``-led
+    reply with no CR, MSH-1 and MSH-2 are also read from the reply as a whole, so where the first
+    line is shorter than the span ``_extract_separators`` reads, the characters after its LF
+    count as delimiters too, and a reply they make unsafe is refused. The fifth MSH-2
     character (the v2.7 truncation character) is not read either. An X12 reply led by ``ISA``
     declares nothing here, so an ``ISA`` delimiter that is ``?`` or that the charset cannot
     encode is not refused, and a ``?`` written for a data character can read as one of the
@@ -342,7 +345,8 @@ def _reply_delimiters(reply: str) -> frozenset[str]:
 
     Leading whitespace and a BOM are skipped first, as the engine's one definition of tolerated
     leading noise (``sniff._LEADING_WS_STR``) skips them. A header line of ``MSH`` alone has no
-    field separator to read and declares nothing, rather than indexing past its end."""
+    field separator of its own to read and declares nothing, rather than indexing past its end;
+    in an ``MSH``-led reply with no CR, the read across its LF above still applies."""
     body = reply.lstrip(_LEADING_WS_STR)
     if not body.startswith(HEADER_IDS):
         return frozenset()
@@ -354,4 +358,8 @@ def _reply_delimiters(reply: str) -> frozenset[str]:
             segment = segment[1:]
         if segment.startswith(HEADER_IDS) and len(segment) >= 4:
             found.update(_extract_separators(segment))
+    if terminator == "\n" and body.startswith("MSH") and len(body) >= 4:
+        # Main's read too: it measures an LF-only reply's MSH-2 across the LF where the first
+        # line is shorter than the span it reads, and so refuses what that span holds.
+        found.update(_extract_separators(body))
     return frozenset(found)

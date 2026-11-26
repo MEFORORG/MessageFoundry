@@ -833,6 +833,52 @@ def test_control_the_main_reference_reads_an_msh_reply() -> None:
     assert _main_reply_delimiters(reply) == framing_mod._reply_delimiters(reply) == expected
 
 
+def _reply_outcome(reply: str, encoding: str) -> bytes | None:
+    """What :func:`framing_mod.encode_reply_reporting` sends for ``reply``, or None if refused."""
+    try:
+        return framing_mod.encode_reply_reporting(reply, encoding, connection="IB_SHORT_LF")[0]
+    except UnicodeError:
+        return None
+
+
+def _short_lf_headers() -> list[str]:
+    """LF-only ``MSH``-led replies whose first line is 4 to 8 characters long, each followed by a
+    line holding a character ASCII, or ASCII and latin-1, cannot encode, or none."""
+    firsts = {"MSH" + ("|^~" + BS + "&")[: n - 3] for n in range(4, 9)}
+    firsts |= {"MSH" + ("|^?" + BS + "&")[: n - 3] for n in range(4, 9)}
+    firsts |= {"MSH|", "MSH|^", "MSH?^", "MSH¦", "MSH|¦"}
+    seconds = ["?SA|AA|中", "MSA|AA|中", "中SA|AA|C", "¦SA|AA|中", "MSA|AA|¦", "MSA|AA|C"]
+    return sorted(f + "\n" + s + "\n" for f in firsts for s in seconds)
+
+
+@pytest.mark.parametrize("encoding", ["ascii", "latin-1"])
+@pytest.mark.parametrize("reply", _short_lf_headers())
+def test_a_short_lf_only_header_sends_or_refuses_as_on_main(
+    reply: str, encoding: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R10f differential: where an LF-only reply's first header line is shorter than the MSH-1 and
+    MSH-2 span, main read that span across the LF and refused what it held; d91caadc2be stopped at
+    the LF and sent with ``?`` written in. This read must give main's send or refuse outcome."""
+    head = _reply_outcome(reply, encoding)
+    monkeypatch.setattr(framing_mod, "_reply_delimiters", _main_reply_delimiters)
+    assert head == _reply_outcome(reply, encoding)
+
+
+@pytest.mark.parametrize("reply", ["MSH|^~\n中", "MSH|^\n?SA|AA|中\n"])
+def test_a_short_lf_only_header_that_main_refused_is_refused(reply: str) -> None:
+    """The two shapes the R10f decision names. Red at d91caadc2be: both were sent."""
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
+        framing_mod.encode_reply(reply, "ascii", connection="IB_SHORT_LF")
+
+
+def test_control_a_well_formed_lf_only_msh_reads_as_before() -> None:
+    """Control for the two tests above: a first line holding all of MSH-1 and MSH-2 declares just
+    those and the LF, and a reply with an unencodable data character is replaced and sent."""
+    reply = "MSH|^~" + BS + "&|R|RF\nMSA|AA|C|中\n"
+    assert framing_mod._reply_delimiters(reply) == frozenset({"|", "^", "~", BS, "&", "\n"})
+    assert framing_mod.encode_reply(reply, "ascii") == reply.replace("中", "?").encode("ascii")
+
+
 def test_an_lf_inside_a_field_of_a_cr_reply_is_data_not_a_header() -> None:
     """Round-2 review: lines were split at LF too, so ``MSH`` after an LF inside a field was read
     as a header and its characters as delimiters, and a reply main replaced and sent was refused.
