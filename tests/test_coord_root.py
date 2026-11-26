@@ -656,7 +656,8 @@ def test_a_non_ascii_checkout_path_reads_the_same_on_both(tmp_path: Path) -> Non
         f"[ordered]@{{ cp = [Console]::OutputEncoding.CodePage; path = Get-CoordLocalRoot -From '{r}' }}"
         " | ConvertTo-Json -Compress -EscapeHandling EscapeNonAscii"
     )
-    assert got["cp"] == 437, got
+    if got["cp"] != 437:
+        pytest.skip(f"this runner refused the console code page setter: {got}")
     assert Path(got["path"]) == want
 
 
@@ -685,6 +686,11 @@ def test_the_down_cache_file_reads_the_same_on_both() -> None:
         '{"server": 5}',
         '{"root": "srv"}',
         '"srv"',
+        # origin/main's shape, which a stale installed hook copy writes: the server is its root's.
+        json.dumps({"root": r"\\srv\share\x", "at": "now"}),
+        '{"root": "//srv/share/x"}',
+        '{"root": 5}',
+        json.dumps({"server": 5, "root": r"\\srv\share"}),
     ]
     quoted = ", ".join("'" + t.replace("'", "''") + "'" for t in texts)
     ps = _pwsh_json(
@@ -692,7 +698,7 @@ def test_the_down_cache_file_reads_the_same_on_both() -> None:
         "{ $s = Get-CoordDownServer -Text $t; if ($null -eq $s) { '' } else { $s } })"
     )
     py = [coord_root._down_server(t) or "" for t in texts]
-    assert ps == py == ["srv", "", "", "", "", "", ""]
+    assert ps == py == ["srv", "", "", "", "", "", "", "srv", "srv", "", ""]
 
 
 def test_local_root_runs_git_in_powershells_location(tmp_path: Path, repo: Path) -> None:
@@ -713,6 +719,47 @@ def test_local_root_runs_git_in_powershells_location(tmp_path: Path, repo: Path)
         cwd=tmp_path,
     )
     assert Path(json.loads(got.stdout)) == _local(repo)
+
+
+def test_local_root_survives_a_deleted_powershell_location(tmp_path: Path, repo: Path) -> None:
+    # A ProcessStartInfo whose WorkingDirectory is gone throws; `& git` ran anyway, so a hook whose
+    # worktree was removed under it still named the common dir.
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    got = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            # The process cwd stays tmp_path, so Windows lets the location be removed; Remove-Item
+            # refuses PowerShell's own location, so the .NET call removes it.
+            f". '{PS}'; Set-Location -LiteralPath '{gone}'; [IO.Directory]::Delete('{gone}'); "
+            "if (Test-Path -LiteralPath (Get-Location).ProviderPath) { throw 'location survived' }; "
+            f"Get-CoordLocalRoot -From '{repo}' | ConvertTo-Json",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        check=True,
+        timeout=60,
+        cwd=tmp_path,
+    )
+    assert Path(json.loads(got.stdout)) == _local(repo)
+
+
+def test_the_probe_refuses_a_device_path_on_both(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A caller that probes a path itself, as coord-migrate.ps1 probes -Target, gets the refusal too.
+    _no_probe(monkeypatch)
+    spelling = r"\\?\UNC\192.0.2.1\nothing\mefor-coord"
+    want = _device_refusal("shared root", spelling)
+    assert coord_root.probe_root(Path(spelling), tmp_path) == want
+    got = _pwsh_json(
+        f"(Test-CoordRoot -Path '{spelling}' -LocalRoot '{tmp_path}').Error | ConvertTo-Json"
+    )
+    assert got == want
+    assert not (tmp_path / "coord-root-down.json").exists()
 
 
 def test_local_root_never_runs_a_git_exe_from_the_cwd(tmp_path: Path, repo: Path) -> None:

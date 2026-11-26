@@ -177,14 +177,23 @@ def unc_host(path: str) -> str | None:
 
 
 def _down_server(text: str) -> str | None:
-    """The server a down-cache file names, or None for any other shape, as Get-CoordDownServer reads."""
+    """The server a down-cache file names, or None for any other shape, as Get-CoordDownServer reads,
+    including its fallback to ``root`` for a file in origin/main's shape."""
     obj = json.loads(text)
-    value = obj.get("server") if isinstance(obj, dict) else None
+    if not isinstance(obj, dict):
+        return None
+    if "server" not in obj:
+        root = obj.get("root")
+        return unc_host(root) if isinstance(root, str) else None
+    value = obj["server"]
     return value if isinstance(value, str) else None
 
 
 def probe_root(path: Path, local: Path | None) -> str | None:
     """None when ``path`` answers; else why not. Fast on a dead SMB server."""
+    device = _device_root_refusal("shared root", str(path))
+    if device is not None:
+        return device
     server = unc_host(str(path))
     if server:
         down = local / DOWN_FILE if local else None

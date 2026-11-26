@@ -210,10 +210,10 @@ call. It caches a "down" verdict for 60 s in `<LOCAL>/coord-root-down.json`, key
 and read by both the PowerShell and the Python resolver, so a dead share costs one timeout per
 minute per clone, not one per hook process.
 
-A device-path root is refused. Any spelling that starts `\\?\` or `\\.\`, with either separator,
-such as `\\?\X:\p` or `\\?\UNC\srv\share\p`, is refused in `MEFOR_COORD_ROOT`, in `root.toml`,
-and in `coord-migrate.ps1`'s `-Source` and `-Target`, before any probe, file call or down-cache
-write. Use the plain spelling instead: `X:\p` or `\\srv\share\p`. `Get-CoordDeviceRootRefusal` in
+A device-path root is refused: any spelling made of two separators, then `?` or `.`, then a
+separator or nothing, such as `\\?\X:\p`, `//?/X:/p`, `\\?\UNC\srv\share\p` or a bare `\\.`. It is
+refused at least in `MEFOR_COORD_ROOT`, in `root.toml`, in the probe, and in `coord-migrate.ps1`'s
+`-Source` and `-Target`, before any probe, file call or down-cache write. Use the plain spelling instead: `X:\p` or `\\srv\share\p`. `Get-CoordDeviceRootRefusal` in
 `scripts/coord/coord-root.ps1` says why. `worktree_gate.ps1` reads the configured spelling itself,
 without the resolver.
 

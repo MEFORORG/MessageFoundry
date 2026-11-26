@@ -87,7 +87,8 @@
       0  clean.
       1  at least one read or write failed. Wins over 3, because the report is then incomplete.
       2  bad arguments: a missing or non-directory -Source, a -Target that is missing, unreachable or
-         not a directory, or nested roots. Nothing was read past the arguments.
+         not a directory, a device-path (\\?\ or \\.\) -Source or -Target, or nested roots. Nothing
+         was read past the arguments.
       3  at least one CONFLICT, COLLISION, UNSTAMPED record or FOREIGN HOST. With -Apply every other
          file was still copied, except after a FOREIGN HOST, which holds back every write. Also the
          cloud-session refusal, which prints only its one stderr line.

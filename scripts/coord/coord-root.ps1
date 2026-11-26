@@ -108,7 +108,9 @@ function Get-CoordLocalRoot {
     try {
         $git = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
         $psi = [System.Diagnostics.ProcessStartInfo]::new($git.Source)
-        $psi.WorkingDirectory = (Get-Location -PSProvider FileSystem).ProviderPath
+        # A location deleted under this process is left to the process cwd, as `& git` left it.
+        $loc = (Get-Location -PSProvider FileSystem).ProviderPath
+        if (Test-Path -LiteralPath $loc -PathType Container) { $psi.WorkingDirectory = $loc }
         if ($From) { $psi.ArgumentList.Add('-C'); $psi.ArgumentList.Add($From) }
         foreach ($a in 'rev-parse', '--path-format=absolute', '--git-common-dir') { $psi.ArgumentList.Add($a) }
         $psi.UseShellExecute = $false
@@ -186,8 +188,9 @@ function Get-CoordSharedRoot {
 
 function Get-CoordDeviceRootRefusal {
     # Why a root spelled as a device path is refused, or $null for any other spelling (BACKLOG #7569).
-    # \\?\ and \\.\, in any form and with either separator, are refused wherever a root is resolved:
-    # here for the env value and root.toml, and in coord-migrate.ps1 for -Source and -Target. Not
+    # \\?\ and \\.\, in any form and with either separator, are refused where a root is resolved, at
+    # least here for the env value and root.toml, in Test-CoordRoot for a caller that probes a path
+    # itself, and in coord-migrate.ps1 for -Source and -Target. Not
     # every consumer handles one: claim.ps1 reads the root with wildcard -Path cmdlets, which misread
     # \\?\, and the 445 probe reads '?' or '.' as the server. Rewriting one to its plain spelling
     # named another directory, or lost the fast probe, in cases no list held, so the spelling is
@@ -221,11 +224,18 @@ function Get-CoordUncHost {
 function Get-CoordDownServer {
     # The server a down-cache file names, or $null for any other shape. Strict, so this twin reads the
     # file exactly as probe_root does: a JSON object with a string `server`, that key in that case.
-    # -NoEnumerate keeps a top-level array an array, and -ceq never filters one.
+    # -NoEnumerate keeps a top-level array an array, and -ceq never filters one. A file with no
+    # `server` key is origin/main's shape, which a stale installed hook copy of coord_root.py still
+    # writes; its server is read from its string `root`, so its verdict still answers here.
     param([string]$Text)
     $obj = ConvertFrom-Json -InputObject $Text -NoEnumerate -ErrorAction Stop
     if ($obj -isnot [System.Management.Automation.PSCustomObject]) { return $null }
     $p = @($obj.PSObject.Properties | Where-Object { $_.Name -ceq 'server' })
+    if ($p.Count -eq 0) {
+        $r = @($obj.PSObject.Properties | Where-Object { $_.Name -ceq 'root' })
+        if ($r.Count -ne 1 -or $r[0].Value -isnot [string]) { return $null }
+        return Get-CoordUncHost -Path $r[0].Value
+    }
     if ($p.Count -ne 1 -or $p[0].Value -isnot [string]) { return $null }
     return $p[0].Value
 }
@@ -234,6 +244,8 @@ function Test-CoordRoot {
     # Returns @{ Ok; Error }. Fast on a dead server; see the header for why.
     param([string]$Path, [string]$LocalRoot)
     if (-not $Path) { return @{ Ok = $false; Error = 'no path' } }
+    $device = Get-CoordDeviceRootRefusal -What 'shared root' -Path $Path
+    if ($device) { return @{ Ok = $false; Error = $device } }
     $server = Get-CoordUncHost -Path $Path
     if ($server) {
         $down = if ($LocalRoot) { Join-Path $LocalRoot $script:CoordDownFile } else { $null }
