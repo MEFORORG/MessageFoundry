@@ -236,7 +236,8 @@ def test_a_quoted_phi_value_ending_in_a_marker_head_is_still_masked() -> None:
     the PHI arm too, left this quoted PHI value in view where the answer before #2968 masked it."""
     text = '{"given":"A^B^C,pwd::Bearer zqbafhgmfb6"]}'
     assert not _all_paths_keeping(text, "zqbafhgmfb6")
-    assert redact(text) == '[redacted] xxxxxxxxxx0"]}'
+    # The `]` meets the object's `{`: a stray closer, so the whole text is the placeholder (#5814).
+    assert redact(text) == "[redacted]"
 
 
 def test_a_label_spelled_with_a_fold_character_is_still_read() -> None:

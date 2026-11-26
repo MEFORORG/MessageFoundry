@@ -2090,8 +2090,10 @@ def redact(text: str) -> str:
     and 0 in 600,000 with it. That zero is a measurement, not a proof for the first-stage labels.
 
     **A JSON value with a mismatched closer makes the whole text redacted (BACKLOG #5814)**: the
-    result is the placeholder alone. The JSON pass reads what the passes before it left, so this
-    holds for a closer that pass still sees as mismatched."""
+    result is the placeholder alone. The JSON pass reads what the passes before it left, so the
+    text as received and the result are read for a stray closer too (:func:`_stray_json_closer`),
+    which also catches one of the same kind as the open container; that check names what it does not
+    see."""
     return _redact_noted(text, noted=False)
 
 
@@ -2111,10 +2113,66 @@ def _redact_noted(text: str, *, noted: bool) -> str:
     is masked. A mask can still change what a later pass or round reads (:func:`_masked_only`), so
     that the answer only hides more is a measurement, not a proof: the differential tests in
     ``tests/test_redaction_clamp_note_end.py`` measure it on their inputs."""
+    if _stray_json_closer(_without_trailing_note(text)):
+        return _REDACTED
     try:
-        return _redact_unguarded(text, noted=noted)
+        out = _redact_unguarded(text, noted=noted)
     except _MismatchedJsonCloser:
         return _REDACTED
+    # The output is read too: a scrub can leave a closer stray that was inside a string as received,
+    # and a second call reads that output as received, so without this the rule broke the fixed point.
+    return _REDACTED if _stray_json_closer(_without_trailing_note(out)) else out
+
+
+def _stray_json_closer(text: str) -> bool:
+    """Whether a closer in ``text`` as received, at or after a PHI JSON key, fails to close an open
+    container: it is of another kind than the innermost open one, or none is open (BACKLOG #5814,
+    added item 2).
+
+    **Read on the text before any pass rewrites it.** The walk in :func:`_scrub_json_value` reads
+    what the flat passes left, and a field-run scrub can consume an opener, so a later closer looks
+    matched there: ``{"identifier": [a|b|c ) , {"value": ...}]}``. **A same-kind stray closer is
+    caught here too, where the walk cannot see it:** in ``{"given": [x] y]}`` the first ``]`` ends the
+    value and the second meets the object's ``{``. The walk tokenizes from the start of the text with
+    :data:`_JSON_TOKEN`, so a closer inside a string is not structure. It is armed at the depth of the
+    first PHI key it passes and disarmed once the depth falls below that, which is the key's own
+    container closing, so a closer in prose after a closed object is not read. A key outside every
+    container stays armed to the end of its line. A stray closer that an unmatched opener of its own
+    kind absorbs, or that sits in text the tokenizer reads as a string, is not seen here."""
+    keys = [match.start() for match in _JSON_PHI_KEY.finditer(text)]
+    if not keys:
+        return False
+    stack: list[str] = []
+    armed: int | None = None
+    next_key = 0
+    pos = 0
+    while pos < len(text):
+        match = _JSON_TOKEN.match(text, pos)
+        if match is None:  # unreachable: every character starts one alternative
+            break
+        while next_key < len(keys) and keys[next_key] <= match.start():
+            armed = len(stack) if armed is None else min(armed, len(stack))
+            next_key += 1
+        pos = match.end()
+        punct = match.group("punct")
+        if punct is None:
+            ws = match.group("ws")
+            if armed == 0 and not stack and ws is not None and ("\n" in ws or "\r" in ws):
+                armed = None
+            continue
+        if punct in "{[(":
+            stack.append("}" if punct == "{" else "]" if punct == "[" else ")")
+        elif punct in "}])":
+            if not stack or stack[-1] != punct:
+                if armed is not None:
+                    return True
+                if stack:
+                    stack.pop()
+                continue
+            stack.pop()
+            if armed is not None and len(stack) < armed:
+                armed = None
+    return False
 
 
 def _redact_unguarded(text: str, *, noted: bool = False) -> str:
