@@ -207,9 +207,10 @@ refused at the shipped posture.
    Otherwise nothing starts, and the user is told why.
 
 **One known gap, engine-side and not closed here.** The probe and the provisioning terminal run in the workspace with
-no `--db`, as `serve` does. Since BACKLOG #5566 they also pass `--service-config=<file>` when
-`messagefoundry.serviceConfig` is set, the file `serve` is handed, and no `--service-config` when it is at its default.
-(This paragraph said they ran with no `--service-config` at all; that stopped being true with #5566.) In the default
+no `--db`, as `serve` does. Since BACKLOG #5566 they are handed the same `serviceConfig` as `serve`: they pass
+`--service-config=<file>` when the IDE resolves `messagefoundry.serviceConfig` to a file, and no `--service-config`
+when it resolves to none, as at its default. (CORRECTED 2026-11-26: this paragraph said they ran with no
+`--service-config` at all, which stopped being true with #5566.) In the default
 layout they reach the store `serve` opens. They do
 not when the service TOML sets `[environments].base_dir`: `serve` anchors a relative `[store].path` under it, and
 `provision-admin` does not. The fix belongs in `provision-admin`, not in the IDE.
@@ -220,12 +221,11 @@ as go-ahead, no serve after a failed provision. The Consequences line above, tha
 node-testable, still holds for the terminal calls themselves; a source check in the same file pins that `serve` is
 reached only through the plan and that the provisioning terminal is awaited. `engine-setup.test.ts` asserts that no
 string in the four files names a bootstrap admin. `tests/test_ide_start_plan_probe_contract.py` takes the probe argv
-from `probeDefault` in `ide/src/test/fixtures/provision-admin-argv.json`, drops its first five elements (the
-interpreter options and `-m messagefoundry`), and hands the rest to the engine's `main` in-process, in a temporary
-working directory with no terminal. One arm has no store there; the others seed one first. It checks both answers
-carry the fragments the IDE matches on, so a rewording on either side goes red. The mocha suite
-`provision-admin-argv.test.ts` pins `buildAdminProbeInvocation`'s whole output against that entry. That suite runs in
-the `ide build` job; its header in `.github/workflows/ci.yml` says whether the job gates a merge. The Python file
-also checks the entry against the argv it builds from the TypeScript constants, and pins how the builder's source is
-written. It does not read what the builder returns, so an element the builder adds to its return is caught only by
-the mocha pin.
+from `probeDefault` in `ide/src/test/fixtures/provision-admin-argv.json` and runs it through the engine's `main`
+in-process; at least one arm has no store, and its module docstring says how. (CORRECTED 2026-11-26: this said it ran
+the probe "against the CLI".) It checks both answers carry the fragments the IDE matches on, so a rewording on either
+side goes red. The mocha suite `provision-admin-argv.test.ts` pins `buildAdminProbeInvocation`'s whole output against
+that entry. That suite runs in the `ide build` job; its header in `.github/workflows/ci.yml` says whether the job
+gates a merge. The Python file reads no builder output: it checks the entry against the argv it builds from the
+TypeScript constants and pins the builders' source text, so an element a builder adds to what it returns is caught by
+the mocha suites that compare the builders' output, not by the Python file.

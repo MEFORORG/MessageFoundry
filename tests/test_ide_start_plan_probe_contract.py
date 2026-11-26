@@ -13,14 +13,18 @@ This file closes that gap. It reads the two fragments out of the TypeScript. The
 is ``probeDefault`` in ``ide/src/test/fixtures/provision-admin-argv.json``, the probe with
 ``messagefoundry.serviceConfig`` at its default: no ``--db``, no ``--service-config``. It hands that
 list, minus the interpreter options and ``-m messagefoundry``, to the engine's ``main`` in-process,
-in a temporary working directory, with no terminal. One arm has no store there at all; the others
-seed one first. Each checks the answer carries the fragment the IDE looks for, in the ``--json``
-error object on stdout, the only place the IDE reads an answer from. Every arm sets the IDE's
-condition, stdin not a terminal, explicitly, so the result does not depend on how pytest was
-started. Whether ``probeDefault`` is the argv the IDE builds is checked from two sides, neither
-whole on its own: the mocha suite ``ide/src/test/suite/provision-admin-argv.test.ts`` pins the
-builder's output against it, and the tests below compare it with the argv built from the
-TypeScript constants and pin how the builder's source is written.
+in a temporary working directory, with no terminal. At least one arm runs it with no store in
+that directory, and others seed a store there first. Each checks the answer carries the fragment
+the IDE looks for, in the ``--json`` error object on stdout, the only place the IDE reads an answer
+from. Each arm that runs the probe sets the IDE's condition, stdin not a terminal, explicitly, so
+the result does not depend on how pytest was started.
+
+Whether ``probeDefault`` is the argv the IDE builds: the mocha suite
+``ide/src/test/suite/provision-admin-argv.test.ts`` compares the builder's whole output with it.
+This file reads no builder output. It compares ``probeDefault`` with the argv built from the
+TypeScript constants and pins the text of the builders' source; the docstring of
+``test_the_shared_fixture_default_probe_is_the_argv_built_from_the_typescript_constants`` names
+what that leaves open.
 """
 
 from __future__ import annotations
@@ -78,9 +82,10 @@ def _no_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _ts_string_list(name: str, text: str | None = None) -> list[str]:
     """The elements of ``export const <name>: readonly string[] = [...];`` in the IDE's control model
-    (or ``text``), comments blanked. The body must be double-quoted string literals with no
-    backslash, comma-separated, and nothing else: a single-quoted or template literal, a spread, an
-    identifier or any other element fails the assertion here instead of being skipped."""
+    (or ``text``), comments blanked. The body must be comma-separated double-quoted string literals
+    with no backslash or newline inside, and nothing else. At least a single-quoted or template
+    literal, a spread, an identifier and an escaped literal fail the assertion here instead of being
+    skipped or misread; the parametrized negative control below shows each."""
     raw = _MODEL.read_text(encoding="utf-8") if text is None else text
     m = re.search(
         rf"export const {name}: readonly string\[\] = \[([^\]]*)\];", blank_js_comments(raw)
@@ -117,25 +122,32 @@ def _probe_argv() -> list[str]:
     return _cli_args(ARGV_FIXTURE["probeDefault"])
 
 
-def test_the_shared_fixture_default_probe_is_the_argv_the_source_pin_reads() -> None:
+def test_the_shared_fixture_default_probe_is_the_argv_built_from_the_typescript_constants() -> None:
     """The fixture's ``probeDefault`` equals, whole, the argv built from the TypeScript constants.
 
-    What reds this test: an ``INTERPRETER_OPTIONS`` element changed, added, removed or reordered, or
-    a changed ``PROBE_USERNAME`` or ``PROBE_EMAIL``, unless the fixture moves with it; and an
-    ``INTERPRETER_OPTIONS`` element that is not a double-quoted string literal, which
-    ``_ts_string_list`` refuses. The gap: the source pin below checks how ``cliArgv`` and the
-    probe's ``provision-admin`` array are written, and that ``--json`` is appended, but not the
-    value ``buildProvisionInvocation`` returns, so an element added to that return passes every
-    test in this file. Only the mocha pin in ``provision-admin-argv.test.ts``, which compares the
-    builder's output with this entry, catches it, and that pin runs in the ``ide build`` job, which
-    was neither a required context nor in the ``CI gate`` roll-up when this was written
-    (branch protection and ``ci.yml`` read 2026-11-26)."""
+    What reds this test includes at least: an ``INTERPRETER_OPTIONS`` element changed, added,
+    removed or reordered, or a changed ``PROBE_USERNAME`` or ``PROBE_EMAIL``, unless the fixture
+    moves with it; an ``INTERPRETER_OPTIONS`` element that is not a double-quoted string literal,
+    which ``_ts_string_list`` refuses; and the fixture's ``probe`` entry drifting from
+    ``probeDefault``.
+
+    What it leaves open: this file reads no builder output. The source pin below matches text
+    anywhere in ``engineControlModel.ts``, not inside a particular function body, so neither
+    builder's return value is checked here, and an element added to what ``buildProvisionInvocation``
+    or ``buildAdminProbeInvocation`` returns passes every test in this file. The mocha suites that
+    compare the builders' whole output catch it, at least ``provision-admin-argv.test.ts`` and
+    ``engine-control.test.ts``. They run in the ``ide build`` job; that job's header in
+    ``.github/workflows/ci.yml`` says whether it gates a merge."""
     raw = _MODEL.read_text(encoding="utf-8")
-    assert ARGV_FIXTURE["probeDefault"] == _expected_probe_argv()
+    assert ARGV_FIXTURE["probeDefault"] == _expected_probe_argv(raw)
     # Negative control: a moved TypeScript constant reds the comparison, so the expected argv is
     # read from the TypeScript and not from the fixture.
     for decl, moved in (
         ('export const PROBE_USERNAME = "probe";', 'export const PROBE_USERNAME = "probe2";'),
+        (
+            'export const PROBE_EMAIL = "probe@example.invalid";',
+            'export const PROBE_EMAIL = "probe2@example.invalid";',
+        ),
         ('"-P", "-X", "disable-remote-debug"]', '"-I", "-P", "-X", "disable-remote-debug"]'),
     ):
         assert raw.count(decl) == 1, decl
@@ -156,8 +168,9 @@ def test_the_shared_fixture_default_probe_is_the_argv_the_source_pin_reads() -> 
         '...EXTRA_OPTIONS, "-P", "-X", "disable-remote-debug"]',
         '"-P", "-X", "disable-remote-debug", `-I`]',
         '"-P", "-X", EXTRA_OPTION, "disable-remote-debug"]',
+        '"-P", "-X", "disable-remote-debug", "-X\\"x"]',
     ],
-    ids=["single-quoted", "spread", "template", "identifier"],
+    ids=["single-quoted", "spread", "template", "identifier", "escaped"],
 )
 def test_an_interpreter_option_the_list_reader_cannot_read_reds_it(moved: str) -> None:
     """Negative control for ``_ts_string_list``: an element it cannot read as a double-quoted string

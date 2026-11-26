@@ -21,8 +21,9 @@ const FIXTURE = JSON.parse(
 const SC = FIXTURE.serviceConfig;
 
 // Typed as records and handed to the builders `as never`, so no call here names `serviceConfig` in a
-// builder's parameter type, and this file also compiles against the code before the flag existed,
-// where the pins below then fail on the argv itself.
+// builder's parameter type, and this file also compiles against the code before the flag existed.
+// There the pins with SC set fail on the argv itself; the default-probe pin passes, because that
+// code built the same argv with no --service-config.
 const provisionOpts: Record<string, string> = { python: "p", username: "alice", email: "alice@example.test", serviceConfig: SC };
 const probeOpts: Record<string, string> = { python: "p", serviceConfig: SC };
 // The call shape statusBar.ts uses with `messagefoundry.serviceConfig` at its default: the property
@@ -37,9 +38,8 @@ const PROBE_ARGV: readonly string[] = FIXTURE.probe;
 
 /**
  * The admin probe's argv with `messagefoundry.serviceConfig` at its default, so no --service-config.
- * tests/test_ide_start_plan_probe_contract.py hands this list, minus its first five elements, to the
- * engine's `main` in-process, in one arm with no store and in others with a seeded one, and checks it
- * against the argv it builds from the TypeScript constants.
+ * tests/test_ide_start_plan_probe_contract.py runs this list through the engine's `main` in-process;
+ * its module docstring says how.
  */
 const PROBE_DEFAULT_ARGV: readonly string[] = FIXTURE.probeDefault;
 
