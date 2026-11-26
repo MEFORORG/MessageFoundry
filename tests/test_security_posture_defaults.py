@@ -4243,6 +4243,12 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         "password_require_lowercase",
         "password_require_digit",
         "password_require_symbol",
+        # HARDENINGS, each shipped OFF (vault BACKLOG #5511): turning one on checks the hop's CRL
+        # file against the server's whole chain, not only the leaf, so a flip tightens. Neither
+        # loads alone: each needs the hop's CRL file and CA file, so this loop's lone flip could
+        # not build it either.
+        "ad_tls_crl_check_chain",
+        "oidc_tls_crl_check_chain",
         # Security-relevant and gated ELSEWHERE, not by this registry — same owed note as [store].
         # Not reported through THIS field: it is the desugared copy of [security].require_mfa, which
         # a loaded config reports and the [security] floor covers. Off, it is also refused at exposure
