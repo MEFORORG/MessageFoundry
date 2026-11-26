@@ -306,7 +306,7 @@ async def test_the_stay_passive_line_claims_no_hand_back(
         ]
         assert len(lines) == 1
         assert "handed back" not in lines[0]
-        assert "it holds no DR role" in lines[0]
+        assert "it no longer serves under the DR run-profile" in lines[0]
         assert await store.list_audit(action="dr.stay_passive", limit=5) != []
     finally:
         await store.close()
@@ -398,13 +398,50 @@ async def test_an_activation_settles_the_restart_alert_for_a_later_release(
         await coord.activate(actor="alice")
         await coord.release(actor="alice")
         fail_profile = True
-        with pytest.raises(DrActivationError):
+        with pytest.raises(DrActivationError) as aborted:
             await coord.activate(actor="alice")
+        # The abort must reach the profile step, where the earlier release's result is dropped;
+        # an earlier abort would answer from that result and never reach the stay-passive read.
+        assert aborted.value.kind == "profile"
         assert not coord.active
         events = len(sink.events)
         await coord.release(actor="bob")
         assert await store.list_audit(action="dr.stay_passive", limit=5) == []
         assert len(sink.events) == events
+    finally:
+        await store.close()
+
+
+async def test_a_failed_hook_on_a_stay_passive_release_claims_no_hand_back(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Lander hold 7204995471, item 4: a release on a passive box hands nothing back.
+    db, archive, ss, key = await _seed(tmp_path)
+    store = await MessageStore.open(db, cipher=make_cipher(key))
+    try:
+        await _coord(store, ss, archive, _Sink(), None).activate(actor="alice")
+
+        async def noop() -> None:
+            return None
+
+        restarted = DrCoordinator(
+            store,
+            DrSettings(enabled=True, seed_archive=archive, release_hook="exit 7"),
+            store_settings=ss,
+            activate_profile=noop,
+            deactivate_profile=noop,
+            alert_sink=_Sink(),
+            instance=lambda: None,
+        )
+        assert await restarted.check_restarted_passive()
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.dr"):
+            await restarted.release(actor="bob")
+        lines = [r.getMessage() for r in caplog.records if "hook exited non-zero" in r.getMessage()]
+        assert len(lines) == 1
+        assert "hand-back" not in lines[0]
+        assert lines[0].startswith("DR release on a passive box")
+        assert len(await store.list_audit(action="dr.stay_passive", limit=5)) == 1
     finally:
         await store.close()
 

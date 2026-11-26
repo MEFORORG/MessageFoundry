@@ -12029,8 +12029,9 @@ def create_app(
         to completion before returning success (no dual-accept window while the VIP moves). Cross-store
         reconciliation with the recovered primary is operator-verified per the runbook (the engine gives
         no cross-store loss/duplicate guarantee). On a box that is already passive but whose identity was
-        last activated, or whose start raised ``dr_restarted_passive``, it is a stay-passive release
-        instead (BACKLOG #5965): it runs the release hook, writes a ``dr.stay_passive`` audit row and
+        last activated, or whose start raised ``dr_restarted_passive`` with no activation recorded
+        since, it is a stay-passive release instead (BACKLOG #5965): it runs the release hook when one
+        is set, writes a ``dr.stay_passive`` audit row and
         closes the alert, but unbinds no listener and drains nothing, so an inbound an operator started
         on that box stays bound. It still answers ``action=release``."""
         coord = engine.dr_coordinator

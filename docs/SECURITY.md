@@ -4262,9 +4262,10 @@ The complete set, as enumerated in the [route map](#route--permission-map-engine
 - **Cluster control** -- `POST /cluster/stepdown` (BACKLOG #1494).
 - **Disaster recovery** -- `POST /dr/activate` and `POST /dr/release` (vault BACKLOG #2581). A promotion
   runs the operator's takeover hook and binds the priority listeners; a release runs the release
-  hook and unbinds every inbound. A release on a box already passive after a restart is a
-  stay-passive release instead: it runs the release hook and writes a `dr.stay_passive` row, but
-  unbinds no listener and drains nothing (BACKLOG #5965). Each asks for the same fresh proof as the planned failover above.
+  hook and unbinds every inbound. A release on a box already passive whose own newest
+  activate or release record is an activation, or whose restart alert is still open, is a
+  stay-passive release instead: it runs the release hook when one is set and writes a
+  `dr.stay_passive` row, but unbinds no listener and drains nothing (BACKLOG #5965). Each asks for the same fresh proof as the planned failover above.
   Under `serve` a DR box starts passive and no setting promotes it: `[dr].activate` is a removed
   key (BACKLOG #5965; the `[dr]` `activate` row of [CONFIGURATION.md](CONFIGURATION.md) says why).
   So this route is the only promotion, and a restart of an activated box needs it again, once

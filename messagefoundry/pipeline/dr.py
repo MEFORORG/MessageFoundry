@@ -411,7 +411,7 @@ class DrCoordinator:
 
     async def _record_stay_passive(self, actor: str, now: float) -> DrResult | None:
         """``POST /dr/release`` on a passive box this identity last activated, or whose start
-        raised ``dr_restarted_passive``: record that the operator leaves it passive, so later
+        raised ``dr_restarted_passive`` with no activation recorded since: record that the operator leaves it passive, so later
         starts stop alerting, and close the alert (BACKLOG #5965). The release hook runs when
         one is set, since the takeover hook may have moved the address here. Nothing drains: the
         box delivers nothing already, so any row left undelivered on it stays queued for the
@@ -743,7 +743,8 @@ class DrCoordinator:
         all inbound listeners while the workers drain the staged queue to completion. Returns success only
         once the VIP is off the DR box and intake is unbound, so there is **no dual-accept window** while
         the VIP moves. **The exception is a box already passive** whose identity was last activated, or
-        whose start raised ``dr_restarted_passive``: that release only runs the release hook, writes a
+        whose start raised ``dr_restarted_passive`` with no activation recorded since: that release
+        only runs the release hook when one is set, writes a
         ``dr.stay_passive`` row and closes the alert (:meth:`_record_stay_passive`). It unbinds no
         listener and drains nothing, so an inbound an operator started on that box stays bound.
         **Within the DR store** at-least-once + idempotency are preserved on drain;
@@ -1547,8 +1548,10 @@ class DrCoordinator:
                 else:
                     # A box already passive hands nothing back, so the line claims no hand-back.
                     log.warning(
-                        "DR release on a passive box: %s; recording that it stays passive anyway. "
-                        "If the takeover hook moved the address here, check where it points now",
+                        "DR release on a passive box: %s; the release still tries to record that "
+                        "the box stays passive. A timed-out hook is left running and may still "
+                        "move the address, so if the takeover hook moved it here, check where it "
+                        "points",
                         reason,
                     )
         return True
