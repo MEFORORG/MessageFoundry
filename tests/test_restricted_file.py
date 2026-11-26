@@ -1143,10 +1143,11 @@ def test_broad_access_problem_refuses_where_the_linux_mount_table_cannot_be_read
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """On Linux an unreadable ``/proc/self/mountinfo`` means no type on the path was judged, so it
-    is refused rather than passed as if it had been. At least the key-file, secrets-directory and
-    custody-directory callers append a remedy about owner and mode, which does not clear it, so
-    the refusal names its own remedy, says that changing owner or mode, or replacing what is
-    refused, does not clear it, and gives no chmod or chown of its own."""
+    is refused rather than passed as if it had been. It is typed, so the key-file,
+    secrets-directory and custody-directory callers say the path could not be fully checked and
+    append no owner-and-mode remedy, which does not clear it. The answer names its own remedy, says
+    that changing owner or mode, or replacing what is at the path, does not clear it, and gives no
+    chmod or chown of its own."""
     os.chmod(tmp_path, 0o700)
     key = tmp_path / "k.key"
     key.write_bytes(b"synthetic")
@@ -1156,9 +1157,11 @@ def test_broad_access_problem_refuses_where_the_linux_mount_table_cannot_be_read
     assert problem is not None and "/proc/self/mountinfo could not be read" in problem
     # Typed, so a caller says the file could not be checked rather than that it is not restricted.
     assert isinstance(problem, restricted_file.UncheckedProblem)
-    assert "This refusal clears once the engine can read /proc/self/mountinfo" in problem
-    assert "Changing the owner or mode of what is refused" in problem
-    assert problem.endswith("or replacing what is refused, does not clear this refusal")
+    assert "This clears once the engine can read /proc/self/mountinfo" in problem
+    assert "Changing the owner or mode of the path" in problem
+    assert problem.endswith("or replacing what is at the path, does not clear it")
+    # Worded for a warning as well as a refusal, since warn prints it and the start goes on.
+    assert "refus" not in problem
     assert "chmod" not in problem and "chown" not in problem
 
 

@@ -60,7 +60,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from messagefoundry.auth.anchor_path import (
     _GRANTING_ACE_TYPES,
@@ -99,6 +99,7 @@ __all__ = [
     "WINERROR_SHARING_VIOLATION",
     "OwnerRefused",
     "RestrictedFileError",
+    "MOUNT_TABLE_UNREAD",
     "UncheckedProblem",
     "administrators_enabled",
     "broad_access_problem",
@@ -1141,13 +1142,29 @@ def _posix_delegated_file_system(fstype: str) -> bool:
 
 
 class UncheckedProblem(str):
-    """A :func:`broad_access_problem` answer that says the check could not be made, rather than
-    that it found ``path`` open to another account (vault BACKLOG #5657). The text carries its own
-    remedy, and no change to the owner or mode of ``path`` or its folders clears it, so a caller
-    says that ``path`` could not be checked and appends no owner-and-mode remedy of its own. Told
-    apart from a finding by its type, never by its text."""
+    """A :func:`broad_access_problem` answer that says the check could not be completed, rather
+    than that it found ``path`` open to another account (vault BACKLOG #5657). Some of the check
+    may have run and passed first, such as the owner and mode of ``path`` itself on POSIX. The
+    text carries its own remedy, and no change to the owner or mode of ``path`` or its folders
+    clears it, so a caller says that ``path`` could not be fully checked and appends no
+    owner-and-mode remedy of its own. Told apart from a finding by its type, never by its text.
+    The type is lost by any operation that builds a new string, so a caller tests the answer as
+    returned. At least the unread Linux mount table (:data:`MOUNT_TABLE_UNREAD`) is answered this
+    way; other answers that the check could not be completed are still plain strings."""
 
     __slots__ = ()
+
+
+#: What :func:`broad_access_problem` answers, as an :class:`UncheckedProblem`, on Linux where
+#: ``/proc/self/mountinfo`` cannot be read. It is worded for a refusal under ``enforce`` and a
+#: warning under ``warn`` alike.
+MOUNT_TABLE_UNREAD: Final = (
+    "/proc/self/mountinfo could not be read, so the file system under its path was not judged, "
+    "and the folders above it were not walked. This clears once the engine can read "
+    "/proc/self/mountinfo, for example with procfs mounted where the engine runs, or with an "
+    "AppArmor or SELinux policy that allows the read. Changing the owner or mode of the path or "
+    "of the folders above it, or replacing what is at the path, does not clear it"
+)
 
 
 def _posix_link_problem(
@@ -1281,13 +1298,7 @@ def _posix_host_link_problem(path: Path) -> str | None:
 
     mounts = read_mounts()
     if mounts is None and sys.platform.startswith("linux"):
-        return UncheckedProblem(
-            "/proc/self/mountinfo could not be read, so the file system under its path was "
-            "not judged. This refusal clears once the engine can read /proc/self/mountinfo, for "
-            "example with procfs mounted where the engine runs, or with an AppArmor or SELinux "
-            "policy that allows the read. Changing the owner or mode of what is refused or of the "
-            "folders above it, or replacing what is refused, does not clear this refusal"
-        )
+        return UncheckedProblem(MOUNT_TABLE_UNREAD)
 
     def fstype_fn(part: str) -> tuple[str, str] | None:
         return None if mounts is None else mount_of(part, mounts)
@@ -1439,8 +1450,9 @@ def broad_access_problem(
     with it the mount check, is skipped under ``holder_judged``. Its refusal where the table
     cannot be read, and at least some of what it does not judge, are
     :func:`_posix_host_link_problem`'s, and ``docs/PHI.md`` lists at least those too. That refusal
-    is an :class:`UncheckedProblem`, which a caller tells apart by its type: nothing about the file
-    was judged, and the text carries its own remedy.
+    is an :class:`UncheckedProblem`, which a caller tells apart by its type: the check was not
+    completed, though the file's own owner and mode were judged first, and the text carries its own
+    remedy.
 
     On both, the folders above ``path`` are walked too (vault BACKLOG #5656, #5657). A junction or
     link among them is refused when an account the check does not trust can change it: on

@@ -29,6 +29,7 @@ from typing import Any, cast
 import pytest
 
 from messagefoundry import __main__ as cli
+from messagefoundry import restricted_file
 from messagefoundry.__main__ import main
 from messagefoundry.config import key_file_access
 from messagefoundry.config.key_file_access import (
@@ -786,17 +787,13 @@ async def test_supervise_runs_its_graph_guard_off_the_event_loop(tmp_path: Path)
 
 # --- a check that could not be made (vault BACKLOG #5657) ----------------------------------------
 
-_UNCHECKED_REASON = (
-    "/proc/self/mountinfo could not be read, so the file system under its path was not judged. "
-    "This refusal clears once the engine can read /proc/self/mountinfo"
-)
+_UNCHECKED_REASON = restricted_file.MOUNT_TABLE_UNREAD
 
 
 def _answer_unchecked(monkeypatch: pytest.MonkeyPatch, *, unchecked: bool) -> None:
-    """Stand the access check in with an answer that it could not be made, or, for the control,
-    with an ordinary broad-access finding. The type, not the text, is what tells the two apart."""
-    from messagefoundry import restricted_file
-
+    """Stand the access check in with an answer that it could not be completed, or, for the
+    control, with an ordinary broad-access finding. The type, not the text, is what tells the two
+    apart."""
     answer = (
         restricted_file.UncheckedProblem(_UNCHECKED_REASON) if unchecked else "Everyone may read it"
     )
@@ -812,7 +809,7 @@ def test_a_key_file_that_could_not_be_checked_says_so_with_its_own_remedy(
     "is not restricted" and the caller's remedy."""
     _answer_unchecked(monkeypatch, unchecked=True)
     problem = key_file_access.key_file_problem("k.key", what="the key file", remedy="RESTRICT IT")
-    assert problem == f"the key file could not be checked: {_UNCHECKED_REASON}", problem
+    assert problem == f"the key file could not be fully checked: {_UNCHECKED_REASON}", problem
     assert "is not restricted" not in problem and "RESTRICT IT" not in problem
 
     _answer_unchecked(monkeypatch, unchecked=False)
@@ -837,7 +834,9 @@ def test_a_generated_tls_key_that_could_not_be_checked_prints_no_owner_or_pair_r
     _answer_unchecked(monkeypatch, unchecked=True)
     assert not cli._generated_tls_key_gate(ServiceSettings(), tmp_path, enforcing=True)
     err = capsys.readouterr().err
-    assert "error: the generated TLS private key" in err and "could not be checked" in err, err
+    assert "error: the generated TLS private key" in err and "could not be fully checked" in err, (
+        err
+    )
     assert _UNCHECKED_REASON in err, err
     assert "is not restricted" not in err, err
     assert "chmod" not in err and "chown" not in err, err

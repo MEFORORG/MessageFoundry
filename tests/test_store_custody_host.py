@@ -4383,10 +4383,7 @@ def test_a_custody_directory_that_could_not_be_checked_says_so_with_its_own_reme
     custody_dir = tmp_path / "custody"
     custody_dir.mkdir()
     environ = {"MEFOR_CUSTODY_DIRECTORY": str(custody_dir)}
-    reason = (
-        "/proc/self/mountinfo could not be read, so the file system under its path was not "
-        "judged. This refusal clears once the engine can read /proc/self/mountinfo"
-    )
+    reason = restricted_file.MOUNT_TABLE_UNREAD
     monkeypatch.setattr(
         restricted_file,
         "broad_access_problem",
@@ -4394,7 +4391,7 @@ def test_a_custody_directory_that_could_not_be_checked_says_so_with_its_own_reme
     )
     refusal = custody_host._own_directory_refusal(environ)
     assert refusal == (
-        f"the custody directory MEFOR_CUSTODY_DIRECTORY names could not be checked: {reason}"
+        f"the custody directory MEFOR_CUSTODY_DIRECTORY names could not be fully checked: {reason}"
     ), refusal
     assert "mode 0700" not in refusal and "Restrict it" not in refusal, refusal
 
