@@ -7526,8 +7526,9 @@ class IntegritySettings(_Section):
     # ALERT-ONLY, like its partner: a missing or unreadable anchor, or one the parser refuses, logs a
     # WARNING and lets the bare walk run, and never fires the tamper alert — a config fault must not
     # manufacture a tamper alarm, or a real one stops meaning anything. The parser passes a `vault:v`
-    # head through unchecked; `_audit_head_shape` in store/store.py says what that costs. `0:`, the anchor of an empty
-    # log, is refused the same way: it can witness nothing, so it is reported rather than compared.
+    # head through unchecked; `_audit_head_shape` in store/store.py says what that costs. `0:`, the
+    # anchor of an empty log, is refused the same way: it can witness nothing, so it is reported
+    # rather than compared.
     #
     # It does nothing on its own: without audit_verify_on_start the engine warns at startup that the
     # anchor is never read.

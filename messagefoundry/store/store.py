@@ -6739,7 +6739,8 @@ AUDIT_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
 #: plus a 64-character hex head, or a shorter `vault:v<N>:<base64>` Transit MAC, comfortably under 200
 #: bytes -- so anything past this is not an anchor file and the excess must never be read, let alone
 #: quoted back. This is the READER's bound, not a parser check: the parser passes a `vault:v` head
-#: through unchecked (:func:`_audit_head_shape` says what that costs), so it does not bound one.
+#: through unchecked (:func:`_audit_head_shape` says what that costs), so only this byte bound limits
+#: one read from a file, and nothing limits one given as ``--expected-anchor`` on the command line.
 #:
 #: THE BOUND IS A LOG-DISCLOSURE CONTROL, NOT A PERFORMANCE ONE. ``str(AuditAnchorError)``
 #: interpolates the offending text with ``{text!r}``. Neither file caller prints it now (vault
@@ -6853,8 +6854,8 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
     It ALSO refuses a hex head of the wrong length and a head of neither shape, rather than hand a
     comparator a head the store can never emit; a ``vault:v`` head is the exception, passed through
     unchecked (see the second bullet), and :func:`_audit_head_shape` states what that costs.
-    Both comparators compare the head byte-exactly and report *any* difference as ``truncated or rewritten``, so an
-    accepted-but-impossible head becomes a FALSE tamper alarm — a red light on an intact chain,
+    Both comparators compare the head byte-exactly and report *any* difference as
+    ``truncated or rewritten``, so an accepted-but-impossible head becomes a FALSE tamper alarm — a red light on an intact chain,
     indistinguishable from a real detection. A control whose whole value is that a FAIL means something
     cannot be allowed to manufacture FAILs out of its own input handling — the inverse of the
     green-while-checking-nothing hole above, and it costs just as much.
@@ -6937,14 +6938,15 @@ def _audit_head_shape(head: str, noun: str = "the head") -> tuple[str | None, st
     :func:`parse_audit_row_pair`, so a hardening of it reaches both. The reason quotes no part of the
     head. ``noun`` names the value in the reason.
 
-    THE KNOWN COST OF THE ``vault:v`` PASS-THROUGH, STATED HERE; other statements of the head rule
-    point here rather than restate it. A malformed ``vault:v`` anchor or row pair, for example one
-    truncated or carrying a space, is not refused: it reaches the comparator, and on an intact chain
-    the walk reports ``truncated or rewritten``. ``audit-verify`` then exits 1, the tamper code, not
-    2; the engine's ``[integrity].audit_anchor_file`` startup check logs that verdict at WARNING
-    (quoting the head's first 12 characters) and, where an alert sink is configured, fires
-    ``integrity_drift`` with subject ``audit-chain-truncated``. Vault BACKLOG #5987 item 1 holds it
-    open."""
+    THE KNOWN COST OF THE ``vault:v`` PASS-THROUGH. A ``vault:v`` anchor or row pair whose count or
+    seq passes, and whose head is malformed (for example truncated, or carrying a space), is not
+    refused: it reaches the comparator, and on an intact chain the walk reports ``truncated or
+    rewritten``. ``audit-verify`` then exits 1, the tamper code, not 2. The engine's
+    ``[integrity].audit_anchor_file`` startup check logs that verdict at WARNING, quoting the
+    anchor's count and the first 12 characters of its head and of the chain's head at that row,
+    and, where an alert sink is configured, fires ``integrity_drift`` with subject
+    ``audit-chain-truncated`` carrying the same text. Vault BACKLOG #5987 item 1 and #4790 items 2
+    and 4 hold it open."""
     if set(head) <= _AUDIT_ANCHOR_HEX:
         if len(head) != AUDIT_ANCHOR_DIGEST_HEX_LEN:
             return (
