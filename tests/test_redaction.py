@@ -39,6 +39,13 @@ from messagefoundry.redaction import (
 from tests._cpu_clock import CPU_SAMPLE_FLOOR_SECONDS
 from tests.test_log_redaction_secret_domain import PCT_STARTED
 
+#: ``record_property`` warns that ``<properties>`` inside a ``<testcase>`` is outside the xunit2
+#: schema, the default family. pytest writes them there all the same, which is where the cost
+#: readings below are wanted. The warning fires only for a test that takes the fixture.
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:record_property is incompatible:pytest.PytestWarning"
+)
+
 ADT = (
     "MSH|^~\\&|SENDINGAPP|FAC|RECV|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\r"
     "PID|1||100^^^H^MR||DOE^JANE||19800101|M\r"
@@ -236,14 +243,6 @@ def _best_of(work: Callable[[], object], reps: int = 3) -> float:
 #: controls below take. At least the wall-clock ratio arms further down record nothing yet.
 _RecordProperty = Callable[[str, object], None]
 
-#: ``record_property`` warns that ``<properties>`` inside a ``<testcase>`` is outside the xunit2
-#: schema, the default family. pytest writes them there all the same, which is where the readings
-#: are wanted, so every test that records one carries this filter, as
-#: ``tests/test_soap_fault_scan_linear.py`` does.
-_RECORDS_A_READING = pytest.mark.filterwarnings(
-    "ignore:record_property is incompatible:pytest.PytestWarning"
-)
-
 
 def _record_reading(
     record_property: _RecordProperty,
@@ -261,13 +260,16 @@ def _record_reading(
     A passing arm prints nothing under ``pytest -q``, so no hosted log held a margin to read. Written
     before the assertion, a failing reading lands in the junit as well. ``margin`` is how many times
     the reading clears its line: the line over the reading for an arm held under it, the reading over
-    the line for a control held over it. Every assertion is strict, so a margin of 1 or under is a
-    red either way. ``label`` prefixes the names when one test reads several inputs. For a CPU-time
+    the line for a control held over it. It describes the one assertion on that reading, which is
+    strict, so a margin of 1 or under is a red for it. A test with a second bound, such as the
+    ceiling, records that bound under its own ``label``. A reading of 0 or under on an arm held under
+    its line has no margin, so it records NaN rather than a pass. ``label`` prefixes the names when
+    one test reads several inputs. For a CPU-time
     ratio, ``sides`` is ``(large, small)``, each side's best CPU seconds as
     :func:`_interleaved_growth` measured them. Recording changes no reading and no assertion."""
     prefix = f"{label}." if label else ""
     above, below = (reading, line) if over else (line, reading)
-    margin = above / below if below > 0 else float("inf")
+    margin = above / below if below > 0 else float("nan")
     record_property(f"{prefix}reading", reading)
     record_property(f"{prefix}line", line)
     record_property(f"{prefix}side", "over" if over else "under")
@@ -424,7 +426,6 @@ def test_the_hostile_fixture_is_actually_hostile() -> None:
     assert _longest_token("A " * 5000) == 1  # the replaced arm's input, for the record
 
 
-@_RECORDS_A_READING
 def test_a_delimiter_free_run_stays_inside_the_scan_budget(
     record_property: _RecordProperty,
 ) -> None:
@@ -458,7 +459,6 @@ def test_a_delimiter_free_run_stays_inside_the_scan_budget(
     )
 
 
-@_RECORDS_A_READING
 def test_the_pre_guard_pattern_blows_that_same_budget(
     monkeypatch: pytest.MonkeyPatch, record_property: _RecordProperty
 ) -> None:
@@ -691,7 +691,6 @@ def test_disabling_the_sniff_restores_the_leak(monkeypatch: pytest.MonkeyPatch) 
     assert redaction.redact(ADT) == _pre_sniff_redact(ADT)
 
 
-@_RECORDS_A_READING
 def test_the_separator_sniff_stays_inside_the_scan_budget(
     record_property: _RecordProperty,
 ) -> None:
@@ -710,16 +709,16 @@ def test_the_separator_sniff_stays_inside_the_scan_budget(
     inputs = (("ops", "ops text", ops_block), ("custom", "300-segment custom message", custom))
     # Both inputs are read and recorded before either is asserted on, so a red on the first still
     # leaves the second's reading in the junit.
-    readings: list[tuple[str, str, float]] = []
+    readings: list[tuple[str, int, float]] = []
     for short, label, text in inputs:
         best = _best_of(lambda text=text: redact(text), 5)  # type: ignore[misc]
         _record_reading(
             record_property, best, _SCAN_BUDGET_SECONDS, over=False, unit="s", label=short
         )
-        readings.append((label, text, best))
-    for label, text, best in readings:
+        readings.append((label, len(text), best))
+    for label, chars, best in readings:
         assert best < _SCAN_BUDGET_SECONDS, (
-            f"redacting {len(text)} characters of {label} cost {best:.4f}s of the event loop against "
+            f"redacting {chars} characters of {label} cost {best:.4f}s of the event loop against "
             f"a {_SCAN_BUDGET_SECONDS}s budget"
         )
 
@@ -2079,7 +2078,6 @@ def test_one_credential_span_can_cover_a_second_opener_and_both_go() -> None:
     assert _PASSWORD_HEAD not in out and second_head not in out
 
 
-@_RECORDS_A_READING
 def test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer(
     record_property: _RecordProperty,
 ) -> None:
@@ -2124,6 +2122,9 @@ def test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer(
     _record_reading(
         record_property, growth, _CPU_GROWTH_LINE, over=False, unit="ratio", sides=(large, small)
     )
+    _record_reading(
+        record_property, large, _CPU_CEILING_SECONDS, over=False, unit="cpu_s", label="ceiling"
+    )
     assert growth < _CPU_GROWTH_LINE, (
         f"an eight times wider window cost the credential walk {growth:.1f} times the CPU time, over "
         f"the {_CPU_GROWTH_LINE} line -- the walk is no longer linear in the window"
@@ -2134,7 +2135,6 @@ def test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer(
     )
 
 
-@_RECORDS_A_READING
 def test_a_credential_search_from_index_0_is_quadratic_on_the_same_line(
     monkeypatch: pytest.MonkeyPatch, record_property: _RecordProperty
 ) -> None:
@@ -2326,7 +2326,6 @@ _FRAME_CAP_SHAPES = {
 _FRAME_CAP_BUDGET_SHAPES = ("one solid run", "segment-shaped")
 
 
-@_RECORDS_A_READING
 @pytest.mark.parametrize("label", _FRAME_CAP_BUDGET_SHAPES)
 def test_a_frame_cap_sized_input_no_longer_buys_the_event_loop(
     label: str, record_property: _RecordProperty
@@ -2357,7 +2356,6 @@ def test_a_frame_cap_sized_input_no_longer_buys_the_event_loop(
     )
 
 
-@_RECORDS_A_READING
 @pytest.mark.parametrize("label", _FRAME_CAP_BUDGET_SHAPES)
 def test_control_the_budget_shapes_are_expensive_unbounded(
     label: str, record_property: _RecordProperty
@@ -2390,7 +2388,6 @@ def _frame_cap_prose_growth(
     return _interleaved_growth(lambda: scan(small_text), lambda: scan(large_text), large_reps)
 
 
-@_RECORDS_A_READING
 def test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs(
     record_property: _RecordProperty,
 ) -> None:
@@ -2414,6 +2411,9 @@ def test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs(
     _record_reading(
         record_property, growth, _CPU_GROWTH_LINE, over=False, unit="ratio", sides=(large, small)
     )
+    _record_reading(
+        record_property, large, _CPU_CEILING_SECONDS, over=False, unit="cpu_s", label="ceiling"
+    )
     assert growth < _CPU_GROWTH_LINE, (
         f"safe_text on the frame-cap prose cost {growth:.1f} times one window of it, over the "
         f"{_CPU_GROWTH_LINE} line -- the scan is no longer bounded by the window"
@@ -2424,7 +2424,6 @@ def test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs(
     )
 
 
-@_RECORDS_A_READING
 def test_control_the_same_inputs_are_expensive_unbounded(
     record_property: _RecordProperty,
 ) -> None:
