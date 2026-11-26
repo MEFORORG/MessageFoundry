@@ -1867,13 +1867,13 @@ def _dsn_password_repl(m: re.Match[str], placeholder: str) -> str:
     return f"{m.group(1)}:{lead}{placeholder}@"
 
 
-#: Words a connection-string member's KEY may end in besides :data:`_CREDENTIAL_WORDS` (BACKLOG
+#: Words a connection-string member's KEY may hold besides :data:`_CREDENTIAL_WORDS` (BACKLOG
 #: #5030), so ``;AccessToken=`` is read as ``;sslpassword=`` is. Its own gate,
 #: :data:`_MEMBER_EXTRA_HINT`, admits the member pass beside :data:`_CREDENTIAL_HINT`.
 _MEMBER_EXTRA_WORDS = ("token",)
 
-# A connection-string member whose KEY ends in a credential word, its value taken to the next ";"
-# (BACKLOG #5030). The generic dialect sends every ``odbc_params`` value plain, ``sslpassword``
+# A connection-string member whose KEY holds a credential word, with at most one qualifier after
+# it, its value taken to the next ";" (BACKLOG #5030). The generic dialect sends every ``odbc_params`` value plain, ``sslpassword``
 # among them, and such a value may hold a space, "," and "&". A plain password can still reach a
 # log by another route, at least a driver's own error text echoing a string, and may also hold
 # "="; since BACKLOG #5041 the builder braces every password it sends. ``_CREDENTIAL_KV``'s plain
@@ -2029,15 +2029,17 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # * a first member whose value does not reach a ";" on its own line that a second ``<key>=``
 #   follows, at least one that ends the text or its line, one that holds a quote not glued between
 #   two word characters, and one that holds a key another member could start at
-#   (``Password=a b token=c;``). Its value is left to ``_CREDENTIAL_KV``, so its tail after a space
-#   prints;
+#   (``Password=a b token=c;``). Where ``_CREDENTIAL_KV`` reads its label it hides the first word
+#   and the tail after a space prints; where no pass reads it, as for ``sslpassword=a b; then``,
+#   the whole value prints;
 # * a key that holds a word followed by something other than one of the qualifiers above, at
 #   least ``PasswordHint``, ``PasswordHash``, ``PasswordEncrypted``, ``TokenKey``, ``Password__2``
 #   (two "_") and ``Password_`` (a "_" and no qualifier), whose whole value prints unless another
 #   pass reads its label, as on ``origin/main``; and a key-material label such as ``AccountKey``,
 #   which is not one of the words: ``_KEY_MATERIAL`` hides its value up to a space, and the tail
 #   after that space prints;
-# * a key holding "." or "-", or a space before its "=" (``;PWD =x``), left to ``_CREDENTIAL_KV``;
+# * a key holding "." or "-", or a space before its "=" (``;PWD =x``), left to ``_CREDENTIAL_KV``,
+#   so where it does not read the label, as for ``x.sslpassword=``, the whole value prints;
 # * on the write-time chain, a member glued to a percent-encoded HL7 run in one token
 #   (``a%7Cb%7Cc;sslpassword=x y``). :mod:`messagefoundry.redaction` runs first and replaces the
 #   whole token, ";" and all, so the value's tail after a space prints, as it did before #5030;
@@ -2284,9 +2286,11 @@ def _mask_member_value(text: str, start: int, end: int) -> str:
 
 
 def _mask_member(m: re.Match[str]) -> str:
-    """The replacement for a :data:`_CONNECTION_STRING_MEMBER` match: the ``;<key>=`` kept, and the
-    value's words masked (BACKLOG #5030). The support bundle runs this one function with this one
-    pattern, so the two surfaces cannot drift apart."""
+    """The replacement for a :data:`_CONNECTION_STRING_MEMBER` or
+    :data:`_CONNECTION_STRING_FIRST_MEMBER` match: group 1 kept, the ``;``, any spaces after it and
+    the key, or a first member's key alone, then the "=", and the value's words masked (BACKLOG
+    #5030). The support bundle runs this one function with the same patterns, so the two surfaces
+    cannot drift apart."""
     start, end = m.span(2)
     return f"{m.group(1)}={_mask_member_value(m.string, start, end)}"
 
@@ -3016,18 +3020,16 @@ _BRACED = "braced_tail"
 #: (:data:`_MEMBER_KEY`). Read with the item 4 shapes there, a line that took the shortcut before
 #: reached the fallback, which returned the reading before whole, and a camelCase value printed:
 #: ``accessToken=Abc9;w=1,userPwd='Sec_77;PWD='`` printed ``Sec_77`` (found by code review).
-#: Spelled literally, so the regex scanner reads it.
-_NARROW_MEMBER = re.compile(
-    r"(?i)(;[A-Za-z0-9_]++(?:(?<=password)|(?<=passwd)|(?<=passphrase)|(?<=pass)|(?<=pwd)"
-    r"|(?<=secret)|(?<=credential)|(?<=token)))=" + _MEMBER_VALUE
+#: Its head is spelled literally, so the regex scanner resolves both patterns built on it.
+_NARROW_KEY_HEAD = (
+    r";[A-Za-z0-9_]++(?:(?<=password)|(?<=passwd)|(?<=passphrase)|(?<=pass)|(?<=pwd)"
+    r"|(?<=secret)|(?<=credential)|(?<=token))"
 )
+_NARROW_MEMBER = re.compile(r"(?i)(" + _NARROW_KEY_HEAD + r")=" + _MEMBER_VALUE)
 #: A connection-string member's key, ``;<key>=``, as :data:`_NARROW_MEMBER` opens it, for
-#: :func:`_union`. Spelled literally, so the regex scanner reads it;
-#: ``tests/test_secretscrub_camelcase_label.py`` holds it to that pattern's own head.
-_MEMBER_KEY = re.compile(
-    r"(?i);[A-Za-z0-9_]++(?:(?<=password)|(?<=passwd)|(?<=passphrase)|(?<=pass)|(?<=pwd)"
-    r"|(?<=secret)|(?<=credential)|(?<=token))="
-)
+#: :func:`_union`; ``tests/test_connection_string_member_scrub.py`` holds the head's words to
+#: :data:`_CREDENTIAL_WORDS` and :data:`_MEMBER_EXTRA_WORDS`.
+_MEMBER_KEY = re.compile(r"(?i)" + _NARROW_KEY_HEAD + r"=")
 
 #: What the reading before did with a character of the line, in :func:`_union`.
 _HIDDEN = b"\x00"
@@ -3310,12 +3312,29 @@ def _union(
         # shipped reading, which runs the widened pass itself, is the whole answer. The question is
         # whether any pattern matches: until one does the text is unchanged, so a search per
         # pattern, stopping at the first that finds anything, answers it without rewriting.
+        #
+        # The probe is asked twice (BACKLOG #5030 added item 4). First with the member pass as it
+        # read before item 4 (:func:`_narrow_probe_sub`): a line that changes there takes the union
+        # below, member-key fallback and all, as it did. A line that changes only once the item 4
+        # shapes are read took the shortcut before item 4, so its answer was the shipped reading
+        # whole. It now takes the union without the fallback, which hides what the shipped reading
+        # hid and what the reading before hid too, so an item 4 value the shipped camelCase reading
+        # swallowed with its key (``cfg userPwd='; sslpassword='Zq7 Kv9``) is still masked. With
+        # the fallback, such a line returned the reading before whole, which reads no camelCase
+        # label: ``accessToken=Abc9;w=1,userPwd='Sec_77;PWD='`` printed ``Sec_77`` (both found by
+        # code review).
+        fallback = True
         try:
             _run(text, placeholder, folded, _narrow_probe_sub, wide=False)
         except _Changed:
             pass
         else:
-            return _run(text, placeholder, folded, sub)
+            try:
+                _run(text, placeholder, folded, _probe_sub, wide=False)
+            except _Changed:
+                fallback = False
+            else:
+                return _run(text, placeholder, folded, sub)
         old = _run(text, placeholder, folded, before.sub)
         new = _run(text, placeholder, folded, shipped.sub)
     except _Untraceable:
@@ -3330,7 +3349,7 @@ def _union(
                 old_masks[origin + k] = old[start + k]
         else:
             state[origin : origin + end - start] = _PRINTED * (end - start)
-    if ";" in text:
+    if fallback and ";" in text:
         # A ";" opens a connection-string member, whose key a pass AFTER this module reads: the
         # support bundle's member mask runs over the joined line. Where the shipped reading hid a
         # member key's ";" the reading before printed, that pass would lose the key and print the

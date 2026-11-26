@@ -1081,6 +1081,13 @@ _CAMEL_LINES_ITEM_4_MUST_NOT_PRINT = (
     ("cfg userPwd='Abc9;Password2=Zz7' rest", ("Abc9", "Zz7")),
     ("cfg accessToken='Abc9;\tsslpassword=Zz7' rest", ("Abc9", "Zz7")),
     ('cfg clientSecret="Abc9; Token=Zz7" rest', ("Abc9", "Zz7")),
+    # Lines only an item 4 shape changes take the union without its member-key fallback, so a
+    # member the shipped camelCase reading took with its key is still masked (code review round 2).
+    ("cfg userPwd='; sslpassword='Zq7 Kv9", ("Zq7", "Kv9")),
+    ("cfg userPwd=';PasswordOld='Zq7 Kv9", ("Zq7", "Kv9")),
+    ("apiToken=secret_new=@db'c3q;UID=,x", ("c3q",)),
+    ("connect redis://:Zq-Pw_1@h failed; userPwd='Kv9q;PWD='", ("Kv9q", "Zq-Pw_1")),
+    ("connect redis://h failed; userPwd='Kv9q;PWD='", ("Kv9q",)),
 )
 
 
@@ -1114,6 +1121,11 @@ def test_the_union_reads_the_member_key_it_read_before_item_4() -> None:
         assert secretscrub._MEMBER_KEY.match(key) is None, key
         assert secretscrub._CONNECTION_STRING_MEMBER.match(key + "x") is not None, key
     assert secretscrub._MEMBER_KEY.match(";sslpassword=") is not None
+    # The narrow head's words are the member words, as the wide key run's are.
+    narrow = re.findall(r"\(\?<=([a-z]+)\)", secretscrub._NARROW_KEY_HEAD)
+    assert sorted(narrow) == sorted(secretscrub._CREDENTIAL_WORDS + secretscrub._MEMBER_EXTRA_WORDS)
+    assert secretscrub._NARROW_KEY_HEAD in secretscrub._NARROW_MEMBER.pattern
+    assert secretscrub._NARROW_KEY_HEAD in secretscrub._MEMBER_KEY.pattern
 
 
 @pytest.mark.parametrize(("surface", "apply"), _SURFACES, ids=[name for name, _ in _SURFACES])
