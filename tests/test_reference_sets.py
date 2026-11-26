@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from pathlib import Path
 from types import MappingProxyType
@@ -1376,7 +1377,10 @@ def test_trace_dry_run_reads_a_passed_reference_view(
 
 @pytest.mark.parametrize("trace", [[], ["--trace"]])
 def test_dryrun_cli_reads_each_reference_file_once_per_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trace: list[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    trace: list[str],
 ) -> None:
     """The ``dryrun`` CLI, plain and traced, builds the view once per run, as ``check`` does: three
     fixtures read the file once, and each still reads the set (BACKLOG #6820). Each fixture used
@@ -1388,9 +1392,16 @@ def test_dryrun_cli_reads_each_reference_file_once_per_run(
     body = "    return Send('OB_REF', reference('provider_npi')['MED1'])\n"
     cfg, msgs = _check_repo(tmp_path, csv, body)
 
-    rc = main(["dryrun", "--config", str(cfg), "--messages", str(msgs), "--json", *trace])
+    rc = main(
+        ["dryrun", "--config", str(cfg), "--messages", str(msgs), "--json", "--show-phi", *trace]
+    )
     assert rc == 0
     assert loads == [str(csv)]
+    entries = json.loads(capsys.readouterr().out)
+    assert len(entries) == 3
+    assert [e["error"] for e in entries] == [None, None, None]
+    if not trace:
+        assert [[d["payload"] for d in e["deliveries"]] for e in entries] == [["9991"]] * 3
 
 
 @pytest.mark.parametrize("trace", [[], ["--trace"]])
