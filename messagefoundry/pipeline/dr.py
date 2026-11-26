@@ -256,11 +256,10 @@ class DrCoordinator:
     ) -> None:
         self._store = store
         self._settings = settings
-        # The engine's process identity, ``shard:<id>`` or ``node:<id>``, or None for a lone
-        # engine (Engine.instance_identity). Read at each use: it is known once the engine holds
-        # its graph. It goes on the dr.activate, dr.release and dr.stay_passive rows, so a start
-        # finds its own process's newest transition among the other engine shards' (BACKLOG
-        # #5965).
+        # The engine's identity, ``shard:<id>`` or ``node:<id>``, or None for a lone engine
+        # (Engine.instance_identity). Read at each use: it is known once the engine holds its
+        # graph. It goes on the dr.activate, dr.release and dr.stay_passive rows, so a start finds
+        # its own identity's newest transition among the other engine shards' (BACKLOG #5965).
         self._instance = instance
         # The instance posture, for the Vault hop the cold-seed verify can dial (vault BACKLOG
         # #2983). The engine passes its own. `None` counts as enforcing on that hop.
@@ -308,8 +307,9 @@ class DrCoordinator:
         # The last completed hand-back, so a retry that finds the box passive answers with that
         # release's outcome (its depth left) rather than with nothing known.
         self._last_release: DrResult | None = None
-        # Whether this process's start raised dr_restarted_passive, so a release can settle it
-        # even where the start could not read the rows (BACKLOG #5965).
+        # Whether this coordinator's start raised dr_restarted_passive, so a release can settle it
+        # even where the start could not read the rows (BACKLOG #5965). Cleared once a dr.activate
+        # row is written, since that activation closes the alert (Lander hold 7204995471).
         self._restart_alerted = False
         # The steps the activation that made the box active left unfinished, so a retry that finds
         # it active still names them (Lander hold 6702318430, item A). Set once its profile applies.
@@ -372,7 +372,7 @@ class DrCoordinator:
 
         It misses at least: an activation whose ``dr.activate`` row was never written (the owed
         row is held in memory only); a box whose host name changed between the activation and
-        the start; and a process whose own newest row is older than the
+        the start; and an identity whose own newest row is older than the
         :data:`_RESTART_SCAN_ROWS` newest. The other way round, it alerts at least on a hand-back
         whose ``dr.release`` row was never written, and on a store restored from a snapshot taken
         while this host was activated. ``[dr]`` is refused with ``[cluster]``, so the identity is
@@ -414,8 +414,8 @@ class DrCoordinator:
         raised ``dr_restarted_passive``: record that the operator leaves it passive, so later
         starts stop alerting, and close the alert (BACKLOG #5965). The release hook runs when
         one is set, since the takeover hook may have moved the address here. Nothing drains: the
-        box delivers nothing already, so rows the activated box took in and did not deliver stay
-        queued for the operator to reconcile, as after a release. ``None`` when there is nothing
+        box delivers nothing already, so any row left undelivered on it stays queued for the
+        operator to reconcile, as after a release. ``None`` when there is nothing
         to record. A write error refuses the release."""
         try:
             last = await self._own_last_transition()
@@ -430,7 +430,7 @@ class DrCoordinator:
         if last != _ACTION_ACTIVATE and not self._restart_alerted:
             return None
         hook_ran = await self._run_vip_hook(
-            self._settings.release_hook, phase="release", actor=actor, now=now
+            self._settings.release_hook, phase="release", actor=actor, now=now, hand_back=False
         )
         detail: dict[str, object] = {"vip_hook_ran": hook_ran, **self._whose()}
         try:
@@ -448,8 +448,8 @@ class DrCoordinator:
             ) from exc
         self._restart_alerted = False
         log.warning(
-            "DR: %s left this box passive after a restart; nothing drained, and any row the "
-            "activated box took in and did not deliver stays queued to reconcile per the runbook",
+            "DR: %s left this box passive after a restart; nothing drained, and any row left "
+            "undelivered on this box stays queued to reconcile per the runbook",
             actor,
         )
         self._alert_dr("dr_released")
@@ -742,7 +742,11 @@ class DrCoordinator:
         optional ``release_hook`` / let the passive LB return it to the primary), then the engine unbinds
         all inbound listeners while the workers drain the staged queue to completion. Returns success only
         once the VIP is off the DR box and intake is unbound, so there is **no dual-accept window** while
-        the VIP moves. **Within the DR store** at-least-once + idempotency are preserved on drain;
+        the VIP moves. **The exception is a box already passive** whose identity was last activated, or
+        whose start raised ``dr_restarted_passive``: that release only runs the release hook, writes a
+        ``dr.stay_passive`` row and closes the alert (:meth:`_record_stay_passive`). It unbinds no
+        listener and drains nothing, so an inbound an operator started on that box stays bound.
+        **Within the DR store** at-least-once + idempotency are preserved on drain;
         **cross-store** reconciliation with the recovered primary is operator-verified per the runbook
         (the engine gives no cross-store loss/duplicate guarantee — documented, not an engine AC)."""
         async with self._lock:
@@ -901,6 +905,10 @@ class DrCoordinator:
                 f"the audit log accepts writes: {safe_exc(exc)}",
             ) from exc
         self._unrecorded_activation = None
+        # This activation closes any dr_restarted_passive the start raised, so a later release
+        # must read the rows rather than settle an alert that is no longer open (Lander hold
+        # 7204995471, item 1).
+        self._restart_alerted = False
         log.warning(
             "DR activated by %s: serving feeds at priority >= %s; cold seed %s verified %s "
             "(new audit-chain segment opened)%s",
@@ -1472,7 +1480,9 @@ class DrCoordinator:
         _count, head = await self._store.audit_anchor()
         return head
 
-    async def _run_vip_hook(self, command: str, *, phase: str, actor: str, now: float) -> bool:
+    async def _run_vip_hook(
+        self, command: str, *, phase: str, actor: str, now: float, hand_back: bool = True
+    ) -> bool:
         """Run the optional VIP takeover/release hook OFF the event loop (a subprocess). Exit 0 = success
         ("VIP acquired"/"VIP released"); any non-zero or a timeout is a failure. On the **takeover** phase
         a failure ABORTS activation (acquire-VIP-or-abort) + records ``dr_activation_aborted``; on the
@@ -1480,7 +1490,8 @@ class DrCoordinator:
         the VIP when intake unbinds — the hook is belt-and-braces). Returns whether a hook was invoked.
         A takeover records whether the hook's process started on the running attempt, at the
         moment :attr:`_ActivationProgress.hook_ran` names (vault BACKLOG #3094). ``""`` = no hook
-        (rely on the passive ADR-0047 LB)."""
+        (rely on the passive ADR-0047 LB). ``hand_back=False`` is a release on a box already passive
+        (:meth:`_record_stay_passive`), where no hand-back follows the hook."""
         if not command:
             return False
         started = False
@@ -1529,9 +1540,17 @@ class DrCoordinator:
                 )
             else:
                 # Release-hook failure is non-fatal (the passive LB returns the VIP on unbind); log loudly.
-                log.warning(
-                    "DR release: %s — continuing hand-back (passive LB moves the VIP)", reason
-                )
+                if hand_back:
+                    log.warning(
+                        "DR release: %s — continuing hand-back (passive LB moves the VIP)", reason
+                    )
+                else:
+                    # A box already passive hands nothing back, so the line claims no hand-back.
+                    log.warning(
+                        "DR release on a passive box: %s; recording that it stays passive anyway. "
+                        "If the takeover hook moved the address here, check where it points now",
+                        reason,
+                    )
         return True
 
     async def _record_aborted(

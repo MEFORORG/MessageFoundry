@@ -4,7 +4,7 @@
 ruling 2026-11-25, decision d20261126T042906640-0b0f76).
 
 No setting starts a box active, so a restart of an activated box drops it to passive. The start
-now reads the newest ``dr.activate``, ``dr.release`` or ``dr.stay_passive`` row its own process
+now reads the newest ``dr.activate``, ``dr.release`` or ``dr.stay_passive`` row its own
 identity wrote. When
 that row is a ``dr.activate``, it logs at ERROR and raises the critical ``dr_restarted_passive``
 alert, which closes the open ``dr_activated``; it never re-activates the box. Each engine shard
@@ -35,7 +35,7 @@ from messagefoundry.config.wiring import MLLP, Registry, build_inbound_connectio
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alert_sinks import AlertRuleSet, NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink
-from messagefoundry.pipeline.dr import DrCoordinator
+from messagefoundry.pipeline.dr import DrActivationError, DrCoordinator
 from messagefoundry.pipeline.dr_backup import BackupRunner, _day_key
 from messagefoundry.store import MessageStore
 from messagefoundry.store.crypto import generate_key, make_cipher
@@ -306,7 +306,7 @@ async def test_the_stay_passive_line_claims_no_hand_back(
         ]
         assert len(lines) == 1
         assert "handed back" not in lines[0]
-        assert "it is passive and serves nothing" in lines[0]
+        assert "it holds no DR role" in lines[0]
         assert await store.list_audit(action="dr.stay_passive", limit=5) != []
     finally:
         await store.close()
@@ -365,6 +365,50 @@ async def test_an_unreadable_store_at_start_fails_loud(
         await store.close()
 
 
+async def test_an_activation_settles_the_restart_alert_for_a_later_release(
+    tmp_path: Path,
+) -> None:
+    # Lander hold 7204995471, item 1: once a dr.activate row is written, the start's alert no
+    # longer describes the box. A later activation that aborts at the profile step leaves the
+    # identity's newest row a dr.release, so a release then records no dr.stay_passive.
+    db, archive, ss, key = await _seed(tmp_path)
+    store = await MessageStore.open(db, cipher=make_cipher(key))
+    try:
+        await _coord(store, ss, archive, _Sink(), None).activate(actor="alice")
+        fail_profile = False
+
+        async def act() -> None:
+            if fail_profile:
+                raise RuntimeError("synthetic profile failure")
+
+        async def deact() -> None:
+            return None
+
+        sink = _Sink()
+        coord = DrCoordinator(
+            store,
+            DrSettings(enabled=True, seed_archive=archive),
+            store_settings=ss,
+            activate_profile=act,
+            deactivate_profile=deact,
+            alert_sink=sink,
+            instance=lambda: None,
+        )
+        assert await coord.check_restarted_passive()
+        await coord.activate(actor="alice")
+        await coord.release(actor="alice")
+        fail_profile = True
+        with pytest.raises(DrActivationError):
+            await coord.activate(actor="alice")
+        assert not coord.active
+        events = len(sink.events)
+        await coord.release(actor="bob")
+        assert await store.list_audit(action="dr.stay_passive", limit=5) == []
+        assert len(sink.events) == events
+    finally:
+        await store.close()
+
+
 async def test_each_engine_shard_alerts_on_its_own(tmp_path: Path) -> None:
     db, archive, ss, key = await _seed(tmp_path)
     store = await MessageStore.open(db, cipher=make_cipher(key))
@@ -373,13 +417,13 @@ async def test_each_engine_shard_alerts_on_its_own(tmp_path: Path) -> None:
         b_served = _coord(store, ss, archive, _Sink(), "shard:b")
         await b_served.activate(actor="alice")
         await b_served.release(actor="alice")
-        # Shard a was last activated, so it alerts under its own label; b handed back, so not.
+        # Engine shard a was last activated, so it alerts under its own label; b handed back, so not.
         a_sink, b_sink = _Sink(), _Sink()
         assert await _coord(store, ss, archive, a_sink, "shard:a").check_restarted_passive()
         assert not await _coord(store, ss, archive, b_sink, "shard:b").check_restarted_passive()
         assert a_sink.events == [("dr_restarted_passive", f"{socket.gethostname()} shard:a")]
         assert b_sink.events == []
-        # A shard that never activated reads nothing of its siblings' rows.
+        # An engine shard that never activated reads nothing of its siblings' rows.
         c_sink = _Sink()
         assert not await _coord(store, ss, archive, c_sink, "shard:c").check_restarted_passive()
         assert c_sink.events == []

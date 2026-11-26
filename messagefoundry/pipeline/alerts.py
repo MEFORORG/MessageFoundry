@@ -1660,8 +1660,8 @@ class LoggingAlertSink:
         # The inverse (auto-resolve) event, logged at INFO, no page. Raised by a fail-back and by a
         # release that leaves a restarted box passive (BACKLOG #5965), so the line claims no hand-back.
         log.info(
-            "ALERT dr_released: DR box %r released: it is passive and serves nothing, and serving "
-            "is left to the %s",
+            "ALERT dr_released: DR box %r released: it holds no DR role, and serving is left to "
+            "the %s",
             node,
             role,
         )
