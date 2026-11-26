@@ -2512,7 +2512,7 @@ class PostgresStore(ServerCipherWalk):
                 return None
             schemas = _search_path_schemas(str(setting["path"]), str(setting["who"]))
             # An index shares the relation namespace, so its name collides as a table's does.
-            declared = _declared_schema()
+            declared = await asyncio.to_thread(_declared_schema)
             tables = sorted({*declared.columns, *declared.named_indexes})
             if not schemas or not tables:
                 return None
@@ -2626,8 +2626,9 @@ class PostgresStore(ServerCipherWalk):
                 # for a crashed host can take as long as TCP keepalive allows. A role- or
                 # database-configured lock_timeout (or transaction_timeout) can still end it sooner.
                 # Read before the lock and the batch, so DDL the live-schema check cannot read
-                # fails here, with no peer queued behind it (BACKLOG #5062). Cached per process.
-                _declared_schema()
+                # fails here, with no peer queued behind it (BACKLOG #5062). Cached per process; the
+                # first parse takes tens of milliseconds, so it runs off the event loop.
+                await asyncio.to_thread(_declared_schema)
                 log.info("postgres: waiting for the schema lock to apply the DDL batch")
                 wait = self._settings.schema_lock_timeout
                 lock = self._lock_key(_SCHEMA_LOCK)
@@ -2794,7 +2795,7 @@ class PostgresStore(ServerCipherWalk):
         Raises :class:`ServerSchemaMismatchError` naming each one, and logs it at ERROR first. Extras
         are tolerated. :mod:`messagefoundry.store.server_schema_verify` says what is compared and
         what is not. Reads only."""
-        expected = _declared_schema()
+        expected = _declared_schema()  # a cache hit: the pre-lock read parsed it off the loop
         column_rows: list[tuple[str, str | None, str | None, ColumnShape | None]] = []
         live_columns = await conn.fetch(_LIVE_COLUMNS_SQL, sorted(expected.columns))
         schema = live_columns[0]["schema_name"] if live_columns else None

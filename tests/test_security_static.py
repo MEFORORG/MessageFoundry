@@ -954,22 +954,22 @@ _UNSCANNABLE_RE_PATTERNS = {
     # ``_assigned_and_run``. Unresolvable because the code splices the variable name that
     # ``_ASSIGNED_LITERAL`` captured from the DDL text into an f-string. That is a choice, not a
     # necessity: a static pattern capturing ``@(\w+)`` and comparing the name after the match would
-    # resolve. The name goes in UNESCAPED. It is safe only while the capture admits nothing but
-    # ``\w`` characters, none of which is a regex metacharacter, and this pin does not bind that
-    # capture: a widened capture, or a new caller passing another name, keeps this test green. The
-    # source of record is ``server_schema_verify.py``.
+    # resolve. The name goes in through ``re.escape``, so a name holding a metacharacter matches
+    # only itself (``test_a_metacharacter_in_an_exec_variable_matches_only_itself``). This pin
+    # does not bind the capture: a widened capture, or a new caller passing another name, keeps
+    # this test green. The source of record is ``server_schema_verify.py``.
     #
     # The text read is the engine's own checked-in DDL: ``declared_schema`` is called from
     # ``postgres.py`` and ``sqlserver.py`` over their ``_SCHEMA`` (and Postgres's migration index
     # DDL), and from nowhere else at this pin's writing. The shapes have no nested quantifier. Each
     # pattern is an alternation of literals, ``@`` and the name, joined by single ``\s*`` or
     # ``\s+`` runs. The runs pattern (the first) also holds the optional ``(?:UTE)?``, a group of
-    # literals only. The changes pattern (the second) also holds the operator class
-    # ``[-+*/|&^%]``, optional in one branch and required in the other. No ``\s`` run is followed
-    # by a token that can match whitespace, so there is one way to split any prefix.
+    # literals only, and a closing ``(?![\w@#$])`` lookahead, which consumes nothing. The changes
+    # pattern (the second) also holds the operator class ``[-+*/|&^%]``, optional in one branch
+    # and required in the other. No ``\s`` run is followed by a token that can match whitespace, so there is one way to split any prefix.
     "messagefoundry/store/server_schema_verify.py": (
-        "f'\\\\b(?:EXEC(?:UTE)?\\\\s*\\\\(\\\\s*@{var}\\\\s*\\\\)|sp_executesql\\\\s+@{var}\\\\b)'",
-        "f'\\\\b(?:SET|SELECT)\\\\s+@{var}\\\\s*[-+*/|&^%]?=|@{var}\\\\s*[-+*/|&^%]='",
+        "f'\\\\b(?:EXEC(?:UTE)?\\\\s*\\\\(\\\\s*@{name}\\\\s*\\\\)|sp_executesql\\\\s+@{name}(?![\\\\w@#$]))'",
+        "f'\\\\b(?:SET|SELECT)\\\\s+@{name}\\\\s*[-+*/|&^%]?=|@{name}\\\\s*[-+*/|&^%]='",
     ),
     # a wrapper's parameter. NOTE: register_ui_action's own re.compile(pattern) stays here BY
     # CONSTRUCTION — its argument is the function's parameter — but every one of its 25 call sites is
