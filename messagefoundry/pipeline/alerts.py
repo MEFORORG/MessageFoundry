@@ -1046,13 +1046,13 @@ class AlertSink(Protocol):
         """A DR box whose newest own activate or release record is an **activation** started
         **passive** (BACKLOG #5965, ADR 0048), so it may have been serving when it went down; a
         store restored from a snapshot taken while it was activated reads the same. It serves
-        nothing and never re-activates itself: an operator re-runs
-        ``POST /dr/activate``. Also raised when the start could not read whether the box was
-        activated. Page-worthy, and CRITICAL unless a matching rule names its own severity. It
-        closes the open ``dr_activated`` instance for ``node``, which no longer describes a box
-        that serves; the next ``dr_activated`` or ``dr_released`` for ``node`` closes this one.
-        ``node`` is the label the coordinator's ``dr_activated`` carries: the host, and on an
-        engine shard the shard too. No PHI."""
+        nothing and never re-activates itself: once the operator has confirmed the primary is not
+        serving, the operator re-runs ``POST /dr/activate``. Also raised when the start could not
+        read whether the box was activated. Page-worthy, and CRITICAL unless a matching rule names
+        its own severity. It closes the open ``dr_activated`` instance for ``node``, which no
+        longer describes a box that serves; the next ``dr_activated`` or ``dr_released`` for
+        ``node`` closes this one. ``node`` is the label the coordinator's ``dr_activated``
+        carries: the host, and on an engine shard the shard too. No PHI."""
         ...
 
     # --- vault BACKLOG #2613: the security-signal rule layer -----------------------------------
@@ -1662,7 +1662,8 @@ class LoggingAlertSink:
         log.critical(
             "ALERT dr_restarted_passive: DR box %r started PASSIVE and may have been serving when "
             "it went down -- the ERROR line before this says what its store shows. It serves "
-            "nothing until POST /dr/activate; POST /dr/release records that it stays passive",
+            "nothing until POST /dr/activate, to be run only once you have confirmed the "
+            "primary is not serving; POST /dr/release records that it stays passive",
             node,
         )
 

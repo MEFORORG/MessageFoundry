@@ -244,6 +244,11 @@ async def test_a_store_rebuilt_from_an_activated_snapshot_alerts_without_claimin
             for line in (r.getMessage() for r in records):
                 assert "was last ACTIVATED" not in line and "after a restart" not in line
                 assert "went down while serving" not in line
+                # The activate advice is conditional: in these cases the primary may be serving.
+                assert "confirmed the primary is not serving" in line
+            # The starting process wrote no record, so the line names the identity's record.
+            assert "for this identity" in records[0].getMessage()
+            assert "this process" not in records[0].getMessage()
     finally:
         await rebuilt.close()
 

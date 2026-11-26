@@ -392,13 +392,14 @@ class DrCoordinator:
             if last != _ACTION_ACTIVATE:
                 return False
             log.error(
-                "DR: the newest activate or release record this process (%s) wrote to its store "
+                "DR: the newest activate or release record for this identity (%s) in its store "
                 "is an activation, so it may have been serving when it went down. A store "
                 "restored from a snapshot taken while it was activated, a release whose record "
                 "was never written, and an earlier start that already came back passive read "
-                "the same way. It has started PASSIVE, serves nothing and does not re-activate "
-                "itself; re-run POST /dr/activate to serve the priority feeds again, or POST "
-                "/dr/release to record that it stays passive",
+                "the same way, and in the first two the primary may be serving again. It has "
+                "started PASSIVE, serves nothing and does not re-activate itself; once you have "
+                "confirmed the primary is not serving, re-run POST /dr/activate to serve the "
+                "priority feeds again, or POST /dr/release to record that it stays passive",
                 self._label(),
             )
         self._restart_alerted = True
