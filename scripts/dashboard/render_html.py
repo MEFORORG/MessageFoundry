@@ -548,7 +548,7 @@ def priority_table(rows: Sequence[Mapping[str, Any]]) -> str:
     body = []
     for p in priorities:
         values = [cell.get((p, s)) for s in statuses]
-        label = "Unscored" if p == tr.UNSCORED_LABEL else p
+        label = tr.PRIORITY_LABELS.get(p, p)
         body.append(
             f"<tr><th>{esc(label)}</th>"
             + "".join(f"<td>{fmt(v)}</td>" for v in values)
@@ -694,9 +694,11 @@ def render(data: dict[str, Any]) -> str:
 <p class="lede">{lede(headline)} Window {esc(window)}, through {esc(data.get("through") or "unknown")} (UTC).</p>
 <div class="tiles">{tiles}</div>
 <section class="chart wide"><h2>Ledger rows by priority</h2>{priority_table(tr.priority_rows(snap))}
-<p class="note">Every ledger row that carries a status banner, open and closed, by the priority on its
-own Cluster line and its status banner. Open, partial and in progress are open rows; closed, declined and superseded are
-closed ones. As of the vault at run time.</p></section>
+<p class="note">Every ledger row that carries a status banner, open and closed, by its tier and its status
+banner. The tier is the one on the row's first banner score line, else the priority on its own
+Cluster line. A row with a score but neither tier is in the "Scored, no tier" row; most of
+these are filing estimates. A row with no score and no Cluster priority is unscored. Open,
+partial and in progress are open rows; closed, declined and superseded are closed ones. As of the vault at run time.</p></section>
 {ledger}
 <section class="chart"><h2>Pull requests merged per week</h2>{merged}
 {legend(repos)}</section>
@@ -708,7 +710,7 @@ closed ones. As of the vault at run time.</p></section>
 the snapshot and render_html.py drew this page. A value that could not be read shows as no data,
 never as zero, and its reason is printed in its tile. A hollow point or faded bar is a week still in
 progress. The ledger range buttons apply to the two ledger charts; the pull request and CI charts
-cover the window. State metrics (open PRs, alerts, ASVS, ledger rows, release distance) are as of
+cover the window. State metrics (alerts, ASVS, ledger rows, release distance) are as of
 the run, whatever the window says. Times are US Central.</p>
 </footer>
 </main>

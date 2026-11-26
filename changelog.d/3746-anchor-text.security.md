@@ -8,4 +8,5 @@
   stricter than `cafile=` in at least three shapes, and at least some shapes can still trust more than `cafile=`.
   The header and private-key refusals now run ahead of the non-ASCII refusal, whose text now says
   what to remove. The encryption-header refusal now quotes `"Proc-Type:"` and `"DEK-Info:"` and says
-  it matches them in any case. (`BACKLOG #3746`)
+  it matches them in any case. Later in this release, `BACKLOG #5229` replaced this entry's line
+  model and its byte-order-mark rule; that entry says what the text does now. (`BACKLOG #3746`)

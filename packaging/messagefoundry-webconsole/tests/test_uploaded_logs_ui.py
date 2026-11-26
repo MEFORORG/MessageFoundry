@@ -656,6 +656,40 @@ async def test_resend_refusal_names_a_distinct_cause_per_status(
         assert "resend_failed" not in denied.headers["location"]
 
 
+async def test_a_padded_username_refusal_is_not_shown_as_a_channel_denial(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # BACKLOG #6589: the engine refuses a resend by an operator whose username has spaces around it
+    # with a 403, as it refuses an out-of-scope target, and marks it with X-Refusal-Code. The console
+    # must name the real cause, not "not authorized to inject". This drives the engine route, so it
+    # also pins the header the console reads to the one the engine sets. The name is padded by a
+    # store write after sign-in, as a directory rename would do it.
+    service = await _service(engine, ("pad", Role.OPERATOR))
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "pad")
+        fid = await _upload(c)
+        user = await engine.store.get_user_by_username("pad")
+        assert user is not None
+        assert await engine.store.set_user_username(
+            user.id, "pad ", expected_username="pad", audits=()
+        )
+        refused = await c.post(
+            f"/ui/uploaded-logs/file/{fid}/resend",
+            params={"index": "0", "to": "in1"},
+            follow_redirects=False,
+        )
+        assert refused.status_code == 303, refused.text
+        assert refused.headers["location"] == "/ui/uploaded-logs?e=resend_username_refused"
+        landed = await c.get(refused.headers["location"], follow_redirects=False)
+        assert landed.status_code == 200, landed.text
+        assert "username is blank or has whitespace before or after it" in landed.text
+        assert "correct the username in the directory" in landed.text
+        assert "not authorized to inject" not in landed.text
+    [reject] = await engine.store.list_audit(action="upload.resend_reject")
+    assert reject["actor"] == "pad "
+
+
 async def test_refused_delete_is_not_shaped_like_a_completed_one(
     engine: Engine, tmp_path: Path
 ) -> None:

@@ -18,6 +18,7 @@ from __future__ import annotations
 import ast
 import base64
 import inspect
+import json
 import textwrap
 import time
 import uuid
@@ -253,6 +254,57 @@ async def test_an_oidc_mint_without_the_verified_pair_is_refused(engine: Engine)
         idp_auth_time=time.time(),
     )
     assert out.ok and out.token is not None
+
+
+@pytest.mark.parametrize("mech", [None, "kerberos"])
+async def test_a_verified_pair_without_mech_oidc_is_refused(
+    engine: Engine, mech: str | None
+) -> None:
+    """BACKLOG #4977. RED when: ``_complete_ad_login`` accepts a ``federated_subject`` whose
+    ``mech`` is not ``"oidc"``. The guard used to run one way only, so this call minted an OIDC
+    session, and its success row, which names ``mech`` only when one is set, did not name the
+    mechanism. The account is bound to the pair, so nothing else about the row refuses it."""
+    service = await _service(engine)
+    account_id = await _bound_fed_account(service, engine)
+    before = len(await engine.store.list_audit(action="auth.login_success"))
+
+    with pytest.raises(ValueError, match="needs mech='oidc'"):
+        await service._complete_ad_login(
+            _principal("fed"),
+            None,
+            mfa_verified=True,
+            mech=mech,
+            session_mechanism=SessionMechanism.OIDC,
+            federated_subject=FED_PAIR,
+            idp_auth_time=time.time(),
+        )
+    assert await engine.store.list_sessions(account_id) == [], "the refused mint wrote a session"
+    after = await engine.store.list_audit(action="auth.login_success")
+    assert len(after) == before, "the refused mint wrote a success row"
+
+
+async def test_a_federated_success_row_names_mech_oidc(engine: Engine) -> None:
+    """BACKLOG #4977, the row half. RED when: the federated success row stops carrying
+    ``"mech": "oidc"``. With the guard two-way, every federated mint passes ``mech="oidc"``, so the
+    row that the ``if mech is not None`` branch writes always names it. The Kerberos row written by
+    :func:`_bound_fed_account` is the control: it carries no ``mech`` key, as before."""
+    service = await _service(engine)
+    await _bound_fed_account(service, engine)
+    out = await service._complete_ad_login(
+        _principal("fed"),
+        None,
+        mfa_verified=True,
+        mech="oidc",
+        session_mechanism=SessionMechanism.OIDC,
+        federated_subject=FED_PAIR,
+        idp_auth_time=time.time(),
+    )
+    assert out.ok and out.token is not None
+    rows = await engine.store.list_audit(action="auth.login_success")
+    details = [json.loads(r["detail"]) for r in rows if r["actor"] == "fed"]
+    assert len(details) == 2, details
+    assert [d.get("mech") for d in details].count("oidc") == 1, details
+    assert [d for d in details if "mech" not in d], "the Kerberos control row grew a mech key"
 
 
 def test_no_directory_entry_point_lets_a_caller_choose_the_seeding() -> None:
