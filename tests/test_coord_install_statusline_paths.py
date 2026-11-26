@@ -467,6 +467,31 @@ def test_the_swap_fault_seam_fires_inside_its_fence(tmp_path: Path) -> None:
     assert json.loads(settings.read_text(encoding="utf-8")) == {"keep": True}
 
 
+# --- #7577: -HomeDir is read only where it is used ---------------------------------------------------
+
+
+@pytest.mark.parametrize("how", ["USERPROFILE", "-HomeDir"])
+@pytest.mark.parametrize("target", ["-SettingsPath", "-ConfigDir"])
+def test_a_named_target_installs_with_a_home_dir_on_a_gone_drive(
+    tmp_path: Path, how: str, target: str
+) -> None:
+    """A -SettingsPath or -ConfigDir install never reads -HomeDir, so a home directory on a drive
+    that is not there (USERPROFILE is the default) must not refuse it."""
+    gone = f"{_free_drive()}:\\Users\\nobody"
+    root = _root(tmp_path, {"keep": True})
+    settings = root / "settings.json"
+    cmd = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(INSTALL), "-CollectorPath"]
+    cmd += [str(COLLECT), target, str(settings if target == "-SettingsPath" else root)]
+    env: dict[str, str] = {"USERPROFILE": gone}
+    if how == "-HomeDir":
+        cmd += ["-HomeDir", gone]
+        env = {}
+    proc = _spawn(cmd, tmp_path, env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    doc = json.loads(settings.read_text(encoding="utf-8"))
+    assert doc["keep"] is True and "statusLine" in doc
+
+
 def test_status_and_uninstall_still_report_on_a_deleted_root(tmp_path: Path) -> None:
     """The missing-directory pre-check guards WRITES. An audit or an uninstall over a list of roots,
     some already deleted, reports each one rather than stopping at the first."""

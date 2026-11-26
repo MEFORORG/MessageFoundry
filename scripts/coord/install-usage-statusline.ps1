@@ -437,7 +437,14 @@ function Test-PathRootReachable([string]$Path) {
     return [bool]$r -and (Test-Path -LiteralPath $r -PathType Container)
 }
 
-$HomeDir = Resolve-ArgPath $HomeDir "-HomeDir"
+# -HomeDir IS RESOLVED ONLY WHERE IT IS READ: -AllRoots, the default root, and the -Status audit. Its
+# default is USERPROFILE, which can be empty or on an unmapped drive, and a -SettingsPath or
+# -ConfigDir install never reads it, so resolving it up front refused an install that had no use for
+# it. A blank one under -Status goes on unresolved, as it did before this resolver.
+function Resolve-HomeDir {
+    if ($Status -and [string]::IsNullOrWhiteSpace($script:HomeDir)) { return $script:HomeDir }
+    return (Resolve-ArgPath $script:HomeDir "-HomeDir")
+}
 
 $targets = @()
 $targetFrom = ""
@@ -459,6 +466,7 @@ elseif ($script:GaveConfigDir) {
 }
 elseif ($AllRoots) {
     $targetFrom = "-AllRoots"
+    $HomeDir = Resolve-HomeDir
     $roots = @(Get-LaunchableConfigRoots -HomeDir $HomeDir -AccountsOnly)
     $addedOutside = $null
     if ($env:CLAUDE_CONFIG_DIR) {
@@ -473,6 +481,7 @@ elseif ($AllRoots) {
         })
 }
 else {
+    $HomeDir = Resolve-HomeDir
     $cur = Resolve-CurrentConfigRoot -HomeDir $HomeDir
     $targetFrom = $cur.Source
     Assert-RootExists $cur.Path $(if ($cur.Source -eq 'CLAUDE_CONFIG_DIR') { "CLAUDE_CONFIG_DIR names a directory that" } else { "config dir" })
@@ -574,6 +583,7 @@ if ($Status) {
     # can contradict them. Without it -Status could only ever confirm this script's own predicate --
     # a validator satisfied by construction. It is also what makes the name predicate's deliberate
     # case-sensitivity loud instead of a silent under-reach.
+    $HomeDir = Resolve-HomeDir
     $seen = @(Get-ClaudeConfigCandidates -HomeDir $HomeDir)
     Write-Host ""
     Write-Host "  audit: $($seen.Count) ~/.claude* dir(s) under $HomeDir carry a settings.json, enumerated"
