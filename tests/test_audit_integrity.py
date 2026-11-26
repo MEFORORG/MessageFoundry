@@ -1847,29 +1847,41 @@ async def test_startup_anchor_nul_path_raises_value_error(tmp_path: Path) -> Non
 
     `_load_audit_anchor` catches only `OSError` and `UnicodeDecodeError`, so the `ValueError` a path
     carrying a NUL character raises escapes it and `Engine.start()`, before any walk runs and with
-    no alert: such a path fails startup rather than degrading to a bare walk. The Manager kept that
-    failure on the w5/r2-store-maint repair brief (R2d) as the safer option; making it alert-only is
-    open. If it changes, change the `_load_audit_anchor` docstring, which states it once.
+    no tamper alert: such a path fails startup rather than degrading to a bare walk. That failure
+    was kept, as the safer option, in a repair of this code that changed text only; whether it
+    should become alert-only is an open finding for the ledger, not settled here. If it changes,
+    change the `_load_audit_anchor` docstring and the `audit_anchor_file` row in
+    docs/CONFIGURATION.md together.
     """
     db = tmp_path / "nul.db"
     await _aseed_audit_rows(db, 1)
     store = await MessageStore.open(db)
+    walks: list[object] = []
+
+    async def counting_verify(**kwargs: object) -> AuditVerdict:
+        walks.append(kwargs)
+        raise AssertionError("the walk ran, but the anchor read should have raised first")
+
+    store.verify_audit_chain = counting_verify  # type: ignore[method-assign]
     sink = _AnchorRecordingSink()
-    eng = Engine(
-        store,
-        alert_sink=sink,
-        audit_verify_on_start=True,
-        audit_anchor_file=str(tmp_path / "anchor\x00.txt"),
-        egress_settings=EgressSettings(deny_by_default=False),
-    )
     try:
-        with pytest.raises(ValueError, match="null"):
-            await eng._load_audit_anchor()
-        with pytest.raises(ValueError, match="null"):
-            await eng.start()
+        eng = Engine(
+            store,
+            alert_sink=sink,
+            audit_verify_on_start=True,
+            audit_anchor_file=str(tmp_path / "anchor\x00.txt"),
+            egress_settings=EgressSettings(deny_by_default=False),
+        )
+        try:
+            with pytest.raises(ValueError, match="null"):
+                await eng._load_audit_anchor()
+            with pytest.raises(ValueError, match="null"):
+                await eng.start()
+        finally:
+            await eng.stop()
     finally:
-        await eng.stop()
         await store.close()
+    assert walks == []
     assert sink.events == []
 
 

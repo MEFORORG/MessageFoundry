@@ -8079,8 +8079,8 @@ or bare `#N` number cites the project's private planning ledger, so it has no pu
   alarm on essentially every restart. The prefix comparison asks instead whether the recorded state was
   ever true and the chain has only **grown** since, which survives restarts while still catching a
   truncated tail and a mid-chain rewrite. A stale anchor therefore stays valid; it just witnesses less.
-  **Alert-only in both directions.** A missing, unreadable or malformed anchor logs a WARNING naming
-  the file, the reason and the coverage lost, then lets the bare walk run — it does not block
+  **Alert-only for the faults it catches.** A missing, unreadable or malformed anchor logs a WARNING
+  naming the file, the reason and the coverage lost, then lets the bare walk run — it does not block
   startup for those faults (at least a NUL in the path still does; see `docs/CONFIGURATION.md`,
   `[integrity]`), and it never fires the tamper alert, because a config fault that raised a tamper
   alarm would train operators to ignore the real one. `0:`, the anchor of an empty log, is reported

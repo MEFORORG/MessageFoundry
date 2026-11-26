@@ -7504,7 +7504,8 @@ class IntegritySettings(_Section):
     # adversary than editing a module. An install that declares itself editable is still exempt.
     fail_closed_on_drift: bool = False
     # When true, the engine re-walks the tamper-evident audit hash-chain once at startup (#190).
-    # This is ALERT-ONLY: a broken chain logs a WARNING + fires the AlertSink but NEVER crashes
+    # This is ALERT-ONLY: a broken chain logs a WARNING + fires the AlertSink, where one is
+    # configured, but NEVER crashes
     # startup (a refuse-to-start on a tripped tamper alarm would be a self-inflicted DoS). The
     # audit_anchor_file read it arms can fail startup; `Engine._load_audit_anchor` says when.
     # Default false — opt in; on a very large audit_log the full re-walk adds startup latency, so it

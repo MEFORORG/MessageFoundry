@@ -6796,8 +6796,10 @@ class AuditAnchorError(ValueError):
 
 
 def read_audit_anchor_file(path: str | Path) -> str:
-    """Read an anchor file into the text :func:`parse_audit_anchor` takes. Raises ``OSError`` or
-    ``UnicodeDecodeError``; each caller words its own operator-facing refusal around those.
+    """Read an anchor file into the text :func:`parse_audit_anchor` takes. Raises at least
+    ``OSError``, ``UnicodeDecodeError``, and ``ValueError`` for a path carrying a NUL character;
+    each caller words its own operator-facing refusal around the first two, and the engine's
+    startup read lets the third escape (``Engine._load_audit_anchor`` says what that does).
 
     ``utf-8-sig`` absorbs a leading BOM: PowerShell 5.1's ``Set-Content -Encoding utf8`` writes UTF-8
     WITH one, and this product deploys as a Windows service, so that is a first-class way an operator
@@ -6959,8 +6961,8 @@ def _audit_head_shape(head: str, noun: str = "the head") -> tuple[str | None, st
         # MAC's shape either: `audit-anchor` prints a tampered `vault:v` head as the store holds it,
         # and `audit-verify` exits 2 on an anchor this parser refuses, before it walks, so a shape
         # check here would leave such a tamper unwalked. A malformed `vault:v` head is therefore
-        # walked, not refused. A tampered head of another shape is still refused
-        # before the walk. The cost is in the docstring.
+        # compared against the walked chain, not refused. A tampered head of another shape is still
+        # refused before the walk. The cost is in the docstring.
         return None, head
     return (
         f"{noun} is neither a {AUDIT_ANCHOR_DIGEST_HEX_LEN}-character hex digest nor an "

@@ -230,7 +230,8 @@ install. All three shipped defaults are unchanged and byte-identical.
   repository. PHI-view exclusion is unchanged.
 - **16.4.2 — tamper-evident audit chain.** Two levers, both instructed (§"Tamper-evident audit chain"):
   (A) `[integrity].audit_verify_on_start = true` re-walks the chain at startup — **alert-only, never
-  crashes** (a broken chain WARNs + fires `integrity_drift`); (B) keying the chain against forgery
+  crashes** (a broken chain WARNs + fires `integrity_drift`), though the `audit_anchor_file` read it
+  arms can fail startup (`docs/CONFIGURATION.md`, `[integrity]`); (B) keying the chain against forgery
   **cannot be a config flip** — its HMAC key is HKDF-derived from the store DEK, so the runbook instructs
   `[ai].data_class = "phi"` + a store key + the one-time `messagefoundry rekey_audit_chain` migration,
   after which keying is automatic. **Residual (accepted):** lever (B) depends on store encryption being
