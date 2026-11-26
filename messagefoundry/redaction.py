@@ -2172,12 +2172,14 @@ def _stray_json_closer(text: str) -> bool:
     It misses at least: a closer with no open container, as in a fragment whose head was cut
     (``"given": [x] y]``); a stray closer of the key's own container's kind (``{"given": [x] y}}``);
     a stray closer a matching unmatched opener absorbs; one inside a string that opened before the
-    key, such as an apostrophe earlier on the line (``can't map {"given": [x] y]}``); and one a
-    quote put in the value hides in an unterminated string (``{"given": [x] y']}``); and a closer
-    in the value of a key outside every container whose colon is on the next line, since the walk
-    disarms at that line break (``"telecom"\n: [a|b|c ) , {"value": y}]``), so the value is kept, as
-    it was before BACKLOG #5814. Counting an
-    unterminated string's closers was tried and dropped: a cut inside any string after a PHI key,
+    key, such as an apostrophe earlier on the line (``can't map {"given": [x] y]}``); one a quote
+    put in the value hides in an unterminated string (``{"given": [x] y']}``); and, for a key
+    outside every container with its colon on the next line, a closer in its value that the JSON
+    pass reads as matched, such as one after an opener a field-run pass consumed
+    (``"telecom"\\n: [a|b|c ) , {"value": y}]``). The walk disarms at that line break, so what
+    follows that closer is kept, as before BACKLOG #5814; a plain mismatched closer there is still
+    blanked by the JSON pass. Counting an unterminated string's closers was tried and dropped: a
+    cut inside any string after a PHI key,
     and the placeholders this module and the support bundle write, then blanked whole texts and
     broke the fixed point. A value of one token after the key's value, with no stray closer at all
     (``{"given": [x] y}``), is not this check's to catch: :func:`_scrub_json_value` keeps it."""

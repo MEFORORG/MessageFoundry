@@ -9,10 +9,10 @@
   mismatched closer anywhere in the key's scope blanks a text that used to keep everything but the
   value. That includes at least one in a malformed sibling after a PHI value, one in prose after a
   top-level key on its line, and one on a later line of a traceback that leaves a PHI-keyed dict
-  unclosed. A key's scope is its container, or for a key outside every container its line, ending
-  at a line break reached with no container open; the docstring of `_stray_json_closer` says
-  exactly how far it runs. The check still misses at least a closer with no open container, a stray
-  closer of the key's own container's kind, one inside a string, whether it opened before the key
-  or in the value, and one in the value of a key outside every container whose colon is on the
-  next line, which disarms the check at that line break, so its value is kept, as before; that
-  docstring lists them. (vault `BACKLOG #5814`)
+  unclosed. A key's scope is its container, or, for a key outside every container, a span that a
+  line break ends; the docstring of `_stray_json_closer` says how far each runs. The check still
+  misses at least a closer with no open container, a stray closer of the key's own container's
+  kind, one inside a string, whether it opened before the key or in the value, and, for a key
+  outside every container with its colon on the next line, a closer the JSON pass reads as
+  matched, such as one after an opener a field-run pass consumed: the check disarms at that line
+  break, so what follows that closer is kept, as before. That docstring lists them. (vault `BACKLOG #5814`)
