@@ -54,6 +54,8 @@ _RUNGS: tuple[tuple[str, str, frozenset[str]], ...] = (
                 "unsupported_crit",
                 "unknown_kid",
                 "ambiguous_kid",
+                # The JWKS lookup's bounded wait for a refresh ran out (BACKLOG #6905).
+                "jwks_refresh_busy",
                 "key_rejected",
             }
         ),
