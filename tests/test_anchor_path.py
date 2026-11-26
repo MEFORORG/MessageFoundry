@@ -898,7 +898,7 @@ def test_a_mount_above_the_suggested_folder_leaves_no_folder_to_move_to(
         assert f"the mount at {mount!r}" in text, text
         order = [text.index(s) for s in (_MOUNT_NOTE, step, "docker/README.md")]
         assert order == sorted(order), text
-    assert "at enforce it has no fix" in by_path
+    assert "at enforce nothing else clears it" in by_path
 
 
 def test_an_insecure_path_under_such_a_mount_is_not_told_to_move(
@@ -914,6 +914,13 @@ def test_an_insecure_path_under_such_a_mount_is_not_told_to_move(
     assert "the mount at '/'" in text
     order = [text.index(s) for s in (_MOUNT_NOTE, "set [x].pin to", "docker/README.md")]
     assert order == sorted(order), text
+    # The path was found replaceable, so the fix quotes no digest of these bytes.
+    assert hashlib.sha256(_pem(tmp_path).read_bytes()).hexdigest() not in text
+    # A finding no command fixes leaves no in-place heading with nothing under it.
+    odd = ap.ChainFinding("/srv/a.pem", FILE, True, "it is not a regular file")
+    root = ap.ChainFinding("/", DIRECTORY, False, "it is a overlay mount", mount=True)
+    text = _refusal(tmp_path, monkeypatch, ap.PathVerdict(False, (odd, root), "posix", "uid 7"))
+    assert "in place" not in text and _MOUNT_NOTE in text and _FOLDER not in text
 
 
 def test_a_mount_below_the_suggested_folder_names_itself_and_keeps_the_folder(

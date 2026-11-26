@@ -1670,31 +1670,43 @@ def _mount_over_folder(verdict: AnchorVerdict) -> str | None:
     such as an overlay ``/`` in a container, or ``/`` where the mount table could not be read. No
     location below it passes, so a fix must not offer to move the anchor there."""
     for f in _findings(verdict, insecure=False):
-        if f.mount and (f.path == "/" or _POSIX_FOLDER.startswith(f.path.rstrip("/") + "/")):
+        if f.mount and _POSIX_FOLDER.startswith(f.path.rstrip("/") + "/"):
             return f.path
     return None
 
 
+_NO_PIN = (
+    "A pin does not help here: this anchor is read again by path when it is used, so a pin "
+    "cannot vouch for the bytes loaded"
+)
+
+
+def _pin_verb(spec: AnchorSpec) -> str:
+    return f"set {spec.pin_setting} to" if spec.pin_setting else "pin it to"
+
+
 def _pin_offer(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
-    pin = f"set {spec.pin_setting} to" if spec.pin_setting else "pin it to"
     return (
-        f"{pin} the {ANCHOR_DIGESTS[ANCHOR_DIGEST].title} of the CA you mean to trust; this file's "
-        f"is {ANCHOR_DIGEST}:{verdict.fingerprint}. Check it against the CA first. With a matching "
-        "pin the engine loads exactly those bytes, so it may load them without this check."
+        f"{_pin_verb(spec)} the {ANCHOR_DIGESTS[ANCHOR_DIGEST].title} of the CA you mean to trust; "
+        f"this file's is {ANCHOR_DIGEST}:{verdict.fingerprint}. Check it against the CA first. With "
+        "a matching pin the engine loads exactly those bytes, so it may load them without this check."
     )
 
 
-def _past_the_mount(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
-    """What is left where :func:`_mount_over_folder` found a mount: a pin, and only for an anchor
-    whose consumer loads the verified bytes."""
+def _past_the_mount(spec: AnchorSpec, mount: str, pin: str) -> str:
+    """Where :func:`_mount_over_folder` found ``mount``: no folder below it, then what is left, which
+    is ``pin``, and only for an anchor whose consumer loads the verified bytes."""
+    head = (
+        f"The check cannot vouch for the mount at {mount!r}, so no location below it passes, and "
+        "moving the anchor does not help."
+    )
     if spec.loads_verified_bytes:
         return (
-            f"What is left is a pin: {_pin_offer(spec, verdict)} Where that mount is an overlay '/' "
-            f"in a container, {_OVERLAY_NOTE}, says more."
+            f"{head} What is left is a pin: {pin} Where that mount is an overlay '/' in a "
+            f"container, {_OVERLAY_NOTE}, says more."
         )
     return (
-        "A pin does not help here: this anchor is read again by path when it is used, so a pin "
-        "cannot vouch for the bytes loaded, and at enforce it has no fix while that mount stays "
+        f"{head} {_NO_PIN}, and at enforce nothing else clears it while that mount stays "
         f"untrusted. Where that mount is an overlay '/' in a container, {_OVERLAY_NOTE}, names the "
         "follow-up that would change this."
     )
@@ -1756,12 +1768,14 @@ def _path_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> list[str]:
             cmds.append(f"  chmod go-w {q}")
     mount = _mount_over_folder(verdict)
     if mount is not None:
-        return [
-            f"Fix it in place, since the check cannot vouch for the mount at {mount!r}, so no "
-            "location below it passes:",
-            *cmds,
-            f"Even then the check cannot settle the anchor. {_past_the_mount(spec, verdict)}",
-        ]
+        # No digest here: the path was just found replaceable, so these bytes may be substituted.
+        pin = (
+            f"{_pin_verb(spec)} the {ANCHOR_DIGESTS[ANCHOR_DIGEST].title} of the CA you mean to "
+            "trust, taken from that CA, since this file could have been replaced."
+        )
+        tail = "Once the path is fixed, the check still cannot settle the anchor. "
+        tail += _past_the_mount(spec, mount, pin)
+        return (["Fix it in place:", *cmds] if cmds else []) + [tail]
     lead = move + f"can change, such as a root-owned 755 folder like {_POSIX_FOLDER}."
     return [lead + " Or, to fix it in place:", *cmds] if cmds else [lead]
 
@@ -1806,10 +1820,7 @@ def _indeterminate_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
     windows = check.platform == "windows" if check is not None else os.name == "nt"
     mount = _mount_over_folder(verdict)
     if mount is not None:
-        return (
-            f"Fix: the check cannot vouch for the mount at {mount!r}, so no location below it "
-            f"passes, and moving the anchor does not help. {_past_the_mount(spec, verdict)}"
-        )
+        return _past_the_mount(spec, mount, _pin_offer(spec, verdict))
     folder = (
         "the engine's data folder under C:\\ProgramData"
         if windows
@@ -1829,8 +1840,7 @@ def _indeterminate_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
     if not spec.loads_verified_bytes:
         return (
             f"Fix: move the anchor into a folder whose permissions the engine can read, such as "
-            f"{folder}.{note} A pin does not help here: this anchor is read again by path when it "
-            "is used, so a pin cannot vouch for the bytes loaded."
+            f"{folder}.{note} {_NO_PIN}."
         )
     return (
         f"Fix: move the anchor into a folder whose permissions the engine can read, such as "
