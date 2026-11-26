@@ -221,8 +221,8 @@ node-testable, still holds for the terminal calls themselves; a source check in 
 reached only through the plan and that the provisioning terminal is awaited. `engine-setup.test.ts` asserts that no
 string in the four files names a bootstrap admin. `tests/test_ide_start_plan_probe_contract.py` takes the probe argv
 from `probeDefault` in `ide/src/test/fixtures/provision-admin-argv.json`. It runs `probeDefault[5:]`, the CLI
-arguments, through the engine's `main` in-process, and compares the interpreter options before them rather than
-executing them; at least one arm has no store, and its module docstring says how. (CORRECTED 2026-11-26: this said it ran
+arguments, through the engine's `main` in-process. It compares the five elements before them, the interpreter options
+and `-m messagefoundry`, against a fixed list rather than executing them; at least one arm has no store, and its module docstring says how. (CORRECTED 2026-11-26: this said it ran
 the probe "against the CLI".) It checks both answers carry the fragments the IDE matches on, so a rewording on either
 side goes red. The mocha suite `provision-admin-argv.test.ts` pins `buildAdminProbeInvocation`'s whole output against
 that entry. That suite runs in the `ide build` job; its header in `.github/workflows/ci.yml` says whether the job
