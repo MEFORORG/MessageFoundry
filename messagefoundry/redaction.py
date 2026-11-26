@@ -2147,7 +2147,9 @@ def _stray_json_closer(text: str) -> bool:
 
     It reads the text from its start as :data:`_JSON_TOKEN` tokenizes it, so a closer inside a
     string is not structure. A PHI key that the walk passes while disarmed arms it at the key's
-    depth. The walk blanks on the first
+    depth. Keys are found on the raw text, not on its tokens, so key-shaped text inside a JSON
+    string arms the walk too: ``'family':`` in a string value, as in
+    ``{"note": "x 'family': y", "a": [1}}``, blanks that text. The walk blanks on the first
     closer, while armed, whose innermost open container is of another kind. It disarms when the
     depth falls below the armed depth, which is the arming key's own container closing; a later
     PHI key can then arm it again. A key outside every container disarms only at a line feed or
