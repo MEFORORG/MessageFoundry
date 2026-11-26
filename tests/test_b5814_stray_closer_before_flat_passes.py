@@ -45,7 +45,7 @@ STRAY = [
     f'[{{"family": ["Doe"] ] {SECRET}}}]',
 ]
 
-#: Some stray closers the check misses: examples, not a complete list. Strict, so a change that
+#: Some texts whose PHI value is kept: examples, not a complete list. Strict, so a change that
 #: catches one turns this red.
 MISSED = [
     f'"given": [Jane] {SECRET}]',  # no container open: the head was cut
@@ -55,6 +55,10 @@ MISSED = [
     f'{{"given": [Jane] {SECRET}"]}}',
     # A top-level key whose colon is on the next line.
     f'"telecom"\n: [a|b|c ) , {{"value": "{SECRET}"}}]',
+    # One token after a closed PHI value, with no stray closer.
+    f'{{"given": [x] {SECRET}}}',
+    # An apostrophe before a same-kind stray closer. origin/main keeps the value identically.
+    f'{{"given": [Jane] can\'t {SECRET}]}}',
 ]
 
 
@@ -100,9 +104,8 @@ def test_the_rule_is_a_fixed_point_of_safe_text(text: str) -> None:
     assert safe_text(once) == once
 
 
-#: Negative controls, each read as before: balanced JSON, a closer in a string, a closer in prose
-#: before the key, and a closer in prose after the key's container closed. Some other balanced texts
-#: are blanked whole (KNOWN_COST).
+#: Negative controls, each read as before. Some other balanced texts are blanked whole
+#: (KNOWN_COST).
 BALANCED = [
     (
         '{"family": ["Zqxdoe"], "status": "ok (1)", "id": f(1, [2], {"a": 3})}',
@@ -131,8 +134,7 @@ TRACEBACK = (
     "ValueError: bad frame\n"
 )
 
-#: Some texts the check blanks whole although the closer is not in the PHI value: examples, not a
-#: complete list.
+#: Some texts blanked whole beyond the PHI value: examples, not a complete list.
 KNOWN_COST = [
     TRACEBACK,
     f'{{"family": "{SECRET}", "note": [1}}}}',

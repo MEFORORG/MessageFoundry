@@ -2134,13 +2134,10 @@ def _redact_noted(text: str, *, noted: bool) -> str:
 
 
 def _stray_json_closer(text: str) -> bool:
-    """Whether this walk reads a mismatched or stray JSON closer after a PHI JSON key, or text
-    shaped like one, in ``text`` (BACKLOG #5814, added item 2). :func:`_redact_noted` returns the
-    placeholder when it does. It is one of two routes there: :class:`_MismatchedJsonCloser` is the
-    other, so a False here does not mean the text is kept.
+    """The stray-closer walk (BACKLOG #5814, added item 2). :func:`_redact_noted` returns the
+    placeholder when it returns True. A False here does not mean the text is kept.
 
-    Text shaped like a PHI JSON key counts as one, including text inside a JSON string. It can blank
-    text beyond the key's value, including some balanced inputs, and it misses some shapes. The code
+    Text shaped like a PHI JSON key counts as one, including text inside a JSON string. The code
     below is the definition; the ``KNOWN_COST`` and ``MISSED`` lists in
     ``tests/test_b5814_stray_closer_before_flat_passes.py`` pin examples, neither of them a complete
     list."""
