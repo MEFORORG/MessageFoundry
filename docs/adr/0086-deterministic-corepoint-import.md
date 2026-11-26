@@ -336,10 +336,13 @@ where its flow-insensitive scan holds the clone, and a write to the input after 
 lands on `msg`. *Corrected 2026-11-26 (BACKLOG #5823):* this said that only `snapshot_on_send` keeps
 that write out of the message already sent. An inline step 1 send of `msg` now renders
 `sends.append(Send(dest, msg.copy()))`. So the message it sends is the input as it stood at the
-send, whatever that setting says. A step 1 handler with no inline send still ends on
-`return Send(dest, msg)`, or a list of such, uncopied. That return is the handler's last
-statement, so no write in the handler runs after it and none can change the message it returns.
-How the differential guard's baseline carries this is stated once, in the docstring of `tests/test_corepoint_import_differential.py`. A step 2 send still delivers its
+send, whatever that setting says. The closing `return Send(dest, msg)` form stays uncopied, and an
+XML action-list handler does not reach it: its destinations are collected from the same live tree
+its inline sends are rendered from, so a handler that names one sends inline. In the Steps view's
+typed-only mode the copy form is not a typed send (ADR 0076 G.6), so a typed-only move or delete
+on or across an imported step 1 send row is refused; it fails closed, and
+`test_a_step1_send_row_is_untyped_so_a_typed_only_edit_on_it_is_refused` pins it. A send the Steps
+view adds beside that row is rendered `Send(<new>, msg)`, uncopied. How the differential guard's baseline carries this is stated once, in the docstring of `tests/test_corepoint_import_differential.py`. A step 2 send still delivers its
 local uncopied, the input's `msg` included; step 2 declines a write after a send instead. Step 2
 helps only straight-line lists, and the canonical-spelling rule is strict: an export whose labels are
 wrapped in spans, or whose spacing differs at all, gets no help. That is deliberate.
@@ -595,17 +598,19 @@ At least these limits remain:
   It is where "every role-parsed send in the list raises" does not hold. One list that shows it:
   a `<Loop Data="Catch">` holding a `<Call Data="ElseIf (y)">`, which holds `<Line Data="Else"/>`
   and a `MsgSend`. main and the head both end that handler on `return Send(...)` and count one
-  step.
+  step. *Corrected 2026-11-26 (BACKLOG #5823, code review):* the head no longer does. It renders
+  that send inline under a dead placeholder and ends on `return sends` (`_lift_branch_branches`);
+  main still ends on `return Send(...)`.
 
 The differential guard compares a gate-declined list with step 1. That step 1 path now carries this
-rule. So the guard's baseline, `step1`, is the vendored step 1 file with three amendments made as
-it loads: the copy amendment of BACKLOG #5823, the fail-closed amendment of BACKLOG #2526, and this
-one, in that order. The file itself is never edited and its blob id stays pinned. This amendment is
+rule. So the guard's baseline, `step1`, is the vendored step 1 file with this amendment among
+those made as it loads; the guard's docstring states which load and in what order. The file itself
+is never edited and its blob id stays pinned. This amendment is
 listed in the guard's `_STEP1_AMENDMENTS`, with the rule copied as text, so a later change to the
 head's rule turns the guard red until the copy is amended on purpose. Two more tests,
 `test_the_amendment_changes_only_a_list_holding_a_statement_off_a_line` and
 `test_no_raw_list_is_quieter_than_main`, compare `step1` with `step1_unlabelled`, the tree this
-amendment loads onto: the vendored file with the copy and fail-closed amendments alone. *Corrected
+amendment loads onto. *Corrected
 2026-11-26 (BACKLOG #5823, code review):* this said the guard loads this amendment alone and that
 the two tests run against the file as vendored. They check
 that the amendment changes only lists that may carry a statement off a `<Line>`, by a wider reading

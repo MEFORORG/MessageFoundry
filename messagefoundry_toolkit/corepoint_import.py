@@ -930,7 +930,7 @@ def _message_handles(action_list: Element) -> tuple[frozenset[str], frozenset[st
 
     In a Handler, ``msg`` is the message that arrived **and** the message ``Send`` delivers. An
     inline step 1 send delivers a copy of ``msg`` as it stood at the send, so the content is the
-    same and the object is not; a closing ``return Send(..., msg)`` delivers ``msg`` itself. Either
+    same and the object is not; a step 2 send delivers its local uncopied, ``msg`` included. Either
     way the subject is the list's **input** handle, and only when that same
     handle is what the list delivers. A list that builds a *separate* output tree and sends that has
     no equivalent at all: writing its fields onto ``msg`` would mutate the inbound message, which is

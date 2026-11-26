@@ -1324,19 +1324,20 @@ def test_a_step1_send_of_msg_is_not_changed_by_a_later_write(
 
 
 @pytest.mark.parametrize(
-    "edit",
+    ("edit", "offset"),
     [
-        {"op": "delete_row"},
-        {"op": "move_row", "direction": "down"},
-        {"op": "move_row", "direction": "up", "offset": 1},
+        ({"op": "delete_row"}, 0),
+        ({"op": "move_row", "direction": "down"}, 0),
+        ({"op": "move_row", "direction": "up"}, 1),
     ],
     ids=["delete-the-send", "move-the-send", "move-a-write-across-it"],
 )
 def test_a_step1_send_row_is_untyped_so_a_typed_only_edit_on_it_is_refused(
-    edit: dict[str, Any],
+    edit: dict[str, Any], offset: int
 ) -> None:
-    """BACKLOG #5823 changed what the Steps view may edit, and this pins the change. The lens types
-    ``Send(<dest>, msg)`` and not ``Send(<dest>, msg.copy())``, so an imported step 1 send row is
+    """BACKLOG #5823 changed what the Steps view may edit, and this pins the change. The lens's typed-only
+    check types ``Send(<dest>, msg)`` and not ``Send(<dest>, msg.copy())``, though it projects
+    both as the same send row. So an imported step 1 send row is
     untyped in typed-only mode, and a typed-only move or delete on or across it is refused: it fails
     closed. Typing the copy form widens ADR 0076 G.6's typed set, which needs its own ruling. The
     controls: the same edit applies outside typed-only mode, and in typed-only mode on the bare
@@ -1350,9 +1351,8 @@ def test_a_step1_send_row_is_untyped_so_a_typed_only_edit_on_it_is_refused(
     send = 1 + next(i for i, line in enumerate(lines) if "sends.append" in line)
     assert lines[send - 1].endswith('Send("OB_IN", msg.copy()))  # Corepoint MsgSend')
     assert lines[send].strip() == 'set_field(msg, "PID-3", "")'
-    row = send + edit.get("offset", 0)
-    spec = {k: v for k, v in edit.items() if k != "offset"} | {"line_start": row, "line_end": row}
-    with pytest.raises(LensRewriteError, match="typed-only mode") as info:
+    spec = edit | {"line_start": send + offset, "line_end": send + offset}
+    with pytest.raises(LensRewriteError, match="does not show as typed steps") as info:
         rewrite_source(src, spec, typed_only=True)
     assert info.value.code == "refused"
     assert rewrite_source(src, spec) != src

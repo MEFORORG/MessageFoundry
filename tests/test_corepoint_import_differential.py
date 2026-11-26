@@ -28,13 +28,14 @@ it is passed ``copy=False``: an inline send of msg renders ``msg.copy()``.
 
 **Three names for the trees, used so throughout this file.** *The file as vendored* is the pinned
 bytes with no amendment at all; only ``test_the_copy_amendment_changes_only_the_send_line`` loads
-it, with ``copy=False``. *The vendored tree* (``step1_as_vendored``) is that file with the copy
-amendment alone. Every other tree is the vendored tree plus amendments of its own:
-``step1_scan_skips`` (the fail-closed amendment's scan half), ``step1_unlabelled`` (the fail-closed
-amendment whole) and ``step1`` (both amendments in ``_STEP1_AMENDMENTS``). *Main*, in a bound, is
-the tree that bound compares against, and each bound's docstring names it. So every bound but the
-copy amendment's own compares two trees that both carry the copy amendment, and is blind to that
-one line's text.
+it, with ``copy=False``. *The vendored tree* (``step1_vendored_tree``) is that file with the copy
+amendment alone. Every other tree :func:`_load_step1` builds is the vendored tree plus amendments of
+its own, at least ``step1_scan_skips`` (the fail-closed amendment's scan half), ``step1_unlabelled``
+(the fail-closed amendment whole), ``step1`` (both amendments in ``_STEP1_AMENDMENTS``, the
+baseline) and the control mutants. *Main*, in a bound, is the tree that bound compares against: the
+tree it loads on the ``was`` side, whatever its docstring calls it. A bound that compares two such
+trees is blind to the copy line's text, since both carry it. A bound that loads the head is not:
+the head renders the copy itself, and a head that lost it differs from those trees.
 
 The two in ``_STEP1_AMENDMENTS`` load on top of it. The fail-closed amendment (BACKLOG #2526) loads
 first: it switches off live code main rendered from switched-off or misplaced source, and
@@ -708,7 +709,7 @@ def _load_step1(name: str, amendments: tuple[tuple[str, str], ...], *, copy: boo
 #: The baseline: the step 1 code path as it stands, which a gate-declined list must match.
 step1: Any = _load_step1("_mefor_corepoint_import_step1", _STEP1_AMENDMENTS)
 #: The vendored tree: the file as vendored with the copy amendment (BACKLOG #5823) alone.
-step1_as_vendored: Any = _load_step1("_mefor_corepoint_import_step1_as_vendored", ())
+step1_vendored_tree: Any = _load_step1("_mefor_corepoint_import_step1_vendored_tree", ())
 #: The tree the label amendment (BACKLOG #2632) is bounded against: the vendored tree with the
 #: amendments that load before it. The fail-closed amendment's bound reads it too, as its amended side.
 step1_unlabelled: Any = _load_step1(
@@ -724,7 +725,7 @@ def test_the_copy_amendment_changes_only_the_send_line() -> None:
     copied = 0
     xmls = [_render(s.nodes, s.inp) for s in _SHAPES] + [xml for _, xml in _RAW_LISTS]
     for xml in xmls:
-        was, now = _generate(bare, xml), _generate(step1_as_vendored, xml)
+        was, now = _generate(bare, xml), _generate(step1_vendored_tree, xml)
         assert now[1] == was[1], xml
         assert now[0].replace(", msg.copy()))", ", msg))") == was[0], xml
         copied += now[0] != was[0]
@@ -1627,10 +1628,11 @@ def _observed(message: object, inp: Message | None) -> str:
 
 # The step 1 path sends ``msg.copy()`` (BACKLOG #5823), which is still a send of msg. A bare local,
 # ``msg`` included, also reads as a send of it; a ``<local>.copy()`` of another local does not match.
-# So a head step 1 send that lost its copy reads like a correct one here. What sees that is the
-# byte-for-byte comparison of the head with ``step1`` wherever the gate is closed, and, outside
-# this file, test_a_step1_send_of_msg_is_not_changed_by_a_later_write. The copy amendment's own
-# bound never loads the head, so it does not.
+# So a head step 1 send that lost its copy reads like a correct one here. What sees that is at
+# least the byte-for-byte comparison of the head with ``step1`` wherever the gate is closed, the
+# bounds that compare the head's render with a loaded tree, and, outside this file, the unit tests
+# that assert ``msg.copy()``, test_a_step1_send_of_msg_is_not_changed_by_a_later_write among them.
+# The copy amendment's own bound never loads the head, so it is not one of them.
 _LIVE_SEND = re.compile(
     r'^(\s*)sends\.append\(Send\("([^"]+)", (msg(?=\.copy\(\)\)\))|\w+(?=\)\)))'
 )
@@ -3544,7 +3546,8 @@ def _bound(name: str, xml: str) -> tuple[bool, list[str]]:
 
     The head is held to the same bound, against the same tree, wherever the gate is
     closed. On the battery that is what the head-equals-baseline check already implies. On a list
-    drawn with no grammar nothing else compares the head with main. A fully understood list takes
+    drawn with no grammar this arm compares the head's render with main, and
+    :func:`_structure_moved` compares the shape of its tree. A fully understood list takes
     the step 2 path, where a refusal may become a delivery the oracle proves."""
     was, now = _generate(step1_unlabelled, xml), _generate(step1, xml)
     broken = [f"{name}: the amended baseline: {b}" for b in _breaches(xml, was, now)]
@@ -3976,7 +3979,7 @@ def test_the_fail_closed_amendment_adds_no_live_code(chunk: int) -> None:
     renders = reverse = 0
     broken: list[str] = []
     for name, xml in _STRUCTURE_SHAPES[chunk::_CHUNKS]:
-        was = _generate(step1_as_vendored, xml)
+        was = _generate(step1_vendored_tree, xml)
         scan, now = _generate(step1_scan_skips, xml), _generate(step1_unlabelled, xml)
         if scan != was and not _holds_a_disabled_wrapper(xml):
             broken.append(f"{name}: the scan changes a list that holds no disabled wrapper")
@@ -4000,7 +4003,7 @@ def test_the_scan_half_of_the_fail_closed_amendment_changes_its_seeds() -> None:
     wrapper, a share render otherwise once the scan skips the wrapper."""
     seeds = [_render(s.nodes, s.inp) for s in _SHAPES if "disabled-list" in s.name]
     changed = sum(
-        _generate(step1_as_vendored, xml) != _generate(step1_scan_skips, xml) for xml in seeds
+        _generate(step1_vendored_tree, xml) != _generate(step1_scan_skips, xml) for xml in seeds
     )
     assert all(map(_holds_a_disabled_wrapper, seeds))
     assert changed >= _SCAN_FLOOR
@@ -4228,8 +4231,8 @@ def test_the_structure_check_sees_an_orphan_and_an_adoption() -> None:
     the vendored tree itself. A ``<List>`` holding a statement between an If and its Else orphans
     the Else on main; an empty one does not."""
     if_x, arm = _SIBLING_PAIRS[0][1], _line("Else", _line("MsgLog %ADT"))
-    adopted = _skeleton(step1_as_vendored, if_x + "<List/>" + arm)
-    orphaned = _skeleton(step1_as_vendored, if_x + "<List>" + _FILLED + "</List>" + arm)
+    adopted = _skeleton(step1_vendored_tree, if_x + "<List/>" + arm)
+    orphaned = _skeleton(step1_vendored_tree, if_x + "<List>" + _FILLED + "</List>" + arm)
     assert adopted == ((("if", (), (("else", (".",), ()),)),),)
     assert orphaned == ((("if", (), ()), ".", ("else", (".",), ())),)
     # The raw lists reach what the seeds are written for: branches main adopts, in number, in
