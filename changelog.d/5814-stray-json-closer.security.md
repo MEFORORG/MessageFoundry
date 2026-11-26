@@ -11,5 +11,7 @@
   top-level key on its line, and one on a later line of a traceback that leaves a PHI-keyed dict
   unclosed. A key's scope is its container, or, for a key outside every container, a span that a
   line break ends; the docstring of `_stray_json_closer` says how far each runs. The check still
-  misses some stray closers, and that docstring lists at least the shapes it is known to miss.
+  misses some stray closers, and that docstring, in
+  [messagefoundry/redaction.py](../messagefoundry/redaction.py), lists at least the shapes it is
+  known to miss.
   (vault `BACKLOG #5814`)

@@ -2136,7 +2136,8 @@ def _redact_noted(text: str, *, noted: bool) -> str:
 
 def _stray_json_closer(text: str) -> bool:
     """Whether ``text`` holds a closer, read as structure, that meets an open container of another
-    kind while the walk is armed by a PHI JSON key (BACKLOG #5814, added item 2).
+    kind while the walk is armed by a PHI JSON key, or by key-shaped text a string holds
+    (BACKLOG #5814, added item 2).
 
     **Read on the text before any pass rewrites it**, and on the result. The walk in
     :func:`_scrub_json_value` reads what the flat passes left, and a field-run scrub can consume an

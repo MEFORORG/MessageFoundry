@@ -46,7 +46,7 @@ STRAY = [
 ]
 
 #: Stray closers the check is documented to miss (``_stray_json_closer``'s docstring). Strict, so a
-#: change that catches one turns this red and the docstring and changelog move with it.
+#: change that catches one turns this red and the docstring moves with it.
 MISSED = [
     f'"given": [Jane] {SECRET}]',  # no container open: the head was cut
     f'{{"given": [x] {SECRET}}}}}',  # the key's own container's kind
