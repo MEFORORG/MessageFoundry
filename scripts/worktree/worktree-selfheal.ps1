@@ -18,8 +18,8 @@
     primary -- a case a PROJECT-scoped hook can never see (the stub has no project .claude/).
 
     For each governed primary (from the shared allowlist), if its HEAD has drifted off the home
-    branch AND its tree is clean, it invokes the repo's own restore-primary.ps1 to un-flip it
-    (that script refuses a dirty tree, so uncommitted work is never lost). If THIS session is
+    branch AND `git status --porcelain` printed nothing for it, it runs `git checkout <home branch>`
+    on it itself rather than calling restore-primary.ps1 (step 1 below says why). If THIS session is
     sitting in a stub worktree, it injects a heads-up telling the model to spin up a real worktree
     with new.ps1 before editing.
 
@@ -35,7 +35,8 @@
 #>
 param(
     # Shared allowlist of primary checkouts to guard (one absolute path per line, '#' comments).
-    # Absent or empty => the backstop is OFF.
+    # When passed, absent or empty => the backstop is OFF. When not passed, the file is chosen below,
+    # and the Off switch paragraph above says when that leaves the backstop on.
     #
     # ONE allowlist, shared with the PreToolUse gate. There used to be two -- the gate read
     # ~/.claude/hooks/worktree-gate.repos.txt and this backstop read ~/.claude-hooks/worktree-gate.repos.txt

@@ -5,7 +5,8 @@ checkout — mechanically, not by reminding you — while leaving reads, plannin
 worktree completely untouched.
 
 It is opt-in, installed by hand, governs only the checkouts you list, and `install-gate.ps1 -Uninstall`
-takes it back out, though not without leaving files behind. See [Backing it out](#backing-it-out).
+takes it back out, though it leaves files behind and can leave the self-heal backstop armed on a legacy
+allowlist. See [Backing it out](#backing-it-out).
 
 > This page is the gate's own design rationale. For the gate **in context** — the whole drift-control
 > estate, which parts are actually installed and enforcing, and an audit of what they miss — see
@@ -45,9 +46,10 @@ and the 44% are two numerators over one denominator rather than two measurements
 This is the one statement of what the cwd decides; the gate's docstring and
 [WORKTREES.md](WORKTREES.md) point here. For a write by absolute path, where a session *sits* is
 irrelevant and only where it *writes* matters. A relative path is rooted at the session's cwd first,
-so for a relative path the cwd does decide the verdict. Not every rule is keyed on a target path: at
-least rule 2 keys on the cwd, and the git rules judge the directory each git invocation runs in, which is
-the session's cwd unless the command names another with `-C`, `cd` or the like.
+so for a relative path the cwd does decide the verdict; give the absolute path. Not every rule is keyed
+on a target path: at least rule 2 keys on the cwd, and the git rules fall back to the session's cwd
+where a command does not name its directory in a form the gate reads. What each git rule reads is in
+the hook, the source of record.
 
 ## What it blocks
 
@@ -170,7 +172,8 @@ This list is not the whole rule set. The hook itself,
 outside every checkout, and `install-gate.ps1` is the owner's to run. See "Installing" below.
 
 **Everything else is allowed.** Reads are never gated — asking a question or planning in the primary stays
-frictionless. Writes by absolute path into any worktree, the scratchpad, or any other repo are allowed
+frictionless. Writes by absolute path into any worktree, the scratchpad, or any repo the allowlist does
+not govern are allowed
 **from a session sitting in the primary**: for such a write there is no need to `cd`, relocate, or
 restart. A dispatch is different (rule 2). Worktrees that git nests *inside*
 the primary's path (`.claude/worktrees/<name>/`, the first-party `claude --worktree` mechanism) are
@@ -294,7 +297,7 @@ Two structural choices worth understanding:
   script; a hook whose script is missing exits non-zero-but-not-2, which means **the tool call runs anyway,
   silently** — the gate would be off in every session with nothing to say so.
 
-- **A SessionStart drift-detector backstop.** Because the gate is a guardrail (it inspects tool arguments,
+- **A SessionStart self-heal backstop.** Because the gate is a guardrail (it inspects tool arguments,
   so a checkout routed through an indirect script slips past), `worktree-selfheal.ps1` — in each config
   dir `install-selfheal.ps1` was run for — runs at session start. It repairs a clean primary that has
   drifted off its home branch. It no longer warns when this session's own linked worktree has moved off

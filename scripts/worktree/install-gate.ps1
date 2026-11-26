@@ -33,7 +33,7 @@
         it on each install.
 
     The gate only governs the checkouts listed in worktree-gate.repos.txt. That file IS the gate's kill
-    switch: -Uninstall removes it (and the hook entries from every config dir). It is not the self-heal
+    switch: -Uninstall removes it (and the hook entries from each config dir it wires). It is not the self-heal
     backstop's: with this file absent, worktree-selfheal.ps1 reads a legacy
     ~/.claude-hooks/worktree-gate.repos.txt where one exists and stays armed on the roots it lists
     (docs/SESSION-DRIFT-CONTROLS.md, G8).

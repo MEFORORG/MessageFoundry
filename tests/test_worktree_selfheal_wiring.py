@@ -144,7 +144,9 @@ def test_once_the_gates_allowlist_exists_a_legacy_only_root_loses_the_backstop(
 
 def test_no_allowlist_anywhere_is_a_clean_no_op(home: Path, drifted: Path) -> None:
     """The kill switch: no allowlist and the backstop touches nothing, without erroring. This is also the
-    control for the two tests above -- if the repair happened here too, they would prove nothing."""
+    control for the two repair tests, test_the_backstop_reads_the_gates_allowlist and
+    test_the_legacy_allowlist_still_works_when_the_shared_one_is_absent -- if the repair happened here
+    too, they would prove nothing."""
     r = run_selfheal(home, cwd=drifted)
     assert r.returncode == 0, r.stderr
     assert head_of(drifted) == "drifted", "an ungoverned repo was repaired anyway"

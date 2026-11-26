@@ -2002,7 +2002,8 @@ blocked.
 
 **The gate's write rule (rule 1) keys on the write's resolved target path, not on where the session
 sits.** [WORKTREE-GATE.md](WORKTREE-GATE.md), *Why it exists*, states once what the cwd decides,
-including for a relative path and for the rules keyed on the cwd. So for writes, a session may stay
+including for a relative path and for the rules keyed on the cwd. Give the absolute path into your
+worktree. So for writes, a session may stay
 where it is and write into its worktree by absolute path, with no need to `cd`, relocate, or restart. A fan-out is different: rule 2
 denies a dispatch made while the session's cwd is the primary. Whether the session must then be
 started in a worktree depends on rule 3, as the blockquote above says.

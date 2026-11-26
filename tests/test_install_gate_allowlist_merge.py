@@ -562,7 +562,8 @@ def test_a_result_with_no_roots_left_warns_that_the_gate_governs_nothing(tmp_pat
 
     It is NOT the state -Uninstall leaves (docs/SESSION-DRIFT-CONTROLS.md, G8): the self-heal backstop
     reads an empty gate allowlist in preference to a legacy one and guards nothing, while -Uninstall
-    deletes the file and lets it fall back. tests/test_worktree_selfheal_wiring.py measures that."""
+    deletes the file and lets it fall back. tests/test_worktree_selfheal_wiring.py measures the
+    backstop's read order against a hand-written empty file; no test here runs -Uninstall itself."""
     out = _show(
         tmp_path,
         _result(lines=[HEADER], roots=[], dropped=[MF, VAULT]),
