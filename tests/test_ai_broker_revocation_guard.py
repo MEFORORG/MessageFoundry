@@ -774,6 +774,24 @@ def test_a_loopback_endpoint_takes_neither_the_internal_ca_nor_the_crl(pki: _Pki
     assert broker._opener is _shared_no_redirect_opener()
 
 
+@pytest.mark.parametrize(
+    ("host", "loopback"),
+    [("[::1]", True), ("localhost", True), ("localhost.", False), ("127.1", False)],
+)
+def test_the_url_host_reading_places_the_trust_anchor(pki: _Pki, host: str, loopback: bool) -> None:
+    """BACKLOG #5527: the docs say the URL host is read as ``hop_url_host`` gives it, so ``[::1]``
+    in a URL reads as loopback and takes neither file, while ``localhost.`` and ``127.1`` read as
+    remote and get the anchored opener with the CRL, which then credits the crossing."""
+    policy = TrustAnchorPolicy(internal_ca_file=pki.ca_file, mode="pinned", crl_file=pki.crl_file)
+    broker = _broker(
+        endpoint=f"https://{host}:8443/v1/messages",
+        allowed=(host,),
+        posture=_ENFORCING,
+        policy=policy,
+    )
+    assert (broker._opener is _shared_no_redirect_opener()) is loopback
+
+
 def test_a_broker_handed_a_tls_policy_offers_the_crl_lever(ai_log: list[str]) -> None:
     """Where a ``[tls]`` policy reaches the broker, ``[tls].crl_file`` is a way across, so the
     refusal and the warn line both offer it beside the pair. The control is the first test in this

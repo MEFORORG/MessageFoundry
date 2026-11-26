@@ -21,18 +21,18 @@ the vetted network call.
 * **Trust anchor (BACKLOG #5527).** The endpoint is verified under the instance ``[tls]`` policy the
   caller hands in, resolved by ``tls_policy.resolve_trust_anchor`` as for every other HTTP-family
   hop: ``[tls].internal_ca_file`` under ``augment`` or ``pinned``, and ``[tls].crl_file``, for an
-  endpoint whose host is not loopback as ``tls_policy.is_loopback_hop_host`` reads it.
-  :func:`_ai_endpoint_opener` says which opener that gives.
+  endpoint whose host is not loopback in the reading :func:`_refuse_an_unrevoked_ai_hop`
+  states. :func:`_ai_endpoint_opener` says which opener that gives.
 * **Off the event loop.** :meth:`AiBroker.chat` blocks (a provider POST), and so can construction,
   which builds rest.py's shared opener on first use (BACKLOG #2484), or reads the CA and CRL files
   when it builds an anchored opener (:func:`_ai_endpoint_opener`). The API route runs the build
   and :meth:`AiBroker.chat` each through :func:`asyncio.to_thread`.
 * **Revocation (BACKLOG #2193 slice (e), BACKLOG #5527).** The endpoint's certificate is verified,
   and stdlib ssl checks no OCSP. It checks no CRL unless ``[tls].crl_file`` is set, the ``[tls]``
-  policy is handed in, and the endpoint host is not loopback as
-  ``tls_policy.is_loopback_hop_host`` reads it. So an endpoint whose host reads as remote there,
-  on the box or off it, is refused under an enforcing or unknown posture unless that CRL is
-  checked or ``[ai].endpoint_revocation_attested`` is set with its reason:
+  policy is handed in, and the endpoint host is not loopback in that reading. So an endpoint
+  whose host reads as remote there, on the box or off it, is refused under an enforcing or
+  unknown posture unless that CRL is checked or ``[ai].endpoint_revocation_attested`` is set
+  with its reason:
   :func:`_refuse_an_unrevoked_ai_hop`.
 * **Secrets / PHI.** The prompt, the reply, and the provider ``api_key`` are NEVER logged. A failure names
   only the redacted endpoint host + HTTP status — never the request or response body (either may echo
@@ -130,8 +130,9 @@ _AI_ATTESTATION_LEVER = (
     "Set [ai].endpoint_revocation_attested = true with an "
     "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
     "endpoint's certificate, or use an endpoint URL whose host reads as loopback here, such as "
-    "localhost, 127.0.0.1 or [::1], with its host listed in [ai].allowed_endpoints; at least a "
-    "spelling with a trailing dot, or a shortened IPv4 address such as 127.1, reads as remote."
+    "localhost, 127.0.0.1 or [::1], with its host listed in [ai].allowed_endpoints, which is "
+    "verified against the OS trust store alone; at least a spelling with a trailing dot, or a "
+    "shortened IPv4 address such as 127.1, reads as remote."
 )
 
 #: The ways across that refusal under an enforcing posture, on the terms below:
@@ -149,8 +150,9 @@ _AI_CRL_LEVER = (
     "or its handshake fails), or set [ai].endpoint_revocation_attested = true with an "
     "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
     "endpoint's certificate, or use an endpoint URL whose host reads as loopback here, such as "
-    "localhost, 127.0.0.1 or [::1], with its host listed in [ai].allowed_endpoints; at least a "
-    "spelling with a trailing dot, or a shortened IPv4 address such as 127.1, reads as remote."
+    "localhost, 127.0.0.1 or [::1], with its host listed in [ai].allowed_endpoints, which is "
+    "verified against the OS trust store alone; at least a spelling with a trailing dot, or a "
+    "shortened IPv4 address such as 127.1, reads as remote."
 )
 
 

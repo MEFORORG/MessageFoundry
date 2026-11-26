@@ -1229,9 +1229,11 @@ bind-guard ladder above:
   `[ai].endpoint_revocation_attested_reason`. The host is read as spelled, so a gateway on this
   machine can be refused; the `[ai].endpoint_revocation_attested` entry in
   [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says how it is read. On that engine the broker
-  also verifies a non-loopback endpoint against `[tls].internal_ca_file` under `augment` or `pinned`. An app built by a direct
-  `create_app` hands the broker no `[tls]` policy unless its embedder passes `tls_settings` or sets
-  `app.state.tls_settings`, so without that neither file reaches the endpoint there. The refusal comes at
+  also verifies a non-loopback endpoint against `[tls].internal_ca_file` under `augment` or
+  `pinned`. An app built by `create_managed_app` hands the broker no `[tls]` policy unless its
+  embedder passes a `TlsSettings` as `tls_settings`, and one built by a direct `create_app` none
+  unless its embedder passes `tls_settings` or sets `app.state.tls_settings`, so without that
+  neither file reaches the endpoint there. The refusal comes at
   `POST /ai/chat`, not at start, and `messagefoundry check` neither reports it nor lists the
   pair. Unlike a Vault hop, a loopback endpoint is on the box even with a proxy set, because
   every opener dials a loopback host direct.

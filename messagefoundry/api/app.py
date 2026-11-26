@@ -5575,10 +5575,11 @@ def create_app(
         # reading ai_broker._refuse_an_unrevoked_ai_hop states (it can be one on this machine), is
         # refused under enforce unless a [tls].crl_file is checked on it or the
         # [ai].endpoint_revocation_attested pair is set, and a None posture counts as enforcing
-        # there. The cleartext-http refusal takes no posture: it refuses in every one (vault BACKLOG #3533 item 5).
-        # BACKLOG #5527: the [tls] policy too, the one the alerts test send reads, so the endpoint is
-        # verified against [tls].internal_ca_file under augment or pinned and checked against
-        # [tls].crl_file as the other HTTP-family hops are. A direct create_app stashes its
+        # there. The cleartext-http refusal takes no posture: it refuses in every one (vault
+        # BACKLOG #3533 item 5). BACKLOG #5527: the [tls] policy too, the one the alerts test send
+        # reads, so a non-loopback endpoint in that reading is verified against
+        # [tls].internal_ca_file under augment or pinned and checked against [tls].crl_file as the
+        # other HTTP-family hops are. A direct create_app stashes its
         # tls_settings argument, and its embedder may set the stash itself; create_managed_app's
         # lifespan stashes its own argument at start. With none, None goes down.
         # Off the event loop: the constructor builds rest.py's shared opener on first use, a TLS

@@ -136,7 +136,14 @@ def test_the_ai_source_text_reads_loopback_as_the_code_does() -> None:
     loopback" with no reading; the code reads loopback with ``is_loopback_hop_host``."""
     broker = (_ROOT / "messagefoundry" / "transports" / "ai_broker.py").read_text(encoding="utf-8")
     assert "and the endpoint is not loopback" not in broker
-    assert broker.count("``tls_policy.is_loopback_hop_host`` reads it") >= 2
+    # The module docstring points at the one reading _refuse_an_unrevoked_ai_hop states, which
+    # names both the URL-host step and the predicate.
+    assert "in the reading :func:`_refuse_an_unrevoked_ai_hop`" in broker
+    assert "``tls_policy.is_loopback_hop_host`` reads it" not in broker
+    assert (
+        "* **On the box** is :func:`~messagefoundry.config.tls_policy.is_loopback_hop_host` on the\n"
+        "      host :func:`~messagefoundry.config.tls_policy.hop_url_host` takes from the endpoint URL"
+    ) in broker
     settings = (_ROOT / "messagefoundry" / "config" / "settings.py").read_text(encoding="utf-8")
     start = settings.index("# Attest that revocation of the AI endpoint's server certificate")
     comment = settings[start : settings.index("endpoint_revocation_attested:", start)]
