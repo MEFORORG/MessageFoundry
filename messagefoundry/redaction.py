@@ -2091,16 +2091,10 @@ def redact(text: str) -> str:
     it: measured at 1 text in 200,000 on a fuzz, at every head of the pull request before this rule,
     and 0 in 600,000 with it. That zero is a measurement, not a proof for the first-stage labels.
 
-    **A mismatched closer after a PHI JSON key, while that key's scope is open, makes the whole
-    text redacted (BACKLOG #5814)**: the result is the placeholder alone. Key-shaped text that a
-    string holds counts as a key too, such as ``'family':`` inside a double-quoted value. The scope
-    is the key's container, or for a key outside every container the text up to a line feed or
-    carriage return reached while no container is open, which can run past the key's line; see
-    :func:`_stray_json_closer`'s docstring. The closer need not be in the key's value: in a
-    malformed sibling, or in prose after the key, it blanks the text too. The JSON pass reads what
-    the passes before it left, so the text as received and the result are both read for a stray
-    closer, and that docstring names some of what the check does not see, not all of it. A
-    trailing bound note is kept after the placeholder."""
+    **A mismatched closer after a PHI JSON key can make the whole text redacted (BACKLOG #5814)**:
+    the result is then the placeholder, followed by any trailing bound note. The text as received
+    and the result are both read for one. :func:`_stray_json_closer`'s docstring states which
+    closers do it, how far a key's scope runs, and at least the shapes the check misses."""
     return _redact_noted(text, noted=False)
 
 
@@ -2158,7 +2152,17 @@ def _stray_json_closer(text: str) -> bool:
     PHI key can then arm it again. A key outside every container disarms only at a line feed or
     carriage return reached with no container open, so not necessarily at the end of its line:
     not while a container opened after it is still open. Other line separators, such as U+2028, do
-    not disarm it.
+    not disarm it, and nor does a line break inside a string, such as one a backslash escapes in a
+    value continued on the next line. A container is any ``{``, ``[`` or ``(`` the walk reads,
+    prose parentheses included, so a key inside ``(see "family": ...)`` disarms at that ``)``. A
+    bracket inside a string is not read either: an apostrophe after the key, as in ``can't (see
+    [ref``, opens a single-quoted string that runs to the line's end and hides that bracket, so the
+    key can disarm at the next line break.
+
+    This walk is one of two routes to the placeholder. The other is :func:`_scrub_json_value`
+    raising :class:`_MismatchedJsonCloser` on a closer it reads as mismatched, and that route does
+    not depend on this scope: ``"family"\\n: [x y}`` is blanked by it although this walk disarmed
+    at the line feed.
 
     So the check is not scoped to the PHI value, and that is a known cost, in the safe direction.
     At least these shapes blank the whole text: a malformed sibling after a well-formed PHI value

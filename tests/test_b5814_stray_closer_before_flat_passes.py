@@ -140,6 +140,10 @@ KNOWN_COST = [
     f'"family": "{SECRET}" rejected by peer (see [ref) for details',
     f'{{"family": "x"}} x {{"given": "{SECRET}", "note": [1}}',
     f'"family": "{SECRET}"\u2028(see [ref)',
+    # A bracket opened after a top-level key carries its scope across line breaks.
+    f'"family": "{SECRET}" (see [ref\n\n}}',
+    # Key-shaped text inside a string arms the check too.
+    f'{{"note": "x \'family\': {SECRET}", "a": [1}}}}',
 ]
 
 
