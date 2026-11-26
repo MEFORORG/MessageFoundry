@@ -3,12 +3,14 @@
   kept every word holding one anywhere, so a password word such as `Passage`, `Statement`,
   `Barcode`, `Compass`, `Codename` or `Bypass` would have printed whole on the write-time log
   filters, the support bundle and `GET /logs/tail`. Now an ASCII word holding a credential, token,
-  key-label, query-filter or PHI JSON key word stays whole only at the openings `_read_as_label`
-  in `messagefoundry/secretscrub.py` lists, so `ad_bind_password=`, `myPassword=`, `x.code=` and
-  `session_state=` stay whole and `Passage:` or `x.name=` is masked. At least these would still
-  print whole on first deployment, as before: a word holding `MEFOR_`, the bundle marker, `basic`,
-  `digest`, `mrn`, `0010` or a DICOM label word anywhere, such as `Outpatient` or `Basically`; a
-  whole label word, such as `Name:`; and a word holding a character outside ASCII. A seeded
-  differential of 60,006 lines over nine redaction paths, against the code before, printed no
-  planted value the code before hid; it is a fuzz result, not a proof. (BACKLOG #8429,
-  BACKLOG #5030)
+  key-label, query-filter or PHI JSON key word is kept by this rule only at the openings
+  `_read_as_label` in `messagefoundry/secretscrub.py` lists, so `ad_bind_password=`,
+  `myPassword=`, `x.code=` and `session_state=` stay whole and `Passage:` or `x.name=` is masked.
+  At least these would still print whole on first deployment, as before: a word holding `MEFOR_`,
+  the bundle marker, `basic`, `digest`, `mrn`, `0010` or a DICOM label word anywhere, such as
+  `Outpatient`, `Basically`, `Digestive`, `Kv20010x` or `Kvmrn`; a word ending in `bearer`,
+  `basic`, `digest` or `mrn` before white space, even before a `:` or `=`, such as
+  `Hunterbearer :`; a whole label word, such as `Name:`; and a word holding a character outside
+  ASCII. A seeded differential of 60,006 lines over nine redaction paths, against the code before,
+  printed no planted value the code before hid; it is a fuzz result, not a proof.
+  (BACKLOG #8429, BACKLOG #5030)

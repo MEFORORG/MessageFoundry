@@ -2246,11 +2246,14 @@ def _read_as_label(text: str, word: str, start: int) -> bool:
 
     It still keeps words no reader opens on, at least: a whole label word whatever its case and
     whatever follows it (``Name:``, ``x.code:``), since the JSON key and query readers need quotes
-    or "=" that this rule does not check; a label word after any "_" (``__secret=``), though
-    ``_LABEL_PREFIX`` needs a letter or digit before it; and a word holding a character
-    outside ASCII, which keeps the old rule, since the patterns fold case the Unicode way and a
-    lower-cased comparison may not. Such a password word would print whole on first deployment, as
-    it did before."""
+    or "=" that this rule does not check; and a word holding a character outside ASCII, which keeps
+    the old rule, since the patterns fold case the Unicode way and a lower-cased comparison may
+    not. Such a password word would print whole on first deployment, as it did before. A label
+    word after any "_" (``__secret=``) is kept too: no label pattern opens there, since
+    ``_LABEL_PREFIX`` needs a letter or digit before the "_", but a value walk's stop before a
+    later quoted label (``_NOT_BEFORE_QUOTED_LABEL``) does, so ``password=abc__secret='v w'``
+    ends the password's value right before ``secret``. :func:`_kept_word`'s scheme-word rule may
+    keep a word this function refuses; its comment says which."""
     if not word.isascii() or _MEMBER_HELD.search(word) is not None:
         return True
     folded = word.lower()
@@ -2294,8 +2297,12 @@ def _kept_word(text: str, word: str, end: int) -> bool:
         and _read_as_label(text, word, end - len(word))
     ):
         return True
-    # A word no label reader opens on still falls to the scheme-word rule, as it did before
-    # BACKLOG #8429: ``xbearer :`` keeps ``xbearer``, as ``xbearer abc`` does. A "#" after spaces does not end the scheme-word rule: ``Bearer #`` is still a scheme word
+    # A word _read_as_label refuses still falls to the scheme-word rule: a word ENDING in bearer,
+    # basic, digest or mrn stays whole before white space, with no opening checked, so ``xbearer :``
+    # and ``Hunterbearer :`` keep the word, as ``Hunterbearer abc`` does. Before BACKLOG #8429 the
+    # ":" tail kept such a word anyway, so this keeps what main kept. The bearer readers open at a
+    # ``\b``, so a password word such as ``Hunterbearer`` would print whole on first deployment.
+    # A "#" after spaces does not end the scheme-word rule: ``Bearer #`` is still a scheme word
     # before a space, and a later bearer pass reads it there.
     return text[end : end + 1].isspace() and _MEMBER_SPACED_WORD.search(word) is not None
 
