@@ -66,10 +66,12 @@ Pure stdlib, so it can be used from any engine package.
 from __future__ import annotations
 
 import builtins
+import codecs
 import encodings
 import encodings.aliases
 import hashlib
 import json
+import locale
 import logging
 import os
 import pkgutil
@@ -82,7 +84,7 @@ from collections import ChainMap, OrderedDict, UserDict, defaultdict, deque
 from collections.abc import Callable, MappingView
 from datetime import UTC, datetime
 from functools import lru_cache
-from itertools import islice
+from itertools import chain, islice
 from string import ascii_lowercase, ascii_uppercase, digits, whitespace
 from types import (
     BuiltinFunctionType,
@@ -1398,8 +1400,8 @@ def _json_scalar(match: re.Match[str], policy: int, widened: bool) -> str:
 
 
 class _MismatchedJsonCloser(Exception):
-    """Raised by :func:`_scrub_json_value` on a closer of another kind than the open container's, and
-    caught only by :func:`redact` (BACKLOG #5814)."""
+    """Raised by :func:`_scrub_json_value` on a closer it reads as mismatched. :func:`_redact_noted`
+    catches it and returns the placeholder, followed by any trailing bound note (BACKLOG #5814)."""
 
 
 def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[str, int]:
@@ -2089,9 +2091,13 @@ def redact(text: str) -> str:
     it: measured at 1 text in 200,000 on a fuzz, at every head of the pull request before this rule,
     and 0 in 600,000 with it. That zero is a measurement, not a proof for the first-stage labels.
 
-    **A JSON value with a mismatched closer makes the whole text redacted (BACKLOG #5814)**: the
-    result is the placeholder alone. The JSON pass reads what the passes before it left, so this
-    holds for a closer that pass still sees as mismatched."""
+    **A mismatched or stray JSON closer after a PHI JSON key can make the result the placeholder
+    for the whole text (BACKLOG #5814)**, followed by any trailing bound note. Text shaped like such
+    a key can do it too, including text inside a JSON string. This can blank text beyond the key's
+    value, including some balanced inputs, and it misses some shapes. The code from
+    :func:`_redact_noted` down is the definition; the ``KNOWN_COST`` and ``MISSED`` lists in
+    ``tests/test_b5814_stray_closer_before_flat_passes.py`` pin examples, neither of them a complete
+    list."""
     return _redact_noted(text, noted=False)
 
 
@@ -2111,10 +2117,80 @@ def _redact_noted(text: str, *, noted: bool) -> str:
     is masked. A mask can still change what a later pass or round reads (:func:`_masked_only`), so
     that the answer only hides more is a measurement, not a proof: the differential tests in
     ``tests/test_redaction_clamp_note_end.py`` measure it on their inputs."""
+    # The whole-text placeholder keeps this module's trailing bound note, the only sign the text
+    # was cut (:data:`_TRAILING_NOTES`).
+    body = _without_trailing_note(text)
+    if _stray_json_closer(body):
+        return _REDACTED + text[len(body) :]
     try:
-        return _redact_unguarded(text, noted=noted)
+        out = _redact_unguarded(text, noted=noted)
     except _MismatchedJsonCloser:
-        return _REDACTED
+        return _REDACTED + text[len(body) :]
+    # The output is read too: a scrub can leave a closer stray that was inside a string as received,
+    # or one whose opener a flat pass consumed, and a second call reads that output as received, so
+    # without this the rule broke the fixed point.
+    out_body = _without_trailing_note(out)
+    return _REDACTED + out[len(out_body) :] if _stray_json_closer(out_body) else out
+
+
+def _stray_json_closer(text: str) -> bool:
+    """The stray-closer walk (BACKLOG #5814, added item 2). :func:`_redact_noted` returns the
+    placeholder when it returns True. A False here does not mean the text is kept.
+
+    Text shaped like a PHI JSON key counts as one, including text inside a JSON string. The code
+    below is the definition; the ``KNOWN_COST`` and ``MISSED`` lists in
+    ``tests/test_b5814_stray_closer_before_flat_passes.py`` pin examples, neither of them a complete
+    list."""
+    keys = [match.start() for match in _JSON_PHI_KEY.finditer(text)]
+    if not keys:
+        return False
+    stack: list[str] = []
+    armed: int | None = None
+    next_key = 0
+    for match in _JSON_STRUCTURE.finditer(text):
+        char = match.group("char")
+        if char is None:
+            break  # the text's tail holds no bracket and no line break
+        at = match.start("char")
+        while next_key < len(keys) and keys[next_key] <= at:
+            armed = len(stack) if armed is None else min(armed, len(stack))
+            next_key += 1
+        if char[0] in "\r\n":
+            if armed == 0 and not stack:
+                armed = None
+        elif char in _CLOSER_OF:
+            stack.append(_CLOSER_OF[char])
+        else:
+            if stack and stack[-1] != char and armed is not None:
+                return True
+            if stack:
+                stack.pop()
+            if armed is not None and len(stack) < armed:
+                armed = None
+        if armed is None and next_key == len(keys):
+            return False  # disarmed with no key left to arm the walk again
+    return False
+
+
+#: :func:`_stray_json_closer`'s step: everything up to the next bracket or line break outside a
+#: string, then that bracket or that run of line feeds and carriage returns. No key starts inside
+#: such a run and disarming at one is idempotent, so a run is one step. What it skips is string tokens, spelled as :data:`_JSON_TOKEN`
+#: spells them, and runs holding no bracket, quote or line break. A string prefix only precedes a
+#: quote and no other alternative there holds a quote, so a quote outside a string always starts a
+#: string token there too, and the characters this captures are the walk's bracket tokens and the
+#: line breaks of its whitespace tokens, in order. The string body is the same language as
+#: ``(?:[^"\\\r\n]|\\[\s\S])*+``, unrolled so a plain run is one step: its two parts start on
+#: disjoint characters, so both read the same longest body. The capture is optional so a tail with
+#: no structure is one match, not a fresh search from each of its characters.
+#: ``tests/test_b5814_stray_closer_before_flat_passes.py`` checks the captures against
+#: :data:`_JSON_TOKEN`'s tokens.
+_JSON_STRUCTURE = re.compile(
+    r"""(?:"[^"\\\r\n]*+(?:\\[\s\S][^"\\\r\n]*+)*+\\?"?"""
+    r"""|'[^'\\\r\n]*+(?:\\[\s\S][^'\\\r\n]*+)*+\\?'?"""
+    r"""|[^{}\[\]()\r\n"']++)*+(?P<char>[{}\[\]()]|[\r\n]++)?"""
+)
+#: The closer each opener expects.
+_CLOSER_OF = {"{": "}", "[": "]", "(": ")"}
 
 
 def _redact_unguarded(text: str, *, noted: bool = False) -> str:
@@ -2966,7 +3042,11 @@ def safe_exc(
     the name anyway: a control that reports success while the hole stays open. The basename is
     replaced as written and in at least the forms one level of ``repr()``, ``ascii()``, a bytes
     ``repr()`` or a JSON string renders it as (:func:`_name_forms`), so a full path is
-    covered; the directory part is operator configuration, not partner-chosen, and stays. A name
+    covered. The part after the last ``/`` is replaced as well, since a backslash is an ordinary
+    character in a POSIX or SFTP name; a Windows path passed whole then loses its directory too. The
+    directory part otherwise stays, and it is not always operator configuration: a subdirectory a
+    partner made under a recursive File source stays in the message, since its callers pass the
+    basename alone. A name
     escaped twice, as ``repr(str(oserror))`` renders it, or encoded any other way, is NOT replaced,
     and only :func:`safe_text`'s patterns stand between it and the output.
 
@@ -3005,29 +3085,79 @@ def safe_exc(
     if engine is None and prints_a_codec_error(exc):  # RuntimeError(exc): the codec error's str()
         return f"{name}: {_HOLDER_TEXT}"
     raw = str(exc) if engine is None else engine
-    if file_name and (base := _basename(file_name)):
+    # A backslash is an ordinary character in a POSIX or SFTP name, so the part after the last `/`
+    # is swapped too, and it is what is left when the name ends in a backslash.
+    tail = file_name.rsplit("/", 1)[-1] if file_name else ""
+    if file_name and (base := _basename(file_name) or tail):
         label = safe_name(file_name)
         # An OSError quotes its path with repr(), so a name holding a control, a non-printable or a
         # quote character appears escaped and the raw name alone matches nothing (BACKLOG #5815).
-        for form in _name_forms(base):
-            raw = raw.replace(form, label)
+        forms = _name_forms(base)
+        if tail and tail != base:
+            forms |= _name_forms(tail)
+        raw = _swap_forms(raw, forms, label)
     message = safe_text(raw, limit=limit)
     return f"{name}: {message}" if message else name
 
 
-def _name_forms(text: str) -> list[str]:
+def _locale_encoding() -> str:
+    """The locale's encoding, as a codec name Python can look up, or UTF-8 with a warning, so a
+    host whose locale names no codec is told its bytes form is not swapped (BACKLOG #5815)."""
+    name = locale.getencoding()
+    try:
+        return codecs.lookup(name).name
+    except LookupError:
+        logging.getLogger(__name__).warning(
+            "the locale encoding %r is not a codec; a file name's bytes in it are not swapped", name
+        )
+        return "utf-8"
+
+
+#: The locale's encoding, read once: on Windows the host's ANSI code page.
+_LOCALE_ENCODING = _locale_encoding()
+
+
+def _swap_forms(raw: str, forms: set[str], label: str) -> str:
+    """``raw`` with each of ``forms`` replaced by ``label``, longest first, so a form never shadows
+    a longer one it is a prefix of. Where two occurrences overlap, the longer is swapped and the
+    shorter one's other characters stay. Each form is first replaced by a run of one private-use
+    character that neither ``raw`` nor any form holds, and the runs by ``label`` last, so no form
+    can match across a label another form wrote; where every such character is taken, the forms
+    are swapped for ``label`` directly, as before BACKLOG #5815."""
+    ordered = sorted(forms, key=lambda form: (-len(form), form))
+    used = set(raw).union(*forms)
+    spare = next(
+        (
+            chr(c)
+            # The private-use areas, without the noncharacters U+FFFFE and U+FFFFF between them.
+            for c in chain(
+                range(0xE000, 0xF900), range(0xF0000, 0xFFFFE), range(0x100000, 0x10FFFE)
+            )
+            if chr(c) not in used
+        ),
+        None,
+    )
+    marker = label if spare is None else spare * 3
+    for form in ordered:
+        raw = raw.replace(form, marker)
+    return raw if spare is None else raw.replace(marker, label)
+
+
+def _name_forms(text: str) -> set[str]:
     """``text`` and the bodies one level of ``repr()``, ``ascii()``, a bytes ``repr()`` or a JSON
-    string can render it as inside a longer quoted string, longest first, so a form never shadows a
-    longer one it is a prefix of. Every form but ``text`` holds a backslash, so none is a substring
-    of a :func:`safe_name` label.
+    string can render it as inside a longer quoted string. Every form but ``text`` holds a
+    backslash, so none is a substring of a :func:`safe_name` label.
 
     repr picks its quote from the WHOLE string, a path whose directory the name does not decide: it
     quotes with ``'`` and escapes it, unless the string holds ``'`` and no ``"``, when it quotes with
     ``"`` and escapes neither. Appending ``"`` forces the first choice, so both forms are read off the
-    interpreter itself rather than reimplemented. The bytes come from each encoding a path can take:
-    the filesystem encoding, and UTF-8 with either surrogate handler, since Windows passes a lone
-    surrogate through and POSIX escapes it. One a name cannot be encoded in is skipped, never raised:
-    this runs on an error arm, and a lone surrogate is a name a partner can choose."""
+    interpreter itself rather than reimplemented. The bytes come from these encodings, not every one
+    a path can take: the filesystem encoding; UTF-8 with either surrogate handler, since Windows
+    passes a lone surrogate through and POSIX escapes it; the locale's encoding, which on Windows is
+    the host's ANSI code page; and cp1252, the Western European ANSI page, for a tool that wrote
+    one on another host. One a name cannot be encoded in is skipped, never raised: this runs on an
+    error arm, and a lone surrogate is a name a partner can choose. Each escaped form is also kept
+    with its hex digits in upper case."""
     forms = {
         text,
         repr(text)[1:-1],
@@ -3038,9 +3168,13 @@ def _name_forms(text: str) -> list[str]:
         json.dumps(text, ensure_ascii=False)[1:-1],
     }
     encoders: list[Callable[[str], bytes]] = [
+        # The host's own: UTF-8 on most, but a POSIX locale's encoding where that is not UTF-8,
+        # and mbcs under Windows' legacy filesystem mode.
         os.fsencode,
         lambda s: s.encode("utf-8", "surrogatepass"),
         lambda s: s.encode("utf-8", "surrogateescape"),
+        lambda s: s.encode(_LOCALE_ENCODING),
+        lambda s: s.encode("cp1252"),
     ]
     for encode in encoders:
         try:
@@ -3048,7 +3182,19 @@ def _name_forms(text: str) -> list[str]:
         except UnicodeEncodeError:
             continue
         forms.update((repr(encoded)[2:-1], repr(encoded + b'"')[2:-2]))
-    return sorted(forms, key=lambda form: (-len(form), form))
+    # Another renderer may write an escape's hex digits in upper case, as some JSON encoders do.
+    forms.update([_HEX_ESCAPE.sub(_upper_hex, form) for form in forms])
+    return forms
+
+
+#: A ``\x``, ``\u`` or ``\U`` escape with lowercase hex digits, as repr, ascii and json write one.
+_HEX_ESCAPE = re.compile(r"\\(x[0-9a-f]{2}|u[0-9a-f]{4}|U[0-9a-f]{8})")
+
+
+def _upper_hex(match: re.Match[str]) -> str:
+    """The escape ``match`` read, its hex digits in upper case and its letter as it was."""
+    escape = match.group(1)
+    return "\\" + escape[0] + escape[1:].upper()
 
 
 #: ``encodings`` modules that are no text codec: the alias table, the bytes-to-bytes and str-to-str
