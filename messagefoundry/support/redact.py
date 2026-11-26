@@ -57,6 +57,8 @@ from messagefoundry.secretscrub import (
     _BEARER_TAILS,
     _BYTES_PROBE,
     _CONNECTION_STRING_MEMBER,
+    _KEY_LINE,
+    _KEY_SEPARATOR,
     _KV_TAILS,
     _MEFOR_GLUED_BRANCH,
     _MEFOR_TAILS,
@@ -77,6 +79,8 @@ from messagefoundry.secretscrub import _PRIVATE_KEY_BLOCK as _SHARED_PRIVATE_KEY
 from messagefoundry.secretscrub import _WIDE_DSN_PASSWORD as _SHARED_DSN_PASSWORD
 
 __all__ = [
+    "key_body_mask_from",
+    "mask_key_body_lines",
     "redact_log_line",
     "redact_log_record",
     "redact_log_text",
@@ -683,7 +687,8 @@ _LEADING_TS = re.compile(
 def redact_log_line(line: str) -> str:
     """Return ``line`` with PHI/secret patterns replaced by a redaction placeholder.
 
-    Two layers: (1) the bundle-specific **secret** markers (``mfb64:`` bodies, ``MEFOR_*`` values,
+    Two layers: (1) on a line holding "-----", secretscrub's PRIVATE KEY block pattern (BACKLOG
+    #5550), then the bundle-specific **secret** markers (``mfb64:`` bodies, ``MEFOR_*`` values,
     bearer/session tokens) the engine redactor does not carry; then (2) the shared engine **PHI**
     redactor (:func:`messagefoundry.redaction.redact`) for HL7-shaped spans (any segment id, not a
     fixed allowlist), free-text DOB/date runs, multi-token name runs, and the labelled values of FHIR
@@ -693,8 +698,10 @@ def redact_log_line(line: str) -> str:
     so far, or over the whole line when the line arrived holding the placeholder text (BACKLOG
     #2694); its last pass masks the words of a connection-string member's value. Then that member
     mask runs once more over the whole joined line (BACKLOG #5030), then secretscrub's widened DSN
-    reading, over the whole line too (BACKLOG #5386). A final long-base64 sweep catches
-    any residual key/token run.
+    reading, over the whole line too (BACKLOG #5386). On a line a masked tail could fire on, the
+    line is also read without the tails, the key-block pattern's included, and that reading is kept
+    unless the tailed one differs from it only by characters written as "x" (the comment on the
+    comparison below says why). A final long-base64 sweep catches any residual key/token run.
     The leading log timestamp is carved off first so the engine's date pass doesn't scrub it. This errs
     toward over-redaction (e.g. a capitalized two-word phrase in ordinary log text may be scrubbed) —
     the correct trade-off for a file that leaves the box."""
@@ -806,8 +813,100 @@ def redact_log_record(line: str) -> str:
 
 
 def redact_log_text(text: str) -> str:
-    """Redact every line of a multi-line block (the log tail), preserving line breaks."""
-    return "\n".join(redact_log_record(ln) for ln in split_log_lines(text))
+    """Redact every line of a multi-line block (the log tail), preserving line breaks.
+
+    A PRIVATE KEY block whose body lines are lines of their own is masked across them first
+    (:func:`mask_key_body_lines`), since no single line holds the whole block."""
+    lines = mask_key_body_lines(split_log_lines(text))
+    return "\n".join(redact_log_record(ln) for ln in lines)
+
+
+#: One line :data:`_PRIVATE_KEY_BLOCK` reads as body, whole, so that its body runs on past the line
+#: break after it: the block pattern's own body-line and separator fragments, under its flag, with
+#: an escaped line break between the pieces of one line.
+_KEY_BODY_PIECE = _KEY_LINE + r"[ \t]*+(?=" + _KEY_SEPARATOR + r"|\Z)"
+_WHOLE_KEY_BODY_LINE = re.compile(
+    r"(?i)" + _KEY_BODY_PIECE + r"(?:[ \t]*+" + _KEY_SEPARATOR + _KEY_BODY_PIECE + r")*+"
+)
+
+
+def key_body_mask_from(lines: list[str], start: int) -> int:
+    """The index to run :func:`mask_key_body_lines` from so that ``lines[start:]`` comes out as it
+    does from the whole list (BACKLOG #5550): the nearest line before ``start`` that a block's body
+    cannot run on past, or 0.
+
+    A block's body runs on from one line to the next only over a line it reads as body whole
+    (:data:`_WHOLE_KEY_BODY_LINE`), so a block that covers a line at or after ``start`` has its
+    BEGIN line at or after the nearest earlier line that is not one. Masking from there costs the
+    lines from there on, not the whole list. A run of whole body lines before ``start`` is scanned
+    back over to its first line, so there the cost is the run's length.
+
+    The list may be cut short at the end too, as ``GET /logs/tail`` cuts it at its page's end: a
+    body line is masked the same whatever follows it, since the pattern reads the end of the text
+    where it reads a line break, and the mask writes each line from that line alone.
+
+    The equivalence holds for ``lines`` as :func:`split_log_lines` returns them, where no element
+    holds a "\\n". An element outside the span masked, before the returned index or after an end
+    cut, that holds one breaks it: over the whole list :func:`mask_key_body_lines` then returns
+    every line unchanged, while over the span it may still mask a block, so the span errs toward
+    masking more, not less."""
+    index = min(start, len(lines))
+    while index > 0 and _WHOLE_KEY_BODY_LINE.fullmatch(lines[index - 1]):
+        index -= 1
+    return max(index - 1, 0)
+
+
+def mask_key_body_lines(lines: list[str]) -> list[str]:
+    """``lines`` with each line after a BEGIN line that a PRIVATE KEY block's body covers whole
+    written as secretscrub's key-block mask writes it, one character for one (BACKLOG #5550).
+
+    ``lines`` is what :func:`split_log_lines` returns: no element holds a "\\n" (one that does is
+    returned unchanged, with every other line). :func:`redact_log_line` can mask a block inside one
+    line, and so one whose line breaks are escaped, but a block with real line breaks reaches it one
+    line at a time, where no line holds its BEGIN marker and its body together. A body line of 24 or
+    more base64 characters fell to the long-base64 sweep, and a shorter one, such as a block's padded
+    last line, printed. So the block is found over the joined lines, and only the lines its body
+    covers from their first character to their last are replaced, each with what the mask writes for
+    it, so no character of the key itself is left on them. The mask writes as "x" every character
+    of such a line but these, which it leaves as they were: its spaces and tabs, an escaped line
+    break in it, and a ``Proc-Type:`` or ``DEK-Info:`` header line whole. So "=" padding, and a
+    letter the pattern's case-insensitive classes read beyond ASCII, become "x" too. A later pass still reads
+    the result: the long-base64 sweep reads a run of 24 or more "x" as base64 and replaces it.
+    Every other line stays as it was.
+
+    At least these still print as before: a last body line that shares its line with an escaped line
+    break, as in ``<body>\\n-----END ...``, and is too short for the sweep; a body whose lines each
+    carry a log record's own prefix, such as a timestamp, which the block pattern does not read as
+    body lines; a block whose BEGIN line is not among ``lines``; and every gap of secretscrub's
+    pattern, such as a body line ending in a label word. A block with no END marker is masked to its
+    last line boundary, so a line after it that reads as a base64 run, such as a single word, is
+    masked too."""
+    if not any("-----" in line for line in lines) or any("\n" in line for line in lines):
+        return lines
+    joined = "\n".join(lines)
+    out = lines
+    index, cursor = 0, 0
+    for block in _PRIVATE_KEY_BLOCK.finditer(joined):
+        start = block.start("key_body")
+        body = block.group("key_body")
+        if "\n" not in body:
+            continue  # every line break in it is escaped, so it sits on one line, left to that line's pass
+        masked = _braced_tail(block)  # the body masked, one character for one
+        # The first real line break in the body ends the BEGIN line, which the line pass masks
+        # itself; every later piece starts a line, and is that whole line unless it is the last
+        # and ends at an escaped line break inside it.
+        index += joined.count("\n", cursor, start) + 1
+        offset = body.index("\n") + 1
+        for piece in body[offset:].split("\n"):
+            if len(lines[index]) == len(piece):
+                if out is lines:
+                    out = list(lines)
+                out[index] = masked[offset : offset + len(piece)]
+            offset += len(piece) + 1
+            index += 1
+        index -= 1
+        cursor = block.end()
+    return out
 
 
 def _keep_label(m: re.Match[str]) -> str:
