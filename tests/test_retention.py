@@ -15,6 +15,7 @@ import logging
 import os
 import sqlite3
 import stat
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -22,6 +23,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.settings import (
     EgressSettings,
     RetentionSettings,
@@ -43,6 +45,7 @@ from messagefoundry.pipeline.engine import Engine
 from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.store import MessageStore, OutboxStatus, open_store
 from messagefoundry.store.store import DbStatus, DiskFreeStatus
+from messagefoundry.transports.file import FileSource
 from tests._log_absence import assert_capture_sees
 
 DAY = 86_400.0
@@ -1883,11 +1886,6 @@ async def test_a_late_demotion_seen_by_the_archive_worker_matches_the_row(
     on after the pass is cancelled. A demotion that thread sees once the interrupted row is written
     must not log the leadership loss that row does not record: the log and the row's
     ``leadership_lost`` come from one value."""
-    import threading
-
-    from messagefoundry.config.models import ConnectorType, Source
-    from messagefoundry.transports.file import FileSource
-
     loop = asyncio.get_running_loop()
     loop_thread = threading.get_ident()
     in_worker = asyncio.Event()

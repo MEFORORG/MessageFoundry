@@ -545,11 +545,11 @@ class RetentionPass:
     # of `did_work`: each only says how a pass ended.
     interrupted: bool = False
     # When `interrupted`, the phase that was working when the pass ended; None if it ended outside
-    # any phase's work, before the first or between two. What that running call itself changed is not in the row's counts: a phase
-    # that works in steps (the embedded-document strip's batches, the `.processed` sweep, the app-log
-    # sweep and compression) may have changed part of its set, and a single-transaction purge
-    # cancelled while its COMMIT was in flight may have committed. A strip threshold call that
-    # finished before the one that ended the pass is counted.
+    # any phase's work, before the first or between two. What that running call itself changed is
+    # not in the row's counts: a phase that works in steps (the embedded-document strip's batches,
+    # the `.processed` sweep, the app-log sweep and compression) may have changed part of its set,
+    # and a single-transaction purge cancelled while its COMMIT was in flight may have committed. A
+    # strip threshold call that finished before the one that ended the pass is counted.
     interrupted_phase: str | None = None
     # Leadership was lost during the pass (BACKLOG #6526, S07-45), so the shared-store phases after
     # the one that was running were skipped and left for the new leader.
@@ -1091,7 +1091,7 @@ class RetentionRunner:
 
         def _archive_halt() -> bool:
             nonlocal archive_saw_demotion
-            if not self._coordinator.is_leader():
+            if not archive_saw_demotion and not self._coordinator.is_leader():
                 archive_saw_demotion = True
             return archive_saw_demotion or _deadline_hit()
 
@@ -1236,32 +1236,27 @@ class RetentionRunner:
             # Connection events (#46): the dedicated `connection_event_retention_hours` window if set,
             # else inherit the message-body window (the ADR 0021 §7.5 default — bound the log alongside
             # the bodies). A positive hours value can keep events longer OR shorter than message bodies.
-            event_window = s.connection_event_retention_hours > 0 or s.messages_days > 0
-            if not _halt() and event_window:
+            if s.connection_event_retention_hours > 0:
+                event_cutoff: float | None = now - s.connection_event_retention_hours * 3600.0
+            elif s.messages_days > 0:
+                event_cutoff = now - s.messages_days * _SECONDS_PER_DAY
+            else:
+                event_cutoff = None
+            if not _halt() and event_cutoff is not None:
                 with _running("connection_events"):
-                    if s.connection_event_retention_hours > 0:
-                        conn_events_purged = await self._store.purge_connection_events(
-                            older_than=now - s.connection_event_retention_hours * 3600.0, now=now
-                        )
-                    else:
-                        conn_events_purged = await self._store.purge_connection_events(
-                            older_than=now - s.messages_days * _SECONDS_PER_DAY, now=now
-                        )
+                    conn_events_purged = await self._store.purge_connection_events(
+                        older_than=event_cutoff, now=now
+                    )
 
             # Resolved operator-alert instances (#56, ADR 0044): pruned on the SAME window as connection
             # events (metadata-only, one pass). Only RESOLVED instances are eligible — an
             # open/acknowledged condition is never aged out from under an operator. No window set ⇒
             # inherit the body window.
-            if not _halt() and event_window:
+            if not _halt() and event_cutoff is not None:
                 with _running("alert_instances"):
-                    if s.connection_event_retention_hours > 0:
-                        alert_instances_purged = await self._store.purge_alert_instances(
-                            older_than=now - s.connection_event_retention_hours * 3600.0, now=now
-                        )
-                    else:
-                        alert_instances_purged = await self._store.purge_alert_instances(
-                            older_than=now - s.messages_days * _SECONDS_PER_DAY, now=now
-                        )
+                    alert_instances_purged = await self._store.purge_alert_instances(
+                        older_than=event_cutoff, now=now
+                    )
 
             # Saved-search presets (ADR 0136, ASVS 14.2.7): the stored `criteria` is a PHI-shaped
             # needle, so it gets a window like every other PHI tier. A PLAIN window with NO inheritance
@@ -1414,28 +1409,27 @@ class RetentionRunner:
         """Write the row for a pass that ended partway (S07-44). A cancellation was delivered once,
         so this await still runs. Written when the pass did work or ended inside a phase that may
         have changed part of its set; a pass that ended in a phase that changes no data, with
-        nothing else done, is logged instead, and one that ended on an error in a
-        single-transaction purge (``_SINGLE_TRANSACTION_PHASES``), with nothing else done, writes
-        none, its error going on to the caller. The wait is bounded by
+        nothing else done, is logged instead, and one ``_SINGLE_TRANSACTION_PHASES`` exempts
+        writes none. The wait is bounded by
         ``_AUDIT_WRITE_WAIT_SECONDS``, so a store that cannot take the write does not hold up the
         exception, and is skipped once :meth:`stop` has been called, whose own drain waits for the
         row within its one budget. A failed write is logged, so ``cause`` is what propagates."""
         phase = partial.interrupted_phase
-        if not partial.did_work and (phase is None or phase in _PHASES_THAT_CHANGE_NO_DATA):
-            if phase is not None:
+        if not partial.did_work:
+            if phase is None:
+                return
+            if phase in _PHASES_THAT_CHANGE_NO_DATA:
                 log.warning(
                     "retention: a pass ended in its %s phase, which changes no data, with nothing "
                     "else done (%s); no audit row written",
                     phase,
                     safe_exc(cause),
                 )
-            return
-        if (
-            not partial.did_work
-            and phase in _SINGLE_TRANSACTION_PHASES
-            and not isinstance(cause, asyncio.CancelledError)
-        ):
-            return  # rolled back; `cause` goes on to the caller, which logs it
+                return
+            if phase in _SINGLE_TRANSACTION_PHASES and not isinstance(
+                cause, asyncio.CancelledError
+            ):
+                return  # rolled back; `cause` goes on to the caller, which logs it
         task = self._start_audit(partial)
         if self._stop.is_set():
             return
