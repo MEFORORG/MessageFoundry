@@ -781,41 +781,53 @@ def _main_reply_delimiters(reply: str) -> frozenset[str]:
 _TA1 = "TA1*000000001*260101*1200*A*000"
 _GS = "GS*FA*SENDER*RECEIVER*20260101*1200*1*X*005010"
 
-#: ``ISA``-led reply shapes from the sweep the #5799 ISA read was reviewed over: a ``?`` at each
-#: delimiter, ISA16 empty, one or two characters, a CR+LF or pretty-printed terminator, an
-#: unpadded or truncated ISA, a pre-00501 ISA11, a separator in element data, ``ISA`` followed by
-#: a run, and an empty ISA16 then ``~`` then NEL or U+2028, each holding a character ASCII cannot.
-_ISA_SHAPES = [
-    _isa(component="?") + _TA1 + "中~",
-    _isa(repetition="?") + _TA1 + "中~",
-    _isa(element="?") + _TA1.replace("*", "?") + "中~",
-    _isa(term="?") + _TA1 + "中?",
-    _isa(term="\r\n") + _TA1 + "中\r\n",
-    _isa(component="?", term="~\n") + _GS + "中~\n",
-    _isa(component="?", repetition="?") + _TA1 + "中~",
-    _isa(repetition="?").replace("*00501*", "*00401*") + _TA1 + "中~",
-    _isa(component="", term="") + "中" + _TA1 + "~",
-    _isa(component="", term="") + "~\u0085" + _TA1 + "中~",
-    _isa(component="", term="") + "~\u2028" + _TA1 + "中~",
-    _isa(component=":?", term="") + "~" + _TA1 + "中~",
-    _isa(component="?").replace("SENDER", "AC*MER", 1) + _TA1 + "中~",
-    "ISA*00**00**ZZ*SENDER*ZZ*RECEIVER*260101*1200*^*00501*000000001*0*P*:~" + _TA1 + "中~",
-    "ISA*00*中~",
-    "ISA" + "中" * 110,
-    "ISA" + "?" * 110 + "中",
-    "\r\n" + _isa(component="?") + _TA1 + "中~",
-]
+#: ``ISA``-led reply shapes from the sweep the #5799 ISA read was reviewed over, each holding a
+#: character ASCII cannot encode. The ``nel-each`` and ``u2028-each`` shapes are the regression
+#: the read was withdrawn for: an empty ISA16, then ``~`` and NEL or U+2028 after each terminator,
+#: refused at 7781f875bb6 where main replaced and sent the reply.
+_ISA_SHAPES = {
+    "isa16-q": _isa(component="?") + _TA1 + "中~",
+    "isa11-q": _isa(repetition="?") + _TA1 + "中~",
+    "element-q": _isa(element="?") + _TA1.replace("*", "?") + "中~",
+    "terminator-q": _isa(term="?") + _TA1 + "中?",
+    "crlf": _isa(term="\r\n") + _TA1 + "中\r\n",
+    "pretty-lf": _isa(component="?", term="~\n") + _GS + "中~\n",
+    "isa11-and-isa16-q": _isa(component="?", repetition="?") + _TA1 + "中~",
+    "isa11-q-00401": _isa(repetition="?").replace("*00501*", "*00401*") + _TA1 + "中~",
+    "isa16-empty": _isa(component="", term="") + "中" + _TA1 + "~",
+    "nel-once": _isa(component="", term="") + "~\u0085" + _TA1 + "中~",
+    "u2028-once": _isa(component="", term="") + "~ " + _TA1 + "中~",
+    "nel-each": _isa(component="", term="") + "~\u0085" + _TA1 + "中~\u0085",
+    "u2028-each": _isa(component="", term="") + "~ " + _TA1 + "中~ ",
+    "isa16-two": _isa(component=":?", term="") + "~" + _TA1 + "中~",
+    "element-in-isa06": _isa(component="?").replace("SENDER", "AC*MER", 1) + _TA1 + "中~",
+    "unpadded": "ISA*00**00**ZZ*SENDER*ZZ*RECEIVER*260101*1200*^*00501*000000001*0*P*:~"
+    + _TA1
+    + "中~",
+    "truncated": "ISA*00*中~",
+    "run-unencodable": "ISA" + "中" * 110,
+    "run-q": "ISA" + "?" * 110 + "中",
+    "leading-crlf": "\r\n" + _isa(component="?") + _TA1 + "中~",
+}
 
 
-@pytest.mark.parametrize("reply", _ISA_SHAPES)
+@pytest.mark.parametrize("reply", list(_ISA_SHAPES.values()), ids=list(_ISA_SHAPES))
 def test_an_isa_led_reply_reads_and_encodes_as_on_main(reply: str) -> None:
     """The ISA half of BACKLOG #5799 item 2 is withdrawn: after four rounds its read still refused
-    shapes main replaced and sent (an empty ISA16, then ``~``, then NEL or U+2028). An ``ISA``-led
-    reply declares what main's read declares, nothing, so its unencodable characters are replaced
-    and the reply is sent, as on main."""
+    shapes main replaced and sent (``nel-each`` and ``u2028-each``). An ``ISA``-led reply declares
+    what main's read declares, nothing, so its unencodable characters are replaced and the reply is
+    sent, as on main."""
     assert framing_mod._reply_delimiters(reply) == _main_reply_delimiters(reply) == frozenset()
     body, replaced = framing_mod.encode_reply_reporting(reply, "ascii", connection="IB_X12_MAIN")
     assert replaced and body == reply.encode("ascii", errors="replace")
+
+
+def test_control_the_main_reference_reads_an_msh_reply() -> None:
+    """Negative control for the reference copy above: on a one-line ``MSH`` reply it and this
+    branch's read both return the declared delimiters, so the copy is not a constant."""
+    reply = "MSH|^~" + BS + "&|R" + CR
+    expected = frozenset({"|", "^", "~", BS, "&", CR})
+    assert _main_reply_delimiters(reply) == framing_mod._reply_delimiters(reply) == expected
 
 
 def test_an_lf_inside_a_field_of_a_cr_reply_is_data_not_a_header() -> None:

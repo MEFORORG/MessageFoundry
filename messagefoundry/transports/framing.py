@@ -275,11 +275,11 @@ def _encode_replacing(reply: str, encoding: str, connection: str) -> bytes:
     The ``replace`` handler writes ``?`` on encode. An HL7 reply declares its own delimiters in
     MSH-1 and MSH-2 (or a ``BHS`` or ``FHS`` header's same fields), and HL7 lets a sender pick
     ``?`` as one, so where it is a delimiter or the segment terminator a replaced data character
-    would become structure (ADR 0206). That reply is refused with the same fixed error instead. So
-    is one with a delimiter the charset cannot hold: the delimiter itself would become ``?`` beside
-    replaced data characters, and both would read as one delimiter. :func:`_reply_delimiters` says
-    which headers are read; a reply led by none of them, an X12 ``ISA``-led reply included, has no
-    delimiters read here to collide with."""
+    would become structure (ADR 0206). Where :func:`_reply_delimiters` reads that delimiter, the
+    reply is refused with the same fixed error instead. So is one with a delimiter it reads that the
+    charset cannot hold: the delimiter itself would become ``?`` beside replaced data characters,
+    and both would read as one delimiter. That function says which headers and fields are read, and
+    which replies declare nothing."""
     delimiters = _reply_delimiters(reply)
     if _REPLACEMENT in delimiters or not all(_encodes(d, encoding) for d in delimiters):
         raise UnicodeError(
@@ -331,10 +331,14 @@ def _reply_delimiters(reply: str) -> frozenset[str]:
     An HL7 reply led by one of ``HEADER_IDS`` (``MSH``, ``BHS``, ``FHS``) is read on every segment
     that starts with one of them, each in the MSH-1/MSH-2 layout ``_extract_separators`` reads, so
     a batch member's own ``MSH`` counts as its envelope does (BACKLOG #5799: before, only the first
-    line of an ``MSH``-led reply was read). Its segments end at CR when the reply holds one, so an
-    LF inside a field is data, and at LF only in a reply with no CR; that terminator, and the LF of
-    a CR+LF end, are declared too. An X12 reply led by ``ISA`` declares nothing here, so a ``?``
-    delimiter in its ``ISA`` is not refused and ``?`` can be written into its data.
+    line of an ``MSH``-led reply was read). Its segments end at CR when the reply holds one, and
+    at LF only in a reply with no CR; that terminator, and the LF of a CR+LF end, are declared too.
+    So a header after a lone LF in a CR reply is not read, though a receiver that reads every LF
+    as a segment break, as ``parsing.peek.normalize`` does, reads it as one. The fifth MSH-2
+    character (the v2.7 truncation character) is not read either. An X12 reply led by ``ISA``
+    declares nothing here, as on main before #5799 (its ISA read was withdrawn and is still open),
+    so an ``ISA`` delimiter that is ``?`` or that the charset cannot encode is not refused, and
+    ``?`` can be written into the reply's data.
 
     Leading whitespace and a BOM are skipped first, as the engine's one definition of tolerated
     leading noise (``sniff._LEADING_WS_STR``) skips them. A header line of ``MSH`` alone has no
