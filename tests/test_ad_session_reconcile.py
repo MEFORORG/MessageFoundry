@@ -3055,11 +3055,9 @@ async def test_a_suspended_rollup_does_not_mute_a_later_rollup_of_other_accounts
             first = await _pass(service, sink)
         assert first.unreached_rollup and len(first.unreached) == 7
         await uac._settle(sink)
-        [(event_type, opened)] = [
-            (t, s)
-            for t, s in await uac._open_alerts(store)
-            if s.startswith(f"{_UNREACHED_ROLLUP_SOURCE}:")
-        ]
+        # The rollup's instance is the only one open, whatever its source is called, so this
+        # reads it as the API's suspend route would, on the code before the fix too.
+        [(event_type, opened)] = await uac._open_alerts(store)
         sink.suspend(event_type, opened, until=time.time() + 3600)
         ldap.unreachable = set(first_group) | set(second_group)
         for _ in range(3):
