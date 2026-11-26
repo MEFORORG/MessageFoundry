@@ -9193,40 +9193,41 @@ def forget_store_salt(path: Path) -> bool:
     For a store that is a copy of another: what ``restore`` places, and the scratch copy the full
     restore-verify opens. A copy carries the original's salt, so it would seal under the original's
     data sub-key while counting that key's use from the copy's older row -- the rewind ADR 0196
-    closes. With no salt row, the first open whose cipher takes a salt (a keyed local AES-GCM open;
-    ``bind_store_salt`` in ``gcm_bound`` names the ciphers that take none) mints a salt and so a key
-    nothing has used, before it seals anything; every value already in the file names its own salt
-    and still opens.
+    closes. With no salt row, the first open that binds a salt mints one and so a key nothing has
+    used, before it seals anything. Not every open binds one: ``bind_store_salt`` in ``gcm_bound``
+    names those that do not, at least the identity and ``vault_transit`` ciphers and the frozen v1
+    writer (``[store].aad_bind = false``), and for those this call changes no key. Values already in
+    the file still open: a v4 value names its own salt, and an older one needs only the DEK.
 
     Synchronous, for the off-loop restore path. What it returns or raises, in at least these cases:
 
     - **True**: an ordinary ``store_salt`` table held at least one row, the delete removed it, and
-      the proof below found none left in the MAIN FILE.
+      the re-read below found none left in the MAIN FILE.
     - **False, with an ordinary table**: the ``store_salt`` table was there but the delete removed no
       row, normally because it was empty, so there was nothing to forget.
     - **False, with no ordinary table of that name**: a file from before ADR 0196 has none, and its
-      first writable open creates one. But the name may instead be held by an object this build did
-      not make, at least a view or a virtual table another tool left. Such an object is neither
-      read nor dropped, so this False proves nothing about a salt. The object stays in the copy,
-      and it is the next writable :meth:`MessageStore.open` of it that refuses, with
-      :class:`SchemaMismatchError` (for a view or a virtual table the differences name ``table
-      'store_salt' is missing``); a ``read_only=True`` open logs the difference and opens. A restore
-      has by then placed the copy.
-    - **Raises** ``sqlite3.OperationalError``, on any of the paths above, when the file stays in WAL
-      mode (the switch below fails while another connection holds a WAL file), when a non-empty
-      ``-wal`` remains afterwards, or when the read-only re-read still finds a row in the ordinary
-      table, whether or not the delete reported removing one. Other ``sqlite3.Error`` subclasses
-      from opening or reading the file propagate too.
+      first writable open creates one. A path with no file is in this case too: the connect creates
+      an empty file there. But the name may instead be held by an object this build did not make, at
+      least a view or a virtual table another tool left. Such an object is neither read nor dropped,
+      so this False proves nothing about a salt. The object stays in the copy, and it is a later
+      :meth:`MessageStore.open` that refuses it: the writable open with
+      :class:`SchemaMismatchError`; see that method for what a ``read_only=True`` open does. A
+      restore that reaches this call with such an object goes on to place the copy.
+    - **Raises** ``sqlite3.OperationalError`` when the file cannot be written as a closed file or
+      the write is not proven: at least when another connection's hold makes the journal-mode switch
+      or the delete fail (``database is locked``, or on a WAL file the switch refused), when a
+      non-empty ``-wal`` remains afterwards, or when the read-only re-read still finds a row in the
+      ordinary table, whether or not the delete reported removing one. SQLite does not refuse every
+      other holder: on a file in rollback-journal mode, an idle second connection lets the call
+      write. Other ``sqlite3.Error`` subclasses from opening or reading the file propagate too.
 
-    **On every path it re-reads the MAIN FILE, and raises if an ordinary table still holds a row.**
-    A snapshot can carry WAL mode in its header, and then a plain DELETE commits into ``-wal``. The
-    callers place or open only the main file, so a delete left in a WAL that was never checkpointed
-    would be silently dropped, and the copy would keep the original's salt. So the file is first
-    switched to ``journal_mode=DELETE``, which checkpoints the WAL and removes it; on a file in WAL
-    mode SQLite refuses the switch while another connection holds the file, but on a file already
-    in rollback-journal mode the switch succeeds whoever else holds it. After the delete, the main
-    file is re-read with no ``-wal`` beside it. A refusal is the caller's to report; it never
-    places an unproven copy."""
+    **On each path that returns, it has re-read the MAIN FILE and found no row in an ordinary
+    table.** A snapshot can carry WAL mode in its header, and then a plain DELETE commits into
+    ``-wal``. The callers place or open only the main file, so a delete left in a WAL that was never
+    checkpointed would be silently dropped, and the copy would keep the original's salt. So the file
+    is first switched to ``journal_mode=DELETE``, which checkpoints the WAL and removes it. After the
+    delete, the main file is re-read with no ``-wal`` beside it. A refusal is the caller's to
+    report; it never places an unproven copy."""
 
     # The ordinary-table predicate, so a virtual `store_salt` another tool left, whose module may
     # not be loaded here, is not probed and cannot raise "no such module" (BACKLOG #6719 item 4).
@@ -9272,9 +9273,9 @@ def _write_closed_store[T](
     """Run ``write`` on a CLOSED SQLite store file and prove it landed in the MAIN FILE, for
     :func:`forget_store_salt` and :func:`write_restore_marker`.
 
-    The file is first switched to ``journal_mode=DELETE``, which checkpoints a WAL and removes it,
-    and which SQLite refuses while another connection holds the file; ``write`` then runs in
-    autocommit. Afterwards a non-empty ``-wal`` beside it, or a read-only re-read on which ``prove``
+    The file is first switched to ``journal_mode=DELETE``, which checkpoints a WAL and removes it;
+    on a WAL file SQLite refuses the switch while another connection holds it, but not every other
+    holder is refused (:func:`forget_store_salt` says which). ``write`` then runs in autocommit. Afterwards a non-empty ``-wal`` beside it, or a read-only re-read on which ``prove``
     answers False, raises ``sqlite3.OperationalError``: a caller places or opens only the main
     file, so a change left in a WAL nobody checkpoints would be silently dropped."""
     wal = path.with_name(path.name + "-wal")

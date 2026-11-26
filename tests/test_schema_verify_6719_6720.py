@@ -292,6 +292,11 @@ async def test_forget_store_salt_true_on_an_ordinary_salt_row_and_the_copy_opens
     await _fresh(path)
     _sql(path, "INSERT INTO store_salt (id, salt, created_at) VALUES (1, 's', 0)")
     assert forget_store_salt(path) is True
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("SELECT count(*) FROM store_salt").fetchone()[0] == 0
+    finally:
+        conn.close()
     await _fresh(path)
 
 
