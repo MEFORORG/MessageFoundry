@@ -1051,6 +1051,41 @@ def test_a_harmless_attribute_container_or_self_still_validates(tmp_path: Path, 
     reg.validate()
 
 
+_EQ_CALLS: list[object] = []
+
+
+class _ComparingMeta(type):
+    """A metaclass whose ``__eq__`` is author code: the walk's container test must never run it."""
+
+    def __eq__(cls, other: object) -> bool:
+        _EQ_CALLS.append(other)
+        return False
+
+    __hash__ = type.__hash__
+
+
+class _Comparing(metaclass=_ComparingMeta):
+    pass
+
+
+_COMPARING = _Comparing()
+
+
+def _reads_a_comparing_global(msg: Any) -> bool:
+    return _COMPARING is not None
+
+
+def test_the_container_test_runs_no_metaclass_eq(tmp_path: Path) -> None:
+    """The walk matches a container by exact type. An equality test (``kind in (tuple, ...)``)
+    would run a reached object's metaclass ``__eq__``, author code, during validate; an identity
+    test runs none (BACKLOG #5514)."""
+    _EQ_CALLS.clear()
+    reg = _reg(tmp_path)
+    reg.handler_accepts["h"] = _reads_a_comparing_global
+    reg.validate()
+    assert _EQ_CALLS == []
+
+
 @pytest.mark.parametrize(
     "pred",
     [

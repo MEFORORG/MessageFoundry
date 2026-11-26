@@ -117,3 +117,31 @@ def test_a_numeric_builtin_cast_keeps_two_refs_equal() -> None:
     """The guard compares equal per cast, so two references written alike still compare equal."""
     assert env("r", cast=abs) == env("r", cast=abs)
     assert EnvRef(key="r", cast=Decimal).cast == env("r", cast=Decimal).cast
+
+
+_EQ_CALLS: list[object] = []
+
+
+class _ComparingMeta(type):
+    """A metaclass whose ``__eq__`` is author code: the numeric-cast test must never run it."""
+
+    def __eq__(cls, other: object) -> bool:
+        _EQ_CALLS.append(other)
+        return False
+
+    __hash__ = type.__hash__
+
+
+class _AuthorCast(metaclass=_ComparingMeta):
+    def __init__(self, raw: object) -> None:
+        self.raw = raw
+
+
+def test_the_numeric_cast_test_runs_no_metaclass_eq() -> None:
+    """The cast is matched against ``bool``, ``int`` and ``float`` by identity, as the docstring
+    says, so an author cast's metaclass ``__eq__`` never runs. A type that is not a number is left
+    as given (vault BACKLOG #1650)."""
+    _EQ_CALLS.clear()
+    ref = env("r", cast=_AuthorCast)
+    assert _EQ_CALLS == []
+    assert ref.cast is _AuthorCast

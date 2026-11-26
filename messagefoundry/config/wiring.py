@@ -362,9 +362,10 @@ class EnvRef:
         # The builtin ``float`` reads a TOML ``true`` as 1.0 the same way.
         elif self.cast is float:
             object.__setattr__(self, "cast", _cast_float)
-        # Any other numeric builtin or number type (``abs``, ``round``, ``decimal.Decimal``) reads a
-        # TOML ``true`` as 1 the same way, so it gets a bool refused ahead of it.
-        elif _is_numeric_builtin_cast(self.cast):
+        # Some other numeric builtins and every number type (``abs``, ``round``, ``decimal.Decimal``)
+        # read a TOML ``true`` as 1 the same way, so those named in _NUMERIC_BUILTIN_FUNCTIONS, and
+        # number types, get a bool refused ahead of them. The function list is partial.
+        elif self.cast is not None and _is_numeric_builtin_cast(self.cast):
             object.__setattr__(self, "cast", _bool_refusing_cast(self.cast))
         # A default is never cast at resolve time, so ``default="false"`` would reach the connector
         # as text and read True there. Read it strictly here, once, on both routes: ``connections.toml``
@@ -427,9 +428,10 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     string as True. A ``default=`` with ``cast=bool`` is read the same way when the reference is
     made, and an unreadable one is refused then. ``cast=int`` means a strict whole-number reading
     (vault BACKLOG #1650, :func:`_cast_int`), and ``cast=float`` a strict finite-number reading
-    (:func:`_cast_float`). Another numeric builtin, such as ``abs`` or ``round``, or a number type,
-    such as ``decimal.Decimal``, refuses a TOML bool before it runs
-    (:func:`_is_numeric_builtin_cast` says which). Any other callable runs as given, on the
+    (:func:`_cast_float`). At least ``abs`` and ``round`` among the numeric builtins, and a number
+    type such as ``decimal.Decimal``, refuse a TOML bool before they run
+    (:func:`_is_numeric_builtin_cast` says which); the builtin list is partial, so at least
+    ``math.sqrt`` and ``operator.neg`` still read ``true`` as 1. Any other callable runs as given, on the
     environment value as it arrives, a TOML bool included, so ``cast=lambda v: int(v)`` still
     reads ``true`` as 1; the connector's own check sees only what the cast returned. On a boolean
     setting (a factory parameter annotated ``bool``, a composer's ``enabled``, or ``Ftp``'s ``tls``),
@@ -578,14 +580,16 @@ _NUMERIC_BUILTIN_FUNCTIONS: Final = (
 )
 
 
-def _is_numeric_builtin_cast(
-    cast: Callable[[Any], Any] | None,
-) -> TypeIs[Callable[[Any], Any]]:
+def _is_numeric_builtin_cast(cast: Callable[[Any], Any] | None) -> bool:
     """Whether ``cast`` is a numeric builtin or a number type, other than the ``int``, ``float`` and
     ``bool`` that :class:`EnvRef` swaps for its own reads. Each reads a TOML ``true`` as 1 (vault
-    BACKLOG #1650). Matched by identity, since an author's callable need not be hashable."""
+    BACKLOG #1650). Every comparison is by identity, since an author's callable need not be
+    hashable and an equality test would run its metaclass ``__eq__``. Returns ``bool``, not
+    ``TypeIs``: a False result says nothing about whether ``cast`` is None."""
     if isinstance(cast, type):
-        return cast not in (bool, int, float) and issubclass(cast, numbers.Number)
+        return not any(cast is own for own in (bool, int, float)) and issubclass(
+            cast, numbers.Number
+        )
     return any(cast is known for known in _NUMERIC_BUILTIN_FUNCTIONS)
 
 
@@ -6145,6 +6149,13 @@ _ACCEPTS_ALWAYS_FOLLOWED: Final = (functools.partial, MethodType, staticmethod, 
 #: code from its ``__iter__`` (BACKLOG #5514, engine PR 2997's left list).
 _ACCEPTS_CONTAINER_TYPES: Final = (tuple, list, dict, set, frozenset)
 
+
+def _is_accepts_container(kind: type) -> bool:
+    """Whether ``kind`` is exactly one of :data:`_ACCEPTS_CONTAINER_TYPES`. By identity: ``kind in``
+    the tuple would test equality and run an author metaclass's ``__eq__`` during the walk."""
+    return any(kind is container for container in _ACCEPTS_CONTAINER_TYPES)
+
+
 #: The instructions that load a local, the first parameter included.
 _LOCAL_LOADS: Final = frozenset({"LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK"})
 
@@ -6256,7 +6267,7 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
         kind = type(value)
         if id(value) in accessors or issubclass(kind, _ACCEPTS_ALWAYS_FOLLOWED):
             return True
-        if kind in _ACCEPTS_CONTAINER_TYPES:  # exact types, so no author __iter__ runs
+        if _is_accepts_container(kind):  # exact types, so no author __iter__ runs
             return True
         if issubclass(kind, type) or not callable(value):
             return False
@@ -6300,7 +6311,7 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
             return []
         kind = type(obj)
         edges = [edge for edge in _accepts_callees(obj) if obj is pred or followed(edge)]
-        if kind in _ACCEPTS_CONTAINER_TYPES:
+        if _is_accepts_container(kind):
             items = cast("Iterable[object]", obj)
             if kind is dict:
                 table = cast("dict[object, object]", obj)
