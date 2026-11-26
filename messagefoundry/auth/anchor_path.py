@@ -83,12 +83,16 @@ class PathVerdict:
     """The result of checking an anchor's resolution chain. ``platform`` picks the fix text.
 
     ``engine`` names the account the check trusted as the engine's own, for the message: the
-    verdict depends on it, so a check run by another account can answer differently."""
+    verdict depends on it, so a check run by another account can answer differently.
+
+    ``regular_file`` is the physical path of the regular file the POSIX walk reached, with links
+    and ``..`` resolved as the kernel resolves them, or ``None`` where it reached none."""
 
     ok: bool | None
     findings: tuple[ChainFinding, ...] = ()
     platform: str = "posix"
     engine: str | None = field(default=None, compare=False)
+    regular_file: str | None = field(default=None, compare=False)
 
 
 def _combine(findings: Iterable[ChainFinding]) -> bool | None:
@@ -916,6 +920,7 @@ def posix_path_verdict(
     todo = [c for c in path.split("/") if c]
     cur = "/"
     hops = 0
+    regular: str | None = None
     try:
         cur_st = lstat_fn(cur)
     except OSError as exc:
@@ -998,10 +1003,14 @@ def posix_path_verdict(
             findings.append(ChainFinding(child, FILE, False, "the path continues past a file"))
         elif not stat.S_ISREG(child_st.mode):
             findings.append(ChainFinding(child, FILE, True, "it is not a regular file"))
-        elif child_st.mode & 0o022:
-            findings.append(
-                ChainFinding(child, FILE, True, "group or others can write to it", writable=True)
-            )
+        else:
+            regular = child
+            if child_st.mode & 0o022:
+                findings.append(
+                    ChainFinding(
+                        child, FILE, True, "group or others can write to it", writable=True
+                    )
+                )
         break
     else:
         # The components ran out on a directory: the anchor is not a file.
@@ -1009,7 +1018,7 @@ def posix_path_verdict(
             ChainFinding(cur, DIRECTORY, True, "the path names a directory, not a file")
         )
     found = _dedupe(findings, fold_case=False)
-    return PathVerdict(_combine(found), found, "posix", engine)
+    return PathVerdict(_combine(found), found, "posix", engine, regular)
 
 
 # =================================================================================================

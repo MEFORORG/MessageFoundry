@@ -363,7 +363,6 @@ from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol, runtime_chec
 
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
 from messagefoundry.auth.anchor_path import (
-    FILE,
     LINK,
     ChainFinding,
     PathVerdict,
@@ -1779,11 +1778,12 @@ def _path_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> list[str]:
     # Under a mount the check cannot vouch for, a fix in place does not make the anchor pass, so
     # only the anchor's own file gets its commands, and its own folder the chmod alone: never a
     # chown of a folder, which may be a user's home folder, nor a command on a folder above them.
+    # Both are the regular file the walk reached, resolved as the kernel resolves the path; a path
+    # that names no regular file has neither.
     mount = _untrusted_mount(verdict)
-    own = {f.path for f in bad if f.kind == FILE}
-    if spec.path.startswith("/"):
-        own.add(posixpath.normpath(spec.path))
-    own_folders = {posixpath.dirname(p) for p in own}
+    reached = check.regular_file if check is not None else None
+    own = {reached} if reached else set()
+    own_folders = {posixpath.dirname(reached)} if reached else set()
     cmds: list[str] = []
     for obj in objects:
         q = shlex.quote(obj)
@@ -1795,13 +1795,6 @@ def _path_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> list[str]:
     if mount is not None:
         lead = "The path is also replaceable; fix that first"
         fixes = [lead + ":", *cmds] if cmds else [lead + "."]
-        # Not a regular file, or a directory: no command fixes the anchor's own path.
-        fixes += [
-            f"{f.path!r}: this finding needs the file replaced by a regular file only root can "
-            "change."
-            for f in bad
-            if f.path in own and not (f.owner or f.writable)
-        ]
         return _mount_fix(spec, verdict, mount, fixes)
     lead = (
         move + f"can change, such as a root-owned 755 folder like {_POSIX_FOLDER} on a file system "

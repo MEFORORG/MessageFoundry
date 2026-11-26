@@ -985,14 +985,42 @@ def test_an_insecure_path_under_an_untrusted_mount_is_the_template(by_path: bool
     _assert_template(text, present, [_S3, _FINGERPRINT, _S2_FILE, "pin it to", "outside '/'"])
 
 
-def test_a_finding_no_command_fixes_names_the_file_to_replace() -> None:
-    """A finding no command fixes, here a path that is not a regular file, gets no command and the
-    sentence saying the file needs replacing. Red under the text that named no remedy."""
+def test_a_path_that_is_not_a_regular_file_gets_no_command() -> None:
+    """A path that is not a regular file is named without a command, as a folder above it is."""
     odd = ap.ChainFinding("/srv/a.pem", FILE, True, "it is not a regular file")
     overlay = _posix("/srv/a.pem", _MOUNT_TABLE, fstype={"/": "overlay"})
     (root,) = overlay.findings
     text = _path_text(ap.PathVerdict(False, (odd, root), "posix", "uid 7"), "/srv/a.pem")
-    _assert_template(text, [_s1("/", "overlay"), _S2, _S2_FILE, _S4, _S6], [_S2 + ":", "chmod"])
+    _assert_template(text, [_s1("/", "overlay"), _S2 + ".", _S4, _S6], [_S2_FILE, "chmod"])
+
+
+def test_a_directory_named_as_the_anchor_gets_no_command() -> None:
+    """The setting names a directory another account owns, under an overlay '/': no chown of that
+    folder, which may be a user's home folder, and no word of replacing it with a file. Red under
+    the own-file commands the configured path drew whatever it named."""
+    table = {**_MOUNT_TABLE, **_USERS}
+    v = _posix("/data/team", table, fstype={"/": "overlay"})
+    assert v.ok is False
+    text = _path_text(v, "/data/team", pin_setting="[x].pin")
+    _assert_template(text, [_s1("/", "overlay"), _S2 + ".", _S4], [_S2_FILE, "chown", "chmod"])
+
+
+def test_a_link_then_dotdot_draws_no_chmod_above_the_anchor() -> None:
+    """``/data/team/link/../ca.pem`` with ``link`` pointing at ``/etc`` opens ``/ca.pem``, as the
+    kernel resolves it, so the anchor's own folder is ``/``, not ``/data/team``. Red under the
+    lexical folder, which drew ``chmod go-w /data/team``."""
+    table = {
+        **_MOUNT_TABLE,
+        **_USERS,
+        "/data/team": (0, D777),
+        "/data/team/link": (0, LNK),
+        "/ca.pem": (0, F644),
+    }
+    anchor = "/data/team/link/../ca.pem"
+    v = _posix(anchor, table, links={"/data/team/link": "/etc"}, fstype={"/": "overlay"})
+    assert v.ok is False and [f.path for f in v.findings if f.insecure] == ["/data/team"]
+    text = _path_text(v, anchor, pin_setting="[x].pin")
+    _assert_template(text, [_s1("/", "overlay"), _S2 + ".", _S4], ["chmod", "chown"])
 
 
 @pytest.mark.parametrize(
