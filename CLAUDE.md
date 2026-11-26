@@ -447,62 +447,57 @@ nobody checked it. A Manager seat added, the same day, that spawning should be r
 cannot outlive a mistake, and a spawned session can. The full notices are in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md
 text moved in wave 2*.
 
-**The Lander may send a repair Builder subagent to a held PR as soon as the hold is posted**
-(owner instruction 2026-11-26, in the Lander's chat: *"Change the rules to allow you and future
-landers to be more proactive"*). That sentence named no number. The 30-minute windows and the
-cap of two repairs here, and the 30-minute transfer and `hold-ack` expiry in the next paragraph,
-were set in the Lander's brief written under that instruction, which the owner directed the
-Manager to follow exactly (2026-11-26, in the Manager's chat); the not-live guard's question
-window in the next paragraph stays at 2 hours. All of these must hold: the hold names one
-determinate fix, such as a doc, a comment, a test, or a code change the hold spells out, and not
-a question of intent, of an owner ruling or of behaviour; the hold still names the PR's head, and
-no author answer since the hold disputes it; the PR is not queued and has no armed auto-merge
-request; the PR carries no unminimized repair-owner marker (next paragraph), since its repairs
-are then the Repair Manager's; the PR is not ASVS record content, which stays a Manager's (owner
-ruling 2026-09-23); and the author has not answered the hold in the last 30 minutes, with a
-`hold-ack` (next paragraph), a comment or a commit. If the author has, the Lander reads that
-answer on its turn and waits for that author until 30 minutes after it. A commit moves the head,
-so a repair after one needs a fresh hold at the new head. The Builder fetches before it pushes,
-never force-pushes, stops if the head moved, stops at any refusal, and makes only the fixes the
-hold names. At most two repairs per PR. A further hold then goes to the Repair Manager by the
-transfer steps in the next paragraph, whether or not the author acknowledged it, though the
-30-minute answer exception still defers it. Every other non-trivial fix still goes to a spawned
-Manager session, as the paragraph above says. Before it merges a repair head, the Lander re-reads
-the PR's comments since the hold, and an author objection returns the PR to the author (fleet
-wiki lesson 20261124T012815379Z-wd9e1o). The Lander merges only once a code-review fork at
-`xhigh` that the Lander starts itself, on the repair head, covers it, its tag read with
-`review_tag.py`; the repair Builder's own QA does not count. That independent review is what
-keeps authoring apart from landing. This paragraph's change left it unchanged, along with the
-review proof the merge bullet below requires, and did not change what goes to the owner.
-**Repairing at once, and the shorter windows in the next paragraph, raise at least this risk:**
-an author's own Builder may already be mid-fix on a held PR that looks quiet. Fleet wiki lesson
-20261103T145659705Z-kqwvhx found one on 2 of 4 quiet PRs, measured under the old 2-hour window,
-so at once is likely worse. The change removed at least two checks that also guarded against
-it, the mail to the author and the live-session test. The collision controls left include at
-least the head-moved check that binds repair Builders, which are briefed with it, the test that
-the hold still names the head, and the 30-minute answer exception. On a PR that looks quiet, the
-last two see nothing; what still bears on this risk there includes at least the head-moved
-check, which acts only if the author pushes first. An author's in-flight Builder is not briefed
-with that check and may have none.
-**CHANGED 2026-11-26:** this rule required 2 hours of author silence, a mail to the author with
-no reply, and an author not live, and allowed one repair per PR (decision
-d20261029T165610526-c13ae6, under the owner's delegation of 2026-10-29; window cut from 4 hours to
-2 by the owner ruling of 2026-11-03 in the next paragraph).
+**The Lander may send a repair Builder subagent to a held PR as soon as the hold is posted** (owner
+instruction 2026-11-26, in the Lander's chat: *"Change the rules to allow you and future landers to
+be more proactive"*). That sentence named no number. The 30-minute windows and the cap of two
+repairs here, and the 30-minute transfer and `hold-ack` expiry in the next paragraph, were set in
+the Lander's brief written under that instruction, which the owner directed the Manager to follow
+exactly (2026-11-26, in the Manager's chat); the not-live guard's question window in the next
+paragraph stays at 2 hours. All of these must hold: the hold names one determinate fix, such as a
+doc, a comment, a test, or a code change the hold spells out, and not a question of intent, of an
+owner ruling or of behaviour; the hold still names the PR's head, and no author answer since the
+hold disputes it; the PR is not queued and has no armed auto-merge request; the PR carries no
+unminimized repair-owner marker (next paragraph), since its repairs are then the Repair Manager's;
+the PR is not ASVS record content, which stays a Manager's (owner ruling 2026-09-23); and the author
+has not answered the hold in the last 30 minutes, with a `hold-ack` (next paragraph), a comment or a
+commit. If the author has, the Lander reads that answer on its turn and waits for that author until
+30 minutes after it. A commit moves the head, so a repair after one needs a fresh hold at the new
+head. The Builder fetches before it pushes, never force-pushes, stops if the head moved, stops at
+any refusal, and makes only the fixes the hold names. At most two repairs per PR. A further hold
+then follows the next paragraph's ordinary transfer rule, with its acknowledgement and not-live
+tests. Every other non-trivial fix still goes to a spawned Manager session, as the paragraph above
+says. Before it merges a repair head, the Lander re-reads the PR's comments since the hold, and an
+author objection returns the PR to the author (fleet wiki lesson 20261124T012815379Z-wd9e1o). The
+Lander merges only once a code-review fork at `xhigh` that the Lander starts itself, on the repair
+head, covers it, its tag read with `review_tag.py`; the repair Builder's own QA does not count. That
+independent review is what keeps authoring apart from landing. This paragraph's change left it
+unchanged, along with the review proof the merge bullet below requires, and did not change what goes
+to the owner. **Repairing at once, and the shorter windows in the next paragraph, raise at least
+this risk:** an author's own Builder may already be mid-fix on a held PR that looks quiet. Fleet
+wiki lesson 20261103T145659705Z-kqwvhx found one on 2 of 4 quiet PRs, measured under the old 2-hour
+window, so at once is likely worse. The change removed at least two checks that also guarded against
+it, the mail to the author and the live-session test. The collision controls left include at least
+the head-moved check that binds repair Builders, which are briefed with it, the test that the hold
+still names the head, and the 30-minute answer exception. On a PR that looks quiet, the last two see
+nothing; what still bears on this risk there includes at least the head-moved check, which acts only
+if the author pushes first. An author's in-flight Builder is not briefed with that check and may
+have none. **CHANGED 2026-11-26:** this rule required 2 hours of author silence, a mail to the
+author with no reply, and an author not live, and allowed one repair per PR (decision
+d20261029T165610526-c13ae6, under the owner's delegation of 2026-10-29; window cut from 4 hours to 2
+by the owner ruling of 2026-11-03 in the next paragraph).
 
 **A held PR whose author has not acknowledged the hold within 30 minutes transfers to the Repair
 Manager.** The owner ruling of 2026-11-03 adopted the transfer, at 2 hours: asked *"Which tiers do
 you want to adopt?"* of the Repair Manager proposal, the owner answered *"Tiers 1 and 2"*. The
 paragraph above says where the 30-minute window comes from. This covers a hold the paragraph above
 does not take, so the Repair Manager is the spawned Manager that paragraph sends a non-trivial fix
-or a hold after its second repair to. That second case transfers whether or not the author
-acknowledged it, with no not-live test; an author answer that disputes the hold returns it to the
-author instead. An acknowledgement is an author comment or commit; the `hold-ack` marker
-`scripts/coord/held_pr_turns.py` reads is its unambiguous form, and since every seat acts as the
-owner's GitHub identity, only the original author's comment or commit counts, a commit its own
-Builders push included; one from the Lander, another seat or a workflow is not one, the Lander's
-branch updates included. A `hold-ack` expires 30 minutes after it while it is still the original
-author's newest event since the hold and no commit by the original author has landed since it
-(2026-11-26, as the paragraph above says; the earlier 2 hours was decided by the Lander under the
+or a hold after its second repair to. An acknowledgement is an author comment or commit; the
+`hold-ack` marker `scripts/coord/held_pr_turns.py` reads is its unambiguous form, and since every
+seat acts as the owner's GitHub identity, only the original author's comment or commit counts, a
+commit its own Builders push included; one from the Lander, another seat or a workflow is not one,
+the Lander's branch updates included. A `hold-ack` expires 30 minutes after it while it is still the
+original author's newest event since the hold and no commit by the original author has landed since
+it (2026-11-26, as the paragraph above says; the earlier 2 hours was decided by the Lander under the
 owner's delegation of 2026-11-03, record d20261103T190111765-2aa8b6: asked *"should a hold-ack
 expire 2h after it"*, the owner answered *"/driver"*). The hold then counts as unacknowledged, which
 `scripts/coord/held_pr_turns.py` shows as the Lander's turn, flagged `ack-expired` only while the
