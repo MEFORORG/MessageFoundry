@@ -3962,7 +3962,7 @@ def _repick_write(source: str, line_start: int, line_end: int, before: ast.AST) 
             raise LensRewriteError(
                 "this edit would copy a whole field into a component or subcomponent, which a "
                 "native msg.set or msg.set_data escapes a second time - delete the row and "
-                "insert a Copy Field "
+                "insert a copy-field row "
                 "(it is written as the copy_field call), or edit it as text"
             )
         if not isinstance(src, str) or _is_leaf_literal(getattr(dst, "value", None)):

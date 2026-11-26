@@ -1111,7 +1111,7 @@ def test_the_refused_whole_field_to_leaf_copy_inserts_as_the_action_call() -> No
     source = LENS_SOURCE + '    msg.set("NK1-2", msg.field("PID-5") or "")\n'
     row = _copy_rows(source)[0]
     edit = {"op": "set_params", "line_start": row["line_start"], "line_end": row["line_end"]}
-    with pytest.raises(LensRewriteError, match="Copy Field"):
+    with pytest.raises(LensRewriteError, match="copy-field row"):
         rewrite_source(source, {**edit, "params": {"dst": "NK1-2.1"}})
     assert '    copy_field(msg, "PID-5", "NK1-2.1")\n' in _lens_insert_copy("PID-5", "NK1-2.1")
 
