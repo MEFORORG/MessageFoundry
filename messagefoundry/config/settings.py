@@ -7805,21 +7805,17 @@ class DrSettings(_Section):
     the fence; ``takeover_hook`` is optional belt-and-braces for non-LB topologies). **Activation is
     MANUAL** (``POST /dr/activate``, gated by the ``dr:operate`` permission); ``auto`` is rejected at load.
 
-    ``enabled``/``activate`` are read at engine start (the DR run-profile is a startup decision, ADR
-    0048); a deployment is either a DR box (``enabled = true``) or it is not. ``activate = true`` (or
-    the operator endpoint) declares this box should run under the DR profile this boot. Without
-    ``enabled``, ``activate = true`` is refused at load, where it was silently ignored (BACKLOG
-    #5965).
+    ``enabled`` is read at engine start; a deployment is either a DR box (``enabled = true``) or it
+    is not. A DR box always starts PASSIVE, and ``POST /dr/activate`` is the only way it comes up
+    under the DR run-profile: that route verifies the cold seed, runs the takeover hook and writes
+    the ``dr.activate`` audit row. The former ``activate`` startup latch skipped all three, so it was
+    removed and is refused at load as a removed key (owner ruling 2026-11-25, BACKLOG #5965).
     """
 
     # Opt-in master switch: is this deployment a DR standby box at all? false = the engine runs the
-    # NORMAL run-profile (every connection starts subject only to ADR 0031), byte-unchanged.
+    # NORMAL run-profile (every connection starts subject only to ADR 0031), byte-unchanged. true =
+    # a provisioned-but-passive box: it binds no priority feed until POST /dr/activate promotes it.
     enabled: bool = False
-    # Whether this DR box should come up UNDER the DR run-profile on this boot (the startup activation
-    # latch — distinct from the runtime POST /dr/activate endpoint, which re-evaluates the graph). When
-    # enabled but activate=false the box is provisioned-but-passive: it does NOT bind the priority feeds
-    # until an operator activates it. Refused at load unless enabled (BACKLOG #5965).
-    activate: bool = False
     activation_mode: DrActivationMode = DrActivationMode.MANUAL
     # The DR run-profile threshold: start ONLY connections whose resolved priority rank >= this tier's
     # rank. CRITICAL (the default, owner-locked) starts only the critical feeds; NORMAL would also start
@@ -7844,11 +7840,9 @@ class DrSettings(_Section):
     # The #60 .mfbak backup archive to cold-seed the DR store from on activation. "" = the operator
     # supplies the archive path in the POST /dr/activate request body instead (the runbook path),
     # which needs seed_dir below. A URL is rejected (the seed is local/UNC only, like the
-    # backup destination — no new egress). With seed_dir also empty, a passive box (enabled, with
-    # activate = false) is refused at load: no activation could ever name a seed (BACKLOG #5965 item
-    # 1). A box latched with activate = true loads with neither set; what that means after POST
-    # /dr/release is stated once, in the [dr] enabled row of docs/CONFIGURATION.md. Whitespace-only
-    # is refused too.
+    # backup destination — no new egress). With seed_dir also empty, an enabled box is refused at
+    # load: no activation could ever name a seed (BACKLOG #5965 item 1). Whitespace-only is refused
+    # too.
     seed_archive: str = ""
     # The one directory a POST /dr/activate request body may name an archive under (vault BACKLOG
     # #2581). "" (the default) = a request may name NO archive, and activation uses seed_archive,
@@ -7963,25 +7957,11 @@ class DrSettings(_Section):
         return self
 
     @model_validator(mode="after")
-    def _activate_needs_enabled(self) -> DrSettings:
-        # BACKLOG #5965: without enabled the engine never read activate, so a box an operator
-        # meant to bring up under the DR run-profile came up as an ordinary engine with nothing
-        # said. With enabled it is the startup latch, unchanged.
-        if self.activate and not self.enabled:
-            raise ValueError(
-                "[dr].activate = true needs [dr].enabled = true: it brings a DR box up under the "
-                "DR run-profile, and has no meaning on a box that is not a DR box"
-            )
-        return self
-
-    @model_validator(mode="after")
     def _enabled_names_a_seed(self) -> DrSettings:
-        # BACKLOG #5965 item 1: on a passive box with neither set, every activation aborts for
-        # want of a seed, and that is found only during the disaster. seed_archive names one;
-        # seed_dir lets the POST /dr/activate request name one. A box under activate = true is
-        # exempt: it takes the startup latch, which reads no seed, and that path is unchanged
-        # here (its routing through a seeded activation is the open part of BACKLOG #5965).
-        if self.enabled and not self.activate and not self.seed_archive and not self.seed_dir:
+        # BACKLOG #5965 item 1: on a DR box with neither set, every activation aborts for want of
+        # a seed, and that is found only during the disaster. seed_archive names one; seed_dir
+        # lets the POST /dr/activate request name one.
+        if self.enabled and not self.seed_archive and not self.seed_dir:
             raise ValueError(
                 "[dr].enabled = true needs [dr].seed_archive or [dr].seed_dir: with neither, "
                 "POST /dr/activate could never name the cold seed it verifies, so every activation "
@@ -8670,16 +8650,13 @@ class ServiceSettings(_InputHidingModel):
         moment it activates. Refuse the combination at config load rather than let it silently co-elect.
         Spans two sections, so it lives here (not on either section, which can't see the other).
 
-        ``[dr].enabled`` is refused with ``[cluster].enabled`` as well, whatever ``activate`` says
-        (vault BACKLOG #3263); ``activate`` without ``enabled`` is refused on its own (BACKLOG
-        #5965). A provisioned DR box that is not activated is passive: it binds no listener and
-        delivers nothing (ADR 0048). As a cluster member it could win the lease and then serve
-        nothing, and ``POST /dr/activate`` would make it the lease-contending DR box described
-        above."""
+        ``[dr].enabled`` is refused with ``[cluster].enabled`` (vault BACKLOG #3263). A DR box
+        starts passive (BACKLOG #5965): it binds no listener and delivers nothing (ADR 0048). As a
+        cluster member it could win the lease and then serve nothing, and ``POST /dr/activate``
+        would make it the lease-contending DR box described above."""
         if self.dr.enabled and self.cluster.enabled:
-            key = "[dr].activate" if self.dr.activate else "[dr].enabled"
             raise ValueError(
-                f"{key} cannot be combined with [cluster].enabled: the DR run-profile gates which "
+                "[dr].enabled cannot be combined with [cluster].enabled: the DR run-profile gates which "
                 "connections start, not leadership acquisition, so a DR box that also contends for the "
                 "cluster lease could win leadership and drive the primary store cross-WAN, and one "
                 "that is not activated is passive, so as leader it would serve nothing. Run the DR "
@@ -9501,6 +9478,14 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
         "check also always fails closed, so this key has nothing left to relax (BACKLOG #2090, "
         "ADR 0066 section 12). To run pooled on SQL Server, turn READ_COMMITTED_SNAPSHOT on for "
         "the database"
+    ),
+    # BACKLOG #5965 (owner ruling 2026-11-25). Named here so a config still setting it, true or
+    # false, is refused with the route to use rather than loaded with the key dropped.
+    ("dr", "activate"): (
+        "a DR box always starts passive, and the only way to bring it up under the DR "
+        "run-profile is POST /dr/activate, which verifies the cold seed, runs the takeover hook "
+        "and writes the dr.activate audit row; the startup latch skipped all three (BACKLOG "
+        "#5965)"
     ),
 }
 

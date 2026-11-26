@@ -153,7 +153,6 @@ async def seeded(tmp_path: Path) -> AsyncIterator[tuple[Engine, str]]:
         store_settings=ss,
         dr_settings=DrSettings(
             enabled=True,
-            activate=False,
             seed_archive=archive,
             takeover_hook=_OK_HOOK,
             priority_threshold=Priority.CRITICAL,

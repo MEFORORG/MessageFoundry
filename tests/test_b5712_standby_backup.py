@@ -161,22 +161,3 @@ async def test_the_scheduled_pass_is_not_due_on_a_passive_standby(tmp_path: Path
         assert runner._backup_due(day + 60.0) is True
     finally:
         await store.close()
-
-
-async def test_a_boot_latched_active_backs_up(tmp_path: Path) -> None:
-    db = tmp_path / "e.db"
-    engine = Engine(
-        await MessageStore.open(db),
-        poll_interval=0.05,
-        store_settings=StoreSettings(path=str(db)),
-        backup_settings=_backup_settings(tmp_path),
-        dr_settings=DrSettings(enabled=True, activate=True, seed_archive="seed.mfbak"),
-        egress_settings=EgressSettings(deny_by_default=False),
-    )
-    try:
-        await engine.start()
-        runner = engine._backup_runner
-        assert runner is not None
-        assert await runner.run_once(now=1.0) is not None
-    finally:
-        await engine.stop()

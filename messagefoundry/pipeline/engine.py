@@ -888,12 +888,11 @@ class Engine:
         self._intake_monitor: IntakeBoundMonitor | None = None
         # DR run-profile (#61, ADR 0048). The global [delivery].priority default a connection inherits
         # when it declares no priority= (every runner inherits it). The DR run-profile THRESHOLD is
-        # active only when this box is a DR standby that has been activated for THIS boot (dr.enabled
-        # AND dr.activate): then the runner binds only connections whose resolved tier rank >=
-        # dr.priority_threshold. A non-DR deployment (the default) passes dr_threshold=None to the runner
-        # → no filtering, byte-identical to before. Held so reload re-applies the same threshold.
-        # A DR box that is not activated passes dr_standby instead, and binds no inbound listener
-        # until it is (vault BACKLOG #3140).
+        # active only once POST /dr/activate has promoted this DR box: then the runner binds only
+        # connections whose resolved tier rank >= dr.priority_threshold. A non-DR deployment (the
+        # default) passes dr_threshold=None to the runner → no filtering, byte-identical to before.
+        # Held so reload re-applies the same threshold. A DR box that is not activated passes
+        # dr_standby instead, and binds no inbound listener until it is (vault BACKLOG #3140).
         self._priority_default = priority_default
         self._dr_settings = dr_settings or DrSettings()
         if self._dr_settings.enabled and (
@@ -902,15 +901,17 @@ class Engine:
             # At start, not only when a hook runs, which on a DR box is during the disaster: the
             # coordinator that runs hooks is built only at the first activate or release.
             warn_unset_pass_environment(self._dr_settings.pass_environment)
-        # Whether THIS boot runs under the DR run-profile (#61, ADR 0048). Latched from
-        # [dr].enabled AND [dr].activate at construction; flipped True by the DR coordinator on a
-        # successful POST /dr/activate (which then reloads the graph so the run-profile filter applies)
-        # and back False on POST /dr/release. A runner takes dr_threshold from _dr_run_threshold() when
-        # it is built, and _set_dr_active hands a running one the new value on each flip (#3067).
-        self._dr_active = bool(self._dr_settings.enabled and self._dr_settings.activate)
+        # Whether the engine runs under the DR run-profile (#61, ADR 0048). Always False at
+        # construction: no configuration brings a box up active, so every activation runs the
+        # seed verification, takeover hook and audit row of POST /dr/activate (BACKLOG #5965).
+        # Flipped True by the DR coordinator on a successful POST /dr/activate (which then reloads
+        # the graph so the run-profile filter applies) and back False on POST /dr/release. A runner
+        # takes dr_threshold from _dr_run_threshold() when it is built, and _set_dr_active hands a
+        # running one the new value on each flip (#3067).
+        self._dr_active = False
         # Whether an activation's reload has completed, so the run-profile is applied and not only
-        # latched; :meth:`_dr_backup_paused` reads it. A boot latched active needs no reload.
-        self._dr_profile_applied = self._dr_active
+        # latched; :meth:`_dr_backup_paused` reads it.
+        self._dr_profile_applied = False
         # This instance's environment values (DEV/PROD), shared with every runner the engine builds —
         # so env() references in a reloaded graph resolve against THIS environment (and a missing
         # value is refused here, on this engine, not on the box the graph was authored on). The
@@ -1175,7 +1176,7 @@ class Engine:
 
     def _dr_run_threshold(self) -> Priority | None:
         """The DR run-profile threshold for the runner (#61, ADR 0048): ``[dr].priority_threshold`` when
-        this boot is running under the DR profile (``_dr_active``), else ``None`` (no DR filtering — a
+        the engine is running under the DR profile (``_dr_active``), else ``None`` (no DR filtering — a
         normal deployment is byte-identical). Read at every runner construction (start + reload) so the
         threshold is consistently applied across reloads."""
         return self._dr_settings.priority_threshold if self._dr_active else None
@@ -1200,7 +1201,8 @@ class Engine:
 
     @property
     def dr_active(self) -> bool:
-        """Whether the engine is running under the DR run-profile this boot (#61, ADR 0048)."""
+        """Whether the engine is running under the DR run-profile, which only ``POST /dr/activate``
+        turns on (#61, ADR 0048; BACKLOG #5965)."""
         return self._dr_active
 
     @property

@@ -275,15 +275,14 @@ class DrCoordinator:
         # cross-shard clobber the scoped startup reset removes. None/None-returning = global (the
         # unsharded DR box, where "no live siblings" genuinely holds).
         self._owned_lanes = owned_lanes
-        # Whether the DR run-profile is currently on (mirrors the engine's _dr_active; the engine seeds
-        # it from [dr].activate at construction and this coordinator flips it on activate/release).
-        self._active = bool(settings.enabled and settings.activate)
+        # Whether the DR run-profile is currently on (mirrors the engine's _dr_active). A box always
+        # starts passive (BACKLOG #5965), and this coordinator flips it on activate/release.
+        self._active = False
         # An activation whose run-profile is applied but whose dr.activate row is not yet known to be
         # written: (detail, actor, now). Set before the write and cleared after it, so a write that a
         # cancellation or a store error cut short is written by the next activate or release call
         # rather than that call answering success with no row (vault BACKLOG #2751). Held in memory
-        # only, so a restart loses it; the refusal and its log line are what record that. A box active
-        # from [dr].activate at boot never set it: that activation is the configuration's.
+        # only, so a restart loses it; the refusal and its log line are what record that.
         self._unrecorded_activation: tuple[dict[str, object], str, float] | None = None
         # The same for a completed hand-back whose dr.release row is not yet known to be written
         # (vault BACKLOG #2752). The next activate or release call writes it first.

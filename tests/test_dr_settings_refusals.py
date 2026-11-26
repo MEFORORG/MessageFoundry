@@ -2,9 +2,12 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``[dr]`` misconfigurations refused at load rather than found during a disaster (BACKLOG #5965).
 
-``[dr].activate = true`` without ``[dr].enabled`` was ignored, so it is refused. With ``enabled`` it
-loads, as the startup latch it has always been. Item 1 (S09-42): a DR box that names no seed, a
-blank or padded seed or token path, and a restore token on a SQLite store where nothing reads it.
+``[dr].activate`` was a startup latch: with ``enabled`` it brought a box up under the DR
+run-profile at engine construction, without the seed verification, the takeover hook or the
+``dr.activate`` audit row ``POST /dr/activate`` runs. By owner ruling of 2026-11-25 it is a
+removed key, refused at load whatever its value, and no engine construction path activates DR.
+Item 1 (S09-42): a DR box that names no seed, a blank or padded seed or token path, and a restore
+token on a SQLite store where nothing reads it.
 """
 
 from __future__ import annotations
@@ -14,42 +17,76 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from messagefoundry.config.settings import DrSettings, load_settings
+from messagefoundry.config.settings import (
+    DrSettings,
+    EgressSettings,
+    StoreSettings,
+    load_settings,
+)
+from messagefoundry.pipeline import Engine
+from messagefoundry.store import MessageStore
 
 _SEED = {"seed_archive": "C:/dr/seed.mfbak"}
+_REMOVED = r"\[dr\]\.activate was REMOVED"
 
 
-def test_activate_without_enabled_is_refused() -> None:
-    """The engine never read it there, so a box meant to come up active came up as a plain engine."""
-    with pytest.raises(ValidationError, match=r"\[dr\]\.activate = true needs \[dr\]\.enabled"):
-        DrSettings.model_validate({"activate": True, **_SEED})
+def test_enabled_and_activate_in_code_are_refused() -> None:
+    """Red on main, where this combination loaded as the startup latch. Every removed key's
+    refusal is pinned for the whole table in ``tests/test_open_mode_is_no_service.py``; this is
+    the owner-ruled case, and it names the route."""
+    with pytest.raises(ValidationError, match=_REMOVED) as caught:
+        DrSettings.model_validate({"enabled": True, "activate": True, **_SEED})
+    assert "POST /dr/activate" in str(caught.value)
 
 
-@pytest.mark.parametrize("activate", [True, False])
-def test_an_enabled_box_loads_either_way(activate: bool) -> None:
-    """The control: with enabled, activate = true loads, as the startup latch."""
-    dr = DrSettings.model_validate({"enabled": True, "activate": activate, **_SEED})
-    assert dr.enabled and dr.activate is activate
-
-
-def test_activate_true_without_enabled_from_a_file_is_refused(tmp_path: Path) -> None:
+def test_enabled_and_activate_from_a_file_are_refused(tmp_path: Path) -> None:
+    """The owner-ruled case through the loader, which names the route and echoes no value."""
     cfg = tmp_path / "messagefoundry.toml"
-    cfg.write_text("[dr]\nactivate = true\n", encoding="utf-8")
-    with pytest.raises(ValidationError, match=r"\[dr\]\.activate = true needs \[dr\]\.enabled"):
+    cfg.write_text(
+        "[dr]\nenabled = true\nactivate = true\nseed_archive = 'C:/dr/seed.mfbak'\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=_REMOVED) as caught:
         load_settings(config_path=cfg, environ={})
+    assert "POST /dr/activate" in str(caught.value)
+    assert "true" not in str(caught.value)
+
+
+def test_an_enabled_box_loads_passive() -> None:
+    """The control: without the removed key an enabled box loads."""
+    dr = DrSettings.model_validate({"enabled": True, **_SEED})
+    assert dr.enabled and "activate" not in DrSettings.model_fields
+
+
+async def test_no_engine_construction_path_activates_dr(tmp_path: Path) -> None:
+    """Red on main: settings that skip validation and still carry ``activate = true`` brought the
+    engine and the coordinator up under the DR run-profile. Every DR box now starts passive."""
+    db = tmp_path / "e.db"
+    smuggled = DrSettings.model_construct(
+        enabled=True, activate=True, seed_archive=_SEED["seed_archive"]
+    )
+    engine = Engine(
+        await MessageStore.open(db),
+        poll_interval=0.05,
+        store_settings=StoreSettings(path=str(db)),
+        dr_settings=smuggled,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        assert engine.dr_active is False
+        assert engine._dr_run_threshold() is None
+        assert engine._dr_standby_threshold() is not None  # passive: binds no listener
+        assert engine._dr_backup_paused() is True
+        coord = engine.dr_coordinator
+        assert coord is not None and coord.active is False
+    finally:
+        await engine.stop()
 
 
 def test_an_enabled_box_with_no_seed_is_refused() -> None:
     """With neither key, every POST /dr/activate aborts for want of a seed."""
     with pytest.raises(ValidationError, match=r"seed_archive or \[dr\]\.seed_dir"):
         DrSettings(enabled=True)
-
-
-def test_a_latched_box_with_no_seed_loads_as_on_main() -> None:
-    """The startup latch reads no seed, and its behaviour is unchanged here, so a box under
-    activate = true with no seed key still loads."""
-    dr = DrSettings(enabled=True, activate=True)
-    assert dr.enabled and dr.activate
 
 
 @pytest.mark.parametrize(
