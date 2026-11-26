@@ -10233,12 +10233,15 @@ def _with_link_targets(
     with none given it raises ``OSError`` naming the link. The load's check hands it
     :func:`_refuse_unvetted_link`, which the dev/test escape does not downgrade.
 
-    **Not vetted**, at least: the links in between, for a link to a link, the folders holding the
-    links outside the config directory, from which a writer could re-point one, the folders above
-    each target's folder, as the folders above the config directory are not, and on Windows a
-    name-surrogate reparse point that is neither a symbolic link nor a junction, which is not
-    followed (the start check's :func:`_link_chain` refuses one). The start check walks the links
-    of its own files further. A path already listed is not repeated."""
+    Each such link is then walked as the ``serve`` start check walks its own files
+    (:func:`_member_link_chain`): what :func:`_link_chain` names is listed too, the real folder
+    holding each link the walk follows, the folder holding the config directory's own link
+    included, each link itself on Windows, and the object it reaches. A walk that cannot run, that
+    reaches nothing, or that reaches another object than the resolve, is refused the same way.
+
+    **Not vetted**, at least: the folders above each target's folder and above each folder
+    holding a link, as the folders above the config directory are not. A path already listed is
+    not repeated."""
     out: list[Path] = []
     for path in paths:
         out.append(path)
@@ -10253,7 +10256,39 @@ def _with_link_targets(
         out.append(target)
         if not target.is_dir():
             out.append(target.parent)
+        chain = _member_link_chain(path, target)
+        if isinstance(chain, str):
+            if refuse is None:
+                raise OSError(errno.EINVAL, chain, str(path))
+            refuse(f"{_CONFIG_SOURCE_LEAD} {path}: {chain}")
+            continue
+        out += chain
     return list(dict.fromkeys(out))
+
+
+def _member_link_chain(path: Path, target: Path) -> list[Path] | str:
+    """What :func:`_link_chain` names for the trust-list link at ``path``, which resolves to
+    ``target``, or the reason as text where the walk cannot vouch for it: the walk could not run,
+    or reached nothing, or reached another object than ``target`` (vault BACKLOG #2596 step 4).
+
+    The walk names the real folder holding each link it follows, each link itself on Windows, and
+    the object it reaches, so a link in between, the folder holding it outside the config
+    directory, and a Windows reparse point the walk cannot follow are vetted or refused, as the
+    ``serve`` start check vets its own files (:func:`_file_and_folder`)."""
+    try:
+        chain, end = _link_chain(path)
+    except (OSError, ValueError) as exc:  # ValueError: a link target holding a NUL
+        reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else None
+        return f"its link chain could not be walked ({reason or type(exc).__name__})"
+    if end is None:
+        return "the walk of its link chain reaches nothing where the link resolves to an object"
+    try:
+        same = os.path.samefile(end, target)
+    except (OSError, ValueError) as exc:
+        return f"its link chain could not be walked ({type(exc).__name__})"
+    if not same:
+        return "the walk of its link chain reaches another object than the link resolves to"
+    return chain
 
 
 def _resolved_link(path: Path) -> Path | str | None:
