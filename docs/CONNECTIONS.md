@@ -170,8 +170,9 @@ transport = "mllp"
   infinity, and text that reads as zero but is not zero in plain digits, such as `"1e-400"` or `"0e0"`. A TOML
   literal `1e-400` in a value file is parsed to `0.0` first, so it reads as zero. A code-first
   `env()` with `cast=int`, `cast=float` or `cast=bool` gets the same strict reading as the named
-  cast. Any other code-first cast runs as given, on the value as it arrives. That includes a
-  builtin such as `abs` and a type such as `decimal.Decimal`. So `cast=lambda v: int(v)` still
+  cast. Another numeric builtin, such as `abs` or `round`, or a number type, such as
+  `decimal.Decimal`, refuses a bool before it runs (BACKLOG #1650). Any other code-first cast runs
+  as given, on the value as it arrives. So `cast=lambda v: int(v)` still
   reads `true` as 1, and the port read takes that as port 1. At least `allowed_mllp`, among the
   host-and-port `[egress]` lists that pin a port,
   compares the port as a number before the connector is built, so the text `"06661"` matches a pin

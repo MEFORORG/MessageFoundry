@@ -360,6 +360,10 @@ class EnvRef:
         # The builtin ``float`` reads a TOML ``true`` as 1.0 the same way.
         elif self.cast is float:
             object.__setattr__(self, "cast", _cast_float)
+        # Any other numeric builtin or number type (``abs``, ``round``, ``decimal.Decimal``) reads a
+        # TOML ``true`` as 1 the same way, so it gets a bool refused ahead of it.
+        elif _is_numeric_builtin_cast(self.cast):
+            object.__setattr__(self, "cast", _bool_refusing_cast(self.cast))
         # A default is never cast at resolve time, so ``default="false"`` would reach the connector
         # as text and read True there. Read it strictly here, once, on both routes: ``connections.toml``
         # hands in ``_cast_bool`` itself. ``None`` stays a deliberate None. The value is withheld for
@@ -421,10 +425,11 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     string as True. A ``default=`` with ``cast=bool`` is read the same way when the reference is
     made, and an unreadable one is refused then. ``cast=int`` means a strict whole-number reading
     (vault BACKLOG #1650, :func:`_cast_int`), and ``cast=float`` a strict finite-number reading
-    (:func:`_cast_float`). Any other callable runs as given, a builtin such as ``abs`` or a
-    type such as ``decimal.Decimal`` included, on the environment value as it arrives, a TOML bool
-    included, so ``cast=lambda v: int(v)`` still reads ``true`` as 1; the connector's own check
-    sees only what the cast returned. On a boolean
+    (:func:`_cast_float`). Another numeric builtin, such as ``abs`` or ``round``, or a number type,
+    such as ``decimal.Decimal``, refuses a TOML bool before it runs
+    (:func:`_is_numeric_builtin_cast` says which). Any other callable runs as given, on the
+    environment value as it arrives, a TOML bool included, so ``cast=lambda v: int(v)`` still
+    reads ``true`` as 1; the connector's own check sees only what the cast returned. On a boolean
     setting (a factory parameter annotated ``bool``, a composer's ``enabled``, or ``Ftp``'s ``tls``),
     the result is then read the same strict way, so an uncast or ``str``-cast ``env()`` there cannot
     hand the connector the text ``"false"`` (vault BACKLOG #3234). A cast that itself returns a ``bool`` is trusted:
@@ -555,6 +560,45 @@ def _cast_float(raw: Any) -> float:
 
 # Named "float" for the reason ``_cast_bool`` is named "bool".
 _cast_float.__name__ = "float"
+
+
+#: Numeric builtins that read a bool as the number 1 or 0. A number TYPE is matched by
+#: :func:`_is_numeric_builtin_cast` instead, so ``decimal.Decimal`` and ``fractions.Fraction`` need
+#: no entry here.
+_NUMERIC_BUILTIN_FUNCTIONS: Final = (
+    abs,
+    round,
+    math.floor,
+    math.ceil,
+    math.trunc,
+    math.fabs,
+    operator.index,
+)
+
+
+def _is_numeric_builtin_cast(cast: Callable[[Any], Any] | None) -> bool:
+    """Whether ``cast`` is a numeric builtin or a number type, other than the ``int``, ``float`` and
+    ``bool`` that :class:`EnvRef` swaps for its own reads. Each reads a TOML ``true`` as 1 (vault
+    BACKLOG #1650). Matched by identity, since an author's callable need not be hashable."""
+    if isinstance(cast, type):
+        return cast not in (bool, int, float) and issubclass(cast, numbers.Number)
+    return any(cast is known for known in _NUMERIC_BUILTIN_FUNCTIONS)
+
+
+@cache
+def _bool_refusing_cast(cast: Callable[[Any], Any]) -> Callable[[Any], Any]:
+    """``cast`` with a bool refused ahead of it, by the rule :func:`_cast_int` holds, value
+    withheld. Cached, so two references written with one cast still compare equal. Only the
+    bounded set :func:`_is_numeric_builtin_cast` matches reaches here."""
+
+    def refusing_bool(raw: Any) -> Any:
+        if isinstance(raw, bool):
+            raise ValueError("a bool is not a number (value withheld)")
+        return cast(raw)
+
+    # Named as the cast the author wrote, for the reason ``_cast_bool`` is named "bool".
+    refusing_bool.__name__ = _cast_name(cast)
+    return refusing_bool
 
 
 #: Named casts a ``connections.toml`` env-ref may request (ADR 0007). A data file/GUI can't author an

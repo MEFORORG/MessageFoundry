@@ -10,7 +10,10 @@ bool cases are red there; the rest are controls the builtin already met."""
 from __future__ import annotations
 
 import math
+import operator
 from decimal import Decimal
+from fractions import Fraction
+from typing import Any
 
 import pytest
 
@@ -75,3 +78,42 @@ def test_a_cast_of_the_authors_own_runs_as_given() -> None:
     """The documented limit: an author's cast is not swapped, so it still reads a TOML ``true``."""
     out = resolve_env_settings({"port": env("p", cast=lambda v: int(v))}, {"p": True})
     assert out["port"] == 1
+
+
+_NUMERIC_BUILTIN_CASTS = [
+    abs,
+    round,
+    Decimal,
+    Fraction,
+    complex,
+    math.floor,
+    math.ceil,
+    math.trunc,
+    math.fabs,
+    operator.index,
+]
+
+
+@pytest.mark.parametrize("cast", _NUMERIC_BUILTIN_CASTS, ids=lambda c: c.__name__)
+@pytest.mark.parametrize("raw", [True, False])
+def test_a_numeric_builtin_cast_refuses_a_bool(cast: Any, raw: bool) -> None:
+    """Each of these read a TOML ``true`` as 1 (``abs(True) == 1``, ``Decimal(True) == 1``), the
+    remainder engine PR 3163 named. A bool is refused before the cast runs, value withheld."""
+    with pytest.raises(WiringError) as ei:
+        resolve_env_settings({"rate": env("acme_rate", cast=cast)}, {"acme_rate": raw})
+    msg = str(ei.value)
+    assert "'rate'" in msg and "'acme_rate'" in msg
+    assert f"not a valid {cast.__name__}" in msg and "value withheld" in msg
+
+
+@pytest.mark.parametrize("cast", _NUMERIC_BUILTIN_CASTS, ids=lambda c: c.__name__)
+def test_a_numeric_builtin_cast_still_reads_a_number(cast: Any) -> None:
+    """The control: the same casts on a number give what the builtin gives."""
+    out = resolve_env_settings({"rate": env("r", cast=cast)}, {"r": 3})
+    assert out["rate"] == cast(3)
+
+
+def test_a_numeric_builtin_cast_keeps_two_refs_equal() -> None:
+    """The guard is one object per cast, so two references written alike still compare equal."""
+    assert env("r", cast=abs) == env("r", cast=abs)
+    assert EnvRef(key="r", cast=Decimal).cast is env("r", cast=Decimal).cast
