@@ -2041,8 +2041,7 @@ class Engine:
         **It CAN raise, and so fail startup.** The read catches only ``OSError`` and
         ``UnicodeDecodeError``, so anything else the reader raises escapes: at least a path carrying
         a NUL character raises ``ValueError`` out of this method and out of :meth:`start`, before
-        any walk runs, so no audit check runs and the engine does not start, although the steps
-        :meth:`start` runs before this one, at least store recovery, have already run (pinned by
+        any walk runs, so no audit check runs and the engine does not start (pinned by
         ``test_startup_anchor_nul_path_raises_value_error``). This docstring states it for the
         code, and the other code comments point here; the ``audit_anchor_file`` row in
         docs/CONFIGURATION.md states it for operators. Change the two together.

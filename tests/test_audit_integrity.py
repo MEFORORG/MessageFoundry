@@ -1860,7 +1860,7 @@ async def test_startup_anchor_nul_path_raises_value_error(tmp_path: Path) -> Non
 
     async def counting_verify(**kwargs: object) -> AuditVerdict:
         walks.append(kwargs)
-        raise AssertionError("the walk ran, but the anchor read should have raised first")
+        raise AssertionError
 
     store.verify_audit_chain = counting_verify  # type: ignore[method-assign]
     sink = _AnchorRecordingSink()
