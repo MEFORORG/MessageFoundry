@@ -206,16 +206,13 @@ refused at the shipped posture.
    with a probe that still cannot answer, so an environment only the terminal has cannot strand a real success.
    Otherwise nothing starts, and the user is told why.
 
-**A known gap, engine-side, since closed by BACKLOG #5926.** The probe and the provisioning terminal run in the workspace with
+**One known gap, engine-side and not closed here.** The probe and the provisioning terminal run in the workspace with
 no `--db`, as `serve` does. Since BACKLOG #5566 they are handed the same `serviceConfig` as `serve`: they pass
 `--service-config=<file>` when the IDE resolves `messagefoundry.serviceConfig` to a file, and no `--service-config`
 when it resolves to none, as at its default. (CORRECTED 2026-11-26: this paragraph said they ran with no
-`--service-config` at all, which stopped being true with #5566.) In the default
-layout they reach the store `serve` opens. They did not when the service TOML set `[environments].base_dir`: `serve`
-anchored a relative `[store].path` under it, and `provision-admin` did not. The fix belonged in `provision-admin`, and
-BACKLOG #5926 made it: `provision-admin` now anchors a relative `[store].path` under the `base_dir` the file or the
-environment sets, and the IDE passes `--project-root` to neither command. (CORRECTED 2026-11-26: this read as an
-open gap.)
+`--service-config` at all, which stopped being true with #5566.) In the default layout they reach the store `serve`
+opens. They do not when the service TOML sets `[environments].base_dir`: `serve` anchors a relative `[store].path`
+under it, and `provision-admin` does not. The fix belongs in `provision-admin`, not in the IDE.
 
 **Where it is pinned.** The sequencing is pure (`runStartPlan` in `engineControlModel.ts`, with the terminal, dialog
 and exec calls injected), so `engine-control.test.ts` asserts the call order: provision before serve, "already exists"
@@ -223,8 +220,9 @@ as go-ahead, no serve after a failed provision. The Consequences line above, tha
 node-testable, still holds for the terminal calls themselves; a source check in the same file pins that `serve` is
 reached only through the plan and that the provisioning terminal is awaited. `engine-setup.test.ts` asserts that no
 string in the four files names a bootstrap admin. `tests/test_ide_start_plan_probe_contract.py` takes the probe argv
-from `probeDefault` in `ide/src/test/fixtures/provision-admin-argv.json` and runs it through the engine's `main`
-in-process; at least one arm has no store, and its module docstring says how. (CORRECTED 2026-11-26: this said it ran
+from `probeDefault` in `ide/src/test/fixtures/provision-admin-argv.json`. It runs `probeDefault[5:]`, the CLI
+arguments, through the engine's `main` in-process, and compares the interpreter options before them rather than
+executing them; at least one arm has no store, and its module docstring says how. (CORRECTED 2026-11-26: this said it ran
 the probe "against the CLI".) It checks both answers carry the fragments the IDE matches on, so a rewording on either
 side goes red. The mocha suite `provision-admin-argv.test.ts` pins `buildAdminProbeInvocation`'s whole output against
 that entry. That suite runs in the `ide build` job; its header in `.github/workflows/ci.yml` says whether the job

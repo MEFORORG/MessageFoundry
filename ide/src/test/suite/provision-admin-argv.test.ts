@@ -39,8 +39,9 @@ const PROBE_ARGV: readonly string[] = FIXTURE.probe;
 
 /**
  * The admin probe's argv with `messagefoundry.serviceConfig` at its default, so no --service-config.
- * tests/test_ide_start_plan_probe_contract.py runs this list through the engine's `main` in-process;
- * its module docstring says how.
+ * tests/test_ide_start_plan_probe_contract.py runs `probeDefault[5:]`, the CLI arguments, through the
+ * engine's `main` in-process, and compares the interpreter options before them rather than executing
+ * them; its module docstring says how.
  */
 const PROBE_DEFAULT_ARGV: readonly string[] = FIXTURE.probeDefault;
 

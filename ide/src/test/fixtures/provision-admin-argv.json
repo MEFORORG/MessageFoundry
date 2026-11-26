@@ -1,5 +1,5 @@
 {
-  "comment": "The provision-admin and probe argv the IDE builds with serviceConfig set (BACKLOG #5566). probeDefault is the probe with messagefoundry.serviceConfig at its default. ide/src/test/suite/provision-admin-argv.test.ts pins the IDE builders against these lists. tests/test_ide_provision_admin_argv.py reads them with the engine parser. tests/test_ide_start_plan_probe_contract.py runs probeDefault through the engine's main in-process; its module docstring says how.",
+  "comment": "The provision-admin and probe argv the IDE builds with serviceConfig set (BACKLOG #5566). probeDefault is the probe with messagefoundry.serviceConfig at its default. ide/src/test/suite/provision-admin-argv.test.ts pins the IDE builders against these lists. tests/test_ide_provision_admin_argv.py reads them with the engine parser. tests/test_ide_start_plan_probe_contract.py runs probeDefault[5:], the CLI arguments, through the engine's main in-process, and compares the interpreter options before them rather than executing them; its module docstring says how.",
   "serviceConfig": "deploy/prod/messagefoundry.toml",
   "provision": [
     "-P",
