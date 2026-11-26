@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.25.4"
+$GateVersion = "2026.11.20.2"
 
 # THE SHELL ENTRY'S TIMEOUT, STATED ONCE (review round 56f5830e). Several notes below say the install
 # gives this hook 15 s and that a killed hook lets the command through. That is NOT true of the
@@ -915,54 +915,6 @@ function Get-ScanRawIndexMap($Seg) {
     if ($again -cne [string]$Seg.Scan -or $map.Count -ne $again.Length) { return $null }
     $map.Add(([string]$Seg.Raw).Length)
     , $map.ToArray()
-}
-
-# $Raw from $Start up to the first match of $Split whose every character the shell reads as code, by
-# $Quote, Get-QuoteStateMap's reading of $Raw, or to the end of $Raw where none is. Rule 3d's quote-aware victim split
-# (BACKLOG #5643). Where Get-QuoteStateMap misreads a quote, the cut lands elsewhere; rule 3d only ADDS
-# the victims read from this text, so a misreading costs a false deny or a victim not read here, never a
-# deny the other splits make.
-#
-# $Mask is Get-CodeMask's copy of $Raw, built once per segment, with every literal character but a `$`
-# masked. $Split is matched against its slice from $Start, so a lookbehind sees no masked character and
-# no text before $Start: in `\&&` the escaped `&` no longer hides the lone `&` after it, which the shell
-# reads as a separator, and a `$(` that opens before the verb does not stop its `)` from ending the
-# victim. A literal `$` is kept, so an escaped `\${` still reads as opening an expansion.
-#
-# At least two cases answer less than that (review round of 70fbdc7122a, each measured a false deny
-# there, ALLOW on origin/main). A `#` Get-QuoteStateMap reads as opening a comment ends the text, where
-# the character before it is not one the map reads literal; the map reads `\ #` as a comment, which
-# bash does not, so there this cuts a victim short. And where the character before $Start is not code,
-# the verb ended inside quotes or a comment, and this answers "", which is origin/main's behaviour for
-# that invocation. That is a mention in `git commit -m "... worktree remove ..."`, but not in quoted
-# text a runner executes. `bash -c "..."` and a backtick span inside double quotes are judged by the
-# interpreter-payload and hoist readings (measured DENY for both by review round 31371c5b75). At least
-# `eval "..."`, `watch "..."`, `Invoke-Expression "..."` and a flagless `powershell "..."` are judged by
-# neither, and a quoted victim holding a separator there is ALLOWED, as on origin/main (70fbdc7122a
-# denied them when the line also held an unquoted `worktree remove`; review round 359e2a53ff).
-function Get-CodeSplitPrefix([string]$Raw, $Quote, [string]$Mask, [int]$Start, [regex]$Split) {
-    if ($null -eq $Quote -or $Start -lt 0 -or $Start -gt $Raw.Length) { return "" }
-    if ($Start -gt 0 -and $Quote[$Start - 1] -ne [char]'N') { return "" }
-    $end = $Raw.Length
-    $k = $Raw.IndexOf([char]'#', $Start)
-    while ($k -gt 0) {
-        if ($Quote[$k] -eq [char]'S' -and $Quote[$k - 1] -ne [char]'S') { $end = $k; break }
-        $k = $Raw.IndexOf([char]'#', $k + 1)
-    }
-    $m = $Split.Match($Mask.Substring($Start, $end - $Start))
-    if ($m.Success) { $end = $Start + $m.Index }
-    $Raw.Substring($Start, $end - $Start)
-}
-
-# $Raw with every character Get-QuoteStateMap does not read as code replaced by `_`, except a `$`, kept so
-# that `"$(pwd)/x"` still reads as a substitution, whose `)` is not a separator. Built once per segment.
-function Get-CodeMask([string]$Raw, $Quote) {
-    if ($null -eq $Quote) { return "" }
-    $chars = $Raw.ToCharArray()
-    for ($k = 0; $k -lt $chars.Length; $k++) {
-        if ($Quote[$k] -ne [char]'N' -and $chars[$k] -ne [char]'$') { $chars[$k] = [char]'_' }
-    }
-    [string]::new($chars)
 }
 
 # ===================================================================================================
@@ -5108,7 +5060,6 @@ What to do instead:
     # and `<wt>&`, which name nothing, and were allowed. Not quote-aware, like the split it widens.
     # A `}` or `)` that closes the shell's own `${...}` or `$(...)` inside the victim is not a closer.
     $wtVictimSplit = '(?:&&|\|\||;|\||(?<!\$\{[^}]*)\}|(?<!\$\([^)]*)\)|(?<![<>&])&(?![>&]))'
-    $wtVictimSplitRe = [regex]::new($wtVictimSplit)
     $wtTargets = foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
         # CASE-INSENSITIVE ON WINDOWS (review of BACKLOG #5643): there `Git` and `GIT` run git.exe, and
         # a case-sensitive test let `Git worktree remove <governed>` through. Elsewhere it stays exact.
@@ -5163,18 +5114,6 @@ What to do instead:
         $oldEnd = $(if ($oldRawMatch.Success) { $oldRawMatch.Index + $oldRawMatch.Length } else { -1 })
         $oldWindow = $null
         $added = @()
-        # One quote map per segment, shared by every quote-aware split below.
-        $segQuote = Get-QuoteStateMap $seg.Raw ([string]$seg.Conv)
-        $segMask = Get-CodeMask $seg.Raw $segQuote
-        # THE FIRST READING'S VICTIM, QUOTE-AWARE TOO (BACKLOG #5643, review round e8390625a8): its split
-        # cuts a quoted victim at a `;`, `&&`, `||` or `|` inside the quotes. The victims read off the
-        # text before the first separator the shell reads as code are ADDED to its own, so this runs
-        # even where Get-ScanRawIndexMap answers nothing and the added reading below is skipped.
-        if ($oldEnd -ge 0) {
-            foreach ($v in @(Get-WorktreeVictimTokens (Get-CodeSplitPrefix $seg.Raw $segQuote $segMask $oldEnd $wtVictimSplitRe))) {
-                if ($oldVictims -cnotcontains $v) { $oldVictims += $v }
-            }
-        }
         $map = Get-ScanRawIndexMap $seg
         if ($null -ne $map) {
             foreach ($sm in [regex]::Matches($seg.Scan, '\bworktree\s+(?<wtverb>remove|move)(?=\s|$)')) {
@@ -5214,16 +5153,7 @@ What to do instead:
                 $sameAsOld = ($rawEnd -eq $oldEnd)
                 if ($sameAsOld) { $oldWindow = $win }
                 $a2 = ($seg.Raw.Substring($rawEnd) -split $wtVictimSplit, 2)[0]
-                # AND THE SAME SPLIT, QUOTE-AWARE (BACKLOG #5643 residual list, "the pre-splitters are
-                # not quote-aware"): the split above cuts a quoted victim at a `;`, `&&`, `||`, `|`,
-                # `}`, `)` or lone `&` inside its quotes, so `"<tmp>/x;y/../<wt>"` named `"<tmp>/x` and
-                # was ALLOWED. This one ends only at a separator the shell reads as code. ADDED beside
-                # it, so a victim it names is still judged.
-                $a3 = Get-CodeSplitPrefix $seg.Raw $segQuote $segMask $rawEnd $wtVictimSplitRe
-                $seenHere = @()
-                foreach ($v in @(Get-WorktreeVictimTokens $a2) + @(Get-WorktreeVictimTokens $a3)) {
-                    if ($seenHere -ccontains $v) { continue }
-                    $seenHere += $v
+                foreach ($v in @(Get-WorktreeVictimTokens $a2)) {
                     if ($sameAsOld -and @($oldVictims | Where-Object {
                                 [string]::Equals($_, $v, [System.StringComparison]::Ordinal) }).Count -gt 0) { continue }
                     $added += [pscustomobject]@{
@@ -5336,20 +5266,7 @@ What to do instead:
         #     `(?:&&|\|\||;|\|)`, so a quoted victim path containing `;` or `&&` is truncated before the
         #     quote-aware scan runs. The added reading splits with $wtVictimSplit, defined above the
         #     segment loop, which also cuts at a `}`, `)` or lone `&`, so there a quoted path holding
-        #     one of those is truncated too. NARROWED 2026-11-25 (BACKLOG #5643), NOT FIXED: the added
-        #     reading, and the first reading where its verb is code, also read the victims before the first separator
-        #     Get-QuoteStateMap calls code (Get-CodeSplitPrefix), so `"<tmp>/x;y/../<wt>"` is judged
-        #     whole. Where the line's first raw `worktree remove` is a quoted mention, the first reading
-        #     reads nothing quote-aware, so an invocation the added reading skips (`git commit -m
-        #     "worktree remove" ; sudo git worktree remove "<tmp>/x;y/../<wt>"`) is still ALLOWED.
-        #     It shares that quoting model's misreadings, at least an interpreter payload's
-        #     escaped quotes (`bash -c "git worktree remove \"<tmp>/x;y/../<wt>\""`, still ALLOWED,
-        #     measured by review round 7f68c804ce), which it reads as escapes. The victim TOKENIZER it feeds still misreads at least these, each
-        #     measured ALLOW on 2026-11-25 by review round e8390625a8: a word quoted only in part
-        #     (`"<tmp>/x;y"/../<wt>`, `"<tmp>/Primary-"wt2`), which it splits at the quote; a posix
-        #     `$'<wt>'`, read as a bare `$`; an unquoted escaped separator (`<tmp>/x\;y/../<wt>`),
-        #     whose backslash it keeps; and, under PowerShell, a `''` doubled inside a single-quoted
-        #     victim (`'<tmp>/x''s;y/../<wt>'`).
+        #     one of those is truncated too, and only the first reading judges it.
         #
         # All of these belong to the RESOLVER rather than to this rule; fixing them here would be the
         # fourth resolution rule in one file, which is what calling the shared helper exists to avoid.

@@ -288,138 +288,23 @@ def test_a_quoted_victim_holding_a_closer_character_is_still_judged(
 @pytest.mark.parametrize(
     "template",
     [
-        'git worktree remove "{tmp}/x;y/../Primary-wt2"',
-        'git worktree remove "{tmp}/x&&y/../Primary-wt2"',
-        'git worktree remove "{tmp}/x)y/../Primary-wt2"',
-        'git worktree remove "{tmp}/x}}y/../Primary-wt2"',
-        "git worktree remove '{tmp}/x;y/../Primary-wt2'",
-        'git worktree move "{tmp}/x;y/../Primary-wt2" {tmp}/moved',
-        'git status ; git worktree remove "{tmp}/x|y/../Primary-wt2"',
-    ],
-)
-def test_a_quoted_victim_holding_a_separator_is_read_whole(
-    rig: SimpleNamespace, template: str
-) -> None:
-    """BACKLOG #5643 residual "the pre-splitters are not quote-aware": both splits cut a quoted
-    victim at a separator inside its quotes, so it named a path that does not exist, and the remove
-    of a governed worktree was ALLOWED (measured on origin/main 33870a40944 for the `;`, `&&` and
-    `|` rows). The `)` and `}` rows already deny there, through the first reading's split, which
-    does not cut at those; they pin that."""
-    cmd = template.format(tmp=rig.tmp.as_posix())
-    verb = "move" if " move " in cmd else "remove"
-    assert f"worktree {verb}" in _reason(rig, cmd, rig.outside)
-
-
-@pytest.mark.parametrize(
-    "template",
-    [
-        'git worktree remove "{tmp}/x;y/../Primary-wt2"',
-        "git worktree remove '{tmp}/x;y/../Primary-wt2'",
-        'git status ; git worktree remove "{tmp}/x;y/../Primary-wt2"',
-    ],
-)
-def test_a_quoted_victim_holding_a_separator_is_read_whole_under_powershell(
-    rig: SimpleNamespace, template: str
-) -> None:
-    """The same, under the PowerShell tool's quoting (review round e8390625a8). A `''` doubled
-    inside the single-quoted victim still allows: the victim tokenizer splits at it (residual)."""
-    cmd = template.format(tmp=rig.tmp.as_posix())
-    assert "worktree remove" in _reason_tool(rig, cmd, rig.outside)
-
-
-@pytest.mark.parametrize(
-    "template",
-    [
-        'git worktree remove "{tmp}/x;y/../Outside"',
-        "git worktree remove {o}/nope; echo '{tmp}/Primary-wt2'",
-    ],
-)
-def test_a_quoted_separator_control_is_allowed_under_powershell(
-    rig: SimpleNamespace, template: str
-) -> None:
-    cmd = template.format(tmp=rig.tmp.as_posix(), o=rig.outside.as_posix())
-    assert run_gate(shell(cmd, rig.outside, tool="PowerShell"), rig.repos) is None
-
-
-def test_a_quoted_victim_the_added_reading_skips_is_still_read_whole(
-    rig: SimpleNamespace,
-) -> None:
-    """Where the line's first `worktree remove` is code, the first reading reads the quote-aware
-    victim itself, so this row does not depend on the added reading, which skips an invocation whose
-    git word is not at command position: here `sudo` stands before it. (The added reading's other
-    skip, a scan map that cannot be built, is not reached by this row. After a quoted mention the
-    first reading reads nothing quote-aware, a residual the gate's rule 3d notes record.)"""
-    cmd = f'sudo git worktree remove "{rig.tmp.as_posix()}/x;y/../Primary-wt2"'
-    assert "worktree remove" in _reason(rig, cmd, rig.outside)
-
-
-@pytest.mark.parametrize(
-    "template",
-    [
-        # The same quoted separator in a victim that names nothing governed.
-        'git worktree remove "{tmp}/x;y/../Outside"',
-        # A separator the shell does read as code still ends the victim.
-        'git worktree remove "{o}/nope" ; echo "{tmp}/Primary-wt2"',
-        "git worktree remove {o}/nope && echo '{tmp}/x;y/../Primary-wt2'",
-    ],
-)
-def test_a_quoted_separator_control_is_allowed(rig: SimpleNamespace, template: str) -> None:
-    cmd = template.format(tmp=rig.tmp.as_posix(), o=rig.outside.as_posix())
-    assert _allowed(rig, cmd, rig.outside)
-
-
-@pytest.mark.parametrize(
-    "template",
-    [
-        # The first reading's `worktree remove` is inside a quoted mention, so the text after it is
-        # not a victim the shell passes to git.
+        # The first `worktree remove` is inside a quoted mention, so the text after it is not a
+        # victim the shell passes to git.
         'git commit -m "see worktree remove x; -- {tmp}/Primary-wt2" && git worktree remove {o}/nope',
         # A `#` comment is not argument text, and a separator inside it ends nothing.
         "git worktree remove {o}/nope # x; echo -- {tmp}/Primary-wt2",
         # `\\&&` is a literal `&` and then a lone `&`, which the shell does read as a separator.
         "git worktree remove {o}/nope\\&& echo -- {tmp}/Primary-wt2",
-        # A `$(` that opens before the verb: its `)` still ends the victim (review round 31371c5b75).
-        "git worktree remove {o}/nope2 ; echo $(git worktree remove --force) {tmp}/Primary-wt2",
-        "git worktree remove {o}/nope2 ; echo $(git worktree remove {o}/nope) -- {tmp}/Primary-wt2",
-        # A `#` the quote map reads as a comment after an escaped space (review round 359e2a53ff).
-        "git worktree remove {o}/nope\\ #x ; echo -- {tmp}/Primary-wt2",
     ],
 )
-def test_these_quote_aware_split_false_denies_are_gone(rig: SimpleNamespace, template: str) -> None:
-    """ALLOW on origin/main. The first three were DENIED on 70fbdc7122a, whose quote-aware victim
-    split read a quoted mention, a comment, or the text past `\\&&` as a victim; the next two were
-    DENIED by the first repair of those, whose lookbehind saw a `$(` before the verb, and the last
-    by the second, and by 70fbdc7122a."""
-    cmd = template.format(tmp=rig.tmp.as_posix(), o=rig.outside.as_posix())
-    assert _allowed(rig, cmd, rig.outside)
-
-
-def test_an_escaped_space_before_a_hash_is_not_a_false_deny_under_powershell(
-    rig: SimpleNamespace,
-) -> None:
-    """The PowerShell tool's form of the escaped-space row above."""
-    o, tmp = rig.outside.as_posix(), rig.tmp.as_posix()
-    cmd = f"git worktree remove {o}/nope` #x ; echo -- {tmp}/Primary-wt2"
-    assert run_gate(shell(cmd, rig.outside, tool="PowerShell"), rig.repos) is None
-
-
-@pytest.mark.parametrize(
-    "template",
-    [
-        'git worktree remove "{tmp}/x;y/../Primary-wt2" # note',
-        'git worktree remove "{tmp}/x;y/../Primary-wt2" \\&& echo hi',
-        'git commit -m "worktree remove" ; git worktree remove "{tmp}/x;y/../Primary-wt2"',
-        # The `$` Get-CodeMask keeps: the `)` that closes this `$( )` is not a separator.
-        "git worktree remove \"{tmp}/x;y/$(echo '(z)')/../../Primary-wt2\"",
-    ],
-)
-def test_the_quote_aware_split_still_denies_beside_those_cases(
+def test_a_separator_outside_the_victim_is_not_a_false_deny(
     rig: SimpleNamespace, template: str
 ) -> None:
-    """The deny the quote-aware split added holds beside a comment, a `\\&&`, a quoted mention and
-    a `$( )` inside the quoted victim."""
-    cmd = template.format(tmp=rig.tmp.as_posix())
-    assert "worktree remove" in _reason(rig, cmd, rig.outside)
+    """ALLOW on origin/main. Pins main's behaviour against a quote-aware victim split that read a
+    quoted mention, a comment, or the text past `\\&&` as a victim, and DENIED these. That split
+    was reverted on this branch; BACKLOG #5643's quote-aware residual stays open."""
+    cmd = template.format(tmp=rig.tmp.as_posix(), o=rig.outside.as_posix())
+    assert _allowed(rig, cmd, rig.outside)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the case-insensitive match is Windows-only")
