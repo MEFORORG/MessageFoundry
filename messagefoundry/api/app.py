@@ -12586,6 +12586,9 @@ _SESSION_REAP_FIRST_DELAY = 300.0
 # maximum slew rate is about 300 s an hour). Each pass that runs also purges as of this much before
 # its own reading, so a step under it cannot delete a row the validator would still accept.
 _SESSION_REAP_STEP_TOLERANCE = 600.0
+# How long the step after a purge (the re-proof count drop, BACKLOG #5336) may run before the reaper
+# stops it, so a re-proof holding an account's lock cannot delay the next purge past this.
+_SESSION_REAP_AFTER_PURGE_TIMEOUT = 300.0
 
 
 async def _session_reaper(
@@ -12644,8 +12647,10 @@ async def _session_reaper(
 
     ``after_purge``, when given, runs after each purge that committed. The lifespan passes
     :meth:`AuthService.drop_reaped_reproof_counts`, which drops the re-proof counts of the
-    sessions the purge took, except where its read is refused, and then they stay until a later
-    pass (BACKLOG #5336). It does not run after a skipped or failed pass.
+    sessions the store shows as revoked or holds no row for, for each account it reaches; its
+    docstring says which it may not (BACKLOG #5336). It does not run after a skipped or failed
+    pass, and it is stopped after ``_SESSION_REAP_AFTER_PURGE_TIMEOUT``, so the next purge is
+    delayed by at most that much.
 
     A transient store error must not kill the reaper for the process lifetime (it would let the
     sessions table grow unbounded, and its stored exception could later abort lifespan shutdown) —
@@ -12687,9 +12692,16 @@ async def _session_reaper(
         if after_purge is None:
             continue
         try:
-            await after_purge()
+            async with asyncio.timeout(_SESSION_REAP_AFTER_PURGE_TIMEOUT):
+                await after_purge()
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            _log.warning(
+                "session reaper: the step after the purge ran past %.0fs and was stopped; will "
+                "retry next interval",
+                _SESSION_REAP_AFTER_PURGE_TIMEOUT,
+            )
         except Exception:
             _log.exception(
                 "session reaper: the step after the purge failed; will retry next interval"

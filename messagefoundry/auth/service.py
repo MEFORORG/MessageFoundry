@@ -930,12 +930,17 @@ def _advance_watched[S: (_BreakerStanding, _ReferralStanding)](
 # the revoke that re-proof makes commits), or a later age prune reaches it. The age prune runs only
 # when a new session's first failure finds no room. After each session reaper purge that commits,
 # the counts of sessions the store shows as revoked or holds no row for are dropped too
-# (:meth:`AuthService.drop_reaped_reproof_counts`), unless that read is refused. A budget
+# (:meth:`AuthService.drop_reaped_reproof_counts`), for each account that drop reaches; its
+# docstring says which it may not. A budget
 # revoke that fails, or never runs because an earlier write raised, leaves it in place, and the
 # session's next re-proof is then revoked unverified. Before BACKLOG #5336 the per-account cap
 # dropped the account's own oldest LIVE count, so round-robin guesses over more sessions than the
 # cap each got a fresh budget.
 _REPROOF_SESSION_MAX = 4096
+# How many refused session reads in a row end a session reaper pass's re-proof count drop
+# (:meth:`AuthService.drop_reaped_reproof_counts`), so a store outage costs that many timed-out reads
+# a pass, not one per account (BACKLOG #5336).
+_REAPED_DROP_REFUSALS = 3
 _REPROOF_SESSION_PER_USER = 64
 
 #: ASVS 6.3.8 — the fixed budget every FAILED authentication response is held to, so the branch a
@@ -4724,6 +4729,8 @@ class AuthService:
         # caveat as _action_step_up_grants: a restart forgets the counts, and a topology that serves
         # the API from more than one process gives each process its own budget.
         self._reproof_session_failures: dict[str, tuple[int, float, str]] = {}
+        # Where drop_reaped_reproof_counts starts its walk; it moves on one account each pass.
+        self._reaped_drop_start = 0
         # Boot-time Kerberos acceptor preflight outcome (ADR 0068 §9): None = usable (or the
         # preflight never ran); a reason string = browser SSO degraded until restart.
         self._kerberos_unavailable_reason: str | None = None
@@ -12361,7 +12368,11 @@ class AuthService:
             # A missing or empty text detail reads as empty, as before. A falsy non-text one, such
             # as 0 or [], raises in json.loads and is logged below, not skipped with no log (vault
             # BACKLOG #3750 item 20).
-            detail = {} if raw is None or raw in ("", b"") else json.loads(raw)
+            detail = (
+                {}
+                if raw is None or (isinstance(raw, (str, bytes)) and not raw)
+                else json.loads(raw)
+            )
         except Exception as exc:  # any class: fail toward reporting, see the docstring
             _log.error(
                 "directory reconcile: could not read a verified earlier revocation of %s (%s); "
@@ -16171,43 +16182,60 @@ class AuthService:
         )
 
     async def drop_reaped_reproof_counts(self) -> None:
-        """After the session reaper's purge, drop the re-proof counts of the sessions it took
-        (BACKLOG #5336). The purge ends rows without naming them by hash, so without this their
-        counts would stay until the age prune, and many accounts' dead counts could fill the whole
-        map, where the drop at an account's own cap never reaches. Each account holding a count is
-        read under its re-proof lock, as :meth:`_drop_unlisted_reproof_counts` requires.
+        """After the session reaper's purge, drop the re-proof counts of the sessions the store
+        shows as revoked or holds no row for (BACKLOG #5336), at least those the purge took. The
+        purge ends rows without naming them by hash, so without this their counts would stay until
+        the age prune, and many accounts' dead counts could fill the whole map, where the drop at an
+        account's own cap never reaches. Each account holding a count is read under its re-proof
+        lock, as :meth:`_drop_unlisted_reproof_counts` requires.
 
-        The drop is housekeeping, and it fails closed: a count it does not reach stays until a
-        later pass. The first store refusal ends the pass, logged once, so an outage costs one
-        timed-out read a pass rather than one per account. A defect, an error the store helpers
-        re-raise rather than read as a refusal, is logged at ERROR for that account and the next
-        account is still read; the first one is raised once every account has been tried, so one
-        bad account cannot keep the accounts after it from ever being reached."""
+        The drop is housekeeping, and it fails closed: a count it does not reach stays. The
+        accounts are walked from a starting point that moves on by one each pass, so an account
+        whose read keeps failing does not hold back the same accounts every pass. A refused read is logged and the
+        next account is read, until :data:`_REAPED_DROP_REFUSALS` refusals in a row end the pass,
+        so an outage costs that many timed-out reads a pass, not one per account. A defect, an
+        error the store helpers re-raise rather than read as a refusal, is logged for that account
+        and the next is still read; the first is raised when the pass ends, with any later ones
+        named in its notes. An error outside the store's refusal set raises at once and ends the
+        pass. The reaper bounds how long the whole drop may take."""
         holders = list(dict.fromkeys(uid for _, _, uid in self._reproof_session_failures.values()))
+        if holders:
+            start = self._reaped_drop_start % len(holders)
+            holders = holders[start:] + holders[:start]
+            self._reaped_drop_start = start + 1
         defect: Exception | None = None
+        refused = 0
         for user_id in holders:
             try:
                 async with self._account_reproof_lock(user_id):
                     await self._drop_unlisted_reproof_counts(user_id)
             except (*store_call_errors(), *store_connect_errors()) as exc:
                 if isinstance(exc, AUDIT_WRITE_DEFECTS):
+                    # No traceback here: the first defect is raised below, and its caller logs it.
                     _log.error(
                         "the session reaper's re-proof count drop for account id %r raised %s, a "
                         "defect; that account's counts stay",
                         user_id,
                         type(exc).__name__,
-                        exc_info=True,
                     )
-                    defect = defect or exc
+                    defect = _hold(defect, exc)
                     continue
+                refused += 1
                 _log.warning(
                     "the session reaper could not read account id %r's sessions to drop the "
-                    "re-proof counts of purged ones (%s); this pass drops no more, and the counts "
-                    "it did not reach stay until a later pass",
+                    "re-proof counts of purged ones (%s); that account's counts stay",
                     user_id,
                     type(exc).__name__,
                 )
-                break
+                if refused >= _REAPED_DROP_REFUSALS:
+                    _log.warning(
+                        "the session reaper's re-proof count drop met %d refused reads in a row; "
+                        "this pass drops no more",
+                        refused,
+                    )
+                    break
+                continue
+            refused = 0
         if defect is not None:
             raise defect
 

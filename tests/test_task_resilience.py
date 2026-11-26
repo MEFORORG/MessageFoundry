@@ -232,6 +232,34 @@ async def test_session_reaper_runs_after_purge_only_after_a_committed_purge(
         await asyncio.gather(task, return_exceptions=True)
 
 
+async def test_a_hung_step_after_the_purge_does_not_stop_the_purges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: the step after the purge takes re-proof locks, so the reaper bounds it; a
+    step that never returns is stopped and the next purge still runs."""
+    monkeypatch.setattr(api_app, "_SESSION_REAP_INTERVAL", 0.01)
+    monkeypatch.setattr(api_app, "_SESSION_REAP_FIRST_DELAY", 0.01)
+    monkeypatch.setattr(api_app, "_SESSION_REAP_AFTER_PURGE_TIMEOUT", 0.02)
+    calls = {"purge": 0}
+
+    class _Store:
+        async def purge_expired_sessions(self, **_: object) -> None:
+            calls["purge"] += 1
+
+    async def hung() -> None:
+        await asyncio.Event().wait()
+
+    task = asyncio.ensure_future(
+        api_app._session_reaper(_Store(), after_purge=hung)  # type: ignore[arg-type]
+    )
+    try:
+        await _until(lambda: calls["purge"] >= 3)
+        assert not task.done()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 def test_the_lifespan_hands_the_reaper_the_reproof_count_drop() -> None:
     """BACKLOG #5336: the lifespan wires the reaper to AuthService.drop_reaped_reproof_counts."""
     source = (Path(__file__).resolve().parents[1] / "messagefoundry/api/app.py").read_text(

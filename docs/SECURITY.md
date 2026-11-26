@@ -7346,9 +7346,10 @@ leaves the map in at least these ways (BACKLOG #5336):
 - a successful re-proof on the step-up re-auth route (a successful current-password check on the
   password-change route keeps the count);
 - a session reaper pass whose purge committed: after it, the accounts holding a count have their
-  sessions read, and the counts of those the store shows as revoked or holds no row for are dropped,
-  under each account's re-proof lock. The first refused read ends that drop for the pass, and the
-  counts it did not reach stay until a later pass;
+  sessions read, starting one account further on each pass, and the counts of those the store
+  shows as revoked or holds no row for are dropped, under each account's re-proof lock. An account
+  whose read is refused, raises a defect, or holds a row that does not parse keeps its counts.
+  Three refused reads in a row, or a drop that runs past five minutes, end that drop for the pass;
 - a restart, which forgets every count.
 
 A rotation moves the count to the session's new key. Of these, at least two drop the count of a
@@ -7367,12 +7368,15 @@ failure, and its count is held at the cap. That count leaves in at least the way
 them when that revoke commits, when a later re-proof finds the session gone, and when a later age
 prune reaches it. The age prune runs only when a new session's first failure finds no room. The
 reaper's drop runs on the reaper's timer, after its purge, which deletes the rows past their
-absolute expiry or idle window, so a lapsed session's count normally goes within about one reaper
-interval. While the reaper skips or fails its purges, or its reads are refused, a count can stay
-in the map for any length of time past its session's lifetime. If the revoke fails, or never runs because an earlier write raised, the count stays, and
+absolute expiry or idle window as of ten minutes before the pass, so a lapsed session's count
+usually goes within about one reaper interval plus those ten minutes. No drop is bound to reach a
+given count: while the reaper skips or fails its purges, or its drop cannot reach an account in
+the ways listed above, a count can stay in the map for any length of time past its session's
+lifetime. If the revoke fails, or never runs because an earlier write raised, the count stays, and
 the session's next re-proof is revoked unverified. A session the session reaper purges without the
 engine ending it, at least one that expired with no request, keeps its count until the reaper's
-drop after that purge, or another drop above, takes it.
+drop after that purge, or another drop above, takes it, and none of them is bound to run before a
+restart.
 
 The per-session cap matters for AD, because since the AD sign-in was retired the step-up re-auth
 route is the **only** place an AD password is still bound: a rejected re-bind counts on the

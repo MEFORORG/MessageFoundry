@@ -35,6 +35,7 @@ from _totp_clock import fresh_totp
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
+from messagefoundry.auth import service as service_module
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind, LdapError
 from messagefoundry.auth.notifications import (
@@ -1372,13 +1373,13 @@ async def test_a_refused_read_keeps_the_reaped_counts(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5336: the drop after a purge is housekeeping, so a store that refuses the read
-    leaves the counts in place (fail closed), logged, rather than failing the reaper's pass. The
-    first refusal ends the pass, so an outage costs one read, not one per account."""
+    leaves the counts in place (fail closed), logged, rather than failing the reaper's pass. Three
+    refusals in a row end the pass, so an outage costs three reads, not one per account."""
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
         tokens = []
-        for name in ("ann", "ben"):
+        for name in ("ann", "ben", "cat", "dan", "eve"):
             await _local_user(store, name)
             identity, token = await _signed_in(service, name)
             assert not (await service.reauth(identity, WRONG, token=token)).ok
@@ -1394,8 +1395,40 @@ async def test_a_refused_read_keeps_the_reaped_counts(
         with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
             await service.drop_reaped_reproof_counts()
         assert all(service._session_reproof_failures(hash_token(t)) == 1 for t in tokens)
-        assert len(reads) == 1, "an outage cost one read per account"
+        assert len(reads) == service_module._REAPED_DROP_REFUSALS
         assert any("this pass drops no more" in r.getMessage() for r in caplog.records)
+    finally:
+        await store.close()
+
+
+async def test_one_accounts_refused_read_does_not_starve_the_rest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: an account whose read the store keeps refusing, such as one with a row the
+    driver cannot decode, keeps its own counts, and the drop still reaches every other account,
+    on every pass and whatever order the accounts come in."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        tokens = {}
+        for name in ("ann", "ben", "cat"):
+            await _local_user(store, name)
+            identity, token = await _signed_in(service, name)
+            assert not (await service.reauth(identity, WRONG, token=token)).ok
+            tokens[name] = token
+        await store.purge_expired_sessions(now=time.time() + _FAR_FUTURE)
+        real = store.list_sessions
+
+        async def flaky(user_id: str, *args: Any, **kwargs: Any) -> Any:
+            if user_id == "u-ann":
+                raise sqlite3.OperationalError("Could not decode to UTF-8 column 'user_id'")
+            return await real(user_id, *args, **kwargs)
+
+        monkeypatch.setattr(store, "list_sessions", flaky)
+        await service.drop_reaped_reproof_counts()
+        assert service._session_reproof_failures(hash_token(tokens["ann"])) == 1
+        assert hash_token(tokens["ben"]) not in service._reproof_session_failures
+        assert hash_token(tokens["cat"]) not in service._reproof_session_failures
     finally:
         await store.close()
 
