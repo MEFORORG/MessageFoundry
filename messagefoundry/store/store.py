@@ -4598,18 +4598,26 @@ def passkey_is_way_past(cred: WebAuthnCredential) -> bool:
     """Whether one passkey can be a way past the sign-in lock: recorded as discoverable, AND stored
     under today's credential-id hash scheme, the only key the sign-in looks a passkey up by (BACKLOG
     #3423). A row the start-up rehash has not moved (a bare digest), or one it refused (an unknown
-    tag, a malformed value), can never sign in, so it is no way past however it is recorded. The one
-    statement of the per-passkey way-past rule: at least the store's conditional writes, the census,
-    the service's gates, the sign-in path and the lock notice ask it. The census's reset list asks
-    only its hash-scheme half for a directory account's second factor, which needs no discoverable
-    record (:func:`~messagefoundry.auth.tokens.credential_id_hash_is_current`)."""
+    tag, a malformed value), can never sign in, so it is no way past however it is recorded. Nor is
+    one whose stored ``public_key`` does not decode, which the verify refuses (BACKLOG #6886). A
+    hash that reads back as bytes counts as the text it holds, as the sign-in's compare does. A
+    stored ``credential_id`` is not asked: the combined sign-in names no credential up front and
+    finds the passkey by the hash of the id the browser sends. Those stored-cell checks are
+    :func:`~messagefoundry.auth.tokens.stored_passkey_is_readable`.
+
+    The one statement of the per-passkey way-past rule: at least the store's conditional writes,
+    the census, the service's gates, the sign-in path and the lock notice ask it. The census's reset
+    list asks only its stored-cell half for a directory account's second factor, which needs no
+    discoverable record, and adds that the stored id decodes, which that leg's allow list needs."""
     if not cred.discoverable:
         return False
     # Lazy: a leaf module of the auth package (stdlib only), imported where the rule is asked so
     # the store module takes no import-time dependency on the auth package.
-    from messagefoundry.auth.tokens import credential_id_hash_is_current
+    from messagefoundry.auth.tokens import stored_passkey_is_readable
 
-    return credential_id_hash_is_current(cred.credential_id_hash)
+    return stored_passkey_is_readable(
+        credential_id_hash=cred.credential_id_hash, public_key=cred.public_key
+    )
 
 
 #: The caller's rule for which passkey counts as a way past at a factor-drop gate (BACKLOG #3937):
