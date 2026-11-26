@@ -9346,8 +9346,8 @@ def forget_store_salt(path: Path) -> bool:
 class _ClosedStoreWriteError(sqlite3.OperationalError):
     """:func:`_write_closed_store`'s own refusals, and :func:`forget_store_salt`'s refusal of a
     ``store_salt`` that is not an ordinary table, whose text the engine wrote: a store or ``-wal``
-    path, the journal mode SQLite reported, a kind word from ``_FOREIGN_SALT_KINDS`` and a fixed
-    sentence, never a row's value or SQLite's message.
+    path, the journal mode SQLite reported, a kind word from ``_FOREIGN_SALT_KINDS`` or its fixed
+    fallback, and a fixed sentence, never a row's value or SQLite's message.
     Marked :func:`~messagefoundry.redaction.engine_text_only`, so a renderer that withholds a
     database driver's message keeps it (vault BACKLOG #8153). ``safe_exc`` and the DR reasons show
     it as ``OperationalError``; a traceback names this class itself.

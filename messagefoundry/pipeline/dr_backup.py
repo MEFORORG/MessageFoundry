@@ -4868,10 +4868,11 @@ def _full_open_check(
     # ADR 0196 AC-8: the snapshot is a copy of the LIVE store and carries its salt. Opened as it is,
     # anything the open seals (the at-open sweep) would land under the live store's data sub-key and
     # be counted only in this throwaway copy's row. Where the open binds a salt, dropping it makes
-    # the open mint a new one, so whatever it seals is under a key nothing else uses; the opens that
-    # bind none, and for which this changes no key, are named in forget_store_salt. Dropping it does not change how an
-    # existing value opens (forget_store_salt says why), so neither walk is affected. The copy is
-    # discarded afterwards either way.
+    # the open mint a new one, so whatever it seals is under a key nothing else uses. An open that
+    # binds none (forget_store_salt names them, at least `[store].aad_bind = false`) is not helped:
+    # the hazard above stays open there. Dropping it does not change how an existing value opens
+    # (forget_store_salt says why), so neither walk is affected. The copy is discarded afterwards
+    # either way.
     from messagefoundry.store.store import forget_store_salt
 
     try:
@@ -5920,9 +5921,11 @@ def _restore_blocking(
             # sub-key. That key's persisted count is the archive's, which may trail the key's real use
             # -- the primary kept sealing after the backup, and the ADR 0048 cold seed can run beside
             # it. Dropping the salt here, after the checks and before the store is placed, makes a
-            # salt-binding first open mint a new salt and so a new key (forget_store_salt names the
-            # opens that bind none, for which it changes no key). Old values open as before (forget_store_salt
-            # says why), and nothing about the key the DR site must hold changes.
+            # salt-binding first open mint a new salt and so a new key. An open that binds none, at
+            # least under `[store].aad_bind = false`, still seals under the DEK with the archive's
+            # count, so this requirement is not met there. forget_store_salt names those opens and
+            # says why old values open as before; nothing about the key the DR site must hold
+            # changes.
             try:
                 dropped = forget_store_salt(snap)
             except sqlite3.Error as exc:
