@@ -33,13 +33,12 @@
   refusal with a fixed text the site chooses, raised after the handler has exited, and nothing
   from the provider or the build is passed through at either site. What runs once the provider
   has answered is not judged: the key check at `resolve_active_key`, whose refusals the engine
-  built and raises as built, and the keyring's assembly at `resolve_decrypt_keys`. The store
-  open's own key custody step is not one of these sites, and no codec judgement runs there, as
-  the end of this bullet says.** The class of every refusal at the cipher build and the key
+  built and raises as built, and the keyring's assembly at `resolve_decrypt_keys`. No codec
+  judgement runs at the store open's own key custody step either, as the end of this bullet
+  says.** The class of every refusal that replaces an error at the cipher build or the key
   resolution, the previous bullet's included, depends on the codec judgement. An error the
   judgement refuses, one with a codec error on it, one whose chain cannot be read whole or one
-  whose judgement raised, takes the previous bullet's two
-  classes, so a hop refusal holding a codec error is a `StoreCipherConfigError` and a `DpapiError`
+  whose judgement raised, takes the previous bullet's two classes, so a hop refusal holding a codec error is a `StoreCipherConfigError` and a `DpapiError`
   holding one a `KeyProviderError`. Otherwise the new refusal's class follows the error's: an
   `InsecureHopRefused`, a `DpapiError` or a `DpapiUnavailable` is replaced by one of that base
   class, not of a subclass it may be, any other `ValueError` by a `StoreCipherConfigError`, and any
@@ -65,12 +64,13 @@
   the key custody step runs inside one guard: a `KeyProviderError` the engine built and recorded is
   re-raised as it is, and any other `Exception` from the step, a `ValueError` included, is replaced
   by a `HostCustodyRefused`, raised with no cause or context, unless building that refusal raises,
-  which then leaves in its place. That refusal is a `HostCustodyRefused` whether or not the
-  replaced error is or chains a codec error, never a `StoreCipherConfigError`, and its text reads
-  nothing from the replaced error's text, arguments or chain: a fixed text naming the custody
-  settings, then the text the engine recorded when it built that error, or else a fixed reason
-  chosen by its class. So a codec error's byte stays out of it. Of the replaced error, the guard
-  logs at most its class name. A `BaseException` that is not an `Exception` is not caught there,
+  which then leaves in its place. No codec judgement runs in that guard: the replacing refusal is
+  a `HostCustodyRefused` whether or not the replaced error is or chains a codec error, never a
+  `StoreCipherConfigError`, and nothing is read from the replaced error itself, neither its text,
+  its arguments nor its chain. Its text is a fixed text naming the custody settings, then either
+  the text the engine recorded, by the error's identity, when it built that error, or else a fixed
+  reason chosen by its class. So a codec error's byte stays out of it. Of the replaced error, the
+  guard logs at most its class name. A `BaseException` that is not an `Exception` is not caught there,
   and a check before the guard
   raises a `ValueError` with a fixed text where a caller passes a host blob or a recovery wrap
   under any key provider but `host`. What the step itself reads, converts, settles and refuses is
