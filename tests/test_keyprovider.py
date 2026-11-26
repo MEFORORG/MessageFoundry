@@ -12,6 +12,7 @@ acceptance criterion). DPAPI round-trips are Windows-only, so the file branch is
 from __future__ import annotations
 
 import base64
+import sys
 from collections.abc import Callable
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -604,6 +605,32 @@ def test_a_refusal_the_engine_built_from_build_provider_keeps_its_recorded_text(
     with pytest.raises(Exception) as caught:
         resolve_active_key(StoreSettings(key_provider="vault"))
     assert str(caught.value) == text
+
+
+def test_an_error_caused_by_the_vault_hop_refusal_keeps_the_vault_hop_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # As above, for an error whose cause is the Vault hop's marked refusal: wrapped, that cause
+    # would sit one link further down than _fresh_refusal reads, and the Vault text would be lost.
+    from messagefoundry.config.tls_policy import _VAULT_HOP_MODULE
+    from messagefoundry.store.base import _VAULT_HOP_TEXT
+
+    class VaultHopRefused(InsecureHopRefused):
+        pass
+
+    monkeypatch.setitem(
+        sys.modules, _VAULT_HOP_MODULE, SimpleNamespace(VaultHopRefused=VaultHopRefused)
+    )
+
+    def _caused() -> Exception:
+        error = RuntimeError("synthetic")
+        error.__cause__ = VaultHopRefused("synthetic hop")
+        return error
+
+    _plant_build_provider(monkeypatch, _caused)
+    with pytest.raises(Exception) as caught:
+        resolve_active_key(StoreSettings(key_provider="vault"))
+    assert str(caught.value) == _VAULT_HOP_TEXT
 
 
 def test_a_plain_value_error_from_build_provider_is_still_refused_by_class(
