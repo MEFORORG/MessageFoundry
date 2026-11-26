@@ -12823,17 +12823,18 @@ _UNREACHED_ALERT_TEXT: Final[str] = (
 #: last rollup's cooldown, or a suspend of any rollup, silenced every later rollup, and with it each
 #: account entering then, which no other page names. Keyed by the account set, a cooldown or
 #: suspend reaches only a later rollup of exactly those accounts, as a per-account one reaches only
-#: that account: a restarted process, or another one on the store, that rolls up the same accounts
-#: lands on the same instance, so it neither pages them again inside the cooldown nor escapes the
-#: suspend. So each rollup is resolved or suspended on its own; the outage page covers a whole
-#: directory. Not under ``directory-reconciler-unreached:``, where a username could spell the label.
+#: that account, so each rollup is resolved or suspended on its own; the outage page covers a whole
+#: directory. A later rollup of a different set pages, even one holding accounts paged before, such
+#: as those of several rollups re-entering together after a restart, as a per-account page does
+#: after one. The rollup WARNING logs the key. Not under ``directory-reconciler-unreached:``, where
+#: a username could spell the label.
 _UNREACHED_ROLLUP_SOURCE = "directory-reconciler-unreached-rollup"
 #: What one page for many such accounts says, on a pass that rolls them up
 #: (``AuthService._record_unreached_accounts`` decides when), so a flapping directory opens one
-#: instance per pass rather than one per signed-in account. It counts only the accounts entering
-#: on its pass, and says so: no process can say how many stand, since each counts its own, and a
-#: later rollup of the same accounts updates the same open instance's text (BACKLOG #3709). ``probes``
-#: is the fewest failures among those entering, of up to each one's last ``window`` probes (its
+#: instance per set of accounts entering together rather than one per account. It counts only
+#: the accounts entering on its pass, and says so: no process can say how many stand, since each
+#: counts its own, and a later rollup of the same accounts updates the same open instance's text
+#: (BACKLOG #3709). ``probes`` is the fewest failures among those entering, of up to each one's last ``window`` probes (its
 #: window can hold fewer, and a probe fault adds nothing to it, hence "faults aside"), counted in
 #: probes, not passes, which differ under a probe budget smaller than the estate.
 _UNREACHED_ROLLUP_TEXT: Final[str] = (

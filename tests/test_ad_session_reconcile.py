@@ -2952,7 +2952,7 @@ async def test_a_pass_that_raises_after_the_unreached_row_leaves_the_next_pass_t
 async def test_a_flapping_directory_pages_once_for_many_unreached_accounts() -> None:
     """BACKLOG #3100 closing step 2, round-one review. A directory that answers only a few probes
     in each pass is not an outage, so each failing account would enter its own run. Past
-    ``ad_session_revoke_max`` of them on one pass, one rollup page covers them,
+    ``_UNREACHED_ROLLUP_ABOVE`` of them on one pass, one rollup page covers them,
     naming none, and each account still has its own row.
 
     RED when: such a pass opens one instance per account."""
@@ -3037,6 +3037,7 @@ async def test_a_suspended_rollup_does_not_mute_a_later_rollup_of_other_accounts
 
     RED when: the later rollup is muted by the earlier rollup's suspend."""
     store = await MessageStore.open(":memory:")
+    sinks: list[NotifierAlertSink] = []
     try:
         first_group = [f"flap{i}" for i in range(7)]
         second_group = [f"more{i}" for i in range(6)]
@@ -3050,36 +3051,49 @@ async def test_a_suspended_rollup_does_not_mute_a_later_rollup_of_other_accounts
         # No cooldown, so the suspend alone decides; the store holds the instance the operator
         # suspends, as the API's suspend route reads it.
         sink = NotifierAlertSink([transport], store=store, realert_seconds=0)
+        sinks.append(sink)
         ldap.unreachable = set(first_group)
         for _ in range(3):
             first = await _pass(service, sink)
         assert first.unreached_rollup and len(first.unreached) == 7
         await uac._settle(sink)
         # The rollup's instance is the only one open, whatever its source is called, so this
-        # reads it as the API's suspend route would, on the code before the fix too.
-        [(event_type, opened)] = await uac._open_alerts(store)
-        sink.suspend(event_type, opened, until=time.time() + 3600)
+        # suspends it as the API's suspend route does, in the store and in the running notifier,
+        # on the code before the fix too.
+        [opened] = await store.list_active_alert_instances(allowed_channels=None)
+        until = time.time() + 3600
+        audit = AuditAppend("alert_suspend", actor="operator", detail=None)
+        assert await store.suspend_alert_instance(opened.id, until=until, audit=audit)
+        sink.suspend(opened.event_type, opened.connection, until=until)
         ldap.unreachable = set(first_group) | set(second_group)
         for _ in range(3):
             later = await _pass(service, sink)
         assert sorted(name for _uid, name, _n in later.unreached) == second_group
         assert later.unreached_rollup
-        # The control: a restart forgets the latch, so the same seven enter and roll up again,
-        # under the instance the operator suspended, which stays muted.
-        restarted = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
-        await restarted.initialize()
-        ldap.unreachable = set(first_group)
-        for _ in range(3):
-            again = await _pass(restarted, sink)
-        assert again.unreached_rollup
-        assert sorted(name for _uid, name, _n in again.unreached) == first_group
         await _drain(sink)
-        await uac._settle(sink)  # no state write may outlive the store
         assert [p["detail"].split(".")[0] for p in _unreached_pages(transport)] == [
             "Accounts newly unreachable: 7",
             "Accounts newly unreachable: 6",
-        ], "the later rollup was muted by the suspend of the first, or the suspend no longer mutes"
+        ], "the later rollup was muted by the suspend of the first"
+        # The control: a restart forgets the latch and the notifier's memory, so the same seven
+        # enter and roll up again, under the instance the operator suspended, whose window the
+        # new notifier reads from the store and which stays muted.
+        restarted = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await restarted.initialize()
+        after = _RecordingTransport("t")
+        resink = NotifierAlertSink([after], store=store, realert_seconds=0)
+        sinks.append(resink)
+        await resink.prime_suspensions()
+        ldap.unreachable = set(first_group)
+        for _ in range(3):
+            again = await _pass(restarted, resink)
+        assert again.unreached_rollup
+        assert sorted(name for _uid, name, _n in again.unreached) == first_group
+        await _drain(resink)
+        assert _unreached_pages(after) == [], "the suspend no longer mutes its own rollup"
     finally:
+        for each in sinks:  # no state write may outlive the store
+            await uac._settle(each)
         await store.close()
 
 

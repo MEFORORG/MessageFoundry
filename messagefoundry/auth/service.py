@@ -884,8 +884,9 @@ _UNREACHED_ROLLUP_ABOVE: Final[int] = 5
 def _unreached_rollup_key(user_ids: Iterable[str]) -> str:
     """The key a rollup's page carries in its source, ``ReconcilePlan.unreached_rollup``: 16 hex
     characters of a SHA-256 over the sorted user ids of the accounts entering (BACKLOG #3100 item
-    14). An alert-instance key, not a secret. The ids, not the names, so the source names nobody
-    and a rename keeps the key; sorted, so the order a pass probed them in does not change it."""
+    14). An alert-instance key, not a secret and not a pseudonym: anyone who can list user ids can
+    recompute it. The ids, not the names, so the source carries no username and a rename keeps the
+    key; sorted, so the order a pass probed them in does not change it."""
     ids = "\n".join(sorted(user_ids))
     return hashlib.sha256(ids.encode("utf-8", "surrogatepass")).hexdigest()[:16]
 
@@ -10457,23 +10458,21 @@ class AuthService:
                 bool(written)
                 and len(self._reconcile_unreached_paged) + len(written) > _UNREACHED_ROLLUP_ABOVE
             )
-            if rollup:
+            key = _unreached_rollup_key(uid for uid, _n, _p in written) if rollup else None
+            if key is not None:
+                # The key is the one the rollup's alert source carries, so the operator can tell
+                # which pass's rows an open rollup instance covers (BACKLOG #3100 item 14).
                 _log.warning(
                     "directory reconcile: %d accounts entered the unreachable state, so "
                     "their sessions are not revoked while this lasts; an "
-                    "auth.ad_reconcile_unreached row names each",
+                    "auth.ad_reconcile_unreached row names each, and their alert's source ends %s",
                     len(written),
+                    key,
                 )
             else:
                 for _user_id, username, probes in written:
                     warn(username, probes)
-        return replace(
-            plan,
-            unreached=tuple(written),
-            unreached_rollup=_unreached_rollup_key(uid for uid, _n, _p in written)
-            if rollup
-            else None,
-        )
+        return replace(plan, unreached=tuple(written), unreached_rollup=key)
 
     def _latch_unreached_accounts(self, plan: reconcile.ReconcilePlan) -> None:
         """Record that each entry's page is raised, last in the pass, as the outage's is
