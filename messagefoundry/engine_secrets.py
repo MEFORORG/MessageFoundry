@@ -170,9 +170,9 @@ def _check(path: Path, what: str, *, directory: bool = False) -> None:
     directory, a broad right to delete a file inside it is refused too, since deleting a file sends
     its setting back to the environment. The directory's own check walks the folders above it; a
     file's does not walk them again, because the directory that holds it is the one just judged
-    (on POSIX that directory's owner and mode are still read for each file). An answer that the
-    check could not be completed, typed
-    :class:`~messagefoundry.restricted_file.UncheckedProblem`, is refused as not fully checked,
+    (on POSIX that directory's owner and mode are still read for each file). An answer typed
+    :class:`~messagefoundry.restricted_file.UncheckedProblem`, as at least the unread Linux mount
+    table gives, is refused as not fully checked,
     with its own remedy rather than :data:`_REMEDY` (vault BACKLOG #5657)."""
     from messagefoundry.restricted_file import UncheckedProblem, broad_access_problem
 

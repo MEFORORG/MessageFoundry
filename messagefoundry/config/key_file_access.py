@@ -116,10 +116,9 @@ def key_file_problem(
     says why, which is the fault the operator needs to hear about. With ``engine_owned``, the file is
     one only the engine writes, and on Windows its owner must be the engine, SYSTEM or
     Administrators (vault BACKLOG #5657). It prints and logs nothing:
-    each caller refuses under ``enforce`` and warns under ``warn``. Where the check answers
-    that it could not be completed, typed
-    :class:`~messagefoundry.restricted_file.UncheckedProblem`, the answer says the file could not
-    be fully checked and carries that answer's own remedy instead of ``remedy``, which would not
+    each caller refuses under ``enforce`` and warns under ``warn``. An answer typed
+    :class:`~messagefoundry.restricted_file.UncheckedProblem`, as at least the unread Linux mount
+    table gives, makes this answer say the file could not be fully checked and carries that answer's own remedy instead of ``remedy``, which would not
     clear it (vault BACKLOG #5657)."""
     from messagefoundry.restricted_file import UncheckedProblem, broad_access_problem
 

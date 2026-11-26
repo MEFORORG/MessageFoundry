@@ -1158,8 +1158,9 @@ def test_broad_access_problem_refuses_where_the_linux_mount_table_cannot_be_read
     # Typed, so a caller says the file could not be checked rather than that it is not restricted.
     assert isinstance(problem, restricted_file.UncheckedProblem)
     assert "This clears once the engine can read /proc/self/mountinfo" in problem
-    assert "Changing the owner or mode of the path" in problem
-    assert problem.endswith("or replacing what is at the path, does not clear it")
+    assert "the owner and mode of the folder that holds it" in problem
+    assert "Changing the owner or mode of the checked path" in problem
+    assert problem.endswith("or replacing what is at that path, does not clear it")
     # Worded for a warning as well as a refusal, since warn prints it and the start goes on.
     assert "refus" not in problem
     assert "chmod" not in problem and "chown" not in problem

@@ -95,11 +95,11 @@ __all__ = [
     "DELETE_ACCESS",
     "LINUX_CREDENTIAL_FILE_SYSTEMS",
     "LINUX_HOST_FILE_SYSTEMS",
+    "MOUNT_TABLE_UNREAD",
     "WINERROR_ACCESS_DENIED",
     "WINERROR_SHARING_VIOLATION",
     "OwnerRefused",
     "RestrictedFileError",
-    "MOUNT_TABLE_UNREAD",
     "UncheckedProblem",
     "administrators_enabled",
     "broad_access_problem",
@@ -1159,11 +1159,12 @@ class UncheckedProblem(str):
 #: ``/proc/self/mountinfo`` cannot be read. It is worded for a refusal under ``enforce`` and a
 #: warning under ``warn`` alike.
 MOUNT_TABLE_UNREAD: Final = (
-    "/proc/self/mountinfo could not be read, so the file system under its path was not judged, "
-    "and the folders above it were not walked. This clears once the engine can read "
-    "/proc/self/mountinfo, for example with procfs mounted where the engine runs, or with an "
-    "AppArmor or SELinux policy that allows the read. Changing the owner or mode of the path or "
-    "of the folders above it, or replacing what is at the path, does not clear it"
+    "/proc/self/mountinfo could not be read, so at least these were not judged for the checked "
+    "path: the type of the file system under it, the folders above it, and the owner and mode of "
+    "the folder that holds it. This clears once the engine can read /proc/self/mountinfo, for "
+    "example with procfs mounted where the engine runs, or with an AppArmor or SELinux policy that "
+    "allows the read. Changing the owner or mode of the checked path or of the folders above it, "
+    "or replacing what is at that path, does not clear it"
 )
 
 
@@ -1449,10 +1450,10 @@ def broad_access_problem(
     reaches the file there; the list is open, so a type it does not name passes. That walk, and
     with it the mount check, is skipped under ``holder_judged``. Its refusal where the table
     cannot be read, and at least some of what it does not judge, are
-    :func:`_posix_host_link_problem`'s, and ``docs/PHI.md`` lists at least those too. That refusal
-    is an :class:`UncheckedProblem`, which a caller tells apart by its type: the check was not
-    completed, though the file's own owner and mode were judged first, and the text carries its own
-    remedy.
+    :func:`_posix_host_link_problem`'s, and ``docs/PHI.md`` lists at least those too. That answer,
+    which a caller turns into a refusal under ``enforce`` and a warning under ``warn``, is an
+    :class:`UncheckedProblem`, told apart by its type: the check was not completed, though the
+    file's own owner and mode were judged first, and the text carries its own remedy.
 
     On both, the folders above ``path`` are walked too (vault BACKLOG #5656, #5657). A junction or
     link among them is refused when an account the check does not trust can change it: on
