@@ -1,9 +1,9 @@
 ---
-name: verify
-description: Run the engine end to end - start a real `serve` on the sample config, send one synthetic ADT over MLLP, assert the AA ACK and the PROCESSED disposition through the API. Use before committing a change to messagefoundry/pipeline/, transports/, parsing/, store/ or config/, or whenever unit tests pass but you need proof the running engine still moves a message.
+name: e2e-smoke
+description: Run the engine end to end - start a real `serve` on the sample config, send one synthetic ADT over MLLP, assert an AA or CA ACK and the PROCESSED disposition through the API. Use before committing a change to messagefoundry/pipeline/, transports/, parsing/, store/ or config/, or whenever unit tests pass but you need proof the running engine still moves a message.
 ---
 
-# verify: end-to-end engine smoke
+# e2e-smoke: end-to-end engine smoke
 
 From the worktree root, with its venv (`scripts\worktree\ensure-venv.ps1` first):
 

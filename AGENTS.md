@@ -16,7 +16,7 @@ When a repo skill applies, read its current source `SKILL.md`, which
 `.agents/skills/` are discovery pointers only; run `source-skill` before
 reporting a skill missing. It reads this checkout's `.claude/skills/`, then the
 primary checkout's, which git does not carry into a linked worktree (all but
-`verify`), then
+`e2e-smoke`), then
 Claude's user-level skills; the first that holds the name wins.
 Resolve linked resources from the source skill's directory.
 Treat an explicit `$<name>` Codex invocation as the source's `/<name>` invocation.

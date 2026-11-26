@@ -1574,7 +1574,7 @@ try {
     # failure to the next session start and make it quiet again.
     #
     # THE MARKER CANNOT RIDE INTO A COMMIT: `.gitignore` carries `/.claude/*`, and its negations
-    # re-include `settings.json` and `skills/verify/SKILL.md` alone. Verified with
+    # re-include `settings.json` and `skills/e2e-smoke/SKILL.md` alone. Verified with
     # `git check-ignore -v`. Do not add a negation that reaches the marker.
     if ($Declare -and $Seat -and $seatRoster.Canonical) {
         try {

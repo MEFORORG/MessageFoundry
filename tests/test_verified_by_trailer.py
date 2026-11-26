@@ -58,7 +58,7 @@ def _one_advisory(proc: subprocess.CompletedProcess[str]) -> str:
         "Verified-by: code-review xhigh",
         "Verified-by: code-review max",
         "Verified-by: code-review ultra",
-        "Verified-by: verify",
+        "Verified-by: e2e-smoke",
         "Verified-by: tests",
         "Verified-by: none",
         "verified-by:   Code-Review   XHIGH",
@@ -67,7 +67,7 @@ def _one_advisory(proc: subprocess.CompletedProcess[str]) -> str:
         # Several valid values, each naming one check that ran. The pre-fix hook flagged these as
         # disagreeing, so they are the negative control for the "none beside a check" rule below.
         "Verified-by: tests\nVerified-by: code-review xhigh",
-        "Verified-by: verify\nVerified-by: tests\nVerified-by: code-review ultra",
+        "Verified-by: e2e-smoke\nVerified-by: tests\nVerified-by: code-review ultra",
         "Signed-off-by: A Person <a@example.invalid>\n  continued\nVerified-by: tests",
     ],
 )
@@ -90,6 +90,8 @@ def test_an_absent_trailer_prints_one_advisory_line_and_passes(tmp_path: Path) -
         "Verified-by: ",
         "Verified-by: looked at it",
         "Verified-by: tests and a review",
+        # The skill's old name: the CLI's bundled `verify` skill would shadow it, so it is gone.
+        "Verified-by: verify",
         # One malformed value among valid ones is still malformed.
         "Verified-by: tests\nVerified-by: looked at it",
     ],

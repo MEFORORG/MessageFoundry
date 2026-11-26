@@ -7,7 +7,7 @@ Read linked resources relative to the Claude skill's directory.
 User-level sources come from `$CLAUDE_CONFIG_DIR/skills` when set, otherwise
 `~/.claude/skills`. This follows junctions into `.claude-shared-skills` too.
 Repo skill names take precedence over user-level names.
-Git ignores `.claude/skills/` but for `verify/SKILL.md`, so any other repo skill exists only in the checkout that holds it.
+Git ignores `.claude/skills/` but for `e2e-smoke/SKILL.md`, so any other repo skill exists only in the checkout that holds it.
 In a linked worktree the bridge also reads the primary checkout's `.claude/skills/`,
 found through the git common dir, after the worktree's own and before user-level ones.
 Every pointer therefore finds its source at run time through `source-skill`.

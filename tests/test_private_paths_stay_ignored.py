@@ -75,9 +75,9 @@ _PRIVATE_PATHS: list[tuple[str, str]] = [
 # another skill, an agent definition, anything -- fails here until someone writes it down, and
 # `.claude/worktrees/` reaching this set would publish full nested checkouts.
 _TRACKED_EXCEPTIONS: dict[str, frozenset[str]] = {
-    # .claude/skills/verify/SKILL.md is the second: the shared end-to-end smoke skill. An untracked
+    # .claude/skills/e2e-smoke/SKILL.md is the second: the shared end-to-end smoke skill. An untracked
     # skill reaches one checkout only, so it travels by name and every other skill stays ignored.
-    "/.claude/*": frozenset({".claude/settings.json", ".claude/skills/verify/SKILL.md"}),
+    "/.claude/*": frozenset({".claude/settings.json", ".claude/skills/e2e-smoke/SKILL.md"}),
     # docs/testing/VERIFY.md is OPERATOR material and stays tracked while the rest of the tree does
     # not. It documents `messagefoundry verify`, the wheel-only on-box acceptance check a deployment
     # runs, and docs/README.md lists it as step 6 of "Start here -- a new operator, in order" while
@@ -164,7 +164,7 @@ def test_the_negations_re_include_exactly_their_files() -> None:
     whose parent directory is excluded — the negation would parse fine, apply to nothing, and leave
     `settings.json` untracked with no error anywhere. The contents form `/.claude/*` is what makes it
     work, so the asymmetry is asserted rather than assumed: the two files un-ignored, their siblings
-    not. `skills/verify/SKILL.md` needs its two directories re-included and their contents
+    not. `skills/e2e-smoke/SKILL.md` needs its two directories re-included and their contents
     re-ignored, so a sibling inside each re-included directory is probed too.
 
     The siblings matter beyond hygiene. `rules/`, `skills/` and `agents/` are the directories a
@@ -177,9 +177,9 @@ def test_the_negations_re_include_exactly_their_files() -> None:
         "effect. Check that the rule above it is `/.claude/*` and not `/.claude/`: a negation cannot "
         "re-include a file whose parent directory is excluded, and it fails silently when it can't."
     )
-    skill = _git("check-ignore", "-q", "--no-index", ".claude/skills/verify/SKILL.md")
+    skill = _git("check-ignore", "-q", "--no-index", ".claude/skills/e2e-smoke/SKILL.md")
     assert skill.returncode != 0, (
-        "`.claude/skills/verify/SKILL.md` is IGNORED -- its negations under `/.claude/skills/` are "
+        "`.claude/skills/e2e-smoke/SKILL.md` is IGNORED -- its negations under `/.claude/skills/` are "
         "not taking effect. The directory must be re-included before its contents can be."
     )
 
@@ -188,14 +188,14 @@ def test_the_negations_re_include_exactly_their_files() -> None:
         ".claude/worktrees/probe-327/CLAUDE.md",
         ".claude/rules/probe-327.md",
         ".claude/skills/probe-327/SKILL.md",
-        ".claude/skills/verify/notes.local.md",
-        ".claude/skills/verify/sub/probe-327.md",
+        ".claude/skills/e2e-smoke/notes.local.md",
+        ".claude/skills/e2e-smoke/sub/probe-327.md",
         ".claude/agents/probe-327.md",
     ):
         res = _git("check-ignore", "-q", "--no-index", sibling)
         assert res.returncode == 0, (
             f"{sibling!r} is NOT ignored. The negations are meant to cover `settings.json` and "
-            "`skills/verify/SKILL.md` alone; a wider one publishes session state or machine-local "
+            "`skills/e2e-smoke/SKILL.md` alone; a wider one publishes session state or machine-local "
             "config. If this path is now "
             "meant to travel, pin it in _TRACKED_EXCEPTIONS and say why in .gitignore."
         )

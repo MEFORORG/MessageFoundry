@@ -526,7 +526,7 @@ def _refuse_trailers(hits: list[tuple[int, str]]) -> int:
 
 
 _CODE_REVIEW_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
-_PLAIN_VALUES = ("verify", "tests", "none")
+_PLAIN_VALUES = ("e2e-smoke", "tests", "none")
 _VERIFIED_BY_VALUES = frozenset(
     (*(f"code-review {level}" for level in _CODE_REVIEW_LEVELS), *_PLAIN_VALUES)
 )

@@ -48,7 +48,7 @@ SETTINGS = _REPO / ".claude" / "settings.json"
 
 #: The marker and the injected copy. BOTH MUST STAY GIT-IGNORED, and the ignore rule here is the
 #: INVERSE of korus's: `/.claude/*` covers the directory, and its negations re-add settings.json
-#: and skills/verify/SKILL.md alone.
+#: and skills/e2e-smoke/SKILL.md alone.
 MARKER_RELPATH = ".claude/seat.local.txt"
 ROLE_COPY_RELPATH = ".claude/ROLE.local.md"
 

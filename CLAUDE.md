@@ -849,11 +849,11 @@ Manager's watch reached the cloud session 29 seconds after its question.
 - `pre-commit` does not run mypy. Run it by hand before you commit, or strict typing first fails in
   CI, after your process is gone.
 - End each commit message with a `Verified-by:` trailer naming what ran on that commit's content
-  before the commit: `code-review <low|medium|high|xhigh|max|ultra>`, `verify`, `tests` or
+  before the commit: `code-review <low|medium|high|xhigh|max|ultra>`, `e2e-smoke`, `tests` or
   `none`. Name only a check that ran on this commit's own content. A review of an earlier head does
   not count for a later commit, so a fix commit made after a review says `tests`, or whatever ran
   on it. An amend keeps the old message, so correct its trailer too. Give one trailer per check that ran, for example `tests` and `code-review xhigh` on two
-  lines; `none` goes alone. `verify` means the project's `verify` skill (`.claude/skills/verify`)
+  lines; `none` goes alone. `e2e-smoke` means the project's `e2e-smoke` skill (`.claude/skills/e2e-smoke`)
   ran. The `commit-msg` hook (`scripts/hooks/claim_check.py`) only advises on this trailer: it
   prints one line, at least for a missing or malformed value, or `none` beside another value, and
   that advice never refuses the commit. The trailer is the author's own word, so it is **not** proof of code review for the
