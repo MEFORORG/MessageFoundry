@@ -405,11 +405,16 @@ class _Scan:
     cat2: str = _END  # the category, text and keyword before that
     text2: str = ";"
     kw2: str = ""
+    kw3: str = ""  # the keyword before those, for `export default async function`
     newline: bool = False  # a line break since the previous token, a block comment's included
     colon: str = ""  # what the last `:` was: "key", "cond" or "label"
-    classes: list[tuple[int, bool]] = field(default_factory=list)  # (depth, expression) per head
+    # (depth, whether its closing brace ends a value) per class head
+    classes: list[tuple[int, bool]] = field(default_factory=list)
     fn: int = 0  # 1 after `function`, 2 after its name: the next `(` opens parameters
     fn_value: bool = False
+    # Whether that function's body ends a value. `export default function` is a declaration, so its
+    # `}` ends a statement, though the declared name stays an entry point rather than a helper.
+    fn_closes: bool = False
     params: _Frame | None = None  # a parameter list that just closed: a `{` next is its body
 
 
@@ -529,7 +534,12 @@ class _Lexer:
         top = st.stack[-1]
         if st.newline and st.cat == _RESTRICTED:
             st.cat = _END  # `return`, `throw`, `yield` take a `;` at a line break
-        brk = st.newline and not _continues(st.cat, self.src, start)
+        # A parameter list's `)` is followed by its body even across a line break (Allman style).
+        brk = (
+            st.newline
+            and not (text == "{" and st.params is not None)
+            and not _continues(st.cat, self.src, start)
+        )
         if brk:
             top.conditionals = 0  # an inserted `;` ends the statement and its conditionals
         role = self.member(st, top, kind, text, start, brk) if top.member else ""
@@ -547,9 +557,11 @@ class _Lexer:
                 elif self.record and st.kw in ("const", "let", "var"):
                     self.notes.declared[start] = "binding"
             if kw == "class":
-                st.classes.append((len(st.stack), self.expression(st)))
+                closes = self.expression(st) and not self.export_default(st)
+                st.classes.append((len(st.stack), closes))
             elif kw == "function":
                 st.fn, st.fn_value = 1, self.expression(st)
+                st.fn_closes = st.fn_value and not self.export_default(st)
         elif text in _PAIRS:
             cat = _END if text == "{" else _OPERAND
             st.stack.append(self.open(st, top, text, role))
@@ -580,7 +592,7 @@ class _Lexer:
             st.fn = 2
         if text != ")":
             st.params = None
-        st.cat2, st.text2, st.kw2 = st.cat, st.text, st.kw
+        st.cat2, st.text2, st.kw2, st.kw3 = st.cat, st.text, st.kw, st.kw2
         st.cat, st.text, st.kw, st.newline = cat, text, kw, False
 
     @staticmethod
@@ -600,6 +612,13 @@ class _Lexer:
             return False
         return cat in (_OPERAND, _RESTRICTED) and kw not in ("export", "else", "do")
 
+    @staticmethod
+    def export_default(st: _Scan) -> bool:
+        """Whether a ``class`` or ``function`` keyword here follows ``export default``."""
+        prefixed = st.text == "async" and not st.newline
+        kw, before = (st.kw2, st.kw3) if prefixed else (st.kw, st.kw2)
+        return kw == "default" and before == "export"
+
     def open(self, st: _Scan, top: _Frame, text: str, role: str) -> _Frame:
         """The frame a bracket opens; ``role`` is what ``member`` said the bracket starts."""
         if text == "[":
@@ -608,7 +627,7 @@ class _Lexer:
             if role == "method":  # a method's parameters: its body ends a value in an object
                 return _Frame("(", "params", top.kind == "object", owner=top)
             if st.fn:
-                return _Frame("(", "params", st.fn_value)
+                return _Frame("(", "params", st.fn_closes)
             if st.kw == "for" or (st.kw == "await" and st.kw2 == "for"):
                 return _Frame("(", "for")
             return _Frame("(", "head" if st.kw in _STATEMENT_HEADS else "")

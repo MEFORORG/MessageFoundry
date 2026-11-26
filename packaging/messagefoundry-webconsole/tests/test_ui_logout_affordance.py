@@ -40,7 +40,12 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from messagefoundry_webconsole import pages
 from messagefoundry_webconsole._html import minimal_nav
-from tests._logout_rows import logout_details, logout_rows, temp_password_expired_rows
+from tests._logout_rows import (
+    logout_details,
+    logout_rows,
+    temp_password_expired_rows,
+)
+from tests._session_rotation_contract import age_sqlite_session_links
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -321,18 +326,19 @@ async def _sign_out_with(engine: Engine, service: AuthService, cookie: str) -> h
 
 
 async def test_ui_logout_with_a_cookie_an_elevation_just_retired_ends_its_successor(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
+    engine: Engine,
 ) -> None:
     """BACKLOG #3715, #3749 item 3. An elevation in another tab re-keys the session while this
     tab's sign-out is in flight, so the cookie it sends names no session. Within 5 seconds of
     the elevation the sign-out follows the link, ends the session under its new token, and the
-    row names the owner, where it used to keep a NULL actor and leave the session live. The clock
-    is FROZEN 2 seconds inside the bound, read after the rotation, so runner speed cannot move it."""
+    row names the owner, where it used to keep a NULL actor and leave the session live. The link
+    is aged 1 second on the store's clock, the one the window is measured on (vault BACKLOG
+    #4276), so it sits 4 seconds inside the bound less the time the sign-out request takes before
+    its store call; real time, unlike the frozen clock this used, so the margin is kept wide."""
     service, old = await _signed_in_operator(engine)
     successor = await service._rotate_session_token(old)
     assert successor is not None, "the rotation failed closed, so the race was not driven"
-    rotated_at = time.time()
-    monkeypatch.setattr(time, "time", lambda: rotated_at + _LOGOUT_LINEAGE_SECONDS - 2.0)
+    await age_sqlite_session_links(engine.store, _LOGOUT_LINEAGE_SECONDS - 4.0)
     out = await _sign_out_with(engine, service, old)
     assert out.status_code == 303
     assert await service.identity_for_token(successor, activity=False) is None
@@ -347,16 +353,16 @@ async def test_ui_logout_with_a_cookie_an_elevation_just_retired_ends_its_succes
 
 
 async def test_ui_logout_with_a_cookie_retired_past_the_window_ends_nothing(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
+    engine: Engine,
 ) -> None:
     """The control for the test above, one second past the 5-second window. This route carries no
     credential, so a retired cookie leads nowhere after that: nothing is revoked, the row says
-    ``nothing_to_revoke`` and has no owner to name."""
+    ``nothing_to_revoke`` and has no owner to name. The link is aged on the store's clock, the one
+    the window is measured on (vault BACKLOG #4276); patching ``time`` would not age it."""
     service, old = await _signed_in_operator(engine)
     successor = await service._rotate_session_token(old)
     assert successor is not None
-    rotated_at = time.time()
-    monkeypatch.setattr(time, "time", lambda: rotated_at + _LOGOUT_LINEAGE_SECONDS + 1.0)
+    await age_sqlite_session_links(engine.store, _LOGOUT_LINEAGE_SECONDS + 1.0)
     out = await _sign_out_with(engine, service, old)
     assert out.status_code == 303
     assert await service.identity_for_token(successor, activity=False) is not None

@@ -44,9 +44,11 @@ PW = "Sup3rSecret!!"
 # A fully-configured engine-broker [ai] section: managed_endpoint + an allow-listed https endpoint.
 _ENDPOINT = "https://ai.internal/v1/messages"
 
-# BACKLOG #2193 slice (e): an off-box endpoint is refused under an enforcing or unknown posture
-# unless its revocation is attested. The tests here are about other behaviour, so their brokers
-# carry the pair; tests/test_ai_broker_revocation_guard.py covers the refusal itself.
+# BACKLOG #2193 slice (e): an endpoint whose host does not read as loopback, in the reading
+# ai_broker._refuse_an_unrevoked_ai_hop states, is refused under an enforcing or unknown posture
+# unless a [tls].crl_file is checked on it or its revocation is attested. The tests here are
+# about other behaviour, so their brokers carry the pair; tests/test_ai_broker_revocation_guard.py
+# covers the refusal itself.
 _ATTESTED_REASON = "synthetic: revocation covered outside the engine for these tests"
 
 

@@ -52,6 +52,7 @@ import functools
 import ipaddress
 import ntpath
 import os
+import re
 import stat
 import sys
 import time
@@ -59,7 +60,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from messagefoundry.auth.anchor_path import (
     _GRANTING_ACE_TYPES,
@@ -80,7 +81,9 @@ from messagefoundry.auth.anchor_path import (
     _win_probe,
     describe_sid,
     evaluate_windows_object,
+    mount_of,
     posix_path_verdict,
+    read_mounts,
     windows_chain,
     windows_host_readers,
 )
@@ -92,10 +95,12 @@ __all__ = [
     "DELETE_ACCESS",
     "LINUX_CREDENTIAL_FILE_SYSTEMS",
     "LINUX_HOST_FILE_SYSTEMS",
+    "MOUNT_TABLE_UNREAD",
     "WINERROR_ACCESS_DENIED",
     "WINERROR_SHARING_VIOLATION",
     "OwnerRefused",
     "RestrictedFileError",
+    "UncheckedProblem",
     "administrators_enabled",
     "broad_access_problem",
     "can_add_a_file",
@@ -1106,6 +1111,79 @@ def _posix_parent(path: Path) -> Path:
     return path / ".." if path.name in {"", ".."} else path.parent
 
 
+#: At least these Linux file system types, and every subtype of one, such as ``fuse.sshfs``, leave
+#: who may read or replace a file to a server, another host or operating system, or a user-space
+#: program, so the owner and mode bits they report can look clean while another account can still
+#: reach the file (vault BACKLOG #5657 step 6 (f)). A type not named here is not judged by this
+#: rule. Unlike the closed lists elsewhere in this module, this list is open, so a type it misses
+#: passes.
+_POSIX_DELEGATED_FILE_SYSTEMS = frozenset(
+    {
+        "nfs",
+        "nfs4",
+        "cifs",
+        "smb3",
+        "smbfs",
+        "9p",
+        "fuse",
+        "fuseblk",
+        "ceph",
+        "afs",
+        "coda",
+        "lustre",
+        "gpfs",
+        "beegfs",
+        "orangefs",
+        "pvfs2",
+        "glusterfs",
+        "ocfs2",
+        "gfs2",
+        "virtiofs",
+        "vboxsf",
+        "drvfs",
+        "fakeowner",
+    }
+)
+#: The characters a type name the refusal quotes may hold. A FUSE subtype is chosen by whoever
+#: mounts it, so any other name is not quoted.
+_PRINTABLE_FILE_SYSTEM_TYPE = re.compile(r"[A-Za-z0-9._+-]{1,64}")
+
+
+def _posix_delegated_file_system(fstype: str) -> bool:
+    """Whether ``fstype``, as ``/proc/self/mountinfo`` names it, is a type in
+    :data:`_POSIX_DELEGATED_FILE_SYSTEMS`, or a subtype of one, such as ``fuse.sshfs`` or
+    ``fuseblk.ntfs-3g``."""
+    return fstype.split(".", 1)[0] in _POSIX_DELEGATED_FILE_SYSTEMS
+
+
+class UncheckedProblem(str):
+    """A :func:`broad_access_problem` answer that says the check could not be completed, rather
+    than that it found ``path`` open to another account (vault BACKLOG #5657). Some of the check
+    may have run and passed first, such as the owner and mode of ``path`` itself on POSIX. The
+    text carries its own remedy, and no change to the owner or mode of ``path`` or its folders
+    clears it, so a caller says that ``path`` could not be fully checked and appends no
+    owner-and-mode remedy of its own. Told apart from a finding by its type, never by its text.
+    The type is lost by any operation that builds a new string, so a caller tests the answer as
+    returned. At least the unread Linux mount table (:data:`MOUNT_TABLE_UNREAD`) is answered this
+    way; other answers that the check could not be completed are still plain strings."""
+
+    __slots__ = ()
+
+
+#: What :func:`broad_access_problem` answers, as an :class:`UncheckedProblem`, on Linux where
+#: ``/proc/self/mountinfo`` cannot be read and the rest of its POSIX check, the path walk and the
+#: holding folder's owner and mode, finds nothing; a finding there is answered in its place, and
+#: under ``holder_judged`` the walk, and so this answer, does not run. It is worded for a refusal
+#: and a warning alike, since a caller may give either.
+MOUNT_TABLE_UNREAD: Final = (
+    "/proc/self/mountinfo could not be read, so the type of the file system under the checked "
+    "path, and of the folders its path runs through, was not judged. This clears once the engine "
+    "can read /proc/self/mountinfo, for example with procfs mounted where the engine runs, or "
+    "with an AppArmor or SELinux policy that allows the read. Changing the owner or mode of the checked path or of the folders above it, "
+    "or replacing what is at that path, does not clear it"
+)
+
+
 def _posix_link_problem(
     path: str,
     *,
@@ -1113,18 +1191,29 @@ def _posix_link_problem(
     euid: int,
     lstat_fn: Callable[[str], PosixStat],
     readlink_fn: Callable[[str], str],
+    fstype_fn: Callable[[str], tuple[str, str] | None] | None = None,
 ) -> str | None:
-    """Why a link on ``path`` lets another account move the key file, or ``None`` (vault BACKLOG
-    #5656). The walk is :func:`~messagefoundry.auth.anchor_path.posix_path_verdict`, ``..`` and
+    """Why a link on ``path`` lets another account move the key file, or the file system under
+    ``path`` is not one whose owner and mode bits decide who reaches it, or ``None`` (vault BACKLOG
+    #5656, #5657). The walk is :func:`~messagefoundry.auth.anchor_path.posix_path_verdict`, ``..`` and
     links followed as the kernel does, and only its findings about a link are kept: one about the
     link itself (another account owns it in a folder others may write), one about a folder that
     holds a link or lies above one (another account owns it, or a group or other may write it
     without the sticky bit, so it could rename or re-point what lies below), and one about a part
     of the path it could not read. A link's own owner and mode change nothing on POSIX, since a
     symbolic link cannot be re-pointed in place. So a link only root or the engine's own account
-    can change passes, such as macOS ``/tmp`` or an ostree host's ``/home``. The file system type
-    is not judged here. Kept free of I/O so the decision is testable everywhere."""
+    can change passes, such as macOS ``/tmp`` or an ostree host's ``/home``.
+
+    ``fstype_fn`` answers ``(mount point, type)`` for a path the walk visits, as
+    :func:`~messagefoundry.auth.anchor_path.mount_of` does. A visited file or folder on a mount of
+    a type :func:`_posix_delegated_file_system` names is refused, since the owner and mode bits this
+    whole check reads are not what decides who reaches the file there (vault BACKLOG #5657 step 6
+    (f)). The mount at ``/`` is not judged by its type: a sandbox whose root is a ``9p`` or
+    ``virtiofs`` share, as at least some container runtimes give, would otherwise refuse every key.
+    Any other type, a type that cannot be read, and every type when ``fstype_fn`` is left out, is
+    not judged. Kept free of I/O so the decision is testable everywhere."""
     links: list[str] = []
+    delegated: dict[str, str] = {}
 
     def recording(part: str) -> PosixStat:
         status = lstat_fn(part)
@@ -1132,24 +1221,42 @@ def _posix_link_problem(
             links.append(part)
         return status
 
+    def typed(part: str) -> tuple[str, str]:
+        mounted = None if fstype_fn is None else fstype_fn(part)
+        if mounted is not None and mounted[0] != "/" and _posix_delegated_file_system(mounted[1]):
+            delegated.setdefault(mounted[0], mounted[1])
+        # The walk's own type rule is not this one, so it is told every type is one it trusts.
+        return ("/", "ext4")
+
     verdict = posix_path_verdict(
         path,
         cwd=cwd,
         euid=euid,
         lstat_fn=recording,
         readlink_fn=readlink_fn,
-        fstype_fn=lambda _part: ("/", "ext4"),  # the file system's type is not this rule's
+        fstype_fn=typed,
     )
 
     def above_a_link(folder: str) -> bool:
         prefix = folder.rstrip("/") + "/"
         return any(link.startswith(prefix) for link in links)
 
+    if delegated:
+        # The mount point is a path; this text names none. "It" is whatever the caller names, a key
+        # file, the secrets directory or the custody directory, so the remedy is the same for each
+        # and names no role (vault BACKLOG #5657).
+        fstype = next(iter(delegated.values()))
+        shown = fstype if _PRINTABLE_FILE_SYSTEM_TYPE.fullmatch(fstype) else "network or FUSE"
+        return (
+            f"its path is on a mount of type {shown}, where something other than the owner and "
+            "mode bits this check reads decides who may read or replace it; keep it, and the "
+            "folders its path runs through, on a local file system"
+        )
     for finding in verdict.findings:
         about_holder = finding.kind == DIRECTORY and above_a_link(finding.path)
         # A folder that could not be read, ``/`` included: the walk stopped there, so no link
-        # below it was judged. With the file system type stubbed, no other directory finding is
-        # neither insecure nor about an owner or a write bit.
+        # below it was judged. Every type answers trusted to the walk, so no other directory
+        # finding is neither insecure nor about an owner or a write bit.
         if finding.kind == DIRECTORY and not finding.insecure:
             return (
                 "a folder on its path could not be read, so no link on it was judged: "
@@ -1168,7 +1275,20 @@ def _posix_link_problem(
 
 def _posix_host_link_problem(path: Path) -> str | None:
     """:func:`_posix_link_problem` for ``path`` on this host. A read that fails is a finding whose
-    reason quotes the error, so the error is rebuilt without the file name it carries. POSIX only."""
+    reason quotes the error, so the error is rebuilt without the file name it carries. The mount
+    types are read from ``/proc/self/mountinfo`` once per call, and judged only where that can be
+    read. On Linux, where ``/proc/self/mountinfo`` itself cannot be read, the walk still runs with
+    no type judged and its findings are answered; where it finds nothing, ``path`` is refused,
+    since no type on it was judged, and the refusal says how to clear that, which no change to the
+    owner or mode of ``path`` or its folders does. Elsewhere, for example on macOS and the BSDs,
+    which have mount tables this does not read, no type is judged. Where the table is read, at least these
+    are not judged either: a part of the path no mount the table lists covers passes, as a table
+    read inside a chroot whose root is not a mount can leave; and since the table is read once,
+    before the walk, a mount an automounter has not made by then, such as an autofs mount point a
+    directory caller names as the last part of its path, is judged by the entry the table holds,
+    so it passes when that entry's type, such as ``autofs``, is not one
+    :func:`_posix_delegated_file_system` names. ``docs/PHI.md`` lists at least these cases too.
+    POSIX only."""
     if sys.platform == "win32":  # pragma: no cover - guard for the type checker on Windows
         raise OSError("a POSIX path is walked on POSIX only")
 
@@ -1194,16 +1314,27 @@ def _posix_host_link_problem(path: Path) -> str | None:
             raise OSError(*failed)
         return target
 
+    mounts = read_mounts()
+
+    def fstype_fn(part: str) -> tuple[str, str] | None:
+        return None if mounts is None else mount_of(part, mounts)
+
     try:
-        return _posix_link_problem(
+        # With no table the walk still runs, judging links and folders with no type judged, so a
+        # link finding is answered as it is where the table reads (vault BACKLOG #5657).
+        problem = _posix_link_problem(
             os.fspath(path),
             cwd=os.getcwd,
             euid=os.geteuid(),
             lstat_fn=lstat_fn,
             readlink_fn=readlink_fn,
+            fstype_fn=fstype_fn,
         )
     except OSError as exc:  # the working directory, which the walk does not guard
         return f"its path could not be examined ({exc.strerror or type(exc).__name__})"
+    if problem is None and mounts is None and sys.platform.startswith("linux"):
+        return UncheckedProblem(MOUNT_TABLE_UNREAD)
+    return problem
 
 
 #: The extended attribute that holds a Linux file's POSIX access control list.
@@ -1333,7 +1464,25 @@ def broad_access_problem(
     or capability SID (:func:`_is_package_sid`) is reported the same way. POSIX
     (:func:`_posix_key_file_problem`): a file owned by an account other than the engine's own or
     root, a group or other read or write bit, and a directory holding it that such an account owns
-    or that a group or other may write with no sticky bit.
+    or that a group or other may write with no sticky bit. Where ``/proc/self/mountinfo`` can be
+    read, the walk below also refuses a path on a mount below ``/`` of at least the types
+    :func:`_posix_delegated_file_system` names, since those owner and mode bits do not decide who
+    reaches the file there; the list is open, so a type it does not name passes. That walk, and
+    with it the mount check, is skipped under ``holder_judged``. Its refusal where the table
+    cannot be read, and at least some of what it does not judge, are
+    :func:`_posix_host_link_problem`'s, and ``docs/PHI.md`` lists at least those too. That answer
+    is an :class:`UncheckedProblem`, told apart by its type: the check was not completed, though the
+    file's own owner and mode were judged first, and the text carries its own remedy. It is
+    answered only where the walk, which still runs with no type judged, and the holding folder's
+    owner and mode find nothing; a finding there is answered in its place. What a caller does with
+    the answer is the caller's: at least
+    :func:`~messagefoundry.config.key_file_access.key_file_problem`'s callers in ``__main__``, for
+    ``serve``'s own key files, refuse under ``enforce`` and warn under ``warn``, while
+    :func:`messagefoundry.engine_secrets._check` and
+    :func:`messagefoundry.store.custody_host._own_directory_refusal` refuse whatever the
+    ``[security].enforcement`` setting, and
+    :func:`messagefoundry.secrets_dpapi.load_protected_key`, on Windows only, warns and does not
+    test the type.
 
     On both, the folders above ``path`` are walked too (vault BACKLOG #5656, #5657). A junction or
     link among them is refused when an account the check does not trust can change it: on
@@ -1380,8 +1529,11 @@ def broad_access_problem(
     # The holder's owner and mode are one stat, so they are read again even when holder_judged:
     # a directory widened since its own check is still caught at the read.
     problem = None if holder_judged else _posix_host_link_problem(path)
-    if problem is not None:
+    if problem is not None and not isinstance(problem, UncheckedProblem):
         return problem
+    # An unread mount table leaves the types unjudged, not the holder's stat: a holder that a broad
+    # account may write is still a finding, so it is answered rather than the UncheckedProblem,
+    # which a caller that warns would otherwise print in its place (vault BACKLOG #5657).
     try:
         # stat, following a link, so the directory judged is the one the file is actually in. A
         # link on the way was judged by the walk above, unless holder_judged skipped it.
@@ -1391,9 +1543,10 @@ def broad_access_problem(
             "the directory that holds it could not be examined "
             f"({exc.strerror or type(exc).__name__})"
         )
-    return _posix_holder_problem(
+    holder = _posix_holder_problem(
         parent_mode=parent.st_mode, parent_uid=parent.st_uid, euid=os.geteuid()
     )
+    return holder if holder is not None else problem
 
 
 # --- the exact check, through an open handle (Windows) --------------------------------------------
@@ -2127,14 +2280,16 @@ def write_restricted_file(
 
     ``read_grants`` (Windows only) names further accounts to grant read: an account name such as
     ``NT SERVICE\\MessageFoundry``, or a SID, with or without a leading ``*``. A name must resolve
-    to a user, a well-known or a computer account (:data:`_GRANT_NAME_KINDS`); a group, an alias or
-    a domain is refused.
+    to a user, a well-known or a computer account (:data:`_GRANT_NAME_KINDS`); a name of any other
+    kind is refused, at least a group, an alias, a domain, and one that resolves to no live account.
 
     ``owner`` (Windows only) is the account the file is created owned by, in the call that creates
     it, and read back through the creating handle before a byte is written. It is a SID, with or
-    without a leading ``*``, or a name: a name Windows reports as a group, an alias, a domain or a
-    computer account is refused (a read grant admits a computer account; an owner name does not),
-    so a group such as Administrators is named by its SID. A name it
+    without a leading ``*``, or a name, which must resolve to a user or a well-known account
+    (:data:`_OWNER_NAME_KINDS`). A name of any other kind is refused, at least a group, an alias, a
+    domain, a computer account (a read grant admits one; an owner name does not), a label, a logon
+    session and one that resolves to no live account, so a group such as Administrators is named by
+    its SID. A name it
     reports as a well-known group (SID_NAME_USE 5, as SYSTEM, a service's virtual account and
     Everyone all report) passes that gate, and a SID is taken as given. Then an
     application package, and at least the broad groups :func:`_is_broad_group` knows, are refused

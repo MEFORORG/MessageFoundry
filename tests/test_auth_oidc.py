@@ -18,9 +18,10 @@ import traceback
 import urllib.error
 import uuid
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from decimal import Decimal
 from fractions import Fraction
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -28,6 +29,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
 from messagefoundry.auth import oidc
 from messagefoundry.auth.oidc import claims as claims_mod
+from messagefoundry.auth.oidc.jwks import JwksRefreshBusy
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.transports.signing import CompactJwtSigner
@@ -588,7 +590,12 @@ _OMIT_TYP = object()
 
 
 def _mint_with_typ(
-    key: rsa.RSAPrivateKey, kid: str, claims: Mapping[str, Any], typ: Any = _OMIT_TYP
+    key: rsa.RSAPrivateKey,
+    kid: str,
+    claims: Mapping[str, Any],
+    typ: Any = _OMIT_TYP,
+    *,
+    extra_header: Mapping[str, Any] | None = None,
 ) -> str:
     """Mint a **properly signed** compact JWS carrying an arbitrary ``typ`` header.
 
@@ -603,6 +610,7 @@ def _mint_with_typ(
     header: dict[str, Any] = {"alg": SignatureAlgorithm.RS256.value, "kid": kid}
     if typ is not _OMIT_TYP:
         header["typ"] = typ
+    header.update(extra_header or {})
     header_b64 = _b64u_encode(json.dumps(header, separators=(",", ":"), sort_keys=True).encode())
     claims_b64 = _b64u_encode(
         json.dumps(dict(claims), separators=(",", ":"), sort_keys=True).encode()
@@ -656,6 +664,146 @@ def test_a_media_type_prefixed_or_differently_cased_typ_still_validates(
     jws = _mint_with_typ(rsa_key, "k1", _good_claims(), typ=typ)
     principal = oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
     assert principal.username == "jdoe"
+
+
+# --- claims: the JOSE crit header (RFC 7515 section 4.1.11) -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "crit",
+    [
+        ["exp"],  # a well-formed crit naming an extension the engine does not implement
+        ["b64"],  # RFC 7797's unencoded payload: real, and not implemented here
+        ["exp", "b64"],
+        [],  # RFC 7515 forbids an empty list
+        ["alg"],  # a registered header name, which crit must not list
+        "exp",  # not an array
+        [1],  # a non-string entry
+        None,  # present as null is present
+    ],
+)
+def test_a_crit_header_is_refused_at_key_selection(rsa_key: rsa.RSAPrivateKey, crit: Any) -> None:
+    """BACKLOG #6065. The engine implements no JWS header extension, so a properly signed token
+    carrying ``crit`` in any form is invalid. The extensions it names are present in the header too,
+    so the refusal cannot come from a crit naming a member the header lacks."""
+    extensions = {"crit": crit, "exp": 1_000_300, "b64": True}
+    jws = _mint_with_typ(rsa_key, "k1", _good_claims(), typ="JWT", extra_header=extensions)
+    fetch = _CountingFetch(_jwks_bytes(_rsa_jwk(rsa_key, "k1")))
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(jws, _policy(), oidc.JwksCache(fetch), clock=lambda: 1_000_100)
+    assert exc.value.reason == "unsupported_crit"
+    # Refused before the kid lookup, so the token spends no JWKS fetch.
+    assert fetch.calls == 0
+
+
+def test_typ_is_checked_before_crit(rsa_key: rsa.RSAPrivateKey) -> None:
+    """The first step of the rung order: a token declaring another class AND carrying crit is
+    refused as wrong_token_type, so this test fails if the crit check moves above the typ check."""
+    jws = _mint_with_typ(
+        rsa_key, "k1", _good_claims(), typ="at+jwt", extra_header={"crit": ["exp"]}
+    )
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert exc.value.reason == "wrong_token_type"
+
+
+@pytest.mark.parametrize(
+    ("header", "other_reason"),
+    [
+        ({"kid": ""}, "unknown_kid"),  # crit before the kid guard
+        ({"alg": "ES256"}, "key_rejected"),  # crit before the alg pin (policy pins RS256 only)
+    ],
+)
+def test_crit_is_checked_before_the_kid_guard_and_the_alg_pin(
+    rsa_key: rsa.RSAPrivateKey, header: dict[str, Any], other_reason: str
+) -> None:
+    """The rung order the federation verifier's title states: typ, then crit, then kid, then the alg
+    pin. A token failing both crit and a later rung is refused as unsupported_crit, and the same token
+    without crit fails that later rung, so each case would catch crit moving below it."""
+    claims = _good_claims()
+    with pytest.raises(oidc.ClaimsError) as exc:
+        jws = _mint_with_typ(rsa_key, "k1", claims, extra_header={"crit": ["exp"], **header})
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert exc.value.reason == "unsupported_crit"
+    with pytest.raises(oidc.ClaimsError) as control:
+        jws = _mint_with_typ(rsa_key, "k1", claims, extra_header=header)
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert control.value.reason == other_reason
+
+
+def test_the_crit_positive_control_validates(rsa_key: rsa.RSAPrivateKey) -> None:
+    """Guard-the-guard for the crit cases: the same extension members WITHOUT ``crit`` validate, so
+    those refusals come from ``crit`` and not from the other members the helper adds."""
+    jws = _mint_with_typ(
+        rsa_key, "k1", _good_claims(), typ="JWT", extra_header={"exp": 1_000_300, "b64": True}
+    )
+    principal = oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert principal.username == "jdoe"
+
+
+def test_a_jwks_with_a_duplicate_kid_is_refused_as_ambiguous_kid(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #6065 item 1 (S12-24). The JWKS refuses two usable keys under one kid; the ladder
+    records that as ``ambiguous_kid``, an IdP key-set fault, not as the token's ``unknown_kid``."""
+    # The refusal is on the kid alone, so the same key twice is enough (and needs no new keygen).
+    body = _jwks_bytes(_rsa_jwk(rsa_key, "k1"), _rsa_jwk(rsa_key, "k1"))
+    jws = _mint(rsa_key, "k1", _good_claims())
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(
+            jws, _policy(), oidc.JwksCache(_CountingFetch(body)), clock=lambda: 1_000_100
+        )
+    assert exc.value.reason == "ambiguous_kid"
+
+
+def test_only_the_fetching_lookup_sees_ambiguous_kid(rsa_key: rsa.RSAPrivateKey) -> None:
+    """Pins the limit the claims.py comment states: a sign-in inside the min-refetch floor after the
+    refused fetch gets the cache's throttled refusal, so it is recorded as unknown_kid."""
+    body = _jwks_bytes(_rsa_jwk(rsa_key, "k1"), _rsa_jwk(rsa_key, "k1"))
+    cache = oidc.JwksCache(_CountingFetch(body), clock=lambda: 0.0)
+    jws = _mint(rsa_key, "k1", _good_claims())
+    reasons = []
+    for _ in range(2):
+        with pytest.raises(oidc.ClaimsError) as exc:
+            oidc.validate_id_token(jws, _policy(), cache, clock=lambda: 1_000_100)
+        reasons.append(exc.value.reason)
+    assert reasons == ["ambiguous_kid", "unknown_kid"]
+
+
+def test_any_other_jwks_fault_is_still_unknown_kid(rsa_key: rsa.RSAPrivateKey) -> None:
+    """The ambiguous_kid arm is narrow: a JWKS with no usable key still reads as unknown_kid."""
+    jws = _mint(rsa_key, "k1", _good_claims())
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(
+            jws,
+            _policy(),
+            oidc.JwksCache(_CountingFetch(_jwks_bytes())),
+            clock=lambda: 1_000_100,
+        )
+    assert exc.value.reason == "unknown_kid"
+
+
+def test_a_jwks_wait_that_runs_out_is_recorded_as_jwks_refresh_busy(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #6905. A sign-in whose JWKS lookup waited out ``gate_wait_seconds`` behind a refresh
+    another sign-in holds is refused ``jwks_refresh_busy``: the IdP was slow, and the token's kid
+    was never judged, so ``unknown_kid`` would misstate the cause in the audit row. The test holds
+    the cache's gate to stand in for that refresh."""
+    fetch = _CountingFetch(_jwks_bytes(_rsa_jwk(rsa_key, "k1")))
+    cache = oidc.JwksCache(fetch, gate_wait_seconds=0.1)
+    jws = _mint(rsa_key, "k1", _good_claims())
+    assert cache._gate.acquire(timeout=10)
+    try:
+        with pytest.raises(oidc.ClaimsError) as exc:
+            oidc.validate_id_token(jws, _policy(), cache, clock=lambda: 1_000_100)
+    finally:
+        cache._gate.release()
+    assert exc.value.reason == "jwks_refresh_busy"
+    assert exc.value.reason != "unknown_kid"
+    assert fetch.calls == 0, "the busy lookup must not fetch"
+    # Once the gate is free the same token verifies, so nothing about the token was refused.
+    assert oidc.validate_id_token(jws, _policy(), cache, clock=lambda: 1_000_100) is not None
 
 
 def test_an_events_bearing_claim_set_is_refused_under_its_own_slug(
@@ -1281,14 +1429,17 @@ class _BlockingFetch:
     holds the cache in exactly the state a concurrent reader must survive: floor armed, keys absent.
     """
 
-    def __init__(self, body: bytes) -> None:
+    def __init__(self, body: bytes, *, first: bytes | None = None) -> None:
         self.body = body
+        self.first = first  # when given, answers the first call at once, unparked
         self.calls = 0
         self.entered = threading.Event()
         self.release = threading.Event()
 
     def __call__(self) -> bytes:
         self.calls += 1
+        if self.first is not None and self.calls == 1:
+            return self.first
         self.entered.set()
         # Bounded. A missed release must fail the assertion below, never hang the worker: an
         # unbounded wait here is the exact shape that got a pytest-xdist worker killed by the
@@ -1349,3 +1500,327 @@ def test_a_concurrent_reader_is_not_refused_while_the_first_fetch_is_in_flight(
     # lock could be "fixed" by simply letting both fetch, which reopens the amplification bound that
     # test_unknown_kid_is_throttled_by_the_min_refetch_floor exists to hold.
     assert fetch.calls == 1, f"expected exactly one fetch, got {fetch.calls}"
+
+
+def _run_lookup(
+    cache: oidc.JwksCache, kid: str, results: dict[str, object], tag: str
+) -> threading.Thread:
+    def call() -> None:
+        try:
+            results[tag] = cache.get_key(kid, alg=SignatureAlgorithm.RS256)
+        except BaseException as exc:  # noqa: BLE001 - the failure IS the subject; asserted on
+            results[tag] = exc
+
+    thread = threading.Thread(target=call, daemon=True)
+    thread.start()
+    return thread
+
+
+class _Warm:
+    """A cache that fetched ``k1`` at 0 s, its clock moved to ``at``, past the 300 s refetch floor,
+    so the next miss fetches, and that fetch parks until released. The TTL is the default 3600 s.
+    ``ticked`` is set on every clock read, which shows a lookup has entered the cache."""
+
+    def __init__(
+        self, rsa_key: rsa.RSAPrivateKey, later: bytes, *, at: float, gate_wait: float = 10.0
+    ) -> None:
+        self._then: float | None = None
+        self._lock = threading.Lock()
+        self.fetch = _BlockingFetch(later, first=_jwks_bytes(_rsa_jwk(rsa_key, "k1")))
+        self.now = [0.0]
+        self.ticked = threading.Event()
+        self.cache = oidc.JwksCache(
+            self.fetch, min_refetch_seconds=300.0, clock=self._clock, gate_wait_seconds=gate_wait
+        )
+        self.warm = self.cache.get_key("k1", alg=SignatureAlgorithm.RS256)
+        self.now[0] = at
+
+    def then(self, value: float) -> None:
+        """Make every clock read after the next one return ``value``. The next read still returns
+        the current time, decided inside the read, so no other thread's timing can move it."""
+        with self._lock:
+            self._then = value
+
+    def _clock(self) -> float:
+        with self._lock:
+            value = self.now[0]
+            if self._then is not None:
+                self.now[0], self._then = self._then, None
+        self.ticked.set()
+        return value
+
+
+def _warm_cache(
+    rsa_key: rsa.RSAPrivateKey, later: bytes, *, at: float = 400.0, gate_wait: float = 10.0
+) -> tuple[oidc.JwksCache, _BlockingFetch, object]:
+    warm = _Warm(rsa_key, later, at=at, gate_wait=gate_wait)
+    return warm.cache, warm.fetch, warm.warm
+
+
+def test_a_cached_kid_lookup_does_not_wait_on_a_stalled_refresh(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #6905. An unknown ``kid`` starts a refresh that stalls on the IdP; a lookup of a kid
+    already cached and within its TTL must return at once rather than queue behind the network call.
+
+    REDS when the fast path takes the gate the refresh holds: the cached lookup then waits for the
+    release.
+    """
+    later = _jwks_bytes(_rsa_jwk(rsa_key, "k1"), _rsa_jwk(rsa_key, "k2"))
+    # A gate wait far past the join below, so a fast path that took the gate could not return in
+    # time through the wait's timeout and its gate-free re-read.
+    cache, fetch, warm = _warm_cache(rsa_key, later, gate_wait=60.0)
+
+    results: dict[str, object] = {}
+    stalled = _run_lookup(cache, "k2", results, "stalled")
+    assert fetch.entered.wait(timeout=10), "the unknown-kid lookup never reached the fetch"
+    try:
+        cached = _run_lookup(cache, "k1", results, "cached")
+        cached.join(timeout=5)
+        assert not cached.is_alive(), "a cached-kid lookup waited on the stalled refresh"
+        assert results["cached"] is warm
+    finally:
+        fetch.release.set()
+        stalled.join(timeout=10)
+    assert not stalled.is_alive(), "the stalled lookup never finished"
+    assert not isinstance(results["stalled"], BaseException), results["stalled"]
+    assert fetch.calls == 2
+
+
+def test_a_kid_past_its_ttl_is_not_served_while_the_refresh_withdrawing_it_runs(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #6905 keeps this bound. Past the TTL, a lookup of ``k1`` refreshes, and the IdP's new
+    key set withdraws ``k1``. A concurrent lookup of ``k1`` made while that refresh is parked must
+    not be served the withdrawn key: only a key WITHIN the TTL skips the gate."""
+    state = _Warm(rsa_key, _jwks_bytes(_rsa_jwk(rsa_key, "k2")), at=4000.0)
+    cache, fetch = state.cache, state.fetch
+
+    results: dict[str, object] = {}
+    refreshing = _run_lookup(cache, "k1", results, "refreshing")
+    assert fetch.entered.wait(timeout=10), "the expired-kid lookup never reached the fetch"
+    state.ticked.clear()  # the refreshing lookup reads the clock no more until it publishes
+    concurrent = _run_lookup(cache, "k1", results, "concurrent")
+    try:
+        assert state.ticked.wait(timeout=10), "the concurrent lookup never entered the cache"
+        concurrent.join(timeout=0.5)  # time for a lookup that skips the gate to have returned
+        assert concurrent.is_alive(), "the concurrent lookup returned while the refresh was parked"
+    finally:
+        fetch.release.set()
+        refreshing.join(timeout=10)
+        concurrent.join(timeout=10)
+    assert not refreshing.is_alive() and not concurrent.is_alive(), "a lookup never finished"
+    for tag in ("refreshing", "concurrent"):
+        assert isinstance(results[tag], oidc.JwksError), f"{tag} was served: {results[tag]!r}"
+    assert fetch.calls == 2
+
+
+@pytest.mark.parametrize("kid", ["k1", "k9"], ids=["past-its-ttl", "unknown"])
+def test_a_lookup_waiting_on_a_stalled_refresh_fails_closed_when_its_wait_runs_out(
+    rsa_key: rsa.RSAPrivateKey, kid: str
+) -> None:
+    """BACKLOG #6905. A lookup that must wait for the gate a stalled refresh holds, for a key past
+    its TTL or an unknown one, waits at most ``gate_wait_seconds`` and is then refused. It is never
+    served the past-TTL key instead, and never left pinned for the length of the stall.
+
+    REDS when the wait is unbounded: the waiter is then still parked when the refresh is released.
+    """
+    later = _jwks_bytes(_rsa_jwk(rsa_key, "k1"))
+    cache, fetch, _ = _warm_cache(rsa_key, later, at=4000.0, gate_wait=0.2)
+
+    results: dict[str, object] = {}
+    refreshing = _run_lookup(cache, "k1", results, "refreshing")
+    assert fetch.entered.wait(timeout=10), "the expired-kid lookup never reached the fetch"
+    waiter = _run_lookup(cache, kid, results, "waiter")
+    try:
+        waiter.join(timeout=5)
+        assert not waiter.is_alive(), "the waiting lookup stayed pinned behind the stalled refresh"
+    finally:
+        fetch.release.set()
+        refreshing.join(timeout=10)
+        waiter.join(timeout=10)
+    refused = results["waiter"]
+    assert isinstance(refused, JwksRefreshBusy), f"the waiter was not refused busy: {refused!r}"
+    assert "waited 0.2s for a JWKS refresh" in str(refused)
+    assert not isinstance(results["refreshing"], BaseException), results["refreshing"]
+    assert fetch.calls == 2
+
+
+def test_a_lookup_whose_wait_runs_out_serves_a_key_published_meanwhile(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #6905. A lookup whose wait for the gate runs out reads the published keys once more
+    without it, so a key that became current while it waited is served rather than refused. The
+    gate is held by the test, and the clock moving back inside the TTL stands in for a publish.
+
+    The lookup's first clock read returns 4000 s, past the TTL, and every later one 100 s, inside
+    it; the clock decides that itself, so the first read always misses and the lookup cannot be
+    served before it has waited. REDS without the re-read: the lookup is then refused although the
+    key is current."""
+    state = _Warm(rsa_key, b"", at=4000.0, gate_wait=0.2)
+    cache = state.cache
+    results: dict[str, object] = {}
+    state.then(100.0)
+    assert cache._gate.acquire(timeout=10)  # stands in for a refresh holding it across a fetch
+    try:
+        waiter = _run_lookup(cache, "k1", results, "waiter")
+        waiter.join(timeout=10)
+    finally:
+        cache._gate.release()
+    assert not waiter.is_alive(), "the lookup never finished"
+    assert results["waiter"] is state.warm
+
+
+@pytest.mark.parametrize(
+    "value",
+    [0, -1.0, float("nan"), float("inf"), threading.TIMEOUT_MAX * 2, True, "10"],
+    ids=["zero", "negative", "nan", "inf", "past-timeout-max", "bool", "text"],
+)
+def test_the_cache_refuses_a_gate_wait_it_cannot_honour(value: float) -> None:
+    """BACKLOG #6905. Zero would refuse every lookup that meets a refresh, and past
+    ``threading.TIMEOUT_MAX`` ``Lock.acquire`` itself refuses; neither is clamped."""
+    with pytest.raises(ValueError, match="gate_wait_seconds") as refused:
+        oidc.JwksCache(lambda: b"", gate_wait_seconds=value)
+    assert "value withheld" in str(refused.value)
+
+
+def test_a_cached_kid_waits_once_the_refresh_in_flight_is_as_old_as_the_gate_wait(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #6905. A key within its TTL skips the gate only while the refresh in flight is
+    younger than the gate wait. A refresh stalled past that age makes the lookup wait like any other
+    and fail closed, so a key that refresh would withdraw does not keep verifying for the whole stall.
+
+    REDS when a key within its TTL always skips the gate: the lookup is then served ``k1``."""
+    later = _jwks_bytes(_rsa_jwk(rsa_key, "k2"))  # the stalled refresh would withdraw k1
+    cache, fetch, _ = _warm_cache(rsa_key, later, gate_wait=0.2)
+
+    results: dict[str, object] = {}
+    stalled = _run_lookup(cache, "k2", results, "stalled")
+    assert fetch.entered.wait(timeout=10), "the unknown-kid lookup never reached the fetch"
+    try:
+        threading.Event().wait(0.4)  # the refresh is now older than the 0.2 s gate wait
+        cached = _run_lookup(cache, "k1", results, "cached")
+        cached.join(timeout=10)
+        assert not cached.is_alive(), "the cached-kid lookup never finished"
+    finally:
+        fetch.release.set()
+        stalled.join(timeout=10)
+    refused = results["cached"]
+    assert isinstance(refused, JwksRefreshBusy), f"k1 was served past the bound: {refused!r}"
+
+
+@pytest.mark.parametrize("site", ["first-read", "re-read-after-the-wait"])
+def test_a_snapshot_a_refresh_replaces_during_the_skip_check_is_not_served(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, site: str
+) -> None:
+    """BACKLOG #6905. A stalled refresh that publishes, and clears the time it started, between a
+    lookup's read of the snapshot and its skip check makes that check pass, although the snapshot
+    read is older than the refresh. The stub skip check performs that publish itself, withdrawing
+    ``k1``, so the interleaving happens on every run, at either gate-free read.
+
+    REDS when the skip check is not followed by a check that the snapshot is still the published
+    one: the withdrawn ``k1`` is then served from the old snapshot."""
+    state = _Warm(rsa_key, b"", at=100.0, gate_wait=0.2)
+    cache = state.cache
+    publish_on = 1 if site == "first-read" else 2
+    calls: list[None] = []
+
+    def skip_check_that_a_publish_overtakes() -> bool:
+        calls.append(None)
+        if len(calls) < publish_on:
+            return False  # a refresh older than the gate wait is in flight
+        if len(calls) == publish_on:
+            published = cache._state
+            assert published is not None
+            cache._state = replace(published, keys=MappingProxyType({}))
+        return True
+
+    monkeypatch.setattr(cache, "_may_skip_gate", skip_check_that_a_publish_overtakes)
+    if site == "first-read":
+        with pytest.raises(oidc.JwksError) as refused:
+            cache.get_key("k1", alg=SignatureAlgorithm.RS256)
+        assert not isinstance(refused.value, JwksRefreshBusy), refused.value
+    else:
+        # The test holds the gate, standing in for the refresh, so the lookup's wait runs out.
+        assert cache._gate.acquire(timeout=10)
+        try:
+            with pytest.raises(JwksRefreshBusy, match="could not be confirmed current"):
+                cache.get_key("k1", alg=SignatureAlgorithm.RS256)
+        finally:
+            cache._gate.release()
+    assert len(calls) == publish_on
+
+
+@pytest.mark.parametrize("field", ["ttl_seconds", "min_refetch_seconds"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        True,
+        False,
+        pytest.param(Decimal("1"), id="decimal"),
+        pytest.param("3600", id="text"),
+    ],
+)
+def test_the_cache_refuses_an_interval_the_settings_can_never_produce(
+    field: str, value: float
+) -> None:
+    """BACKLOG #6904. A NaN or infinite floor wedges key rotation after the first fetch, and a bool,
+    text or other type is not a number of seconds. The settings produce none of them, so refusing
+    them takes no value a site could configure. Each is a ValueError naming the field and
+    withholding the value."""
+    with pytest.raises(ValueError, match=field) as refused:
+        _cache_with(field, value, lambda: b"")
+    assert "value withheld" in str(refused.value)
+
+
+def _cache_with(field: str, value: float, fetch: Callable[[], bytes]) -> oidc.JwksCache:
+    if field == "ttl_seconds":
+        return oidc.JwksCache(fetch, ttl_seconds=value)
+    return oidc.JwksCache(fetch, min_refetch_seconds=value)
+
+
+@pytest.mark.parametrize("field", ["ttl_seconds", "min_refetch_seconds"])
+@pytest.mark.parametrize(
+    "value",
+    [-1, -0.5, 10**400],
+    ids=["negative-int", "negative-float", "int-too-large-for-a-float"],
+)
+def test_the_cache_refuses_an_interval_the_settings_load_refuses(field: str, value: float) -> None:
+    """BACKLOG #6904. The settings load refuses a negative for both knobs (BACKLOG #5318) and an int
+    too large for a float, so the cache refuses the same values."""
+    with pytest.raises(ValueError, match=field) as refused:
+        _cache_with(field, value, lambda: b"")
+    assert "value withheld" in str(refused.value)
+
+
+@pytest.mark.parametrize("field", ["ttl_seconds", "min_refetch_seconds"])
+@pytest.mark.parametrize(
+    "value",
+    [0, 365 * 24 * 3600 + 1, 10**300, 1e300],
+    ids=["zero", "past-one-year", "huge-int-within-float-range", "huge-finite"],
+)
+def test_the_cache_accepts_any_value_the_settings_load_accepts(
+    field: str, value: float, rsa_key: rsa.RSAPrivateKey
+) -> None:
+    """BACKLOG #6904. Every value the settings load accepts still builds the cache, so ``serve``
+    does not refuse a value ``check`` and ``verify`` pass. An unknown kid then meets the throttled
+    path, which must refuse with JwksError and nothing else."""
+    cache = _cache_with(field, value, lambda: _jwks_bytes(_rsa_jwk(rsa_key, "k1")))
+    cache.get_key("k1", alg=SignatureAlgorithm.RS256)
+    with pytest.raises(oidc.JwksError):
+        cache.get_key("k9", alg=SignatureAlgorithm.RS256)
+
+
+def test_a_zero_refetch_floor_removes_the_bound(rsa_key: rsa.RSAPrivateKey) -> None:
+    """BACKLOG #6904. ``min_refetch_seconds`` of ``0`` removes the amplification bound, as the
+    security-loosening report says: every unknown-kid lookup fetches."""
+    fetch = _CountingFetch(_jwks_bytes(_rsa_jwk(rsa_key, "k1")))
+    cache = oidc.JwksCache(fetch, min_refetch_seconds=0, clock=lambda: 0.0)
+    for _ in range(3):
+        with pytest.raises(oidc.JwksError):
+            cache.get_key("k9", alg=SignatureAlgorithm.RS256)
+    assert fetch.calls == 3

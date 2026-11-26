@@ -863,3 +863,27 @@ def test_an_exec_after_a_plain_block_comment_still_runs(dialect: Dialect | None)
 def test_an_exec_in_a_line_comment_is_not_a_run(dialect: Dialect | None) -> None:
     with pytest.raises(ValueError, match="sees no EXEC run"):
         declared_schema((f"{_RUN_DDL} -- EXEC(@sql)\n",), dialect)
+
+
+def test_a_metacharacter_in_an_exec_variable_matches_only_itself() -> None:
+    """Red before #5062 item 15: the variable name went into the EXEC and assignment patterns
+    unescaped, so a name holding a metacharacter, such as ``a+``, matched other variables. The
+    caller's capture is ``\\w+`` today; the escape keeps a wider one later from widening the read."""
+    from messagefoundry.store.server_schema_verify import _assigned_and_run, _string_spans
+
+    text = "EXEC(@aaa)"
+    spans = _string_spans(text)
+    assert not _assigned_and_run(text, spans, "a+", 0)
+    assert _assigned_and_run("EXEC(@a+)", _string_spans("EXEC(@a+)"), "a+", 0)  # the control
+    assert _assigned_and_run(text, spans, "aaa", 0)  # the control: a plain name still matches
+    for run in ("sp_executesql @a+", "sp_executesql @a+;"):  # the second form matches itself too
+        assert _assigned_and_run(run, _string_spans(run), "a+", 0), run
+    assert not _assigned_and_run("sp_executesql @a+b", _string_spans("sp_executesql @a+b"), "a+", 0)
+    # The changes pattern: `SET @aaa` is not an assignment to `@a+`, so the run still counts.
+    changed = "SET @aaa = 1 EXEC(@a+)"
+    assert _assigned_and_run(changed, _string_spans(changed), "a+", 0)
+    reset = "SET @a+ = 1 EXEC(@a+)"
+    assert not _assigned_and_run(reset, _string_spans(reset), "a+", 0)  # the control
+    # `$`, `#` and `@` continue a T-SQL name, so `@sql$2` is another variable.
+    for other in ("sp_executesql @sql$2", "sp_executesql @sql#x"):
+        assert not _assigned_and_run(other, _string_spans(other), "sql", 0), other

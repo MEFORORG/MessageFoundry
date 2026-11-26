@@ -1575,8 +1575,9 @@ try {
     # gets a loud stderr notice below; leaving a marker the card hook will refuse would move that
     # failure to the next session start and make it quiet again.
     #
-    # THE MARKER CANNOT RIDE INTO A COMMIT: `.gitignore` carries `/.claude/*` with one negation, for
-    # `settings.json`. Verified with `git check-ignore -v`. Do not add a second negation.
+    # THE MARKER CANNOT RIDE INTO A COMMIT: `.gitignore` carries `/.claude/*`, and its negations
+    # re-include `settings.json` and `skills/e2e-smoke/SKILL.md` alone. Verified with
+    # `git check-ignore -v`. Do not add a negation that reaches the marker.
     if ($Declare -and $Seat -and $seatRoster.Canonical) {
         try {
             $markerPath = Join-Path $wt '.claude/seat.local.txt'

@@ -593,9 +593,9 @@ def redacted_log_field(
     text: str,
     limit: int,
     *,
-    before: str = "",
+    before: str,
     after: str = "",
-    checks: tuple[tuple[str, str], ...] = (),
+    checks: tuple[tuple[str, str], ...],
 ) -> str:
     """``text`` as one ``key="value"`` field value of a log line (BACKLOG #3770): ``text`` as
     :func:`redact_log_value` reads it in the line ``before`` + ``text`` + ``after``, escaped and
@@ -613,7 +613,13 @@ def redacted_log_field(
     or ``after``. What a caller passes there decides what the field hides, and empty or wrongly
     spelled context can leave readable what the shipped filters would redact in the full line. A new
     caller adds its own hides-no-less-than-main test, as tests/test_admin_new_ip.py does, before it
-    ships.
+    ships. Two checks back this up in code (BACKLOG #3770): ``before`` and ``checks`` have no
+    default, so a caller states both, an empty one included; and
+    ``tests/test_redacted_log_field_census.py`` pins the references to this function,
+    :func:`redact_log_value` and :func:`~messagefoundry.controlchars.log_field_token` that its walk
+    of the shipped packages finds by name, fails on a new one or on a ``before`` or ``after`` that
+    is not a literal or a module constant bound once, and names for each pinned caller a test
+    module with a test that calls it. That test's docstring lists at least what the walk misses.
 
     The reading is the one every later shipped handler leaves, not a fixed number of handler
     passes, so the field hides what the last sink of a logger with any number of handlers would
@@ -915,6 +921,11 @@ _SPOOL_POLL = 1.0
 #: instead, which keeps the order.
 _SPOOL_REPLAY_BATCH = 500
 
+#: The least time, in seconds, from a UDP forwarder's socket being built to its rebuild after a
+#: failed send (BACKLOG #5923). A rebuild clears a socket that went bad; the interval keeps an
+#: outage from costing a new socket per record.
+_UDP_SOCKET_REBUILD_SECONDS = 30.0
+
 
 def is_permanent_connect_error(exc: BaseException) -> bool:
     """Whether a connect failure will not fix itself by waiting (BACKLOG #1966).
@@ -987,6 +998,9 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
     send_error_cause: str = ""
     #: The connect error a ``defer_connect`` handler absorbed at construction, or ``None``.
     startup_error: OSError | None = None
+    #: When :meth:`createSocket` last ran, on the monotonic clock: a UDP socket is rebuilt after a
+    #: failed send only once :data:`_UDP_SOCKET_REBUILD_SECONDS` have passed since.
+    _socket_built_at: float = 0.0
 
     def __init__(
         self,
@@ -1022,6 +1036,7 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
             self.startup_error = exc
 
     def createSocket(self) -> None:
+        self._socket_built_at = time.monotonic()
         super().createSocket()
         # SysLogHandler.socket is set at runtime (not in typeshed); getattr keeps this mypy-clean
         # across typeshed versions without a fragile per-version type: ignore.
@@ -1058,7 +1073,8 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
             self.handleError(record)
 
     def handleError(self, record: logging.LogRecord) -> None:
-        """Drop the socket after a network error, so the **next** record reconnects (BACKLOG #1199).
+        """Drop a stream socket after a network error, so the **next** record reconnects (BACKLOG
+        #1199); a UDP socket only on the age and error terms the comment in the body gives.
 
         ``SysLogHandler.emit`` reconnects only under ``if not self.socket``, and it never clears
         ``self.socket`` when a send fails. On the shipped handler a stream forwarder that broke
@@ -1107,9 +1123,19 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         elif isinstance(exc, OSError):
             self.send_failed = True
             sock = getattr(self, "socket", None)
-            # An unconnected datagram socket stays usable after a failed sendto, so only a stream
-            # socket is dropped; a UDP reset would cost a fresh lookup per record in an outage.
-            if sock is not None and self.socktype != socket.SOCK_DGRAM:
+            # A stream socket is dropped on every failure. An unconnected datagram socket usually
+            # stays usable after a failed sendto, so it is dropped, for the next send to rebuild,
+            # only once it is older than an interval (BACKLOG #5923): never dropped, one that went
+            # bad stayed bad for good; dropped each time, an outage would cost a new socket per
+            # record. A failed lookup of the collector's name is no fault of the socket, so it
+            # drops nothing.
+            if sock is not None and (
+                self.socktype != socket.SOCK_DGRAM
+                or (
+                    not isinstance(exc, socket.gaierror)
+                    and time.monotonic() - self._socket_built_at >= _UDP_SOCKET_REBUILD_SECONDS
+                )
+            ):
                 self.socket = None  # cleared first; a concurrent emit must not use a closing socket
                 # Already-broken sockets raise here. Closing was housekeeping; the point (stop reusing
                 # it) is achieved above, and logging from inside the logging error path would recurse.

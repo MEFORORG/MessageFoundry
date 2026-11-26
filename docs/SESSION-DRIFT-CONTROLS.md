@@ -57,14 +57,15 @@ there is no defence in depth between them.
 |---|---|---|
 | 1 | `Write`/`Edit`/`MultiEdit`/`NotebookEdit` targeting the primary's tree | **target path** |
 | 2 | `Task`/`Agent`/`Workflow` dispatch from the primary, except a `Task`/`Agent` call whose `subagent_type` is exactly `web-fetch` or `claude-code-guide` | **session cwd**; the exemption also reads `tool_input.subagent_type` |
-| 3 | 11 git verbs that swap or discard the primary's tree | target path parsed out of the command string |
-| 3b | `checkout`/`switch` moving a *linked worktree* onto an existing branch | ditto |
+| 3 | 11 git verbs that swap or discard the primary's tree | target path parsed out of the command string, falling back to the session cwd |
+| 3b | at least `checkout`/`switch` moving a *linked worktree* onto an existing branch, and `reset`/`rebase`/`merge`/`cherry-pick`/`revert`/`am` aimed at a linked worktree | target path, read as for rule 3; the head-moving verbs also compare it with the tree the session stands in and deny only when they differ |
 | 4 | `EnterWorktree` (relocating a live session) | tool name only |
 
-The single most important design decision is that **rules 1/3/3b key on the target, never on the cwd**.
-The gate's own docstring records that 29% of the Edit/Write calls made by sessions *sitting* in the primary
-wrote *correctly* into a worktree by absolute path; a cwd-keyed gate would have denied all of them.
-Rule 2 is the sole exception, and that exception is the source of the ultracode friction in §4.
+The single most important design decision is that **rule 1 keys on the write's target path, not on the
+cwd**: 29% of the Edit/Write calls made by sessions *sitting* in the primary wrote *correctly* into a
+worktree by absolute path, and a cwd-keyed write rule would have denied all of them. It is not true of
+every rule; [WORKTREE-GATE.md](WORKTREE-GATE.md), *Why it exists*, states what the cwd decides. Rule
+2's cwd keying is the source of the ultracode friction in §4.
 
 **[`scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1)** refuses
 blanket `git add -A`/`.`/`-u` and `git commit -a`, so two sessions in one tree can't sweep each other's
@@ -88,8 +89,9 @@ an href to a missing non-withheld path fails the check, the same href under `.cl
 ### Detection — `SessionStart` hooks
 
 **[`worktree-selfheal.ps1`](../scripts/worktree/worktree-selfheal.ps1)** (user scope) does one mutation —
-auto-`checkout` of a **clean** primary that has drifted off its home branch — and two warnings: a
-ghost-stub cwd, and this worktree's HEAD not matching its recorded home branch.
+auto-`checkout` of a **clean** primary that sits on another branch than its home branch (a detached
+HEAD is left alone) — and one warning, for a ghost-stub cwd. It records this worktree's current
+branch as its home branch and no longer warns when the two differ (owner ruling 2026-08-26).
 
 **[`session-context.ps1`](../scripts/worktree/session-context.ps1)** (project scope) injects the
 coordination banner. It holds at least which worktree this chat owns, the live peers, what they are
@@ -231,13 +233,13 @@ reading the emitted decision — not by reading source alone.
 | Rule 3d — `git worktree remove` / `move` on another session's checkout | user | **NEW** — every other rule protects a tree from being *swapped*; this protects it from being *deleted* |
 | Rule 2 — dispatch from primary | user | **LIVE** (probe-verified DENY, measured before the exemption in the rule table above; the exemption is tested against the repo copy and not probed against the installed hook; section 5's re-install caveat applies) |
 | Rule 3 — git verbs vs primary | user | **LIVE, partial** — the `-c` and relative-`cd` holes are fixed in source (G2/G3); enumerated-verb gaps remain (G9) |
-| Rule 3b — worktree hijack | user | **LIVE but narrow** — 2 of 11 verbs, existing-local-branch destinations only |
+| Rule 3b — worktree hijack | user | **LIVE but narrow** — a branch switch only onto an existing local branch, and the head-moving verbs only when aimed from outside the target tree; `restore`, `stash`, `clean` and `apply` are not covered |
 | Rule 4 — `EnterWorktree` | — | **INERT BY DESIGN** — now opt-in behind `-EnterWorktreeGate`; was inert by accident (absent from the installed script *and* unmatched in all 5 config dirs) |
 | Deny receipts (`worktree-gate.log`) | user | **NEW** — every deny logs rule/tool/cwd/detail; never the raw command |
 | Installed-vs-source parity check | local test | **NEW** — `tests/test_gate_installed_parity.py`; skips on CI, red on a stale box |
 | Blanket-stage guard | project | **LIVE, best-effort** — wired by `.claude/settings.json` since BACKLOG #1339; the forms it still lets through are in [`BLANKET-STAGE-GUARD-FAIL-OPENS.md`](BLANKET-STAGE-GUARD-FAIL-OPENS.md). This row read "LIVE but leaky" while no matcher in this repository named the script |
 | Selfheal — primary auto-repair | user (4 of 5 dirs) | LIVE |
-| Selfheal — hijack warning | user (4 of 5 dirs) | **LIVE and currently mis-firing** (§3, G4) |
+| Selfheal — hijack warning | user (4 of 5 dirs) | **RETIRED** by the owner ruling of 2026-08-26: the script records the worktree's current branch and warns about nothing (§3, G4) |
 | `session-context.ps1` banner | user | **NOT WIRED ANYWHERE** — MISSING in all 5 config roots, and project settings carry no hook rows at all (measured 2026-08-17, `install-coordination.ps1 -Status` plus an independent read of each `settings.json`). The scope column said `project`; the installer wires this row at USER scope. This row previously read "LIVE where the branch carries the file", which is the dangerous direction of doc drift — see [`SESSION-MAIL.md`](SESSION-MAIL.md) |
 | Announce-on-join (`announce-session.ps1`) | user | **LIVE** (re-verified 2026-08-03 by receipt *and* by `-Status`). The only **push** control. It **asks** for the peers the model's tools can reach and **sends** for the ones they cannot: from 2026-09-14 a cross-login or unenumerable-surface peer is mailed by the hook itself through `mail.ps1`, because no instruction can conjure a session id outside the caller's namespace. Every decision leaves a receipt, with `msg=` for what the model was asked to send and `mail=` for what the hook sent. Was inert-by-accident for ~13h after merge — see below, the lesson outlived the defect |
 | Announce wiring reaches a real script | test | **NEW** — `tests/test_announce_wiring.py`; nothing asserted this for *any* hook before, which is how a wired-but-inert shim survived weeks |
@@ -312,9 +314,11 @@ is that persuasion doesn't work here.
 `pwsh -File whatever.ps1` has none. This is not hypothetical or adversarial — `restore-primary.ps1` is a
 sanctioned example of exactly this shape, and its header states outright that an agent may run it.
 
-*Hijack detection.* Rule 3b covers `checkout`/`switch` onto an **existing local branch** only.
-`git checkout <sha>`, `<tag>`, `origin/main` and `git reset --hard` inside another session's worktree all
-return early. The selfheal detector meant to catch the residue is currently wrong (G4).
+*Hijack detection.* Rule 3b denies `checkout`/`switch` only onto an **existing local branch**, so at
+least `git checkout <sha>`, `<tag>` and `origin/main` inside another session's worktree return early.
+Its head-moving verbs (`reset`, `rebase`, `merge` and the like) deny only when aimed from outside the
+target tree. No selfheal detector catches the residue: the one meant to was retired by the owner
+ruling of 2026-08-26 (G4).
 
 *Writes into another session's worktree are allowed — and advertised.* This is the unavoidable price of
 keying on the target path, and the alternative is strictly worse. But rule 1's own deny text says
@@ -369,9 +373,15 @@ Upstream hit the same class and fixed it: Claude Code 2.1.216 — *"Fixed worktr
 redirecting git into the shared checkout via `git -C`, `--git-dir`, or `GIT_DIR`/`GIT_WORK_TREE`."*
 Note `--git-dir` and the env vars are absent from our gate entirely.
 
-### G4 — The home-branch detector is wrong now, and it has no update path
+### G4 — The home-branch detector is wrong now, and it has no update path — **RETIRED**
 
-`worktree-selfheal.ps1` compares HEAD against an untracked `mefor-home-branch` file. That file has two
+**Since the owner ruling of 2026-08-26 the detector is gone**: at session start `worktree-selfheal.ps1`
+rewrites `mefor-home-branch` to the current branch of the session's linked worktree, where that
+worktree belongs to a governed primary, and warns about nothing,
+because re-tasking a pooled worktree is sanctioned (the script's section 3 comment says why). The rest
+of this section is the state as found.
+
+As found, `worktree-selfheal.ps1` compared HEAD against an untracked `mefor-home-branch` file. That file has two
 writers (`new.ps1` at creation, selfheal's bootstrap-on-first-sighting) and **no update path**. `new.ps1`
 only ever creates *siblings*, so for a nested `.claude/worktrees/<dir>` the record is whatever branch the
 hook first saw — and re-tasking such a directory, which is the normal lifecycle, mismatches forever.
@@ -442,10 +452,10 @@ exists and the gate's file is absent. The reverse also holds: once `install-gate
 gate's file, the backstop stops reading the legacy one, and a root only the legacy file listed loses
 the backstop with no message. By the same rule, `-Uninstall -Repo` narrowed to zero roots leaves a
 gate file that names no root, which the backstop reads in preference to the legacy one, so the
-backstop is off, although `install-gate.ps1` calls that the same state as `-Uninstall`.
+backstop is off.
 
-So the "verified byte-for-byte clean uninstall" claim is false, of the gate alone as well as of the
-estate. Depending on what earlier runs did, `-Uninstall` leaves at least
+So `-Uninstall` is not a clean uninstall, of the gate alone as well as of the estate. Depending on
+what earlier runs did, `-Uninstall` leaves at least
 `worktree-gate.repos.txt.bak`, `worktree_gate.ps1.receipt.json`, `worktree_gate.ps1.bak` after a
 re-install, the deny log `worktree-gate.log` after any deny, and a `settings.json.bak` in each config
 dir it rewrites, besides any legacy allowlist.

@@ -1086,9 +1086,11 @@ def check_handoff_writable(service_account: str, *, enforcing: bool = True) -> s
     except RestrictedFileError as exc:
         refused = str(exc)
     if refused is not None:
-        # Every refusal names the account itself, through describe_sid where it resolved, which the
-        # log's patient-name scrubber leaves readable. The typed name, such as NT AUTHORITY\LOCAL
-        # SERVICE, is an all-capitals run it would scrub (vault BACKLOG #6674 item 4).
+        # A refusal about an account that resolved names it by its SID, through describe_sid in
+        # most, which the log's patient-name scrubber leaves readable. The typed name, such as NT AUTHORITY\LOCAL
+        # SERVICE, is an all-capitals run it would scrub (vault BACKLOG #6674 item 4), and the
+        # refusal for a name that did not resolve quotes it, so that one may reach the log
+        # scrubbed (vault BACKLOG #5929 item 4).
         raise CustodyError(f"the handoff was not written: {refused}")
     if not administrators_enabled():
         raise CustodyError(

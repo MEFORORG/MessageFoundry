@@ -206,8 +206,12 @@ export function settingIsSet(
   return seen !== undefined && (seen.globalValue !== undefined || seen.workspaceValue !== undefined);
 }
 
-function serviceConfigArgs(serviceConfig: string | undefined): string[] {
-  return serviceConfig === undefined ? [] : ["--service-config", serviceConfig];
+/** The `--service-config` argv element for `serviceConfig`, or none when undefined. Bound with `=`,
+ *  so a value that starts with `-` stays the flag's value (BACKLOG #5411, #8237 item 24). Used at
+ *  least by the connection edits, Start (engineControlModel.ts), the alert editor and engine trust;
+ *  the security editor binds its own flag the same way (securityEditorModel.ts). */
+export function serviceConfigArgs(serviceConfig: string | undefined): string[] {
+  return serviceConfig === undefined ? [] : [`--service-config=${serviceConfig}`];
 }
 
 /**

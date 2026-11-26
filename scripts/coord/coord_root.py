@@ -49,6 +49,8 @@ _BLANK_OR_COMMENT = re.compile(r"\A[ \t]*(#.*)?\Z")
 _LINE_BREAK = re.compile(r"\r\n|\n|\r")
 # A drive letter, colon and separator, a UNC \\server\share, or (off Windows) a leading slash.
 _ABSOLUTE = re.compile(r"\A(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+|/(?![\\/]))")
+# A \\?\ or \\.\ device path, in any form; Get-CoordDeviceRootRefusal says why one is refused.
+_DEVICE_PREFIX = re.compile(r"\A[\\/]{2}[?.](?:[\\/]|\Z)")
 _UNC = re.compile(r"\A[\\/]{2}([^\\/]+)[\\/]")
 
 
@@ -86,6 +88,9 @@ def shared_root(
     """
     env = os.environ.get(ROOT_ENV, "").strip(_WS)
     if env:
+        device = _device_root_refusal(ROOT_ENV, env)
+        if device is not None:
+            return None, "env", device
         if not _absolute(env):
             return None, "env", f"{ROOT_ENV} is not an absolute path: {env}"
         return Path(env), "env", None
@@ -122,9 +127,23 @@ def shared_root(
         found = m.group(1).strip(_WS)
     if found is None:
         return None, "file", f"{file} names no shared_root"
+    device = _device_root_refusal(f"{file} shared_root", found)
+    if device is not None:
+        return None, "file", device
     if not _absolute(found):
         return None, "file", f"{file} names a shared_root that is not an absolute path: {found}"
     return Path(found), "file", None
+
+
+def _device_root_refusal(what: str, path: str) -> str | None:
+    """Why a root spelled as a device path is refused, or None for any other spelling, in the text
+    Get-CoordDeviceRootRefusal gives; its comment says why every such spelling is refused."""
+    if not _DEVICE_PREFIX.match(path):
+        return None
+    return (
+        f"{what} is a device path, which is refused: {path}. Spell the root plainly instead, as"
+        " X:\\... or \\\\srv\\share\\.... Nothing was read from or written to that root."
+    )
 
 
 def _absolute(path: str) -> bool:
@@ -147,20 +166,39 @@ def unc_host(path: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _down_server(text: str) -> str | None:
+    """The server a down-cache file names, or None for any other shape, as Get-CoordDownServer reads,
+    including its fallback to ``root`` for a file in origin/main's shape."""
+    obj = json.loads(text)
+    if not isinstance(obj, dict):
+        return None
+    if "server" not in obj:
+        root = obj.get("root")
+        return unc_host(root) if isinstance(root, str) else None
+    value = obj["server"]
+    return value if isinstance(value, str) else None
+
+
 def probe_root(path: Path, local: Path | None) -> str | None:
     """None when ``path`` answers; else why not. Fast on a dead SMB server."""
+    device = _device_root_refusal("shared root", str(path))
+    if device is not None:
+        return device
     server = unc_host(str(path))
     if server:
         down = local / DOWN_FILE if local else None
-        # The verdict is about ONE root. A cache written for another root, or stamped in the future by a
-        # skewed clock or a copied file, is ignored rather than trusted.
+        # The verdict is about ONE server; Test-CoordRoot's comment says why. A cache naming another
+        # server, or stamped in the future by a skewed clock or a copied file, is ignored.
         try:
             if down is not None and down.is_file():
                 age = time.time() - down.stat().st_mtime
-                cached = json.loads(down.read_text(encoding="utf-8")).get("root")
-                if cached == str(path) and 0 <= age < DOWN_TTL_SECONDS:
-                    return f"shared root {path} was unreachable {int(age)} s ago (cached in {down})"
-        except (OSError, ValueError, AttributeError):
+                cached = _down_server(down.read_text(encoding="utf-8"))
+                if cached == server and 0 <= age < DOWN_TTL_SECONDS:
+                    return (
+                        f"server {server}, for shared root {path}, was unreachable"
+                        f" {int(age)} s ago (cached in {down})"
+                    )
+        except (OSError, ValueError):
             pass
         if not _reachable(server):
             if down is not None:
@@ -169,6 +207,7 @@ def probe_root(path: Path, local: Path | None) -> str | None:
                     down.write_text(
                         json.dumps(
                             {
+                                "server": server,
                                 "root": str(path),
                                 "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                             }
@@ -200,7 +239,9 @@ def _reachable(server: str) -> bool:
         try:
             with socket.create_connection((server, 445), timeout=PROBE_TIMEOUT_SECONDS):
                 result.append(True)
-        except OSError:
+        # UnicodeError: the idna codec refuses a server name with an empty label, such as '..',
+        # which otherwise killed this thread with a traceback on stderr.
+        except (OSError, UnicodeError):
             result.append(False)
 
     t = threading.Thread(target=attempt, daemon=True)

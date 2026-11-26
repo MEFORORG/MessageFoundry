@@ -899,7 +899,7 @@ class MLLPDestination(DestinationConnector):
         # TIME_WAIT port pressure, with the default flip planned once the §8 trigger is met. Key absent
         # → off; the two freshness knobs follow the receive_timeout convention: None/0 in any
         # spelling = disabled, a negative = refused.
-        self.persistent: bool = bool(s.get("persistent", False))
+        self.persistent: bool = flag_from_settings(s, "persistent")
         self.idle_timeout_seconds: float | None = positive_cap(
             s.get("idle_timeout_seconds", 60.0),
             float,
@@ -918,7 +918,7 @@ class MLLPDestination(DestinationConnector):
         # ACK-waiting behavior, byte-identical. Composes with persistent (the no-ack persistent path
         # is SIMPLER — no reply frame to read, no desync guard). Mutually exclusive with
         # capture_response/reingress_to (nothing to capture) and MLLP-only — both rejected at wiring.
-        self.no_ack: bool = bool(s.get("no_ack", False))
+        self.no_ack: bool = flag_from_settings(s, "no_ack")
         # The cached connection + freshness stamps (monotonic clock — a wall-clock jump must not
         # expire a healthy socket). Cached only after a FULLY successful transaction (including a
         # NAK — a complete request/response on a healthy transport); any transport failure discards
@@ -955,14 +955,14 @@ class MLLPDestination(DestinationConnector):
         # MSA/ERR the partner returned) for the delivery worker to capture. Default False → returns None,
         # byte-identical. A *read* failure (peer-close, frame-size) is never captured — it stays a
         # retryable DeliveryError; only a read-but-unparseable ACK becomes outcome='unparseable'.
-        self.capture_response: bool = bool(s.get("capture_response", False))
+        self.capture_response: bool = flag_from_settings(s, "capture_response")
         # BACKLOG #82: when True, a positive ACK (MSA-1 AA/CA) is accepted only if its MSA-2 echoes the
         # sent message's MSH-10 — a mismatched control id is a correlation failure (retryable). A reject
         # (AR/CR) naming a different, non-empty MSA-2 is one too (BACKLOG #5681). Default
         # False → no correlation, byte-identical (the sent control id is never threaded to _check_ack).
         # The sent MSH-10 is read defensively in send() (a non-HL7 / unreadable payload → skip, deliver
         # as before); MSA-2 is read separator-aware via Peek, never hardcoded delimiters.
-        self.verify_ack_control_id: bool = bool(s.get("verify_ack_control_id", False))
+        self.verify_ack_control_id: bool = flag_from_settings(s, "verify_ack_control_id")
         # WP-13b: per-connection outbound TLS (verify the peer). Built once here so a bad cert/CA fails
         # at build (dry-run/check), not per delivery. None when tls is off → plaintext, byte-identical.
         # #190 (ADR 0093): thread the instance [tls] internal-CA trust-anchor policy so an internal hop

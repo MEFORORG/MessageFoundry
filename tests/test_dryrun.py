@@ -878,6 +878,221 @@ def test_shareable_payload_delegates_to_build_payload(monkeypatch: pytest.Monkey
     assert len(calls) == 1  # HL7 is never shared, so never built here
 
 
+# --- BACKLOG #6819: a bytes body reaches the public entry points in the listener's form ---------
+
+#: Not valid UTF-8 (0xFF never is), and a NUL besides, as a DICOM preamble holds.
+_BINARY_NOT_UTF8 = b"\x00" * 8 + b"DICM\xff\xfe\x80"
+#: Valid UTF-8, so a text decode "succeeds" and hands the Handler an uncarried body.
+_BINARY_UTF8 = b"DICM-plain"
+
+
+def _bytes_registry(seen: list[Any], *, content_type: ContentType, encoding: str | None = None):
+    """A non-HL7 inbound whose Router and Handler record what they were handed."""
+
+    def route(msg: RawMessage) -> list[str]:
+        seen.append(("router", msg))
+        return ["h"]
+
+    def handle(msg: RawMessage) -> Send:
+        seen.append(("handler", msg))
+        return Send("out", msg.raw)
+
+    reg = _raw_registry(route, {"h": handle}, content_type=content_type)
+    if encoding is not None:
+        reg.inbound["in"].spec.settings["encoding"] = encoding
+    return reg
+
+
+def _run_entry(entry: str, reg: Registry, raw: bytes) -> None:
+    ic = reg.inbound["in"]
+    if entry == "route_message":
+        route_message(reg, ic, raw)
+    elif entry == "route_only":
+        route_only(reg, ic, raw)
+    else:
+        transform_one(reg, "h", raw, ic.content_type.value)
+
+
+@pytest.mark.parametrize("entry", ["route_message", "route_only", "transform_one"])
+@pytest.mark.parametrize("content_type", [ContentType.DICOM, ContentType.BINARY])
+@pytest.mark.parametrize("data", [_BINARY_NOT_UTF8, _BINARY_UTF8], ids=["not-utf8", "utf8"])
+def test_binary_bytes_are_carried_at_each_public_entry_point(
+    entry: str, content_type: ContentType, data: bytes
+) -> None:
+    """Bytes for a binary inbound reach the Router and Handler base64-carried (ADR 0028), as
+    ``_dry_run_raw`` carries them, so ``raw_bytes`` gives the bytes back (BACKLOG #6819). The
+    DICOM bodies hold no preamble, so the listener's declared-type sniff would refuse them; the
+    entry points do not run it.
+    They used to be decoded as UTF-8: a body that is not UTF-8 raised ``UnicodeDecodeError``, and
+    one that is reached the Handler uncarried, so ``raw_bytes`` raised ``BinaryCarriageError``."""
+    seen: list[Any] = []
+    _run_entry(entry, _bytes_registry(seen, content_type=content_type), data)
+    assert seen, "no Router or Handler ran"
+    for _, msg in seen:
+        assert isinstance(msg, RawMessage)
+        assert msg.raw_bytes == data
+
+
+@pytest.mark.parametrize("entry", ["route_message", "route_only"])
+def test_text_bytes_decode_with_the_inbound_charset(entry: str) -> None:
+    """Bytes for a text inbound are decoded with the charset it declares, as the listener does
+    (BACKLOG #6819). A latin-1 body used to be decoded as UTF-8 and raise ``UnicodeDecodeError``."""
+    seen: list[Any] = []
+    reg = _bytes_registry(seen, content_type=ContentType.JSON, encoding="latin-1")
+    _run_entry(entry, reg, '{"n": "café"}'.encode("latin-1"))
+    assert seen, "no Router or Handler ran"
+    assert [msg.json() for _, msg in seen] == [{"n": "café"}] * len(seen)
+
+
+@pytest.mark.parametrize("entry", ["route_message", "route_only"])
+def test_undecodable_text_bytes_are_a_typed_decode_refusal(entry: str) -> None:
+    """Bytes a text inbound's charset refuses are the listener's ``decode``-phase
+    :class:`IngressGuardError`, quoting no byte of the body, and no Router or Handler runs
+    (BACKLOG #6819). They used to escape as a bare ``UnicodeDecodeError``, whose ``.object`` is the
+    whole body."""
+    from messagefoundry.pipeline.ingress_guards import IngressGuardError
+
+    seen: list[Any] = []
+    with pytest.raises(IngressGuardError) as info:
+        _run_entry(entry, _bytes_registry(seen, content_type=ContentType.JSON), b'{"n": "MRN\xff"}')
+    assert info.value.phase == "decode"
+    assert "MRN" not in info.value.reason
+    assert info.value.__cause__ is None and info.value.__context__ is None
+    assert seen == []
+
+
+@pytest.mark.parametrize("data", [b'{"n": "MRN\xff"}', b'{"n": "MRN"}'], ids=["not-utf8", "utf8"])
+def test_transform_one_refuses_text_bytes(data: bytes) -> None:
+    """``transform_one`` has no inbound to name a text body's charset or run its post-decode
+    guards, so bytes for a text type are a ``TypeError``, the caller's fault, quoting no byte of
+    the body, and no Handler runs (BACKLOG #6819). It used to decode them as UTF-8, raising a bare
+    ``UnicodeDecodeError`` on any other charset."""
+    seen: list[Any] = []
+    with pytest.raises(TypeError, match="takes a 'json' body as str") as info:
+        _run_entry("transform_one", _bytes_registry(seen, content_type=ContentType.JSON), data)
+    assert "MRN" not in str(info.value)
+    assert info.value.__cause__ is None and info.value.__context__ is None
+    assert seen == []
+
+
+def test_an_undecodable_body_reads_no_reference_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``route_message`` refuses an undecodable body before it builds the reference view, so the
+    refusal costs no reference-file read (BACKLOG #6819)."""
+    from messagefoundry.pipeline import dryrun
+    from messagefoundry.pipeline.ingress_guards import IngressGuardError
+
+    built: list[object] = []
+
+    def counting(reg: Registry) -> dict[str, Any]:
+        built.append(reg)
+        return {}
+
+    monkeypatch.setattr(dryrun, "dry_run_reference_view", counting)
+    reg = _bytes_registry([], content_type=ContentType.JSON)
+    with pytest.raises(IngressGuardError):
+        route_message(reg, reg.inbound["in"], b"\xff")
+    assert built == []
+
+
+@pytest.mark.parametrize("entry", ["route_only", "transform_one"])
+def test_the_sandbox_child_rebuilds_from_the_carried_body(
+    monkeypatch: pytest.MonkeyPatch, entry: str
+) -> None:
+    """On the sandboxed branch the child rebuilds the payload from ``origin``, so ``origin``
+    holds the carried ``str``, never the bytes ``build_payload`` would decode as UTF-8
+    (BACKLOG #6819)."""
+    from messagefoundry.pipeline import dryrun
+    from messagefoundry.pipeline.sandbox import SandboxMode
+
+    origins: list[Any] = []
+
+    def fake_run(fn: Any, payload: Any, **kw: Any) -> Any:
+        origins.append(kw["origin"])
+        assert payload.raw_bytes == _BINARY_NOT_UTF8
+        return ["h"] if kw["phase"] == "router" else Send("out", payload.raw)
+
+    class _Session:
+        mode = SandboxMode.SUBPROCESS
+
+    monkeypatch.setattr(dryrun, "run_sandboxed", fake_run)
+    reg = _bytes_registry([], content_type=ContentType.DICOM)
+    ic = reg.inbound["in"]
+    session: Any = _Session()
+    if entry == "route_only":
+        route_only(reg, ic, _BINARY_NOT_UTF8, sandbox=session)
+    else:
+        transform_one(reg, "h", _BINARY_NOT_UTF8, ic.content_type.value, sandbox=session)
+    [(raw, ct)] = origins
+    assert isinstance(raw, str) and ct == "dicom"
+    assert RawMessage(raw, ct).raw_bytes == _BINARY_NOT_UTF8
+
+
+def test_an_oversize_binary_body_is_the_size_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A binary body over the engine ceiling is the ``size``-phase refusal at each entry point
+    that carries it, as the listener's is (BACKLOG #6819)."""
+    from messagefoundry.pipeline import ingress_guards
+    from messagefoundry.pipeline.ingress_guards import IngressTooLarge
+
+    # Refuses only the RAW length, 1 byte: a check on the carried text, which is longer, passes.
+    monkeypatch.setattr(
+        ingress_guards, "ingress_size_error", lambda size: "too large" if size == 1 else None
+    )
+    for entry in ("route_message", "route_only", "transform_one"):
+        seen: list[Any] = []
+        with pytest.raises(IngressTooLarge):
+            _run_entry(entry, _bytes_registry(seen, content_type=ContentType.BINARY), b"\x00")
+        assert seen == [], entry
+        _run_entry(entry, _bytes_registry(seen, content_type=ContentType.BINARY), b"\x00\x00")
+        assert seen, f"{entry}: the control body was refused too"
+
+
+@pytest.mark.parametrize("entry", ["route_message", "route_only"])
+def test_hl7_bytes_decode_with_the_inbound_charset(entry: str) -> None:
+    """HL7 bytes are decoded with the charset the inbound declares, as ``dry_run`` and the
+    listener decode them (BACKLOG #6819). ``Message.parse`` used to decode them as UTF-8 with
+    replacement, so a latin-1 name reached the Router and Handler with a U+FFFD in it."""
+    names: list[str | None] = []
+
+    def route(msg: Message) -> list[str]:
+        names.append(msg["PID-5"])
+        return ["h"]
+
+    def handle(msg: Message) -> Send:
+        names.append(msg["PID-5"])
+        return Send("out", msg)
+
+    reg = _registry(route, {"h": handle})
+    reg.inbound["in"].spec.settings["encoding"] = "latin-1"
+    raw = ADT_A01.replace("DOE^JANE", "CAF\u00c9^JANE").encode("latin-1")
+    if entry == "route_message":
+        route_message(reg, reg.inbound["in"], raw)
+    else:
+        route_only(reg, reg.inbound["in"], raw)
+    assert names and set(names) == {"CAF\u00c9^JANE"}
+
+
+@pytest.mark.parametrize("encoding", ["latin-1", "utf-8"])
+def test_transform_one_refuses_hl7_bytes(encoding: str) -> None:
+    """``transform_one`` has no inbound to name an HL7 body's charset, so HL7 bytes are a
+    ``TypeError``, as text bytes are, quoting no byte of the body, and no Handler runs
+    (BACKLOG #6819). It used to hand them to ``Message.parse``, which decodes as UTF-8 with
+    replacement, so a latin-1 name reached the Handler with a U+FFFD where ``route_only`` decodes
+    the same bytes with the inbound's charset."""
+    seen: list[Any] = []
+
+    def handle(msg: Message) -> Send:
+        seen.append(msg)
+        return Send("out", msg)
+
+    reg = _registry(lambda msg: ["h"], {"h": handle})
+    raw = ADT_A01.replace("DOE^JANE", "CAF\u00c9^JANE").encode(encoding)
+    with pytest.raises(TypeError, match="takes a 'hl7v2' body as str") as info:
+        transform_one(reg, "h", raw)
+    assert "CAF" not in str(info.value)
+    assert info.value.__cause__ is None and info.value.__context__ is None
+    assert seen == []
+
+
 # --- BACKLOG #6821: a fault in a peek read is a recorded ERROR, as on the listener --------------
 
 

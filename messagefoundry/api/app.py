@@ -564,7 +564,7 @@ from messagefoundry.store.content_search import (
     sends_a_needle,
 )
 from messagefoundry.store.crypto import CipherError, CipherUnavailableError, audit_body_digests
-from messagefoundry.store.metadata import user_metadata
+from messagefoundry.store.metadata import MetadataTooDeepError, user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
 from messagefoundry.store.row_seal import TransitSealUnavailableError, probe_row_sealer_at_start
 from messagefoundry.store.store import (
@@ -984,10 +984,20 @@ def _read_log_tail(
 
     Returns ``(redacted_lines, total_lines, available)``. ``offset`` counts lines back from the END of the
     newest ``.log``/``.txt`` file (``offset=0`` = the most recent ``limit`` lines); the page is returned in
-    file order (oldest-first within the window). Every line is passed through
-    :func:`~messagefoundry.support.redact.redact_log_line` — the SAME redactor the support bundle uses — so
-    the browser sees identical PHI/secret coverage; the redaction is best-effort (a residual single-token
-    identifier can survive), which is why the route is RBAC-gated + audited. ``available`` is False when no
+    file order (oldest-first within the window). Every line served is passed through
+    :func:`~messagefoundry.support.redact.redact_log_record`, the per-line pass the support bundle's
+    ``redact_log_text`` runs too, after the cross-line key-body mask
+    (:func:`~messagefoundry.support.redact.mask_key_body_lines`) over the page and the lines before it
+    back to where a key block covering it could begin
+    (:func:`~messagefoundry.support.redact.key_body_mask_from`). The two do not mask the same text.
+    At least: they pick their file with different listings, so they can read different files; the
+    bundle masks across its bounded read window, and keeps the audit copies, while this reads the
+    whole file and, with ``audit_copies=False``, drops them before the mask, so a key block an audit
+    copy splits can be masked for one reader and print for another. A BEGIN line with no END marker
+    after it masks the lines after it that read as base64 runs, such as a single word, as
+    :func:`~messagefoundry.support.redact.mask_key_body_lines` says. The redaction is best-effort (a
+    residual single-token identifier can survive), which is why the route is RBAC-gated + audited.
+    ``available`` is False when no
     ``[logging].log_dir`` is configured or no readable log file exists, so ``/logs/tail`` degrades
     gracefully. **Blocking** (a file read + redaction pass) — the caller runs it off the event loop — and
     **never raises** (an unreadable dir/file yields an empty, unavailable page).
@@ -996,6 +1006,7 @@ def _read_log_tail(
     and the page boundaries do not count them either (BACKLOG #1131; see
     :func:`~messagefoundry.auth.audit_visibility.reads_audit_copies_in_the_log`)."""
     from messagefoundry.auth.audit_visibility import is_audit_copy_line
+    from messagefoundry.support import redact
     from messagefoundry.support.redact import redact_log_record, split_log_lines
 
     if not log_dir:
@@ -1019,7 +1030,11 @@ def _read_log_tail(
     total = len(all_lines)
     end = max(0, total - offset)  # exclusive upper bound of this page (from the end)
     start = max(0, end - limit)
-    page = all_lines[start:end]
+    # From where a PRIVATE KEY block covering the page could begin, so a block whose BEGIN line is on
+    # an earlier page still has its body masked on this one, without masking the whole file on each
+    # request (BACKLOG #5550). A file with no "-----" holds no block, so it skips the scan back.
+    first = redact.key_body_mask_from(all_lines, start) if "-----" in text else start
+    page = redact.mask_key_body_lines(all_lines[first:end])[start - first :]
     return [redact_log_record(line) for line in page], total, True
 
 
@@ -1075,11 +1090,21 @@ def _replay_in_scope(identity: Identity, channel_id: str | None) -> bool:
 _CONTROL_ACTION_SIDE: Final = {"restart_inbound": "inbound", "restart_outbound": "outbound"}
 
 #: Which side of the graph raises each alert event type (BACKLOG #3378). ``"outbound"`` marks a type
-#: whose emitters, read on 2026-11-22, raise it only for an outbound lane. ``GET /alerts/rules``
-#: reads only that value: it withholds a rule of an ``"outbound"`` type, or of a type missing here,
-#: from a channel-scoped caller. The other values are notes, not checked per emitter: ``"inbound"``
-#: and ``"both"`` for the side or sides read, ``"none"`` for a type whose settings comment keys it
-#: on something other than a connection name. A test pins the keys to
+#: whose emitters, read on 2026-11-22, raise it only for an outbound lane, ``"both"`` one raised
+#: on both sides, ``"inbound"`` one raised only on the inbound side, and ``"none"`` one whose
+#: emitters were read as keying it on something other than a connection name, a label such as a
+#: sink's or ``dr_backup``; a type any emitter keys on a connection name is not ``"none"``. The
+#: withholding rule is stated in docs/SECURITY.md, in the text that opens "``GET /alerts/rules``
+#: shows a scoped caller", and applied in that route's ``visible()``; it binds a channel-scoped
+#: caller only, since an all-channels caller sees every rule whatever the side. For a scoped
+#: caller, a side recorded lower than the emitters justify (outbound above both, both above
+#: inbound and none, which rank alike) lets a rule pass the side test that should fail it, in at
+#: least these cases: an outbound-only type read as ``"inbound"`` or ``"none"`` (a ``"*"`` rule,
+#: or one naming a connection) or as ``"both"`` (a rule naming a connection); and a type both
+#: sides raise read as ``"inbound"`` or ``"none"`` (a ``"*"`` rule). A higher side only withholds
+#: more, so record ``"outbound"`` when unsure, which is also how ``visible()`` reads a type missing
+#: from this map, except ``"any"``, which it reads as ``"both"``. No test checks a value against
+#: the emitters. A test pins the keys to
 #: ``config.settings._ALERT_EVENT_TYPES``, so a new type has to be classified.
 _ALERT_EVENT_SIDE: Final[Mapping[str, str]] = MappingProxyType(
     {
@@ -3020,7 +3045,8 @@ _LEASE_LOST_RELEASE_DETAIL: Final = (
 _UNREADABLE_DETAIL: Final = "the engine could not read the config directory; see the engine log"
 
 #: The answer's bound on a hop refusal raised BUILDING the ``POST /alerts/test-email`` transport
-#: (BACKLOG #2193). The revocation guard's text runs to about 900 characters and its levers start
+#: (BACKLOG #2193). The revocation guard's text runs to about 900 to 1,150 characters, the longer
+#: for a sink built with no ``[tls]`` policy (BACKLOG #5527), and its levers start
 #: past ``safe_exc``'s default 200, so the default cut answered a refusal with no way across. Not
 #: :data:`_REFUSAL_LOG_LIMIT`: that one bounds a log line whose text the answer withholds, and this
 #: one bounds what the answer carries. 2048 leaves room for any DNS host name in that text.
@@ -3766,7 +3792,11 @@ async def _record_a_restore(store: Store, sink: AlertSink) -> None:
     processes on the same store, such as ``serve --shard`` processes, check sessions too, and may
     start before or after this one; what keeps the archive's sessions from them is the restore
     itself, which ended every session in the file before placing it (``write_restore_marker``).
-    This revoke repeats that for anything minted since, and raises every account's epoch.
+    This revoke repeats that for anything minted since. It also raises the global session epoch,
+    which ends the sessions minted before it unless someone with write access to the database
+    lowers or deletes its row, and the epoch of each account but those
+    ``AuthStore.revoke_all_sessions`` says go without it. docs/SECURITY.md, *Limits of the
+    session sweep*, says what else it may miss.
 
     A store write that fails here raises, so the start fails rather than serving the archive's
     sessions. The alert itself never raises: the record is already committed."""
@@ -3918,6 +3948,47 @@ async def _record_start_audit(
     )
 
 
+#: How often, per message, :func:`_summary_metadata` logs a too-deep cell, and how many messages
+#: it remembers, so a page reloaded over such rows does not repeat the line on every read.
+_TOO_DEEP_LOG_INTERVAL_S: Final = 3600.0
+_TOO_DEEP_LOG_MAX: Final = 4096
+_too_deep_logged: dict[str, float] = {}
+
+
+def _first_too_deep_log(message_id: str) -> bool:
+    """Whether to log a too-deep cell for ``message_id`` now, as the layered search's refusal log
+    decides per preset."""
+    now = time.monotonic()
+    last = _too_deep_logged.pop(message_id, None)
+    if last is not None and now - last < _TOO_DEEP_LOG_INTERVAL_S:
+        _too_deep_logged[message_id] = last
+        return False
+    _too_deep_logged[message_id] = now
+    while len(_too_deep_logged) > _TOO_DEEP_LOG_MAX:
+        _too_deep_logged.pop(next(iter(_too_deep_logged)))
+    return True
+
+
+def _summary_metadata(d: Mapping[str, Any]) -> str | None:
+    """The user bag :func:`_summary` shows for one row, or ``None`` when the stored cell is too
+    deep to read (BACKLOG #6712). Raising there would fail the whole answer the row is on: at least
+    a message list or search page, a layered search, or one message's detail. So the row shows no
+    metadata, and a WARNING names the message, never the cell. The line repeats for a message
+    after :data:`_TOO_DEEP_LOG_INTERVAL_S`, or once more than :data:`_TOO_DEEP_LOG_MAX` other
+    messages have been logged or re-read since it was last read. The wire shows such a row as it shows one with no metadata. The
+    delivery reader still raises."""
+    try:
+        return user_metadata(d.get("metadata"), row_id=d["id"])
+    except MetadataTooDeepError:
+        message_id = str(d["id"])
+        if _first_too_deep_log(message_id):
+            _log.warning(
+                "message %r: its stored metadata is too deeply nested to read; shown as none",
+                message_id[:12],
+            )
+        return None
+
+
 def _summary(row: Row) -> MessageSummary:
     # dict() so optional columns (last_event on list rows; summary/metadata) read via .get,
     # letting the same builder serve list rows and SELECT * detail rows.
@@ -3935,7 +4006,7 @@ def _summary(row: Row) -> MessageSummary:
         summary=d.get("summary"),
         # Surface ONLY the operator/handler user bag (ADR 0081, #150) — user_metadata strips the
         # engine-internal ADR-0013 correlation-lineage keys so they never leak to the API.
-        metadata=user_metadata(d.get("metadata"), row_id=d["id"]),
+        metadata=_summary_metadata(d),
     )
 
 
@@ -4188,18 +4259,20 @@ def _needle_shape(needle: str) -> str:
 
     An operator's needle may itself be PHI — an MRN, a patient name (ADR 0046 §4/AC-6). The audit must
     record *that a content search ran and roughly what kind of term*, never the term verbatim. We emit
-    only a structural class (all-digits / alphanumeric / has-separators / other) — not the characters —
-    so even a 9-digit MRN logs as ``digits`` with a length, never the number itself.
+    only a structural class, the first of ``str.isdigit`` (``digits``), ``isalpha`` (``alpha``) and
+    ``isalnum`` (``alnum``) the needle passes, else ``mixed`` — not the characters — so even a
+    9-digit MRN logs as ``digits`` with a length, never the number itself.
 
     The shape is read with the padding removed: ``make_spec`` keeps a needle's spaces (BACKLOG #6700),
     and a pasted `` 123456789`` is still an MRN-shaped lookup, so it must audit as ``digits``."""
     needle = needle.strip()
     if needle.isdigit():
         return "digits"
-    if needle.isalnum():
-        return "alnum"
+    # Before isalnum, which every all-letter needle also passes (BACKLOG #6700).
     if needle.isalpha():
         return "alpha"
+    if needle.isalnum():
+        return "alnum"
     return "mixed"
 
 
@@ -4223,7 +4296,8 @@ def _search_audit_detail(
 ) -> dict[str, object]:
     """Build the ``message_search`` audit detail — metadata filters + needle SHAPE + scan counts, with
     **no** needle value (AC-6). The HL7 ``field_path`` (e.g. ``PID-3``) is a structural locator, not PHI,
-    so it is recorded; the matched VALUE is never recorded."""
+    so it is recorded; the matched VALUE is never recorded. ``needle_len`` is the needle's length with
+    its padding removed, as :func:`_needle_shape` reads it (BACKLOG #6700)."""
     # `result` is a MessageSearchResult (kept loosely-typed to avoid importing the store dataclass here).
     scanned = getattr(result, "scanned", None)
     matched = getattr(result, "matched", None)
@@ -4239,7 +4313,7 @@ def _search_audit_detail(
     if spec.substring is not None:
         detail["needle_kind"] = "substring"
         detail["needle_shape"] = _needle_shape(spec.substring)
-        detail["needle_len"] = len(spec.substring)
+        detail["needle_len"] = len(spec.substring.strip())
     else:
         detail["needle_kind"] = "field_path"
         detail["field_path"] = spec.field_path  # structural locator, not PHI
@@ -4247,26 +4321,37 @@ def _search_audit_detail(
         detail["field_value_present"] = spec.field_value is not None
         if spec.field_value is not None:
             detail["needle_shape"] = _needle_shape(spec.field_value)
-            detail["needle_len"] = len(spec.field_value)
+            detail["needle_len"] = len(spec.field_value.strip())
     return detail
 
 
+def _preset_target(stored: object) -> Any:
+    """A stored preset's ``target``, with an absent or empty one read as ``"both"``. Any other
+    value reaches ``make_spec`` as stored, so a non-text one is refused rather than dropped
+    (BACKLOG #6700)."""
+    return "both" if stored is None or stored == "" else stored
+
+
 def _compose_preset_layers(
-    criterias: list[dict[str, Any]],
+    criterias: list[dict[str, Any]], *, scan_limit: int
 ) -> tuple[SearchSpec, dict[str, str | None]]:
     """AND-compose N saved-preset criteria into one ``(SearchSpec, metadata-filters)`` for
     ``search_messages`` (ADR 0136 §5, BACKLOG #151). Each metadata scalar
     (``channel_id``/``status``/``message_type``/``control_id``) takes the first non-empty value and
     **rejects a conflicting second** (400). **Exactly one** preset may carry a content needle (a
     ``content`` substring or a ``field_path``[+``field_value``]); >1 or 0 → 400. Raises
-    :class:`HTTPException` (400) on a conflict / missing-or-duplicate needle; the caller maps the
-    ``ContentSearchError`` from a malformed field path likewise.
+    :class:`HTTPException` (400) on a conflict / missing-or-duplicate needle, and maps
+    ``make_spec``'s refusal of a malformed needle to a 400 too.
 
     A lone ``field_value`` counts as a needle too, so ``make_spec`` refuses it (400) rather than the
-    compose dropping it (BACKLOG #6700)."""
+    compose dropping it (BACKLOG #6700). Each needle is validated as it is found, at ``scan_limit``,
+    so a malformed one is refused with its own cause rather than counted as a second needle. A
+    preset that carries a needle passes its terms to ``make_spec`` as stored, so a non-text one
+    there is refused rather than dropped. Whether a preset carries one is :func:`sends_a_needle`
+    applied to its content and path stripped, so a blank one does not count here."""
     meta_keys = ("channel_id", "status", "message_type", "control_id")
     meta: dict[str, str | None] = dict.fromkeys(meta_keys)
-    needle: dict[str, Any] | None = None
+    spec: SearchSpec | None = None
     for crit in criterias:
         for key in meta_keys:
             value = crit.get(key)
@@ -4284,26 +4369,29 @@ def _compose_preset_layers(
             v.strip() if isinstance(v, str) else v
             for v in (crit.get("content"), crit.get("field_path"))
         )
-        if sends_a_needle(content, path, crit.get("field_value")):
-            if needle is not None:
-                raise HTTPException(
-                    400, "layered search allows at most one content predicate across presets"
-                )
-            needle = crit
-    if needle is None:
+        if not sends_a_needle(content, path, crit.get("field_value")):
+            continue
+        # make_spec reads an empty or blank term as not sent, so nothing here coerces one.
+        try:
+            found = make_spec(
+                content=crit.get("content"),
+                field_path=crit.get("field_path"),
+                field_value=crit.get("field_value"),
+                target=_preset_target(crit.get("target")),
+                scan_limit=scan_limit,
+            )
+        except (ContentSearchError, ValueError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if spec is not None:
+            raise HTTPException(
+                400, "layered search allows at most one content predicate across presets"
+            )
+        spec = found
+    if spec is None:
         raise HTTPException(
             400,
             "layered search needs exactly one preset carrying a content term (substring or field)",
         )
-    try:
-        spec = make_spec(
-            content=(needle.get("content") or None),
-            field_path=(needle.get("field_path") or None),
-            field_value=(needle.get("field_value") or None),
-            target=needle.get("target") or "both",
-        )
-    except (ContentSearchError, ValueError) as exc:
-        raise HTTPException(400, str(exc)) from exc
     return spec, meta
 
 
@@ -5579,12 +5667,15 @@ def create_app(
         # + cleartext-credential checks run in the constructor; a misconfiguration is an operator error.
         # BACKLOG #2193 slice (e): the derived instance posture (the same _phi_read_posture derived at
         # create_app time from ai_settings, which == app.state.ai == `ai` on the managed path) keys
-        # the broker's revocation refusal. An off-box endpoint with no [ai].endpoint_revocation_attested
-        # pair is refused under enforce, and a None posture counts as enforcing there. The cleartext-
-        # http refusal takes no posture: it refuses in every one (vault BACKLOG #3533 item 5).
-        # BACKLOG #5527: the [tls] policy too, the one the alerts test send reads, so the endpoint is
-        # verified against [tls].internal_ca_file under augment or pinned and checked against
-        # [tls].crl_file as the other HTTP-family hops are. A direct create_app stashes its
+        # the broker's revocation refusal. An endpoint whose host does not read as loopback, in the
+        # reading ai_broker._refuse_an_unrevoked_ai_hop states (it can be one on this machine), is
+        # refused under enforce unless a [tls].crl_file is checked on it or the
+        # [ai].endpoint_revocation_attested pair is set, and a None posture counts as enforcing
+        # there. The cleartext-http refusal takes no posture: it refuses in every one (vault
+        # BACKLOG #3533 item 5). BACKLOG #5527: the [tls] policy too, the one the alerts test send
+        # reads, so a non-loopback endpoint in that reading is verified against
+        # [tls].internal_ca_file under augment or pinned and checked against [tls].crl_file as the
+        # other HTTP-family hops are. A direct create_app stashes its
         # tls_settings argument, and its embedder may set the stash itself; create_managed_app's
         # lifespan stashes its own argument at start. With none, None goes down.
         # Off the event loop: the constructor builds rest.py's shared opener on first use, a TLS
@@ -10675,15 +10766,7 @@ def create_app(
                     "malformed",
                 )
             criterias.append(criteria)
-        spec, meta = _compose_preset_layers(criterias)
-        # Re-clamp the scan against the request bound (the composed spec used make_spec's default).
-        spec = make_spec(
-            content=spec.substring,
-            field_path=spec.field_path,
-            field_value=spec.field_value,
-            target=spec.target,
-            scan_limit=scan_limit,
-        )
+        spec, meta = _compose_preset_layers(criterias, scan_limit=scan_limit)
         allowed = _scope(identity)
         result = await engine.store.search_messages(
             spec,
@@ -11002,11 +11085,13 @@ def create_app(
                 _CONTROL_ACTION_SIDE.get(rule.control_action, "outbound") == "outbound"
             ):
                 return False
-            # An event type only an outbound raises makes the rule an outbound rule, a "*" one
-            # included. "any" matches every side, as connection_stopped does, so it shows.
-            return rule.event_type == "any" or (
-                _ALERT_EVENT_SIDE.get(rule.event_type, "outbound") != "outbound"
+            # The event-type rule is stated in docs/SECURITY.md (BACKLOG #3378, #8390).
+            side = (
+                "both"
+                if rule.event_type == "any"
+                else _ALERT_EVENT_SIDE.get(rule.event_type, "outbound")
             )
+            return side != "outbound" and not (rule.connection == "*" and side == "both")
 
         rules = [r for r in alerts.rules if visible(r)]
         show_ids = not scoped
@@ -12515,9 +12600,14 @@ async def _session_reaper(
     """Drop expired session rows, first ``_SESSION_REAP_FIRST_DELAY`` after start and then every
     ``_SESSION_REAP_INTERVAL``, until the task is cancelled. With ``idle_seconds`` given,
     idle-expired rows go too (BACKLOG #2096); the lifespan passes the idle timeout the validator
-    uses. With ``lineage_seconds`` given, session lineage links older than that go too (vault
-    BACKLOG #3028); the lifespan passes the window the supersession follows them for. Purging as of
-    the earlier instant below only keeps a link longer, never shortens that window.
+    uses. With ``lineage_seconds`` given, session lineage links go too (vault
+    BACKLOG #3028); the lifespan passes the window the supersession follows them for. The store
+    measures a link's age on its own clock, the one the supersession measures its window on (vault
+    BACKLOG #4276), never from the ``now`` passed below. So the reaper asks for that window plus
+    ``_SESSION_REAP_STEP_TOLERANCE``: the purge then deletes a link younger than ``lineage_seconds``
+    in real time only after the store's clock has gained more than ``_SESSION_REAP_STEP_TOLERANCE``
+    on real time since the link was written. The guard below reads only the engine host's clock.
+    The cost is that a link can be kept longer.
 
     **The reaper skips a pass when the wall clock has jumped forward (BACKLOG #2283).** The purge
     judges expiry and idleness by the wall clock, and its deletes cannot be undone. Run just after
@@ -12578,7 +12668,11 @@ async def _session_reaper(
             await store.purge_expired_sessions(
                 now=now - _SESSION_REAP_STEP_TOLERANCE,
                 idle_seconds=idle_seconds,
-                lineage_seconds=lineage_seconds,
+                lineage_seconds=(
+                    None
+                    if lineage_seconds is None
+                    else lineage_seconds + _SESSION_REAP_STEP_TOLERANCE
+                ),
             )
         except asyncio.CancelledError:
             raise

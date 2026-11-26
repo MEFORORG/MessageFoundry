@@ -24,11 +24,18 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
-from messagefoundry.auth.oidc.jwks import JwkAlgMismatch, JwksCache, JwksError
+from messagefoundry.auth.oidc.jwks import (
+    JwkAlgMismatch,
+    JwksAmbiguousKid,
+    JwksCache,
+    JwksError,
+    JwksRefreshBusy,
+)
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.domainshape import upn_suffix_key
 from messagefoundry.transports.signing import (
     SigningError,
+    refuse_critical_extensions,
     require_public_key_for_alg,
     unverified_jws_header,
     verify_compact_jws,
@@ -43,9 +50,15 @@ REASONS: frozenset[str] = frozenset(
         "claim_not_numeric",
         "claim_sub_missing",
         "wrong_token_type",
+        # RFC 7515 section 4.1.11: a header carrying ``crit``, which names an extension the engine
+        # does not implement (it implements none) or is malformed. Refused at key selection.
+        "unsupported_crit",
         "unexpected_events_claim",
         "unknown_kid",
         "ambiguous_kid",
+        # BACKLOG #6905: the JWKS cache's wait for a refresh in progress ran out before the token's
+        # key was current. The IdP was slow or stalled; the token's kid was never judged.
+        "jwks_refresh_busy",
         "key_rejected",
         "bad_signature",
         "claim_iss",
@@ -188,6 +201,12 @@ def _select_key_and_alg(
     except SigningError as exc:
         raise ClaimsError("malformed_token", str(exc)) from exc
     _assert_id_token_typ(header)
+    # Before the kid lookup, so a token the engine must refuse whatever its key never spends the JWKS
+    # refetch budget. ``verify_compact_jws`` refuses it too; this one names the rung in the audit.
+    try:
+        refuse_critical_extensions(header)
+    except SigningError as exc:
+        raise ClaimsError("unsupported_crit", str(exc)) from exc
     kid = header.get("kid")
     if not isinstance(kid, str) or kid == "":
         raise ClaimsError("unknown_kid", "id_token header carries no kid")
@@ -202,6 +221,17 @@ def _select_key_and_alg(
     except JwkAlgMismatch as exc:
         # The kid names a key, but its JWK restricts it to another alg (BACKLOG #5517).
         raise ClaimsError("key_rejected", str(exc)) from exc
+    except JwksAmbiguousKid as exc:
+        # The JWKS this lookup just fetched gives two usable keys one kid, whichever kid that is, so
+        # that fetched set is refused and the cache keeps any keys it held before. The IdP's key set
+        # is at fault, not necessarily this token's kid. Only the lookup that made the fetch sees
+        # it: a lookup inside the min-refetch floor after it is served a key the cache still holds
+        # for its kid, or gets the throttled JwksError, recorded as unknown_kid below.
+        raise ClaimsError("ambiguous_kid", str(exc)) from exc
+    except JwksRefreshBusy as exc:
+        # A refresh another sign-in started held the cache past this lookup's bounded wait (BACKLOG
+        # #6905). Not the token's fault, so not unknown_kid.
+        raise ClaimsError("jwks_refresh_busy", str(exc)) from exc
     except JwksError as exc:
         raise ClaimsError("unknown_kid", str(exc)) from exc
     try:
@@ -483,9 +513,11 @@ def validate_id_token(
     """Verify an ``id_token`` end to end and return the :class:`FederatedPrincipal`, or raise
     :class:`ClaimsError` with a closed-set ``reason``.
 
-    Order is deliberate: signature first (nothing downstream trusts an unverified claim), then the
-    core OIDC claims, then the MFA gate, then the username claim. ``clock`` is wall-clock ``time.time``
-    (token lifetimes are wall-clock, unlike the monotonic caches) and injectable for tests.
+    Order is deliberate: key selection first, whose ``typ`` and ``crit`` refusals read the
+    unverified protected header before the signature is checked, and can only refuse, never accept;
+    then the signature (nothing downstream trusts an unverified claim), then the core OIDC claims,
+    then the MFA gate, then the username claim. ``clock`` is wall-clock ``time.time`` (token
+    lifetimes are wall-clock, unlike the monotonic caches) and injectable for tests.
     """
     key, _alg = _select_key_and_alg(id_token, policy, jwks)
     claims = _verify_signature(id_token, key, policy)

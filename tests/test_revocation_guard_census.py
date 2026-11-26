@@ -247,8 +247,9 @@ _CENSUS: dict[str, Guarded | Exempt] = {
     "messagefoundry/transports/soap.py::SoapDestination.__init__": Guarded(),
     "messagefoundry/transports/ai_broker.py::AiBroker.__init__": Guarded(
         note="the AI endpoint's opener, which _ai_endpoint_opener chooses under the [tls] policy since "
-        "BACKLOG #5527, handed to _refuse_an_unrevoked_ai_hop (BACKLOG #2193 slice (e)). Off "
-        "the box it crosses an enforcing posture only on a [tls].crl_file that reaches its opener "
+        "BACKLOG #5527, handed to _refuse_an_unrevoked_ai_hop (BACKLOG #2193 slice (e)). An "
+        "endpoint whose host does not read as loopback, in the reading that function states, "
+        "crosses an enforcing posture only on a [tls].crl_file that reaches its opener "
         "(BACKLOG #5527) or on its [ai].endpoint_revocation_attested pair; an unknown posture "
         "counts as enforcing",
     ),

@@ -535,9 +535,9 @@ def test_a_tree_under_claude_worktrees_is_not_reached_and_name_still_removes_the
     this route does not reach one. A clean tree and a clearing registry change nothing, and neither
     does -Force.
 
-    The overlap is a sibling new.ps1 made BESIDE a linked worktree, which also sits under
-    ``.claude/worktrees``. ``-Path`` refuses it like the rest; the copy of the script in that linked
-    worktree still removes it by ``-Name``, which is the control here.
+    The overlap is a sibling an older new.ps1 made BESIDE a linked worktree, which also sits under
+    ``.claude/worktrees``. ``-Path`` refuses it like the rest; ``-RepoRoot <that linked worktree>
+    -Name`` still removes it (BACKLOG #1894), which is the control here.
     """
     managed = rig.primary / ".claude" / "worktrees"
     foo = rig.add(managed / "foo")

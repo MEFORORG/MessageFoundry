@@ -241,7 +241,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `[auth].mfa_recovery_code_count` | `10` (more codes is named. `0` mints none, which is stricter. The load refuses a value outside `0` to `50`) |
 | | `[auth].password_min_length` | `15` (a shorter floor is named, and `0` sets none; a negative floor is refused at load) |
 | | `[auth].oidc_clock_skew_seconds`, `oidc_jwks_ttl_seconds`, `oidc_flow_ttl_seconds`, `oidc_max_age_seconds` | `60` s / `3600` s / `300` s / `43200` s (*conditional* — a loosening only while OIDC is on; a value above its default is named) |
-| | `[auth].oidc_jwks_min_refetch_seconds` | `300` s (*conditional* — a loosening only while OIDC is on; a value below `300` s, or above the default JWKS lifetime of `3600` s, is named, and `0` removes the bound; a negative value is refused at load) |
+| | `[auth].oidc_jwks_min_refetch_seconds` | `300` s (*conditional* — a loosening only while OIDC is on; a value below `300` s, or above the default JWKS lifetime of `3600` s, is named, and `0` removes the bound; what the load refuses is in [SECURITY.md](SECURITY.md#the-documented-protection-set-asvs-611), control 9) |
 | | `[approvals].min_dwell_seconds`, `expiry_hours` | `2.0` s / `72` h (*conditional* — a loosening only while `[approvals].enabled` holds at least one operation; a floor below `2.0` s or an expiry above `72` h, and `0` turns either off) |
 | | `[approvals].operations` | `["connection_purge", "dead_letter_replay"]` (*conditional* — a loosening only while `[approvals].enabled` is on; a list that leaves out either default operation is named, and so is an empty list, which holds nothing; named as `approvals.operations`) |
 | | `[api].trusted_proxies` | `[]` (any network covering more than one address is named, once, a `/31` or `/127` included, because every host inside it may set `X-Forwarded-For`. Entries covering every address, such as `0.0.0.0/0` or `::/0`, trust it from every peer, as the refused `*` would, and get their own wording) |
@@ -1040,12 +1040,21 @@ count is above `0` (vault BACKLOG #2613).
 - **What you lose:** a fixed set of routes asks for a fresh proof bound to that one action, used
   once. The `require_action_step_up` row of [CONFIGURATION.md](CONFIGURATION.md), under `[auth]`, lists them.
   With the switch off, those routes accept the session-wide step-up window instead. At least a
-  sign-in, a TOTP or recovery code on any session but an `oidc` one, and a passkey assertion that
+  local sign-in that owes no further factor, unless the first-seen address check withholds the
+  window, a combined sign-in (a passkey one included) from any address, a TOTP
+  or recovery code on any session but an `oidc` one, and a passkey assertion that
   completes a pending factor with the user-verification flag, on any session but an `oidc` one,
   can open that window; that flag is
   the authenticator's own report ([ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md),
-  2026-11-14 amendment). So a session taken over inside it can bind an authenticator, inject a message
-  or export bodies in bulk with no fresh proof.
+  2026-11-14 amendment). The `step_up_max_age_seconds` row of [CONFIGURATION.md](CONFIGURATION.md)
+  says when that check withholds the window, and that it fails open, so the window opens, when the
+  sign-in carries no client address or the known-address record cannot be read. So a session taken over inside it can, with no fresh proof, at
+  least bind an authenticator, disable MFA where `[security].require_mfa` does not refuse the
+  disable, end the account's other sessions, reset another
+  account's password or factor, inject a message, export bodies in bulk, purge a queue or reload
+  config. CORRECTED 2026-11-26 (vault BACKLOG #8391): this read "At least a sign-in" and gave the
+  three consequences "bind an authenticator, inject a message or export bodies in bulk" as the
+  whole list.
 - **When acceptable:** a site that has chosen the earlier session-window behaviour, for example
   while a client that cannot send the bound proof is updated.
 - **Compensating controls:** keep `[auth].step_up_max_age_seconds` short, keep
@@ -1387,7 +1396,7 @@ count is above `0` (vault BACKLOG #2613).
 
 ### `[auth].oidc_*` lifetimes and skew looser than their defaults **with OIDC on** — federated sign-in accepts more
 > **Conditional** on `[auth].oidc_enabled` (vault BACKLOG #2600). With it off nothing reads these.
-> Each is named alone. Every entry but the `0`-or-less refetch one quotes the configured value and a
+> Each is named alone. Every entry but the `0` refetch one quotes the configured value and a
 > default.
 - **What you lose:**
   - `oidc_clock_skew_seconds` above `60` s accepts an expired id_token for that much longer, and lets
@@ -1654,7 +1663,11 @@ count is above `0` (vault BACKLOG #2613).
   something outside the engine stops it. The SMTP hop carries the login password; the webhook
   URL can carry its path token. **Setting the flag adds no check on the wire.**
 - **What the attestation can truthfully rest on:** for the SMTP relay, `[tls].crl_file` reaches
-  that hop and adds a real check, where you hold the relay issuer's CRL. It is instance-wide:
+  that hop and adds a real check, where you hold the relay issuer's CRL, the `[tls]` policy reaches
+  the caller that builds the sink, and the relay's host is not loopback as `is_loopback_hop_host`
+  in `config/tls_policy.py` reads it, under which at least `localhost.` reads as remote; the
+  `alerts.email_tls_revocation_attested`
+  entry `security_loosenings()` prints names which callers hand that policy over. It is instance-wide:
   every non-loopback hop the `[tls]` policy reaches then needs its issuer's CRL in that file, or
   its handshake fails. For the webhook no CRL can reach the hop, so the
   flag is the only way across, and the honest basis is the same as for the Vault hops: a
@@ -1683,11 +1696,21 @@ count is above `0` (vault BACKLOG #2613).
   sent for assistance over https that verifies the endpoint's certificate, and its handshake
   checks no OCSP. **It checks no CRL unless all three of these hold** (BACKLOG #5527):
   `[tls].crl_file` is set; the `[tls]` section reaches the app serving `POST /ai/chat`; and the
-  endpoint is not loopback. `messagefoundry serve` hands its app that section. A direct
-  `create_app` (the embedded path) holds none unless its embedder passes a `TlsSettings` as
-  `tls_settings` or sets `app.state.tls_settings` to one.
+  endpoint's host, as `hop_url_host` takes it from the URL, is not loopback as
+  `is_loopback_hop_host` reads it, both in `config/tls_policy.py`. `hop_url_host` lowercases the
+  host and strips the brackets of an IPv6 host, so an endpoint URL holding `[::1]` reads as
+  loopback, though `is_loopback_hop_host` reads a raw `[::1]` as remote. Otherwise the host is
+  read as spelled, not where the endpoint runs: at least a spelling with a trailing dot, such as
+  `localhost.`, or a shortened IPv4 address such as `127.1` reads as remote, so an endpoint on
+  this machine spelled that way is judged below as any non-loopback endpoint is. In this entry,
+  "loopback" means this reading.
+  `messagefoundry serve`
+  hands its app that section. An embedder's `create_managed_app` holds none unless it passes a
+  `TlsSettings` as `tls_settings`. A direct `create_app` (the embedded path) holds none unless its
+  embedder passes one as `tls_settings` or sets `app.state.tls_settings` to one.
   So at least these check no CRL, whatever `[tls].crl_file` says: a loopback endpoint, and an app
-  the `[tls]` section never reached, such as a direct `create_app` whose embedder did neither.
+  the `[tls]` section never reached, such as a `create_managed_app` or a direct `create_app`
+  whose embedder handed it none.
   Without such a CRL, an `[ai].endpoint` whose host is not loopback is refused under
   `[security].enforcement = enforce`, and wherever a broker is built without a known posture,
   which counts as enforcing. The broker is built for each `POST /ai/chat` request, so the refusal
@@ -1696,14 +1719,18 @@ count is above `0` (vault BACKLOG #2613).
   unexpired endpoint certificate is then accepted unless something outside the engine stops it, and the API key
   crosses to whoever holds it. **Setting the flag adds no check on the wire.**
 - **What the attestation can truthfully rest on:** not on the engine. Since BACKLOG #5527 a set
-  `[tls].crl_file` is checked on this hop where the first bullet says, for example an off-box
-  endpoint on an engine started by `serve`, and there it is the other way across under
+  `[tls].crl_file` is checked on this hop where the first bullet says, for example a
+  non-loopback endpoint on an engine started by `serve`, and there it is the other way across under
   `enforce`, so prefer it where you hold the CRL of the endpoint certificate's
-  issuer. It is instance-wide: once set, an off-box endpoint it reaches whose issuer has no CRL
+  issuer. It is instance-wide: once set, a non-loopback endpoint it reaches whose issuer has no CRL
   in that file fails its handshake, and this flag does not change that.
   For an endpoint under a public CA you hold no CRL for, a short-lived endpoint certificate is the
   main honest basis; put its lifetime in the reason. A gateway on this machine that checks the
-  upstream's revocation itself needs no attestation at all: a loopback endpoint is not refused.
+  upstream's revocation itself needs no attestation when the endpoint URL spells its host as
+  loopback, in the first bullet's reading: a loopback endpoint is not refused. It is verified
+  against the OS roots alone, since a loopback endpoint takes neither `[tls]` file. Spelled so
+  that it reads as remote, it is judged like any non-loopback endpoint, and a proxy that applies
+  can carry it off the box.
 - **What it cannot do:** it never lifts the broker's other refusals, at least an `http` endpoint,
   an endpoint missing from `[ai].allowed_endpoints`, and credentials in the URL. The process-wide
   `MEFOR_TLS_REVOCATION_ATTESTED` does **not** cross this hop under an enforcing or unknown
@@ -1718,7 +1745,7 @@ count is above `0` (vault BACKLOG #2613).
   whatever `[ai].mode` is.
 - **At load:** the flag without a reason, a blank reason, a reason without the flag, or a reason
   holding a control character or a lone surrogate is refused when the settings load.
-- **Reversible:** yes. Delete both lines and restart. An off-box endpoint then refuses again,
+- **Reversible:** yes. Delete both lines and restart. A non-loopback endpoint then refuses again,
   unless a set `[tls].crl_file` is checked on it, where the first bullet says (BACKLOG #5527):
   that hop crosses on its CRL, with or without this pair.
 

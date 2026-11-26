@@ -29,6 +29,7 @@ from typing import Any, cast
 import pytest
 
 from messagefoundry import __main__ as cli
+from messagefoundry import restricted_file
 from messagefoundry.__main__ import main
 from messagefoundry.config import key_file_access
 from messagefoundry.config.key_file_access import (
@@ -782,3 +783,69 @@ async def test_supervise_runs_its_graph_guard_off_the_event_loop(tmp_path: Path)
     )
     assert rc == 2
     assert len(seen) == 1 and seen[0] != threading.get_ident()
+
+
+# --- a check that could not be made (vault BACKLOG #5657) ----------------------------------------
+
+_UNCHECKED_REASON = restricted_file.MOUNT_TABLE_UNREAD
+
+
+def _answer_unchecked(monkeypatch: pytest.MonkeyPatch, *, unchecked: bool) -> None:
+    """Stand the access check in with an answer that it could not be completed, or, for the
+    control, with an ordinary broad-access finding. The type, not the text, is what tells the two
+    apart."""
+    answer = (
+        restricted_file.UncheckedProblem(_UNCHECKED_REASON) if unchecked else "Everyone may read it"
+    )
+    monkeypatch.setattr(restricted_file, "broad_access_problem", lambda *a, **k: answer)
+
+
+def test_a_key_file_that_could_not_be_checked_says_so_with_its_own_remedy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Where the check could not be made, the refusal says the key file could not be checked, not
+    that it is not restricted, and carries the refusal's own remedy, not the owner-and-mode remedy
+    the caller passes, which would not clear it. The control is an ordinary finding, which keeps
+    "is not restricted" and the caller's remedy."""
+    _answer_unchecked(monkeypatch, unchecked=True)
+    problem = key_file_access.key_file_problem("k.key", what="the key file", remedy="RESTRICT IT")
+    assert problem == f"the key file could not be fully checked: {_UNCHECKED_REASON}", problem
+    assert "is not restricted" not in problem and "RESTRICT IT" not in problem
+
+    _answer_unchecked(monkeypatch, unchecked=False)
+    control = key_file_access.key_file_problem("k.key", what="the key file", remedy="RESTRICT IT")
+    assert control == "the key file is not restricted: Everyone may read it. RESTRICT IT"
+
+
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_a_generated_tls_key_that_could_not_be_checked_prints_no_owner_or_pair_remedy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    platform: str,
+) -> None:
+    """The generated-TLS gate prints no chmod, no chown and no delete-the-pair step for a check
+    that could not be made: none of them clears it, and a new pair would be judged the same way.
+    The control is an ordinary finding, which keeps that remedy."""
+    from messagefoundry.config.settings import ServiceSettings
+
+    monkeypatch.setattr(cli, "_engine_account_name", lambda: "mefor")
+    monkeypatch.setattr(sys, "platform", platform)
+    _answer_unchecked(monkeypatch, unchecked=True)
+    assert not cli._generated_tls_key_gate(ServiceSettings(), tmp_path, enforcing=True)
+    err = capsys.readouterr().err
+    assert "error: the generated TLS private key" in err and "could not be fully checked" in err, (
+        err
+    )
+    assert _UNCHECKED_REASON in err, err
+    assert "is not restricted" not in err, err
+    assert "chmod" not in err and "chown" not in err, err
+    assert "delete it" not in err and "certificate" not in err, err
+
+    _answer_unchecked(monkeypatch, unchecked=False)
+    assert not cli._generated_tls_key_gate(ServiceSettings(), tmp_path, enforcing=True)
+    err = capsys.readouterr().err
+    assert "is not restricted: Everyone may read it." in err, err
+    assert "delete it and its certificate" in err, err
+    if platform == "linux":
+        assert "chmod go-w" in err and "chown mefor" in err, err

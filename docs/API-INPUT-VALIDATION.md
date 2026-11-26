@@ -295,7 +295,12 @@ Where each rule lives:
   a `field_path` or a `field_value` saved in a preset. A preset holding a `field_value` with no
   `field_path` counts as one, and the search refuses it with a 400. A `field_value` that is empty or
   only whitespace does not count, nor does a stored one that is not text, so on a preset with no
-  other content term it is ignored.
+  other content term it is ignored. Each preset that carries a content term is checked as it is
+  found, so a malformed one is refused with its own reason, before a second term is counted. On
+  such a preset a `content`, `field_path`, `field_value` or `target` that is not text is refused
+  with a 400 (BACKLOG #6700). A stored `content` or `field_path` that is empty, only whitespace,
+  zero, false or an empty list does not make a preset carry a term, so where no other term is
+  stored it is ignored.
 - Edit and resubmit, and the statistics reset: each route itself, in the same file.
 - Password change: the API rule is in the route, in
   [`messagefoundry/api/auth_routes.py`](../messagefoundry/api/auth_routes.py). The API takes no

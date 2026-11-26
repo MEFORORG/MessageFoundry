@@ -246,7 +246,10 @@ async def test_a_caller_session_the_revoke_declines_is_ended_and_said_to_be(
         r = await c.delete("/sessions", headers=_auth(root))
         assert r.status_code == 200, r.text
         assert live and live[0] >= 2  # the caller's row and ops', both unrevoked at the revoke
-        assert r.json()["detail"] == f"revoked {live[0]} session(s); this session was ended too"
+        assert r.json()["detail"] == (
+            f"ended {live[0]} unrevoked session row(s), expired ones included; "
+            "this session was ended too"
+        )
         # Read before anything presents the token: the gate would end a live one it refuses.
         assert await _revoked(store, root)  # ended by the revoke itself
         assert not await _alive(c, root)
@@ -873,3 +876,55 @@ def test_the_cli_text_says_what_the_count_holds(
     # Two live sessions and the expired row: the count is every unrevoked row the sweep ended.
     assert out.startswith("OK: ended 3 unrevoked session row(s), expired ones included"), out
     assert "raised the global session epoch" in out, out
+
+
+_ROOT = Path(__file__).resolve().parents[1]
+
+#: BACKLOG #5095 step 3: phrases the every-account revoke's texts no longer say, by file. Each
+#: claimed more than the code does, at least where an account's record fails its seal check, a
+#: count holds expired rows, the audit row follows the commit, or the step-up is turned off.
+_RETRACTED = {
+    "messagefoundry/__main__.py": (
+        "The engine may be running or stopped.",
+        "OK: revoked {revoked} session(s); every signed-in user must sign in again",
+    ),
+    "messagefoundry/api/auth_routes.py": ("Audited, with the count, even when nothing was live.",),
+    "messagefoundry/api/app.py": ("and raises every account's epoch.",),
+    "messagefoundry/store/store.py": (
+        "then every account's epoch, as :meth:`revoke_user_sessions` raises one",
+        "The first start still raises every account's session epoch",
+    ),
+    "messagefoundry/pipeline/dr_backup.py": ("open session(s)",),
+    "docs/SECURITY.md": ("or ending every session (BACKLOG #2614)",),
+}
+
+
+def _flat(path: str) -> str:
+    """The file's text with every run of whitespace as one space, so a phrase a re-wrap split
+    across lines is still found."""
+    return " ".join((_ROOT / path).read_text("utf-8").split())
+
+
+@pytest.mark.parametrize("path", sorted(_RETRACTED))
+def test_the_retracted_revoke_all_phrases_stay_out(path: str) -> None:
+    text = _flat(path)
+    assert text  # the control: the file was read
+    for phrase in _RETRACTED[path]:
+        assert phrase not in text, f"{path} says {phrase!r} again"
+
+
+def test_the_store_contract_states_the_transaction_and_reseal_rules() -> None:
+    """BACKLOG #5095 step 3, its second half: ``AuthStore.revoke_all_sessions`` states that the
+    raises, the sweep and the kept session's re-seal are one transaction, and that a refused
+    re-seal or a missing global epoch rolls it back."""
+    text = _flat("messagefoundry/store/base.py")
+    contract = text[text.index("async def revoke_all_sessions(") :]
+    contract = contract[: contract.index("async def consume_restore_record(")]
+    for rule in (
+        "In one transaction it raises the store's global session epoch",
+        "re-seals the kept session under its account's new epoch and the new global one",
+        "(an account whose raise a seal refusal stops goes without it, and so does every account "
+        "after a Vault Transit outage trips the revoke",
+        "either way the transaction rolls back",
+    ):
+        assert rule in contract, rule

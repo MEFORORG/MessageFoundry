@@ -171,3 +171,72 @@ async def test_sqlite_purge_state_reads_and_deletes_in_one_immediate_transaction
         assert ("ns", "old") not in store.state_view()
     finally:
         await store.close()
+
+
+def _acm_then(value: Any, on_release: Any) -> Any:
+    """An acquire whose release runs ``on_release``: the await between the commit and the eviction,
+    in which another coroutine on the loop can commit and publish a write."""
+
+    @asynccontextmanager
+    async def cm(*_args: Any, **_kwargs: Any) -> Any:
+        yield value
+        on_release()
+
+    return cm
+
+
+async def test_sqlserver_purge_state_keeps_a_key_rewritten_before_its_eviction() -> None:
+    """Engine PR 2989 open finding 3: a same-key write that commits and publishes while the purge
+    releases its connection must survive the purge's eviction, because its row survives."""
+    table = _Table()
+    store = object.__new__(SqlServerStore)
+    store._settings = StoreSettings()
+    store._cipher = IdentityCipher()
+    store.committed_txns = 0
+    store._state_cache = _cache()
+
+    def rewrite_stale() -> None:
+        table.rows[("ns", "stale")] = 5_000.0
+        store.publish_state_cache([(("ns", "stale"), {"v": 3})])
+
+    store._acquire = _acm_then(_SsConn(), rewrite_stale)  # type: ignore[method-assign]
+    store._cursor = _acm(_SsCursor(table))  # type: ignore[method-assign]
+
+    assert await store.purge_state(older_than=_CUTOFF) == 1
+    assert ("ns", "stale") in table.rows
+    assert store._state_cache[("ns", "stale")] == {"v": 3}
+    assert store._state_purge_watches == ()
+
+
+async def test_postgres_purge_state_keeps_a_key_rewritten_before_its_eviction() -> None:
+    table = _Table()
+    store = object.__new__(PostgresStore)
+    store._cluster_state_convergence = False
+    store._state_versions = {}
+    store._state_cache = _cache()
+
+    def rewrite_stale() -> None:
+        table.rows[("ns", "stale")] = 5_000.0
+        store._publish_state_cache([(("ns", "stale"), {"v": 3})])
+
+    store._timed_acquire = _acm_then(_PgConn(table), rewrite_stale)  # type: ignore[method-assign]
+
+    assert await store.purge_state(older_than=_CUTOFF, now=2_000.0) == 1
+    assert ("ns", "stale") in table.rows
+    assert store._state_cache[("ns", "stale")] == {"v": 3}
+    assert store._state_purge_watches == ()
+
+
+async def test_a_write_outside_a_purge_pass_is_not_watched() -> None:
+    """Control: with no purge in flight a publish records nothing, so an untouched expired key is
+    still evicted by the next pass."""
+    table = _Table()
+    store = object.__new__(PostgresStore)
+    store._cluster_state_convergence = False
+    store._state_versions = {}
+    store._state_cache = _cache()
+    store._publish_state_cache([(("ns", "stale"), {"v": 1})])
+    store._timed_acquire = _acm(_PgConn(table))  # type: ignore[method-assign]
+
+    assert await store.purge_state(older_than=_CUTOFF, now=2_000.0) == 1
+    assert ("ns", "stale") not in store._state_cache

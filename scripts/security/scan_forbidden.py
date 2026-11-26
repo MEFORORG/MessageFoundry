@@ -1523,6 +1523,9 @@ SKIP_DIRS = {
     ".mypy_cache",
     ".ruff_cache",
     ".pytest_cache",
+    # Hypothesis storage, which caches the string literals of imported modules. The property tests
+    # move it out of the checkout; this covers a run that does not import their settings.
+    ".hypothesis",
     "build",
     "dist",
 }

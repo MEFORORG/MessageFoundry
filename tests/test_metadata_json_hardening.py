@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``store/metadata.py`` JSON hardening: no bare NaN/Infinity token from the reference sink (BACKLOG
-#6711), and deeply nested JSON never escapes the three decoders as json's ``RecursionError`` (BACKLOG
-#6712): the header decoder reads it as malformed, while ``merge_user_metadata`` and ``user_metadata``
-raise ``MetadataTooDeepError``."""
+#6711), and deeply nested JSON does not escape the decoders tested here as json's ``RecursionError``
+(BACKLOG #6712): the header decoder reads it as malformed, while ``merge_user_metadata`` and
+``user_metadata`` raise ``MetadataTooDeepError``. Other readers of ``messages.metadata``, at least
+``intake_of`` and readers in the store backends, are not covered here."""
 
 from __future__ import annotations
 
@@ -16,11 +17,12 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.config.models import InternalErrorPolicy
 from messagefoundry.config.settings import EgressSettings, ReferenceSettings
 from messagefoundry.config.wiring import FileRef, ReferenceSpec
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
-from messagefoundry.pipeline.wiring_runner import RegistryRunner
-from messagefoundry.store import Stage
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
+from messagefoundry.store import MessageStatus, OutboxStatus, Stage
 from messagefoundry.store import metadata as metadata_module
 from messagefoundry.store.cell_tag import message_cell_aad
 from messagefoundry.store.metadata import (
@@ -32,6 +34,14 @@ from messagefoundry.store.metadata import (
     user_metadata,
 )
 from messagefoundry.store.store import MessageStore
+from tests.test_delivery_fault_classification import (
+    DEST,
+    _hl7,
+    _last_error_and_attempts,
+    _Sender,
+)
+from tests.test_delivery_fault_classification import _runner as _fault_runner
+from tests.test_delivery_fault_classification import _status as _outbox_status
 from tests.test_metadata_bag import _to_routed
 
 # Deep enough to exhaust json's C scanner on every supported platform (measured: 100_000 overflows).
@@ -147,7 +157,7 @@ async def test_a_toml_nan_fails_the_sync_and_writes_no_snapshot(
         await store.close()
 
 
-# --- #6712: the three decoders; only the header decoder reads deep nesting as empty ----------
+# --- #6712: the decoders above; only the header decoder reads deep nesting as empty ----------
 
 
 def test_the_deep_input_really_reaches_the_recursion_limit() -> None:
@@ -218,8 +228,9 @@ def test_user_metadata_reads_plain_malformed_input_as_none() -> None:
 
 @pytest.mark.parametrize("deep", [_DEEP, _DEEP.encode("ascii")], ids=["str", "bytes"])
 def test_user_metadata_raises_on_a_cell_too_deep_to_decode(deep: Any) -> None:
-    """None would send a dynamic_headers delivery out without its headers; on main json's
-    RecursionError faulted it instead, so the delivery retried. Raised unchained, content-free."""
+    """None would send a dynamic_headers delivery out without its headers; before PR 2879 json's
+    RecursionError reached the delivery worker's internal-error arm instead, as this error does
+    now. Raised unchained, content-free."""
     with pytest.raises(MetadataTooDeepError) as info:
         user_metadata(deep)
     assert info.value.__cause__ is None
@@ -265,6 +276,62 @@ async def test_a_dynamic_headers_read_faults_rather_than_proceeding_without_head
     runner.store = _Store()  # type: ignore[assignment]
     with pytest.raises(MetadataTooDeepError):
         await runner._user_metadata_for("m1")
+
+
+@pytest.mark.parametrize(
+    ("policy", "outcome", "status"),
+    [
+        (None, _ItemOutcome.PROCESSED, OutboxStatus.DEAD),
+        (InternalErrorPolicy.STOP, _ItemOutcome.STOPPED, OutboxStatus.PENDING),
+    ],
+    ids=["default-continue", "stop"],
+)
+async def test_the_delivery_worker_takes_a_too_deep_bag_on_its_internal_error_arm(
+    tmp_path: Path,
+    policy: InternalErrorPolicy | None,
+    outcome: _ItemOutcome,
+    status: OutboxStatus,
+) -> None:
+    """BACKLOG #6712 item 17: the worker's handling of ``MetadataTooDeepError``, pinned as main
+    behaves. Nothing is sent; the default policy dead-letters the row, and ``stop`` returns STOPPED
+    with the row re-pended below the retry cap (lane hold and alert are not asserted here).
+    Control: an intact cell on the same runner delivers its headers."""
+    store = await MessageStore.open(tmp_path / "worker.db")
+    try:
+        sender = _Sender(consumes_metadata=True)
+        runner = _fault_runner(store, sender, internal_error=policy)
+        raw = _hl7("plain")
+        ctl = await store.enqueue_message(
+            channel_id="IB",
+            raw=raw,
+            deliveries=[(DEST, raw)],
+            metadata=json.dumps({"user": {"X-Synth": "v1"}}),
+            now=100.0,
+        )
+        item = await store.claim_next_fifo(DEST)
+        assert item is not None and item.message_id == ctl
+        assert (await runner._process_delivery_item(DEST, item))[0] is _ItemOutcome.PROCESSED
+        assert sender.metadata == [{"X-Synth": "v1"}]
+
+        mid = await store.enqueue_message(
+            channel_id="IB", raw=raw, deliveries=[(DEST, raw)], metadata=_DEEP_CELL, now=101.0
+        )
+        item = await store.claim_next_fifo(DEST)
+        assert item is not None and item.message_id == mid
+        got, retry_until = await runner._process_delivery_item(DEST, item)
+
+        assert got is outcome and retry_until is None
+        assert await _outbox_status(store, mid) == status.value
+        assert await _outbox_status(store, ctl) == OutboxStatus.DONE.value
+        assert len(sender.sent) == 1  # only the control was sent
+        # The refusal itself took the arm, not some other fault on the same row.
+        last_error, _ = await _last_error_and_attempts(store, mid)
+        assert "MetadataTooDeepError" in last_error
+        if policy is None:
+            msg = await store.get_message(mid)
+            assert msg is not None and msg["status"] == MessageStatus.ERROR.value
+    finally:
+        await store.close()
 
 
 def test_merge_user_metadata_refuses_when_existing_will_not_re_encode(

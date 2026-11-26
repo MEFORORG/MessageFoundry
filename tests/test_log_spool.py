@@ -968,7 +968,7 @@ def test_a_dangling_symlink_segment_is_retired_and_its_link_unlinked(
     spool_dir: Path, monkeypatch: pytest.MonkeyPatch, winerror: int
 ) -> None:
     """A head segment whose path is a dangling symlink (lstat shows a link, stat says not found)
-    can never be opened, so it counts as gone: it is retired, the link itself is unlinked, and
+    cannot be opened now, so it counts as gone: it is retired, the link itself is unlinked, and
     the read moves on. On Windows a link into a missing directory gives winerror 3, which counts
     here too. NEGATIVE CONTROL: on cf6bfe2d12 the link was not unlinked, and winerror 3 wedged
     the spool."""
@@ -2034,6 +2034,141 @@ def test_a_stream_arm_send_error_reconnects_and_retries(
         assert handler.socket is None  # dropped for a reconnect
     finally:
         handler.close()
+
+
+def test_a_failed_udp_send_rebuilds_a_socket_older_than_the_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5923 step 2: a UDP socket that went bad was never rebuilt, since only a stream
+    socket was dropped after a failed send. One older than the rebuild interval is now dropped, and
+    the next send builds a fresh one that delivers. NEGATIVE CONTROL: on 33870a40944, with
+    ``_UDP_SOCKET_REBUILD_SECONDS`` added to logging_setup by hand so the setattr applies, the bad
+    socket stayed in place and took the second send too."""
+    handler = _TimeoutSysLogHandler(
+        address=("127.0.0.1", 9), socktype=socket.SOCK_DGRAM, defer_connect=True
+    )
+    try:
+        bad = _FailingDatagramSocket(OSError(errno.EBADF, "bad file descriptor"))
+        _swap_socket(handler, bad)
+        monkeypatch.setattr(logging_setup, "_UDP_SOCKET_REBUILD_SECONDS", 0.0)
+        handler.emit(logging.makeLogRecord({"msg": "one", "levelname": "WARNING"}))
+        assert handler.send_failed is True
+        handler.send_failed = False
+        handler.emit(logging.makeLogRecord({"msg": "two", "levelname": "WARNING"}))
+        assert len(bad.sent) == 1, "the bad socket took the next send too"
+        assert handler.send_failed is False
+        assert handler.socket is not None and handler.socket is not bad
+    finally:
+        handler.close()
+
+
+@pytest.mark.parametrize("error", [OSError(errno.EBADF, "bad"), socket.gaierror(-2, "lookup")])
+def test_a_failed_udp_send_keeps_a_young_socket_or_one_a_lookup_failed(
+    monkeypatch: pytest.MonkeyPatch, error: OSError
+) -> None:
+    """The controls for the test above: a socket younger than the interval is kept, so an outage
+    does not cost a socket per record, and a failed name lookup keeps the socket whatever its age,
+    since a new socket would not fix it."""
+    handler = _TimeoutSysLogHandler(
+        address=("127.0.0.1", 9), socktype=socket.SOCK_DGRAM, defer_connect=True
+    )
+    try:
+        bad = _FailingDatagramSocket(error)
+        _swap_socket(handler, bad)
+        if isinstance(error, socket.gaierror):
+            monkeypatch.setattr(logging_setup, "_UDP_SOCKET_REBUILD_SECONDS", 0.0)
+        for n in range(3):
+            handler.emit(logging.makeLogRecord({"msg": f"m{n}", "levelname": "WARNING"}))
+        assert len(bad.sent) == 3
+        assert handler.socket is bad
+    finally:
+        handler.socket = None
+        handler.close()
+
+
+#: How many replay retries the head-holding test below drives. Each retry clears the backoff, so
+#: the test rules out a head drop keyed to fewer failed retries than this, and nothing keyed to time.
+_HEAD_RETRIES = 15
+
+
+def _stream_listener(
+    spool: LogSpool, monkeypatch: pytest.MonkeyPatch, connect: Callable[[Any], None]
+) -> tuple[_ForwardQueueListener, _TimeoutSysLogHandler]:
+    """A stopped listener over a TCP handler whose connect is ``connect``, so a test drives
+    replay by hand with no network."""
+    monkeypatch.setattr(logging.handlers.SysLogHandler, "createSocket", connect)
+    handler = _TimeoutSysLogHandler(
+        address=("127.0.0.1", 9), socktype=socket.SOCK_STREAM, defer_connect=True
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    return _ForwardQueueListener(queue.Queue(), handler, spool=spool), handler
+
+
+def _replay_retries(listener: _ForwardQueueListener, times: int) -> None:
+    for _ in range(times):
+        listener._retry_at = 0.0
+        listener._replay()
+
+
+class _FailingStream:
+    """A connected stream socket whose every ``sendall`` raises a fresh error from ``make``, so no
+    one exception object gathers a traceback across retries."""
+
+    def __init__(self, make: Callable[[], OSError]) -> None:
+        self.make = make
+
+    def sendall(self, data: bytes) -> None:
+        raise self.make()
+
+    def close(self) -> None:
+        pass
+
+
+def _connect_refused() -> OSError:
+    return ConnectionRefusedError(errno.ECONNREFUSED, "refused")
+
+
+@pytest.mark.parametrize(
+    ("on_connect", "make"),
+    [
+        (True, _connect_refused),
+        (False, lambda: TimeoutError("timed out")),
+        (False, lambda: OSError(errno.ENETUNREACH, "unreachable")),
+        (False, lambda: ConnectionResetError(errno.ECONNRESET, "the collector reset it")),
+    ],
+    ids=["connect-refused", "send-timeout", "send-unreachable", "send-reset"],
+)
+def test_a_failing_collector_keeps_the_spool_head_in_place(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, on_connect: bool, make: Callable[[], OSError]
+) -> None:
+    """Controls for the spool head (BACKLOG #5923). A collector that is down, or a send on a
+    connection that was up but timed out, could not route or was reset on every frame, fails every
+    retry: the head stays first, nothing is dropped, each failed retry is counted, and both entries
+    are still there in order. The reset case resets every frame, so it is a down collector, not
+    the one-frame reset ADR 0200 Amendment B leaves unmeasured. NEGATIVE CONTROL: on 2026-11-25 a
+    test plugin that advanced the spool past the head after five failed retries turned every case
+    red."""
+
+    def connect(self: Any) -> None:
+        if on_connect:
+            raise make()
+        self.socket = _FailingStream(make)
+
+    spool = LogSpool(spool_dir, max_bytes=1_000_000)
+    spool.open()
+    try:
+        listener, handler = _stream_listener(spool, monkeypatch, connect)
+        try:
+            assert spool.append(SpoolEntry(level="WARNING", line="head"))
+            assert spool.append(SpoolEntry(level="WARNING", line="behind"))
+            _replay_retries(listener, _HEAD_RETRIES)
+            assert listener.undeliverable == 0
+            assert listener.send_failures == _HEAD_RETRIES
+            assert _drain(spool) == ["head", "behind"]
+        finally:
+            handler.close()
+    finally:
+        spool.close()
 
 
 @pytest.mark.parametrize(

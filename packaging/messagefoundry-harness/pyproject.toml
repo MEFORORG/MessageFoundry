@@ -126,6 +126,7 @@ Contributing = "https://github.com/MEFORORG/MessageFoundry/blob/main/CONTRIBUTIN
 "../../harness/bounded_file.py" = "harness/bounded_file.py"
 "../../harness/compose.py" = "harness/compose.py"
 "../../harness/coverage.py" = "harness/coverage.py"
+"../../harness/e2e_smoke.py" = "harness/e2e_smoke.py"
 "../../harness/file_panel.py" = "harness/file_panel.py"
 "../../harness/file_transport.py" = "harness/file_transport.py"
 "../../harness/frame_cap.py" = "harness/frame_cap.py"

@@ -71,7 +71,7 @@ import inspect
 import math
 import sys
 import threading
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from time import perf_counter
@@ -600,6 +600,7 @@ def trace_dry_run(
     inbound: str | None = None,
     show_phi: bool = False,
     snapshot_on_send: bool = True,
+    reference_view: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Dry-run ``raw`` against ``registry`` with the execution tracer installed; return the trace JSON.
 
@@ -612,11 +613,21 @@ def trace_dry_run(
     ``dryrun --trace`` would silently preview a different posture than plain ``dryrun`` and break the
     byte-identical contract above. The *library* default is ``True``, as the engine's is (BACKLOG #5794,
     ADR 0104 §8.1 as amended); the ``dryrun`` CLI passes its resolved
-    ``[pipeline].snapshot_on_send`` to both paths (#230)."""
+    ``[pipeline].snapshot_on_send`` to both paths (#230).
+
+    ``reference_view`` is passed straight through too, as :func:`dry_run` takes it: ``None`` builds
+    the reference sets on this call, and a caller tracing many messages against one graph builds
+    :func:`~messagefoundry.pipeline.dryrun.dry_run_reference_view` once and passes it, so each file
+    is read once (BACKLOG #6820)."""
     tracer = _Tracer(show_phi=show_phi)
     with _patched_message_writes():
         result = dry_run(
-            registry, raw, inbound=inbound, tracer=tracer, snapshot_on_send=snapshot_on_send
+            registry,
+            raw,
+            inbound=inbound,
+            tracer=tracer,
+            snapshot_on_send=snapshot_on_send,
+            reference_view=reference_view,
         )
     disposition = result.disposition.value
     return {

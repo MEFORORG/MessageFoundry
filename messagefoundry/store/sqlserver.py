@@ -239,9 +239,6 @@ from messagefoundry.store.store import (
     _SESSION_CAP_ORDER_SQL,
     _SESSION_CAP_RANK_NOT_AHEAD_SQL,
     _SESSION_INSERT,
-    _SESSION_LINEAGE_INSERT,
-    _SESSION_LINEAGE_PURGE,
-    _SESSION_LINEAGE_SUCCESSOR,
     _SESSION_LIVE_SQL,
     _SESSION_NOT_AHEAD_SQL,
     _SQL_ADMIN_GUARD_HOLDERS,
@@ -502,6 +499,20 @@ _RELEASE_CHUNK = 500
 _MSSQL_EPOCH_NOW = (
     "(CAST(DATEDIFF_BIG(MICROSECOND, CAST('1970-01-01' AS DATETIME2), SYSUTCDATETIME()) AS FLOAT)"
     " / 1000000.0)"
+)
+# Vault BACKLOG #3028, ADR 0210: store.py's three session lineage statements, respelled to stamp and
+# measure `retired_at` on this server's clock (vault BACKLOG #4276). store.py says which method runs
+# each, and that no other statement names the table. Each names the clock once, as above.
+_MSSQL_SESSION_LINEAGE_INSERT: Final = (
+    "INSERT INTO session_lineage (retired_hash, successor_hash, retired_at)"
+    f" VALUES (?,?,{_MSSQL_EPOCH_NOW})"
+)
+_MSSQL_SESSION_LINEAGE_SUCCESSOR: Final = (
+    "SELECT successor_hash FROM session_lineage WHERE retired_hash=?"
+    f" AND retired_at >= {_MSSQL_EPOCH_NOW} - ?"
+)
+_MSSQL_SESSION_LINEAGE_PURGE: Final = (
+    f"DELETE FROM session_lineage WHERE retired_at < {_MSSQL_EPOCH_NOW} - ?"
 )
 # BACKLOG #1169: rows per batch for the `attachment_chunk` at-rest migration. Every OTHER cipher pass
 # batches 500 because its rows are kilobyte-shaped; one attachment_chunk row is a whole
@@ -3667,6 +3678,17 @@ def _any_grant(answers: str) -> str:
 class SqlServerStore(ServerCipherWalk):
     """SQL Server-backed durable queue (the :class:`Store` protocol). Open with :meth:`open`."""
 
+    #: Keys published to ``_state_cache`` while a :meth:`purge_state` pass runs, from its start to its
+    #: post-release eviction, one set per pass in flight (BACKLOG #5734). Empty, so free, otherwise.
+    #: A tuple, so the class default is never shared mutable state.
+    _state_purge_watches: tuple[set[tuple[str, str]], ...] = ()
+
+    def _note_state_published(self, ck: tuple[str, str]) -> None:
+        """Record that ``ck`` was just published to the state cache, for any purge pass in
+        flight."""
+        for touched in self._state_purge_watches:
+            touched.add(ck)
+
     # The staged ingress pipeline (enqueue_ingress + the ingress->routed->outbound handoffs) is
     # implemented on the unified ``queue`` table: atomic DELETE...OUTPUT claim-handoffs, an
     # sp_getapplock-serialized queue-aware finalizer, and RCSI for non-blocking claim/finalize
@@ -4477,10 +4499,10 @@ class SqlServerStore(ServerCipherWalk):
                 # build must find a store here before it runs, not after.
                 await cls._refuse_a_database_with_no_store(settings, posture=posture)
             # RCSI must be enabled BEFORE the pool exists: its one-time ALTER ... WITH ROLLBACK
-            # IMMEDIATE takes momentary exclusivity, and with no MEFOR pool session open yet it has
-            # nothing of ours to terminate (concurrency_fixes (a)). #305: under external schema
-            # management the runtime login issues no ALTER DATABASE, so there is nothing to do before
-            # the pool; _verify_schema_external reads the two options on a pooled connection instead.
+            # IMMEDIATE takes exclusivity once the transactions it ends have rolled back, and with
+            # no MEFOR pool session open yet it has nothing of ours to terminate (concurrency_fixes
+            # (a)). #305: under external schema management the runtime login issues no ALTER
+            # DATABASE, so there is nothing to do before the pool; _verify_schema_external reads the two options on a pooled connection instead.
             # A read-only open issues no ALTER either (#1780).
             await cls._ensure_database_options(settings)
         pool, executor = await cls._create_pool(settings, maxsize=settings.pool_size)
@@ -5034,8 +5056,9 @@ class SqlServerStore(ServerCipherWalk):
         """Enable READ_COMMITTED_SNAPSHOT (RCSI) so the staged claim/finalize paths read on a
         row-version snapshot rather than taking shared locks that deadlock writers under concurrent
         load (concurrency_fixes (a)). Runs on its OWN autocommit connection BEFORE the pool is
-        created, so the momentary exclusivity of ``WITH ROLLBACK IMMEDIATE`` has no sibling MEFOR
-        session to terminate; IF-guarded on the live state, so the disruptive ALTER fires at most ONCE
+        created, so the exclusivity of ``WITH ROLLBACK IMMEDIATE`` has no sibling MEFOR session to
+        terminate (how long it can wait, and why it has no statement limit: the comment at the state
+        read); IF-guarded on the live state, so the disruptive ALTER fires at most ONCE
         (greenfield first boot) and every later open()/failover is a detect-and-skip no-op.
 
         **FAILS CLOSED when RCSI is off and cannot be turned on (BACKLOG #1628).** This used to degrade
@@ -5140,10 +5163,15 @@ class SqlServerStore(ServerCipherWalk):
             # its first call, and the `finally` closes it while nothing runs on it.
             _require_call_gate(conn)
             if fail_closed:
-                # BACKLOG #5666: at an open, the state read and the re-read probes run under
-                # [store].command_timeout. The ALTERs below do not, at an open or under
-                # provision-schema: a cancel that lands after ROLLBACK IMMEDIATE has rolled back
-                # the peers leaves RCSI off, and the retry at every restart rolls them back again.
+                # BACKLOG #5666: at an open, the state read, the re-read probes and the
+                # ALLOW_SNAPSHOT_ISOLATION ALTER run under [store].command_timeout. The RCSI ALTER
+                # does not, at an open or under provision-schema. ROLLBACK IMMEDIATE ends the peers'
+                # transactions, but the ALTER still waits for their rollback and for the database
+                # lock, with no statement limit, so it can stall at least as long as a large
+                # rollback takes. It stays unbounded anyway: a cancel that lands
+                # after the rollback leaves RCSI off, so the retry at every restart rolls the peers
+                # back again. The snapshot ALTER can wait on transactions open when it runs, and it
+                # is only warned about, so a limit there turns a stall into that warning.
                 _bound_one_shot(conn, settings.command_timeout)
             await _assert_autocommit(conn)
             # Standalone one-shot connection (NOT pooled), so the EF-6 pool-bleed race `_cursor`
@@ -5167,18 +5195,20 @@ class SqlServerStore(ServerCipherWalk):
                 log.warning("%s", message)
                 return
             off = _options_off(row)
-            swap = bool(off) and fail_closed and bool(settings.command_timeout)
+            # The state read's limit, which is unset (the driver's no limit) under
+            # provision-schema. The snapshot ALTER keeps it; `cur_limit` tracks the open cursor's.
+            bounded = settings.command_timeout if fail_closed else 0
+            cur_limit = bounded
 
-            async def alter(sql: str) -> None:
-                """Run one ALTER inside its caller's try, so a failure to open its cursor reaches
-                the same handler as the ALTER's own failure: the peer re-read and the remedy."""
-                nonlocal cur, swap
-                if swap or cur is None:
-                    # The ALTERs run with no statement limit, as on a provision-schema run, so
-                    # they get a cursor opened after the limit is lifted (see the comment at the
-                    # state read). `cur` is cleared before the close, so a cancellation landing in
-                    # it does not hand the same cursor to the gate a second time.
-                    swap = False
+            async def alter(sql: str, limit: int) -> None:
+                """Run one ALTER under ``limit`` seconds (0 = none) inside its caller's try, so a
+                failure to open its cursor reaches the same handler as the ALTER's own failure:
+                the peer re-read and the remedy."""
+                nonlocal cur, cur_limit
+                if cur is None or cur_limit != limit:
+                    # pyodbc fixes a cursor's limit when the cursor opens, so a different limit
+                    # needs a new cursor. `cur` is cleared before the close, so a cancellation
+                    # landing in it does not hand the same cursor to the gate a second time.
                     old, cur = cur, None
                     if old is not None:
                         try:
@@ -5186,17 +5216,17 @@ class SqlServerStore(ServerCipherWalk):
                         except Exception as exc:  # noqa: BLE001 - the ALTER meets a dead session
                             # A peer's ROLLBACK IMMEDIATE may have killed the session; the cursor
                             # open or the ALTER then fails in the caller's handler.
-                            log.debug(
-                                "options state-read cursor close failed: %s", _options_error(exc)
-                            )
-                    _bound_one_shot(conn, 0)
+                            log.debug("options cursor close failed (%s)", type(exc).__name__)
+                    _bound_one_shot(conn, limit)
+                    cur_limit = limit
                     cur = await conn.cursor()
                 await cur.execute(sql)
 
             if "READ_COMMITTED_SNAPSHOT" in off:
                 try:
                     await alter(
-                        "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"
+                        "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE",
+                        0,
                     )
                     log.info("enabled READ_COMMITTED_SNAPSHOT on database %r", db)
                 except Exception as exc:
@@ -5229,7 +5259,7 @@ class SqlServerStore(ServerCipherWalk):
             if "ALLOW_SNAPSHOT_ISOLATION" in off:
                 try:
                     # ALLOW_SNAPSHOT_ISOLATION is an online change (no exclusivity required).
-                    await alter("ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON")
+                    await alter("ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON", bounded)
                 except Exception as exc:  # noqa: BLE001 - non-fatal
                     log.warning(
                         "could not enable ALLOW_SNAPSHOT_ISOLATION on %r (%s); a DBA should run once: %s",
@@ -5588,8 +5618,9 @@ class SqlServerStore(ServerCipherWalk):
                             self.backend, self._settings.database
                         )
                 # Read before the applock and the batch, so DDL the live-schema check cannot read
-                # fails here, with no peer queued behind it (BACKLOG #5062). Cached per process.
-                _declared_schema()
+                # fails here, with no peer queued behind it (BACKLOG #5062). Cached per process; the
+                # first parse takes tens of milliseconds, so it runs off the event loop.
+                await asyncio.to_thread(_declared_schema)
                 # pyodbc copies the connection timeout into a cursor only when it creates the cursor,
                 # so each step below runs on its own cursor, opened after the connection timeout is set
                 # for that step, and closed before the next opens (no MARS: one active statement per
@@ -5722,7 +5753,7 @@ class SqlServerStore(ServerCipherWalk):
         Raises :class:`ServerSchemaMismatchError` naming each one, and logs it at ERROR first. Extras
         are tolerated. :mod:`messagefoundry.store.server_schema_verify` says what is compared and
         what is not. Reads only."""
-        expected = _declared_schema()
+        expected = _declared_schema()  # a cache hit: the pre-lock read parsed it off the loop
         tables = sorted(expected.columns)
         column_rows: list[tuple[str, str | None, str | None, ColumnShape | None]] = []
         # `VALUES ()` is a syntax error, so a batch that declared nothing reads nothing.
@@ -6100,7 +6131,8 @@ class SqlServerStore(ServerCipherWalk):
         found: bool | None = None
         # A named constraint is a schema-wide object, so its name collides as a table's does.
         constraints = {name for each in _SCHEMA for name in _NAMED_CONSTRAINT.findall(each)}
-        tables = tuple(sorted({*_declared_schema().columns, *constraints}))
+        declared = await asyncio.to_thread(_declared_schema)
+        tables = tuple(sorted({*declared.columns, *constraints}))
         if not tables:
             return None
         async with (
@@ -8685,6 +8717,7 @@ class SqlServerStore(ServerCipherWalk):
         thread). ``state_view()`` then reflects the new values in-process."""
         for ck, cv in applied:
             self._state_cache[ck] = cv
+            self._note_state_published(ck)
 
     async def complete_with_response(
         self,
@@ -11384,17 +11417,36 @@ class SqlServerStore(ServerCipherWalk):
 
         One ``DELETE ... OUTPUT`` names exactly the rows it removed (BACKLOG #5734). A SELECT of the
         expired keys followed by a separate DELETE would list a key a concurrent ``state_set`` refreshed
-        between the two, so the cache would drop a key whose row survives."""
-        rows = await self._execute_output(
-            "DELETE FROM state OUTPUT deleted.namespace, deleted.[key] AS state_key"
-            " WHERE set_at < ?",
-            (older_than,),
-        )
-        purged_keys = [(r["namespace"], r["state_key"]) for r in rows]
-        for ck in purged_keys:
-            # `in` + `del`, not pop(): pop would decrypt each purged value just to drop it (#1174).
-            if ck in self._state_cache:
-                del self._state_cache[ck]
+        between the two, so the cache would drop a key whose row survives.
+
+        The eviction runs after the connection is released, an await later than the DELETE, so a
+        same-key write that commits and publishes in that window would be evicted while its row
+        survives. So a watched publish of a key, at any point from the start of the pass to its
+        eviction, keeps that key cached (BACKLOG #5734). The watch belongs to this store handle. At
+        least a publish of this handle's own committed writes (``publish_state_cache``) is watched. A
+        :meth:`reload_state_cache` swap is not. A reload whose read ran before the DELETE and whose
+        swap lands after the eviction brings the purged keys back with their deleted values, which
+        stay cached until a later reload or a restart; the watch does not close that. Keeping a
+        watched key is sound only under the cutoff premise that
+        :meth:`~messagefoundry.store.base.QueueStore.purge_state` states; a cutoff near the present
+        could keep a cached value whose row the DELETE removed."""
+        touched: set[tuple[str, str]] = set()
+        self._state_purge_watches = (*self._state_purge_watches, touched)
+        try:
+            rows = await self._execute_output(
+                "DELETE FROM state OUTPUT deleted.namespace, deleted.[key] AS state_key"
+                " WHERE set_at < ?",
+                (older_than,),
+            )
+            purged_keys = [(r["namespace"], r["state_key"]) for r in rows]
+            for ck in purged_keys:
+                # `in` + `del`, not pop(): pop would decrypt each purged value just to drop it (#1174).
+                if ck not in touched and ck in self._state_cache:
+                    del self._state_cache[ck]
+        finally:
+            self._state_purge_watches = tuple(
+                w for w in self._state_purge_watches if w is not touched
+            )
         return len(purged_keys)
 
     async def purge_dead_letters(
@@ -17986,17 +18038,16 @@ class SqlServerStore(ServerCipherWalk):
         written = await self._write_session_txn(token_hash, stamp)
         return written is not None and stamp.anchored
 
-    async def rotate_session(
-        self, token_hash: str, *, new_token_hash: str, now: float | None = None
-    ) -> bool:
+    async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
         The token hash is sealed, so the re-key goes through :meth:`_write_session` (BACKLOG
         #2592), whose write reads an ``OUTPUT`` rowset and never ``cursor.rowcount`` (BACKLOG
         #2283). ``token_hash`` is ``NVARCHAR(64)`` and a hex digest is exactly 64 chars, so the
         clustered-PK row move is width-safe. The lineage link goes in the same transaction, only
-        when the re-key landed (vault BACKLOG #3028), its time read then, after any wait for the
-        borrow or the row lock. The borrow is :meth:`_acquire_after_commit`'s, for the reason it
+        when the re-key landed (vault BACKLOG #3028), its time this server's clock when the link's
+        own statement runs (vault BACKLOG #4276), after any wait for the borrow or the row lock.
+        The borrow is :meth:`_acquire_after_commit`'s, for the reason it
         gives (BACKLOG #3023).
 
         LOCK ORDER (BACKLOG #4974). The re-key takes its account's ``users`` row under ``UPDLOCK,
@@ -18016,8 +18067,7 @@ class SqlServerStore(ServerCipherWalk):
         against store calls only, and not against a TOTP re-enrolment."""
 
         async def _link(cur: Any) -> None:
-            retired_at = time.time() if now is None else now
-            await cur.execute(_SESSION_LINEAGE_INSERT, (token_hash, new_token_hash, retired_at))
+            await cur.execute(_MSSQL_SESSION_LINEAGE_INSERT, (token_hash, new_token_hash))
 
         rotated = await self._write_session_txn(
             token_hash,
@@ -18035,7 +18085,7 @@ class SqlServerStore(ServerCipherWalk):
         )
 
     async def supersede_session(
-        self, token_hash: str, *, now: float, lineage_since: float | None = None
+        self, token_hash: str, *, now: float, lineage_seconds: float | None = None
     ) -> SessionRecord | None:
         """Revoke and return, one statement per step, in one transaction (BACKLOG #2146, vault
         BACKLOG #3028). See :meth:`AuthStore.supersede_session`.
@@ -18044,6 +18094,7 @@ class SqlServerStore(ServerCipherWalk):
         which a session-wide ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283). Each statement reads
         what has committed when it runs, so a rotation that commits while the walk runs is seen by
         the next step's lineage read. Committed as a durable write, never as a READ."""
+        started = time.monotonic()  # before the borrow, so its wait cannot shorten the window
         async with self._acquire() as conn, self._cursor(conn) as cur:
 
             async def _revoke(h: str) -> SessionRecord | None:
@@ -18055,8 +18106,8 @@ class SqlServerStore(ServerCipherWalk):
                 rows = await self._fetch_dicts(cur)
                 return SessionRecord.from_mapping(rows[0]) if rows else None
 
-            async def _successor(h: str, since: float) -> str | None:
-                await cur.execute(_SESSION_LINEAGE_SUCCESSOR, (h, since))
+            async def _successor(h: str, seconds: float) -> str | None:
+                await cur.execute(_MSSQL_SESSION_LINEAGE_SUCCESSOR, (h, seconds))
                 rows = await cur.fetchall()
                 return str(rows[0][0]) if rows else None
 
@@ -18065,7 +18116,8 @@ class SqlServerStore(ServerCipherWalk):
                 try:
                     ended = await revoke_through_lineage(
                         token_hash,
-                        lineage_since=lineage_since,
+                        lineage_seconds=lineage_seconds,
+                        started=started,
                         revoke=_revoke,
                         successor=_successor,
                     )
@@ -18356,8 +18408,9 @@ class SqlServerStore(ServerCipherWalk):
         purged = await self._execute(sql, params)
         if lineage_seconds is not None:
             # Its own statement and transaction, as on Postgres: a link is table hygiene, and the
-            # supersession stops following one at its window whether or not this has run.
-            await self._execute(_SESSION_LINEAGE_PURGE, (now - float(lineage_seconds),))
+            # supersession stops following one at its window whether or not this has run. Measured
+            # back from this server's clock, as the supersession measures (vault BACKLOG #4276).
+            await self._execute(_MSSQL_SESSION_LINEAGE_PURGE, (float(lineage_seconds),))
         return purged
 
     async def stats(self) -> dict[str, int]:

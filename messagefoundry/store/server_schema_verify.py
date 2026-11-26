@@ -1316,8 +1316,16 @@ def _assigned_and_run(text: str, spans: list[tuple[int, int]], var: str, end: in
     @var``, ``SELECT @var`` or compound assignment such as ``@var +=``, outside a literal, in
     between. An assignment written another way, such as ``SELECT @a = 1, @var = ...``, is not
     seen."""
-    runs = re.compile(rf"\b(?:EXEC(?:UTE)?\s*\(\s*@{var}\s*\)|sp_executesql\s+@{var}\b)", re.I)
-    changes = re.compile(rf"\b(?:SET|SELECT)\s+@{var}\s*[-+*/|&^%]?=|@{var}\s*[-+*/|&^%]=", re.I)
+    # Escaped although the caller's capture is `\w+` today, which holds no metacharacter: a
+    # wider capture later must not turn a name into pattern syntax.
+    name = re.escape(var)
+    # `(?![\w@#$])`, not `\b`, after the name: an escaped name ending in a non-word character has
+    # no word boundary after it, and `$`, `#` and `@` continue a T-SQL name, so `@sql$2` is not
+    # `@sql`.
+    runs = re.compile(
+        rf"\b(?:EXEC(?:UTE)?\s*\(\s*@{name}\s*\)|sp_executesql\s+@{name}(?![\w@#$]))", re.I
+    )
+    changes = re.compile(rf"\b(?:SET|SELECT)\s+@{name}\s*[-+*/|&^%]?=|@{name}\s*[-+*/|&^%]=", re.I)
     first = next(
         (f for f in runs.finditer(text, end) if _enclosing_span(spans, f.start()) is None), None
     )
