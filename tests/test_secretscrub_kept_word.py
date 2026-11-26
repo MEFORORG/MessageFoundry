@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The connection-string member mask keeps a word before a ":" or "=" only where a later pass reads
-it as a label (BACKLOG #8429 item 1, BACKLOG #5030 added item 9), and three neighbouring shapes the
-mask does not reach yet, pinned as strict expected failures.
+"""The connection-string member mask keeps a word before a ":" or "=" only where
+``secretscrub._read_as_label`` keeps it (BACKLOG #8429 item 1, BACKLOG #5030 added item 9), and
+three neighbouring shapes the mask does not reach yet, pinned as strict expected failures.
 
 Measured on ``main`` at b54e0528, before the change, through ``scrub_credentials``, the filter
 chain ``_install_phi_filters`` puts on a handler, and ``redact_log_line``: inside a member value, a
 password word that HOLDS a kept word anywhere, such as ``Passage``, ``Statement``, ``Barcode``,
-``Compass``, ``Codename`` or ``Bypass``, printed whole before a ":" or "=", though no label pattern
-reads a label there. On first deployment that word of a password would reach the write-time log, the
-support bundle and ``GET /logs/tail``.
+``Compass``, ``Codename`` or ``Bypass``, printed whole before a ":" or "=". On first deployment
+that word of a password would reach the write-time log, the support bundle and ``GET /logs/tail``.
 
 Values are synthetic."""
 
@@ -55,7 +54,7 @@ def _printed(out: str) -> list[str]:
 # --- The kept-word fix --------------------------------------------------------------------------
 
 _WORDS_HOLDING_A_KEPT_WORD = ("Passage", "Statement", "Barcode", "Compass", "Codename", "Bypass")
-#: A PHI JSON key word after a "." or "-": the PHI pass reads one only as a whole quoted key.
+#: A PHI JSON key word after a "." or "-", which the mask keeps only as the whole word.
 _PHI_WORDS_INSIDE_A_WORD = ("my-name", "x.address", "a-b.given", "x.birthDate")
 
 
@@ -78,8 +77,8 @@ def test_a_password_word_holding_a_kept_word_is_masked(
 @pytest.mark.parametrize(
     ("line", "kept"),
     [
-        # A label a later pass reads: a whole word, after a label prefix's "_" or a ".", at a
-        # camelCase capital, or right after a "%XX" escape.
+        # A label word at an opening ``_read_as_label`` checks: the whole word, after a "_" or a
+        # ".", at a camelCase capital, or right after a "%XX" escape.
         (";sslpassword=a1q token=b2q;", "token"),
         (";sslpassword=a1q ad_bind_password=b2q;", "ad_bind_password"),
         (";sslpassword=a1q x.secret=b2q;", "x.secret"),
@@ -89,18 +88,17 @@ def test_a_password_word_holding_a_kept_word_is_masked(
         (";sslpassword=a1q%3Bpassword=b2q;", "3Bpassword"),
         (";sslpassword=a1q ?code=b2q;", "code"),
         (";sslpassword=a1q x.code=b2q;", "x.code"),
-        # A PHI JSON key word, whole. Kept whatever follows it, though the PHI pass reads only a
-        # quoted key; ``_read_as_label``'s docstring lists this among the words kept for no reader.
+        # A PHI JSON key word, whole; ``_read_as_label``'s docstring lists it among the residuals.
         (";sslpassword=a1q name=b2q;", "name"),
-        # A query-filter key the filter reads whole, though it holds two kept words elsewhere.
+        # A query-filter key, whole or after a ".".
         (";sslpassword=a1q session_state=b2q;", "session_state"),
         (";sslpassword=a1q x.session_state=b2q;", "x.session_state"),
-        # A member key right after a ";" inside a braced value, which the member pass reads.
+        # A member key word right after a ";" inside a braced value, with "=" after it.
         (";sslpassword={a1q;sslkeypassword=b2q};", "sslkeypassword"),
         # A word ending in a scheme word before spaces keeps the scheme-word rule, as before,
         # whatever follows the spaces (code review).
         (";sslpassword=a1q xbearer :b2q;", "xbearer"),
-        # The words read inside a longer word: the MEFOR_ prefix and the DICOM labels.
+        # Held words, kept anywhere in a word: the MEFOR_ prefix and a DICOM label word.
         (";sslpassword=a1q MEFOR_X=b2q;", "MEFOR_X"),
         (";sslpassword=a1q IssuerOfPatientID=b2q;", "IssuerOfPatientID"),
     ],
@@ -130,7 +128,7 @@ def test_the_label_words_are_the_kept_words_outside_the_held_ones() -> None:
 @pytest.mark.parametrize(
     ("line", "word"),
     [
-        # After a ";" but no "=" right after it: no member key, so a password word (code review).
+        # After a ";" but no "=" right after it: the mask masks the word (code review).
         ("DRIVER={X};sslpassword={Zq7;Compass:Vw9};PORT=1", "Compass"),
         ("DRIVER={X};sslpassword={Zq7;Bypass :Vw9", "Bypass"),
     ],
@@ -152,8 +150,8 @@ def test_a_word_after_a_semicolon_is_a_member_key_only_before_an_equals(
 )
 def test_a_password_word_holding_a_held_word_prints_as_before(line: str, word: str) -> None:
     """A KNOWN RESIDUAL, pinned as printed: a word holding one of ``_MEMBER_HELD``'s words anywhere
-    is kept whole, as before BACKLOG #8429 (the comment on ``_MEMBER_HELD`` says why), so such a
-    password word would print on first deployment. A change that masks it goes red here and must
+    is kept whole, as before BACKLOG #8429, so such a password word would print on first
+    deployment. A change that masks it goes red here and must
     move it to the tests above. The value after it is masked."""
     for surface, apply in _SURFACES:
         out = apply(line)
@@ -166,8 +164,8 @@ _KEPT_WORD_LINES = tuple(_member(word, sep) for sep in ":=" for word in _MASKED_
 
 @pytest.mark.parametrize("line", _KEPT_WORD_LINES)
 def test_no_fragment_prints_on_a_later_redaction(line: str) -> None:
-    """The member-mask regressions showed on the later paths: a second or third handler, a chain
-    line the bundle reads back, and store error text. Each line is hidden on all nine."""
+    """Each line is hidden on all nine redaction paths: a second or third handler, a chain line
+    the bundle reads back, and store error text among them."""
     paths = _every_redaction_path(line)
     assert {path: out for path, out in paths.items() if _printed(out)} == {}
 
@@ -182,14 +180,10 @@ def test_the_kept_words_print_under_the_rule_before(monkeypatch: pytest.MonkeyPa
             assert word in apply(_member(word, ":")), (surface, word)
 
 
-#: Openings ``_read_as_label`` keeps a word at, each switched off, with a line a seeded differential
-#: against ``main`` at b54e0528 or a code review found then printing, on a later path, a value the
-#: rule before hid. So each of these is there for a measured reason; at least the whole-word keep,
-#: the ``%XX`` start alone and the non-ASCII keep have no control here. In order: ``PatientName``
-#: masked is no DICOM label for the PHI pass, which took the rest of the line; ``session_state``,
-#: ``.code``, ``_token`` and ``myPassword`` masked are no label for the query filter or the label
-#: passes of a later redaction, which read on past the member's end; ``v1token`` masked no longer
-#: ends the carriage pass's run; and ``;Compass=`` masked is no member key on a later handler.
+#: Openings ``_read_as_label`` keeps a word at, each with a line, found by a seeded differential or
+#: a code review, that prints on some path a value the rule before hid once that opening is
+#: switched off. At least the whole-word keep, the ``%XX`` start alone and the non-ASCII keep have
+#: no control here.
 _OPENING_CONTROLS = (
     (
         "held words anywhere",
@@ -230,8 +224,7 @@ _OPENING_CONTROLS = (
         "lookup DOE%26a1q;sslpassword=Jane Doemfb64:v1:mfb64:v1token=|x",
     ),
     (
-        # Code review round-7d59d34d6f: on a later handler the PHI pass replaces the token holding
-        # the "{", and ";Compass=" becomes a member key whose value hides f6q.
+        # Code review round-7d59d34d6f.
         "a member key after a semicolon",
         "_MEMBER_KEY_WORDS",
         (),
@@ -274,9 +267,7 @@ def test_each_opening_is_needed(
     assert _printed_where_the_rule_before_hid(line, before)
 
 
-#: The heads ``redaction._BINARY_CARRIAGE`` ends a run before: a marker head with no colon after its
-#: ``v1``, which it reads with no boundary after the ``v1``, so it reads the ``v1`` at the start of a
-#: member-value word. Each in the spellings the member mask meets as a word start.
+#: Carriage-marker heads with no colon after the ``v1`` that follows them here.
 _CARRIAGE_HEADS = ("mfb64:", "[redacted]:", "<redacted>:", "MFB64:", "mfb64%3A", "mfb64\\u003A")
 
 
@@ -312,10 +303,9 @@ def test_the_member_carriage_head_is_the_carriage_pass_run_end() -> None:
 def test_a_word_after_a_carriage_head_prints_nothing_the_rule_before_hid(
     monkeypatch: pytest.MonkeyPatch, head: str, word: str, separator: str
 ) -> None:
-    """Code review (round-09fccbb450): with ``v1<kept word>=`` masked to ``x0...``, the chain's
-    carriage pass no longer ended its run at that head, took the body, and the bundle reading the
-    chain line back (the support bundle and ``GET /logs/tail``) printed ``DOE`` and ``a1q``, which
-    the rule before hid. A word holding part of such a head is kept as before."""
+    """Code review (round-09fccbb450) found the ``mfb64:`` and ``MFB64:`` lines printing ``DOE``
+    and ``a1q`` on the paths where the bundle reads a chain line back, which the rule before hid.
+    Each line prints nothing the rule before hid, on all nine paths."""
     line = f"lookup DOE%26a1q;sslpassword=Jane Doemfb64:v1:{head}v1{word}{separator}|x"
     with monkeypatch.context() as patched:
         patched.setattr(secretscrub, "_read_as_label", lambda _text, _word, _start: True)

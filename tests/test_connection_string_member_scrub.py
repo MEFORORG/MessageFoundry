@@ -303,11 +303,11 @@ def _keep_without(*words: str) -> re.Pattern[str]:
     return re.compile("|".join(re.escape(w) for w in kept), re.IGNORECASE)
 
 
-#: Control shapes whose fuzz original glued its planted value to a kept word where no label may
-#: open (``a1qpwd=``, ``a1qencryption_key=``). Since BACKLOG #8429 the mask keeps such a word only
-#: where a label may open, so it masks those words whatever rule is off, and a control on the
-#: original line no longer sees its rule. Each control below takes the same line with a "_" or a
-#: camelCase capital before the kept word, where the mask keeps it and a later pass reads it. The
+#: Control shapes whose fuzz original glued its planted value to a kept word
+#: (``a1qpwd=``, ``a1qencryption_key=``). Since BACKLOG #8429 ``secretscrub._read_as_label`` masks
+#: such a word whatever rule is off, so a control on the original line no longer sees its rule.
+#: Each control below takes the same line with a "_" or a camelCase capital before the kept word,
+#: where the mask keeps it. The
 #: originals stay in the differential: the ones the shape tuples above hold, and the scheme-word
 #: control's own line, last here.
 _SHAPES_WITH_A_LABEL_START = (
@@ -456,8 +456,8 @@ _DIFFERENTIAL_PIECES = (
     # BACKLOG #8429: a label prefix before a kept word, password words that hold a kept word, and
     # kept words where a reader opens on them.
     "_pwd=", "Compass=", "Statement:", "Barcode=", "session_state=", "x.name=", ";sslkeypassword=",
-    # A kept word right after a carriage head with no colon after its v1, which the chain's
-    # carriage pass reads (code review round-09fccbb450).
+    # A kept word right after a carriage head with no colon after its v1 (code review
+    # round-09fccbb450).
     "mfb64:v1token=", "mfb64:v1Passage:", "MFB64:v1code=", "[redacted]:v1state:",
     "<redacted>:v1secret=", "mfb64%3Av1name=",
 )  # fmt: skip
@@ -492,9 +492,7 @@ def _member_led_lines() -> list[str]:
 
 #: A third seeded block (BACKLOG #8429 code review round-09fccbb450): a member value holding a
 #: carriage head with no colon after its ``v1`` and a kept word glued after the ``v1``, with PHI
-#: shapes before it. The chain's carriage pass reads that ``v1`` with no boundary after it; with the
-#: word masked, a chain line the bundle read back printed text the rule before hid, and the two
-#: blocks above held the shape too rarely to find it.
+#: shapes before it.
 _CARRIAGE_HEAD_PRE = ("", "%26a1q", "DOE%26b2q", "lookup DOE%26c3q", "%7Cd4q", "x%5Ee5q", "a1q")
 _CARRIAGE_HEAD_KEYS = (";epwd=", ";sslpassword=", ";PWD=", ";Token=", ";xpass=")
 _CARRIAGE_HEAD_MID = ("Je De", "Jane Doe", "", "a1q", "Xy Zw", "x ")
@@ -940,10 +938,9 @@ def test_the_member_mask_keeps_a_replaced_marker_head(monkeypatch: pytest.Monkey
     on the chain where the baseline hid it; the fuzz differential found the line below. With the
     unit's alternative removed, it prints again.
 
-    The fuzz line glued its planted value to ``pwd``. Since BACKLOG #8429 the mask keeps a kept word
-    only where a label may open, so ``a1qpwd`` is masked whatever the unit does, and the control runs
-    on the same line with ``a1q_pwd``, which the mask keeps as a label prefix and a later pass reads.
-    Both lines must print nothing the baseline hid."""
+    The fuzz line glued its planted value to ``pwd``. Since BACKLOG #8429 ``a1qpwd`` is masked
+    whatever the unit does, so the control runs on the same line with ``a1q_pwd``, which the mask
+    keeps. Both lines must print nothing the baseline hid."""
     lines = (
         ';PWD="family": .=amfb64:v1:a1qpwd=/"family": ',
         ';PWD="family": .=amfb64:v1:a1q_pwd=/"family": ',

@@ -3280,11 +3280,10 @@ def test_the_outside_lines_print_their_value_under_the_denylist_tail(
     value in the bundle and on the store path.
 
     The second line's value is spelled ``vq7.code`` here. Its fuzz spelling, ``vq7code``, glues the
-    planted value to ``code`` where no label pattern opens, and since BACKLOG #8429 the member mask the
-    denylist tail writes with masks such a word, so it no longer prints under that tail either.
-    With a "." before ``code``, where the query filter's ``\\b`` opens, the mask keeps the word, as
-    it kept ``vq7code`` before. The shipped reading still hides it, which the pinned test above
-    holds for the fuzz spelling."""
+    planted value to ``code``, and since BACKLOG #8429 the member mask the denylist tail writes
+    with masks such a word, so it no longer prints under that tail either. With a "." before
+    ``code`` the mask keeps the word, as it kept ``vq7code`` before. The shipped reading still
+    hides it, which the pinned test above holds for the fuzz spelling."""
     lines = [
         (line.replace("vq7code", "vq7.code"), value.replace("vq7code", "vq7.code"), *rest)
         for line, value, *rest in _OUTSIDE_THE_ALLOWLIST_LINES
