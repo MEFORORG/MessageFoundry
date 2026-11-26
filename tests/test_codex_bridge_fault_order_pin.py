@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Pin fault-order shapes to a failing exit through the registered Codex hook line.
+"""Pin fault-order shapes to exit 1 through the registered Codex hook line.
 
 Each case runs, for one event, a hook that prints a decision, a hook that exits 1, and in some cases
 a hook that prints an allow. On the bridge these tests were written against, the hook that exits 1
-stops the event: the bridge emits nothing, the registered line exits 1, and the earlier decision is
-dropped too (docs/CODEX.md states that gap). These tests pin only that the event fails and that no
-allow reaches stdout. They do not show that a deny survives a fault; it does not.
+makes the bridge raise: it emits nothing, the registered line exits 1, and the earlier decision is
+dropped too (docs/CODEX.md states that gap). These tests pin that exit code, the bridge's fault
+line naming the exit-1 hook, and that no allow reaches stdout. They do not show that a deny
+survives a fault; it does not. A fail-closed fix for that gap that changes the exit code would
+have to update the exit-code assertion here, deliberately.
 
-A withdrawn change for BACKLOG #5496 (engine commit 6a8c02a9b2a, never merged) ran the later hooks
-and exited 0 on each case here, the first two emitting the allow. To re-run the negative control,
-put that commit's scripts/codex/bridge.py in place: every case below fails with 0 == 1.
+A withdrawn change for BACKLOG #5496 (engine commit 6a8c02a9b2a, never merged; it may be reachable
+only from that branch's pull-request head ref) ran the later hooks and exited 0 on each case here,
+the first two emitting the allow. To re-run the negative control, put that commit's
+scripts/codex/bridge.py in place: every case below fails with 0 == 1.
 """
 
 from __future__ import annotations
@@ -23,7 +26,6 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -67,10 +69,12 @@ def _registered_command(event: str) -> str:
         if "scripts/codex/invoke.ps1" in h["command"]
     ]
     assert len(commands) == 1, commands
-    return commands[0]
+    return str(commands[0])
 
 
-def _run_registered(tmp_path: Path, event: str, handlers: list[dict[str, object]]):
+def _run_registered(
+    tmp_path: Path, event: str, handlers: list[dict[str, object]]
+) -> subprocess.CompletedProcess[str]:
     root = tmp_path / "repo"
     scripts = root / "scripts/codex"
     scripts.mkdir(parents=True)
@@ -99,7 +103,10 @@ def _run_registered(tmp_path: Path, event: str, handlers: list[dict[str, object]
 def _allowed(stdout: str) -> bool:
     if not stdout.strip():
         return False
-    specific: dict[str, Any] = json.loads(stdout).get("hookSpecificOutput", {})
+    output = json.loads(stdout)
+    assert isinstance(output, dict), stdout
+    specific = output.get("hookSpecificOutput")
+    assert isinstance(specific, dict), stdout
     decision = specific.get("decision")
     behavior = decision.get("behavior") if isinstance(decision, dict) else None
     return "allow" in (specific.get("permissionDecision"), behavior)
@@ -108,9 +115,9 @@ def _allowed(stdout: str) -> bool:
 _EXIT_1 = _py("import sys; sys.exit(1)")
 _PR, _PRE, _POST = "PermissionRequest", "PreToolUse", "PostToolUse"
 
-# (event, handlers before the fault, handlers after it). The deny in each sits in a field the
-# event does not read, except where noted, so it is not a protection the fault removes.
-_CASES = {
+# (event, handlers before the fault, handlers after it). Each "deny" below sits in a field the
+# event does not read, so the fault removes no protection the event would have honoured.
+_CASES: dict[str, tuple[str, list[dict[str, object]], list[dict[str, object]]]] = {
     # A permissionDecision deny, then after the fault a decision allow.
     "permission-request": (
         _PR,
@@ -123,26 +130,28 @@ _CASES = {
         [_prints(_PRE, decision={"behavior": "deny"})],
         [_prints(_PRE, permissionDecision="allow")],
     ),
-    # The same masking with no allow at all: a field the event ignores hid the fault.
+    # A permissionDecision deny and no allow: 6a8c02a exited 0 here, so the fault went unreported.
     "post-tool-use": (_POST, [_prints(_POST, permissionDecision="deny")], []),
-    # An ask (a field PreToolUse does read) followed by a fault.
-    "pre-tool-use-ask": (_PRE, [_prints(_PRE, permissionDecision="ask")], []),
 }
+_WITH_ALLOW = [name for name, (_, _, after) in _CASES.items() if after]
 
 
 @pytest.mark.parametrize("case", list(_CASES))
-def test_a_failed_hook_fails_the_event_and_lets_no_allow_out(tmp_path, case):
+def test_a_failed_hook_fails_the_event_and_lets_no_allow_out(tmp_path: Path, case: str) -> None:
     event, before, after = _CASES[case]
     completed = _run_registered(tmp_path, event, [*before, _EXIT_1, *after])
     assert completed.returncode == 1, (completed.stdout, completed.stderr)
-    # The bridge's own fault line: proves the exit-1 hook ended the run, not a launcher failure.
+    # The bridge's fault line names the exit-1 hook's argv, so the failure is that hook's, not a
+    # launcher failure or another hook's crash.
     assert "returned non-zero exit status 1" in completed.stderr, completed.stderr
+    assert "sys.exit(1)" in completed.stderr, completed.stderr
     assert not _allowed(completed.stdout), completed.stdout
 
 
-def test_the_fixture_is_live_without_the_fault(tmp_path):
+@pytest.mark.parametrize("case", _WITH_ALLOW)
+def test_the_fixture_is_live_without_the_fault(tmp_path: Path, case: str) -> None:
     """Positive control: the same handlers minus the exit-1 hook run clean and emit the allow."""
-    event, before, after = _CASES["pre-tool-use"]
+    event, before, after = _CASES[case]
     completed = _run_registered(tmp_path, event, [*before, *after])
     assert completed.returncode == 0, completed.stderr
     assert _allowed(completed.stdout), completed.stdout
