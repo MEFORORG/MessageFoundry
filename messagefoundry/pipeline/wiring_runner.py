@@ -285,6 +285,7 @@ from messagefoundry.store.store import (
     OwnedLanes,
 )
 from messagefoundry.store.transit_attestation import utf16_units
+from messagefoundry.threadhop import to_thread_or_loop
 from messagefoundry.transports import (
     DeliveryError,
     DestinationConnector,
@@ -5735,7 +5736,9 @@ class RegistryRunner:
         outcome = build.result().outcome
         if isinstance(outcome, DestinationConnector):
             # Logged through safe_exc, as a reload's retired close is.
-            await self._close_replaced(name, outcome, [])
+            await self._close_replaced(
+                name, outcome, [], what="connector its abandoned DR-park build made"
+            )
 
     def _install_lane_destination(self, name: str, built: _LaneBuild) -> Exception | None:
         """Put a :meth:`_build_lane_destination` result in its lane, with no await: the connector,
@@ -7510,7 +7513,7 @@ class RegistryRunner:
 
         async def close() -> None:
             try:
-                await asyncio.to_thread(session.close)
+                await to_thread_or_loop("sandbox session close", session.close)
             except Exception as exc:  # noqa: BLE001 - logged by type; the session is already dropped
                 # A failed close leaves at most a worker for the collector. It is not the
                 # message's fault, and the dispatch that dropped the session raised it as a close.
@@ -7527,7 +7530,16 @@ class RegistryRunner:
         a process. A no-op unless a worker sandbox mode spawned any. The next dispatch on an
         inbound makes a fresh session, whose worker loads the config as it is then. A dispatch already
         holding a closed session is retried or re-pended by :meth:`_off_loop_sandboxed`, never
-        dead-lettered as a Router or Handler fault."""
+        dead-lettered as a Router or Handler fault.
+
+        The sessions leave tracking before the hop, so a refused hop or a cancelled caller must
+        not drop them unclosed with their worker children alive (BACKLOG #5755, item 4). A default
+        executor that refuses the hop closes them on a thread of its own, or on the loop when no
+        thread can start (:func:`~messagefoundry.threadhop.to_thread_or_loop`). The close runs in a
+        tracked task, so a cancellation of the caller stops only the wait, and
+        :meth:`_teardown_body` waits for it. At least one case still drops them: a close still
+        queued behind a hung pool when a demotion abandons it and a later SHUTDOWN cancels it. A
+        session whose close raises is logged by type and the rest are still closed."""
         if not self._sandbox_sessions:
             return
         sessions = list(self._sandbox_sessions.values())
@@ -7535,9 +7547,14 @@ class RegistryRunner:
 
         def close_all() -> None:
             for session in sessions:
-                session.close()
+                try:
+                    session.close()
+                except Exception as exc:  # noqa: BLE001 - one close stops no other; logged by type
+                    log.warning("could not close a sandbox session (%s)", type(exc).__name__)
 
-        await asyncio.to_thread(close_all)
+        closing = asyncio.create_task(to_thread_or_loop("sandbox session close", close_all))
+        self._track_detached_close(closing)
+        await asyncio.shield(closing)
 
     def _sandbox_for(self, name: str) -> SandboxSession | None:
         """The persistent sandbox worker for inbound ``name`` (ADR 0087), or ``None`` to run in-process.
@@ -8152,7 +8169,11 @@ class RegistryRunner:
             self._fuse_transform_executor = None
         self._fusion_active = False
         # ADR 0087 (#197): stop the per-inbound sandbox worker children (kills + reaps each subprocess).
-        # Run OFF the loop (each close() waits on a process) so a draining child can't wedge the loop.
+        # Run OFF the loop (each close() waits on a process) so a draining child can't wedge the loop;
+        # what a refused hop does instead is stated on _close_sandbox_sessions. The fusing shutdown
+        # above has no such fallback, so with fusion active a refused executor stops this teardown
+        # there, skipping the rest of it; fusion never runs with a sandbox mode on, so no session
+        # is left unclosed by that.
         # No-op unless [sandbox].mode=subprocess actually spawned any.
         await self._close_sandbox_sessions()
         # THE LOOKUP-EXECUTOR CLOSE, stated here once. The live executor retires like a reload's:
@@ -8176,14 +8197,14 @@ class RegistryRunner:
                 self._abandoned_lookup_closes |= still
                 self._lookup_close_tasks -= still
                 log.warning(
-                    "teardown: %d detached close(s) (lookup executors, sandbox sessions) still pending "
-                    "after %.2fs; left running",
+                    "teardown: %d detached task(s) (closes and abandoned connector builds) still "
+                    "pending after %.2fs; left running",
                     len(still),
                     budget,
                 )
         if not demote and self._abandoned_lookup_closes:
             log.warning(
-                "teardown: cancelling %d detached close(s) a demotion abandoned; a sandbox session "
+                "teardown: cancelling %d detached task(s) a demotion abandoned; a sandbox session "
                 "close already running runs on, and one not yet started never runs",
                 len(self._abandoned_lookup_closes),
             )
@@ -9653,7 +9674,12 @@ class RegistryRunner:
             self._close_retired(connectors)
 
     async def _close_replaced(
-        self, name: str, replaced: DestinationConnector, failures: list[tuple[str, str]]
+        self,
+        name: str,
+        replaced: DestinationConnector,
+        failures: list[tuple[str, str]],
+        *,
+        what: str = "replaced connector",
     ) -> None:
         """Close the connector a reload has just taken out of ``name``'s lane, whether a rebuild
         swapped it out or a not-deployed, ``auto_start`` or DR park retired it. A close that raises
@@ -9662,14 +9688,15 @@ class RegistryRunner:
         BACKLOG #5755). A cancellation still propagates.
 
         A send in flight on ``replaced`` is not cancelled here; its delivery path settles it
-        (:meth:`_connector_retired`, BACKLOG #5718)."""
+        (:meth:`_connector_retired`, BACKLOG #5718).
+
+        ``what`` names the connector in the WARNING, so the connector an abandoned DR-park build
+        made, which no lane ever held, is not logged as a replaced one (PR 3012 open finding 9)."""
         try:
             await replaced.aclose()
         except Exception as exc:  # noqa: BLE001 - a connector's close can fail in any way; logged
             reason = safe_exc(exc)
-            log.warning(
-                "reload: closing the replaced connector of outbound %r failed: %s", name, reason
-            )
+            log.warning("reload: outbound %r: closing the %s failed: %s", name, what, reason)
             failures.append((name, reason))
 
     # --- atomic reload (quiesce-and-swap) ------------------------------------
@@ -10062,8 +10089,9 @@ class RegistryRunner:
                 # a child that has no such predicate, which returns a denial → SandboxError → EVERY message
                 # dead-letters until restart. Dropping the sessions here makes the next dispatch respawn a
                 # child that re-loads the swapped config (its docstring's "Router/Handler changes take
-                # effect immediately" now also holds under mode=subprocess). Off-loop: close() waits on a
-                # process. No-op unless mode=subprocess actually spawned any.
+                # effect immediately" now also holds under mode=subprocess). Off-loop, since close()
+                # waits on a process; _close_sandbox_sessions says what a refused hop does instead.
+                # No-op unless mode=subprocess actually spawned any.
                 await self._close_sandbox_sessions()
                 for ic in new_registry.inbound.values():
                     # The skips are _listener_skip, in its order, which listener_bind_predicate reads
@@ -15561,8 +15589,10 @@ async def _build_off_loop[T](
     an executor fault at this hop never leaves a connector unbuilt (Lander hold 6730392844, item
     3). ``run()`` never began in those cases, so nothing is built twice. A reload's build check
     comes through here too (:meth:`RegistryRunner.build_check_off_loop`, ``what`` naming it in
-    the WARNING), so it has the same fallback (Lander hold 6733221092, item 2). Another
-    worker-thread hop, at least a lane's anchor check, has no such fallback. A build still queued
+    the WARNING), so it has the same fallback (Lander hold 6733221092, item 2). Some other hops
+    a reload makes take it through :func:`~messagefoundry.threadhop.to_thread_or_loop`, which
+    closes nothing on a cancellation (BACKLOG #5755); docs/SECURITY.md names them, and at least
+    one that does not have it. A build still queued
     behind a busy or hung pool has not been refused, so the caller waits for it. A build the pool
     queued before it failed to start a thread is cancelled first, or, if a worker already took
     it, awaited, and its own result or refusal is the answer. A build that began and then failed

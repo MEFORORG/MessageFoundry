@@ -1159,6 +1159,382 @@ def test_request_ids_are_unpredictable_and_never_reused(
     assert len({rid[:8] for rid in seen}) == 3
 
 
+def _stray_during_encode(
+    monkeypatch: pytest.MonkeyPatch, session: SandboxSession, times: int = 1
+) -> list[str]:
+    """Patch ``encode_request`` to queue a stray frame on ``session`` after the call's first check
+    and before its request is written, ``times`` times. Returns the request ids encoded."""
+    real_encode = codec.encode_request
+    ids: list[str] = []
+
+    def _encode(*, request_id: str, **kw: Any) -> bytes:
+        ids.append(request_id)
+        out = real_encode(request_id=request_id, **kw)
+        if len(ids) <= times:
+            session._responses.put(b"\x00\x00\x00\x02{}")
+        return out
+
+    monkeypatch.setattr(codec, "encode_request", _encode)
+    return ids
+
+
+def test_a_stray_frame_queued_after_the_check_is_found_before_the_request_is_written(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3135 steps 7 and 13: the AC-10 window is narrowed by a second check.
+
+    A frame queued after :meth:`SandboxSession._live_worker`'s check and before the request is
+    written used to be read in that call's answer slot, which killed the worker as an invalid frame
+    and failed a message that never reached it. The check now runs again once the request is
+    encoded, right before the write, so that frame is found there: the worker is killed as
+    unsolicited and the message is retried once on a fresh worker, as for a frame found at the
+    first check."""
+    registry, config_dir = graph
+    expected = _deliveries(registry, "h_ok")
+    session = _session(config_dir)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        first = session._proc
+        generation = session._generation
+        ids = _stray_during_encode(monkeypatch, session)
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
+        assert len(ids) == 1  # encoded once: the retry writes the same request to the new worker
+        assert session.last_kill_cause is KillCause.UNSOLICITED_BEFORE
+        assert session.kill_counts[KillCause.UNSOLICITED_BEFORE] == 1
+        assert KillCause.INVALID_FRAME not in session.kill_counts
+        assert first is not None and first.poll() is not None
+        assert session._generation == generation + 1
+    finally:
+        session.close()
+
+
+def test_the_second_check_shares_the_one_retry_a_dispatch_gets(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stray frame at the first check uses the dispatch's one retry, so a second one found by the
+    check before the write fails the call rather than retry again (vault BACKLOG #3135 step 7)."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        session._responses.put(b"\x00\x00\x00\x02{}")
+        _stray_during_encode(monkeypatch, session)
+        with pytest.raises(SandboxError, match="unsolicited"):
+            _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert session.kill_counts[KillCause.UNSOLICITED_BEFORE] == 2
+    finally:
+        session.close()
+
+
+# A Handler that spawns a grandchild the ordinary way, inheriting its standard streams, and reports
+# whether the grandchild's fd 0 is a pipe. Before vault BACKLOG #3135 step 8 fd 0 was the worker's
+# request pipe, through which the grandchild could read a later request's id and forge its answer.
+_FD0_GRAPH = """
+from messagefoundry import inbound, outbound, router, handler, MLLP, Send
+
+inbound("IB_F", MLLP(port=19353), router="r")
+outbound("OB_F", MLLP(host="127.0.0.1", port=19354))
+
+
+@router("r")
+def r(msg):
+    return "h_fd0"
+
+
+@handler("h_fd0")
+def h_fd0(msg):
+    import subprocess
+    import sys
+
+    probe = (
+        "import os, stat, sys\\n"
+        "mode = os.fstat(0).st_mode\\n"
+        "sys.exit(3 if stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) else 0)\\n"
+    )
+    argv = [sys.executable, "-c", probe]
+    inherited = subprocess.run(argv, timeout=30).returncode
+    every_fd = subprocess.run(argv, timeout=30, close_fds=False).returncode
+    # The negative control: the probe must see a pipe it is handed.
+    piped = subprocess.run(argv, timeout=30, stdin=subprocess.PIPE).returncode
+    return Send("OB_F", f"{inherited},{every_fd},{piped}")
+"""
+
+
+# A sandbox worker boot plus six interpreter starts, each a fresh process: unloaded this took
+# about 14 s on Windows (2026-11-24), and under a loaded runner it has reached the 60 s per-test cap
+# the Ubuntu leg passes with --timeout, which this marker overrides. Each probe keeps its own 30 s
+# subprocess timeout, so 240 s still bounds a hang. Starting with -I -S measured no faster.
+@pytest.mark.timeout(240)
+def test_a_process_a_handler_spawns_does_not_get_the_request_pipe_on_fd_0(tmp_path: Path) -> None:
+    """Vault BACKLOG #3135 steps 8 and 13: a process a Handler spawns finds no pipe on its fd 0.
+
+    The worker moves the pipe to a private, non-inheritable descriptor before it reads the boot
+    frame, and points fd 0 at the null device, so a process a Handler spawns, with its descriptors
+    inherited or not, finds no pipe on fd 0. Exit status 3 means the grandchild's fd 0 was a pipe;
+    the third probe is handed one, to show the probe can see it.
+
+    This proves only what fd 0 is, not that the grandchild cannot reach the request pipe another
+    way. On Windows, a worker started through a virtual environment's ``python.exe`` launcher
+    holds a second inheritable handle to the pipe, which the ``close_fds=False`` probe inherits
+    while its fd 0 is not the pipe (ADR 0087, the step 8 notes)."""
+    (tmp_path / "graph.py").write_text(_FD0_GRAPH, encoding="utf-8")
+    registry = load_config(tmp_path)
+    # Each dispatch starts three interpreters, so the default 15 s wall cap would fail it on the
+    # loaded runner the marker above is for.
+    session = _session(
+        str(tmp_path),
+        inbound="IB_F",
+        policy=SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=120.0),
+    )
+    try:
+        assert _deliveries(registry, "h_fd0", sandbox=session, run_context=RunContext()) == [
+            ("OB_F", "0,0,3")
+        ]
+        # The worker still reads its requests: a second message is answered by the same worker.
+        proc = session._proc
+        assert _deliveries(registry, "h_fd0", sandbox=session, run_context=RunContext()) == [
+            ("OB_F", "0,0,3")
+        ]
+        assert session._proc is proc
+    finally:
+        session.close()
+
+
+def test_the_request_pipe_leaves_fd_0_before_any_admin_code_runs() -> None:
+    """Vault BACKLOG #3135 step 8: the detach must come before the boot frame is read, since the
+    boot frame's reply path runs ``load_snapshot()``, the earliest admin code, which can start a
+    process of its own. The Handler-time test above cannot see a detach moved below that point, so
+    this reads the order of the calls in ``main`` from its syntax tree, never from its text."""
+    import ast
+    import inspect
+    import textwrap
+
+    from messagefoundry.pipeline import _sandbox_worker
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(_sandbox_worker.main)))
+    first: dict[str, int] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            called = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if called is not None:
+                first[called] = min(first.get(called, node.lineno), node.lineno)
+    assert first["_detach_request_pipe"] < first["_read_frame_bytes"]
+    assert first["_detach_request_pipe"] < first["load_snapshot"]
+
+
+_DETACH_PROBE = """
+import os, stat, sys
+from messagefoundry.pipeline._sandbox_worker import _detach_request_pipe
+
+reader = _detach_request_pipe()
+fd0_is_pipe = stat.S_ISFIFO(os.fstat(0).st_mode)
+sys.stderr.write(
+    f"{os.get_inheritable(reader.fileno())},{fd0_is_pipe},{reader.readline().decode().strip()}"
+)
+"""
+
+
+def test_the_private_request_pipe_is_not_inheritable() -> None:
+    """Vault BACKLOG #3135 step 8: the private copy of the request pipe is non-inheritable, fd 0 is
+    no longer a pipe, and the copy still reads what the parent writes. A grandchild that keeps
+    every inheritable descriptor (``close_fds=False``) therefore does not get the copy either."""
+    proc = subprocess.run(
+        [sys.executable, "-c", _DETACH_PROBE],
+        input=b"hello\n",
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr.decode().splitlines()[-1] == "False,False,hello"
+
+
+# The detach failing after its os.dup: the null device cannot be opened. The refusal must carry a
+# reader on the private copy, so the caller can drain the boot frame and close it, and fd 0 must
+# still be the pipe, since nothing was moved.
+_DETACH_FAIL_PROBE = """
+import os, stat, sys
+from messagefoundry.pipeline import _sandbox_worker
+
+def _no_devnull(*a, **k):
+    raise OSError("no null device")
+
+os.open = _no_devnull
+try:
+    _sandbox_worker._detach_request_pipe()
+except _sandbox_worker._RequestPipeRefused as exc:
+    with exc.reader as reader:
+        line = reader.readline().decode().strip()
+    fd0_is_pipe = stat.S_ISFIFO(os.fstat(0).st_mode)
+    sys.stderr.write(f"{line},{fd0_is_pipe},{reader.closed}")
+"""
+
+
+def test_a_detach_that_fails_after_its_dup_hands_back_the_private_copy() -> None:
+    """Vault BACKLOG #3135 step 8: a detach that fails once the pipe is duplicated does not leak
+    the copy. The refusal hands it back as a reader, which the caller drains and closes."""
+    proc = subprocess.run(
+        [sys.executable, "-c", _DETACH_FAIL_PROBE],
+        input=b"hello\n",
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr.decode().splitlines()[-1] == "hello,True,True"
+
+
+def test_a_detach_refusal_drains_the_boot_frame_and_reports_its_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_run_one: Any,  # noqa: F811 - imports the worker without keeping its root handler
+) -> None:
+    """Vault BACKLOG #3135 step 8: a worker that refuses to detach its request pipe reads the boot
+    frame before it replies, so the parent's boot write completes and the parent reads the
+    refusal's reason as a failed boot, rather than recording a failed boot write."""
+    from messagefoundry.config.snapshot import ConfigSnapshot
+    from messagefoundry.pipeline import _sandbox_worker
+
+    class _Tracked(io.BytesIO):
+        # Where the reader stood when it was closed: a drain reads to the end of the boot frame.
+        closed_at = -1
+
+        def close(self) -> None:
+            if not self.closed:
+                self.closed_at = self.tell()
+            super().close()
+
+    stdin, stdout = _Tracked(), io.BytesIO()
+    boot = codec.encode_boot(
+        snapshot=ConfigSnapshot(directory=Path("."), files={}),
+        forbidden=(),
+        mem_mb=None,
+        code_sets=None,
+    )
+    sandbox_mod._write_frame(stdin, boot)
+    size = stdin.tell()
+    stdin.seek(0)
+
+    def _refuse() -> io.BufferedReader:
+        raise _sandbox_worker._RequestPipeRefused("the request pipe stays", reader=stdin)
+
+    monkeypatch.setattr(_sandbox_worker, "_detach_request_pipe", _refuse)
+    monkeypatch.setattr(sys, "stdout", SimpleNamespace(buffer=stdout))
+    assert _sandbox_worker.main() == 1
+    assert stdin.closed
+    assert stdin.closed_at == size > 0  # read to the end of the boot frame before it was closed
+    stdout.seek(0)
+    reply = sandbox_mod._read_frame_bytes(stdout)
+    assert reply is not None
+    worker_graph, why = codec.decode_boot_reply(reply)
+    assert worker_graph is None
+    assert "the request pipe stays" in why
+
+
+def test_a_worker_booted_in_the_dispatch_that_dies_during_encode_is_recorded(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3135 step 7: a worker spawned by a dispatch's first check and dead by its
+    second is recorded as ``EXITED_AFTER_BOOT``, not reaped silently by the respawn."""
+    registry, config_dir = graph
+    expected = _deliveries(registry, "h_ok")
+    session = _session(config_dir)
+    try:
+        real_encode = codec.encode_request
+
+        def _encode(**kw: Any) -> bytes:
+            doomed = session._proc
+            assert doomed is not None
+            doomed.kill()
+            _wait_exited(doomed)
+            return real_encode(**kw)
+
+        monkeypatch.setattr(codec, "encode_request", _encode)
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
+        assert session.kill_counts[KillCause.EXITED_AFTER_BOOT] == 1
+        assert session._generation == 2
+    finally:
+        session.close()
+
+
+def test_a_worker_that_dies_while_its_request_is_encoded_is_replaced_before_the_write(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3135 step 7: the second check also finds a worker that exited while the
+    request was encoded, and the request goes to a fresh worker rather than a dead pipe."""
+    registry, config_dir = graph
+    expected = _deliveries(registry, "h_ok")
+    session = _session(config_dir)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        doomed = session._proc
+        assert doomed is not None
+        generation = session._generation
+        real_encode = codec.encode_request
+
+        def _encode(**kw: Any) -> bytes:
+            doomed.kill()
+            _wait_exited(doomed)
+            return real_encode(**kw)
+
+        monkeypatch.setattr(codec, "encode_request", _encode)
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
+        assert session._proc is not doomed
+        assert session._generation == generation + 1
+        assert KillCause.REQUEST_WRITE not in session.kill_counts
+        # It died during this dispatch, so the death is recorded, as a write to it would have been.
+        assert session.kill_counts[KillCause.CRASH] == 1
+    finally:
+        session.close()
+
+
+def test_a_kept_worker_already_dying_at_the_first_check_is_not_recorded_as_a_crash(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #3135 step 7: a kept worker that died between dispatches, and was still in its
+    exit tail at the dispatch's first check (not yet a zombie, its EOF not yet queued), is found
+    dead by the second check. Its response pipe closed before the first check ended, so it did not
+    die during this dispatch: it is replaced as the first check replaces such a worker, with no
+    kill recorded and no WARNING, not as a ``CRASH``. The test above is the control: a worker that
+    dies while the request is encoded is still recorded."""
+    registry, config_dir = graph
+    expected = _deliveries(registry, "h_ok")
+    session = _session(config_dir)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        doomed = session._proc
+        assert doomed is not None
+        generation = session._generation
+        doomed.kill()
+        _wait_exited(doomed)
+        # Hold the EOF the reader queued, and hide the exit from the first check, so the first
+        # check meets the exit tail: a running process with nothing queued.
+        eof = session._responses.get(timeout=10.0)
+        assert eof is sandbox_mod._EOF
+        real_exited = sandbox_mod._has_exited
+        monkeypatch.setattr(sandbox_mod, "_has_exited", lambda proc: False)
+        real_encode = codec.encode_request
+
+        def _encode(**kw: Any) -> bytes:
+            # The tail ends while the request is encoded: the exit and the EOF become visible.
+            monkeypatch.setattr(sandbox_mod, "_has_exited", real_exited)
+            session._responses.put(eof)
+            return real_encode(**kw)
+
+        monkeypatch.setattr(codec, "encode_request", _encode)
+        with caplog.at_level(logging.WARNING, logger=sandbox_mod.log.name):
+            assert (
+                _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
+            )
+        assert session._proc is not doomed
+        assert session._generation == generation + 1
+        assert not session.kill_counts, session.kill_counts
+        assert session.last_kill_cause is None
+        assert not [r for r in caplog.records if "cause=" in r.getMessage()]
+    finally:
+        session.close()
+
+
 def test_response_view_reaches_a_sandboxed_handler(graph: tuple[Registry, str]) -> None:
     """New capability, not a regression guard: ``response_view`` carries ``CapturedResponse`` objects,
     which used to live in ``messagefoundry.store`` — a FORBIDDEN import inside the child, raised from

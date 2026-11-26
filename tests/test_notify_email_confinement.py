@@ -41,6 +41,7 @@ from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import AuditAppend, MessageStore
 from tests._admin_account import create_local_user_chosen, forget_addresses, provision_totp
+from tests.test_operator_audit_required import signature_problem
 
 PW = "a-strong-test-passphrase"
 ADDRESS = "ops@example.org"
@@ -353,18 +354,98 @@ def _refuse_audit_appends(store: Any, *, after: int = 0) -> None:
 
 async def test_a_refused_birth_and_its_audit_row_roll_back_together() -> None:
     """BACKLOG #2100. The not-adopted row commits with the INSERT, so no crash can keep one and
-    lose the other. Driven by refusing the audit append: before #2100 the account survived it."""
+    lose the other. Driven by refusing the audit append: before #2100 the account survived it.
+    The birth's row comes first (BACKLOG #6589), so the second append, the not-adopted row's, is
+    the one refused: the count below proves the refusal reached it, and the birth row the first
+    append wrote must have rolled back with the account."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _ad_service(store)
+        await service.initialize()
+        _refuse_audit_appends(store, after=1)
+        refusing = store._audit_append_mac
+        appends = [0]
+
+        def counted() -> Any:
+            appends[0] += 1
+            return refusing()
+
+        store._audit_append_mac = counted  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="audit append refused"):
+            await service._create_directory_row(
+                _directory_principal("torn", _UNADOPTABLE_DIRECTORY_MAIL[0][1]),
+                client=None,
+                birth=lambda _new_id: AuditAppend("auth.ad_user_created", actor="torn"),
+            )
+        # Two appends: the birth's, allowed, then the not-adopted row's, refused.
+        assert appends[0] == 2
+        assert await store.get_user_by_username("torn") is None
+        assert await store.list_audit(action="auth.ad_user_created") == []
+        # Not vacuous with the count above: a not-adopted row committed on its own, before the
+        # INSERT, would take the allowed append and survive here (BACKLOG #2100).
+        assert await store.list_audit(action="auth.ad_notify_email_not_adopted") == []
+    finally:
+        await store.close()
+
+
+async def test_the_directory_birth_requires_its_row() -> None:
+    """BACKLOG #6589: ``_create_directory_row`` takes ``birth`` keyword-only, not ``None``, with no
+    default, so each caller states the row that records a birth; a ``birth`` that builds no row is
+    refused before anything is written."""
+    assert signature_problem(AuthService, "_create_directory_row", "birth") is None
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _ad_service(store)
+        await service.initialize()
+        with pytest.raises(TypeError, match="BACKLOG #6589"):
+            await service._create_directory_row(
+                _directory_principal("empty", "empty@example.org"),
+                client=None,
+                birth=lambda _new_id: None,  # type: ignore[arg-type,return-value]
+            )
+        assert await store.get_user_by_username("empty") is None
+    finally:
+        await store.close()
+
+
+async def test_a_sign_in_birth_commits_its_own_audit_row() -> None:
+    """BACKLOG #6589. A directory sign-in that creates the row records the birth as
+    ``auth.ad_user_created``, in the INSERT's transaction: with the append refused, neither the row
+    nor the account lands. Control: with the append working, both land, and a second sign-in, which
+    finds the row, records no second birth."""
     store = await MessageStore.open(":memory:")
     try:
         service = _ad_service(store)
         await service.initialize()
         _refuse_audit_appends(store)
         with pytest.raises(RuntimeError, match="audit append refused"):
-            await service._create_directory_row(
-                _directory_principal("torn", _UNADOPTABLE_DIRECTORY_MAIL[0][1]), client=None
+            await service._upsert_ad_user(
+                _directory_principal("born", "born@example.org"), by_name=None, federated=False
             )
-        assert await store.get_user_by_username("torn") is None
-        assert await store.list_audit(action="auth.ad_notify_email_not_adopted") == []
+        assert await store.get_user_by_username("born") is None
+        assert await store.list_audit(action="auth.ad_user_created") == []
+    finally:
+        await store.close()
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _ad_service(store)
+        await service.initialize()
+        for _ in range(2):
+            out = await service._complete_ad_login(
+                _directory_principal("born", "born@example.org"), None, mfa_verified=True
+            )
+            assert out.ok
+        [row] = await store.list_audit(action="auth.ad_user_created")
+        user = await store.get_user_by_username("born")
+        assert user is not None
+        assert row["actor"] == "born"
+        assert json.loads(row["detail"]) == {
+            "user_id": user.id,
+            "username": "born",
+            "provider": "ad",
+            "federated": False,
+        }
     finally:
         await store.close()
 
@@ -458,8 +539,8 @@ async def test_an_administrator_directory_create_writes_its_rows_with_the_insert
     mail: str,
 ) -> None:
     """The control for the test above. The account and its ``user.created`` row both land. When
-    the directory's ``mail`` is not adopted, the not-adopted row lands too, first, in the same
-    transaction, and the chain verifies over both."""
+    the directory's ``mail`` is not adopted, the not-adopted row lands too, after it (BACKLOG
+    #6589), in the same transaction, and the chain verifies over both."""
     store = await MessageStore.open(":memory:")
     try:
         service = _ad_service(store)
@@ -478,7 +559,7 @@ async def test_an_administrator_directory_create_writes_its_rows_with_the_insert
             if r["action"] in ("user.created", "auth.ad_notify_email_not_adopted")
         ]
         expected = (
-            ["user.created"] if adopted else ["auth.ad_notify_email_not_adopted", "user.created"]
+            ["user.created"] if adopted else ["user.created", "auth.ad_notify_email_not_adopted"]
         )
         assert [r["action"] for r in sorted(rows, key=lambda r: r["seq"])] == expected
         ok, message = await store.verify_audit_chain()
@@ -990,8 +1071,9 @@ async def test_every_store_backend_rolls_the_insert_back_with_a_refused_audit_ro
 async def test_every_store_backend_commits_several_audit_rows_with_the_insert_in_order(
     backend_store: Any,
 ) -> None:
-    """BACKLOG #2221. An administrator's directory create carries two rows: the not-adopted one
-    and ``user.created``. Both join the INSERT's transaction, in the order given."""
+    """BACKLOG #2221. An administrator's directory create carries two rows: ``user.created`` and
+    the not-adopted one, the birth first (BACKLOG #6589). Both join the INSERT's transaction, in
+    the order given."""
     name = f"tworows-{uuid4().hex[:12]}"
     user_id = uuid4().hex
     await backend_store.create_user(
@@ -1002,14 +1084,14 @@ async def test_every_store_backend_commits_several_audit_rows_with_the_insert_in
         adopt_notify_email=False,
         notify_email=ADDRESS,
         audits=(
-            AuditAppend("auth.ad_notify_email_not_adopted", actor=name),
             AuditAppend("user.created", actor=name),
+            AuditAppend("auth.ad_notify_email_not_adopted", actor=name),
         ),
         password_generated=False,
     )
     try:
         rows = sorted(await backend_store.list_audit(actor=name), key=lambda r: r["seq"])
-        assert [r["action"] for r in rows] == ["auth.ad_notify_email_not_adopted", "user.created"]
+        assert [r["action"] for r in rows] == ["user.created", "auth.ad_notify_email_not_adopted"]
         assert rows[1]["seq"] == rows[0]["seq"] + 1
     finally:
         await backend_store.delete_user(user_id)
@@ -1033,8 +1115,8 @@ async def test_every_store_backend_rolls_everything_back_when_the_second_row_fai
                 adopt_notify_email=False,
                 notify_email=ADDRESS,
                 audits=(
-                    AuditAppend("auth.ad_notify_email_not_adopted", actor=name),
                     AuditAppend("user.created", actor=name),
+                    AuditAppend("auth.ad_notify_email_not_adopted", actor=name),
                 ),
                 password_generated=False,
             )

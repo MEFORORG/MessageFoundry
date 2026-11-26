@@ -41,7 +41,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from operator import itemgetter
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, BinaryIO, ClassVar, Literal, NamedTuple, Self, TypeVar
 
 from messagefoundry.config.models import (
@@ -50,6 +50,7 @@ from messagefoundry.config.models import (
     Destination,
     Source,
     WindowsCredential,
+    flag_from_settings,
 )
 from messagefoundry.parsing.compression import CompressionError, gzip_compress, gzip_decompress
 from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek
@@ -58,6 +59,7 @@ from messagefoundry.parsing.sniff import (
     _looks_like_hl7,
 )
 from messagefoundry.parsing.split import one_message_bytes, split_batch
+from messagefoundry.path_reach import is_absent
 from messagefoundry.redaction import safe_exc, safe_name
 from messagefoundry.transports import wincred
 from messagefoundry.transports.base import (
@@ -548,7 +550,7 @@ class FileDestination(DestinationConnector):
         self.validate_directory: bool = bool(s.get("validate_directory", False))
         self.filename_template: str = s.get("filename", "{MSH-10}.hl7")
         # When two messages resolve to the same name, append a counter rather than clobber.
-        self._overwrite: bool = bool(s.get("overwrite", False))
+        self._overwrite: bool = flag_from_settings(s, "overwrite")
         self.encoding: str = s.get("encoding", "utf-8")
         # Alternate Windows/UNC credential (ADR 0132, #111). None (the default) => the ambient
         # service-account identity, byte-identical. On a non-Windows host a configured credential
@@ -1130,6 +1132,23 @@ class FileSource(SourceConnector):
         """Create the ``.processed``/``.error`` subdirs (runs on the credentialed thread when a
         credential is set). In ``leave`` mode both are best-effort (a read-only share can't create them
         and must not fail start); otherwise both are required."""
+        # _archive_subdir compares spellings, so a value spelled outside the watch directory that
+        # reaches it through a link, a junction, an 8.3 name, or a device or UNC form passes it.
+        # Moved files would then sit where the scan lists them and its spelling-based skip does
+        # not, and be ingested again on every poll (BACKLOG #5682). Compared here by file identity,
+        # before either directory is created, so a refused one is not made inside the watch tree.
+        # processed_dir is written only by the move mode; error_dir takes a quarantine in any mode.
+        archives = [("error_subdir", self.error_dir)]
+        if self.after_read == "move":
+            archives.insert(0, ("processed_subdir", self.processed_dir))
+        for knob, dest in archives:
+            if _inside_watch_tree_by_identity(dest, self.directory, knob):
+                raise SourceStartupError(
+                    f"file source {knob} reaches the watch directory {self.directory} or a "
+                    "directory inside it through another spelling (a link, a junction or a short "
+                    "name), so every archived file would be ingested again; spell it relative to "
+                    "the watch directory, or point it outside the watch directory (value withheld)"
+                )
         if self.after_read == "leave":
             # Leave-in-place (#142) never moves/deletes a source file, so it needs no .processed dir — and
             # a genuinely read-only share can't create either subdir anyway. Best-effort: a quarantine
@@ -3399,6 +3418,90 @@ def _open_dest(dest_dir: Path, directory: Path, root_real: Path) -> _Dest:
     if dirs is None:
         return _Dest(dest_dir)
     return _Dest(root_real.joinpath(*dirs), held=_win_hold_dirs(root_real, dirs))
+
+
+def _inside_watch_tree_by_identity(
+    dest_dir: Path, directory: Path, setting: str = "archive directory"
+) -> bool:
+    """True when ``dest_dir`` is spelled outside the watch ``directory`` but is, by file identity,
+    that directory or one inside it (BACKLOG #5682). Each of ``dest_dir``'s resolved path and its
+    parents is compared with the watch directory by ``os.path.samestat``. A ``dest_dir`` spelled
+    below the watch directory returns False: the scan's skip matches its spelling, and
+    :func:`_open_dest` refuses a link in it. ``dest_dir`` need not exist yet: its nearest existing
+    parent is what is compared. When the watch directory cannot be read or reports no file
+    identity (an inode of 0, as some SMB servers do, which would make every directory on the volume
+    match), the check does not run. A part of ``dest_dir`` that cannot be read, a Windows share
+    fault that maps to ENOENT included (:func:`~messagefoundry.path_reach.is_absent`), is not
+    compared, and the walk goes on to its parents, which can still match. When the walk then
+    matches nothing and some part could not be read, or no part gave an identity at all, the
+    False is no verdict. Each of those outcomes is logged at WARNING, naming ``setting`` and the
+    archive path's class, never its text. The False return does not tell a verdict from no
+    verdict. Touches the filesystem, so call it off the event loop."""
+    if _dirs_below(dest_dir, directory) is not None:
+        return False
+    try:
+        watch = os.stat(directory)
+        real = Path(os.path.realpath(dest_dir))
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "file source %s: the %s identity check did not run: %s",
+            directory,
+            setting,
+            _describe_os_error(exc) if isinstance(exc, OSError) else type(exc).__name__,
+        )
+        return False
+    if watch.st_ino == 0:
+        logger.warning(
+            "file source %s: the %s identity check did not run: the watch directory reports no "
+            "file identity",
+            directory,
+            setting,
+        )
+        return False
+    compared = False
+    fault: str | None = None
+    for candidate in (real, *real.parents):
+        try:
+            st = os.stat(candidate)
+        except (OSError, ValueError) as exc:
+            if isinstance(exc, OSError) and is_absent(exc):
+                continue  # not created yet: its parent is compared next
+            if fault is None:  # the first fault names the cause; later parts usually repeat it
+                fault = _describe_os_error(exc) if isinstance(exc, OSError) else type(exc).__name__
+            continue
+        if os.path.samestat(st, watch):
+            return True
+        # An inode of 0 is no identity (some SMB servers), so it is no comparison either.
+        compared = compared or st.st_ino != 0
+    if fault is not None or not compared:
+        # A part that could not be read may be the one that reaches the watch tree, and with no
+        # identity read nothing was compared, so this False is no verdict.
+        logger.warning(
+            "file source %s: the %s identity check gave no verdict on its %s path: %s",
+            directory,
+            setting,
+            _path_class(real),
+            f"a part could not be read: {fault}"
+            if fault is not None
+            else "no part gave a file identity to compare",
+        )
+    return False
+
+
+def _path_class(path: PurePath) -> str:
+    """The class of ``path`` for a log line that must not carry its text: ``UNC`` for a UNC path,
+    ``//?/UNC/`` and ``//./UNC/`` forms included, ``device`` for any other ``//?/`` or ``//./``
+    form, ``drive`` for any other Windows path with a drive, else ``local``."""
+    # Windows reads the prefix in any case. ntpath splits //./UNC/server as a device drive
+    # ``//./UNC`` with no separator after it, so the separator is added before comparing.
+    drive = path.drive.upper() + "\\"
+    if drive.startswith(("\\\\?\\UNC\\", "\\\\.\\UNC\\")):
+        return "UNC"
+    if drive.startswith(("\\\\?\\", "\\\\.\\")):
+        return "device"
+    if drive.startswith("\\\\"):
+        return "UNC"
+    return "drive" if path.drive else "local"
 
 
 def _dirs_below(dest_dir: Path, directory: Path) -> tuple[str, ...] | None:

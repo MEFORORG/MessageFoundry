@@ -15,19 +15,19 @@ and BOTH halves are checked against BOTH the code and the doc in the same run:
 * :func:`test_monitoring_plane_scope_is_measured_against_a_live_app` EXECUTES every route in both
   sets against a channel-scoped operator, with an ALL-CHANNELS operator in the same run as the
   positive control, and asserts the constants describe what the app does.
-* :func:`test_security_doc_states_the_measured_monitoring_scope` asserts the doc's blockquote names
-  those same routes on the correct side.
+* :func:`test_security_doc_states_the_measured_monitoring_scope` asserts, among other things, that
+  each of those same routes appears somewhere in the doc's DLQ-SCOPE blockquote. It does not check
+  which paragraph holds a route or which side of the rule the blockquote puts it on.
 
 So the constants cannot drift from the code without the first test reddening, and the doc cannot
-drift from the constants without the second. A name-presence scan was rejected as the instrument
-after measurement: over the live app it MISSES ``_control_guard`` (the three ``connections:control``
-routes enforce the scope through a helper, so their bodies name no primitive) and it misses the
-per-property rule inside ``/ws/stats``. A scan that cannot see a rule it is checking for is not an
-instrument, so the executed request is the measurement here.
+drop a route the constants name without the second. A name-presence scan was rejected as the
+instrument after measurement: over the live app it MISSES ``_control_guard`` (the three
+``connections:control`` routes enforce the scope through a helper, so their bodies name no
+primitive) and it misses the per-property rule inside ``/ws/stats``. A scan that cannot see a
+rule it is checking for is not an instrument, so the executed request is the measurement here.
 
-NOT-DEPLOYED beta: ``GET /metrics`` is recorded below as the one monitoring read that is NOT
-narrowed. That is a gap a first deployment would carry, tracked as BACKLOG #1152 (the
-metrics-exposition scoping), not a live exposure.
+``GET /metrics`` was recorded here as the one monitoring read that was NOT narrowed. It narrows
+since BACKLOG #4346, the route build of #1152, and is measured below with the other narrowed reads.
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from __future__ import annotations
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -79,16 +80,13 @@ _NARROWED_READS = (
     "GET /events",
     "GET /graph/edges",
     "GET /alerts/active",
+    "GET /metrics",
 )
 
 #: Monitoring reads that stay GLOBAL because they carry no connection identity at all — aggregate
 #: queue counters. These are the "both halves" the rule has to state: narrowing the topology reads
 #: while leaving these global is the actual shipped behaviour.
 _GLOBAL_AGGREGATES = ("GET /stats", "GET /metrics/history")
-
-#: The one monitoring read that is per-connection AND not narrowed. Stating it is what keeps the
-#: correction from trading one false sentence for another.
-_UNSCOPED_PER_CONNECTION = "GET /metrics"
 
 PW = "Sup3rSecret!!"
 
@@ -151,11 +149,6 @@ async def _service(engine: Engine) -> AuthService:
     return service
 
 
-def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
-    return httpx.AsyncClient(transport=transport, base_url="http://t")
-
-
 async def _operator(service: AuthService, username: str) -> str:
     user_id = await create_local_user_chosen(
         service,
@@ -186,7 +179,7 @@ async def _login(c: httpx.AsyncClient, username: str) -> dict[str, str]:
 
 async def test_monitoring_plane_scope_is_measured_against_a_live_app(engine: Engine) -> None:
     """Every route in ``_NARROWED_READS`` narrows for a scoped caller; every route in
-    ``_GLOBAL_AGGREGATES`` does not; ``_UNSCOPED_PER_CONNECTION`` is per-connection and not narrowed.
+    ``_GLOBAL_AGGREGATES`` does not.
 
     The all-channels operator is the positive control, in the SAME run: if the fixture were
     mis-seeded, or a route 500'd, the control's assertions fail too rather than the scoped side
@@ -201,7 +194,14 @@ async def test_monitoring_plane_scope_is_measured_against_a_live_app(engine: Eng
     wide_id = await _operator(service, "allchannels")
     await service.set_channel_scope(wide_id, [ALL_CHANNELS], actor="admin")
 
-    async with _client(engine, service) as c:
+    app = create_app(engine, auth=service)
+    # One planted history sample, so a history read that answered the scoped caller an empty or
+    # rewritten ring would differ from it. The sample carries no channel identity, so this does not
+    # tell a narrowing that kept channel-free samples from a global read. The ring is otherwise fed
+    # only by the /ws/stats sampler, which this test does not run.
+    planted = {"pending": 2}
+    app.state.metrics_history.record(time.time(), planted)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
         s = await _login(c, "scoped")
         u = await _login(c, "allchannels")
 
@@ -248,34 +248,33 @@ async def test_monitoring_plane_scope_is_measured_against_a_live_app(engine: Eng
         # narrow. Asserted as "no connection name reaches the payload" rather than as byte equality:
         # /stats also exposes live cost counters (committed_txns) that tick between two requests, and
         # an equality assertion on those would be flaky for a reason unrelated to scoping.
+        bodies: dict[str, tuple[Any, Any]] = {}
         for path in ("/stats", "/metrics/history"):
-            scoped_body, control_body = (
-                (await c.get(path, headers=s)).json(),
-                (await c.get(path, headers=u)).json(),
-            )
+            scoped_r, control_r = await c.get(path, headers=s), await c.get(path, headers=u)
+            assert scoped_r.status_code == 200, f"{path} answered the scoped caller {scoped_r.text}"
+            assert control_r.status_code == 200, f"{path} answered the control {control_r.text}"
+            scoped_body, control_body = scoped_r.json(), control_r.json()
             assert scoped_body.keys() == control_body.keys()
             for name in ("IB_A", "IB_B", "OB_X"):
                 assert name not in str(scoped_body), f"{path} named {name} — it is not an aggregate"
+            bodies[path] = (scoped_body, control_body)
+        # GLOBAL, not narrowed: the scoped caller reads the same counts as the control, and they
+        # count both inbounds' deliveries (one each), where a narrowing to IB_A would count one.
+        scoped_stats, control_stats = bodies["/stats"]
+        assert scoped_stats["outbox_by_status"] == control_stats["outbox_by_status"]
+        assert sum(scoped_stats["outbox_by_status"].values()) == 2
+        scoped_hist, control_hist = bodies["/metrics/history"]
+        assert scoped_hist == control_hist
+        assert [x["outbox_by_status"] for x in scoped_hist["samples"]] == [planted]
 
-        # --- GET /metrics: per-connection AND NOT narrowed ----------------------------------------
+        # --- GET /metrics: NARROWED (BACKLOG #4346) -----------------------------------------------
         smetrics = (await c.get("/metrics", headers=s)).text
         umetrics = (await c.get("/metrics", headers=u)).text
-        # It is per-connection: the out-of-scope connection name appears in the exposition...
-        assert 'connection="IB_B"' in smetrics, (
-            "the exposition is keyed by connection name, so a scoped caller reads a connection "
-            "outside their scope — BACKLOG #1152 (metrics-exposition scoping)"
-        )
-        # ...and it is identical to what the all-channels caller reads, i.e. not narrowed at all.
-        assert _strip_volatile(smetrics) == _strip_volatile(umetrics)
-
-
-def _strip_volatile(exposition: str) -> list[str]:
-    """Metric LINES with the sampled values dropped, so a process gauge moving between two requests
-    cannot make an equality assertion flaky. The label sets — which is what scoping would change —
-    survive."""
-    return sorted(
-        line.split(" ")[0] for line in exposition.splitlines() if line and not line.startswith("#")
-    )
+        # The control reads both inbounds and the shared outbound...
+        assert 'connection="IB_B"' in umetrics and 'destination="OB_X"' in umetrics
+        # ...and the scoped caller its own inbound only, with no shared-outbound series.
+        assert 'connection="IB_A"' in smetrics
+        assert "IB_B" not in smetrics and "OB_X" not in smetrics
 
 
 # =====================================================================================================
@@ -312,11 +311,9 @@ def _monitoring_scope_problems(text: str) -> list[str]:
     for route in _GLOBAL_AGGREGATES:
         if route not in tokens:
             problems.append(f"{route} stays global and the blockquote omits it")
-    if _UNSCOPED_PER_CONNECTION not in tokens:
-        problems.append(
-            f"{_UNSCOPED_PER_CONNECTION} is per-connection and NOT narrowed; omitting it would "
-            "trade one false sentence for a quieter one"
-        )
+    # The sentence GET /metrics carried before BACKLOG #4346 must not come back beside its token.
+    if "is **not** narrowed" in block:
+        problems.append("the blockquote says a monitoring read is not narrowed again")
     if "shared outbound" not in block.lower():
         problems.append("the shared-outbound suppression is the sharpest half and must be stated")
     return problems
@@ -324,7 +321,8 @@ def _monitoring_scope_problems(text: str) -> list[str]:
 
 def test_security_doc_states_the_measured_monitoring_scope() -> None:
     """For a documentation requirement the DOCUMENTATION is the control; this guard only keeps it
-    true. Every route the measurement above classifies must appear on the right side of the rule."""
+    true. Among other things, every route the measurement above classifies must appear somewhere in
+    the DLQ-SCOPE blockquote; which side of the rule it sits on is not checked."""
     assert _monitoring_scope_problems(_doc_text()) == []
 
 
@@ -342,7 +340,7 @@ def test_scope_guard_detects_the_retired_falsehood() -> None:
     assert any("retired falsehood" in p for p in _monitoring_scope_problems(planted))
 
 
-@pytest.mark.parametrize("route", (*_NARROWED_READS, *_GLOBAL_AGGREGATES, _UNSCOPED_PER_CONNECTION))
+@pytest.mark.parametrize("route", (*_NARROWED_READS, *_GLOBAL_AGGREGATES))
 def test_scope_guard_detects_a_planted_omission(route: str) -> None:
     """Deleting any single classified route from the blockquote must red the guard — the row-count
     floor in its per-row form. The walk's own docstring prescribes flooring because a refactor once

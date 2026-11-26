@@ -33,7 +33,11 @@ from messagefoundry.auth.notifications import (  # noqa: E402
     MFA_DISABLED,
     SecurityEvent,
 )
-from messagefoundry.auth.service import AuthService, Elevation  # noqa: E402
+from messagefoundry.auth.service import (  # noqa: E402
+    AuthService,
+    Elevation,
+    StoredPasskeysUnreadable,
+)
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
 from messagefoundry.store.store import MessageStore, WebAuthnCredential  # noqa: E402
 from tests._admin_account import ADMIN_USERNAME, create_admin, login_admin  # noqa: E402
@@ -468,6 +472,349 @@ async def test_a_stored_key_registration_would_refuse_fails_sign_in_audited(
             credential_current_sign_count=0,
         )
         assert verified.new_sign_count == 0
+    finally:
+        await store.close()
+
+
+#: Stored keys ``base64.urlsafe_b64decode`` cannot read: a length one past a multiple of four
+#: (``binascii.Error``), non-ASCII text (``ValueError``), and bytes, as a BLOB written into the
+#: TEXT column reads back (``TypeError``). Synthetic, and none is a key.
+_UNDECODABLE_KEYS: tuple[Any, ...] = ("AAAAA", "\u00e9\u00e9\u00e9\u00e9", b"AAAA")
+
+
+@pytest.mark.parametrize("stored", _UNDECODABLE_KEYS, ids=["one-past-four", "non-ascii", "bytes"])
+async def test_an_undecodable_stored_key_is_a_refused_key_on_the_second_factor_leg(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, stored: Any
+) -> None:
+    """BACKLOG #6886. RED when: a stored key that is not base64url raises out of
+    :meth:`AuthService.finish_webauthn_assertion` instead of being refused. Such a key will never
+    sign in, so it takes the refused-key path: the caller's one refusal, the WARNING naming the
+    label, and the ``stored_key_refused`` row, with nothing of the key in the log or the row."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        auth, token = await _enroll(service, identity, token)
+        real_list = store.list_webauthn_credentials
+
+        async def undecodable(user_id: str) -> list[WebAuthnCredential]:
+            return [
+                dataclasses.replace(cred, public_key=stored) for cred in await real_list(user_id)
+            ]
+
+        monkeypatch.setattr(store, "list_webauthn_credentials", undecodable)
+        with caplog.at_level(logging.WARNING, logger=_SERVICE_LOG):
+            refused = await _finish_assertion(service, token, auth)
+        assert refused == Elevation(), "the caller must see the same refusal as a bad signature"
+        # Its own line, so a corrupted row is not reported as an old key the rule now refuses.
+        assert not _stored_key_warnings(caplog)
+        warned = [r.getMessage() for r in caplog.records if "cannot be decoded" in r.getMessage()]
+        assert len(warned) == 1 and "'test key'" in warned[0], warned
+        assert _as_text(stored) not in caplog.text
+        events = await service.security_events_for(identity.username)
+        failed = [e for e in events if e["action"] == "auth.webauthn_failed"]
+        assert len(failed) == 1
+        assert json.loads(failed[0]["detail"]) == {
+            "reason": "stored_key_refused",
+            "label": "test key",
+        }
+        assert "auth.webauthn_verified" not in [e["action"] for e in events]
+    finally:
+        await store.close()
+
+
+def _as_text(stored: Any) -> str:
+    """The stored value as a log line would show it: bytes as their ASCII text, not ``b'...'``,
+    so a check for the value can fail on the bytes case too."""
+    return stored.decode("ascii") if isinstance(stored, bytes) else str(stored)
+
+
+def _with_stored(monkeypatch: pytest.MonkeyPatch, store: MessageStore, **fields: Any) -> None:
+    """Serve every passkey row of ``store`` with ``fields`` replaced, as a row written outside
+    the store might hold. The store is keyless, so no digest check reads the row first."""
+    real_list = store.list_webauthn_credentials
+
+    async def replaced(user_id: str) -> list[WebAuthnCredential]:
+        return [dataclasses.replace(cred, **fields) for cred in await real_list(user_id)]
+
+    monkeypatch.setattr(store, "list_webauthn_credentials", replaced)
+
+
+def _undecodable_id_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == _SERVICE_LOG and "credential id that cannot be decoded" in r.getMessage()
+    ]
+
+
+@pytest.mark.parametrize("stored", _UNDECODABLE_KEYS, ids=["one-past-four", "non-ascii", "bytes"])
+async def test_an_undecodable_stored_credential_id_is_refused_at_the_begin_leg(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, stored: Any
+) -> None:
+    """BACKLOG #6886, the id. RED when: a stored ``credential_id`` that does not decode raises a
+    decode error out of :meth:`AuthService.begin_webauthn_assertion`, when that leg answers
+    ``None`` for it (the web console reads ``None`` as an origin migration), or when it writes the
+    refusal on every call, or when the WARNING or the row says the passkey can never sign in. The
+    passkey is left out of the allow list and reported: the WARNING by label, saying it is not
+    listed in this leg's allow list, and the ``stored_id_unreadable`` row, once per throttle
+    interval.
+    Not ``stored_key_refused``, which the verify writes for a stored key that never signs in
+    again. It was the only passkey, so no ceremony can be staged:
+    :class:`StoredPasskeysUnreadable`."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        _, token = await _enroll(service, identity, token)
+        # CONTROL: the same row with its own id stages a ceremony.
+        assert await service.begin_webauthn_assertion(token, rp_id=RP) is not None
+        _with_stored(monkeypatch, store, credential_id=stored)
+        with caplog.at_level(logging.WARNING, logger=_SERVICE_LOG):
+            for _ in range(3):  # as three page renders would
+                with pytest.raises(StoredPasskeysUnreadable):
+                    await service.begin_webauthn_assertion(token, rp_id=RP)
+        warned = _undecodable_id_warnings(caplog)
+        assert len(warned) == 1 and "'test key'" in warned[0], warned
+        assert "is not listed in this leg's allow list" in warned[0], warned
+        assert "registered again" not in warned[0], warned
+        assert _as_text(stored) not in caplog.text
+        events = await service.security_events_for(identity.username)
+        failed = [json.loads(e["detail"]) for e in events if e["action"] == "auth.webauthn_failed"]
+        assert failed == [{"reason": "stored_id_unreadable", "label": "test key"}]
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("stored", _UNDECODABLE_KEYS, ids=["one-past-four", "non-ascii", "bytes"])
+async def test_registration_leaves_out_an_undecodable_stored_credential_id(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, stored: Any
+) -> None:
+    """BACKLOG #6886, the id at registration. RED when: a discoverable passkey whose stored
+    ``credential_id`` does not decode raises out of the registration options instead of being left
+    out of the exclude list. Left out, its holder can register that authenticator again, which is
+    the remedy. The control shows the same row with its own id is excluded."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        _, token = await _enroll(service, identity, token)
+
+        async def excluded() -> list[Any]:
+            opts = await service.begin_webauthn_registration(
+                identity, token=token, rp_id=RP, rp_name="MessageFoundry"
+            )
+            return list(json.loads(opts).get("excludeCredentials") or [])
+
+        _with_stored(monkeypatch, store, discoverable=True)
+        assert len(await excluded()) == 1, "the control: a discoverable passkey is excluded"
+        _with_stored(monkeypatch, store, discoverable=True, credential_id=stored)
+        with caplog.at_level(logging.WARNING, logger=_SERVICE_LOG):
+            assert await excluded() == []
+        warned = _undecodable_id_warnings(caplog)
+        assert len(warned) == 1 and "'test key'" in warned[0], warned
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("stored", _UNDECODABLE_KEYS, ids=["one-past-four", "non-ascii", "bytes"])
+async def test_the_rehash_pass_counts_an_undecodable_stored_credential_id_as_refused(
+    monkeypatch: pytest.MonkeyPatch, stored: Any
+) -> None:
+    """BACKLOG #6886, the start-up pass. RED when: a stored ``credential_id`` that is not text
+    raises ``TypeError`` out of :meth:`AuthService.rehash_webauthn_credentials`, which caught only
+    ``ValueError``. Every undecodable id is refused and counted, and start-up goes on."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        await _enroll(service, identity, token)
+        _with_stored(monkeypatch, store, credential_id=stored)
+        assert await service.rehash_webauthn_credentials() == (0, 1)
+    finally:
+        await store.close()
+
+
+async def test_the_rehash_pass_reads_a_bytes_hash_as_the_sign_in_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6886. RED when: the rehash pass refuses a ``credential_id_hash`` that reads back as
+    bytes holding today's hash, as when the pass parsed the stored value as text, whose WARNING
+    would then call a passkey
+    the sign-in finds unusable. The sign-in's compare reads it as its text, so the pass leaves it
+    as it is and counts nothing. The control: bytes that are not UTF-8 match no hash, and are
+    refused."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        await _enroll(service, identity, token)
+        (cred,) = await store.list_webauthn_credentials(identity.user_id)
+        _with_stored(monkeypatch, store, credential_id_hash=cred.credential_id_hash.encode())
+        assert await service.rehash_webauthn_credentials() == (0, 0)
+        _with_stored(
+            monkeypatch, store, credential_id_hash=b"\xff" + cred.credential_id_hash.encode()
+        )
+        assert await service.rehash_webauthn_credentials() == (0, 1)
+    finally:
+        await store.close()
+
+
+async def test_the_registration_leg_does_not_use_up_the_begin_legs_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6886. RED when: the registration options leg's report of an undecodable stored id
+    uses up the throttle slot the assertion begin leg needs, so that leg writes no
+    ``stored_id_unreadable`` row for the interval. The two legs are throttled apart."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        _, token = await _enroll(service, identity, token)
+        _with_stored(monkeypatch, store, discoverable=True, credential_id="AAAAA")
+        await service.begin_webauthn_registration(
+            identity, token=token, rp_id=RP, rp_name="MessageFoundry"
+        )
+        with pytest.raises(StoredPasskeysUnreadable):
+            await service.begin_webauthn_assertion(token, rp_id=RP)
+        events = await service.security_events_for(identity.username)
+        failed = [json.loads(e["detail"]) for e in events if e["action"] == "auth.webauthn_failed"]
+        assert failed == [{"reason": "stored_id_unreadable", "label": "test key"}]
+    finally:
+        await store.close()
+
+
+async def test_the_finish_leg_accepts_a_passkey_whose_stored_id_does_not_decode() -> None:
+    """BACKLOG #6886. RED when: the verify refuses a valid assertion because the stored
+    ``credential_id`` does not decode, as when the verify decoded that id to check it. The finish
+    leg finds the passkey by the hash of the id the browser sends, and the signature check reads
+    only the stored key, so the stored id plays no part and the passkey signs in, as it did before
+    BACKLOG #6886. The begin leg leaves such
+    a passkey out of the allow list and reports it, but a browser can still answer with it. Here
+    the account holds a good passkey, so a ceremony is staged, and the second one answers it: it
+    signs in, and the finish leg writes no refusal row."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        _, token = await _enroll(service, identity, token, label="good key")
+        bad = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
+        bad, token = await _enroll(service, identity, token, label="bad key", auth=bad)
+        await store._db.execute(
+            "UPDATE webauthn_credentials SET credential_id='AAAAA' WHERE label=?", ("bad key",)
+        )
+        await store._db.commit()
+
+        async def refusals() -> list[Any]:
+            events = await service.security_events_for(identity.username)
+            return [
+                json.loads(e["detail"]) for e in events if e["action"] == "auth.webauthn_failed"
+            ]
+
+        # The begin leg writes its own report of the bad passkey; only the finish leg's row counts.
+        options = await service.begin_webauthn_assertion(token, rp_id=RP)
+        assert options is not None
+        before = await refusals()
+        challenge = base64url_to_bytes(json.loads(options)["challenge"])
+        verified = await service.finish_webauthn_assertion(
+            token, bad.get_response(challenge), rp_id=RP, origin=ORIGIN
+        )
+        assert verified.ok and verified.token is not None, verified
+        assert await refusals() == before, "the finish leg refused it"
+    finally:
+        await store.close()
+
+
+#: A label as a BLOB in the TEXT column reads back: bytes, which ``json.dumps`` refuses. Synthetic.
+_BYTES_LABEL = b"bytes key"
+
+
+async def _refusal_details(service: AuthService, username: str, action: str) -> list[Any]:
+    events = await service.security_events_for(username)
+    return [json.loads(e["detail"]) for e in events if e["action"] == action]
+
+
+async def test_a_bytes_label_does_not_break_the_finish_legs_stored_key_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6886. RED when: a stored label that reads back as bytes makes the
+    ``stored_key_refused`` detail raise ``TypeError`` from ``json.dumps``, so a refusal of an
+    undecodable stored key becomes a server error, which a caller can tell from the refusal. The
+    detail renders the label so that it cannot raise: the caller sees the one refusal, and the row
+    carries the label as text."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        auth, token = await _enroll(service, identity, token)
+        _with_stored(monkeypatch, store, label=_BYTES_LABEL, public_key="AAAAA")
+        refused = await _finish_assertion(service, token, auth)
+        assert refused == Elevation(), "the caller must see the same refusal as a bad signature"
+        failed = await _refusal_details(service, identity.username, "auth.webauthn_failed")
+        assert failed == [{"reason": "stored_key_refused", "label": "bytes key"}]
+    finally:
+        await store.close()
+
+
+async def test_a_bytes_label_does_not_break_the_begin_legs_stored_key_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6886. RED when: the begin leg's ``stored_id_unreadable`` row for a passkey whose
+    stored id does not decode raises ``TypeError`` on a label that reads back as bytes, a server
+    error in place of :class:`StoredPasskeysUnreadable`. The row is built by the same builder as
+    the finish leg's ``stored_key_refused`` row, with its own reason."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        _, token = await _enroll(service, identity, token)
+        _with_stored(monkeypatch, store, label=_BYTES_LABEL, credential_id="AAAAA")
+        with pytest.raises(StoredPasskeysUnreadable):
+            await service.begin_webauthn_assertion(token, rp_id=RP)
+        failed = await _refusal_details(service, identity.username, "auth.webauthn_failed")
+        assert failed == [{"reason": "stored_id_unreadable", "label": "bytes key"}]
+    finally:
+        await store.close()
+
+
+async def test_a_bytes_label_does_not_break_the_clone_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6886. RED when: the clone signal's detail raises ``TypeError`` on a label that
+    reads back as bytes, so a replayed counter becomes a server error and writes no
+    ``auth.webauthn_clone_suspected`` row. The control is the advancing assertion before it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        auth = SoftAuthenticator(rp_id=RP, origin=ORIGIN, sign_count=5)
+        _, token = await _enroll(service, identity, token, auth=auth)
+        _with_stored(monkeypatch, store, label=_BYTES_LABEL)
+        ok, token = await _assert_once(service, token, auth, sign_count=6)
+        assert ok is True
+        ok, token = await _assert_once(service, token, auth, sign_count=6)
+        assert ok is False
+        cloned = await _refusal_details(service, identity.username, "auth.webauthn_clone_suspected")
+        assert cloned == [{"label": "bytes key"}]
+    finally:
+        await store.close()
+
+
+async def test_a_good_assertion_never_encodes_the_stored_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6886, a regression this item's first fix made. RED when: the verify builds the
+    refused-key row's detail before it knows the assertion is refused. A stored label JSON cannot
+    encode (bytes, as a BLOB read back from the TEXT column) then raised on every assertion,
+    a good one included. Here the good assertion signs in."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        auth, token = await _enroll(service, identity, token)
+        _with_stored(monkeypatch, store, label=b"test key")
+        elevation = await _finish_assertion(service, token, auth)
+        assert elevation.ok and elevation.token is not None, elevation
     finally:
         await store.close()
 
@@ -1659,11 +2006,8 @@ async def test_a_non_uv_passkey_is_never_weaker_than_a_code_completing_the_same_
             "grant_spendable_from_b": True,
         }
         # The non-UV passkey matches it on everything but the window, which it shuts: stricter.
+        # The two exact matches pin every key, so no key can read more permissive for the tap.
         assert by_tap == {**by_code, "window_open": False}
-        for key in ("window_open", "grant_spendable_from_b"):
-            assert not (by_tap[key] and not by_code[key]), key  # never more permissive
-        signal = "new_address_signal_from_b"  # here the permissive answer is False
-        assert not (by_code[signal] and not by_tap[signal]), signal
     finally:
         await store.close()
 

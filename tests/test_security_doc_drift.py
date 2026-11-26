@@ -688,8 +688,8 @@ _CONTEXTUAL_PROSE_ONLY = frozenset(
 # that account; +2 BACKLOG #288: the first-seen sign-in address, split by outcome; +1 BACKLOG #1957
 # (ADR 0198): the reconciler's scope re-diff; +2 BACKLOG #2301: the two second-step time floors;
 # +1 BACKLOG #2298: a session whose temporary credential lapsed is ended; +1 vault BACKLOG #1191:
-# the monitoring-read volume per actor.
-_CONTEXT_TABLE_A_ROWS = 44
+# the monitoring-read volume per actor; +1 BACKLOG #6065: the federated assertion's crit header.
+_CONTEXT_TABLE_A_ROWS = 45
 # +1 BACKLOG #4907 (Table B): the MLLP listener's expected-sender allowlist, tls_client_subjects.
 _CONTEXT_TABLE_B_ROWS = 14
 

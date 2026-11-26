@@ -1338,7 +1338,7 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
         poll_interval=0.02,
         config_dir=None,
         store_settings=StoreSettings(path=str(db)),
-        dr_settings=DrSettings(enabled=True, activate=False),
+        dr_settings=DrSettings(enabled=True, activate=False, seed_archive="seed.mfbak"),
         egress_settings=EgressSettings(deny_by_default=False),
     )
     yield eng
