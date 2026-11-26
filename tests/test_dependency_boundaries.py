@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from functools import cache
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -2161,30 +2161,36 @@ def test_no_walked_source_file_imports_the_anon_package() -> None:
     )
 
 
-def test_a_real_anon_import_fails_with_the_owner_ruling_first(
+def test_a_real_anon_import_names_the_owner_ruling_ahead_of_the_reword_advice(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # BACKLOG #3006: a developer who builds a real import reads the ADR and the owner ruling that
-    # decide it, before the advice to reword a docstring hit. One real import planted in a tree is
-    # both a text hit and a parsed import, so it drives both real-tree tests' own messages. The
-    # names are pinned here as literals, so an edit to the shared advice that drops one fails.
+    # decide it, right after the hit list and before any advice to reword a docstring hit. One
+    # real import planted in a tree is both a text hit and a parsed import, so it drives both
+    # real-tree tests' own messages. The names are pinned here as literals, so an edit to the
+    # shared advice that drops one fails. Only the text-hit message carries the reword advice.
     planted = tmp_path / "harness" / "live.py"
     planted.parent.mkdir()
     planted.write_text("from messagefoundry_toolkit.anon import Keyer\n", encoding="utf-8")
     search = _anon_search(tmp_path)
     assert search.outside and search.imports, search
     monkeypatch.setattr(sys.modules[__name__], "_real_anon_search", lambda: search)
-    for test, hits in (
-        (test_no_walked_source_file_looks_like_it_imports_the_anon_package, search.outside),
-        (test_no_walked_source_file_imports_the_anon_package, search.imports),
+    reword = "If a hit is docstring"
+    for test, hits, rewords in (
+        (test_no_walked_source_file_looks_like_it_imports_the_anon_package, search.outside, True),
+        (test_no_walked_source_file_imports_the_anon_package, search.imports, False),
     ):
         with pytest.raises(AssertionError) as raised:
             test()
-        # The message's own text, up to pytest's explanation of the failed `assert`.
+        # The message's own text: pytest's rewrite puts its explanation of the failed `assert`
+        # on the lines after it, and neither message holds a newline of its own.
         message = str(raised.value).partition("\n")[0]
         advice = message.partition(f"{list(hits)}. ")[2]
         assert advice.startswith("If a hit is a REAL import, the import must go."), message
-        ahead_of_rewording = advice.partition("If a hit is docstring")[0]
+        # Present where expected, so a reworded sentence cannot turn the order check below into
+        # a bare presence check.
+        assert (reword in advice) is rewords, (test.__name__, message)
+        ahead_of_rewording = advice.partition(reword)[0]
         for name in ("ADR 0030 section 1", "owner ruling 2026-10-12", "BACKLOG #3006 part 3"):
             assert name in ahead_of_rewording, (test.__name__, name, message)
 
@@ -2193,22 +2199,59 @@ def test_the_anon_view_refuses_a_corpus_whose_view_rule_drifted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # BACKLOG #3006: `_anon_pattern_texts` keeps its own copy of `_absence_corpus`'s view rule, so
-    # the multiset comparison is what stops the two drifting apart. A docstring under `scripts/`
-    # is blanked by that rule, so a corpus that stops blanking it gives a different text.
-    planted = tmp_path / "scripts" / "tool.py"
-    planted.parent.mkdir()
-    planted.write_text(_ANON_DOCSTRING_PLANT, encoding="utf-8")
-    # The control: with the two rules agreeing, the same tree reads clean and the view applies.
-    ((rel, raw, text),) = _anon_pattern_texts(tmp_path)
-    assert (rel, raw) == (PurePosixPath("scripts/tool.py"), _ANON_DOCSTRING_PLANT)
-    assert text != raw and not _ANON_IMPORT.search(text)
+    # the multiset comparison is what stops the two drifting apart. The tree holds a file the view
+    # blanks, one it stops early in, which both rules read raw, and two raw files with one text.
+    stopped = "# a comment\ny = '''unterminated\n"
+    plants = {
+        "scripts/tool.py": _ANON_DOCSTRING_PLANT,
+        "scripts/stopped.py": stopped,
+        "harness/one.py": "import json\n",
+        "harness/two.py": "import json\n",
+    }
+    for planted, source in plants.items():
+        target = tmp_path / planted
+        target.parent.mkdir(exist_ok=True)
+        target.write_text(source, encoding="utf-8")
+    # The control: with the two rules agreeing the same tree reads clean, the docstring is
+    # blanked, and the early stop gives way to the raw text. A local copy that dropped either
+    # half of the rule would raise here instead.
+    texts = {rel.as_posix(): (raw, text) for rel, raw, text in _anon_pattern_texts(tmp_path)}
+    assert {rel: raw for rel, (raw, _text) in texts.items()} == plants
+    blanked = texts["scripts/tool.py"][1]
+    assert blanked != _ANON_DOCSTRING_PLANT and not _ANON_IMPORT.search(blanked)
+    assert texts["scripts/stopped.py"][1] == stopped
+    view = scorecard._pattern_view(PurePosixPath("scripts/stopped.py"), stopped)
+    assert view is not None and view[1] is not None and view[0] != stopped, view
 
     real_corpus = scorecard._absence_corpus
 
-    def raw_corpus(root: Path) -> tuple[list[str], list[str], list[str | None]]:
-        raw_texts, _view, viewed = real_corpus(root)
-        return raw_texts, raw_texts, viewed
+    def stopped_blanking(root: Path) -> list[str]:
+        return real_corpus(root)[0]
 
-    monkeypatch.setattr(scorecard, "_absence_corpus", raw_corpus)
-    with pytest.raises(AssertionError, match="no longer gives the texts `_absence_corpus` gives"):
-        _anon_pattern_texts(tmp_path)
+    def kept_a_stopped_view(root: Path) -> list[str]:
+        return [
+            got[0] if (got := scorecard._pattern_view(scorecard._rel(root, path), raw)) else raw
+            for path, raw in zip(
+                scorecard._absence_sources(root), real_corpus(root)[0], strict=True
+            )
+        ]
+
+    def same_set_other_counts(root: Path) -> list[str]:
+        # One of the two equal texts becomes another file's text, so only the counts differ.
+        view = real_corpus(root)[1]
+        view[view.index("import json\n")] = stopped
+        assert set(view) == set(real_corpus(root)[1]), view
+        return view
+
+    for drift in (stopped_blanking, kept_a_stopped_view, same_set_other_counts):
+
+        def drifted(
+            root: Path, drift: Callable[[Path], list[str]] = drift
+        ) -> tuple[list[str], list[str], list[str | None]]:
+            raw_texts = real_corpus(root)[0]
+            # `None` throughout: the fake names no file as viewed, a claim no test here reads.
+            return raw_texts, drift(root), [None] * len(raw_texts)
+
+        monkeypatch.setattr(scorecard, "_absence_corpus", drifted)
+        with pytest.raises(AssertionError, match="no longer gives the texts `_absence_corpus`"):
+            _anon_pattern_texts(tmp_path)
