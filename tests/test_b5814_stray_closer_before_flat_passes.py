@@ -32,9 +32,6 @@ STRAY = [
     f'{{"identifier": [{{"value": "x"}}] ], "value": "{SECRET}"}}',
     f'x {{"name": [ "a" ] ] {SECRET}',
     f'[{{"family": ["Doe"] ] {SECRET}}}]',
-    # A quote put in the value would hide the stray closer in an unterminated string.
-    f'{{"given": [Jane] {SECRET}\']}}',
-    f'{{"given": [Jane] {SECRET}"]}}',
 ]
 
 #: Stray closers the check is documented to miss (``_stray_json_closer``'s docstring). Strict, so a
@@ -43,7 +40,27 @@ MISSED = [
     f'"given": [Jane] {SECRET}]',  # no container open: the head was cut
     f'{{"given": [x] {SECRET}}}}}',  # the key's own container's kind
     f'can\'t map {{"given": [Jane] {SECRET}]}}',  # a string opened before the key
+    f'{{"given": [Jane] {SECRET}\']}}',  # a quote in the value hides the closer
+    f'{{"given": [Jane] {SECRET}"]}}',
 ]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"resourceType": "OperationOutcome", "name": "IB_FHIR", "diagnostics": "'
+        + "word " * 60
+        + '"}',
+        'config error: "name": IB_ACME_ADT - can\'t open the drop folder (permission denied)',
+        "2026-11-26 10:00:00 WARNING {'name': 'IB_X', 'token=[REDACTED] failed",
+    ],
+)
+def test_a_cut_or_quoted_string_after_a_key_keeps_its_diagnostic(text: str) -> None:
+    """Review round 2's controls: a cut inside a string after a PHI key, an apostrophe in prose, and a
+    support-bundle placeholder are not stray closers, so the text is not blanked whole, cut or not."""
+    for limit in (200, 10_000):
+        once = safe_text(text, limit=limit)
+        assert once != PLACEHOLDER and safe_text(once, limit=limit) != PLACEHOLDER, once
 
 
 @pytest.mark.xfail(strict=True, reason="KNOWN RESIDUAL of BACKLOG #5814: see _stray_json_closer")

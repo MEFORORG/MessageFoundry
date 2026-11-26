@@ -25,6 +25,13 @@ def test_a_posix_name_holding_a_backslash_is_swapped_out_whole() -> None:
     assert safe_name(name) in out
 
 
+def test_a_posix_name_ending_in_a_backslash_is_swapped_out() -> None:
+    """Its last backslash-separated component is empty, so the whole name is what is swapped."""
+    name = f"Zqxdoe{BS}MRN4455667{BS}"
+    out = safe_exc(OSError(2, "No such file or directory", f"/drops/{name}"), file_name=name)
+    assert "Zqxdoe" not in out and "MRN4455667" not in out, out
+
+
 def test_a_cp1252_bytes_path_is_swapped_out() -> None:
     """A bytes path from a tool writing the Windows ANSI code page renders a character as that
     page's byte, which no UTF-8 form holds."""
@@ -64,7 +71,8 @@ def test_a_swap_never_matches_across_a_label_it_wrote() -> None:
 
 def test_a_longer_form_wins_over_a_shorter_one_that_starts_earlier() -> None:
     """Where two forms overlap, the longer is swapped, as one replacement per form in length order
-    did: a shorter form starting earlier does not leave the longer one's escaped tail in view."""
+    did: a shorter form starting earlier does not leave the longer one's escaped tail in view. The
+    shorter one's other characters stay, which ``_swap_forms`` states."""
     name = "x\x01x"
     out = safe_exc(RuntimeError(f"bad: x\x01x{BS}x01x"), file_name=name)
     assert f"{BS}x01x" not in out, out

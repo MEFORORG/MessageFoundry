@@ -66,6 +66,7 @@ Pure stdlib, so it can be used from any engine package.
 from __future__ import annotations
 
 import builtins
+import codecs
 import encodings
 import encodings.aliases
 import hashlib
@@ -83,7 +84,7 @@ from collections import ChainMap, OrderedDict, UserDict, defaultdict, deque
 from collections.abc import Callable, MappingView
 from datetime import UTC, datetime
 from functools import lru_cache
-from itertools import islice
+from itertools import chain, islice
 from string import ascii_lowercase, ascii_uppercase, digits, whitespace
 from types import (
     BuiltinFunctionType,
@@ -2116,17 +2117,18 @@ def _redact_noted(text: str, *, noted: bool) -> str:
     ``tests/test_redaction_clamp_note_end.py`` measure it on their inputs."""
     # The whole-text placeholder keeps this module's trailing bound note, the only sign the text
     # was cut (:data:`_TRAILING_NOTES`).
-    whole = _REDACTED + text[len(_without_trailing_note(text)) :]
-    if _stray_json_closer(_without_trailing_note(text)):
-        return whole
+    body = _without_trailing_note(text)
+    if _stray_json_closer(body):
+        return _REDACTED + text[len(body) :]
     try:
         out = _redact_unguarded(text, noted=noted)
     except _MismatchedJsonCloser:
-        return whole
+        return _REDACTED + text[len(body) :]
     # The output is read too: a scrub can leave a closer stray that was inside a string as received,
     # or one whose opener a flat pass consumed, and a second call reads that output as received, so
     # without this the rule broke the fixed point.
-    return whole if _stray_json_closer(_without_trailing_note(out)) else out
+    out_body = _without_trailing_note(out)
+    return _REDACTED + out[len(out_body) :] if _stray_json_closer(out_body) else out
 
 
 def _stray_json_closer(text: str) -> bool:
@@ -2143,13 +2145,17 @@ def _stray_json_closer(text: str) -> bool:
     This tokenizes from the start of the text with :data:`_JSON_TOKEN`, so a closer inside a string
     is not structure. It is armed at the depth of the first PHI key it passes and disarmed once the
     depth falls below that, which is the key's own container closing; a key outside every container
-    is disarmed at the end of its line. While armed, an unterminated string holding a closer counts
-    as a stray closer, since a quote put in a value would otherwise hide one.
+    is disarmed at the end of its line.
 
     It misses at least: a closer with no open container, as in a fragment whose head was cut
     (``"given": [x] y]``); a stray closer of the key's own container's kind (``{"given": [x] y}}``);
-    a stray closer a matching unmatched opener absorbs; and one inside a string that opened before
-    the key, such as an apostrophe earlier on the line (``can't map {"given": [x] y]}``)."""
+    a stray closer a matching unmatched opener absorbs; one inside a string that opened before the
+    key, such as an apostrophe earlier on the line (``can't map {"given": [x] y]}``); and one a
+    quote put in the value hides in an unterminated string (``{"given": [x] y']}``). Counting an
+    unterminated string's closers was tried and dropped: a cut inside any string after a PHI key,
+    and the placeholders this module and the support bundle write, then blanked whole texts and
+    broke the fixed point. A value of one token after the key's value, with no stray closer at all
+    (``{"given": [x] y}``), is not this check's to catch: :func:`_scrub_json_value` keeps it."""
     keys = [match.start() for match in _JSON_PHI_KEY.finditer(text)]
     if not keys:
         return False
@@ -2172,15 +2178,6 @@ def _stray_json_closer(text: str) -> bool:
             ws = match.group("ws")
             if armed == 0 and not stack and ws is not None and ("\n" in ws or "\r" in ws):
                 armed = None
-            elif (
-                armed is not None
-                and ws is None
-                and match.group("bare") is None
-                and not (match.group("dq") or match.group("sq"))
-                # The placeholder's own `]` is no closer: a scrubbed cut head ends `"[redacted]`.
-                and any(closer in match.group().replace(_REDACTED, "") for closer in "}])")
-            ):
-                return True
             continue
         if punct in "{[(":
             stack.append("}" if punct == "{" else "]" if punct == "[" else ")")
@@ -3086,32 +3083,59 @@ def safe_exc(
     if engine is None and prints_a_codec_error(exc):  # RuntimeError(exc): the codec error's str()
         return f"{name}: {_HOLDER_TEXT}"
     raw = str(exc) if engine is None else engine
-    if file_name and (base := _basename(file_name)):
+    # A backslash is an ordinary character in a POSIX or SFTP name, so the part after the last `/`
+    # is swapped too, and it is what is left when the name ends in a backslash.
+    tail = file_name.rsplit("/", 1)[-1] if file_name else ""
+    if file_name and (base := _basename(file_name) or tail):
         label = safe_name(file_name)
         # An OSError quotes its path with repr(), so a name holding a control, a non-printable or a
         # quote character appears escaped and the raw name alone matches nothing (BACKLOG #5815).
-        # A backslash is an ordinary character in a POSIX or SFTP name, so the part after the last
-        # `/` is swapped too.
         forms = _name_forms(base)
-        if (tail := file_name.rsplit("/", 1)[-1]) != base:
+        if tail and tail != base:
             forms |= _name_forms(tail)
         raw = _swap_forms(raw, forms, label)
     message = safe_text(raw, limit=limit)
     return f"{name}: {message}" if message else name
 
 
+def _locale_encoding() -> str:
+    """The locale's encoding, as a codec name Python can look up, or UTF-8 with a warning, so a
+    host whose locale names no codec is told its bytes form is not swapped (BACKLOG #5815)."""
+    name = locale.getencoding()
+    try:
+        return codecs.lookup(name).name
+    except LookupError:
+        logging.getLogger(__name__).warning(
+            "the locale encoding %r is not a codec; a file name's bytes in it are not swapped", name
+        )
+        return "utf-8"
+
+
+#: The locale's encoding, read once: on Windows the host's ANSI code page.
+_LOCALE_ENCODING = _locale_encoding()
+
+
 def _swap_forms(raw: str, forms: set[str], label: str) -> str:
     """``raw`` with each of ``forms`` replaced by ``label``, longest first, so a form never shadows
-    a longer one it is a prefix of or overlaps. Each form is first replaced by a run of one
+    a longer one it is a prefix of. Where two occurrences overlap, the longer is swapped and the
+    shorter one's other characters stay. Each form is first replaced by a run of one private-use
     character that neither ``raw`` nor any form holds, and the runs by ``label`` last, so no form
-    can match across a label another form wrote."""
-    code = 0xE000
-    while chr(code) in raw or any(chr(code) in form for form in forms):
-        code += 1
-    marker = chr(code) * 3
-    for form in sorted(forms, key=lambda form: (-len(form), form)):
+    can match across a label another form wrote; where every such character is taken, the forms
+    are swapped for ``label`` directly, as before BACKLOG #5815."""
+    ordered = sorted(forms, key=lambda form: (-len(form), form))
+    used = set(raw).union(*forms)
+    spare = next(
+        (
+            chr(c)
+            for c in chain(range(0xE000, 0xF900), range(0xF0000, 0x10FFFE))
+            if chr(c) not in used
+        ),
+        None,
+    )
+    marker = label if spare is None else spare * 3
+    for form in ordered:
         raw = raw.replace(form, marker)
-    return raw.replace(marker, label)
+    return raw if spare is None else raw.replace(marker, label)
 
 
 def _name_forms(text: str) -> set[str]:
@@ -3144,13 +3168,13 @@ def _name_forms(text: str) -> set[str]:
         os.fsencode,
         lambda s: s.encode("utf-8", "surrogatepass"),
         lambda s: s.encode("utf-8", "surrogateescape"),
-        lambda s: s.encode(locale.getencoding()),
+        lambda s: s.encode(_LOCALE_ENCODING),
         lambda s: s.encode("cp1252"),
     ]
     for encode in encoders:
         try:
             encoded = encode(text)
-        except (UnicodeEncodeError, LookupError):
+        except UnicodeEncodeError:
             continue
         forms.update((repr(encoded)[2:-1], repr(encoded + b'"')[2:-2]))
     # Another renderer may write an escape's hex digits in upper case, as some JSON encoders do.

@@ -6,5 +6,5 @@
   already was, with any trailing bound note kept. Read on the result too, so a text whose flat pass
   consumed an opener after a PHI key now ships as the placeholder where it used to keep its other
   fields. The check still misses at least a closer with no open container, a stray closer of the
-  key's own container's kind, and one inside a string that opened before the key; the docstring of
-  `_stray_json_closer` lists them. (vault `BACKLOG #5814`)
+  key's own container's kind, and one inside a string, whether it opened before the key or in the
+  value; the docstring of `_stray_json_closer` lists them. (vault `BACKLOG #5814`)
