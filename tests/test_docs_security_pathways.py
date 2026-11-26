@@ -1286,12 +1286,14 @@ def test_the_mfa_gate_and_window_prose_points_at_one_statement() -> None:
     text = _flat(raw)
     for stated in (
         "`POST /auth/mfa-verify` has no such must-change ask",
-        "unless the temporary credential has lapsed, which ends the session instead",
+        "unless, at least, the temporary credential has lapsed, which ends the session instead",
         "submits a code to `verify_mfa`, through at least `POST /auth/mfa-verify` or `POST /ui/mfa`",
+        "an account holding a TOTP can do while the second-step lock is not live",
         "`GET /ui/mfa` renders its code form only to a session that owes a second factor it has "
         "not met",
         "or with a user-verified passkey that completes a pending factor, passes the window check",
-        "a user-verified passkey that completes the pending factor, or a step-up",
+        "CORRECTED 2026-11-26 (vault BACKLOG #2964 (review of items 19, 26, 28)): this called it the "
+        "*second* such signal",
     ):
         assert stated in text, f"the doc no longer states: {stated}"
 
@@ -1333,6 +1335,27 @@ def test_the_mfa_gate_and_window_prose_points_at_one_statement() -> None:
                 f"the {label} restates the stamped-window rule ({restated!r}) again; it points at "
                 "the Step-up re-verification paragraph instead (vault BACKLOG #2964 item 28)."
             )
+    assert "An OIDC session's step-up is always the IdP leg (BACKLOG #2142" in ambience, (
+        "the ambience row no longer says an OIDC session's step-up is the IdP leg."
+    )
+    assert "The step-up is the **AD** row's directory re-bind" in kerberos, (
+        "the Kerberos row no longer names its step-up as the AD row's directory re-bind."
+    )
+    assert "the authentication ambience of an SSO/OIDC-minted session" in bullet, (
+        "the honest-limits bullet no longer names the SSO/OIDC-minted ambience signal."
+    )
+
+    # The first-seen-address row and defense-in-depth layer 5 point at the paragraph too, rather
+    # than restate which proofs stamp a window.
+    first_seen = _table_a_row(
+        "First-seen sign-in address — sign-in owes a second factor, or any directory sign-in"
+    )
+    assert f"born without step-up freshness anyway. {pointer}" in first_seen, (
+        "the first-seen sign-in address row no longer points at the paragraph."
+    )
+    assert f"The step-up gate refuses a session that has not. {pointer}" in text, (
+        "defense-in-depth layer 5 no longer points at the paragraph."
+    )
 
     # The count of challenge signals the ambience row and the bullet give is read off Table A.
     table = next(t for t in _tables(_heading_block(_H_TABLE_A)) if t[0][0] == "Attribute")
@@ -1356,6 +1379,15 @@ def test_the_mfa_gate_and_window_prose_points_at_one_statement() -> None:
         "or a user-verified passkey, proved at the MFA gate",
         "the *second* signal in this table",
         "A Kerberos session skips it when its holder",
+        "a user-verified passkey that completes the pending factor, or a step-up",
+        "also stamps the window on its own",
+        "code form for such a session",
+        "can do at any time the second-step lock",
+        "unless the temporary credential has lapsed",
+        "at first naming a user-verified passkey",
+        "always the IdP leg: a code meets its pending factor",
+        "That step-up is the **AD** row's",
+        "ambience of a browser SSO/OIDC-minted",
     ):
         assert retired not in text, (
             f"docs/SECURITY.md says {retired!r} again; vault BACKLOG #2964 retired that wording."
