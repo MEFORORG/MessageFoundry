@@ -7,11 +7,13 @@
 # This job is that run. It builds the -postgres image, mints a throwaway CA with a Postgres server
 # certificate and an API certificate, stages the files at the paths compose.yaml names, owned and
 # moded as its comments say, starts Postgres, schema-provision and the engine pair, and asserts:
-#   * both engines report healthy (the image HEALTHCHECK), and neither has restarted by the end;
+#   * both engines report healthy (the image HEALTHCHECK), and neither has restarted 45 seconds
+#     after the other checks pass, past one leader-lease renewal;
 #   * both answer GET /health over https, verified against the throwaway CA from the host;
-#   * both engines joined the cluster (two fresh rows in `nodes`) and exactly one holds a live
-#     leader lease;
-#   * every store session the engines hold on Postgres is encrypted, and at least one exists.
+#   * both engines joined the cluster (two fresh rows in `nodes`), exactly one of those rows says
+#     it leads, and the live leader lease is owned by a fresh node;
+#   * every store session the two engine containers hold, read once, is encrypted, and each
+#     engine holds at least one.
 #     pg_stat_ssl records encryption only. That the engines verify the server certificate rests on
 #     the shipped MEFOR_STORE_SSL_ROOT_CERT pin and the engine's own refusal; this job does not
 #     measure it.
@@ -117,11 +119,19 @@ jobs:
               environment: *ci-dev-env
           YAML
 
-          # The uids to own the files by, read from the images rather than copied from a comment.
-          pg_image="$(docker compose config --format json | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["postgres"]["image"])')"
-          pg_uid="$(docker run --rm --entrypoint id "$pg_image" -u postgres)"
-          engine_uid="$(docker run --rm --entrypoint id messagefoundry:postgres -u)"
-          echo "postgres image $pg_image runs as uid $pg_uid; the engine image runs as uid $engine_uid"
+          # The images compose will run, and the ids to own the files by, read from compose and
+          # the images rather than copied from a comment. The build step tagged
+          # messagefoundry:postgres; if x-ha-engine-image moves, stop here rather than test a
+          # stale image.
+          images="$(docker compose config --format json | python3 -c 'import json, sys; s = json.load(sys.stdin)["services"]; print(s["postgres"]["image"], s["engine-ha"]["image"], s["engine-standby"]["image"])')"
+          read -r pg_image ha_image standby_image <<< "$images"
+          if [ "$ha_image" != messagefoundry:postgres ] || [ "$standby_image" != messagefoundry:postgres ]; then
+            echo "FAIL: compose runs $ha_image and $standby_image for the pair, but this job built messagefoundry:postgres"
+            exit 1
+          fi
+          pg_ids="$(docker run --rm --entrypoint id "$pg_image" -u postgres):$(docker run --rm --entrypoint id "$pg_image" -g postgres)"
+          engine_ids="$(docker run --rm --entrypoint id messagefoundry:postgres -u):$(docker run --rm --entrypoint id messagefoundry:postgres -g)"
+          echo "postgres image $pg_image runs as $pg_ids; the engine image runs as $engine_ids"
 
           # One CA signs both leaves. The extensions are what Python's VERIFY_X509_STRICT asks of
           # a chain, and the CA carries cRLSign as compose.yaml asks of the store CA.
@@ -172,7 +182,7 @@ jobs:
           chmod 0755 docker/pg-tls
           chmod 0644 docker/pg-tls/server.crt
           chmod 0600 docker/pg-tls/server.key
-          sudo chown -R "$pg_uid:$pg_uid" docker/pg-tls
+          sudo chown -R "$pg_ids" docker/pg-tls
 
           # ./tls: owned by the engine's uid, every file 0600 and the directory 0700 (the default
           # engine's ./tls comment; the ha engines mount the same directory).
@@ -180,7 +190,7 @@ jobs:
           cp "$pki/api.key" docker/tls/api.key
           chmod 0600 docker/tls/api.crt docker/tls/api.key
           chmod 0700 docker/tls
-          sudo chown -R "$engine_uid:$engine_uid" docker/tls
+          sudo chown -R "$engine_ids" docker/tls
 
           # ./config: the docker/smoke graph plus the store CA pin, readable by all and writable by
           # root alone, as the engine requires of a config it executes and of a trust anchor.
@@ -194,10 +204,11 @@ jobs:
 
       - name: Start Postgres, schema-provision and the engine pair
         # `up -d` waits on each depends_on condition: Postgres healthy, then the attestation check
-        # and schema-provision completed successfully, so a refusal there fails this step.
+        # and schema-provision completed successfully, so a refusal there fails this step. Every
+        # image is already local (built, or pulled by the staging step), so nothing is pulled.
         run: |
           set -euo pipefail
-          docker compose up -d postgres schema-provision engine-ha engine-standby
+          docker compose up -d --pull never postgres schema-provision engine-ha engine-standby
           docker compose ps -a
 
       - name: Assert both engines report healthy and answer /health over verified TLS
@@ -237,11 +248,11 @@ jobs:
 
           # From the host, through each engine's published API port, verified against the CA
           # this job minted. Only the API certificate it signed can pass, so the reply comes from
-          # the engine's own TLS listener and not from anything else on the port.
+          # the engine's own TLS listener and not from anything else on the port. /health is a
+          # liveness answer, so a 200 that curl -f accepts is the whole assertion.
           for port in 8444 8445; do
             body="$(curl -fsS --max-time 10 --cacert "$RUNNER_TEMP/ha-pki/ca.crt" "https://localhost:$port/health")"
             echo "port $port: $body"
-            python3 -c 'import json, sys; sys.exit(0 if json.loads(sys.argv[1]).get("status") == "ok" else "FAIL: /health did not say ok")' "$body"
           done
 
       - name: Assert the pair formed a cluster, holds encrypted store sessions, and never restarted
@@ -257,34 +268,53 @@ jobs:
               esac
             done
           }
-          # Both engines heartbeat a `nodes` row and the leader holds the lease, both stamped with
-          # wall-clock seconds; the containers share the host clock.
-          cluster_q="select (select count(*) from nodes where last_seen > extract(epoch from now()) - 60), (select count(*) from leader_lease where owner is not null and lease_expires_at > extract(epoch from now()))"
-          # Sessions from the engine containers, not the health probe on Postgres's own loopback.
-          ssl_q="select count(*) filter (where s.ssl), count(*) filter (where not s.ssl), count(distinct a.client_addr) from pg_stat_activity a join pg_stat_ssl s using (pid) where a.usename = 'mefor' and a.client_addr is not null and a.client_addr <> '127.0.0.1'"
+          # The two engine containers' addresses on the compose network, so the session counts
+          # below are the engines' own and no other client's.
+          addrs=()
+          for svc in engine-ha engine-standby; do
+            ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$(docker compose ps -aq "$svc")")"
+            read -r ip _ <<< "$ip"
+            case "$ip" in
+              '' | *[!0-9.]*) echo "FAIL: could not read $svc's address (read '$ip')"; exit 1 ;;
+            esac
+            addrs+=("'$ip'")
+          done
+          in_list="$(IFS=,; echo "${addrs[*]}")"
+          echo "engine addresses: $in_list"
+          # Both engines heartbeat a `nodes` row, stamped with wall-clock seconds; the containers
+          # share the host clock. One fresh row may say is_leader, and the lease must be live and
+          # owned by one of the fresh nodes, so a lease held by a node that is gone does not count.
+          fresh="last_seen > extract(epoch from now()) - 60"
+          cluster_q="select (select count(*) from nodes where $fresh), (select count(*) from nodes where $fresh and is_leader), (select count(*) from leader_lease where lease_expires_at > extract(epoch from now()) and owner in (select node_id from nodes where $fresh))"
+          ssl_q="select count(*) filter (where s.ssl), count(*) filter (where not s.ssl), count(distinct a.client_addr) from pg_stat_activity a join pg_stat_ssl s using (pid) where a.usename = 'mefor' and a.client_addr in ($in_list)"
           ok=0
           for _ in $(seq 1 12); do
-            nodes='' leaders='' tls='' plain='' clients=''
-            read -r nodes leaders <<< "$(sql "$cluster_q")" || true
+            nodes='' leaders='' leases='' tls='' plain='' clients=''
+            read -r nodes leaders leases <<< "$(sql "$cluster_q")" || true
             read -r tls plain clients <<< "$(sql "$ssl_q")" || true
-            if numeric "$nodes" "$leaders" "$tls" "$plain" "$clients"               && [ "$nodes" -eq 2 ] && [ "$leaders" -eq 1 ] && [ "$tls" -ge 1 ] && [ "$clients" -eq 2 ]; then
+            if numeric "$nodes" "$leaders" "$leases" "$tls" "$plain" "$clients" \
+              && [ "$nodes" -eq 2 ] && [ "$leaders" -eq 1 ] && [ "$leases" -eq 1 ] \
+              && [ "$tls" -ge 1 ] && [ "$clients" -eq 2 ]; then
               ok=1
               break
             fi
             sleep 5
           done
-          echo "cluster: fresh nodes=$nodes live leader leases=$leaders"
-          echo "engine store sessions: encrypted=$tls plaintext=$plain from $clients client addresses"
+          echo "cluster: fresh nodes=$nodes fresh leaders=$leaders live leases owned by a fresh node=$leases"
+          echo "engine store sessions: encrypted=$tls plaintext=$plain from $clients engine addresses"
           if [ "$ok" -ne 1 ]; then
-            echo "FAIL: within 60 seconds the pair did not show two fresh nodes, one live leader lease and encrypted store sessions from both engines"
+            echo "FAIL: within 60 seconds the pair did not show two fresh nodes, one leader holding a live lease, and encrypted store sessions from both engines"
             exit 1
           fi
           if [ "$plain" -ne 0 ]; then
             echo "FAIL: an engine holds a plaintext store session"
             exit 1
           fi
-          # The health wait read the restart count only until both were healthy; read it again
-          # now, after every other assertion, so a later crash and restart cannot pass.
+          # The health wait read the restart count only until both were healthy. Hold the pair
+          # past one lease renewal (leader_lease_ttl is 30 seconds, compose.yaml's
+          # stop_grace_period comment) and read it again, so a crash at the leader's first
+          # renewal, or while it starts the graph, cannot pass. A crash after this window can.
+          sleep 45
           for svc in engine-ha engine-standby; do
             read -r status restarts <<< "$(docker inspect -f '{{.State.Status}} {{.RestartCount}}' "$(docker compose ps -aq "$svc")")" || true
             if ! numeric "$restarts" || [ "$restarts" -ne 0 ] || [ "$status" != running ]; then
@@ -294,10 +324,15 @@ jobs:
           done
           echo "engine-ha and engine-standby are still running with no restart"
 
-      - name: Compose state and logs (on failure)
-        if: failure()
+      - name: Compose state, health probes and logs (on failure or cancel)
+        if: failure() || cancelled()
         run: |
           docker compose ps -a || true
+          # The HEALTHCHECK's own output lives only in docker inspect.
+          for svc in postgres engine-ha engine-standby; do
+            echo "--- $svc health"
+            docker inspect -f '{{json .State.Health}}' "$(docker compose ps -aq "$svc")" || true
+          done
           docker compose logs --no-color --timestamps || true
 
       - name: Tear down
