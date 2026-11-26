@@ -44,9 +44,8 @@ output, which the registered line delivers to Codex as 1: on any event but
 SessionStart, a hook that exits non-zero other than 2 or times out, unless
 another hook of the event exited 2, or a deny, an ask, a block or a
 `"continue": false` from another hook still stands once the event's hooks end
-(a PermissionRequest `decision` deny does not once a later hook sets
-`decision` to a value that is not a deny, an allow among them, since the last
-one set replaces it; a `permissionDecision` deny does still stand); and, on
+(a PermissionRequest `decision` deny that a later `decision` replaced, as
+above, does not); and, on
 any event, unreadable settings, a bad payload or a missing `.venv`. Outside
 SessionStart, a hook that exits non-zero other than 2, times out or prints JSON
 that is not an object does not stop the event's later hooks. They still run

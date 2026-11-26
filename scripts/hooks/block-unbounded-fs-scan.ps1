@@ -21,9 +21,9 @@
 # joining a backslash-newline (`E\` then `OF`), or sit in a later heredoc the views open after
 # ending a body early, at a raw delimiter bash joins to the line before it (`x\` then `EOF`) or at
 # a padded copy (` EOF`), since the views compare after .Trim(). It can also sit in a heredoc the
-# views open inside a body they never saw. In a command with no quote, at least, Hide-HeredocBodies
-# reads only the first opener on a line, and only one at the line's start or after whitespace, so
-# a second opener on a line (`cat <<A <<B`) and a glued one (`cat<<EOF`) leave their bodies
+# views open inside a body they never saw. Hide-HeredocBodies reads only the first opener on a
+# line that sits at the line's start or after whitespace, so in a command with no quote, at least,
+# a second opener on a line (`cat <<A <<B`) and a glued one (`cat<<EOF`) can leave their bodies
 # visible. The heredoc pass reads a `$(...)` or backtick substitution there only where one of its
 # readings puts the line in a body whose delimiter is unquoted, so at least these are missed: a
 # walk outside a substitution, as in `cat <<EOF\nx\\\nEOF\ncat <<B\nEOF\nfind /proc\nB` and
@@ -63,10 +63,10 @@ function Deny {
 # in program position. The opener is found on the quote-masked text and its delimiter read from the
 # raw text, at the same offset. Raw-only let `grep "x << y"` open a heredoc that never ends, and
 # blank the real walk after it; masked-only loses `<<'EOF'`. `<<<` opens nothing, and the delimiter
-# must start with a letter or underscore, so `$((1<<2))` opens nothing either. Only the first opener
-# on a line is read, and only one at the line's start or after whitespace. A missed opener, such as
-# `cat<<EOF` or the second in `cat <<A <<B`, leaves its body visible, which can add a false deny,
-# and an opener in that body can then blank lines bash runs, a miss the header names.
+# must start with a letter or underscore when bare, so `$((1<<2))` opens nothing either. Only the
+# first opener on a line that sits at its start or after whitespace is read. A missed opener, such
+# as `cat<<EOF` or the second in `cat <<A <<B`, leaves its body visible, which can add a false
+# deny, and an opener in that body can then blank lines bash runs, a miss the header names.
 # DEBT: this and Hide-QuotedSpans are second copies of block-blanket-git-stage.ps1's helpers, and
 # have already diverged in error posture. Extracting them needs a library entry in the unwired list
 # of tests/test_claude_settings_contract.py, which globs every scripts/hooks/*.ps1.
@@ -119,8 +119,9 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # .Trim(), as the views end it, so the lines after that raw `EOF`, or after a padded ` EOF`, are
 # read as the views read them, and a later opener there can be read. A quoted delimiter's body it
 # ends as the first reading does, where bash ends it for a delimiter it captures whole, so it
-# opens no heredoc the views open in that body. Both readings also read every opener on a line, as
-# bash does, and so open no heredoc the views open inside the body of an opener they miss. Each of
+# opens no heredoc the views open in that body. Both readings also read at least some openers the
+# views miss, such as the second on a line, as bash does, and so open no heredoc the views open
+# inside that opener's body. Each of
 # these leaves a known gap, which the header lists with an example. The second reading can open a
 # heredoc bash never opens, and read lines bash runs as commands as its body, so it adds false
 # denies main did not have, such as

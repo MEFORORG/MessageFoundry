@@ -636,8 +636,8 @@ def test_a_deny_stands_over_another_hooks_fault(bridge, tmp_path, order):
     # The deny is merged before the fault in one order and after it in the other, so the message
     # names neither order.
     assert (
-        "a hook or its settings failed; the decision merged from the hooks' output stands"
-        in result["systemMessage"]
+        "a hook or its settings failed, and it is not raised because the merged output holds a"
+        " deny, an ask, a block or continue false. Fault: " in result["systemMessage"]
     )
 
 

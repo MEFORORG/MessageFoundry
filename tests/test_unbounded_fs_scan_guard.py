@@ -1144,7 +1144,8 @@ def test_the_heredoc_pass_adds_no_deny_for_data(command: str) -> None:
 
 # KNOWN GAPS, PINNED AS THEY ARE: bash runs the walk in each of these, and the guard allows it. The
 # guard's header names each shape. A fix that starts denying one fails this test on purpose: move
-# the row to a deny corpus then, and drop the shape from the header.
+# the row to a deny corpus then, move both counts in EXPECTED_ROW_COUNTS, and drop the shape from
+# the header.
 HEREDOC_KNOWN_GAP_ALLOW = [
     pytest.param(
         "cat <<'EOF'\n EOF\ncat <<B\nEOF\n$(find /proc)\nB",
