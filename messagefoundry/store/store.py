@@ -9210,9 +9210,10 @@ def forget_store_salt(path: Path) -> bool:
     # The ordinary-table predicate, so a virtual `store_salt` another tool left, whose module may
     # not be loaded here, is not probed and cannot raise "no such module" (BACKLOG #6719 item 4).
     # lower(), as schema_verify's salt read matches it: SQLite resolves the name case-blind, so a
-    # `Store_Salt` table is the one the next open reads. One helper serves the drop and its proof, so
-    # the two cannot read different tables; the statement is spelled at the call rather than held in a
-    # local so tests/test_writer_txn_is_the_only_begin.py can read it.
+    # `Store_Salt` table is the one the next open reads. One helper holds the table-exists check that
+    # the drop and its proof both make, so those two checks cannot drift apart; it also means the proof
+    # cannot catch a table that check misses. The statement is spelled at the call rather than held in
+    # a local so tests/test_writer_txn_is_the_only_begin.py can read it.
 
     def has_salt_table(conn: sqlite3.Connection) -> bool:
         return bool(
