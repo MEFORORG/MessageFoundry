@@ -10458,20 +10458,22 @@ class AuthService:
                 bool(written)
                 and len(self._reconcile_unreached_paged) + len(written) > _UNREACHED_ROLLUP_ABOVE
             )
-            key = _unreached_rollup_key(uid for uid, _n, _p in written) if rollup else None
-            if key is not None:
-                # The key is the one the rollup's alert source carries, so the operator can tell
-                # which pass's rows an open rollup instance covers (BACKLOG #3100 item 14).
+            if rollup:
                 _log.warning(
                     "directory reconcile: %d accounts entered the unreachable state, so "
                     "their sessions are not revoked while this lasts; an "
-                    "auth.ad_reconcile_unreached row names each, and their alert's source ends %s",
+                    "auth.ad_reconcile_unreached row names each",
                     len(written),
-                    key,
                 )
             else:
                 for _user_id, username, probes in written:
                     warn(username, probes)
+        key = _unreached_rollup_key(uid for uid, _n, _p in written) if rollup else None
+        if key is not None:
+            # So an operator can match an open rollup instance to this pass's rows by its key
+            # (BACKLOG #3100 item 14). Outside the finally, so a raise out of a row write logs no
+            # key; a raise later in the pass can still leave the key with no page.
+            _log.info("directory reconcile: those %d accounts roll up as %s", len(written), key)
         return replace(plan, unreached=tuple(written), unreached_rollup=key)
 
     def _latch_unreached_accounts(self, plan: reconcile.ReconcilePlan) -> None:

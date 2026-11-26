@@ -6526,8 +6526,7 @@ type alone matches at least the breaker, the referral, the probe fault, the conf
 each paging refusal, the lasting outage and each account the directory keeps failing to answer for
 (`directory-reconciler-unreached:<username>`, reason `account_unreachable`,
 audited as `auth.ad_reconcile_unreached`, vault BACKLOG #3100; on a rolled-up pass, those entering
-page once, under `directory-reconciler-unreached-rollup:<key>`, keyed by those accounts, so
-suspending one rollup does not mute a later rollup of other accounts; the `ad_reconcile_outage_passes`
+page once, under `directory-reconciler-unreached-rollup:<key>`, keyed by those accounts; the `ad_reconcile_outage_passes`
 row of [CONFIGURATION.md](CONFIGURATION.md) states when),
 and so does a source glob such as `directory-reconciler*`, which also matches the hold's
 `ad_reconcile_held`. To mute only the referral, a rule names its source exactly. The alert's text

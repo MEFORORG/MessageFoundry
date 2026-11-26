@@ -12826,7 +12826,7 @@ _UNREACHED_ALERT_TEXT: Final[str] = (
 #: that account, so each rollup is resolved or suspended on its own; the outage page covers a whole
 #: directory. A later rollup of a different set pages, even one holding accounts paged before, such
 #: as those of several rollups re-entering together after a restart, as a per-account page does
-#: after one. The rollup WARNING logs the key. Not under ``directory-reconciler-unreached:``, where
+#: after one. An INFO line logs the key with the pass's count. Not under ``directory-reconciler-unreached:``, where
 #: a username could spell the label.
 _UNREACHED_ROLLUP_SOURCE = "directory-reconciler-unreached-rollup"
 #: What one page for many such accounts says, on a pass that rolls them up
@@ -12834,9 +12834,10 @@ _UNREACHED_ROLLUP_SOURCE = "directory-reconciler-unreached-rollup"
 #: instance per set of accounts entering together rather than one per account. It counts only
 #: the accounts entering on its pass, and says so: no process can say how many stand, since each
 #: counts its own, and a later rollup of the same accounts updates the same open instance's text
-#: (BACKLOG #3709). ``probes`` is the fewest failures among those entering, of up to each one's last ``window`` probes (its
-#: window can hold fewer, and a probe fault adds nothing to it, hence "faults aside"), counted in
-#: probes, not passes, which differ under a probe budget smaller than the estate.
+#: (BACKLOG #3709). ``probes`` is the fewest failures among those entering, of up to each one's
+#: last ``window`` probes (its window can hold fewer, and a probe fault adds nothing to it, hence
+#: "faults aside"), counted in probes, not passes, which differ under a probe budget smaller than
+#: the estate.
 _UNREACHED_ROLLUP_TEXT: Final[str] = (
     "Accounts newly unreachable: {entering}. Their sessions are not revoked; each failed {probes}+ "
     "of up to its last {window} probes, faults aside. Check the directory. "

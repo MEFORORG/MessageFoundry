@@ -2970,8 +2970,12 @@ async def test_a_flapping_directory_pages_once_for_many_unreached_accounts() -> 
             plan = await _pass(service, sink)
         assert plan.unreached_rollup and len(plan.unreached) == 7
         assert _unreached_events(sink) == []
-        [(kind, _source, payload)] = _rollup_events(sink)
+        [(kind, source, payload)] = _rollup_events(sink)
         assert kind == "ad_reconcile_aborted"
+        ids = [await uac._id(store, n) for n in names[1:]]
+        assert source == f"{_UNREACHED_ROLLUP_SOURCE}:{plan.unreached_rollup}"
+        assert plan.unreached_rollup == service_module._unreached_rollup_key(reversed(ids))
+        assert "flap" not in source  # keyed by user id, never by name
         assert payload["reason"] == reconcile.UNREACHED_ACCOUNT and payload["probed"] == 8
         assert payload["detail"].startswith("Accounts newly unreachable: 7.")
         assert len(payload["detail"]) <= 200 and "flap" not in payload["detail"]
