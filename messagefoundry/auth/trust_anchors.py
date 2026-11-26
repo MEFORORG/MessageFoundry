@@ -346,6 +346,7 @@ import hashlib
 import json
 import logging
 import os
+import posixpath
 import re
 import shlex
 import ssl
@@ -360,6 +361,7 @@ from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol, runtime_chec
 
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
 from messagefoundry.auth.anchor_path import (
+    FILE,
     LINK,
     ChainFinding,
     PathVerdict,
@@ -1705,25 +1707,31 @@ def _pin_offer(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
 
 
 def _past_the_mount(spec: AnchorSpec, verdict: AnchorVerdict, mount: str) -> str:
-    """Where :func:`_mount_over_folder` found ``mount``: no folder below it, then the pin
-    (:func:`_pin_offer`), only for an anchor whose consumer loads the verified bytes. Only ``/``,
-    which an unread mount table also names, leaves no folder to move to."""
+    """Where :func:`_mount_over_folder` found ``mount``: no folder below it, then
+    :func:`_mount_tail`. Only ``/``, which an unread mount table also names, leaves no folder to
+    move to."""
     head = f"The check cannot vouch for the mount at {mount!r}, so no location below it passes"
     if mount == "/":
-        head, pin = f"{head}, and moving the anchor does not help.", "What is left is a pin"
+        head = f"{head}, and moving the anchor does not help."
     else:
         head = (
             f"{head}. Move the anchor to a folder on a file system the check trusts, outside that "
             "mount."
         )
-        pin = "Or use a pin"
+    return f"{head} {_mount_tail(spec, verdict, mount)}"
+
+
+def _mount_tail(spec: AnchorSpec, verdict: AnchorVerdict, mount: str) -> str:
+    """What is left below ``mount``: the pin (:func:`_pin_offer`), only for an anchor whose consumer
+    loads the verified bytes, and otherwise what enforce and warn do."""
     if spec.loads_verified_bytes:
+        pin = "What is left is a pin" if mount == "/" else "Or use a pin"
         return (
-            f"{head} {pin}: {_pin_offer(spec, verdict)} Where that mount is an overlay '/' in a "
+            f"{pin}: {_pin_offer(spec, verdict)} Where that mount is an overlay '/' in a "
             f"container, {_OVERLAY_NOTE}, says more."
         )
     return (
-        f"{head} {_NO_PIN}, so at enforce this check refuses it anywhere below that mount, and at "
+        f"{_NO_PIN}, so at enforce this check refuses it anywhere below that mount, and at "
         f"warn it is used anyway. Where that mount is an overlay '/' in a container, "
         f"{_OVERLAY_NOTE}, names the follow-up that would change this."
     )
@@ -1775,19 +1783,43 @@ def _path_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> list[str]:
     #
     # Always -h: on a link it re-owns the link and not its target, and on anything else it acts
     # the same. The owner the finding names can swap its entry for a link before root runs this.
+    #
+    # Under a mount the check cannot vouch for, a fix in place does not make the anchor pass, so
+    # only the anchor's own file gets its commands, and its own folder the chmod alone: never a
+    # chown of a folder, which may be a user's home folder, nor a command on a folder above them.
+    mounts = [f.path for f in _findings(verdict, insecure=False) if f.mount]
+    own = {f.path for f in bad if f.kind == FILE}
+    if spec.path.startswith("/"):
+        own.add(posixpath.normpath(spec.path))
+    own_folders = {posixpath.dirname(p) for p in own}
     cmds: list[str] = []
     for obj in objects:
         q = shlex.quote(obj)
         here = [f for f in bad if f.path == obj]
-        if any(f.owner for f in here):
+        if any(f.owner for f in here) and (not mounts or obj in own):
             cmds.append(f"  chown -h root {q}")
-        if any(f.writable for f in here):
+        if any(f.writable for f in here) and (not mounts or obj in own | own_folders):
             cmds.append(f"  chmod go-w {q}")
-    mount = _mount_over_folder(verdict)
-    if mount is not None:
-        tail = "Once the path is fixed, the check still cannot settle the anchor. "
-        tail += _past_the_mount(spec, verdict, mount)
-        return (["Fix it in place:", *cmds] if cmds else []) + [tail]
+    if mounts:
+        mount = mounts[0]  # the walk runs from '/' down, so an untrusted '/' comes first
+        if mount == "/":
+            lead = (
+                "Fix: the check cannot vouch for the mount at '/', so no location below it passes, "
+                "but moving the anchor into a folder that only root can change, as only root can "
+                "change every folder above it, clears the finding above."
+            )
+            after = "Even so, the check still cannot settle the anchor."
+        else:
+            lead = (
+                "Fix: move the anchor into a root-owned 755 folder on a file system the check "
+                f"trusts, such as ext4 or xfs, outside the mount at {mount!r}, which the check "
+                "cannot vouch for."
+            )
+            after = "Fixed in place, the check still cannot settle the anchor."
+        lines = (
+            [lead + " Or fix the anchor's own file or folder in place:", *cmds] if cmds else [lead]
+        )
+        return [*lines, f"{after} {_mount_tail(spec, verdict, mount)}"]
     lead = (
         move + f"can change, such as a root-owned 755 folder like {_POSIX_FOLDER} on a file system "
         "the check trusts."
@@ -1835,7 +1867,8 @@ def _indeterminate_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
     substituted (:func:`_pin_offer`)."""
     check = verdict.path_check
     windows = check.platform == "windows" if check is not None else os.name == "nt"
-    mount = _mount_over_folder(verdict)
+    # Only where the message lists the path's findings, so it names no mount it never did.
+    mount = _mount_over_folder(verdict) if verdict.path_ok is None else None
     if mount is not None:
         return _past_the_mount(spec, verdict, mount)
     folder = (

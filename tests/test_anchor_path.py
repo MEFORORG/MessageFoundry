@@ -853,6 +853,25 @@ _MOUNT_TABLE = {
 }
 
 
+_FINGERPRINT = "ab" * 32
+
+
+def _path_text(
+    verdict: ap.PathVerdict,
+    anchor: str,
+    *,
+    pin_setting: str | None = None,
+    loads_verified_bytes: bool = True,
+) -> str:
+    """The insecure-path message for a POSIX anchor path, so the fix can tell the anchor's own file
+    and folder from a folder above them. ``_refusal`` reads a real file, whose path is this host's."""
+    spec = AnchorSpec(
+        "t", "[x]", anchor, None, pin_setting, loads_verified_bytes=loads_verified_bytes
+    )
+    found = ta.AnchorVerdict(_FINGERPRINT, True, None, verdict.ok, verdict)
+    return ta._path_message(spec, found)
+
+
 def _no_mountinfo(anchor: str) -> ap.PathVerdict:
     """The host reader with no mount table: it answers no type for any path."""
     return posix_path_verdict(
@@ -914,17 +933,18 @@ def test_an_insecure_path_under_such_a_mount_is_not_told_to_move(
     table = {**_MOUNT_TABLE, "/srv": (0, D777)}
     v = _posix("/srv/a.pem", table, fstype={"/": "overlay"})
     assert v.ok is False
-    text = _refusal(tmp_path, monkeypatch, v, pin_setting="[x].pin")
+    text = _path_text(v, "/srv/a.pem", pin_setting="[x].pin")
+    # /srv is the anchor's own folder, so dropping its write bits is the anchor's own fix.
     assert "  chmod go-w /srv" in text and _FOLDER not in text
     assert "the mount at '/'" in text
     order = [text.index(s) for s in (_MOUNT_NOTE, "set [x].pin to", "docker/README.md")]
     assert order == sorted(order), text
     # The path was found replaceable, so the fix quotes no digest of these bytes.
-    assert hashlib.sha256(_pem(tmp_path).read_bytes()).hexdigest() not in text
+    assert _FINGERPRINT not in text
     # A finding no command fixes leaves no in-place heading with nothing under it.
     odd = ap.ChainFinding("/srv/a.pem", FILE, True, "it is not a regular file")
     root = ap.ChainFinding("/", DIRECTORY, False, "it is a overlay mount", mount=True)
-    text = _refusal(tmp_path, monkeypatch, ap.PathVerdict(False, (odd, root), "posix", "uid 7"))
+    text = _path_text(ap.PathVerdict(False, (odd, root), "posix", "uid 7"), "/srv/a.pem")
     assert "in place" not in text and _MOUNT_NOTE in text and _FOLDER not in text
 
 
@@ -962,7 +982,7 @@ def test_a_by_path_anchor_with_an_insecure_path_under_an_overlay_root(
     nothing else clears it."""
     table = {**_MOUNT_TABLE, "/srv": (0, D777)}
     v = _posix("/srv/a.pem", table, fstype={"/": "overlay"})
-    text = _refusal(tmp_path, monkeypatch, v, pin_setting="[x].pin", loads_verified_bytes=False)
+    text = _path_text(v, "/srv/a.pem", pin_setting="[x].pin", loads_verified_bytes=False)
     assert "  chmod go-w /srv" in text and _FOLDER not in text and "set [x].pin to" not in text
     steps = (_MOUNT_NOTE, "A pin does not help here", "at enforce this check refuses it")
     order = [text.index(s) for s in (*steps, "docker/README.md")]
@@ -984,6 +1004,67 @@ def test_no_warning_quotes_the_digest_of_a_replaceable_file(
     acl = [r.message for r in caplog.records if "could not settle" in r.message]
     digest = hashlib.sha256(p.read_bytes()).hexdigest()
     assert len(acl) == 1 and digest not in caplog.text and "set [x].pin to" in acl[0], acl
+    # The ACL warning lists no path finding, so it names no mount either. Red under the over-folder
+    # text, which named '/'.
+    assert "the mount at" not in acl[0] and _MOUNT_NOTE not in acl[0], acl
+
+
+# A folder another account owns, standing in for a user's home folder.
+_USERS = {
+    "/data": (0, D755),
+    "/data/team": (1000, D755),
+    "/data/team/ca.pem": (0, F644),
+    "/data/team/pki": (0, D755),
+    "/data/team/pki/ca.pem": (0, F644),
+    "/srv/x": (0, D755),
+    "/srv/x/a.pem": (1000, F644),
+}
+
+
+@pytest.mark.parametrize(
+    ("anchor", "fstype", "table"),
+    [
+        ("/data/team/ca.pem", {"/": "overlay"}, {}),
+        ("/data/team/pki/ca.pem", {"/": "overlay"}, {}),
+        ("/data/team/pki/ca.pem", None, {}),
+        ("/data/team/pki/ca.pem", {"/data": "nfs"}, {}),
+        ("/srv/x/a.pem", {"/srv": "nfs"}, {"/srv": (1000, D755)}),
+    ],
+    ids=["overlay-own-folder", "overlay-ancestor", "no-mountinfo", "nfs-data", "nfs-srv"],
+)
+def test_no_fix_under_an_untrusted_mount_chowns_a_folder(
+    anchor: str,
+    fstype: dict[str, str] | None,
+    table: dict[str, tuple[int, int]],
+) -> None:
+    """Under a mount the check cannot vouch for, fixing the path in place does not make it pass,
+    so the fix never hands a folder such as a user's home to root. Under '/' it says moving the
+    anchor into a folder only root can change clears the finding; under another mount, it says to
+    move it onto a file system the check trusts, outside that mount. A command for the anchor's
+    own file stays. Red under the chown of /data/team (or /srv) the fix offered."""
+    full = {**_MOUNT_TABLE, **_USERS, **table}
+    if fstype is None:
+        v = posix_path_verdict(
+            anchor,
+            cwd="/",
+            euid=10001,
+            lstat_fn=lambda q: PosixStat(*{**_ETC, **full}[q]),
+            readlink_fn=lambda q: "",
+            fstype_fn=lambda q: None,
+        )
+    else:
+        v = _posix(anchor, full, fstype=fstype)
+    assert v.ok is False
+    text = _path_text(v, anchor, pin_setting="[x].pin")
+    folders = [line for line in text.splitlines() if "chown" in line and "a.pem" not in line]
+    assert not folders, text
+    mount = next(f.path for f in v.findings if f.mount)
+    if mount == "/":
+        assert "clears the finding above" in text and _MOUNT_NOTE in text, text
+    else:
+        assert f"outside the mount at {mount!r}" in text and "such as ext4" in text, text
+    if anchor == "/srv/x/a.pem":
+        assert "  chown -h root /srv/x/a.pem" in text, text  # the anchor's own file
 
 
 def test_a_matching_pin_is_not_offered_again(
