@@ -208,13 +208,14 @@ PreToolUse hook that waits on it would stall every tool call in every session on
 One shared resolver does the probe: a TCP connect to port 445 with a 1.5 s timeout, then the file
 call. It caches a "down" verdict for 60 s in `<LOCAL>/coord-root-down.json`, keyed by the server
 and read by both the PowerShell and the Python resolver, so a dead share costs one timeout per
-minute per clone, not one per hook process. Both resolvers, and `coord-migrate.ps1` for its
-`-Source` and `-Target`,
-rewrite a device-path root (`\\?\X:\p`, `\\?\UNC\srv\share\p`, and their `\\.\` forms) to its
-plain spelling, except where the rewrite would name another directory or skip the probe;
-`ConvertTo-CoordPlainRoot` in `scripts/coord/coord-root.ps1` lists at least those cases. A device
-form left as it is names `?` or `.` as its server and fails fast. Not every reader goes through the
-rewrite: `worktree_gate.ps1` reads the configured spelling itself.
+minute per clone, not one per hook process.
+
+A device-path root is refused. Any spelling that starts `\\?\` or `\\.\`, with either separator,
+such as `\\?\X:\p` or `\\?\UNC\srv\share\p`, is refused in `MEFOR_COORD_ROOT`, in `root.toml`,
+and in `coord-migrate.ps1`'s `-Source` and `-Target`, before any probe, file call or down-cache
+write. Use the plain spelling instead: `X:\p` or `\\srv\share\p`. `Get-CoordDeviceRootRefusal` in
+`scripts/coord/coord-root.ps1` says why. `worktree_gate.ps1` reads the configured spelling itself,
+without the resolver.
 
 ## Atomicity over SMB
 
