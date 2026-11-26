@@ -4611,12 +4611,13 @@ passkey is then refused with, audited `auth.webauthn_failed`, include at least
 its seal, `reason=session_lost` when the session or the account went with it, and `reason=locked`;
 an MFA reset gives `reason=session_lost` once its revocation has landed, and
 `reason=factor_removed` before. In the passkey set read after the write, on any sign-count answer,
-an exception the read refuses leaves the factor unmarked and gives a refusal, after a row naming
-`reason=store_error` is tried. Every other exception raises out of the ceremony with the factor
-unmarked, and for at least some of them a row naming `reason=read_raised` is tried first. Either
-row can be missing, and at least some faults in the `store_error` row's own write raise in place
-of the refusal (BACKLOG #3775). Which classes it refuses, which raises try the `read_raised` row,
-and when a row is missing or a write raises, are in [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md), amendment
+an exception of a class the read's catch refuses is refused as `store_error` with the factor
+unmarked, after a row naming `reason=store_error` is tried; at least some faults in that row's own
+write raise in place of the refusal. Every other exception raises out of the ceremony with the
+factor unmarked, and for at least some of them a row naming `reason=read_raised` is tried first;
+at least some faults in that row's own write raise in place of the read's exception. Either row can
+be missing (BACKLOG #3775). Which classes the read's catch refuses, which raises try the
+`read_raised` row, and when a row is missing or its write raises, are in [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md), amendment
 of 2026-10-17.
 Assertion failures are audited but deliberately do **not** feed the
 account lockout (signatures aren't guessable secrets). Unless a setting turns it off or loosens it (at least
