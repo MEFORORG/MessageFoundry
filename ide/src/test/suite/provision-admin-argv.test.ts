@@ -73,4 +73,22 @@ suite("provision-admin and its probe open the service TOML the guard judged (BAC
     // Control: the unmutated argv passes the same pin.
     pin(good, PROVISION_ARGV);
   });
+
+  test("negative control: the two probe pins refuse an element before provision-admin, one appended, and --json missing", () => {
+    for (const [good, expected] of [
+      [buildAdminProbeInvocation(probeOpts as never).args, PROBE_ARGV],
+      [buildAdminProbeInvocation({ python: "p" }).args, PROBE_DEFAULT_ARGV],
+    ] as const) {
+      const before = [...good.slice(0, 5), "--db=other.db", ...good.slice(5)];
+      const after = [...good, "--db=other.db"];
+      const dropped = good.filter((a) => a !== "--json");
+      for (const bad of [before, after, dropped]) {
+        assert.throws(() => pin(bad, expected), assert.AssertionError, bad.join(" "));
+      }
+      // Control: the unmutated argv passes the same pin.
+      pin(good, expected);
+    }
+    // The default probe is not the one with serviceConfig set, so the two pins are not one pin twice.
+    assert.throws(() => pin(PROBE_DEFAULT_ARGV, PROBE_ARGV), assert.AssertionError);
+  });
 });

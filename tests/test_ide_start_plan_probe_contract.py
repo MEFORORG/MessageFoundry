@@ -25,6 +25,7 @@ import re
 import sys
 import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -36,22 +37,28 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import make_cipher
 from messagefoundry.store.store import MessageStore
 from scripts.security.js_lexer import blank_js_comments
+from tests.test_ide_provision_admin_argv import FIXTURE as ARGV_FIXTURE
+from tests.test_ide_provision_admin_argv import _cli_args
 from tests.test_provision_first_administrator import _PASSWORD, _key_in_this_shell, _tty
 
 _MODEL = Path(__file__).resolve().parents[1] / "ide" / "src" / "engineControlModel.ts"
-# The probe argv ``buildAdminProbeInvocation`` builds, held as data: the mocha suite
-# ide/src/test/suite/provision-admin-argv.test.ts pins the builder's whole output against
-# ``probeDefault``, and this file runs that same list, so the two sides cannot pin different argv.
-_ARGV_FIXTURE = _MODEL.parent / "test" / "fixtures" / "provision-admin-argv.json"
-# The IDE runs `python -P -X disable-remote-debug -m messagefoundry <command> ...`.
-_PREFIX = ["-P", "-X", "disable-remote-debug", "-m", "messagefoundry"]
+_WIZARD = _MODEL.with_name("connectionWizardModel.ts")
+
+
+def _code_view(text: str) -> str:
+    """TypeScript with its comments blanked and its whitespace collapsed, for the source pins."""
+    return " ".join(blank_js_comments(text).split())
+
+
+# A declaration of ``name`` in the code view: a function, const, let or var of that name.
+_DECLARES = r"\b(?:function|const|let|var)\s+{name}\b"
 
 
 def _ts_string_const(name: str, text: str | None = None) -> str:
     """The value of ``export const <name> = "...";`` in the IDE's control model (or ``text``), with
     comments blanked so a comment quoting the constant cannot supply it. Whitespace is NOT
-    collapsed: the value is read byte for byte, so a doubled space or a tab inside the literal
-    changes it."""
+    collapsed here, unlike ``_code_view``: the value is read byte for byte, so a doubled space or a
+    tab inside the literal changes it."""
     raw = _MODEL.read_text(encoding="utf-8") if text is None else text
     code = blank_js_comments(raw)
     m = re.search(rf'export const {name} = "([^"]+)";', code)
@@ -64,42 +71,101 @@ def _no_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
 
 
-def _fixture() -> dict[str, list[str]]:
-    data: dict[str, list[str]] = json.loads(_ARGV_FIXTURE.read_text(encoding="utf-8"))
-    return data
-
-
-def _probe_argv() -> list[str]:
-    """The fixture's ``probeDefault``, the argv ``buildAdminProbeInvocation`` builds with
-    ``messagefoundry.serviceConfig`` at its default, after ``python -m messagefoundry``."""
-    argv = _fixture()["probeDefault"]
-    assert argv[: len(_PREFIX)] == _PREFIX, argv
-    return argv[len(_PREFIX) :]
-
-
-def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
-    """The argv the tests below run is the fixture the mocha suite pins ``buildAdminProbeInvocation``
-    against, so a change to the IDE's default probe argv reds one side or the other.
-
-    The mocha pin compares the builder's whole output, element for element, with ``probeDefault``.
-    Here the fixture's account must be the one ``engineControlModel.ts`` declares, read byte for
-    byte, and the fixture must carry no ``--db`` and no ``--service-config``, the default the
-    tests below describe.
-    """
-    assert _probe_argv() == [
+def _expected_probe_argv() -> list[str]:
+    """The probe argv the source pin below reads out of the TypeScript, after ``python -m messagefoundry``."""
+    return [
         "provision-admin",
         f"--username={_ts_string_const('PROBE_USERNAME')}",
         f"--email={_ts_string_const('PROBE_EMAIL')}",
         "--json",
     ]
-    # Control: the fixture's probe with serviceConfig set is this argv with only the flag added,
-    # before --json, so the two entries cannot drift apart either.
-    fixture = _fixture()
-    with_flag = fixture["probe"]
-    flag = [a for a in with_flag if a.startswith("--service-config=")]
-    assert len(flag) == 1
-    assert [a for a in with_flag if a not in flag] == fixture["probeDefault"]
-    assert with_flag[-2:] == [*flag, "--json"]
+
+
+def _default_probe(fixture: dict[str, Any]) -> list[str]:
+    """``probeDefault`` from the shared argv fixture, after ``python -m messagefoundry``.
+
+    The mocha suite ``ide/src/test/suite/provision-admin-argv.test.ts`` pins
+    ``buildAdminProbeInvocation``'s whole default output against the same entry, so this file
+    runs the list that suite pins rather than a second spelling of it.
+    """
+    argv: list[str] = list(_cli_args(fixture["probeDefault"]))
+    return argv
+
+
+def _probe_argv() -> list[str]:
+    """The argv ``buildAdminProbeInvocation`` builds with ``messagefoundry.serviceConfig`` at its default."""
+    return _default_probe(ARGV_FIXTURE)
+
+
+def test_the_shared_fixture_default_probe_is_the_argv_the_source_pin_reads() -> None:
+    """The fixture's ``probeDefault`` is the argv the TypeScript pin below describes, so the mocha
+    pin (builder against fixture) and this file's pin (source, then fixture) cannot disagree."""
+    assert _probe_argv() == _expected_probe_argv()
+    # Negative control: a fixture whose default probe gained a store override, or lost --json,
+    # does not read as the expected argv.
+    for bad in (
+        [*ARGV_FIXTURE["probeDefault"][:-1], "--db=x.db", "--json"],
+        ARGV_FIXTURE["probeDefault"][:-1],
+    ):
+        assert _default_probe({"probeDefault": bad}) != _expected_probe_argv(), bad
+
+
+def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
+    """If the TypeScript stops building this argv, the tests below that run the probe stop describing the IDE.
+
+    The probe forwards the ``serviceConfig`` it is handed, which the mocha suite pins as undefined
+    with ``messagefoundry.serviceConfig`` at its default; this file's probe runs there, where
+    ``serviceConfigFlag`` (an alias of ``connectionWizardModel.ts``'s ``serviceConfigArgs``) is
+    handed undefined and adds nothing. Comments are blanked first in both files, so a comment
+    quoting the code cannot satisfy a pin (a string literal still could), and the pin ends at the
+    array's close, so an element added after the flag reds it. The array is handed to ``cliArgv``
+    (BACKLOG #5409), so its body is pinned too: the interpreter options, then ``-m messagefoundry``,
+    then this array, and nothing after it.
+    """
+    raw = _MODEL.read_text(encoding="utf-8")
+    src = _code_view(raw)
+    # Control: the JSDoc right above the pinned array is in the file and is blanked from the code.
+    assert "Each value is bound with" in raw
+    assert "Each value is bound with" not in src
+    assert re.search(
+        re.escape(
+            'const args = cliArgv("messagefoundry", [ "provision-admin", '
+            "`--username=${opts.username}`, `--email=${opts.email.trim()}`, "
+            "...serviceConfigFlag(opts.serviceConfig)"
+        )
+        + r",? \]\);",
+        src,
+    )
+    assert (
+        "function cliArgv(module: string, args: readonly string[]): string[] { "
+        'return [...INTERPRETER_OPTIONS, "-m", module, ...args]; }' in src
+    )
+    assert len(re.findall(_DECLARES.format(name="cliArgv"), src)) == 1, "a second cliArgv"
+    # serviceConfigFlag is an alias of connectionWizardModel's serviceConfigArgs, so follow it there:
+    # the alias and its import here, and the body there, where undefined (this probe) adds nothing.
+    # serviceConfigArgs appears only in the import, unrenamed in either direction, and the alias;
+    # serviceConfigFlag is declared once, by the alias, and is otherwise only called. These catch at
+    # least a const or function shadow, a parameter of that name and a local serviceConfigArgs.
+    assert re.search(
+        r"import \{[^}]*(?<!\bas )\bserviceConfigArgs\b(?! as\b)[^}]*\} "
+        r'from "\./connectionWizardModel";',
+        src,
+    )
+    assert "const serviceConfigFlag = serviceConfigArgs;" in src
+    assert len(re.findall(r"\bserviceConfigArgs\b", src)) == 2, "only the import and the alias"
+    assert len(re.findall(_DECLARES.format(name="serviceConfigFlag"), src)) == 1, "a second one"
+    assert len(re.findall(r"\bserviceConfigFlag\b(?!\()", src)) == 1, "a non-call mention"
+    wizard_raw = _WIZARD.read_text(encoding="utf-8")
+    wizard = _code_view(wizard_raw)
+    # Control: the wizard has comments, and comment blanking removed them from the code view.
+    assert "/**" in wizard_raw
+    assert "/**" not in wizard
+    assert (
+        "export function serviceConfigArgs(serviceConfig: string | undefined): string[] { "
+        "return serviceConfig === undefined ? [] :" in wizard
+    )
+    assert "serviceConfig: opts.serviceConfig, username: PROBE_USERNAME, email: PROBE_EMAIL" in src
+    assert '[...inv.args, "--json"]' in src
 
 
 def test_a_store_with_no_administrator_answers_with_the_no_terminal_fragment(
