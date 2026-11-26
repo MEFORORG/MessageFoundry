@@ -218,15 +218,29 @@ async def test_a_virtual_outbox_is_not_folded_into_the_queue(tmp_path: Path) -> 
             assert await cur.fetchone() == (1,)
 
 
-def test_forget_store_salt_leaves_a_virtual_salt_table_alone(tmp_path: Path) -> None:
-    """BACKLOG #6719 item 4: an unloaded virtual ``store_salt`` is not this build's salt table, so
-    forgetting the salt finds nothing to drop instead of raising "no such module"."""
+def _salt_objects(path: Path) -> list[tuple[str, str]]:
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute(
+            "SELECT type, sql FROM sqlite_master WHERE name = 'store_salt'"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_forget_store_salt_refuses_a_virtual_salt_table_and_leaves_it(tmp_path: Path) -> None:
+    """BACKLOG #6719 item 4: an unloaded virtual ``store_salt`` is not this build's salt table. It
+    is not probed, so the call raises its own refusal naming the type, not "no such module", and
+    the table is left as it was."""
     from messagefoundry.store.store import forget_store_salt
 
     path = tmp_path / "vt-salt.db"
     _sql(path, "CREATE TABLE t (a TEXT)")
     _plant_unloaded_virtual_table(path, "store_salt")
-    assert forget_store_salt(path) is False
+    before = _salt_objects(path)
+    with pytest.raises(sqlite3.OperationalError, match="holds a virtual table named store_salt"):
+        forget_store_salt(path)
+    assert _salt_objects(path) == before
     # Control: an ordinary salt table holding a row is still dropped.
     other = tmp_path / "salt.db"
     _sql(other, "CREATE TABLE store_salt (salt TEXT)", "INSERT INTO store_salt VALUES ('s')")
@@ -250,12 +264,13 @@ _VIEW_SALT_SQL = "CREATE VIEW store_salt AS SELECT 's' AS salt"
     ("foreign", "kind", "planted"),
     [("virtual", "table", _VIRTUAL_SALT_SQL), ("view", "view", _VIEW_SALT_SQL)],
 )
-async def test_forget_store_salt_false_on_a_foreign_salt_object_and_the_next_open_refuses(
+async def test_forget_store_salt_refuses_a_foreign_salt_object_and_leaves_it(
     tmp_path: Path, foreign: str, kind: str, planted: str
 ) -> None:
-    """``forget_store_salt``'s False case with no ordinary ``store_salt`` table: a store copy whose
-    salt name is held by another tool's object. Nothing is dropped and nothing is proven, so the
-    call returns False without raising, and it is the next writable open that refuses the copy."""
+    """A store copy whose salt name is held by another tool's object: nothing is dropped and
+    nothing is proven, so the call fails closed with a refusal naming the object's type, rather
+    than return a False a restore would read as "nothing to forget" and go on to place the copy.
+    The object stays, so the next writable open still refuses the copy."""
     from messagefoundry.store.store import forget_store_salt
 
     path = tmp_path / f"{foreign}-copy.db"
@@ -265,16 +280,11 @@ async def test_forget_store_salt_false_on_a_foreign_salt_object_and_the_next_ope
         _plant_unloaded_virtual_table(path, "store_salt")
     else:
         _sql(path, planted)
-    assert forget_store_salt(path) is False
+    named = "a virtual table" if foreign == "virtual" else "a view"
+    with pytest.raises(sqlite3.OperationalError, match=f"holds {named} named store_salt"):
+        forget_store_salt(path)
     # The planted object is left in the copy exactly as it was: neither dropped nor replaced.
-    conn = sqlite3.connect(path)
-    try:
-        rows = conn.execute(
-            "SELECT type, sql FROM sqlite_master WHERE name = 'store_salt'"
-        ).fetchall()
-    finally:
-        conn.close()
-    assert rows == [(kind, planted)]
+    assert _salt_objects(path) == [(kind, planted)]
     # A read-only open logs the difference and opens; the writable open is the one that refuses.
     await (await MessageStore.open(path, read_only=True)).close()
     with pytest.raises(SchemaMismatchError, match="table 'store_salt' is missing"):

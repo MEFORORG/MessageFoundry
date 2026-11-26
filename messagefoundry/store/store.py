@@ -9196,8 +9196,9 @@ def forget_store_salt(path: Path) -> bool:
     closes. With no salt row, the first open that binds a salt mints one and so a key nothing has
     used, before it seals anything. Not every open binds one: ``bind_store_salt`` in ``gcm_bound``
     names those that do not, at least the identity and ``vault_transit`` ciphers and the frozen v1
-    writer (``[store].aad_bind = false``), and for those this call changes no key. Values already in
-    the file still open: a v4 value names its own salt, and an older one needs only the DEK.
+    writer (``[store].aad_bind = false``), and for those this call changes no key. It does not change
+    how a value already in the file opens: a v4 value names its own salt in the value, a v1 or v2
+    value is sealed under the DEK itself, and a v3 value is the Transit cipher's, opened by Vault.
 
     Synchronous, for the off-loop restore path. What it returns or raises, in at least these cases:
 
@@ -9205,29 +9206,32 @@ def forget_store_salt(path: Path) -> bool:
       the re-read below found none left in the MAIN FILE.
     - **False, with an ordinary table**: the ``store_salt`` table was there but the delete removed no
       row, normally because it was empty, so there was nothing to forget.
-    - **False, with no ordinary table of that name**: a file from before ADR 0196 has none, and its
-      first writable open creates one. A path with no file is in this case too: the connect creates
-      an empty file there. But the name may instead be held by an object this build did not make, at
-      least a view or a virtual table another tool left. Such an object is neither read nor dropped,
-      so this False proves nothing about a salt. The object stays in the copy, and it is a later
-      :meth:`MessageStore.open` that refuses it: the writable open with
-      :class:`SchemaMismatchError`; see that method for what a ``read_only=True`` open does. A
-      restore that reaches this call with such an object goes on to place the copy.
+    - **False, with no object of that name**: a file from before ADR 0196 has no ``store_salt``, and
+      its first writable open creates the table. A path with no file is in this case too: the
+      connect creates an empty file there.
+    - **Raises** ``sqlite3.OperationalError`` naming the object's type when the name is held by
+      anything other than an ordinary table, at least a view or a virtual table another tool left.
+      Such an object is neither read nor dropped and is left in the file as it was, so nothing
+      about a salt is proven. Before the raise the file has been taken out of WAL mode, as below.
     - **Raises** ``sqlite3.OperationalError`` when the file cannot be written as a closed file or
       the write is not proven: at least when another connection's hold makes the journal-mode switch
       or the delete fail (``database is locked``, or on a WAL file the switch refused), when a
-      non-empty ``-wal`` remains afterwards, or when the read-only re-read still finds a row in the
-      ordinary table, whether or not the delete reported removing one. SQLite does not refuse every
-      other holder: on a file in rollback-journal mode, an idle second connection lets the call
-      write. Other ``sqlite3.Error`` subclasses from opening or reading the file propagate too.
+      non-empty ``-wal`` remains afterwards or its size cannot be read (the ``OSError`` is converted,
+      so a caller that catches ``sqlite3.Error`` refuses the copy), or when the read-only re-read
+      still finds a row in the ordinary table, whether or not the delete reported removing one.
+      SQLite does not refuse every other holder: on a file in rollback-journal mode an idle second
+      connection lets the call write, and on a WAL file so does one opened with ``immutable=1``,
+      which takes no lock. Other ``sqlite3.Error`` subclasses from opening or reading the file
+      propagate too.
 
     **On each path that returns, it has re-read the MAIN FILE and found no row in an ordinary
-    table.** A snapshot can carry WAL mode in its header, and then a plain DELETE commits into
-    ``-wal``. The callers place or open only the main file, so a delete left in a WAL that was never
-    checkpointed would be silently dropped, and the copy would keep the original's salt. So the file
-    is first switched to ``journal_mode=DELETE``, which checkpoints the WAL and removes it. After the
-    delete, the main file is re-read with no ``-wal`` beside it. A refusal is the caller's to
-    report; it never places an unproven copy."""
+    table, and no other object held the name.** A snapshot can carry WAL mode in its header, and
+    then a plain DELETE commits into ``-wal``. The callers place or open only the main file, so a
+    delete left in a WAL that was never checkpointed would be silently dropped, and the copy would
+    keep the original's salt. So the file is first switched to ``journal_mode=DELETE``, which
+    checkpoints the WAL and removes it. After the delete, the main file is re-read with no ``-wal``
+    beside it. A raise is the caller's to report: the restore in ``pipeline/dr_backup`` refuses
+    before it places the store, and the full restore-verify fails its open check."""
 
     # The ordinary-table predicate, so a virtual `store_salt` another tool left, whose module may
     # not be loaded here, is not probed and cannot raise "no such module" (BACKLOG #6719 item 4).
@@ -9246,7 +9250,21 @@ def forget_store_salt(path: Path) -> bool:
         )
 
     def drop(conn: sqlite3.Connection) -> bool:
-        return has_salt_table(conn) and conn.execute("DELETE FROM store_salt").rowcount > 0
+        if has_salt_table(conn):
+            return conn.execute("DELETE FROM store_salt").rowcount > 0
+        # Fail closed on a name another tool's object holds: returning False there let a restore
+        # place a copy that its first writable open then refuses, with the salt question unasked.
+        foreign = conn.execute(
+            "SELECT m.type FROM sqlite_master AS m WHERE lower(m.name) = 'store_salt'"
+        ).fetchone()
+        if foreign is not None:
+            kind = "virtual table" if foreign[0] == "table" else str(foreign[0])
+            article = "an" if kind[0] in "aeiou" else "a"
+            raise sqlite3.OperationalError(
+                f"{path} holds {article} {kind} named store_salt, not this build's salt table, so "
+                "its store salt cannot be dropped"
+            )
+        return False
 
     def gone(proof: sqlite3.Connection) -> bool:
         return not (
@@ -9274,10 +9292,12 @@ def _write_closed_store[T](
     :func:`forget_store_salt` and :func:`write_restore_marker`.
 
     The file is first switched to ``journal_mode=DELETE``, which checkpoints a WAL and removes it;
-    on a WAL file SQLite refuses the switch while another connection holds it, but not every other
-    holder is refused (:func:`forget_store_salt` says which). ``write`` then runs in autocommit. Afterwards a non-empty ``-wal`` beside it, or a read-only re-read on which ``prove``
-    answers False, raises ``sqlite3.OperationalError``: a caller places or opens only the main
-    file, so a change left in a WAL nobody checkpoints would be silently dropped."""
+    on a WAL file SQLite refuses the switch while another connection holds it through SQLite's
+    locks, but not every other holder is refused (:func:`forget_store_salt` says which). ``write``
+    then runs in autocommit. Afterwards a non-empty ``-wal`` beside it, a ``-wal`` whose size
+    cannot be read, or a read-only re-read on which ``prove`` answers False, raises
+    ``sqlite3.OperationalError``: a caller places or opens only the main file, so a change left in
+    a WAL nobody checkpoints would be silently dropped."""
     wal = path.with_name(path.name + "-wal")
     conn = sqlite3.connect(str(path), isolation_level=None)  # autocommit: each statement commits
     try:
@@ -9290,7 +9310,15 @@ def _write_closed_store[T](
         result = write(conn)
     finally:
         conn.close()
-    if wal.exists() and wal.stat().st_size:
+    try:
+        wal_size = wal.stat().st_size
+    except FileNotFoundError:
+        wal_size = 0
+    except OSError as exc:
+        # The callers catch sqlite3.Error, so an OSError here would escape their refusal; an
+        # unreadable -wal is an unproven write, and fails closed as one.
+        raise sqlite3.OperationalError(f"{wal} could not be read after leaving WAL mode") from exc
+    if wal_size:
         raise sqlite3.OperationalError(f"{wal} still holds changes after leaving WAL mode")
     proof = sqlite3.connect(_sqlite_readonly_uri(str(path.absolute())), uri=True)
     try:
