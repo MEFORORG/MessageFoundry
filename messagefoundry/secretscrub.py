@@ -1925,13 +1925,11 @@ _MEMBER_EXTRA_WORDS = ("token",)
 #
 # * a word a later pass reads as a label stays whole when a ":" or "=" follows the word (after an
 #   optional quote and spaces), or a "#" and the word ends in "MRN", and so does a word ending in a
-#   scheme word or "MRN" when a space follows it, a "#" after that space included. A label is a
-#   word holding one of :data:`_MEMBER_KEEP_WORDS`, the label and anchor words of the credential
-#   passes, the query filter, the support bundle and the PHI pass, where that word's reader opens
-#   on it (:func:`_read_as_label`; BACKLOG #8429). The whole word stays, not only the anchor, so
-#   ``ad_bind_password=`` keeps ``ad_bind_password``. Anywhere else it is masked, so a password
-#   such as ``Passw0rd!2024``, a token holding ``sig``, and ``Passage``, ``Compass`` or ``a1qpwd``
-#   before a ":" or "=" are masked like any other;
+#   scheme word or "MRN" when a space follows it, a "#" after that space included. Which words
+#   those are is :func:`_read_as_label`'s to say (BACKLOG #8429). The whole word stays, not only
+#   the anchor, so ``ad_bind_password=`` keeps ``ad_bind_password``. Anywhere else it is masked,
+#   so a password such as ``Passw0rd!2024``, a token holding ``sig``, and ``Passage``, ``Compass``
+#   or ``a1qpwd`` before a ":" or "=" are masked like any other;
 # * a percent-encoded HL7 separator, a DICOM tag ``(gggg,eeee)``, the ``nonnumeric port: `` opener
 #   of the PHI pass's userinfo backstop, and the support bundle's ``mfb64:v1:`` marker stay whole,
 #   and a word stops where the opener or the marker starts;
@@ -2179,12 +2177,16 @@ def _masked_word(word: str, after_percent: bool = False) -> str:
     return head + "".join(pieces)
 
 
-#: The kept words a later pass reads INSIDE a longer word, so a word holding one anywhere stays whole
-#: before a ":" or "=", as every kept word did before BACKLOG #8429: the ``MEFOR_`` prefix, the
-#: bundle marker and scheme words, the MRN label, and the DICOM label words, which
-#: ``redaction._DICOM_PHI_LABEL`` reads in the middle of a keyword (``IssuerOfPatientID``). Spelled
-#: literally, so the regex scanner in ``tests/test_security_static.py`` reads it;
-#: ``tests/test_secretscrub_kept_word.py`` holds it to :data:`_MEMBER_KEEP_WORDS`.
+#: The kept words a word may hold ANYWHERE and stay whole before a ":" or "=", as every kept word did
+#: before BACKLOG #8429: the ``MEFOR_`` prefix, the bundle marker and scheme words, the MRN label,
+#: ``0010`` and the DICOM label words, which ``redaction._DICOM_PHI_LABEL`` reads in the middle of a
+#: keyword (``IssuerOfPatientID``). That is a precaution kept from before, not a reading of where
+#: each reader opens: at least the scheme words, ``mrn`` and ``0010`` are read only at some starts,
+#: so a password word holding one, such as ``Outpatient`` or ``Basically``, still prints whole
+#: before a ":" or "=", as it did before. A run with no word held printed values on later paths
+#: (``tests/test_secretscrub_kept_word.py``), and no narrower set was measured. Spelled literally, so
+#: the regex scanner in ``tests/test_security_static.py`` reads it; the same test file holds it to
+#: :data:`_MEMBER_KEEP_WORDS`.
 _MEMBER_HELD = re.compile(
     r"(?i)medicalrecordlocator|responsibleperson|patient|mefor_|mfb64|basic|digest|0010|mrn"
 )
@@ -2209,7 +2211,8 @@ _MEMBER_WORD_AT = re.compile(_LABEL_START)
 _MEMBER_PREFIX_AT = re.compile(r"(?<=_)")
 _MEMBER_CAMEL_AT = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 #: The key words of :data:`_CONNECTION_STRING_MEMBER`, which may END a longer key
-#: (``sslkeypassword``): a word right after a ";" ending in one is a member key the member pass reads.
+#: (``sslkeypassword``): a word right after a ";" ending in one, with "=" right after it, is a member
+#: key, which the member pass and :func:`_union`'s ``_MEMBER_KEY`` read.
 _MEMBER_KEY_WORDS = _CREDENTIAL_WORDS + _MEMBER_EXTRA_WORDS
 
 
@@ -2220,25 +2223,34 @@ def _read_as_label(text: str, word: str, start: int) -> bool:
     The mask kept a word holding a kept word ANYWHERE, so a password word such as ``Passage``,
     ``Statement``, ``Barcode``, ``Compass``, ``Codename`` or ``Bypass`` before a ":" or "=" printed
     whole, though no pass reads a label there. Now a word is kept where it holds one of
-    :data:`_MEMBER_HELD`'s words, which their readers find anywhere; where it right follows a ";"
-    and ends in a member key word, which the member pass reads as a key; or where it ENDS in one of
-    :data:`_MEMBER_LABEL_WORDS`, as every label pattern ends its keyword with ``\\b``, and that word
-    opens where its reader opens. A JSON key word must be the whole word. Any other may also open
-    where :data:`_LABEL_START` does: after a ".", "-" or other non-word character, or a ``%XX``
-    escape. A word the label patterns read (:data:`_CAMEL_WORDS`) may also open after a label
-    prefix's "_", or at a capital after a lower-case letter or a digit.
+    :data:`_MEMBER_HELD`'s words anywhere (that constant says why); where it right follows a ";",
+    ends in a member key word and "=" follows it, which the member pass reads as a key; or where it
+    ENDS in one of :data:`_MEMBER_LABEL_WORDS`, as every label pattern ends its keyword with
+    ``\\b``, and that word opens where its reader opens. A JSON key word must be the whole word. Any
+    other may also open where :data:`_LABEL_START` does: after a ".", "-" or other non-word
+    character, or a ``%XX`` escape. A word the label patterns read (:data:`_CAMEL_WORDS`) may also
+    open after a label prefix's "_", or at a capital after a lower-case letter or a digit.
 
-    Not every reader is followed: at least ``_DSN_RUN_STOP`` stops the wide DSN pass's user segment
-    at a label word glued anywhere before a ":" or "=", so a word masked here no longer stops it
-    there. The seeded differential the comment on :data:`_CONNECTION_STRING_MEMBER` gives held
-    DSN shapes and found no line printing from that.
+    THE OPENINGS ARE WRITTEN HERE BY HAND, not derived from the readers, and a reader that gains a
+    start would not move them; the controls in ``tests/test_secretscrub_kept_word.py`` show each is
+    needed, not that they are enough. Not every reader is followed either: at least
+    ``_DSN_RUN_STOP``, which stops the wide DSN pass's user segment, and :data:`_NO_LABEL_BEFORE`,
+    which ends a token68's padding, read a label word glued anywhere before a ":" or "=", so a word
+    masked here no longer stops them there. The seeded differential the comment on
+    :data:`_CONNECTION_STRING_MEMBER` gives held DSN and scheme shapes and found no line printing
+    from that, which is a fuzz result, not a proof.
 
     A word holding a character outside ASCII keeps the old rule, since the patterns fold case the
     Unicode way and a lower-cased comparison may not."""
     if not word.isascii() or _MEMBER_HELD.search(word) is not None:
         return True
     folded = word.lower()
-    if start > 0 and text[start - 1] == ";" and folded.endswith(_MEMBER_KEY_WORDS):
+    if (
+        start > 0
+        and text[start - 1] == ";"
+        and text.startswith("=", start + len(word))
+        and folded.endswith(_MEMBER_KEY_WORDS)
+    ):
         return True
     # The common case, a password word ending in no label word, is one C-level check.
     if not folded.endswith(_MEMBER_LABEL_WORDS):

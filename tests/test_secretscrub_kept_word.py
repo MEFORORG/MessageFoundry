@@ -123,6 +123,39 @@ def test_the_label_words_are_the_kept_words_outside_the_held_ones() -> None:
         assert f"(?<={word})" in secretscrub._CONNECTION_STRING_MEMBER.pattern, word
 
 
+@pytest.mark.parametrize(
+    ("line", "word"),
+    [
+        # After a ";" but no "=" right after it: no member key, so a password word (code review).
+        ("DRIVER={X};sslpassword={Zq7;Compass:Vw9};PORT=1", "Compass"),
+        ("DRIVER={X};sslpassword={Zq7;Bypass :Vw9", "Bypass"),
+    ],
+)
+@pytest.mark.parametrize(("surface", "apply"), _SURFACES, ids=_SURFACE_IDS)
+def test_a_word_after_a_semicolon_is_a_member_key_only_before_an_equals(
+    surface: str, apply: Callable[[str], str], line: str, word: str
+) -> None:
+    out = apply(line)
+    assert word not in out and not _printed(out), f"{surface}: {out!r}"
+
+
+@pytest.mark.parametrize(
+    ("line", "word"),
+    [
+        ("DRIVER={X};sslpassword=Outpatient:Zq7Vw9;PORT=1", "Outpatient"),
+        ("DRIVER={X};sslpassword=Basically:Zq7Vw9;PORT=1", "Basically"),
+    ],
+)
+def test_a_password_word_holding_a_held_word_prints_as_before(line: str, word: str) -> None:
+    """A KNOWN RESIDUAL, pinned as printed: a word holding one of ``_MEMBER_HELD``'s words anywhere
+    is kept whole, as before BACKLOG #8429 (the comment on ``_MEMBER_HELD`` says why), so such a
+    password word would print on first deployment. A change that masks it goes red here and must
+    move it to the tests above. The value after it is masked."""
+    for surface, apply in _SURFACES:
+        out = apply(line)
+        assert word in out and not _printed(out), (surface, out)
+
+
 _MASKED_WORDS = _WORDS_HOLDING_A_KEPT_WORD + _PHI_WORDS_INSIDE_A_WORD
 _KEPT_WORD_LINES = tuple(_member(word, sep) for sep in ":=" for word in _MASKED_WORDS)
 
