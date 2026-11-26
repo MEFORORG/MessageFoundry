@@ -2188,8 +2188,8 @@ def _masked_word(word: str, after_percent: bool = False) -> str:
 #: character), so a password word holding one, such as ``Outpatient`` or ``Basically``, would still
 #: print whole before a ":" or "=", as before. A run with no word held printed values on later paths
 #: (``tests/test_secretscrub_kept_word.py``), and no narrower set was measured. Spelled literally, so
-#: the regex scanner in ``tests/test_security_static.py`` reads it; the same test file holds it to
-#: :data:`_MEMBER_KEEP_WORDS`.
+#: the regex scanner in ``tests/test_security_static.py`` reads it;
+#: ``tests/test_secretscrub_kept_word.py`` holds it to :data:`_MEMBER_KEEP_WORDS`.
 _MEMBER_HELD = re.compile(
     r"(?i)medicalrecordlocator|responsibleperson|patient|mefor_|mfb64|basic|digest|0010|mrn"
 )
@@ -2225,7 +2225,9 @@ def _read_as_label(text: str, word: str, start: int) -> bool:
 
     The mask kept a word holding a kept word ANYWHERE, so a password word such as ``Passage``,
     ``Statement``, ``Barcode``, ``Compass``, ``Codename`` or ``Bypass`` before a ":" or "=" printed
-    whole, though no label pattern reads a label there (two stops do, named below). Now a word is
+    whole, though no label pattern reads a label there. At least these other readers do read a
+    word glued so: the member pattern's own key lookbehinds and :func:`_union`'s ``_MEMBER_KEY``,
+    at the end of a ";" key (the ";" opening below), and the two stops named below. Now a word is
     kept where it holds one of
     :data:`_MEMBER_HELD`'s words anywhere (that constant says why); where it right follows a ";",
     ends in a member key word and "=" follows it, which the member pass reads as a key; or where it
@@ -2297,11 +2299,13 @@ def _kept_word(text: str, word: str, end: int) -> bool:
         and _read_as_label(text, word, end - len(word))
     ):
         return True
-    # A word _read_as_label refuses still falls to the scheme-word rule: a word ENDING in bearer,
-    # basic, digest or mrn stays whole before white space, with no opening checked, so ``xbearer :``
-    # and ``Hunterbearer :`` keep the word, as ``Hunterbearer abc`` does. Before BACKLOG #8429 the
-    # ":" tail kept such a word anyway, so this keeps what main kept. The bearer readers open at a
-    # ``\b``, so a password word such as ``Hunterbearer`` would print whole on first deployment.
+    # A word _read_as_label refuses still falls to the scheme-word rule. Of that rule's words only
+    # ``bearer`` can get here after a ":" or "=" tail, since basic, digest and mrn are in
+    # _MEMBER_HELD and _read_as_label keeps a word holding one. A word ENDING in bearer stays whole
+    # before white space with no opening checked, so ``xbearer :`` and ``Hunterbearer :`` keep the
+    # word, as ``Hunterbearer abc`` does. Before BACKLOG #8429 the ":" tail kept such a word anyway,
+    # so this keeps what main kept. The bearer readers open at a ``\b``, so a password word such as
+    # ``Hunterbearer`` would print whole on first deployment.
     # A "#" after spaces does not end the scheme-word rule: ``Bearer #`` is still a scheme word
     # before a space, and a later bearer pass reads it there.
     return text[end : end + 1].isspace() and _MEMBER_SPACED_WORD.search(word) is not None
