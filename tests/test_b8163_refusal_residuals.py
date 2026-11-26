@@ -210,10 +210,9 @@ def test_the_cipher_build_frame_holds_no_store_key_when_the_build_fails(
     and ``build_store_cipher`` drops this traceback whole (the next test)."""
     from messagefoundry.store import base as store_base
 
-    def refuse(*args: object, **kwargs: object) -> Any:
-        raise ValueError("synthetic: make_cipher refused")
-
-    monkeypatch.setattr(store_base, "make_cipher", refuse)
+    monkeypatch.setattr(
+        store_base, "make_cipher", _b3471._raising(ValueError("synthetic: make_cipher refused"))
+    )
     escaped = _escaping(lambda: store_base._build_store_cipher(_planted_settings(), None))
     assert type(escaped) is ValueError, type(escaped)
     shown = _frame_locals_reprs(escaped, only="_build_store_cipher")
@@ -228,10 +227,9 @@ def test_the_cipher_build_refusal_holds_no_store_key_in_its_frames(
     ``settings`` among them, print no key."""
     from messagefoundry.store import base as store_base
 
-    def refuse(*args: object, **kwargs: object) -> Any:
-        raise ValueError("synthetic: make_cipher refused")
-
-    monkeypatch.setattr(store_base, "make_cipher", refuse)
+    monkeypatch.setattr(
+        store_base, "make_cipher", _b3471._raising(ValueError("synthetic: make_cipher refused"))
+    )
     escaped = _escaping(lambda: store_base.build_store_cipher(_planted_settings()))
     assert isinstance(escaped, store_base.StoreCipherConfigError), type(escaped)
     _assert_no_planted_key(_frame_locals_reprs(escaped))

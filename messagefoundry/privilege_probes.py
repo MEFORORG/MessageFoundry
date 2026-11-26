@@ -45,7 +45,6 @@ from messagefoundry.exception_origin import (
     ExceptionChainTooLong,
     exception_chain,
     is_ssl_error,
-    own_message,
     raised_by_the_engine,
     raised_through,
 )
@@ -208,14 +207,13 @@ def _why(exc: BaseException) -> str:
 
 def _own_text(exc: BaseException) -> str | None:
     """``exc``'s text with control characters stripped, read with
-    :func:`~messagefoundry.exception_origin.own_message`, or ``None`` where that gives none or
-    ``exc`` holds a codec error (:func:`~messagefoundry.redaction.prints_a_codec_error`)."""
-    from messagefoundry.redaction import prints_a_codec_error
+    :func:`~messagefoundry.redaction.own_message`, or ``None`` where that gives none. A codec
+    error, or an error whose one argument is one, gives none there, since its argument is no
+    ``str``."""
+    from messagefoundry.redaction import own_message
 
     text = own_message(exc)
-    if text is None or prints_a_codec_error(exc):
-        return None
-    return strip_control_chars(text)
+    return None if text is None else strip_control_chars(text)
 
 
 def _ad_why(exc: BaseException) -> str:

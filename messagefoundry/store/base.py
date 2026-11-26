@@ -4535,7 +4535,6 @@ def _build_store_cipher(
             "(expected 'aesgcm' or 'vault_transit')"
         )
     retired = _split_retired(settings.encryption_keys_retired)
-    active: str | None = None
     try:
         # A host key passes the same key check a resolved one does (BACKLOG #5310, #5308), so a
         # refusal ``make_cipher`` would raise unrecorded, and the build's fixed-text replacement
@@ -4553,8 +4552,11 @@ def _build_store_cipher(
         )
     finally:
         # Vault BACKLOG #8163 item 21: an error leaving here keeps this frame on its traceback, so
-        # the key text it holds is dropped first, whatever raised. Assigned, not deleted, since
-        # the call that raised may have left ``active`` unset.
+        # the key text it holds is dropped first, whatever raised. That matters where
+        # build_store_cipher does not replace the error, a BaseException that is not an Exception,
+        # and there the frames below this one, make_cipher's among them, still hold the key they
+        # were passed. Assigned, not deleted, since the call that raised may have left ``active``
+        # unset.
         active = host_key = None
         retired = []
 
