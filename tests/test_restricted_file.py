@@ -1135,6 +1135,7 @@ def test_broad_access_problem_refuses_a_key_the_mount_table_puts_on_nfs(
     )
     problem = restricted_file.broad_access_problem(key)
     assert problem is not None and "its path is on a mount of type nfs4," in problem
+    assert not isinstance(problem, restricted_file.UncheckedProblem)  # a finding, judged
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux has a mount table to read")
@@ -1153,6 +1154,8 @@ def test_broad_access_problem_refuses_where_the_linux_mount_table_cannot_be_read
     monkeypatch.setattr(restricted_file, "read_mounts", lambda: None)
     problem = restricted_file.broad_access_problem(key)
     assert problem is not None and "/proc/self/mountinfo could not be read" in problem
+    # Typed, so a caller says the file could not be checked rather than that it is not restricted.
+    assert isinstance(problem, restricted_file.UncheckedProblem)
     assert "This refusal clears once the engine can read /proc/self/mountinfo" in problem
     assert "Changing the owner or mode of what is refused" in problem
     assert problem.endswith("or replacing what is refused, does not clear this refusal")

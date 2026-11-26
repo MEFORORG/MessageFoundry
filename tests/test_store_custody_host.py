@@ -4371,3 +4371,40 @@ def test_a_server_create_that_fails_before_connecting_removes_the_minted_key(
     else:
         assert not host_file.exists(), err
         assert "was removed from" in err and "Keep both" not in err, err
+
+
+def test_a_custody_directory_that_could_not_be_checked_says_so_with_its_own_remedy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Where the check of the custody directory could not be made, the refusal says it could not
+    be checked, not that it is not restricted, and carries the refusal's own remedy, not the
+    owner-and-mode remedy, which would not clear it (vault BACKLOG #5657). The control is an
+    ordinary finding, which keeps "is not restricted" and that remedy."""
+    custody_dir = tmp_path / "custody"
+    custody_dir.mkdir()
+    environ = {"MEFOR_CUSTODY_DIRECTORY": str(custody_dir)}
+    reason = (
+        "/proc/self/mountinfo could not be read, so the file system under its path was not "
+        "judged. This refusal clears once the engine can read /proc/self/mountinfo"
+    )
+    monkeypatch.setattr(
+        restricted_file,
+        "broad_access_problem",
+        lambda *a, **k: restricted_file.UncheckedProblem(reason),
+    )
+    refusal = custody_host._own_directory_refusal(environ)
+    assert refusal == (
+        f"the custody directory MEFOR_CUSTODY_DIRECTORY names could not be checked: {reason}"
+    ), refusal
+    assert "mode 0700" not in refusal and "Restrict it" not in refusal, refusal
+
+    monkeypatch.setattr(
+        restricted_file, "broad_access_problem", lambda *a, **k: "Everyone may read it"
+    )
+    control = custody_host._own_directory_refusal(environ)
+    assert control is not None
+    assert control.startswith(
+        "the custody directory MEFOR_CUSTODY_DIRECTORY names is not restricted: "
+        "Everyone may read it. "
+    ), control
+    assert "mode 0700" in control or "Restrict it" in control, control

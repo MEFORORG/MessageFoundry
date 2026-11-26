@@ -99,6 +99,7 @@ __all__ = [
     "WINERROR_SHARING_VIOLATION",
     "OwnerRefused",
     "RestrictedFileError",
+    "UncheckedProblem",
     "administrators_enabled",
     "broad_access_problem",
     "can_add_a_file",
@@ -1139,6 +1140,16 @@ def _posix_delegated_file_system(fstype: str) -> bool:
     return fstype.split(".", 1)[0] in _POSIX_DELEGATED_FILE_SYSTEMS
 
 
+class UncheckedProblem(str):
+    """A :func:`broad_access_problem` answer that says the check could not be made, rather than
+    that it found ``path`` open to another account (vault BACKLOG #5657). The text carries its own
+    remedy, and no change to the owner or mode of ``path`` or its folders clears it, so a caller
+    says that ``path`` could not be checked and appends no owner-and-mode remedy of its own. Told
+    apart from a finding by its type, never by its text."""
+
+    __slots__ = ()
+
+
 def _posix_link_problem(
     path: str,
     *,
@@ -1270,7 +1281,7 @@ def _posix_host_link_problem(path: Path) -> str | None:
 
     mounts = read_mounts()
     if mounts is None and sys.platform.startswith("linux"):
-        return (
+        return UncheckedProblem(
             "/proc/self/mountinfo could not be read, so the file system under its path was "
             "not judged. This refusal clears once the engine can read /proc/self/mountinfo, for "
             "example with procfs mounted where the engine runs, or with an AppArmor or SELinux "
@@ -1427,7 +1438,9 @@ def broad_access_problem(
     reaches the file there; the list is open, so a type it does not name passes. That walk, and
     with it the mount check, is skipped under ``holder_judged``. Its refusal where the table
     cannot be read, and at least some of what it does not judge, are
-    :func:`_posix_host_link_problem`'s, and ``docs/PHI.md`` lists at least those too.
+    :func:`_posix_host_link_problem`'s, and ``docs/PHI.md`` lists at least those too. That refusal
+    is an :class:`UncheckedProblem`, which a caller tells apart by its type: nothing about the file
+    was judged, and the text carries its own remedy.
 
     On both, the folders above ``path`` are walked too (vault BACKLOG #5656, #5657). A junction or
     link among them is refused when an account the check does not trust can change it: on

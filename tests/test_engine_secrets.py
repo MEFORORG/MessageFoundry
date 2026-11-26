@@ -1145,3 +1145,41 @@ def test_a_moved_module_reads_no_secret_straight_from_the_environment(relative: 
 )
 def test_the_census_sees_a_direct_read(planted: str) -> None:
     assert _direct_reads(planted) == ["MEFOR_STORE_VAULT_TOKEN"]
+
+
+def test_a_secrets_directory_that_could_not_be_checked_says_so_with_its_own_remedy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Where the check of the secrets directory could not be made, the refusal says the directory
+    could not be checked, not that it is not restricted, and carries the refusal's own remedy, not
+    the owner-and-mode remedy, which would not clear it (vault BACKLOG #5657). The control is an
+    ordinary finding, which keeps "is not restricted" and that remedy."""
+    from messagefoundry import engine_secrets, restricted_file
+
+    directory = _directory(tmp_path)
+    reason = (
+        "/proc/self/mountinfo could not be read, so the file system under its path was not "
+        "judged. This refusal clears once the engine can read /proc/self/mountinfo"
+    )
+    monkeypatch.setattr(
+        restricted_file,
+        "broad_access_problem",
+        lambda *a, **k: restricted_file.UncheckedProblem(reason),
+    )
+    with pytest.raises(SecretsDirectoryError) as refused:
+        open_secrets_directory(_env(directory))
+    text = str(refused.value)
+    assert text == (
+        f"the secrets directory {SECRETS_DIRECTORY_VARIABLE} names could not be checked: {reason}"
+    ), text
+    assert engine_secrets._REMEDY not in text, text
+
+    monkeypatch.setattr(
+        restricted_file, "broad_access_problem", lambda *a, **k: "Everyone may read it"
+    )
+    with pytest.raises(SecretsDirectoryError) as control:
+        open_secrets_directory(_env(directory))
+    assert str(control.value) == (
+        f"the secrets directory {SECRETS_DIRECTORY_VARIABLE} names is not restricted: "
+        f"Everyone may read it. {engine_secrets._REMEDY}"
+    ), str(control.value)
