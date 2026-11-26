@@ -268,7 +268,10 @@ python -m tee purge --db ./tee.db --captures-only -y      # drop only the captur
 
 * **Test data only** — not hardened for production PHI (no at-rest encryption; on open the DB and
   its `-wal` and `-shm` are restricted to their owner best-effort only, `chmod 0600` on POSIX and an
-  owner-only access list on Windows, with a logged warning when that fails). On Windows the DB is
+  owner-only access list on Windows, with a logged warning when that fails). On Windows a `-wal` or
+  `-shm` that SQLite deletes, on the last connection's close or a journal-mode switch, and later
+  re-creates takes its folder's access list until a later open by the tee restricts it; a tool other
+  than the tee that opens the DB re-creates them and restricts nothing. On Windows the DB is
   then usable only by the account that opened it last, so run the relay and the commands that read
   its DB under one account. Keep every tee DB on a protected volume, capture on or off, because a log row's
   detail can name a patient. Enable `--capture-bodies` only with test data.

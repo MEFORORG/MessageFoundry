@@ -555,6 +555,47 @@ async def test_the_db_and_its_wal_and_shm_get_an_owner_only_dacl_on_windows(
         await store.close()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="the owner-only DACL is the Windows half of #5637")
+async def test_a_wal_sqlite_re_creates_takes_its_folder_list_until_a_later_open(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #5637: ``_secure_file``'s docstring states that a -wal or -shm SQLite deletes and
+    re-creates takes its folder's access list until a later open restricts it. Both halves are
+    pinned: the re-created siblings carry the folder's inherited entries, Administrators included,
+    and a second open, run while the first still holds them, makes each owner-only again."""
+    from messagefoundry.restricted_file import _windows_engine_sid
+    from messagefoundry.store.store import _parse_sddl_dacl, _read_dacl_sddl
+    from tests._win_acl import assert_owner_only, folder_granting
+
+    me = _windows_engine_sid()
+    assert me
+    folder = folder_granting(tmp_path / "acl", me, "S-1-5-32-544")
+    db_path = folder / "tee.db"
+    siblings = (Path(f"{db_path}-wal"), Path(f"{db_path}-shm"))
+    store = await RelayStore.open(str(db_path))
+    try:
+        # Leaving WAL mode deletes both siblings; the next write in WAL mode re-creates them.
+        assert await _set_journal_mode(store, "DELETE") == "delete"
+        assert not any(s.exists() for s in siblings)
+        assert await _set_journal_mode(store, "WAL") == "wal"
+        await store.record_capture(direction="corepoint_copy", control_id="C", raw=b"MSH|x")
+        for sibling in siblings:
+            assert sibling.exists(), sibling
+            sddl = _read_dacl_sddl(sibling, owner=True)
+            assert sddl is not None, sibling
+            parsed = _parse_sddl_dacl(sddl)
+            assert parsed is not None and not parsed.protected, sddl
+            assert "S-1-5-32-544" in sddl or ";;;BA)" in sddl, sddl
+        later = await RelayStore.open(str(db_path))
+        try:
+            for sibling in (db_path, *siblings):
+                assert_owner_only(sibling, me)
+        finally:
+            await later.close()
+    finally:
+        await store.close()
+
+
 def test_a_file_it_cannot_restrict_is_logged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
