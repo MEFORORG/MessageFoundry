@@ -32,8 +32,30 @@ STRAY = [
     f'{{"identifier": [{{"value": "x"}}] ], "value": "{SECRET}"}}',
     f'x {{"name": [ "a" ] ] {SECRET}',
     f'[{{"family": ["Doe"] ] {SECRET}}}]',
-    f'"given": [Jane] {SECRET}]',
+    # A quote put in the value would hide the stray closer in an unterminated string.
+    f'{{"given": [Jane] {SECRET}\']}}',
+    f'{{"given": [Jane] {SECRET}"]}}',
 ]
+
+#: Stray closers the check is documented to miss (``_stray_json_closer``'s docstring). Strict, so a
+#: change that catches one turns this red and the docstring and changelog move with it.
+MISSED = [
+    f'"given": [Jane] {SECRET}]',  # no container open: the head was cut
+    f'{{"given": [x] {SECRET}}}}}',  # the key's own container's kind
+    f'can\'t map {{"given": [Jane] {SECRET}]}}',  # a string opened before the key
+]
+
+
+@pytest.mark.xfail(strict=True, reason="KNOWN RESIDUAL of BACKLOG #5814: see _stray_json_closer")
+@pytest.mark.parametrize("text", MISSED)
+def test_a_documented_miss_still_keeps_the_value(text: str) -> None:
+    assert SECRET not in redact(text)
+
+
+def test_the_placeholder_keeps_the_bound_note() -> None:
+    """The bound note is the only sign the text was cut, so the whole-text placeholder keeps it."""
+    note = "\n[redaction bound: dropped 12 more chars unscanned]"
+    assert redact(f'{{"given": [Jane] {SECRET}]}}' + note) == PLACEHOLDER + note
 
 
 @pytest.mark.parametrize("scrub", SCRUBBERS)

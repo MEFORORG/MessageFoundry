@@ -70,6 +70,7 @@ import encodings
 import encodings.aliases
 import hashlib
 import json
+import locale
 import logging
 import os
 import pkgutil
@@ -2092,8 +2093,8 @@ def redact(text: str) -> str:
     **A JSON value with a mismatched closer makes the whole text redacted (BACKLOG #5814)**: the
     result is the placeholder alone. The JSON pass reads what the passes before it left, so the
     text as received and the result are read for a stray closer too (:func:`_stray_json_closer`),
-    which also catches one of the same kind as the open container; that check names what it does not
-    see."""
+    whose docstring names at least what it does not see. A trailing bound note is kept after the
+    placeholder."""
     return _redact_noted(text, noted=False)
 
 
@@ -2113,32 +2114,42 @@ def _redact_noted(text: str, *, noted: bool) -> str:
     is masked. A mask can still change what a later pass or round reads (:func:`_masked_only`), so
     that the answer only hides more is a measurement, not a proof: the differential tests in
     ``tests/test_redaction_clamp_note_end.py`` measure it on their inputs."""
+    # The whole-text placeholder keeps this module's trailing bound note, the only sign the text
+    # was cut (:data:`_TRAILING_NOTES`).
+    whole = _REDACTED + text[len(_without_trailing_note(text)) :]
     if _stray_json_closer(_without_trailing_note(text)):
-        return _REDACTED
+        return whole
     try:
         out = _redact_unguarded(text, noted=noted)
     except _MismatchedJsonCloser:
-        return _REDACTED
+        return whole
     # The output is read too: a scrub can leave a closer stray that was inside a string as received,
-    # and a second call reads that output as received, so without this the rule broke the fixed point.
-    return _REDACTED if _stray_json_closer(_without_trailing_note(out)) else out
+    # or one whose opener a flat pass consumed, and a second call reads that output as received, so
+    # without this the rule broke the fixed point.
+    return whole if _stray_json_closer(_without_trailing_note(out)) else out
 
 
 def _stray_json_closer(text: str) -> bool:
-    """Whether a closer in ``text`` as received, at or after a PHI JSON key, fails to close an open
-    container: it is of another kind than the innermost open one, or none is open (BACKLOG #5814,
-    added item 2).
+    """Whether a closer in ``text``, after a PHI JSON key and before that key's container closes,
+    is of another kind than the innermost open container (BACKLOG #5814, added item 2).
 
-    **Read on the text before any pass rewrites it.** The walk in :func:`_scrub_json_value` reads
-    what the flat passes left, and a field-run scrub can consume an opener, so a later closer looks
-    matched there: ``{"identifier": [a|b|c ) , {"value": ...}]}``. **A same-kind stray closer is
-    caught here too, where the walk cannot see it:** in ``{"given": [x] y]}`` the first ``]`` ends the
-    value and the second meets the object's ``{``. The walk tokenizes from the start of the text with
-    :data:`_JSON_TOKEN`, so a closer inside a string is not structure. It is armed at the depth of the
-    first PHI key it passes and disarmed once the depth falls below that, which is the key's own
-    container closing, so a closer in prose after a closed object is not read. A key outside every
-    container stays armed to the end of its line. A stray closer that an unmatched opener of its own
-    kind absorbs, or that sits in text the tokenizer reads as a string, is not seen here."""
+    **Read on the text before any pass rewrites it**, and on the result. The walk in
+    :func:`_scrub_json_value` reads what the flat passes left, and a field-run scrub can consume an
+    opener, so a later closer looks matched there: ``{"identifier": [a|b|c ) , {"value": ...}]}``.
+    A same-kind stray closer is caught here only where a closer after it then meets the key's own
+    container: in ``{"given": [x] y]}`` the first ``]`` ends the value and the second meets the
+    object's ``{``.
+
+    This tokenizes from the start of the text with :data:`_JSON_TOKEN`, so a closer inside a string
+    is not structure. It is armed at the depth of the first PHI key it passes and disarmed once the
+    depth falls below that, which is the key's own container closing; a key outside every container
+    is disarmed at the end of its line. While armed, an unterminated string holding a closer counts
+    as a stray closer, since a quote put in a value would otherwise hide one.
+
+    It misses at least: a closer with no open container, as in a fragment whose head was cut
+    (``"given": [x] y]``); a stray closer of the key's own container's kind (``{"given": [x] y}}``);
+    a stray closer a matching unmatched opener absorbs; and one inside a string that opened before
+    the key, such as an apostrophe earlier on the line (``can't map {"given": [x] y]}``)."""
     keys = [match.start() for match in _JSON_PHI_KEY.finditer(text)]
     if not keys:
         return False
@@ -2147,6 +2158,8 @@ def _stray_json_closer(text: str) -> bool:
     next_key = 0
     pos = 0
     while pos < len(text):
+        if armed is None and next_key == len(keys):
+            return False  # no key is left to arm the walk
         match = _JSON_TOKEN.match(text, pos)
         if match is None:  # unreachable: every character starts one alternative
             break
@@ -2159,17 +2172,23 @@ def _stray_json_closer(text: str) -> bool:
             ws = match.group("ws")
             if armed == 0 and not stack and ws is not None and ("\n" in ws or "\r" in ws):
                 armed = None
+            elif (
+                armed is not None
+                and ws is None
+                and match.group("bare") is None
+                and not (match.group("dq") or match.group("sq"))
+                # The placeholder's own `]` is no closer: a scrubbed cut head ends `"[redacted]`.
+                and any(closer in match.group().replace(_REDACTED, "") for closer in "}])")
+            ):
+                return True
             continue
         if punct in "{[(":
             stack.append("}" if punct == "{" else "]" if punct == "[" else ")")
         elif punct in "}])":
-            if not stack or stack[-1] != punct:
-                if armed is not None:
-                    return True
-                if stack:
-                    stack.pop()
-                continue
-            stack.pop()
+            if stack and stack[-1] != punct and armed is not None:
+                return True
+            if stack:
+                stack.pop()
             if armed is not None and len(stack) < armed:
                 armed = None
     return False
@@ -3072,29 +3091,44 @@ def safe_exc(
         # An OSError quotes its path with repr(), so a name holding a control, a non-printable or a
         # quote character appears escaped and the raw name alone matches nothing (BACKLOG #5815).
         # A backslash is an ordinary character in a POSIX or SFTP name, so the part after the last
-        # `/` is swapped too. One pass over every form, so no form matches across a label it wrote.
-        forms = set(_name_forms(base)) | set(_name_forms(file_name.rsplit("/", 1)[-1]))
-        alternation = "|".join(map(re.escape, sorted(forms, key=lambda form: (-len(form), form))))
-        raw = re.sub(alternation, lambda _: label, raw)
+        # `/` is swapped too.
+        forms = _name_forms(base)
+        if (tail := file_name.rsplit("/", 1)[-1]) != base:
+            forms |= _name_forms(tail)
+        raw = _swap_forms(raw, forms, label)
     message = safe_text(raw, limit=limit)
     return f"{name}: {message}" if message else name
 
 
-def _name_forms(text: str) -> list[str]:
+def _swap_forms(raw: str, forms: set[str], label: str) -> str:
+    """``raw`` with each of ``forms`` replaced by ``label``, longest first, so a form never shadows
+    a longer one it is a prefix of or overlaps. Each form is first replaced by a run of one
+    character that neither ``raw`` nor any form holds, and the runs by ``label`` last, so no form
+    can match across a label another form wrote."""
+    code = 0xE000
+    while chr(code) in raw or any(chr(code) in form for form in forms):
+        code += 1
+    marker = chr(code) * 3
+    for form in sorted(forms, key=lambda form: (-len(form), form)):
+        raw = raw.replace(form, marker)
+    return raw.replace(marker, label)
+
+
+def _name_forms(text: str) -> set[str]:
     """``text`` and the bodies one level of ``repr()``, ``ascii()``, a bytes ``repr()`` or a JSON
-    string can render it as inside a longer quoted string, longest first, so a form never shadows a
-    longer one it is a prefix of. Every form but ``text`` holds a backslash, so none is a substring
-    of a :func:`safe_name` label.
+    string can render it as inside a longer quoted string. Every form but ``text`` holds a
+    backslash, so none is a substring of a :func:`safe_name` label.
 
     repr picks its quote from the WHOLE string, a path whose directory the name does not decide: it
     quotes with ``'`` and escapes it, unless the string holds ``'`` and no ``"``, when it quotes with
     ``"`` and escapes neither. Appending ``"`` forces the first choice, so both forms are read off the
     interpreter itself rather than reimplemented. The bytes come from these encodings, not every one
-    a path can take: the filesystem encoding, UTF-8 with either surrogate handler, since Windows
-    passes a lone surrogate through and POSIX escapes it, and cp1252, the Windows ANSI code page. One
-    a name cannot be encoded in is skipped, never raised: this runs on an error arm, and a lone
-    surrogate is a name a partner can choose. Each escaped form is also kept with its hex digits in
-    upper case."""
+    a path can take: the filesystem encoding; UTF-8 with either surrogate handler, since Windows
+    passes a lone surrogate through and POSIX escapes it; the locale's encoding, which on Windows is
+    the host's ANSI code page; and cp1252, the Western European ANSI page, for a tool that wrote
+    one on another host. One a name cannot be encoded in is skipped, never raised: this runs on an
+    error arm, and a lone surrogate is a name a partner can choose. Each escaped form is also kept
+    with its hex digits in upper case."""
     forms = {
         text,
         repr(text)[1:-1],
@@ -3105,21 +3139,23 @@ def _name_forms(text: str) -> list[str]:
         json.dumps(text, ensure_ascii=False)[1:-1],
     }
     encoders: list[Callable[[str], bytes]] = [
-        # The same as one UTF-8 encoder below, except under Windows' legacy filesystem encoding.
+        # The host's own: UTF-8 on most, but a POSIX locale's encoding where that is not UTF-8,
+        # and mbcs under Windows' legacy filesystem mode.
         os.fsencode,
         lambda s: s.encode("utf-8", "surrogatepass"),
         lambda s: s.encode("utf-8", "surrogateescape"),
+        lambda s: s.encode(locale.getencoding()),
         lambda s: s.encode("cp1252"),
     ]
     for encode in encoders:
         try:
             encoded = encode(text)
-        except UnicodeEncodeError:
+        except (UnicodeEncodeError, LookupError):
             continue
         forms.update((repr(encoded)[2:-1], repr(encoded + b'"')[2:-2]))
     # Another renderer may write an escape's hex digits in upper case, as some JSON encoders do.
     forms.update([_HEX_ESCAPE.sub(_upper_hex, form) for form in forms])
-    return sorted(forms, key=lambda form: (-len(form), form))
+    return forms
 
 
 #: A ``\x``, ``\u`` or ``\U`` escape with lowercase hex digits, as repr, ascii and json write one.

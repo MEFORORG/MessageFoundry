@@ -60,3 +60,11 @@ def test_a_swap_never_matches_across_a_label_it_wrote() -> None:
     out = safe_exc(RuntimeError(f"drop refused: ]Zqx{BS}tZqx\t"), file_name=name)
     assert out.count("[name:") == 1, out
     assert label in out
+
+
+def test_a_longer_form_wins_over_a_shorter_one_that_starts_earlier() -> None:
+    """Where two forms overlap, the longer is swapped, as one replacement per form in length order
+    did: a shorter form starting earlier does not leave the longer one's escaped tail in view."""
+    name = "x\x01x"
+    out = safe_exc(RuntimeError(f"bad: x\x01x{BS}x01x"), file_name=name)
+    assert f"{BS}x01x" not in out, out

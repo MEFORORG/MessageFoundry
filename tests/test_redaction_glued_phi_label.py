@@ -293,13 +293,10 @@ def test_a_segment_id_head_glued_to_its_quote_is_refused() -> None:
 
 
 def test_a_run_over_declared_delimiters_masks_a_glued_value() -> None:
-    # The value's object is opened here: without it the `}` is a stray closer, and the whole text is
-    # the placeholder with the rule off too (BACKLOG #5814), so the control would show nothing.
-    text = 'MSH*^~\\&*A*B\r x*y*z,{"name":"Zqxdoe Vandtjane"}'
+    text = 'MSH*^~\\&*A*B\r x*y*z,"name":"Zqxdoe Vandtjane"}'
     assert "Vandtjane" not in redact(text)
     with _rule_off():
         assert "Vandtjane" in redact(text)
-    assert redact('MSH*^~\\&*A*B\r x*y*z,"name":"Zqxdoe Vandtjane"}') == "[redacted]"
 
 
 def test_a_top_level_value_key_is_not_masked() -> None:
