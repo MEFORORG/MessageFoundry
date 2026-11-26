@@ -227,14 +227,11 @@ class Keyer:
         # would leak it into a traceback, a log or a CI transcript.
         entropy = _estimated_entropy_bits(salt)
         per_char = entropy / len(salt)
-        # Names the per-character floor, the one that binds (see MIN_SALT_ENTROPY_BITS). It states
-        # the rate and the floor at MIN_SALT_LEN, not this salt's length or total.
         if entropy < MIN_SALT_ENTROPY_BITS:
             raise ValueError(
                 f"anonymizer salt is too predictable: about {per_char:.2f} bits of estimated "
                 f"entropy per character, against a floor of {MIN_SALT_ENTROPY_BITS_PER_CHAR:.1f} "
-                f"({MIN_SALT_ENTROPY_BITS_PER_CHAR * MIN_SALT_LEN:.0f} bits at the "
-                f"{MIN_SALT_LEN}-character minimum length). {_GENERATE_ADVICE} "
+                f"per character. {_GENERATE_ADVICE} "
                 "Note this floor is a SCREEN, not the ADR 0030 section 4 requirement: that one is "
                 "128 bits at generation, which no check on a supplied string can confirm."
             )

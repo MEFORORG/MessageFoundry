@@ -973,9 +973,7 @@ def test_the_two_floors_are_independent() -> None:
         Keyer("ab" * MIN_SALT_LEN)
 
 
-_BINDING_FLOOR_TEXT = (
-    "per character, against a floor of 2.0 (64 bits at the 32-character minimum length)."
-)
+_BINDING_FLOOR_TEXT = "per character, against a floor of 2.0 per character."
 
 
 @pytest.mark.parametrize(
@@ -992,18 +990,18 @@ _BINDING_FLOOR_TEXT = (
             + _BINDING_FLOOR_TEXT,
         ),
         (
-            "a" * 40,  # longer than the minimum: neither its length nor its total is stated
-            "anonymizer salt is too predictable: about 0.00 bits of estimated entropy "
+            "x" * 39 + "y",  # longer than the minimum, so the rate's denominator shows
+            "anonymizer salt is too predictable: about 0.17 bits of estimated entropy "
             + _BINDING_FLOOR_TEXT,
         ),
     ],
-    ids=["at-the-length-floor", "skewed-non-zero", "forty-characters"],
+    ids=["at-the-length-floor", "skewed-non-zero", "skewed-forty-characters"],
 )
 def test_too_predictable_names_the_floor_that_binds(salt: str, expected: str) -> None:
     """The too-predictable refusal names the PER-CHARACTER floor, because that is the floor that
     binds: every salt that reaches the total check is at least MIN_SALT_LEN characters, so the
     per-character floor refuses it too (BACKLOG #4652 item 3). The literal pins the wording; the
-    last assertion checks the 32-bit total is not cited anywhere in the message."""
+    last assertion checks the 32-bit total is not cited in the shapes its regex names."""
     with pytest.raises(ValueError) as excinfo:
         Keyer(salt)
     message = str(excinfo.value)
@@ -1018,8 +1016,9 @@ def test_too_predictable_names_the_floor_that_binds(salt: str, expected: str) ->
 
 def test_the_per_character_floor_subsumes_the_total_at_the_length_floor() -> None:
     """The too-predictable message names the per-character floor, which is true only while that
-    floor refuses every salt the total does at MIN_SALT_LEN. Raising the total, or lowering the
-    length floor, past this point would make the message name a floor the salt clears."""
+    floor refuses every salt the total does at MIN_SALT_LEN. Moving any of the three constants
+    past this point, at least by raising the total or lowering either floor, would make the
+    message name a floor the salt clears."""
     assert MIN_SALT_ENTROPY_BITS <= MIN_SALT_LEN * MIN_SALT_ENTROPY_BITS_PER_CHAR
 
 
