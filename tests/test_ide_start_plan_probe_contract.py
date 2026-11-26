@@ -42,6 +42,11 @@ _MODEL = Path(__file__).resolve().parents[1] / "ide" / "src" / "engineControlMod
 _WIZARD = _MODEL.with_name("connectionWizardModel.ts")
 
 
+def _code_view(text: str) -> str:
+    """TypeScript with its comments blanked and its whitespace collapsed, for the source pins."""
+    return " ".join(blank_js_comments(text).split())
+
+
 def _ts_string_const(name: str) -> str:
     """The value of ``export const <name> = "...";`` in the IDE's control model."""
     m = re.search(rf'export const {name} = "([^"]+)";', _MODEL.read_text(encoding="utf-8"))
@@ -67,16 +72,17 @@ def _probe_argv() -> list[str]:
 def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
     """If the TypeScript stops building this argv, the three tests below stop describing the IDE.
 
-    The IDE adds ``--service-config`` only when ``messagefoundry.serviceConfig`` is set and not
-    blank; this file's probe runs with the setting at its default, where ``serviceConfigFlag`` (an
-    alias of ``connectionWizardModel.ts``'s ``serviceConfigArgs``) adds nothing. Comments are
-    blanked first, so a comment quoting the argv cannot satisfy the pin, and the pin ends at the
+    The probe gets ``--service-config`` only when ``connectionServiceConfig`` gives it a value, which
+    it does not with ``messagefoundry.serviceConfig`` at its default; this file's probe runs there,
+    where ``serviceConfigFlag`` (an alias of ``connectionWizardModel.ts``'s ``serviceConfigArgs``)
+    is handed undefined and adds nothing. Comments are blanked first in both files, so a comment
+    quoting the code cannot satisfy a pin (a string literal still could), and the pin ends at the
     array's close, so an element added after the flag reds it. The array is handed to ``cliArgv``
     (BACKLOG #5409), so its body is pinned too: the interpreter options, then ``-m messagefoundry``,
     then this array, and nothing after it.
     """
     raw = _MODEL.read_text(encoding="utf-8")
-    src = " ".join(blank_js_comments(raw).split())
+    src = _code_view(raw)
     # Control: the JSDoc right above the pinned array is in the file and is blanked from the code.
     assert "Each value is bound with" in raw
     assert "Each value is bound with" not in src
@@ -95,12 +101,20 @@ def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
     )
     # serviceConfigFlag is an alias of connectionWizardModel's serviceConfigArgs, so follow it there:
     # the alias and its import here, and the body there, where undefined (this probe) adds nothing.
-    assert "const serviceConfigFlag = serviceConfigArgs;" in src
+    # Every other mention of either name here must be a call: a second declaration, a parameter, an
+    # `as` rename or a local serviceConfigArgs would each add a mention that is not one.
     assert re.search(
-        r'import \{[^}]*\bserviceConfigArgs\b[^}]*\} from "\./connectionWizardModel";', src
+        r'import \{[^}]*\bserviceConfigArgs\b(?! as\b)[^}]*\} from "\./connectionWizardModel";',
+        src,
     )
-    assert "function serviceConfigFlag" not in src, "a second serviceConfigFlag shadows the alias"
-    wizard = " ".join(blank_js_comments(_WIZARD.read_text(encoding="utf-8")).split())
+    assert "const serviceConfigFlag = serviceConfigArgs;" in src
+    assert len(re.findall(r"\bserviceConfigArgs\b", src)) == 2, "only the import and the alias"
+    assert len(re.findall(r"\bserviceConfigFlag\b(?!\()", src)) == 1, "only the alias declares it"
+    wizard_raw = _WIZARD.read_text(encoding="utf-8")
+    wizard = _code_view(wizard_raw)
+    # Control: the JSDoc right above serviceConfigArgs is in the file and is blanked from the code.
+    assert "so a value that starts with" in wizard_raw
+    assert "so a value that starts with" not in wizard
     assert (
         "export function serviceConfigArgs(serviceConfig: string | undefined): string[] { "
         "return serviceConfig === undefined ? [] :" in wizard
