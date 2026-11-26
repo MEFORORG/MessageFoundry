@@ -199,8 +199,9 @@ _HOSTILE_RUN_CHARS = 16_000
 #: (#2896). They moved to a CPU-time ratio, ``_CPU_GROWTH_LINE``, and their controls moved with them.
 #: Two more moved to a CPU-time ratio after the hosted readings of engine PR 3334, at ``-n 12`` on
 #: ubuntu: the frame-cap segment shape (tightest 1.88 times, worst 26.6 ms), on
-#: ``_CPU_GROWTH_LINE`` and ``_SEGMENT_CEILING_SECONDS``, and the separator sniff on operational text (tightest 2.7 times, worst
-#: 18.5 ms), on its own ``_OPS_GROWTH_LINE`` and ``_OPS_CEILING_SECONDS``.
+#: ``_CPU_GROWTH_LINE`` and ``_SEGMENT_CEILING_SECONDS``, and the separator sniff on operational
+#: text (tightest 2.7 times, worst 18.5 ms), on its own ``_OPS_GROWTH_LINE`` and
+#: ``_OPS_CEILING_SECONDS``.
 _SCAN_BUDGET_SECONDS = 0.05
 
 
@@ -730,11 +731,10 @@ def test_the_separator_sniff_stays_inside_the_scan_budget(
 _OPS_GROWTH_LINE = 64.0
 
 #: The absolute bound the operational-text arm reads, in thread CPU seconds for its SMALL input, the
-#: block the budget arm used to time. **The same number as ``_SCAN_BUDGET_SECONDS``.** An earlier
-#: cut of this arm read ``_CPU_CEILING_SECONDS`` on this small input, ten times looser than the
-#: budget on the same block; this restores the budget's strength there. A separate literal, because
-#: it is read on another clock: a re-derived wall-clock budget does not move it. The readings and
-#: the margin are in the arm's docstring.
+#: block the budget arm used to time. **The same number as ``_SCAN_BUDGET_SECONDS``**, not
+#: ``_CPU_CEILING_SECONDS``, which is ten times looser than the budget on the same block. A
+#: separate literal, because it is read on another clock: a re-derived wall-clock budget does not
+#: move it. The readings and the margin are in the arm's docstring.
 _OPS_CEILING_SECONDS = 0.05
 
 
@@ -2578,10 +2578,9 @@ def test_control_the_same_inputs_are_expensive_unbounded(
 
 #: The absolute bound the frame-cap segment arm reads, in thread CPU seconds for the 16 MiB
 #: segment-shaped input, the input the budget arm timed with ``safe_text`` before this arm left it.
-#: **The same number as ``_SCAN_BUDGET_SECONDS``.** An earlier cut of this arm read
-#: ``_CPU_CEILING_SECONDS`` there, ten times looser than the budget on the same input; this restores
-#: the budget's strength. A separate literal, because it is read on another clock: a re-derived
-#: wall-clock budget does not move it. The readings and the margin are in the arm's docstring.
+#: **The same number as ``_SCAN_BUDGET_SECONDS``**, not ``_CPU_CEILING_SECONDS``, which is ten
+#: times looser than the budget on the same input. Its own literal for the reason
+#: ``_OPS_CEILING_SECONDS`` gives. The readings and the margin are in the arm's docstring.
 _SEGMENT_CEILING_SECONDS = 0.05
 
 
@@ -2593,19 +2592,18 @@ def test_a_frame_cap_sized_segment_input_costs_what_a_window_of_it_costs(
     was thin; the hosted readings are in the comment on ``_SCAN_BUDGET_SECONDS``.
 
     Measured 2026-11-26 (Central) on a Windows box, over twelve runs: a ratio of 0.85 to 1.6, at
-    least 15 times under the line. Over twelve more on a 32-core Windows box, seven of this arm alone
-    and five inside a ``pytest -n 12`` run of this file, a ratio of 0.85 to 1.55 and 3.28 to 3.98 ms
-    of CPU for the frame cap, the slowest under ``-n 12``: at least 0.05 / 0.00398 = 12.5 times under
-    ``_SEGMENT_CEILING_SECONDS``.
+    least 15 times under the line. Over twelve more on a 32-core Windows box, seven of this arm
+    alone and five inside a ``pytest -n 12`` run of this file, a ratio of 0.85 to 1.55 and 3.28 to
+    3.98 ms of CPU for the frame cap, the slowest under ``-n 12``: at least 0.05 / 0.00398 = 12.5
+    times under ``_SEGMENT_CEILING_SECONDS``.
 
     **The ceiling is read on the large side, at the budget's number**, the input and the number the
-    budget arm used. What changed is the clock, thread CPU time rather than wall time, and that has
-    a cost: time the thread spends blocked, on a lock, a sleep or a joined helper thread, stalls the
-    event loop but is charged almost nothing, so neither bound here reads it. A loaded runner still
-    inflates CPU seconds by a factor, through cache and frequency loss, and that factor has the
-    12.5 times above locally. The ``-n 12`` run did not oversubscribe the 32 cores, and no hosted
-    CPU reading exists yet; the hosted wall reading bounds hosted CPU only from above, and its worst,
-    26.6 ms, sits 1.88 times under this ceiling.
+    budget arm used, on thread CPU time rather than wall time. Thread CPU time does not charge time
+    the thread spends blocked, so neither bound here reads a stall of that kind;
+    ``test_the_separator_sniff_on_operational_text_grows_linearly`` states that cost and the
+    loaded-runner factor once. The factor has the 12.5 times above locally. The ``-n 12`` run did
+    not oversubscribe the 32 cores, and no hosted CPU reading exists yet; the hosted wall reading
+    bounds hosted CPU only from above, and its worst, 26.6 ms, sits 1.88 times under this ceiling.
 
     **What it gives up against the budget:** a change that widens the clamp's window moves both
     sides of the ratio, since the small side is cut at ``_REDACT_WINDOW``, and the ceiling passes a
@@ -2634,15 +2632,27 @@ def test_control_the_segment_input_is_expensive_unbounded(
     """Non-vacuity for the segment arm above: ``redact`` called directly, which is what
     ``safe_text`` did before the bound, on the same pair, the same clock and the same line. Measured
     2026-11-26 (Central) on a Windows box, over seventeen runs: 178 to 329. One rep for the large
-    input, because a slow sample there only helps this assertion."""
+    input, because a slow sample there only helps both assertions.
+
+    **The ceiling is read over too**, on the same large input, so ``_SEGMENT_CEILING_SECONDS``
+    provably separates the bounded scan from the unbounded one on this clock, as the budget's
+    control did on the wall clock."""
     growth, large, small = _frame_cap_growth("segment-shaped", redact, large_reps=1)
     _record_reading(
         record_property, growth, _CPU_GROWTH_LINE, over=True, unit="ratio", sides=(large, small)
+    )
+    _record_reading(
+        record_property, large, _SEGMENT_CEILING_SECONDS, over=True, unit="cpu_s", label="ceiling"
     )
     assert growth > _CPU_GROWTH_LINE, (
         f"the unbounded scan of the segment shape cost only {growth:.1f} times one window of it, "
         f"under the {_CPU_GROWTH_LINE} line the bounded arm clears -- this fixture no longer "
         f"discriminates and the line needs re-deriving"
+    )
+    assert large > _SEGMENT_CEILING_SECONDS, (
+        f"the unbounded scan of the segment shape cost only {large:.4f} CPU seconds, under the "
+        f"{_SEGMENT_CEILING_SECONDS}s ceiling the bounded arm clears -- this fixture no longer "
+        f"discriminates"
     )
 
 
@@ -3018,11 +3028,13 @@ def test_the_token_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
     #2896 removed. Absolute bounds on one clamp live in at least these arms instead: two of the
     CPU-time arms under ``_CPU_CEILING_SECONDS``
     (``test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer`` and
-    ``test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs``), and the one frame-cap shape
-    still under ``_SCAN_BUDGET_SECONDS``, the solid run. None of their walls is name-shaped where
-    the cut lands, so none drives the name walk past a token or two. So a name walk that stays
-    linear but carries a large constant still passes everything here. That gap is accepted, and it
-    is recorded rather than closed."""
+    ``test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs``), the segment arm under
+    ``_SEGMENT_CEILING_SECONDS``
+    (``test_a_frame_cap_sized_segment_input_costs_what_a_window_of_it_costs``), and the one
+    frame-cap shape still under ``_SCAN_BUDGET_SECONDS``, the solid run. None of their walls is
+    name-shaped where the cut lands, so none drives the name walk past a token or two. So a name
+    walk that stays linear but carries a large constant still passes everything here. That gap is
+    accepted, and it is recorded rather than closed."""
     growth = _walk_growth()
     assert growth < _WALK_GROWTH_LINE, (
         f"doubling the window multiplied the characters the walk touches by {growth:.2f}, over the "
