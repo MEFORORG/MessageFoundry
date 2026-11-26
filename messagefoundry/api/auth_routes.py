@@ -1174,7 +1174,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> MfaEnrollResponse:
         """Begin TOTP enrollment: stage a secret and return it + the ``otpauth://`` URI for the QR.
         Gated by a fresh **password** step-up BOUND to this enroll action (ADR 0077 — not MFA, you may
-        have none yet; and not the shared login window, so a hijacked session can't bind a factor); not
+        have none yet; and not the shared login window, so a hijacked session can't bind a factor,
+        except under ``[auth].require_action_step_up = false``, where that window is the gate); not
         active until confirmed via ``/me/mfa/confirm``. No provider gate: an engine factor is engine-
         held state and every provider may hold one (BACKLOG #1144, and see
         :meth:`~messagefoundry.auth.service.AuthService.begin_mfa_enrollment` for why)."""
@@ -1198,7 +1199,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         single-use recovery codes (shown **once** — save them). A wrong code is a 400, and a
         directory account the directory could not confirm a 403 (BACKLOG #3061), as is a directory
         account under a second-step lock (BACKLOG #3810 finding 4). Gated by a fresh
-        password step-up BOUND to this confirm action (ADR 0077), independent of the enroll grant."""
+        password step-up BOUND to this confirm action (ADR 0077), independent of the enroll grant;
+        under ``[auth].require_action_step_up = false`` the session window instead."""
         # Post-session ceremony (enrolling a factor while signed in): per-ACTOR budget.
         if not service.allow_reauth_attempt(identity.user_id):
             raise _rate_limited(request, "mfa-confirm")

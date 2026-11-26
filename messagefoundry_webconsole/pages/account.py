@@ -812,7 +812,8 @@ def sessions_page(sessions: Sequence[Mapping[str, object]], *, notice: str | Non
     **Revoking one's OWN sessions is step-up gated** (ASVS 7.5.2, BACKLOG #1149): both terminate
     POSTs take ``require_ui_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE)``, so the cookie
     alone does not carry them — ``/ui/reauth`` mints a single-use grant bound to that action and each
-    terminate consumes one. It is the password-only family, but no pending session passes it: an
+    terminate consumes one, except under ``[auth].require_action_step_up = false``, where a live
+    session window carries them. It is the password-only family, but no pending session passes it: an
     operator who HAS a factor proves it first (BACKLOG #1951), and one with no factor under
     ``require_mfa`` is sent to enrol first (BACKLOG #1149).
 

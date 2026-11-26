@@ -747,7 +747,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # 7.5.2 wants an authentication event AFTER the one that established the session. The proof is
     # now bound to the action and single-use, so an immediate post-login revoke 303s to
     # /ui/reauth?next=<this action> and auto-retries after re-verification (both terminate POSTs are
-    # registered auto_retry, step_up=False, above). The handlers read the HEADER/cookie session token
+    # registered auto_retry, step_up=False, above). Under [auth].require_action_step_up = false,
+    # _ui_action_step_up_ok reads the session window instead, so a post-login revoke goes through
+    # (docs/SECURITY.md, the DELETE /me/sessions/{session_id} row). The handlers read the HEADER/cookie session token
     # to identify the current session and drive the SERVICE directly (the ui_mfa_verify pattern).
     _SESSION_NOTICES = {
         "revoked": "Session revoked.",

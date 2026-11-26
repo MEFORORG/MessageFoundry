@@ -875,7 +875,7 @@ which record the opener the guard is handed. `test_an_ech_sidecar_and_a_crl_stil
 `test_rest_with_an_ech_sidecar_and_a_crl_is_still_refused` pin the refusal, each with a control in
 which the same CRL relaxes the same hop without a sidecar. They read the outcome, not the argument,
 so they do not tell no opener apart from the plain opener each ECH hop posts through, which loads
-no CRL: the token hop's since BACKLOG #2977 item 5, and the sidecar opener that replaces the REST
+no CRL: the token hop's since vault BACKLOG #2977 item 5, and the sidecar opener that replaces the REST
 destination's direct-hop opener. *(CORRECTED 2026-11-26: this read "Two cases there carry the ECH
 claim", naming only those two outcome tests.)*
 
