@@ -9210,23 +9210,24 @@ def forget_store_salt(path: Path) -> bool:
     # The ordinary-table predicate, so a virtual `store_salt` another tool left, whose module may
     # not be loaded here, is not probed and cannot raise "no such module" (BACKLOG #6719 item 4).
     # lower(), as schema_verify's salt read matches it: SQLite resolves the name case-blind, so a
-    # `Store_Salt` table is the one the next open reads. Spelled at each call rather than held in a
-    # local, so tests/test_writer_txn_is_the_only_begin.py can read the statement.
+    # `Store_Salt` table is the one the next open reads. One helper serves the drop and its proof, so
+    # the two cannot read different tables; the statement is spelled at the call rather than held in a
+    # local so tests/test_writer_txn_is_the_only_begin.py can read it.
 
-    def drop(conn: sqlite3.Connection) -> bool:
-        exists = conn.execute(
-            "SELECT count(*) FROM sqlite_master AS m"
-            f" WHERE {_ORDINARY_TABLE} AND lower(m.name) = 'store_salt'"
-        ).fetchone()[0]
-        return bool(exists) and conn.execute("DELETE FROM store_salt").rowcount > 0
-
-    def gone(proof: sqlite3.Connection) -> bool:
-        return not (
-            proof.execute(
+    def has_salt_table(conn: sqlite3.Connection) -> bool:
+        return bool(
+            conn.execute(
                 "SELECT count(*) FROM sqlite_master AS m"
                 f" WHERE {_ORDINARY_TABLE} AND lower(m.name) = 'store_salt'"
             ).fetchone()[0]
-            and proof.execute("SELECT count(*) FROM store_salt").fetchone()[0]
+        )
+
+    def drop(conn: sqlite3.Connection) -> bool:
+        return has_salt_table(conn) and conn.execute("DELETE FROM store_salt").rowcount > 0
+
+    def gone(proof: sqlite3.Connection) -> bool:
+        return not (
+            has_salt_table(proof) and proof.execute("SELECT count(*) FROM store_salt").fetchone()[0]
         )
 
     return _write_closed_store(
