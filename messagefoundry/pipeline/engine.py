@@ -898,8 +898,7 @@ class Engine:
         if self._dr_settings.enabled and (
             self._dr_settings.takeover_hook or self._dr_settings.release_hook
         ):
-            # At start, not only when a hook runs, which on a DR box is during the disaster: the
-            # coordinator that runs hooks is built only at the first activate or release.
+            # At construction, not only when a hook runs, which on a DR box is during the disaster.
             warn_unset_pass_environment(self._dr_settings.pass_environment)
         # Whether the engine runs under the DR run-profile (#61, ADR 0048). Always False at
         # construction: no configuration brings a box up active, so every activation runs the
@@ -1372,9 +1371,10 @@ class Engine:
         if self._backup_runner is not None and self._backup_runner.enabled:
             # Once per activation (BACKLOG #5965): the runner itself skips each pass silently.
             log.warning(
-                "DR backup: paused while this box is activated, so a later re-activation of the "
-                "same restore still passes the restore-token vintage check; the primary's backups "
-                "are the ones a restore uses"
+                "DR backup: scheduled passes are paused while this box is activated, so a later "
+                "re-activation of the same restore still passes the restore-token vintage check. "
+                "Nothing backs up what this box takes in meanwhile; the `messagefoundry backup` "
+                "command still can, and its row then becomes the token check's newest anchor"
             )
         if not close_failures:
             return {}

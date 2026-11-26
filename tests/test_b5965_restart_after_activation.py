@@ -12,16 +12,25 @@ so a later re-activation of the same restore still passes the restore-token vint
 
 from __future__ import annotations
 
+import json
 import logging
+import socket
 from pathlib import Path
 
 import pytest
 
 from messagefoundry.config.models import Priority
-from messagefoundry.config.settings import BackupSettings, DrSettings, EgressSettings, StoreSettings
+from messagefoundry.config.settings import (
+    AlertRule,
+    AlertSeverity,
+    BackupSettings,
+    DrSettings,
+    EgressSettings,
+    StoreSettings,
+)
 from messagefoundry.config.wiring import MLLP, Registry, build_inbound_connection
 from messagefoundry.pipeline import Engine
-from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
+from messagefoundry.pipeline.alert_sinks import AlertRuleSet, NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.dr import DrCoordinator
 from messagefoundry.pipeline.dr_backup import BackupRunner
@@ -142,7 +151,8 @@ async def test_a_restart_after_activation_alerts_and_stays_passive(
         assert first.dr_active
     finally:
         await first.stop()
-    assert first_sink.events == [("dr_activated", first_sink_label(first_sink))]
+    # A lone engine's label is the host.
+    assert first_sink.events == [("dr_activated", socket.gethostname())]
 
     sink = _Sink()
     store = await MessageStore.open(db, cipher=make_cipher(key))
@@ -152,7 +162,7 @@ async def test_a_restart_after_activation_alerts_and_stays_passive(
         with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.dr"):
             await engine.start()
         # Loud: the critical alert, for the same label the activation raised, and an ERROR line.
-        assert sink.events == [("dr_restarted_passive", first_sink_label(first_sink))]
+        assert sink.events == [("dr_restarted_passive", socket.gethostname())]
         assert any(
             r.levelno == logging.ERROR and "POST /dr/activate" in r.getMessage()
             for r in caplog.records
@@ -164,11 +174,6 @@ async def test_a_restart_after_activation_alerts_and_stays_passive(
         assert await _activations(store) == 1
     finally:
         await engine.stop()
-
-
-def first_sink_label(sink: _Sink) -> str:
-    """The label the first event carried, which is the host on a lone engine."""
-    return sink.events[0][1]
 
 
 async def test_a_never_activated_box_raises_nothing(tmp_path: Path) -> None:
@@ -187,13 +192,85 @@ async def test_a_released_box_raises_nothing_on_restart(tmp_path: Path) -> None:
     db, archive, ss, key = await _seed(tmp_path)
     store = await MessageStore.open(db, cipher=make_cipher(key))
     try:
-        await _coord(store, ss, archive, _Sink(), None).activate(actor="alice")
-        released = _coord(store, ss, archive, _Sink(), None)
-        released._active = True  # the same process, still serving, then fails back
-        await released.release(actor="alice")
+        served = _coord(store, ss, archive, _Sink(), None)
+        await served.activate(actor="alice")
+        await served.release(actor="alice")
         sink = _Sink()
         assert await _coord(store, ss, archive, sink, None).check_restarted_passive() is False
         assert sink.events == []
+    finally:
+        await store.close()
+
+
+async def test_a_release_on_the_restarted_box_records_that_it_stays_passive(
+    tmp_path: Path,
+) -> None:
+    # The operator's way to leave a restarted box passive, so later starts stop paging.
+    db, archive, ss, key = await _seed(tmp_path)
+    store = await MessageStore.open(db, cipher=make_cipher(key))
+    try:
+        await _coord(store, ss, archive, _Sink(), None).activate(actor="alice")
+        restarted_sink = _Sink()
+        restarted = _coord(store, ss, archive, restarted_sink, None)
+        assert await restarted.check_restarted_passive()
+        result = await restarted.release(actor="bob")
+        assert result.active is False and not restarted.active
+        rows = await store.list_audit(action="dr.release", limit=5)
+        assert len(rows) == 1
+        detail = json.loads(rows[0]["detail"])
+        assert detail["after_restart"] is True and detail["vip_hook_ran"] is False
+        assert restarted_sink.events[-1] == ("dr_released", socket.gethostname())
+        # A second release records nothing more, and the next start raises nothing.
+        await restarted.release(actor="bob")
+        assert len(await store.list_audit(action="dr.release", limit=5)) == 1
+        later = _Sink()
+        assert not await _coord(store, ss, archive, later, None).check_restarted_passive()
+        assert later.events == []
+    finally:
+        await store.close()
+
+
+async def test_a_never_activated_box_writes_no_release_row(tmp_path: Path) -> None:
+    db, archive, ss, key = await _seed(tmp_path)
+    store = await MessageStore.open(db, cipher=make_cipher(key))
+    try:
+        sink = _Sink()
+        await _coord(store, ss, archive, sink, None).release(actor="bob")
+        assert await store.list_audit(action="dr.release", limit=5) == []
+        assert sink.events == []
+    finally:
+        await store.close()
+
+
+async def test_a_row_another_box_wrote_does_not_count(tmp_path: Path) -> None:
+    # A store restored from another box carries that box's rows; only this host's count.
+    db, archive, ss, key = await _seed(tmp_path)
+    store = await MessageStore.open(db, cipher=make_cipher(key))
+    try:
+        other = _coord(store, ss, archive, _Sink(), None)
+        other._host = "other-dr-box"
+        await other.activate(actor="alice")
+        sink = _Sink()
+        assert not await _coord(store, ss, archive, sink, None).check_restarted_passive()
+        assert sink.events == []
+    finally:
+        await store.close()
+
+
+async def test_an_unreadable_store_at_start_fails_loud(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db, archive, ss, key = await _seed(tmp_path)
+    store = await MessageStore.open(db, cipher=make_cipher(key))
+    try:
+
+        async def refuse(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+            raise OSError("disk I/O error")
+
+        monkeypatch.setattr(store, "recent_audit_of", refuse)
+        sink = _Sink()
+        assert await _coord(store, ss, archive, sink, None).check_restarted_passive()
+        assert sink.events == [("dr_restarted_passive", socket.gethostname())]
     finally:
         await store.close()
 
@@ -203,17 +280,14 @@ async def test_each_engine_shard_alerts_on_its_own(tmp_path: Path) -> None:
     store = await MessageStore.open(db, cipher=make_cipher(key))
     try:
         await _coord(store, ss, archive, _Sink(), "shard:a").activate(actor="alice")
-        await _coord(store, ss, archive, _Sink(), "shard:b").activate(actor="alice")
-        b_back = _coord(store, ss, archive, _Sink(), "shard:b")
-        b_back._active = True
-        await b_back.release(actor="alice")
+        b_served = _coord(store, ss, archive, _Sink(), "shard:b")
+        await b_served.activate(actor="alice")
+        await b_served.release(actor="alice")
         # Shard a was last activated, so it alerts under its own label; b handed back, so not.
         a_sink, b_sink = _Sink(), _Sink()
         assert await _coord(store, ss, archive, a_sink, "shard:a").check_restarted_passive()
         assert not await _coord(store, ss, archive, b_sink, "shard:b").check_restarted_passive()
-        assert len(a_sink.events) == 1
-        kind, label = a_sink.events[0]
-        assert kind == "dr_restarted_passive" and label.endswith(" shard:a")
+        assert a_sink.events == [("dr_restarted_passive", f"{socket.gethostname()} shard:a")]
         assert b_sink.events == []
         # A shard that never activated reads nothing of its siblings' rows.
         c_sink = _Sink()
@@ -250,16 +324,17 @@ async def test_an_activated_box_writes_no_dr_backup_row(
         await engine.stop()
 
 
-async def test_the_restart_alert_closes_dr_activated_and_is_critical() -> None:
+async def test_the_restart_alert_closes_dr_activated_and_an_activation_closes_it() -> None:
     store = _RecordingStore()
     sink = NotifierAlertSink([], store=store)
-    sink.dr_activated("dr-box", role="dr_standby")
     sink.dr_restarted_passive("dr-box")
     await _drain(sink)
-    assert {"event_type": "dr_activated", "connection": "dr-box"} in store.resolves
-    assert {"event_type": "dr_restarted_passive", "connection": "dr-box"} in store.upserts
-    # The next activation closes the critical one.
-    assert _AUTO_RESOLVE["dr_reactivated"] == "dr_restarted_passive"
+    assert store.resolves == [{"event_type": "dr_activated", "connection": "dr-box"}]
+    assert store.upserts == [{"event_type": "dr_restarted_passive", "connection": "dr-box"}]
+    store.resolves.clear()
+    sink.dr_activated("dr-box", role="dr_standby")
+    await _drain(sink)
+    assert store.resolves == [{"event_type": "dr_restarted_passive", "connection": "dr-box"}]
 
 
 async def test_the_restart_alert_defaults_to_critical() -> None:
@@ -271,3 +346,13 @@ async def test_the_restart_alert_defaults_to_critical() -> None:
     by_type = {e["type"]: e for e in t.events}
     assert by_type["dr_restarted_passive"]["severity"] == "critical"
     assert by_type["dr_activated"]["severity"] == "warning"
+
+
+def test_a_rule_that_names_no_severity_keeps_it_critical() -> None:
+    event = {"type": "dr_restarted_passive", "connection": "dr-box"}
+    catch_all = AlertRuleSet([AlertRule(cooldown_seconds=600)])
+    assert catch_all.decide(event).severity == "critical"
+    named = AlertRuleSet([AlertRule(severity=AlertSeverity.INFO)])
+    assert named.decide(event).severity == "info"
+    # Every other event type keeps the rule's default.
+    assert catch_all.decide({"type": "dr_activated", "connection": "x"}).severity == "warning"

@@ -1045,11 +1045,12 @@ class AlertSink(Protocol):
     def dr_restarted_passive(self, node: str) -> None:
         """A DR box that was last **activated** came back up **passive** after a restart (BACKLOG
         #5965, ADR 0048). It serves nothing and never re-activates itself: an operator re-runs
-        ``POST /dr/activate``. Page-worthy, and CRITICAL when no rule sets its severity. It closes
-        the open ``dr_activated`` instance for ``node``, which no longer describes a box that
-        serves; the next ``dr_activated`` for ``node`` closes this one. ``node`` is the label the
-        coordinator's ``dr_activated`` carries: the host, and on an engine shard or a cluster node
-        the process too. No PHI."""
+        ``POST /dr/activate``. Also raised when the start could not read whether the box was
+        activated. Page-worthy, and CRITICAL unless a matching rule names its own severity. It
+        closes the open ``dr_activated`` instance for ``node``, which no longer describes a box
+        that serves; the next ``dr_activated`` or ``dr_released`` for ``node`` closes this one.
+        ``node`` is the label the coordinator's ``dr_activated`` carries: the host, and on an
+        engine shard the shard too. No PHI."""
         ...
 
     # --- vault BACKLOG #2613: the security-signal rule layer -----------------------------------

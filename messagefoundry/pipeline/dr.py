@@ -70,7 +70,7 @@ from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.dr_backup import VerifyResult, join_before_checks, run_restore_verify
 from messagefoundry.pipeline.path_confine import confine, lexical_roots
-from messagefoundry.redaction import safe_exc, safe_text
+from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
 from messagefoundry.store import Store
 from messagefoundry.store.store import OwnedLanes
 
@@ -334,52 +334,93 @@ class DrCoordinator:
         identity = self._identity()
         return f"{self._host} {identity}" if identity else self._host
 
+    def _whose(self) -> dict[str, object]:
+        """The fields a ``dr.activate`` or ``dr.release`` row carries so a later start can tell
+        whether this process wrote it: the host, and the process identity (BACKLOG #5965). The
+        host keeps a row restored from another box's store from reading as this box's own."""
+        return {"host": self._host, "instance": self._identity()}
+
+    async def _own_last_transition(self) -> str | None:
+        """``dr.activate`` or ``dr.release``: the action of the newest such row this process
+        wrote, by :meth:`_whose`, or ``None`` when none is found. A store error raises."""
+        rows = await self._store.recent_audit_of(
+            (_ACTION_ACTIVATE, _ACTION_RELEASE), limit=_RESTART_SCAN_ROWS
+        )
+        return _last_transition(rows, self._whose())
+
     async def check_restarted_passive(self) -> bool:
         """At start: fail loud when this process was last recorded as activated (BACKLOG #5965;
         owner ruling 2026-11-25, decision d20261126T042906640-0b0f76).
 
         A box always starts passive, and nothing here changes that: it never re-activates itself,
         and ``POST /dr/activate`` stays the only route back to serving. When the newest
-        ``dr.activate`` or ``dr.release`` row written by this process's identity is a
+        ``dr.activate`` or ``dr.release`` row this process wrote (same host, same identity) is a
         ``dr.activate``, the box was serving when it went down, so this logs at ERROR and raises
         the critical ``dr_restarted_passive`` alert, which also closes the open ``dr_activated``
         for the same label. Each engine shard reads only the rows its own identity wrote, so each
-        alerts on its own. Returns whether it alerted.
+        alerts on its own. A store that cannot be read is the same loud outcome, since the box may
+        have been serving. ``POST /dr/release`` on the passive box records the operator's choice
+        to leave it passive, and closes the alert (:meth:`release`). Returns whether it alerted.
 
         It misses at least: an activation whose ``dr.activate`` row was never written (the owed
         row is held in memory only), and a process whose own newest row is older than the
         :data:`_RESTART_SCAN_ROWS` newest. The other way round, a hand-back whose ``dr.release``
-        row was never written alerts, though the box had handed back. A store that cannot be read
-        is logged at ERROR and raises nothing. ``[dr]`` is refused with ``[cluster]``, so the
-        identity is a shard's or none."""
+        row was never written alerts, though the box had handed back. ``[dr]`` is refused with
+        ``[cluster]``, so the identity is a shard's or none."""
         if self._settings.enabled is False or self._active:
             return False
-        identity = self._identity()
         try:
-            rows = await self._store.recent_audit_of(
-                (_ACTION_ACTIVATE, _ACTION_RELEASE), limit=_RESTART_SCAN_ROWS
-            )
+            last = await self._own_last_transition()
         except Exception as exc:
             log.error(
-                "DR: could not read the dr.activate and dr.release audit rows at start, so whether "
-                "this box was serving when it went down is unknown: %s",
+                "DR: could not read the dr.activate and dr.release audit rows at start, so this "
+                "box may have been serving when it went down; it stays PASSIVE: %s",
                 safe_exc(exc),
             )
-            return False
-        if _last_transition(rows, identity) != _ACTION_ACTIVATE:
-            return False
-        label = self._label()
-        log.error(
-            "DR: this box (%s) was last ACTIVATED and has come back up PASSIVE after a restart. "
-            "It serves nothing and does not re-activate itself; re-run POST /dr/activate to serve "
-            "the priority feeds again",
-            label,
-        )
+        else:
+            if last != _ACTION_ACTIVATE:
+                return False
+            log.error(
+                "DR: this box (%s) was last ACTIVATED and has come back up PASSIVE after a "
+                "restart. It serves nothing and does not re-activate itself; re-run POST "
+                "/dr/activate to serve the priority feeds again, or POST /dr/release to record "
+                "that it stays passive",
+                self._label(),
+            )
         try:
-            self._alert_sink.dr_restarted_passive(label)
+            self._alert_sink.dr_restarted_passive(self._label())
         except Exception:  # pragma: no cover - defensive; a sink must never break DR
             log.warning("DR: dr_restarted_passive alert failed", exc_info=True)
         return True
+
+    async def _record_release_after_restart(self, actor: str, now: float) -> None:
+        """``POST /dr/release`` on a passive box this process last activated: record that the
+        operator leaves it passive, so later starts stop alerting, and close the open
+        ``dr_restarted_passive`` (BACKLOG #5965). It runs no hook and drains nothing: the box
+        binds nothing and delivers nothing already. A store error refuses the release."""
+        try:
+            if await self._own_last_transition() != _ACTION_ACTIVATE:
+                return
+            detail: dict[str, object] = {
+                **_release_detail(False, None),
+                **self._whose(),
+                "after_restart": True,
+            }
+            await self._store.record_audit(
+                _ACTION_RELEASE, actor=actor, detail=json.dumps(detail, sort_keys=True), now=now
+            )
+        except Exception as exc:
+            raise DrActivationError(
+                "audit",
+                "this box restarted passive after an activation, and recording the release that "
+                f"leaves it passive failed; retry once the audit log accepts writes: {safe_exc(exc)}",
+            ) from exc
+        log.warning(
+            "DR released by %s after a restart: the box was already passive and stays so; no hook "
+            "ran and nothing drained",
+            actor,
+        )
+        self._alert_dr("dr_released")
 
     def note_profile_preflight(self, running: bool) -> None:
         """Record whether the ``activate_profile`` callback is inside its preflight.
@@ -620,7 +661,7 @@ class DrCoordinator:
         detail: dict[str, object] = {
             "archive": _basename(seed),
             # Read back at the next start (check_restarted_passive, BACKLOG #5965).
-            "instance": self._identity(),
+            **self._whose(),
             "verify": verify.status,
             "threshold": self._settings.priority_threshold.value,
             "seed_segment": progress.seed_segment,
@@ -674,6 +715,8 @@ class DrCoordinator:
                     # cut-short release owes first, or refuse (vault BACKLOG #2752).
                     if self._unrecorded_release is not None:
                         await self._record_owed_release()
+                    elif self._last_release is None:
+                        await self._record_release_after_restart(actor, now)
                 finally:
                     # A release whose row or cleanup was cut short never ran the cleanup, or not
                     # to its end. It is safe to repeat, so a retry finishes it, and does so
@@ -717,7 +760,7 @@ class DrCoordinator:
                 phase = "record"
                 self._active = False
                 detail = _release_detail(hook_ran, drain)
-                detail["instance"] = self._identity()  # BACKLOG #5965, as on dr.activate
+                detail.update(self._whose())  # BACKLOG #5965, as on dr.activate
                 self._last_release = self._release_result(detail)
                 # Owed from here: a write cut short is made good by the next activate or release.
                 self._unrecorded_release = (detail, actor, now)
@@ -1702,19 +1745,20 @@ def _release_detail(hook_ran: bool, drain: Mapping[str, object] | None) -> dict[
     return detail
 
 
-def _last_transition(rows: Collection[Mapping[str, object]], identity: str | None) -> str | None:
-    """The action of the newest row in ``rows`` whose detail names ``identity`` as its
-    ``instance``, or ``None`` when none does. A row whose detail is not a JSON object is passed
-    over (BACKLOG #5965)."""
-    for row in sorted(rows, key=lambda r: _count(r.get("id")) or 0, reverse=True):
+def _last_transition(
+    rows: Collection[Mapping[str, object]], whose: Mapping[str, object]
+) -> str | None:
+    """The action of the first row in ``rows`` (newest first, as ``recent_audit_of`` returns
+    them) whose detail carries every field of ``whose``, or ``None`` when none does. A detail that
+    is not a JSON object is passed over (BACKLOG #5965)."""
+    for row in rows:
         raw = row.get("detail")
         if not isinstance(raw, str):
             continue
-        try:
-            parsed = json.loads(raw)
-        except ValueError:
+        parsed, refusal = json_loads_or_refusal(raw)
+        if refusal is not None or not isinstance(parsed, dict):
             continue
-        if isinstance(parsed, dict) and parsed.get("instance") == identity:
+        if all(parsed.get(key) == value for key, value in whose.items()):
             action = row.get("action")
             return action if isinstance(action, str) else None
     return None

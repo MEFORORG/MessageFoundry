@@ -618,8 +618,8 @@ class BackupRunner:
         )
         if self._dr_paused():
             log.info(
-                "DR backup: no pass starts on a DR box, passive or activated (BACKLOG #5965); the "
-                "primary's backups are the ones a restore uses"
+                "DR backup: no scheduled pass starts on a DR box, passive or activated (BACKLOG "
+                "#5965); the `messagefoundry backup` command still runs one"
             )
 
     async def stop(self) -> None:
@@ -683,8 +683,9 @@ class BackupRunner:
         the rule it follows is stated once, at :data:`_STAGING_SUFFIX`.
 
         Leader-gated (AC-12): a non-leader returns ``None`` without touching the store or the shared
-        destination (so in a cluster exactly one node backs up), and so does a passive DR standby
-        (vault BACKLOG #5712). On success records a ``dr_backup`` audit
+        destination (so in a cluster exactly one node backs up), and so does an engine-gated DR
+        box, passive or activated (vault BACKLOG #5712, BACKLOG #5965). On success records a
+        ``dr_backup`` audit
         row + returns the :class:`BackupResult`; on failure records a ``dr_backup`` ERROR row, raises
         ``AlertSink.backup_failed``, leaves any prior good archive intact, and re-raises
         :class:`BackupError`. ``force_config_only`` (the CLI ``--config-only`` flag) backs up the config
