@@ -747,6 +747,14 @@ def test_local_root_survives_a_deleted_powershell_location(tmp_path: Path, repo:
     assert Path(json.loads(got.stdout)) == _local(repo)
 
 
+def test_an_empty_label_server_reads_unreachable_with_no_traceback(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    # The idna codec raises UnicodeError for '..', which the probe thread once let escape.
+    assert coord_root._reachable("..") is False
+    assert "Traceback" not in capfd.readouterr().err
+
+
 def test_the_probe_refuses_a_device_path_on_both(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

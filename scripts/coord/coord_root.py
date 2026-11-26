@@ -249,7 +249,9 @@ def _reachable(server: str) -> bool:
         try:
             with socket.create_connection((server, 445), timeout=PROBE_TIMEOUT_SECONDS):
                 result.append(True)
-        except OSError:
+        # UnicodeError: the idna codec refuses a server name with an empty label, such as '..',
+        # which otherwise killed this thread with a traceback on stderr.
+        except (OSError, UnicodeError):
             result.append(False)
 
     t = threading.Thread(target=attempt, daemon=True)

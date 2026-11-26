@@ -307,6 +307,21 @@ def test_a_device_path_source_or_target_is_refused_with_the_message(
     assert not dst.exists()
 
 
+def test_a_provider_qualified_device_source_is_refused_once_resolved(tmp_path: Path) -> None:
+    # FileSystem::\\?\X:\p is not a device path as typed and resolves to one. Past the refusal, its
+    # target nested inside it would slip the nesting check and be copied into its own source.
+    src = _source(tmp_path)
+    spelling = "FileSystem::\\\\?\\" + str(src)
+    proc = _pwsh(
+        MIGRATE, "-Source", spelling, "-Target", str(src / "nested"), "-Apply", cwd=tmp_path
+    )
+    assert proc.returncode == 2, (proc.stdout, proc.stderr)
+    assert proc.stderr.startswith(
+        f"coord-migrate.ps1: -Source is a device path, which is refused: \\\\?\\{src}."
+    ), proc.stderr
+    assert not (src / "nested").exists()
+
+
 @pytest.mark.parametrize("script", [MIGRATE, RACE], ids=["migrate", "race"])
 def test_a_bare_call_refuses_rather_than_prompting(tmp_path: Path, script: Path) -> None:
     code, err = run_holding_stdin_open(
