@@ -2973,14 +2973,41 @@ included, and released, any error the reload raises that none of the other reaso
 raised by a runner start or swap. A `FileNotFoundError` there is never `not_found`. That reason is
 for the config directory itself: at least one that is missing, and one moved away between the
 reload's target check and its read of the directory. An executor fault is named by its own type,
-at least when a lane's anchor check meets it. The row never
+at least when a worker-thread hop with no fallback meets it. The row never
 carries the error's text. A connector build or build check that the executor refused at submit,
 before a worker took it, or cancelled or failed before it began, runs on the event loop instead,
-with a WARNING in the engine log, so that hop does not fail; a bad config is still refused. Work
-still queued behind a busy or hung pool waits for it and is not run on the loop. Other
-worker-thread hops have no such fallback, at least a lane's anchor check and a reload's reads of
-its config directory, so a pool that stays broken still fails the reload. The row does not claim
-the old graph is still serving: at least a
+with a WARNING in the engine log, so that hop does not fail; a bad config is still refused. The
+refused-executor hop list follows (BACKLOG #5755). At least these hops fall back too, except that
+each runs on a thread of its own rather than on the loop: some trust-anchor reads (at least a
+lane's anchor check, the settings preflight and the registry anchor preflight), a reload's target
+check, its content snapshot and its reload snapshot of the config directory, its approval check, a
+DICOM listener's start and stop, and the sandbox session closes. Only when no thread can be
+started does such a hop run on the event loop, which then blocks while it runs: an anchor read on
+a stalled share for as long as the read takes, and a DICOM stop or a sandbox close for as long as
+it runs, which includes waiting out an in-flight C-STORE or brokered lookup whose own wait on the
+loop then times out and fails it. A C-STORE failed that way can still be committed once the loop
+is free, because the commit it waited on was already scheduled, so a re-send by the sender then
+makes a duplicate. A DICOM listener's start still fails there, because it starts its accept loop
+on a thread of its own. Work still queued behind a busy or hung pool waits for it and is not run
+on the loop. Other worker-thread hops have no such fallback, at least: in a reload, the
+environment value read, the config load, which runs author code, the bundle fingerprint, which
+also reads the config directory, and a connector's own startup check, such as a remote-file
+listing; at a load the engine runs, a reload or a DR activation's profile included, the connection
+key-file check that `serve` runs as the first registry preflight (`config/key_file_access.py`); in
+a DR activation, the cold-seed restore-verify (`pipeline/dr_backup.py`) and the confinement of an
+archive the request names; and at serve start and store open, the SMTP alert CA check and the SQL
+Server store's certificate pin checks. So a pool that stays broken still fails an operator reload
+at the first of these it meets, which comes before either registry preflight. A DR activation on
+such a pool aborts before any VIP step, at the latest at its first step, the cold-seed
+restore-verify. A pool that breaks later in an activation, once the takeover hook has run, meets
+the key-file check under `serve` at the profile's preflight, so the activation aborts there and
+the VIP may already have moved. Nor does a rollback on such a pool bring every inbound back. It
+restarts, one at a time, the inbounds that were listening when the runner took its reload lock,
+which is after the engine has loaded and checked the new config, so an inbound stopped or started
+in between is not put back as it was when the reload was asked for. One whose start meets such a
+hop is recorded `failed` and stays down after the rollback, while the rollback still tries to
+restart the rest. That record alerts once while it stands: a repeat failure of the same class, a
+store fault or not, records and alerts nothing new. The row does not claim the old graph is still serving: at least a
 fault raised after the swap committed leaves the new one live, and `GET /config/provenance` says
 which is. At least these write no such row: a DR activation's reload, and a row whose own write
 fails, which is logged. A cluster convergence reload records such a fault with reason
