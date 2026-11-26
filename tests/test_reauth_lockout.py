@@ -50,6 +50,7 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.base import AuthStore
+from messagefoundry.store.row_seal import RowSealError
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_admin, create_local_user_chosen
 
@@ -1397,6 +1398,46 @@ async def test_a_refused_read_keeps_the_reaped_counts(
         assert all(service._session_reproof_failures(hash_token(t)) == 1 for t in tokens)
         assert len(reads) == service_module._REAPED_DROP_REFUSALS
         assert any("this pass drops no more" in r.getMessage() for r in caplog.records)
+    finally:
+        await store.close()
+
+
+async def test_an_unparseable_account_between_refusals_resets_the_refused_run(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5336: pins the reset as built. Any account between refused reads, except one whose
+    read raised a defect, starts the run of refusals again, even one whose row does not parse and
+    so keeps its counts. Refused, unparseable, refused, refused is therefore not three in a run,
+    and the account after them is still read."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        tokens = {}
+        for name in ("ann", "ben", "cat", "dan", "eve"):
+            await _local_user(store, name)
+            identity, token = await _signed_in(service, name)
+            assert not (await service.reauth(identity, WRONG, token=token)).ok
+            tokens[name] = token
+        await store.purge_expired_sessions(now=time.time() + _FAR_FUTURE)
+        real = store.list_sessions
+        reads: list[str] = []
+
+        async def walk(user_id: str, *args: Any, **kwargs: Any) -> Any:
+            reads.append(user_id)
+            if user_id == "u-ben":
+                raise RowSealError("session")
+            if user_id in {"u-ann", "u-cat", "u-dan"}:
+                raise sqlite3.OperationalError("database is locked")
+            return await real(user_id, *args, **kwargs)
+
+        monkeypatch.setattr(store, "list_sessions", walk)
+        with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
+            await service.drop_reaped_reproof_counts()
+        assert reads == ["u-ann", "u-ben", "u-cat", "u-dan", "u-eve"]
+        assert not any("this pass drops no more" in r.getMessage() for r in caplog.records)
+        for name in ("ann", "ben", "cat", "dan"):
+            assert service._session_reproof_failures(hash_token(tokens[name])) == 1
+        assert hash_token(tokens["eve"]) not in service._reproof_session_failures
     finally:
         await store.close()
 
