@@ -2092,13 +2092,15 @@ def redact(text: str) -> str:
     and 0 in 600,000 with it. That zero is a measurement, not a proof for the first-stage labels.
 
     **A mismatched closer after a PHI JSON key, while that key's scope is open, makes the whole
-    text redacted (BACKLOG #5814)**: the result is the placeholder alone. The scope is the key's
-    container, or for a key outside every container its line while no container is open, and
-    :func:`_stray_json_closer`'s docstring says exactly how far it runs. The closer need not be in
-    the key's value: in a malformed sibling, or in prose after the key, it blanks the text too. The JSON pass reads what the passes before it
-    left, so the text as received and the result are both read for a stray closer, and that
-    docstring names at least what the check does not see. A trailing bound note is kept after the
-    placeholder."""
+    text redacted (BACKLOG #5814)**: the result is the placeholder alone. Key-shaped text that a
+    string holds counts as a key too, such as ``'family':`` inside a double-quoted value. The scope
+    is the key's container, or for a key outside every container the text up to a line feed or
+    carriage return reached while no container is open, which can run past the key's line; see
+    :func:`_stray_json_closer`'s docstring. The closer need not be in the key's value: in a
+    malformed sibling, or in prose after the key, it blanks the text too. The JSON pass reads what
+    the passes before it left, so the text as received and the result are both read for a stray
+    closer, and that docstring names some of what the check does not see, not all of it. A
+    trailing bound note is kept after the placeholder."""
     return _redact_noted(text, noted=False)
 
 
