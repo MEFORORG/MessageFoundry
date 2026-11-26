@@ -45,6 +45,17 @@ def test_the_ide_argv_names_the_service_config_to_provision_admin(which: str) ->
     assert ns.json is (which == "probe")
 
 
+def test_the_ide_default_probe_argv_names_no_service_config() -> None:
+    """``probeDefault`` is the probe with ``messagefoundry.serviceConfig`` at its default: the
+    engine reads it as provision-admin with no service-config file and no store override."""
+    parser, _ = _build_parser()
+    ns = parser.parse_args(_cli_args(FIXTURE["probeDefault"]))
+    assert ns.command == "provision-admin"
+    assert ns.service_config is None
+    assert ns.db is None
+    assert ns.json is True
+
+
 def test_control_without_the_flag_the_engine_falls_back_to_its_default() -> None:
     parser, _ = _build_parser()
     args = [a for a in _cli_args(FIXTURE["provision"]) if not a.startswith("--service-config")]
