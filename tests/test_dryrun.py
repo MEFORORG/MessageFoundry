@@ -942,13 +942,12 @@ def test_text_bytes_decode_with_the_inbound_charset(entry: str) -> None:
     assert [msg.json() for _, msg in seen] == [{"n": "café"}] * len(seen)
 
 
-@pytest.mark.parametrize("entry", ["route_message", "route_only", "transform_one"])
+@pytest.mark.parametrize("entry", ["route_message", "route_only"])
 def test_undecodable_text_bytes_are_a_typed_decode_refusal(entry: str) -> None:
     """Bytes a text inbound's charset refuses are the listener's ``decode``-phase
     :class:`IngressGuardError`, quoting no byte of the body, and no Router or Handler runs
     (BACKLOG #6819). They used to escape as a bare ``UnicodeDecodeError``, whose ``.object`` is the
-    whole body. ``transform_one`` has no inbound, so it decodes as UTF-8, an undeclared inbound's
-    charset."""
+    whole body."""
     from messagefoundry.pipeline.ingress_guards import IngressGuardError
 
     seen: list[Any] = []
@@ -960,13 +959,21 @@ def test_undecodable_text_bytes_are_a_typed_decode_refusal(entry: str) -> None:
     assert seen == []
 
 
-def test_transform_one_decodes_utf8_text_bytes() -> None:
-    """``transform_one`` still takes UTF-8 bytes for a text type, decoded as an undeclared
-    inbound's charset would decode them (BACKLOG #6819)."""
+@pytest.mark.parametrize("data", [b'{"n": "MRN\xff"}', b'{"n": "MRN"}'], ids=["not-utf8", "utf8"])
+def test_transform_one_refuses_text_bytes(data: bytes) -> None:
+    """``transform_one`` has no inbound to name a text body's charset or run its post-decode
+    guards, so bytes for a text type are a typed ``decode``-phase refusal quoting no byte of the
+    body, and no Handler runs (BACKLOG #6819). It used to decode them as UTF-8, raising a bare
+    ``UnicodeDecodeError`` on any other charset."""
+    from messagefoundry.pipeline.ingress_guards import IngressGuardError
+
     seen: list[Any] = []
-    reg = _bytes_registry(seen, content_type=ContentType.JSON)
-    _run_entry("transform_one", reg, '{"n": "café"}'.encode())
-    assert [msg.json() for _, msg in seen] == [{"n": "café"}]
+    with pytest.raises(IngressGuardError) as info:
+        _run_entry("transform_one", _bytes_registry(seen, content_type=ContentType.JSON), data)
+    assert info.value.phase == "decode"
+    assert "MRN" not in info.value.reason
+    assert info.value.__cause__ is None and info.value.__context__ is None
+    assert seen == []
 
 
 # --- BACKLOG #6821: a fault in a peek read is a recorded ERROR, as on the listener --------------

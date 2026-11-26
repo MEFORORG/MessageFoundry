@@ -68,7 +68,6 @@ from messagefoundry.pipeline.ingress_guards import (
     strict_validation_due,
 )
 from messagefoundry.pipeline.sandbox import SandboxMode, SandboxSession, run_sandboxed
-from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStatus
 from messagefoundry.store.metadata import encode_reference_value
 
@@ -256,41 +255,42 @@ def _shareable_payload(raw: str | bytes, content_type: str) -> Message | RawMess
 _BINARY_CONTENT_TYPE_VALUES = frozenset(ct.value for ct in ContentType if ct.is_binary)
 
 
-def _listener_body(raw: str | bytes, ic: InboundConnection) -> str | bytes:
-    """``raw`` in the form the live listener hands ``ic``'s Router, for a ``bytes`` non-HL7 body.
-
-    The live engine only ever routes a ``str``: a binary body base64-carried (ADR 0028), a text one
-    decoded with the inbound's declared charset. :func:`route_message` and :func:`route_only` are
-    public and take ``bytes`` too, and :func:`build_payload` decodes a ``bytes`` body as UTF-8, so a
-    DICOM or latin-1 body used to raise ``UnicodeDecodeError``, and a binary body that happened to be
-    UTF-8 reached the Handler uncarried, where ``raw_bytes`` raised ``BinaryCarriageError`` (BACKLOG
-    #6819). This carries or decodes it the way :func:`_dry_run_raw` does, through the same two ingress
-    calls, so a body the listener would refuse raises the listener's :class:`IngressGuardError`. A
-    ``str`` and an HL7 body pass through unchanged: a ``str`` is already in routed form, and the HL7
-    parse takes either."""
-    if isinstance(raw, str) or ic.content_type is ContentType.HL7V2:
-        return raw
+def _carry_or_decode(raw: str | bytes, ic: InboundConnection) -> str:
+    """``raw`` as the listener commits it for a non-HL7 ``ic``: base64-carried for a binary type,
+    decoded with the declared charset and guarded otherwise (BACKLOG #1689). Raises the listener's
+    :class:`IngressGuardError` for a body it would refuse."""
     return carry_binary_ingress(raw, ic) if ic.content_type.is_binary else decode_ingress(raw, ic)
 
 
-def _handler_body(raw: str | bytes, content_type: str) -> str | bytes:
-    """``raw`` in routed form for :func:`transform_one`, for a ``bytes`` non-HL7 body.
+def _listener_body(raw: str | bytes, ic: InboundConnection) -> str | bytes:
+    """A ``bytes`` non-HL7 ``raw`` in the form the listener hands ``ic``'s Router (BACKLOG #6819).
 
-    The :func:`_listener_body` rule without an inbound (BACKLOG #6819): a binary type's bytes are
-    size-bounded and base64-carried; a text type's are decoded as UTF-8, the charset an inbound that
-    declares none decodes with, because no declaration reaches this call. Bytes that are not UTF-8
-    are the ``decode``-phase :class:`IngressGuardError`, raised outside the handler so the
-    ``UnicodeDecodeError``, whose ``.object`` is the whole body, is not chained onto it."""
+    The live engine routes only a ``str``, and :func:`build_payload` decodes ``bytes`` as UTF-8, so
+    without this a DICOM or latin-1 body raised ``UnicodeDecodeError`` and a binary body that was
+    valid UTF-8 reached the Handler uncarried. A ``str`` and an HL7 body pass through unchanged."""
+    if isinstance(raw, str) or ic.content_type is ContentType.HL7V2:
+        return raw
+    return _carry_or_decode(raw, ic)
+
+
+def _handler_body(raw: str | bytes, content_type: str) -> str | bytes:
+    """A ``bytes`` non-HL7 ``raw`` in routed form for :func:`transform_one`, which has no inbound
+    (BACKLOG #6819).
+
+    A binary type's bytes need no charset, so they are size-bounded and base64-carried as
+    :func:`carry_binary_ingress` carries them. A text type's bytes need the inbound's charset and
+    post-decode guards, which do not reach this call, so they are refused as the ``decode``-phase
+    :class:`IngressGuardError` rather than decoded by a guess."""
     if isinstance(raw, str) or content_type == ContentType.HL7V2.value:
         return raw
     if content_type in _BINARY_CONTENT_TYPE_VALUES:
         check_binary_size(raw)
         return RawMessage.from_bytes(raw, content_type).raw
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        refused = f"decode error (utf-8): {safe_exc(exc)}"
-    raise IngressGuardError(refused, phase="decode")
+    raise IngressGuardError(
+        f"transform_one takes a {content_type!r} body as str: decoding bytes needs the inbound's "
+        "charset, so decode them with decode_ingress, or call route_message",
+        phase="decode",
+    )
 
 
 @dataclass(frozen=True)
@@ -471,10 +471,8 @@ def route_only(
     for the payload being a faithful, *isolated-where-mutable* view of ``raw``; ``None`` (the default)
     keeps the self-parsing behavior, so every existing call site is byte-identical.
 
-    A ``bytes`` ``raw`` for a non-HL7 inbound is self-parsed in the form the listener hands it:
-    base64-carried for a binary type, decoded with the inbound's charset otherwise. A body the
-    listener would refuse raises its :class:`IngressGuardError` (BACKLOG #6819; see
-    :func:`_listener_body`).
+    A ``bytes`` non-HL7 ``raw`` is self-parsed in the form the listener hands it, and a body the
+    listener would refuse raises its :class:`IngressGuardError` (BACKLOG #6819, :func:`_listener_body`).
 
     ``tracer`` (ADR 0072) is an optional observer: when given, the Router is invoked **through**
     ``tracer.trace_router`` (which installs ``sys.settrace`` around the call) instead of called directly.
@@ -492,8 +490,7 @@ def route_only(
     # API) is described as the object it actually is, never assumed to equal _payload(raw, ct).
     derived = payload is None
     if payload is None:
-        # BACKLOG #6819: in the listener's form, which is also the body the sandbox child rebuilds from.
-        raw = _listener_body(raw, ic)
+        raw = _listener_body(raw, ic)  # also the body the sandbox child rebuilds from (#6819)
         payload = _payload(raw, ic.content_type.value)
     # Built only on the sandboxed branch (`_accepted` reads it only there too), so `mode=off` keeps
     # its "not even an allocation" promise rather than paying for a seam it never crosses.
@@ -583,10 +580,9 @@ def transform_one(
     and may be shared across a message's handlers; a mutable HL7 :class:`Message` must *not* be reused
     across handlers (the caller passes ``None`` for HL7 so each handler re-parses its own).
 
-    A ``bytes`` ``raw`` for a non-HL7 type is self-parsed in routed form: base64-carried for a
-    binary type, decoded as UTF-8 otherwise, since no inbound names a charset here. A binary body
-    over the engine ceiling, or text bytes that are not UTF-8, raise :class:`IngressGuardError`
-    (BACKLOG #6819; see :func:`_handler_body`).
+    A ``bytes`` ``raw`` is base64-carried for a binary type; for a text type it is refused, since no
+    inbound names its charset here. Both refusals are :class:`IngressGuardError` (BACKLOG #6819,
+    :func:`_handler_body`).
 
     ``tracer`` (ADR 0072) is an optional observer: when given, the Handler is invoked **through**
     ``tracer.trace_handler`` (which installs ``sys.settrace`` around the call) instead of called
@@ -596,8 +592,7 @@ def transform_one(
     # See route_only: `origin` is passed only when this call derived the payload itself.
     derived = payload is None
     if payload is None:
-        # BACKLOG #6819: in routed form, which is also the body the sandbox child rebuilds from.
-        raw = _handler_body(raw, content_type)
+        raw = _handler_body(raw, content_type)  # also the body the sandbox child rebuilds from
         payload = _payload(raw, content_type)
     raw_result: HandlerResult
     if sandbox is not None and sandbox.mode is not SandboxMode.OFF:
@@ -826,9 +821,8 @@ def route_message(
     :func:`transform_one`). Router/Handler exceptions propagate to the caller, a ``SystemExit`` as
     :class:`UserCodeCalledSysExit`.
 
-    A ``bytes`` ``raw`` for a non-HL7 inbound reaches the Router and every Handler in the form the
-    listener hands it, as :func:`route_only` describes, and a body the listener would refuse raises
-    its :class:`IngressGuardError` before any of them runs (BACKLOG #6819).
+    A ``bytes`` non-HL7 ``raw`` reaches the Router and every Handler in the listener's form, and a
+    body the listener would refuse raises its :class:`IngressGuardError` before any runs (#6819).
 
     ``tracer`` (ADR 0072) is threaded to :func:`route_only` / :func:`transform_one` so the traced
     dry-run can observe each Router/Handler call; it is a pure observer, so the outcome is byte-identical.
@@ -888,9 +882,7 @@ def route_message(
     )
     with run_contexts(rc, phase="transform"):
         ct = ic.content_type.value
-        # Once, before the fan-out, so the Router and every Handler get the body in the form the
-        # listener hands it, and a body it would refuse raises before any of them runs (#6819).
-        raw = _listener_body(raw, ic)
+        raw = _listener_body(raw, ic)  # once, before the fan-out (BACKLOG #6819)
         # Parse-once on the per-message fan-out: for a non-HL7 feed the payload is a read-only
         # RawMessage, so build it ONCE and reuse it for the router and every handler instead of
         # re-decoding/re-constructing it N+1 times. For HL7 this is None (Handlers mutate their
@@ -1077,9 +1069,7 @@ def _dry_run_raw(
     latin-1 one raised ``UnicodeDecodeError`` straight out of ``dry_run`` instead of reporting ERROR."""
     ct = ic.content_type.value
     try:
-        body = (
-            carry_binary_ingress(raw, ic) if ic.content_type.is_binary else decode_ingress(raw, ic)
-        )
+        body = _carry_or_decode(raw, ic)
     except IngressGuardError as exc:
         return DryRunResult(
             inbound=ic.name,
