@@ -20,6 +20,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from decimal import Decimal
+from fractions import Fraction
 from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
@@ -870,7 +871,7 @@ def test_pkce_challenge_is_s256_of_the_verifier() -> None:
 
 def test_flow_round_trip_binds_and_is_single_use() -> None:
     cache = oidc.FlowCache(clock=lambda: 0.0)
-    flow_id, flow = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1", clock=lambda: 0.0)
+    flow_id, flow = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1")
     got, consumed = cache.pop_if_state_matches(flow_id, flow.state)
     assert got is not None and got.state == flow.state and consumed
     assert cache.pop_if_state_matches(flow_id, flow.state) == (None, False)  # single-use
@@ -882,9 +883,7 @@ def test_a_consumed_flows_age_stops_at_its_consumption() -> None:
     read, so that work must not count as time the person spent before the callback arrived."""
     clock = [0.0]
     cache = oidc.FlowCache(clock=lambda: clock[0])
-    flow_id, flow = oidc.start_flow(
-        cache, return_to="/ui", client_ip="10.0.0.1", clock=lambda: clock[0]
-    )
+    flow_id, flow = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1")
     assert cache.age(flow) == 0.0 and flow.redeemed is None
     clock[0] = 0.5
     assert cache.age(flow) == 0.5, "an unconsumed flow ages with the clock"
@@ -898,7 +897,7 @@ def test_a_flow_is_consumed_only_by_its_own_state() -> None:
     """BACKLOG #3198. A missing or wrong ``state`` leaves the flow staged, so a forged callback
     cannot spend the one the real IdP return needs. The matching state consumes it once."""
     cache = oidc.FlowCache(clock=lambda: 0.0)
-    flow_id, flow = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1", clock=lambda: 0.0)
+    flow_id, flow = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1")
     for forged in (None, "", "forged-" + flow.state, "café"):
         got, consumed = cache.pop_if_state_matches(flow_id, forged)
         assert got is not None and not consumed, forged
@@ -910,32 +909,130 @@ def test_a_flow_is_consumed_only_by_its_own_state() -> None:
 def test_flow_expires() -> None:
     clock = [0.0]
     cache = oidc.FlowCache(ttl_seconds=100.0, clock=lambda: clock[0])
-    flow_id, flow = oidc.start_flow(
-        cache, return_to="/ui", client_ip="10.0.0.1", ttl_seconds=100.0, clock=lambda: clock[0]
-    )
+    flow_id, flow = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1")
     clock[0] = 200.0
     assert cache.pop_if_state_matches(flow_id, flow.state) == (None, False)
     assert cache._entries == {}, "an expired flow found on lookup is dropped"
 
 
+def test_the_caches_own_ttl_and_clock_set_a_flows_deadline() -> None:
+    """BACKLOG #6902. RED when: the deadline comes from a TTL or a clock other than the cache's
+    own, such as ``start_flow``'s old defaults of 300 s on ``time.monotonic``. This clock starts far
+    from ``time.monotonic`` and the TTL is far from 300 s, so either mistake moves the deadline."""
+    clock = [1e9]
+    cache = oidc.FlowCache(ttl_seconds=7.0, clock=lambda: clock[0])
+    flow_id, flow = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1")
+    assert flow.deadline == 1e9 + 7.0
+    clock[0] = 1e9 + 6.5
+    assert cache.peek(flow_id) is not None, "the flow lives until the cache's own TTL runs out"
+    clock[0] = 1e9 + 7.0
+    assert cache.peek(flow_id) is None, "the cache's TTL, not the module default, ends it"
+    assert cache.pop_if_state_matches(flow_id, flow.state) == (None, False)
+
+
+def test_put_replaces_a_deadline_set_before_staging() -> None:
+    """BACKLOG #6902. A flow handed straight to ``put`` with a deadline of its own is held to the
+    cache's TTL on the cache's clock, so no caller can set a deadline the cache then reads on
+    another clock."""
+    clock = [50.0]
+    cache = oidc.FlowCache(ttl_seconds=10.0, clock=lambda: clock[0])
+    flow = oidc.PendingFlow(
+        state="st",
+        nonce="n",
+        code_verifier="v",
+        return_to="/ui",
+        client_ip="10.0.0.1",
+        deadline=1e12,
+    )
+    staged = cache.put("flow-1", flow)
+    assert staged.deadline == 60.0 and staged.started == 50.0
+    clock[0] = 60.0
+    assert cache.peek("flow-1") is None
+
+
+#: TTLs the cache must refuse, each with the reason it is wrong. The cache's TTL alone sets every
+#: deadline, so each of these would keep a flow, holding its cap slot for good, or expire it as it
+#: is staged (BACKLOG #6902).
+_BAD_FLOW_TTLS: dict[str, object] = {
+    "zero": 0.0,
+    "negative": -5.0,
+    "nan": float("nan"),
+    "inf": float("inf"),
+    "-inf": float("-inf"),
+    # A bool is not a number of seconds; True would have built a one-second TTL.
+    "true": True,
+    "false": False,
+    # Positive, yet too small to move a clock reading of 1e9: the deadline equals the stamp.
+    "too-small-to-move-the-clock": 1e-300,
+    "below-the-floor": 0.5,
+    # Finite, yet past any deadline that ever arrives.
+    "huge-finite": 1e300,
+    "above-the-ceiling": 86_400.5,
+    # math.isfinite raised OverflowError on this rather than a ValueError.
+    "int-too-large-for-a-float": 10**400,
+    "decimal-nan": Decimal("NaN"),
+    "decimal-signalling-nan": Decimal("sNaN"),
+    "decimal-that-rounds-to-zero": Decimal("1e-400"),
+    "not-a-number": [300],
+    # The shared rule reads text, as a setting can arrive; this cache's caller passes a number.
+    "text": "300",
+}
+
+
+@pytest.mark.parametrize("ttl", list(_BAD_FLOW_TTLS.values()), ids=list(_BAD_FLOW_TTLS))
+def test_a_flow_cache_refuses_a_ttl_outside_its_bounds(ttl: Any) -> None:
+    """BACKLOG #6902. RED when: the cache builds with this TTL, or the refusal is not a
+    ValueError."""
+    with pytest.raises(ValueError, match="FlowCache ttl_seconds") as raised:
+        oidc.FlowCache(ttl_seconds=ttl)
+    assert "value withheld" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "ttl", [1.0, 7, 300.0, 86_400.0, Decimal("300"), Fraction(601, 2)], ids=str
+)
+def test_a_flow_cache_reads_a_ttl_inside_its_bounds_as_a_float(ttl: Any) -> None:
+    """BACKLOG #6902. The control for the refusals above, at both bounds. Each TTL is stored as a
+    float, a Decimal or a Fraction included, so ``put`` adds it to a float clock reading."""
+    clock = [1e9]
+    cache = oidc.FlowCache(ttl_seconds=ttl, clock=lambda: clock[0])
+    flow = oidc.PendingFlow(
+        state="st", nonce="n", code_verifier="v", return_to="/ui", client_ip="10.0.0.1"
+    )
+    staged = cache.put("flow-1", flow)
+    assert staged.deadline == 1e9 + float(ttl) and staged.deadline > staged.started
+    assert type(cache._ttl) is float
+
+
+@pytest.mark.parametrize("ttl", [86_400.5 + 0.123456789, 0.987654321, 1e300])
+def test_a_flow_cache_ttl_refusal_withholds_the_value(ttl: float) -> None:
+    """BACKLOG #6902, docs/REVIEW-STANDARDS.md R12. The refusal names the key and the bounds, never
+    the value, as the transport setting readers do; nor does anything it chains."""
+    with pytest.raises(ValueError) as raised:
+        oidc.FlowCache(ttl_seconds=ttl)
+    chain = "".join(traceback.format_exception(raised.value))
+    for spelling in (repr(ttl), str(ttl), f"{ttl:g}"):
+        assert spelling not in chain, spelling
+
+
 def test_flow_cache_rejects_when_full_never_evicts() -> None:
     """A start-leg flood must be REFUSED, not silently drop an earlier legitimate flow."""
     cache = oidc.FlowCache(global_cap=2, per_ip_cap=99, clock=lambda: 0.0)
-    a, _ = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1", clock=lambda: 0.0)
-    oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.2", clock=lambda: 0.0)
+    a, _ = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1")
+    oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.2")
     with pytest.raises(oidc.FlowCacheFullError):
-        oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.3", clock=lambda: 0.0)
+        oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.3")
     assert cache.peek(a) is not None  # the earliest flow survived the flood
 
 
 def test_per_ip_cap_contains_one_source() -> None:
     cache = oidc.FlowCache(global_cap=99, per_ip_cap=2, clock=lambda: 0.0)
-    oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.9", clock=lambda: 0.0)
-    oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.9", clock=lambda: 0.0)
+    oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.9")
+    oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.9")
     with pytest.raises(oidc.FlowCacheFullError):
-        oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.9", clock=lambda: 0.0)
+        oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.9")
     # a different source is unaffected
-    oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.8", clock=lambda: 0.0)
+    oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.8")
 
 
 def test_state_comparison_is_constant_time() -> None:

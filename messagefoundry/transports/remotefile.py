@@ -2521,6 +2521,9 @@ class RemoteFileDestination(DestinationConnector):
 
     def __init__(self, config: Destination) -> None:
         s = config.settings
+        # Read strictly, and before the hop guard below can log a crossing for a build this refuses
+        # (vault BACKLOG #3234): bool("false") is True.
+        overwrite = flag_from_settings(s, "overwrite")
         _validate_common(
             s,
             cleartext_accepted=config.cleartext_accepted,
@@ -2549,7 +2552,7 @@ class RemoteFileDestination(DestinationConnector):
         # ADR 0204: a template whose fixed text alone is over the cap would name every upload by
         # the fallback, so it is refused here.
         _check_template_fits(self._filename_template, "", FILENAME_MAX_BYTES)
-        self._overwrite = bool(s.get("overwrite", False))
+        self._overwrite = overwrite
         # An explicit None is "not declared": utf-8, as the source's batch split reads it. Left
         # None, .encode(None) raised a TypeError that reached the internal-error arm (vault
         # BACKLOG #3044).

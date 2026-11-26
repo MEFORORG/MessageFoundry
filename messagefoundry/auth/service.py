@@ -2535,15 +2535,22 @@ async def _write_through_cancellation(
 ) -> None:
     """Run ``writes`` to completion even if the caller is cancelled, then re-raise the cancel.
 
-    Shielded, and awaited again after each cancel, so a repeated cancellation neither abandons the
-    writes nor lets the caller leave (and release the account's queue) before they finish. A write
-    that fails raises as it did when the rows were written inline. ``what`` names the writes in
-    the ERROR line logged when one fails while the caller is cancelled."""
+    Waited on, and waited on again after each cancel, so a repeated cancellation neither abandons
+    the writes nor lets the caller leave (and release the account's queue) before they finish. A
+    write that fails raises as it did when the rows were written inline. ``what`` names the writes
+    in the ERROR line logged when one fails while the caller is cancelled.
+
+    BACKLOG #6884: :func:`asyncio.wait`, not :func:`asyncio.shield`. A cancel of the caller cancels
+    neither, but an awaited shield raises the write's own error, so a write that failed after an
+    earlier cancel left the loop with that error, skipping the branch below: the caller left with
+    the write's error and its cancel unconsumed. ``wait`` raises only the caller's cancel, so every
+    outcome is read from ``task`` below. It also leaves no shield behind to log the same failure a
+    second time on asyncio's own logger."""
     task = asyncio.ensure_future(_run_in_order(writes))
     cancelled = False
     while not task.done():
         try:
-            await asyncio.shield(task)
+            await asyncio.wait((task,))
         except asyncio.CancelledError:
             # Recorded before anything else, so a cancel that lands in the turn the writes finish
             # is still re-raised rather than swallowed.
@@ -2803,6 +2810,50 @@ def _in_directory_sign_in_queue[**P](
             return await method(self, principal, *args, **kwargs)
 
     return queued
+
+
+#: How many times a directory sign-in tries its compare-and-set scope write before it fails
+#: (BACKLOG #6887). A miss on a row still there means another writer committed in between; what
+#: counts as a change differs per backend, and ``AuthStore.set_ad_channel_scope_if_unchanged``
+#: states it. A bound this small is reached only by a row other writers keep moving.
+_AD_SCOPE_WRITE_ATTEMPTS: Final = 3
+
+#: The closed-set reason a directory sign-in is refused with when its scope write's compare-and-set
+#: missed on every one of :data:`_AD_SCOPE_WRITE_ATTEMPTS` attempts (BACKLOG #6887). Contention
+#: says nothing about the account, so it is answered as a temporary failure, like
+#: :data:`SESSION_MINT_CONTENDED`.
+SCOPE_SYNC_CONTENDED = "scope_sync_contended"
+
+
+class _AdChannelScopeNotWritten(Exception):
+    """A directory sign-in's scope write was not made, so the sign-in is refused (BACKLOG #6887).
+
+    Raised by :meth:`AuthService._sync_ad_channel_scope` with nothing written, and caught at its
+    one call site in :meth:`AuthService._complete_ad_login`, which audits and answers it as the
+    pre-mint refusals there are answered, so no session is minted. ``reason`` is the closed-set
+    slug the refusal row carries. The message is that slug, which is PHI-free."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class _AdChannelScopeContended(_AdChannelScopeNotWritten):
+    """The scope write met a concurrent writer on every attempt: :data:`SCOPE_SYNC_CONTENDED`.
+    Not a refusal of the account, so the caller answers it as a temporary failure."""
+
+    def __init__(self, attempts: int) -> None:
+        super().__init__(SCOPE_SYNC_CONTENDED)
+        self.attempts = attempts
+
+
+class _AdChannelScopeRefused(_AdChannelScopeNotWritten):
+    """The scope write missed, and the row read again refuses the sign-in. ``reason`` names the
+    row as the caller's pre-mint read would: :data:`ACCOUNT_DELETED` for a row gone (BACKLOG
+    #5624), :data:`ACCOUNT_REFUSED` for one failing its seal, or the reason
+    :func:`_directory_login_refusal` gives for the sign-in's leg (disabled, locked or, off the
+    federated leg, ``FEDERATED_SIGN_IN_REQUIRED``), as the role write's re-read judges it. The role
+    write names a gone row :data:`ACCOUNT_REFUSED`; this one does not."""
 
 
 @dataclass(frozen=True)
@@ -4513,8 +4564,8 @@ class AuthService:
         # (_step_up_return_audit_floor, charged only past the backstop), so the ceiling never
         # silences a named user outright; a source with no account gets no such row, because
         # client addresses are the caller's to multiply and accounts are not. A row it stops pages
-        # (_page_step_up_return_audit_backstop). Neither is built for a window of 0 or less, which
-        # removes the whole budget (a negative global would otherwise refuse every row there).
+        # (_page_step_up_return_audit_backstop). Neither is built for a window of 0, which removes
+        # the whole budget. The load refuses a negative window or global (BACKLOG #5318).
         backstop_on = (
             settings.login_rate_limit_enabled and settings.login_rate_limit_window_seconds > 0
         )
@@ -5428,7 +5479,7 @@ class AuthService:
         # Before every account write, the repair branch's clears included (R3-F1).
         if await self._unverifiable_account_held():
             raise FirstAdministratorRefused(_UNVERIFIABLE_ACCOUNT_REFUSAL)
-        violations = self._policy.violations(password, username=username)
+        violations = await self._screened_violations(password, username=username)
         if violations:
             raise FirstAdministratorRefused("; ".join(violations))
         # ADR 0197 Amendment A (N-A): the code is proved in memory, before any write.
@@ -7289,7 +7340,6 @@ class AuthService:
             self._oidc_flows,
             return_to="/ui",
             client_ip=client or "",
-            ttl_seconds=self._settings.oidc_flow_ttl_seconds,
             prior_session_hash=_superseded_hash(prior_session),
         )
         challenge = oidc.pkce_challenge(flow.code_verifier)
@@ -7857,7 +7907,6 @@ class AuthService:
             self._oidc_flows,
             return_to=return_to,
             client_ip=client or "",
-            ttl_seconds=self._settings.oidc_flow_ttl_seconds,
             step_up_session_hash=token_hash,
             step_up_user_id=session.user_id,
             step_up_purpose=purpose,
@@ -8637,6 +8686,11 @@ class AuthService:
             # required no pair, so it could sign in an account bound to another identity. No
             # production caller did.
             raise ValueError("a federated login (mech='oidc') needs the verified federated_subject")
+        if federated_subject is not None and mech != "oidc":
+            # BACKLOG #4977, the other direction. A pair with ``mech`` None (or any other value)
+            # minted an OIDC session whose success row, which names ``mech`` only when it is set,
+            # did not say ``"mech": "oidc"``. The pair and the mechanism name travel together.
+            raise ValueError("a federated login (one carrying federated_subject) needs mech='oidc'")
         federated = federated_subject is not None
         if federated != (session_mechanism is SessionMechanism.OIDC):
             # A programming error, not a login outcome: a verified federated pair minted under any
@@ -8936,7 +8990,29 @@ class AuthService:
             raise held
         ad_roles = _roles_from_ids(role_ids)
         ad_custom_permissions = await self._custom_permissions_for_ids(role_ids)
-        user = await self._sync_ad_channel_scope(user, ad_roles, principal.groups, client=client)
+        try:
+            user = await self._sync_ad_channel_scope(
+                user, ad_roles, principal.groups, client=client, federated=federated
+            )
+        except _AdChannelScopeNotWritten as unwritten:
+            # BACKLOG #6887: the scope write was not made, so no session is minted. Answered as the
+            # refusals below are: a row gone on the federated leg as there, contention as the
+            # session insert's, and everything else through the directory row refusal.
+            contended = isinstance(unwritten, _AdChannelScopeContended)
+            if federated and (contended or unwritten.reason == ACCOUNT_DELETED):
+                await self._directory_reject_audit(
+                    principal.username, "oidc", unwritten.reason, client=client, extra=outcome_extra
+                )
+                scope_refused = LoginOutcome(
+                    ok=False, error="federated sign-in failed", reason=unwritten.reason
+                )
+            else:
+                scope_refused = await self._refuse_directory_row(
+                    principal.username, unwritten.reason, client=client, extra=outcome_extra
+                )
+            if contended:
+                scope_refused = replace(scope_refused, error=_SIGN_IN_UNAVAILABLE)
+            return replace(scope_refused, roles_gained=roles_gained)
         identity = Identity.build(
             user_id=user.id,
             username=user.username,
@@ -9196,9 +9272,13 @@ class AuthService:
         groups: Iterable[str],
         *,
         client: str | None = None,
+        federated: bool = False,
     ) -> VerifiedUser:
         """Persist a user's AD-group-derived per-channel scope (C3) so it's durable for later
         requests (mirrors role sync). Returns the (possibly refreshed) user record.
+
+        ``federated`` is the sign-in's leg, passed to the eligibility check on a re-read as the
+        role write passes it. Its default is the Kerberos shape, for direct test callers.
 
         **The rule is** :func:`~messagefoundry.auth.channel_scope.decide_ad_channel_scope` **and is
         stated there once**; this method applies what it decides. The directory reconciler plans its
@@ -9208,42 +9288,126 @@ class AuthService:
 
         History worth keeping: before BACKLOG #1927 this path returned early for every no-match
         login, so a user removed from their last scope-mapped group kept the directory's channels
-        for as long as the account existed."""
+        for as long as the account existed.
+
+        **BOTH WRITES ARE COMPARE-AND-SETS ON WHAT THE DECISION READ**: the withdrawal on the scope,
+        the grant on the scope and its source. How far the compare holds against another process
+        differs per backend, and ``AuthStore.set_ad_channel_scope_if_unchanged`` states it; on a
+        keyless SQLite store it does not. ``user`` was read several awaits earlier, and the
+        per-process sign-in queue orders neither a sign-in on another engine shard nor an
+        administrator's write. Before BACKLOG #6887 the grant was written unconditionally, so a
+        sign-in that read the scope before a concurrent one replaced it judged ``changes`` against
+        the replaced value: it revoked the other sign-in's brand-new session and audited the resync
+        a second time. On a miss, of the grant or of the withdrawal, the scope is NOT taken from
+        the row the other writer left, since that writer may have read older group memberships: a
+        sign-in whose groups map to no channel would otherwise mint on another writer's grant.
+        Nothing tells which read is newer, though: when this sign-in's groups are the older ones,
+        its write replaces the newer scope and revokes, as the role write's compare cannot tell
+        either. The row is read again and decided again from this sign-in's own groups, at most
+        :data:`_AD_SCOPE_WRITE_ATTEMPTS` times, and past that the sign-in fails
+        (:class:`_AdChannelScopeContended`). A re-read that finds this sign-in's target already
+        written revokes, as the role write does on finding its roles already written, and writes
+        no row. A re-read that finds the row gone, failing its seal, or ineligible to sign in
+        (disabled, locked or, off the federated leg, bound) fails the sign-in too, with nothing
+        written (:class:`_AdChannelScopeRefused`); the reasons are the role write's except that a
+        gone row is ``account_deleted``, as the caller's pre-mint read names it. Both are raised,
+        and the caller audits and answers them as refusals.
+
+        **WHAT THE COMPARE-AND-SET DOES NOT CLOSE.** A concurrent sign-in's new session can still
+        be ended, at least three ways. The revoke after a write is a separate transaction, so a
+        sign-in that misses, reads the new scope and mints in the gap between this write and this
+        revoke loses that session to the revoke. A sign-in that finds its target already written
+        revokes deliberately, as above, and so ends a session the other writer minted. And the
+        role write earlier in the same sign-in does the same when it finds its target roles already
+        written (``_SignInRoleSync``). Where the compare holds against another process (not on a
+        keyless SQLite store), what it does stop is a second write and a second
+        ``auth.ad_scope_resynced`` row for a scope already stored."""
         administrator = Role.ADMINISTRATOR in roles
-        decision = channel_scope.decide_ad_channel_scope(
-            channel_scope.ScopeInput(
-                stored_scope=user.channel_scope,
-                stored_source=user.channel_scope_source,
-                # An administrator's groups are not read: the decision ignores them.
-                mapped=frozenset() if administrator else await self._ad_channels_for_groups(groups),
-                administrator=administrator,
+        # An administrator's groups are not read: the decision ignores them. Read once: a retry
+        # re-reads the ROW, never the groups, so every attempt decides from this sign-in's answer.
+        mapped = frozenset() if administrator else await self._ad_channels_for_groups(groups)
+
+        def decide(stored: VerifiedUser) -> channel_scope.ScopeDecision:
+            return channel_scope.decide_ad_channel_scope(
+                channel_scope.ScopeInput(
+                    stored_scope=stored.channel_scope,
+                    stored_source=stored.channel_scope_source,
+                    mapped=mapped,
+                    administrator=administrator,
+                )
             )
-        )
+
+        decision = decide(user)
         if not decision.write:
             return user
-        if decision.scope_json is None:
-            if user.channel_scope is None:
-                # The decision never withdraws a NULL scope, which already denies. This narrows
-                # the type for the compare-and-set below, which needs a stored value to compare.
+        # Whether the scope this sign-in FIRST read differs from its target. It is the revoke
+        # trigger when another writer is found to have written that target already, as the role
+        # write's ``previous`` is the set it first read, so a failed revoke by that writer cannot
+        # leave stale-scope sessions live.
+        first_changes = decision.changes
+        # ``mapped`` is the same on every pass, so every pass decides the same kind of write: a
+        # withdrawal when it is empty, a grant otherwise.
+        attempt = 1
+        while True:
+            if decision.scope_json is None:
+                if user.channel_scope is None:
+                    # The decision never withdraws a NULL scope, which already denies. This narrows
+                    # the type for the compare-and-set below, which needs a stored value to compare.
+                    return user
+                written = await self._store.withdraw_ad_channel_scope(user.id, user.channel_scope)
+            else:
+                written = await self._store.set_ad_channel_scope_if_unchanged(
+                    user.id,
+                    decision.scope_json,
+                    expected_scope=user.channel_scope,
+                    expected_source=user.channel_scope_source,
+                )
+            if written:
+                break
+            # Settled, as the role write's re-read is: a single read can report a row a concurrent
+            # write is moving as refused, and that must not end the loop with nothing written.
+            settled = await self._lookup_user_settled(user.id)
+            fresh = settled.user
+            if fresh is None:
+                # Refused here, not returned: the caller's own re-read before the mint can find the
+                # row readable again, and would then mint on a scope this sign-in neither wrote nor
+                # checked. Nothing was written. The role write names a gone row ACCOUNT_REFUSED;
+                # this names it ACCOUNT_DELETED, as the caller's pre-mint read does (BACKLOG
+                # #5624), and keeps ACCOUNT_REFUSED for a row failing its seal.
+                reason = ACCOUNT_REFUSED if settled.held else ACCOUNT_DELETED
+                _log.error(
+                    "auth: the record of %s is gone or fails its seal, read after the sign-in's "
+                    "scope write found it moved; nothing was written and the sign-in is refused",
+                    scrub_log_argument(user.username),
+                )
+                raise _AdChannelScopeRefused(reason)
+            # The re-read decides eligibility too, as the role write's does, with the same
+            # ``federated``: the account may have been disabled, locked or bound since the read the
+            # sign-in's own gate ran on. Unlogged, as the role write's is; the caller audits it.
+            ineligible = _directory_login_refusal(fresh, time.time(), federated=federated)
+            if ineligible is not None:
+                raise _AdChannelScopeRefused(ineligible)
+            user = fresh
+            decision = decide(user)
+            if not decision.write:
+                # Kept: either this sign-in's target, already written by another writer, or (for a
+                # withdrawal) a scope an administrator set, which a withdrawal never overrides.
+                # Judged before the bound, so a last miss onto either is not contention. At the
+                # target, revoke as the role write does when it finds its roles already written.
+                if first_changes and user.channel_scope_source != SCOPE_SOURCE_MANUAL:
+                    await self._revoke_after_commit(
+                        user.id, change="ad_scope_resynced", actor=user.username, client=client
+                    )
                 return user
-            # Compare-and-set against the value read: an administrator or a concurrent login may
-            # have written the scope since ``user`` was read.
-            if not await self._store.withdraw_ad_channel_scope(user.id, user.channel_scope):
-                return await self._load_user(user.id) or user
-            await self._revoke_after_commit(
-                user.id, change="ad_scope_resynced", actor=user.username, client=client
-            )
-            # ``withdrawn`` keeps the removed grant, which the row itself no longer holds.
-            await self._audit(
-                AD_SCOPE_RESYNCED_ACTION,
-                actor=user.username,
-                detail=_json({"channels": None, "withdrawn": user.channel_scope}),
-                client=client,
-            )
-            return await self._load_user(user.id) or user
-        await self._store.set_user_channel_scope(
-            user.id, decision.scope_json, source=SCOPE_SOURCE_AD
-        )
+            if attempt >= _AD_SCOPE_WRITE_ATTEMPTS:
+                _log.warning(
+                    "auth: the directory scope write for account id %r met a concurrent writer on "
+                    "each of %d attempts; the sign-in fails",
+                    user.id,
+                    attempt,
+                )
+                raise _AdChannelScopeContended(attempt)
+            attempt += 1
         # Drop stale-scope tokens; the new one is issued after. Skipped when only the provenance
         # moved -- the directory taking over an identical manual scope changes no decision, so
         # there is nothing stale to drop -- but that write is still audited below.
@@ -9251,14 +9415,23 @@ class AuthService:
             await self._revoke_after_commit(
                 user.id, change="ad_scope_resynced", actor=user.username, client=client
             )
-        await self._audit(
-            AD_SCOPE_RESYNCED_ACTION,
-            actor=user.username,
-            detail=_json(
-                {"channels": ALL_CHANNELS if decision.wildcard else list(decision.channels)}
-            ),
-            client=client,
-        )
+        if decision.scope_json is None:
+            # ``withdrawn`` keeps the removed grant, which the row itself no longer holds.
+            await self._audit(
+                AD_SCOPE_RESYNCED_ACTION,
+                actor=user.username,
+                detail=_json({"channels": None, "withdrawn": user.channel_scope}),
+                client=client,
+            )
+        else:
+            await self._audit(
+                AD_SCOPE_RESYNCED_ACTION,
+                actor=user.username,
+                detail=_json(
+                    {"channels": ALL_CHANNELS if decision.wildcard else list(decision.channels)}
+                ),
+                client=client,
+            )
         return await self._load_user(user.id) or user
 
     async def _upsert_ad_user(
@@ -9357,8 +9530,29 @@ class AuthService:
             if refusal is not None:
                 raise _DirectoryLoginRefused(refusal)
         if existing is None:
+            # BACKLOG #6589: the birth is recorded in the INSERT's transaction, as an
+            # administrator's create is, so no directory row commits without a row naming it. Its
+            # own action, not `user.created`: no administrator issued anything, and
+            # `_temporary_credential_issuer` reads `user.created` rows as credential issues,
+            # counting each in its window against its page. It names the new row's id, because a
+            # directory may reissue the username (BACKLOG #1471).
+            def born(new_id: str) -> AuditAppend:
+                return AuditAppend(
+                    "auth.ad_user_created",
+                    actor=principal.username,
+                    detail=_json(
+                        {
+                            "user_id": new_id,
+                            "username": principal.username,
+                            "provider": "ad",
+                            "federated": federated,
+                        }
+                    ),
+                    client=client,
+                )
+
             try:
-                user_id = await self._create_directory_row(principal, client=client)
+                user_id = await self._create_directory_row(principal, client=client, birth=born)
             except Exception as exc:
                 if not _is_integrity_refusal(exc):
                     raise
@@ -9535,7 +9729,7 @@ class AuthService:
         client: str | None,
         actor: str | None = None,
         typed_notify_email: str | None = None,
-        audits: Sequence[AuditAppend] = (),
+        birth: Callable[[str], AuditAppend],
     ) -> str:
         """Insert the mirror row for a directory principal the store does not hold, and return its id.
 
@@ -9548,10 +9742,19 @@ class AuthService:
         not adopted (#2021 only). It is bound in the same INSERT, so no crash leaves that row with
         no address. The profile mirror still gets the directory's ``mail``.
 
-        ``audits`` are the caller's own rows for this birth. They commit in the INSERT's
-        transaction, after any not-adopted row (BACKLOG #2221).
+        ``birth`` builds the caller's row recording this birth from the new row's id:
+        ``user.created`` for an administrator's create, ``auth.ad_user_created`` for a sign-in's.
+        Required with no default (BACKLOG #6589), and it must return an :class:`AuditAppend`, or
+        :class:`TypeError` is raised before anything is written. The row commits in the INSERT's
+        transaction (BACKLOG #2221), first, so any not-adopted row follows the birth it names.
         """
         user_id = uuid4().hex
+        born = birth(user_id)
+        if not isinstance(born, AuditAppend):
+            raise TypeError(
+                f"a directory account's birth needs its AuditAppend; got {type(born).__name__}"
+                " (BACKLOG #6589)"
+            )
         # BACKLOG #2014, ASVS 6.3.7. The birth seed is the one time the directory's `mail` can
         # become `notify_email`, where every later security notice goes. So it must pass the test
         # the address form applies before it suggests the same value; the form never sees an
@@ -9587,7 +9790,7 @@ class AuthService:
             directory_object_id=principal.directory_object_id,
             adopt_notify_email=adopt,
             notify_email=typed_notify_email,
-            audits=[*rows, *audits],
+            audits=[born, *rows],
             password_generated=False,
         )
         if not adopt:
@@ -9685,23 +9888,33 @@ class AuthService:
                     " give one as notify_email, such as name@example.org"
                 )
             typed = address = _require_single_mailbox(notify_email)
-        # Committed with the INSERT, not after it (BACKLOG #2221).
-        created = AuditAppend(
-            "user.created",
-            actor=actor,
-            detail=_json(
-                {
-                    "username": principal.username,
-                    "roles": [],
-                    "provider": "ad",
-                    "notify_email_source": "directory" if typed is None else "administrator",
-                }
-            ),
-            client=client,
-        )
+
+        # Committed with the INSERT, not after it (BACKLOG #2221). It names the new row's id, as
+        # the sign-in's birth row does, because a directory may reissue the username (BACKLOG
+        # #6589); `_temporary_credential_issuer` keys on `username` and ignores the extra key.
+        def created(new_id: str) -> AuditAppend:
+            return AuditAppend(
+                "user.created",
+                actor=actor,
+                detail=_json(
+                    {
+                        "user_id": new_id,
+                        "username": principal.username,
+                        "roles": [],
+                        "provider": "ad",
+                        "notify_email_source": "directory" if typed is None else "administrator",
+                    }
+                ),
+                client=client,
+            )
+
         try:
             user_id = await self._create_directory_row(
-                principal, client=client, actor=actor, typed_notify_email=typed, audits=(created,)
+                principal,
+                client=client,
+                actor=actor,
+                typed_notify_email=typed,
+                birth=created,
             )
         except Exception as exc:
             if not _is_integrity_refusal(exc):
@@ -12852,8 +13065,9 @@ class AuthService:
         multi-session revocations record it. The count includes lapsed rows the cap ended, which
         the validator already refused; the store returns one count for both.
         """
+        # 0 = unlimited; the load refuses a negative cap (BACKLOG #5318).
         cap = self._settings.max_sessions_per_user
-        if not cap or cap <= 0:
+        if not cap:
             return
         user = await self._load_user(user_id)
         # A user row that has gone owes nothing more; splitting is then the closed choice, since it
@@ -15349,8 +15563,12 @@ class AuthService:
         ``keep_token_hash`` names the caller's own session for the revoke to keep, so the
         administrator who ran it is not signed out mid-response where the revoke re-stamps it.
         Returns the count and whether that session was kept. Audited even when the count is zero,
-        because the act itself is the record an investigator looks for. The host command
-        ``admin-revoke-sessions`` keeps nothing and calls the store itself.
+        because the act itself is the record an investigator looks for; the row is appended after
+        the revoke commits, so a store that refuses it raises with the sessions already ended.
+        No ``auth.session_revoked`` row is written when the store's seal report fails after the
+        revoke commits: the call raises before that row is appended, with the sessions already
+        ended.
+        The host command ``admin-revoke-sessions`` keeps nothing and calls the store itself.
 
         A kept session whose seal fails makes the store write nothing. The caller's own session is
         then suspect, so it is ended with the rest, and the audit row's scope says so, as
@@ -15530,6 +15748,75 @@ class AuthService:
 
     def password_violations(self, password: str, *, username: str | None = None) -> list[str]:
         return self._policy.violations(password, username=username)
+
+    async def _screened_violations(self, password: str, *, username: str) -> list[str]:
+        """:meth:`PasswordPolicy.violations`, run off the event loop (BACKLOG #6881).
+
+        The screen can read a file. ``lru_cache`` caches no exception, so a missing or unreadable
+        operator corpus is opened again on every call, and a file placed after startup is read
+        whole by the first call; a broken bundled corpus is re-read the same way. Run on a worker
+        thread, none of that blocks the loop. The answer, and any exception, is unchanged.
+
+        One screen at a time per service instance, as the loop used to run them, and the lock is
+        held until the screen's THREAD ends, not until its caller stops waiting. The lock is this
+        instance's while the corpus cache is the module's, so the claims that follow hold within
+        one instance; two instances can each load a corpus, or each block a thread, at once. Within
+        one, a corpus that appears is loaded once, not by every screen that missed the cache
+        together, and a corpus on a path that stops answering blocks one worker thread in all,
+        however many callers give up on it;
+        the others wait on the lock, which a caller may leave by being cancelled. The one way the
+        lock goes early is a cancel of the screen task itself, at loop teardown for example, which
+        releases it while the thread runs on. The screen itself is set lookups, so the queue costs
+        nothing measurable. A screen that fails after its caller left is logged at ERROR, as
+        :func:`_write_through_cancellation` logs a write, since nobody else reads it."""
+        if self._screen_lock is None:
+            self._screen_lock = asyncio.Lock()
+        lock = self._screen_lock
+        await lock.acquire()
+        caller_left = False
+        reported = False
+
+        def report(done: asyncio.Future[list[str]]) -> None:
+            nonlocal reported
+            if reported or done.cancelled() or done.exception() is None:
+                return
+            reported = True
+            _log.error(
+                "a password screen failed after its caller was cancelled",
+                exc_info=done.exception(),
+            )
+
+        def finished(done: asyncio.Future[list[str]]) -> None:
+            lock.release()
+            if not done.cancelled():
+                done.exception()  # retrieved: the caller re-raises it below, or report() logs it
+            if caller_left:
+                report(done)
+
+        try:
+            screen = asyncio.ensure_future(
+                asyncio.to_thread(self._policy.violations, password, username=username)
+            )
+            screen.add_done_callback(finished)
+        except BaseException:
+            # Nothing was scheduled to release it, so a later screen would wait forever.
+            lock.release()
+            raise
+        # ``wait``, not ``await screen``: a cancel of the caller then leaves the screen running,
+        # and its callback, not the caller, releases the lock when the thread is done.
+        try:
+            await asyncio.wait((screen,))
+        except asyncio.CancelledError:
+            caller_left = True
+            if screen.done():
+                # ``finished`` may already have run, before it could know the caller left; report
+                # here, and ``reported`` keeps it to one line if ``finished`` runs after this.
+                report(screen)
+            raise
+        return screen.result()
+
+    #: Serializes :meth:`_screened_violations`; made on first use, inside the running loop.
+    _screen_lock: asyncio.Lock | None = None
 
     async def verify_current_password(
         self,
@@ -17400,7 +17687,7 @@ class AuthService:
             # before the policy, so the answer does not depend on the password typed, and before the
             # hash, so no password_changed row is written for an absent account.
             raise ValueError("no such user")
-        violations = self._policy.violations(new_password, username=identity.username)
+        violations = await self._screened_violations(new_password, username=identity.username)
         if violations:
             return violations
         covered = self._covered_by_requirement(user, identity.roles)

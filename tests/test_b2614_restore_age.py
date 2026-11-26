@@ -104,7 +104,10 @@ def test_a_fresh_archive_restores_and_says_what_to_reapply(
     assert RESTORE_ROLLBACK_NOTICE in out  # BACKLOG #5094: the CLI prints the one statement whole
     # Worded from the restore's own count (none here: the archive holds no session), never as
     # "every session" whether or not its revoke ran.
-    assert "The restore ended 0 open session(s) in the store it placed" in out
+    ended = (
+        "The restore ended 0 unrevoked session(s), expired ones included, in the store it placed"
+    )
+    assert ended in out
     assert "every session the archive held" not in out
 
     json_dest = tmp_path / "json" / "msg.db"

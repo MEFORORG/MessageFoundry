@@ -36,6 +36,7 @@ import os
 import shutil
 import subprocess
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -88,35 +89,53 @@ def _cache_path(repo: Path) -> Path:
     return Path(common) / "mefor-coord" / "overlap-cache" / f"{key}.json"
 
 
-def _run(repo: Path, sandbox: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _run(
+    repo: Path, sandbox: Path, *args: str, culture: str | None = None
+) -> subprocess.CompletedProcess[str]:
     """Drive overlap.ps1 against one throwaway repo, with every machine-global input redirected.
 
     ``-ConfigRoot`` and ``-TasksDir`` point at paths that do not exist on purpose: without them the
     script reads this developer's REAL session registry and task lists, and the answer would depend on
     who else is logged in. They cannot contribute a row here anyway (only worktrees of this repo are
     walked), but a fixture whose result varies with the machine is not a fixture.
+
+    With ``culture``, ``CurrentCulture`` is set in the runspace the script then runs in, and printed
+    to stderr first, so the caller can prove the setting took rather than assume it.
     """
+    script_args = [
+        "-Repo",
+        str(repo),
+        "-ConfigRoot",
+        str(sandbox / "no-such-config"),
+        "-TasksDir",
+        str(sandbox / "no-such-tasks"),
+        *args,
+    ]
+    if culture is None:
+        argv = ["-File", str(OVERLAP), *script_args]
+    else:
+        # A quoted '-Refresh' binds as a positional STRING, not the switch, so names stay bare.
+        def lit(a: str) -> str:
+            return "'" + a.replace("'", "''") + "'"
+
+        quoted = " ".join(a if a.startswith("-") else lit(a) for a in script_args)
+        argv = [
+            "-Command",
+            f"[System.Globalization.CultureInfo]::CurrentCulture = {lit(culture)}; "
+            "[Console]::Error.WriteLine('culture=' + "
+            "[System.Globalization.CultureInfo]::CurrentCulture.Name); "
+            f"& {lit(str(OVERLAP))} {quoted}; exit $LASTEXITCODE",
+        ]
     proc = subprocess.run(
-        [
-            "pwsh",
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            str(OVERLAP),
-            "-Repo",
-            str(repo),
-            "-ConfigRoot",
-            str(sandbox / "no-such-config"),
-            "-TasksDir",
-            str(sandbox / "no-such-tasks"),
-            *args,
-        ],
+        ["pwsh", "-NoProfile", "-NonInteractive", *argv],
         capture_output=True,
         text=True,
         timeout=TIMEOUT,
         check=False,
     )
     assert proc.returncode == 0, f"overlap exited {proc.returncode}: {proc.stderr}\n{proc.stdout}"
+    if culture is not None:
+        assert f"culture={culture}" in proc.stderr, f"the culture did not take: {proc.stderr!r}"
     return proc
 
 
@@ -226,6 +245,66 @@ def test_the_cache_is_keyed_on_the_querying_head_and_not_only_its_root(tmp_path:
     assert json.loads(second or "[]") == [], (
         "the cached map survived a HEAD move under the same root, so the answer describes a commit "
         "the caller has since taken -- the peer is credited with the caller's own work"
+    )
+
+
+@pytest.mark.parametrize("culture", ["en-US", "th-TH", "fi-FI", "ar-SA"])
+def test_a_fresh_cache_is_a_hit_under_any_culture(tmp_path: Path, culture: str) -> None:
+    """The cache stamp is ISO-8601 and must be read back as ISO-8601 whatever the current culture.
+
+    ``ConvertFrom-Json`` hands the stamp back as a ``[datetime]``; the old reader passed that to
+    ``[datetime]::Parse``, which turned it into an invariant-culture string and re-parsed it under the
+    CURRENT culture. Under th-TH, fi-FI and ar-SA that threw, a catch-all turned the throw into a
+    miss, and the cache never hit. en-US is the control that passes either way.
+    """
+    repo = _repo(tmp_path, "culture")
+    _run(repo, tmp_path, "-Refresh", "-Json", culture=culture)
+    before = _cache_path(repo).read_bytes()
+    _run(repo, tmp_path, "-CacheSeconds", "3600", "-Json", culture=culture)
+    assert _cache_path(repo).read_bytes() == before, (
+        f"under {culture} a cache written seconds ago was not a hit: the run re-walked and rewrote it"
+    )
+
+
+def test_an_unreadable_cache_stamp_is_a_miss_that_says_so(tmp_path: Path) -> None:
+    """A stamp nobody can read misses and re-walks, and stderr names why rather than staying silent."""
+    repo = _repo(tmp_path, "badstamp")
+    _run(repo, tmp_path, "-Refresh", "-Json")
+    cache = _cache_path(repo)
+    body = json.loads(cache.read_text(encoding="utf-8"))
+    body["at"] = "not a date"
+    cache.write_text(json.dumps(body), encoding="utf-8")
+
+    proc = _run(repo, tmp_path, "-CacheSeconds", "3600", "-Json")
+    assert json.loads(cache.read_text(encoding="utf-8"))["at"] != "not a date", (
+        "an unreadable stamp must miss and re-walk, which rewrites the cache"
+    )
+    assert "re-walking" in proc.stderr, f"the miss was silent: {proc.stderr!r}"
+    assert "not a date" not in proc.stderr, "the raw stamp, foreign text, reached the terminal"
+
+
+@pytest.mark.parametrize("culture", ["en-US", "th-TH"])
+def test_a_string_stamp_is_parsed_invariantly(tmp_path: Path, culture: str) -> None:
+    """The STRING branch: a stamp ConvertFrom-Json leaves as text is parsed with InvariantCulture.
+
+    ``ConvertFrom-Json`` turns the script's own ISO stamp into a ``[datetime]``, so the culture test
+    above never reaches this branch. An invariant ``MM/dd/yyyy`` stamp stays a string. Under th-TH a
+    culture-sensitive parse (``-as [datetime]`` or ``[datetime]::Parse``) reads its year as Buddhist
+    and misdates it by 543 years, so the fresh cache misses. en-US is the control.
+    """
+    repo = _repo(tmp_path, "stringstamp")
+    _run(repo, tmp_path, "-Refresh", "-Json")
+    cache = _cache_path(repo)
+    body = json.loads(cache.read_text(encoding="utf-8"))
+    # Two hours back with a day-long window: a DST shift of an hour either way still leaves the
+    # stamp in the past and inside the window, so the test has no fall-back-night flake.
+    body["at"] = (datetime.now() - timedelta(hours=2)).strftime("%m/%d/%Y %H:%M:%S")
+    cache.write_text(json.dumps(body), encoding="utf-8")
+    before = cache.read_bytes()
+
+    proc = _run(repo, tmp_path, "-CacheSeconds", "86400", "-Json", culture=culture)
+    assert cache.read_bytes() == before, (
+        f"under {culture} a fresh invariant string stamp missed: {proc.stderr!r}"
     )
 
 

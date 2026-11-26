@@ -854,7 +854,10 @@ message, and confirm the **"wiring started"** banner in `service.out.log`.
 **Monitoring surfaces (scrape `/metrics`; poll the API and parse logs for what it does not cover):**
 - `/metrics` — **Prometheus exposition** (`text/plain`). Gated by `monitoring:read` like `/stats`, so a
   scraper authenticates with a service token. Aggregate counts and latency histograms keyed by
-  connection / destination / status only — never PHI (BACKLOG #21). **Prefer this to polling `/stats`
+  connection / destination / status only — never PHI (BACKLOG #21). Give the scraper's account the
+  all-channels grant: a channel-scoped caller reads only its own inbounds' series and no
+  per-destination or latency series (BACKLOG #4346), and an account with no scope set is scoped
+  to no channel. **Prefer this to polling `/stats`
   if you already run Prometheus.**
 - `/metrics/history` — the same counters over time, for a dashboard without a scraper.
 - `/stats` — outbox counts by status.

@@ -2351,7 +2351,7 @@ async def test_a_builtin_cause_under_a_driver_error_is_withheld(
     with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
         await _run_one_failed_poll(_src(body_column="payload"), failure)
     assert "direct cause of the following exception" in caplog.text
-    assert "RedactedDbError: ValueError [driver message withheld]" in caplog.text
+    assert "RedactedDbError: ValueError [message withheld under a driver error]" in caplog.text
     assert _SYNTHETIC_ID not in caplog.text
 
 
@@ -2362,7 +2362,10 @@ def test_a_link_under_a_driver_error_names_no_sqlstate_shaped_value() -> None:
 
     Red mutation: drop the ``withhold and not driver`` arm in ``_safe_db_error``. Reds here.
     """
-    assert _safe_db_error(KeyError("A4242"), withhold=True) == "KeyError [driver message withheld]"
+    assert (
+        _safe_db_error(KeyError("A4242"), withhold=True)
+        == "KeyError [message withheld under a driver error]"
+    )
     assert _safe_db_error(_DbApiError("23505"), withhold=True) == "_DbApiError [23505]"
 
 

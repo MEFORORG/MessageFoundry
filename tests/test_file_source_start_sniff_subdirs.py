@@ -13,14 +13,16 @@ Synthetic HL7 only. Deliberately ASCII-only: pytest echoes a failing body to a c
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 import pytest
 
 from messagefoundry.config.models import ConnectorType, ContentType, Source
+from messagefoundry.transports.base import SourceStartupError
 from messagefoundry.transports.file import FileSource
 
 _HL7 = "MSH|^~\\&|SND|FAC|RCV|FAC|20260101120000||ADT^A01|CTL5684|P|2.5.1\rPID|1||12345\r"
@@ -397,3 +399,262 @@ async def test_a_successful_leave_ledger_write_comes_before_the_cache(tmp_path: 
     await src._leave_record("fk1:" + "0" * 64)
     assert seen_when_written == [False]
     assert "fk1:" + "0" * 64 in src._processed_seen
+
+
+# --- BACKLOG #5682: the identity limb ------------------------------------------------------------
+
+
+def _link_dir(target: Path, link: Path) -> None:
+    """A directory link at ``link``: a junction on Windows, which needs no privilege, else a symlink."""
+    if sys.platform == "win32":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+@pytest.mark.parametrize(
+    ("after_read", "knob"),
+    [
+        ("move", "processed_subdir"),
+        ("move", "error_subdir"),
+        ("delete", "error_subdir"),
+        ("leave", "error_subdir"),
+    ],
+)
+@pytest.mark.parametrize("below", ["", "done"], ids=["the-watch-dir", "inside-it"])
+def test_an_archive_subdir_reaching_the_watch_tree_through_a_link_is_refused_at_start(
+    tmp_path: Path, knob: str, below: str, after_read: str
+) -> None:
+    """Red on the unfixed code: a value spelled outside the watch directory that reaches it, or a
+    directory inside it, through a link or a junction passed, and archived files would be listed
+    and ingested again on every poll. Refused before it is created, so nothing is made inside the
+    watch tree."""
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    alias = tmp_path / "alias"
+    _link_dir(inbox, alias)
+    value = str(alias / below) if below else str(alias)
+    src = _source(inbox, after_read=after_read, **{knob: value})
+    with pytest.raises(SourceStartupError, match=knob) as caught:
+        src._prepare_subdirs()
+    assert "alias" not in str(caught.value)
+    assert not (inbox / "done").exists()
+
+
+@pytest.mark.parametrize("after_read", ["leave", "delete"])
+def test_a_processed_subdir_through_a_link_is_not_judged_where_nothing_is_archived(
+    tmp_path: Path, after_read: str
+) -> None:
+    # Only the move mode writes processed_dir, so in the others it is not judged.
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    alias = tmp_path / "alias"
+    _link_dir(inbox, alias)
+    src = _source(inbox, after_read=after_read, processed_subdir=str(alias / "done"))
+    src._prepare_subdirs()
+
+
+def test_a_watch_directory_with_no_file_identity_skips_the_check_and_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An inode of 0 on every directory (some SMB servers) would make every archive directory on
+    the volume match, so the check does not run, and a WARNING says it did not."""
+    from messagefoundry.transports import file as file_module
+
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    real_stat = os.stat
+
+    def no_identity(path: Any, *args: Any, **kwargs: Any) -> Any:
+        st = real_stat(path, *args, **kwargs)
+        return os.stat_result((st.st_mode, 0, *tuple(st)[2:]))
+
+    monkeypatch.setattr(os, "stat", no_identity)
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.file"):
+        assert not file_module._inside_watch_tree_by_identity(archive, inbox)
+    assert "reports no file identity" in caplog.text
+
+
+def test_an_archive_path_with_no_readable_part_skips_the_check_and_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Red before: on Windows an unreachable UNC share reports ENOENT for every part of the path,
+    its root included, so nothing was compared and the check returned False with no word. It now
+    logs a WARNING naming the path's class, and not the archive path's text."""
+    from messagefoundry.transports import file as file_module
+
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    archive = tmp_path / "unreachable-share" / "archive"
+    real_stat = os.stat
+
+    def unreachable(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if os.fspath(path) == os.fspath(inbox):
+            return real_stat(path, *args, **kwargs)
+        raise FileNotFoundError(2, "The network path was not found")
+
+    monkeypatch.setattr(os, "stat", unreachable)
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.file"):
+        assert not file_module._inside_watch_tree_by_identity(archive, inbox, "error_subdir")
+    path_class = "drive" if sys.platform == "win32" else "local"
+    assert (
+        f"the error_subdir identity check gave no verdict on its {path_class} path: no part gave"
+        in caplog.text
+    )
+    assert "unreachable-share" not in caplog.text
+
+
+def test_a_share_fault_reported_as_enoent_is_logged_not_read_as_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """ERROR_BAD_NETPATH (53) maps to FileNotFoundError, as at a DFS link whose target server is
+    down while the namespace root reads. It is a share fault, so it is logged, not skipped as a
+    directory still to be created."""
+    from messagefoundry.transports import file as file_module
+
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    link = tmp_path / "dfs-link"
+    archive = link / "archive"
+    real_stat = os.stat
+
+    def bad_netpath(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if os.fspath(path) in (os.fspath(archive), os.fspath(link)):
+            exc = FileNotFoundError(2, "The network path was not found")
+            exc.winerror = 53  # type: ignore[attr-defined,unused-ignore]
+            raise exc
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", bad_netpath)
+    monkeypatch.setattr(os.path, "realpath", lambda p, *a, **k: os.fspath(p))
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.file"):
+        assert not file_module._inside_watch_tree_by_identity(archive, inbox, "error_subdir")
+    # The namespace root above the link reads, and that is still no verdict on the archive.
+    assert caplog.text.count("the error_subdir identity check gave no verdict") == 1
+    assert "a part could not be read" in caplog.text
+    assert "dfs-link" not in caplog.text
+
+
+def test_a_share_fault_on_every_part_is_no_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A missing share (ERROR_BAD_NET_NAME, 67) faults on every part, the share root included.
+    from messagefoundry.transports import file as file_module
+
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    archive = tmp_path / "missing-share" / "archive"
+    real_stat = os.stat
+
+    def bad_net_name(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if os.fspath(path) == os.fspath(inbox):
+            return real_stat(path, *args, **kwargs)
+        exc = FileNotFoundError(2, "The network name cannot be found")
+        exc.winerror = 67  # type: ignore[attr-defined,unused-ignore]
+        raise exc
+
+    monkeypatch.setattr(os, "stat", bad_net_name)
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.file"):
+        assert not file_module._inside_watch_tree_by_identity(archive, inbox, "processed_subdir")
+    assert caplog.text.count("the processed_subdir identity check gave no verdict") == 1
+    assert "a part could not be read" in caplog.text
+    assert "missing-share" not in caplog.text
+
+
+def test_a_part_that_cannot_be_read_does_not_stop_a_match_above_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The walk goes on past an unreadable part, so a parent that is the watch directory matches.
+    from messagefoundry.transports import file as file_module
+
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    alias = tmp_path / "alias"
+    _link_dir(inbox, alias)
+    blocked = inbox / "blocked"
+    real_stat = os.stat
+
+    def denied(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if os.fspath(path) == os.fspath(blocked):
+            raise PermissionError(13, "Access is denied")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", denied)
+    monkeypatch.setattr(os.path, "realpath", lambda p, *a, **k: os.fspath(blocked))
+    assert file_module._inside_watch_tree_by_identity(alias / "blocked", inbox)
+
+
+def test_an_archive_path_with_no_file_identity_is_no_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # An archive volume that reports inode 0 everywhere gives nothing to compare.
+    from messagefoundry.transports import file as file_module
+
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    archive = tmp_path / "archive"
+    real_stat = os.stat
+
+    def archive_side_no_identity(path: Any, *args: Any, **kwargs: Any) -> Any:
+        st = real_stat(path, *args, **kwargs)
+        if os.fspath(path) == os.fspath(inbox):
+            return st
+        return os.stat_result((st.st_mode, 0, *tuple(st)[2:]))
+
+    monkeypatch.setattr(os, "stat", archive_side_no_identity)
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.file"):
+        assert not file_module._inside_watch_tree_by_identity(archive, inbox)
+    assert "gave no verdict" in caplog.text
+
+
+def test_an_archive_path_whose_parent_exists_logs_no_skip(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The control: a not-yet-created archive directory under an existing parent is compared.
+    from messagefoundry.transports import file as file_module
+
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.file"):
+        assert not file_module._inside_watch_tree_by_identity(tmp_path / "new" / "archive", inbox)
+    assert "did not run" not in caplog.text
+    assert "no verdict" not in caplog.text
+    assert "could not be read" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        (PureWindowsPath(r"\\server\share\archive"), "UNC"),
+        (PureWindowsPath("//server/share/archive"), "UNC"),
+        (PureWindowsPath(r"\\?\UNC\server\share\archive"), "UNC"),
+        (PureWindowsPath(r"\\?\D:\archive"), "device"),
+        (PureWindowsPath(r"\\.\D:\archive"), "device"),
+        (PureWindowsPath(r"\\?\unc\server\share\archive"), "UNC"),
+        (PureWindowsPath(r"\\.\UNC\server\share\archive"), "UNC"),
+        (PureWindowsPath(r"D:\archive"), "drive"),
+        (PurePosixPath("/srv/archive"), "local"),
+    ],
+)
+def test_the_path_class_names_no_path_text(path: Any, expected: str) -> None:
+    from messagefoundry.transports import file as file_module
+
+    assert file_module._path_class(path) == expected
+
+
+def test_an_archive_subdir_outside_the_watch_tree_through_a_link_still_starts(
+    tmp_path: Path,
+) -> None:
+    # The control: a link to a directory outside the watch tree is the operator's to use.
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    alias = tmp_path / "alias"
+    _link_dir(archive, alias)
+    src = _source(inbox, processed_subdir=str(alias), error_subdir=str(tmp_path / "err"))
+    src._prepare_subdirs()

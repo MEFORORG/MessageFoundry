@@ -8,8 +8,10 @@ Wave 2 (BACKLOG #1136), and their tests went with them. What a fresh store holds
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -34,7 +36,14 @@ from messagefoundry.auth.notifications import (
 from messagefoundry.auth.service import AuthService, IssuedCredential, UsernameTaken
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
-from tests._admin_account import ADMIN_USERNAME, create_admin, create_local_user_chosen
+from tests._admin_account import (
+    ADMIN_USERNAME,
+    PROVISION_EMAIL,
+    create_admin,
+    create_local_user_chosen,
+    login_admin,
+    provision_totp,
+)
 from tests._log_absence import assert_capture_sees
 
 GOOD_PASSWORD = "Sup3rSecret!!"
@@ -1560,5 +1569,183 @@ async def test_an_integrity_refusal_with_no_holder_is_not_called_a_username_conf
                 roles=[],
                 actor="admin",
             )
+    finally:
+        await store.close()
+
+
+async def test_the_breach_screen_runs_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #6881. RED when: ``change_password`` or ``provision_first_administrator`` runs the
+    password screen on the event loop again. An operator corpus that cannot be read is opened on
+    every call, since ``lru_cache`` caches no exception, so the screen is file I/O. The corpus
+    loader is replaced by one that records its thread and refuses, as a missing file does; the
+    direct call first is the control that the recorder sees the loop's own thread."""
+    from messagefoundry.auth import policy as policy_module
+
+    loop_thread = threading.get_ident()
+    seen: list[int] = []
+
+    def unreadable(path: str) -> tuple[frozenset[str], bool]:
+        seen.append(threading.get_ident())
+        raise OSError("synthetic: the corpus file cannot be read")
+
+    monkeypatch.setattr(policy_module, "_operator_corpus", unreadable)
+    settings = AuthSettings(password_breach_corpus_file=str(tmp_path / "absent-corpus.txt"))
+
+    store = await _store()
+    try:
+        service = AuthService(store, settings)
+        await service.initialize()
+        assert service.policy.violations(NEW_PASSWORD) == []
+        assert seen == [loop_thread], "the control: the recorder did not see a direct call"
+        seen.clear()
+
+        await service.provision_first_administrator(
+            username="site-admin",
+            password=GOOD_PASSWORD + "-long-enough",
+            notify_email=PROVISION_EMAIL,
+            actor="test",
+            **provision_totp(),
+        )
+        assert seen and loop_thread not in seen, "provisioning screened on the event loop"
+    finally:
+        await store.close()
+
+    seen.clear()
+    store = await _store()
+    try:
+        # Off here, so a covered account needs no factor to rotate; provisioning above ran under
+        # the shipped default, which enrols one.
+        service = AuthService(
+            store,
+            AuthSettings(
+                password_breach_corpus_file=settings.password_breach_corpus_file, require_mfa=False
+            ),
+        )
+        await service.initialize()
+        identity, _token, _password = await login_admin(service)
+        seen.clear()
+        assert await service.change_password(identity, NEW_PASSWORD + "-long-enough") == []
+        assert seen and loop_thread not in seen, "change_password screened on the event loop"
+    finally:
+        await store.close()
+
+
+async def test_a_cancelled_screen_keeps_the_lock_until_its_thread_ends() -> None:
+    """BACKLOG #6881. RED when: ``_screened_violations`` lets the next screen start while a
+    cancelled caller's screen is still running on its worker thread. Released on the caller's
+    cancel, the lock let a corpus on a path that stops answering take one worker thread per
+    cancelled password change, and let a new corpus be loaded more than once. The screen here
+    blocks on an event, as a hung file read would."""
+    gate = threading.Event()
+    running: list[str] = []
+    peak = 0
+
+    class _HungScreen:
+        def violations(self, password: str, *, username: str | None = None) -> list[str]:
+            nonlocal peak
+            running.append(password)
+            peak = max(peak, len(running))
+            try:
+                gate.wait(timeout=30)
+            finally:
+                running.remove(password)
+            return []
+
+    async def until(condition: Any) -> None:
+        for _ in range(500):
+            if condition():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("timed out waiting")
+
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        service._policy = _HungScreen()  # type: ignore[assignment]
+        first = asyncio.ensure_future(service._screened_violations("first", username="u"))
+        await until(lambda: running == ["first"])
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        second = asyncio.ensure_future(service._screened_violations("second", username="u"))
+        await asyncio.sleep(0.2)
+        assert running == ["first"], "the next screen started while the first thread ran on"
+        gate.set()
+        assert await asyncio.wait_for(second, timeout=30) == []
+        assert peak == 1
+    finally:
+        gate.set()
+        await store.close()
+
+
+class _ScreenFailed(Exception):
+    """The synthetic failure of a password screen."""
+
+
+async def test_a_screen_that_fails_after_its_caller_left_is_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #6881. RED when: a screen that fails after its caller was cancelled is dropped with
+    no log line. Nobody else reads it, so it is logged at ERROR, once, as
+    ``_write_through_cancellation`` logs a write that fails after its caller left."""
+    gate = threading.Event()
+    started = threading.Event()
+
+    class _FailingScreen:
+        def violations(self, password: str, *, username: str | None = None) -> list[str]:
+            started.set()
+            gate.wait(timeout=30)
+            raise _ScreenFailed("synthetic screen failure")
+
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        service._policy = _FailingScreen()  # type: ignore[assignment]
+        caller = asyncio.ensure_future(service._screened_violations("pw", username="u"))
+        for _ in range(500):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        with caplog.at_level(logging.ERROR, logger=_AUTH_LOGGER):
+            gate.set()
+            assert service._screen_lock is not None
+            for _ in range(500):  # the thread ends, then its callback releases the lock
+                if not service._screen_lock.locked():
+                    break
+                await asyncio.sleep(0.01)
+        lines = [r for r in caplog.records if "password screen failed" in r.getMessage()]
+        assert len(lines) == 1, [r.getMessage() for r in caplog.records]
+        assert lines[0].exc_info is not None and isinstance(lines[0].exc_info[1], _ScreenFailed)
+    finally:
+        gate.set()
+        await store.close()
+
+
+async def test_the_screen_lock_is_released_when_scheduling_the_screen_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6881. RED when: the screen lock stays held after the screen could not be
+    scheduled. Nothing would release it then, so every later password change would wait on it
+    forever. The next screen is the control that the lock works again."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(password_check_breached=False))
+        # The service module calls ``asyncio.to_thread`` through the one asyncio module.
+        real = asyncio.to_thread
+
+        def refuse(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("synthetic: the screen could not be scheduled")
+
+        monkeypatch.setattr(asyncio, "to_thread", refuse)
+        with pytest.raises(RuntimeError, match="could not be scheduled"):
+            await service._screened_violations(NEW_PASSWORD, username="u")
+        monkeypatch.setattr(asyncio, "to_thread", real)
+        assert service._screen_lock is not None and not service._screen_lock.locked()
+        assert await service._screened_violations(NEW_PASSWORD, username="u") == []
     finally:
         await store.close()

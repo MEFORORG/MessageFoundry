@@ -12,8 +12,10 @@
 .DESCRIPTION
     THREE WAYS IN.
 
-      -Name <n>   The sibling worktree new.ps1 made for <n>, at <repo>-<n> beside the checkout THIS
-                  COPY lives in. Unchanged by the routes below. It can also delete the branch.
+      -Name <n>   The sibling worktree new.ps1 made for <n>, at <repo>-<n> beside the PRIMARY
+                  checkout, run from the primary's own copy at its real path; any other copy
+                  needs -RepoRoot (BACKLOG #1894; the header below says more). It must
+                  be a registered worktree of this clone. It can also delete the branch.
       -Path <p>   Any registered linked worktree of this clone that is not under .claude/worktrees (a
                   segment above the primary does not count, as the list below says): a
                   harness scratchpad, a hand-made directory, a sibling. This is the CHECKED route, and
@@ -29,8 +31,8 @@
       * a target under a .claude/worktrees path segment. That is where the Claude Code harness puts
         its worktrees, and a subagent started with `isolation: worktree` is recorded under its
         PARENT's directory, so the occupancy check below would read its tree as empty (BACKLOG
-        #1038, Manager decision batch 184). A sibling new.ps1 made beside a linked worktree also
-        sits there; the copy of this script in that worktree still removes it by -Name. A segment
+        #1038, Manager decision batch 184). A sibling an older new.ps1 made beside a linked worktree
+        also sits there; -RepoRoot <that worktree> -Name still removes it (BACKLOG #1894). A segment
         ABOVE the primary checkout does not count, so a clone that lives below one is reachable;
       * a target that CONTAINS another registered worktree, since the removal would delete that
         checkout too and leave it registered with no directory;
@@ -163,12 +165,14 @@
     refuse a claimed tree, so after a removal no claim should name it. One taken in the moment between the check and the removal is reported, never deleted:
     claim.ps1 -Release -Force is the release that leaves a record.
 
-    WHICH COPY YOU RUN DECIDES WHAT -Name SEARCHES. -Name anchors on $PSScriptRoot (or -RepoRoot), not
-    on your cwd, so run the copy living in the checkout the worktree was created FROM -- which is
-    not necessarily the primary, since new.ps1 anchors the same way and creates its worktree beside
-    itself. By absolute path it works from any cwd outside the worktree being removed. new.ps1 prints
-    the exact command with the root already filled in (BACKLOG #1078). -Path and -List read the
-    clone's whole worktree list, so every copy gives the same answer. See docs/WORKTREES.md.
+    RUN THE PRIMARY'S COPY (BACKLOG #1894). -Name reaches <parent>\<leaf>-<Name> of the clone's
+    PRIMARY checkout, the first entry of `git worktree list`, from whatever cwd outside the worktree
+    being removed. A copy whose own <copy root>-<Name> is spelled differently refuses -Name unless
+    -RepoRoot names the checkout: a linked worktree's copy, one below a checkout's top, and one
+    reached through an alias at least. new.ps1 creates its sibling beside the primary from every copy.
+    Until #1894 both anchored on the copy's own checkout, so a copy in a linked worktree
+    made and searched `<that worktree>-<Name>`; -RepoRoot <that worktree> still reaches a tree made
+    that way. -Path and -List read the clone's whole worktree list. See docs/WORKTREES.md.
 
     -Name is the DIRECTORY component only. -DeleteBranch deletes whichever branch that worktree
     actually has checked out, read from git -- not a branch named after the directory. Since new.ps1
@@ -180,7 +184,8 @@
     branch-delete path was therefore covered by review only, and it is the one place in
     scripts/worktree/ where being wrong loses commits reachable from no ref and no reflog. Same
     parameter, same reason, as prune-merged.ps1. See tests/test_worktree_remove.py and
-    tests/test_worktree_remove_path.py.
+    tests/test_worktree_remove_path.py. It is also the operator's route to a sibling an older new.ps1
+    made beside a linked worktree (BACKLOG #1894): -RepoRoot <that worktree> -Name <n>.
 
 .EXAMPLE
     .\remove.ps1 -Name alerts
@@ -231,16 +236,17 @@ param(
 
     # Remove even when this worktree OWNS a ledger number whose item is not yet on origin/main
     # (BACKLOG #1293). DELIBERATELY NOT -Force: that one means "I accept losing uncommitted changes",
-    # and one consent must not silently cover an unrelated, IRREVERSIBLE risk. A stranded allocation
-    # cannot be re-keyed -- ownership is non-transferable -- so the number is burned and the PR
-    # carrying it is unlandable BY ANYONE.
+    # and one consent must not silently cover an unrelated risk. Ownership is non-transferable, so a
+    # number this removal strands may be one nothing can commit again; the refusal says, per record,
+    # which. docs/LEDGER-GATE.md, "When the owning worktree is gone", has the rule and the recovery.
     [Parameter(ParameterSetName = 'ByName')]
     [Parameter(ParameterSetName = 'ByPath')]
     [switch]$AllowOrphanedAllocations,
 
-    # Repo to operate on. Defaults to this script's own checkout -- which is what makes an absolute-
-    # path invocation from ANY cwd resolve the checkout that owns the worktree. Tests point it at a
-    # fixture so the real logic is what gets exercised.
+    # Repo to operate on, used as given; with -Name it must be a checkout's top as git resolves it,
+    # else it is refused (BACKLOG #1894). Defaults to the PRIMARY checkout of the clone this copy
+    # belongs to (BACKLOG #1894); with -Name a copy whose own pre-#1894 target is spelled otherwise
+    # refuses instead. Tests point it at a fixture so the real logic is what gets exercised.
     [Parameter(Position = 1)]
     [string]$RepoRoot
 )
@@ -271,12 +277,11 @@ if ($gitRedirects) {
         "the one named. Unset it and re-run. Nothing was removed.")
 }
 
+# Without -RepoRoot this copy's checkout is only where to ASK; the primary replaces it below.
+$anchorOnPrimary = -not $RepoRoot
 if (-not $RepoRoot) { $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path }
 elseif (-not (Test-Path -LiteralPath $RepoRoot)) { throw "RepoRoot does not exist: $RepoRoot" }
 else { $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path }
-
-$Parent = Split-Path $RepoRoot -Parent
-$RepoName = Split-Path $RepoRoot -Leaf
 
 # Refs that do not keep a commit alive for long, so they never count as holding one. refs/stash moves
 # with any session's next stash; the others are cleared by prefetch, bisect reset, a finished rebase
@@ -367,10 +372,63 @@ if ($gitCarriers.Count -gt 0) {
     throw ("$($gitCarriers -join ', ') is set, so git would read config the operator did not set up " +
         "for this clone. Unset it and re-run. Nothing was removed.")
 }
+
+# ANCHOR ON THE PRIMARY, NOT ON THIS COPY (BACKLOG #1894). $PSScriptRoot\..\.. is the checkout the
+# copy sits in, so a copy in a linked worktree used to search `<that worktree>-<Name>`: what -Name
+# reached depended on which copy ran. The first entry of `git worktree list` is the same from every
+# worktree of one clone. FAIL CLOSED: an unreadable list must not fall back to this copy's own
+# checkout. The list is reused below; nothing between here and there changes it.
+#
+# -NAME WITHOUT -RepoRoot NEVER MOVES ITS TARGET (BACKLOG #1894 review rounds 4 and 5). Before #1894
+# this copy's -Name built `<copy root>-<Name>` from $PSScriptRoot\..\.., and a command printed then
+# meant that tree. Re-anchored, it builds `<primary>-<Name>`. Where the two spellings differ, the run
+# refuses and names both, whatever stands at either path: a linked worktree's copy, a copy below a
+# checkout's top, one reached through a junction, subst or 8.3 alias, one inside a .git directory,
+# and a primary whose .git is a gitfile all differ. Earlier rounds tested stand-ins for this (is the
+# old target registered, is the copy linked), and every case a stand-in missed widened the reach.
+# So -Name keeps this copy's root, origin/main's literal spelling, and runs only when that root is
+# ORDINALLY equal to git's primary entry. Ordinal, not -ne on normalised text: the culture
+# comparison folds case and ignores a zero-width character or soft hyphen, so a linked worktree at
+# `<primary>` plus one such character would pass (BACKLOG #1894 review round 6). An alias, or a
+# spelling differing only in case, that does name the primary refuses too: fail closed. On this
+# route -Name therefore builds exactly the target the pre-#1894 script built, or refuses.
+$anchorList = @()
+if ($anchorOnPrimary) {
+    $anchorList = @(Get-RepoWorktrees $RepoRoot)
+    if ($anchorList.Count -eq 0) {
+        throw "Could not list the registered worktrees of '$RepoRoot', so the primary checkout is unknown. Nothing was removed."
+    }
+    $primaryOfClone = [System.IO.Path]::GetFullPath($anchorList[0].Path).TrimEnd('\', '/')
+    if ($byPath -or $listing) { $RepoRoot = $primaryOfClone }
+    elseif (-not [string]::Equals($RepoRoot, $primaryOfClone, [System.StringComparison]::Ordinal)) {
+        $primarySibling = Join-Path (Split-Path $primaryOfClone -Parent) "$(Split-Path $primaryOfClone -Leaf)-$Name"
+        Write-Host "REFUSED: -Name $Name from the copy in '$RepoRoot' could mean two trees." -ForegroundColor Red
+        Write-Host "  Before BACKLOG #1894 this copy reached: $(Join-Path (Split-Path $RepoRoot -Parent) "$(Split-Path $RepoRoot -Leaf)-$Name")" -ForegroundColor Red
+        Write-Host "  The primary's sibling is:              $primarySibling" -ForegroundColor Red
+        Write-Host ("Name the checkout: -RepoRoot `"$primaryOfClone`" for the second, or for the first -RepoRoot " +
+            "naming the checkout top that copy sits in, as git spells it.") -ForegroundColor Red
+        throw "-Name from this copy needs -RepoRoot. Nothing was removed."
+    }
+}
+elseif (-not ($byPath -or $listing)) {
+    # -Name builds its target from this spelling, so it must BE a checkout's top. A subdirectory, or a
+    # positional `.` run from one, used to build `<subdir>-<Name>` and fail as "No such worktree";
+    # re-anchored on the enclosing checkout it would reach `<checkout>-<Name>`, a tree the caller
+    # never named (BACKLOG #1894 review round 3). An alias spelling of the top is refused too, since
+    # git's list below would never match a target built from it.
+    $top = "$(& git -C $RepoRoot rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $top -or (ConvertTo-Norm $top) -ne (ConvertTo-Norm $RepoRoot)) {
+        throw ("-RepoRoot '$RepoRoot' is not the top of a checkout as git resolves it" +
+            $(if ($top) { " ('$top')" } else { '' }) + ". Name the checkout itself. Nothing was removed.")
+    }
+}
+$Parent = Split-Path $RepoRoot -Parent
+$RepoName = Split-Path $RepoRoot -Leaf
+
 if ($byPath -or $listing) {
     # Every registered worktree, primary first. FAIL CLOSED: an unreadable list is the same empty
     # answer as a clone with none, and must never read as permission.
-    $registered = @(Get-RepoWorktrees $RepoRoot)
+    $registered = @(if ($anchorOnPrimary) { $anchorList } else { Get-RepoWorktrees $RepoRoot })
     if ($registered.Count -eq 0) {
         throw "Could not list the registered worktrees of '$RepoRoot'. Nothing was removed."
     }
@@ -379,9 +437,9 @@ if ($byPath -or $listing) {
 }
 
 if ($listing) {
-    # The class is where a worktree sits; the route is what reaches it. A sibling is a sibling of THE
-    # CHECKOUT THIS COPY LIVES IN, because that is the only place this copy's -Name looks.
-    Write-Host "Primary: $PrimaryRoot   this copy: $RepoRoot   linked worktrees: $($linked.Count)"
+    # The class is where a worktree sits; the route is what reaches it. A sibling is a sibling of
+    # $RepoRoot, the primary unless -RepoRoot named another checkout, because that is where -Name looks.
+    Write-Host "Primary: $PrimaryRoot   -Name root: $RepoRoot   linked worktrees: $($linked.Count)"
     $siblingPrefix = (ConvertTo-Norm (Join-Path $Parent $RepoName)) + '-'
     # -Name's own pattern, read off the parameter rather than written out a fifth time.
     $namePattern = ($MyInvocation.MyCommand.Parameters['Name'].Attributes |
@@ -456,8 +514,8 @@ if ($byPath) {
         Write-Host "REFUSED: '$WorktreePath' is under .claude/worktrees, where the Claude Code harness puts its worktrees." -ForegroundColor Red
         Write-Host ("-Path never removes one: a subagent's tree there is recorded under its parent's directory, " +
             "so the occupancy check would read it as empty.") -ForegroundColor Red
-        Write-Host ("If new.ps1 made it as a sibling of a linked worktree, the copy of remove.ps1 in THAT " +
-            "worktree removes it by -Name. Otherwise removing it is the user's decision.") -ForegroundColor Red
+        Write-Host ("If an older new.ps1 made it as a sibling of a linked worktree, remove.ps1 -RepoRoot <THAT " +
+            "worktree> -Name <n> removes it. Otherwise removing it is the user's decision.") -ForegroundColor Red
         throw "Target is under .claude/worktrees. Nothing was removed."
     }
 
@@ -479,15 +537,24 @@ if ($byPath) {
 }
 else {
     $WorktreePath = Join-Path $Parent "$RepoName-$Name"
-    if (-not (Test-Path $WorktreePath)) { throw "No such worktree: $WorktreePath" }
-    Assert-NotInsideTarget $WorktreePath "Run the copy in the checkout the worktree was created from ($RepoRoot)."
-    # A worktree registered INSIDE the target goes with it, and a harness tree under the target's own
-    # .claude/worktrees is one: a session launched in the target puts its subagents there. Refused as
-    # on -Path, and for the same reason not overridable.
-    $nameRegistered = @(Get-RepoWorktrees $RepoRoot)
+    # Read from the clone's own list, never from the target, so a directory that is not this clone's
+    # worktree is refused before any git call runs inside it.
+    $nameRegistered = @(if ($anchorOnPrimary) { $anchorList } else { Get-RepoWorktrees $RepoRoot })
     if ($nameRegistered.Count -eq 0) {
         throw "Could not list the registered worktrees of '$RepoRoot'. Nothing was removed."
     }
+    $linkedNorms = @($nameRegistered | Select-Object -Skip 1 | ForEach-Object { ConvertTo-Norm $_.Path })
+    if (-not (Test-Path $WorktreePath)) { throw "No such worktree: $WorktreePath" }
+    # The target must be a registered LINKED worktree of this clone. A directory that only sits at the
+    # sibling path, such as a separate clone beside the primary, would have every read below asked of
+    # the wrong repository's refs and registries.
+    if (@($linkedNorms | Where-Object { $_ -eq (ConvertTo-Norm $WorktreePath) }).Count -ne 1) {
+        throw "'$WorktreePath' is not a registered linked worktree of '$RepoRoot'. Nothing was removed."
+    }
+    Assert-NotInsideTarget $WorktreePath "Run a copy in another checkout of this clone, such as $RepoRoot."
+    # A worktree registered INSIDE the target goes with it, and a harness tree under the target's own
+    # .claude/worktrees is one: a session launched in the target puts its subagents there. Refused as
+    # on -Path, and for the same reason not overridable.
     $nestedTrees = @(Get-NestedWorktrees -Occupancy ([pscustomobject]@{ Worktrees = $nameRegistered }) -Path $WorktreePath)
     if ($nestedTrees.Count -gt 0) {
         Write-Host "REFUSED: '$WorktreePath' contains $($nestedTrees.Count) other registered worktree(s):" -ForegroundColor Red
@@ -1219,20 +1286,13 @@ else {
 
 # --- BACKLOG #1293: refuse to strand a ledger number ---------------------------
 #
-# `Checker.owns` (scripts/hooks/ledger_check.py) decides ownership by CASEFOLDED PATH-STRING
-# EQUALITY against the worktree recorded at allocation time. There is no fallback for a recorded
-# worktree that no longer exists, so once this directory is gone `owns()` returns false for EVERY
-# session, forever. The number is burned and any PR that must re-introduce its heading is
-# unlandable by anybody. PR #397 was stranded exactly this way.
+# Removing the worktree an allocation record names can strand that number; PR #397 was stranded this
+# way. Whether anything else can still commit it depends on the record, so the refusal says so per
+# record. The ownership rule and the recoveries are in docs/LEDGER-GATE.md, "When the owning worktree
+# is gone"; this guard does not restate them.
 #
-# THE GATE IS NOT WRONG AND THIS DOES NOT WIDEN IT. It fails closed and is behaving correctly; the
-# defect is that there is no route back. Recovery for ALREADY-stranded numbers is an open route
-# decision (three candidates, none obviously right -- see the item). PREVENTION needs no such
-# decision, which is why it is here and the recovery is not.
-#
-# WHY IT REFUSES RATHER THAN WARNS. A claim can be released after the fact; an allocation CANNOT be
-# re-keyed, because ownership is documented non-transferable. There is no post-hoc fix, so the only
-# moment this can be stopped is before the removal.
+# WHY IT REFUSES RATHER THAN WARNS. A claim can be released after the fact; an allocation cannot be
+# re-keyed, because ownership is documented non-transferable.
 #
 # CANNOT-TELL COUNTS AS AT-RISK. An unreadable allocation record might name this worktree, and an
 # unreadable ledger read might hide a heading. Both refuse.
@@ -1241,6 +1301,15 @@ else {
 # are read) and on an alloc directory that cannot be listed. -Name used to read both as "no records
 # found" (vault BACKLOG #2985, item 11, and #2988).
 $allocDirRoot = Join-Path $ownShared.Path 'alloc'
+
+function Format-RecordText($Value) {
+    # A record field lands in prose an operator or agent acts on, so a line break or other invisible
+    # character in it must not be able to forge a line (the BACKLOG #1040 route). \p{C} includes the
+    # surrogate halves .NET sees for an astral format character; the cap matches _safe_for_message.
+    $t = ([string]$Value).Trim() -replace '[\p{C}\p{Zl}\p{Zp}]', '?'
+    if ($t.Length -gt 400) { $t = $t.Substring(0, 400) + '...' }
+    $t
+}
 
 function Test-LedgerNumberOnMain([string]$Kind, [string]$Number) {
     <# $true on origin/main, $false absent, $null CANNOT TELL (which the caller treats as at-risk).
@@ -1274,13 +1343,27 @@ if (Test-RegistryDirPresent $allocDirRoot 'the allocation directory') {
         $r = Read-RecordFile $f
         # The retired-allocator tombstone names no worktree on purpose, so it can strand nothing.
         if ($r.Tombstone) { continue }
-        if ($r.Problem) { $allocUnreadable += "$($f.Name) ($($r.Problem))"; continue }
+        if ($r.Problem) { $allocUnreadable += "$(Format-RecordText $f.Name) ($($r.Problem))"; continue }
         if ($r.Elsewhere -or $targetNorms -notcontains $r.Holder) { continue }
         $a = $r.Record
         $onMain = Test-LedgerNumberOnMain ([string]$a.kind) ([string]$a.number)
         if ($onMain -ne $true) {
             $why = if ($null -eq $onMain) { 'COULD NOT CHECK origin/main' } else { 'not on origin/main' }
-            $atRisk += "$([string]$a.kind) #$([string]$a.number) -- $why -- $([string]$a.title)"
+            # The engine's gate checks only adr numbers with owns(), so only an adr record's branch is a
+            # second key. alloc.ps1 records a detached HEAD as `detached@<sha>`, which names no branch.
+            $recBranch = if ($a.branch -is [string]) { Format-RecordText $a.branch } else { '' }
+            if ($recBranch -like 'detached@*') { $recBranch = '' }
+            # Under -DeleteBranch the re-run this refusal offers can delete the branch checked out here,
+            # which is usually the recorded one, so the line must not promise that branch survives.
+            $outcome = if ([string]$a.kind -eq 'adr' -and $recBranch -and $DeleteBranch) {
+                "-DeleteBranch on this run can delete the branch checked out here, and if that is the recorded branch $recBranch, the number then rests on a worktree recreated at this path (docs/LEDGER-GATE.md)"
+            } elseif ([string]$a.kind -eq 'adr' -and $recBranch) {
+                "a recorded branch $recBranch can still commit it: a worktree on a branch of that name is entitled to it"
+            } else {
+                'no other worktree can commit it once this one is removed, short of one recreated at this path'
+            }
+            # The outcome before the title, so a title cannot put a forged outcome ahead of the real one.
+            $atRisk += "$(Format-RecordText $a.kind) #$(Format-RecordText $a.number) -- $why -- $outcome -- title: $(Format-RecordText $a.title)"
         }
     }
     if (($atRisk.Count -gt 0 -or $allocUnreadable.Count -gt 0) -and -not $AllowOrphanedAllocations) {
@@ -1291,14 +1374,17 @@ if (Test-RegistryDirPresent $allocDirRoot 'the allocation directory') {
             $lines += "  record MIGHT name this worktree: $($allocUnreadable -join ', ')"
         }
         $lines += ""
-        $lines += "Removing it BURNS those numbers. Ownership is a path-string comparison against this"
-        $lines += "directory and is NON-TRANSFERABLE, so once it is gone ledger_check.owns() returns"
-        $lines += "false for every session forever and any PR that must re-introduce the heading is"
-        $lines += "unlandable BY ANYONE. This is not recoverable after the fact."
+        if ($DeleteBranch) {
+            $lines += "A record with no branch, or whose branch is deleted (-DeleteBranch on this run can delete the"
+            $lines += "branch checked out here), can then be committed from a worktree recreated at this path"
+            $lines += "(docs/LEDGER-GATE.md)."
+            $lines += ""
+        }
+        $lines += "Recovery for a stranded number: docs/LEDGER-GATE.md, `"When the owning worktree is gone`"."
         $lines += ""
         $lines += "Do this instead:"
         $lines += "  land the item(s) first, so the heading is on origin/main and ownership stops mattering;"
-        $lines += "  or, if you accept burning them, re-run with -AllowOrphanedAllocations."
+        $lines += "  or, if the operator accepts each line above, they may re-run with -AllowOrphanedAllocations."
         throw ($lines -join "`n")
     }
 }

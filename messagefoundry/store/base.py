@@ -118,6 +118,7 @@ from messagefoundry.store.store import (
     EnrolmentCodeOutcome,
     FailOutcome,
     FederatedUnbind,
+    InjectAudit,
     LatencyHistogram,
     LockoutCounter,
     LockoutIncrement,
@@ -456,7 +457,7 @@ class QueueStore(StoreLifecycle, Protocol):
         metadata: str | None = None,
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
-        audit: OperatorAudit[str] | None = None,
+        audit: InjectAudit | None = None,
         origin: MessageOrigin = MessageOrigin.PARTNER,
         origin_actor: str | None = None,
     ) -> str:
@@ -472,12 +473,10 @@ class QueueStore(StoreLifecycle, Protocol):
         ``audit`` is for an operator's inject only (BACKLOG #2624): its row, built from the new
         message id, commits in the same transaction. A live receipt passes none. It stays optional
         in the type because this one method is both paths, so nothing at the type level holds a
-        direct caller here. At runtime an operator ``origin`` (``operator_edit``,
-        ``operator_upload``) with no audit raises :class:`TypeError` before anything is written;
-        an operator inject whose audit builds no row raises inside the transaction, which rolls
-        the inject back (BACKLOG #5071,
-        ``store.require_ingress_audit``, where the limit is stated: it keys on ``origin``). The
-        engine's inject, :meth:`~messagefoundry.pipeline.Engine.inject_message`, requires one.
+        direct caller here. The runtime refusals of ``audit``, ``origin`` and ``origin_actor`` are
+        stated once, on ``store.require_ingress_audit`` (BACKLOG #5071, #6589), with the limit that
+        it keys on ``origin``. The engine's inject,
+        :meth:`~messagefoundry.pipeline.Engine.inject_message`, requires its audit.
 
         ``origin`` and ``origin_actor`` fill the plain ``messages.origin`` pair (vault BACKLOG #2615).
         A live receipt keeps the default, ``partner``; an operator's inject names itself and the user."""
@@ -3253,6 +3252,42 @@ class AuthStore(Protocol):
         written and this returns ``False``. The withdrawn row is marked ``"ad"``."""
         ...
 
+    async def set_ad_channel_scope_if_unchanged(
+        self,
+        user_id: str,
+        scope_json: str,
+        *,
+        expected_scope: str | None,
+        expected_source: ChannelScopeSource | None,
+        now: float | None = None,
+    ) -> bool:
+        """Write a directory-derived scope, marked ``"ad"``, as a COMPARE-AND-SET on the scope AND
+        its source the AD sign-in decided from, and report whether it wrote (BACKLOG #6887).
+
+        The sign-in decides from a row it read several awaits earlier, and the per-process sign-in
+        queue orders neither a sign-in on another engine shard nor an administrator's write. If
+        ``expected_scope`` or ``expected_source`` (``None`` matching NULL) differs from the row
+        read, or the row is gone, nothing is written and this returns ``False``; how far that
+        compare holds against another process is the next paragraph's. It does not keep the
+        caller from replacing a newer scope: on a miss the caller reads the row again and decides
+        again from its own groups, which may be the older ones, and a scope written back to the
+        value read passes the compare. Nor does it stop concurrent sign-ins from revoking each
+        other's sessions; the caller's docstring, ``AuthService._sync_ad_channel_scope``, names at
+        least three revokes that remain under *WHAT THE COMPARE-AND-SET DOES NOT CLOSE*.
+
+        **What makes that compare hold differs per backend**, as for every user-record write. Each
+        reads the row, compares in Python, and writes with a compare on the seal it read. Whether a
+        row changed after the read then writes nothing depends on the backend. Postgres and SQL
+        Server also read the row under a lock held to the write (``FOR UPDATE``, ``UPDLOCK,
+        ROWLOCK``), so there it does, and the seal compare is a second guard. On SQLite the writer
+        lock holds the read and the write together within one process, but the read takes no lock
+        against ANOTHER process writing the same file. Across processes the only guard there is
+        the seal compare in the ``UPDATE``, and only under a row sealer: with one, a row changed in
+        any column after the read loses the compare, and the caller reads that as a miss. A
+        keyless store writes an empty seal on every row, so the compare always matches and nothing
+        stops another process's write landing between this read and this write."""
+        ...
+
     async def set_user_federated_subject(
         self,
         user_id: str,
@@ -3688,7 +3723,9 @@ class AuthStore(Protocol):
 
         In one transaction it raises the store's global session epoch (BACKLOG #5091), which ends
         every session minted before it whatever account it belongs to, raises the epoch of each
-        account its read of the account list returns, ends the sessions it finds, and re-seals the
+        account its read of the account list returns (an account whose raise a seal refusal
+        stops goes without it, and so does every account after a Vault Transit outage trips the
+        revoke: store.py's ``raise_account_epoch``), ends the sessions it finds, and re-seals the
         kept session under its account's new epoch and the new global one, only when it carried
         both epochs those raises replaced (store.py's ``KeptSessionRestamp``, BACKLOG #4975): a
         kept session an earlier sweep missed, or one whose account's record failed its seal, is
