@@ -47,7 +47,8 @@ from messagefoundry.parsing import message as message_module
 from messagefoundry.parsing.dicom.hl7_map import encode_segment
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import starts_with_msh
-from messagefoundry.parsing.x12.delimiters import ELEMENT_SEP_OFFSETS
+from messagefoundry.parsing.x12.delimiters import ELEMENT_SEP_OFFSETS, discover_delimiters
+from messagefoundry.parsing.x12.errors import X12PeekError
 from messagefoundry.pipeline import ingress_guards, wiring_runner
 from messagefoundry.pipeline.dryrun import dry_run
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
@@ -872,28 +873,31 @@ def _lined_up(header: str) -> bool:
 
 
 @pytest.mark.parametrize(
-    ("header", "delimiter"),
+    "header",
     [
-        (_isa(element="?").replace("SENDER", "AC?MER", 1), "?"),
-        (_isa(component="?").replace("SENDER", "AC*MER", 1), "*"),
-        (_isa(element="?", repetition="?"), "?"),
-        (_isa(element="A", component="?"), "A"),
+        _isa(element="?").replace("SENDER", "AC?MER", 1),
+        _isa(component="?").replace("SENDER", "AC*MER", 1),
+        _isa(element="?", repetition="?"),
+        _isa(element="?", repetition="?").replace("*00501*", "*00401*"),
+        _isa(element="A", component="?"),
     ],
-    ids=["element-in-isa06", "component-q-isa06", "element-is-00501-isa11", "element-in-isa-tag"],
+    ids=["element-in-isa06", "component-q-isa06", "isa11-00501", "isa11-00401", "isa-tag"],
 )
 def test_a_lined_up_isa_with_its_separator_elsewhere_before_isa16_declares_nothing(
-    header: str, delimiter: str
+    header: str,
 ) -> None:
-    """Pins a residual the #5799 docstring and changelog name: a padded ISA whose separators sit
-    at their fixed offsets, but whose element separator also appears before ISA16 elsewhere (in
-    ISA06's data, in a 00501 ISA11, or in the ``ISA`` tag), is not fixed-width, so it declares
-    nothing, and a ``?`` delimiter in it gets ``?`` written into its data, as on main. Mutation:
-    drop the element-data count from ``_isa_is_fixed_width`` and the call raises."""
-    assert len(header) == 106 and _lined_up(header) and header[3] == delimiter
-    assert header.count(delimiter, 0, 104) > len(ELEMENT_SEP_OFFSETS)
-    reply = header + header[3].join(["TA1", "000000001", "260101", "1200", "Z", "000中"]) + "~"
+    """Pins a residual the #5799 docstring and changelog name, not a wanted outcome: a padded ISA
+    whose separators sit at their fixed offsets, but whose element separator also appears before
+    ISA16 elsewhere (in ISA06's data, in ISA11 in any version, or in the ``ISA`` tag), is not
+    fixed-width, so it declares nothing and a ``?`` delimiter in it gets ``?`` written into its
+    data, as on main. A fix that closes the residual turns this red on purpose. Mutation: drop the
+    element-data count from ``_isa_is_fixed_width`` and the call raises."""
+    element = header[3]
+    assert len(header) == 106 and _lined_up(header)
+    assert header.count(element, 0, 104) > len(ELEMENT_SEP_OFFSETS)
+    reply = header + element.join(["TB1", "000000001", "260101", "1200", "Z", "000\u4e2d"]) + "~"
     wire = framing_mod.encode_reply(reply, "ascii", connection="IB_X12_SEP_ELSEWHERE")
-    assert wire == reply.replace("中", "?").encode("ascii")
+    assert wire == reply.replace("\u4e2d", "?").encode("ascii")
 
 
 def test_an_isa16_equal_to_the_element_separator_still_declares() -> None:
@@ -902,6 +906,8 @@ def test_an_isa16_equal_to_the_element_separator_still_declares() -> None:
     declared and the reply is refused."""
     header = _isa(element="?", component="?")
     assert len(header) == 106 and _lined_up(header)
+    with pytest.raises(X12PeekError, match="not mutually distinct"):
+        discover_delimiters(header)
     reply = header + "TA1?000000001?260101?1200?Z?000中~"
     with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
         framing_mod.encode_reply(reply, "ascii", connection="IB_X12_ISA16_SEP")

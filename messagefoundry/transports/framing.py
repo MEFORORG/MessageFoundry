@@ -347,18 +347,20 @@ def _reply_delimiters(reply: str) -> frozenset[str]:
     terminator, and the LF of a CR+LF end, are declared too. An X12 reply led by ``ISA`` is read
     at the ISA's fixed delimiter offsets only when :func:`_isa_is_fixed_width` holds for it. Those
     offsets are read raw, without the distinctness check ``discover_delimiters`` makes and without
-    the terminator half of its element-data check, so a fixed-width ISA that read refuses for one of
-    those still declares what its offsets hold: at least ISA11 and ISA16 both ``?``, and an ISA16
-    equal to the element separator. ISA11 counts only from version 00501, as that read counts it.
-    An ISA that is not fixed-width declares nothing, as every ``ISA``-led reply did before this
-    read: in an unpadded ISA, offsets 82, 104 and 105 can hold element data, and reading them
-    refused a reply whose data there the charset cannot hold. That leaves a residual: an ISA that
-    is not fixed-width has ``?`` written into its data wherever ``?`` is one of its delimiters, as
-    before, even where its separators sit at their fixed offsets. At least these are not
-    fixed-width: an ISA whose elements are unpadded, one cut short, and a padded one whose element
-    separator also appears before ISA16 away from its separator offsets, whether in element data
-    (an ISA06 of ``AC*MER``), in a 00501 ISA11 (where ISA11 is a delimiter), or in the ``ISA`` tag
-    itself (an element separator of ``A``). A reply with any other lead declares nothing here.
+    the terminator half of its element-data check, so a fixed-width ISA that read refuses for one
+    of those still declares what its offsets hold: at least ISA11 and ISA16 both ``?``, and an
+    ISA16 equal to the element separator. ISA11 is declared only from version 00501, as that read
+    takes it as a delimiter. An ISA that is not fixed-width declares nothing, as every
+    ``ISA``-led reply did before this read: in an unpadded ISA, offsets 82, 104 and 105 can hold
+    element data, and reading them would refuse a reply whose data there the charset cannot hold.
+    That leaves a residual, as before: an ISA that is not fixed-width is neither refused where
+    ``?`` is one of its delimiters, so ``?`` is written into its data, nor where a delimiter is a
+    character the charset cannot encode, even where its separators sit at their fixed offsets. At
+    least these are not fixed-width: an ISA whose elements are unpadded, one cut short, and one
+    whose element separator also appears before ISA16 away from its separator offsets, whether in
+    element data (an ISA06 of ``AC*MER``), in ISA11 in any version, or in the ``ISA`` tag itself
+    (an element separator of ``I``, ``S`` or ``A``). A reply with any other lead declares nothing
+    here.
 
     Leading whitespace and a BOM are skipped first, as the engine's one definition of tolerated
     leading noise (``sniff._LEADING_WS_STR``) skips them. A header line of ``MSH`` alone has no
@@ -395,9 +397,10 @@ _ISA_DELIMITER_OFFSETS = (ELEMENT_SEP_OFFSETS[0], _COMPONENT_SEP_OFFSET, _SEGMEN
 def _isa_is_fixed_width(body: str) -> bool:
     """Whether the ``ISA`` that opens ``body`` is laid out at its fixed widths: all
     ``ISA_SEGMENT_LEN`` characters are present and every element-separator offset holds the
-    character at +3, and no other offset before ISA16 holds it, the ``ISA`` tag and ISA11 included;
-    X12 keeps the element separator out of element data. So its delimiter offsets hold delimiters rather than element data, and
-    ``ISA`` followed by a run of one character is not read as one."""
+    character at +3, and no other offset before ISA16 holds it, the ``ISA`` tag and ISA11 included,
+    as X12 keeps the element separator out of element data. So ``ISA`` followed by a run of one
+    character is not read as one. ISA16's width is not checked: an empty or a longer ISA16 that
+    passes puts other characters at offsets 104 and 105, and they are read as delimiters."""
     if len(body) < ISA_SEGMENT_LEN:
         return False
     element = body[ELEMENT_SEP_OFFSETS[0]]
