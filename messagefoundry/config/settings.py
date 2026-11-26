@@ -7806,10 +7806,13 @@ class DrSettings(_Section):
     MANUAL** (``POST /dr/activate``, gated by the ``dr:operate`` permission); ``auto`` is rejected at load.
 
     ``enabled`` is read at engine start; a deployment is either a DR box (``enabled = true``) or it
-    is not. A DR box always starts PASSIVE, and ``POST /dr/activate`` is the only way it comes up
-    under the DR run-profile: that route verifies the cold seed, runs the takeover hook and writes
+    is not. No setting brings a DR box up under the DR run-profile: ``POST /dr/activate`` is the
+    only way, and that route verifies the cold seed, runs the takeover hook if one is set, and writes
     the ``dr.activate`` audit row. The former ``activate`` startup latch skipped all three, so it was
-    removed and is refused at load as a removed key (owner ruling 2026-11-25, BACKLOG #5965).
+    removed and is refused at load as a removed key (owner ruling 2026-11-25, BACKLOG #5965). So
+    under ``serve`` a DR box always starts PASSIVE, and an activated box that restarts comes back
+    passive until it is activated again. An engine an embedder builds with no store settings has no
+    coordinator, so it does not park its graph at all (``Engine._dr_standby_threshold``).
     """
 
     # Opt-in master switch: is this deployment a DR standby box at all? false = the engine runs the
@@ -9484,8 +9487,8 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
     ("dr", "activate"): (
         "a DR box always starts passive, and the only way to bring it up under the DR "
         "run-profile is POST /dr/activate, which verifies the cold seed, runs the takeover hook "
-        "and writes the dr.activate audit row; the startup latch skipped all three (BACKLOG "
-        "#5965)"
+        "if one is set, and writes the dr.activate audit row; the startup latch skipped all three "
+        "(BACKLOG #5965)"
     ),
 }
 

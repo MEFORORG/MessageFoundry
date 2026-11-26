@@ -49,7 +49,7 @@ def test_enabled_and_activate_from_a_file_are_refused(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match=_REMOVED) as caught:
         load_settings(config_path=cfg, environ={})
     assert "POST /dr/activate" in str(caught.value)
-    assert "true" not in str(caught.value)
+    assert "true" not in str(caught.value).lower()
 
 
 def test_an_enabled_box_loads_passive() -> None:
@@ -58,18 +58,24 @@ def test_an_enabled_box_loads_passive() -> None:
     assert dr.enabled and "activate" not in DrSettings.model_fields
 
 
+class _CarriesActivate(DrSettings):
+    """Settings that still carry ``activate = true``, as main's field did, so an engine or
+    coordinator that read the attribute would see it."""
+
+    activate: bool = True
+
+
 async def test_no_engine_construction_path_activates_dr(tmp_path: Path) -> None:
-    """Red on main: settings that skip validation and still carry ``activate = true`` brought the
-    engine and the coordinator up under the DR run-profile. Every DR box now starts passive."""
+    """Red on main: settings carrying ``activate = true`` brought the engine and the coordinator up
+    under the DR run-profile. Every DR box now starts passive, whatever the settings carry."""
     db = tmp_path / "e.db"
-    smuggled = DrSettings.model_construct(
-        enabled=True, activate=True, seed_archive=_SEED["seed_archive"]
-    )
+    carried = _CarriesActivate.model_construct(enabled=True, seed_archive=_SEED["seed_archive"])
+    assert carried.activate is True  # the control: the attribute is there to be read
     engine = Engine(
         await MessageStore.open(db),
         poll_interval=0.05,
         store_settings=StoreSettings(path=str(db)),
-        dr_settings=smuggled,
+        dr_settings=carried,
         egress_settings=EgressSettings(deny_by_default=False),
     )
     try:

@@ -3,7 +3,8 @@
 """DR run-profile status surfacing (#61, ADR 0048 AC-4): a connection the DR run-profile parks below the
 threshold reports status:"filtered" on GET /connections and GET /connections/{name}/metadata — a fifth
 status value distinct from ADR 0031's "failed". A failed connection (a bad bind) stays "failed", so an
-operator can tell a deliberately-parked DR feed from a broken one."""
+operator can tell a deliberately-parked DR feed from a broken one. Since BACKLOG #5965 no box starts
+activated, so the two are checked apart: see test_a_failed_outbound_reads_failed_not_filtered."""
 
 from __future__ import annotations
 
@@ -88,8 +89,9 @@ async def test_filtered_vs_failed_status(engine: Engine, tmp_path: Path) -> None
 
 async def test_a_failed_outbound_reads_failed_not_filtered(tmp_path: Path) -> None:
     """ADR 0031: an outbound whose env() cannot resolve fails to build and reads "failed", a
-    status distinct from the DR park's "filtered". On a non-DR engine, because an activation
-    reload refuses a graph whose critical outbound cannot build."""
+    status distinct from the DR park's "filtered". On a non-DR engine: on a passive DR box the
+    outbound is parked and reads "filtered", and an activation reload refuses a graph whose
+    critical outbound cannot build, so no DR box shows the two side by side (BACKLOG #5965)."""
     store = await MessageStore.open(tmp_path / "failed.db")
     eng = Engine(
         store,
