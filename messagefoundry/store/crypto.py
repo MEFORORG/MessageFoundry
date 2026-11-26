@@ -1072,7 +1072,9 @@ def detached(error: CipherError) -> CipherError:
 
     Past :data:`_DETACH_LIMIT` exceptions it stops, cuts the graph there and then logs a
     WARNING (vault BACKLOG #6706 item 1). A failure to log that raises an ``Exception`` is
-    reported on stderr by its class, where the process has a writable one, and is not raised.
+    reported on stderr, by its class where that can be read, and is not raised; nothing is
+    reported where the process has no writable stderr, and any other ``BaseException`` from the
+    log step is raised.
     The cut: a visited error's link to an unvisited one is set to ``None``,
     and an unvisited member of a visited group, which its group's tuple keeps, has its traceback
     and its own links cleared, down through any group nested in it. The nearest links are visited
@@ -1096,29 +1098,33 @@ def detached(error: CipherError) -> CipherError:
         if isinstance(link, BaseExceptionGroup):
             pending.extend(link.exceptions)
     if over_limit:
-        # Cut, then drop this frame's hold on the exceptions the cut unlinked, and only then
-        # log: a failure to log cannot skip the cut, and an error the log step raises carries
-        # this frame, which then reaches no traceback the cut left attached.
-        _cut_unvisited(visited, seen)
+        # Drop this frame's hold on the unvisited exceptions, cut, and only then log: a failure
+        # to log cannot skip the cut, and this frame, which an error raised by the cut or the log
+        # step carries, holds none of the exceptions the cut unlinked. That error's traceback
+        # still carries its callers' frames. A cut that raises still logs the WARNING.
         pending.clear()
         del link
-        _warn_detach_limit()
+        try:
+            _cut_unvisited(visited, seen)
+        finally:
+            _warn_detach_limit()
     return error
 
 
 def _warn_detach_limit() -> None:
-    """:func:`detached`'s WARNING, with a failure to log reported on stderr by its class
-    (``ascii``-escaped) and not raised."""
+    """:func:`detached`'s WARNING. A failure to log that raises an ``Exception`` is reported on
+    stderr, by its class (``ascii``-escaped) where that can be read, and not raised; any other
+    ``BaseException`` is raised, and nothing is reported where there is no writable stderr."""
     try:
         _log.warning(
             "an error's exception graph has more than %d links; the rest are cut off it",
             _DETACH_LIMIT,
         )
-    except Exception as fault:  # noqa: BLE001 -- reported below, by class, not raised
+    except Exception as fault:  # noqa: BLE001 -- an Exception is reported below, not raised
+        text = "a detached-error WARNING could not be logged"
         with contextlib.suppress(Exception):
-            _last_resort(
-                f"a detached-error WARNING could not be logged ({ascii(type(fault).__name__)})"
-            )
+            text = f"{text} ({ascii(type(fault).__name__)})"
+        _last_resort(text)
 
 
 def _cut_unvisited(visited: list[BaseException], seen: set[int]) -> None:

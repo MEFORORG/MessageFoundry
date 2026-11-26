@@ -245,7 +245,7 @@ def test_a_raising_log_filter_leaves_the_hvac_refusal_whole(
         keyprovider_vault._log.removeFilter(raising)
     assert "did not import (OSError)" in str(caught.value)
     assert caught.value.__cause__ is None and caught.value.__context__ is None
-    assert "could not be logged (ValueError)" in capsys.readouterr().err
+    assert "could not be logged ('ValueError')" in capsys.readouterr().err
 
 
 def test_the_hvac_refusal_survives_the_key_seams_fixed_text(

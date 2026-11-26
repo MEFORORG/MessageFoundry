@@ -36,6 +36,7 @@ KeyProvider's no-oracle contract and PHI.md never-log rules).
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import logging
 import os
@@ -153,12 +154,16 @@ def log_import_failure(
 
 
 def _warn_or_report(logger: logging.Logger, message: str, *args: object) -> None:
-    """``logger.warning(message, *args)``, with a failure to log reported on stderr by its class
-    (``logging_guard._last_resort``), never raised."""
+    """``logger.warning(message, *args)``. A failure to log that raises an ``Exception`` is
+    reported on stderr (``logging_guard._last_resort``), by its class (``ascii``-escaped) where
+    that can be read, and not raised; any other ``BaseException`` is raised."""
     try:
         logger.warning(message, *args)
-    except Exception as fault:  # noqa: BLE001 -- reported below, by class, never raised
-        _last_resort(f"a provider WARNING could not be logged ({type(fault).__name__})")
+    except Exception as fault:  # noqa: BLE001 -- an Exception is reported below, not raised
+        text = "a provider WARNING could not be logged"
+        with contextlib.suppress(Exception):
+            text = f"{text} ({ascii(type(fault).__name__)})"
+        _last_resort(text)
 
 
 def _load_external_provider(
@@ -169,9 +174,10 @@ def _load_external_provider(
     The seam: a per-provider module ``messagefoundry/config/secretprovider_<name>.py`` exposes
     ``build_provider(settings, *, posture) -> SecretProvider`` behind an optional extra; this
     dispatch imports it by name with **no edit here**. A missing provider module, a missing backend
-    SDK, or a provider module that is present but whose import raises an ``Exception``, **fails
-    closed** with :class:`SecretProviderError`; the last two name the extra. A ``MemoryError`` or
-    ``RecursionError`` from the import propagates, as the process's own limit. The base install pulls
+    SDK, or a provider module that is present but whose import raises any other ``Exception``
+    than ``MemoryError`` or ``RecursionError``, **fails closed** with
+    :class:`SecretProviderError`; the last two name the extra. A ``MemoryError`` or
+    ``RecursionError`` from the import propagates, read as the process's own limit. The base install pulls
     **zero** external SDK. A provider that imports its SDK lazily, as ``vault`` does, refuses a
     failed SDK import itself, at its first read rather than here
     (``secretprovider_vault._import_hvac``).

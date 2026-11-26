@@ -887,6 +887,36 @@ def test_detached_past_its_limit_cuts_when_its_warning_cannot_be_logged(
     assert "could not be logged ('ValueError')" in capsys.readouterr().err
 
 
+class _UnnamedMeta(type):
+    @property
+    def __name__(cls) -> str:  # type: ignore[override]
+        raise RuntimeError("no name")
+
+
+class _Unnamed(ValueError, metaclass=_UnnamedMeta):
+    """A synthetic error whose class name cannot be read."""
+
+
+class _UnnamedFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        raise _Unnamed
+
+
+def test_detached_reports_a_log_failure_whose_class_cannot_be_named(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Round 2: building the classed text sat inside the suppress, so it dropped the report whole.
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 3)
+    error = _chain(CipherError("synthetic"), 5)
+    unnamed = _UnnamedFilter()
+    crypto._log.addFilter(unnamed)
+    try:
+        assert detached(error) is error
+    finally:
+        crypto._log.removeFilter(unnamed)
+    assert "a detached-error WARNING could not be logged" in capsys.readouterr().err
+
+
 class _Interrupt(BaseException):
     """A synthetic non-``Exception`` error, which the WARNING's guard does not catch."""
 
@@ -917,7 +947,14 @@ def test_an_error_escaping_detacheds_warning_holds_nothing_the_cut_unlinked(
         tb = tb.tb_next
     (frame,) = [f for f in frames if f.f_code.co_name == "detached"]
     held = [v for v in frame.f_locals.values() if isinstance(v, BaseException)]
-    held += [e for v in frame.f_locals.values() if isinstance(v, collections.deque) for e in v]
+    held += [
+        e
+        for v in frame.f_locals.values()
+        if isinstance(v, (collections.deque, list, tuple))
+        for e in v
+        if isinstance(e, BaseException)
+    ]
+    assert any(e is error for e in held)  # the floor: the frame's locals were read
     assert all(e.__traceback__ is None for e in held)
     assert not _frames_reach(error, "value 0")
 

@@ -281,7 +281,7 @@ def _load_external_provider(
     ``build_provider(settings, *, posture) -> KeyProvider`` behind the optional ``<extra>`` extra,
     imported only when selected, so the base install pulls no provider SDK. A provider is added by
     shipping that module and naming it in :data:`_EXTERNAL_PROVIDERS` in the same change. An import
-    that fails **fails closed**.
+    that fails **fails closed**, except that a ``MemoryError`` or ``RecursionError`` propagates.
 
     ``posture`` is handed to every external provider, because each one dials a network hop that
     a posture-keyed guard may judge (vault BACKLOG #2983). It is ``None`` where the caller holds
@@ -309,8 +309,8 @@ def _load_external_provider(
         # Present but broken: a C extension that fails to load, or a name its SDK or the provider
         # module itself no longer has. Importing runs the module's top-level code, which can fail
         # with any class (an OSError from a native library, an AttributeError, a SyntaxError in a
-        # truncated file), so this takes any Exception but the two above (vault BACKLOG #6709
-        # item 3). Left raw, a ValueError would reach store.base, which reads it as a refused key
+        # truncated file), so this takes any Exception but MemoryError and RecursionError (vault
+        # BACKLOG #6709 item 3). Left raw, a ValueError would reach store.base, which reads it as a refused key
         # and tells the operator to generate a new one; a failed import is never a bad key. The
         # error is chained, not swallowed. This seam's own text does not reach an operator through
         # resolve_active_key or resolve_decrypt_keys, which replace any error with a fixed text of
