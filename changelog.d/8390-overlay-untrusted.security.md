@@ -8,4 +8,4 @@
   the check read; for an anchor read again by path, such as an outbound connection's `tls_ca_file`
   or `[logging].forward_tls_ca_file`, a pin is no escape. **A container whose root file system is
   overlay now gets that answer for every trust anchor, so an enforcing PHI start there refuses**;
-  see [docker/README.md](../docker/README.md). (`BACKLOG #8390`)
+  see [docker/README.md](../docker/README.md). (vault `BACKLOG #8390` item 31)

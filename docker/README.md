@@ -286,19 +286,19 @@ certificate (A) and its revocation attestation, or it **refuses to start** — b
 - **Never bake `MEFOR_ALLOW_INSECURE_TLS`.** It is a dev / trusted-lab switch;
   [the escape hatch](../docs/DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) says what it
   means.
-- **A trust-anchor file is refused at `enforce` in a container whose root file system is overlay**
-  (vault BACKLOG #8390 item 31). The Linux path check reads the file system type of every
+- **A trust-anchor file is refused at `enforce` where the root file system is overlay** (vault
+  BACKLOG #8390 item 31), as it usually is in a Docker or Kubernetes container, and on any other
+  host whose `/` mounts as overlay. The Linux path check reads the file system type of every
   directory from `/` down, and does not vouch for overlay (the `POSIX_TRUSTED_FS` comment in
-  `messagefoundry/auth/anchor_path.py` says why). So where `/` is overlay, as it usually is under
-  Docker and Kubernetes, every anchor answers *could not settle*, even one on a bind-mounted ext4
-  volume, and moving the file elsewhere in the container does not clear it. `enforce` refuses it,
-  unless the refusal offers a pin, naming the setting and the file's digest, and you set that pin;
-  check the digest against the CA first. An anchor the engine reads again by path takes no pin escape, at least the store CAs,
-  `[tls].internal_ca_file`, `[alerts].email_tls_ca_file`, `[logging].forward_tls_ca_file` and an
-  outbound connection's `tls_ca_file`, so at `enforce` none of them can be used there. **An
-  enforcing PHI start therefore refuses in such a container**: it needs verified-TLS log
-  forwarding, and that needs `[logging].forward_tls_ca_file`. Derived from the code, not measured
-  on a running container.
+  `messagefoundry/auth/anchor_path.py` says why). So every anchor there answers *could not
+  settle*, even one on a bind-mounted ext4 volume, and moving the file does not clear it. `enforce`
+  refuses it, unless the refusal offers a pin, naming the setting and the file's digest, and you
+  set that pin; check the digest against the CA first. An anchor the engine reads again by path
+  (`loads_verified_bytes=False` in `messagefoundry/auth/trust_anchors.py`) takes no pin escape, so
+  at `enforce` it cannot be used there. **That includes `[logging].forward_tls_ca_file`, so an
+  enforcing PHI start refuses there**: it needs verified-TLS log forwarding, which needs that file.
+  The deployment steps above that put trust files under `/config/pki/` meet this refusal. Derived
+  from the code, not measured on a running container.
 - **Cert-expiry monitor skips `env()`-referenced cert paths.** Use literal paths for any cert you want the
   built-in expiry alert to watch (the `[api]` cert is always literal and covered).
 - **In-engine TLS revocation is delegated** (ADR 0002). For enforced revocation use Topology B with an

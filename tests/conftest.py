@@ -378,7 +378,8 @@ def _pass_the_anchor_path_check_on_windows() -> Iterator[None]:
     ``/tmp`` holding the runner's own directory) on a host whose file systems from ``/`` down are on
     ``POSIX_TRUSTED_FS``, as on the GitHub-hosted Linux runners, so the Linux leg runs the real check
     in every anchor test. Where ``/`` is overlay, as in most containers, that check answers
-    indeterminate (vault BACKLOG #8390 item 31), and the anchor tests that run it would fail there. The config-source readers above are scoped to win32 the same way."""
+    indeterminate (vault BACKLOG #8390 item 31), and the anchor tests that run it would fail there.
+    The config-source readers above are scoped to win32 the same way."""
     if sys.platform != "win32":
         yield
         return
