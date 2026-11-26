@@ -2738,8 +2738,8 @@ known; it does not prove there are no others.
 
 **Everything else in a field no rule maps passes.** That includes a name, a date, an undashed SSN,
 a bare ten-digit phone number, an account number and a free-text note. A Z-segment is the common
-case, since no default rule names one. A value in a standard field no rule maps, such as `NK1-10`,
-the next of kin's job title, passes the same way. The detectors stay narrow on purpose: a broad digit search flags almost every HL7 body.
+case, since no default rule names one. A value in a standard field no rule maps, such as `NK1-11`,
+the next of kin's job code and class, passes the same way. The detectors stay narrow on purpose: a broad digit search flags almost every HL7 body.
 
 **An escaped value is read decoded too (BACKLOG #5532).** HL7 lets a sender write any character
 as an escape sequence, so `123\X2D\45\X2D\6789` is a dashed SSN and `M\X52\` is the id type
@@ -3031,6 +3031,7 @@ and fills the rest of the value at the same width. BACKLOG #2248 added it.
 | `PV1-6`, `PV1-11`, `PV1-42`, `PV1-43` | Prior, temporary, pending and prior temporary patient locations (BACKLOG #5533) | `freetext`, the whole field becomes `[REDACTED]` |
 | `PID-23` | Birth place (BACKLOG #5533) | `freetext`, the whole field becomes `[REDACTED]` |
 | `GT1-24` | Guarantor's death date and time (BACKLOG #5533) | `date` |
+| `PID-33`, `NK1-8`, `NK1-9`, `GT1-13`, `GT1-14`, `GT1-31`, `GT1-32`, `PV1-25`, `PV1-30`, `PV1-35` | Last update time; contact start and end; guarantor begin and end, hire and employment stop; contract effective, bad debt transfer and account delete dates (BACKLOG #5533) | `date` |
 | `GT1-56`, `NK1-38` | Birth places of the guarantor and the next of kin (BACKLOG #5533) | `freetext`, the whole field becomes `[REDACTED]` |
 | `PV1-37` | Discharged-to location and its effective date (BACKLOG #5533) | `freetext`, the whole field becomes `[REDACTED]`, its location code too |
 
