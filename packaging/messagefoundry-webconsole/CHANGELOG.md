@@ -359,12 +359,12 @@ this line.**
   that set, an empty one included, is refused with the generic "invalid input". A body that starts
   with a line break keeps it. The seam digest moved because the route's form parser changed, and
   it now hashes the helper that rewrites the breaks. (BACKLOG #5930)
-- **A resubmit with no `eol` field gives a body that starts with MSH CR terminators.** A form
-  the editor did not render, such as a stale page or a hand-built POST, used to resubmit the
-  browser's line breaks. A submitted body that starts with MSH now goes out with CR, whatever the
-  original used, since the parser has no original to read; any other body, an `FHS` or `BHS`
-  batch included, goes out as sent. The seam digest moved again, because
-  the form parser and its new helper changed. (BACKLOG #5930)
+- **A resubmit with no `eol` field gives an HL7 body CR terminators.** A form the editor did not
+  render, such as a stale page or a hand-built POST, used to resubmit the browser's line breaks. A
+  submitted body that starts with MSH, or with a `BHS` or `FHS` batch header in its separator
+  shape, now goes out with CR, whatever the original used, since the parser has no original to
+  read; any other body goes out as sent. The seam digest moved again, because the form parser and
+  its new helper changed. (BACKLOG #5930)
 
 - **TOTP enrolment no longer drops the first code.** Under the default
   `[auth].require_action_step_up`, the enroll page showed a code form whose submit the confirm

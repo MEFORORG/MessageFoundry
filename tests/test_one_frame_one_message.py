@@ -47,6 +47,7 @@ from messagefoundry.parsing import message as message_module
 from messagefoundry.parsing.dicom.hl7_map import encode_segment
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import starts_with_msh
+from messagefoundry.parsing.sniff import _LEADING_WS_STR
 from messagefoundry.pipeline import ingress_guards, wiring_runner
 from messagefoundry.pipeline.dryrun import dry_run
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
@@ -757,6 +758,186 @@ def test_frame_reply_reads_delimiters_past_a_leading_bom(lead: str) -> None:
     reply = lead + "MSH|?~" + BS + "&|R|RF" + CR + "MSA|AA|CTRL1|\u4e2d" + CR
     with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
         frame_reply(MLLP_CODEC, reply, "latin-1", connection="IB_BOM")
+
+
+def _isa(
+    *, element: str = "*", component: str = ":", repetition: str = "^", term: str = "~"
+) -> str:
+    """A synthetic ISA header: 106 characters with a one-character ISA16 and terminator,
+    one more for a CR+LF terminator, fewer or more as ``component`` and ``term`` set."""
+    fields = ["ISA", "00", " " * 10, "00", " " * 10, "ZZ", "SENDER".ljust(15), "ZZ"]
+    fields += ["RECEIVER".ljust(15), "260101", "1200", repetition, "00501", "000000001", "0", "P"]
+    return element.join([*fields, component]) + term
+
+
+def _main_reply_delimiters(reply: str) -> frozenset[str]:
+    """origin/main's ``_reply_delimiters`` at this branch's base, copied as the reference the
+    differential tests below compare an ``ISA``-led reply and a short LF-only ``MSH`` header
+    against."""
+    line = reply.lstrip(_LEADING_WS_STR).partition("\r")[0]
+    if not line.startswith("MSH") or len(line) < 4:
+        return frozenset()
+    return frozenset((*_builtin_hl7._extract_separators(line), "\r"))
+
+
+_TA1 = "TA1*000000001*260101*1200*A*000"
+_GS = "GS*FA*SENDER*RECEIVER*20260101*1200*1*X*005010"
+
+#: ``ISA``-led reply shapes from the sweep the #5799 ISA read was reviewed over, each holding a
+#: character ASCII cannot encode. The ``nel-each`` and ``u2028-each`` shapes are the regression
+#: the read was withdrawn for: an empty ISA16, then ``~`` and NEL or U+2028 after each terminator,
+#: refused by the withdrawn read where main replaced and sent the reply.
+_ISA_SHAPES = {
+    "isa16-q": _isa(component="?") + _TA1 + "中~",
+    "isa11-q": _isa(repetition="?") + _TA1 + "中~",
+    "element-q": _isa(element="?") + _TA1.replace("*", "?") + "中~",
+    "terminator-q": _isa(term="?") + _TA1 + "中?",
+    "crlf": _isa(term="\r\n") + _TA1 + "中\r\n",
+    "pretty-lf": _isa(component="?", term="~\n") + _GS + "中~\n",
+    "isa11-and-isa16-q": _isa(component="?", repetition="?") + _TA1 + "中~",
+    "isa11-q-00401": _isa(repetition="?").replace("*00501*", "*00401*") + _TA1 + "中~",
+    "isa16-empty": _isa(component="", term="") + "中" + _TA1 + "~",
+    "nel-once": _isa(component="", term="") + "~\u0085" + _TA1 + "中~",
+    "u2028-once": _isa(component="", term="") + "~\u2028" + _TA1 + "中~",
+    "nel-each": _isa(component="", term="") + "~\u0085" + _TA1 + "中~\u0085",
+    "u2028-each": _isa(component="", term="") + "~\u2028" + _TA1 + "中~\u2028",
+    "isa16-two": _isa(component=":?", term="") + "~" + _TA1 + "中~",
+    "element-in-isa06": _isa(component="?").replace("SENDER", "AC*MER", 1) + _TA1 + "中~",
+    "unpadded": "ISA*00**00**ZZ*SENDER*ZZ*RECEIVER*260101*1200*^*00501*000000001*0*P*:~"
+    + _TA1
+    + "中~",
+    "truncated": "ISA*00*中~",
+    "run-unencodable": "ISA" + "中" * 110,
+    "run-q": "ISA" + "?" * 110 + "中",
+    "leading-crlf": "\r\n" + _isa(component="?") + _TA1 + "中~",
+}
+
+
+@pytest.mark.parametrize("reply", list(_ISA_SHAPES.values()), ids=list(_ISA_SHAPES))
+def test_an_isa_led_reply_reads_and_encodes_as_on_main(reply: str) -> None:
+    """Pins a residual, not a wanted outcome: the ISA half of BACKLOG #5799 item 2 is withdrawn
+    and still open, because its read refused shapes main replaced and sent (``nel-each`` and
+    ``u2028-each``). An ``ISA``-led reply declares nothing, as main's read does, so its
+    unencodable characters are replaced and the reply is sent, even where the ``?`` written
+    then reads as one of the ISA's delimiters (ADR 0206). A fix that closes the open half turns
+    the ``?``-delimiter shapes red on purpose; the NEL and U+2028 shapes must stay green."""
+    assert framing_mod._reply_delimiters(reply) == _main_reply_delimiters(reply) == frozenset()
+    body, replaced = framing_mod.encode_reply_reporting(reply, "ascii", connection="IB_X12_MAIN")
+    assert replaced and body == reply.encode("ascii", errors="replace")
+
+
+def test_control_the_main_reference_reads_an_msh_reply() -> None:
+    """Negative control for the reference copy above: on a one-line ``MSH`` reply it and this
+    branch's read both return the declared delimiters, so the copy is not a constant."""
+    reply = "MSH|^~" + BS + "&|R" + CR
+    expected = frozenset({"|", "^", "~", BS, "&", CR})
+    assert _main_reply_delimiters(reply) == framing_mod._reply_delimiters(reply) == expected
+
+
+def _reply_outcome(reply: str, encoding: str) -> bytes | str:
+    """What :func:`framing_mod.encode_reply_reporting` sends for ``reply``, or the refusal's text."""
+    try:
+        return framing_mod.encode_reply_reporting(reply, encoding, connection="IB_SHORT_LF")[0]
+    except UnicodeError as exc:
+        return str(exc)
+
+
+def _short_lf_headers() -> list[str]:
+    """LF-only ``MSH``-led replies whose first line is 3 to 8 characters long, ``MSH`` alone
+    included, each followed by a line holding a character ASCII, or ASCII and latin-1, cannot
+    encode, or none; then the same with no final LF, and some led by whitespace and a BOM. The
+    ``BHS``- and ``FHS``-led shapes, the header ID alone among them, pin a residual, not a wanted
+    outcome: main declared nothing for them and they are sent with ``?`` written in, so a fix
+    that reads a short ``BHS`` or ``FHS`` line past its LF turns them red on purpose."""
+    bar, bom = "\N{BROKEN BAR}", "\N{ZERO WIDTH NO-BREAK SPACE}"
+    firsts = {"MSH" + ("|^~" + BS + "&")[: n - 3] for n in range(3, 9)}
+    firsts |= {"MSH" + ("|^?" + BS + "&")[: n - 3] for n in range(3, 9)}
+    firsts |= {"MSH?^", "MSH" + bar, "MSH|" + bar}
+    seconds = ["?SA|AA|中", "MSA|AA|中", "中SA|AA|C", bar + "SA|AA|中", "MSA|AA|" + bar, "MSA|AA|C"]
+    replies = {f + "\n" + s + end for f in firsts for s in seconds for end in ("\n", "")}
+    replies |= {" " + bom + f + "\n" + s + "\n" for f in firsts for s in seconds[:2]}
+    replies |= {h + lead + "\n" + seconds[0] + "\n" for h in ("BHS", "FHS") for lead in ("|^", "")}
+    return sorted(replies)
+
+
+@pytest.mark.parametrize("encoding", ["ascii", "latin-1"])
+@pytest.mark.parametrize("reply", _short_lf_headers())
+def test_a_short_lf_only_header_sends_or_refuses_as_on_main(
+    reply: str, encoding: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5799 differential: where an LF-only reply's first ``MSH`` line is shorter than the
+    MSH-1 and MSH-2 span, main's read declares that span across the LF, and a reply it makes unsafe
+    is refused. A read stopping at the LF sent such a reply with ``?`` written in. This read must
+    give main's outcome, the refusal's text included; the shape helper says which cases pin a
+    residual."""
+    head = _reply_outcome(reply, encoding)
+    monkeypatch.setattr(framing_mod, "_reply_delimiters", _main_reply_delimiters)
+    assert head == _reply_outcome(reply, encoding)
+
+
+@pytest.mark.parametrize("reply", ["MSH|^~\n中", "MSH|^\n?SA|AA|中\n", "MSH\n?SA|AA|中\n"])
+def test_a_short_lf_only_header_that_main_refused_is_refused(
+    reply: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shapes main refused and a read stopping at the LF sent; the last, a first line of ``MSH``
+    alone, is also sent by a read that skips a first line under 4 characters. The refusal chains
+    nothing."""
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters") as ei:
+        framing_mod.encode_reply(reply, "ascii", connection="IB_SHORT_LF")
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
+    monkeypatch.setattr(framing_mod, "_reply_delimiters", _main_reply_delimiters)
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
+        framing_mod.encode_reply(reply, "ascii", connection="IB_SHORT_LF")
+
+
+def test_control_a_well_formed_lf_only_msh_declares_its_header_and_sends_as_main(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Control for the two tests above: a first line holding all of MSH-1 and MSH-2 declares just
+    those and the LF, and a reply with an unencodable data character is replaced and sent, the
+    same bytes main's read sends."""
+    reply = "MSH|^~" + BS + "&|R|RF\nMSA|AA|C|中\n"
+    assert framing_mod._reply_delimiters(reply) == frozenset({"|", "^", "~", BS, "&", "\n"})
+    sent = reply.replace("中", "?").encode("ascii")
+    assert framing_mod.encode_reply(reply, "ascii") == sent
+    monkeypatch.setattr(framing_mod, "_reply_delimiters", _main_reply_delimiters)
+    assert framing_mod.encode_reply(reply, "ascii") == sent
+
+
+def test_an_lf_inside_a_field_of_a_cr_reply_is_data_not_a_header() -> None:
+    """Round-2 review: lines were split at LF too, so ``MSH`` after an LF inside a field was read
+    as a header and its characters as delimiters, and a reply main replaced and sent was refused.
+    A reply that holds a CR ends its segments at CR only. Red on the round-1 head: it raised."""
+    reply = "MSH|^~" + BS + "&|R" + CR + "MSA|AA|1|ok\nMSH中" + CR
+    wire = framing_mod.encode_reply(reply, "latin-1", connection="IB_LF_DATA")
+    assert wire == reply.replace("中", "?").encode("latin-1")
+
+
+@pytest.mark.parametrize("eol", [CR, "\n", "\r\n"], ids=["cr", "lf", "crlf"])
+def test_a_batch_members_own_msh_is_read_for_its_delimiters(eol: str) -> None:
+    """Round-1 review: only the first header line was read, so a member ``MSH`` declaring ``?``
+    inside an ordinary envelope had ``?`` written into its data, and LF line ends split nothing.
+    Every header line is read now, at CR, LF or CRLF."""
+    reply = eol.join(["BHS|^~" + BS + "&|R", "MSH|?~" + BS + "&|R", "MSA|AA|C|中", "BTS|1", ""])
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
+        framing_mod.encode_reply(reply, "latin-1", connection="IB_BATCH_MEMBER")
+    short_lead = eol.join(["FHS", "MSH|?~" + BS + "&|R", "MSA|AA|中", ""])
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
+        framing_mod.encode_reply(short_lead, "latin-1", connection="IB_BATCH_MEMBER")
+
+
+@pytest.mark.parametrize("head", ["BHS", "FHS"])
+def test_frame_reply_reads_a_batch_headers_delimiters_as_an_msh(head: str) -> None:
+    """BACKLOG #5799 item 2: a ``BHS`` or ``FHS`` header declares its delimiters in MSH-1 and MSH-2's
+    layout, so a batch-led reply declaring ``?`` is refused as an ``MSH``-led one is. Red on the
+    code before: the call returns a reply with ``?`` written into its data."""
+    reply = head + "|?~" + BS + "&|R|RF" + CR + "MSH|?~" + BS + "&|R" + CR + "MSA|AA|C|中" + CR
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
+        frame_reply(MLLP_CODEC, reply, "latin-1", connection="IB_BATCH_QDELIM")
+    # Control: ordinary delimiters, so only the data character is replaced and it answers.
+    plain = reply.replace("|?~", "|^~")
+    wire = frame_reply(MLLP_CODEC, plain, "latin-1", connection="IB_BATCH_QDELIM")
+    assert wire == MLLP_CODEC.frame(plain.replace("中", "?").encode("latin-1"))
 
 
 def test_frame_reply_refuses_leading_noise_the_charset_cannot_hold() -> None:
