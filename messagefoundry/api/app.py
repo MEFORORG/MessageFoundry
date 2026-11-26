@@ -12643,8 +12643,9 @@ async def _session_reaper(
     than bound at import, so a test that patches ``time`` reaches the reaper too.
 
     ``after_purge``, when given, runs after each purge that committed. The lifespan passes
-    :meth:`AuthService.drop_reaped_reproof_counts`, so the re-proof counts of the sessions the
-    purge took leave with them (BACKLOG #5336). It does not run after a skipped or failed pass.
+    :meth:`AuthService.drop_reaped_reproof_counts`, which drops the re-proof counts of the
+    sessions the purge took, except where its read is refused, and then they stay until a later
+    pass (BACKLOG #5336). It does not run after a skipped or failed pass.
 
     A transient store error must not kill the reaper for the process lifetime (it would let the
     sessions table grow unbounded, and its stored exception could later abort lifespan shutdown) —

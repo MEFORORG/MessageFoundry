@@ -224,8 +224,9 @@ async def test_session_reaper_runs_after_purge_only_after_a_committed_purge(
     try:
         await _until(lambda: calls["after"] >= 3)
         assert not task.done()
-        # The failed first purge ran no follow-up; every later one did.
-        assert calls["after"] in (calls["purge"] - 1, calls["purge"] - 2)
+        # The failed first purge ran no follow-up; every later one did. The fakes never yield
+        # between a purge and its follow-up, so the count is exact.
+        assert calls["after"] == calls["purge"] - 1
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -246,6 +247,8 @@ def test_the_lifespan_hands_the_reaper_the_reproof_count_drop() -> None:
             k.arg == "after_purge"
             and isinstance(k.value, ast.Attribute)
             and k.value.attr == "drop_reaped_reproof_counts"
+            and isinstance(k.value.value, ast.Name)
+            and k.value.value.id == "auth"
             for k in c.keywords
         )
     ]

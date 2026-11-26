@@ -7345,9 +7345,10 @@ leaves the map in at least these ways (BACKLOG #5336):
   which that re-proof refuses unverified and ends (the count goes only once that revoke commits);
 - a successful re-proof on the step-up re-auth route (a successful current-password check on the
   password-change route keeps the count);
-- a session reaper pass whose purge committed: after it, each account holding a count has its
+- a session reaper pass whose purge committed: after it, the accounts holding a count have their
   sessions read, and the counts of those the store shows as revoked or holds no row for are dropped,
-  under that account's re-proof lock. A refused read keeps that account's counts until a later pass;
+  under each account's re-proof lock. The first refused read ends that drop for the pass, and the
+  counts it did not reach stay until a later pass;
 - a restart, which forgets every count.
 
 A rotation moves the count to the session's new key. Of these, at least two drop the count of a
@@ -7365,9 +7366,10 @@ only after a wall-clock step. If there is still no room, that session is revoked
 failure, and its count is held at the cap. That count leaves in at least the ways above, among
 them when that revoke commits, when a later re-proof finds the session gone, and when a later age
 prune reaches it. The age prune runs only when a new session's first failure finds no room. The
-reaper's drop, which runs on its timer, takes only the counts of rows the store shows as revoked or
-holds no row for, so an unrevoked row's count can stay in the map for any length of time past its
-session's lifetime. If the revoke fails, or never runs because an earlier write raised, the count stays, and
+reaper's drop runs on the reaper's timer, after its purge, which deletes the rows past their
+absolute expiry or idle window, so a lapsed session's count normally goes within about one reaper
+interval. While the reaper skips or fails its purges, or its reads are refused, a count can stay
+in the map for any length of time past its session's lifetime. If the revoke fails, or never runs because an earlier write raised, the count stays, and
 the session's next re-proof is revoked unverified. A session the session reaper purges without the
 engine ending it, at least one that expired with no request, keeps its count until the reaper's
 drop after that purge, or another drop above, takes it.
