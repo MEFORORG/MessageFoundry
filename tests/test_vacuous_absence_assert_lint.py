@@ -597,21 +597,22 @@ def _scope_sites(
     # The bindings are read only by this scope's absence assertions and by a def nested in it
     # (directly or in a class), so a scope with neither skips them. Most scopes have neither, and
     # building bindings was a third of the walk over the real tree.
-    needed = any(
-        isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-        or (isinstance(n, ast.Assert) and _absence_subject(n.test) is not None)
-        for n in nodes
+    absences = sorted(
+        (
+            (node, name)
+            for node in nodes
+            if isinstance(node, ast.Assert) and (name := _absence_subject(node.test)) is not None
+        ),
+        key=lambda pair: _pos(pair[0]),
     )
-    bindings = _bindings(nodes) if needed else {}
+    nests = any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) for n in nodes)
+    bindings = _bindings(nodes) if absences or nests else {}
     # Only a guard at the function's own top level is sure to have RUN before the site: one in
     # a loop body runs zero times on an empty input, and one in a `with pytest.raises` block or
     # a nested def may never run at all.
     top_level = tuple(s for s in fn.body if isinstance(s, ast.Assert))
     found: list[Site] = []
-    for node in sorted((n for n in nodes if isinstance(n, ast.Assert)), key=_pos):
-        name = _absence_subject(node.test)
-        if name is None:
-            continue
+    for node, name in absences:
         reaching = _reaching(bindings.get(name, []), _pos(node))
         if reaching is None or reaching.comp is None:
             continue
@@ -699,23 +700,25 @@ def _rel(path: Path) -> str:
 #: The walk over the real tree is split into this many buckets, one test case each. Parsing every
 #: test file in one case ran at the 60 s per-test timeout on a hosted runner, and the thread
 #: timeout kills the xdist worker. A bucket is a stable hash of the relative path, so the split
-#: does not move with file order. ``test_the_walk_reaches_the_test_trees`` pins that the buckets
-#: split a fresh listing of the tree with no file left out, and each bucket case pins that its
-#: measurement covers exactly its bucket's files.
+#: does not move with file order. Every listed file lands in exactly one bucket by construction;
+#: ``test_the_walk_reaches_the_test_trees`` pins that the buckets hold the whole listing, and each
+#: bucket case pins that its measurement covers exactly its bucket's files.
 _BUCKETS = 8
 _BUCKET_IDS = range(_BUCKETS)
 
 
 def _bucket(rel: str) -> int:
-    # surrogateescape, so a file name that is not valid UTF-8 still hashes instead of raising.
-    return zlib.crc32(rel.encode("utf-8", "surrogateescape")) % _BUCKETS
+    # surrogatepass, so a file name holding any lone surrogate still hashes instead of raising.
+    return zlib.crc32(rel.encode("utf-8", "surrogatepass")) % _BUCKETS
 
 
 @functools.cache
 def _bucket_files() -> tuple[tuple[Path, ...], ...]:
     """The test files in each bucket, from ONE listing of the tree shared by every bucket case."""
-    files = _test_files()
-    return tuple(tuple(p for p in files if _bucket(_rel(p)) == b) for b in _BUCKET_IDS)
+    out: list[list[Path]] = [[] for _ in _BUCKET_IDS]
+    for p in _test_files():
+        out[_bucket(_rel(p))].append(p)
+    return tuple(tuple(b) for b in out)
 
 
 @functools.cache
@@ -1157,6 +1160,43 @@ def test_a_nested_helper_counts_the_tests_guard_on_a_value_it_reads(
     assert [(s.test, s.guarded) for s in _sites(source)] == [("test_x.check", guarded)]
 
 
+@pytest.mark.parametrize(
+    "opener",
+    [
+        "    try:\n        pass\n    except OSError:\n",
+        "    match files:\n        case _:\n",
+        "    if files:\n        pass\n    else:\n",
+    ],
+)
+def test_a_helper_under_an_except_case_or_else_body_is_a_scope(opener: str) -> None:
+    # The module visit skips expressions; a def under an except clause or a match case must still
+    # be reached, since those nodes are not statements.
+    indent = "        " if "case" not in opener else "            "
+    source = (
+        "def test_x(files):\n"
+        f"{opener}"
+        f"{indent}def helper(fs):\n"
+        f"{indent}    bad = [p for p in fs if p]\n"
+        f"{indent}    assert not bad\n"
+    )
+    assert [(s.test, s.guarded) for s in _sites(source)] == [("test_x.helper", False)]
+
+
+def test_a_method_of_a_class_in_a_test_sees_a_rebinding_after_the_guard() -> None:
+    # A scope holding only a class still builds its bindings, or the method below would read the
+    # test's guard as fresh although `files` is rebound after it.
+    source = (
+        "def test_x(files):\n"
+        "    assert files\n"
+        "    class C:\n"
+        "        def check(self):\n"
+        "            bad = [p for p in files if p]\n"
+        "            assert not bad\n"
+        "    files = []\n"
+    )
+    assert [(s.test, s.guarded) for s in _sites(source)] == [("test_x.check", False)]
+
+
 def test_a_recollected_site_keeps_the_guard_of_its_walk() -> None:
     source = (
         "def test_x(files):\n"
@@ -1196,16 +1236,19 @@ _MIN_BUCKET_SITES = -(-_MIN_CANDIDATE_SITES // _BUCKETS)
 
 
 def test_the_walk_reaches_the_test_trees() -> None:
-    """The tree is walked, and the buckets split a fresh listing of it with no file left out."""
+    """The tree is walked, and the buckets hold the whole listing, each file once.
+
+    The candidate-site floor moved to ``test_each_bucket_reaches_candidate_sites``, one case per
+    bucket, so select both when rerunning the walk's floors.
+    """
     files = _test_files()
     assert len(files) >= _MIN_TEST_FILES, f"walked {len(files)} test file(s) under {_ROOTS}"
     buckets = _bucket_files()
     assert len(buckets) == _BUCKETS, f"{len(buckets)} bucket(s), expected {_BUCKETS}"
-    missing = sorted(set(files) - {p for b in buckets for p in b})
-    assert missing == [], f"{len(missing)} test file(s) fall in no bucket: {missing[:5]}"
-    assert sum(len(b) for b in buckets) == len(files), (
-        f"the buckets hold {sum(len(b) for b in buckets)} file(s) for {len(files)} walked: a file "
-        f"sits in more than one bucket, or a bucket holds a file the walk did not list"
+    held = [p for b in buckets for p in b]
+    assert sorted(held) == files, (
+        f"the buckets hold {len(held)} file(s) for {len(files)} walked; "
+        f"left out: {sorted(set(files) - set(held))[:5]}"
     )
 
 
