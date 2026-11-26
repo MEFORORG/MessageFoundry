@@ -937,8 +937,9 @@ from typing import Any
 #: ``f16ae6b198ad952b`` to ``10638208017f77d0``.
 #:
 #: BACKLOG #5930: ``_resubmit_form`` now restores the line endings of a form with no ``eol``
-#: field too, to the style ``missing_eol_style`` names (CR for a body that starts with MSH). That
-#: helper is defined in ``pages/messages.py`` and imported as a ``routes/core.py`` global, so the
+#: field too, to the style ``missing_eol_style`` names (at the time, CR for a body that starts with
+#: MSH; the batch-header note below widens it). That helper
+#: is defined in ``pages/messages.py`` and imported as a ``routes/core.py`` global, so the
 #: hashed closure changed. No engine surface changed. Re-derived with ``--write`` on the branch,
 #: from ``f16ae6b198ad952b`` to ``3ae6bcfdebbf1401``, and over the merge with BACKLOG #5505 above,
 #: from ``10638208017f77d0`` to ``92b8db415d6730cc``.
@@ -986,7 +987,14 @@ from typing import Any
 #: relying party all have stored ids that do not decode, and shows its own notice for it. Before,
 #: that leg let the decode error escape, a 500. A console built against the old seam
 #: would meet that exception unhandled, so the seam moves. Re-derived with ``--write``, from
-#: ``c5417861cbb1bd67`` to ``7802871bd39526f1``, and over the merge with BACKLOG #5930 above, from
+#: ``c5417861cbb1bd67`` to ``7802871bd39526f1``.
+#:
+#: BACKLOG #5930: ``missing_eol_style``, which ``_resubmit_form`` calls for a form with no ``eol``
+#: field, now names CR for a body led by a ``BHS`` or ``FHS`` batch header in its separator shape,
+#: as well as for one that starts with MSH. The snapshot hashes that function's body, so the digest
+#: moved. What it leaves unhashed includes at least the ``_LEADS_WITH_BATCH_HEADER`` pattern, which
+#: is module data. No engine surface changed. Re-derived with ``--write``, on the branch from
+#: ``c5417861cbb1bd67`` to ``46614ee1fc6617d6``, and over the merge with BACKLOG #6886 above, from
 #: ``7802871bd39526f1`` to ``2fdef0ec34ace13d``.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
