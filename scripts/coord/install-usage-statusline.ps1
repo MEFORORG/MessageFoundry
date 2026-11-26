@@ -221,11 +221,17 @@ function Write-SettingsFile([string]$Path, $Data) {
     # cannot be copied: installing it with a wider ACL would be worse than the in-place write it
     # replaced.
     #
-    # A SHARING VIOLATION OR AN ACCESS DENIAL IS RETRIED, because a file just created is often held open
-    # for a moment by a scanner, and a reader holding settings.json open without delete sharing refuses
-    # the rename (measured: a Python reader's plain open() refused most renames in a tight loop). When
-    # the retries run out, the in-place write runs instead: that reader never blocked the old write, so
-    # refusing the install there would be worse than it was. A missing directory fails at once.
+    # A FILE THIS USER CANNOT WRITE IS WRITTEN IN PLACE TOO, so it fails as the in-place write did. A
+    # rename needs only delete access through the directory, so it would replace a settings.json that a
+    # Deny-Write ACE or ReadOnly protects. Opening it for write, and closing it at once, asks the
+    # question the old write asked, without truncating anything.
+    #
+    # A SHARING VIOLATION, A LOCK VIOLATION OR AN ACCESS DENIAL IS RETRIED, 8 times over about 1.1 s as
+    # Invoke-CoordIoRetry does, because a file just created is often held open for a moment by a
+    # scanner, and a reader holding settings.json open without delete sharing refuses the rename
+    # (measured: a Python reader's plain open() refused most renames in a tight loop). When the retries
+    # run out, the in-place write runs instead, with a warning: that reader never blocked the old write,
+    # so refusing the install there would be worse than it was. A missing directory fails at once.
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
     if ($item -and $item.LinkType) {
         Set-Content -LiteralPath $Path -Value $json -Encoding UTF8
@@ -235,15 +241,26 @@ function Write-SettingsFile([string]$Path, $Data) {
     # A FAILED SWAP MUST NEVER LEAVE NEITHER FILE (BACKLOG #7576). The move itself cannot leave
     # settings.json gone, but a concurrent deleter can, so a COMPLETE temp file is deleted only while
     # settings.json exists, and the failure report names every copy.
+    # A FREE NAME: a file already there may be the new content an earlier failed run's report named.
     $tmp = "$Path.$PID.tmp"
+    $n = 1
+    while (Test-Path -LiteralPath $tmp) { $tmp = "$Path.$PID.$n.tmp"; $n++ }
     $tmpComplete = $false
+    $keepTmp = $false
     $inPlaceWhy = $null
+    if ($item) {
+        try { ([System.IO.File]::Open($Path, 'Open', 'Write', 'ReadWrite, Delete')).Dispose() }
+        catch { $inPlaceWhy = "it cannot be opened for writing ($($_.Exception.GetBaseException().Message))" }
+    }
     try {
-        [System.IO.File]::WriteAllText($tmp, $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
-        $tmpComplete = $true
-        if ($item) { $inPlaceWhy = Copy-SettingsSecurity $item $tmp }
-        # No move when the security copy failed: the in-place write below runs instead.
-        foreach ($attempt in $(if ($inPlaceWhy) { @() } else { 1..3 })) {
+        if (-not $inPlaceWhy) {
+            [System.IO.File]::WriteAllText($tmp, $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+            $tmpComplete = $true
+            if ($item) { $inPlaceWhy = Copy-SettingsSecurity $item $tmp }
+        }
+        # No move when the probe or the security copy failed: the in-place write below runs instead.
+        $delays = @(50, 100, 150, 150, 200, 200, 250)
+        foreach ($attempt in $(if ($inPlaceWhy) { @() } else { 1..8 })) {
             # Untyped catch: a .NET method's exception arrives wrapped in MethodInvocationException.
             try {
                 Invoke-SettingsSwap $tmp $Path ([bool]$item)
@@ -251,44 +268,52 @@ function Write-SettingsFile([string]$Path, $Data) {
             }
             catch {
                 $hr = $_.Exception.GetBaseException().HResult
-                $transient = $hr -eq -2147024864 -or $hr -eq -2147024891  # ERROR_SHARING_VIOLATION, ERROR_ACCESS_DENIED
+                # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION, ERROR_ACCESS_DENIED
+                $transient = $hr -in @(-2147024864, -2147024863, -2147024891)
                 # A retry, or the in-place write, only while settings.json is still where it was.
                 if (-not $transient -or ($item -and -not (Test-Path -LiteralPath $Path))) { throw }
-                if ($attempt -eq 3) {
-                    if (-not $item) { throw }
-                    $inPlaceWhy = "the move was refused 3 times ($($_.Exception.GetBaseException().Message))"
+                if ($attempt -eq 8) {
+                    $inPlaceWhy = "the move was refused 8 times ($($_.Exception.GetBaseException().Message))"
                     break
                 }
-                Start-Sleep -Milliseconds (50 * $attempt)
+                Start-Sleep -Milliseconds $delays[$attempt - 1]
             }
         }
     }
     catch {
         $why = $_.Exception.GetBaseException().Message
         if (-not $tmpComplete) { throw "settings.json was not touched: writing the new content to a temp file failed ($why)" }
-        throw (Get-FailedSwapReport $Path $tmp ([bool]$item) $backedTo $why)
+        # ONE READING decides both the report and the cleanup, so a settings.json that reappears between
+        # them cannot get the temp file the report named deleted.
+        $keepTmp = -not (Test-Path -LiteralPath $Path)
+        throw (Get-FailedSwapReport $Path $tmp ([bool]$item) (-not $keepTmp) $backedTo $why)
     }
     finally {
-        # A temp file that was never completely written is never anyone's only copy.
-        if (-not $tmpComplete -or (Test-Path -LiteralPath $Path)) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        # A temp file that was never completely written is never anyone's only copy, and this run's name
+        # was free, so it is never an earlier run's.
+        if (-not $keepTmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
     }
     if ($inPlaceWhy) {
-        Write-Verbose "in-place write of ${Path}: $inPlaceWhy"
+        Write-Warning "${Path} was written in place, not swapped atomically: $inPlaceWhy"
         Set-Content -LiteralPath $Path -Value $json -Encoding UTF8
     }
     return $backedTo
 }
 
-# THE OLD FILE'S OWNER, GROUP, DACL AND VISIBLE ATTRIBUTES, ONTO THE TEMP FILE. Returns $null on
-# success, or why it could not, and the caller then writes in place. The DACL travels as SDDL, so its
-# protection flag goes with it. Setting an owner other than this user needs a privilege the run may
-# lack, which is one of the cases that falls back. ReadOnly is not copied: a move over a read-only file
-# fails anyway, as the in-place write did.
+# THE OLD FILE'S DACL AND VISIBLE ATTRIBUTES, AND ITS OWNER WHEN THAT DIFFERS, ONTO THE TEMP FILE.
+# Returns $null on success, or why it could not, and the caller then writes in place. The DACL travels
+# as SDDL, so its protection flag goes with it. The owner is set only when it differs, because setting
+# it at all needs WRITE_OWNER, which a user with Modify but not Full Control lacks; an owner other
+# than this user can also need a privilege the run lacks, which is one of the cases that falls back.
+# ReadOnly is not copied: a read-only file never reaches the move (the write probe above).
 function Copy-SettingsSecurity([System.IO.FileSystemInfo]$Item, [string]$Tmp) {
     try {
         if (Test-SwapFault $Item.FullName 'security-copy-fails') { throw "simulated security copy failure" }
-        $sections = [System.Security.AccessControl.AccessControlSections]'Owner, Group, Access'
-        $src = [System.IO.FileSystemAclExtensions]::GetAccessControl([System.IO.FileInfo]$Item.FullName, $sections)
+        $both = [System.Security.AccessControl.AccessControlSections]'Owner, Access'
+        $src = [System.IO.FileSystemAclExtensions]::GetAccessControl([System.IO.FileInfo]$Item.FullName, $both)
+        $have = [System.IO.FileSystemAclExtensions]::GetAccessControl([System.IO.FileInfo]$Tmp, [System.Security.AccessControl.AccessControlSections]::Owner)
+        $sid = [System.Security.Principal.SecurityIdentifier]
+        $sections = if ($src.GetOwner($sid) -eq $have.GetOwner($sid)) { [System.Security.AccessControl.AccessControlSections]::Access } else { $both }
         $dst = [System.Security.AccessControl.FileSecurity]::new()
         $dst.SetSecurityDescriptorSddlForm($src.GetSecurityDescriptorSddlForm($sections), $sections)
         [System.IO.FileSystemAclExtensions]::SetAccessControl([System.IO.FileInfo]$Tmp, $dst)
@@ -307,8 +332,9 @@ function Copy-SettingsSecurity([System.IO.FileSystemInfo]$Item, [string]$Tmp) {
 #   - the settings file sits DIRECTLY in that directory;
 #   - that directory is strictly inside an explicitly set, absolute TEMP. GetTempPath is not consulted:
 #     with TMP and TEMP unset it falls back to USERPROFILE, the directory real roots live in.
-# Modes: 'move-fails' throws where the move would run; 'move-fails-target-gone' first deletes the
-# target, standing in for a concurrent deleter; 'security-copy-fails' fails the security copy.
+# Modes: 'move-fails' throws where the move would run; 'move-refused' throws a sharing violation there,
+# every time; 'move-fails-target-gone' first deletes the target, standing in for a concurrent deleter;
+# 'security-copy-fails' fails the security copy.
 function Test-SwapFault([string]$Path, [string]$Mode) {
     if ($env:MEFOR_TEST_STATUSLINE_SWAP_FAULT -cne $Mode) { return $false }
     $dir = $env:MEFOR_TEST_STATUSLINE_SWAP_FAULT_DIR
@@ -329,6 +355,7 @@ function Invoke-SettingsSwap([string]$Tmp, [string]$Path, [bool]$Exists) {
         throw [System.IO.IOException]::new("simulated move failure after a concurrent delete")
     }
     if (Test-SwapFault $Path 'move-fails') { throw [System.IO.IOException]::new("simulated move failure") }
+    if (Test-SwapFault $Path 'move-refused') { throw [System.IO.IOException]::new("simulated sharing violation", -2147024864) }
     # Overwrite only a file this run saw: a root that had none must not clobber one a concurrent writer
     # created meanwhile.
     [System.IO.File]::Move($Tmp, $Path, $Exists)
@@ -337,8 +364,8 @@ function Invoke-SettingsSwap([string]$Tmp, [string]$Path, [bool]$Exists) {
 # SAYS WHERE EVERY COPY IS. The returned text is the FAILED line's reason, so an operator reads the
 # paths without opening a log. It never says what settings.json now HOLDS: a concurrent writer can have
 # put anything there.
-function Get-FailedSwapReport([string]$Path, [string]$Tmp, [bool]$Existed, [string]$BackedTo, [string]$Why) {
-    $present = Test-Path -LiteralPath $Path
+function Get-FailedSwapReport([string]$Path, [string]$Tmp, [bool]$Existed, [bool]$Present, [string]$BackedTo, [string]$Why) {
+    $present = $Present
     $msg = if ($present) { "settings.json was not updated ($Why); the new content was not installed" }
     elseif ($Existed) { "settings.json is MISSING after a failed swap ($Why)" }
     else { "settings.json was not created ($Why)" }
@@ -431,20 +458,29 @@ function Resolve-ArgPath([string]$Path, [string]$What) {
 # A MISSING FILE ON A MISSING DRIVE IS NOT AN ABSENT FILE. Test-Path answers False for both a deleted
 # settings.json and one on a drive or share that is not there, and Read-Settings turns False into an
 # empty document, so -Uninstall reported a root on an unmapped drive as NOT PRESENT and exited 0 -- a
-# state no part of the run observed. A path whose root is not a reachable directory is UNKNOWN.
+# state no part of the run observed. A path is UNKNOWN when neither its own directory nor its root is a
+# reachable directory. The directory is asked first: a share root the user cannot list, with a config
+# root under it that the user can, is still reachable.
 function Test-PathRootReachable([string]$Path) {
+    $parent = [System.IO.Path]::GetDirectoryName($Path)
+    if ($parent -and (Test-Path -LiteralPath $parent -PathType Container)) { return $true }
     $r = [System.IO.Path]::GetPathRoot($Path)
     return [bool]$r -and (Test-Path -LiteralPath $r -PathType Container)
 }
 
-# -HomeDir IS RESOLVED ONLY WHERE IT IS READ: -AllRoots, the default root, and the -Status audit. Its
-# default is USERPROFILE, which can be empty or on an unmapped drive, and a -SettingsPath or
-# -ConfigDir install never reads it, so resolving it up front refused an install that had no use for
-# it. A blank one under -Status goes on unresolved, as it did before this resolver.
-function Resolve-HomeDir {
-    if ($Status -and [string]::IsNullOrWhiteSpace($script:HomeDir)) { return $script:HomeDir }
-    return (Resolve-ArgPath $script:HomeDir "-HomeDir")
+# -HomeDir IS MADE ABSOLUTE WHEN IT CAN BE, AND OTHERWISE GOES ON AS GIVEN, the way it did before this
+# resolver. Its default is USERPROFILE, which can be empty or on an unmapped drive, and at least a
+# -SettingsPath, a -ConfigDir and a CLAUDE_CONFIG_DIR-pinned install never read it, so refusing one
+# here refused an install with no use for it. A relative -HomeDir still resolves against $PWD.
+function Resolve-HomeDir([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    $provider = $null; $drive = $null
+    try { $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path, [ref]$provider, [ref]$drive) }
+    catch { return $Path }
+    if ($provider.Name -ne 'FileSystem') { return $Path }
+    return $full
 }
+$HomeDir = Resolve-HomeDir $HomeDir
 
 $targets = @()
 $targetFrom = ""
@@ -466,7 +502,6 @@ elseif ($script:GaveConfigDir) {
 }
 elseif ($AllRoots) {
     $targetFrom = "-AllRoots"
-    $HomeDir = Resolve-HomeDir
     $roots = @(Get-LaunchableConfigRoots -HomeDir $HomeDir -AccountsOnly)
     $addedOutside = $null
     if ($env:CLAUDE_CONFIG_DIR) {
@@ -481,7 +516,6 @@ elseif ($AllRoots) {
         })
 }
 else {
-    $HomeDir = Resolve-HomeDir
     $cur = Resolve-CurrentConfigRoot -HomeDir $HomeDir
     $targetFrom = $cur.Source
     Assert-RootExists $cur.Path $(if ($cur.Source -eq 'CLAUDE_CONFIG_DIR') { "CLAUDE_CONFIG_DIR names a directory that" } else { "config dir" })
@@ -583,7 +617,6 @@ if ($Status) {
     # can contradict them. Without it -Status could only ever confirm this script's own predicate --
     # a validator satisfied by construction. It is also what makes the name predicate's deliberate
     # case-sensitivity loud instead of a silent under-reach.
-    $HomeDir = Resolve-HomeDir
     $seen = @(Get-ClaudeConfigCandidates -HomeDir $HomeDir)
     Write-Host ""
     Write-Host "  audit: $($seen.Count) ~/.claude* dir(s) under $HomeDir carry a settings.json, enumerated"

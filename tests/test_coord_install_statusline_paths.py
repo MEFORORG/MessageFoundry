@@ -471,25 +471,84 @@ def test_the_swap_fault_seam_fires_inside_its_fence(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("how", ["USERPROFILE", "-HomeDir"])
-@pytest.mark.parametrize("target", ["-SettingsPath", "-ConfigDir"])
-def test_a_named_target_installs_with_a_home_dir_on_a_gone_drive(
+@pytest.mark.parametrize("target", ["-SettingsPath", "-ConfigDir", "pin"])
+def test_a_target_that_needs_no_home_dir_installs_with_one_on_a_gone_drive(
     tmp_path: Path, how: str, target: str
 ) -> None:
-    """A -SettingsPath or -ConfigDir install never reads -HomeDir, so a home directory on a drive
-    that is not there (USERPROFILE is the default) must not refuse it."""
+    """At least a -SettingsPath, a -ConfigDir and a CLAUDE_CONFIG_DIR-pinned install never read
+    -HomeDir, so a home directory on a drive that is not there (USERPROFILE is the default) must not
+    refuse them, as origin/main did not. -AllRoots does read it, and fails there on origin/main too."""
     gone = f"{_free_drive()}:\\Users\\nobody"
     root = _root(tmp_path, {"keep": True})
     settings = root / "settings.json"
     cmd = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(INSTALL), "-CollectorPath"]
-    cmd += [str(COLLECT), target, str(settings if target == "-SettingsPath" else root)]
+    cmd += [str(COLLECT)]
     env: dict[str, str] = {"USERPROFILE": gone}
+    if target in ("-SettingsPath", "-ConfigDir"):
+        cmd += [target, str(settings if target == "-SettingsPath" else root)]
+    else:
+        env["CLAUDE_CONFIG_DIR"] = str(root)
     if how == "-HomeDir":
         cmd += ["-HomeDir", gone]
-        env = {}
+        del env["USERPROFILE"]
     proc = _spawn(cmd, tmp_path, env)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     doc = json.loads(settings.read_text(encoding="utf-8"))
     assert doc["keep"] is True and "statusLine" in doc
+
+
+@pytest.mark.parametrize("existing", [True, False])
+def test_a_move_refused_past_its_retries_falls_back_to_the_in_place_write(
+    tmp_path: Path, existing: bool
+) -> None:
+    """A reader that opens settings.json without delete sharing refuses the rename but never blocked
+    the old in-place write, so after the retries the install still lands, written in place, with a
+    warning, on a root that had a settings.json and on one that had none."""
+    root = _root(tmp_path, {"keep": True} if existing else None, name=FAULT_ROOT)
+    settings = root / "settings.json"
+    before = os.stat(settings).st_ino if existing else None
+    proc = _install(
+        tmp_path,
+        "-SettingsPath",
+        str(settings),
+        cwd=tmp_path,
+        extra_env=_fault(tmp_path, "move-refused", root),
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "written in place" in proc.stdout + proc.stderr
+    if before is not None:
+        assert os.stat(settings).st_ino == before
+    doc = json.loads(settings.read_text(encoding="utf-8"))
+    assert "statusLine" in doc and doc.get("keep", existing) is existing
+    assert not [p.name for p in root.iterdir() if p.name.endswith(".tmp")]
+
+
+def test_a_write_denied_settings_file_is_not_replaced(tmp_path: Path) -> None:
+    """A rename needs only delete access through the directory, so it could replace a settings.json
+    that a Deny-Write ACE protects, which the in-place write could not. The write probe sends such a
+    file to the in-place write, which fails as before and leaves it as it was."""
+    root = _root(tmp_path, {"keep": True})
+    settings = root / "settings.json"
+    deny = (
+        f"$p = {_q(settings)}; $a = Get-Acl -LiteralPath $p; "
+        "$me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name; "
+        "$a.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($me, 'WriteData', 'Deny')); "
+        "Set-Acl -LiteralPath $p -AclObject $a; (Get-Item -LiteralPath $p).Attributes = 'Normal'"
+    )
+    undo = (
+        f"$p = {_q(settings)}; $a = Get-Acl -LiteralPath $p; "
+        "$me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name; "
+        "[void]$a.RemoveAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($me, 'WriteData', 'Deny')); "
+        "Set-Acl -LiteralPath $p -AclObject $a"
+    )
+    pw = ["pwsh", "-NoProfile", "-NonInteractive", "-Command"]
+    assert _spawn([*pw, deny], tmp_path).returncode == 0
+    try:
+        proc = _install(tmp_path, "-SettingsPath", str(settings), cwd=tmp_path)
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert json.loads(settings.read_text(encoding="utf-8")) == {"keep": True}
+    finally:
+        _spawn([*pw, undo], tmp_path)
 
 
 def test_status_and_uninstall_still_report_on_a_deleted_root(tmp_path: Path) -> None:
