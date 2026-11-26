@@ -176,9 +176,10 @@ def test_the_budget_never_lengthens_a_wait_past_its_fixed_bound() -> None:
 
 
 def test_the_time_kept_after_the_crl_wait_fits_the_engine_reserve() -> None:
-    """The CRL runner's wait is the first budgeted one, so what it keeps back is the most any wait
-    keeps. With the managed lifespan's closed gate and a write still running, the late drain's
-    fixed bound is kept; the CRL wait must still get more than its floor inside the reserve."""
+    """The CRL runner's wait comes second, after the retention runner's (see the retention test
+    below), so it keeps back the most of the waits after it. With the managed lifespan's closed gate
+    and a write still running, the late drain's fixed bound is kept; the CRL wait must still get
+    more than its floor inside the reserve."""
     kept = (
         engine_module._STOP_CLOSE_ALLOWANCE_SECONDS
         + engine_module._CONFIG_WRITE_LATE_DRAIN_SECONDS
@@ -206,7 +207,7 @@ async def test_the_retention_stop_is_held_inside_the_budget(tmp_path: Path) -> N
     retention = _RetentionRecorder()
     eng._retention_runner = retention  # type: ignore[assignment]
     await eng.drain_config_writes(0.0)
-    await _stop(eng, budget_seconds=2.0)
+    await _stop(eng, budget_seconds=3.0)
     [wait] = retention.timeouts
     kept = (
         engine_module._STOP_CLOSE_ALLOWANCE_SECONDS
@@ -214,7 +215,8 @@ async def test_the_retention_stop_is_held_inside_the_budget(tmp_path: Path) -> N
         + remote_debug_watch.STOP_FLOOR_SECONDS
     )
     assert wait is not None
-    assert 2.0 - kept - 0.5 <= wait <= 2.0 - kept
+    # 3 s, so the lower bound is above zero and the assertion can fail on a wait cut to the floor.
+    assert 0.0 < 3.0 - kept - 0.5 <= wait <= 3.0 - kept
 
 
 async def test_with_no_budget_the_retention_stop_keeps_its_fixed_bound(tmp_path: Path) -> None:

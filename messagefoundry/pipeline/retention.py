@@ -67,11 +67,14 @@ __all__ = [
 log = logging.getLogger(__name__)
 
 _SECONDS_PER_DAY = 86_400
-# How long a pass that ended partway waits for a retention_purge audit row still being written, and
-# the one budget stop() spends in all on the loop's exit and those rows when it is handed none
-# (BACKLOG #6526). Shutdown must not hang on a store that cannot take the write; engine.stop()
-# hands stop() a shorter budget to fit its own. A row still unwritten then is logged at ERROR.
+# How long a pass that ended partway waits for a retention_purge audit row still being written
+# (BACKLOG #6526), so a store that cannot take the write does not hold up the pass's exception. A
+# row still unwritten then is logged at ERROR.
 _AUDIT_WRITE_WAIT_SECONDS = 5.0
+# The one budget stop() spends in all on the loop's exit and audit rows still being written when it
+# is handed none (BACKLOG #6526). Shutdown must not hang on a store that cannot take the write;
+# engine.stop() hands stop() a shorter budget to fit its own.
+_STOP_WAIT_SECONDS = 5.0
 # Phases that change no data. A pass that ends in one of these with nothing else done writes no
 # interrupted audit row (BACKLOG #6526): one failing every interval would otherwise add a row of
 # zeros each time. Any phase not named here is treated as one that may have changed data.
@@ -801,7 +804,7 @@ class RetentionRunner:
     def stop_timeout_seconds(self) -> float:
         """The bound :meth:`stop` uses when it is handed none; engine.stop() shortens it to fit its
         stop budget (BACKLOG #6526)."""
-        return _AUDIT_WRITE_WAIT_SECONDS
+        return _STOP_WAIT_SECONDS
 
     async def stop(self, *, timeout: float | None = None) -> None:
         """Signal the loop, await its exit, and wait for audit rows still being written
@@ -809,29 +812,62 @@ class RetentionRunner:
 
         The loop's exit and those rows share one budget, ``timeout`` or
         :attr:`stop_timeout_seconds` when it is None, so a store that cannot take the write does
-        not hold up shutdown (BACKLOG #6526). Concurrent calls share one stop, so none returns
-        before the cancelled pass's audit row has been started. A call that finds a loop started
-        after that stop took the old one stops the new loop as well, and waits for the earlier
-        stop too, within its own budget. A cancellation of the caller still waits for the stop, which is bounded, before
-        it goes on."""
+        not hold up shutdown (BACKLOG #6526). The budget wins over the work it cuts (owner ruling
+        2026-11-22): a stop that runs out of it returns with the loop possibly still running, and
+        logs that the pass's interrupted audit row may not be written. Concurrent calls share one
+        stop. A call that joins a stop already under way waits for it within its own budget, and
+        the shared stop runs on for the earlier caller. A call that finds a loop started after that
+        stop took the old one stops the new loop as well, and waits for the earlier stop too, within
+        its own budget. A cancellation of the caller still waits for the stop, within the same
+        bound, before it goes on."""
         self._stop.set()
         self._wake.set()
+        bound = self.stop_timeout_seconds if timeout is None else timeout
         # Taken here, not in the stop's task, so a second call before that task runs cannot take
         # the same loop, and a loop start() spawned during a stop is never left to that stop.
         task, self._task = self._task, None
         stopping = self._stopping
         if stopping is not None and stopping.done():
             stopping = None
+        loop = asyncio.get_running_loop()
+        deadline: float | None = None
         if stopping is None or task is not None:
-            bound = self.stop_timeout_seconds if timeout is None else timeout
+            # This stop's own task is bounded by `bound`, so its caller waits for it to end.
             stopping = self._stopping = asyncio.create_task(
                 self._stop_and_drain(task, bound, earlier=stopping)
             )
+        else:
+            deadline = loop.time() + bound
+
+        def left() -> float | None:
+            return None if deadline is None else max(0.0, deadline - loop.time())
+
+        # asyncio.wait, not wait_for: neither this caller's timeout nor its cancellation cancels
+        # the shared stop, which an earlier caller may still be waiting on.
         try:
-            await asyncio.shield(stopping)
+            await asyncio.wait({stopping}, timeout=left())
         except asyncio.CancelledError:
-            await asyncio.wait({stopping})
+            await asyncio.wait({stopping}, timeout=left())
+            if (
+                stopping.done()
+                and not stopping.cancelled()
+                and (exc := stopping.exception()) is not None
+            ):
+                log.error(
+                    "retention: the loop failed (%s); stop()'s caller was cancelled, so it is "
+                    "logged here",
+                    safe_exc(exc),
+                )
             raise
+        if not stopping.done():
+            log.warning(
+                "retention: stop() joined a stop already under way and returned after its own "
+                "%gs; the retention pass may still be running and its interrupted audit row may "
+                "not be written",
+                bound,
+            )
+            return
+        stopping.result()  # a loop that failed raises to the caller of stop(), as before
 
     async def _stop_and_drain(
         self, task: asyncio.Task[None] | None, timeout: float, earlier: asyncio.Task[None] | None
@@ -850,15 +886,19 @@ class RetentionRunner:
                 await asyncio.wait({earlier}, timeout=max(0.0, deadline - loop.time()))
         # A loop that has ended no longer needs the signal, so a later run_once() is a normal pass,
         # waiting for its own interrupted row (BACKLOG #6526). Left set while the loop runs on, or
-        # while a later stop is under way, so neither loop goes round again.
+        # while a later stop is under way, so neither loop goes round again on this stop's account.
+        # A start() clears it, though, and an old loop that outlived its stop then sees it clear and
+        # can go round again beside the new loop.
         if (task is None or task.done()) and self._stopping is asyncio.current_task():
             self._stop.clear()
         if task is None:
             return
         if not task.done():
+            # The budget wins over the work it cuts (owner ruling 2026-11-22): the loop is left to
+            # end on its own, and can outlive the store's close.
             log.error(
-                "retention: the loop had not ended %gs after stop(); a pass it was running may "
-                "write its audit row later or not at all",
+                "retention: the loop had not ended %gs after stop(); the retention pass may still "
+                "be running when the store closes, and its interrupted audit row may not be written",
                 timeout,
             )
         elif not task.cancelled():
@@ -954,9 +994,9 @@ class RetentionRunner:
 
         Each purge phase commits in its own store transaction, so a pass that raises or is cancelled
         (``stop()``) partway writes its audit row for the phases that finished, marked
-        ``interrupted``, before the exception goes on (BACKLOG #6526, S07-44). A pass that ends inside
-        a phase that changes its set in steps writes the row even with nothing else done, naming that
-        phase in ``interrupted_phase``, since its count is lost, unless that phase changes no data
+        ``interrupted`` (BACKLOG #6526, S07-44). A pass that ends inside a phase that changes its
+        set in steps writes the row even with nothing else done, naming that phase in
+        ``interrupted_phase``, since its count is lost, unless that phase changes no data
         (``_PHASES_THAT_CHANGE_NO_DATA``), which is logged instead. The audit writes are shielded
         from a further cancellation. A row can still be missing at least when the audit write itself
         fails (the same store fault that ended the pass, say), when it is still unfinished
@@ -1313,10 +1353,10 @@ class RetentionRunner:
         await asyncio.shield(self._start_audit(result))
 
     async def _audit_interrupted(self, partial: RetentionPass, cause: BaseException) -> None:
-        """Write the row for a pass that ended partway (S07-44), before its exception goes on. A
-        cancellation was delivered once, so this await still runs. Written when the pass did work
-        or ended inside a phase that may have changed part of its set; a pass that ended in a phase
-        that changes no data, with nothing else done, is logged instead. The wait is bounded by
+        """Write the row for a pass that ended partway (S07-44). A cancellation was delivered once,
+        so this await still runs. Written when the pass did work or ended inside a phase that may
+        have changed part of its set; a pass that ended in a phase that changes no data, with
+        nothing else done, is logged instead. The wait is bounded by
         ``_AUDIT_WRITE_WAIT_SECONDS``, so a store that cannot take the write does not hold up the
         exception, and is skipped once :meth:`stop` has been called, whose own drain waits for the
         row within its one budget. A failed write is logged, so ``cause`` is what propagates."""

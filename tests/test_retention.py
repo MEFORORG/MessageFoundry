@@ -1055,12 +1055,20 @@ async def _retention_audit_details(store: MessageStore) -> list[dict[str, Any]]:
     return [json.loads(r["detail"]) for r in await store.list_audit(action="retention_purge")]
 
 
-def _hang_on_entry(entered: asyncio.Event) -> Callable[..., Awaitable[int]]:
-    """A store call that sets ``entered`` and never returns, so a test can stop a pass in it."""
+def _hang_on_entry(
+    entered: asyncio.Event, release: asyncio.Event | None = None
+) -> Callable[..., Awaitable[int]]:
+    """A store call that sets ``entered`` and never returns, so a test can stop a pass in it.
+    Given ``release``, a cancelled call does not end until ``release`` is set."""
 
     async def hangs(*_a: object, **_k: object) -> int:
         entered.set()
-        await asyncio.Event().wait()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if release is not None:
+                await release.wait()
+            raise
         return 0
 
     return hangs
@@ -1380,6 +1388,7 @@ async def test_stop_bounds_its_wait_for_a_hung_audit_write_to_one_budget(
     so engine.stop() stays well inside NSSM's stop timeout."""
     budget = 0.3
     monkeypatch.setattr(retention_mod, "_AUDIT_WRITE_WAIT_SECONDS", budget)
+    monkeypatch.setattr(retention_mod, "_STOP_WAIT_SECONDS", budget)
     await _delivered(store, now=0.0)
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -1477,7 +1486,7 @@ async def test_stop_holds_to_the_timeout_it_is_handed(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #6526: engine.stop() hands retention a share of its stop budget, which can be well
-    under ``_AUDIT_WRITE_WAIT_SECONDS``; a hung audit write must not hold the stop past it."""
+    under ``_STOP_WAIT_SECONDS``; a hung audit write must not hold the stop past it."""
     await _delivered(store, now=0.0)
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -1545,6 +1554,106 @@ async def test_a_stop_after_a_restart_mid_stop_cancels_the_new_loop(
         await runner.stop()
 
 
+async def test_a_stop_cut_by_its_timeout_says_the_pass_may_still_be_running(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6526: the stop budget wins over the work it cuts (owner ruling 2026-11-22), so a
+    stop whose timeout runs out with the loop not ended returns anyway. The log must say the pass
+    may still be running and that its interrupted audit row may not be written."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    monkeypatch.setattr(store, "purge_state", _hang_on_entry(entered, release))
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+            await runner.stop(timeout=0.1)
+        assert not loop_task.done()
+    finally:
+        release.set()
+        await asyncio.wait({loop_task}, timeout=10)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert [
+        m
+        for m in messages
+        if "may still be running" in m and "interrupted audit row may not be written" in m
+    ], messages
+
+
+async def test_a_stop_that_joins_a_stop_in_progress_holds_to_its_own_timeout(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: a stop() that finds a stop already under way shares it, but returns within
+    its own timeout; the shared stop runs on for the earlier caller, within that caller's."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    monkeypatch.setattr(store, "purge_state", _hang_on_entry(entered, release))
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    await asyncio.wait_for(entered.wait(), 10)
+    first = asyncio.create_task(runner.stop(timeout=2.0))
+    await asyncio.sleep(0)
+    try:
+        started = time.monotonic()
+        await runner.stop(timeout=0.1)
+        elapsed = time.monotonic() - started
+        assert not first.done()  # the shared stop is still running for the first caller
+    finally:
+        release.set()
+        await asyncio.wait_for(first, 10)
+        await asyncio.wait({loop_task}, timeout=10)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+    assert elapsed < 0.1 * 5
+
+
+async def test_a_cancelled_stop_caller_retrieves_the_loops_failure(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6526: when the caller of stop() is cancelled, the shared stop's exception (the
+    loop's failure) is retrieved and logged by retention, so no task exception goes unretrieved."""
+    entered = asyncio.Event()
+
+    async def sleep_then_fail(_delay: float) -> None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.05)
+            raise RuntimeError("the retention loop broke") from None
+
+    runner = RetentionRunner(store, RetentionSettings(messages_days=1), clock=lambda: 10 * DAY)
+    monkeypatch.setattr(runner, "_sleep", sleep_then_fail)
+    runner.start()
+    await asyncio.wait_for(entered.wait(), 10)
+    stopping = asyncio.create_task(runner.stop())
+    await asyncio.sleep(0)
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.retention"):
+        stopping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+    shared = runner._stopping
+    assert shared is not None and shared.done()
+    # Retention's own log, not asyncio's "exception in shielded future" fallback.
+    messages = [
+        r.getMessage() for r in caplog.records if r.name == "messagefoundry.pipeline.retention"
+    ]
+    assert [m for m in messages if "the retention loop broke" in m], messages
+
+
 async def test_run_once_after_stop_waits_for_its_interrupted_row_as_a_normal_pass(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1582,7 +1691,7 @@ async def test_the_drain_error_names_the_time_it_waited(
     """BACKLOG #6526: the drain gets what the loop's exit left of the stop's budget, so its ERROR
     line names that wait, not the whole budget."""
     budget = 0.4
-    monkeypatch.setattr(retention_mod, "_AUDIT_WRITE_WAIT_SECONDS", budget)
+    monkeypatch.setattr(retention_mod, "_STOP_WAIT_SECONDS", budget)
     await _delivered(store, now=0.0)
     entered = asyncio.Event()
     release = asyncio.Event()

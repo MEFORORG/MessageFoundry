@@ -545,7 +545,9 @@ can be lost:
   1.5 s at the 3 s minimum, or about 0.5 s while a config write is still running, and less when an
   earlier stop step was slow, down to 0.1 s. A row still unwritten then is logged at ERROR and may
   land later or not at all, so a purge that finished can be left with no audit row
-  ([PHI.md](PHI.md)).
+  ([PHI.md](PHI.md)). When the budget runs out before the loop has ended, the stop returns anyway:
+  the retention pass may still be running when the store closes, and the interrupted audit row it
+  would write for the phases it finished can be lost. An ERROR says so.
 - **A CRL reload pass in flight** gets at most about 1.8 s at the 3 s minimum, or about 0.8 s
   while a config write is still running, and less when an earlier stop step was slow, down to the
   same 0.1 s. When the budget cuts the pass, it is abandoned with a WARNING; a cancel of the stop
