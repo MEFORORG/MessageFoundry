@@ -222,6 +222,16 @@ engine). The DR profile is a **startup decision**, not a runtime toggle: the thr
 a reload re-evaluates the whole graph, so a connection never flips between bound and filtered mid-run with
 in-flight rows stranded.
 
+> **Amendment (BACKLOG #5965, 2026-11-25): no box starts under the DR run-profile.** The
+> `[dr].activate` startup latch let a box configured with `enabled` and `activate` both true come
+> up under the profile at engine construction, binding the priority feeds without the seed
+> verification, the takeover hook or the `dr.activate` audit row that `POST /dr/activate` runs. By
+> owner ruling of 2026-11-25 the key is removed and refused at load as a removed key, `true` or
+> `false`, and the engine and the DR coordinator start every DR box passive. `POST /dr/activate` is
+> the only activation. "Startup decision" above now holds only of `[dr].enabled`, whether the box is
+> a DR box at all. This narrows the Decision rather than replacing it, so it is an amendment, not a
+> superseding ADR.
+
 > **Amendment (vault BACKLOG #3067): `POST /dr/activate` applies the RUNNING graph, and disk drift is only
 > recorded.** The paragraph above calls the profile a startup decision, but `POST /dr/activate` and
 > `POST /dr/release` turn it on and off on a running engine. That half was broken: the runner took its
@@ -416,6 +426,7 @@ in-flight rows stranded.
 > lane, and a build that fails holds its rows as it does at the activation.
 >
 > **`[dr].enabled` with `[cluster].enabled` is refused at load**, as `[dr].activate` already was.
+> *(The `[dr].activate` key itself was later removed; see the BACKLOG #5965 amendment above.)*
 > A cluster member that is a passive DR box could win the lease and serve nothing.
 >
 > **Left as it is, deliberately.** The ACTIVE profile's parks of feeds below the threshold are

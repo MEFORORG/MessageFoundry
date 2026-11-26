@@ -71,14 +71,18 @@ lease and the graph never drains. An all-non-promotable cluster is a documented 
 guarded in code — a node cannot see its siblings' flags at config load).
 
 **Rider — `[dr].activate` + `[cluster]` guard.** A cross-section `ServiceSettings` validator **refuses**
-`[dr].activate = true` combined with `[cluster].enabled = true`. The DR run-profile gates *connections*,
+`[dr].activate = true` (a key since removed) combined with `[cluster].enabled = true`. The DR
+run-profile gates *connections*,
 not *lease acquisition*; a DR box that also contends for the cluster lease could win leadership and drive
 the primary store cross-WAN. The intended warm-DR posture is a **non-promotable cluster member**
 (`[cluster].enabled = true, promotable = false`), not a lease-contending `[dr]` box. A
-provisioned-but-passive DR box (`enabled = true, activate = false`) may still coexist with cluster
+provisioned-but-passive DR box (`enabled = true, activate = false`, a key since removed) may still
+coexist with cluster
 membership. *(That last sentence is superseded: `[dr].enabled` with `[cluster].enabled` is refused
 at load whatever `activate` says. The #3263 amendment of
-[ADR 0048](0048-third-tier-disaster-recovery-standby.md) says why.)*
+[ADR 0048](0048-third-tier-disaster-recovery-standby.md) says why.)* *(Amended 2026-11-25, BACKLOG
+#5965: `[dr].activate` itself is now a removed key, refused at load whatever its value, so this
+rider is enforced through `[dr].enabled` alone. The #5965 amendment of ADR 0048 says why.)*
 
 **What it must not break:** the self-fencing lease + split-brain guard, at-least-once delivery, and
 strict FIFO. Default `(delay = 0.0, promotable = True)` is **behaviourally byte-identical** to before —
@@ -110,9 +114,9 @@ short-circuits, and the added `nodes` columns default to `0`/`TRUE`.
   → `tests/test_cluster_lease.py::test_default_delay_zero_is_byte_identical_takeover`
 - **AC-7** — IF `[dr].activate` is combined with `[cluster].enabled`, THEN THE SYSTEM SHALL refuse the
   config at load.
-  → `tests/test_settings.py::test_dr_activate_with_cluster_is_rejected`
-  *(Widened by vault BACKLOG #3263 to `[dr].enabled`:
-  `tests/test_settings.py::test_dr_enabled_but_not_activated_with_cluster_is_rejected`.)*
+  → `tests/test_settings.py::test_dr_enabled_but_not_activated_with_cluster_is_rejected`
+  *(Widened by vault BACKLOG #3263 to `[dr].enabled`. The `[dr].activate` test this cited went
+  with that key, removed under BACKLOG #5965; the `[dr].enabled` test now carries AC-7.)*
 - **AC-8** — THE SYSTEM SHALL surface each node's `acquire_delay_seconds` + `promotable` in
   `GET /cluster/nodes`.
   → `tests/test_cluster.py::test_build_coordinator_threads_leader_preference_knobs`
