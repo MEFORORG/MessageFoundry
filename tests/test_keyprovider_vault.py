@@ -270,19 +270,20 @@ def test_a_missing_hvac_says_install_not_reinstall(monkeypatch: pytest.MonkeyPat
     assert "install 'messagefoundry[vault]'" in text and "reinstall" not in text
 
 
-def test_a_provider_build_that_fails_is_a_key_provider_error(
+def test_a_value_error_from_the_provider_build_propagates_raw(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Vault BACKLOG #6709: build_provider ran outside the dispatch's try, so a ValueError from a
-    # provider's construction escaped raw, which store.base reads as a refused key.
+    # The build part of vault BACKLOG #6709 was withdrawn to main: the dispatch calls
+    # build_provider bare, so its error reaches store.base unwrapped, which judges it.
+    error = ValueError(_BROKEN_HVAC_TEXT)
+
     def _boom(*_a: Any, **_k: Any) -> Any:
-        raise ValueError(_BROKEN_HVAC_TEXT)
+        raise error
 
     monkeypatch.setattr(keyprovider_vault, "build_provider", _boom)
-    with pytest.raises(KeyProviderError) as caught:
+    with pytest.raises(ValueError) as caught:
         resolve_key_provider(StoreSettings(key_provider="vault"))
-    assert "could not be built (ValueError" in str(caught.value)
-    assert "0451" not in str(caught.value)
+    assert caught.value is error
 
 
 @pytest.mark.parametrize("error", [MemoryError, RecursionError])

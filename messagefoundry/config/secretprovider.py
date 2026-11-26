@@ -41,7 +41,7 @@ import importlib
 import logging
 import os
 import re
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from messagefoundry.logging_guard import _last_resort
 
@@ -210,39 +210,12 @@ def _load_external_provider(
         failed = type(exc).__name__
         log_import_failure(f"[secrets].provider={name!r}", exc)
     else:
-        return _build_external_provider(name, module, settings, posture)
+        provider: SecretProvider = module.build_provider(settings, posture=posture)
+        return provider
     raise SecretProviderError(
         f"[secrets].provider={name!r} could not load its provider module or backend (an import "
         f"failed: {failed}) — reinstall MessageFoundry with the optional {extra!r} extra "
         f"('messagefoundry[{extra}]')."
-    )
-
-
-def _build_external_provider(
-    name: str, module: Any, settings: SecretsSettings, posture: HopPosture | None
-) -> SecretProvider:
-    """Call ``module.build_provider`` and refuse an error it raises by class, as a
-    :class:`SecretProviderError` (vault BACKLOG #6709). These propagate unchanged, as on main: a
-    provider's own ``SecretProviderError``, which keeps its text; an ``InsecureHopRefused``, and an
-    error whose ``__cause__`` is one, since at least the alert-transport and ``verify`` callers
-    read a hop refusal raw or as a cause; and ``MemoryError`` and ``RecursionError``. A refused
-    error is a fault in the provider's construction: its text is not repeated or chained, for the
-    reason :func:`_load_external_provider` gives for an import's."""
-    from messagefoundry.config.tls_policy import InsecureHopRefused
-
-    try:
-        provider: SecretProvider = module.build_provider(settings, posture=posture)
-    except (SecretProviderError, InsecureHopRefused, MemoryError, RecursionError):
-        raise
-    except Exception as exc:  # noqa: BLE001 -- a provider's construction may raise any class; refused below, logged by class
-        if isinstance(exc.__cause__, InsecureHopRefused):
-            raise
-        failed = type(exc).__name__
-    else:
-        return provider
-    _warn_or_report(_log, "[secrets].provider=%r: building the provider failed (%s)", name, failed)
-    raise SecretProviderError(
-        f"[secrets].provider={name!r}: its provider could not be built ({failed})."
     )
 
 

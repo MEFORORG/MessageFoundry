@@ -318,24 +318,20 @@ def test_log_import_failure_names_a_plain_module_and_withholds_any_other(
         assert logged in message
 
 
-def test_an_external_provider_whose_build_fails_is_refused_by_class(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_an_error_from_an_external_providers_build_propagates_raw(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Vault BACKLOG #6709: build_provider ran outside the dispatch's try, so an error from a
-    # provider's construction escaped raw. It is refused by class, with no text and no chain.
-    caplog.set_level(logging.WARNING)
+    # The build part of vault BACKLOG #6709 was withdrawn to main: the dispatch calls
+    # build_provider bare, so an error from a provider's construction propagates unchanged.
+    error = ValueError(_BROKEN_IMPORT_TEXT)
 
     def _boom(*_a: Any, **_k: Any) -> Any:
-        raise ValueError(_BROKEN_IMPORT_TEXT)
+        raise error
 
     monkeypatch.setattr(secretprovider_vault, "build_provider", _boom)
-    with pytest.raises(SecretProviderError) as caught:
+    with pytest.raises(ValueError) as caught:
         resolve_secret_provider(SecretsSettings(provider="vault"))
-    text = str(caught.value)
-    assert "could not be built (ValueError)" in text
-    assert "synthetic" not in text and "0451" not in text
-    assert caught.value.__cause__ is None and caught.value.__context__ is None
-    _assert_one_class_only_warning(caplog, "ValueError", "messagefoundry.config.secretprovider")
+    assert caught.value is error
 
 
 def test_an_external_providers_own_refusal_from_its_build_keeps_its_text(
@@ -353,7 +349,7 @@ def test_a_hop_refusal_from_an_external_providers_build_passes_through(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Engine PR 3321 hold item 2: the callers that print a hop refusal in its own words read it
-    # raw, so the build arm passes it through, as main did, rather than refusing it by class.
+    # raw, and the dispatch lets it propagate from build_provider unchanged, as on main.
     from messagefoundry.config.tls_policy import InsecureHopRefused
 
     refusal = InsecureHopRefused("synthetic hop refusal")

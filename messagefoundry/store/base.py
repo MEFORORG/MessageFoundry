@@ -4127,27 +4127,6 @@ def _in_place_of(
 _SiteTexts = tuple[str, str, str, str, str]
 
 
-def _judged_apart_from_its_class(exc: ValueError) -> bool:
-    """Whether this module's key sites refuse the ``ValueError`` ``exc`` with more than the text
-    for a refused key, so that wrapping it in a ``KeyProviderError`` would change the refusal they
-    raise. ``True`` when it is an ``InsecureHopRefused``, read with ``type``, or its cause is the
-    Vault hop's marked refusal (:func:`_fresh_refusal`'s hop and Vault slots), when the engine
-    built it (:func:`_recorded_text`), or when a codec error is on its chain
-    (:func:`_codec_safe_refusal`). A chain that cannot be read whole answers ``False``, so it is
-    wrapped and never reaches the refused-key slot, even where a second read would finish.
-    ``keyprovider._load_external_provider``'s build arm passes the ``True`` cases through
-    unwrapped, and calls this outside any handler, so a ``BaseException`` the walk raises, which
-    propagates, has no error of the provider's as its context."""
-    if (
-        issubclass(type(exc), InsecureHopRefused)
-        or is_vault_hop_refusal(_CAUSE.__get__(exc))
-        or _recorded_text(exc) is not None
-    ):
-        return True
-    codec, _read_whole = _codec_error_on(exc)  # no codec is named when the read did not finish
-    return codec is not None
-
-
 def _fresh_refusal(
     exc: Exception, texts: _SiteTexts, hop_as: type[Exception] = InsecureHopRefused
 ) -> Exception:
@@ -4475,8 +4454,7 @@ def _codec_error_on(exc: BaseException) -> tuple[BaseException | None, bool]:
     ``exc``, ``exc`` first, that is a codec error or prints one, or ``None``; and whether the chain
     was read whole. It was not when the walk raised, too long or from a link's own code, and then
     no error is named (BACKLOG #4882). A ``BaseException`` that is not an ``Exception``
-    propagates; each caller clears its links, as :func:`_codec_safe_refusal` says, or calls it
-    outside any handler (:func:`_judged_apart_from_its_class`)."""
+    propagates; each caller clears its links, as :func:`_codec_safe_refusal` says."""
     try:
         codec = next(
             (
