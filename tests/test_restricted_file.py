@@ -1028,9 +1028,11 @@ def test_a_posix_root_that_could_not_be_read_is_refused() -> None:
     assert problem is not None and "could not be read, so no link on it was judged" in problem
 
 
-def _typed_link_problem(path: str, mounts: list[tuple[str, str]]) -> str | None:
+def _typed_link_problem(path: str, mounts: list[tuple[str, str]] | None) -> str | None:
     """:func:`_posix_link_problem` over :data:`_KEY_TREE`, every object root's or the engine's and
-    no folder others may write without the sticky bit, so only the mount type can refuse."""
+    no folder others may write without the sticky bit, so only the mount type can refuse. With
+    ``mounts`` ``None`` no table was read, so ``fstype_fn`` answers ``None`` for every part, as
+    :func:`_posix_host_link_problem` passes it off Linux."""
 
     def lstat_fn(part: str) -> PosixStat:
         if part not in _KEY_TREE:
@@ -1046,7 +1048,7 @@ def _typed_link_problem(path: str, mounts: list[tuple[str, str]]) -> str | None:
         euid=_ENGINE_UID,
         lstat_fn=lstat_fn,
         readlink_fn=lambda _part: "",
-        fstype_fn=lambda part: mount_of(part, mounts),
+        fstype_fn=lambda part: None if mounts is None else mount_of(part, mounts),
     )
 
 
@@ -1108,9 +1110,16 @@ def test_a_posix_mount_type_the_refusal_cannot_print_is_not_quoted() -> None:
 
 
 def test_a_posix_mount_table_that_could_not_be_read_judges_no_type() -> None:
-    """With no mount read (``fstype_fn`` answers ``None``, as off Linux) nothing is refused for
-    its type, and the walk is otherwise unchanged."""
+    """With no mount table read (``fstype_fn`` answers ``None``, as off Linux) nothing is refused
+    for its type, and the walk is otherwise unchanged."""
+    assert _typed_link_problem("/private/tmp/keys/k.key", None) is None
+
+
+def test_a_posix_mount_table_that_lists_no_mount_covering_the_path_judges_no_type() -> None:
+    """A table that reads but lists no mount covering the path, as one read inside a chroot can,
+    judges no type: a gap the docstrings name, pinned so a change to it is seen."""
     assert _typed_link_problem("/private/tmp/keys/k.key", []) is None
+    assert _typed_link_problem("/private/tmp/keys/k.key", [("/elsewhere", "nfs")]) is None
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the POSIX key-file check runs off Windows")
@@ -1148,6 +1157,25 @@ def test_broad_access_problem_refuses_where_the_linux_mount_table_cannot_be_read
     monkeypatch.setattr(restricted_file, "read_mounts", lambda: None, raising=False)
     problem = restricted_file.broad_access_problem(key)
     assert problem is not None and "/proc/self/mountinfo could not be read" in problem
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux has a mount table to read")
+def test_the_unreadable_mount_table_refusal_names_a_remedy_that_clears_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The caller appends a remedy about the key's owner and mode, which does not clear this
+    refusal, so the refusal names its own and says the other does not clear it, and gives no
+    chmod or chown of its own."""
+    os.chmod(tmp_path, 0o700)
+    key = tmp_path / "k.key"
+    key.write_bytes(b"synthetic")
+    os.chmod(key, 0o600)
+    monkeypatch.setattr(restricted_file, "read_mounts", lambda: None, raising=False)
+    problem = restricted_file.broad_access_problem(key)
+    assert problem is not None
+    assert "make that file readable to the account the engine runs as" in problem
+    assert "changing the owner or mode of the file or its folders does not clear this" in problem
+    assert "chmod" not in problem and "chown" not in problem
 
 
 def test_a_posix_link_another_account_can_change_is_refused() -> None:

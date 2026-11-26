@@ -1232,9 +1232,13 @@ def _posix_host_link_problem(path: Path) -> str | None:
     """:func:`_posix_link_problem` for ``path`` on this host. A read that fails is a finding whose
     reason quotes the error, so the error is rebuilt without the file name it carries. The mount
     types are read from ``/proc/self/mountinfo`` once per call, and judged only where that can be
-    read. On Linux a file that cannot be read is refused, since no type on the path was judged.
+    read. On Linux a file that cannot be read is refused, since no type on the path was judged,
+    and the refusal says how to clear it, which no change to the key's owner or mode does.
     Elsewhere, for example on macOS and the BSDs, which have mount tables this does not read, no
-    type is judged. POSIX only."""
+    type is judged. Where the table is read, at least these are not judged either: a path no mount
+    it lists covers, as a table read inside a chroot can leave, passes; and since the table is read
+    once, before the walk, a mount the walk itself brings up, such as an autofs one, is judged by
+    the entry the table held before it came up. POSIX only."""
     if sys.platform == "win32":  # pragma: no cover - guard for the type checker on Windows
         raise OSError("a POSIX path is walked on POSIX only")
 
@@ -1264,7 +1268,9 @@ def _posix_host_link_problem(path: Path) -> str | None:
     if mounts is None and sys.platform.startswith("linux"):
         return (
             "/proc/self/mountinfo could not be read, so the file system under its path was "
-            "not judged"
+            "not judged; make that file readable to the account the engine runs as, or run the "
+            "engine where it is, since changing the owner or mode of the file or its folders does "
+            "not clear this"
         )
 
     def fstype_fn(part: str) -> tuple[str, str] | None:
@@ -1413,7 +1419,12 @@ def broad_access_problem(
     or that a group or other may write with no sticky bit. Where ``/proc/self/mountinfo`` can be
     read, the walk below also refuses a path on a mount below ``/`` of at least the types
     :func:`_posix_delegated_file_system` names, since those owner and mode bits do not decide who
-    reaches the file there; the list is open, so a type it does not name passes.
+    reaches the file there; the list is open, so a type it does not name passes. At least these
+    are not judged by type either: a path no mount in a readable table covers, as inside a chroot,
+    passes, and a mount the walk itself brings up, such as an autofs one, is judged by the entry
+    the table held before, since the table is read once, before the walk. On Linux a table that
+    cannot be read is refused, with a remedy of its own that a change of owner or mode does not
+    replace (:func:`_posix_host_link_problem`).
 
     On both, the folders above ``path`` are walked too (vault BACKLOG #5656, #5657). A junction or
     link among them is refused when an account the check does not trust can change it: on
