@@ -3775,18 +3775,24 @@ def test_the_credential_pattern_matches_every_text_a_credential_filter_changes(
         "".join(rand.choice(fragments) for _ in range(rand.randint(2, 9))) for _ in range(20_000)
     ]
     shipped = [secretscrub.scrub_credentials(text) != text for text in texts]
+    # After a ";" and optional spaces, or as a first member with no ";" (BACKLOG #5030 added item
+    # 4), a key holding a word and at most one qualifier after it.
     member_shape = re.compile(
-        r"(?i);[A-Za-z0-9_]*(?:password|passwd|passphrase|pass|pwd|secret|credential|token)="
+        r"(?i)(?:;[ \t]*|(?<![A-Za-z0-9_.\-;]))[A-Za-z0-9_]*"
+        r"(?:password|passwd|passphrase|pass|pwd|secret|credential|token)(?:_?(?:value|primary"
+        r"|secondary|old|new|next|current|previous|prev|plaintext|plain|raw|text|string|[0-9]+))?="
     )
     # Which texts the shipped filters change with the escape start kept and only the member pass
     # off, so a text the escape start alone changes cannot be counted as the member's.
     with monkeypatch.context() as patched:
         patched.setattr(secretscrub, "_CONNECTION_STRING_MEMBER", re.compile(r"(?!)"))
+        patched.setattr(secretscrub, "_CONNECTION_STRING_FIRST_MEMBER", re.compile(r"(?!)"))
         without_member = [secretscrub.scrub_credentials(text) != text for text in texts]
     changed = unmatched = escape_only = member_only = 0
     with monkeypatch.context() as patched:
         _start_labels_at_a_word_boundary_alone(patched)
         patched.setattr(secretscrub, "_CONNECTION_STRING_MEMBER", re.compile(r"(?!)"))
+        patched.setattr(secretscrub, "_CONNECTION_STRING_FIRST_MEMBER", re.compile(r"(?!)"))
         for text, shipped_changed, escape_changed in zip(
             texts, shipped, without_member, strict=True
         ):

@@ -286,6 +286,13 @@ FAMILIES: tuple[Family, ...] = (
         patterns=("_CONNECTION_STRING_MEMBER",),
     ),
     Family(
+        # The first member, with no ";" before it (BACKLOG #5030 added item 4).
+        name="connection_string_first_member",
+        line="odbc conn sslpassword=wt-Fm1_Memb-94 x;Server=db",
+        secret="wt-Fm1_Memb-94",
+        patterns=("_CONNECTION_STRING_FIRST_MEMBER",),
+    ),
+    Family(
         name="dsn_inline_password",
         line="store dsn postgres://svc:wt-D5n_Pass-61@db.invalid:5432/mefor",
         secret="wt-D5n_Pass-61",
@@ -324,7 +331,10 @@ def test_the_production_filter_chain_scrubs_every_credential_family(fam: Family)
     assert fam.secret not in out, f"{fam.name}: the credential survived the chain -- got {out!r}"
     # The member pass masks each word of a value with a bare word and no brackets, so a later pass
     # reads the same separators (BACKLOG #5030); that word after the "=" is its mark.
-    member_only = fam.patterns == ("_CONNECTION_STRING_MEMBER",)
+    member_only = fam.patterns in (
+        ("_CONNECTION_STRING_MEMBER",),
+        ("_CONNECTION_STRING_FIRST_MEMBER",),
+    )
     marker = f"={secretscrub._MEMBER_MASK}" if member_only else CREDENTIAL_PLACEHOLDER
     assert marker in out, f"{fam.name}: nothing was marked redacted -- got {out!r}"
 

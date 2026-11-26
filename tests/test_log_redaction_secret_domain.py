@@ -370,6 +370,13 @@ FAMILIES: tuple[Family, ...] = (
         patterns=("_CONNECTION_STRING_MEMBER",),
     ),
     Family(
+        # The first member, with no ";" before it (BACKLOG #5030 added item 4).
+        name="connection_string_first_member",
+        line="odbc conn sslpassword=pw-Fm1_Memb-93 x;Server=db",
+        secret="pw-Fm1_Memb-93",
+        patterns=("_CONNECTION_STRING_FIRST_MEMBER",),
+    ),
+    Family(
         name="secret_kv",
         line="provider bind secret=sc-V4ult_Val-44",
         secret="sc-V4ult_Val-44",
@@ -606,7 +613,10 @@ def test_every_secret_family_value_is_redacted(fam: Family) -> None:
     assert fam.secret not in out, f"{fam.name}: secret survived redaction -- got {out!r}"
     # The member pass masks each word of a value with a bare word and no brackets, so a later pass
     # reads the same separators (BACKLOG #5030); that word after the "=" is its mark.
-    member_only = fam.patterns == ("_CONNECTION_STRING_MEMBER",)
+    member_only = fam.patterns in (
+        ("_CONNECTION_STRING_MEMBER",),
+        ("_CONNECTION_STRING_FIRST_MEMBER",),
+    )
     marker = f"={scrub_mod._MEMBER_MASK}" if member_only else REDACTION_PLACEHOLDER
     if fam.patterns == ("_PRIVATE_KEY_BLOCK",):
         # A key body is masked one character for one (BACKLOG #5550), so its mark is the "x" run.
@@ -3645,8 +3655,9 @@ def _secret_passes_only(monkeypatch: pytest.MonkeyPatch) -> None:
     ``tests/test_connection_string_member_scrub.py``."""
     monkeypatch.setattr(redact_mod, "_redact_phi", lambda text: text)
     monkeypatch.setattr(redact_mod, "_LONG_B64", NEVER_MATCHES)
-    monkeypatch.setattr(redact_mod, "_CONNECTION_STRING_MEMBER", NEVER_MATCHES)
-    monkeypatch.setattr(scrub_mod, "_CONNECTION_STRING_MEMBER", NEVER_MATCHES)
+    for name in ("_CONNECTION_STRING_MEMBER", "_CONNECTION_STRING_FIRST_MEMBER"):
+        monkeypatch.setattr(redact_mod, name, NEVER_MATCHES)
+        monkeypatch.setattr(scrub_mod, name, NEVER_MATCHES)
 
 
 #: The two surfaces the differential compares. ``CredentialScrubFilter`` is left out because it runs
@@ -3861,7 +3872,6 @@ def test_the_second_review_rounds_shapes_print_nothing_new(
 #: line newly prints. Pinned as still printing, so a fix turns this red and must update both.
 _OPEN_CASCADE_DEFECTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("cfg password='pw-A1 MEFOR_A=x;private_key='pké-B1 pk-B2'", ("pké-B1", "pk-B2")),
-    ("cfg password='pw-A1 pw-A2;MEFOR_A=x;MEFOR_B='pw-B1'", ("pw-A2",)),
     ("secret=pw-A0@MEFOR_B_PW=pw-A2;MEFOR_X = 'pw-A4'@x.password='pw-A6", ("pw-A6",)),
     ("connect failed encryption_key=token=password='hunter2',private_key='abc def=='", ("abc",)),
     ('cfg private_key=pass=credential="c1"|private_key\'=pk-SECRET-9', ("pk-SECRET-9",)),
@@ -3875,7 +3885,7 @@ _OPEN_CASCADE_DEFECTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     "case",
     _OPEN_CASCADE_DEFECTS,
     ids=(
-        *("refused-run-on", "swallowed-mefor", "split-mefor"),
+        *("refused-run-on", "split-mefor"),
         *("key-material-run-on", "key-material-echo", "key-material-unclosed"),
         *("mefor-takes-outer-closer", "mefor-match-taken-away"),
     ),
