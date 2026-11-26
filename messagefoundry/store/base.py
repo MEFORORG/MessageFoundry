@@ -1929,7 +1929,14 @@ class QueueStore(StoreLifecycle, Protocol):
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
         """Delete transform-state entries (ADR 0005) last written before ``older_than`` (age-based
-        retention). Returns the number purged. Off unless ``[retention].state_max_age_days`` is set."""
+        retention). Returns the number purged. Off unless ``[retention].state_max_age_days`` is set.
+
+        The cutoff premise (BACKLOG #5734): the retention runner passes ``older_than`` at least a whole
+        day back (it calls this only when the integer ``state_max_age_days`` is above zero), so it lies
+        well behind every state write in flight, and such a write's row is newer than the cutoff and
+        survives the DELETE. The PostgreSQL and SQL Server backends rest one thing on that premise:
+        keeping cached a key published while the pass runs. A caller passing a cutoff near the present
+        could leave a cached value whose row the DELETE removed."""
         ...
 
     async def purge_connection_events(self, *, older_than: float, now: float | None = None) -> int:

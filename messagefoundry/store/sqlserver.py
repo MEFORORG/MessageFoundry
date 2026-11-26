@@ -3678,6 +3678,17 @@ def _any_grant(answers: str) -> str:
 class SqlServerStore(ServerCipherWalk):
     """SQL Server-backed durable queue (the :class:`Store` protocol). Open with :meth:`open`."""
 
+    #: Keys published to ``_state_cache`` while a :meth:`purge_state` pass runs, from its start to its
+    #: post-release eviction, one set per pass in flight (BACKLOG #5734). Empty, so free, otherwise.
+    #: A tuple, so the class default is never shared mutable state.
+    _state_purge_watches: tuple[set[tuple[str, str]], ...] = ()
+
+    def _note_state_published(self, ck: tuple[str, str]) -> None:
+        """Record that ``ck`` was just published to the state cache, for any purge pass in
+        flight."""
+        for touched in self._state_purge_watches:
+            touched.add(ck)
+
     # The staged ingress pipeline (enqueue_ingress + the ingress->routed->outbound handoffs) is
     # implemented on the unified ``queue`` table: atomic DELETE...OUTPUT claim-handoffs, an
     # sp_getapplock-serialized queue-aware finalizer, and RCSI for non-blocking claim/finalize
@@ -8696,6 +8707,7 @@ class SqlServerStore(ServerCipherWalk):
         thread). ``state_view()`` then reflects the new values in-process."""
         for ck, cv in applied:
             self._state_cache[ck] = cv
+            self._note_state_published(ck)
 
     async def complete_with_response(
         self,
@@ -11395,17 +11407,36 @@ class SqlServerStore(ServerCipherWalk):
 
         One ``DELETE ... OUTPUT`` names exactly the rows it removed (BACKLOG #5734). A SELECT of the
         expired keys followed by a separate DELETE would list a key a concurrent ``state_set`` refreshed
-        between the two, so the cache would drop a key whose row survives."""
-        rows = await self._execute_output(
-            "DELETE FROM state OUTPUT deleted.namespace, deleted.[key] AS state_key"
-            " WHERE set_at < ?",
-            (older_than,),
-        )
-        purged_keys = [(r["namespace"], r["state_key"]) for r in rows]
-        for ck in purged_keys:
-            # `in` + `del`, not pop(): pop would decrypt each purged value just to drop it (#1174).
-            if ck in self._state_cache:
-                del self._state_cache[ck]
+        between the two, so the cache would drop a key whose row survives.
+
+        The eviction runs after the connection is released, an await later than the DELETE, so a
+        same-key write that commits and publishes in that window would be evicted while its row
+        survives. So a watched publish of a key, at any point from the start of the pass to its
+        eviction, keeps that key cached (BACKLOG #5734). The watch belongs to this store handle. At
+        least a publish of this handle's own committed writes (``publish_state_cache``) is watched. A
+        :meth:`reload_state_cache` swap is not. A reload whose read ran before the DELETE and whose
+        swap lands after the eviction brings the purged keys back with their deleted values, which
+        stay cached until a later reload or a restart; the watch does not close that. Keeping a
+        watched key is sound only under the cutoff premise that
+        :meth:`~messagefoundry.store.base.QueueStore.purge_state` states; a cutoff near the present
+        could keep a cached value whose row the DELETE removed."""
+        touched: set[tuple[str, str]] = set()
+        self._state_purge_watches = (*self._state_purge_watches, touched)
+        try:
+            rows = await self._execute_output(
+                "DELETE FROM state OUTPUT deleted.namespace, deleted.[key] AS state_key"
+                " WHERE set_at < ?",
+                (older_than,),
+            )
+            purged_keys = [(r["namespace"], r["state_key"]) for r in rows]
+            for ck in purged_keys:
+                # `in` + `del`, not pop(): pop would decrypt each purged value just to drop it (#1174).
+                if ck not in touched and ck in self._state_cache:
+                    del self._state_cache[ck]
+        finally:
+            self._state_purge_watches = tuple(
+                w for w in self._state_purge_watches if w is not touched
+            )
         return len(purged_keys)
 
     async def purge_dead_letters(

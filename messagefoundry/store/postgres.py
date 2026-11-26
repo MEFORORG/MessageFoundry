@@ -2088,6 +2088,25 @@ def _refuse_store_revocation(
 class PostgresStore(ServerCipherWalk):
     """PostgreSQL-backed durable queue (the :class:`Store` protocol). Open with :meth:`open`."""
 
+    #: Keys published to ``_state_cache`` while a :meth:`purge_state` pass runs, from its start to its
+    #: post-release eviction, one set per pass in flight (BACKLOG #5734). Empty, so free, otherwise.
+    #: A tuple, so the class default is never shared mutable state. A converge publish is not noted:
+    #: a converge pass publishes rows it may have read before the DELETE, so it is not evidence that
+    #: the row survived. :meth:`purge_state` says which publishes are.
+    _state_purge_watches: tuple[set[tuple[str, str]], ...] = ()
+
+    def _note_state_published(self, ck: tuple[str, str]) -> None:
+        """Record that ``ck`` was just published to the state cache, for any purge pass in
+        flight."""
+        for touched in self._state_purge_watches:
+            touched.add(ck)
+
+    def _publish_state_cache(self, applied: Sequence[tuple[tuple[str, str], Any]]) -> None:
+        """Publish committed transform-state writes to the read-through cache, after the commit."""
+        for ck, cv in applied:
+            self._state_cache[ck] = cv
+            self._note_state_published(ck)
+
     # Postgres implements the full staged ingress pipeline (enqueue_ingress/route_handoff/
     # transform_handoff), so the engine starts the staged runner on this backend.
     supports_ingest_stage = True
@@ -5324,8 +5343,7 @@ class PostgresStore(ServerCipherWalk):
                 # snapshot. The lock is taken inside this txn, so it auto-releases at commit.
                 await self._maybe_finalize_message(conn, message_id, now)
         # Commit succeeded → publish the committed state writes to the read-through cache.
-        for ck, cv in applied:
-            self._state_cache[ck] = cv
+        self._publish_state_cache(applied)
         # The writer records its own new per-namespace versions so its own converge_state_cache() skips
         # re-reading the namespaces it just wrote (Track B Step 6b).
         self._record_own_state_bumps(bumped)
@@ -12902,21 +12920,41 @@ class PostgresStore(ServerCipherWalk):
 
         One ``DELETE ... RETURNING`` names exactly the rows it removed (BACKLOG #5734). A SELECT of the
         expired keys followed by a separate DELETE would list a key a concurrent ``state_set`` refreshed
-        between the two, so the cache would drop a key whose row survives."""
+        between the two, so the cache would drop a key whose row survives.
+
+        The eviction runs after the connection is released, an await later than the DELETE, so a
+        same-key write that commits and publishes in that window would be evicted while its row
+        survives. So a watched publish of a key, at any point from the start of the pass to its
+        eviction, keeps that key cached (BACKLOG #5734). The watch belongs to this store handle. At
+        least a publish of this handle's own committed writes (``_publish_state_cache``) is watched. A
+        :meth:`converge_state_cache` publish, which is how a sibling engine shard's write reaches this
+        process, is not: a purged key a converge pass republishes in that window is evicted whether
+        or not its row survives. The reverse also holds: a converge that read a purged row before the
+        DELETE and publishes it after the eviction leaves its deleted value cached until a later
+        converge reseeds the namespace; the watch does not close that. Keeping a watched key is sound
+        only under the cutoff premise that :meth:`~messagefoundry.store.base.QueueStore.purge_state`
+        states; a cutoff near the present could keep a cached value whose row the DELETE removed."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn, conn.transaction():
-            rows = await conn.fetch(
-                "DELETE FROM state WHERE set_at < $1 RETURNING namespace, key", older_than
+        touched: set[tuple[str, str]] = set()
+        self._state_purge_watches = (*self._state_purge_watches, touched)
+        try:
+            async with self._timed_acquire() as conn, conn.transaction():
+                rows = await conn.fetch(
+                    "DELETE FROM state WHERE set_at < $1 RETURNING namespace, key", older_than
+                )
+                purged_keys = [(r["namespace"], r["key"]) for r in rows]
+                bumped: list[tuple[str, int]] = []
+                if self._cluster_state_convergence:
+                    bumped = await self._bump_state_versions(conn, (n for n, _ in purged_keys), now)
+            # Commit succeeded → evict the purged keys from the read-through cache.
+            for ck in purged_keys:
+                # `in` + `del`, not pop(): pop would decrypt each purged value just to drop it (#1174).
+                if ck not in touched and ck in self._state_cache:
+                    del self._state_cache[ck]
+        finally:
+            self._state_purge_watches = tuple(
+                w for w in self._state_purge_watches if w is not touched
             )
-            purged_keys = [(r["namespace"], r["key"]) for r in rows]
-            bumped: list[tuple[str, int]] = []
-            if self._cluster_state_convergence:
-                bumped = await self._bump_state_versions(conn, (n for n, _ in purged_keys), now)
-        # Commit succeeded → evict the purged keys from the read-through cache.
-        for ck in purged_keys:
-            # `in` + `del`, not pop(): pop would decrypt each purged value just to drop it (#1174).
-            if ck in self._state_cache:
-                del self._state_cache[ck]
         # Record this node's new per-namespace versions so its own converge skips re-reading them.
         self._record_own_state_bumps(bumped)
         return len(purged_keys)

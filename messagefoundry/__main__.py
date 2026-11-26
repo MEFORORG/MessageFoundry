@@ -7482,10 +7482,14 @@ def _resolve_expected_rows(args: argparse.Namespace) -> list[tuple[int, str]] | 
     """The ``(seq, row_hash)`` pairs for ``audit-verify``, or the exit code 2 if one is unusable
     (vault BACKLOG #2612). An empty list when neither flag was given.
 
-    Each pair is parsed by :func:`parse_audit_row_pair`, which shares the anchor parser's rule for
-    which heads the store can emit. A refusal for a ``--expected-row`` value quotes it, since the
-    operator typed it; one for a file line names the line number and a reason that quotes nothing,
-    so a path typo'd onto another file does not put that file's content on the job's output.
+    Each pair is parsed by :func:`parse_audit_row_pair`, which shares the anchor parser's count
+    grammar and head rule: it refuses at least a malformed seq and a hex head that is not 64
+    characters, and passes a
+    ``vault:v`` head through unchecked, at the cost
+    :func:`~messagefoundry.store.store._audit_head_shape` states. A refusal for a ``--expected-row``
+    value quotes it, since the operator typed it; one for a file line names the line number and a
+    reason that quotes nothing, so a path typo'd onto another file does not put that file's content
+    on the job's output.
     """
     from messagefoundry.redaction import codec_safe_str
     from messagefoundry.store.store import (
