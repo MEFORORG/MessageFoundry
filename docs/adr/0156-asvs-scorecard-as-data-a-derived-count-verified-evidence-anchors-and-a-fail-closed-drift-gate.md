@@ -173,6 +173,20 @@ That last row is the fix for **15.1.3**: the guards stop being inspection-only t
 > `scripts/asvs/register_check.py` cites as its reason for staying advisory. Whoever installs it must
 > set that variable in the same change.
 >
+> *(2026-11-26: the paragraph above and the table measured the vault's `asvs-scorecard` hook entry
+> as it stood on 2026-08-17, and no longer describe it. The vault's installed shim already skips the
+> hook at commit time when `MEFOR_ENGINE_ROOT` is unset. Vault PR 3065, open on this date, replaces
+> the entry once it merges: the hook looks for an engine checkout itself, passes with a SKIPPED line when it finds
+> none, and narrows what it refuses. That qualifies this ADR's title and §6 for the pre-commit hook;
+> the verifier, `scripts/asvs/scorecard.py`, is not changed. This copy does not restate the rest of
+> the hook's behaviour or its limits. Their source of record is the docstring of the vault's
+> `scripts/asvs/precommit_scorecard.py`, summarised in Amendment 2's 2026-11-25 note in the vault's
+> copy of this ADR, which cites the owner ruling behind it; both are on vault `main` only once PR
+> 3065 merges. Do not run `pre-commit install` in the vault, whatever the remedy above says: the
+> vault installer's header forbids it. A clone's installed shim changes only when the vault's
+> `scripts\coord\install-git-hooks.ps1 -Arm`, which that header marks owner-gated, is re-run in it
+> from an up-to-date vault `main`.)*
+>
 > **WHY THIS IS RECORDED RATHER THAN QUIETLY FIXED.** The claim is load-bearing in a security record:
 > it tells a reader that authoring-time enforcement is in place, and a reader who believes it will not
 > look for the gap. That is a compensating control resting on a false premise, which
