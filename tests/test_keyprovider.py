@@ -587,7 +587,12 @@ def test_a_classified_refusal_from_build_provider_keeps_its_own_text(
     # passes through the build arm unwrapped, so the operator reads that slot's text at the key
     # seam and at the cipher build, as on main, and not the generic "key source failed" one a
     # KeyProviderError gets.
-    from messagefoundry.store.base import _BUILD_TEXTS, _KEY_SEAM_TEXTS, build_store_cipher
+    from messagefoundry.store.base import (
+        _BUILD_TEXTS,
+        _KEY_SEAM_TEXTS,
+        StoreCipherConfigError,
+        build_store_cipher,
+    )
 
     raised = _plant_build_provider(monkeypatch, make_error)
     with pytest.raises(Exception) as direct:
@@ -595,9 +600,13 @@ def test_a_classified_refusal_from_build_provider_keeps_its_own_text(
     assert direct.value is raised[-1]
     with pytest.raises(Exception) as caught:
         resolve_active_key(StoreSettings(key_provider="vault"))
+    assert type(caught.value) is type(raised[-1])
     assert str(caught.value) == _KEY_SEAM_TEXTS[index]
+    # The cipher build raises a hop refusal as a StoreCipherConfigError, every other as its class.
+    hop_as = StoreCipherConfigError if index == 0 else type(raised[-1])
     with pytest.raises(Exception) as built:
         build_store_cipher(StoreSettings(key_provider="vault"))
+    assert type(built.value) is hop_as
     assert str(built.value) == _BUILD_TEXTS[index]
 
 
@@ -650,6 +659,54 @@ def test_a_codec_error_from_build_provider_keeps_the_codec_text(
     )
     with pytest.raises(StoreCipherConfigError, match="is or holds a codec error"):
         resolve_active_key(StoreSettings(key_provider="vault"))
+
+
+def test_a_value_error_caused_by_a_codec_error_keeps_the_chain_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # As above, with the codec error one link down, so the judgement walks the chain.
+    from messagefoundry.store.base import StoreCipherConfigError
+
+    def _caused() -> Exception:
+        error = ValueError("synthetic")
+        error.__cause__ = UnicodeDecodeError("utf-8", bytes([0xFF]), 0, 1, "synthetic")
+        return error
+
+    _plant_build_provider(monkeypatch, _caused)
+    with pytest.raises(StoreCipherConfigError, match="whose chain holds a codec error"):
+        resolve_active_key(StoreSettings(key_provider="vault"))
+
+
+def test_a_value_error_whose_chain_cannot_be_read_is_wrapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A chain the judgement cannot read whole is wrapped, so it never reaches the refused-key
+    # slot, even where store.base's own later read would finish.
+    reads: list[int] = []
+
+    class _Flaky(ValueError):
+        @property
+        def __cause__(self) -> BaseException | None:  # type: ignore[override]
+            reads.append(1)
+            if len(reads) == 1:
+                raise RuntimeError("synthetic")
+            return None
+
+    raised = _plant_build_provider(monkeypatch, _Flaky)
+    with pytest.raises(KeyProviderError, match="could not be built") as caught:
+        resolve_key_provider(StoreSettings(key_provider="vault"))
+    assert caught.value.__cause__ is raised[-1]
+    assert reads, "the judgement never read the chain, so this test pins nothing"
+
+
+def test_an_error_that_is_not_a_value_error_from_build_provider_propagates_raw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Only a ValueError is wrapped; any other class reaches store.base raw, as on main.
+    raised = _plant_build_provider(monkeypatch, lambda: RuntimeError("synthetic"))
+    with pytest.raises(RuntimeError) as caught:
+        resolve_key_provider(StoreSettings(key_provider="vault"))
+    assert caught.value is raised[-1]
 
 
 def test_a_plain_value_error_from_build_provider_is_still_refused_by_class(

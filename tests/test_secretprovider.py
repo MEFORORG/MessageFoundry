@@ -367,6 +367,24 @@ def test_a_hop_refusal_from_an_external_providers_build_passes_through(
     assert caught.value is refusal
 
 
+def test_an_error_caused_by_a_hop_refusal_from_a_build_passes_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # As above, for an error whose cause is the hop refusal, which `verify` reads as a cause.
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+
+    error = ValueError("synthetic")
+    error.__cause__ = InsecureHopRefused("synthetic hop refusal")
+
+    def _refuse(*_a: Any, **_k: Any) -> Any:
+        raise error
+
+    monkeypatch.setattr(secretprovider_vault, "build_provider", _refuse)
+    with pytest.raises(ValueError) as caught:
+        resolve_secret_provider(SecretsSettings(provider="vault"))
+    assert caught.value is error
+
+
 @pytest.mark.parametrize("error", [MemoryError, RecursionError])
 def test_the_processs_own_limits_from_the_lazy_hvac_import_fail_closed(
     monkeypatch: pytest.MonkeyPatch, error: type[BaseException]

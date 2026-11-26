@@ -322,27 +322,28 @@ def _load_external_provider(
             f"with the optional {extra!r} extra."
         ) from exc
     # The provider module owns its own construction; annotate the local so mypy keeps the contract.
-    # A provider's own KeyProviderError keeps its text, and a MemoryError or RecursionError
-    # propagates. So does an error store.base would judge by more than its class
-    # (base._judged_apart_from_its_class names the cases), so its refusal is the one main raised.
-    # Any other Exception from its construction is refused as a KeyProviderError by class (vault
-    # BACKLOG #6709): left raw, a ValueError would reach store.base, which reads a ValueError as a
-    # refused key. Chained, as the import refusal above is.
+    # Only a ValueError from its construction is refused here, as a KeyProviderError by class
+    # (vault BACKLOG #6709): left raw, store.base reads a ValueError as a refused key and tells the
+    # operator to generate a new one. Every other class propagates raw, as on main, so store.base
+    # judges it and logs its cause as it did there. So does a ValueError store.base judges by more
+    # than its class (base._judged_apart_from_its_class says which), so its refusal is the one main
+    # raised. It is judged after the handler exits, so nothing the judgement raises has the
+    # provider's error as its context. Chained, as the import refusal above is.
     try:
         provider: KeyProvider = module.build_provider(settings, posture=posture)
-    except (KeyProviderError, MemoryError, RecursionError):
-        raise
-    except Exception as exc:
-        # Imported here, and only on a failure: store.base imports this module.
-        from messagefoundry.store.base import _judged_apart_from_its_class
+    except ValueError as exc:
+        failed = exc
+    else:
+        return provider
+    # Imported here, and only on a failure: store.base imports this module.
+    from messagefoundry.store.base import _judged_apart_from_its_class
 
-        if _judged_apart_from_its_class(exc):
-            raise
-        raise KeyProviderError(
-            f"[store].key_provider={name!r}: its provider could not be built "
-            f"({type(exc).__name__}, chained below)."
-        ) from exc
-    return provider
+    if _judged_apart_from_its_class(failed):
+        raise failed
+    raise KeyProviderError(
+        f"[store].key_provider={name!r}: its provider could not be built "
+        f"({type(failed).__name__}, chained below)."
+    ) from failed
 
 
 def resolve_key_provider(

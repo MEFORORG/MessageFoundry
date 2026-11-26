@@ -222,10 +222,10 @@ def _build_external_provider(
     name: str, module: Any, settings: SecretsSettings, posture: HopPosture | None
 ) -> SecretProvider:
     """Call ``module.build_provider`` and refuse an error it raises by class, as a
-    :class:`SecretProviderError` (vault BACKLOG #6709), unless it is one of four that propagate
-    unchanged: a provider's own ``SecretProviderError``, which keeps its text; an
-    ``InsecureHopRefused``, as on main, since the callers that report a hop refusal read it raw or
-    as a ``SecretProviderError``'s cause; and ``MemoryError`` and ``RecursionError``. A refused
+    :class:`SecretProviderError` (vault BACKLOG #6709). These propagate unchanged, as on main: a
+    provider's own ``SecretProviderError``, which keeps its text; an ``InsecureHopRefused``, and an
+    error whose ``__cause__`` is one, since at least the alert-transport and ``verify`` callers
+    read a hop refusal raw or as a cause; and ``MemoryError`` and ``RecursionError``. A refused
     error is a fault in the provider's construction: its text is not repeated or chained, for the
     reason :func:`_load_external_provider` gives for an import's."""
     from messagefoundry.config.tls_policy import InsecureHopRefused
@@ -235,6 +235,8 @@ def _build_external_provider(
     except (SecretProviderError, InsecureHopRefused, MemoryError, RecursionError):
         raise
     except Exception as exc:  # noqa: BLE001 -- a provider's construction may raise any class; refused below, logged by class
+        if isinstance(exc.__cause__, InsecureHopRefused):
+            raise
         failed = type(exc).__name__
     else:
         return provider
