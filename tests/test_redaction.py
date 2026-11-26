@@ -232,7 +232,8 @@ def _best_of(work: Callable[[], object], reps: int = 3) -> float:
     return best
 
 
-#: The type of pytest's ``record_property`` fixture, which every cost arm and control below takes.
+#: The type of pytest's ``record_property`` fixture, which the BACKLOG #2958 and #3721 cost arms and
+#: controls below take. At least the wall-clock ratio arms further down record nothing yet.
 _RecordProperty = Callable[[str, object], None]
 
 #: ``record_property`` warns that ``<properties>`` inside a ``<testcase>`` is outside the xunit2
@@ -252,18 +253,18 @@ def _record_reading(
     over: bool,
     unit: str,
     label: str = "",
-    large_cpu_seconds: float | None = None,
+    sides: tuple[float, float] | None = None,
 ) -> None:
     """Write one cost reading into the junit XML as test properties, before the test asserts on it
-    (BACKLOG #2958 step 1, #3721 step 1).
+    (BACKLOG #2958 steps 1, 3 and 5, #3721 step 1).
 
     A passing arm prints nothing under ``pytest -q``, so no hosted log held a margin to read. Written
     before the assertion, a failing reading lands in the junit as well. ``margin`` is how many times
     the reading clears its line: the line over the reading for an arm held under it, the reading over
-    the line for a control held over it, so a margin under 1 is a red either way. ``label`` prefixes
-    the names when one test reads several inputs. For a CPU-time ratio, ``large_cpu_seconds`` adds
-    both sides' CPU seconds, the small side derived as the large over the ratio, which is how
-    :func:`_interleaved_growth` formed it. Recording changes no reading and no assertion."""
+    the line for a control held over it. Every assertion is strict, so a margin of 1 or under is a
+    red either way. ``label`` prefixes the names when one test reads several inputs. For a CPU-time
+    ratio, ``sides`` is ``(large, small)``, each side's best CPU seconds as
+    :func:`_interleaved_growth` measured them. Recording changes no reading and no assertion."""
     prefix = f"{label}." if label else ""
     above, below = (reading, line) if over else (line, reading)
     margin = above / below if below > 0 else float("inf")
@@ -272,10 +273,9 @@ def _record_reading(
     record_property(f"{prefix}side", "over" if over else "under")
     record_property(f"{prefix}margin", margin)
     record_property(f"{prefix}unit", unit)
-    if large_cpu_seconds is not None:
-        record_property(f"{prefix}large_cpu_seconds", large_cpu_seconds)
-        small = large_cpu_seconds / reading if reading > 0 else float("inf")
-        record_property(f"{prefix}small_cpu_seconds", small)
+    if sides is not None:
+        record_property(f"{prefix}large_cpu_seconds", sides[0])
+        record_property(f"{prefix}small_cpu_seconds", sides[1])
 
 
 #: The line the CPU-time cost arms share. Each arm divides a large input's CPU time by a small one's,
@@ -334,9 +334,9 @@ def _thread_cpu_sample(
 
 def _interleaved_growth(
     small: Callable[[], object], large: Callable[[], object], large_reps: int = 3
-) -> tuple[float, float]:
-    """``(ratio, large)``: the best of at least three ``small`` samples over the best of
-    ``large_reps`` ``large`` ones, and the large reading alone.
+) -> tuple[float, float, float]:
+    """``(ratio, large, small)``: the best of at least three ``small`` samples over the best of
+    ``large_reps`` ``large`` ones, then each of those two readings alone.
 
     **Paired rounds in a drawn order, not two blocks (BACKLOG #3721).** In blocks every small sample
     came first, so a slow spell that ended during the test landed on the small side alone and
@@ -359,7 +359,7 @@ def _interleaved_growth(
                 best_small = min(best_small, _thread_cpu_sample(small))
             else:
                 best_large = min(best_large, _thread_cpu_sample(large))
-    return best_large / best_small, best_large
+    return best_large / best_small, best_large, best_small
 
 
 def test_the_cpu_sample_charges_the_measuring_thread_only() -> None:
@@ -707,16 +707,17 @@ def test_the_separator_sniff_stays_inside_the_scan_budget(
     assert len(ops_block) > 9_000
     custom = _custom_delimiter_message(300)
 
-    for label, text in (("ops text", ops_block), ("300-segment custom message", custom)):
+    inputs = (("ops", "ops text", ops_block), ("custom", "300-segment custom message", custom))
+    # Both inputs are read and recorded before either is asserted on, so a red on the first still
+    # leaves the second's reading in the junit.
+    readings: list[tuple[str, str, float]] = []
+    for short, label, text in inputs:
         best = _best_of(lambda text=text: redact(text), 5)  # type: ignore[misc]
         _record_reading(
-            record_property,
-            best,
-            _SCAN_BUDGET_SECONDS,
-            over=False,
-            unit="s",
-            label=label.split()[0],
+            record_property, best, _SCAN_BUDGET_SECONDS, over=False, unit="s", label=short
         )
+        readings.append((label, text, best))
+    for label, text, best in readings:
         assert best < _SCAN_BUDGET_SECONDS, (
             f"redacting {len(text)} characters of {label} cost {best:.4f}s of the event loop against "
             f"a {_SCAN_BUDGET_SECONDS}s budget"
@@ -2119,12 +2120,9 @@ def test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer(
     linear but costs up to about 70 times today's, where the old budget caught about 8 times. The
     batch 255 Manager ruling on #2952 and #2958 (2026-10-13) chose that trade for headroom on a loaded
     runner. The ratio's own margin is smaller, about 2.4 times, so load can still turn it red."""
-    growth, large = _credential_walk_growth()
+    growth, large, small = _credential_walk_growth()
     _record_reading(
-        record_property, growth, _CPU_GROWTH_LINE, over=False, unit="ratio", large_cpu_seconds=large
-    )
-    _record_reading(
-        record_property, large, _CPU_CEILING_SECONDS, over=False, unit="cpu_s", label="ceiling"
+        record_property, growth, _CPU_GROWTH_LINE, over=False, unit="ratio", sides=(large, small)
     )
     assert growth < _CPU_GROWTH_LINE, (
         f"an eight times wider window cost the credential walk {growth:.1f} times the CPU time, over "
@@ -2171,9 +2169,9 @@ def test_a_credential_search_from_index_0_is_quadratic_on_the_same_line(
         return -1
 
     monkeypatch.setattr(redaction, "_first_truncated_userinfo", search_from_zero)
-    growth, large = _credential_walk_growth(large_reps=1)
+    growth, large, small = _credential_walk_growth(large_reps=1)
     _record_reading(
-        record_property, growth, _CPU_GROWTH_LINE, over=True, unit="ratio", large_cpu_seconds=large
+        record_property, growth, _CPU_GROWTH_LINE, over=True, unit="ratio", sides=(large, small)
     )
     assert growth > _CPU_GROWTH_LINE, (
         f"a search from index 0 grew only {growth:.1f} times for an eight times wider window, under "
@@ -2190,9 +2188,9 @@ def _credential_wall(window: int) -> str:
     return (block * (cut // len(block) + 2))[: cut + 200] + "Q" * 200_000
 
 
-def _credential_walk_growth(large_reps: int = 3) -> tuple[float, float]:
-    """``(ratio, large)``: CPU seconds for one clamp of a ``_credential_wall`` at the shipped window,
-    over the same at an eighth of it, and the large reading alone.
+def _credential_walk_growth(large_reps: int = 3) -> tuple[float, float, float]:
+    """``(ratio, large, small)``: CPU seconds for one clamp of a ``_credential_wall`` at the shipped
+    window, over the same at an eighth of it, then each of those two readings alone.
 
     Both walls are checked before anything is divided, because a ratio hides a broken reading: a walk
     that stopped after a pass or two would be fast at both sizes for the wrong reason."""
@@ -2380,9 +2378,9 @@ def test_control_the_budget_shapes_are_expensive_unbounded(
 
 def _frame_cap_prose_growth(
     scan: Callable[[str], object], large_reps: int = 3
-) -> tuple[float, float]:
-    """``(ratio, large)``: CPU seconds for ``scan`` over the 16 MiB prose shape, over the same for one
-    window of it, and the large reading alone.
+) -> tuple[float, float, float]:
+    """``(ratio, large, small)``: CPU seconds for ``scan`` over the 16 MiB prose shape, over the same
+    for one window of it, then each of those two readings alone.
 
     **A window as the small size, so the two sides of the line are far apart.** The prose is about
     267 windows long. Bounded, both inputs cost one window's scan and the ratio is near 1; unbounded,
@@ -2412,12 +2410,9 @@ def test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs(
     **The ceiling is an absolute bound of the kind BACKLOG #2952 limit 3 asks to keep**, ten times looser than
     the old line: it passes a scan up to about 69 times today's, on the re-measured 7.25 ms. ``safe_text`` runs the whole clamp on
     this input, the name walk included."""
-    growth, large = _frame_cap_prose_growth(safe_text)
+    growth, large, small = _frame_cap_prose_growth(safe_text)
     _record_reading(
-        record_property, growth, _CPU_GROWTH_LINE, over=False, unit="ratio", large_cpu_seconds=large
-    )
-    _record_reading(
-        record_property, large, _CPU_CEILING_SECONDS, over=False, unit="cpu_s", label="ceiling"
+        record_property, growth, _CPU_GROWTH_LINE, over=False, unit="ratio", sides=(large, small)
     )
     assert growth < _CPU_GROWTH_LINE, (
         f"safe_text on the frame-cap prose cost {growth:.1f} times one window of it, over the "
@@ -2439,9 +2434,9 @@ def test_control_the_same_inputs_are_expensive_unbounded(
     the bound. **The same pair, the same clock and the same line as the arm**, so the line provably
     separates a bounded scan from an unbounded one. One rep for the large input, because a slow
     sample there only helps this assertion."""
-    growth, large = _frame_cap_prose_growth(redact, large_reps=1)
+    growth, large, small = _frame_cap_prose_growth(redact, large_reps=1)
     _record_reading(
-        record_property, growth, _CPU_GROWTH_LINE, over=True, unit="ratio", large_cpu_seconds=large
+        record_property, growth, _CPU_GROWTH_LINE, over=True, unit="ratio", sides=(large, small)
     )
     assert growth > _CPU_GROWTH_LINE, (
         f"the unbounded scan cost only {growth:.1f} times one window of it, under the "
