@@ -2985,15 +2985,15 @@ async def test_a_flapping_directory_pages_once_for_many_unreached_accounts() -> 
         await store.close()
 
 
-async def test_a_later_rollup_says_it_counts_only_the_accounts_entering() -> None:
-    """BACKLOG #3709, #3100 item 14. With seven accounts paged by a rollup, one more entering is
-    rolled up too. Its page counts only the accounts entering, as newly unreachable: no process
-    can count every account standing. It has its own source, so the notifier's cooldown on the
-    first rollup, 300 s by default, cannot swallow it. The passes between page nothing, so the
-    seven are not paged again.
+async def test_a_lone_entrant_after_a_rollup_pages_under_its_own_name() -> None:
+    """BACKLOG #3709, #3100 item 14, finding 1 of the Lander's hold on PR 3350. The rollup is
+    decided on the rows its own pass wrote, never on the accounts latched before. So with seven
+    accounts paged by a rollup, one more entering pages under its own source, naming it, rather
+    than in a one-account rollup that names nobody. The first rollup's text counts only the
+    accounts entering, as newly unreachable, and the passes between page nothing, so the seven are
+    not paged again.
 
-    RED when: the rollup's text reads as a total of the accounts standing, or the late account's
-    rollup is throttled by the earlier rollup's cooldown."""
+    RED when: the lone entrant pages in a rollup, or the latched seven page again."""
     store = await MessageStore.open(":memory:")
     try:
         names = ["ok", "late"] + [f"flap{i}" for i in range(7)]
@@ -3012,16 +3012,17 @@ async def test_a_later_rollup_says_it_counts_only_the_accounts_entering() -> Non
         for _ in range(3):
             later = await _pass(service, sink)
         assert [name for _uid, name, _n in later.unreached] == ["late"]
-        assert later.unreached_rollup
+        assert later.unreached_rollup is None, "a lone entrant was rolled up, naming nobody"
         await _drain(sink)
-        rollups = _unreached_pages(transport)
-        assert [p["detail"].split(".")[0] for p in rollups] == [
-            "Accounts newly unreachable: 7",
-            "Accounts newly unreachable: 1",
-        ], "the late account's page was throttled by the first rollup's cooldown"
-        assert rollups[0]["connection"] != rollups[1]["connection"]
-        assert "each failed 3+ of up to its last 5 probes" in rollups[1]["detail"]
-        assert all("sessions are not revoked;" in p["detail"] for p in rollups)
+        pages = _unreached_pages(transport)
+        assert [p["connection"] for p in pages] == [
+            f"{_UNREACHED_ROLLUP_SOURCE}:{first.unreached_rollup}",
+            f"{_UNREACHED_PREFIX}late",
+        ], "the late account did not page under its own name, or the seven paged again"
+        assert pages[0]["detail"].startswith("Accounts newly unreachable: 7.")
+        assert "each failed 3+ of up to its last 5 probes" in pages[0]["detail"]
+        assert pages[1]["detail"].startswith("This account's sessions are not revoked")
+        assert all("sessions are not revoked" in p["detail"] for p in pages)
     finally:
         await store.close()
 

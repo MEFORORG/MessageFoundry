@@ -1,8 +1,5 @@
-- **The rolled-up unreachable-account alert no longer reads as a total.** Where those entering
-  whose audit row was written, plus the accounts this process has latched as paged that still hold
-  a live session and a directory key and whose window has not since held only answers, are more
-  than five, those
-  entering page as one
+- **The rolled-up unreachable-account alert no longer reads as a total.** Where the accounts
+  entering on one pass whose audit row was written are more than five, they page as one
   `ad_reconcile_aborted` alert, under one source until vault BACKLOG #3100 item 14. Its text
   read "N accounts' sessions are not revoked", counting only the accounts entering on that pass,
   so a later rollup that updated the open alert replaced the count with a smaller one while more
