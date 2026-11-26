@@ -834,12 +834,13 @@ _UNSCANNABLE_RE_PATTERNS = {
     # ``_without_tails``' compiles of a shipped pattern rewritten at runtime.
     #
     # BACKLOG #8429 adds two. ``_ESCAPE_PROBE`` is a literal backslash, one escape letter or its
-    # fixed hex digits, ``_LABEL_PREFIX``'s bounded prefix and the label words, built by
-    # ``_alternation``: it starts only at a backslash, and a prefix segment cannot cross one, so the
-    # walks from two starts never overlap. ``_without_escape``'s compile, the third ``source``, is a shipped pattern with
-    # the escape start's three fixed-width lookbehinds removed, which removes start positions only.
+    # fixed hex digits, ``_LABEL_PREFIX``'s bounded prefix, the label words built by
+    # ``_alternation``, and a possessive separator: it starts only at a backslash, and a prefix
+    # segment cannot cross one, so the walks from two starts never overlap. ``_without_escape``'s
+    # compile, the third ``source``, is a shipped pattern with the escape start's fixed-width
+    # lookbehinds and its one-character lookahead removed, which removes start positions only.
     "messagefoundry/secretscrub.py": (
-        "'(?i)\\\\\\\\(?-i:[bfnrt]|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})' + _LABEL_PREFIX + '(?:' + _alternation(_CAMEL_WORDS) + ')\\\\b'",
+        "'(?i)\\\\\\\\(?-i:[bfnrt]|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})' + _LABEL_PREFIX + '(?:' + _alternation(_CAMEL_WORDS) + ')\\\\b[\\'\\\\\"]?\\\\s*+[:=]'",
         "'(?i)(-----BEGIN (?:(?!PRIVATE )[A-Z0-9]++ )*+PRIVATE KEY-----)(?P<key_body>(?:[ \\\\t]*+' + _KEY_SEPARATOR + _KEY_LINE + '[ \\\\t]*+(?=' + _KEY_SEPARATOR + '|\\\\Z))++)'",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_TOKEN_WORDS) + '))\\\\b(?:[\\'\\\\\"]\\\\s*:|\\\\s*[:=])\\\\s*' + _MARKED_SCHEME_WORDS + _BYTES_PROBE + '(?:' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_VALUE + ')' + _BEARER_TAILS",
         "'(?i)' + _LABEL_START + '(bearer)\\\\s+(?=[\\'\\\\\"]?[^\\\\s\\'\\\\\",;]{4})' + _PLAIN_SCHEME_VALUE",

@@ -971,7 +971,7 @@ def test_a_password_word_holding_a_query_credential_word_is_masked(
 def test_the_query_credential_words_are_not_kept_words() -> None:
     """No log pass reads them inside a member value: ``credential_query_params`` reads them in a
     configured URL's parameter names, and the member pass reads each as a member's whole key after
-    a ";" (BACKLOG #8429), which a member value holds only inside a closed quoted value, whose
+    a ";" (BACKLOG #8429), which a member value holds only inside a closed quoted or a braced value, whose
     words the member pass masks. A log pass reads ``key`` and ``auth``
     inside a longer label this list keeps, at least ``_KEY_LABEL_WORDS`` (``accessKey``,
     ``AccountKey``, ``authKey``), checked here. CORRECTED 2026-11-26: this read "No log pass reads

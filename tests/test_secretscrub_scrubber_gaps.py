@@ -333,3 +333,61 @@ def test_a_phi_or_query_word_glued_inside_a_password_word_is_masked(
 def test_a_quoted_member_value_closed_before_an_outer_quote_is_masked(line: str) -> None:
     for surface, apply in _SURFACES:
         assert not _printed(apply(line)), surface
+
+
+@pytest.mark.parametrize(
+    "escape",
+    ["\\n", "\\r", "\\t", "\\b", "\\f", "\\x0c", "\\u2028", "\\U0001f600", "\\N", "\\v", "\\X0C"],
+)
+def test_the_escape_probe_and_the_escape_start_read_the_same_escapes(escape: str) -> None:
+    """The probe that sends a line to the union spells the escapes again, forward; a test holds it
+    to the start, so an escape added to one and not the other goes red (code review)."""
+    text = f"x{escape}password=v"
+    at = text.index("password")
+    started = secretscrub._MEMBER_LABEL_AT.match(text, at) is not None
+    probed = secretscrub._ESCAPE_PROBE.search(text) is not None
+    assert started == probed, (escape, started, probed)
+
+
+def _patched_without(patch: pytest.MonkeyPatch, fragment: str) -> None:
+    """The three label patterns, or the member pattern, with ``fragment`` taken out."""
+    for name in ("_BEARER", "_CREDENTIAL_KV", "_KEY_MATERIAL", "_CONNECTION_STRING_MEMBER"):
+        pattern: re.Pattern[str] = getattr(secretscrub, name)
+        if fragment in pattern.pattern:
+            stripped = re.compile(pattern.pattern.replace(fragment, ""), pattern.flags)
+            patch.setattr(secretscrub, name, stripped)
+            if name == "_CONNECTION_STRING_MEMBER":
+                patch.setattr(bundle_redact, name, stripped)
+
+
+def test_the_escape_lines_print_without_the_escape_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE NEGATIVE CONTROL for section 4: with the start taken out of the label patterns, each
+    escaped line prints on scrub_credentials, so the start is what hides it."""
+    _patched_without(monkeypatch, "|" + secretscrub._ESCAPE_START)
+    for line in _ESCAPED_LINES:
+        assert _printed(scrub_credentials(line)), line
+
+
+def test_the_bare_members_print_without_their_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE NEGATIVE CONTROL for section 1: with the whole-key lookbehinds taken out, each bare
+    member prints on every surface, so they are what hide it."""
+    bare = "".join(f"|(?<=;{word})" for word in secretscrub._QUERY_CREDENTIAL_WORDS)
+    _patched_without(monkeypatch, bare)
+    for line in _BARE_MEMBERS:
+        for surface, apply in _SURFACES:
+            assert _printed(apply(line)), (surface, line)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # The value walks' stops before a later label do not take the escape start, so the
+        # earlier plain value runs over the escape label and stops at its quote.
+        repr('[db]\ntoken=abc\npassword="Zq7 Vw9Kp2"\n'),
+        # A credential that is not a ";" member keeps the glued-quote residual.
+        "login failed password=P'Zq7Vw9Kp2 x",
+    ],
+)
+def test_known_residual_prints(line: str) -> None:
+    """Pinned as printed, so a change that closes one goes red here and must move it."""
+    assert _printed(scrub_credentials(line)), line

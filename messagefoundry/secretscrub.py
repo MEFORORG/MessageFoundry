@@ -357,6 +357,11 @@ _LABEL_START = r"(?:\b|(?<=%[0-9A-Fa-f]{2}))"
 # linear, as the ``%XX`` start does. The cost is over-redaction where a path or a doubled backslash
 # puts a label word after one of those letters, the direction this module may fail in.
 #
+# IT NEVER OPENS ON A CAPITAL. The escape's last character is a lower-case letter or a digit, so
+# a capital there is a camelCase start already, and that start's same-line rule and narrowed value
+# class must apply: taken by this start first, ``x\rAuthorization=Bearer v;AccessToken: w`` ran
+# its value over the later label (code review).
+#
 # IT IS PART OF THE CAMELCASE READING, NOT OF :data:`_LABEL_START`, because alone it was a trade as
 # the other two new starts were: a seeded differential against ``origin/main`` found
 # ``\tBearer secret: v`` printing ``v``, since ``_AUTH_SCHEME`` then read the scheme word and took
@@ -371,23 +376,34 @@ _LABEL_START = r"(?:\b|(?<=%[0-9A-Fa-f]{2}))"
 # ``_AUTH_SCHEME``, ``_MEFOR_SECRET`` and the bundle's own copy of the label patterns keep their
 # starts, so ``foo\nMEFOR_X=v`` and ``foo\nBearer v`` are residuals; the bundle's second layer is
 # this module, which reads the others. Where :func:`_union` would return its reading before whole,
-# it returns the union without this start instead (:func:`_union_without_escape`), so such a line
-# reads as ``origin/main`` read it and its escape label is a residual too.
+# because the shipped reading hid a member key's ";" both readings before printed, it returns the
+# union without this start instead (:func:`_union_without_escape`), so such a line reads as
+# ``origin/main`` read it and its escape label is a residual too.
 #
 # THE UNION HOLDS FOR THIS FUNCTION'S OWN OUTPUT, NOT FOR A LATER PASS, as on the camelCase start.
 # Measured 2026-11-26 with the nine-path differential the comment on
-# :data:`_CONNECTION_STRING_MEMBER` describes, against an ``origin/main`` tree, seeds 21 to 32,
+# :data:`_CONNECTION_STRING_MEMBER` describes, against an ``origin/main`` tree, seeds 41 to 52,
 # 60,000 random lines whose pieces hold escapes before labels, camelCase and compound labels and
 # member keys after them: no line printed a planted value ``origin/main`` hid on
-# ``scrub_credentials``, ``redact_log_line`` or one handler, and 18 lines holding an escape label
+# ``scrub_credentials``, ``redact_log_line`` or one handler, and 9 lines, each holding an escape,
 # printed one on a second or third handler, a chain line the bundle read back, or the store path.
 # On those the label the start read hid a separator, a label or a PHI anchor a later pass needed,
 # so that pass no longer hid the text after it, the trade the ``%XX`` start's paragraph above
-# measures. Against it, the same run, which holds BACKLOG #8429's other changes too, hid a value
-# ``origin/main`` printed on 4,014 to 5,515 lines per path.
+# measures. The installed chain writes a real line break as the text ``\n``, so every later
+# handler of a multi-line record meets this start. A code review's denser fuzz of such lines,
+# before the start stopped opening on a capital, found about 70 lines per 100,000 printing on a
+# later path; it was not run again. Against it, the run above, which holds BACKLOG #8429's other
+# changes too, hid a value ``origin/main`` printed on 3,876 to 5,144 lines per path. That is a
+# fuzz result over its corpus, not a proof, and a shape it did not generate may print on a first
+# pass too.
+#
+# A RESIDUAL OF ITS OWN: the value walks' stops before a later label (:data:`_LABEL_HEAD`,
+# :data:`_RUN_ON_LABEL`) do not take this start, so an earlier label's plain value runs over an
+# escape label and stops at its quote: in the ``%r`` of ``token=abc\npassword="Zq7 Vw9"`` the
+# quoted password prints, while ``token=abc password="Zq7 Vw9"`` hides it.
 _ESCAPE_START = (
-    r"(?<=\\(?-i:[bfnrt]))|(?<=\\(?-i:x)[0-9A-Fa-f]{2})|(?<=\\(?-i:u)[0-9A-Fa-f]{4})"
-    r"|(?<=\\(?-i:U)[0-9A-Fa-f]{8})"
+    r"(?:(?<=\\(?-i:[bfnrt]))|(?<=\\(?-i:x)[0-9A-Fa-f]{2})|(?<=\\(?-i:u)[0-9A-Fa-f]{4})"
+    r"|(?<=\\(?-i:U)[0-9A-Fa-f]{8}))(?-i:(?![A-Z]))"
 )
 
 #: The label words a camelCase start may open on (BACKLOG #5545): every family's.
@@ -515,7 +531,7 @@ _ESCAPE_PROBE = re.compile(
     + _LABEL_PREFIX
     + r"(?:"
     + _alternation(_CAMEL_WORDS)
-    + r")\b"
+    + r")\b['\"]?\s*+[:=]"
 )
 
 # A QUOTED value span, for the two quoting forms a credential value actually arrives in (BACKLOG
@@ -2033,11 +2049,12 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # paths. BACKLOG #8429's changes, the whole-key query-credential words, the quoted and
 # placeholder-quote values and the narrower kept-word rule, were measured by a smaller run of the
 # same differential against an ``origin/main`` tree, the comment on :data:`_ESCAPE_START` gives
-# the run. On a first pass it printed nothing ``origin/main`` hid. On a later path it printed 19
-# lines: 18 hold a label after a backslash escape, and 1 an upper case ``MFB64:v1:`` marker the
-# mask now keeps, whose body the chain's carriage pass then took with a ``MEFOR_`` label in it.
-# Kept only in lower case, the marker printed a body on ``;auth=MFB64:v1:...`` the same way, the
-# other side of that trade. The seeded sample in the tests holds the new pieces.
+# the run. On a first pass it printed nothing ``origin/main`` hid; every line it printed on a
+# later path holds a backslash escape. An earlier run of seeds 21 to 32 printed one more line on a
+# later path, with no escape: an upper case ``MFB64:v1:`` marker the mask now keeps, whose body the
+# chain's carriage pass then took with a ``MEFOR_`` label in it. Kept only in lower case, the
+# marker printed a body on ``;auth=MFB64:v1:...`` the same way, the other side of that trade. The
+# seeded sample in the tests holds the new pieces.
 #
 # THE COST, at least these. Every character of the value outside a word prints as it was: its
 # spaces, its punctuation and symbols, ASCII ones such as "@" and "!" and non-ASCII ones such
@@ -2076,10 +2093,10 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # first, such as ``;PWD=``, has that pass end its value at the quote and write its placeholder, so
 # ``;PWD=P'Kv9_Sec;`` printed ``Kv9_Sec`` while this pass stopped there. Spaces and then one quote
 # may open it, and a value that opens with a quote and closes on its line, before a space, a ";",
-# ",", a closing bracket, a quote, ">" or the end, is taken to that closer, over any ";" inside it
-# (a quote and ">" since code review: a connection string inside a JSON string or a repr)
-# (BACKLOG
-# #8429): ``;sslpassword='a;b c' refused`` printed ``b c``. Stopping at a later quote costs
+# ",", a closing bracket, a quote, "<", ">", "&", "|" or the end, is taken to that closer, over
+# any ";" inside it (BACKLOG #8429): ``;sslpassword='a;b c' refused`` printed ``b c``, and code
+# review found the same inside a JSON string, a repr, an XML element, a query and an HL7 field.
+# A JSON-escaped quote (``\"``) does not close it. Stopping at a later quote costs
 # nothing the builder sends, since every ``odbc_params`` value refuses quotes,
 # and it keeps the rest of a quoted echo (``'...;PWD=a b' refused``) readable. A braced value is
 # taken by ``_ODBC_BRACED`` with its body kept to one line, and then on to the same stops, so
@@ -2110,8 +2127,8 @@ _MEMBER_EXTRA_WORDS = ("token",)
 #   (``a%7Cb%7Cc;sslpassword=x y``). :mod:`messagefoundry.redaction` runs first and replaces the
 #   whole token, ";" and all, so the value's tail after a space prints, as it did before #5030;
 # * a quoted value that holds a ";" and does not close before a space, a ";", ",", a closing
-#   bracket, a quote, ">" or the end (``;sslpassword="a;b"c``), which the value stops at, so the text after the
-#   ";" prints, as it did before #5030. The builder refuses a quote and a ";" in such a value;
+#   bracket, a quote, "<", ">", "&", "|" or the end (``;sslpassword="a;b"c``), or that closes
+#   on a JSON-escaped quote, which the value stops at, so the text after the ";" prints, as it did before #5030. The builder refuses a quote and a ";" in such a value;
 # * a key that only ends in a query-credential word (``;SharedAccessSignature=``, ``;ApiKey=``
 #   aside, which a label pass reads), and such a word as a URL query parameter (``&sig=``) or a
 #   bare ``key=`` in prose, which no pass here reads, by design (:data:`_QUERY_CREDENTIAL_WORDS`).
@@ -2130,7 +2147,7 @@ _CONNECTION_STRING_MEMBER = re.compile(
     r"|(?<=secret)|(?<=credential)|(?<=token)"
     r"|(?<=;key)|(?<=;sig)|(?<=;signature)|(?<=;auth)|(?<=;jwt)))="
     r"(\{(?:[^}\r\n]|\}\})*+\}(?!\})(?:[^;'\"\r\n]|(?<=\w)['\"](?=\w))*+|\{[^\r\n]*"
-    r"|[ \t]*+(?:'[^'\r\n]*+'|\"[^\"\r\n]*+\")(?=[\s;,)\]}'\">]|\Z)"
+    r"|[ \t]*+(?:'[^'\r\n]*+'|\"[^\"\r\n]*+\")(?=[\s;,)\]}'\"<>&|]|\Z)"
     r"|[ \t]*+['\"]?(?:[^;'\"\r\n]|(?<=\w)['\"](?=\w)"
     r"|(?<==<redacted>|=\[REDACTED\]|=\[redacted\])['\"](?=\w))++)"
 )
@@ -2154,7 +2171,7 @@ _CONNECTION_STRING_MEMBER = re.compile(
 #: URL's parameter names. A log pass reads ``key`` and ``auth`` inside a longer label this list
 #: keeps, at least the key-label words above, and the member pass reads each word as a member's
 #: whole key after a ";" (BACKLOG #8429), which a member value holds only inside a closed quoted
-#: value, whose words this pass masks. CORRECTED 2026-11-26: this said a log pass reads ``key`` and ``auth``
+#: or a braced value, whose words this pass masks. CORRECTED 2026-11-26: this said a log pass reads ``key`` and ``auth``
 #: ONLY inside a longer label. Kept alone, they kept a password word that held one before a ":" or
 #: "=", so ``;sslpassword=Monkey:Banana42;`` printed ``Monkey``.
 #: ``tests/test_connection_string_member_scrub.py`` holds this to those sources.
@@ -3456,7 +3473,7 @@ def _union(
     escaped = escape and _holds_escape_label(text)
     before = _Trace(len(text), _pre_camel)
     shipped = _Trace(len(text), _same if read is None else read)
-    unescaped = _Trace(len(text), _escape_free(read))
+    unescaped = _Trace(len(text), _escape_free(read)) if escaped else before
     try:
         # The shortcut is decided on the reading before WITHOUT the widened DSN pass, as it was
         # before BACKLOG #5386 widened that reading. Decided on the widened one, a line where that
