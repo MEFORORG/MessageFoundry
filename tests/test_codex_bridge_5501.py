@@ -4,14 +4,14 @@
 
 BACKLOG #5501: the tracked-settings tests dispatch over the repository's own .claude/settings.json
 rather than a synthetic one, with the hook process stubbed. For each tracked group, probed with a
-Claude Code tool name or event the test picks, they check that the bridge runs exactly the hooks of
-the groups that match, each with the argv Claude Code would run, a command-only hook with no args
-included. A stubbed exit 1 raises CalledProcessError and a stubbed exit 2 raises HookBlocked, so
-the two stay distinct. On this bridge both end the event at once: no later hook runs.
+Claude Code tool name or event the test picks, they check that the bridge runs the hooks of the
+groups the test's own matcher reading selects, each with the argv the test expects, a command-only
+hook with no args included. On PreToolUse a stubbed exit 1 raises CalledProcessError and a stubbed
+exit 2 raises HookBlocked, so the two stay distinct as exceptions. This file does not show they
+stay distinct at the process exit code, and does not cover SessionStart, which handles both apart.
 
-The exit-2 test uses synthetic settings and real hook processes. It came from the withdrawn
-BACKLOG #5496 section of this branch, where it pinned the one fault that change did not let later
-hooks run past.
+The exit-2 test uses synthetic settings and real hook processes: on PreToolUse an exit 2 ends the
+event before a later hook runs. It came from the withdrawn BACKLOG #5496 section of this branch.
 """
 
 from __future__ import annotations
@@ -165,7 +165,8 @@ def test_every_tracked_hook_is_dispatched_with_its_claude_argv(
         bridge.dispatch(root, payload)
         for hook in group["hooks"]:
             assert _expected_argv(root, hook) in calls, (payload, hook)
-        # Exactly the matching groups' hooks, once each: a bridge that over-matches fails here.
+        # Exactly the selected groups' hooks, once each: a bridge that runs a group the test's
+        # matcher reading does not select fails here.
         assert sorted(calls) == sorted(_matched_argvs(root, event, payload)), payload
 
 
