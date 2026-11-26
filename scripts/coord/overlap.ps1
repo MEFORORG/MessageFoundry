@@ -334,7 +334,7 @@ if ($LASTEXITCODE -eq 0 -and $omOut) { $originMain = ([string]$omOut).Trim() }
 $termCache = @{}
 try {
     if (Test-Path -LiteralPath $termCacheFile) {
-        $tc = Get-Content $termCacheFile -Raw -EA Stop | ConvertFrom-Json -EA Stop
+        $tc = Get-Content -LiteralPath $termCacheFile -Raw -EA Stop | ConvertFrom-Json -EA Stop
         foreach ($p in $tc.PSObject.Properties) { $termCache[$p.Name] = @($p.Value) }
     }
 } catch { $termCache = @{} }   # unreadable memo is a slow walk, not a wrong one
@@ -486,8 +486,8 @@ function Format-Census($C) {
     # "task(s)", never "task file(s)". tests/test_coord_overlap_attribution.py selects the changed-file
     # line by searching every line for the substring "file(s)", so a census that spelled the unit out
     # would be picked up as a file count and asserted against a rule written for a different sentence.
-    $ages = "newest task " + $(if ($C.TaskNewest) { ([datetime]$C.TaskNewest).ToString("yyyy-MM-dd HH:mm") } else { "none" }) +
-            ", newest seat record " + $(if ($C.SeatNewest) { ([datetime]$C.SeatNewest).ToString("yyyy-MM-dd HH:mm") } else { "none" })
+    $ages = "newest task " + $(if ($C.TaskNewest) { ([datetime]$C.TaskNewest).ToString("yyyy-MM-dd HH:mm", [cultureinfo]::InvariantCulture) } else { "none" }) +
+            ", newest seat record " + $(if ($C.SeatNewest) { ([datetime]$C.SeatNewest).ToString("yyyy-MM-dd HH:mm", [cultureinfo]::InvariantCulture) } else { "none" })
     $lines = @(
         "work signal: read $($C.TaskFiles) task(s) across $($C.StoresPresent) of $($C.StoresConfigured) task store(s) " +
         "and $($C.SeatRecords) seat record(s); $ages."
@@ -957,9 +957,26 @@ function Build-Map {
 # --- cache -------------------------------------------------------------------------------------
 $map = $null
 if (-not $Refresh -and (Test-Path -LiteralPath $cacheFile)) {
-    try {
-        $c = Get-Content $cacheFile -Raw -EA Stop | ConvertFrom-Json -EA Stop
-        $age = ((Get-Date) - [datetime]::Parse($c.at)).TotalSeconds
+    # A cache that is missing, locked or not JSON is a silent miss: that is ordinary churn. -LiteralPath,
+    # as on the write: a `[` in the path is a wildcard class to a positional Get-Content, which would
+    # make every read a silent miss while the writes kept succeeding.
+    $c = try { Get-Content -LiteralPath $cacheFile -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { $null }
+    # THE STAMP IS ISO-8601 AND IS READ CULTURE-INVARIANTLY. ConvertFrom-Json hands it back as a
+    # [datetime]; `[datetime]::Parse` once took that, rendered it as an invariant-culture string, and
+    # re-parsed it under the CURRENT culture, which threw under th-TH, fi-FI and ar-SA (and can misdate
+    # elsewhere), and a catch-all turned the throw into a cache that silently never hit. The `[datetime]`
+    # CAST passes a [datetime] through and parses a string with InvariantCulture, throwing on garbage.
+    # NOT `-as [datetime]`: that operator is culture-sensitive (measured: null or year 1483 under th-TH).
+    #
+    # Still caught, because a caller's strict mode reaches this scope and turns a field an older cache
+    # lacks into a throw; but every miss past the read is reported on stderr, never silent. The census
+    # is restored on a miss, so a merge that threw halfway cannot leave cached counts under a fresh walk.
+    if ($c) { $censusBefore = [ordered]@{}; foreach ($k in @($script:Census.Keys)) { $censusBefore[$k] = $script:Census[$k] }; try {
+        $stamp = [datetime]$c.at
+        # In UTC on both sides. A zone-less (Unspecified) stamp is read as LOCAL, which is how this
+        # script writes it: `ToString("o")` of a local time carries its offset, and a stamp with none is
+        # not one it wrote.
+        $age = ([datetime]::UtcNow - $stamp.ToUniversalTime()).TotalSeconds
         # Bound BOTH ways: a cache stamped in the future (clock skew, or a file copied between boxes)
         # would otherwise look eternally fresh and pin a stale map forever.
         #
@@ -981,7 +998,11 @@ if (-not $Refresh -and (Test-Path -LiteralPath $cacheFile)) {
             # A cache written before this field existed reads back null and the census says so.
             if ($c.census) { foreach ($k in @($script:Census.Keys)) { if ($null -ne $c.census.$k) { $script:Census[$k] = $c.census.$k } } }
         }
-    } catch { $map = $null }
+    } catch {
+        $map = $null
+        $script:Census = $censusBefore
+        [Console]::Error.WriteLine("overlap.ps1: cache not used ($($_.Exception.GetType().Name)); re-walking.")
+    } }
 }
 if ($null -eq $map) {
     # @() for the SAME reason Write-JsonArray filters nulls, at the other end of the same round trip.
@@ -1055,13 +1076,22 @@ function Write-PartialBanner {
 
 # --- single-file query (the hook's fast path) ----------------------------------------------------
 if ($File) {
-    $q = $File
-    if ([System.IO.Path]::IsPathRooted($q)) {
-        $qn = ConvertTo-Norm $q
-        $rn = "$myRootNorm/"
-        if ($qn.StartsWith($rn)) { $q = $qn.Substring($rn.Length) } else { $q = $qn }
+    # ONE SPELLING PER FILE. A -File typed the way a shell tab-completes it at the repo root (`.\docs\x.md`), or carrying
+    # a `.` or `..` segment, names the same file git reports as `docs/x.md`, and an exact `-contains`
+    # against git's spelling once missed every such form, so the gate read a real collision as an
+    # all-clear. GetFullPath resolves the query the way Windows does, against the REPO ROOT (a relative
+    # -File is repo-relative, as the usage line above shows, not relative to the caller's directory), and
+    # the root is then stripped. A `..` that climbs out of the repo leaves the path outside the root, so it
+    # matches nothing. Only the query is resolved: git's own paths are already clean. Backslashes flip
+    # first so the resolution also holds where `\` is not a separator, and the prefix test is ordinal.
+    $q = $File -replace '\\', '/'
+    try { $q = [System.IO.Path]::GetFullPath($q, $myRoot) }
+    catch [System.ArgumentException] {
+        [Console]::Error.WriteLine("overlap.ps1: -File could not be resolved against the repo root; matching it as typed.")
     }
     $q = ConvertTo-Norm $q
+    $rn = "$myRootNorm/"
+    if ($q.StartsWith($rn, [System.StringComparison]::Ordinal)) { $q = $q.Substring($rn.Length) }
     $hits = @()
     foreach ($r in $map) {
         if (@($r.Files | ForEach-Object { ConvertTo-Norm $_ }) -contains $q) {

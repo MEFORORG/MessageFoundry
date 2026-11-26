@@ -981,12 +981,20 @@ from typing import Any
 #: digest moved. No engine surface changed. Re-derived with ``--write``, from
 #: ``a888b8fed812bbe6`` to ``c5417861cbb1bd67``.
 #:
+#: BACKLOG #6886: the console imports ``StoredPasskeysUnreadable``, which
+#: ``AuthService.begin_webauthn_assertion`` now raises for an account whose passkeys under the
+#: relying party all have stored ids that do not decode, and shows its own notice for it. Before,
+#: that leg let the decode error escape, a 500. A console built against the old seam
+#: would meet that exception unhandled, so the seam moves. Re-derived with ``--write``, from
+#: ``c5417861cbb1bd67`` to ``7802871bd39526f1``, and over the merge with BACKLOG #5930 above, from
+#: ``7802871bd39526f1`` to ``2fdef0ec34ace13d``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "46614ee1fc6617d6"
+ENGINE_UI_SEAM: str = "2fdef0ec34ace13d"
 
 
 @dataclass(frozen=True, slots=True)

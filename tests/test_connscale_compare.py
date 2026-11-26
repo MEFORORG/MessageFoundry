@@ -13,7 +13,7 @@ from harness.load.connscale.compare import (
     COLLAPSE_PASS,
     build_comparison,
 )
-from harness.load.connscale.report import ConnScaleRecord, NoLoss
+from harness.load.connscale.report import ConnScaleRecord, NoLoss, SandboxReading
 
 
 def _record(
@@ -462,3 +462,67 @@ def test_an_inconclusive_arm_is_labelled_inconclusive_not_a_breach() -> None:
     assert cmp is not None and len(cmp.rows) == 1
     assert not cmp.rows[0].ok
     assert _loss_label(cmp.rows[0]).startswith("CANDIDATE INCONCLUSIVE")
+
+
+_SUBPROCESS = SandboxReading(requested="subprocess", effective="subprocess", startup_seconds=1.0)
+
+
+def test_the_ab_table_names_its_sandbox_arm_bug_5090() -> None:
+    # `--report-compare` writes this table; it named no sandbox arm, so a subprocess-arm A/B read
+    # the same as an in-process one.
+    recs = [
+        dataclasses.replace(
+            _record(claim_mode=mode, count=500, achieved_read=400.0, idle_poll=idle),
+            sandbox=_SUBPROCESS,
+        )
+        for mode, idle in (("per_lane", 100.0), ("pooled", 0.0))
+    ]
+    cmp = build_comparison(recs, ("per_lane", "pooled"))
+    assert cmp is not None
+    assert cmp.ok
+    assert cmp.sandbox_arms == ("subprocess",)
+    assert "\nsandbox: subprocess\n" in cmp.render_table()
+    assert cmp.to_json_dict()["sandbox_arms"] == ["subprocess"]
+
+
+def test_a_record_with_no_sandbox_reading_names_no_arm_bug_5090() -> None:
+    # A record with no SandboxReading (a batch-box record) once read as "sandbox: off", an arm nobody
+    # read. It reads as not recorded.
+    recs = [
+        _record(claim_mode="per_lane", count=500, achieved_read=400.0, idle_poll=100.0),
+        _record(claim_mode="pooled", count=500, achieved_read=400.0, idle_poll=0.0),
+    ]
+    cmp = build_comparison(recs, ("per_lane", "pooled"))
+    assert cmp is not None
+    assert cmp.sandbox_arms == ("not recorded",)
+    assert "\nsandbox: not recorded\n" in cmp.render_table()
+    assert "sandbox: off" not in cmp.render_table()
+
+
+_OFF = SandboxReading(requested="off", effective="off", startup_seconds=None)
+
+
+def test_records_from_two_sandbox_arms_fail_the_ab_rather_than_pool_bug_5090() -> None:
+    # No cell is keyed on the sandbox arm, so two arms' records would pool into one cell. A profile
+    # cannot produce this (a sandbox A/B composes with no other), so the comparison refuses it.
+    recs = [
+        dataclasses.replace(
+            _record(claim_mode="per_lane", count=500, achieved_read=400.0, idle_poll=100.0),
+            sandbox=_OFF,
+        ),
+        dataclasses.replace(
+            _record(claim_mode="pooled", count=500, achieved_read=400.0, idle_poll=0.0),
+            sandbox=_OFF,
+        ),
+        dataclasses.replace(
+            _record(claim_mode="per_lane", count=500, achieved_read=400.0, idle_poll=100.0),
+            sandbox=_SUBPROCESS,
+        ),
+    ]
+    cmp = build_comparison(recs, ("per_lane", "pooled"))
+    assert cmp is not None
+    assert all(row.ok for row in cmp.rows)  # the control: only the mixture fails it
+    assert not cmp.ok
+    assert cmp.sandbox_arms == ("off", "subprocess")
+    assert "SANDBOX ARMS MIXED (off, subprocess) -> the A/B FAILS" in cmp.render_table()
+    assert any("[sandbox] arms" in n for n in cmp.notes)

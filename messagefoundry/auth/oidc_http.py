@@ -44,7 +44,7 @@ import urllib.request
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from messagefoundry.auth.oidc.jwks import _MAX_JWKS_BYTES
+from messagefoundry.auth.oidc.jwks import _MAX_JWKS_BYTES, IDP_TIMEOUT_SECONDS
 from messagefoundry.auth.trust_anchors import oidc_anchor_spec, verified_anchor_cadata
 from messagefoundry.config.tls_policy import (
     harden_cipher_suites,
@@ -80,9 +80,12 @@ __all__ = [
 _JWKS_CODED = "JWKS response is in a content coding the engine does not decode"
 _JWKS_MISFRAMED = "JWKS response framed its body length ambiguously"
 
-#: Wall-clock bound for a single IdP HTTP round trip. Deliberately short: both legs run inside a
-#: browser request, and a hung IdP must degrade the federated login, never pin a worker thread.
-DEFAULT_IDP_TIMEOUT_SECONDS = 10.0
+#: The urllib ``timeout`` for the JWKS fetch, which bounds each socket operation (the connect and
+#: each read), not the round trip as a whole. Deliberately short: the fetch runs inside a browser
+#: request, and a hung IdP must degrade the federated login. Defined in ``jwks`` as
+#: ``IDP_TIMEOUT_SECONDS``, because that module also bounds its gate wait by it and cannot import
+#: this one. The token endpoint leg keeps its own 10 s default in ``flow.exchange_code``.
+DEFAULT_IDP_TIMEOUT_SECONDS = IDP_TIMEOUT_SECONDS
 
 
 class IdpReplyError(http.client.HTTPException):

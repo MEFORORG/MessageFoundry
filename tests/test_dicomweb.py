@@ -1323,7 +1323,8 @@ async def test_dicomweb_the_pre_read_writes_its_held_lines_with_the_first_read_f
 ) -> None:
     # Where the read raises a fault the codec does not wrap, the lines pydicom logged on the way
     # are written with the first WARNING, so it has its reason in the log; they pass the same
-    # redacting filter. A later read's lines are dropped, as its WARNING is.
+    # default-deny filter, so a line no template pins is written withheld. A later read's lines
+    # are dropped, as its WARNING is.
     pytest.importorskip("pydicom")
     from messagefoundry.transports import dicomweb
 
@@ -1342,7 +1343,7 @@ async def test_dicomweb_the_pre_read_writes_its_held_lines_with_the_first_read_f
         assert await dest.send(PAYLOAD) is None
         assert await dest.send(PAYLOAD) is None
     assert [r.getMessage() for r in caplog.records if r.name == "pydicom"] == [
-        "synthetic pydicom line before the fault"
+        "pydicom WARNING line withheld: it matches no pinned template"
     ]
     assert len(opener.requests) == 2
 
@@ -1373,6 +1374,50 @@ async def test_dicomweb_the_pre_read_drops_its_held_lines_on_the_other_exits(
         else:
             assert await dest.send(PAYLOAD) is None
     assert caplog.records == []
+
+
+async def test_dicomweb_the_pre_read_puts_a_replaced_record_factory_back(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A host that replaced the log record factory after the import has it put back before the
+    # DICOMweb read, over the host's own, as the SCP start, each C-STORE and each SCU association
+    # do, so a pydicom logger with no filter on it is screened during the read too (BACKLOG #6637).
+    pytest.importorskip("pydicom")
+    from messagefoundry.transports import dicom as dicom_module
+    from messagefoundry.transports import dicomweb
+
+    in_force: list[object] = []
+    unlisted = "pydicom.unlisted_probe_6637"
+    assert dicom_module._PEER_VALUE_FILTER not in logging.getLogger(unlisted).filters  # control
+
+    def host(*args: object, **kwargs: object) -> logging.LogRecord:
+        return logging.LogRecord(*args, **kwargs)  # type: ignore[arg-type]
+
+    def parse(data: bytes) -> object:
+        in_force.append(logging.getLogRecordFactory())
+        logging.getLogger(unlisted).warning("synthetic unlisted line PAYLOAD-MARKER-6637")
+        raise DicomPeekError("synthetic parse failure")
+
+    monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: True)
+    monkeypatch.setattr(DicomPeek, "parse", staticmethod(parse))
+    dest = _dest()
+    dest._opener = _FakeOpener(body=STORED_OK.encode(), status=200)  # type: ignore[assignment]
+    original = logging.getLogRecordFactory()
+    caplog.clear()
+    try:
+        logging.setLogRecordFactory(host)
+        with caplog.at_level(logging.WARNING):
+            assert await dest.send(PAYLOAD) is None
+    finally:
+        logging.setLogRecordFactory(original)
+        logging.Logger.manager.loggerDict.pop(unlisted, None)  # the probe logger is the test's own
+    assert len(in_force) == 1  # control: the read ran
+    factory = in_force[0]
+    assert isinstance(factory, dicom_module._ScreeningRecordFactory)
+    assert factory._previous is host  # the host's factory is wrapped, not dropped
+    assert [r.getMessage() for r in caplog.records if r.name == unlisted] == [
+        f"{unlisted} WARNING {dicom_module._LINE_WITHHELD}"
+    ]
 
 
 def test_dicomweb_the_pre_read_object_does_warn_through_pydicom(

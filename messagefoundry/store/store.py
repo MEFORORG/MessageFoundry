@@ -103,7 +103,7 @@ from messagefoundry.credential import constant_time_equal
 from messagefoundry.logging_guard import _last_resort
 from messagefoundry.parsing.binary import doc_ref_addresses_in_hl7 as _doc_ref_addresses_in_hl7
 from messagefoundry.parsing.binary import may_hold_doc_ref as _may_hold_doc_ref
-from messagefoundry.redaction import json_loads_or_refusal, safe_text
+from messagefoundry.redaction import engine_text_only, json_loads_or_refusal, safe_text
 from messagefoundry.service_status import _system_exe
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
@@ -1818,6 +1818,12 @@ def _refusal_key(refusal: _RevokeSealRefusal) -> tuple[object, ...]:
     return ("refusal", refusal.unverifiable, refusal.kind, refusal.ident)
 
 
+#: The note :meth:`RevokeSealOutcome.committing` adds to a failure of the report it runs after the
+#: revoke committed, so a caller can tell a revoke that landed from one that rolled back (BACKLOG
+#: #5093): ``admin-revoke-sessions`` reads it.
+REVOKE_COMMITTED_NOTE = "raised by the report after the revoke committed"
+
+
 @dataclass
 class RevokeSealOutcome:
     """What one revoke's sealed writes met (decision d20261109T200352805-599b24 on ADR 0217, items
@@ -1847,7 +1853,8 @@ class RevokeSealOutcome:
         known, on every exit (decision d20261110T063908944-857965, item 6).
 
         **On a clean exit** the revoke has committed, and :meth:`report` runs here, so no path
-        between the commit and a separate call can skip it.
+        between the commit and a separate call can skip it. A failure of that report carries
+        :data:`REVOKE_COMMITTED_NOTE`, since the revoke it reports on has landed (BACKLOG #5093).
 
         **If the transaction raises**, the report says the revoke failed before its commit was
         confirmed, rather than that it went ahead, and the exception propagates (decision
@@ -1883,7 +1890,11 @@ class RevokeSealOutcome:
         carry = _REVOKE_CARRY.get()
         if carry is not None and not carry.closed:
             carry.covered_by(self)
-        await self.report(record_audit)
+        try:
+            await self.report(record_audit)
+        except Exception as exc:
+            exc.add_note(REVOKE_COMMITTED_NOTE)
+            raise
 
     def refused(self, exc: Exception, *, what: str, kind: str, ident: str) -> None:
         """Take one refusal :func:`revoke_seal_refusals` names, which the revoke goes ahead without.
@@ -2653,6 +2664,13 @@ def new_session_record(
     )
 
 
+def _reanchored(stored: str | None, client: str | None) -> str | None:
+    """A session's address after a proof from ``client``: ``client``, or the stored one when it is
+    ``None`` (WP-L3-13). The one rule both :func:`reauth_stamp` and :func:`mfa_stamp` move the
+    anchor by (vault BACKLOG #2964 item 30)."""
+    return stored if client is None else client
+
+
 def reauth_stamp(
     now: float, client: str | None, idp_auth_time: float | None
 ) -> Callable[[SessionRecord], SessionRecord]:
@@ -2671,7 +2689,7 @@ def reauth_stamp(
         return replace(
             s,
             reauth_at=when,
-            client=s.client if client is None else client,
+            client=_reanchored(s.client, client),
             idp_auth_time=forward,
         )
 
@@ -2707,7 +2725,7 @@ class _MfaStamp:
         return replace(
             s,
             mfa_verified_at=self._when,
-            client=s.client if anchor.client is None else anchor.client,
+            client=_reanchored(s.client, anchor.client),
             reauth_at=self._when if anchor.open_window else None,
         )
 
@@ -4587,18 +4605,26 @@ def passkey_is_way_past(cred: WebAuthnCredential) -> bool:
     """Whether one passkey can be a way past the sign-in lock: recorded as discoverable, AND stored
     under today's credential-id hash scheme, the only key the sign-in looks a passkey up by (BACKLOG
     #3423). A row the start-up rehash has not moved (a bare digest), or one it refused (an unknown
-    tag, a malformed value), can never sign in, so it is no way past however it is recorded. The one
-    statement of the per-passkey way-past rule: at least the store's conditional writes, the census,
-    the service's gates, the sign-in path and the lock notice ask it. The census's reset list asks
-    only its hash-scheme half for a directory account's second factor, which needs no discoverable
-    record (:func:`~messagefoundry.auth.tokens.credential_id_hash_is_current`)."""
+    tag, a malformed value), can never sign in, so it is no way past however it is recorded. Nor is
+    one whose stored ``public_key`` does not decode, which the verify refuses (BACKLOG #6886). A
+    hash that reads back as bytes counts as the text it holds, as the sign-in's compare does. A
+    stored ``credential_id`` is not asked: the combined sign-in names no credential up front and
+    finds the passkey by the hash of the id the browser sends. Those stored-cell checks are
+    :func:`~messagefoundry.auth.tokens.stored_passkey_is_readable`.
+
+    The one statement of the per-passkey way-past rule: at least the store's conditional writes,
+    the census, the service's gates, the sign-in path and the lock notice ask it. The census's reset
+    list asks only its stored-cell half for a directory account's second factor, which needs no
+    discoverable record, and adds that the stored id decodes, which that leg's allow list needs."""
     if not cred.discoverable:
         return False
     # Lazy: a leaf module of the auth package (stdlib only), imported where the rule is asked so
     # the store module takes no import-time dependency on the auth package.
-    from messagefoundry.auth.tokens import credential_id_hash_is_current
+    from messagefoundry.auth.tokens import stored_passkey_is_readable
 
-    return credential_id_hash_is_current(cred.credential_id_hash)
+    return stored_passkey_is_readable(
+        credential_id_hash=cred.credential_id_hash, public_key=cred.public_key
+    )
 
 
 #: The caller's rule for which passkey counts as a way past at a factor-drop gate (BACKLOG #3937):
@@ -5522,6 +5548,31 @@ def scope_withdrawal(expected_scope: str, now: float) -> UserChange:
             return None
         return r.changed(
             channel_scope=None, channel_scope_source=SCOPE_SOURCE_AD, updated_at=float(now)
+        )
+
+    return apply
+
+
+def ad_scope_replacement(
+    scope_json: str,
+    expected_scope: str | None,
+    expected_source: ChannelScopeSource | None,
+    now: float,
+) -> UserChange:
+    """``set_ad_channel_scope_if_unchanged``'s compare-and-set (BACKLOG #6887): write the
+    directory's scope, marked ``ad``, only while the row still holds ``expected_scope`` AND
+    ``expected_source`` exactly (``None`` matching NULL). Both, because the AD sign-in decides from
+    both: the value decides whether the write changes the scope, which is what triggers its revoke,
+    and the source decides whether an unchanged value still needs taking over. The compare is
+    Python's, so it is byte-exact on every backend, as :func:`scope_withdrawal`'s is."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if r.row.channel_scope != expected_scope:
+            return None
+        if r.row.channel_scope_source != expected_source:
+            return None
+        return r.changed(
+            channel_scope=scope_json, channel_scope_source=SCOPE_SOURCE_AD, updated_at=float(now)
         )
 
     return apply
@@ -9180,6 +9231,18 @@ def forget_store_salt(path: Path) -> bool:
     )
 
 
+class _ClosedStoreWriteError(sqlite3.OperationalError):
+    """:func:`_write_closed_store`'s own refusal, whose text the engine wrote: the store's path,
+    the journal mode SQLite reported and a fixed sentence, never a row's value or SQLite's message.
+    Marked :func:`~messagefoundry.redaction.engine_text_only`, so a renderer that withholds a
+    database driver's message keeps it (vault BACKLOG #8153). ``safe_exc`` and the DR reasons show
+    it as ``OperationalError``; a traceback names this class itself.
+    Still a ``sqlite3.OperationalError``, so every handler that caught one catches it."""
+
+
+engine_text_only(_ClosedStoreWriteError, named_as_driver=True)
+
+
 def _write_closed_store[T](
     path: Path,
     write: Callable[[sqlite3.Connection], T],
@@ -9201,7 +9264,7 @@ def _write_closed_store[T](
     try:
         mode = str(conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]).lower()
         if mode != "delete":
-            raise sqlite3.OperationalError(
+            raise _ClosedStoreWriteError(
                 f"could not take {path} out of WAL mode (it is still {mode!r}); another "
                 f"connection holds it, so {what}"
             )
@@ -9209,14 +9272,14 @@ def _write_closed_store[T](
     finally:
         conn.close()
     if wal.exists() and wal.stat().st_size:
-        raise sqlite3.OperationalError(f"{wal} still holds changes after leaving WAL mode")
+        raise _ClosedStoreWriteError(f"{wal} still holds changes after leaving WAL mode")
     proof = sqlite3.connect(_sqlite_readonly_uri(str(path.absolute())), uri=True)
     try:
         proven = prove(proof)
     finally:
         proof.close()
     if not proven:
-        raise sqlite3.OperationalError(f"{path} {proof_failed}")
+        raise _ClosedStoreWriteError(f"{path} {proof_failed}")
     return result
 
 
@@ -9267,7 +9330,11 @@ def write_restore_marker(
     The sessions are ended here too, in the same transaction as the marker, because a revoke
     needs no key: so no path that honours a session without consuming the marker, such as an
     older build started on the file, gets the archive's sessions back. The first start still
-    raises every account's session epoch, which needs the key, and adds this count to its own.
+    revokes as :meth:`MessageStore.revoke_all_sessions` does, raising the global session epoch
+    and each account's, the second of which needs the key, and adds this count to its own. An
+    account goes without its own raise where :func:`raise_account_epoch` says, at least on a seal
+    refusal and after a Vault Transit outage trips the revoke; the global epoch still ends its
+    sessions.
 
     It is proven in the main file as :func:`forget_store_salt`'s drop is, through
     :func:`_write_closed_store`: a non-empty ``-wal`` beside it, or a re-read that finds no row
@@ -10394,6 +10461,14 @@ row locks (and on SQLite the writer lock). It runs BEFORE the audit chain's lock
 not read chain state."""
 
 
+type InjectAudit = Callable[[str], AuditAppend]
+"""An operator inject's :data:`OperatorAudit`, built from the new message id (BACKLOG #6589).
+
+It returns a row every time: an inject always writes a message, so it always records one, and
+:func:`require_ingress_audit` refuses a ``None`` row at runtime. Typed apart from
+:data:`OperatorAudit` so mypy refuses, at a typed caller, an inject audit that may build none."""
+
+
 def no_audit_row(_result: object) -> None:
     """An :data:`OperatorAudit` that records nothing, for a write whose caller records it itself.
 
@@ -10882,35 +10957,54 @@ def require_mutation_audit[R](audit: OperatorAudit[R], mutation: str) -> Operato
 OPERATOR_ORIGINS: Final = frozenset({MessageOrigin.OPERATOR_EDIT, MessageOrigin.OPERATOR_UPLOAD})
 
 
-def require_ingress_audit(
-    audit: OperatorAudit[str] | None, origin: MessageOrigin
-) -> OperatorAudit[str] | None:
-    """``enqueue_ingress``'s refusal (BACKLOG #5071), and the audit it then runs.
+def is_origin_actor(value: object) -> TypeGuard[str]:
+    """Whether ``value`` can name the user behind an operator origin (BACKLOG #6589): a non-blank
+    string with no surrounding whitespace. The rule :func:`require_ingress_audit` applies, exposed
+    so a caller can refuse first, as the upload resend route does."""
+    return isinstance(value, str) and bool(value) and value == value.strip()
 
-    Before anything is written, an operator origin with no audit or with one that is not callable,
-    and an audit given with any other origin, raise :class:`TypeError`. The audit must also build
-    a row: an inject always writes a message, so a ``None`` row raises inside the transaction and
-    rolls the inject back. A live receipt keeps the default ``partner`` origin and passes none.
+
+def require_ingress_audit(
+    audit: OperatorAudit[str] | None, origin: MessageOrigin, origin_actor: str | None
+) -> InjectAudit | None:
+    """``enqueue_ingress``'s refusal (BACKLOG #5071, #6589), and the audit it then runs.
+
+    Before anything is written, :class:`TypeError` is raised for an operator origin (one in
+    :data:`OPERATOR_ORIGINS`) with no audit, with one that is not callable, or with no
+    ``origin_actor`` naming the user, which must be non-blank and carry no surrounding whitespace;
+    and for an audit or an ``origin_actor`` given with any other origin. The audit must also build a
+    row: an inject always writes a message, so a ``None`` row raises inside the transaction and
+    rolls the inject back. A live receipt keeps the default ``partner`` origin and passes neither.
 
     It keys on ``origin``, so it cannot see an operator's inject written with the default
-    ``partner`` origin: such a call writes neither the operator label nor an audit row. Nothing at
-    the type level holds a direct caller of the store either, since ``audit`` stays optional there.
-    The engine's inject, :meth:`~messagefoundry.pipeline.Engine.inject_message`, requires its
-    ``audit`` and always writes ``operator_upload``."""
+    ``partner`` origin and nothing else: such a call writes neither the operator label nor an audit
+    row. Nothing at the type level holds a direct caller of the store either, since ``audit`` stays
+    optional there. The engine's inject, :meth:`~messagefoundry.pipeline.Engine.inject_message`,
+    requires its ``audit`` and ``actor`` and always writes ``operator_upload``."""
     operator = origin in OPERATOR_ORIGINS
     if not operator:
+        # An audit or an actor is an operator's inject; with this origin the message would be
+        # labelled as a receipt, so the caller forgot the origin.
         if audit is not None:
-            # An audit is an operator's inject; with this origin the message would be labelled
-            # as a receipt, so the caller forgot the origin.
             raise TypeError(
                 f"enqueue_ingress was given an audit with origin {str(origin)!r}; an operator's"
                 " inject names its operator origin (BACKLOG #5071)"
+            )
+        if origin_actor is not None:
+            raise TypeError(
+                f"enqueue_ingress was given an origin_actor with origin {str(origin)!r}; only an"
+                " operator origin names its user (BACKLOG #6589)"
             )
         return None
     if not callable(audit):
         raise TypeError(
             f"enqueue_ingress with origin {str(origin)!r} needs an operator audit, a callable that"
             f" builds its audit row; got {type(audit).__name__} (BACKLOG #5071)"
+        )
+    if not is_origin_actor(origin_actor):
+        raise TypeError(
+            f"enqueue_ingress with origin {str(origin)!r} needs the origin_actor that names its"
+            f" user; got {origin_actor!r} (BACKLOG #6589)"
         )
     build = audit
 
@@ -10952,7 +11046,8 @@ def if_applied(audit: AuditAppend) -> OperatorAudit[bool]:
 
     Anything but an :class:`AuditAppend`, an explicit ``None`` included, raises :class:`TypeError`
     here, so an alert mutation given no row cannot change the alert and record nothing (BACKLOG
-    #5069)."""
+    #5069). Its callers take it as their first statement, so that refusal comes before any write
+    or lock (BACKLOG #6589)."""
     if not isinstance(audit, AuditAppend):
         raise TypeError(
             f"an operator alert mutation or connection flag needs an AuditAppend; got {type(audit).__name__}"
@@ -15013,7 +15108,7 @@ class MessageStore:
         metadata: str | None = None,
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
-        audit: OperatorAudit[str] | None = None,
+        audit: InjectAudit | None = None,
         origin: MessageOrigin = MessageOrigin.PARTNER,
         origin_actor: str | None = None,
     ) -> str:
@@ -15034,7 +15129,7 @@ class MessageStore:
         leaves the attachment at refcount 0 (no ACK → the sender resends; content-addressing dedups the
         resend and the startup ``sweep_orphan_attachments`` reclaims the orphan). Empty/None → the
         byte-identical no-detach path (no incref)."""
-        audit = require_ingress_audit(audit, origin)  # BACKLOG #5071
+        audit = require_ingress_audit(audit, origin, origin_actor)  # BACKLOG #5071, #6589
         now = time.time() if now is None else now
         mid = uuid4().hex
         # Distinct refs only: one skeleton holds a de-duplicated document (two identical OBX-5.5 values
@@ -19339,13 +19434,15 @@ class MessageStore:
         )
 
     async def _commit_alert_change(
-        self, written: AuditedWrite, audit: AuditAppend, applied: bool
+        self, written: AuditedWrite, audit_row: OperatorAudit[bool], applied: bool
     ) -> bool:
         """Append an operator alert mutation's row, when its UPDATE matched, and commit both in the
         one transaction (vault BACKLOG #3217), so a failed append changes nothing and a 404 writes
-        no row. Each caller spells its UPDATE at its own ``execute``, which the transaction-verb
-        guard reads (tests/test_writer_txn_is_the_only_begin.py)."""
-        await self._append_operator_audit(written, if_applied(audit), applied)
+        no row. ``audit_row`` is the caller's :func:`if_applied`, taken as its first statement, so a
+        missing row was refused before the UPDATE (BACKLOG #6589). Each caller spells its UPDATE at
+        its own ``execute``, which the transaction-verb guard reads
+        (tests/test_writer_txn_is_the_only_begin.py)."""
+        await self._append_operator_audit(written, audit_row, applied)
         await self._commit()
         return applied
 
@@ -19359,6 +19456,7 @@ class MessageStore:
         now: float | None = None,
     ) -> None:
         """See :meth:`messagefoundry.store.base.QueueStore.set_connection_flag`."""
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             if flagged:
@@ -19372,7 +19470,7 @@ class MessageStore:
                     "DELETE FROM connection_flag WHERE connection=? AND direction=?",
                     (connection, direction),
                 )
-            await self._append_operator_audit(written, if_applied(audit), True)
+            await self._append_operator_audit(written, audit_row, True)
             await self._commit()
 
     async def list_connection_flags(self) -> set[tuple[str, str]]:
@@ -19385,6 +19483,7 @@ class MessageStore:
     async def ack_alert_instance(
         self, alert_id: int, *, actor: str, audit: AuditAppend, now: float | None = None
     ) -> bool:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # Operator ack: open|acknowledged -> acknowledged, recording acked_by/acked_at. Idempotent (a
         # re-ack is a no-op update). Returns True iff a non-resolved instance with this id existed (so
         # the API can 404 a resolved/unknown id). Acking a resolved instance is refused (no-op, False).
@@ -19395,11 +19494,12 @@ class MessageStore:
                 " WHERE id=? AND status!='resolved'",
                 (actor, now, alert_id),
             )
-            return await self._commit_alert_change(written, audit, cur.rowcount > 0)
+            return await self._commit_alert_change(written, audit_row, cur.rowcount > 0)
 
     async def resolve_alert_instance(
         self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> bool:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # Operator resolve: open|acknowledged -> resolved, recording resolved_at. Returns True iff a
         # non-resolved instance with this id existed.
         now = time.time() if now is None else now
@@ -19409,7 +19509,7 @@ class MessageStore:
                 " WHERE id=? AND status!='resolved'",
                 (now, alert_id),
             )
-            return await self._commit_alert_change(written, audit, cur.rowcount > 0)
+            return await self._commit_alert_change(written, audit_row, cur.rowcount > 0)
 
     async def resolve_alert_instances_for(
         self, *, event_type: str, connection: str, now: float | None = None
@@ -19488,6 +19588,7 @@ class MessageStore:
     async def suspend_alert_instance(
         self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # #143 windowed suspend: mute NOTIFICATIONS for this instance's (event_type, connection) key until
         # `until` (an epoch). NOTIFICATION-only (ADR 0044 AC-3): the instance's status/count/visibility is
         # untouched; only `suspended_until` is set, so it stays open on the dashboard. Refuses a resolved
@@ -19499,7 +19600,7 @@ class MessageStore:
                 "UPDATE alert_instance SET suspended_until=? WHERE id=? AND status!='resolved'",
                 (until, alert_id),
             )
-            applied = await self._commit_alert_change(written, audit, cur.rowcount > 0)
+            applied = await self._commit_alert_change(written, audit_row, cur.rowcount > 0)
         if not applied:
             return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
@@ -19507,6 +19608,7 @@ class MessageStore:
     async def resume_alert_instance(
         self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # #143: clear a windowed suspend (re-alerts resume immediately). Idempotent (clearing an
         # un-suspended instance is a no-op UPDATE). Returns the row, or None if unknown/already resolved.
         now = time.time() if now is None else now
@@ -19515,7 +19617,7 @@ class MessageStore:
                 "UPDATE alert_instance SET suspended_until=NULL WHERE id=? AND status!='resolved'",
                 (alert_id,),
             )
-            applied = await self._commit_alert_change(written, audit, cur.rowcount > 0)
+            applied = await self._commit_alert_change(written, audit_row, cur.rowcount > 0)
         if not applied:
             return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
@@ -22131,6 +22233,23 @@ class MessageStore:
             await self._commit()
         return written is not None
 
+    async def set_ad_channel_scope_if_unchanged(
+        self,
+        user_id: str,
+        scope_json: str,
+        *,
+        expected_scope: str | None,
+        expected_source: ChannelScopeSource | None,
+        now: float | None = None,
+    ) -> bool:
+        """The AD sign-in's compare-and-set scope write (BACKLOG #6887); see ``AuthStore``."""
+        now = time.time() if now is None else now
+        change = ad_scope_replacement(scope_json, expected_scope, expected_source, now)
+        async with _writer_guard(self._db, self._lock):
+            written = await self._write_user(user_id, change)
+            await self._commit()
+        return written is not None
+
     async def set_user_federated_subject(
         self,
         user_id: str,
@@ -22636,9 +22755,16 @@ class MessageStore:
         ``anchor`` on any session but an OIDC one. Session issuance does not call this;
         :meth:`AuthStore.create_session` says how its ``mfa_verified`` stamps the row in the INSERT
         (BACKLOG #5624). See :meth:`AuthStore.mark_session_mfa_verified` for ``anchor`` and the
-        answer."""
+        answer.
+
+        ``BEGIN IMMEDIATE`` (vault BACKLOG #2964 item 23): the stamp reads the row before it writes,
+        and under a deferred ``BEGIN`` the write failed busy at once whenever a writer in another
+        process held SQLite's write lock, since a read transaction's upgrade waits for nobody, so a
+        factor just proved read as a store error. Taking the lock at the ``BEGIN`` waits that writer
+        out under ``busy_timeout`` instead. The lock is then held across the seal check and the
+        re-seal, which under a Vault transit sealer are Vault calls."""
         stamp = mfa_stamp(time.time() if now is None else now, anchor)
-        async with _writer_txn(self._db, self._lock):
+        async with _writer_txn(self._db, self._lock, immediate=True):
             written = await self._write_session(token_hash, stamp)
             await self._commit()
         return written is not None and stamp.anchored
@@ -22836,8 +22962,11 @@ class MessageStore:
     ) -> RevokeResult:
         """The body of :meth:`revoke_all_sessions`, inside the caller's writer transaction.
 
-        The store's global session epoch is raised first (BACKLOG #5091), then every account's
-        epoch, as :meth:`revoke_user_sessions` raises one, then one sweep ends the rows and the kept
+        The store's global session epoch is raised first (BACKLOG #5091), then the epoch of each
+        account its read of the account list returns, as :meth:`revoke_user_sessions` raises one;
+        an account goes without its raise where :func:`raise_account_epoch` says, at least on a
+        seal refusal and after a Vault Transit outage trips the revoke, and the global epoch
+        still ends its sessions. Then one sweep ends the rows and the kept
         row is re-sealed under its own account's new epoch and the new global one, when it carried
         both epochs those raises replaced (:class:`KeptSessionRestamp`, BACKLOG #4975), and is
         otherwise ended and counted (:meth:`_keep_or_end_session`).

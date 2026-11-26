@@ -1024,11 +1024,15 @@ try {
     # Same claim primitive the sender uses, for the same reason: three call sites hand-rolling "did my
     # move win" is three chances for one to drift back to a check that cannot tell a winner from a loser.
     . "$PSScriptRoot\..\coord\mail-claim.ps1"
-    $key = ConvertTo-BoxKey -Path $cwd
-    # The box key hashes the host as well as the path (docs/COORD-SHARED-ROOT.md, step 4). Mail queued
-    # under the old path-only key is moved into this box first, so it is read rather than stranded. That
-    # is the one read of the legacy box; nothing writes to it.
-    Move-LegacyInbox -Root $root -Key $key -LegacyKey (ConvertTo-LegacyBoxKey -Path $cwd)
+    # Resolve-BoxPath raises a cwd in a subdirectory of the worktree to its root, the box seat.ps1
+    # publishes and the sender addresses (BACKLOG #7581).
+    $boxPath = Resolve-BoxPath -Path $cwd
+    $key = ConvertTo-BoxKey -Path $boxPath
+    # The box key hashes the host as well as the path (docs/COORD-SHARED-ROOT.md, step 4), and a
+    # subdirectory cwd was keyed on itself before #7581. Mail queued under any of those older keys is
+    # moved into this box first, so it is read rather than stranded. That is the one read of those
+    # boxes; nothing writes to them.
+    foreach ($oldKey in (Get-BoxReadKeys -Path $cwd -Resolved $boxPath)) { Move-LegacyInbox -Root $root -Key $key -LegacyKey $oldKey }
 
     # --- MAIL ADDRESSED TO WHERE THE SESSION IS NOW. A pinned session whose `cwd` is in another
     # worktree of this repository (EnterWorktree, or a stray `cd`) has that box NAMED here, never shown

@@ -158,6 +158,10 @@ async def test_two_concurrent_first_sign_ins_of_one_account_make_one_row_and_bot
         row = await store.get_user_by_username("pfielding")
         assert row is not None and row.directory_object_id == _OBJECT_ID
         assert await _failed_reasons(store) == []
+        # BACKLOG #6589: the loser's birth row rolled back with its refused INSERT, so one birth
+        # is recorded, naming the row both sign-ins landed on.
+        [born] = await store.list_audit(action="auth.ad_user_created")
+        assert json.loads(born["detail"])["user_id"] == row.id
     finally:
         await store.close()
 
