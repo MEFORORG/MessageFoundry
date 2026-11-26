@@ -212,3 +212,92 @@ def test_each_builder_refuses_the_chain_check_with_no_crl_file(two_tier: _TwoTie
             connector="LDAPS (test)",
             crl_check_chain=True,
         )
+
+
+def test_the_ad_chain_setting_reaches_the_context_a_bind_wraps_with(two_tier: _TwoTier) -> None:
+    """A setting that never reaches the builder is a knob that does nothing: read the flag off the
+    context ``NarrowedTls.wrap_socket`` really wraps with, built from the authenticator's own
+    settings, as the OIDC service test does for its seam."""
+    from messagefoundry.auth.ldap import LdapAuthenticator
+    from tests.test_tls_cipher_assertion_sites import _ad_settings, _context_ldap3_builds
+
+    def bind_context(*, chain: bool) -> ssl.SSLContext:
+        auth = LdapAuthenticator(
+            _ad_settings(
+                ad_tls_ca_cert_file=str(two_tier.root_file),
+                ad_tls_crl_file=str(two_tier.revokes_nothing),
+                ad_tls_crl_check_chain=chain,
+            ),
+            enforcing=False,
+            hop_posture=None,
+        )
+        return _context_ldap3_builds(auth._tls)
+
+    chained = bind_context(chain=True)
+    assert chained.verify_flags & ssl.VERIFY_CRL_CHECK_CHAIN == ssl.VERIFY_CRL_CHECK_CHAIN
+    assert not chained.verify_flags & ssl.VERIFY_X509_PARTIAL_CHAIN
+    leaf = bind_context(chain=False)
+    assert leaf.verify_flags & ssl.VERIFY_CRL_CHECK_CHAIN == ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_each_ldaps_bind_judges_a_replaced_crl_file_by_the_start_rule(
+    two_tier: _TwoTier, tmp_path: Path
+) -> None:
+    """The LDAPS factory builds a fresh context per bind and loads the file again, so a replaced
+    file that drops a CA's own CRL fails the next bind rather than handshaking on it."""
+    crl = tmp_path / "dc-crl.pem"
+    crl.write_bytes(two_tier.revokes_nothing.read_bytes())
+    factory = assert_ldap3_tls_suites(
+        validate=ssl.CERT_REQUIRED,
+        ca_certs_data=two_tier.root_file.read_text(encoding="ascii"),
+        connector="LDAPS (test)",
+        crl_file=str(crl),
+        crl_check_chain=True,
+    )
+    factory()
+    crl.write_bytes(two_tier.inter_crl_file.read_bytes())
+    with pytest.raises(ValueError, match="no CRL of their own") as caught:
+        factory()
+    assert _AD_CHAIN in str(caught.value)
+
+
+def test_the_ldaps_builder_refuses_the_chain_check_on_a_context_that_does_not_verify(
+    two_tier: _TwoTier,
+) -> None:
+    """With no verification there is no chain to check, so the switch refuses rather than reading
+    as on. The authenticator refuses ``ad_tls_verify = false`` first; this is the builder's own
+    contract."""
+    with pytest.raises(ValueError, match=r"ad_tls_crl_check_chain"):
+        assert_ldap3_tls_suites(
+            validate=ssl.CERT_NONE,
+            ca_certs_data=two_tier.root_file.read_text(encoding="ascii"),
+            connector="LDAPS (test)",
+            crl_file=str(two_tier.revokes_nothing),
+            crl_check_chain=True,
+        )
+
+
+def test_the_verify_revocation_row_says_the_oidc_legs_check_the_whole_chain(
+    two_tier: _TwoTier,
+) -> None:
+    """``fed.idp_revocation`` reads the opener the engine built. On a chain-checking context it
+    must not call the check a leaf check, and it must ask for a CRL from every CA in the chain."""
+    from messagefoundry.verify.federation import _revocation_row
+    from tests.test_verify_federation import _settings
+
+    settings = _settings()
+
+    def row_detail(*, chain: bool) -> str:
+        opener = build_idp_opener(
+            str(two_tier.root_file),
+            enforcing=False,
+            crl_file=str(two_tier.revokes_nothing),
+            crl_check_chain=chain,
+        )
+        return _revocation_row(settings, opener).detail
+
+    chained = row_detail(chain=True)
+    assert "leaf" not in chained
+    assert chained.count("every certificate in its chain") == 2
+    assert chained.count("each intermediate") == 2
+    assert row_detail(chain=False).count("checks the leaf certificate") == 2

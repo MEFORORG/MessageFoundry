@@ -372,8 +372,13 @@ def _idp_opener(
             *_TLS_ROW, Status.FAIL, f"the engine refuses this anchor: {safe_exc_text(exc)}"
         )
     except ValueError as exc:  # harden_crl_check: a missing, expired, CRL-less or cert-bearing file
+        # Vault BACKLOG #5511: harden_own_crl_check also refuses the CA file under
+        # [auth].oidc_tls_crl_check_chain, so the row does not blame the CRL file alone. The
+        # refusal itself names the setting at fault.
         return CheckResult(
-            *_TLS_ROW, Status.FAIL, f"the engine refuses this CRL file: {safe_exc_text(exc)}"
+            *_TLS_ROW,
+            Status.FAIL,
+            f"the engine refuses this CRL file or its chain check: {safe_exc_text(exc)}",
         )
     except Exception as exc:
         return CheckResult(*_TLS_ROW, Status.ERROR, safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT))
@@ -493,8 +498,10 @@ def _revocation_row(
     from messagefoundry.config.tls_policy import (
         HopDisposition,
         InsecureHopRefused,
+        context_checks_chain_revocation,
         is_loopback_hop_host,
     )
+    from messagefoundry.transports.rest import opener_tls_context
 
     rid, title = _REVOCATION_ROW
     if opener is None:
@@ -509,6 +516,10 @@ def _revocation_row(
     status = Status.PASS
     notes: list[str] = []
     try:
+        # Vault BACKLOG #5511: read off the opener's own context, as each guard's crl_checked is,
+        # so the row words the check the engine built rather than the setting.
+        context = opener_tls_context(opener, connector="OIDC identity provider (token + JWKS)")
+        chain = context is not None and context_checks_chain_revocation(context)
         for guard in idp_revocation_guards(settings.auth, opener, posture):
             leg = f"{guard.cell.split(' (', 1)[0]} at {guard.host}"
             disposition = guard.disposition()
@@ -525,6 +536,14 @@ def _revocation_row(
                 note = (
                     "crosses with NO certificate revocation checking and a logged warning, "
                     "because [security].enforcement is not enforce. Set [auth].oidc_tls_crl_file"
+                )
+            elif guard.crl_checked and chain:
+                status = Status.MANUAL
+                note = (
+                    "checks every certificate in its chain against [auth].oidc_tls_crl_file "
+                    "([auth].oidc_tls_crl_check_chain). Confirm the file holds a CRL from each "
+                    "CA in that chain, the root's and each intermediate's: without one, every "
+                    "handshake on it fails with 'unable to get certificate CRL'"
                 )
             elif guard.crl_checked:
                 status = Status.MANUAL

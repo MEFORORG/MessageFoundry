@@ -4394,15 +4394,26 @@ class AuthSettings(_Section):
         # nothing is checked. With no CA file the hop trusts the OS store, where the whole-chain
         # start rule would need a CRL from every root it loads, so the builder would refuse it at
         # start; refusing here says so at load, even with the hop off.
-        for prefix in ("oidc", "ad"):
-            if not getattr(self, f"{prefix}_tls_crl_check_chain"):
+        # Each value read as an attribute, so a renamed field fails type checking, not a load.
+        hops = (
+            (
+                "oidc",
+                self.oidc_tls_crl_check_chain,
+                self.oidc_tls_crl_file,
+                self.oidc_tls_ca_cert_file,
+            ),
+            ("ad", self.ad_tls_crl_check_chain, self.ad_tls_crl_file, self.ad_tls_ca_cert_file),
+        )
+        for prefix, chain, crl_file, ca_file in hops:
+            if not chain:
                 continue
-            for needed in (f"{prefix}_tls_crl_file", f"{prefix}_tls_ca_cert_file"):
-                if not getattr(self, needed):
+            for needed, value in (("crl_file", crl_file), ("ca_cert_file", ca_file)):
+                if not value:
                     raise ValueError(
-                        f"[auth].{prefix}_tls_crl_check_chain = true requires [auth].{needed}: "
-                        f"the whole-chain check reads the CRLs in [auth].{prefix}_tls_crl_file "
-                        f"against the CAs in [auth].{prefix}_tls_ca_cert_file alone"
+                        f"[auth].{prefix}_tls_crl_check_chain = true requires "
+                        f"[auth].{prefix}_tls_{needed}: the whole-chain check reads the CRLs in "
+                        f"[auth].{prefix}_tls_crl_file against the CAs in "
+                        f"[auth].{prefix}_tls_ca_cert_file alone"
                     )
         return self
 

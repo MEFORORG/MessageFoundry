@@ -1518,11 +1518,6 @@ OUTBOUND_NO_PARTNER_TLS_CASE = (
 )
 
 
-#: The server-auth hops with a CRL setting of their own and an opt-in whole-chain check (vault
-#: BACKLOG #5511): each hop's CRL setting, mapped to its chain setting and to the CA setting the
-#: start rule reads its CAs from. Each chain setting is refused at load without both files, and
-#: each builder refuses it with no CA, so the CAs come from the operator's own CA file and never
-#: from the OS trust store.
 class OwnCrlChainHop(NamedTuple):
     """The settings of a hop in :data:`OWN_CRL_CHAIN_HOPS`, besides its CRL setting."""
 
@@ -1530,6 +1525,11 @@ class OwnCrlChainHop(NamedTuple):
     ca: str  # the CA setting whose CAs the start rule reads
 
 
+#: The server-auth hops with a CRL setting of their own and an opt-in whole-chain check (vault
+#: BACKLOG #5511): each hop's CRL setting, mapped to its chain setting and to the CA setting the
+#: start rule reads its CAs from. Each chain setting is refused at load without both files, and
+#: each builder refuses it with no CA, so the CAs come from the operator's own CA file and never
+#: from the OS trust store.
 OWN_CRL_CHAIN_HOPS: Mapping[str, OwnCrlChainHop] = {
     "[auth].oidc_tls_crl_file": OwnCrlChainHop(
         "[auth].oidc_tls_crl_check_chain", "[auth].oidc_tls_ca_cert_file"

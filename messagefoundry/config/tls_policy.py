@@ -2108,8 +2108,16 @@ def assert_ldap3_tls_suites(
 
     ``crl_check_chain`` is ``[auth].ad_tls_crl_check_chain`` (vault BACKLOG #5511): the CRL is then
     checked against the domain controller's whole chain, on CAs from ``ca_certs_data`` alone
-    (:func:`harden_own_crl_check`). Set with no ``crl_file``, the build refuses.
+    (:func:`harden_own_crl_check`). Set with no ``crl_file``, or on a ``validate`` of
+    ``CERT_NONE``, the build refuses.
     """
+    if crl_check_chain and validate == ssl.CERT_NONE:
+        # The CRL block below runs only on a verifying context, so the switch would read as on
+        # while no chain is checked. The authenticator refuses ad_tls_verify = false before here.
+        raise ValueError(
+            "[auth].ad_tls_crl_check_chain is set on an LDAPS context that does not verify the "
+            "domain controller, so no chain would be checked; leave [auth].ad_tls_verify on"
+        )
 
     def narrowed_context() -> ssl.SSLContext:
         ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH, cadata=ca_certs_data)
