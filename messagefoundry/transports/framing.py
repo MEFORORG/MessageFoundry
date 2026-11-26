@@ -352,10 +352,11 @@ def _reply_delimiters(reply: str) -> frozenset[str]:
     ISA16 and the segment terminator, at offsets 104 and 105, are declared only where
     :func:`_isa16_and_terminator` reads them as one; where ISA16 is empty or longer than one
     character those offsets hold the terminator or the next segment's data, and reading them would
-    refuse a reply main replaced and sent. The offsets are read raw, without the distinctness check
-    ``discover_delimiters`` makes, so a lined-up ISA that read refuses for delimiters that are not
-    distinct still declares what this read takes: at least ISA11 and ISA16 both ``?``, and an
-    ISA16 equal to the element separator. An ISA that is not lined up declares
+    refuse a reply main replaced and sent. The offsets are read without most of the distinctness
+    check ``discover_delimiters`` makes (only a terminator equal to ISA16 or to the element
+    separator stops ISA16 and the terminator being read), so a lined-up ISA that read refuses for
+    delimiters that are not distinct still declares what this read takes: at least ISA11 and ISA16
+    both ``?``, and an ISA16 equal to the element separator. An ISA that is not lined up declares
     nothing, as every ``ISA``-led reply did before this read: in an unpadded ISA, offsets 82, 104
     and 105 can hold element data. That leaves a residual, as before: what is not declared is
     refused neither where it is ``?``, so ``?`` is written into the reply's data, nor where it is a
@@ -363,8 +364,8 @@ def _reply_delimiters(reply: str) -> frozenset[str]:
     unpadded, one cut short, and one whose element separator also appears before ISA16 away from
     its separator offsets, whether in element data (an ISA06 of ``AC*MER``), in ISA11 in any
     version, or in the ``ISA`` tag itself (an element separator of ``I``, ``S`` or ``A``). The
-    shapes whose ISA16 and terminator are not declared are listed on
-    :func:`_isa16_and_terminator`. A reply with any other lead declares nothing here.
+    shapes whose ISA16 and terminator are not declared include at least those
+    :func:`_isa16_and_terminator` names. A reply with any other lead declares nothing here.
 
     Leading whitespace and a BOM are skipped first, as the engine's one definition of tolerated
     leading noise (``sniff._LEADING_WS_STR``) skips them. A header line of ``MSH`` alone has no
@@ -404,11 +405,9 @@ def _isa_is_lined_up(body: str) -> bool:
     return lined_up and body.count(element, 0, _COMPONENT_SEP_OFFSET) == len(ELEMENT_SEP_OFFSETS)
 
 
-#: An X12 segment ID: a letter, then one or two letters or digits.
-_X12_SEGMENT_ID = re.compile(r"[A-Z][A-Z0-9]{1,2}")
-
-#: Line breaks: a cosmetic one may follow a segment terminator, but none falls inside a segment.
-_LINE_BREAKS = "\r\n"
+#: An X12 segment ID (a letter, then one or two letters or digits), as ``parsing.x12.validate``
+#: reads one.
+_X12_SEGMENT_ID = "[A-Z][A-Z0-9]{1,2}"
 
 
 def _isa16_and_terminator(body: str) -> tuple[str, ...]:
@@ -417,19 +416,23 @@ def _isa16_and_terminator(body: str) -> tuple[str, ...]:
     its terminator; empty otherwise (BACKLOG #5799). An empty ISA16 puts the terminator at 104 and
     the next segment's first character at 105, and a two-character one puts its second character
     at 105, so read raw those offsets can name data, and a reply main replaced and sent would be
-    refused. So they are read only where ISA16 is not a space or a line break; the terminator is
-    not a letter or a digit and differs from ISA16 and the element separator; and what follows the
-    terminator, past the LF of a CR+LF end, is nothing, or, past any cosmetic whitespace, a segment
-    ID and the element separator, with the terminator again before any line break.
+    refused. So they are read only where ISA16 is not one of ``_SEGMENT_WHITESPACE`` (space, tab,
+    CR, LF, VT, FF); the terminator is not a letter or a digit, ASCII or not, and differs from
+    ISA16 and the element separator; and right after the terminator, past the LF of a CR+LF end,
+    a segment ID and the element separator open the next segment, which ends at the terminator
+    before any CR or LF.
 
     This is a reading of the layout, not a parse, and a string can read both ways: at least a
-    two-character ISA16 whose second character recurs, in the next segment, as the character
-    before a line break reads as a one-character ISA16 and that second character as the
-    terminator, and the reply is then refused where that character is ``?`` or one the charset
-    cannot encode. Where the ISA16 is one character, these are not read, so ``?`` is written into
-    its data where one of them is ``?``: an ISA16 that is a space or a line break or equals the
-    terminator, a terminator equal to the element separator, an ``ISA`` followed by whitespace
-    alone, and a reply whose next segment has no terminator before its line break or end."""
+    two-character ISA16 with no terminator after it, directly followed by a segment, reads as a
+    one-character ISA16 and its second character as the terminator, and the reply is then refused
+    where that character is ``?`` or one the charset cannot encode. Where the ISA16 is one
+    character, ISA16 and the terminator are not read, so ``?`` is written into the reply's data
+    where one of them is ``?`` (the element separator and ISA11 are still declared), in at least
+    these: an ISA16 that is whitespace or equals the terminator, an ISA16 whose terminator equals
+    the element separator, a reply that ends at the terminator, a line break or other whitespace after the
+    terminator before the next segment (a pretty-printed ``~`` then LF layout), and a next segment
+    whose ID is not an X12 segment ID, is not followed by the element separator, or has no
+    terminator before a CR, an LF or the reply's end."""
     element = body[ELEMENT_SEP_OFFSETS[0]]
     component = body[_COMPONENT_SEP_OFFSET]
     term = body[_SEGMENT_TERM_OFFSET]
@@ -439,19 +442,13 @@ def _isa16_and_terminator(body: str) -> tuple[str, ...]:
     i = _SEGMENT_TERM_OFFSET + 1
     if term == "\r" and body.startswith("\n", i):
         found, i = (component, term, "\n"), i + 1
-    if i == len(body):
-        return found
-    while i < len(body) and body[i] in _SEGMENT_WHITESPACE:
-        i += 1
-    if i == len(body):
-        return ()  # ISA16, then a terminator, then whitespace alone: a two-character ISA16 reads so
-    seg = _X12_SEGMENT_ID.match(body, i)
-    if seg is None:
+    # A cosmetic line break here would read both ways: after a one-character ISA16's terminator,
+    # or as the terminator after a two-character ISA16. So only a segment right after counts.
+    if re.compile(_X12_SEGMENT_ID + re.escape(element)).match(body, i) is None:
         return ()
-    opens = body.startswith(element, seg.end()) or (
-        seg.end() - i == 3 and body.startswith(element, i + 2)
-    )
+    # And that segment ends at the terminator before any line break: an empty ISA16 followed by
+    # stray text would otherwise put that text's first character at 105.
     stop = body.find(term, i)
-    if not opens or stop < 0 or any(c in body[i:stop] for c in _LINE_BREAKS):
+    if stop < 0 or body.find("\n", i, stop) >= 0 or body.find("\r", i, stop) >= 0:
         return ()
     return found

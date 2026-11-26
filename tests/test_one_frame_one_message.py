@@ -856,9 +856,10 @@ def test_isa_followed_by_a_run_of_one_character_is_not_fixed_width(run: str) -> 
         ("", "?TA1*000000001*260101*1200*A*000中~"),
         (":中", "~TA1*000000001*260101*1200*A*000~"),
         (":?", "~TA1*000000001*260101*1200*A*000中~"),
-        (":?", "\nTA1*000000001*260101*1200*A*000中\n"),
-        ("", "\r?TA1*000000001*260101*1200*A*000中\r"),
+        (":?", "\nTA1*000?00001*260101*1200*A*000中\n"),
+        ("", "\r?TA1*000000001*260101*1200*A*000中?\r"),
         (":?", "\n中\n"),
+        (":?", ""),
     ],
     ids=[
         "empty-unencodable",
@@ -868,6 +869,7 @@ def test_isa_followed_by_a_run_of_one_character_is_not_fixed_width(run: str) -> 
         "two-lf",
         "empty-cr",
         "two-lf-nonascii-next",
+        "two-isa-only",
     ],
 )
 def test_an_isa16_that_is_not_one_character_is_not_read_at_104_and_105(
@@ -876,34 +878,56 @@ def test_an_isa16_that_is_not_one_character_is_not_read_at_104_and_105(
     """Review of #5799 (the repair after 8f987a6): an ISA lined up through ISA15 with an empty or
     two-character ISA16 was read at offsets 104 and 105, which then hold the terminator or the next
     segment's data, so a data character there read as a delimiter and the reply was refused, where
-    main replaced it and sent it (the X12 listener closes on that refusal). Green on main, red on
-    8f987a6."""
-    reply = _isa(component=component, term="") + after
+    main replaced it and sent it (where a reply is owed, the X12 listener closes on that refusal).
+    Green on main, red on 8f987a6. ``two-lf`` pins that a line break after offset 105 is not
+    skipped, ``empty-cr`` the whitespace-ISA16 guard, ``two-isa-only`` that a reply ending at
+    offset 105 is not read."""
+    reply = _isa(component=component, term="").replace("SENDER", "SEND中R", 1) + after
     wire = framing_mod.encode_reply(reply, "ascii", connection="IB_X12_ISA16_WIDTH")
     assert wire == reply.encode("ascii", errors="replace")
 
 
 _GS = "GS*FA*SENDER*RECEIVER*20260101*1200*1*X*005010中"
+_TA1_Q = "TA1*000000001*260101*1200*A*000中?"
 
 
 @pytest.mark.parametrize(
     ("header", "after"),
     [
         (_isa(element="?", component="", term=""), "?TA1?000000001?260101?1200?A?000中~"),
-        (_isa(component="\x1f", repetition="?"), "TA1*000000001*260101*1200*A*000中~"),
-        (_isa(component="?", term="~\n"), _GS + "~\nIEA*1*000000001~\n"),
+        (_isa(component="\x1f", term="?"), _TA1_Q),
         (_isa(component="?", term="\r\n"), _GS + "\r\nIEA*1*000000001\r\n"),
-        (_isa(component="?", term="\r\n").replace("SENDER", "SEND中R", 1), ""),
+        (_isa(component="?"), _GS + "~IEA*1*000000001~"),
     ],
-    ids=["element-q-isa16-empty", "isa16-control", "pretty-lf", "crlf-gs", "isa-only-crlf"],
+    ids=["element-q-isa16-empty", "isa16-control-term-q", "crlf-gs", "gs"],
 )
 def test_a_lined_up_isa_still_declares_what_its_layout_fixes(header: str, after: str) -> None:
-    """Negative controls for the ISA16 width repair: the element separator and (from 00501) ISA11
-    of an ISA lined up through ISA15 are declared whatever ISA16's width, an information-separator
-    control is a valid ISA16, and a one-character ISA16 is read past a CR+LF or a cosmetic line
-    break after its terminator. Each reply is refused because ``?`` is one of its delimiters."""
+    """Negative controls for the ISA16 width repair: the element separator of an ISA lined up
+    through ISA15 is declared whatever ISA16's width, an information-separator control is read as
+    a one-character ISA16 so its terminator is read too, and a one-character ISA16 is read past a
+    CR+LF terminator. Each reply is refused because ``?`` is one of its delimiters."""
     with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
         framing_mod.encode_reply(header + after, "ascii", connection="IB_X12_LINED_UP")
+
+
+@pytest.mark.parametrize(
+    ("header", "after"),
+    [
+        (_isa(component="?", term="?"), "TA1*000000001*260101*1200*A*000中?"),
+        (_isa(component="中", term="*"), "TA1*000000001*260101*1200*A*000~"),
+        (_isa(component="?", term="~\n"), _GS + "~\n"),
+        (_isa(component="?").replace("SENDER", "SEND中R", 1), ""),
+    ],
+    ids=["isa16-equals-term", "term-equals-element", "pretty-lf", "isa-only"],
+)
+def test_a_one_character_isa16_left_unread_is_a_residual(header: str, after: str) -> None:
+    """Pins residuals ``_isa16_and_terminator`` names, not wanted outcomes: a one-character ISA16
+    whose terminator equals it or the element separator, or that is followed by a line break or by
+    nothing, is not read, so ``?`` is written into the reply's data as on main. Each reads the same
+    as an ISA16 that is not one character, which main sent. A fix that closes one turns it red."""
+    reply = header + after
+    wire = framing_mod.encode_reply(reply, "ascii", connection="IB_X12_ISA16_RESIDUAL")
+    assert wire == reply.encode("ascii", errors="replace")
 
 
 def test_an_lf_inside_a_field_of_a_cr_reply_is_data_not_a_header() -> None:
