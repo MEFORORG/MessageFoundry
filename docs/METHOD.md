@@ -218,11 +218,14 @@ the worktree in place and untouched either way, so the next session can see what
 
 ### The harness guards refuse the tool call, not the commit
 
-The worktree gate is not a git hook. `scripts/worktree/install-gate.ps1` installs it as a PreToolUse
-hook in user scope. It denies the tool call itself, long before commit time. It also denies two kinds of Bash or PowerShell call.
-One swaps the primary checkout onto another branch. The other points a git command at a worktree
-that is not yours. It fires when
-you try to write inside the primary checkout, so write inside your own worktree, by absolute path.
+`collision_gate.ps1` and `worktree_gate.ps1` are user-scope PreToolUse hooks, not git hooks, so a
+refusal from one arrives at the tool call rather than at commit time. Which tools each sees, and
+what it does not intercept, is stated in
+[*A Builder gets one turn, items 2, 5 and 6, from section 5*](#a-builder-gets-one-turn-items-2-5-and-6-from-section-5),
+item 2. What each refuses is in the hook sources,
+[`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1) and
+[`collision_gate.ps1`](../scripts/hooks/collision_gate.ps1); where a description and a hook
+disagree, the hook wins.
 
 ### Stage explicit paths; a guard catches only the common blanket spellings
 
