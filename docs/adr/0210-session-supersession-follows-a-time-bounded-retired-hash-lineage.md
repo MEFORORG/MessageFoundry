@@ -49,7 +49,7 @@ record as accepted.
    `oidc_flow_ttl_seconds` plus 120 seconds, the longest sign-in a rotation can race plus the
    callback's own work after it. With no `lineage_since`, `supersede_session` is the plain revoke
    it was, which `_end_lapsed_session` keeps.
-4. **The session reaper purges links past the window**, in the same pass as expired sessions,
+4. **The session reaper purges links past the window plus the reaper's step tolerance (600 s)**, in the same pass as expired sessions,
    through a new `lineage_seconds` argument to `purge_expired_sessions`.
 5. **No session read consults the table.** `get_session`, `list_sessions` and the service's session
    loader read `sessions` only. A test pins, per backend, that only `rotate_session`,

@@ -14679,7 +14679,9 @@ class AuthService:
         slack covers a link stamped before its rotation commits.
 
         ``proven_at`` has no default, so every caller states what it proved. It is a
-        :func:`time.monotonic` reading, never a wall-clock one, so no clock step moves the window.
+        `time.monotonic()` reading, so no engine wall-clock step between the proof and the call
+        moves the window; a step of the store's own clock still can, and on SQLite that is the host
+        clock (docs/SECURITY.md).
         ``POST /auth/logout`` passes the moment its request arrived. Its gate proved the token live after that, so any
         link from it was committed after that proof, and the route gains no reach: the caller could
         sign that session out anyway. ``/ui/logout`` proves nothing about the token and passes
