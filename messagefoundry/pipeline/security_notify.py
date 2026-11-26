@@ -216,8 +216,9 @@ _DESCRIPTIONS = {
 # so neither takes the generic directory line: a re-sync's roles come from the directory's groups
 # through the group-to-role map, which an administrator edits in the console, so "not from the
 # MessageFoundry console" would be false for it. The directory disable says what the directory
-# reported; no MessageFoundry row was disabled.
-_DIRECTORY_WORDED = frozenset({ROLES_CHANGED, ACCOUNT_DISABLED})
+# reported; no MessageFoundry row was disabled. Both kinds are worded from their evidence
+# (``_evidenced_description``), from an administrator or the directory alike.
+_EVIDENCED_KINDS = frozenset({ROLES_CHANGED, ACCOUNT_DISABLED})
 
 # BACKLOG #6034 (S08-57). What a role or disable notice says rests on the evidence its sender put on
 # the event, never on the order of the sender's calls, because the directory senders notify on
@@ -233,6 +234,8 @@ _SESSIONS_UNCONFIRMED = (
 _ROLES_WORDING = {
     # (from the directory, the write confirmed)
     (False, True): "Your account's roles were changed by an administrator.",
+    # No current administrator sender reaches this: ``set_roles`` notifies only after its write
+    # returned applied. It is the fail-closed wording for a sender that passes no evidence.
     (False, False): (
         "An administrator asked to change your account's roles. MessageFoundry could not confirm "
         "that the change was saved."
@@ -260,10 +263,15 @@ def _roles_written(event: SecurityEvent) -> bool:
     return event.event_type == ROLES_CHANGED and event.detail.get("roles_written") is True
 
 
-def _sessions_revoked(event: SecurityEvent) -> bool:
-    """Whether the sender's revoke returned, so ``sessions_revoked`` holds its count (BACKLOG
-    #6034). A bool or any other shape is no count, through :func:`_count`."""
-    return _count(event.detail.get("sessions_revoked")) is not None
+def _roles_unconfirmed(event: SecurityEvent) -> bool:
+    """A ROLES_CHANGED whose write is not confirmed, which must claim no change (BACKLOG #6034)."""
+    return event.event_type == ROLES_CHANGED and not _roles_written(event)
+
+
+def _revoked_count(event: SecurityEvent) -> int | None:
+    """The ``sessions_revoked`` count, present only once the sender's revoke returned (BACKLOG
+    #6034, vault #2609). A bool or any other shape is no count, through :func:`_count`."""
+    return _count(event.detail.get("sessions_revoked"))
 
 
 def _evidenced_description(event: SecurityEvent, *, from_directory: bool) -> str:
@@ -274,7 +282,8 @@ def _evidenced_description(event: SecurityEvent, *, from_directory: bool) -> str
         what = _ROLES_WORDING[(from_directory, _roles_written(event))]
     else:
         what = _DISABLE_WORDING[from_directory]
-    return f"{what} {_SESSIONS_ENDED if _sessions_revoked(event) else _SESSIONS_UNCONFIRMED}"
+    ended = _revoked_count(event) is not None
+    return f"{what} {_SESSIONS_ENDED if ended else _SESSIONS_UNCONFIRMED}"
 
 
 def _from_directory(event: SecurityEvent) -> bool:
@@ -282,18 +291,18 @@ def _from_directory(event: SecurityEvent) -> bool:
     #2291, vault #3121). Gated on the kind as well as the tag: the reconciler tags every notice it
     sends, and its ``directory_sessions_ended`` must not claim the directory changed anything."""
     return (
-        event.event_type in (EMAIL_CHANGED, USERNAME_CHANGED, *_DIRECTORY_WORDED)
+        event.event_type in (EMAIL_CHANGED, USERNAME_CHANGED, *_EVIDENCED_KINDS)
         and event.detail.get("source") == "directory"
     )
 
 
 def _subject(event: SecurityEvent) -> str:
     # BACKLOG #6034: each subject claims no more than the body's evidence does.
-    if event.event_type == ROLES_CHANGED and not _roles_written(event):
+    if _roles_unconfirmed(event):
         return "A change to your MessageFoundry account roles could not be confirmed"
     if event.event_type == ACCOUNT_DISABLED and _from_directory(event):
         # The administrator subject says the MessageFoundry account was disabled, false here.
-        if _sessions_revoked(event):
+        if _revoked_count(event) is not None:
             return "Your MessageFoundry sessions were ended: your directory account is disabled"
         return "Your directory account is reported as disabled"
     return _SUBJECTS.get(event.event_type, "MessageFoundry security alert")
@@ -450,7 +459,7 @@ def _build_body(event: SecurityEvent) -> str:
         description = (
             "An administrator set this address to receive security notices about your account."
         )
-    elif event.event_type in _DIRECTORY_WORDED:
+    elif event.event_type in _EVIDENCED_KINDS:
         description = _evidenced_description(event, from_directory=from_directory)
     else:
         description = _DESCRIPTIONS.get(
@@ -470,7 +479,7 @@ def _build_body(event: SecurityEvent) -> str:
         opening = f"A notice for you as a MessageFoundry administrator ({account})."
     elif event.event_type == TEMPORARY_CREDENTIAL_EXPIRING:
         opening = f"A reminder about your MessageFoundry account ({account})."
-    elif event.event_type == ROLES_CHANGED and not _roles_written(event):
+    elif _roles_unconfirmed(event):
         # BACKLOG #6034: no change is confirmed (see ``_evidenced_description``).
         opening = f"A notice about your MessageFoundry account ({account})."
     else:
@@ -565,12 +574,12 @@ def _build_body(event: SecurityEvent) -> str:
                     scrub_log_argument(event.username),
                     key,
                 )
-    if from_directory and event.event_type not in _DIRECTORY_WORDED:
+    if from_directory and event.event_type not in _EVIDENCED_KINDS:
         # BACKLOG #1139. Say WHERE the change came from, because it changes what the reader can do
         # about it: a directory-driven change is not editable in the console, so "contact your
         # administrator" is the only action, and an unexplained change the holder cannot find a
         # cause for reads as a compromise. The vault #3121 kinds name their source in their own
-        # description instead (see ``_DIRECTORY_WORDED``).
+        # description instead (see ``_EVIDENCED_KINDS``).
         lines.append(
             "This change came from your organization's directory, not from the MessageFoundry "
             "console."
@@ -600,7 +609,7 @@ def _build_body(event: SecurityEvent) -> str:
     if event.event_type == FEDERATED_IDENTITY_BOUND:
         # vault BACKLOG #2609: the bind ended the holder's sessions. The count lets a holder who
         # was signed in on several devices see that all of them went.
-        ended = _count(event.detail.get("sessions_revoked"))
+        ended = _revoked_count(event)
         if ended is not None:
             lines.append(f"Sessions ended: {ended}")
     if event.event_type == MFA_ENABLED and event.detail.get("issued_credential"):
@@ -648,16 +657,13 @@ def _build_body(event: SecurityEvent) -> str:
         # sign-in (``_upsert_ad_user``, and since vault BACKLOG #3121 the role re-sync in
         # ``_complete_ad_login``), but nothing on the event says so, so the line names only the
         # request (BACKLOG #6034). An unconfirmed role write claims no change.
-        if event.event_type == ROLES_CHANGED and not _roles_written(event):
-            what = "sent this notice"
-        else:
-            what = "picked up this change"
+        what = "sent this notice" if _roles_unconfirmed(event) else "picked up this change"
         lines.append(f"MessageFoundry {what} while handling a request from {client_ip}.")
     elif client_ip:
         lines.append(f"Source IP: {client_ip}")
     if lock_closing is not None:
         closing = lock_closing
-    elif event.event_type == ROLES_CHANGED and not _roles_written(event):
+    elif _roles_unconfirmed(event):
         # BACKLOG #6034: "this change" would claim one (see ``_evidenced_description``).
         closing = "If you did not expect this notice, contact your MessageFoundry administrator."
     elif event.event_type == PASSWORD_RESET:

@@ -12849,6 +12849,10 @@ class AuthService:
             and revocation.reason in _ALWAYS_REPORTED_REASONS
             and await self._already_revoked_elsewhere(revocation, watermark=watermark)
         )
+        # BACKLOG #6034 (S08-57): the notice's evidence. ``roles_written`` only for a write whose
+        # commit is known (``committed``, set only when it counted a change); ``sessions_revoked``
+        # is added below, once the revoke returned.
+        notice_evidence: dict[str, object] = {"roles_written": True} if committed == "roles" else {}
         revoke_error: Exception | None = None
         try:
             ended = await self._revoke_with_row(
@@ -12874,11 +12878,7 @@ class AuthService:
                     ROLES_CHANGED,
                     username=user.username,
                     email=user.notify_email,
-                    detail={
-                        "reason": revocation.reason,
-                        "source": "directory",
-                        **({"roles_written": True} if committed == "roles" else {}),
-                    },
+                    detail={"reason": revocation.reason, "source": "directory", **notice_evidence},
                 )
             raise _hold(pending, revoke_error) or revoke_error
         revoked, written, retried = ended.result, ended.written, ended.retried
@@ -12920,13 +12920,10 @@ class AuthService:
         #
         # BACKLOG #6034 (S08-57): ROLES_CHANGED only when this call's write counted a change; a
         # role revocation that wrote none only ended sessions, so it gets the neutral notice.
-        # ``roles_written`` only for a write whose commit is known (``committed``), and
-        # ``sessions_revoked`` on every notice here, since the revoke returned.
-        notice_evidence: dict[str, object] = {"sessions_revoked": revoked}
+        # ``sessions_revoked`` goes on every notice here, since the revoke returned.
+        notice_evidence["sessions_revoked"] = revoked
         if roles_changed:
             kind = ROLES_CHANGED
-            if committed == "roles":
-                notice_evidence["roles_written"] = True
         elif revocation.reason == reconcile.REVOKE_REASONS[reconcile.ProbeOutcome.DISABLED]:
             kind = ACCOUNT_DISABLED
         else:
@@ -21639,6 +21636,8 @@ class AuthService:
                     detail={"set_by": "administrator"},
                 )
         refused = False
+        # BACKLOG #6034: the disable's revoke count, the notice's evidence that the sessions ended.
+        revoked: int | None = None
         if disabled:
             refused = not await self._store.remove_unless_last_admin(
                 user_id,
@@ -21660,6 +21659,7 @@ class AuthService:
                 ended = await self._revoke_after_commit(
                     user_id, change="account_disabled", actor=actor
                 )
+                revoked = ended.count  # only once the revoke returned
                 # After the write, so a request that read the row before it predates the exit.
                 self._forget_cert_probe_fault(user_id)
         elif disabled is not None:
@@ -21699,13 +21699,13 @@ class AuthService:
                     detail={"new_email": email},
                 )
             if disabled and not refused and not before.disabled:
-                # BACKLOG #6034 (S08-57): the revoke's count is the notice's evidence that the
-                # sessions ended.
+                # BACKLOG #6034 (S08-57): ``revoked`` is the revoke's count, which this branch
+                # always has, since a revoke that gave up raised above.
                 await self._notify_security(
                     ACCOUNT_DISABLED,
                     username=before.username,
                     email=notice_to,
-                    detail={"sessions_revoked": ended.count},
+                    detail={"sessions_revoked": revoked},
                 )
         if refused:
             raise LastAdministratorRefused("cannot disable the last administrator")
