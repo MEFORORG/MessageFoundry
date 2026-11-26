@@ -6736,8 +6736,11 @@ AUDIT_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
 
 
 #: How much of an anchor file is read before it is refused. An anchor is ONE short line -- the longest
-#: producible form is a count plus a `vault:v1:<base64>` MAC, comfortably under 200 bytes -- so anything
-#: past this is not an anchor file and the excess must never be read, let alone quoted back.
+#: form a store produces is a count plus a `vault:v<N>:<base64>` MAC, comfortably under 200 bytes -- so
+#: anything past this is not an anchor file and the excess must never be read, let alone quoted back.
+#: This is the READER's bound, not a parser check: the parser refuses at least a malformed count, but
+#: passes a `vault:v` head through unchecked, so a first line up to this size reaches the comparator.
+#: What that costs is stated once, at :func:`_audit_head_shape`.
 #:
 #: THE BOUND IS A LOG-DISCLOSURE CONTROL, NOT A PERFORMANCE ONE. ``str(AuditAnchorError)``
 #: interpolates the offending text with ``{text!r}``. Neither file caller prints it now (vault
@@ -6850,7 +6853,8 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
 
     It ALSO refuses a hex head of the wrong length and a head of neither shape, rather than hand a
     comparator a head the store can never emit; a ``vault:v`` head is the exception, passed through
-    unchecked (see the second bullet). Both comparators
+    unchecked (see the second bullet), and :func:`_audit_head_shape` states what that costs. Both
+    comparators
     compare the head byte-exactly and report *any* difference as ``truncated or rewritten``, so an
     accepted-but-impossible head becomes a FALSE tamper alarm — a red light on an intact chain,
     indistinguishable from a real detection. A control whose whole value is that a FAIL means something
@@ -6888,7 +6892,7 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
         raise AuditAnchorError("no ':' separator", text)
     count_text = count_text.strip()
     # The row pair's grammar, not `int()`'s, which also takes `+5`, `1_000`, non-ASCII digits and
-    # any length up to Python's digit limit (vault BACKLOG #5987). The count is quoted in `str(exc)`
+    # any length up to Python's digit limit (vault BACKLOG #4790). The count is quoted in `str(exc)`
     # via `text`; no reason names a value, not even the count: `--expected-anchor-file` prints the
     # reason, and the count is that file's content (vault BACKLOG #2612).
     # A minus sign before ASCII digits is judged on the sign before the width, so each reason is
@@ -6942,13 +6946,17 @@ def _audit_head_shape(head: str, noun: str = "the head") -> tuple[str | None, st
             )
         return None, head.lower()
     if head.startswith(AUDIT_ANCHOR_ISOLATED_MAC_PREFIX):
-        # Opaque by construction; never normalise what we do not define. Not held to the Transit MAC's
-        # shape either: `audit-anchor` prints a tampered `vault:v` head as the store holds it, and
-        # `audit-verify` refuses a malformed anchor (exit 2) before it walks, so a shape check here
-        # would leave such a tamper unwalked. The cost: a truncated or space-bearing `vault:v` anchor
-        # or row pair reaches the comparator and can raise a false tamper alarm on an intact chain
-        # (vault BACKLOG #5987 item 1). A tampered head of another shape is still refused before the
-        # walk.
+        # Opaque by construction; never normalise what we do not define. Not held to the Transit
+        # MAC's shape either: `audit-anchor` prints a tampered `vault:v` head as the store holds it,
+        # and `audit-verify` refuses a malformed anchor (exit 2) before it walks, so a shape check
+        # here would leave such a tamper unwalked. A tampered head of another shape is still refused
+        # before the walk.
+        # THE KNOWN COST, STATED HERE ONCE; every other statement of the head rule points here. A
+        # malformed `vault:v` anchor or row pair (truncated, or carrying a space) is not refused: it
+        # reaches the comparator, and on an intact chain the walk reports `truncated or rewritten`.
+        # `audit-verify` then exits 1, a tamper verdict, and the engine's
+        # `[integrity].audit_anchor_file` startup check fires `integrity_drift` (subject
+        # `audit-chain-truncated`). Vault BACKLOG #5987 item 1 holds it open.
         return None, head
     return (
         f"{noun} is neither a {AUDIT_ANCHOR_DIGEST_HEX_LEN}-character hex digest nor an "

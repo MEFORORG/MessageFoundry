@@ -2036,13 +2036,16 @@ class Engine:
         survives restarts while still catching the two things #328 is about — a truncated tail and a
         mid-chain rewrite. A stale anchor therefore stays VALID here; it just witnesses less.
 
-        **Never raises, and never fires the tamper alert.** A missing, unreadable or malformed anchor is a
+        **Never raises, and never fires the tamper alert for an anchor it cannot use.** A missing or
+        unreadable anchor, or one :func:`~messagefoundry.store.store.parse_audit_anchor` refuses, is a
         CONFIG fault, and routing it to ``integrity_drift`` would manufacture a tamper alarm out of input
-        handling — the same defect :func:`~messagefoundry.store.store.parse_audit_anchor` refuses on the
-        CLI side, and worse here, because an alarm that fires on a typo is an alarm operators learn to
-        ignore. It logs a WARNING naming the file and the reason, and the caller runs the bare walk: the
-        chain is still checked as far as it can be, and the operator is told, in the same line, that the
-        truncation half did not run.
+        handling, and worse here than on the CLI, because an alarm that fires on a typo is an alarm
+        operators learn to ignore. It logs a WARNING naming the file and the reason, and the caller runs
+        the bare walk: the chain is still checked as far as it can be, and the operator is told, in the
+        same line, that the truncation half did not run. The parser refuses at least a malformed count,
+        but it passes a ``vault:v`` head through unchecked, so a malformed one is NOT caught here and
+        does reach ``integrity_drift``; that known cost is stated once, at
+        :func:`~messagefoundry.store.store._audit_head_shape`.
 
         The read goes through ``asyncio.to_thread`` like every other file the engine touches, so a slow or
         hung filesystem cannot block the loop during startup."""

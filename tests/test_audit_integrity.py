@@ -1994,7 +1994,7 @@ _NOT_A_DECIMAL = "the row count is not a plain decimal integer of up to 19 digit
     ],
 )
 def test_parse_audit_anchor_takes_only_a_count_a_store_can_hold(count: str, reason: str) -> None:
-    """Vault BACKLOG #5987: the count is ASCII digits bounded by the signed 64-bit ``seq`` column,
+    """Vault BACKLOG #4790: the count is ASCII digits bounded by the signed 64-bit ``seq`` column,
     not whatever ``int()`` takes, and the reason names no part of it."""
     with pytest.raises(AuditAnchorError) as caught:
         parse_audit_anchor(f"{count}:{'a' * 64}")

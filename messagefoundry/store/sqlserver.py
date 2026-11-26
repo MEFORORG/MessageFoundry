@@ -3671,7 +3671,8 @@ class SqlServerStore(ServerCipherWalk):
     _state_purge_watches: tuple[set[tuple[str, str]], ...] = ()
 
     def _note_state_published(self, ck: tuple[str, str]) -> None:
-        """Record that ``ck`` was just published to the state cache, for any purge pass in flight."""
+        """Record that ``ck`` was just published to the state cache, for any purge pass in
+        flight."""
         for touched in self._state_purge_watches:
             touched.add(ck)
 
