@@ -45,15 +45,15 @@ STRAY = [
     f'[{{"family": ["Doe"] ] {SECRET}}}]',
 ]
 
-#: Stray closers the check is documented to miss (``_stray_json_closer``'s docstring). Strict, so a
-#: change that catches one turns this red and the docstring moves with it.
+#: Some stray closers the check misses: examples, not a complete list. Strict, so a change that
+#: catches one turns this red.
 MISSED = [
     f'"given": [Jane] {SECRET}]',  # no container open: the head was cut
     f'{{"given": [x] {SECRET}}}}}',  # the key's own container's kind
     f'can\'t map {{"given": [Jane] {SECRET}]}}',  # a string opened before the key
     f'{{"given": [Jane] {SECRET}\']}}',  # a quote in the value hides the closer
     f'{{"given": [Jane] {SECRET}"]}}',
-    # A top-level key whose colon is on the next line: the walk disarms at that line break.
+    # A top-level key whose colon is on the next line.
     f'"telecom"\n: [a|b|c ) , {{"value": "{SECRET}"}}]',
 ]
 
@@ -130,9 +130,8 @@ TRACEBACK = (
     "ValueError: bad frame\n"
 )
 
-#: The check is not scoped to the PHI value: a malformed sibling, prose after a top-level key, and
-#: a later key arming the walk again after the first key's container closed, then a malformed
-#: sibling of that key; and a U+2028 line separator, which does not disarm a top-level key.
+#: Some texts the check blanks whole although the closer is not in the PHI value: examples, not a
+#: complete list.
 KNOWN_COST = [
     TRACEBACK,
     f'{{"family": "{SECRET}", "note": [1}}}}',
@@ -140,18 +139,19 @@ KNOWN_COST = [
     f'"family": "{SECRET}" rejected by peer (see [ref) for details',
     f'{{"family": "x"}} x {{"given": "{SECRET}", "note": [1}}',
     f'"family": "{SECRET}"\u2028(see [ref)',
-    # A bracket opened after a top-level key carries its scope across line breaks.
     f'"family": "{SECRET}" (see [ref\n\n}}',
-    # Key-shaped text inside a string arms the check too.
+    # Key-shaped text inside a string.
     f'{{"note": "x \'family\': {SECRET}", "a": [1}}}}',
+    # Balanced, well-formed JSON: the result is read too, and a scrub left a stray closer there.
+    f'{{"family": "{SECRET}", "id": ["a|b|c", 1]}}',
 ]
 
 
 @pytest.mark.parametrize("scrub", SCRUBBERS)
 @pytest.mark.parametrize("text", KNOWN_COST)
 def test_a_known_cost_blanks_the_whole_text(scrub: Callable[[str], str], text: str) -> None:
-    """KNOWN COST, pinned so a change to it is deliberate (``_stray_json_closer``'s docstring names
-    it). The direction is safe: more is hidden. Before BACKLOG #5814 each kept its text."""
+    """KNOWN COST, pinned so a change to it is deliberate. The direction is safe: more is hidden.
+    Before BACKLOG #5814 each kept its text."""
     assert scrub(text) == PLACEHOLDER
 
 

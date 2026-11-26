@@ -1400,8 +1400,8 @@ def _json_scalar(match: re.Match[str], policy: int, widened: bool) -> str:
 
 
 class _MismatchedJsonCloser(Exception):
-    """Raised by :func:`_scrub_json_value` on a closer of another kind than the open container's, and
-    caught only by :func:`redact` (BACKLOG #5814)."""
+    """Raised by :func:`_scrub_json_value` on a closer it reads as mismatched. :func:`_redact_noted`
+    catches it and returns the placeholder, followed by any trailing bound note (BACKLOG #5814)."""
 
 
 def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[str, int]:
@@ -2091,10 +2091,13 @@ def redact(text: str) -> str:
     it: measured at 1 text in 200,000 on a fuzz, at every head of the pull request before this rule,
     and 0 in 600,000 with it. That zero is a measurement, not a proof for the first-stage labels.
 
-    **A mismatched closer after a PHI JSON key can make the whole text redacted (BACKLOG #5814)**:
-    the result is then the placeholder, followed by any trailing bound note. The text as received
-    and the result are both read for one. :func:`_stray_json_closer`'s docstring states which
-    closers do it, how far a key's scope runs, and at least the shapes the check misses."""
+    **A mismatched or stray JSON closer after a PHI JSON key can make the result the placeholder
+    for the whole text (BACKLOG #5814)**, followed by any trailing bound note. Text shaped like such
+    a key can do it too, including text inside a JSON string. This can blank text beyond the key's
+    value, including some balanced inputs. The check is a heuristic walk and misses some shapes: the
+    code of :func:`_redact_noted` and :func:`_stray_json_closer` is the definition, and
+    ``tests/test_b5814_stray_closer_before_flat_passes.py`` pins examples in its ``KNOWN_COST`` and
+    ``MISSED`` lists, neither of them a complete list."""
     return _redact_noted(text, noted=False)
 
 
@@ -2131,67 +2134,15 @@ def _redact_noted(text: str, *, noted: bool) -> str:
 
 
 def _stray_json_closer(text: str) -> bool:
-    """Whether ``text`` holds a closer, read as structure, that meets an open container of another
-    kind while the walk is armed by a PHI JSON key, or by key-shaped text a string holds
-    (BACKLOG #5814, added item 2).
+    """Whether to return the placeholder for ``text`` because a mismatched or stray JSON closer
+    follows a PHI JSON key, or text shaped like one (BACKLOG #5814, added item 2).
+    :func:`_redact_noted` calls it on the text as received and on the result.
 
-    **Read on the text before any pass rewrites it**, and on the result. The walk in
-    :func:`_scrub_json_value` reads what the flat passes left, and a field-run scrub can consume an
-    opener, so a later closer looks matched there: ``{"identifier": [a|b|c ) , {"value": ...}]}``.
-    A same-kind stray closer is caught here only where a closer after it then meets the key's own
-    container: in ``{"given": [x] y]}`` the first ``]`` ends the value and the second meets the
-    object's ``{``.
-
-    It reads the text from its start as :data:`_JSON_TOKEN` tokenizes it, so a closer inside a
-    string is not structure. A PHI key that the walk passes while disarmed arms it at the key's
-    depth. Keys are found on the raw text, not on its tokens, so key-shaped text inside a JSON
-    string arms the walk too: ``'family':`` in a string value, as in
-    ``{"note": "x 'family': y", "a": [1}}``, blanks that text. The walk blanks on the first
-    closer, while armed, whose innermost open container is of another kind. It disarms when the
-    depth falls below the armed depth, which is the arming key's own container closing; a later
-    PHI key can then arm it again. A key outside every container disarms only at a line feed or
-    carriage return reached with no container open, so not necessarily at the end of its line:
-    not while a container opened after it is still open. Other line separators, such as U+2028, do
-    not disarm it, and nor does a line break inside a string, such as one a backslash escapes in a
-    value continued on the next line. A container is any ``{``, ``[`` or ``(`` the walk reads,
-    prose parentheses included, so a key inside ``(see "family": ...)`` disarms at that ``)``. A
-    bracket inside a string is not read either: an apostrophe after the key, as in ``can't (see
-    [ref``, opens a single-quoted string that runs to the line's end and hides that bracket, so the
-    key can disarm at the next line break.
-
-    This walk is one of two routes to the placeholder. The other is :func:`_scrub_json_value`
-    raising :class:`_MismatchedJsonCloser` on a closer it reads as mismatched, and that route does
-    not depend on this scope: ``"family"\\n: [x y}`` is blanked by it although this walk disarmed
-    at the line feed.
-
-    So the check is not scoped to the PHI value, and that is a known cost, in the safe direction.
-    At least these shapes blank the whole text: a malformed sibling after a well-formed PHI value
-    (``{"family": "Doe", "note": [1}}``, or ``"family": "Doe", "note": [1}`` at top level); prose
-    with a mismatched closer after a top-level key on its line
-    (``"family": "Doe" rejected (see [ref) for details``); and a
-    text whose key's own container is never closed, which stays armed to its end, as in a
-    traceback whose frame line leaves a PHI-keyed dict unclosed and whose later frame holds a
-    mismatched closer. Before BACKLOG #5814 each of those kept its text and scrubbed the value;
-    ``tests/test_b5814_stray_closer_before_flat_passes.py`` pins them.
-
-    The walk visits only brackets and runs of line breaks (:data:`_JSON_STRUCTURE`), one step each
-    rather than one per token, and stops once it is disarmed with no key left to arm it again.
-    While armed, as in a key's container that never closes, it walks to the end of the text.
-
-    It misses at least: a closer with no open container, as in a fragment whose head was cut
-    (``"given": [x] y]``); a stray closer of the key's own container's kind (``{"given": [x] y}}``);
-    a stray closer a matching unmatched opener absorbs; one inside a string that opened before the
-    key, such as an apostrophe earlier on the line (``can't map {"given": [x] y]}``); one a quote
-    put in the value hides in an unterminated string (``{"given": [x] y']}``); and, for a key
-    outside every container with its colon on the next line, a closer in its value that the JSON
-    pass reads as matched, such as one after an opener a field-run pass consumed
-    (``"telecom"\\n: [a|b|c ) , {"value": y}]``). The walk disarms at that line break, so what
-    follows that closer is kept, as before BACKLOG #5814; a plain mismatched closer there is still
-    blanked by the JSON pass. Counting an unterminated string's closers was tried and dropped: a
-    cut inside any string after a PHI key,
-    and the placeholders this module and the support bundle write, then blanked whole texts and
-    broke the fixed point. A value of one token after the key's value, with no stray closer at all
-    (``{"given": [x] y}``), is not this check's to catch: :func:`_scrub_json_value` keeps it."""
+    A heuristic walk. Text shaped like a PHI JSON key counts as one, including text inside a JSON
+    string. It can blank text beyond the key's value, including some balanced inputs, and it misses
+    some shapes. The code below is the definition; this docstring does not restate it.
+    ``tests/test_b5814_stray_closer_before_flat_passes.py`` pins examples in its ``KNOWN_COST`` and
+    ``MISSED`` lists, neither of them a complete list."""
     keys = [match.start() for match in _JSON_PHI_KEY.finditer(text)]
     if not keys:
         return False
