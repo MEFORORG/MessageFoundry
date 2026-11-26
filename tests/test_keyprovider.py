@@ -612,10 +612,20 @@ def _context_is_codec() -> Exception:
             return error
 
 
-def _outcome(call: Callable[[], object]) -> tuple[type[BaseException], str]:
+def _outcome(call: Callable[[], object]) -> list[tuple[type[BaseException], str]]:
+    """The class and text ``call`` raises, read once bare and once while an unrelated error is
+    being handled, since a re-raise in the dispatch would take that error as its context there."""
+    seen: list[tuple[type[BaseException], str]] = []
     with pytest.raises(Exception) as caught:
         call()
-    return type(caught.value), str(caught.value)
+    seen.append((type(caught.value), str(caught.value)))
+    try:
+        raise LookupError("synthetic unrelated")
+    except LookupError:
+        with pytest.raises(Exception) as caught:
+            call()
+    seen.append((type(caught.value), str(caught.value)))
+    return seen
 
 
 @pytest.mark.parametrize(
