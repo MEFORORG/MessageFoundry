@@ -4038,8 +4038,9 @@ class AuthSettings(_Section):
     oidc_acr_values: str | None = None
     oidc_prompt: str | None = None  # requested `prompt` authorize param; blank loads as None
     # 0 serves no key as fresh, so each unknown or stale lookup asks for a fetch, still throttled by
-    # the refetch bound below; 0 there removes that bound. A negative is refused for both (BACKLOG
-    # #5318): the consumers read it as 0.
+    # the refetch bound below; 0 there removes that bound. The load refuses for both at least a
+    # negative (BACKLOG #5318) and a value too large for a float (_check_oidc_jwks_interval), and
+    # JwksCache refuses both at construction too.
     oidc_jwks_ttl_seconds: int = Field(default=3600, ge=0)
     oidc_jwks_min_refetch_seconds: int = Field(default=300, ge=0)  # the amplification bound
     oidc_flow_ttl_seconds: int = 300  # single-use flow window; validator-capped 30..1800

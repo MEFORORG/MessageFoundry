@@ -165,6 +165,12 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + "the new message interpolates the caught CodeSetError whole",
     ),
     _Allowed(
+        "messagefoundry/config/settings.py::AuthSettings._check_oidc_jwks_interval::"
+        "OverflowError::ValueError",
+        _SAFE + "float() overflow text is fixed ('int too large to convert to float'), no value; "
+        "the new message names only the field",
+    ),
+    _Allowed(
         "messagefoundry/config/reference.py::reference::KeyError::ReferenceError",
         _SAFE + "KeyError carries an operator-authored reference-set name, also in the message",
     ),
