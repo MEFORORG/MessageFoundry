@@ -4,7 +4,8 @@
 ruling 2026-11-25, decision d20261126T042906640-0b0f76).
 
 No setting starts a box active, so a restart of an activated box drops it to passive. The start
-now reads the newest ``dr.activate`` or ``dr.release`` row its own process identity wrote. When
+now reads the newest ``dr.activate``, ``dr.release`` or ``dr.stay_passive`` row its own process
+identity wrote. When
 that row is a ``dr.activate``, it logs at ERROR and raises the critical ``dr_restarted_passive``
 alert, which closes the open ``dr_activated``; it never re-activates the box. Each engine shard
 reads only its own rows. An activated server-DB box with ``[dr].restore_token`` set also writes no
@@ -309,7 +310,7 @@ async def test_each_engine_shard_alerts_on_its_own(tmp_path: Path) -> None:
         await store.close()
 
 
-async def test_an_activated_sqlite_box_still_backs_up_and_warns_of_no_pause(
+async def test_an_activated_sqlite_box_still_backs_up_and_logs_no_pause_warning(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     # Owner ruling 2026-11-26 (decision d20261126T095342812-893e1d): only a server-DB box with

@@ -692,9 +692,8 @@ class BackupRunner:
 
         Leader-gated (AC-12): a non-leader returns ``None`` without touching the store or the shared
         destination (so in a cluster exactly one node backs up), and so does an engine-gated DR
-        box (vault BACKLOG #5712, BACKLOG #5965; which boxes, at ``dr_paused``). On success records a
-        ``dr_backup`` audit
-        row + returns the :class:`BackupResult`; on failure records a ``dr_backup`` ERROR row, raises
+        box (vault BACKLOG #5712, BACKLOG #5965; which boxes, at ``dr_paused``). On success
+        records a ``dr_backup`` audit row + returns the :class:`BackupResult`; on failure records a ``dr_backup`` ERROR row, raises
         ``AlertSink.backup_failed``, leaves any prior good archive intact, and re-raises
         :class:`BackupError`. ``force_config_only`` (the CLI ``--config-only`` flag) backs up the config
         bundle only even on a SQLite store (a server-DB store is always config-only per the boundary)."""

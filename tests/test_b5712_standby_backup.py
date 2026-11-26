@@ -149,7 +149,11 @@ async def _token_engine(
         ),
         egress_settings=EgressSettings(deny_by_default=False),
     )
-    await engine.start()
+    try:
+        await engine.start()
+    except BaseException:
+        await engine.stop()
+        raise
     return engine
 
 

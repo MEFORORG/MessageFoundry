@@ -259,8 +259,8 @@ class DrCoordinator:
         # The engine's process identity, ``shard:<id>`` or ``node:<id>``, or None for a lone
         # engine (Engine.instance_identity). Read at each use: it is known once the engine holds
         # its graph. It goes on the dr.activate, dr.release and dr.stay_passive rows, so a start
-        # finds its own
-        # process's newest transition among the other engine shards' (BACKLOG #5965).
+        # finds its own process's newest transition among the other engine shards' (BACKLOG
+        # #5965).
         self._instance = instance
         # The instance posture, for the Vault hop the cold-seed verify can dial (vault BACKLOG
         # #2983). The engine passes its own. `None` counts as enforcing on that hop.

@@ -1248,7 +1248,8 @@ class Engine:
                 self.store,
                 self._dr_settings,
                 store_settings=self._store_settings,
-                # BACKLOG #5965: each engine shard's dr.activate, dr.release and dr.stay_passive rows name it.
+                # BACKLOG #5965: each engine shard's dr.activate, dr.release and dr.stay_passive
+                # rows name it.
                 instance=lambda: self.instance_identity,
                 activate_profile=self._dr_activate_profile,
                 deactivate_profile=self._dr_release_drain,
