@@ -5621,8 +5621,9 @@ class SqlServerStore(ServerCipherWalk):
                             self.backend, self._settings.database
                         )
                 # Read before the applock and the batch, so DDL the live-schema check cannot read
-                # fails here, with no peer queued behind it (BACKLOG #5062). Cached per process.
-                _declared_schema()
+                # fails here, with no peer queued behind it (BACKLOG #5062). Cached per process; the
+                # first parse takes tens of milliseconds, so it runs off the event loop.
+                await asyncio.to_thread(_declared_schema)
                 # pyodbc copies the connection timeout into a cursor only when it creates the cursor,
                 # so each step below runs on its own cursor, opened after the connection timeout is set
                 # for that step, and closed before the next opens (no MARS: one active statement per
@@ -5755,7 +5756,7 @@ class SqlServerStore(ServerCipherWalk):
         Raises :class:`ServerSchemaMismatchError` naming each one, and logs it at ERROR first. Extras
         are tolerated. :mod:`messagefoundry.store.server_schema_verify` says what is compared and
         what is not. Reads only."""
-        expected = _declared_schema()
+        expected = await asyncio.to_thread(_declared_schema)
         tables = sorted(expected.columns)
         column_rows: list[tuple[str, str | None, str | None, ColumnShape | None]] = []
         # `VALUES ()` is a syntax error, so a batch that declared nothing reads nothing.
@@ -6133,7 +6134,8 @@ class SqlServerStore(ServerCipherWalk):
         found: bool | None = None
         # A named constraint is a schema-wide object, so its name collides as a table's does.
         constraints = {name for each in _SCHEMA for name in _NAMED_CONSTRAINT.findall(each)}
-        tables = tuple(sorted({*_declared_schema().columns, *constraints}))
+        declared = await asyncio.to_thread(_declared_schema)
+        tables = tuple(sorted({*declared.columns, *constraints}))
         if not tables:
             return None
         async with (

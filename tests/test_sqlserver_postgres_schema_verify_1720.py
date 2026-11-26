@@ -1642,6 +1642,39 @@ async def test_ddl_the_check_cannot_read_fails_before_the_lock_and_the_batch(
         assert ms.rolledback >= 1
 
 
+@pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
+async def test_the_batch_is_parsed_off_the_event_loop(
+    backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Red before #5062's event-loop item: the open parsed the batch on the event loop, tens of
+    milliseconds on a first call that every other task on the loop waited out. Each read the open
+    makes now runs on a worker thread."""
+    import sys
+    import threading
+
+    from messagefoundry.store import postgres, sqlserver
+
+    module = postgres if backend == "postgres" else sqlserver
+    real = module._declared_schema
+    calls: list[tuple[int, str]] = []
+
+    def recording() -> ServerSchemaShape:
+        # The fake live rows read the shape too, from the test helpers, on the loop; only the
+        # store's own reads are this test's subject.
+        calls.append((threading.get_ident(), sys._getframe(1).f_globals["__name__"]))
+        return real()
+
+    monkeypatch.setattr(module, "_declared_schema", recording)
+    loop_thread = threading.get_ident()
+    if backend == "postgres":
+        assert await _pg_store(_PgConn())._ensure_schema() is True
+    else:
+        assert await _ms_store(_MsConn())._ensure_schema() is True
+    off_loop = [caller for thread, caller in calls if thread != loop_thread]
+    assert len(off_loop) >= 2, calls  # the control: the pre-lock read and the live check ran
+    assert (loop_thread, module.__name__) not in calls, calls
+
+
 def test_a_nextval_default_reads_as_numbered_without_not_null() -> None:
     """The live read counts a ``nextval()`` default as numbering, so the declared side must too, or a
     correct column refuses. Unlike ``SERIAL`` it adds no NOT NULL."""
