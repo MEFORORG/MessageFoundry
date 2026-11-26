@@ -63,9 +63,6 @@ regexes = [
   # `sslpassword=`, a key glued to its credential word (BACKLOG #5030); pattern
   # _CONNECTION_STRING_MEMBER.
   '''wt-Ss1_Memb-92''',
-  # `sslpassword=` as the first member, with no ";" before it (BACKLOG #5030 added item 4);
-  # pattern _CONNECTION_STRING_FIRST_MEMBER.
-  '''wt-Fm1_Memb-94''',
   # --- BACKLOG #1183 -- log-redaction secret-domain fixtures --------------------------------------
   # Nine SYNTHETIC needles invented for tests/test_log_redaction_secret_domain.py (plus one sibling in
   # tests/test_environments.py). Each is a value a redaction test asserts does NOT survive a log line,
@@ -96,9 +93,6 @@ regexes = [
   # Family "connection_string_member" -- an ODBC string's `sslpassword=` (BACKLOG #5030);
   # pattern _CONNECTION_STRING_MEMBER.
   '''pw-Ss1_Memb-91''',
-  # Family "connection_string_first_member" -- `sslpassword=` as the first member, with no ";"
-  # before it (BACKLOG #5030 added item 4); pattern _CONNECTION_STRING_FIRST_MEMBER.
-  '''pw-Fm1_Memb-93''',
   # tests/test_environments.py -- the needle proving a cast failure never echoes an env() value into
   # the startup error (#1183). Never a real credential; it is chosen to FAIL int() on purpose.
   '''pw-C4st_Val-66''',
