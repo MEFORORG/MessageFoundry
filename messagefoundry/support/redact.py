@@ -56,6 +56,7 @@ from messagefoundry.redaction import redact as _redact_phi
 from messagefoundry.secretscrub import (
     _BEARER_TAILS,
     _BYTES_PROBE,
+    _CONNECTION_STRING_FIRST_MEMBER,
     _CONNECTION_STRING_MEMBER,
     _KEY_LINE,
     _KEY_SEPARATOR,
@@ -737,6 +738,7 @@ def redact_log_line(line: str) -> str:
         # same separators; secretscrub's comment on the pattern says why that matters.
         if ";" in body:
             body = _CONNECTION_STRING_MEMBER.sub(_mask_member, body)
+            body = _CONNECTION_STRING_FIRST_MEMBER.sub(_mask_member, body)
         # The widened DSN reading, last and over the whole line (BACKLOG #5386): at least a
         # password-only DSN, and a password holding an "@" that the narrow copy above cut at its
         # first one; the comment on secretscrub's _WIDE_DSN_PASSWORD says what else. It does not
