@@ -1143,18 +1143,22 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
             f"the {label} MFA route's factor-state reads before verify_mfa are {pre_code}; the doc "
             "names only rotation_comes_first's must-change redirect."
         )
+    raw = _doc_text()
+    text = _flat(raw)
     assert (
         "before the code, through `rotation_comes_first`, whether a must-change session must "
-        "change its password first" in " ".join(_doc_text().split())
+        "change its password first" in text
     ), "the doc no longer states POST /ui/mfa's must-change redirect ahead of the code."
-    # Vault BACKLOG #2964 items 19, 26 and 28: the JSON route has no pre-code ask (pinned above),
-    # GET /ui/mfa renders no gate for a satisfied session, and only a passkey that completes the
-    # pending factor stamps the window (the anchor pin above).
-    text = " ".join(_doc_text().split())
+    # Vault BACKLOG #2964 items 19, 26 and 28. These pin the prose only. The code facts behind
+    # them are pinned elsewhere, at least: the JSON route's empty pre-code list and verify_mfa's
+    # no-mfa_verified_at check above (item 19); test_ui_mfa_gate.py's
+    # test_a_satisfied_session_is_bounced_off_the_page (item 26); and test_webauthn.py's
+    # test_a_factor_met_during_the_assertion_is_not_re_anchored (item 28).
     for stated in (
         "`POST /auth/mfa-verify` has no such must-change ask",
-        "`GET /ui/mfa` sends a session that has met its factor to `/ui`",
+        "`GET /ui/mfa` renders its code form only to a session that has not met its factor",
         "a user-verified passkey that completes the pending factor, or a step-up",
+        "a user-verified passkey that completes a pending factor, which does too",
     ):
         assert stated in text, f"the doc no longer states: {stated}"
 
@@ -1198,12 +1202,16 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
         # Found by the sweep: POST /ui/mfa counted among the routes that charge nothing.
         "the remaining three charge nothing",
         "limiter 3 on the assertion **finish** leg only",
+        # Vault BACKLOG #2964 items 19, 26 and 28, in forms longer than their CORRECTED quotes.
+        "until its holder submits a code to the MFA gate, which",
+        "outside that must-change case, an account holding a TOTP",
+        "a user-verified passkey, or a step-up",
+        "a user-verified passkey, which does too",
     ):
         assert retired not in text, (
             f"docs/SECURITY.md says {retired!r} again; the code contradicts it (BACKLOG #1133)."
         )
 
-    raw = _doc_text()
     oidc_row = next(
         line for line in raw.splitlines() if line.startswith("| `POST /ui/oidc/start`, `GET /ui")
     )
