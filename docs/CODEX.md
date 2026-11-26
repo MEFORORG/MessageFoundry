@@ -23,8 +23,7 @@ The bridge combines context. Among the hooks of one event that complete, it keep
 a `hookSpecificOutput.permissionDecision` of deny over ask or allow, and a
 top-level `decision: block` or `continue: false` over later hooks.
 PermissionRequest's `hookSpecificOutput.decision` is not ranked: the last hook
-that sets it wins, so any later value, an allow among them, replaces an earlier
-deny. For how the other
+that sets it wins, so a later allow replaces an earlier deny. For how the other
 `hookSpecificOutput` keys merge, see `merge_output` in `scripts/codex/bridge.py`.
 The known gap below covers a fault.
 
@@ -40,30 +39,11 @@ the other hooks' context is kept, as in Claude Code.
 
 The bridge does not fail closed on a fault; this is a known gap. At least these
 end the bridge or its launcher with a non-zero exit, and no deny or block
-output, which the registered line delivers to Codex as 1: on any event but
-SessionStart, a hook that exits non-zero other than 2 or times out, unless
-another hook of the event exited 2, or a deny, an ask, a block or a
-`"continue": false` from another hook still stands once the event's hooks end
-(a PermissionRequest `decision` deny that a later `decision` replaced, as
-above, does not); and, on
-any event, unreadable settings, a bad payload or a missing `.venv`. Outside
-SessionStart, a hook that exits non-zero other than 2, times out or prints JSON
-that is not an object does not stop the event's later hooks. They still run
-while the event's shared budget lasts, and once it is spent each later hook is
-recorded as timed out without running. The first such failure is raised once
-the event's hooks end. Claude Code takes a UserPromptSubmit hook's output that
-does not start with `{` as plain text, so there JSON such as `3` is context in
-Claude Code and a failure here. A hook's exit 2 still ends the event at once,
-as a block, and no later hook runs. A fault outside a hook's own run also ends
-the hooks early. Examples are an unsupported hook, or an object whose fields
-have the wrong type, such as `{"systemMessage": 5}`. That fault then takes the
-first failure's place, and a decision in that same object, such as a deny, a
-block or a `"continue": false`, can be lost when the bad field merges first, as
-`merge_output` orders the fields. Nothing is
-raised when a deny, an ask, a block or a `"continue": false` merged before the
-fault stands, from another hook or from the same object. The bridge then prints
-the event's output with that decision and a `systemMessage` naming the failure,
-and exits 0. How Codex handles
+output, which the registered line delivers to Codex as 1: a hook that exits
+non-zero other than 2, or times out, on any event but SessionStart, and, on any
+event, unreadable settings, a bad payload or a missing `.venv`. The bridge then
+prints none of the event's output, so what earlier hooks returned, a deny
+included, is lost, and later hooks of the event do not run. How Codex handles
 that 1 is not measured here. The assumed behaviour is that Codex treats an exit
 other than 0 or 2 as a non-blocking error, so the event is not blocked: a
 PreToolUse fault lets the tool run, a PostToolUse fault loses the event's
