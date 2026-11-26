@@ -205,6 +205,50 @@ async def test_a_released_box_raises_nothing_on_restart(tmp_path: Path) -> None:
         await store.close()
 
 
+async def test_a_store_rebuilt_from_an_activated_snapshot_alerts_without_claiming_a_restart(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The store is rebuilt from a snapshot taken while the box was activated, and the box was
+    # released after that snapshot. Its newest own row is still dr.activate, so it alerts as
+    # before, but the ERROR line must not say the box went down while serving.
+    db, archive, ss, key = await _seed(tmp_path)
+    store = await MessageStore.open(db, cipher=make_cipher(key))
+    try:
+        await _coord(store, ss, archive, _Sink(), None).activate(actor="alice")
+    finally:
+        await store.close()
+    snapshot = tmp_path / "snapshot.db"
+    snapshot.write_bytes(db.read_bytes())
+    store = await MessageStore.open(db, cipher=make_cipher(key))
+    try:
+        # The release after the snapshot; on this restarted coordinator it is a stay-passive row.
+        await _coord(store, ss, archive, _Sink(), None).release(actor="alice")
+        assert len(await store.list_audit(action="dr.stay_passive", limit=5)) == 1
+    finally:
+        await store.close()
+
+    rebuilt = await MessageStore.open(snapshot, cipher=make_cipher(key))
+    try:
+        assert await rebuilt.list_audit(action="dr.stay_passive", limit=5) == []
+        assert len(await rebuilt.list_audit(action="dr.activate", limit=5)) == 1
+        sink = _Sink()
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.dr"):
+            assert await _coord(rebuilt, ss, archive, sink, None).check_restarted_passive()
+        # Same alert and same passive outcome as a restart while serving.
+        assert sink.events == [("dr_restarted_passive", socket.gethostname())]
+        errors = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.ERROR and r.name == "messagefoundry.pipeline.dr"
+        ]
+        assert len(errors) == 1
+        line = errors[0]
+        assert "newest DR record" in line and "snapshot" in line
+        assert "was last ACTIVATED" not in line and "after a restart" not in line
+    finally:
+        await rebuilt.close()
+
+
 async def test_a_release_on_the_restarted_box_records_that_it_stays_passive(
     tmp_path: Path,
 ) -> None:
