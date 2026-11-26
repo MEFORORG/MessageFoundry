@@ -328,8 +328,11 @@ def harden_crl_check(
     and only where they trust operator CAs alone (:func:`build_verifying_client_context`): a hop
     on the OS trust store is refused at build instead (:data:`OS_ROOTS_CHAIN_CHECK_REASON`
     says why).
+    LDAPS and the OIDC legs pass it only with their own opt-in, through
+    :func:`harden_own_crl_check`, on their own CA file alone.
     The start rule's refusal is worded for a server chain when ``setting`` is
-    :data:`OUTBOUND_CRL_SETTING`. Every other hop keeps the leaf check.
+    :data:`OUTBOUND_CRL_SETTING` or a key of :data:`messagefoundry.pki.OWN_CRL_CHAIN_HOPS`.
+    Every other hop keeps the leaf check.
 
     The opt-in revocation half of :func:`harden_verify_flags`, which does strict RFC 5280 path
     validation and explicitly NOT revocation. Call it only on a context that already verifies the
@@ -511,7 +514,7 @@ def harden_crl_check(
         anchors,
         label=label,
         refusal=(
-            own_crl_reason(anchors, pem, outbound=setting == OUTBOUND_CRL_SETTING)
+            own_crl_reason(anchors, pem, outbound=setting == OUTBOUND_CRL_SETTING, setting=setting)
             if chain
             else None
         ),
@@ -2065,6 +2068,7 @@ def assert_ldap3_tls_suites(
     ca_certs_data: str | None,
     connector: str,
     crl_file: str | None = None,
+    crl_check_chain: bool = False,
 ) -> Ldap3ContextFactory:
     """Build and assert the LDAPS hop's TLS context; return the factory that builds it.
 
@@ -2101,6 +2105,10 @@ def assert_ldap3_tls_suites(
     store). A file that cannot be loaded refuses, at construction and at any later bind: ldap3
     turns the refusal raised inside ``wrap_socket`` into ``LDAPSocketOpenError``, so that bind
     fails rather than handshaking unchecked.
+
+    ``crl_check_chain`` is ``[auth].ad_tls_crl_check_chain`` (vault BACKLOG #5511): the CRL is then
+    checked against the domain controller's whole chain, on CAs from ``ca_certs_data`` alone
+    (:func:`harden_own_crl_check`). Set with no ``crl_file``, the build refuses.
     """
 
     def narrowed_context() -> ssl.SSLContext:
@@ -2110,10 +2118,16 @@ def assert_ldap3_tls_suites(
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         if validate != ssl.CERT_NONE:
             harden_verify_flags(ctx)
-            if crl_file:
-                harden_crl_check(
-                    ctx, crl_file, setting="[auth].ad_tls_crl_file", record_held_copy=False
-                )
+            harden_own_crl_check(
+                ctx,
+                crl_file,
+                setting="[auth].ad_tls_crl_file",
+                chain=crl_check_chain,
+                # An empty string loads the OS store too (create_default_context tests it for
+                # truth), so it is no CA of the hop's own.
+                has_own_ca=bool(ca_certs_data),
+                record_held_copy=False,
+            )
         harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
         _narrow_library_context(ctx, connector=connector, hop="the LDAPS TLS context")
         harden_cipher_suites(ctx, connector=connector)
@@ -3587,7 +3601,25 @@ def _require_rooted_cas(ctx: ssl.SSLContext, anchor: TrustAnchor) -> None:
     root it does not hold is refused here, at build, since no chain through that CA could end at
     a root the CRL file covers. An intermediate beside its root is admitted: the chain runs on
     through it to the root, and the own-CRL rule then asks for the intermediate's CRL too."""
-    from messagefoundry.pki import OUTBOUND_NO_PARTNER_TLS_CASE, cas_not_reaching_a_root
+    from messagefoundry.pki import OUTBOUND_NO_PARTNER_TLS_CASE
+
+    _require_rooted_ca_store(
+        ctx,
+        chain_setting="[tls].crl_check_chain",
+        ca_setting=anchor.cafile_setting or "the CA file setting",
+        crl_setting=OUTBOUND_CRL_SETTING,
+        case=f"{OUTBOUND_NO_PARTNER_TLS_CASE}. ",
+    )
+
+
+def _require_rooted_ca_store(
+    ctx: ssl.SSLContext, *, chain_setting: str, ca_setting: str, crl_setting: str, case: str = ""
+) -> None:
+    """:func:`_require_rooted_cas` for any hop, worded with its own settings (vault BACKLOG
+    #5511): refuse a store holding a certificate that is no CA, or a CA with no path to a
+    self-signed root in it, then clear ``VERIFY_X509_PARTIAL_CHAIN`` so a chain must end at a
+    root. ``case`` is a sentence, ending in a space, that the refusals carry before the remedy."""
+    from messagefoundry.pki import cas_not_reaching_a_root
 
     stats = ctx.cert_store_stats()
     if stats["x509"] != stats["x509_ca"]:
@@ -3595,20 +3627,19 @@ def _require_rooted_cas(ctx: ssl.SSLContext, anchor: TrustAnchor) -> None:
         # so the checks below could not see it, and under the chain check it would need a CRL
         # of its own that no rule here asks for.
         raise ValueError(
-            f"[tls].crl_check_chain is set, and {anchor.cafile_setting or 'the CA file setting'} "
+            f"{chain_setting} is set, and {ca_setting} "
             f"loads {stats['x509'] - stats['x509_ca']} certificate(s) that are not CAs. The "
-            "whole-chain check needs the chain to end at a root whose CRL is in [tls].crl_file. "
-            f"{OUTBOUND_NO_PARTNER_TLS_CASE}. Put only CA certificates in that CA file"
+            f"whole-chain check needs the chain to end at a root whose CRL is in {crl_setting}. "
+            f"{case}Put only CA certificates in that CA file"
         )
     unrooted = cas_not_reaching_a_root(ctx.get_ca_certs(binary_form=True))
     if unrooted:
         raise ValueError(
-            f"[tls].crl_check_chain is set, and {anchor.cafile_setting or 'the CA file setting'} "
+            f"{chain_setting} is set, and {ca_setting} "
             f"loads CA(s) that do not chain to a self-signed root CA in that file: "
             f"{', '.join(unrooted)}. The whole-chain check needs the chain to end at a root "
-            f"whose CRL is in [tls].crl_file. {OUTBOUND_NO_PARTNER_TLS_CASE}. Add each one's root CA "
-            "to that CA file, or remove "
-            "the CA; the server can send its intermediates"
+            f"whose CRL is in {crl_setting}. {case}Add each one's root CA to that CA file, or "
+            "remove the CA; the server can send its intermediates"
         )
     # int(): the complement of the IntFlag member keeps only VerifyFlags' own bits, so it would
     # also clear a flag above them that OpenSSL or an earlier step set.
@@ -3627,6 +3658,54 @@ def _harden_outbound_crl(ctx: ssl.SSLContext, anchor: TrustAnchor) -> None:
     )
     # Vault BACKLOG #2319: a CRL inside the CA file is live now that the check is on.
     record_ca_bundle_crls(ctx, anchor.cafile, setting=anchor.cafile_setting)
+
+
+def harden_own_crl_check(
+    ctx: ssl.SSLContext,
+    crl_file: str | None,
+    *,
+    setting: str,
+    chain: bool,
+    has_own_ca: bool,
+    record_held_copy: bool = True,
+) -> None:
+    """:func:`harden_crl_check` for a server-auth hop with a CRL setting of its own, ``setting``,
+    a key of :data:`messagefoundry.pki.OWN_CRL_CHAIN_HOPS`: the leaf check, or with ``chain``
+    the whole chain (vault BACKLOG #5511). Call it on a verifying ``ctx`` whose trust store is
+    final. With no ``crl_file`` it does nothing, unless ``chain`` is set: then it refuses, since
+    no CRL would be checked.
+
+    With ``chain`` the hop must trust its own CA setting alone, ``has_own_ca``, or it refuses: on
+    the OS trust store the start rule could not be met (:data:`OS_ROOTS_CHAIN_CHECK_REASON` says
+    why for the ``[tls]`` hops, and it holds here too). Its settings refuse that at load, so this
+    refusal is the builder's own check that no caller skipped it. Then, as on an outbound hop,
+    every certificate the store holds must be a CA reaching a self-signed root in it, and the CRL
+    file must hold a CRL from each CA (:func:`messagefoundry.pki.own_crl_reason`). Each refusal
+    names this hop's own settings."""
+    from messagefoundry.pki import OWN_CRL_CHAIN_HOPS
+
+    if chain:
+        chain_setting, ca_setting = OWN_CRL_CHAIN_HOPS[setting]
+        if not crl_file:
+            raise ValueError(
+                f"{chain_setting} is set with no {setting}, so no CRL would be checked; set the "
+                "CRL file, or unset the chain check"
+            )
+        if not has_own_ca:
+            raise ValueError(
+                f"{chain_setting} is set, but this hop verifies its server against the OS trust "
+                f"store, with no {ca_setting}. The whole-chain check would need a CRL in "
+                f"{setting} from every CA that store loads, so it is refused rather than honoured "
+                f"unchecked. Set {ca_setting} to the CA file the server's chain ends in, or unset "
+                f"{chain_setting}"
+            )
+        _require_rooted_ca_store(
+            ctx, chain_setting=chain_setting, ca_setting=ca_setting, crl_setting=setting
+        )
+    if crl_file:
+        harden_crl_check(
+            ctx, crl_file, setting=setting, record_held_copy=record_held_copy, chain=chain
+        )
 
 
 def build_verifying_client_context(

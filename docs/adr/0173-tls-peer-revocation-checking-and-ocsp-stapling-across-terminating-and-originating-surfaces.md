@@ -1852,3 +1852,23 @@ names its own kind of connection. LDAPS, OIDC, the log forwarder and the Postgre
 have CRL settings of their own, keep the leaf check.
 
 Pinned by `tests/test_outbound_crl_chain.py`.
+
+## 16. Amendment 2026-11-26 -- an opt-in whole-chain check on LDAPS and the OIDC legs (vault BACKLOG #5511)
+
+**What changed.** `[auth].ad_tls_crl_check_chain` and `[auth].oidc_tls_crl_check_chain`, each
+default `false`, turn on section 14's chain check on the LDAPS bind and on both OIDC legs. Section
+15's last sentence now holds for them only while each is unset. Each hop keeps its own CRL setting
+(BACKLOG #299, #2193), so each takes its own switch rather than `[tls].crl_check_chain`, which
+those hops never read.
+
+**Where it holds.** Each needs the hop's CRL file and its own CA file, `[auth].ad_tls_ca_cert_file`
+or `[auth].oidc_tls_ca_cert_file`, and is refused at load without either, so the check never runs
+on the OS trust store, for the reason section 15 gives. The builder refuses the same case too.
+With it on, `harden_own_crl_check` in `messagefoundry/config/tls_policy.py` applies section 15's
+rooted-CA rule and clears `VERIFY_X509_PARTIAL_CHAIN`, and section 14's start rule, each worded
+with the hop's own settings (`messagefoundry.pki.OWN_CRL_CHAIN_HOPS`). The LDAPS factory applies
+them at every bind; the OIDC context is reloaded under the same start rule.
+
+**Still leaf only.** At least the log forwarder and the Postgres store.
+
+Pinned by `tests/test_own_crl_chain_hops.py`.

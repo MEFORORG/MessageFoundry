@@ -1848,6 +1848,8 @@ class LdapAuthenticator:
             ca_certs_data=self._ca_certs_data,
             connector=_LDAPS_CONNECTOR,
             crl_file=settings.ad_tls_crl_file,  # BACKLOG #2193: the hop's own CRL knob
+            # Vault BACKLOG #5511: opt-in, the CRL checked against the controller's whole chain.
+            crl_check_chain=settings.ad_tls_crl_check_chain,
         )
         # BACKLOG #2193 (ADR 0173): the revocation-hop guard, on a context the finished Tls built.
         # This block runs before the bind secret is resolved, like the two refusals above, so a
