@@ -45,7 +45,8 @@ MIN_SALT_LEN = 32
 #: ``MIN_SALT_LEN`` times clears the length floor and is guessable on the first try, so the length
 #: floor could be passed by a salt with no secrecy at all. Since ``MIN_SALT_LEN`` became 32, the
 #: per-character floor below refuses every salt this one does (2.0 bits x 32 characters is 64), so
-#: this total decides only which refusal message a salt gets, not whether it is refused.
+#: this total decides only which refusal message a salt gets, not whether it is refused. Both
+#: messages state the per-character floor, because that is the one that binds.
 MIN_SALT_ENTROPY_BITS = 32.0
 
 #: Floor on the salt's estimated entropy PER CHARACTER, in bits. The total-bits floor above is
@@ -225,10 +226,17 @@ class Keyer:
         # it appears in the message: it is a re-identification key, so an exception that quotes it
         # would leak it into a traceback, a log or a CI transcript.
         entropy = _estimated_entropy_bits(salt)
+        per_char = entropy / len(salt)
+        # The message names the PER-CHARACTER floor, not MIN_SALT_ENTROPY_BITS: a salt here is at
+        # least MIN_SALT_LEN characters, so the per-character floor below refuses it as well, and
+        # that is the floor that binds (BACKLOG #4652 item 3).
         if entropy < MIN_SALT_ENTROPY_BITS:
             raise ValueError(
                 f"anonymizer salt is too predictable: about {entropy:.1f} bits of estimated "
-                f"entropy against a floor of {MIN_SALT_ENTROPY_BITS:.0f}. {_GENERATE_ADVICE} "
+                f"entropy, {per_char:.2f} per character, against a floor of "
+                f"{MIN_SALT_ENTROPY_BITS_PER_CHAR:.1f} bits per character "
+                f"({MIN_SALT_ENTROPY_BITS_PER_CHAR * len(salt):.0f} bits at this length). "
+                f"{_GENERATE_ADVICE} "
                 "Note this floor is a SCREEN, not the ADR 0030 section 4 requirement: that one is "
                 "128 bits at generation, which no check on a supplied string can confirm."
             )
@@ -236,7 +244,6 @@ class Keyer:
         # otherwise rescue a degenerate pattern -- "ab" repeated sixteen times reaches the 32-bit
         # total on 1.00 bits per character. At the 32-character length floor this check refuses
         # every salt the total refuses too, so the total only decides which message is raised.
-        per_char = entropy / len(salt)
         if per_char < MIN_SALT_ENTROPY_BITS_PER_CHAR:
             raise ValueError(
                 f"anonymizer salt repeats too few distinct characters: about {per_char:.2f} bits "

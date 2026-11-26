@@ -155,7 +155,11 @@ def test_keyer_rejects_a_long_salt_with_too_little_entropy() -> None:
         "salt-" + "a" * 27,  # a plausible-looking placeholder
     ):
         assert len(salt) >= MIN_SALT_LEN, "the length gate must not be what fires here"
-        with pytest.raises(ValueError, match="too predictable|too few distinct characters"):
+        # Whichever message fires, it names the per-character floor, the one that binds.
+        with pytest.raises(
+            ValueError,
+            match=r"(too predictable|too few distinct characters)[\s\S]*against a floor of 2\.0",
+        ):
             Keyer(salt)
 
 
@@ -963,6 +967,36 @@ def test_the_two_floors_are_independent() -> None:
         Keyer("a" * MIN_SALT_LEN)
     with pytest.raises(ValueError, match="too few distinct characters" + generator):
         Keyer("ab" * MIN_SALT_LEN)
+
+
+@pytest.mark.parametrize(
+    ("salt", "expected"),
+    [
+        (
+            "a" * MIN_SALT_LEN,
+            "anonymizer salt is too predictable: about 0.0 bits of estimated entropy, 0.00 per "
+            "character, against a floor of 2.0 bits per character (64 bits at this length).",
+        ),
+        (
+            "a" * 40,
+            "anonymizer salt is too predictable: about 0.0 bits of estimated entropy, 0.00 per "
+            "character, against a floor of 2.0 bits per character (80 bits at this length).",
+        ),
+    ],
+    ids=["at-the-length-floor", "forty-characters"],
+)
+def test_too_predictable_names_the_floor_that_binds(salt: str, expected: str) -> None:
+    """The too-predictable refusal names the PER-CHARACTER floor, because that is the floor that
+    binds. Every salt that reaches the total check is at least MIN_SALT_LEN characters, so a total
+    under MIN_SALT_ENTROPY_BITS is under 1 bit per character and the per-character floor would
+    refuse it too. Naming the 32-bit total told an operator a floor about half the real one at 32
+    characters (BACKLOG #4652 item 3). The thresholds and the check order are unchanged; this pins
+    only the wording, and that the retired 32-bit figure is gone from it."""
+    with pytest.raises(ValueError) as excinfo:
+        Keyer(salt)
+    message = str(excinfo.value)
+    assert message.startswith(expected)
+    assert f"floor of {MIN_SALT_ENTROPY_BITS:.0f}." not in message
 
 
 # --- a segment id is untrusted text too (BACKLOG #1710 repair) --------------------------------------
