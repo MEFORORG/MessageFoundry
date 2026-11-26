@@ -43,11 +43,13 @@ already write *correctly* into a worktree by absolute path, and a cwd-keyed writ
 all 4,010 of them. Both percentages are shares of the same 166 sessions' Edit/Write calls, so the 29%
 and the 44% are two numerators over one denominator rather than two measurements.
 
-This is the one statement of what the cwd decides; other files point here. For a write by absolute path, where a session *sits* is
-irrelevant and only where it *writes* matters. A relative path is rooted at the session's cwd first,
-so for a relative path the cwd does decide the verdict; give the absolute path. Not every rule is keyed
-on a target path: at least rule 2 keys on the cwd, and the git rules fall back to the session's cwd
-where a command does not name its directory in a form the gate reads. What each git rule reads is in
+For a write by absolute path, where a session *sits* is irrelevant and only where it *writes* matters.
+A relative path is rooted at the session's cwd first, so for a relative path the cwd does decide the
+verdict; give the absolute path. Not every rule is keyed on a target path alone. At least these also
+read the cwd: rule 2 keys on it; the git rules fall back to it where a command does not name its
+directory in a form the gate reads; and rule 3b's head-moving verbs (`reset`, `rebase`, `merge` and
+the like) compare the named target with the tree the session stands in, denying only when the two
+differ. Rule 3d compares them too, but only to choose its deny text. What each git rule reads is in
 the hook, the source of record.
 
 ## What it blocks
@@ -296,10 +298,11 @@ Two structural choices worth understanding:
   script; a hook whose script is missing exits non-zero-but-not-2, which means **the tool call runs anyway,
   silently** — the gate would be off in every session with nothing to say so.
 
-- **A SessionStart self-heal backstop.** Because the gate is a guardrail (it inspects tool arguments,
-  so a checkout routed through an indirect script slips past), `worktree-selfheal.ps1` — in each config
-  dir `install-selfheal.ps1` was run for — runs at session start. It repairs a clean primary that sits
-  on another branch than its home branch; a detached primary is left for `restore-primary.ps1`. It no longer warns when this session's own linked worktree has moved off
+- **A SessionStart self-heal backstop.** `worktree-selfheal.ps1` — in each config dir
+  `install-selfheal.ps1` was run for — runs at session start. It repairs a clean primary that sits on
+  another branch than its home branch, however it got there; a detached primary is left for
+  `restore-primary.ps1`. It does not repair at least a dirty primary, a HEAD moved along the home
+  branch, or a linked worktree. It no longer warns when this session's own linked worktree has moved off
   its recorded home branch: under the owner ruling of 2026-08-26 that re-tasking a pooled worktree is
   sanctioned, it records the current branch instead (the script's section 3 comment says why). It never
   switches a linked worktree under the session using it.

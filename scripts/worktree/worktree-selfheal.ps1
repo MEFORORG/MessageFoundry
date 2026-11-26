@@ -48,8 +48,8 @@ param(
     # The legacy path is still read as a FALLBACK, because this script is installed as a copy: this
     # copy, on a box whose only allowlist is the legacy one, keeps the backstop on. Whichever file exists
     # wins, gate location first. It does NOT cover the reverse skew: once the gate's file exists the
-    # legacy one is never read, so a root only the legacy file lists loses the backstop with no message,
-    # and an older installed copy reads only the legacy file whatever this one does
+    # legacy one is never read, so a root only the legacy file lists loses the backstop with no message.
+    # An installed copy taken before 98c9cc91ec9 reads only the legacy file whatever this one does
     # (docs/SESSION-DRIFT-CONTROLS.md, G8).
     [string]$ReposFile
 )
@@ -131,9 +131,10 @@ foreach ($root in $roots) {
 }
 
 # 3) Record THIS session's own LINKED worktree's current branch as its home branch. This step once
-#    warned when the branch had been SWITCHED (the worktree hijack, which gate rule 3b blocks); since the
-#    2026-08-26 ruling below it detects nothing and warns about nothing. It never switches a linked
-#    worktree under the session that is using it.
+#    warned when the branch had been SWITCHED (the worktree hijack); since the 2026-08-26 ruling below it
+#    detects nothing and warns about nothing. Gate rule 3b blocks at least some hijacks, and only in the
+#    config dirs install-gate.ps1 wired; nothing here backs it up. It never switches a linked worktree
+#    under the session that is using it.
 if ($cwd -and (Test-Path -LiteralPath $cwd)) {
     # A linked worktree's private git dir is <repo>/.git/worktrees/<id>/; the main worktree's is <repo>/.git.
     # Only a linked worktree can be hijacked away from an assigned branch, so act only on those.

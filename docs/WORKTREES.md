@@ -2006,7 +2006,8 @@ including for a relative path and for the rules keyed on the cwd. For writes, a 
 where it is and write into its worktree by absolute path, with no need to `cd`, relocate, or
 restart. A fan-out is different: rule 2
 denies a dispatch made while the session's cwd is the primary. Whether the session must then be
-started in a worktree depends on rule 3, as the blockquote above says.
+started in a worktree depends on the gate's rule 4, the `EnterWorktree` rule this section calls rule 3,
+as the blockquote above says.
 
 ### Recovering a relocated session — `sessions.ps1`
 
