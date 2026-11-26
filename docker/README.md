@@ -118,7 +118,7 @@ docker run --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privile
 ```
 A **Docker-Desktop-on-Windows** bind mount surfaces as `0o777` and **will be refused** — bake instead.
 A **Docker Desktop for Mac** bind mount reports an owner and mode the Mac does not enforce. The
-key-file check refuses a key file, the TLS pair included, on one that surfaces as a mount of a type
+key-file check refuses a key file, such as the TLS key, on one that surfaces as a mount of a type
 it refuses, at least `virtiofs`, `fakeowner`, and `fuse` with its subtypes such as
 `fuse.grpcfuse`, and `chown` or `chmod` on the Mac does not clear that. Bake config in there, and
 put TLS material on a named volume, as the `./tls` comment in [`compose.yaml`](compose.yaml) shows.

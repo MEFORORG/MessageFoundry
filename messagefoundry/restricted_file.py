@@ -1159,9 +1159,8 @@ class UncheckedProblem(str):
 #: ``/proc/self/mountinfo`` cannot be read. It is worded for a refusal under ``enforce`` and a
 #: warning under ``warn`` alike.
 MOUNT_TABLE_UNREAD: Final = (
-    "/proc/self/mountinfo could not be read, so at least these were not judged for the checked "
-    "path: the type of the file system under it, and the folders above the folder that holds it. "
-    "This clears once the engine can read /proc/self/mountinfo, for "
+    "/proc/self/mountinfo could not be read, so the type of the file system under the checked "
+    "path, and of the folders its path runs through, was not judged. This clears once the engine can read /proc/self/mountinfo, for "
     "example with procfs mounted where the engine runs, or with an AppArmor or SELinux policy that "
     "allows the read. Changing the owner or mode of the checked path or of the folders above it, "
     "or replacing what is at that path, does not clear it"
@@ -1261,9 +1260,10 @@ def _posix_host_link_problem(path: Path) -> str | None:
     """:func:`_posix_link_problem` for ``path`` on this host. A read that fails is a finding whose
     reason quotes the error, so the error is rebuilt without the file name it carries. The mount
     types are read from ``/proc/self/mountinfo`` once per call, and judged only where that can be
-    read. On Linux, where ``/proc/self/mountinfo`` itself cannot be read, ``path`` is refused, since
-    no type on it was judged, and the refusal says how to clear that, which no change to the owner
-    or mode of ``path`` or its folders does. Elsewhere, for example on macOS and the BSDs, which
+    read. On Linux, where ``/proc/self/mountinfo`` itself cannot be read, the walk still runs with
+    no type judged and its findings are answered; where it finds nothing, ``path`` is refused,
+    since no type on it was judged, and the refusal says how to clear that, which no change to the
+    owner or mode of ``path`` or its folders does. Elsewhere, for example on macOS and the BSDs, which
     have mount tables this does not read, no type is judged. Where the table is read, at least these
     are not judged either: a part of the path no mount the table lists covers passes, as a table
     read inside a chroot whose root is not a mount can leave; and since the table is read once,
@@ -1298,14 +1298,14 @@ def _posix_host_link_problem(path: Path) -> str | None:
         return target
 
     mounts = read_mounts()
-    if mounts is None and sys.platform.startswith("linux"):
-        return UncheckedProblem(MOUNT_TABLE_UNREAD)
 
     def fstype_fn(part: str) -> tuple[str, str] | None:
         return None if mounts is None else mount_of(part, mounts)
 
     try:
-        return _posix_link_problem(
+        # With no table the walk still runs, judging links and folders with no type judged, so a
+        # link finding is answered as it is where the table reads (vault BACKLOG #5657).
+        problem = _posix_link_problem(
             os.fspath(path),
             cwd=os.getcwd,
             euid=os.geteuid(),
@@ -1315,6 +1315,9 @@ def _posix_host_link_problem(path: Path) -> str | None:
         )
     except OSError as exc:  # the working directory, which the walk does not guard
         return f"its path could not be examined ({exc.strerror or type(exc).__name__})"
+    if problem is None and mounts is None and sys.platform.startswith("linux"):
+        return UncheckedProblem(MOUNT_TABLE_UNREAD)
+    return problem
 
 
 #: The extended attribute that holds a Linux file's POSIX access control list.
@@ -1452,11 +1455,12 @@ def broad_access_problem(
     cannot be read, and at least some of what it does not judge, are
     :func:`_posix_host_link_problem`'s, and ``docs/PHI.md`` lists at least those too. That answer
     is an :class:`UncheckedProblem`, told apart by its type: the check was not completed, though the
-    file's own owner and mode were judged first, and the text carries its own remedy. The holding
-    folder's owner and mode are still read then, and a finding there is answered in its place.
-    What a caller does with the answer is the caller's: at least
-    :func:`~messagefoundry.config.key_file_access.key_file_problem`'s callers in ``__main__``
-    refuse under ``enforce`` and warn under ``warn``, while
+    file's own owner and mode were judged first, and the text carries its own remedy. It is
+    answered only where the walk, which still runs with no type judged, and the holding folder's
+    owner and mode find nothing; a finding there is answered in its place. What a caller does with
+    the answer is the caller's: at least
+    :func:`~messagefoundry.config.key_file_access.key_file_problem`'s callers in ``__main__``, for
+    ``serve``'s own key files, refuse under ``enforce`` and warn under ``warn``, while
     :func:`messagefoundry.engine_secrets._check` and
     :func:`messagefoundry.store.custody_host._own_directory_refusal` refuse whatever the
     ``[security].enforcement`` setting, and
@@ -1510,13 +1514,12 @@ def broad_access_problem(
     problem = None if holder_judged else _posix_host_link_problem(path)
     if problem is not None and not isinstance(problem, UncheckedProblem):
         return problem
-    # An unread mount table stops the walk, not the holder's stat: a holder that a broad account
-    # may write is still a finding, so it is answered rather than the UncheckedProblem, which a
-    # caller that warns would otherwise print in its place (vault BACKLOG #5657).
+    # An unread mount table leaves the types unjudged, not the holder's stat: a holder that a broad
+    # account may write is still a finding, so it is answered rather than the UncheckedProblem,
+    # which a caller that warns would otherwise print in its place (vault BACKLOG #5657).
     try:
         # stat, following a link, so the directory judged is the one the file is actually in. A
-        # link on the way was judged by the walk above, unless holder_judged skipped it or the
-        # mount table could not be read.
+        # link on the way was judged by the walk above, unless holder_judged skipped it.
         parent = os.stat(_posix_parent(path))
     except OSError as exc:
         return (

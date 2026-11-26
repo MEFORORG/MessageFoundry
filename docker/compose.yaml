@@ -259,10 +259,9 @@ services:
       #   chmod -R a+rX,go-w ./config && sudo chown -R root:root ./config
       # The robust production alternative is to BAKE config into a derived image (see docker/README.md);
       # a Docker-Desktop-on-Windows bind mount surfaces as 0o777 and will be refused. A Docker Desktop
-      # for Mac bind mount (virtiofs, gRPC FUSE or fakeowner) reports an owner and mode the Mac does
-      # not enforce. The key-file check refuses a key file on such a mount, at least where it surfaces
-      # as one of those types, and the config check reads those bits, so a pass there does not show
-      # the config is protected. Bake it.
+      # for Mac bind mount reports an owner and mode the Mac does not enforce, and the config check
+      # reads those bits, so a pass there does not show the config is protected. Bake it there too;
+      # docker/README.md says which mount types the key-file check refuses.
       - ./config:/config:ro
       # TLS material, read-only. The MLLP key must be UNENCRYPTED unless the MLLP() sets tls_key_password
       # (env-sourced); the API key may be encrypted (MEFOR_API_TLS_KEY_PASSWORD).
@@ -273,10 +272,10 @@ services:
       #   sudo chown -R 10001:10001 ./tls && sudo find ./tls -type f -exec chmod 0600 {} + && sudo chmod 0700 ./tls
       # Under rootless Docker, Podman or userns-remap, chown to the host uid that container uid 10001
       # maps to instead. A Docker-Desktop-on-Windows bind mount surfaces as 0o777 and would be
-      # refused, as config is. A Docker Desktop for Mac bind mount of ./tls is refused too, at least
-      # where it surfaces as a mount of a type the key-file check refuses, such as virtiofs,
-      # fakeowner or a fuse subtype such as fuse.grpcfuse: the owner and mode bits do not decide
-      # who reaches the file there, so chown and chmod on the Mac do not clear it.
+      # refused, as config is. A Docker Desktop for Mac bind mount of a key file in ./tls is refused
+      # too, where it surfaces as a mount of a type the key-file check refuses (docker/README.md
+      # names at least some): the owner and mode bits do not decide who reaches the file there, so
+      # chown and chmod on the Mac do not clear it.
       # There, mount a named volume at /etc/mefor/tls in place of ./tls (on this service and the
       # `ha` engines), filled and owned inside Docker's Linux VM, for example:
       #   docker volume create mefor-tls
