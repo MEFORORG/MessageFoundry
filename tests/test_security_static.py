@@ -832,7 +832,14 @@ _UNSCANNABLE_RE_PATTERNS = {
     # old match. BACKLOG #5550's ``_PRIVATE_KEY_BLOCK`` splices ``_KEY_LINE``, which holds those label
     # stops; why it is linear is on the pattern. The two ``source`` entries are ``_pre_camel``'s and
     # ``_without_tails``' compiles of a shipped pattern rewritten at runtime.
+    #
+    # BACKLOG #8429 adds two. ``_ESCAPE_PROBE`` is a literal backslash, one escape letter or its
+    # fixed hex digits, ``_LABEL_PREFIX``'s bounded prefix and the label words, built by
+    # ``_alternation``: it starts only at a backslash, and a prefix segment cannot cross one, so the
+    # walks from two starts never overlap. ``_without_escape``'s compile, the third ``source``, is a shipped pattern with
+    # the escape start's three fixed-width lookbehinds removed, which removes start positions only.
     "messagefoundry/secretscrub.py": (
+        "'(?i)\\\\\\\\(?:[bfnrt]|x[0-9a-f]{2}|u[0-9a-f]{4})' + _LABEL_PREFIX + '(?:' + _alternation(_CAMEL_WORDS) + ')\\\\b'",
         "'(?i)(-----BEGIN (?:(?!PRIVATE )[A-Z0-9]++ )*+PRIVATE KEY-----)(?P<key_body>(?:[ \\\\t]*+' + _KEY_SEPARATOR + _KEY_LINE + '[ \\\\t]*+(?=' + _KEY_SEPARATOR + '|\\\\Z))++)'",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_TOKEN_WORDS) + '))\\\\b(?:[\\'\\\\\"]\\\\s*:|\\\\s*[:=])\\\\s*' + _MARKED_SCHEME_WORDS + _BYTES_PROBE + '(?:' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_VALUE + ')' + _BEARER_TAILS",
         "'(?i)' + _LABEL_START + '(bearer)\\\\s+(?=[\\'\\\\\"]?[^\\\\s\\'\\\\\",;]{4})' + _PLAIN_SCHEME_VALUE",
@@ -841,6 +848,7 @@ _UNSCANNABLE_RE_PATTERNS = {
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _KEY_LABEL_ALTERNATION + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*' + _BYTES_PROBE + '(?:' + _GUARDED_BRACED_VALUE + f'(?![^{_KEY_TERMINATORS}])|' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_KEY_VALUE + ')' + _KV_TAILS",
         "'(?i)(?<![a-z0-9+.\\\\-])([a-z0-9+.\\\\-]+://[^\\\\s:/@]*+(?:(@)[a-z0-9.\\\\-]++)?):(?(2)(?![0-9]++(?![a-z0-9_])|@)' + _DSN_WIDE_SEGMENT + '|(?:(?<=//:)' + _DSN_WIDE_SEGMENT + '|(?<!//:)(?:(?P<lead>@++)' + _DSN_WIDE_SEGMENT + '|' + _DSN_USER_FIRST_SEGMENT + ')))' + _DSN_RUN + _DSN_TAIL + '@'",
         "_camel_start('\\\\b[\\'\\\\\"]?\\\\s*+[:=]')",
+        "source",
         "source",
         "source",
     ),

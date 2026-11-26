@@ -345,6 +345,41 @@ _LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-]){0,6}"
 # ``tests/test_log_redaction_secret_domain.py`` reads 0 printed.
 _LABEL_START = r"(?:\b|(?<=%[0-9A-Fa-f]{2}))"
 
+# A THIRD PLACE A LABEL MAY START: RIGHT AFTER A BACKSLASH ESCAPE WRITTEN AS TEXT (BACKLOG #8429),
+# ``\n``, ``\r``, ``\t``, ``\b`` or ``\f``, ``\xNN`` or ``\uNNNN``. The ``%r`` of a multi-line
+# string, a JSON string and an exception's repr write a line break as those two characters, and the
+# escape's last character is a word character, so ``\b`` did not fire before a label glued after
+# it: ``foo\npassword=abc123zz`` and ``'[db]\nhost = h\npassword = abc123zz\n'`` printed the
+# password through every surface, while ``x password=abc123zz`` did not. Each lookbehind is fixed
+# width and needs a backslash, so it adds at most one start per backslash and keeps the scan
+# linear, as the ``%XX`` start does. The cost is over-redaction where a path or a doubled backslash
+# puts a label word after one of those letters, the direction this module may fail in.
+#
+# IT IS PART OF THE CAMELCASE READING, NOT OF :data:`_LABEL_START`, because alone it was a trade as
+# the other two new starts were: a seeded differential against ``origin/main`` found
+# ``\tBearer secret: v`` printing ``v``, since ``_AUTH_SCHEME`` then read the scheme word and took
+# ``secret:`` as its credential, where ``origin/main`` read ``secret:`` as a label and hid ``v``. So
+# only the three label patterns take it, inside :data:`_LABEL_OR_CAMEL_START`, :func:`_pre_camel`
+# drops it with the camelCase start, and :func:`_reads_camel` sends a line holding one to
+# :func:`_union`, which keeps a character only where the reading without it printed it too.
+# ``_AUTH_SCHEME``, ``_MEFOR_SECRET`` and the bundle's own copy of the label patterns keep their
+# starts, so ``foo\nMEFOR_X=v`` and ``foo\nBearer v`` are residuals; the bundle's second layer is
+# this module, which reads the others. Where :func:`_union` would return its reading before whole,
+# it returns the union without this start instead (:func:`_union_without_escape`), so such a line
+# reads as ``origin/main`` read it and its escape label is a residual too.
+#
+# THE UNION HOLDS FOR THIS FUNCTION'S OWN OUTPUT, NOT FOR A LATER PASS, as on the camelCase start.
+# Measured 2026-11-26 with the nine-path differential the comment on
+# :data:`_CONNECTION_STRING_MEMBER` describes, against an ``origin/main`` tree, seeds 1 to 12,
+# 60,000 random lines whose pieces hold escapes before labels: no line printed a planted value
+# ``origin/main`` hid on ``scrub_credentials`` or ``redact_log_line``, and 10 lines printed one on a
+# second or third handler, a chain line the bundle read back, or the store path. On each, the label
+# the start read hid a "%26", an HL7 segment or a DICOM tag a later PHI pass needed, so that pass
+# no longer hid the text after it, the trade the ``%XX`` start's paragraph above measures. Against
+# it, the same run, which holds BACKLOG #8429's other changes too, hid a value ``origin/main``
+# printed on 4,141 to 5,908 lines per path.
+_ESCAPE_START = r"(?<=\\[bfnrt])|(?<=\\x[0-9A-Fa-f]{2})|(?<=\\u[0-9A-Fa-f]{4})"
+
 #: The label words a camelCase start may open on (BACKLOG #5545): every family's.
 _CAMEL_WORDS = _CREDENTIAL_WORDS + _TOKEN_WORDS + _KEY_LABEL_WORDS
 #: Their first letters, as capitals: a one-character gate in front of the camelCase start.
@@ -453,12 +488,25 @@ _SAME_LINE_VALUE = (
 #: and :data:`_SAME_LINE_VALUE` follows it. :data:`_CAMEL_START` itself is what a value walk's
 #: :data:`_RUN_UNIT` splits at, and what :func:`scrub_credentials` probes for.
 _CAMEL_LABEL_START = _camel_start(_SAME_LINE_VALUE)
-#: Where the three LABEL patterns may start: :data:`_LABEL_START` or :data:`_CAMEL_LABEL_START`.
-#: ``_AUTH_SCHEME`` keeps :data:`_LABEL_START` alone, since a scheme word glued on by a capital, as
-#: in ``isBearer token``, is no ``Authorization`` header. The empty ``camel`` group records which
-#: start a match took, for :func:`_narrowed_value`. Each pattern opens its group 1, the label, right
-#: in front of this, so the label stays group 1; both starts are zero-width, so it spans what it did.
-_LABEL_OR_CAMEL_START = r"(?:" + _LABEL_START + r"|(?P<camel>)" + _CAMEL_LABEL_START + r")"
+#: Where the three LABEL patterns may start: :data:`_LABEL_START`, :data:`_ESCAPE_START` (BACKLOG
+#: #8429) or :data:`_CAMEL_LABEL_START`. ``_AUTH_SCHEME`` keeps :data:`_LABEL_START` alone, since a
+#: scheme word glued on by a capital, as in ``isBearer token``, is no ``Authorization`` header. The
+#: empty ``camel`` group records which start a match took, for :func:`_narrowed_value`. Each
+#: pattern opens its group 1, the label, right in front of this, so the label stays group 1; every
+#: start is zero-width, so it spans what it did.
+_LABEL_OR_CAMEL_START = (
+    r"(?:" + _LABEL_START + r"|" + _ESCAPE_START + r"|(?P<camel>)" + _CAMEL_LABEL_START + r")"
+)
+#: A backslash escape written as text with a label word after it, which :data:`_ESCAPE_START` may
+#: open a label on, for :func:`_reads_camel`. It starts only at a backslash and its prefix is
+#: :data:`_LABEL_PREFIX`'s bounded one, so it scans linearly.
+_ESCAPE_PROBE = re.compile(
+    r"(?i)\\(?:[bfnrt]|x[0-9a-f]{2}|u[0-9a-f]{4})"
+    + _LABEL_PREFIX
+    + r"(?:"
+    + _alternation(_CAMEL_WORDS)
+    + r")\b"
+)
 
 # A QUOTED value span, for the two quoting forms a credential value actually arrives in (BACKLOG
 # #1685). Both exist for one reason: a value is quoted PRECISELY so it may carry the characters that
@@ -775,7 +823,9 @@ _GUARDED_BRACED_NO_SPACE = r"\{(?:[^}'\"\s]|\}\})*+\}(?!\})"
 # refused-shape cases.
 #: Words a later pass reads, as lower case ASCII letters spell them, at least: :data:`_MEMBER_KEEP_WORDS`
 #: (and :data:`_QUERY_CREDENTIAL_WORDS`, which it held until BACKLOG #5030 added item 1 and no
-#: log pass reads as words of their own; ``key`` and ``auth`` stand for the compound key labels
+#: log pass reads as words of their own inside such a value: the member pass reads each only as a
+#: whole member key after a ";" (BACKLOG #8429), and this braced tail holds no ";";
+#: ``key`` and ``auth`` stand for the compound key labels
 #: ``_KEY_MATERIAL`` reads, and ``sig`` and ``jwt`` stay since refusing costs coverage only) and the PHI pass's anchor and unbounded words (``redaction._ANCHOR_PREFIXES``' sources and
 #: ``redaction._UNBOUNDED_WORDS``, ``nonnumeric`` among them), reduced by subsumption, with entries
 #: holding "_", "-" or a digit left out, since no such text holds one. Refusing a short word such as
@@ -1869,6 +1919,15 @@ def _dsn_password_repl(m: re.Match[str], placeholder: str) -> str:
     return f"{m.group(1)}:{lead}{placeholder}@"
 
 
+#: Query-parameter NAMES that carry a credential in a URL. Each is too ordinary for
+#: :data:`_CREDENTIAL_WORDS` -- ``key=`` is a cache key in log text, which is why that list leaves it
+#: out -- but a query parameter is a narrower place, and these are how common partner APIs spell a
+#: credential there: an API ``key=`` or ``subscription-key=``, a shared access ``sig=``, a signed
+#: URL's ``X-Amz-Signature=``, and a bare ``auth=`` or ``jwt=``. A connection-string member is a
+#: narrower place too, so the member pass also reads each as a member's WHOLE key
+#: (:data:`_CONNECTION_STRING_MEMBER`, BACKLOG #8429); no label pass reads one alone.
+_QUERY_CREDENTIAL_WORDS = ("key", "sig", "signature", "auth", "jwt")
+
 #: Words a connection-string member's KEY may end in besides :data:`_CREDENTIAL_WORDS` (BACKLOG
 #: #5030), so ``;AccessToken=`` is read as ``;sslpassword=`` is. Its own gate,
 #: :data:`_MEMBER_EXTRA_HINT`, admits the member pass beside :data:`_CREDENTIAL_HINT`.
@@ -1923,13 +1982,16 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # either side into one field run the pass hid whole. A second redaction leaves the mask as it is.
 # The mask also keeps what a later pass reads in a word, at least these:
 #
-# * a word that holds one of :data:`_MEMBER_KEEP_WORDS` anywhere inside it, the label and anchor
-#   words of the credential passes, the query filter, the support bundle and the PHI pass, stays
-#   whole when a ":" or "=" follows the word (after an optional quote and spaces), or a "#" and
-#   the word ends in "MRN", and so does a word ending in a scheme word or "MRN" when a space
-#   follows it, a "#" after that space included. The whole word stays, not only the anchor, so
-#   ``a1qpwd=`` keeps ``a1qpwd``. Anywhere else it is masked, so a password such as
-#   ``Passw0rd!2024`` or a token holding ``sig`` is masked like any other;
+# * a word a later pass reads as a label stays whole when a ":" or "=" follows the word (after an
+#   optional quote and spaces), or a "#" and the word ends in "MRN", and so does a word ending in a
+#   scheme word or "MRN" when a space follows it, a "#" after that space included. A label is one
+#   of :data:`_MEMBER_KEEP_WORDS`, the label and anchor words of the credential passes, the query
+#   filter, the support bundle and the PHI pass, ending the word and opening where a label may
+#   open (:func:`_read_as_label`; BACKLOG #8429), or a word holding one of :data:`_MEMBER_HELD`'s
+#   words anywhere. The whole word stays, not only the anchor, so ``ad_bind_password=`` keeps
+#   ``ad_bind_password``. Anywhere else it is masked, so a password such as ``Passw0rd!2024``, a
+#   token holding ``sig``, and ``Passage``, ``Compass`` or ``a1qpwd`` before a ":" or "=" are
+#   masked like any other;
 # * a percent-encoded HL7 separator, a DICOM tag ``(gggg,eeee)``, the ``nonnumeric port: `` opener
 #   of the PHI pass's userinfo backstop, and the support bundle's ``mfb64:v1:`` marker stay whole,
 #   and a word stops where the opener or the marker starts;
@@ -1958,15 +2020,20 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # ``sig`` or ``jwt`` word, and only three fixed cases of a hex escape before a segment ID. The
 # word mask before it, ``redacted`` for every word, printed 1 line on a chain line the
 # bundle read back on the first ten seeds, and the "#" rule before its fix printed on five later
-# paths.
+# paths. BACKLOG #8429's changes, the whole-key query-credential words, the quoted and
+# placeholder-quote values and the narrower kept-word rule, were measured by a smaller run of the
+# same differential against an ``origin/main`` tree: seeds 1 to 12, 60,000 random lines whose
+# pieces add those shapes, printed no line on any path but lines a label read after a backslash
+# escape reaches (the comment on :data:`_ESCAPE_START`), and the seeded sample holds the pieces.
 #
 # THE COST, at least these. Every character of the value outside a word prints as it was: its
 # spaces, its punctuation and symbols, ASCII ones such as "@" and "!" and non-ASCII ones such
 # as a currency sign, and its combining marks (``P@ss!w0rd`` is ``x@xx!x0xx``). So a reader sees
 # that a password held a space, a "," and an "&", and how many words. The mask prints each word's LENGTH,
-# where its digits, "_", "." and "-" sat, and where a name-shaped piece had its capitals. A word that holds
-# a kept word anywhere inside it prints whole when a ":" or "=" follows it, such as the ``pass`` of
-# ``pass=word`` or the ``a1qpwd`` of ``a1qpwd=``, and so does a three-character segment ID before a
+# where its digits, "_", "." and "-" sat, and where a name-shaped piece had its capitals. A word a
+# later pass reads as a label prints whole when a ":" or "=" follows it, such as the ``pass`` of
+# ``pass=word`` or the ``ad_bind_password`` of ``ad_bind_password=``, and so does a word holding a
+# :data:`_MEMBER_HELD` word, such as ``xMEFOR_A=``, and a three-character segment ID before a
 # "|". Each of those printed on ``origin/main`` too, which hid at most the first word. Redacting a
 # record ONCE, so a later handler reads nothing this pass wrote, was measured and not taken:
 # ``origin/main``'s own second handler hides a value its first prints on 313 to 584 lines per
@@ -1980,17 +2047,24 @@ _MEMBER_EXTRA_WORDS = ("token",)
 #
 # THE KEY IS A RUN OF LETTERS, DIGITS AND "_" THAT ENDS IN ONE OF THE WORDS. ``sslpassword``,
 # ``SSLPassword`` and ``KeyStorePwd`` glue a word on with no separator, and only the fixed-width
-# lookbehinds below read that. ``;Bypass=1`` is a member too, and its value is masked.
+# lookbehinds below read that. ``;Bypass=1`` is a member too, and its value is masked. A key that
+# IS one of :data:`_QUERY_CREDENTIAL_WORDS`, ``;key=``, ``;sig=``, ``;signature=``, ``;auth=`` or
+# ``;jwt=``, is a member too (BACKLOG #8429): its value printed whole, since no label pass reads
+# those words alone. Only the whole key, by a lookbehind that holds the ";", so ``;cache_key=``,
+# ``;oauth=`` and ``;monkey=`` are not members.
 #
 # THE VALUE RUNS TO THE NEXT ";", QUOTE OR LINE BREAK, OR THE END OF THE TEXT, over spaces, ",",
 # "&", "=" and "://" alike, and over a quote glued between two word characters, so
 # ``;sslpassword=P'Kv9_Sec;`` is masked whole (BACKLOG #5386 wave 3; a quote ending the value there
 # printed ``Kv9_Sec``). The cost: prose after a glued apostrophe on the same member, as in
-# ``;sslpassword=x wasn't accepted``, is masked to the next ";". A key ``_CREDENTIAL_KV`` reads
-# first, such as ``;PWD=``, is a residual: that pass ends its value at the quote and writes its placeholder, and this pass, reading a quote after
-# the placeholder, stops there, so ``;PWD=P'Kv9_Sec;`` prints ``Kv9_Sec``. Taking a quote after a
-# placeholder was tried and changed what the member differential's whole-value control reads. Spaces
-# and then one quote may open it. Stopping at a later quote costs
+# ``;sslpassword=x wasn't accepted``, is masked to the next ";". It also runs over a quote glued
+# right after the placeholder an earlier pass wrote as the whole value, ``=<redacted>'`` and the
+# bundle's two spellings, before a word character (BACKLOG #8429): a key ``_CREDENTIAL_KV`` reads
+# first, such as ``;PWD=``, has that pass end its value at the quote and write its placeholder, so
+# ``;PWD=P'Kv9_Sec;`` printed ``Kv9_Sec`` while this pass stopped there. Spaces and then one quote
+# may open it, and a value that opens with a quote and closes on its line, before a space, a ";",
+# ",", a closing bracket or the end, is taken to that closer, over any ";" inside it (BACKLOG
+# #8429): ``;sslpassword='a;b c' refused`` printed ``b c``. Stopping at a later quote costs
 # nothing the builder sends, since every ``odbc_params`` value refuses quotes,
 # and it keeps the rest of a quoted echo (``'...;PWD=a b' refused``) readable. A braced value is
 # taken by ``_ODBC_BRACED`` with its body kept to one line, and then on to the same stops, so
@@ -2004,7 +2078,10 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # possessive, the overrun has nothing after it to retry, and the lookbehinds are a fixed set of fixed
 # widths. Every walk stays on its line. A plain walk stops at the next ";", so walks from two starts
 # never overlap; a braced walk may cross a ";" on its line, and then ends the match there, or fails
-# and the overrun takes that line, so no later start re-reads it. The mask walks its value once.
+# and the overrun takes that line, so no later start re-reads it. A quoted walk may cross a ";" too,
+# but it stops at the first quote of its kind after its opener, and its opener is itself such a
+# quote, so the quoted walks of one kind cover the stretches between consecutive quotes once each.
+# The mask walks its value once.
 # ``tests/test_connection_string_member_scrub.py`` pins the time on a long line and on many lines.
 #
 # WHAT IT LEAVES, at least these:
@@ -2017,13 +2094,17 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # * on the write-time chain, a member glued to a percent-encoded HL7 run in one token
 #   (``a%7Cb%7Cc;sslpassword=x y``). :mod:`messagefoundry.redaction` runs first and replaces the
 #   whole token, ";" and all, so the value's tail after a space prints, as it did before #5030;
-# * a quoted value that holds a ";" (``;sslpassword="a;b c"``), which the value stops at, so the text
-#   after the ";" prints, as it did before #5030. The builder refuses a quote and a ";" in such a
-#   value.
+# * a quoted value that holds a ";" and does not close before a space, a ";", ",", a closing
+#   bracket or the end (``;sslpassword="a;b"c``), which the value stops at, so the text after the
+#   ";" prints, as it did before #5030. The builder refuses a quote and a ";" in such a value;
+# * a key that only ends in a query-credential word (``;SharedAccessSignature=``, ``;ApiKey=``
+#   aside, which a label pass reads), and such a word as a URL query parameter (``&sig=``) or a
+#   bare ``key=`` in prose, which no pass here reads, by design (:data:`_QUERY_CREDENTIAL_WORDS`).
 #
 # The key words are :data:`_CREDENTIAL_WORDS` and :data:`_MEMBER_EXTRA_WORDS`: the builder's own
 # secret keywords, ``transports/database.py`` ``_ODBC_SECRET_KEY_RE``, plus a bare ``pass``, which
-# that set lacks and which is why ``;Bypass=1`` is masked. They and the two brace fragments are
+# that set lacks and which is why ``;Bypass=1`` is masked, and the whole keys of
+# :data:`_QUERY_CREDENTIAL_WORDS`. They and the two brace fragments are
 # spelled literally, so the regex scanner in ``tests/test_security_static.py`` reads the pattern;
 # ``tests/test_connection_string_member_scrub.py`` holds the words to the tuples and the fragments
 # to ``_ODBC_BRACED`` and ``_ODBC_BRACED_OVERRUN``. ``support/redact.py`` imports this one object
@@ -2031,13 +2112,18 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # drift.
 _CONNECTION_STRING_MEMBER = re.compile(
     r"(?i)(;[A-Za-z0-9_]++(?:(?<=password)|(?<=passwd)|(?<=passphrase)|(?<=pass)|(?<=pwd)"
-    r"|(?<=secret)|(?<=credential)|(?<=token)))="
+    r"|(?<=secret)|(?<=credential)|(?<=token)"
+    r"|(?<=;key)|(?<=;sig)|(?<=;signature)|(?<=;auth)|(?<=;jwt)))="
     r"(\{(?:[^}\r\n]|\}\})*+\}(?!\})(?:[^;'\"\r\n]|(?<=\w)['\"](?=\w))*+|\{[^\r\n]*"
-    r"|[ \t]*+['\"]?(?:[^;'\"\r\n]|(?<=\w)['\"](?=\w))++)"
+    r"|[ \t]*+(?:'[^'\r\n]*+'|\"[^\"\r\n]*+\")(?=[\s;,)\]}]|\Z)"
+    r"|[ \t]*+['\"]?(?:[^;'\"\r\n]|(?<=\w)['\"](?=\w)"
+    r"|(?<==<redacted>|=\[REDACTED\]|=\[redacted\])['\"](?=\w))++)"
 )
 
 #: Words a member value keeps where a word holds one, matched as a substring ignoring case, and a
-#: later pass reads the word there (:func:`_kept_word`; BACKLOG #5030). Each is a word some pass
+#: later pass reads the word there (:func:`_kept_word`; BACKLOG #5030), which since BACKLOG #8429
+#: is where the word ends in one and it opens where a label may, or where it holds one of
+#: :data:`_MEMBER_HELD`'s anywhere (:func:`_read_as_label`). Each is a word some pass
 #: after the member pass reads, so masking it would change what that pass does on a second
 #: redaction. At least: this module's credential and token words, its key-label words
 #: (:data:`_KEY_LABEL_WORDS`, the compound ones such as ``accessKey`` and ``AccountKey`` among them,
@@ -2050,9 +2136,12 @@ _CONNECTION_STRING_MEMBER = re.compile(
 #:
 #: NOT the words of :data:`_QUERY_CREDENTIAL_WORDS`, at least ``key``, ``sig``, ``auth`` and ``jwt``,
 #: which this list held until BACKLOG #5030 added item 1: :func:`credential_query_params` reads them in a configured
-#: URL's parameter names. A log pass reads ``key`` and ``auth`` only inside a longer label this
-#: list keeps, at least the key-label words above. Kept alone, they kept a password word that held
-#: one before a ":" or "=", so ``;sslpassword=Monkey:Banana42;`` printed ``Monkey``.
+#: URL's parameter names. A log pass reads ``key`` and ``auth`` inside a longer label this list
+#: keeps, at least the key-label words above, and the member pass reads each word as a member's
+#: whole key after a ";" (BACKLOG #8429), which a member value never holds, since it stops at a
+#: ";" outside a closed quote. CORRECTED 2026-11-26: this said a log pass reads ``key`` and ``auth``
+#: ONLY inside a longer label. Kept alone, they kept a password word that held one before a ":" or
+#: "=", so ``;sslpassword=Monkey:Banana42;`` printed ``Monkey``.
 #: ``tests/test_connection_string_member_scrub.py`` holds this to those sources.
 _MEMBER_KEEP_WORDS = (
     *_CREDENTIAL_WORDS,
@@ -2096,7 +2185,10 @@ _MEMBER_KEEP = re.compile(
 #: earlier pass wrote, a percent-encoded HL7 separator (``%7C``, ``%7E``, ``%5E``, ``%26``), the
 #: PHI pass's userinfo opener, the support bundle's ``mfb64:v1:`` marker and a DICOM tag.
 #:
-#: The marker is spelled as ``support/redact.py`` ``_MFB64`` spells it, case and all. One more form
+#: The marker is spelled as ``support/redact.py`` ``_MFB64`` spells it, in either case, since the log
+#: chain's carriage pass reads it ignoring case: kept only in lower case, ``;auth=MFB64:v1:a1qb`` had
+#: its ``v1`` masked, the carriage pass no longer read the marker, and the body printed on the chain
+#: where the member pass off hid it (BACKLOG #8429, found by a seeded differential). One more form
 #: is kept whole: a marker whose ``mfb64`` an earlier pass replaced with a placeholder
 #: (``[redacted]:v1:``), which the log chain's carriage pass still reads as a marker
 #: (``redaction._BINARY_CARRIAGE``, BACKLOG #5378). A word ends where the marker or the userinfo opener starts, so a word glued on before either
@@ -2106,11 +2198,11 @@ _MEMBER_KEEP = re.compile(
 #: ends, since it keeps the class of each character.
 _MEMBER_VALUE_UNIT = re.compile(
     r"(?:<redacted>|\[(?:REDACTED|redacted)\]):v1:"
-    r"|<redacted>|\[(?:REDACTED|redacted)\]|%(?:7[CcEe]|5[Ee]|26)|nonnumeric port: |mfb64:v1:"
-    r"|\([0-9A-Fa-f]{4}, ?[0-9A-Fa-f]{4}\)|((?:(?!mfb64:v1:|nonnumeric port: )[\w.\-])++)"
+    r"|<redacted>|\[(?:REDACTED|redacted)\]|%(?:7[CcEe]|5[Ee]|26)|nonnumeric port: |(?i:mfb64:v1:)"
+    r"|\([0-9A-Fa-f]{4}, ?[0-9A-Fa-f]{4}\)|((?:(?!(?i:mfb64:v1:)|nonnumeric port: )[\w.\-])++)"
 )
-#: What must follow a word that holds a kept word anywhere inside it for the mask to keep the whole
-#: word: an optional quote, spaces, and a ":" or "=", or a "#" (group 1) after a word ending in MRN. Read in the whole text, past
+#: What must follow a word a later pass reads as a label (:func:`_read_as_label`) for the mask to
+#: keep the whole word: an optional quote, spaces, and a ":" or "=", or a "#" (group 1) after a word ending in MRN. Read in the whole text, past
 #: the value's end, since a value that opens with a quote ends at the quote that closes a JSON key
 #: (``;Token="name": ...``). A "#" keeps only a word that ends in ``mrn``
 #: (:data:`_MEMBER_MRN_WORD`), since the PHI pass's MRN label is the only reader of a "#" after a
@@ -2172,6 +2264,55 @@ def _masked_word(word: str, after_percent: bool = False) -> str:
     return head + "".join(pieces)
 
 
+#: The kept words a later pass reads INSIDE a longer word, so a word holding one anywhere stays whole
+#: before a ":" or "=": the ``MEFOR_`` prefix, which opens its label, the bundle marker and scheme
+#: words, the MRN label, and the DICOM label words, which ``redaction._DICOM_PHI_LABEL`` reads in the
+#: middle of a keyword (``IssuerOfPatientID``). Spelled literally, so the regex scanner in
+#: ``tests/test_security_static.py`` reads it; ``tests/test_secretscrub_scrubber_gaps.py`` holds it to
+#: :data:`_MEMBER_KEEP_WORDS`.
+_MEMBER_HELD = re.compile(
+    r"(?i)medicalrecordlocator|responsibleperson|patient|mefor_|mfb64|basic|digest|0010|mrn"
+)
+#: Every other kept word, lower case: each is read only as a whole label, which ENDS the word and
+#: opens where a label may open (:func:`_read_as_label`; BACKLOG #8429).
+_MEMBER_LABEL_WORDS = tuple(
+    sorted({word.lower() for word in _MEMBER_KEEP_WORDS if _MEMBER_HELD.search(word) is None})
+)
+#: A position right after a ``%XX`` escape or a backslash escape written as text, read by the
+#: label patterns' own fragments, so :func:`_read_as_label` cannot drift from them. Each is a
+#: fixed-width lookbehind, tried at one position per call.
+_MEMBER_ESCAPE_AT = re.compile(_LABEL_START + "|" + _ESCAPE_START, re.IGNORECASE)
+
+
+def _read_as_label(text: str, word: str, start: int) -> bool:
+    """Whether a later pass may read ``word``, which starts at ``start`` in ``text`` and holds a kept
+    word, as a label before its ":" or "=" (BACKLOG #8429).
+
+    A word holding one of :data:`_MEMBER_HELD`'s words is, as before. Any other kept word is read only
+    where it ENDS the word, as every label pattern ends its keyword with ``\\b``, and where it OPENS
+    at a place a label may open: the word's start, after a "." "_" or "-" of a label prefix, at a
+    camelCase capital after a lower-case letter or a digit, or right after a ``%XX`` escape or a
+    backslash escape written as text (:data:`_LABEL_START`). The mask kept a word holding one
+    anywhere, so a password word such as ``Passage``, ``Statement``, ``Barcode``, ``Compass`` or
+    ``Codename`` before a ":" or "=" printed whole; no pass reads a label there. A word holding a
+    character outside ASCII keeps the old rule, since the patterns fold case the Unicode way and a
+    lower-cased comparison may not."""
+    if _MEMBER_HELD.search(word) is not None or not word.isascii():
+        return True
+    folded = word.lower()
+    for label in _MEMBER_LABEL_WORDS:
+        if not folded.endswith(label):
+            continue
+        at = len(word) - len(label)
+        if at == 0 or word[at - 1] in "._-":
+            return True
+        if word[at].isupper() and (word[at - 1].islower() or word[at - 1].isdigit()):
+            return True
+        if _MEMBER_ESCAPE_AT.match(text, start + at) is not None:
+            return True
+    return False
+
+
 def _kept_word(text: str, word: str, end: int) -> bool:
     """Whether a later pass reads ``word``, which ends at ``end`` in ``text``, as a label or a scheme
     word, so the mask must leave it."""
@@ -2179,7 +2320,7 @@ def _kept_word(text: str, word: str, end: int) -> bool:
         return False
     tail = _MEMBER_LABEL_TAIL.match(text, end)
     if tail is not None and (tail.group(1) != "#" or _MEMBER_MRN_WORD.search(word) is not None):
-        return True
+        return _read_as_label(text, word, end - len(word))
     # A "#" after spaces does not end the scheme-word rule: ``Bearer #`` is still a scheme word
     # before a space, and a later bearer pass reads it there.
     return text[end : end + 1].isspace() and _MEMBER_SPACED_WORD.search(word) is not None
@@ -2438,6 +2579,12 @@ def _folded(words: tuple[str, ...]) -> tuple[str, ...]:
 _CREDENTIAL_HINT = _folded(_CREDENTIAL_WORDS)
 _TOKEN_HINT = _folded(_TOKEN_WORDS)
 _MEMBER_EXTRA_HINT = _folded(_MEMBER_EXTRA_WORDS)
+#: A member whose whole key is a query-credential word, as the member pass reads it: the ";", the
+#: word and the "=" (BACKLOG #8429). The whole spelling, so a line that merely holds one of these
+#: ordinary words (``idempotency_key``, ``authenticated``) is not admitted for it.
+_MEMBER_BARE_HINT = tuple(f";{word}=" for word in _folded(_QUERY_CREDENTIAL_WORDS))
+#: Every word that admits the member pass.
+_MEMBER_PASS_HINT = _CREDENTIAL_HINT + _MEMBER_EXTRA_HINT + _MEMBER_BARE_HINT
 _KEY_MATERIAL_HINT = _folded(_KEY_LABEL_WORDS)
 _SCHEME_HINT = _folded(("bearer",))
 _ENV_HINT = _folded((_ENV_PREFIX,))
@@ -2455,10 +2602,13 @@ _CAMEL_PROBE = re.compile(_camel_start(r"\b['\"]?\s*+[:=]"), re.IGNORECASE)
 #: is dropped, because any text holding it holds the shorter one too. Derived, so it cannot drift from
 #: the tuples above -- ``pass`` subsumes ``password``/``passwd``/``passphrase``, ``encryption_key``
 #: subsumes ``encryption_keys_retired``, ``api_key`` subsumes ``intake_api_key_next``, ``accesskey``
-#: subsumes ``sharedaccesskey``. One scan of 23 members instead of 30 (counted with BACKLOG #5545's
-#: compound key words), and it rejects the overwhelmingly common record: the one carrying no
+#: subsumes ``sharedaccesskey``. One scan of 24 members instead of 31 (counted with BACKLOG #5550's
+#: key-block hint), and it rejects the overwhelmingly common record: the one carrying no
 #: credential word at all. The member pass's own words (:data:`_MEMBER_EXTRA_HINT`) are in it too,
-#: so a word added there and nowhere else still admits the record (BACKLOG #5030).
+#: so a word added there and nowhere else still admits the record (BACKLOG #5030). The whole
+#: query-credential member keys (:data:`_MEMBER_BARE_HINT`) are not: :func:`_admitted` reads them
+#: only on a line holding a ";", so a plain line pays no more scans for them (BACKLOG #8429).
+#: CORRECTED 2026-11-26: this read 23 of 30, one short since the key-block hint.
 _ANY_HINT = tuple(
     sorted(
         {
@@ -2487,6 +2637,11 @@ _ANY_HINT = tuple(
         }
     )
 )
+
+
+def _admitted(folded: str) -> bool:
+    """Whether any pass of :func:`scrub_credentials` may match ``folded``."""
+    return _admits(folded, _ANY_HINT) or (";" in folded and _admits(folded, _MEMBER_BARE_HINT))
 
 
 def _admits(folded: str | None, words: tuple[str, ...]) -> bool:
@@ -2522,7 +2677,7 @@ def scrub_credentials(text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER) -
     BACKLOG #5545 added can hide more of this function's output but never print what the reading
     before it hid there. The comment on :data:`_CAMEL_START` says what a later pass still sees."""
     folded = _gate_fold(text)
-    if not _admits(folded, _ANY_HINT):
+    if not _admitted(folded):
         return text
     return _scrub_credentials(text, placeholder, folded)
 
@@ -2531,7 +2686,7 @@ def scrub_credentials_without_tails(text: str, *, placeholder: str = CREDENTIAL_
     """:func:`scrub_credentials` as it read before the masked tails and the key-block pass, for a
     caller that compares the two readings itself (``support/redact.py``)."""
     folded = _gate_fold(text)
-    if not _admits(folded, _ANY_HINT):
+    if not _admitted(folded):
         return text
     return _scrub_credentials(text, placeholder, folded, tails=False)
 
@@ -2573,13 +2728,6 @@ def _one_reading(
         return _union(text, placeholder, folded, read, sub)
     return _run(text, placeholder, folded, sub)
 
-
-#: Query-parameter NAMES that carry a credential in a URL and in nothing else here. Each is too
-#: ordinary for :data:`_CREDENTIAL_WORDS` -- ``key=`` is a cache key in log text, which is why that
-#: list leaves it out -- but a query parameter is a narrower place, and these are how common partner
-#: APIs spell a credential there: an API ``key=`` or ``subscription-key=``, a shared access ``sig=``,
-#: a signed URL's ``X-Amz-Signature=``, and a bare ``auth=`` or ``jwt=``.
-_QUERY_CREDENTIAL_WORDS = ("key", "sig", "signature", "auth", "jwt")
 
 #: Words matched only as a whole name or after a separator, never as a camelCase tail: as a tail they
 #: name ordinary flags (``requireAuth``, ``useOAuth``, ``useJwt``).
@@ -2896,7 +3044,7 @@ def _run(
         if wide:
             text = apply(_WIDE_DSN_PASSWORD, dsn_repl, text, None)
     # LAST, over what every pass above left, masking words only (BACKLOG #5030; see the pattern).
-    if ";" in text and (_admits(folded, _CREDENTIAL_HINT) or _admits(folded, _MEMBER_EXTRA_HINT)):
+    if ";" in text and _admits(folded, _MEMBER_PASS_HINT):
         text = apply(_CONNECTION_STRING_MEMBER, _mask_member, text, 2)
     return text
 
@@ -2943,7 +3091,12 @@ _BRACED = "braced_tail"
 
 #: A connection-string member's key, ``;<key>=``, as :data:`_CONNECTION_STRING_MEMBER` opens it, for
 #: :func:`_union`. Spelled literally, so the regex scanner reads it;
-#: ``tests/test_secretscrub_camelcase_label.py`` holds it to that pattern's own head.
+#: ``tests/test_secretscrub_camelcase_label.py`` holds it to that pattern's own head. NOT the keys
+#: that are a whole query-credential word (BACKLOG #8429): with them, a line whose camelCase label
+#: took a later ``;key=`` into its value went back to the reading before whole, which reads no
+#: camelCase label, so that label's value printed where ``origin/main`` hid it (a seeded
+#: differential found ``myPassword=v\\ntoken: x;KEY==``). Both readings mask such a member's value,
+#: since the member pass is in both, so the union keeps that mask.
 _MEMBER_KEY = re.compile(
     r"(?i);[A-Za-z0-9_]++(?:(?<=password)|(?<=passwd)|(?<=passphrase)|(?<=pass)|(?<=pwd)"
     r"|(?<=secret)|(?<=credential)|(?<=token))="
@@ -3171,10 +3324,58 @@ _DIGEST_TRIGGER = re.compile(r"[:=]\s*+digest\s")
 _BYTES_TRIGGER = re.compile(r"[:=\s]b['\"]")
 
 
+#: :func:`_without_escape`'s compiled readings, keyed as :data:`_PRE_CAMEL` is.
+_NO_ESCAPE: dict[int, tuple[re.Pattern[str], re.Pattern[str]]] = {}
+
+
+def _without_escape(pattern: re.Pattern[str]) -> re.Pattern[str]:
+    """``pattern`` without :data:`_ESCAPE_START`, as it read before BACKLOG #8429. A pattern that
+    does not hold the start is compiled unchanged. Compiled once per pattern."""
+    found = _NO_ESCAPE.get(id(pattern))
+    if found is not None and found[0] is pattern:
+        return found[1]
+    if len(_NO_ESCAPE) >= 64:  # only patched test patterns get here
+        _NO_ESCAPE.clear()
+    source = pattern.pattern.replace("|" + _ESCAPE_START, "")
+    if _ESCAPE_START in source:  # spelled some other way, so the strip would change nothing
+        raise ValueError("the escape start is not where _without_escape strips it")
+    compiled = re.compile(source, pattern.flags)
+    _NO_ESCAPE[id(pattern)] = (pattern, compiled)
+    return compiled
+
+
+def _holds_escape_label(text: str) -> bool:
+    """Whether :data:`_ESCAPE_START` could open a label on ``text``."""
+    return "\\" in text and _ESCAPE_PROBE.search(text) is not None
+
+
+def _union_without_escape(
+    text: str,
+    placeholder: str,
+    folded: str | None,
+    read: Callable[[re.Pattern[str]], re.Pattern[str]] | None,
+) -> str:
+    """:func:`_union` with the shipped reading ``read`` taken without :data:`_ESCAPE_START`."""
+    shipped = _same if read is None else read
+
+    def read_without(pattern: re.Pattern[str]) -> re.Pattern[str]:
+        return _without_escape(shipped(pattern))
+
+    def sub_without(
+        pattern: re.Pattern[str], repl: _Repl, line: str, _tail: str | int | None
+    ) -> str:
+        return read_without(pattern).sub(repl, line)
+
+    return _union(text, placeholder, folded, read_without, sub_without, escape=False)
+
+
 def _reads_camel(text: str, folded: str | None, placeholder: str) -> bool:
     """Whether the camelCase reading could change anything on ``text``: the comment above says why
     these tests are enough."""
     if placeholder[-1:].isalnum() or _CAMEL_PROBE.search(text) is not None:
+        return True
+    # The escape start rides the same union (BACKLOG #8429; the comment on :data:`_ESCAPE_START`).
+    if _holds_escape_label(text):
         return True
     # Every compound key word ends in "key", so one substring test rejects most lines.
     return folded is None or ("key" in folded and _admits(folded, _COMPOUND_HINT))
@@ -3200,12 +3401,20 @@ def _union(
     folded: str | None,
     read: Callable[[re.Pattern[str]], re.Pattern[str]] | None = None,
     sub: _Sub | None = None,
+    *,
+    escape: bool = True,
 ) -> str:
     """``text`` scrubbed with the shipped patterns, keeping a character of the line only where
     :func:`_pre_camel` of them printed it too: where that reading masked it, its mask, and where it
     hid it, one ``placeholder`` for the run. That reading's own output instead where the shipped one
     would hide a ";" it printed. ``read`` and ``sub`` give the shipped reading, the patterns as
-    they are by default; :func:`_scrub_credentials` passes the reading without the tails."""
+    they are by default; :func:`_scrub_credentials` passes the reading without the tails.
+
+    On a line :data:`_ESCAPE_START` could open a label on, each of the two places this returns a
+    reading before whole returns this union with the shipped patterns read without that start
+    instead (:func:`_union_without_escape`; BACKLOG #8429), which is the union ``origin/main``
+    computed, so the escape start never sends a line to a reading that reads no camelCase label.
+    ``escape`` is False for that inner union."""
     before = _Trace(len(text), _pre_camel)
     shipped = _Trace(len(text), _same if read is None else read)
     try:
@@ -3226,6 +3435,8 @@ def _union(
         old = _run(text, placeholder, folded, before.sub)
         new = _run(text, placeholder, folded, shipped.sub)
     except _Untraceable:
+        if escape and _holds_escape_label(text):
+            return _union_without_escape(text, placeholder, folded, read)
         return _run(text, placeholder, folded, _pre_camel_sub)
     # What the reading before did with each character of the line: printed it, masked it, or hid it.
     state = bytearray(len(text))  # _HIDDEN
@@ -3249,6 +3460,8 @@ def _union(
         at = text.find(";")
         while at != -1:
             if state[at] == _PRINTED[0] and not carried[at] and _MEMBER_KEY.match(text, at):
+                if escape and _holds_escape_label(text):
+                    return _union_without_escape(text, placeholder, folded, read)
                 return old
             at = text.find(";", at + 1)
     out: list[str] = []

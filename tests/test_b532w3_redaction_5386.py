@@ -332,10 +332,6 @@ def test_prose_after_a_glued_apostrophe_is_masked_to_the_next_semicolon() -> Non
 #: changed, and the comments on ``secretscrub._WIDE_DSN_PASSWORD`` and
 #: ``_CONNECTION_STRING_MEMBER`` must change with it. Each pairs a line with what prints.
 _KNOWN_RESIDUALS = (
-    # A key _CREDENTIAL_KV reads first ends its value at the glued quote.
-    ("x;PWD=P'Kv9_Sec;", "Kv9_Sec"),
-    ("Server=h;Password=P'Kv9_Sec;Database=d", "Kv9_Sec"),
-    ('x;pwd=P"Kv9_Sec;', "Kv9_Sec"),
     # A JDBC DSN with no user before its host: the narrow match takes the member's key.
     ("jdbc:sqlserver://db.invalid:1433;user=svc;sslpassword=P@ss_Sec9;", "ss_Sec9"),
     # After user@host: a password opening with digits then a non-word character, a host word
@@ -360,6 +356,26 @@ _KNOWN_RESIDUALS = (
 @pytest.mark.parametrize(("line", "printed"), _KNOWN_RESIDUALS)
 def test_known_residual_prints(line: str, printed: str, call: Callable[[str], str]) -> None:
     assert printed in call(line)
+
+
+#: Residuals this file pinned as printed until BACKLOG #8429: a key ``_CREDENTIAL_KV`` reads first
+#: ended its value at the glued quote and wrote its placeholder, and the member pass stopped at the
+#: quote after that placeholder. The member value now runs on over a quote glued right after an
+#: earlier pass's placeholder, so the rest of the value is masked.
+_RESIDUALS_CLOSED_BY_8429 = (
+    ("x;PWD=P'Kv9_Sec;", "Kv9_Sec"),
+    ("Server=h;Password=P'Kv9_Sec;Database=d", "Kv9_Sec"),
+    ('x;pwd=P"Kv9_Sec;', "Kv9_Sec"),
+)
+
+
+@pytest.mark.parametrize("call", _ENTRY_POINTS, ids=_IDS)
+@pytest.mark.parametrize(("line", "printed"), _RESIDUALS_CLOSED_BY_8429)
+def test_a_value_after_a_quote_glued_to_a_placeholder_is_hidden(
+    line: str, printed: str, call: Callable[[str], str]
+) -> None:
+    out = call(line)
+    assert printed not in out and "Kv9" not in out and "Sec" not in out, out
 
 
 def test_a_placeholder_is_never_crossed_by_an_empty_users_segment() -> None:

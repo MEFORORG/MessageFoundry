@@ -630,7 +630,13 @@ def test_the_member_key_is_the_member_patterns_own_head() -> None:
     """``_union`` keeps the reading before where a member key's ";" would be lost; the key it looks
     for must be the one the member pass opens with."""
     head = secretscrub._MEMBER_KEY.pattern.removeprefix("(?i)").removesuffix("=")
-    assert secretscrub._CONNECTION_STRING_MEMBER.pattern.startswith(f"(?i)({head})=")
+    # The member pass also reads a whole query-credential key (BACKLOG #8429), which the union's
+    # key leaves out on purpose; ``secretscrub._MEMBER_KEY``'s comment says why. Every other key is
+    # the same.
+    bare = "".join(f"|(?<=;{word})" for word in secretscrub._QUERY_CREDENTIAL_WORDS)
+    assert head.endswith("(?<=token))")
+    member_head = head[:-1] + bare + ")"
+    assert secretscrub._CONNECTION_STRING_MEMBER.pattern.startswith(f"(?i)({member_head})=")
 
 
 def test_a_semicolon_inside_a_camelcase_value_keeps_the_camelcase_reading() -> None:

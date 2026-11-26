@@ -2116,8 +2116,8 @@ def test_the_dsn_scan_grows_linearly_in_line_length() -> None:
     )
 
     # THE GATE-REJECT PATH IS A SUBJECT IN ITS OWN RIGHT, and it is the one that runs on nearly every
-    # record: a line naming no credential word at all. It reaches `_ANY_HINT`'s substring sweeps (23
-    # since BACKLOG #5545) and then returns, so nothing below it is exercised -- which is exactly why
+    # record: a line naming no credential word at all. It reaches `_ANY_HINT`'s substring sweeps (24
+    # since BACKLOG #5550) and then returns, so nothing below it is exercised -- which is exactly why
     # it needs its own timed row rather than being inferred from the marked one. Without it a
     # regression that made that sweep pathological would have no timed coverage anywhere in this file.
     subjects: tuple[tuple[str, Callable[[str], object], bool], ...] = (
@@ -3277,9 +3277,19 @@ def test_the_outside_lines_print_their_value_under_the_denylist_tail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """THE POSITIVE CONTROL. With the tail put back to the round-2 denylist, each line prints its
-    value in the bundle and on the store path."""
+    value in the bundle and on the store path.
+
+    The second line's value is spelled ``vq7_code`` here. Its fuzz spelling, ``vq7code``, glues the
+    planted value to ``code`` where no label may open, and since BACKLOG #8429 the member mask the
+    denylist tail writes with masks such a word, so it no longer prints under that tail either. With
+    a label prefix's "_" before ``code`` the mask keeps the word, as it kept ``vq7code`` before."""
     _restore_an_earlier_tail(monkeypatch)
-    for line, value, _, _ in _OUTSIDE_THE_ALLOWLIST_LINES:
+    lines = [
+        (line.replace("vq7code", "vq7_code"), value.replace("vq7code", "vq7_code"), *rest)
+        for line, value, *rest in _OUTSIDE_THE_ALLOWLIST_LINES
+    ]
+    assert lines[1][1] == "vq7_code"
+    for line, value, _, _ in lines:
         for surface, out in (("bundle", redact_log_line(line)), ("store", _store_detail(line))):
             assert value in out, f"{surface}: {line!r} hid -- got {ascii(out)}"
 
