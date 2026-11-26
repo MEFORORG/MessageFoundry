@@ -5615,6 +5615,20 @@ Both kinds of user share one identity model (`users.auth_provider` is `local` or
   this acceptor against a real domain. If it does, every Windows SSO sign-in on a Windows host fails
   closed until a lab run decides how to read it. That is no looser than before, when its directory
   lookup missed.
+  **The realm is bound to the directory entry too (BACKLOG #4846).** The Kerberos lookup asks only
+  what a ticket proves: a person account, `objectCategory=person` and `objectClass=user`, whose own
+  `sAMAccountName` is the ticket's account name, and whose DN's whole trailing run of `DC=` RDNs
+  equals the realm's domain, compared up to ASCII case as the ticket's realm is. So under a forest-wide base or the
+  global catalog, `alice@CORP.EXAMPLE` never resolves to a child domain's `alice`; an entry holding
+  the name only as its UPN answers no ticket; and a machine's ticket (`WS01$`) finds nothing. A
+  name ending in `$` is never looked up, which also covers an interdomain trust account, a
+  person-category `user`. The binding assumes Active Directory's rule that a domain's realm is its
+  DNS name and its naming context that name's `DC=` RDNs. An entry whose trailing `DC=` run is
+  not exactly the realm's labels, one per RDN, matches nothing, and neither does one whose DN the
+  engine's parser refuses; the sign-in is then refused as `not_in_directory`. So does a ticket naming the account by an implicit UPN rather than its
+  `sAMAccountName`, which a client that does not ask the KDC to canonicalize the name may present;
+  that is unverified against a real KDC. The password sign-in and the other name-keyed lookups,
+  `create_directory_account`'s among them, are unchanged.
 
 ### AD-group → role mapping
 
