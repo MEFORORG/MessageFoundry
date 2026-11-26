@@ -2147,7 +2147,7 @@ def _stray_json_closer(text: str) -> bool:
 
     It reads the text from its start as :data:`_JSON_TOKEN` tokenizes it, so a closer inside a
     string is not structure. A PHI key that the walk passes while disarmed arms it at the key's
-    depth, and a later key at a shallower depth lowers that depth. The walk blanks on the first
+    depth. The walk blanks on the first
     closer, while armed, whose innermost open container is of another kind. It disarms when the
     depth falls below the armed depth, which is the arming key's own container closing; a later
     PHI key can then arm it again. A key outside every container disarms only at a line feed or
@@ -2173,7 +2173,10 @@ def _stray_json_closer(text: str) -> bool:
     (``"given": [x] y]``); a stray closer of the key's own container's kind (``{"given": [x] y}}``);
     a stray closer a matching unmatched opener absorbs; one inside a string that opened before the
     key, such as an apostrophe earlier on the line (``can't map {"given": [x] y]}``); and one a
-    quote put in the value hides in an unterminated string (``{"given": [x] y']}``). Counting an
+    quote put in the value hides in an unterminated string (``{"given": [x] y']}``); and a closer
+    in the value of a key outside every container whose colon is on the next line, since the walk
+    disarms at that line break (``"telecom"\n: [a|b|c ) , {"value": y}]``), so the value is kept, as
+    it was before BACKLOG #5814. Counting an
     unterminated string's closers was tried and dropped: a cut inside any string after a PHI key,
     and the placeholders this module and the support bundle write, then blanked whole texts and
     broke the fixed point. A value of one token after the key's value, with no stray closer at all

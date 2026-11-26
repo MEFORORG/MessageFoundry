@@ -53,6 +53,8 @@ MISSED = [
     f'can\'t map {{"given": [Jane] {SECRET}]}}',  # a string opened before the key
     f'{{"given": [Jane] {SECRET}\']}}',  # a quote in the value hides the closer
     f'{{"given": [Jane] {SECRET}"]}}',
+    # A top-level key whose colon is on the next line: the walk disarms at that line break.
+    f'"telecom"\n: [a|b|c ) , {{"value": "{SECRET}"}}]',
 ]
 
 
