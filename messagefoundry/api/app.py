@@ -12522,10 +12522,9 @@ async def _session_reaper(
     BACKLOG #3028); the lifespan passes the window the supersession follows them for. The store
     measures a link's age on its own clock, the one the supersession measures its window on (vault
     BACKLOG #4276), never from the ``now`` passed below. So the reaper asks for that window plus
-    ``_SESSION_REAP_STEP_TOLERANCE``: a forward step of the store's clock no larger than that, which
-    the guard below lets through, or cannot see at all when the store's clock is a database
-    server's, then cannot make the purge delete a link the supersession would follow once the clock
-    is set right. A larger step of a database server's clock still can.
+    ``_SESSION_REAP_STEP_TOLERANCE``: the purge then deletes a link younger than that window in
+    real time only after the store's clock has gained more than ``_SESSION_REAP_STEP_TOLERANCE``
+    on real time since the link was written. The guard below reads only the engine host's clock.
     The cost is that a link waits that much longer to go, and the supersession ignores it meanwhile.
 
     **The reaper skips a pass when the wall clock has jumped forward (BACKLOG #2283).** The purge

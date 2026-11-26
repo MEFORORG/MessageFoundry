@@ -12143,7 +12143,8 @@ CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at);
 CREATE TABLE IF NOT EXISTS session_lineage (
     retired_hash   TEXT PRIMARY KEY,           -- the hash the rotation retired
     successor_hash TEXT NOT NULL,              -- the hash the session carried next
-    retired_at     REAL NOT NULL               -- when the re-key landed, in its transaction (wall clock)
+    retired_at     REAL NOT NULL               -- when the re-key landed, in its transaction
+                                               -- (the database's clock)
 );
 CREATE INDEX IF NOT EXISTS ix_session_lineage_retired ON session_lineage(retired_at);
 

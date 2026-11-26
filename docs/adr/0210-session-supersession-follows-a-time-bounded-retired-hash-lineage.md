@@ -49,7 +49,8 @@ record as accepted.
    `oidc_flow_ttl_seconds` plus 120 seconds, the longest sign-in a rotation can race plus the
    callback's own work after it. With no `lineage_since`, `supersede_session` is the plain revoke
    it was, which `_end_lapsed_session` keeps.
-4. **The session reaper purges links past the window plus the reaper's step tolerance (600 s)**, in the same pass as expired sessions,
+4. **The session reaper purges links older than the window plus the reaper's step tolerance
+   (600 s), measured on the store's clock (Amendment B)**, in the same pass as expired sessions,
    through a new `lineage_seconds` argument to `purge_expired_sessions`.
 5. **No session read consults the table.** `get_session`, `list_sessions` and the service's session
    loader read `sessions` only. A test pins, per backend, that only `rotate_session`,
@@ -77,10 +78,13 @@ record as accepted.
   `tests/test_session_supersession_lineage.py::test_a_token_whose_hash_links_to_a_live_session_authenticates_nothing`
 - **AC-5** -- THE SYSTEM SHALL read the lineage only from the supersession, on every backend.
   -> `tests/test_session_supersession_lineage.py::test_only_the_rotation_the_supersession_and_the_purge_touch_the_lineage`
-- **AC-6** -- WHEN a reaper pass purges, THE SYSTEM SHALL delete links past the window plus the reaper's step tolerance (Amendment B) and keep the rest.
+- **AC-6** -- THE SYSTEM SHALL NOT delete a link until its age on the store's clock exceeds the
+  window plus the reaper's step tolerance (Amendment B). A reaper pass deletes the older links its
+  purge sees, and a pass that skips or fails can delete none.
   -> `tests/_session_rotation_contract.py` (`assert_session_lineage_contract`, run on all three
   backends),
-  `tests/test_session_supersession_lineage.py::test_the_reaper_purges_links_by_the_window_it_is_given`
+  `tests/test_session_supersession_lineage.py::test_the_reaper_purges_links_by_the_window_it_is_given`,
+  `tests/test_session_supersession_lineage.py::test_the_lifespan_hands_the_reaper_the_supersession_window`
 
 ## Options considered
 
@@ -103,7 +107,8 @@ so `logout` and `revoke_own_session` (#3029) can follow the same links by passin
 
 **Negative** -- For the length of the window, a retired token gains one power: presented at a
 sign-in that succeeds, it ends the session it became. It cannot open or extend one.
-`docs/SECURITY.md` states this. Each rotation writes one more row, which the reaper deletes.
+`docs/SECURITY.md` states this. Each rotation writes one more row, for the reaper to delete
+(AC-6); while every pass skips or fails, the rows accumulate.
 
 **Stated limits** -- An elevation that finished longer ago than the window, such as one a second
 holder of the token completed earlier, is not followed, and neither is a sign-in that runs past the
@@ -139,8 +144,8 @@ length, `lineage_seconds`, not an instant, `lineage_since`, and `rotate_session`
 The sign-out asks for its 5 seconds plus the time since its proof, on the engine's monotonic clock.
 Each store adds back, on the monotonic clock, the time its own call spent waiting before a lookup,
 so no lock, connection or row wait shortens the window. The reaper asks the purge for the window
-plus its step tolerance, so a forward step of the store's clock under that tolerance cannot delete
-a link the supersession would still follow.
+plus its step tolerance, so a pass deletes a link younger than the window in real time only after
+the store's clock has gained more than that tolerance on real time since the link was written.
 
 What this closes: on PostgreSQL and SQL Server, a step of an engine host's clock, and skew between
 engine hosts sharing one store, no longer move the window. What stays: a step of the store's own

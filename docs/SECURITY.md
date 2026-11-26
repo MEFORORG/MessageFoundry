@@ -6837,7 +6837,12 @@ end, in the same transaction as the revoke. The audit row names that session and
 field, the hash the browser presented.
 
 The link is followed for a bounded time: `[auth].oidc_flow_ttl_seconds` plus 120 seconds, which is
-420 seconds at the default, and the session reaper deletes a link only once it is older than the bound plus the reaper's step tolerance, as stated below. **At least these cases stay
+420 seconds at the default. The session reaper deletes a link only once the link's age on the
+store's clock exceeds the bound plus the reaper's step tolerance, 600 seconds, and it can keep a
+link far longer: its passes run about hourly, and a pass that skips or fails deletes none. So it
+deletes a link younger than the bound in real time only after the store's clock has gained more
+than 600 seconds on real time since the link was written; the last case below is one way that
+happens. **At least these cases stay
 open**, and in each the session lives on under the token the elevation handed out, until it expires,
 as before this change:
 
@@ -6867,10 +6872,8 @@ the bound after the elevation too, through a sign-in whose first credential pass
 required, the supersession runs when the password-only session is minted, before the second factor,
 so a password alone is enough. A store
 clock that stepped back between the elevation and the sign-in lengthens that time by the step; the
-reaper's clock-step guard reads the engine's clock and does not cover this. The reaper deletes a link
-only once it is older than the bound plus that guard's step tolerance on the store's clock, so a
-forward step of the store's clock smaller than the tolerance cannot delete a link the sign-in would
-still follow. The links are not under the session integrity seal (BACKLOG #2592): a forged link can only direct a
+reaper's clock-step guard reads the engine's clock and does not cover this. The links are not under
+the session integrity seal (BACKLOG #2592): a forged link can only direct a
 revoke, and a revoke needs no key on any backend.
 
 **A sign-out follows the links too, for far less time (BACKLOG #3715).** An elevation in another
