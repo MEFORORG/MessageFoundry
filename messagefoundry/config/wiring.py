@@ -6137,11 +6137,12 @@ def _accepts_callees(obj: object) -> list[object]:
     function, a ``__wrapped__`` it carries, and a callable instance's ``__call__``. Empty for a plain
     function with no ``__wrapped__``.
 
-    The ``__wrapped__`` and ``__call__`` lookups are static, as ``reachability._function_of`` reads
-    (``type()``, ``__dict__`` and ``inspect.getattr_static``), so no author ``__class__``,
-    ``__getattr__`` or ``__getattribute__`` runs for them. The ``func`` read off a
-    ``functools.partial`` is a plain attribute read, so a subclass of ``functools.partial`` that
-    overrides ``func`` runs its own code here. A class-based wrapper that calls ``functools.update_wrapper``
+    A callable instance's ``__call__`` and ``__wrapped__`` are looked up with
+    ``inspect.getattr_static``, so no author ``__getattr__`` or ``__getattribute__`` runs for
+    them. Not every read here is free of author code: at least the ``func`` read off a
+    ``functools.partial`` runs a subclass's override, and a function's ``__wrapped__`` is read with
+    ``.get`` on its ``__dict__``, which an author can replace with a ``dict`` subclass whose
+    ``get`` runs. A class-based wrapper that calls ``functools.update_wrapper``
     yields both its own ``__call__`` and the function it wraps, since either may run."""
     kind = type(obj)
     if issubclass(kind, functools.partial):
@@ -6251,7 +6252,8 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
     ``inspect.getattr_static``, but it is not free of author code: at least the ``func``, ``args``
     and ``keywords`` it reads off a ``functools.partial`` and the ``__func__`` it reads off a
     ``staticmethod`` or ``classmethod`` are plain attribute reads, which a subclass can override,
-    and ``captured_values`` tests a global with ``isinstance``, which can run an object's
+    a function's ``__wrapped__`` is read off a ``__dict__`` an author can replace (see
+    :func:`_accepts_callees`), and ``captured_values`` tests a global with ``isinstance``, which can run an object's
     ``__class__``; :func:`_check_accepts_predicate` refuses a predicate whose walk raises.
 
     Engine PR 2997's left list adds these edges (vault BACKLOG #5514): an attribute a function
