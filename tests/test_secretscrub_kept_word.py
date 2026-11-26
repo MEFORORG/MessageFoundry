@@ -4,11 +4,11 @@
 it as a label (BACKLOG #8429 item 1, BACKLOG #5030 added item 9), and three neighbouring shapes the
 mask does not reach yet, pinned as strict expected failures.
 
-Measured on ``origin/main`` before the change, through ``scrub_credentials``, the filter chain
-``_install_phi_filters`` puts on a handler, and ``redact_log_line``: inside a member value, a
+Measured on ``main`` at b54e0528, before the change, through ``scrub_credentials``, the filter
+chain ``_install_phi_filters`` puts on a handler, and ``redact_log_line``: inside a member value, a
 password word that HOLDS a kept word anywhere, such as ``Passage``, ``Statement``, ``Barcode``,
-``Compass``, ``Codename`` or ``Bypass``, printed whole before a ":" or "=", though no pass reads a
-label there. On first deployment that word of a password would reach the write-time log, the
+``Compass``, ``Codename`` or ``Bypass``, printed whole before a ":" or "=", though no label pattern
+reads a label there. On first deployment that word of a password would reach the write-time log, the
 support bundle and ``GET /logs/tail``.
 
 Values are synthetic."""
@@ -89,13 +89,17 @@ def test_a_password_word_holding_a_kept_word_is_masked(
         (";sslpassword=a1q%3Bpassword=b2q;", "3Bpassword"),
         (";sslpassword=a1q ?code=b2q;", "code"),
         (";sslpassword=a1q x.code=b2q;", "x.code"),
-        # A PHI JSON key word, whole.
+        # A PHI JSON key word, whole. Kept whatever follows it, though the PHI pass reads only a
+        # quoted key; ``_read_as_label``'s docstring lists this among the words kept for no reader.
         (";sslpassword=a1q name=b2q;", "name"),
         # A query-filter key the filter reads whole, though it holds two kept words elsewhere.
         (";sslpassword=a1q session_state=b2q;", "session_state"),
         (";sslpassword=a1q x.session_state=b2q;", "x.session_state"),
         # A member key right after a ";" inside a braced value, which the member pass reads.
         (";sslpassword={a1q;sslkeypassword=b2q};", "sslkeypassword"),
+        # A word ending in a scheme word before spaces keeps the scheme-word rule, as before,
+        # whatever follows the spaces (code review).
+        (";sslpassword=a1q xbearer :b2q;", "xbearer"),
         # The words read inside a longer word: the MEFOR_ prefix and the DICOM labels.
         (";sslpassword=a1q MEFOR_X=b2q;", "MEFOR_X"),
         (";sslpassword=a1q IssuerOfPatientID=b2q;", "IssuerOfPatientID"),
@@ -193,7 +197,7 @@ _OPENING_CONTROLS = (
         "'d4q e5q' tail b2q",
     ),
     (
-        "query-filter keys",
+        "session_state",
         "_MEMBER_LABEL_WORDS",
         tuple(w for w in secretscrub._MEMBER_LABEL_WORDS if w != "session_state"),
         "postgres://svc:;sslpassword=session_state=a1qa1qdigestx=;'d4q e5q'' refused",

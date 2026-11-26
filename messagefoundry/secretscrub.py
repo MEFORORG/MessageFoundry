@@ -1959,10 +1959,12 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # word mask before it, ``redacted`` for every word, printed 1 line on a chain line the
 # bundle read back on the first ten seeds, and the "#" rule before its fix printed on five later
 # paths. BACKLOG #8429's narrower kept-word rule (:func:`_read_as_label`) was measured by the same
-# nine paths over 60,006 seeded lines dense with kept-word shapes, against an ``origin/main`` tree:
-# no line printed a planted value ``origin/main`` hid. With each opening but the ";" one switched
-# off in turn, some lines did, and ``tests/test_secretscrub_kept_word.py`` holds one for each. The
-# ";" opening is a precaution no line in that run needed.
+# nine paths over 60,006 seeded lines dense with kept-word shapes, against a tree of ``main`` at
+# b54e0528, the rule before: no line printed a planted value that tree hid. With one opening
+# switched off in turn, some lines did for the held words, ``session_state``, a ``\b`` start, a
+# "_" prefix and a camelCase capital, and ``tests/test_secretscrub_kept_word.py`` holds one for
+# each. The ";" opening found no line; the whole-word, ``%XX`` and non-ASCII keeps were not
+# switched off alone.
 #
 # THE COST, at least these. Every character of the value outside a word prints as it was: its
 # spaces, its punctuation and symbols, ASCII ones such as "@" and "!" and non-ASCII ones such
@@ -1972,7 +1974,7 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # later pass reads as a label prints whole when a ":" or "=" follows it, such as the ``pass`` of
 # ``pass=word`` or the ``ad_bind_password`` of ``ad_bind_password=``, and so do a word holding a
 # :data:`_MEMBER_HELD` word anywhere, such as ``xMEFOR_A=``, and a three-character segment ID before
-# a "|". Each of those printed on ``origin/main`` too, which hid at most the first word. Redacting a
+# a "|". Each of those printed before BACKLOG #5030 too, which hid at most the first word. Redacting a
 # record ONCE, so a later handler reads nothing this pass wrote, was measured and not taken:
 # ``origin/main``'s own second handler hides a value its first prints on 313 to 584 lines per
 # 20,000, so a record redacted once would print each of them on every handler after the first.
@@ -2179,11 +2181,12 @@ def _masked_word(word: str, after_percent: bool = False) -> str:
 
 #: The kept words a word may hold ANYWHERE and stay whole before a ":" or "=", as every kept word did
 #: before BACKLOG #8429: the ``MEFOR_`` prefix, the bundle marker and scheme words, the MRN label,
-#: ``0010`` and the DICOM label words, which ``redaction._DICOM_PHI_LABEL`` reads in the middle of a
-#: keyword (``IssuerOfPatientID``). That is a precaution kept from before, not a reading of where
-#: each reader opens: at least the scheme words, ``mrn`` and ``0010`` are read only at some starts,
-#: so a password word holding one, such as ``Outpatient`` or ``Basically``, still prints whole
-#: before a ":" or "=", as it did before. A run with no word held printed values on later paths
+#: ``0010`` and the DICOM label words, which the keywords ``redaction._DICOM_PHI_LABEL`` reads hold
+#: in their middle (``IssuerOfPatientID``). That is a precaution kept from before, not a reading of
+#: where each reader opens: at least the scheme words, ``mrn``, ``0010`` and the DICOM keywords are
+#: read only at some starts (``_DICOM_PHI_LABEL`` reads a whole keyword after a non-word
+#: character), so a password word holding one, such as ``Outpatient`` or ``Basically``, would still
+#: print whole before a ":" or "=", as before. A run with no word held printed values on later paths
 #: (``tests/test_secretscrub_kept_word.py``), and no narrower set was measured. Spelled literally, so
 #: the regex scanner in ``tests/test_security_static.py`` reads it; the same test file holds it to
 #: :data:`_MEMBER_KEEP_WORDS`.
@@ -2222,7 +2225,8 @@ def _read_as_label(text: str, word: str, start: int) -> bool:
 
     The mask kept a word holding a kept word ANYWHERE, so a password word such as ``Passage``,
     ``Statement``, ``Barcode``, ``Compass``, ``Codename`` or ``Bypass`` before a ":" or "=" printed
-    whole, though no pass reads a label there. Now a word is kept where it holds one of
+    whole, though no label pattern reads a label there (two stops do, named below). Now a word is
+    kept where it holds one of
     :data:`_MEMBER_HELD`'s words anywhere (that constant says why); where it right follows a ";",
     ends in a member key word and "=" follows it, which the member pass reads as a key; or where it
     ENDS in one of :data:`_MEMBER_LABEL_WORDS`, as every label pattern ends its keyword with
@@ -2240,8 +2244,13 @@ def _read_as_label(text: str, word: str, start: int) -> bool:
     :data:`_CONNECTION_STRING_MEMBER` gives held DSN and scheme shapes and found no line printing
     from that, which is a fuzz result, not a proof.
 
-    A word holding a character outside ASCII keeps the old rule, since the patterns fold case the
-    Unicode way and a lower-cased comparison may not."""
+    It still keeps words no reader opens on, at least: a whole label word whatever its case and
+    whatever follows it (``Name:``, ``x.code:``), since the JSON key and query readers need quotes
+    or "=" that this rule does not check; a label word after any "_" (``__secret=``), though
+    ``_LABEL_PREFIX`` needs a letter or digit before it; and a word holding a character
+    outside ASCII, which keeps the old rule, since the patterns fold case the Unicode way and a
+    lower-cased comparison may not. Such a password word would print whole on first deployment, as
+    it did before."""
     if not word.isascii() or _MEMBER_HELD.search(word) is not None:
         return True
     folded = word.lower()
@@ -2279,9 +2288,14 @@ def _kept_word(text: str, word: str, end: int) -> bool:
     if _MEMBER_KEEP.search(word) is None:
         return False
     tail = _MEMBER_LABEL_TAIL.match(text, end)
-    if tail is not None and (tail.group(1) != "#" or _MEMBER_MRN_WORD.search(word) is not None):
-        return _read_as_label(text, word, end - len(word))
-    # A "#" after spaces does not end the scheme-word rule: ``Bearer #`` is still a scheme word
+    if (
+        tail is not None
+        and (tail.group(1) != "#" or _MEMBER_MRN_WORD.search(word) is not None)
+        and _read_as_label(text, word, end - len(word))
+    ):
+        return True
+    # A word no label reader opens on still falls to the scheme-word rule, as it did before
+    # BACKLOG #8429: ``xbearer :`` keeps ``xbearer``, as ``xbearer abc`` does. A "#" after spaces does not end the scheme-word rule: ``Bearer #`` is still a scheme word
     # before a space, and a later bearer pass reads it there.
     return text[end : end + 1].isspace() and _MEMBER_SPACED_WORD.search(word) is not None
 
