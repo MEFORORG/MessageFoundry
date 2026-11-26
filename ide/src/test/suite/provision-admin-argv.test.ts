@@ -17,7 +17,7 @@ import { buildAdminProbeInvocation, buildProvisionInvocation } from "../../engin
 
 const FIXTURE = JSON.parse(
   fs.readFileSync(path.join(__dirname, "..", "..", "..", "src", "test", "fixtures", "provision-admin-argv.json"), "utf8"),
-) as { serviceConfig: string; provision: string[]; probe: string[] };
+) as { serviceConfig: string; provision: string[]; probe: string[]; probeDefault: string[] };
 const SC = FIXTURE.serviceConfig;
 
 // Built without the `serviceConfig` property in the type, so this file also compiles against the
@@ -30,6 +30,13 @@ const PROVISION_ARGV: readonly string[] = FIXTURE.provision;
 
 /** The admin probe's argv with SC set: provision-admin for the probe account, answering in JSON. */
 const PROBE_ARGV: readonly string[] = FIXTURE.probe;
+
+/**
+ * The admin probe's argv with `messagefoundry.serviceConfig` at its default, so no --service-config.
+ * tests/test_ide_start_plan_probe_contract.py runs this same list against a real store, so the two
+ * suites read one list rather than each spelling it.
+ */
+const PROBE_DEFAULT_ARGV: readonly string[] = FIXTURE.probeDefault;
 
 /** The pin: the whole argv, element for element. */
 function pin(actual: readonly string[], expected: readonly string[]): void {
@@ -47,6 +54,12 @@ suite("provision-admin and its probe open the service TOML the guard judged (BAC
     const inv = buildAdminProbeInvocation(probeOpts as never);
     assert.strictEqual(inv.command, "p");
     pin(inv.args, PROBE_ARGV);
+  });
+
+  test("the probe's whole argv with serviceConfig at its default, no --service-config element", () => {
+    const inv = buildAdminProbeInvocation({ python: "p" });
+    assert.strictEqual(inv.command, "p");
+    pin(inv.args, PROBE_DEFAULT_ARGV);
   });
 
   test("negative control: the pin refuses an element before provision-admin, one appended, and none missing", () => {

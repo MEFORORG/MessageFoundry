@@ -1,5 +1,5 @@
 {
-  "comment": "The provision-admin and probe argv the IDE builds with serviceConfig set (BACKLOG #5566). Pinned against the IDE builders by ide/src/test/suite/provision-admin-argv.test.ts and read with the engine's parser by tests/test_ide_provision_admin_argv.py.",
+  "comment": "The provision-admin and probe argv the IDE builds with serviceConfig set (BACKLOG #5566), and probeDefault, the probe's argv with messagefoundry.serviceConfig at its default (no --service-config). Pinned against the IDE builders by ide/src/test/suite/provision-admin-argv.test.ts and read with the engine's parser by tests/test_ide_provision_admin_argv.py; tests/test_ide_start_plan_probe_contract.py runs probeDefault against a real store.",
   "serviceConfig": "deploy/prod/messagefoundry.toml",
   "provision": [
     "-P",
@@ -22,6 +22,17 @@
     "--username=probe",
     "--email=probe@example.invalid",
     "--service-config=deploy/prod/messagefoundry.toml",
+    "--json"
+  ],
+  "probeDefault": [
+    "-P",
+    "-X",
+    "disable-remote-debug",
+    "-m",
+    "messagefoundry",
+    "provision-admin",
+    "--username=probe",
+    "--email=probe@example.invalid",
     "--json"
   ]
 }
