@@ -61,10 +61,12 @@ there is no defence in depth between them.
 | 3b | `checkout`/`switch` moving a *linked worktree* onto an existing branch | ditto |
 | 4 | `EnterWorktree` (relocating a live session) | tool name only |
 
-The single most important design decision is that **rules 1/3/3b key on the target, never on the cwd**.
-The gate's own docstring records that 29% of the Edit/Write calls made by sessions *sitting* in the primary
-wrote *correctly* into a worktree by absolute path; a cwd-keyed gate would have denied all of them.
-Rule 2 is the sole exception, and that exception is the source of the ultracode friction in §4.
+The single most important design decision is that **rule 1 keys on the write's target path, not on the
+cwd**: 29% of the Edit/Write calls made by sessions *sitting* in the primary wrote *correctly* into a
+worktree by absolute path, and a cwd-keyed write rule would have denied all of them. It is not true of
+every rule: the cwd roots a relative path, rule 2 keys on the cwd, and rules 3 and 3b read the cwd
+whenever the command names no other directory. [WORKTREE-GATE.md](WORKTREE-GATE.md), *Why it exists*,
+states what the cwd decides. Rule 2 is the source of the ultracode friction in §4.
 
 **[`scripts/hooks/block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1)** refuses
 blanket `git add -A`/`.`/`-u` and `git commit -a`, so two sessions in one tree can't sweep each other's
@@ -442,7 +444,8 @@ exists and the gate's file is absent. The reverse also holds: once `install-gate
 gate's file, the backstop stops reading the legacy one, and a root only the legacy file listed loses
 the backstop with no message. By the same rule, `-Uninstall -Repo` narrowed to zero roots leaves a
 gate file that names no root, which the backstop reads in preference to the legacy one, so the
-backstop is off, although `install-gate.ps1` calls that the same state as `-Uninstall`.
+backstop is off. `install-gate.ps1` used to call that the same state as `-Uninstall`; its warning
+now says it is not.
 
 So the "verified byte-for-byte clean uninstall" claim is false, of the gate alone as well as of the
 estate. Depending on what earlier runs did, `-Uninstall` leaves at least

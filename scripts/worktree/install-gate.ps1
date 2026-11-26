@@ -15,7 +15,8 @@
     session UNGATED -- and those are where the parallel VS Code chats run. A session running under an
     ungoverned account checked its own branch out inside another session's linked worktree (a hijack that
     silently swapped that session's files mid-task); the gate that would have blocked it was simply not
-    installed there. This mirrors what install-selfheal.ps1 already does: wire all of them.
+    installed there. install-selfheal.ps1 does not do this: it wires the one -ConfigDir it is given,
+    so it is run once per config dir (docs/SESSION-DRIFT-CONTROLS.md, B10).
 
     WHY USER SCOPE, and why an installed COPY:
 
@@ -31,8 +32,11 @@
         copy outside every tree (once, shared, referenced by absolute path from each account) and re-copy
         it on each install.
 
-    The gate only governs the checkouts listed in worktree-gate.repos.txt. That file IS the kill switch:
-    -Uninstall removes it (and the hook entries from every config dir).
+    The gate only governs the checkouts listed in worktree-gate.repos.txt. That file IS the gate's kill
+    switch: -Uninstall removes it (and the hook entries from every config dir). It is not the self-heal
+    backstop's: with this file absent, worktree-selfheal.ps1 reads a legacy
+    ~/.claude-hooks/worktree-gate.repos.txt where one exists and stays armed on the roots it lists
+    (docs/SESSION-DRIFT-CONTROLS.md, G8).
 
     THE ALLOWLIST IS MERGED, NEVER REPLACED (BACKLOG #1375). A run ADDS the roots it names and keeps
     every root already there. It used to overwrite the file with just this run's repos, and a bare run
@@ -126,7 +130,8 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 
 # The gate SCRIPT + its allowlist live ONCE, shared, under ~/.claude\hooks -- referenced by absolute path
-# from every config dir's settings.json, so a single copy (and a single kill switch) governs all accounts.
+# from every config dir's settings.json, so a single copy (and a single kill switch for the gate; see
+# .DESCRIPTION) governs all accounts.
 # Null-safely: $env:USERPROFILE is Windows-only and NULL elsewhere, where Join-Path throws a
 # parameter-binding error instead of returning a path. Same idiom as its sibling scripts.
 $HomeDir   = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
@@ -740,7 +745,9 @@ function Show-AllowlistResult {
         if ($BackupPath) { Write-Host "  backup    : $BackupPath  (the allowlist as it was BEFORE this run)" }
         if ($m -eq 0) {
             Write-Host "  WARNING   : the allowlist now names NO root, so the gate governs NOTHING and every session on" -ForegroundColor Yellow
-            Write-Host "              this box is ungated. That is the same state as -Uninstall, reached one root at a time." -ForegroundColor Yellow
+            Write-Host "              this box is ungated. This is NOT the state -Uninstall leaves. A self-heal backstop" -ForegroundColor Yellow
+            Write-Host "              that reads this file first now guards nothing too, while after -Uninstall it would" -ForegroundColor Yellow
+            Write-Host "              fall back to a legacy allowlist where one exists (docs/SESSION-DRIFT-CONTROLS.md, G8)." -ForegroundColor Yellow
         }
         Write-Host "  The hook wiring, the installed gate and every other root are untouched."
         return

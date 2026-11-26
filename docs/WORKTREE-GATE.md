@@ -4,8 +4,8 @@
 checkout — mechanically, not by reminding you — while leaving reads, planning, and writes into any
 worktree completely untouched.
 
-It is opt-in, installed by hand, governs only the checkouts you list, and comes back out cleanly
-(`settings.json` is restored byte-for-byte). See [Backing it out](#backing-it-out).
+It is opt-in, installed by hand, governs only the checkouts you list, and `install-gate.ps1 -Uninstall`
+takes it back out, though not without leaving files behind. See [Backing it out](#backing-it-out).
 
 > This page is the gate's own design rationale. For the gate **in context** — the whole drift-control
 > estate, which parts are actually installed and enforcing, and an audit of what they miss — see
@@ -36,12 +36,18 @@ period, a working, one-command, dry-run-by-default cleanup script (`prune-merged
 session — accumulated 12 stale worktrees. Advisory text has no measurable effect on this machine, on the
 human or on the model.
 
-**Second — and this is the part that is easy to get wrong — the gate must key on the write's TARGET PATH,
-never on the session's cwd.** The worktree row of the table above is the 29%: those sessions already
-write *correctly* into a worktree by absolute path, and a cwd-keyed gate would have denied all 4,010 of
-them. Both percentages are shares of the same 166 sessions' Edit/Write calls, so the 29% and the 44%
-are two numerators over one denominator rather than two measurements. Where a session *sits* is
-irrelevant; only where it *writes* matters.
+**Second — and this is the part that is easy to get wrong — the write rule must key on the write's
+TARGET PATH, not on the session's cwd.** The worktree row of the table above is the 29%: those sessions
+already write *correctly* into a worktree by absolute path, and a cwd-keyed write rule would have denied
+all 4,010 of them. Both percentages are shares of the same 166 sessions' Edit/Write calls, so the 29%
+and the 44% are two numerators over one denominator rather than two measurements.
+
+This is the one statement of what the cwd decides; the gate's docstring and
+[WORKTREES.md](WORKTREES.md) point here. For a write by absolute path, where a session *sits* is
+irrelevant and only where it *writes* matters. A relative path is rooted at the session's cwd first,
+so for a relative path the cwd does decide the verdict. Not every rule is keyed on a target path: at
+least rule 2 keys on the cwd, and the git rules judge the directory each git invocation runs in, which is
+the session's cwd unless the command names another with `-C`, `cd` or the like.
 
 ## What it blocks
 
@@ -164,8 +170,9 @@ This list is not the whole rule set. The hook itself,
 outside every checkout, and `install-gate.ps1` is the owner's to run. See "Installing" below.
 
 **Everything else is allowed.** Reads are never gated — asking a question or planning in the primary stays
-frictionless. Writes into any worktree, the scratchpad, or any other repo are allowed **from a session
-sitting in the primary**: there is no need to `cd`, relocate, or restart. Worktrees that git nests *inside*
+frictionless. Writes by absolute path into any worktree, the scratchpad, or any other repo are allowed
+**from a session sitting in the primary**: for such a write there is no need to `cd`, relocate, or
+restart. A dispatch is different (rule 2). Worktrees that git nests *inside*
 the primary's path (`.claude/worktrees/<name>/`, the first-party `claude --worktree` mechanism) are
 recognised as worktrees, not as the primary.
 
@@ -271,14 +278,15 @@ Two structural choices worth understanding:
   `~/.claude-account-2.lock`, a directory the installer then wrote gate wiring into on every run while the
   wiring check read it back as evidence (BACKLOG #1024). `-Status` now enumerates `~/.claude*`
   independently of that predicate, so its audit cannot agree with the writer by construction, and it names
-  any dir outside the wire set that still carries gate wiring. This mirrors
-  what `install-selfheal.ps1` already does. This is not a detail: the gate originally wired only
+  any dir outside the wire set that still carries gate wiring. This is not a detail: the gate originally wired only
   `~/.claude`, which left every account-N session **ungated** — and those are where the parallel VS Code
   chats run. A session under an ungoverned account then checked its own branch out inside another session's
   linked worktree (rule 3b's exact scenario) and the gate that would have blocked it simply wasn't there.
-  Override the set with `-ConfigDir`. The gate **script** and its allowlist still live once, shared, under
-  `~/.claude/hooks/`, referenced by absolute path from each account — one copy, one kill switch, all
-  accounts. (User scope, not the repo's `.claude/settings.json`: a project-scoped hook is git-tracked, so it
+  Override the set with `-ConfigDir`. `install-selfheal.ps1` does not do this: it wires the one
+  `-ConfigDir` it is given, so it is run once per config dir
+  ([SESSION-DRIFT-CONTROLS.md](SESSION-DRIFT-CONTROLS.md), B10). The gate **script** and its allowlist
+  still live once, shared, under `~/.claude/hooks/`, referenced by absolute path from each account — one
+  copy, one kill switch for the gate, all accounts. (User scope, not the repo's `.claude/settings.json`: a project-scoped hook is git-tracked, so it
   lives on **one branch** and would protect nothing in the other worktrees until each merged it.)
 
 - **An installed copy, not a path into a working tree.** The registered command points at
@@ -287,10 +295,12 @@ Two structural choices worth understanding:
   silently** — the gate would be off in every session with nothing to say so.
 
 - **A SessionStart drift-detector backstop.** Because the gate is a guardrail (it inspects tool arguments,
-  so a checkout routed through an indirect script slips past), `worktree-selfheal.ps1` — wired into *every*
-  account already — also **warns** at session start when this session's own linked worktree has drifted off
-  its recorded home branch (recorded by `new.ps1` at creation). Warn-only: it never switches a worktree
-  under the session using it.
+  so a checkout routed through an indirect script slips past), `worktree-selfheal.ps1` — in each config
+  dir `install-selfheal.ps1` was run for — runs at session start. It repairs a clean primary that has
+  drifted off its home branch. It no longer warns when this session's own linked worktree has moved off
+  its recorded home branch: under the owner ruling of 2026-08-26 that re-tasking a pooled worktree is
+  sanctioned, it records the current branch instead (the script's section 3 comment says why). It never
+  switches a linked worktree under the session using it.
 
 ## Backing it out
 
@@ -299,8 +309,8 @@ next `Edit` into the primary was denied with no restart. Removing it is the same
 
 | Level | Command | Effect |
 |---|---|---|
-| **Instant off** | delete `~/.claude/hooks/worktree-gate.repos.txt` | Gate stops firing immediately, **including for sessions already running** — the allowlist is re-read on every invocation, so it does not matter whether Claude Code cached `settings.json` at session start. |
-| **Full uninstall** | `install-gate.ps1 -Uninstall` | Removes both hook entries, the installed script, and the allowlist. Verified: `settings.json` returns **byte-for-byte identical** to its pre-install content, with all other hooks and settings intact, and zero leftover files. |
+| **Instant off** | delete `~/.claude/hooks/worktree-gate.repos.txt` | Gate stops firing immediately, **including for sessions already running** — the allowlist is re-read on every invocation, so it does not matter whether Claude Code cached `settings.json` at session start. It is the gate's off switch, not the self-heal backstop's: with this file gone, the backstop reads a legacy `~/.claude-hooks/worktree-gate.repos.txt` where one exists ([SESSION-DRIFT-CONTROLS.md](SESSION-DRIFT-CONTROLS.md), G8). |
+| **Full uninstall** | `install-gate.ps1 -Uninstall` | Removes the gate's hook entries from each config dir it wires, the installed gate and its dispatcher, and the allowlist, and rewrites each `settings.json` it touches. It is not a clean uninstall: depending on what earlier runs did, it leaves backup, receipt and log files, and the backstop can stay armed on a legacy allowlist. [SESSION-DRIFT-CONTROLS.md](SESSION-DRIFT-CONTROLS.md) G8 lists what remains. |
 | **Safety net** | automatic | Every install writes `settings.json.bak` and validates the JSON before moving it into place, so a botched write cannot break hooks across every session at once. |
 
 Nothing lives in the repo or in `.git`. Merging this branch changes no behaviour by itself — the gate only
@@ -314,7 +324,8 @@ becomes real when someone runs the installer.
   catches every write route — see [LEDGER-GATE.md](LEDGER-GATE.md). (Today it polices the ADR/BACKLOG
   number space; it is the seam any further commit-time rule should hang off.)
 - **It does not stop one session writing into another session's worktree** by absolute path. That is the
-  unavoidable price of keying on the target path, and the alternative (keying on cwd) is strictly worse.
+  unavoidable price of keying writes on the target path, and the alternative (keying them on the cwd) is
+  strictly worse.
 - **It does not prevent merge conflicts** — and does not need to. The measured cross-session conflict rate
   in this repo is **zero** (28/28 merged branches and 6/6 in-flight pairs merge clean). This gate exists to
   stop concurrent sessions trampling one shared working tree, not to arbitrate merges.
