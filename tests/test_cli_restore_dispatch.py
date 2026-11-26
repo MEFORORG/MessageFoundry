@@ -2006,6 +2006,54 @@ def test_a_refused_restore_whose_staging_survives_keeps_its_refusal(tmp_path, ca
     _no_staging_left(tmp_path)
 
 
+def test_a_refused_restore_keeps_its_refusal_when_rmtree_of_its_staging_raises(
+    tmp_path, capsys
+) -> None:
+    """BACKLOG #5617, through a seam the code before engine PR 2982 also used: ``shutil.rmtree``
+    refusing the restore staging directory, as a scanner holding a file in it does on Windows.
+    The refusal in flight is the one reported, alone, and no file in the staging the teardown
+    could not remove still holds plaintext; the blocks a truncation frees may, until reused
+    (docs/PHI.md). The archive here is a plaintext one on a keyless box, so the
+    staged copy is a plain copy, not a decrypted one; the key path is not exercised. At
+    717bb0ef3b, the parent of PR 2982's merge, the refusal already survived this seam, and the
+    leftover's archive.tar still held the whole archive."""
+    tar = _undated_config_only_tar(tmp_path)
+    toml = _service_toml(tmp_path, key_b64=None)
+    real_rmtree = shutil.rmtree
+    refused: list[str] = []
+
+    def refuse(path: Any, *args: Any, **kwargs: Any) -> None:
+        if "mefor-restore-" in os.fspath(path):
+            refused.append(os.fspath(path))
+            raise PermissionError(13, "held open by another process", os.fspath(path))
+        real_rmtree(path, *args, **kwargs)
+
+    def walk_error(exc: OSError) -> None:
+        raise exc
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(shutil, "rmtree", refuse)
+        mp.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", ())
+        assert main(_config_only_argv(str(tar), toml, tmp_path / "cfg")) == 1
+    assert refused, "the staging teardown never reached rmtree"
+    err = _refusal(capsys)
+    assert "restore failed (age_undated)" in err and "Nothing was written" in err, err
+    assert "Traceback" not in err, err
+    assert not (tmp_path / "cfg").exists()
+    leftovers = list(tmp_path.glob("mefor-restore-*"))
+    try:
+        (leftover,) = leftovers
+        assert (leftover / "archive.tar").stat().st_size == 0
+        # os.walk with an onerror that raises: a listing that fails is a failure, not an empty one.
+        for root, _dirs, files in os.walk(leftover, onerror=walk_error):
+            for name in files:
+                assert os.lstat(os.path.join(root, name)).st_size == 0, (root, name)
+        assert "Separately" not in err, err
+    finally:
+        for leftover in leftovers:
+            real_rmtree(leftover)
+
+
 def test_a_refusal_names_a_staging_leftover_that_still_holds_plaintext(tmp_path, capsys) -> None:
     # Where a staged file could be neither removed nor emptied, the refusal stands and names the
     # directory after it, rather than being replaced by the teardown's error.
