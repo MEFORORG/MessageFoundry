@@ -75,8 +75,9 @@ NSSM) or the file is unreadable, the route returns an empty, `available=false` p
 gracefully and never raises**. Redaction is best-effort (a residual single-token identifier can survive),
 which is why the surface is RBAC-gated + audited rather than open: the control is defence-in-depth over
 the redactor, mirroring the "never put PHI in a log line" convention. *(Corrected 2026-11-25. The
-paragraph read that the route returns each line "through `support.redact.redact_log_line` — the same
-per-line redactor the support bundle uses"; `_read_log_tail` calls `redact_log_record`, which wraps
+paragraph read that the route "returns each line **through
+`support.redact.redact_log_line`** — the same redactor the support bundle uses, so the browser sees the
+identical PHI/secret coverage", and that coverage claim is retracted; `_read_log_tail` calls `redact_log_record`, which wraps
 `redact_log_line`.)*
 
 ### §3 — `set_runtime_level` lands CLEAN for the S7a file-handler work to build on
