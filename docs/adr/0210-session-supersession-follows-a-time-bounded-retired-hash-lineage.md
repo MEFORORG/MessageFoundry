@@ -77,9 +77,10 @@ record as accepted.
   `tests/test_session_supersession_lineage.py::test_a_token_whose_hash_links_to_a_live_session_authenticates_nothing`
 - **AC-5** -- THE SYSTEM SHALL read the lineage only from the supersession, on every backend.
   -> `tests/test_session_supersession_lineage.py::test_only_the_rotation_the_supersession_and_the_purge_touch_the_lineage`
-- **AC-6** -- WHEN the reaper runs, THE SYSTEM SHALL delete links past the window plus the reaper's step tolerance (Amendment B) and keep the rest.
+- **AC-6** -- WHEN a reaper pass purges, THE SYSTEM SHALL delete links past the window plus the reaper's step tolerance (Amendment B) and keep the rest.
   -> `tests/_session_rotation_contract.py` (`assert_session_lineage_contract`, run on all three
-  backends)
+  backends),
+  `tests/test_session_supersession_lineage.py::test_the_reaper_purges_links_by_the_window_it_is_given`
 
 ## Options considered
 
