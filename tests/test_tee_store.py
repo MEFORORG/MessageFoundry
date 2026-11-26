@@ -566,8 +566,7 @@ async def test_a_re_created_wal_takes_its_folder_list_until_a_later_open(
     that is not already in WAL mode. The re-created siblings carry exactly the folder's inherited
     entries, Administrators included, and a second open, run while the first still holds them,
     makes each owner-only again. This test does not pin re-creation after the last connection's
-    close, or the access a handle opened before a restriction keeps; when this was written no other
-    test pinned them either."""
+    close, or the access a handle opened before a restriction keeps."""
     from messagefoundry.config.atomic_edit import _canonical_sid
     from messagefoundry.restricted_file import _windows_engine_sid
     from messagefoundry.store.store import _parse_sddl_dacl, _read_dacl_sddl

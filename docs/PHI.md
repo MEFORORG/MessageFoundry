@@ -2390,8 +2390,11 @@ files take the DB file's mode. That mode is `0600` only when the store's `0600` 
 new DB, or its best-effort `chmod` on open, succeeds; a failed `chmod` is logged as a warning,
 and a failed pre-create is not reported. On Windows each open gives the DB, `-wal` and `-shm` a
 protected access list granting full control to the opening account alone, logged when it fails.
-Another account's later tee open is then refused, so run the relay and the tee commands that read
-its DB under one account. The restriction leaves at least these gaps. It removes the folder's
+Another account's later tee open is then refused while that list holds. An account that can still
+open the DB, for example the owner after re-granting itself, or any account when an earlier
+restriction failed, re-restricts the DB, `-wal` and `-shm` to itself on its open, and the account
+that opened before is then locked out. So run the relay and the tee commands that read its DB
+under one account. On Windows the restriction leaves at least these gaps. It removes the folder's
 grants for later opens only: a handle another account opened earlier, while a file still carried
 its folder's list, keeps its access until it closes. That window opens at least during a tee open,
 between a file's creation and the restriction at the end of the open, and stays open past an open
@@ -2402,11 +2405,14 @@ the tee's last close, stays on the folder's list until a later tee open restrict
 `-journal`, which SQLite can write while the DB is out of WAL mode, is not restricted by the tee. A
 restriction that fails leaves a file's list as it was, with a logged warning; for a file created in
 that open, that is the folder's list. When a file's owner is not the opening account, for example a
-DB another account created, or one an elevated account created with Administrators as its owner,
-the owner keeps its implicit right to change the list. An administrator holding the backup or
-take-ownership privilege can read the files whatever the list says. Keep every tee DB in a folder
-whose own access list grants no other account, which narrows the gaps above except the owner's
-rights and an administrator's privileges, and on a protected volume regardless.
+DB another account created, the owner keeps its implicit right to change the list. When the owner
+is the Administrators group, as it can be for a DB an elevated account created, every elevated
+member of Administrators holds that right, not one account. An account holding the backup
+privilege, an administrator for example, can read the files past the list. One holding the
+take-ownership privilege can make itself the files' owner and then change the list, a change that
+is visible on the files. Keep every tee DB in a folder whose own access list grants no other
+account, which narrows the gaps above except the owner's rights and those two privileges, and on a
+protected volume regardless.
 
 The **opt-in ADR 0087 sandbox worker** (`[sandbox].mode = "subprocess"`, default `"off"`) is **not** an
 exclusion, and this paragraph is the single statement of how its output reaches stream 1 — the code
