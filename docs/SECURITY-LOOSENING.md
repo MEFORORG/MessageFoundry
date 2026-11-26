@@ -1040,15 +1040,15 @@ count is above `0` (vault BACKLOG #2613).
 - **What you lose:** a fixed set of routes asks for a fresh proof bound to that one action, used
   once. The `require_action_step_up` row of [CONFIGURATION.md](CONFIGURATION.md), under `[auth]`, lists them.
   With the switch off, those routes accept the session-wide step-up window instead. At least a
-  local sign-in that owes no further factor, unless an account with a baseline signs in from an
-  address its known-address record has not seen in the last 90 days (so an account's first
-  sign-in, which has no baseline yet, opens it), a TOTP
+  local sign-in that owes no further factor, unless the first-seen address check withholds the
+  window, a combined sign-in (a passkey one included) from any address, a TOTP
   or recovery code on any session but an `oidc` one, and a passkey assertion that
   completes a pending factor with the user-verification flag, on any session but an `oidc` one,
   can open that window; that flag is
   the authenticator's own report ([ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md),
   2026-11-14 amendment). The `step_up_max_age_seconds` row of [CONFIGURATION.md](CONFIGURATION.md)
-  says which sign-ins open none. So a session taken over inside it can, with no fresh proof, at
+  says when that check withholds the window, and that it fails open, so the window opens, when the
+  sign-in carries no client address or the known-address record cannot be read. So a session taken over inside it can, with no fresh proof, at
   least bind an authenticator, disable MFA where `[security].require_mfa` does not refuse the
   disable, end the account's other sessions, reset another
   account's password or factor, inject a message, export bodies in bulk, purge a queue or reload
