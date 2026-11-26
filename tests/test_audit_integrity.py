@@ -1853,7 +1853,9 @@ async def test_startup_anchor_nul_path_raises_value_error(tmp_path: Path) -> Non
     change the `_load_audit_anchor` docstring and the `audit_anchor_file` row in
     docs/CONFIGURATION.md together.
     """
-    db = tmp_path / "nul.db"
+    # Not "nul.db": NUL is a reserved DOS device name, and Windows Server 2022 opens NUL.<ext> as
+    # the device, so SQLite there cannot open the store at all.
+    db = tmp_path / "nul-anchor-path.db"
     await _aseed_audit_rows(db, 1)
     store = await MessageStore.open(db)
     walks: list[object] = []
