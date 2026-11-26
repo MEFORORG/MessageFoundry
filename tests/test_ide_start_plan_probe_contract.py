@@ -51,10 +51,13 @@ def _code_view(text: str) -> str:
 _DECLARES = r"\b(?:function|const|let|var)\s+{name}\b"
 
 
-def _ts_string_const(name: str) -> str:
-    """The value of ``export const <name> = "...";`` in the IDE's control model, read from the code
-    view so a comment quoting the constant cannot supply it."""
-    code = _code_view(_MODEL.read_text(encoding="utf-8"))
+def _ts_string_const(name: str, text: str | None = None) -> str:
+    """The value of ``export const <name> = "...";`` in the IDE's control model (or ``text``), with
+    comments blanked so a comment quoting the constant cannot supply it. Whitespace is NOT
+    collapsed here, unlike ``_code_view``: the value is read byte for byte, so a doubled space or a
+    tab inside the literal changes it."""
+    raw = _MODEL.read_text(encoding="utf-8") if text is None else text
+    code = blank_js_comments(raw)
     m = re.search(rf'export const {name} = "([^"]+)";', code)
     assert m, f"{name} is not a plain string constant in {_MODEL.name}"
     return m.group(1)
@@ -203,3 +206,29 @@ def test_a_store_run_only_by_directory_administrators_answers_with_the_no_termin
     error = json.loads(capsys.readouterr().out)["error"]
     assert _ts_string_const("NO_TERMINAL_REFUSAL") in error
     assert _ts_string_const("ADMIN_EXISTS_REFUSAL") not in error
+
+
+def test_a_whitespace_change_inside_the_fragment_is_read_and_reds_the_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Negative control for the constant reader: a doubled space inside ``NO_TERMINAL_REFUSAL``
+    changes what the IDE matches on, so the reader must return the changed value and the
+    fragment check above must fail against it. A reader that collapsed whitespace would hand back
+    the original value and pass wrongly."""
+    raw = _MODEL.read_text(encoding="utf-8")
+    original = _ts_string_const("NO_TERMINAL_REFUSAL")
+    assert " " in original
+    mutated_value = original.replace(" ", "  ", 1)
+    decl = f'export const NO_TERMINAL_REFUSAL = "{original}";'
+    assert raw.count(decl) == 1
+    mutated = raw.replace(decl, f'export const NO_TERMINAL_REFUSAL = "{mutated_value}";')
+    assert _ts_string_const("NO_TERMINAL_REFUSAL", mutated) == mutated_value
+
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    _no_terminal(monkeypatch)
+    assert main(_probe_argv()) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    # The real fragment is in the answer and the mutated one is not, so the check would red.
+    assert original in error
+    assert mutated_value not in error
