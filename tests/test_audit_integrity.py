@@ -2009,9 +2009,9 @@ def test_parse_audit_anchor_takes_only_a_count_a_store_can_hold(count: str, reas
     ids=["prefix-only", "no-body", "short-digest", "inner-space"],
 )
 def test_parse_audit_anchor_passes_any_isolated_module_head_through(head: str) -> None:
-    """A ``vault:v`` head is opaque and is NOT held to the Transit MAC's shape (vault BACKLOG #5987):
-    ``audit-anchor`` prints whatever head the store holds, so a shape check here would refuse an
-    anchor that command printed. The CLI pin is
+    """A ``vault:v`` head is opaque and is NOT held to the Transit MAC's shape, as on origin/main
+    (vault BACKLOG #5987): ``audit-anchor`` prints a tampered ``vault:v`` head as stored, so a shape
+    check here would refuse an anchor that command printed. The CLI pin is
     ``test_audit_verify_walks_on_an_anchor_audit_anchor_printed_for_a_malformed_transit_head``."""
     body = base64.b64encode(bytes([4]) * 32).decode("ascii")
     head = head.format(b=body)
@@ -2022,10 +2022,11 @@ def test_parse_audit_anchor_passes_any_isolated_module_head_through(head: str) -
 def test_audit_verify_walks_on_an_anchor_audit_anchor_printed_for_a_malformed_transit_head(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Vault BACKLOG #5987: whatever head ``audit-anchor`` prints, ``audit-verify`` takes as an
-    anchor and walks the chain. The newest row's hash is overwritten with a truncated ``vault:v1:``
-    string, a head no Transit backend returns, so the walk FAILS on it (exit 1). Exit 2, a refusal
-    of the anchor as malformed before any walk, would leave the tampered row unreported."""
+    """Vault BACKLOG #5987: a ``vault:v`` head ``audit-anchor`` prints, ``audit-verify`` takes as an
+    anchor and walks the chain, as on origin/main. The newest row's hash is overwritten with a
+    truncated ``vault:v1:`` string, a head no Transit backend returns, so the walk FAILS on it
+    (exit 1). Exit 2, a refusal of the anchor as malformed before any walk, would leave the
+    tampered row unreported."""
     db = tmp_path / "transit_head.db"
     _seed_audit_rows(db, 3)
     with contextlib.closing(sqlite3.connect(db)) as conn:
@@ -2039,7 +2040,7 @@ def test_audit_verify_walks_on_an_anchor_audit_anchor_printed_for_a_malformed_tr
     assert main(["audit-verify", "--db", str(db), "--expected-anchor", anchor]) == 1
     captured = capsys.readouterr()
     assert "malformed audit anchor" not in captured.err, captured.err
-    assert "FAIL" in captured.out, captured.out
+    assert "audit chain broken at seq=3" in captured.out, captured.out
 
 
 @pytest.mark.parametrize(

@@ -6748,13 +6748,19 @@ AUDIT_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
 AUDIT_ANCHOR_MAX_BYTES = 4096
 
 
+def _ascii_digits(text: str) -> bool:
+    """``text`` is ASCII decimal digits only: the digit rule of :func:`_audit_decimal`, which the
+    anchor's sign check shares."""
+    return text.isascii() and text.isdigit()
+
+
 def _audit_decimal(text: str) -> int | None:
     """``text`` as an int when it is ASCII digits only, at most 19 of them (the width of the signed
     64-bit ``seq`` column every backend uses), else ``None``. The one count grammar of
     :func:`parse_audit_anchor` and :func:`parse_audit_row_pair`: ``int()`` alone would read
     ``1_0`` as 10, accept a sign or non-ASCII digits, and parse any length up to Python's limit.
     The caller checks the value against :data:`_AUDIT_SEQ_MAX`."""
-    if not (text.isascii() and text.isdigit()) or len(text) > 19:
+    if not _ascii_digits(text) or len(text) > 19:
         return None
     return int(text)
 
@@ -6887,7 +6893,7 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
     # true of its input: "-0" is a signed zero, not a negative count, and a minus before 20 or more
     # digits is negative whatever its width.
     unsigned = count_text.removeprefix("-")
-    if unsigned != count_text and unsigned.isascii() and unsigned.isdigit():
+    if unsigned != count_text and _ascii_digits(unsigned):
         if not unsigned.strip("0"):
             raise AuditAnchorError("the row count is a signed zero, which no store prints", text)
         raise AuditAnchorError("the row count is negative", text)
@@ -6923,7 +6929,7 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
 
 def _audit_head_shape(head: str, noun: str = "the head") -> tuple[str | None, str]:
     """``(why a non-empty head is refused, or None; the head normalised)``. The one statement of
-    which heads the store can emit, shared by :func:`parse_audit_anchor` and
+    which heads are taken, shared by :func:`parse_audit_anchor` and
     :func:`parse_audit_row_pair`, so a hardening of it reaches both. The reason quotes no part of the
     head. ``noun`` names the value in the reason."""
     if set(head) <= _AUDIT_ANCHOR_HEX:
@@ -6935,8 +6941,12 @@ def _audit_head_shape(head: str, noun: str = "the head") -> tuple[str | None, st
         return None, head.lower()
     if head.startswith(AUDIT_ANCHOR_ISOLATED_MAC_PREFIX):
         # Opaque by construction; never normalise what we do not define. Not held to the Transit MAC's
-        # shape either: `audit-anchor` prints whatever head the store holds, and a shape check here
-        # would refuse a head that command printed instead of walking the chain (vault BACKLOG #5987).
+        # shape either, as on origin/main: `audit-anchor` prints a tampered `vault:v` head as the store
+        # holds it, and a shape check here made `audit-verify` refuse that anchor (exit 2) instead of
+        # walking the chain (exit 1). The cost is that a truncated or space-bearing `vault:v` anchor
+        # reaches the comparator and can raise a false tamper alarm on an intact chain; vault
+        # BACKLOG #5987 item 1's `vault:v` limb stays open on that. A tampered head of another shape
+        # is still refused before the walk.
         return None, head
     return (
         f"{noun} is neither a {AUDIT_ANCHOR_DIGEST_HEX_LEN}-character hex digest nor an "
@@ -6967,8 +6977,8 @@ def parse_audit_row_pair(text: str) -> tuple[int, str]:
     """Parse a ``SEQ:ROW_HASH`` pair, one row the off-box tee witnessed, into the tuple
     ``verify_audit_chain(expected_rows=...)`` takes (vault BACKLOG #2612).
 
-    It refuses, as :func:`parse_audit_anchor` does and for the same reason, any head the store can
-    never emit, since a comparator would report it as tampering. Unlike an anchor, a pair names a
+    It applies :func:`parse_audit_anchor`'s head rule, so it refuses a short hex head and a head of
+    neither shape, and passes a ``vault:v`` head through unchecked. Unlike an anchor, a pair names a
     ROW, so its sequence number is at least 1 and its head is never empty."""
     seq_text, sep, head = text.strip().partition(":")
     if not sep:
@@ -9186,7 +9196,7 @@ def forget_store_salt(path: Path) -> bool:
     # `Store_Salt` table is the one the next open reads.
     salt_table = (
         "SELECT count(*) FROM sqlite_master AS m"
-        f" WHERE ({_ORDINARY_TABLE}) AND lower(m.name) = 'store_salt'"
+        f" WHERE {_ORDINARY_TABLE} AND lower(m.name) = 'store_salt'"
     )
 
     def drop(conn: sqlite3.Connection) -> bool:
@@ -14348,7 +14358,7 @@ class MessageStore:
         cur = await db.execute(
             # Exact case, unlike the salt probe: nothing but this fold reads `outbox`, and it drops
             # the table, so a case variant another tool left must be left alone.
-            f"SELECT name FROM sqlite_master AS m WHERE ({_ORDINARY_TABLE}) AND m.name = 'outbox'"
+            f"SELECT name FROM sqlite_master AS m WHERE {_ORDINARY_TABLE} AND m.name = 'outbox'"
         )
         if await cur.fetchone() is None:
             return  # already migrated (or a fresh DB) — nothing to fold in
@@ -23108,7 +23118,7 @@ class MessageStore:
             # (BACKLOG #6719 item 5). The NULL-sql case the old copy also took is unreachable: SQLite
             # refuses to load a schema holding a table row with no SQL.
             cur = await db.execute(
-                f"SELECT m.name FROM main.sqlite_master AS m WHERE ({_ORDINARY_TABLE})"
+                f"SELECT m.name FROM main.sqlite_master AS m WHERE {_ORDINARY_TABLE}"
                 " AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
             )
             names = [str(row[0]) for row in await cur.fetchall()]

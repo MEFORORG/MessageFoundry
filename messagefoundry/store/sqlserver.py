@@ -11391,11 +11391,12 @@ class SqlServerStore(ServerCipherWalk):
         The eviction runs after the connection is released, an await later than the DELETE, so a
         same-key write that commits and publishes in that window would be evicted while its row
         survives. So a watched publish of a key, at any point from the start of the pass to its
-        eviction, keeps that key cached (BACKLOG #5734). At least a publish of this node's own committed
-        writes (``publish_state_cache``) is watched. A :meth:`reload_state_cache` swap is not, so a key
-        a reload loads in that window is evicted as before. Keeping a watched key is sound only under the cutoff premise
-        that :meth:`~messagefoundry.store.base.QueueStore.purge_state` states; a cutoff near the
-        present could keep a cached value whose row the DELETE removed."""
+        eviction, keeps that key cached (BACKLOG #5734). The watch is per store handle, so per process.
+        At least a publish of this handle's own committed writes (``publish_state_cache``) is watched.
+        A :meth:`reload_state_cache` swap is not watched, so a key a reload loads in that window is
+        evicted whether or not its row survives. Keeping a watched key is sound only under the cutoff
+        premise that :meth:`~messagefoundry.store.base.QueueStore.purge_state` states; a cutoff near
+        the present could keep a cached value whose row the DELETE removed."""
         touched: set[tuple[str, str]] = set()
         self._state_purge_watches = (*self._state_purge_watches, touched)
         try:
