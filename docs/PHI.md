@@ -2390,14 +2390,14 @@ files take the DB file's mode. That mode is `0600` only when the store's `0600` 
 new DB, or its best-effort `chmod` on open, succeeds; a failed `chmod` is logged as a warning,
 and a failed pre-create is not reported. On Windows each tee open attempts to restrict the DB,
 `-wal` and `-shm` to the opening account. The attempt can fail or not take effect, and a failure is
-not always reported, so it is not the only control on who can read those files. Another account's
-later tee open is refused while the restriction holds on all three files. An account whose tee open
-succeeds makes the same attempt for itself, and the account that opened before can then be locked
-out. So run the relay and the tee commands that read its DB under one account. On Windows the
-restriction leaves at least these gaps. It applies to later opens only: a handle another account
-opened earlier, before the restriction, keeps its access until it closes. That window opens at
-least during a tee open, between a file's creation and the restriction at the end of the open, and
-stays open past an open that fails before it restricts. SQLite deletes the `-wal` and `-shm` at
+not always reported, so do not rely on it alone to limit who can read those files. Another
+account's later tee open is refused while the restriction holds on the DB. An account whose tee
+open succeeds makes the same attempt for itself, and the account that opened before can then be
+locked out. So run the relay and the tee commands that read its DB under one account. On Windows
+the restriction leaves at least these gaps. It applies to later opens only: a handle another
+account opened earlier, before the restriction, keeps its access until it closes. That window opens
+at least during a tee open, between a file's creation and the restriction at the end of the open,
+and stays open past an open that fails before it restricts. SQLite deletes the `-wal` and `-shm` at
 least on the last connection's close and on a switch out of WAL mode. A tee open that completes
 attempts to restrict the ones it re-creates. One re-created any other way, for example by another
 SQLite client opening the DB after the tee's last close, is not restricted until a later tee open
