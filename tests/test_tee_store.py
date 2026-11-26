@@ -559,9 +559,9 @@ async def test_the_db_and_its_wal_and_shm_get_an_owner_only_dacl_on_windows(
 async def test_a_re_created_wal_takes_its_folder_list_until_a_later_open(
     tmp_path: Path,
 ) -> None:
-    """BACKLOG #5637: docs/PHI.md, the tee relay paragraph of *Logging inventory*, states that a
-    sibling re-created other than by a tee open stays on its folder's access list until a later tee
-    open restricts it. The re-creation here is a journal-mode switch the test makes itself, out of
+    """BACKLOG #5637: the ``tee.store._secure_file`` docstring states that a sibling SQLite
+    re-creates on a journal-mode switch takes its folder's access list again until a later open
+    restricts it. The re-creation here is a journal-mode switch the test makes itself, out of
     WAL mode and back. The tee's own open runs ``PRAGMA journal_mode=WAL``, which switches only a DB
     that is not already in WAL mode. The re-created siblings carry exactly the folder's inherited
     entries, Administrators included, and a second open, run while the first still holds them,

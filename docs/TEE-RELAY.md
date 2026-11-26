@@ -267,11 +267,10 @@ python -m tee purge --db ./tee.db --captures-only -y      # drop only the captur
 ## Limits (by design, for the test-only scope)
 
 * **Test data only** — not hardened for production PHI (no at-rest encryption; on open the DB and
-  its `-wal` and `-shm` are restricted best-effort only, `chmod 0600` on POSIX and an access list
-  granting the opening account alone on Windows, with a logged warning when that fails). On Windows
-  run the relay and the commands that read its DB under one account; the tee relay paragraph of
-  [PHI.md, Logging inventory](PHI.md#logging-inventory-1611--1623) says why, and what the
-  restriction leaves open. Keep every tee DB on a protected volume, capture on or off, because a log row's
+  its `-wal` and `-shm` are restricted to their owner best-effort only, `chmod 0600` on POSIX and an
+  owner-only access list on Windows, with a logged warning when that fails). On Windows the DB is
+  then usable only by the account that opened it last, so run the relay and the commands that read
+  its DB under one account. Keep every tee DB on a protected volume, capture on or off, because a log row's
   detail can name a patient. Enable `--capture-bodies` only with test data.
 * **Not store-and-forward** — no durable retry queue; recovery of post-trip traffic is delegated to Epic's
   resend/queue (see *Fail-closed* above).
