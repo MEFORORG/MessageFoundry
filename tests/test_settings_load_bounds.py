@@ -3,7 +3,7 @@
 """Load-time bounds on numeric settings that a consumer would otherwise read as nonsense.
 
 Each case plants one value and asserts the model refuses it, with the field named in the error.
-Where 0 is a documented off value, 0 still loads and only a negative is refused.
+Where 0 is a documented off value, 0 still loads and at least a negative is refused.
 """
 
 from __future__ import annotations

@@ -4427,8 +4427,7 @@ class AuthSettings(_Section):
         # `oidc_flow_cache_max` slot -- see that field for why the cache rejects rather than evicts.
         #
         # The endpoints are a JUDGMENT with no measured anchor, and no neighbouring field supplies
-        # one: every other lifetime and size in this OIDC block is itself unbounded (verified by
-        # execution -- `oidc_jwks_ttl_seconds` accepts 10_000_000). What is NOT a judgment is that
+        # one. What is NOT a judgment is that
         # an unbounded value is wrong in both directions.
         if not 30 <= value <= 1800:
             raise ValueError("oidc_flow_ttl_seconds must be between 30 and 1800")
@@ -9971,7 +9970,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       its own default it weakens the bound on fetches an unknown key id can force, and 0 or less
       removes it. ``oidc_flow_ttl_seconds`` above its default keeps a staged flow redeemable for
       longer, and ``oidc_max_age_seconds`` above its default accepts an older identity-provider
-      sign-in. The load bounds all but the JWKS pair, each above its default.
+      sign-in.
     * ``oidc_session_max_hours`` is never named: the sign-in takes the minimum of it and the
       token's own expiry, so any value only ends a session sooner.
 

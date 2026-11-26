@@ -1791,9 +1791,7 @@ def _cache_with(field: str, value: float, fetch: Callable[[], bytes]) -> oidc.Jw
 )
 def test_the_cache_refuses_an_interval_the_settings_load_refuses(field: str, value: float) -> None:
     """BACKLOG #6904. The settings load refuses a negative for both knobs (BACKLOG #5318) and an int
-    too large for a float, so the cache refuses the same values. An int past the float range used
-    to build the cache and then raise OverflowError on the throttled path, ending a sign-in in an
-    unaudited 500."""
+    too large for a float, so the cache refuses the same values."""
     with pytest.raises(ValueError, match=field) as refused:
         _cache_with(field, value, lambda: b"")
     assert "value withheld" in str(refused.value)
