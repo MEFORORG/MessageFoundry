@@ -150,6 +150,35 @@ def test_the_rule_refuses_a_reserved_form_with_a_lookalike_delimiter(name: str) 
         UserCreateRequest(username=name, email="x@example.test", roles=[])
 
 
+#: BACKLOG #5519: reserved forms spelled with accented letters. A store or audit column that
+#: compares accent-insensitively finds each as the reserved form, so each is refused. Precomposed
+#: and combining spellings both, and a dotted capital I, whose case fold carries a combining dot.
+ACCENTED_RESERVED = [
+    "s\xfdst\xe9m",  # precomposed y with acute, e with acute
+    "sy\u0301stem",  # y + COMBINING ACUTE ACCENT
+    "syst\xe8m:rotate-key",
+    "cl\xed:root",
+    "CL\u0130:root",  # LATIN CAPITAL LETTER I WITH DOT ABOVE
+    "<oidc>\u0332",  # trailing COMBINING LOW LINE
+]
+
+#: Controls for ACCENTED_RESERVED: accented names that are not a reserved form once unaccented.
+ACCENTED_ACCEPTED = ["Jos\xe9", "s\xfdstems", "cl\xedent", "Ren\xe9e"]
+
+
+@pytest.mark.parametrize("name", ACCENTED_RESERVED)
+def test_the_rule_refuses_a_reserved_form_spelled_with_accents(name: str) -> None:
+    """BACKLOG #5519: the accent-insensitive collation case of the reserved-name check."""
+    assert username_refusal(name) is not None
+    with pytest.raises(ValidationError):
+        UserCreateRequest(username=name, email="x@example.test", roles=[])
+
+
+@pytest.mark.parametrize("name", ACCENTED_ACCEPTED)
+def test_the_rule_accepts_an_accented_name_outside_a_reserved_form(name: str) -> None:
+    assert username_refusal(name) is None
+
+
 def test_the_directory_marker_is_a_reserved_form() -> None:
     """BACKLOG #5520 item 37: the comment on DIRECTORY_GRANTED_BY says the rule refuses it."""
     assert DIRECTORY_GRANTED_BY in REFUSED

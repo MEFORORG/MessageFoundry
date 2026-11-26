@@ -37,11 +37,12 @@ What it admits, at least: a space separator inside the name (U+00A0, U+3000), a 
 :data:`_BLANK_GLYPHS` does not list, and a lookalike letter from another script, so a Cyrillic
 spelling that reads as ``system`` passes, as does a reserved form spelled with a delimiter
 lookalike :data:`_DELIMITER_LOOKALIKES` does not list. At least some lookalikes from the same
-script pass too: ``cli:root`` spelled with a dotless i (U+0131), ``<oidc>`` spelled with the
-modifier low arrowheads U+02F1 and U+02F2, and ``<oidc>`` followed by a combining low line
-(U+0332). It matches the reserved forms after NFKC,
-with the delimiter lookalikes that table lists taken to ASCII, and case folding; it folds no
-confusable letters, in any script.
+script pass too: ``cli:root`` spelled with a dotless i (U+0131), and ``<oidc>`` spelled with the
+modifier low arrowheads U+02F1 and U+02F2. It matches the reserved forms after NFKC,
+with the delimiter lookalikes that table lists taken to ASCII, case folding, and the nonspacing
+marks dropped after NFD (BACKLOG #5519), so ``system`` with an accent on a letter, or ``<oidc>``
+followed by a combining low line (U+0332), is refused; it folds no other confusable letters, in
+any script.
 
 This docstring is the one statement of the rule; the request model, the service and
 docs/SECURITY.md point here rather than restate it.
@@ -87,8 +88,17 @@ _DELIMITER_LOOKALIKES: Final = str.maketrans(
 
 def _reserved_form_key(username: str) -> str:
     """What :data:`RESERVED_ACTOR_FORMS` is matched against: the name's NFKC form, its
-    :data:`_DELIMITER_LOOKALIKES` taken to ASCII, case folded."""
-    return unicodedata.normalize("NFKC", username).translate(_DELIMITER_LOOKALIKES).casefold()
+    :data:`_DELIMITER_LOOKALIKES` taken to ASCII, case folded, then decomposed (NFD) with its
+    nonspacing marks (category Mn) dropped (BACKLOG #5519). The last step is for a store or audit
+    column that compares accent-insensitively, which would find ``system`` spelled with a y acute
+    (U+00FD) as ``system``. It strips the accents that decompose into a base letter and nonspacing
+    marks, and a nonspacing mark typed on its own; a letter with no decomposition, such as o with
+    stroke (U+00F8) or the dotless i (U+0131), is left as it is, so a collation that folds one of
+    those still matches a name this rule admits. Case folding runs first, because it turns U+0130 into ``i`` and a combining dot."""
+    folded = unicodedata.normalize("NFKC", username).translate(_DELIMITER_LOOKALIKES).casefold()
+    return "".join(
+        ch for ch in unicodedata.normalize("NFD", folded) if unicodedata.category(ch) != "Mn"
+    )
 
 
 #: Unicode's Default_Ignorable_Code_Point ranges (DerivedCoreProperties.txt), inclusive. Most are
