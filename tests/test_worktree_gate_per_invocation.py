@@ -288,21 +288,21 @@ def test_a_quoted_victim_holding_a_closer_character_is_still_judged(
 @pytest.mark.parametrize(
     "template",
     [
-        # The first `worktree remove` is inside a quoted mention, so the text after it is not a
-        # victim the shell passes to git.
+        # A `worktree remove` inside a quoted mention, with a `;` in the mention.
         'git commit -m "see worktree remove x; -- {tmp}/Primary-wt2" && git worktree remove {o}/nope',
-        # A `#` comment is not argument text, and a separator inside it ends nothing.
+        # A `#` comment holding a `;`.
         "git worktree remove {o}/nope # x; echo -- {tmp}/Primary-wt2",
-        # `\\&&` is a literal `&` and then a lone `&`, which the shell does read as a separator.
+        # The shell text is `nope\&& echo`: an escaped `&` and then a lone `&` separator.
         "git worktree remove {o}/nope\\&& echo -- {tmp}/Primary-wt2",
     ],
 )
 def test_a_separator_outside_the_victim_is_not_a_false_deny(
     rig: SimpleNamespace, template: str
 ) -> None:
-    """ALLOW on origin/main. Pins main's behaviour against a quote-aware victim split that read a
-    quoted mention, a comment, or the text past `\\&&` as a victim, and DENIED these. That split
-    was reverted on this branch; BACKLOG #5643's quote-aware residual stays open."""
+    """ALLOW today. The gate's split ignores quotes and comments and cuts at the `;` or `&` here,
+    so the governed path past it is not read as a victim. A quote-aware victim split once DENIED
+    all three; these pin that a later attempt does not bring those false denies back. The same
+    mention or comment without the `;` is still DENIED today, so these rest on the cut."""
     cmd = template.format(tmp=rig.tmp.as_posix(), o=rig.outside.as_posix())
     assert _allowed(rig, cmd, rig.outside)
 
