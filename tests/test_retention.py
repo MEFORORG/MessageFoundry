@@ -1007,7 +1007,8 @@ async def test_run_once_acts_as_leader_with_default_coordinator(store: MessageSt
 class _DemoteMidPurgeCoordinator(_FollowerCoordinator):
     """A coordinator that is leader for the FIRST ``is_leader()`` read (the top-of-pass gate) then NOT
     leader on subsequent reads — simulating leadership lost (a self-fence) BETWEEN the top gate and the
-    L1 pre-purge re-check, so the pass must abandon the purge without touching any PHI body."""
+    leadership read before the first purge phase (`_halt`, BACKLOG #6526), so the pass must abandon the
+    purge without touching any PHI body."""
 
     node_id = "demoting"
 
@@ -1020,7 +1021,8 @@ class _DemoteMidPurgeCoordinator(_FollowerCoordinator):
 
 
 async def test_run_once_demotion_mid_purge_leaves_bodies_intact(store: MessageStore) -> None:
-    """L1 pre-purge re-check: if leadership is lost BETWEEN the top-of-pass gate and the purges, the pass
+    """The read before the first purge phase: if leadership is lost BETWEEN the top-of-pass gate and the
+    purges, the pass
     returns a did-nothing result WITHOUT nulling any message body or writing an audit row — a demoted node
     must never purge PHI as a stale ex-leader (count-and-log: bodies stay for the new leader)."""
     mid, outbox_id = await _delivered(store, now=0.0)
@@ -1036,7 +1038,7 @@ async def test_run_once_demotion_mid_purge_leaves_bodies_intact(store: MessageSt
 
     assert (
         coord._reads >= 2
-    )  # the top gate passed (leader) then the pre-purge re-check saw the demotion
+    )  # the top gate passed (leader) then the read before the first purge phase saw the demotion
     assert not result.did_work
     assert result.messages_purged == 0 and result.dead_purged == 0
     # The PHI body + the delivered payload are untouched; no audit row written.
@@ -1046,6 +1048,181 @@ async def test_run_once_demotion_mid_purge_leaves_bodies_intact(store: MessageSt
     assert msg["summary"] is not None
     assert await _payload(store, outbox_id) == "OUT|delivered-body"  # payload intact
     assert [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"] == []
+
+
+async def _retention_audit_details(store: MessageStore) -> list[dict[str, Any]]:
+    return [json.loads(r["detail"]) for r in await store.list_audit(action="retention_purge")]
+
+
+async def test_a_pass_that_fails_after_a_purge_still_audits_the_purge(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526, S07-44: each purge phase commits on its own, so a later phase that raises must
+    not leave the earlier, already-committed body purge with no ``retention_purge`` row. The pass
+    still raises, and its row records the phases that finished and that it was interrupted."""
+    await _delivered(store, now=0.0)
+
+    async def state_purge_fails(*_a: object, **_k: object) -> int:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(store, "purge_state", state_purge_fails)
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+
+    with pytest.raises(sqlite3.OperationalError):
+        await runner.run_once()
+
+    details = await _retention_audit_details(store)
+    assert [d["messages_purged"] for d in details] == [1]
+    assert details[0]["interrupted"] is True
+
+
+async def test_a_pass_stopped_after_a_purge_still_audits_the_purge(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526, S07-44: ``stop()`` cancels a running pass at once. A pass cancelled after its
+    body purge committed writes the ``retention_purge`` row for that purge before it ends."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+
+    async def state_purge_hangs(*_a: object, **_k: object) -> int:
+        entered.set()
+        await asyncio.Event().wait()
+        return 0
+
+    monkeypatch.setattr(store, "purge_state", state_purge_hangs)
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    await asyncio.wait_for(entered.wait(), 10)
+    await runner.stop()
+
+    details = await _retention_audit_details(store)
+    assert [d["messages_purged"] for d in details] == [1]
+    assert details[0]["interrupted"] is True
+
+
+class _SwitchableCoordinator(_FollowerCoordinator):
+    """A coordinator whose leadership a test flips between phases of one pass."""
+
+    node_id = "switchable"
+
+    def __init__(self) -> None:
+        self.leader = True
+
+    def is_leader(self) -> bool:
+        return self.leader
+
+
+async def test_leadership_lost_between_phases_stops_the_later_purges(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526, S07-45: every purge phase awaits the store, and leadership can be lost during
+    any of those awaits. A node demoted after its body purge must not go on to purge dead letters as
+    a stale ex-leader. The purge it already committed is still audited, and the row says why the
+    pass stopped."""
+    await _delivered(store, now=0.0)
+    _dead_mid, dead_row = await _dead(store, now=0.0)
+    coord = _SwitchableCoordinator()
+    real_purge = store.purge_message_bodies
+
+    async def purge_then_demote(*a: Any, **k: Any) -> int:
+        purged = await real_purge(*a, **k)
+        coord.leader = False
+        return purged
+
+    monkeypatch.setattr(store, "purge_message_bodies", purge_then_demote)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(messages_days=1, dead_letter_days=1),
+        clock=lambda: 10 * DAY,
+        coordinator=coord,
+    )
+
+    result = await runner.run_once()
+
+    # The dead letter stays for the new leader.
+    assert await _payload(store, dead_row) == "OUT|dead-body"
+    # Both message rows were past the body window; the dead row's payload is the dead-letter phase's.
+    assert result.messages_purged == 2 and result.dead_purged == 0
+    assert result.leadership_lost
+    details = await _retention_audit_details(store)
+    assert [d["messages_purged"] for d in details] == [2]
+    assert details[0]["leadership_lost"] is True
+
+
+async def test_a_standby_sweeps_and_compresses_its_own_app_logs(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """BACKLOG #6526, S07-46: ``[logging].log_dir`` is each host's own directory, so a standby must
+    age out and compress its own application logs. It still purges nothing in the shared store: the
+    old message body stays for the leader. The deletion is audited like the leader's."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    to_delete = logs / "engine-old.log"
+    to_compress = logs / "engine-recent.log"
+    body = b"engine started\n" * 500
+    for p, age in ((to_delete, 10 * DAY), (to_compress, 5 * DAY)):
+        p.write_bytes(body)
+        os.utime(p, (now - age, now - age))
+    mid, _ = await _delivered(store, now=0.0)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(messages_days=1, app_log_days=7, app_log_compress_days=3),
+        clock=lambda: now,
+        coordinator=_FollowerCoordinator(),
+        log_dir=str(logs),
+    )
+
+    result = await runner.run_once()
+
+    assert not to_delete.exists()
+    assert not to_compress.exists()
+    assert gzip.decompress((logs / "engine-recent.log.gz").read_bytes()) == body
+    assert result.app_logs_deleted == 1 and result.app_logs_compressed == 1
+    assert result.standby and result.messages_purged == 0
+    msg = await store.get_message(mid)
+    assert msg is not None and msg["raw"] == "MSH|^~\\&|raw-body"
+    details = await _retention_audit_details(store)
+    assert len(details) == 1
+    assert details[0]["standby"] is True and details[0]["app_logs_deleted"] == 1
+    assert details[0]["messages_purged"] == 0
+
+
+async def test_a_standby_pass_that_fails_after_its_sweep_still_audits_the_sweep(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526, S07-44 on a standby: the sweep's deletions are counted as soon as the sweep
+    ends, so compression failing after it still leaves a row recording them."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old = logs / "engine-old.log"
+    old.write_text("x")
+    os.utime(old, (now - 10 * DAY, now - 10 * DAY))
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(app_log_days=7, app_log_compress_days=3),
+        clock=lambda: now,
+        coordinator=_FollowerCoordinator(),
+        log_dir=str(logs),
+    )
+
+    def compress_fails(*_a: object) -> tuple[int, int]:
+        raise OSError("volume went away")
+
+    monkeypatch.setattr(runner, "_compress_app_logs", compress_fails)
+
+    with pytest.raises(OSError, match="volume went away"):
+        await runner.run_once()
+
+    assert not old.exists()
+    details = await _retention_audit_details(store)
+    assert [d["app_logs_deleted"] for d in details] == [1]
+    assert details[0]["interrupted"] is True and details[0]["standby"] is True
 
 
 async def test_run_once_no_work_writes_no_audit(store: MessageStore) -> None:

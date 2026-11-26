@@ -515,6 +515,17 @@ class RetentionPass:
     # the warning would grow the table by one row every pass. False when the warning is off, when
     # the read failed, or on a follower, which never reads the table.
     audit_log_over_warn: bool = False
+    # The pass ended on an exception or a cancellation (`stop()`) after at least one phase had
+    # committed (BACKLOG #6526, S07-44). Its audit row records the phases that finished; the counts
+    # are exact for those, and a phase that raised committed nothing. None of these three flags is
+    # part of `did_work`: each only says how a pass that did work ended.
+    interrupted: bool = False
+    # Leadership was lost during the pass (BACKLOG #6526, S07-45), so the shared-store phases after
+    # the one that was running were skipped and left for the new leader.
+    leadership_lost: bool = False
+    # The pass ran on a cluster standby (BACKLOG #6526, S07-46): only the host-local app-log sweep
+    # and compression ran, and nothing in the shared store was purged.
+    standby: bool = False
 
     @property
     def did_work(self) -> bool:
@@ -542,6 +553,23 @@ class RetentionPass:
             or self.over_limit
             or self.capped
         )
+
+
+class _PassCap:
+    """The #121 between-phase duration cap of one pass. :meth:`hit` reads the monotonic clock and
+    LATCHES :attr:`capped` the first time the elapsed pass time reaches ``cap``; ``cap <= 0`` never
+    hits. Construction takes the pass's start reading."""
+
+    def __init__(self, monotonic: Callable[[], float], cap: float) -> None:
+        self._monotonic = monotonic
+        self._cap = cap
+        self._start = monotonic()
+        self.capped = False
+
+    def hit(self) -> bool:
+        if not self.capped and self._cap > 0 and self._monotonic() - self._start >= self._cap:
+            self.capped = True
+        return self.capped
 
 
 class RetentionRunner:
@@ -789,61 +817,45 @@ class RetentionRunner:
         ``now`` does not decide whether the WAL truncate is due: that cadence reads the injected
         ``monotonic`` clock (BACKLOG #6526).
 
-        Leader-gated (Track B Step 4): a non-leader node returns a did-nothing pass without touching the
-        store, so in a cluster exactly one node purges. The loop keeps ticking on followers
-        (reactive-by-polling), so when a follower becomes leader the very next pass acts. A follower
-        never advances its WAL/VACUUM cadence state (the gate returns before those timers update), so a
-        newly-promoted leader runs any due WAL checkpoint / daily VACUUM on its first acting pass — which
-        is the correct behavior (the new leader picks up the maintenance the cluster owes). Single-node
-        (the NullCoordinator default) is always leader, so this is byte-identical there.
+        Leader-gated (Track B Step 4): a non-leader node purges nothing in the shared store, so in a
+        cluster exactly one node purges. A standby still runs the app-log sweep and compression (#120,
+        #119) on ``[logging].log_dir``, its own host's directory, and audits a pass that deleted or
+        compressed a file, as the leader does (BACKLOG #6526, S07-46). The loop
+        keeps ticking on followers (reactive-by-polling), so when a follower becomes leader the very
+        next pass acts. A follower never advances its WAL/VACUUM cadence state, so a newly-promoted
+        leader runs any due WAL checkpoint / daily VACUUM on its first acting pass — which is the
+        correct behavior (the new leader picks up the maintenance the cluster owes). Single-node (the
+        NullCoordinator default) is always leader, so none of this changes a pass there.
+
+        Leadership is read again before every shared-store phase, because each phase awaits the store
+        and a node can be demoted (a self-fence) during any of those awaits (BACKLOG #6526, S07-45). A
+        node that finds itself demoted skips the shared-store phases left, audits what it had already
+        purged, and reports ``leadership_lost``. The read is a cheap cached check, not a fence: a phase
+        already running when the node is demoted runs to its end.
+
+        Each purge phase commits in its own store transaction, so a pass that raises or is cancelled
+        (``stop()``) partway writes its audit row for the phases that finished, marked
+        ``interrupted``, before the exception goes on (BACKLOG #6526, S07-44). A standby's pass is the
+        same pass with every shared-store phase skipped, so it has the same handler. A process that
+        dies with no chance to run that handler can still leave a committed purge with no row, and
+        app-log files a worker thread deleted after the cancellation are not counted in it.
 
         The low-disk floor check (BACKLOG #290) runs FIRST, before the leader gate and outside the
         #121 duration cap: it is read-only, it measures this host's own volume, and a pass that ran
         out of time must still say the disk is nearly full."""
         below_disk_floor = await self._check_disk_floor()
-        if not self._coordinator.is_leader():
-            return RetentionPass(
-                messages_purged=0,
-                dead_purged=0,
-                state_purged=0,
-                conn_events_purged=0,
-                wal_checkpointed=False,
-                vacuumed=False,
-                size_bytes=0,
-                over_limit=False,
-                below_disk_floor=below_disk_floor,
-            )
         now = self._clock() if now is None else now
         s = self._settings
-
-        # L1 pre-purge leadership re-check (active-passive HA). The top-of-method gate above ran when the
-        # pass began; leadership can be lost (a self-fence) BETWEEN that gate and the purges below — a
-        # demoted node must not null PHI bodies / write audit rows as a stale ex-leader. A cheap,
-        # SYNCHRONOUS is_leader() read (cached state, no DB round-trip) closes that narrow window: if we
-        # are no longer leader, return a did-nothing pass WITHOUT touching the store — the message bodies
-        # stay intact and the new leader purges on its next acting pass (count-and-log: nothing is
-        # purged-and-lost on a demoted node). This is a cheap fast-path guard, not the authority — the
-        # purge writes themselves are leader-only WRITE singletons gated above; this only tightens the
-        # gate→purge window. Single-node (NullCoordinator) is always leader, so this never fires.
-        if not self._coordinator.is_leader():
-            return RetentionPass(
-                messages_purged=0,
-                dead_purged=0,
-                state_purged=0,
-                conn_events_purged=0,
-                wal_checkpointed=False,
-                vacuumed=False,
-                size_bytes=0,
-                over_limit=False,
-                below_disk_floor=below_disk_floor,
-            )
+        # A standby (S07-46) runs this same pass with every shared-store phase skipped by `_halt()`,
+        # so only the host-local app-log phases act.
+        standby = not self._coordinator.is_leader()
 
         # The audit-log growth check (BACKLOG #1421) runs after the leader gate, unlike the disk
         # floor: audit_log is the shared store's table, not this host's volume, so in a cluster only
         # the leader warns. (Each engine shard runs its own retention, so each one warns.) It runs
         # before the duration cap, like the floor: it is one index seek, and a pass that ran out of
         # time must still say the table is large.
-        audit_log_over_warn = await self._check_audit_growth()
+        audit_log_over_warn = False if standby else await self._check_audit_growth()
 
         # Between-phase duration cap (#121, ADR 0137): bound the wall time one maintenance pass may spend
         # so a long pass can't run unbounded into the next window. `cap <= 0` (the default) disables it —
@@ -854,262 +866,329 @@ class RetentionRunner:
         # running VACUUM is never interrupted (its deadline check happens only BEFORE it is dispatched).
         # Once the cap is hit the remaining phases are skipped and re-run next interval; a skipped
         # WAL-checkpoint/VACUUM leaves its last-run marker unadvanced, so it stays due (defer, don't drop).
-        pass_start = self._monotonic()
-        cap = s.max_pass_seconds
-        capped = False
+        pass_cap = _PassCap(self._monotonic, s.max_pass_seconds)
+        _deadline_hit = pass_cap.hit
 
-        def _deadline_hit() -> bool:
-            nonlocal capped
-            if not capped and cap > 0 and self._monotonic() - pass_start >= cap:
-                capped = True
-            return capped
+        # The shared-store phases run only while `_halt()` is False: the cap above, a standby, or
+        # leadership lost since the pass began (S07-45), latched like the cap. The host-local app-log
+        # phases take the cap alone, because a standby runs those too. `_halt` is also handed to the
+        # `.processed` archive sweep, which reads it per file on a worker thread; `is_leader()` is a
+        # cached attribute read. A node demoted mid-pass still writes the audit row for the purges it
+        # had already committed: an unaudited purge is the worse outcome, and the row is not a
+        # leader-only write the way a purge is.
+        leadership_lost = False
 
-        # Per-connection retention overrides (#34, ADR 0027), resolved once per pass from the LIVE
-        # registry: inbound name -> messages_days, outbound name -> dead_letter_days (0 = keep forever,
-        # None = inherit the global window so the connection is omitted from the cutoff map → it uses the
-        # global cutoff). Empty when no registry/overrides → byte-identical single global cutoff.
-        msg_days_overrides, dead_days_overrides = self._resolve_overrides()
-        # A per-connection purge can run even when the GLOBAL window is off (a connection sets its own
-        # window while the global default is keep-forever). Run the purge whenever the global window is
-        # set OR any connection overrides it.
-        messages_purged = 0
-        if not _deadline_hit() and (s.messages_days > 0 or msg_days_overrides):
-            messages_purged = await self._store.purge_message_bodies(
-                older_than=self._global_cutoff(now, s.messages_days),
-                now=now,
-                connection_cutoffs=self._cutoff_map(now, msg_days_overrides),
-            )
-        dead = DeadLetterPurge()
-        if not _deadline_hit() and (s.dead_letter_days > 0 or dead_days_overrides):
-            dead = await self._store.purge_dead_letters(
-                older_than=self._global_cutoff(now, s.dead_letter_days),
-                now=now,
-                connection_cutoffs=self._cutoff_map(now, dead_days_overrides),
-            )
-        # Embedded-document pruning (#47, ADR 0042): an in-place strip of bulky base64 attachments on a
-        # per-connection window, layered over NO global default (it never runs unless a connection sets
-        # prune_documents_after). Driven in the same pass; the cutoff map is the per-connection windows
-        # mapped to cutoffs, the global ELSE is keep-forever (nothing without an override is stripped).
-        # Each connection may set its OWN size threshold, so the strip is run once per distinct min_bytes
-        # value with the connections sharing it (a single call carries one threshold).
-        doc_overrides, doc_min_bytes, doc_content_types = self._resolve_document_prune()
-        strip = StripResult()
-        # The whole embedded-document strip is one phase: skip it (empty threshold set) if the cap was hit
-        # before it; otherwise strip once per distinct min_bytes threshold.
-        doc_thresholds: list[int] = [] if _deadline_hit() else sorted(set(doc_min_bytes.values()))
-        for threshold in doc_thresholds:
-            group = {n: d for n, d in doc_overrides.items() if doc_min_bytes[n] == threshold}
-            part = await self._store.strip_embedded_documents(
-                older_than=_KEEP_FOREVER,  # no global document-prune default → keep-forever ELSE
-                now=now,
-                connection_cutoffs=self._cutoff_map(now, group),
-                min_bytes=threshold,
-                content_types={n: doc_content_types[n] for n in group if n in doc_content_types},
-            )
-            strip = StripResult(
-                messages_stripped=strip.messages_stripped + part.messages_stripped,
-                documents_stripped=strip.documents_stripped + part.documents_stripped,
-                bytes_reclaimed=strip.bytes_reclaimed + part.bytes_reclaimed,
-                ended_early=part.ended_early,
-                read_failed=part.read_failed,
-                write_failed=strip.write_failed or part.write_failed,
-            )
-            if part.ended_early:
-                # BACKLOG #5651: a key-service outage, a failed batch read, or batch writes failing
-                # in a row. End only this phase; the rest of the pass still runs.
-                break
-        state_purged = 0
-        if not _deadline_hit() and s.state_max_age_days > 0:
-            state_purged = await self._store.purge_state(
-                older_than=now - s.state_max_age_days * _SECONDS_PER_DAY, now=now
-            )
-        # Connection events (#46): the dedicated `connection_event_retention_hours` window if set,
-        # else inherit the message-body window (the ADR 0021 §7.5 default — bound the log alongside
-        # the bodies). A positive hours value can keep events longer OR shorter than message bodies.
-        conn_events_purged = 0
-        if not _deadline_hit():
-            if s.connection_event_retention_hours > 0:
-                conn_events_purged = await self._store.purge_connection_events(
-                    older_than=now - s.connection_event_retention_hours * 3600.0, now=now
-                )
-            elif s.messages_days > 0:
-                conn_events_purged = await self._store.purge_connection_events(
-                    older_than=now - s.messages_days * _SECONDS_PER_DAY, now=now
-                )
-
-        # Resolved operator-alert instances (#56, ADR 0044): pruned on the SAME window as connection
-        # events (metadata-only, one pass). Only RESOLVED instances are eligible — an open/acknowledged
-        # condition is never aged out from under an operator. No window set ⇒ inherit the body window.
-        alert_instances_purged = 0
-        if not _deadline_hit():
-            if s.connection_event_retention_hours > 0:
-                alert_instances_purged = await self._store.purge_alert_instances(
-                    older_than=now - s.connection_event_retention_hours * 3600.0, now=now
-                )
-            elif s.messages_days > 0:
-                alert_instances_purged = await self._store.purge_alert_instances(
-                    older_than=now - s.messages_days * _SECONDS_PER_DAY, now=now
-                )
-
-        # Saved-search presets (ADR 0136, ASVS 14.2.7): the stored `criteria` is a PHI-shaped needle, so
-        # it gets a window like every other PHI tier. A PLAIN window with NO inheritance — unlike
-        # connection events above, an unset `search_preset_days` does NOT fall back to the body window.
-        # A preset is a user-authored artifact whose `updated_at` only moves on a SAVE, so inheriting a
-        # body window would silently delete every preset not re-saved inside it on the first pass after
-        # upgrade (a PHI instance always has a bounded body window). Opt-in only. BACKLOG #306 softened
-        # this further — the purge now keys on MAX(updated_at, last_used_at), so a preset merely RECALLED
-        # inside the window survives; the argument above still holds for the first pass after upgrade,
-        # where every pre-#306 row's `last_used_at` is NULL and the key degrades to `updated_at`.
-        search_presets_purged = 0
-        if not _deadline_hit() and s.search_preset_days > 0:
-            search_presets_purged = await self._store.purge_search_presets(
-                older_than=now - s.search_preset_days * _SECONDS_PER_DAY, now=now
-            )
-
-        # Orphaned reference snapshots (ADR 0006, ASVS 14.2.7): `reference.value` is PL-2 and had NO
-        # purge path at all — a set dropped from config kept its decryptable rows forever, because the
-        # only thing that ever replaced them was the next sync's build-new-then-flip, which never comes
-        # for a set nobody declares.
-        #
-        # THE GUARD IS POSITIVE-SIGNAL, and that is the whole design. `declared` is the keep-set, so an
-        # EMPTY one reads as "every set is abandoned" and would purge the entire store. `registry is
-        # None` does not cover it: a registry that LOADS FINE while declaring zero reference sets — a
-        # subset `--config`, a per-team config split, a harness-redirect run pointed at the real DB —
-        # yields `references == {}`. Absence-based guards fail open by construction, so this one
-        # requires a POSITIVE signal: at least one declared set, or the phase does not run at all. A
-        # registry declaring zero reference sets can never authorize purging any.
-        #
-        # The store ALSO raises on an empty `declared` rather than trusting this check — belt and
-        # braces, because the cost of one refactor dropping this line is every snapshot in the store.
-        #
-        # Worse without it: ReferenceSyncRunner deliberately does NOT advance `synced_at` when a source
-        # fetch fails, so the rows most likely to look "stale" belong to a still-wired set whose source
-        # is merely down — precisely the last-good copy an operator would want kept.
-        reference_snapshots_purged = 0
-        if not _deadline_hit() and s.reference_snapshot_days > 0:
-            registry = self._registry_source() if self._registry_source is not None else None
-            declared = frozenset(registry.references) if registry is not None else frozenset()
-            if declared:
-                reference_snapshots_purged = await self._store.purge_reference_snapshots(
-                    older_than=now - s.reference_snapshot_days * _SECONDS_PER_DAY,
-                    declared=declared,
-                    now=now,
-                )
-            else:
+        def _halt() -> bool:
+            nonlocal leadership_lost
+            hit = _deadline_hit()
+            if standby:
+                return True
+            if not leadership_lost and not self._coordinator.is_leader():
+                leadership_lost = True
                 log.warning(
-                    "reference-snapshot retention skipped: the loaded registry declares no reference "
-                    "sets, so there is no keep-set and a purge would delete every snapshot in the "
-                    "store. Set [retention].reference_snapshot_days=0 to silence this, or check that "
-                    "--config points at the configuration this store belongs to."
+                    "retention: this node lost cluster leadership during the pass, so the store "
+                    "phases left are skipped for the new leader"
+                )
+            return hit or leadership_lost
+
+        # Every count starts at "nothing done", so a pass that ends partway can audit exactly the
+        # phases that finished (S07-44).
+        msg_days_overrides: dict[str, int] = {}
+        dead_days_overrides: dict[str, int] = {}
+        doc_overrides: dict[str, int] = {}
+        messages_purged = 0
+        dead = DeadLetterPurge()
+        strip = StripResult()
+        state_purged = 0
+        conn_events_purged = 0
+        alert_instances_purged = 0
+        search_presets_purged = 0
+        reference_snapshots_purged = 0
+        app_logs_deleted = 0
+        app_logs_compressed = 0
+        app_log_bytes_reclaimed = 0
+        processed_archives_deleted = 0
+        wal_checkpointed = False
+        wal_left_untruncated = False
+        vacuumed = False
+        size_bytes, over_limit = 0, False
+
+        def _tally(*, interrupted: bool = False) -> RetentionPass:
+            return RetentionPass(
+                messages_purged=messages_purged,
+                dead_purged=dead.bodies,
+                dead_errors_cleared=dead.errors_cleared,
+                state_purged=state_purged,
+                conn_events_purged=conn_events_purged,
+                wal_checkpointed=wal_checkpointed,
+                vacuumed=vacuumed,
+                size_bytes=size_bytes,
+                over_limit=over_limit,
+                messages_overrides=msg_days_overrides,
+                dead_letter_overrides=dead_days_overrides,
+                documents_messages_stripped=strip.messages_stripped,
+                documents_stripped=strip.documents_stripped,
+                documents_bytes_reclaimed=strip.bytes_reclaimed,
+                documents_strip_ended_early=strip.ended_early,
+                documents_strip_read_failed=strip.read_failed,
+                documents_strip_write_failed=strip.write_failed,
+                document_prune_overrides=doc_overrides,
+                alert_instances_purged=alert_instances_purged,
+                app_logs_deleted=app_logs_deleted,
+                app_logs_compressed=app_logs_compressed,
+                app_log_bytes_reclaimed=app_log_bytes_reclaimed,
+                search_presets_purged=search_presets_purged,
+                reference_snapshots_purged=reference_snapshots_purged,
+                processed_archives_deleted=processed_archives_deleted,
+                capped=pass_cap.capped,
+                below_disk_floor=below_disk_floor,
+                wal_left_untruncated=wal_left_untruncated,
+                audit_log_over_warn=audit_log_over_warn,
+                interrupted=interrupted,
+                leadership_lost=leadership_lost,
+                standby=standby,
+            )
+
+        try:
+            # Per-connection retention overrides (#34, ADR 0027), resolved once per pass from the LIVE
+            # registry: inbound name -> messages_days, outbound name -> dead_letter_days (0 = keep
+            # forever, None = inherit the global window so the connection is omitted from the cutoff map
+            # → it uses the global cutoff). Empty when no registry/overrides → byte-identical single
+            # global cutoff.
+            msg_days_overrides, dead_days_overrides = self._resolve_overrides()
+            # A per-connection purge can run even when the GLOBAL window is off (a connection sets its
+            # own window while the global default is keep-forever). Run the purge whenever the global
+            # window is set OR any connection overrides it.
+            if not _halt() and (s.messages_days > 0 or msg_days_overrides):
+                messages_purged = await self._store.purge_message_bodies(
+                    older_than=self._global_cutoff(now, s.messages_days),
+                    now=now,
+                    connection_cutoffs=self._cutoff_map(now, msg_days_overrides),
+                )
+            if not _halt() and (s.dead_letter_days > 0 or dead_days_overrides):
+                dead = await self._store.purge_dead_letters(
+                    older_than=self._global_cutoff(now, s.dead_letter_days),
+                    now=now,
+                    connection_cutoffs=self._cutoff_map(now, dead_days_overrides),
+                )
+            # Embedded-document pruning (#47, ADR 0042): an in-place strip of bulky base64 attachments
+            # on a per-connection window, layered over NO global default (it never runs unless a
+            # connection sets prune_documents_after). Driven in the same pass; the cutoff map is the
+            # per-connection windows mapped to cutoffs, the global ELSE is keep-forever (nothing without
+            # an override is stripped). Each connection may set its OWN size threshold, so the strip is
+            # run once per distinct min_bytes value with the connections sharing it (a single call
+            # carries one threshold).
+            doc_overrides, doc_min_bytes, doc_content_types = self._resolve_document_prune()
+            # The whole embedded-document strip is one phase: skip it (empty threshold set) if the pass
+            # halted before it; otherwise strip once per distinct min_bytes threshold.
+            doc_thresholds: list[int] = [] if _halt() else sorted(set(doc_min_bytes.values()))
+            for threshold in doc_thresholds:
+                group = {n: d for n, d in doc_overrides.items() if doc_min_bytes[n] == threshold}
+                part = await self._store.strip_embedded_documents(
+                    older_than=_KEEP_FOREVER,  # no global document-prune default → keep-forever ELSE
+                    now=now,
+                    connection_cutoffs=self._cutoff_map(now, group),
+                    min_bytes=threshold,
+                    content_types={
+                        n: doc_content_types[n] for n in group if n in doc_content_types
+                    },
+                )
+                strip = StripResult(
+                    messages_stripped=strip.messages_stripped + part.messages_stripped,
+                    documents_stripped=strip.documents_stripped + part.documents_stripped,
+                    bytes_reclaimed=strip.bytes_reclaimed + part.bytes_reclaimed,
+                    ended_early=part.ended_early,
+                    read_failed=part.read_failed,
+                    write_failed=strip.write_failed or part.write_failed,
+                )
+                if part.ended_early:
+                    # BACKLOG #5651: a key-service outage, a failed batch read, or batch writes
+                    # failing in a row. End only this phase; the rest of the pass still runs.
+                    break
+            if not _halt() and s.state_max_age_days > 0:
+                state_purged = await self._store.purge_state(
+                    older_than=now - s.state_max_age_days * _SECONDS_PER_DAY, now=now
+                )
+            # Connection events (#46): the dedicated `connection_event_retention_hours` window if set,
+            # else inherit the message-body window (the ADR 0021 §7.5 default — bound the log alongside
+            # the bodies). A positive hours value can keep events longer OR shorter than message bodies.
+            if not _halt():
+                if s.connection_event_retention_hours > 0:
+                    conn_events_purged = await self._store.purge_connection_events(
+                        older_than=now - s.connection_event_retention_hours * 3600.0, now=now
+                    )
+                elif s.messages_days > 0:
+                    conn_events_purged = await self._store.purge_connection_events(
+                        older_than=now - s.messages_days * _SECONDS_PER_DAY, now=now
+                    )
+
+            # Resolved operator-alert instances (#56, ADR 0044): pruned on the SAME window as connection
+            # events (metadata-only, one pass). Only RESOLVED instances are eligible — an
+            # open/acknowledged condition is never aged out from under an operator. No window set ⇒
+            # inherit the body window.
+            if not _halt():
+                if s.connection_event_retention_hours > 0:
+                    alert_instances_purged = await self._store.purge_alert_instances(
+                        older_than=now - s.connection_event_retention_hours * 3600.0, now=now
+                    )
+                elif s.messages_days > 0:
+                    alert_instances_purged = await self._store.purge_alert_instances(
+                        older_than=now - s.messages_days * _SECONDS_PER_DAY, now=now
+                    )
+
+            # Saved-search presets (ADR 0136, ASVS 14.2.7): the stored `criteria` is a PHI-shaped
+            # needle, so it gets a window like every other PHI tier. A PLAIN window with NO inheritance
+            # — unlike connection events above, an unset `search_preset_days` does NOT fall back to the
+            # body window. A preset is a user-authored artifact whose `updated_at` only moves on a SAVE,
+            # so inheriting a body window would silently delete every preset not re-saved inside it on
+            # the first pass after upgrade (a PHI instance always has a bounded body window). Opt-in
+            # only. BACKLOG #306 softened this further — the purge now keys on MAX(updated_at,
+            # last_used_at), so a preset merely RECALLED inside the window survives; the argument above
+            # still holds for the first pass after upgrade, where every pre-#306 row's `last_used_at` is
+            # NULL and the key degrades to `updated_at`.
+            if not _halt() and s.search_preset_days > 0:
+                search_presets_purged = await self._store.purge_search_presets(
+                    older_than=now - s.search_preset_days * _SECONDS_PER_DAY, now=now
                 )
 
+            # Orphaned reference snapshots (ADR 0006, ASVS 14.2.7): `reference.value` is PL-2 and had NO
+            # purge path at all — a set dropped from config kept its decryptable rows forever, because
+            # the only thing that ever replaced them was the next sync's build-new-then-flip, which never
+            # comes for a set nobody declares.
+            #
+            # THE GUARD IS POSITIVE-SIGNAL, and that is the whole design. `declared` is the keep-set, so
+            # an EMPTY one reads as "every set is abandoned" and would purge the entire store. `registry
+            # is None` does not cover it: a registry that LOADS FINE while declaring zero reference sets
+            # — a subset `--config`, a per-team config split, a harness-redirect run pointed at the real
+            # DB — yields `references == {}`. Absence-based guards fail open by construction, so this
+            # one requires a POSITIVE signal: at least one declared set, or the phase does not run at
+            # all. A registry declaring zero reference sets can never authorize purging any.
+            #
+            # The store ALSO raises on an empty `declared` rather than trusting this check — belt and
+            # braces, because the cost of one refactor dropping this line is every snapshot in the store.
+            #
+            # Worse without it: ReferenceSyncRunner deliberately does NOT advance `synced_at` when a
+            # source fetch fails, so the rows most likely to look "stale" belong to a still-wired set
+            # whose source is merely down — precisely the last-good copy an operator would want kept.
+            if not _halt() and s.reference_snapshot_days > 0:
+                registry = self._registry_source() if self._registry_source is not None else None
+                declared = frozenset(registry.references) if registry is not None else frozenset()
+                if declared:
+                    reference_snapshots_purged = await self._store.purge_reference_snapshots(
+                        older_than=now - s.reference_snapshot_days * _SECONDS_PER_DAY,
+                        declared=declared,
+                        now=now,
+                    )
+                else:
+                    log.warning(
+                        "reference-snapshot retention skipped: the loaded registry declares no "
+                        "reference sets, so there is no keep-set and a purge would delete every "
+                        "snapshot in the store. Set [retention].reference_snapshot_days=0 to silence "
+                        "this, or check that --config points at the configuration this store belongs to."
+                    )
+
+            # Application log files (#120, then #119): host-local, so they take the cap alone and
+            # run on a standby and after a demotion too. Each count lands as its phase ends, so an
+            # interrupted pass still audits a sweep that finished.
+            app_logs_deleted = await self._sweep_app_log_phase(now, _deadline_hit)
+            (
+                app_logs_compressed,
+                app_log_bytes_reclaimed,
+            ) = await self._compress_app_log_phase(now, _deadline_hit)
+
+            # The File source's `.processed` archive (owner ruling A2 of 2026-10-08, BACKLOG #1188): a
+            # clear-text copy of every inbound payload, aged out on ARCHIVE time at the body window.
+            # Each source does its own blocking I/O off the loop and under its own credential, re-reading
+            # `_halt` per file, so a large directory releases the pass like the compressor does.
+            if not _halt() and s.processed_archive_days > 0:
+                processed_archives_deleted = await self._prune_processed_archives(
+                    now - s.processed_archive_days * _SECONDS_PER_DAY, _halt
+                )
+
+            # Maintenance phases (WAL-checkpoint, then daily VACUUM). Their cadence markers advance ONLY
+            # when the phase actually runs, so a phase SKIPPED by the cap stays due for the next pass
+            # (#121). A running VACUUM is non-interruptible: the deadline is checked only BEFORE it is
+            # dispatched.
+            # The cadence reads `self._monotonic`, not `now` (see __init__).
+            if not _halt() and self._wal_truncate_applies():
+                wal_at = self._monotonic()
+                if self._last_wal is None or wal_at - self._last_wal >= s.wal_checkpoint_seconds:
+                    # `is False`: None is a backend with no -wal file, which `_wal_truncate_applies`
+                    # skips.
+                    wal_left_untruncated = await self._store.wal_checkpoint() is False
+                    # The marker advances either way, so a reader that pins the WAL costs writers one
+                    # busy timeout per cadence rather than one per pass.
+                    self._last_wal = wal_at
+                    wal_checkpointed = True
+                    if wal_left_untruncated:
+                        # Vault BACKLOG #2619: a purged body can still sit in the -wal frames. Names the
+                        # file and the cause only; no message content reaches this line.
+                        log.warning(
+                            "retention: the WAL truncate did not finish -- another connection (one of "
+                            "the engine's own reads, a DR snapshot copy, or another process on this "
+                            "store) still held %s-wal, so frames written before this pass, purged "
+                            "bodies among them, stay in that file until a later truncate (the first "
+                            "retention pass at least %gs from now)",
+                            self._floor_path,
+                            s.wal_checkpoint_seconds,
+                        )
+
+            if not _halt() and self._vacuum_due(now):
+                await self._store.vacuum()
+                self._last_vacuum_day = self._day_key(now)
+                vacuumed = True
+
+            if not _halt():
+                size_bytes, over_limit = await self._check_size()
+        except BaseException:
+            # S07-44: the phases that finished have committed, so their row is written before the
+            # exception goes on. A cancellation was delivered once, so this await still runs.
+            partial = _tally(interrupted=True)
+            if partial.did_work:
+                try:
+                    await self._audit(partial)
+                except Exception as exc:
+                    log.error(
+                        "retention: the pass ended partway and the audit row for the phases that "
+                        "finished could not be written (%s)",
+                        safe_exc(exc),
+                    )
+            raise
+
+        result = _tally()
+        if result.did_work:
+            await self._audit(result)
+        return result
+
+    async def _sweep_app_log_phase(self, now: float, deadline_hit: Callable[[], bool]) -> int:
+        """The #120 app-log sweep phase, host-local, so the leader and a standby both run it."""
         # Application log-file retention (#120): delete app-log FILES older than `app_log_days` from
         # `[logging].log_dir`. Filesystem I/O (scandir/stat/unlink is blocking), so it runs off the
         # event loop; metadata only (mtime) — file content is never read (no PHI). A no-op unless the
         # window and a log_dir are both set, so a deployment that doesn't use it is byte-identical.
-        app_logs_deleted = 0
-        if not _deadline_hit() and s.app_log_days > 0 and self._log_dir:
-            app_logs_deleted = await asyncio.to_thread(self._sweep_app_logs, now)
+        if deadline_hit() or self._settings.app_log_days <= 0 or not self._log_dir:
+            return 0
+        return await asyncio.to_thread(self._sweep_app_logs, now)
 
+    async def _compress_app_log_phase(
+        self, now: float, deadline_hit: Callable[[], bool]
+    ) -> tuple[int, int]:
+        """The #119 app-log compression phase, host-local like the sweep. Returns
+        ``(compressed, bytes_reclaimed)``."""
         # Application log-file compression (#119): gzip app-log FILES older than `app_log_compress_days`
         # in place, free-space-prechecked and integrity-validated before the original is removed. Its own
         # phase beside the #120 sweep and deliberately AFTER it, so a file the delete window has already
         # aged out is never compressed first (wasted I/O on a file about to vanish). Blocking file I/O
         # (scandir/read/write/fsync/unlink), so it runs off the event loop exactly as the sweep does. It
-        # is the one phase that takes the deadline INSIDE itself (`_deadline_hit` is handed to the worker
+        # is the one phase that takes the deadline INSIDE itself (`deadline_hit` is handed to the worker
         # and re-read PER FILE): it is a loop over an unbounded directory of up-to-64 MiB files, so
         # checking only before dispatch would let one dispatch run the whole directory and blow straight
         # through `max_pass_seconds` (#121). Per-file granularity is the natural interruption point — a
         # file is compressed whole or not at all, and whatever is left is simply still there next pass. A
         # no-op unless the window and a log_dir are both set → byte-identical for a deployment that's off.
-        app_logs_compressed = 0
-        app_log_bytes_reclaimed = 0
-        if not _deadline_hit() and s.app_log_compress_days > 0 and self._log_dir:
-            app_logs_compressed, app_log_bytes_reclaimed = await asyncio.to_thread(
-                self._compress_app_logs, now, _deadline_hit
-            )
-
-        # The File source's `.processed` archive (owner ruling A2 of 2026-10-08, BACKLOG #1188): a
-        # clear-text copy of every inbound payload, aged out on ARCHIVE time at the body window. Each
-        # source does its own blocking I/O off the loop and under its own credential, re-reading the
-        # deadline per file, so a large directory releases the pass like the compressor does.
-        processed_archives_deleted = 0
-        if not _deadline_hit() and s.processed_archive_days > 0:
-            processed_archives_deleted = await self._prune_processed_archives(
-                now - s.processed_archive_days * _SECONDS_PER_DAY, _deadline_hit
-            )
-
-        # Maintenance phases (WAL-checkpoint, then daily VACUUM). Their cadence markers advance ONLY when
-        # the phase actually runs, so a phase SKIPPED by the cap stays due for the next pass (#121). A
-        # running VACUUM is non-interruptible: the deadline is checked only BEFORE it is dispatched.
-        wal_checkpointed = False
-        wal_left_untruncated = False
-        # The cadence reads `self._monotonic`, not `now` (see __init__).
-        if not _deadline_hit() and self._wal_truncate_applies():
-            wal_at = self._monotonic()
-            if self._last_wal is None or wal_at - self._last_wal >= s.wal_checkpoint_seconds:
-                # `is False`: None is a backend with no -wal file, which `_wal_truncate_applies`
-                # skips.
-                wal_left_untruncated = await self._store.wal_checkpoint() is False
-                # The marker advances either way, so a reader that pins the WAL costs writers one
-                # busy timeout per cadence rather than one per pass.
-                self._last_wal = wal_at
-                wal_checkpointed = True
-                if wal_left_untruncated:
-                    # Vault BACKLOG #2619: a purged body can still sit in the -wal frames. Names the
-                    # file and the cause only; no message content reaches this line.
-                    log.warning(
-                        "retention: the WAL truncate did not finish -- another connection (one of "
-                        "the engine's own reads, a DR snapshot copy, or another process on this "
-                        "store) still held %s-wal, so frames written before this pass, purged "
-                        "bodies among them, stay in that file until a later truncate (the first "
-                        "retention pass at least %gs from now)",
-                        self._floor_path,
-                        s.wal_checkpoint_seconds,
-                    )
-
-        vacuumed = False
-        if not _deadline_hit() and self._vacuum_due(now):
-            await self._store.vacuum()
-            self._last_vacuum_day = self._day_key(now)
-            vacuumed = True
-
-        size_bytes, over_limit = (0, False) if _deadline_hit() else await self._check_size()
-
-        result = RetentionPass(
-            messages_purged=messages_purged,
-            dead_purged=dead.bodies,
-            dead_errors_cleared=dead.errors_cleared,
-            state_purged=state_purged,
-            conn_events_purged=conn_events_purged,
-            wal_checkpointed=wal_checkpointed,
-            vacuumed=vacuumed,
-            size_bytes=size_bytes,
-            over_limit=over_limit,
-            messages_overrides=msg_days_overrides,
-            dead_letter_overrides=dead_days_overrides,
-            documents_messages_stripped=strip.messages_stripped,
-            documents_stripped=strip.documents_stripped,
-            documents_bytes_reclaimed=strip.bytes_reclaimed,
-            documents_strip_ended_early=strip.ended_early,
-            documents_strip_read_failed=strip.read_failed,
-            documents_strip_write_failed=strip.write_failed,
-            document_prune_overrides=doc_overrides,
-            alert_instances_purged=alert_instances_purged,
-            app_logs_deleted=app_logs_deleted,
-            app_logs_compressed=app_logs_compressed,
-            app_log_bytes_reclaimed=app_log_bytes_reclaimed,
-            search_presets_purged=search_presets_purged,
-            reference_snapshots_purged=reference_snapshots_purged,
-            processed_archives_deleted=processed_archives_deleted,
-            capped=capped,
-            below_disk_floor=below_disk_floor,
-            wal_left_untruncated=wal_left_untruncated,
-            audit_log_over_warn=audit_log_over_warn,
-        )
-        if result.did_work:
-            await self._audit(result)
-        return result
+        if deadline_hit() or self._settings.app_log_compress_days <= 0 or not self._log_dir:
+            return 0, 0
+        return await asyncio.to_thread(self._compress_app_logs, now, deadline_hit)
 
     async def _prune_processed_archives(
         self, older_than: float, deadline_hit: Callable[[], bool]
@@ -1124,10 +1203,11 @@ class RetentionRunner:
         identity cannot be read is read again by each archive under its own identity, and an archive
         that still cannot read it is not swept (:class:`ArchiveGuard`), nor is one whose opened
         directory has no readable identity. A directory two connections share is swept once. A
-        fault in one connection is logged and the others still run, because a sweep must never stop the pass: a pass that
-        raised here would lose the audit row for what it had already purged."""
+        fault in one connection is logged and the others still run, because a sweep must never stop
+        the pass: a pass that raised here would skip its later phases, and its audit row would record
+        an interrupted pass."""
         # Everything up to the sweep itself is contained: a fault here, a connector's declared
-        # directories raising say, must not escape the pass and lose its audit row.
+        # directories raising say, must not escape the pass and end it early.
         try:
             archives = list(self._archive_source()) if self._archive_source is not None else []
             if not any(a.archiving for a in archives):
@@ -1801,6 +1881,11 @@ class RetentionRunner:
                 # hit it and skipped its remaining phases. Timing metadata only — no PHI.
                 "max_pass_seconds": self._settings.max_pass_seconds,
                 "capped": result.capped,
+                # How the pass ended (BACKLOG #6526): partway on an exception or a stop, after a
+                # leadership loss, or on a standby that only touched its own app logs.
+                "interrupted": result.interrupted,
+                "leadership_lost": result.leadership_lost,
+                "standby": result.standby,
                 "vacuumed": result.vacuumed,
                 # Vault BACKLOG #2619: a purge this row records may still sit in the -wal frames.
                 # null when this pass ran no truncate, so "never tried" cannot read as "truncated".

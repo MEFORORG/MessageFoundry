@@ -2524,13 +2524,20 @@ under `enforce`, or an explicit `0` alone under `warn`, which warns and starts.
 policy.** The engine picks that number; a deploying site with a retention obligation of its own must
 set each window explicitly, because an auto-bounded window is a number nobody decided.
 
-**The pass itself.** It is **leader-gated twice** — at entry and again immediately before the purges, so
-a node demoted mid-pass never nulls PHI as a stale ex-leader. An optional between-phase wall-clock cap
-(`[retention].max_pass_seconds`, default 0 = off) bounds one pass: once hit, the remaining phases are
+**The pass itself.** It is **leader-gated** at entry, and leadership is read again before every
+shared-store phase, so a node demoted mid-pass skips the store phases left for the new leader. The read
+is a cached check, not a fence: a phase already running when the demotion lands runs to its end. A
+standby purges nothing in the store; it runs only the app-log sweep and compression on its own
+`[logging].log_dir` (BACKLOG #6526). *Corrected 2026-11-26:* this said the pass was "leader-gated
+twice — at entry and again immediately before the purges, so a node demoted mid-pass never nulls PHI
+as a stale ex-leader"; the second read had no await before it, so it could not see a demotion. An
+optional between-phase wall-clock cap (`[retention].max_pass_seconds`, default 0 = off) bounds one pass: once hit, the remaining phases are
 **skipped and left due** (their last-run markers are not advanced), so work is deferred, never dropped;
 a running `VACUUM` is never interrupted. **Each pass that does real work writes exactly one
 `retention_purge` `audit_log` entry** with the cutoffs, counts and per-connection overrides — no message
-content, no PHI.
+content, no PHI. Each purge phase commits on its own, so a pass that raises or is stopped partway writes
+that entry for the phases that finished, marked `interrupted`, before it ends; a process killed outright
+can still leave a committed purge with no entry.
 
 ### What each pass does, per backend
 
