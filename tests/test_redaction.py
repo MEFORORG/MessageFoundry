@@ -197,6 +197,11 @@ _HOSTILE_RUN_CHARS = 16_000
 #: **Only the arms with a wide margin still read it (BACKLOG #2958).** The credential walk and the
 #: frame-cap prose case ran 5 to 10 ms against it, the margin the token walk lost on a loaded runner
 #: (#2896). They moved to a CPU-time ratio, ``_CPU_GROWTH_LINE``, and their controls moved with them.
+#: Two more moved to a CPU-time ratio after the hosted readings of engine PR 3334, at ``-n 12`` on
+#: ubuntu: the frame-cap segment shape (tightest 1.88 times, worst 26.6 ms), on
+#: ``_CPU_GROWTH_LINE`` and ``_SEGMENT_CEILING_SECONDS``, and the separator sniff on operational
+#: text (tightest 2.7 times, worst 18.5 ms), on its own ``_OPS_GROWTH_LINE`` and
+#: ``_OPS_CEILING_SECONDS``.
 _SCAN_BUDGET_SECONDS = 0.05
 
 
@@ -284,12 +289,14 @@ def _record_reading(
 #: and the sizes are chosen so the shipped code and the regression it guards land on opposite sides
 #: of 24, each with room. **The number is borrowed, the clock is not:**
 #: ``test_the_mrn_pass_stays_linear_and_affordable`` reads the same 24 off a WALL-clock ratio, and
-#: keeps its own literal.
+#: keeps its own literal. The operational-text sniff arm reads its own line, ``_OPS_GROWTH_LINE``.
 _CPU_GROWTH_LINE = 24.0
 
 #: The absolute ceiling those arms also read, in CPU seconds for the large input. **Ten times the
 #: wall-clock budget, on purpose.** The ratio is what the arm is about; this bound keeps a linear
-#: path with a ruinous constant from passing. It is the same 0.5 s the MRN arm uses.
+#: path with a ruinous constant from passing. It is the same 0.5 s the MRN arm uses. The
+#: operational-text sniff arm reads its own ceiling, ``_OPS_CEILING_SECONDS``, on its small input,
+#: and the frame-cap segment arm reads ``_SEGMENT_CEILING_SECONDS`` on its large one.
 _CPU_CEILING_SECONDS = 0.5
 
 
@@ -694,43 +701,155 @@ def test_disabling_the_sniff_restores_the_leak(monkeypatch: pytest.MonkeyPatch) 
 def test_the_separator_sniff_stays_inside_the_scan_budget(
     record_property: _RecordProperty,
 ) -> None:
-    """Cost, on the two inputs that matter: a block of ordinary operational text carrying no MSH (the
-    sniff runs and finds nothing) and a long fully-custom message (the sniff runs and the extra pass
-    fires). Both share the ``_SCAN_BUDGET_SECONDS`` line the #1437 arms use, and best-of-5 for the same
-    reason: a scheduling hiccup can only inflate a sample.
+    """Cost on a long fully-custom message, where the sniff runs and the extra pass fires, against
+    the ``_SCAN_BUDGET_SECONDS`` line the #1437 arms use, best-of-5 for the same reason: a
+    scheduling hiccup can only inflate a sample.
 
-    **Kept on the budget because the margins are wide (BACKLOG #2958).** Measured 2026-10-13, three
-    runs on an unloaded Windows box: 1.6 to 1.8 ms for the ops text and 0.66 to 0.79 ms for the custom
-    message, at least 27 and 63 times under the line."""
-    ops_block = "\n".join(_OPERATIONAL_LINES * 40)  # about 10 KB, no MSH anywhere
-    assert len(ops_block) > 9_000
+    **Kept on the budget because the margin is wide (BACKLOG #2958).** Measured 2026-10-13, three
+    runs on an unloaded Windows box: 0.66 to 0.79 ms, at least 63 times under the line. The other
+    input this arm read, operational text with no MSH, moved to
+    ``test_the_separator_sniff_on_operational_text_grows_linearly``, because its hosted margin was
+    the thin one. Its reading keeps the ``custom`` label it had beside that input."""
     custom = _custom_delimiter_message(300)
-
-    inputs = (("ops", "ops text", ops_block), ("custom", "300-segment custom message", custom))
-    # Both inputs are read and recorded before either is asserted on, so a red on the first still
-    # leaves the second's reading in the junit.
-    readings: list[tuple[str, int, float]] = []
-    for short, label, text in inputs:
-        best = _best_of(lambda text=text: redact(text), 5)  # type: ignore[misc]
-        _record_reading(
-            record_property, best, _SCAN_BUDGET_SECONDS, over=False, unit="s", label=short
-        )
-        readings.append((label, len(text), best))
-    for label, chars, best in readings:
-        assert best < _SCAN_BUDGET_SECONDS, (
-            f"redacting {chars} characters of {label} cost {best:.4f}s of the event loop against "
-            f"a {_SCAN_BUDGET_SECONDS}s budget"
-        )
+    best = _best_of(lambda: redact(custom), 5)
+    _record_reading(
+        record_property, best, _SCAN_BUDGET_SECONDS, over=False, unit="s", label="custom"
+    )
+    assert best < _SCAN_BUDGET_SECONDS, (
+        f"redacting {len(custom)} characters of a 300-segment custom message cost {best:.4f}s of "
+        f"the event loop against a {_SCAN_BUDGET_SECONDS}s budget"
+    )
 
     assert "MRN12345" not in redact(custom) and "Glucose" not in redact(custom)
+
+
+#: The line the operational-text arm reads, for its 16 times pair. **Its own number, not
+#: ``_CPU_GROWTH_LINE``**: an 8 times pair against 24 left a linear ``redact`` and a quadratic sniff
+#: each about 2 times from the line on an unloaded box, thinner than the wall-clock margin the arm
+#: left. At 16 times, linear reads about 16 and a dominant quadratic cost up to 256; 64 is their
+#: geometric middle. The readings are in the arm's and the control's docstrings.
+_OPS_GROWTH_LINE = 64.0
+
+#: The absolute bound the operational-text arm reads, in thread CPU seconds for its SMALL input, the
+#: block the budget arm used to time. **The same number as ``_SCAN_BUDGET_SECONDS``**, not
+#: ``_CPU_CEILING_SECONDS``, which is ten times looser than the budget on the same block. A
+#: separate literal, because it is read on another clock: a re-derived wall-clock budget does not
+#: move it. The readings and the margin are in the arm's docstring.
+_OPS_CEILING_SECONDS = 0.05
+
+
+def _ops_texts() -> tuple[str, str]:
+    """``(small, large)``: 40 and 640 copies of the operational lines, checked against the SHIPPED
+    sniff, so call it before any mutant is patched in.
+
+    The small side is the block the budget arm used to time, about 15,600 characters."""
+    small_text = "\n".join(_OPERATIONAL_LINES * 40)
+    large_text = "\n".join(_OPERATIONAL_LINES * 640)
+    assert len(small_text) > 15_000
+    assert redaction._sniff_delimiters(large_text) == frozenset(), (
+        "the operational text declares delimiters, so the arm no longer measures the no-header path"
+    )
+    return small_text, large_text
+
+
+def _ops_text_growth(texts: tuple[str, str], large_reps: int = 3) -> tuple[float, float, float]:
+    """``(ratio, large, small)``: CPU seconds for ``redact`` on the large text of
+    :func:`_ops_texts`, over the same for the small one, then each reading alone, as
+    :func:`_interleaved_growth` reads them.
+
+    ``redact`` has no window, so a linear pass reads about 16. **A quadratic cost reads over the
+    line only once it is large enough**: a sniff rescanning every 256th prefix read 99 to 111, and
+    every 512th, about a quarter of ``redact``'s linear cost at the small side, read 61 to 81,
+    astride the line; a smaller quadratic constant passes."""
+    small_text, large_text = texts
+    return _interleaved_growth(lambda: redact(small_text), lambda: redact(large_text), large_reps)
+
+
+def test_the_separator_sniff_on_operational_text_grows_linearly(
+    record_property: _RecordProperty,
+) -> None:
+    """Cost on ordinary operational text carrying no MSH, where the sniff runs and finds nothing, on
+    a CPU-time ratio rather than the 0.05 s budget (BACKLOG #2958 step 2), because the hosted
+    wall-clock margin was thin; the hosted readings are in the comment on ``_SCAN_BUDGET_SECONDS``.
+
+    Measured 2026-11-26 (Central) on a 32-core Windows box, over fifteen runs: a ratio of 12 to
+    19.4, at least 3.3 times under ``_OPS_GROWTH_LINE``. Over fifteen more, ten of this arm alone
+    and five inside a ``pytest -n 12`` run of this file, 2.33 to 3.03 ms of CPU for the small side,
+    the slowest in both conditions: at least 0.05 / 0.00303 = 16.5 times under
+    ``_OPS_CEILING_SECONDS``.
+
+    **The ceiling is read on the small side, at the budget's number**, the block and the number the
+    budget arm used. What changed is the clock, thread CPU time rather than wall time, and that has
+    a cost: time the thread spends blocked, on a lock, a sleep or a joined helper thread, stalls the
+    event loop but is charged almost nothing, so neither bound here reads it. A loaded runner still
+    inflates CPU seconds by a factor, through cache and frequency loss, and that factor has the
+    16.5 times above locally. The ``-n 12`` run did not oversubscribe the 32 cores, and no hosted
+    CPU reading exists yet; the hosted wall readings are a best single call, a different statistic,
+    so they do not bound it. A quadratic cost is the ratio's to catch.
+
+    **The ratio guards every pass ``redact`` makes over this text, not the sniff alone**, for a
+    quadratic cost as large as ``_ops_text_growth`` says."""
+    texts = _ops_texts()
+    growth, large, small = _ops_text_growth(texts)
+    _record_reading(
+        record_property, growth, _OPS_GROWTH_LINE, over=False, unit="ratio", sides=(large, small)
+    )
+    _record_reading(
+        record_property,
+        small,
+        _OPS_CEILING_SECONDS,
+        over=False,
+        unit="cpu_s",
+        label="small_ceiling",
+    )
+    assert growth < _OPS_GROWTH_LINE, (
+        f"redact on 16 times the operational text cost {growth:.1f} times as much, over the "
+        f"{_OPS_GROWTH_LINE} line -- a pass is no longer linear in the text"
+    )
+    assert small < _OPS_CEILING_SECONDS, (
+        f"redact on {len(texts[0])} characters of operational text cost {small:.4f} CPU seconds "
+        f"against a {_OPS_CEILING_SECONDS}s ceiling"
+    )
+
+
+def test_control_a_sniff_that_rescans_every_128th_prefix_crosses_the_same_line(
+    monkeypatch: pytest.MonkeyPatch, record_property: _RecordProperty
+) -> None:
+    """Non-vacuity for the arm above: the regression it guards, run on the same pair, the same clock
+    and the same line.
+
+    The mutant sniff reads the whole text with the shipped sniff, then every 128th prefix of it, so
+    it returns exactly what the shipped one does at a cost quadratic in the text. Measured
+    2026-11-26 (Central) on a Windows box, over twelve runs: 135 to 177, at least 2.1 times over the
+    line; every 64th prefix read 105 to 188, no wider at its floor, at nearly twice the cost. One
+    rep for the large side, because a slow sample there only helps this assertion."""
+    texts = _ops_texts()
+    shipped = redaction._sniff_delimiters
+
+    def rescanning_sniff(text: str) -> frozenset[str]:
+        found: set[str] = set(shipped(text))
+        for end in range(0, len(text), 128):
+            found |= shipped(text[:end])
+        return frozenset(found)
+
+    monkeypatch.setattr(redaction, "_sniff_delimiters", rescanning_sniff)
+    growth, large, small = _ops_text_growth(texts, large_reps=1)
+    _record_reading(
+        record_property, growth, _OPS_GROWTH_LINE, over=True, unit="ratio", sides=(large, small)
+    )
+    assert growth > _OPS_GROWTH_LINE, (
+        f"a sniff quadratic in the text cost only {growth:.1f} times as much on 16 times the "
+        f"operational text, under the {_OPS_GROWTH_LINE} line the arm clears -- the pair no longer "
+        f"discriminates and the line needs re-deriving"
+    )
 
 
 # --- BACKLOG #2958 step 4: the field-run and segment patterns stay linear, read with no clock ----------
 #
 # ``_delimiter_patterns`` compiles the separator-aware segment and field-run patterns at runtime, from
 # the delimiter set a message declares, so the ReDoS scanner cannot read them
-# (``tests/test_security_static.py``, ``_UNSCANNABLE_RE_PATTERNS``). The budget arm above times
-# ``redact`` on two inputs, and no input it carries puts the separator-aware field run on a long
+# (``tests/test_security_static.py``, ``_UNSCANNABLE_RE_PATTERNS``). The sniff cost arms above time
+# ``redact`` on two inputs, and no input they carry puts the separator-aware field run on a long
 # delimiter-free token. The arms below read the compiled patterns themselves, for real declared
 # delimiter sets and for the hardcoded pair, with a character meter and no clock, plus two structural
 # reads of the parsed patterns: the nesting the meters cannot see, and a stated shape of each
@@ -2321,31 +2440,43 @@ _FRAME_CAP_SHAPES = {
 }
 
 
-#: The two frame-cap shapes still read against ``_SCAN_BUDGET_SECONDS``. Prose left it for a CPU-time
-#: ratio (BACKLOG #2958), because its margin was the thin one.
-_FRAME_CAP_BUDGET_SHAPES = ("one solid run", "segment-shaped")
+#: The one frame-cap shape still read against ``_SCAN_BUDGET_SECONDS``. Prose and then the segment
+#: shape left it for a CPU-time ratio (BACKLOG #2958), each because its margin was the thin one.
+_FRAME_CAP_BUDGET_SHAPES = ("one solid run",)
 
 
 @pytest.mark.parametrize("label", _FRAME_CAP_BUDGET_SHAPES)
 def test_a_frame_cap_sized_input_no_longer_buys_the_event_loop(
     label: str, record_property: _RecordProperty
 ) -> None:
-    """THE ROW'S ACCEPTANCE ARM: event-loop responsiveness against an input a remote peer sizes.
+    """Event-loop responsiveness against an input a remote peer sizes, for the one frame-cap shape
+    still on the wall-clock budget. It was the row's acceptance arm while it read all three shapes;
+    the acceptance now spans it and the prose and segment arms named below.
 
     A negative acknowledgment's MSA-3 runs to the 16 MiB frame cap, and ``safe_text`` scanned all of it
     before truncating to 200 characters. Measured unbounded on the author's box: 0.29 s for the
     segment shape and 0.78 s for prose, which matches the 0.53-0.94 s band measured independently on
-    another. Those are the first readings; the controls below hold the current ones.
+    another. Those are the first readings, of shapes this arm no longer reads. The solid run's
+    current unbounded reading is in the control below; the prose and segment controls read a
+    CPU-time ratio, not seconds.
 
     The budget is ``_SCAN_BUDGET_SECONDS`` -- the same line the #1437 cost arms use, so a regression
     that reopened the scan would fail here at the same threshold it fails there -- and best-of-3
     because a scheduling hiccup can only inflate a sample.
 
-    **Kept on the budget because the margins are wide (BACKLOG #2958).** Measured best-of-3 on
-    2026-10-13, three runs on an unloaded Windows box: 2.0 to 3.0 ms for the segment shape and 0.06
-    to 0.09 ms for the solid run. A runner would have to inflate them at least 16 and 550 times to
-    fake a red. The token walk that failed #2896 had about 7 times. Prose is the third shape, and it moved to
-    ``test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs``."""
+    **Kept on the budget because the margin is wide (BACKLOG #2958).** Measured best-of-3 on
+    2026-10-13, three runs on an unloaded Windows box: 0.06 to 0.09 ms for the solid run. A runner
+    would have to inflate it at least 550 times to fake a red. The token walk that failed #2896 had
+    about 7 times. The other two shapes moved to the CPU clock:
+    ``test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs`` and
+    ``test_a_frame_cap_sized_segment_input_costs_what_a_window_of_it_costs``.
+
+    **This shape has no whitespace, so the clamp keeps an empty head** and this arm times the clamp,
+    not a scan of a window. No arm in this file now holds a non-empty frame-cap window under this
+    number on the wall clock. The segment arm holds one under the same number on the thread CPU
+    clock, ``_SEGMENT_CEILING_SECONDS``; the prose arm holds one only under the looser
+    ``_CPU_CEILING_SECONDS``. The parametrize over one shape is kept so the test id, and the
+    readings recorded under it, stay what they were."""
     text = _FRAME_CAP_SHAPES[label]()
     assert len(text) >= 16_000_000
     best = _best_of(lambda: safe_text(text))
@@ -2363,8 +2494,8 @@ def test_control_the_budget_shapes_are_expensive_unbounded(
     """Non-vacuity for the budget arm above, on the SAME fixture and the SAME line. Without it, a fast
     ``safe_text`` would be equally consistent with a fixture too cheap to measure anything.
     ``redact`` is called directly, which is what ``safe_text`` did before the bound. Measured
-    2026-10-13, five single samples each: 1.24 to 1.56 s for the solid run and 0.59 to 1.03 s for
-    the segment shape. One sample, because noise can only make it slower."""
+    2026-10-13, five single samples: 1.24 to 1.56 s for the solid run. One sample, because noise can
+    only make it slower."""
     text = _FRAME_CAP_SHAPES[label]()
     best = _best_of(lambda: redact(text), 1)
     _record_reading(record_property, best, _SCAN_BUDGET_SECONDS, over=True, unit="s")
@@ -2374,16 +2505,17 @@ def test_control_the_budget_shapes_are_expensive_unbounded(
     )
 
 
-def _frame_cap_prose_growth(
-    scan: Callable[[str], object], large_reps: int = 3
+def _frame_cap_growth(
+    label: str, scan: Callable[[str], object], large_reps: int = 3
 ) -> tuple[float, float, float]:
-    """``(ratio, large, small)``: CPU seconds for ``scan`` over the 16 MiB prose shape, over the same
-    for one window of it, then each of those two readings alone.
+    """``(ratio, large, small)``: CPU seconds for ``scan`` over the 16 MiB shape ``label`` names,
+    over the same for one window of it, then each of those two readings alone.
 
     **A window as the small size, so the two sides of the line are far apart.** The prose is about
-    267 windows long. Bounded, both inputs cost one window's scan and the ratio is near 1; unbounded,
-    it is near 267. An 8x pair, the shape the MRN arm uses, would read 8 unbounded and sit under the line."""
-    large_text = _FRAME_CAP_SHAPES["delimiter-free prose"]()
+    267 windows long, the segment shape about 256. Bounded, both inputs cost one window's scan and
+    the ratio is near 1; unbounded, it is near that window count. An 8x pair, the shape the MRN arm
+    uses, would read 8 unbounded and sit under the line."""
+    large_text = _FRAME_CAP_SHAPES[label]()
     small_text = large_text[: redaction._REDACT_WINDOW]
     return _interleaved_growth(lambda: scan(small_text), lambda: scan(large_text), large_reps)
 
@@ -2407,7 +2539,7 @@ def test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs(
     **The ceiling is an absolute bound of the kind BACKLOG #2952 limit 3 asks to keep**, ten times looser than
     the old line: it passes a scan up to about 69 times today's, on the re-measured 7.25 ms. ``safe_text`` runs the whole clamp on
     this input, the name walk included."""
-    growth, large, small = _frame_cap_prose_growth(safe_text)
+    growth, large, small = _frame_cap_growth("delimiter-free prose", safe_text)
     _record_reading(
         record_property, growth, _CPU_GROWTH_LINE, over=False, unit="ratio", sides=(large, small)
     )
@@ -2433,7 +2565,7 @@ def test_control_the_same_inputs_are_expensive_unbounded(
     the bound. **The same pair, the same clock and the same line as the arm**, so the line provably
     separates a bounded scan from an unbounded one. One rep for the large input, because a slow
     sample there only helps this assertion."""
-    growth, large, small = _frame_cap_prose_growth(redact, large_reps=1)
+    growth, large, small = _frame_cap_growth("delimiter-free prose", redact, large_reps=1)
     _record_reading(
         record_property, growth, _CPU_GROWTH_LINE, over=True, unit="ratio", sides=(large, small)
     )
@@ -2441,6 +2573,118 @@ def test_control_the_same_inputs_are_expensive_unbounded(
         f"the unbounded scan cost only {growth:.1f} times one window of it, under the "
         f"{_CPU_GROWTH_LINE} line the bounded arm clears -- this fixture no longer discriminates "
         f"and the line needs re-deriving"
+    )
+
+
+#: The absolute bound the frame-cap segment arm reads, in thread CPU seconds for the 16 MiB
+#: segment-shaped input, the input the budget arm timed with ``safe_text`` before this arm left it.
+#: **The same number as ``_SCAN_BUDGET_SECONDS``**, not ``_CPU_CEILING_SECONDS``, which is ten
+#: times looser than the budget on the same input. Its own literal for the reason
+#: ``_OPS_CEILING_SECONDS`` gives. The readings and the margin are in the arm's docstring.
+_SEGMENT_CEILING_SECONDS = 0.05
+
+
+def test_a_frame_cap_sized_segment_input_costs_what_a_window_of_it_costs(
+    record_property: _RecordProperty,
+) -> None:
+    """The frame-cap arm's segment shape, on a CPU-time ratio rather than the 0.05 s budget (BACKLOG
+    #2958 step 2), in the shape the prose arm above moved to, because the hosted wall-clock margin
+    was thin; the hosted readings are in the comment on ``_SCAN_BUDGET_SECONDS``.
+
+    Measured 2026-11-26 (Central) on a Windows box, over twelve runs: a ratio of 0.85 to 1.6, at
+    least 15 times under the line. Over twelve more on a 32-core Windows box, against the redactor
+    of engine PR 3329, seven of this arm alone and five inside a ``pytest -n 12`` run of this file:
+    a ratio of 0.93 to 1.40, and 2.94 to 4.23 ms of CPU for the frame cap, the slowest under
+    ``-n 12``, at least 0.05 / 0.00423 = 11.8 times under ``_SEGMENT_CEILING_SECONDS``.
+
+    **The ceiling is read on the large side, at the budget's number**, the input and the number the
+    budget arm used, on thread CPU time rather than wall time. Thread CPU time does not charge time
+    the thread spends blocked, so neither bound here reads a stall of that kind;
+    ``test_the_separator_sniff_on_operational_text_grows_linearly`` states that cost and the
+    loaded-runner factor once. The ``-n 12`` run did not oversubscribe the 32 cores, and no hosted
+    CPU reading exists yet. The hosted wall readings are a different statistic, a best single call,
+    so they do not bound this one.
+
+    **A wider window is the ceiling's to read, not the ratio's:** a change that widens the clamp's
+    window moves both sides of the ratio, since the small side is cut at ``_REDACT_WINDOW``, and the
+    ceiling passes a widening of up to the margin above, about 11.8 times;
+    ``test_the_redact_window_is_pinned_for_the_frame_cap_ratios`` reads that, with no clock."""
+    growth, large, small = _frame_cap_growth("segment-shaped", safe_text)
+    _record_reading(
+        record_property, growth, _CPU_GROWTH_LINE, over=False, unit="ratio", sides=(large, small)
+    )
+    _record_reading(
+        record_property, large, _SEGMENT_CEILING_SECONDS, over=False, unit="cpu_s", label="ceiling"
+    )
+    assert growth < _CPU_GROWTH_LINE, (
+        f"safe_text on the frame-cap segment shape cost {growth:.1f} times one window of it, over "
+        f"the {_CPU_GROWTH_LINE} line -- the scan is no longer bounded by the window"
+    )
+    assert large < _SEGMENT_CEILING_SECONDS, (
+        f"safe_text on the frame-cap segment shape cost {large:.4f} CPU seconds against a "
+        f"{_SEGMENT_CEILING_SECONDS}s ceiling"
+    )
+
+
+def test_control_the_segment_input_is_expensive_unbounded(
+    record_property: _RecordProperty,
+) -> None:
+    """Non-vacuity for the segment arm above: ``redact`` called directly, which is what
+    ``safe_text`` did before the bound, on the same pair, the same clock and the same line. Measured
+    2026-11-26 (Central) on a Windows box, over seventeen runs: 178 to 329. One rep for the large
+    input, because a slow sample there only helps both assertions.
+
+    **The ceiling is read over too**, on the same large input, so ``_SEGMENT_CEILING_SECONDS``
+    provably separates the bounded scan from the unbounded one on this clock, as the budget's
+    control did on the wall clock."""
+    growth, large, small = _frame_cap_growth("segment-shaped", redact, large_reps=1)
+    _record_reading(
+        record_property, growth, _CPU_GROWTH_LINE, over=True, unit="ratio", sides=(large, small)
+    )
+    _record_reading(
+        record_property, large, _SEGMENT_CEILING_SECONDS, over=True, unit="cpu_s", label="ceiling"
+    )
+    assert growth > _CPU_GROWTH_LINE, (
+        f"the unbounded scan of the segment shape cost only {growth:.1f} times one window of it, "
+        f"under the {_CPU_GROWTH_LINE} line the bounded arm clears -- this fixture no longer "
+        f"discriminates and the line needs re-deriving"
+    )
+    assert large > _SEGMENT_CEILING_SECONDS, (
+        f"the unbounded scan of the segment shape cost only {large:.4f} CPU seconds, under the "
+        f"{_SEGMENT_CEILING_SECONDS}s ceiling the bounded arm clears -- this fixture no longer "
+        f"discriminates"
+    )
+
+
+#: The widest window the window-relative ratio arms were derived for, in characters.
+_REDACT_WINDOW_PINNED = 64 * 1024
+
+
+@pytest.mark.parametrize("label", ("delimiter-free prose", "segment-shaped"))
+def test_the_redact_window_is_pinned_for_the_frame_cap_ratios(label: str) -> None:
+    """A clock-free guard on the clamp's window, which the window-relative ratio arms cannot read.
+
+    At least the prose, segment and credential-walk arms size both sides of their ratio from
+    ``_REDACT_WINDOW``, so a wider window moves both sides together, and their ceilings pass a
+    widening; the segment arm's docstring gives its figure. **This bound is what reads a
+    widening.** It reads the constant, and the head ``safe_text_bound`` returns, which is what
+    ``safe_text`` scans today, so a widening made in that call is read too. A widening made in a
+    caller that bypasses ``safe_text_bound``, or in ``clamp_untrusted``'s default, is not. A
+    narrower window only makes the clamp cheaper, so it is an upper bound."""
+    advice = (
+        "the window-relative ratio arms were derived for. Their sides are sized from the window, "
+        "so no ratio sees a wider one: re-measure at least the prose, segment and credential-walk "
+        "arms and their ceilings on the new window, then raise _REDACT_WINDOW_PINNED"
+    )
+    assert redaction._REDACT_WINDOW <= _REDACT_WINDOW_PINNED, (
+        f"_REDACT_WINDOW is {redaction._REDACT_WINDOW} characters, over the "
+        f"{_REDACT_WINDOW_PINNED} {advice}"
+    )
+    head, note = redaction.safe_text_bound(_FRAME_CAP_SHAPES[label]())
+    assert note, f"the {label} frame-cap shape was not cut at all"
+    assert len(head) <= _REDACT_WINDOW_PINNED, (
+        f"safe_text scans a {len(head)}-character head of the {label} frame-cap shape, over the "
+        f"{_REDACT_WINDOW_PINNED} {advice}"
     )
 
 
@@ -2781,14 +3025,16 @@ def test_the_token_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
 
     **No absolute bound is added here, and that is BACKLOG #2952 limit 3 answered by a reason rather
     than by code.** Any absolute bound is a number of seconds, and seconds on this walk are what
-    #2896 removed. Absolute bounds on one clamp live in at least these arms instead: the two CPU-time
-    arms under ``_CPU_CEILING_SECONDS``
+    #2896 removed. Absolute bounds on one clamp live in at least these arms instead: two of the
+    CPU-time arms under ``_CPU_CEILING_SECONDS``
     (``test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer`` and
-    ``test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs``), and the two frame-cap shapes
-    still under ``_SCAN_BUDGET_SECONDS``. None of their walls is name-shaped where the cut lands, so
-    none drives the name walk past a token or two. So a name walk that stays linear but carries a
-    large constant still passes everything here. That gap is accepted, and it is recorded rather
-    than closed."""
+    ``test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs``), the segment arm under
+    ``_SEGMENT_CEILING_SECONDS``
+    (``test_a_frame_cap_sized_segment_input_costs_what_a_window_of_it_costs``), and the one
+    frame-cap shape still under ``_SCAN_BUDGET_SECONDS``, the solid run. None of their walls is
+    name-shaped where the cut lands, so none drives the name walk past a token or two. So a name
+    walk that stays linear but carries a large constant still passes everything here. That gap is
+    accepted, and it is recorded rather than closed."""
     growth = _walk_growth()
     assert growth < _WALK_GROWTH_LINE, (
         f"doubling the window multiplied the characters the walk touches by {growth:.2f}, over the "
