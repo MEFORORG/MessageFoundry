@@ -792,9 +792,10 @@ class AlertSink(Protocol):
         for a probe fault, ``"directory-reconciler-misconfigured"`` for a configuration refusal,
         ``"directory-reconciler-paging:<username>"`` for a paging refusal,
         ``"directory-reconciler-outage"`` for a lasting outage, and
-        ``"directory-reconciler-unreached:<username>"`` for an unreached account, or the bare
-        ``"directory-reconciler-unreached"`` for a rollup of those entering on one pass
-        (``AuthService._record_unreached_accounts`` decides when), so each
+        ``"directory-reconciler-unreached:<username>"`` for an unreached account, or
+        ``"directory-reconciler-unreached-rollup:<digest>"`` for a rollup of those entering on one
+        pass, keyed by those accounts (``AuthService._record_unreached_accounts`` decides when,
+        and the API's ``_UNREACHED_ROLLUP_SOURCE`` says why), so each
         is its own instance and throttle. ``reason`` is one of those eight closed-set slugs.
         ``probed`` is, for
         the breaker, how many principals the pass judged, its denominator, and a paging refusal

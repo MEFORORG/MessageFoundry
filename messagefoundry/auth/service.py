@@ -879,6 +879,17 @@ _FORFEIT_NOBODY_ELSE: Final[str] = (
 #: `AuthService._record_unreached_accounts`). A fixed number, not a setting, so tuning the
 #: mass-revoke breaker does not change how these page.
 _UNREACHED_ROLLUP_ABOVE: Final[int] = 5
+
+
+def _unreached_rollup_key(entries: Iterable[tuple[str, str, int]]) -> str:
+    """The key a rollup's page carries in its source, ``ReconcilePlan.unreached_rollup``: 16 hex
+    characters of a SHA-256 over the sorted user ids of the accounts entering (BACKLOG #3100 item
+    14). An alert-instance key, not a secret. The ids, not the names, so the source names nobody
+    and a rename keeps the key; sorted, so the order a pass probed them in does not change it."""
+    ids = "\n".join(sorted(user_id for user_id, _n, _p in entries))
+    return hashlib.sha256(ids.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+
 #: What a forfeited standing logs when a new condition of its kind opens (BACKLOG #3083).
 _FORFEITED_EPISODE_WARNINGS: Final[dict[_EpisodeKind, str]] = {
     "breaker": (
@@ -10394,7 +10405,7 @@ class AuthService:
         written: whether the accounts already paged and those just written are more than
         :data:`_UNREACHED_ROLLUP_ABOVE`. Nothing is latched before the pass ends, so the paged set
         holds only earlier passes' accounts. Decided on the entries instead, a pass whose refusals
-        left five or fewer standing paged its written ones under the bare source, naming none, and
+        left five or fewer standing paged its written ones in a rollup, naming none, and
         one whose every row was refused carried a rollup with nothing in it.
 
         It logs one WARNING naming each account whose row was written, or one WARNING with the
@@ -10456,7 +10467,11 @@ class AuthService:
             else:
                 for _user_id, username, probes in written:
                     warn(username, probes)
-        return replace(plan, unreached=tuple(written), unreached_rollup=rollup)
+        return replace(
+            plan,
+            unreached=tuple(written),
+            unreached_rollup=_unreached_rollup_key(written) if rollup else None,
+        )
 
     def _latch_unreached_accounts(self, plan: reconcile.ReconcilePlan) -> None:
         """Record that each entry's page is raised, last in the pass, as the outage's is

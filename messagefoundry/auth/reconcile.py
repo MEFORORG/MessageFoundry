@@ -369,13 +369,16 @@ class ReconcilePlan:
     #: a pass with no candidates returns.
     unreached_window: int = 0
     #: Set by ``AuthService._record_unreached_accounts`` (BACKLOG #3100, #3709), on the rows it
-    #: wrote: True when those entering whose row was written, plus the accounts latched as paged
+    #: wrote: set when those entering whose row was written, plus the accounts latched as paged
     #: that still hold a live session and a directory key and whose window has not since held
     #: only answers, are more than ``AuthService``'s fixed rollup bound, so the lifespan task
     #: pages once for those
     #: entering rather than once per account. A directory that answers only a few probes
-    #: in each pass would otherwise open an instance per signed-in account.
-    unreached_rollup: bool = False
+    #: in each pass would otherwise open an instance per signed-in account. ``None`` on a pass
+    #: that does not roll up. Set, it is the key of the accounts entering, which the page's
+    #: source carries, so no earlier rollup's cooldown or suspend reaches a rollup of other
+    #: accounts (BACKLOG #3100 item 14; the API's ``_UNREACHED_ROLLUP_SOURCE`` says why).
+    unreached_rollup: str | None = None
     #: Set by the auth service after the pass, never by :func:`plan_pass` (BACKLOG #3709): how many
     #: passes running, this one included, have read the directory unreachable
     #: (:attr:`directory_outage`), in this process. 0 on a pass that reached it. A pass whose

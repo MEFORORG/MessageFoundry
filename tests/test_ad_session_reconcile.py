@@ -36,6 +36,7 @@ from pydantic import ValidationError
 from messagefoundry.api.app import (
     _OUTAGE_ALERT_SOURCE,
     _UNREACHED_ALERT_SOURCE,
+    _UNREACHED_ROLLUP_SOURCE,
     _alert_reconcile_plan,
 )
 from messagefoundry.auth import channel_scope, reconcile
@@ -71,6 +72,7 @@ from messagefoundry.auth.service import (
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.store.base import StoreAcquireTimeout
 from messagefoundry.store.crypto import CipherError, generate_key, make_cipher
@@ -97,6 +99,7 @@ from tests import test_ad_user_account_control as uac
 from tests._admin_account import create_local_user_chosen
 from tests._log_absence import assert_capture_sees
 from tests.test_ad_user_account_control import _InverseSink
+from tests.test_alert_sinks import _drain, _RecordingTransport
 from tests.test_approval_requester_recheck import _Sink
 from tests.test_user_seal import _raw_for
 
@@ -2756,6 +2759,11 @@ def _unreached_events(sink: _InverseSink) -> list[tuple[str, str, dict[str, Any]
     return [e for e in sink.events if e[1].startswith(_UNREACHED_PREFIX)]
 
 
+def _rollup_events(sink: _InverseSink) -> list[tuple[str, str, dict[str, Any]]]:
+    """Each rollup's page, whatever accounts key its source (BACKLOG #3100 item 14)."""
+    return [e for e in sink.events if e[1].startswith(f"{_UNREACHED_ROLLUP_SOURCE}:")]
+
+
 async def _unreached_rows(store: MessageStore) -> list[tuple[str, int]]:
     """``(actor, probes)`` of each lasting unreachable account's audit row."""
     rows = [dict(r) for r in await store.list_audit(action="auth.ad_reconcile_unreached")]
@@ -2945,7 +2953,7 @@ async def test_a_pass_that_raises_after_the_unreached_row_leaves_the_next_pass_t
 async def test_a_flapping_directory_pages_once_for_many_unreached_accounts() -> None:
     """BACKLOG #3100 closing step 2, round-one review. A directory that answers only a few probes
     in each pass is not an outage, so each failing account would enter its own run. Past
-    ``ad_session_revoke_max`` of them on one pass, one page under the bare source covers them,
+    ``ad_session_revoke_max`` of them on one pass, one rollup page covers them,
     naming none, and each account still has its own row.
 
     RED when: such a pass opens one instance per account."""
@@ -2962,10 +2970,8 @@ async def test_a_flapping_directory_pages_once_for_many_unreached_accounts() -> 
         for _ in range(3):
             plan = await _pass(service, sink)
         assert plan.unreached_rollup and len(plan.unreached) == 7
-        [(kind, source, payload)] = _unreached_events(sink) + [
-            e for e in sink.events if e[1] == "directory-reconciler-unreached"
-        ]
-        assert (kind, source) == ("ad_reconcile_aborted", "directory-reconciler-unreached")
+        [(kind, source, payload)] = _unreached_events(sink) + _rollup_events(sink)
+        assert kind == "ad_reconcile_aborted" and source.startswith(_UNREACHED_ROLLUP_SOURCE)
         assert payload["reason"] == reconcile.UNREACHED_ACCOUNT and payload["probed"] == 8
         assert payload["detail"].startswith("Accounts newly unreachable: 7.")
         assert len(payload["detail"]) <= 200 and "flap" not in payload["detail"]
@@ -2976,7 +2982,8 @@ async def test_a_flapping_directory_pages_once_for_many_unreached_accounts() -> 
 
 
 async def test_a_later_rollup_says_it_counts_only_the_accounts_entering() -> None:
-    """BACKLOG #3709. A later rollup under the bare source updates the open instance's text. The
+    """BACKLOG #3709. A later rollup under the bare source updated the open instance's text, as
+    every rollup did before BACKLOG #3100 item 14 and one of the same accounts still does. The
     text read "7 accounts' sessions are not revoked", a total, and one more account entering
     after seven replaced it with "1 accounts' ...", though eight stood. No process can count
     every account standing, so the text names its count as the accounts newly unreachable.
@@ -3000,13 +3007,120 @@ async def test_a_later_rollup_says_it_counts_only_the_accounts_entering() -> Non
             later = await _pass(service, sink)
         assert [name for _uid, name, _n in later.unreached] == ["late"]
         assert later.unreached_rollup
-        rollups = [p for _k, s, p in sink.events if s == _UNREACHED_ALERT_SOURCE]
+        rollups = [p for _k, _s, p in _rollup_events(sink)]
         assert [p["detail"].split(".")[0] for p in rollups] == [
             "Accounts newly unreachable: 7",
             "Accounts newly unreachable: 1",
         ]
         assert "each failed 3+ of up to its last 5 probes" in rollups[1]["detail"]
         assert all("sessions are not revoked;" in p["detail"] for p in rollups)
+    finally:
+        await store.close()
+
+
+async def _notified_pass(service: AuthService, sink: NotifierAlertSink) -> reconcile.ReconcilePlan:
+    """One pass, alerted as the lifespan task alerts it, through the real notifier, so its
+    cooldown and suspend gates decide what reaches a transport."""
+    plan = await service.reconcile_directory_sessions()
+    _alert_reconcile_plan(plan, service, sink)
+    return plan
+
+
+def _unreached_pages(transport: _RecordingTransport) -> list[dict[str, Any]]:
+    return [e for e in transport.events if e.get("reason") == reconcile.UNREACHED_ACCOUNT]
+
+
+async def test_an_account_rolled_up_after_a_rollup_pages_inside_its_cooldown() -> None:
+    """BACKLOG #3100 item 14. With seven accounts paged by a rollup, one more entering is rolled
+    up too. Every rollup shared one source, so the notifier's cooldown on the first rollup, 300 s
+    by default, swallowed the second page: the account entered the unreachable state and nobody
+    was told. Each rollup now has its own instance, so the late account pages. The passes between
+    page nothing, so the seven are not paged again.
+
+    RED when: the late account's rollup is throttled by the earlier rollup's cooldown."""
+    store = await MessageStore.open(":memory:")
+    try:
+        names = ["ok", "late"] + [f"flap{i}" for i in range(7)]
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for n in names:
+            assert await _signed_in_ad_user(service, store, n) is not None
+        transport = _RecordingTransport("t")
+        sink = NotifierAlertSink([transport])  # the default 300 s cooldown
+        ldap.unreachable = set(names[2:])
+        for _ in range(3):
+            first = await _notified_pass(service, sink)
+        assert first.unreached_rollup and len(first.unreached) == 7
+        ldap.unreachable = set(names[1:])  # "late" joins; the seven still fail
+        for _ in range(3):
+            later = await _notified_pass(service, sink)
+        assert [name for _uid, name, _n in later.unreached] == ["late"]
+        assert later.unreached_rollup
+        await _drain(sink)
+        pages = _unreached_pages(transport)
+        assert [p["detail"].split(".")[0] for p in pages] == [
+            "Accounts newly unreachable: 7",
+            "Accounts newly unreachable: 1",
+        ], "the late account's page was throttled by the first rollup's cooldown"
+        assert pages[0]["connection"] != pages[1]["connection"]
+    finally:
+        await store.close()
+
+
+async def test_a_suspended_rollup_does_not_mute_a_later_rollup_of_other_accounts() -> None:
+    """BACKLOG #3100 item 14, the Lander's round-627e9b4814. An operator who suspends one rollup's
+    alert suspended every later rollup with it, since all shared one source, so six more accounts
+    entering paged nobody while the window lasted. Each rollup is now keyed by the accounts it
+    covers, so a later rollup of other accounts pages. The suspend still mutes what it named: a
+    restarted process that rolls up the same seven again pages nothing.
+
+    RED when: the later rollup is muted by the earlier rollup's suspend."""
+    store = await MessageStore.open(":memory:")
+    try:
+        first_group = [f"flap{i}" for i in range(7)]
+        second_group = [f"more{i}" for i in range(6)]
+        names = ["ok", *first_group, *second_group]
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for n in names:
+            assert await _signed_in_ad_user(service, store, n) is not None
+        transport = _RecordingTransport("t")
+        # No cooldown, so the suspend alone decides; the store holds the instance the operator
+        # suspends, as the API's suspend route reads it.
+        sink = NotifierAlertSink([transport], store=store, realert_seconds=0)
+        ldap.unreachable = set(first_group)
+        for _ in range(3):
+            first = await _notified_pass(service, sink)
+        assert first.unreached_rollup and len(first.unreached) == 7
+        await uac._settle(sink)
+        [(event_type, opened)] = [
+            (t, s)
+            for t, s in await uac._open_alerts(store)
+            if s.startswith(_UNREACHED_ALERT_SOURCE)
+        ]
+        sink.suspend(event_type, opened, until=time.time() + 3600)
+        ldap.unreachable = set(first_group) | set(second_group)
+        for _ in range(3):
+            later = await _notified_pass(service, sink)
+        assert sorted(name for _uid, name, _n in later.unreached) == second_group
+        assert later.unreached_rollup
+        # The control: a restart forgets the latch, so the same seven enter and roll up again,
+        # under the instance the operator suspended, which stays muted.
+        restarted = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await restarted.initialize()
+        ldap.unreachable = set(first_group)
+        for _ in range(3):
+            again = await _notified_pass(restarted, sink)
+        assert again.unreached_rollup
+        assert sorted(name for _uid, name, _n in again.unreached) == first_group
+        await _drain(sink)
+        await uac._settle(sink)
+        assert [p["detail"].split(".")[0] for p in _unreached_pages(transport)] == [
+            "Accounts newly unreachable: 7",
+            "Accounts newly unreachable: 6",
+        ], "the later rollup was muted by the suspend of the first, or the suspend no longer mutes"
     finally:
         await store.close()
 
@@ -3018,7 +3132,7 @@ async def test_a_rollup_left_with_five_or_fewer_written_rows_pages_each_account(
     or fewer accounts stand, a rollup is not for them: each written account pages under its own
     source, and the refused ones are left to the next pass.
 
-    RED when: one written account of seven entering still pages under the bare source, naming
+    RED when: one written account of seven entering still pages in a rollup, naming
     none, and gets no instance of its own."""
     store = await MessageStore.open(":memory:")
     try:
@@ -3045,7 +3159,7 @@ async def test_a_rollup_left_with_five_or_fewer_written_rows_pages_each_account(
         assert [source for _k, source, _p in _unreached_events(sink)] == [
             f"{_UNREACHED_PREFIX}flap0"
         ]
-        assert not [e for e in sink.events if e[1] == _UNREACHED_ALERT_SOURCE]
+        assert _rollup_events(sink) == []
     finally:
         await store.close()
 
@@ -3084,7 +3198,7 @@ async def test_a_refused_entrant_after_a_rollup_pages_nothing_and_does_not_raise
         for _ in range(3):
             plan = await _pass(service, sink)
         assert plan.unreached == () and not plan.unreached_rollup
-        assert len([e for e in sink.events if e[1] == _UNREACHED_ALERT_SOURCE]) == 1
+        assert len(_rollup_events(sink)) == 1
     finally:
         await store.close()
 
@@ -3346,7 +3460,7 @@ async def test_a_rollup_whose_rows_are_all_refused_pages_nothing_and_does_not_ra
             plan = await _pass(service, sink)  # raised ValueError on the third pass before the fix
         assert plan.unreached == () and not plan.unreached_rollup
         assert _unreached_events(sink) == []
-        assert not [e for e in sink.events if e[1] == "directory-reconciler-unreached"]
+        assert _rollup_events(sink) == []
     finally:
         await store.close()
 
@@ -3592,7 +3706,7 @@ async def test_a_window_met_under_the_outage_cover_pages_on_the_first_failure_af
 
 async def test_alternating_accounts_past_the_rollup_bound_page_as_one() -> None:
     """BACKLOG #3709 closing step 6. Seven accounts alternating on the same passes enter together
-    and, past ``_UNREACHED_ROLLUP_ABOVE``, page once under the bare source, each with its own row.
+    and, past ``_UNREACHED_ROLLUP_ABOVE``, page once in a rollup, each with its own row.
 
     RED when: alternating accounts never page, or page one instance each past the bound."""
     store = await MessageStore.open(":memory:")
@@ -3607,7 +3721,7 @@ async def test_alternating_accounts_past_the_rollup_bound_page_as_one() -> None:
         plans = await _drive(service, ldap, sink, "FAFAF", who=names[1:])
         assert [bool(plan.unreached) for plan in plans] == [False] * 4 + [True]
         assert plans[-1].unreached_rollup and len(plans[-1].unreached) == 7
-        rollups = [p for _k, s, p in sink.events if s == _UNREACHED_ALERT_SOURCE]
+        rollups = [p for _k, _s, p in _rollup_events(sink)]
         assert len(rollups) == 1 and _unreached_events(sink) == []
         assert rollups[0]["detail"].startswith("Accounts newly unreachable: 7.")
         assert "each failed 3+ of up to its last 5 probes" in rollups[0]["detail"]
