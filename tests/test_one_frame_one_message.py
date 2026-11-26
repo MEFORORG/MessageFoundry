@@ -851,12 +851,12 @@ def _short_lf_headers() -> list[str]:
     that reads a short ``BHS`` or ``FHS`` line past its LF turns them red on purpose."""
     bar, bom = "\N{BROKEN BAR}", "\N{ZERO WIDTH NO-BREAK SPACE}"
     firsts = {"MSH" + ("|^~" + BS + "&")[: n - 3] for n in range(3, 9)}
-    firsts |= {"MSH" + ("|^?" + BS + "&")[: n - 3] for n in range(4, 9)}
+    firsts |= {"MSH" + ("|^?" + BS + "&")[: n - 3] for n in range(3, 9)}
     firsts |= {"MSH?^", "MSH" + bar, "MSH|" + bar}
     seconds = ["?SA|AA|中", "MSA|AA|中", "中SA|AA|C", bar + "SA|AA|中", "MSA|AA|" + bar, "MSA|AA|C"]
     replies = {f + "\n" + s + end for f in firsts for s in seconds for end in ("\n", "")}
     replies |= {" " + bom + f + "\n" + s + "\n" for f in firsts for s in seconds[:2]}
-    replies |= {h + t for h in ("BHS", "FHS") for t in ("|^\n?SA|AA|中\n", "\n?SA|AA|中\n")}
+    replies |= {h + lead + "\n" + seconds[0] + "\n" for h in ("BHS", "FHS") for lead in ("|^", "")}
     return sorted(replies)
 
 
@@ -880,7 +880,7 @@ def test_a_short_lf_only_header_that_main_refused_is_refused(
     reply: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Shapes main refused and a read stopping at the LF sent; the last, a first line of ``MSH``
-    alone, is also sent by a read that keys on the first line's length. The refusal chains
+    alone, is also sent by a read that skips a first line under 4 characters. The refusal chains
     nothing."""
     with pytest.raises(UnicodeError, match="collide with one of its own delimiters") as ei:
         framing_mod.encode_reply(reply, "ascii", connection="IB_SHORT_LF")

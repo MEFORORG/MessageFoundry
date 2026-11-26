@@ -337,22 +337,20 @@ def _reply_delimiters(reply: str) -> frozenset[str]:
     well, so where its first line is shorter than the span ``_extract_separators`` reads, the
     characters after that line's LF are declared too.
 
-    Not read, so a ``?`` written for a data character can still land on a delimiter a receiver
-    reads, in at least these shapes (the changelog fragment for BACKLOG #5799 points here rather
-    than repeat them):
+    Not read, in at least these shapes, so a delimiter there that is ``?``, or that the charset
+    cannot encode, is not refused, and a ``?`` written for a data character can land on a
+    delimiter a receiver reads:
 
-    - an X12 reply led by ``ISA``, which declares nothing here, so an ``ISA`` delimiter that is
-      ``?`` or that the charset cannot encode is not refused either;
-    - a header after a lone LF in a CR reply, such as a member header after an LF-only blank line,
-      or every header after the first in a reply whose header lines end at LF but which holds a CR
-      elsewhere, though a receiver that reads every LF as a segment break, as
-      ``parsing.peek.normalize`` does, reads it as one;
-    - a ``BHS`` or ``FHS`` first line, in a reply with no CR, shorter than that span: it is read
-      only to its LF, so of the span a receiver splitting only at CR reads as its BHS-1 and BHS-2
-      (or FHS-1 and FHS-2), the characters after the LF are not declared. Before BACKLOG #5799 no
-      ``BHS`` or ``FHS`` header was read at all, so this leaves undeclared nothing the earlier
-      read declared;
-    - the fifth MSH-2 character (the v2.7 truncation character), declared as ``?``.
+    - an X12 reply led by ``ISA``, which declares nothing here;
+    - in a CR reply, a header that follows a lone LF rather than a CR, such as a member header
+      after an LF-only blank line, or a later header in a reply whose header lines end at LF,
+      though a receiver that reads every LF as a segment break, as ``parsing.peek.normalize``
+      does, reads it as one;
+    - a ``BHS`` or ``FHS`` first line, in a reply with no CR, shorter than the MSH-1 and MSH-2
+      span ``_extract_separators`` reads: it is read only to its LF, so of the span a receiver
+      splitting only at CR reads as its BHS-1 and BHS-2 (or FHS-1 and FHS-2), the characters
+      after the LF are not declared;
+    - the fifth MSH-2 character (the v2.7 truncation character).
 
     Leading whitespace and a BOM are skipped first, as the engine's one definition of tolerated
     leading noise (``sniff._LEADING_WS_STR``) skips them. In a reply with a CR, or after the first
