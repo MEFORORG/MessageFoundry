@@ -67,9 +67,10 @@ serve's Gate #1 refuses to start at it. *(Corrected 2026-10-06. This sentence re
 `GET /logs/tail` reads the **newest** file under `[logging].log_dir` (one level, `.log`/`.txt`), pages
 back from the end (`offset`/`limit`, newest page first), and returns each line **through
 `support.redact.redact_log_record`**, the per-line pass the support bundle's `redact_log_text` also
-runs; the `redact_log_record` docstring says how it wraps `redact_log_line`. Since BACKLOG
-#5550 both also mask PRIVATE KEY body lines across lines first, over different spans of text, so the
-two need not mask a line the same way; the `_read_log_tail` docstring says how they differ. The route is gated by a **new `logs:view` permission** via `require_phi_read`,
+runs; the `redact_log_record` docstring says how it wraps `redact_log_line`. Since the vault
+BACKLOG #5550 cross-line mask, both also mask PRIVATE KEY body lines across lines first, best-effort:
+the `mask_key_body_lines` docstring lists body lines that still print. They do so over different spans
+of text, so the two need not mask a line the same way; the `_read_log_tail` docstring says how they differ. The route is gated by a **new `logs:view` permission** via `require_phi_read`,
 which folds in the [ADR 0092] `enforce_phi_read_hop` data-path guard (a production-PHI instance on an
 unproven-secure serve hop refuses to emit) and the per-actor anti-automation throttle — exactly like the
 message-detail read. Each page served writes a `logs_view` audit row (actor + how many lines exposed —
