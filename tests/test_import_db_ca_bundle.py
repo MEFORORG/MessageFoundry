@@ -662,7 +662,7 @@ def test_a_bundle_holding_a_certificate_that_cannot_sign_certificates_imports_no
     )
     # Each refused certificate is named by its Subject too, not by thumbprint alone (BACKLOG #5561
     # item 27), on its own line under its reason.
-    # The attribute type admits bytes; a CN here is text, so narrow it and format the name itself.
+    # The attribute type admits bytes; a CN here is text, so narrow it and format the CN value by hand.
     subjects: list[str] = []
     for key, _why in refused:
         cn = chain[key][0].subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
