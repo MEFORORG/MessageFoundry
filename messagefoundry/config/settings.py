@@ -4401,6 +4401,20 @@ class AuthSettings(_Section):
             raise ValueError("oidc_clock_skew_seconds must be between 0 and 300")
         return value
 
+    @field_validator("oidc_jwks_ttl_seconds", "oidc_jwks_min_refetch_seconds")
+    @classmethod
+    def _check_oidc_jwks_interval(cls, value: int, info: ValidationInfo) -> int:
+        # JwksCache reads both as floats and refuses an int past the float range at construction
+        # (BACKLOG #6904), so the load refuses it too: `check` and `verify` then refuse what
+        # `serve` would. The value is withheld.
+        try:
+            float(value)
+        except OverflowError:
+            raise ValueError(
+                f"{info.field_name} is too large for a float (value withheld)"
+            ) from None
+        return value
+
     @field_validator("oidc_flow_ttl_seconds")
     @classmethod
     def _check_oidc_flow_ttl(cls, value: int) -> int:

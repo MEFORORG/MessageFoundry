@@ -27,7 +27,6 @@ amplify into a fetch storm against the IdP.
 from __future__ import annotations
 
 import base64
-import math
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -264,21 +263,24 @@ class _CacheState:
 
 
 def _require_interval(name: str, value: float) -> float:
-    """``value`` as an int or a finite float, or :class:`ValueError` (BACKLOG #6904).
+    """``value`` as a number of seconds at or above 0, or :class:`ValueError` (BACKLOG #6904).
 
-    Only what the settings can never produce is refused: a NaN or an infinity, a bool, text, or any
-    other type. Every comparison against NaN is false, so a NaN floor refuses every refetch after
-    the first and wedges key rotation for good, as an infinite floor does. Any int stays legal and
-    behaves as it always has, a negative one included: ``min_refetch_seconds`` of ``0`` or less
-    removes the amplification bound, a choice the security-loosening report names. Range limits are
-    the settings layer's to set, where the operator sees them at load. The refusal withholds the
-    value.
+    The type must be an int or a float; a bool, text or any other type is refused. The number is
+    then read by :func:`~messagefoundry.transports.base.float_setting`, which refuses a NaN, an
+    infinity and an int too large for a float. Every comparison against NaN is false, so a NaN floor
+    refuses every refetch after the first and wedges key rotation for good, as an infinite floor
+    does. An int past the float range would build the cache and then raise ``OverflowError`` where
+    the throttled path formats it, ending a sign-in callback in an unaudited 500. A negative is
+    refused too, the floor the settings load sets for both knobs (``ge=0``, BACKLOG #5318). Zero
+    stays legal: ``min_refetch_seconds`` of 0 removes the amplification bound, a choice the
+    security-loosening report names. The refusal withholds the value.
     """
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise ValueError(f"JwksCache {name} must be an int or a float (value withheld)")
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ValueError(f"JwksCache {name} must be finite (value withheld)")
-    return value
+    seconds = float_setting(value, knob=name, transport="JwksCache")
+    if seconds < 0:
+        raise ValueError(f"JwksCache {name} must not be negative (value withheld)")
+    return seconds
 
 
 def _require_gate_wait(value: float) -> float:
@@ -320,7 +322,8 @@ class JwksCache:
       (BACKLOG #6905). The wait is bounded; the fetch is bounded only per socket operation;
     * a fetch that fails leaves the previous good keys in place (fail-static within the TTL).
 
-    ``ttl_seconds`` and ``min_refetch_seconds`` must be an int or a finite float, and
+    ``ttl_seconds`` and ``min_refetch_seconds`` must be an int or a float that is finite, within
+    the float range and not negative, and
     ``gate_wait_seconds`` a number above 0 and at most ``threading.TIMEOUT_MAX``, or construction
     raises :class:`ValueError` (BACKLOG #6904).
     """

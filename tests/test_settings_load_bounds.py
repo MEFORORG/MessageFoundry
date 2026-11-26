@@ -33,6 +33,9 @@ _AUTH_REFUSED: list[tuple[str, Any]] = [
     ("max_sessions_per_user", -1),
     ("oidc_jwks_ttl_seconds", -1),
     ("oidc_jwks_min_refetch_seconds", -1),
+    # JwksCache refuses an int past the float range (BACKLOG #6904), so the load refuses it too.
+    ("oidc_jwks_ttl_seconds", 10**400),
+    ("oidc_jwks_min_refetch_seconds", 10**400),
     ("oidc_flow_cache_max", 0),
     ("oidc_flow_cache_max", -1),
     ("oidc_session_max_hours", 0),

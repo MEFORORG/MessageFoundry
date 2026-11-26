@@ -1786,24 +1786,42 @@ def _cache_with(field: str, value: float, fetch: Callable[[], bytes]) -> oidc.Jw
 @pytest.mark.parametrize("field", ["ttl_seconds", "min_refetch_seconds"])
 @pytest.mark.parametrize(
     "value",
-    [0, -1, 365 * 24 * 3600 + 1, 10**400, 1e300],
-    ids=["zero", "negative", "past-one-year", "int-too-large-for-a-float", "huge-finite"],
+    [-1, -0.5, 10**400],
+    ids=["negative-int", "negative-float", "int-too-large-for-a-float"],
 )
-def test_the_cache_accepts_any_int_or_finite_interval(
+def test_the_cache_refuses_an_interval_the_settings_load_refuses(field: str, value: float) -> None:
+    """BACKLOG #6904. The settings load refuses a negative for both knobs (BACKLOG #5318) and an int
+    too large for a float, so the cache refuses the same values. An int past the float range used
+    to build the cache and then raise OverflowError on the throttled path, ending a sign-in in an
+    unaudited 500."""
+    with pytest.raises(ValueError, match=field) as refused:
+        _cache_with(field, value, lambda: b"")
+    assert "value withheld" in str(refused.value)
+
+
+@pytest.mark.parametrize("field", ["ttl_seconds", "min_refetch_seconds"])
+@pytest.mark.parametrize(
+    "value",
+    [0, 365 * 24 * 3600 + 1, 10**300, 1e300],
+    ids=["zero", "past-one-year", "huge-int-within-float-range", "huge-finite"],
+)
+def test_the_cache_accepts_any_value_the_settings_load_accepts(
     field: str, value: float, rsa_key: rsa.RSAPrivateKey
 ) -> None:
-    """BACKLOG #6904. Any int the settings accept still builds the cache, as before this guard, so
-    ``serve`` does not refuse a value ``check`` and ``verify`` pass. Range limits are the settings
-    layer's."""
+    """BACKLOG #6904. Every value the settings load accepts still builds the cache, so ``serve``
+    does not refuse a value ``check`` and ``verify`` pass. An unknown kid then meets the throttled
+    path, which must refuse with JwksError and nothing else."""
     cache = _cache_with(field, value, lambda: _jwks_bytes(_rsa_jwk(rsa_key, "k1")))
     cache.get_key("k1", alg=SignatureAlgorithm.RS256)
+    with pytest.raises(oidc.JwksError):
+        cache.get_key("k9", alg=SignatureAlgorithm.RS256)
 
 
-def test_a_negative_refetch_floor_still_removes_the_bound(rsa_key: rsa.RSAPrivateKey) -> None:
-    """BACKLOG #6904. ``min_refetch_seconds`` of ``0`` or less removes the amplification bound, as
-    the security-loosening report says: every unknown-kid lookup fetches."""
+def test_a_zero_refetch_floor_removes_the_bound(rsa_key: rsa.RSAPrivateKey) -> None:
+    """BACKLOG #6904. ``min_refetch_seconds`` of ``0`` removes the amplification bound, as the
+    security-loosening report says: every unknown-kid lookup fetches."""
     fetch = _CountingFetch(_jwks_bytes(_rsa_jwk(rsa_key, "k1")))
-    cache = oidc.JwksCache(fetch, min_refetch_seconds=-1, clock=lambda: 0.0)
+    cache = oidc.JwksCache(fetch, min_refetch_seconds=0, clock=lambda: 0.0)
     for _ in range(3):
         with pytest.raises(oidc.JwksError):
             cache.get_key("k9", alg=SignatureAlgorithm.RS256)
