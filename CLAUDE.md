@@ -478,20 +478,24 @@ review proof the merge bullet below requires, and did not change what goes to th
 an author's own Builder may already be mid-fix on a held PR that looks quiet. Fleet wiki lesson
 20261103T145659705Z-kqwvhx found one on 2 of 4 quiet PRs, measured under the old 2-hour window,
 so at once is likely worse. The change removed at least two checks that also guarded against
-it, the mail to the author and the live-session test. What still guards against it includes at
+it, the mail to the author and the live-session test. The collision controls left include at
 least the head-moved check that binds repair Builders, which are briefed with it, the test that
-the hold still names the head, and the 30-minute answer exception. An author's in-flight Builder
-is not briefed with the head-moved check and may have none. **CHANGED 2026-11-26:** this rule required 2 hours of author silence, a mail to the
-author with no reply, and an author not live, and allowed one repair per PR (decision
+the hold still names the head, and the 30-minute answer exception. On a PR that looks quiet, the
+last two see nothing, so only the head-moved check bears on this risk, and only if the author
+pushes first. An author's in-flight Builder is not briefed with that check and may have none.
+**CHANGED 2026-11-26:** this rule required 2 hours of author silence, a mail to the author with
+no reply, and an author not live, and allowed one repair per PR (decision
 d20261029T165610526-c13ae6, under the owner's delegation of 2026-10-29; window cut from 4 hours to
 2 by the owner ruling of 2026-11-03 in the next paragraph).
 
 **A held PR whose author has not acknowledged the hold within 30 minutes transfers to the Repair
-Manager** (owner ruling 2026-11-03: asked *"Which tiers do you want to adopt?"* of the Repair
-Manager proposal, the owner answered *"Tiers 1 and 2"*; the paragraph above says where the
-30-minute window comes from). This covers a hold the paragraph above does not take, so the
-Repair Manager is the spawned Manager that paragraph sends a non-trivial fix or a hold after its
-second repair to; that second case transfers whether or not the author acknowledged it. An acknowledgement is an author comment or commit; the `hold-ack` marker
+Manager.** The owner ruling of 2026-11-03 adopted the transfer, at 2 hours: asked *"Which tiers do
+you want to adopt?"* of the Repair Manager proposal, the owner answered *"Tiers 1 and 2"*. The
+paragraph above says where the 30-minute window comes from. This covers a hold the paragraph above
+does not take, so the Repair Manager is the spawned Manager that paragraph sends a non-trivial fix
+or a hold after its second repair to. That second case transfers whether or not the author
+acknowledged it, with no not-live test; an author answer that disputes the hold returns it to the
+author instead. An acknowledgement is an author comment or commit; the `hold-ack` marker
 `scripts/coord/held_pr_turns.py` reads is its unambiguous form, and since every seat acts as the
 owner's GitHub identity, only the original author's comment or commit counts, a commit its own
 Builders push included; one from the Lander, another seat or a workflow is not one, the Lander's
@@ -499,36 +503,35 @@ branch updates included. A `hold-ack` expires 30 minutes after it while it is st
 author's newest event since the hold and no commit by the original author has landed since it
 (2026-11-26, as the paragraph above says; the earlier 2 hours was decided by the Lander under the
 owner's delegation of 2026-11-03, record d20261103T190111765-2aa8b6: asked *"should a hold-ack
-expire 2h after it"*, the owner answered *"/driver"*). The hold then counts as unacknowledged,
-which `scripts/coord/held_pr_turns.py` shows as the Lander's turn, flagged `ack-expired` only while the
-head is unchanged; any other head move already reads as the Lander's turn. A transfer on an
-expired `hold-ack` also needs the author to read not live: the author's claim and seat record show
-no live session, or the author's transcript ENDS on a question unanswered for more than 30
-minutes, which counts as no live session whatever its running state. That 30 minutes is the
-Manager's reading of the 2026-11-26 brief, not a number the brief set. The Lander reads this with
-`list_events` or korus `scripts/board/seatstate.py`, and confirms the question is the
-transcript's last turn rather than an older orphaned ask. The paragraph above's repair takes no
-such test. An author commit or ordinary reply hands the turn back to the Lander, and nothing
-expires then. The author may also hand the PR over sooner. The PR must not be queued or carry an armed auto-merge request.
-The Lander spawns one Manager for repairs in its own CCD
-instance, so `send_message` can wake it, and keeps it alive, respawning it if it dies. The
-transfer is, in order: the hold's URL sent to the Repair Manager with `send_message` as its brief;
-no transfer unless the send reports delivered, not queued or an error; the repair-owner marker
-`<!-- repair-owner session=<id> -->` on the PR, `<id>` being the Repair Manager's CCD `local_` id
-copied whole; the hold's URL sent to it again; and mail to the original author's seat-record
-worktree where it has one, naming the PR URL and that id. A Repair Manager that does not find the
-marker stops and waits to be woken. It never briefs a Builder without the marker naming it.
-Minimizing the newest marker, and any older one still unminimized, cancels the transfer and hands
-the PR back to the original author. At least stacks, landing order, author intent and anything
-already waiting on an owner ruling stay with the original author. Like the Lander and the
-Watchdog, the Repair Manager never uses `AskUserQuestion`; an owner question its own repair
-raises goes in a table. It never opens a PR, enqueues or merges. Its Builders fetch before they
-push, never force-push, stop if the head moved, stop at any refusal, and make only the fixes the
-hold names; the paragraph above names the collision risk that leaves. Every repair head it
-pushes takes the Lander's own independent review the paragraph above requires, before the merge.
-The procedure is in korus `roles/LANDER.md` and `roles/MANAGER.md`. **CHANGED 2026-11-26:** each
-window here was 2 hours: the transfer, the `hold-ack` expiry (`ACK_TTL` in
-`scripts/coord/held_pr_turns.py`) and the unanswered question.
+expire 2h after it"*, the owner answered *"/driver"*). The hold then counts as unacknowledged, which
+`scripts/coord/held_pr_turns.py` shows as the Lander's turn, flagged `ack-expired` only while the
+head is unchanged; any other head move already reads as the Lander's turn. A transfer on an expired
+`hold-ack` also needs the author to read not live: the author's claim and seat record show no live
+session, or the author's transcript ENDS on a question unanswered for more than 30 minutes, which
+counts as no live session whatever its running state. That 30 minutes is the Manager's reading of
+the 2026-11-26 brief, not a number the brief set. The Lander reads this with `list_events` or korus
+`scripts/board/seatstate.py`, and confirms the question is the transcript's last turn rather than an
+older orphaned ask. The paragraph above's repair takes no such test. An author commit or ordinary
+reply hands the turn back to the Lander, and nothing expires then. The author may also hand the PR
+over sooner. The PR must not be queued or carry an armed auto-merge request. The Lander spawns one
+Manager for repairs in its own CCD instance, so `send_message` can wake it, and keeps it alive,
+respawning it if it dies. The transfer is, in order: the hold's URL sent to the Repair Manager with
+`send_message` as its brief; no transfer unless the send reports delivered, not queued or an error;
+the repair-owner marker `<!-- repair-owner session=<id> -->` on the PR, `<id>` being the Repair
+Manager's CCD `local_` id copied whole; the hold's URL sent to it again; and mail to the original
+author's seat-record worktree where it has one, naming the PR URL and that id. A Repair Manager that
+does not find the marker stops and waits to be woken. It never briefs a Builder without the marker
+naming it. Minimizing the newest marker, and any older one still unminimized, cancels the transfer
+and hands the PR back to the original author. At least stacks, landing order, author intent and
+anything already waiting on an owner ruling stay with the original author. Like the Lander and the
+Watchdog, the Repair Manager never uses `AskUserQuestion`; an owner question its own repair raises
+goes in a table. It never opens a PR, enqueues or merges. Its Builders fetch before they push, never
+force-push, stop if the head moved, stop at any refusal, and make only the fixes the hold names; the
+paragraph above names the collision risk that leaves. Every repair head it pushes takes the Lander's
+own independent review the paragraph above requires, before the merge. The procedure is in korus
+`roles/LANDER.md` and `roles/MANAGER.md`. **CHANGED 2026-11-26:** each window here was 2 hours: the
+transfer, the `hold-ack` expiry (`ACK_TTL` in `scripts/coord/held_pr_turns.py`) and the unanswered
+question.
 
 **Every seat but Special runs the driver and empower rules.** Each seat except Special applies the
 `driver` and `empower` skills' rules by default, in local and cloud sessions, without the owner
