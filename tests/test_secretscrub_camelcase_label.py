@@ -630,7 +630,7 @@ def test_the_member_key_is_the_member_patterns_own_head() -> None:
     """``_union`` keeps the reading before where a member key's ";" would be lost; the key it looks
     for must be the one the member pass opens with."""
     head = secretscrub._MEMBER_KEY.pattern.removeprefix("(?i)").removesuffix("=")
-    assert secretscrub._CONNECTION_STRING_MEMBER.pattern.startswith(f"(?i)({head})=")
+    assert secretscrub._NARROW_MEMBER.pattern.startswith(f"(?i)({head})=")
 
 
 def test_a_semicolon_inside_a_camelcase_value_keeps_the_camelcase_reading() -> None:
