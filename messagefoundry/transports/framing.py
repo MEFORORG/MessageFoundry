@@ -336,9 +336,9 @@ def _reply_delimiters(reply: str) -> frozenset[str]:
     So a header after a lone LF in a CR reply is not read, though a receiver that reads every LF
     as a segment break, as ``parsing.peek.normalize`` does, reads it as one. The fifth MSH-2
     character (the v2.7 truncation character) is not read either. An X12 reply led by ``ISA``
-    declares nothing here, as on main before #5799 (its ISA read was withdrawn and is still open),
-    so an ``ISA`` delimiter that is ``?`` or that the charset cannot encode is not refused, and
-    ``?`` can be written into the reply's data.
+    declares nothing here, so an ``ISA`` delimiter that is ``?`` or that the charset cannot
+    encode is not refused, and a ``?`` written for a data character can read as one of the
+    ISA's delimiters. These are at least the residuals; the changelog names more.
 
     Leading whitespace and a BOM are skipped first, as the engine's one definition of tolerated
     leading noise (``sniff._LEADING_WS_STR``) skips them. A header line of ``MSH`` alone has no

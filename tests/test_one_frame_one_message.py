@@ -763,7 +763,8 @@ def test_frame_reply_reads_delimiters_past_a_leading_bom(lead: str) -> None:
 def _isa(
     *, element: str = "*", component: str = ":", repetition: str = "^", term: str = "~"
 ) -> str:
-    """A 106-character synthetic ISA header (106 plus one for a CR+LF terminator)."""
+    """A synthetic ISA header: 106 characters with a one-character ISA16 and terminator,
+    one more for a CR+LF terminator, fewer or more as ``component`` and ``term`` set."""
     fields = ["ISA", "00", " " * 10, "00", " " * 10, "ZZ", "SENDER".ljust(15), "ZZ"]
     fields += ["RECEIVER".ljust(15), "260101", "1200", repetition, "00501", "000000001", "0", "P"]
     return element.join([*fields, component]) + term
@@ -784,7 +785,7 @@ _GS = "GS*FA*SENDER*RECEIVER*20260101*1200*1*X*005010"
 #: ``ISA``-led reply shapes from the sweep the #5799 ISA read was reviewed over, each holding a
 #: character ASCII cannot encode. The ``nel-each`` and ``u2028-each`` shapes are the regression
 #: the read was withdrawn for: an empty ISA16, then ``~`` and NEL or U+2028 after each terminator,
-#: refused at 7781f875bb6 where main replaced and sent the reply.
+#: refused by the withdrawn read where main replaced and sent the reply.
 _ISA_SHAPES = {
     "isa16-q": _isa(component="?") + _TA1 + "中~",
     "isa11-q": _isa(repetition="?") + _TA1 + "中~",
@@ -796,9 +797,9 @@ _ISA_SHAPES = {
     "isa11-q-00401": _isa(repetition="?").replace("*00501*", "*00401*") + _TA1 + "中~",
     "isa16-empty": _isa(component="", term="") + "中" + _TA1 + "~",
     "nel-once": _isa(component="", term="") + "~\u0085" + _TA1 + "中~",
-    "u2028-once": _isa(component="", term="") + "~ " + _TA1 + "中~",
+    "u2028-once": _isa(component="", term="") + "~\u2028" + _TA1 + "中~",
     "nel-each": _isa(component="", term="") + "~\u0085" + _TA1 + "中~\u0085",
-    "u2028-each": _isa(component="", term="") + "~ " + _TA1 + "中~ ",
+    "u2028-each": _isa(component="", term="") + "~\u2028" + _TA1 + "中~\u2028",
     "isa16-two": _isa(component=":?", term="") + "~" + _TA1 + "中~",
     "element-in-isa06": _isa(component="?").replace("SENDER", "AC*MER", 1) + _TA1 + "中~",
     "unpadded": "ISA*00**00**ZZ*SENDER*ZZ*RECEIVER*260101*1200*^*00501*000000001*0*P*:~"
@@ -813,10 +814,12 @@ _ISA_SHAPES = {
 
 @pytest.mark.parametrize("reply", list(_ISA_SHAPES.values()), ids=list(_ISA_SHAPES))
 def test_an_isa_led_reply_reads_and_encodes_as_on_main(reply: str) -> None:
-    """The ISA half of BACKLOG #5799 item 2 is withdrawn: after four rounds its read still refused
-    shapes main replaced and sent (``nel-each`` and ``u2028-each``). An ``ISA``-led reply declares
-    what main's read declares, nothing, so its unencodable characters are replaced and the reply is
-    sent, as on main."""
+    """Pins a residual, not a wanted outcome: the ISA half of BACKLOG #5799 item 2 is withdrawn
+    and still open, because its read refused shapes main replaced and sent (``nel-each`` and
+    ``u2028-each``). An ``ISA``-led reply declares nothing, as main's read does, so its
+    unencodable characters are replaced and the reply is sent, even where the ``?`` written
+    then reads as one of the ISA's delimiters (ADR 0206). A fix that closes the open half turns
+    the ``?``-delimiter shapes red on purpose; the NEL and U+2028 shapes must stay green."""
     assert framing_mod._reply_delimiters(reply) == _main_reply_delimiters(reply) == frozenset()
     body, replaced = framing_mod.encode_reply_reporting(reply, "ascii", connection="IB_X12_MAIN")
     assert replaced and body == reply.encode("ascii", errors="replace")
