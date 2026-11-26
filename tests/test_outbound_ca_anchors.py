@@ -1291,6 +1291,23 @@ def test_a_ca_behind_an_http_ech_sidecar_is_unread() -> None:
     assert ta.unread_ca_reason({**base, "ech_egress": False}) is None
 
 
+def test_a_fhir_lookup_with_ech_egress_is_refused_at_executor_build() -> None:
+    """Pins the refusal the unread-CA reading above rests on. A FhirLookup holding ``ech_egress`` is
+    refused when its executor builds, before any opener could load a ``tls_ca_file`` beside it, so
+    no lookup hop reads such a CA. This passes on origin/main by design: it pins existing
+    behaviour, and fails only if that refusal is removed."""
+    from messagefoundry.transports.base import ECH_UNSUPPORTED_DESTINATION_MSG
+    from messagefoundry.transports.fhir import FhirLookupExecutor
+
+    egress = EgressSettings(deny_by_default=False)
+    base = {"url": "https://fhir.example.org/r4", "tls_ca_file": "unused-ca.pem"}
+    with pytest.raises(ValueError) as exc:
+        FhirLookupExecutor({"epic": {**base, "ech_egress": True}}, egress=egress)
+    assert str(exc.value) == ECH_UNSUPPORTED_DESTINATION_MSG
+    # CONTROL: the same lookup without the key builds, so the refusal is the key.
+    FhirLookupExecutor({"epic": {"url": "https://fhir.example.org/r4"}}, egress=egress)
+
+
 async def test_a_first_load_by_reload_leaves_the_lanes_to_the_runner(
     store: MessageStore, tmp_path: Path, judged: None
 ) -> None:

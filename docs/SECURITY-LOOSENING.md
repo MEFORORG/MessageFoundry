@@ -1040,12 +1040,21 @@ count is above `0` (vault BACKLOG #2613).
 - **What you lose:** a fixed set of routes asks for a fresh proof bound to that one action, used
   once. The `require_action_step_up` row of [CONFIGURATION.md](CONFIGURATION.md), under `[auth]`, lists them.
   With the switch off, those routes accept the session-wide step-up window instead. At least a
-  sign-in, a TOTP or recovery code on any session but an `oidc` one, and a passkey assertion that
+  local sign-in that owes no further factor, unless an account with a baseline signs in from an
+  address its known-address record has not seen in the last 90 days (so an account's first
+  sign-in, which has no baseline yet, opens it), a TOTP
+  or recovery code on any session but an `oidc` one, and a passkey assertion that
   completes a pending factor with the user-verification flag, on any session but an `oidc` one,
   can open that window; that flag is
   the authenticator's own report ([ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md),
-  2026-11-14 amendment). So a session taken over inside it can bind an authenticator, inject a message
-  or export bodies in bulk with no fresh proof.
+  2026-11-14 amendment). The `step_up_max_age_seconds` row of [CONFIGURATION.md](CONFIGURATION.md)
+  says which sign-ins open none. So a session taken over inside it can, with no fresh proof, at
+  least bind an authenticator, disable MFA where `[security].require_mfa` does not refuse the
+  disable, end the account's other sessions, reset another
+  account's password or factor, inject a message, export bodies in bulk, purge a queue or reload
+  config. CORRECTED 2026-11-26 (vault BACKLOG #8391): this read "At least a sign-in" and gave the
+  three consequences "bind an authenticator, inject a message or export bodies in bulk" as the
+  whole list.
 - **When acceptable:** a site that has chosen the earlier session-window behaviour, for example
   while a client that cannot send the bound proof is updated.
 - **Compensating controls:** keep `[auth].step_up_max_age_seconds` short, keep

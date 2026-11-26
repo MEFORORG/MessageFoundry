@@ -1174,7 +1174,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> MfaEnrollResponse:
         """Begin TOTP enrollment: stage a secret and return it + the ``otpauth://`` URI for the QR.
         Gated by a fresh **password** step-up BOUND to this enroll action (ADR 0077 — not MFA, you may
-        have none yet; and not the shared login window, so a hijacked session can't bind a factor); not
+        have none yet; and not the shared login window, so a hijacked session can't bind a factor,
+        except under ``[auth].require_action_step_up = false``, see docs/CONFIGURATION.md); not
         active until confirmed via ``/me/mfa/confirm``. No provider gate: an engine factor is engine-
         held state and every provider may hold one (BACKLOG #1144, and see
         :meth:`~messagefoundry.auth.service.AuthService.begin_mfa_enrollment` for why)."""
@@ -1198,7 +1199,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         single-use recovery codes (shown **once** — save them). A wrong code is a 400, and a
         directory account the directory could not confirm a 403 (BACKLOG #3061), as is a directory
         account under a second-step lock (BACKLOG #3810 finding 4). Gated by a fresh
-        password step-up BOUND to this confirm action (ADR 0077), independent of the enroll grant."""
+        password step-up BOUND to this confirm action (ADR 0077), except under
+        ``[auth].require_action_step_up = false`` (docs/CONFIGURATION.md); the bound proof is
+        independent of the enroll grant."""
         # Post-session ceremony (enrolling a factor while signed in): per-ACTOR budget.
         if not service.allow_reauth_attempt(identity.user_id):
             raise _rate_limited(request, "mfa-confirm")
@@ -1342,7 +1345,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         request: Request,
         service: AuthService = Depends(_service),
         # 7.5.2 (ASVS): terminating a session needs a fresh PASSWORD re-proof BOUND TO THIS ACTION
-        # (BACKLOG #1149) — single-use, so the login-seeded window no longer satisfies it. Still the
+        # (BACKLOG #1149) — single-use, so the login-seeded window no longer satisfies it, except
+        # under [auth].require_action_step_up = false (docs/CONFIGURATION.md, that row). Still the
         # reauth-only family and NOT the MFA gate, but no pending session passes it: one on an
         # account WITH a factor is refused (#1951), and so is one with NO factor that require_mfa
         # covers, which is told to enrol (#1149). The gate runs before the
@@ -1365,6 +1369,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # 7.5.2 (ASVS): action-bound password re-proof before mass-terminating the user's other
         # sessions (BACKLOG #1149). This is the route the cell turns on — a login-seeded window let a
         # caller sign every other session out with no proof beyond the sign-in they already held.
+        # Under [auth].require_action_step_up = false it still can (docs/CONFIGURATION.md, that row).
         identity: Identity = Depends(require_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE)),
     ) -> SimpleMessage:
         current = hash_token(bearer_token(request) or "")
@@ -1820,7 +1825,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         Refuses the caller's own account (BACKLOG #1149, ASVS 7.5.2). This route takes the login
         window, so on yourself it would end every session you hold with no fresh proof. The
         self-service ``DELETE /me/sessions`` ends your other sessions behind a single-use
-        ``session_terminate`` grant, and sign-out ends the current one."""
+        ``session_terminate`` grant, except under ``[auth].require_action_step_up = false``
+        (docs/CONFIGURATION.md, that row), and sign-out ends the current one."""
         target = await read_user_or_unreadable(service.store.get_user(user_id))
         await _refuse_if_self(
             request,
@@ -1924,7 +1930,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         request: Request,
         service: AuthService = Depends(_service),
         # BACKLOG #1148 (ASVS 7.5.1): the proof must be BOUND TO THIS ACTION and single-use, not
-        # the login-seeded window. require_step_up_ACTION, never the reauth_only variant -- that
+        # the login-seeded window, except under [auth].require_action_step_up = false
+        # (docs/CONFIGURATION.md, that row). require_step_up_ACTION, never the reauth_only variant -- that
         # one carries mfa_gate=False and would DROP the second factor from an admin resetting
         # someone else's credential. The enrolment deadlock that justifies mfa_gate=False does
         # not exist here: the operator's own enrolment has nothing to do with the target's.

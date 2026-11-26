@@ -174,7 +174,8 @@ register_ui_action(
 # BACKLOG #1149 (ASVS 7.5.2): both now carry an action= tag, the same treatment the factor lanes got
 # for 7.5.1. Without it these were the LAST /ui write actions whose gate a login-seeded window
 # satisfied, so the browser path -- the one a human actually uses -- stayed open after the JSON API
-# was closed. /ui/reauth mints the matching single-use grant and each terminate consumes one.
+# was closed. /ui/reauth mints the matching single-use grant and each terminate consumes one,
+# except under [auth].require_action_step_up = false (docs/CONFIGURATION.md, that row).
 register_ui_action(
     r"^/ui/account/sessions/[^/?#]+/revoke$",
     None,
@@ -739,16 +740,22 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     # --- L6b: self-service session management (#75 parity — desktop sessions.py twin) ---
     # LISTING one's OWN sessions is plain cookie-authenticated self-service (require_ui). TERMINATING
-    # one (revoke one / revoke-others) additionally requires a fresh PASSWORD re-proof
-    # (require_ui_reauth_only_action — ASVS 7.5.2), NOT the full MFA step-up. No pending session
+    # one (revoke one / revoke-others) additionally requires a fresh PASSWORD re-proof, except under
+    # [auth].require_action_step_up = false (docs/CONFIGURATION.md, that row), and NOT the full MFA
+    # step-up (require_ui_reauth_only_action — ASVS 7.5.2). No pending session
     # passes it: one with no factor under require_mfa is sent to enrol first. BACKLOG #1149
     # CORRECTED THE SENTENCE THAT STOOD HERE: it read "a fresh login seeds the step-up window, so an
     # immediate post-login revoke is unaffected", which was true of the code and was the defect --
     # 7.5.2 wants an authentication event AFTER the one that established the session. The proof is
     # now bound to the action and single-use, so an immediate post-login revoke 303s to
     # /ui/reauth?next=<this action> and auto-retries after re-verification (both terminate POSTs are
-    # registered auto_retry, step_up=False, above). The handlers read the HEADER/cookie session token
-    # to identify the current session and drive the SERVICE directly (the ui_mfa_verify pattern).
+    # registered auto_retry, step_up=False, above). Under the opt-out above, _ui_action_step_up_ok
+    # reads the session window instead, so a revoke with a live window goes through unless an
+    # earlier refusal stops it. At least these run first, in this order: the must-change
+    # confinement, the pending-session refusal (refuse_pending) and the new-client-IP refusal, all
+    # in require_ui; _ui_action_step_up_ok then repeats the factor-binding check. The
+    # handlers read the HEADER/cookie session token to identify the current session and drive the
+    # SERVICE directly (the ui_mfa_verify pattern).
     _SESSION_NOTICES = {
         "revoked": "Session revoked.",
         "revoke_missed": (

@@ -429,6 +429,41 @@ async def test_opt_out_restores_session_window(engine: Engine) -> None:
         assert (await c.post("/me/mfa/enroll", headers=_auth(token))).status_code == 200
 
 
+@pytest.mark.parametrize("action_step_up", [False, True], ids=["opted-out", "enforced"])
+async def test_opt_out_lets_a_login_seeded_window_terminate_a_session(
+    engine: Engine, action_step_up: bool
+) -> None:
+    """Under ``[auth].require_action_step_up = false`` the terminate gate falls back to the session
+    window, and a local sign-in that owes no further factor opens that window (an account's first
+    sign-in included; one from an address its known-address record has not seen in 90 days, on an
+    account with a baseline, opens none). So such a sign-in ends another session with no re-proof.
+    The ``require_action_step_up`` row of docs/CONFIGURATION.md states this, and docs/SECURITY.md
+    points there from "a login-seeded window does not unlock a terminate"; this pins it. The ``enforced`` arm is the contrast on the same account and
+    settings: there the same fresh sign-in is refused and told to bind a proof to the action."""
+    service = await _service(
+        engine, AuthSettings(require_action_step_up=action_step_up, require_mfa=False)
+    )
+    await _add_admin(service, "boss")
+    async with _client(engine, service) as c:
+        first = await _login(c, "boss")
+        second = await _login(c, "boss")
+        # CONTROL: from a stale window the terminate is refused, so a 200 below is the window.
+        await _make_stale(service, first)
+        stale = await c.delete(f"/me/sessions/{hash_token(second)}", headers=_auth(first))
+        assert stale.status_code == 403
+        assert stale.headers.get("X-Step-Up-Required") == "1"
+        assert (await c.get("/auth/me", headers=_auth(second))).status_code == 200
+        fresh = await c.delete(f"/me/sessions/{hash_token(first)}", headers=_auth(second))
+        if action_step_up:
+            assert fresh.status_code == 403
+            assert fresh.headers.get("X-Step-Up-Action") == "session_terminate"
+            assert (await c.get("/auth/me", headers=_auth(first))).status_code == 200
+        else:
+            # The fresh sign-in's window alone ends the other session, with no re-proof.
+            assert fresh.status_code == 200, fresh.text
+            assert (await c.get("/auth/me", headers=_auth(first))).status_code == 401
+
+
 async def test_mfa_pending_and_ad_do_not_deadlock(engine: Engine) -> None:
     """AC-5: an MFA-pending session (required-but-unenrolled admin) can still reach enrollment — the
     factor-binding routes are password-only (no MFA gate), so a per-action reauth unlocks them without
