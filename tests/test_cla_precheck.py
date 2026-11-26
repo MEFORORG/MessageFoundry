@@ -740,13 +740,50 @@ def test_a_committer_error_under_a_linked_author_past_page_one_is_judged() -> No
     assert evaluate(read, _ALLOWLIST, _no_signatures) == cla_precheck.Verdict(())
 
 
+def test_a_committer_error_past_page_one_still_lets_rule_two_refuse_its_linked_author() -> None:
+    """A linked author seen only past page one, whose commit has a committer error, is judged under
+    rule 2 from the intact author: unsigned, they are refused, not silently dropped."""
+    octo = {"oid": f"{1:040x}", "author": _OCTO, "committer": _OCTO}
+    bob = {"name": "Bob", "user": {"databaseId": 90000002, "login": "bob-contributor"}}
+    later = {"oid": f"{2:040x}", "author": bob, "committer": bob}
+    page_two = {
+        **_page([_committer_errored(later, "user")], 2, False),
+        "errors": [_node_error(0, "commit", "committer", "user")],
+    }
+    read = fetch_commits(
+        _serve([_page([octo], 2, True), page_two]), "MEFORORG", "MessageFoundry", 7
+    )
+    assert read.committer_tainted == frozenset({1})
+    verdict = evaluate(read, _ALLOWLIST, _no_signatures)
+    assert len(verdict.refusals) == 1 and "'bob-contributor'" in verdict.refusals[0]
+    assert verdict.fault is None
+
+
+def test_committer_errored_commits_with_no_oid_count_by_their_slot() -> None:
+    """As for any errored commit, a committer-errored one whose oid is unreadable counts once by its
+    slot, so two of them do not read as one commit and trip the count check."""
+    nodes: list[Mapping[str, Any]] = [
+        {"author": _UNLINKED, "committer": None},
+        {"author": _UNLINKED, "committer": None},
+    ]
+    page = {
+        **_page(nodes, 2, False),
+        "errors": [_node_error(0, "commit", "committer"), _node_error(1, "commit", "committer")],
+    }
+    verdict = evaluate(fetch_commits(_serve([page]), "MEFORORG", "MessageFoundry", 7), _ALLOWLIST)
+    assert verdict.fault is not None and "distinct commits" not in verdict.fault
+    assert "the commit at position 1: GraphQL reported an error inside its committer" in (
+        verdict.fault
+    )
+
+
 @pytest.mark.parametrize("rest", [("user",), ("user", "login"), ()])
 def test_a_committer_error_under_a_linked_page_one_author_leaves_it_unkeyed(
     rest: tuple[str, ...], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """PR 3323 hold, finding 17: a page-one committer error under a linked author must not key
-    that author, or their unsigned later-page commit skips rule 2 and the pre-check passes. As on
-    origin/main, the slot stays unkeyed with a fault, and rule 2 refuses the later commit."""
+    """PR 3323 hold, finding 17: a page-one committer error under a linked author leaves that
+    commit unkeyed with a fault, as origin/main did, so rule 2 still refuses the same author's
+    unsigned later-page commit rather than the pre-check passing it."""
     octo = {"oid": f"{1:040x}", "author": _OCTO, "committer": _OCTO}
     page_one = {
         **_page([_committer_errored(octo, *rest)], 2, True),
@@ -833,13 +870,23 @@ def test_a_partial_error_on_page_two_is_indexed_past_page_one() -> None:
     assert len(refusals) == 1 and f"{3:040x}" in refusals[0]
 
 
-def test_an_errored_first_page_commit_does_not_claim_the_author_is_absent() -> None:
-    """Its key is unknown, so an unsigned author past page one may be that commit's author. They
-    owe a signature either way, so the refusal stands, but its reason names only the first-page
-    commits the read could resolve."""
+@pytest.mark.parametrize(
+    ("path", "fault"),
+    [
+        (("commit", "committer", "user"), "error inside its committer; its key is missing"),
+        (("commit", "author", "user"), "error inside it; not judged"),
+        (("commit",), "error inside it; not judged"),
+    ],
+)
+def test_an_errored_first_page_commit_does_not_claim_the_author_is_absent(
+    path: tuple[str, ...], fault: str
+) -> None:
+    """The read leaves the commit out of the first page's keys, so an unsigned author past page
+    one may be that commit's author. They owe a signature either way, so the refusal stands, but
+    its reason names only the first-page commits the read keyed."""
     octo = _commit(1, "Octo", "octo-contributor", 90000001)
     pages = [
-        {**_page([octo], 2, True), "errors": [_node_error(0, "commit", "committer", "user")]},
+        {**_page([octo], 2, True), "errors": [_node_error(0, *path)]},
         _page([_commit(2, "Octo", "octo-contributor", 90000001)], 2, False),
     ]
     read = fetch_commits(_serve(pages), "MEFORORG", "MessageFoundry", 7)
@@ -849,7 +896,7 @@ def test_an_errored_first_page_commit_does_not_claim_the_author_is_absent() -> N
         "none of the 0 of them this read could key carries its author's key "
         "'octo-contributor'" in verdict.refusals[0]
     )
-    assert verdict.fault is not None and "GraphQL reported an error inside" in verdict.fault
+    assert verdict.fault is not None and fault in verdict.fault
     # The neighbour: with page one readable, the same author is on it, so nothing is owed.
     pages = [_page([octo], 2, True), pages[1]]
     read = fetch_commits(_serve(pages), "MEFORORG", "MessageFoundry", 7)
