@@ -11,13 +11,17 @@ All material is synthetic. No PHI.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from messagefoundry.config.tls_policy import InsecureHopRefused
+from messagefoundry.store.crypto import generate_key
 from messagefoundry.store.keyprovider import KeyProviderError
+from tests import test_b3471_key_and_hop_refusal_text as _b3471
 from tests.test_b3471_key_and_hop_refusal_text import (
     _HOST,
     _assert_no_key_byte,
@@ -25,6 +29,7 @@ from tests.test_b3471_key_and_hop_refusal_text import (
     _escaping,
     _host_echoing,
 )
+from tests.test_keyless_chain_every_command import _keyed_chain
 
 # --- item 2: only the guard's own call is the guard's refusal -------------------------------------
 
@@ -97,3 +102,52 @@ def test_the_probe_still_keeps_a_fail_closed_errors_own_text() -> None:
     assert _probe_why(KeyProviderError("[store].synthetic is not set")) == (
         "[store].synthetic is not set"
     )
+
+
+# --- item 11: a key-seam hop refusal is a key that could not be resolved ------------------------
+
+# Fixtures bound by name, so pytest applies them in this module too.
+key_file = _b3471.key_file
+shell = _b3471.shell
+
+
+@pytest.mark.parametrize("entry", ["resolve_active_key", "resolve_decrypt_keys"])
+def test_a_key_seam_hop_refusal_is_caught_by_every_cli_key_arm(
+    entry: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Red before the fix: the key seam raised a plain ``InsecureHopRefused``, which is not one of
+    the CLI's key-unresolved classes, so a key arm that catches only those missed it. It stays a
+    hop refusal, so a caller that reports one still does."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.config.settings import StoreSettings
+    from messagefoundry.store import base as store_base
+
+    _b3471._with_provider(monkeypatch, _host_echoing())
+    escaped = _escaping(lambda: getattr(store_base, entry)(StoreSettings()))
+    assert isinstance(escaped, InsecureHopRefused), type(escaped)
+    assert isinstance(escaped, cli._key_unresolved()), type(escaped)
+    assert _HOST not in str(escaped)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [_b3471._restore_verify_argv, _b3471._restore_argv],
+    ids=["restore-verify", "restore"],
+)
+def test_restore_and_restore_verify_exit_2_on_a_key_seam_hop_refusal(
+    argv: Callable[[Path], list[str]],
+    key_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Red before the fix: each reached the dispatch floor and exited 1."""
+    from messagefoundry.__main__ import main
+
+    _keyed_chain(key_file.parent / "keyed.db", generate_key())
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY_FILE", str(key_file))
+    _b3471._with_provider(monkeypatch, _host_echoing())
+    rc = main(argv(key_file.parent))
+    captured = capsys.readouterr()
+    assert rc == 2, (captured.out, captured.err)
+    assert "the store key or cipher could not be resolved" in captured.out, captured.out
+    assert _HOST not in captured.out + captured.err

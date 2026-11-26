@@ -3913,7 +3913,7 @@ def resolve_active_key(settings: StoreSettings, *, posture: HopPosture | None = 
         # caught error as its context; and the caught error is dropped, so the refusal's traceback
         # holds no frame local that reaches it.
         try:
-            refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, InsecureHopRefused)
+            refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, KeySeamHopRefused)
         finally:
             del caught  # dropped even where the call raises, at the recursion limit included
         raise refusal from None
@@ -4035,7 +4035,7 @@ def resolve_decrypt_keys(
         # As at :func:`resolve_active_key`, and with neither the caught error nor the refusal left
         # bound, even where the call raises, so no cycle through this frame keeps either.
         try:
-            refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, InsecureHopRefused)
+            refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, KeySeamHopRefused)
             raise refusal from None
         finally:
             del caught, refusal
@@ -4509,6 +4509,14 @@ class StoreCipherConfigError(ValueError):
     its own refusal. Three kinds get :func:`_codec_safe_refusal`'s fixed text instead (BACKLOG
     #3471, #4882): one with a codec error on it, one whose chain cannot be read whole, whether or
     not it holds a codec error, and one whose judgement raised an ``Exception``."""
+
+
+class KeySeamHopRefused(InsecureHopRefused, KeyProviderError):
+    """A hop refusal at the key seam, :func:`resolve_active_key` and :func:`resolve_decrypt_keys`
+    (vault BACKLOG #8163 item 11). Still an ``InsecureHopRefused``, so a caller that reports a hop
+    refusal still does, and a ``KeyProviderError`` too, so a CLI key arm that catches a key that
+    could not be resolved reports it: ``restore`` and ``restore-verify`` exit 2 on it, where a
+    plain hop refusal reached the dispatch floor and exited 1."""
 
 
 def _build_store_cipher(
