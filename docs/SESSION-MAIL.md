@@ -150,6 +150,9 @@ pwsh -NoProfile -File scripts\coord\mail.ps1 -Send -To all -Body "rebasing main 
 # every box in the repo, and this worktree's own box
 pwsh -NoProfile -File scripts\coord\mail.ps1 -List
 pwsh -NoProfile -File scripts\coord\mail.ps1 -Status
+
+# your own sent mail still in an inbox (not consumed), expiring within 24 hours
+pwsh -NoProfile -File scripts\coord\mail.ps1 -Expiring -WithinHours 24
 ```
 
 - `-To <path>` -- the recipient **worktree** path. Matched case-insensitively and exactly. `all`
@@ -161,8 +164,21 @@ pwsh -NoProfile -File scripts\coord\mail.ps1 -Status
   target is keyed for this PC.
 - `-ToSessionId <id>` -- optional filter. The message is delivered only if the reading session has that
   id. Use it when the note would be misleading to whoever occupies that worktree next.
-- `-TtlMinutes <n>` -- default 720. Past the TTL the message is swept to `expired/` rather than shown,
-  so a session starting next week is not told to act on something from last Tuesday.
+- `-TtlMinutes <n>` -- default 4320 (72 hours). Past the TTL the message is swept to `expired/` rather
+  than shown, so a session starting next week is not told to act on something from last Tuesday.
+  **CORRECTED (BACKLOG #1386):** this said the default was 720; `mail.ps1` raised it to 4320 on
+  2026-08-11, and its parameter comment says why.
+- `-Expiring [-WithinHours <n>]` -- the warning **before** a TTL fires (BACKLOG #1386). It lists the
+  mail this worktree sent, on this PC, that is still in a recipient's inbox, so not consumed, and whose
+  TTL falls within the window, default 24 hours. Mail a session was shown but has not consumed is
+  listed too, flagged HELD: the drain still sweeps it at its TTL, and its receipt then reads
+  `expired-unshown`. Mail past its TTL is listed until a drain of that box sweeps it, and a box no
+  session reads is never swept. The view is sender-side on purpose. The case that loses mail is an
+  idle recipient, and an idle seat runs no drain. After the loss, the recipient is told the swept id
+  only if the sweeping drain emits output, as at least a drain that shows mail or one at SessionStart
+  does. The sender learns from the `expired-unshown` receipt, when that write succeeds. Before the loss there are at least two signals: this view, and the drain
+  footer's inbox depth and oldest age, which reach only a recipient that runs a drain. A `from` field
+  is whatever the writer chose, so a row is a claim, not provenance.
 - `-Kind note|handoff|alert|broadcast` -- a label for the reader, nothing more.
 - `-MailRoot <path>` -- point the queue at a fixture. Tests use it; nothing else should.
 
