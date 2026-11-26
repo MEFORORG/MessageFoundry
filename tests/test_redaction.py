@@ -199,7 +199,7 @@ _HOSTILE_RUN_CHARS = 16_000
 #: (#2896). They moved to a CPU-time ratio, ``_CPU_GROWTH_LINE``, and their controls moved with them.
 #: Two more moved to a CPU-time ratio after the hosted readings of engine PR 3334, at ``-n 12`` on
 #: ubuntu: the frame-cap segment shape (tightest 1.88 times, worst 26.6 ms), on
-#: ``_CPU_GROWTH_LINE``, and the separator sniff on operational text (tightest 2.7 times, worst
+#: ``_CPU_GROWTH_LINE`` and ``_SEGMENT_CEILING_SECONDS``, and the separator sniff on operational text (tightest 2.7 times, worst
 #: 18.5 ms), on its own ``_OPS_GROWTH_LINE`` and ``_OPS_CEILING_SECONDS``.
 _SCAN_BUDGET_SECONDS = 0.05
 
@@ -294,7 +294,8 @@ _CPU_GROWTH_LINE = 24.0
 #: The absolute ceiling those arms also read, in CPU seconds for the large input. **Ten times the
 #: wall-clock budget, on purpose.** The ratio is what the arm is about; this bound keeps a linear
 #: path with a ruinous constant from passing. It is the same 0.5 s the MRN arm uses. The
-#: operational-text sniff arm reads its own ceiling, ``_OPS_CEILING_SECONDS``, on its small input.
+#: operational-text sniff arm reads its own ceiling, ``_OPS_CEILING_SECONDS``, on its small input,
+#: and the frame-cap segment arm reads ``_SEGMENT_CEILING_SECONDS`` on its large one.
 _CPU_CEILING_SECONDS = 0.5
 
 
@@ -2472,7 +2473,8 @@ def test_a_frame_cap_sized_input_no_longer_buys_the_event_loop(
 
     **This shape has no whitespace, so the clamp keeps an empty head** and this arm times the clamp,
     not a scan of a window. No arm in this file now holds a non-empty frame-cap window under this
-    number: the prose and segment arms read a CPU-time ratio and the looser
+    number on the wall clock. The segment arm holds one under the same number on the thread CPU
+    clock, ``_SEGMENT_CEILING_SECONDS``; the prose arm holds one only under the looser
     ``_CPU_CEILING_SECONDS``. The parametrize over one shape is kept so the test id, and the
     readings recorded under it, stay what they were."""
     text = _FRAME_CAP_SHAPES[label]()
@@ -2574,6 +2576,15 @@ def test_control_the_same_inputs_are_expensive_unbounded(
     )
 
 
+#: The absolute bound the frame-cap segment arm reads, in thread CPU seconds for the 16 MiB
+#: segment-shaped input, the input the budget arm timed with ``safe_text`` before this arm left it.
+#: **The same number as ``_SCAN_BUDGET_SECONDS``.** An earlier cut of this arm read
+#: ``_CPU_CEILING_SECONDS`` there, ten times looser than the budget on the same input; this restores
+#: the budget's strength. A separate literal, because it is read on another clock: a re-derived
+#: wall-clock budget does not move it. The readings and the margin are in the arm's docstring.
+_SEGMENT_CEILING_SECONDS = 0.05
+
+
 def test_a_frame_cap_sized_segment_input_costs_what_a_window_of_it_costs(
     record_property: _RecordProperty,
 ) -> None:
@@ -2582,28 +2593,38 @@ def test_a_frame_cap_sized_segment_input_costs_what_a_window_of_it_costs(
     was thin; the hosted readings are in the comment on ``_SCAN_BUDGET_SECONDS``.
 
     Measured 2026-11-26 (Central) on a Windows box, over twelve runs: a ratio of 0.85 to 1.6, at
-    least 15 times under the line, and 2.2 to 4.1 ms of CPU for the frame cap, at least 120 times
-    under ``_CPU_CEILING_SECONDS``.
+    least 15 times under the line. Over twelve more on a 32-core Windows box, seven of this arm alone
+    and five inside a ``pytest -n 12`` run of this file, a ratio of 0.85 to 1.55 and 3.28 to 3.98 ms
+    of CPU for the frame cap, the slowest under ``-n 12``: at least 0.05 / 0.00398 = 12.5 times under
+    ``_SEGMENT_CEILING_SECONDS``.
 
-    **What it gives up against the budget:** the ceiling is ten times looser than the old line, the
-    prose arm's trade. And a change that widens the clamp's window moves both sides of the ratio,
-    since the small side is cut at ``_REDACT_WINDOW``, and the ceiling passes a widening of about
-    0.5 / 0.0041 = 120 times; ``test_the_redact_window_is_pinned_for_the_frame_cap_ratios`` reads
-    that, with no clock."""
+    **The ceiling is read on the large side, at the budget's number**, the input and the number the
+    budget arm used. What changed is the clock, thread CPU time rather than wall time, and that has
+    a cost: time the thread spends blocked, on a lock, a sleep or a joined helper thread, stalls the
+    event loop but is charged almost nothing, so neither bound here reads it. A loaded runner still
+    inflates CPU seconds by a factor, through cache and frequency loss, and that factor has the
+    12.5 times above locally. The ``-n 12`` run did not oversubscribe the 32 cores, and no hosted
+    CPU reading exists yet; the hosted wall reading bounds hosted CPU only from above, and its worst,
+    26.6 ms, sits 1.88 times under this ceiling.
+
+    **What it gives up against the budget:** a change that widens the clamp's window moves both
+    sides of the ratio, since the small side is cut at ``_REDACT_WINDOW``, and the ceiling passes a
+    widening of about 0.05 / 0.00398 = 12.5 times;
+    ``test_the_redact_window_is_pinned_for_the_frame_cap_ratios`` reads that, with no clock."""
     growth, large, small = _frame_cap_growth("segment-shaped", safe_text)
     _record_reading(
         record_property, growth, _CPU_GROWTH_LINE, over=False, unit="ratio", sides=(large, small)
     )
     _record_reading(
-        record_property, large, _CPU_CEILING_SECONDS, over=False, unit="cpu_s", label="ceiling"
+        record_property, large, _SEGMENT_CEILING_SECONDS, over=False, unit="cpu_s", label="ceiling"
     )
     assert growth < _CPU_GROWTH_LINE, (
         f"safe_text on the frame-cap segment shape cost {growth:.1f} times one window of it, over "
         f"the {_CPU_GROWTH_LINE} line -- the scan is no longer bounded by the window"
     )
-    assert large < _CPU_CEILING_SECONDS, (
+    assert large < _SEGMENT_CEILING_SECONDS, (
         f"safe_text on the frame-cap segment shape cost {large:.4f} CPU seconds against a "
-        f"{_CPU_CEILING_SECONDS}s ceiling"
+        f"{_SEGMENT_CEILING_SECONDS}s ceiling"
     )
 
 
@@ -2634,7 +2655,7 @@ def test_the_redact_window_is_pinned_for_the_frame_cap_ratios(label: str) -> Non
     """A clock-free guard on the clamp's window, which the window-relative ratio arms cannot read.
 
     At least the prose, segment and credential-walk arms size both sides of their ratio from
-    ``_REDACT_WINDOW``, so a wider window moves both sides together, and their ceilings pass a wide
+    ``_REDACT_WINDOW``, so a wider window moves both sides together, and their ceilings pass a
     widening; the segment arm's docstring gives its figure. **This bound is what reads a
     widening.** It reads the constant, and the head ``safe_text_bound`` returns, which is what
     ``safe_text`` scans today, so a widening made in that call is read too. A widening made in a
