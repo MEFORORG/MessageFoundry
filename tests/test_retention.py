@@ -2076,6 +2076,62 @@ async def test_a_late_demotion_seen_by_the_archive_worker_matches_the_row(
     assert bool(logged) == details[0]["leadership_lost"], (logged, details)
 
 
+async def test_a_sweep_whose_archive_absorbed_the_cancel_starts_no_further_archive(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #6526: a stop cut by its timeout returns while the `.processed` sweep runs on. When
+    one archive's sweep swallows the cancel, the sweep must not start the next archive once the
+    stop may have returned: it reads the loop's stop on the event loop before each archive."""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    later: list[str] = []
+    first = FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path / "a")}))
+    second = FileSource(
+        Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path / "b")})
+    )
+
+    async def absorbs_the_cancel(*_a: object, **_k: object) -> int:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()
+        return 0
+
+    async def records(*_a: object, **_k: object) -> int:
+        later.append("second archive")
+        return 0
+
+    monkeypatch.setattr(first, "prune_processed_archive", absorbs_the_cancel)
+    monkeypatch.setattr(second, "prune_processed_archive", records)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(processed_archive_days=30),
+        clock=lambda: 100 * DAY,
+        archive_source=lambda: (first, second),
+    )
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        await runner.stop(timeout=0.1)
+        release.set()
+        await asyncio.wait({loop_task}, timeout=5)
+        assert later == []
+        assert loop_task.done()
+    finally:
+        release.set()
+        loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+    details = await _retention_audit_details(store)
+    assert [(d["interrupted"], d["interrupted_phase"]) for d in details] == [
+        (True, "processed_archives")
+    ]
+
+
 async def test_run_once_no_work_writes_no_audit(store: MessageStore) -> None:
     await _delivered(store, now=0.0)
     # Everything off → a pass does nothing and must not spam the audit log.

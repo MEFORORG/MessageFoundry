@@ -1604,6 +1604,10 @@ class RetentionRunner:
         swept: set[str] = set()
         deleted = 0
         for archive, key in zip(archives, keys, strict=True):
+            # The loop's stop, read here on the event loop: an archive whose sweep absorbed the
+            # cancel leaves `cancelled` clear, and the next must not start once stop() may have
+            # returned (BACKLOG #6526).
+            _raise_if_stopped()
             if stop_hit():
                 break
             # Only a source that archives is swept, and only it claims the directory, so a leave
