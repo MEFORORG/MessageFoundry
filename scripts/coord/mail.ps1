@@ -136,10 +136,11 @@ param(
     # expired the mail. Expiry is the only place in this transport where a message is genuinely LOST
     # rather than merely late, and it was reachable by doing nothing.
     #
-    # CORRECTED (BACKLOG #1386): this said expiry is silent in both directions. It is not, since
-    # BACKLOG #1228: the drain that sweeps a message names its id to the recipient and writes an
-    # 'expired-unshown' receipt the sender can read. Both arrive only AFTER the loss; the warning
-    # BEFORE it is -Expiring, below.
+    # CORRECTED (BACKLOG #1386): this said expiry is silent in both directions. Since BACKLOG #1228
+    # it is not always: the recipient is told the swept id only if the sweeping drain emits output,
+    # which it does when it shows mail or runs at SessionStart; a Stop drain that shows nothing emits
+    # nothing. The sender learns from the 'expired-unshown' receipt, when that write succeeds, after
+    # the loss, or before it from -Expiring, below.
     #
     # 72h is chosen to span a weekend, which is the longest gap a working session is expected to sit
     # through. It does NOT abandon the staleness argument above -- a three-day-old instruction is still
@@ -149,10 +150,11 @@ param(
     [Parameter(ParameterSetName = 'Send')][ValidateSet('note', 'handoff', 'alert', 'broadcast')][string]$Kind = 'note',
 
     [Parameter(ParameterSetName = 'List', Mandatory)][switch]$List,
-    # The caller's OWN sent mail that no session has been shown yet and whose TTL falls within
+    # The caller's OWN sent mail still in a recipient's inbox (not consumed) whose TTL falls within
     # -WithinHours, past-TTL-but-unswept included. The warning BEFORE expiry (BACKLOG #1386). It is
     # sender-side on purpose: the recipient that loses mail is an idle one, and it runs no drain.
-    [Parameter(ParameterSetName = 'Expiring', Mandatory)][switch]$Expiring,
+    # NOT Mandatory, for the reason given at $Send: -WithinHours alone would bind this set and prompt.
+    [Parameter(ParameterSetName = 'Expiring')][switch]$Expiring,
     [Parameter(ParameterSetName = 'Expiring')][ValidateRange(1, 8760)][int]$WithinHours = 24,
     [Parameter(ParameterSetName = 'Status', Mandatory = $false)][switch]$Status,
     [switch]$Json,
@@ -173,6 +175,9 @@ if ($env:CLAUDE_CODE_REMOTE -eq 'true') {
 # Send-set arguments without -Send: refuse by name, before anything is read or written. See $Send.
 if ($PSCmdlet.ParameterSetName -eq 'Send' -and -not $Send) {
     throw "Send arguments were given without -Send. Nothing was sent. Add -Send and re-run."
+}
+if ($PSCmdlet.ParameterSetName -eq 'Expiring' -and -not $Expiring) {
+    throw "-WithinHours was given without -Expiring. Nothing was read. Add -Expiring and re-run."
 }
 
 # --- Location ------------------------------------------------------------------------------------
@@ -607,7 +612,7 @@ if ($Send) {
         throw (
             "-ToSessionId '$ToSessionId' is not a harness session id, so the drain would compare it " +
             "against the reading session's id, never match, and leave the message in the inbox until " +
-            "it expired unshown, with each end told only after the loss. A harness session id is a " +
+            "it expired unshown. A harness session id is a " +
             "bare UUID; an id carrying a namespace prefix such as 'local_' belongs to a different id " +
             "space. Send with -To " +
             "<worktree path> and omit -ToSessionId unless you have the harness id."
@@ -684,13 +689,14 @@ if ($Send) {
         Write-Host "  'shown-held' means it was rendered; 'expired-unshown' means it reached its TTL"
         Write-Host "  first and NOBODY EVER SAW IT; no file at all means no drain has run yet, OR the"
         Write-Host "  receipt is older than the drain's retention window and has been swept."
-        # The warning BEFORE 'expired-unshown' (BACKLOG #1386). A receipt can only report the loss.
-        Write-Host "  Before that: mail.ps1 -Expiring lists your own mail still unshown near its TTL."
         # THE SECOND HALF OF THAT LAST LINE IS NOT HEDGING. The drain sweeps receipts/ of files past
         # RETAIN_DAYS, so an absent receipt stopped meaning one thing the day that sweep shipped. A
         # sender reading the old sentence a week later would conclude their message was never drained,
         # which is a false statement rather than a missing one -- the failure the sweep's own guards
         # exist to prevent, one file over. Read it within the window, or not at all.
+        #
+        # The warning BEFORE 'expired-unshown' (BACKLOG #1386). A receipt can only report the loss.
+        Write-Host "  Before that: mail.ps1 -Expiring lists your own mail still in an inbox near its TTL."
         Write-Host ""
     }
     if (@($written | Where-Object { $_.Status -ne 'queued' }).Count -gt 0) { exit 1 }
@@ -726,10 +732,24 @@ function ConvertTo-ExpiringUtc {
     return $Value.ToUniversalTime()
 }
 
+function Get-PrintableField {
+    # A message-supplied field made safe to print on one line. A minimal copy of the drain's Get-Fold
+    # (mail-drain.ps1), which lives in a hook this file cannot dot-source: control characters and line
+    # breaks become spaces, anything else outside printable ASCII becomes '?', whitespace collapses,
+    # and the result is capped. Without it a to.cwd holding a newline would print its own line.
+    param($Text, [int]$Cap = 240)
+    $t = ([string]$Text) -replace '[\p{C}]', ' '
+    $t = ($t -replace '[^\x20-\x7E]', '?' -replace '\s+', ' ').Trim()
+    if ($t.Length -gt $Cap) { $t = $t.Substring(0, $Cap - 3) + '...' }
+    return $t
+}
+
 if ($Expiring) {
     # THE WARNING BEFORE EXPIRY (BACKLOG #1386). Every box's inbox is read for mail this worktree
-    # sent that no session has been shown: no shown marker and no receipt, the two things the drain
-    # writes when it renders a message. Mail mid-claim in claiming/ is being shown and is skipped.
+    # sent that is still there, so not consumed. HELD mail is listed too, flagged: a message a session
+    # was shown but has not consumed (a shown marker or a receipt, which the drain writes when it
+    # renders) is still swept at its TTL, and its receipt then reads 'expired-unshown'. Mail mid-claim
+    # in claiming/ is being consumed and is skipped.
     $now = [DateTime]::UtcNow
     $horizon = $now.AddHours($WithinHours)
     $here = (Get-Location).Path
@@ -753,8 +773,8 @@ if ($Expiring) {
                 $shownStems = [System.Collections.Generic.HashSet[string]]::new(
                     [string[]]@(Get-BoxShownMarkerStems -Root $root -Key $d.Name), [StringComparer]::OrdinalIgnoreCase)
             }
-            if ($shownStems.Contains($parts.Stem)) { continue }
-            if (Test-Path -LiteralPath (Join-Path $receiptDir "$($parts.Stem).json")) { continue }
+            $held = $shownStems.Contains($parts.Stem) -or
+                (Test-Path -LiteralPath (Join-Path $receiptDir "$($parts.Stem).json"))
             $exp = ConvertTo-ExpiringUtc $row.Message.expiresUtc
             if ($null -eq $exp) { $undated++; continue }
             if ($exp -gt $horizon) { $beyond++; continue }
@@ -770,6 +790,7 @@ if ($Expiring) {
                 ExpiresUtc  = $exp.ToString('o')
                 MinutesLeft = [int][Math]::Floor(($exp - $now).TotalMinutes)
                 PastTtl     = ($exp -lt $now)
+                Held        = $held
             }
         }
     }
@@ -777,21 +798,22 @@ if ($Expiring) {
     if ($Json) {
         ([pscustomobject]@{
                 Worktree = $here; WithinHours = $WithinHours; Near = $near
-                UnshownBeyondWindow = $beyond; UnshownUndated = $undated
+                BeyondWindow = $beyond; Undated = $undated
                 MailRoot = $root; AsOfUtc = $now.ToString('o')
             } | ConvertTo-Json -Depth 5) | Write-Output
         exit 0
     }
     Write-Host ""
-    Write-Host "Mail sent from $here, not yet shown to any session, expiring within $WithinHours h (as of $($now.ToString('o'))):"
+    Write-Host "Mail sent from $here, still in an inbox (not consumed), expiring within $WithinHours h (as of $($now.ToString('o'))):"
     if ($near.Count -eq 0) { Write-Host "  (none)" }
     foreach ($n in $near) {
-        $when = if ($n.PastTtl) { "PAST ITS TTL; the next drain of that box sweeps it unshown" }
+        $when = if ($n.PastTtl) { "PAST ITS TTL; a drain of that box, if one ever runs, sweeps it as expired-unshown" }
         else { "expires in $($n.MinutesLeft) min" }
-        $sid = if ($n.ToSessionId) { "  only for session $($n.ToSessionId)" } else { '' }
-        Write-Host ("  {0}  ->  {1}  {2}{3}" -f $n.Id, $n.ToCwd, $when, $sid)
+        $state = if ($n.Held) { "  shown but HELD, not consumed; still swept at its TTL" } else { "  not yet shown" }
+        $sid = if ($n.ToSessionId) { "  only for session $(Get-PrintableField $n.ToSessionId 80)" } else { '' }
+        Write-Host ("  {0}  ->  {1}  {2}{3}{4}" -f $n.Id, (Get-PrintableField $n.ToCwd), $when, $state, $sid)
     }
-    Write-Host "  $beyond more unshown expire later than that; $undated carry an expiry this script did not write."
+    Write-Host "  $beyond more expire later than that; $undated carry an expiry this script did not write, or none."
     Write-Host "  The recipient may be idle: an idle seat runs no drain. Re-send by another channel, or"
     Write-Host "  re-send with a longer -TtlMinutes, if the hand-off still matters. A sender field is"
     Write-Host "  whatever the writer chose, so a row here is a claim, not provenance."
@@ -810,8 +832,9 @@ if ($List) {
                 Seen     = @(Get-BoxMessages -Root $root -Key $d.Name -Sub 'seen').Count
                 Done     = @(Get-BoxMessages -Root $root -Key $d.Name -Sub 'done').Count
                 # EXPIRY IS OTHERWISE VISIBLE FOR ONE TURN AND THEN GONE (BACKLOG #1228). The drain
-                # sweeps a message past its TTL into expired/ and says so once, in the render of the
-                # turn that swept it. After that only the sender's 'expired-unshown' receipt names it,
+                # sweeps a message past its TTL into expired/ and says so at most once, in the render
+                # of the turn that swept it, and only if that drain emits output (a Stop drain that
+                # shows nothing emits nothing). After that only the sender's 'expired-unshown' receipt names it,
                 # and only to a sender who reads that file, while both counts above stay whole. A message
                 # that expired unshown is the one outcome this channel most needs to be able to
                 # report, so it must be countable after the fact and not only as it happens.
@@ -920,13 +943,13 @@ Write-Host ("Next drain shows: at least {0} of {1} (caps: {2} messages / {3} byt
         $fits, $inbox.Count, $MAIL_CAP_MESSAGES, $MAIL_CAP_TOTAL_BYTES, [Math]::Max(0, $inbox.Count - $fits))
 Write-Host "In flight:     $($claiming.Count) claimed by a drain that has not finished"
 # CORRECTED (BACKLOG #1386): this said NOBODY WAS TOLD, silent to the sender and to the recipient.
-# Since BACKLOG #1228 the sweeping drain names each id once and writes the sender's receipt.
-Write-Host "Expired:       $($expired.Count) swept past their TTL unread. The drain that swept each one named"
-Write-Host "               it to this box's session once, and wrote its sender a receipt reading"
-Write-Host "               'expired-unshown'; both came AFTER the loss. Here is the only place this box"
-Write-Host "               names the count after that turn."
-Write-Host "Sent mail:     this view is mail sent TO you. For your own sent mail still unshown near its"
-Write-Host "               TTL, run mail.ps1 -Expiring."
+# Since BACKLOG #1228 that is not always so; what each end is told is stated in the lines below.
+Write-Host "Expired:       $($expired.Count) swept past their TTL before they were consumed. This box's session"
+Write-Host "               was told a swept id only if the sweeping drain emitted output: one that showed"
+Write-Host "               mail, or one at SessionStart. A Stop drain that shows nothing emits nothing."
+Write-Host "               The sender learns from the receipt 'expired-unshown', when it could be written."
+Write-Host "Sent mail:     this view is mail sent TO you. For your own sent mail still in an inbox near"
+Write-Host "               its TTL, run mail.ps1 -Expiring."
 if ($legacyInbox + $legacyClaiming + $legacyStranded -gt 0) {
     Write-Host "Legacy box:    $($oldKeys -join ', '), the older keys (path-only, or this subdirectory's own)."
     Write-Host "               $legacyInbox waiting, which each drain tries to move into this box; a count"
