@@ -58,7 +58,9 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
    replace the anchor, so ``enforce`` refuses to load it. A configured SHA-256 pin that matches the
    bytes read lets it load anyway, with a warning and the audit row: since item 5 those bytes are the
    bytes the context loads, so the pin already defeats a substitution. ``warn`` warns and loads.
-   The refusal names both fixes: move the anchor, or set the pin.
+   The refusal names both fixes: move the anchor, or set the pin. Under a mount the check cannot
+   vouch for, it names no move, and offers the pin only where the path is not also replaceable and
+   the anchor's consumer loads the verified bytes.
 7. **The per-connection inbound CAs** (BACKLOG #1142, slice 3). Every inbound connection whose server
    context requires a peer certificate (``tls`` and ``tls_ca_file`` set: MLLP, the HTTP listener and
    the DICOM SCP) gets the same checks. The connector loads its CA through
@@ -1684,13 +1686,10 @@ def _pin_verb(spec: AnchorSpec) -> str:
 
 
 def _pin_offer(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
-    """The pin to set: none where a configured pin already matches, and no digest of a file whose
-    path was found replaceable, or that a non-owner can write, since those bytes may be
-    substituted."""
-    if verdict.pin_ok is True:
-        return (
-            f"{spec.pin_setting or 'the configured pin'} already matches the bytes read; keep it."
-        )
+    """The pin to set, with no digest of a file whose path was found replaceable, or that a
+    non-owner can write, since those bytes may be substituted. Never called with a matching pin:
+    :func:`_enforce_verdict` loads such an anchor before it builds a fix, and a replaceable path
+    gets no pin offer."""
     if verdict.path_ok is False or verdict.acl_ok is False:
         return (
             f"{_pin_verb(spec)} the {ANCHOR_DIGESTS[ANCHOR_DIGEST].title} of the CA you mean to "
@@ -1718,6 +1717,8 @@ def _mount_fix(
     if verdict.path_ok is not False and spec.loads_verified_bytes:
         offer = _pin_offer(spec, verdict)
         lines.append(offer[0].upper() + offer[1:])
+    elif not spec.loads_verified_bytes and spec.pin:
+        lines.append(f"{_NO_PIN}.")
     lines.append(
         "As it stands, at warn the anchor is used with a warning; at enforce it is refused."
     )
@@ -1849,8 +1850,11 @@ def _indeterminate_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
     bytes may be substituted (:func:`_pin_offer`)."""
     check = verdict.path_check
     windows = check.platform == "windows" if check is not None else os.name == "nt"
-    # Only where the message lists the path's findings, so it names no mount it never did.
-    mount = _untrusted_mount(verdict) if verdict.path_ok is None else None
+    mount = _untrusted_mount(verdict)
+    if mount is not None and verdict.path_ok is False:
+        # The ACL could not be read beside a replaceable path: the path's own fix, which offers no
+        # pin for a replaceable path and no folder below the mount.
+        return "\n".join(_path_fix(spec, verdict))
     if mount is not None:
         return " ".join(_mount_fix(spec, verdict, mount, []))
     folder = (

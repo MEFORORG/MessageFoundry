@@ -995,39 +995,31 @@ def test_a_finding_no_command_fixes_names_the_file_to_replace() -> None:
     _assert_template(text, [_s1("/", "overlay"), _S2, _S2_FILE, _S4, _S6], [_S2 + ":", "chmod"])
 
 
-def test_the_mount_note_names_only_a_mount_the_message_lists(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize(
+    ("mount", "kind"), [("/", "overlay"), ("/srv", "nfs")], ids=["overlay-root", "nfs-srv"]
+)
+def test_the_acl_warning_under_an_untrusted_mount_is_the_template(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    mount: str,
+    kind: str,
 ) -> None:
-    """At warn, an insecure path whose chain also crosses an untrusted mount, with an ACL that
-    could not be read: the ACL's warning lists no path finding, so its fix names no mount. Red
-    under the note built from every finding."""
+    """At warn, an ACL that could not be read beside a replaceable path under an untrusted mount:
+    the ACL's warning follows the same template as the path's, with no pin for a replaceable path,
+    no digest, and no folder to move to. Red under the text that fell through to the folder and
+    the pin."""
     table = {**_MOUNT_TABLE, "/srv": (0, D777)}
-    v = _posix("/srv/a.pem", table, fstype={"/srv": "nfs"})
-    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: None)
-    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: v)
-    ta.enforce_anchor(AnchorSpec("t", "[x]", str(_pem(tmp_path)), None), enforcing=False)
-    acl = [r.message for r in caplog.records if "could not settle" in r.message]
-    assert len(acl) == 1 and "'/srv'" not in acl[0] and "the mount at" not in acl[0], acl
-
-
-def test_no_warning_quotes_the_digest_of_a_replaceable_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """At warn, an insecure path under an overlay root with an ACL that could not be read: the
-    ACL's warning comes after the path was found replaceable, so it quotes no digest of these
-    bytes. Red under the over-folder fix that quoted it."""
-    table = {**_MOUNT_TABLE, "/srv": (0, D777)}
-    v = _posix("/srv/a.pem", table, fstype={"/": "overlay"})
+    v = _posix("/srv/a.pem", table, fstype={mount: kind})
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: None)
     monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: v)
     p = _pem(tmp_path)
     ta.enforce_anchor(AnchorSpec("t", "[x]", str(p), None, "[x].pin"), enforcing=False)
     acl = [r.message for r in caplog.records if "could not settle" in r.message]
+    assert len(acl) == 1, acl
+    tail = [_S4, _S6] if kind == "overlay" else [_S4, _s5(mount)]
     digest = hashlib.sha256(p.read_bytes()).hexdigest()
-    assert len(acl) == 1 and digest not in caplog.text and "set [x].pin to" in acl[0], acl
-    # The ACL warning lists no path finding, so it names no mount either. Red under the over-folder
-    # text, which named '/'.
-    assert "the mount at" not in acl[0], acl
+    _assert_template(acl[0], [_s1(mount, kind), _S2, *tail], [_S3, "pin it to", digest])
 
 
 def test_no_digest_of_a_file_a_non_owner_can_write(
@@ -1099,6 +1091,20 @@ def test_no_fix_under_an_untrusted_mount_chowns_a_folder(
     _assert_template(text, [_s1(mount, kind), _S2, _S4, *s5], [_S3])
     if anchor == "/srv/x/a.pem":
         assert "  chown -h root /srv/x/a.pem" in text, text  # the anchor's own file
+
+
+def test_a_by_path_anchor_with_a_pin_says_why_the_pin_does_not_help(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A by-path anchor under an overlay '/' whose pin matches: the refusal says why that pin does
+    not help. Red under the template that dropped the sentence."""
+    v = _posix("/srv/a.pem", _MOUNT_TABLE, fstype={"/": "overlay"})
+    digest = hashlib.sha256(_pem(tmp_path).read_bytes()).hexdigest()
+    text = _refusal(
+        tmp_path, monkeypatch, v, pin_setting="[x].pin", loads_verified_bytes=False, pin=digest
+    )
+    no_pin = "A pin does not help here: this anchor is read again by path"
+    _assert_template(text, [_s1("/", "overlay"), no_pin, _S4, _S6], [_S3, _S2])
 
 
 def test_a_pin_is_not_offered_for_a_replaceable_path(
