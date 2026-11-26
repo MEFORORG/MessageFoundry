@@ -991,7 +991,10 @@ federated-identity bind and unbind, disable, delete, the admin session revoke, t
 the channel-scope write. The last three joined under BACKLOG #1149 (ASVS 7.5.2): each revokes the
 target's sessions on the login window, so aimed at yourself it would end every session you hold
 with no fresh proof. The self-service `DELETE /me/sessions` ends your other sessions only behind a
-single-use `session_terminate` grant, and *Sign out* ends the current one. The refusal is per
+single-use `session_terminate` grant while `[auth].require_action_step_up` is on (the default; the
+route table's `DELETE /me/sessions/{session_id}` row says what admits it when that is off), and
+*Sign out* ends the current one. CORRECTED 2026-11-26 (vault BACKLOG #8391): this named no
+exception for that setting. The refusal is per
 route and by target, so it does not reach a write that ends a whole group's sessions. At least four
 such writes, the AD group-map and scope-map saves and the custom-role edit and delete, are not refused
 (BACKLOG #3401): refusing them would lock an Administrator whose only account is a directory one out
@@ -1467,7 +1470,7 @@ apply. What each **adds** over plain `require()`:
 | `require_phi_read` | 8 | the ADR 0092 PHI-read hop refusal (`enforce_phi_read_hop`) **before** any identity work, then the **new-client-IP** refusal (403 + `X-Step-Up-Required: 1`, vault BACKLOG #2620), then the per-actor PHI-read budget, 429 + a `Retry-After` naming the actor's wait (the whole window while the global count is spent) |
 | `require_step_up` | 23 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
 | `require_step_up_action` | 20 | the same non-GET pacing (BACKLOG #1148), the **MFA gate**, then a **single-use, action-bound** step-up grant, minted on this plane only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`; the password leg of `POST /ui/reauth` and the IdP leg mint it for a cookie session). Promoting a route here no longer drops the pacing floor. Since vault BACKLOG #2625 it also gates the injection and bulk-export set (see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)) |
-| `require_reauth_only_action` | 4 | password step-up **without** the MFA gate — deadlock avoidance on the MFA-enrollment lanes. Session terminate (ASVS 7.5.2) rides it too, though no pending session passes there (BACKLOG #1149), and its grant is action-bound so a login-seeded window does not unlock it. `require_reauth_only` still exists and still backs the `/ui` twin, but BACKLOG #1149 moved the last JSON route off it, so it no longer appears in this walk |
+| `require_reauth_only_action` | 4 | password step-up **without** the MFA gate — deadlock avoidance on the MFA-enrollment lanes. Session terminate (ASVS 7.5.2) rides it too, though no pending session passes there (BACKLOG #1149), and its grant is action-bound so a login-seeded window does not unlock it, except under `[auth].require_action_step_up = false` (the `DELETE /me/sessions/{session_id}` row below says when). The enrolment lanes still refuse a pending session on an account that already has a factor (the `POST /me/mfa/enroll` row below). CORRECTED 2026-11-26 (vault BACKLOG #8391): this cell named neither. `require_reauth_only` still exists and still backs the `/ui` twin, but BACKLOG #1149 moved the last JSON route off it, so it no longer appears in this walk |
 | `require_service_cert` | 1 | cert-only authentication (a bearer token gets 401), and a **PHI fence** that raises at *app construction* if asked to gate `messages:view_summary` / `messages:view_raw` |
 
 `optional_identity` (2 routes) never raises, so a tokenless client is answered.
@@ -1685,12 +1688,12 @@ tuple: they act only on the caller's own account.
 | `POST` | `/me/reauth` | `require` | per-**actor** credential-ceremony limiter; mints the action-bound grant when `purpose=` is given; refuses an `oidc` session with 403 naming `/ui/reauth`, before any verify and charging nothing to the lockout (that session steps up at the IdP) |
 | `POST` | `/auth/mfa-verify` | `require` | draws the **sign-in** window (per-IP + global); feeds the per-account lockout; exempt from the confinement, so a must-change account that has a factor can prove it before it rotates (BACKLOG #1954) |
 | `GET` | `/me/mfa` | `require` | |
-| `POST` | `/me/mfa/enroll` | `require_reauth_only_action` (action `mfa_enroll`) | password-only step-up — the MFA gate is skipped so a required-but-unenrolled user cannot deadlock |
-| `POST` | `/me/mfa/confirm` | `require_reauth_only_action` (action `mfa_confirm`) | per-actor ceremony limiter; password-only step-up |
+| `POST` | `/me/mfa/enroll` | `require_reauth_only_action` (action `mfa_enroll`) | password-only step-up — the MFA gate is skipped so a required-but-unenrolled user cannot deadlock. That skip serves an account with no factor only: a pending session on an account that already has one is refused, `403` + `X-MFA-Required`, and proves that factor first (`AuthService._PENDING_REFUSED_ACTIONS`, BACKLOG #1951), whatever `[auth].require_action_step_up` says. CORRECTED 2026-11-26 (vault BACKLOG #8391): this row did not name that refusal |
+| `POST` | `/me/mfa/confirm` | `require_reauth_only_action` (action `mfa_confirm`) | per-actor ceremony limiter; password-only step-up, with the same refusal of a pending session on an account that already has a factor as the row above. CORRECTED 2026-11-26 (vault BACKLOG #8391): this row did not name that refusal |
 | `DELETE` | `/me/mfa` | `require_step_up_action` (action `mfa_disable`) | step-up bound to the disable action (current factor + a fresh password). **Refuses (400) whenever `[security].require_mfa` covers your local account and TOTP is on, unless a passkey recorded as discoverable remains**, because TOTP is then your only factor with a way past the sign-in lock; an administrator's factor reset is the recovery (`AuthService.disable_mfa`, ADR 0197 Amendment A). A directory account is refused only when TOTP is its last second factor and the requirement's scope covers it (BACKLOG #1022), and a local account the requirement does not cover is not refused. The passkey removal path refuses that last-factor case (ADR 0068 decision 5) and, from wave 2, the removal of a covered local account's last discoverable passkey while no TOTP remains, so the two routes no longer refuse on the same condition |
 | `GET` | `/me/sessions` | `require` | |
 | `GET` | `/me/security-events` | `require` | data rule: *Single-route data rules* below (BACKLOG #1151) |
-| `DELETE` | `/me/sessions/{session_id}` | `require_reauth_only_action` (action `session_terminate`) | re-proof step-up with no second-factor gate, bound to the action (ASVS 7.5.2): a login-seeded window does not unlock a terminate. The re-proof is at least the password or directory re-bind; the JSON plane has no federated leg of its own. A pending session is refused: one on an account with a factor proves it first (BACKLOG #1951), and under `[security].require_mfa` one with no factor, including a directory session that proved no factor whatever `require_mfa_scope` says, is MFA-pending and is told to enrol first (BACKLOG #1149). The refusal is `403` + `X-MFA-Required`, except for a must-change session, which the must-change confinement refuses first with its own `403`. See [Session inventory](#session-inventory--targeted-revocation-wp-10) |
+| `DELETE` | `/me/sessions/{session_id}` | `require_reauth_only_action` (action `session_terminate`) | re-proof step-up with no second-factor gate, bound to the action (ASVS 7.5.2): a login-seeded window does not unlock a terminate, except under `[auth].require_action_step_up = false`. There the gate falls back to the session window (`_action_step_up_ok` reads `has_recent_step_up`), and a local sign-in opens that window when it owes no further factor and does not come from an address first seen for the account (BACKLOG #288), so such a sign-in terminates with no re-proof. CORRECTED 2026-11-26 (vault BACKLOG #8391): this cell named no exception. The re-proof is at least the password or directory re-bind; the JSON plane has no federated leg of its own. A pending session is refused: one on an account with a factor proves it first (BACKLOG #1951), and under `[security].require_mfa` one with no factor, including a directory session that proved no factor whatever `require_mfa_scope` says, is MFA-pending and is told to enrol first (BACKLOG #1149). The refusal is `403` + `X-MFA-Required`, except for a must-change session, which the must-change confinement refuses first with its own `403`. See [Session inventory](#session-inventory--targeted-revocation-wp-10) |
 | `DELETE` | `/me/sessions` | `require_reauth_only_action` (action `session_terminate`) | as the row above: re-proof step-up bound to the action (ASVS 7.5.2). A pending session is refused as on the row above (BACKLOG #1951, #1149) |
 
 #### Gate-only check routes (ADR 0215)
@@ -6661,7 +6664,10 @@ engine bounds its own sessions with short caps, and the reconciler carries direc
 - end another user's sessions at once with `DELETE /users/{user_id}/sessions`, or by disabling the
   user in the engine. Both refuse the caller's own account with `400` (BACKLOG #1149 for the
   route). For your own sessions, Sign out ends the current one. `DELETE /me/sessions` ends the
-  others, but asks for a fresh step-up first. With `[auth].require_action_step_up` on (the
+  others, but asks for a fresh step-up first, except under `[auth].require_action_step_up = false`,
+  where a live session window, including one a sign-in opened, is enough (the route table's
+  `DELETE /me/sessions/{session_id}` row; CORRECTED 2026-11-26, vault BACKLOG #8391: this named
+  no exception). With `[auth].require_action_step_up` on (the
   default), a Kerberos session can give that step-up only by password. So a Kerberos session on a
   passwordless or smartcard-only account cannot end its other sessions this way. Under
   `[security].require_mfa` a Kerberos session that has proven no engine factor is MFA-pending,
@@ -6689,7 +6695,9 @@ Users and admins can see and revoke individual sessions (ASVS 7.5.2 / 7.4.5):
 - **`DELETE /me/sessions/{id}`** — revoke one of **your own** sessions (ownership-checked: another
   user's id returns 404, never revealing or touching it). **Gated on a fresh password re-proof bound
   to the `session_terminate` action** (ASVS 7.5.2 — see the route table above): the sign-in you
-  already hold does not unlock a terminate, and the grant is single-use.
+  already hold does not unlock a terminate, and the grant is single-use, except under
+  `[auth].require_action_step_up = false`, as the route table says. CORRECTED 2026-11-26 (vault
+  BACKLOG #8391): this bullet named no exception.
 - **`DELETE /me/sessions`** — "sign out everywhere else": revoke all your other sessions. The
   current one is kept only when the revoke re-stamps it. Otherwise it is ended too, in the
   revoke's own transaction, or, where its own seal fails, by the seal-failure handler before a
