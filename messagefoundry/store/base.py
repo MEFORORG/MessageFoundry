@@ -4087,6 +4087,24 @@ def _in_place_of(
 #: refusal, a DPAPI error, DPAPI unavailable, a ``ValueError``, and any other class.
 _SiteTexts = tuple[str, str, str, str, str]
 
+#: The classes :func:`_fresh_refusal` gives a text of their own, read with ``type``. A plain
+#: ``ValueError`` is not one: its text is the generic one for a refused key.
+_CLASSIFIED_REFUSALS: Final = (InsecureHopRefused, DpapiError, DpapiUnavailable)
+
+
+def _is_classified_refusal(exc: BaseException) -> bool:
+    """Whether :func:`_fresh_refusal` chooses ``exc``'s text by more than "``ValueError`` or
+    other": its class is one of :data:`_CLASSIFIED_REFUSALS`, it or its cause is the Vault hop's
+    marked refusal, or the engine built it (:func:`_recorded_text`). A seam that wraps an error
+    before ``_fresh_refusal`` sees it passes these through unwrapped, so the text stays the one
+    ``_fresh_refusal`` would have chosen (``keyprovider._load_external_provider``)."""
+    return (
+        issubclass(type(exc), _CLASSIFIED_REFUSALS)
+        or is_vault_hop_refusal(exc)
+        or is_vault_hop_refusal(_CAUSE.__get__(exc))
+        or _recorded_text(exc) is not None
+    )
+
 
 def _fresh_refusal(
     exc: Exception, texts: _SiteTexts, hop_as: type[Exception] = InsecureHopRefused

@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.settings import _FILE_SECRET_KEYS, StoreSettings
-from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.config.tls_policy import HopPosture, InsecureHopRefused
 from messagefoundry.store.base import resolve_active_key, resolve_decrypt_keys
 from messagefoundry.store.crypto import PREFIX, CipherError, cipher_info, make_cipher
 from messagefoundry.store.keyprovider import (
@@ -538,3 +538,80 @@ def test_the_processs_own_limits_from_the_provider_module_import_fail_closed(
     with pytest.raises(KeyProviderError, match=f"import failed: {error.__name__}") as caught:
         resolve_key_provider(StoreSettings(key_provider="vault"))
     assert isinstance(caught.value.__cause__, error)
+
+
+def _plant_build_provider(
+    monkeypatch: pytest.MonkeyPatch, make_error: Callable[[], Exception]
+) -> None:
+    fake = ModuleType("messagefoundry.store.keyprovider_vault")
+
+    def _build(settings: StoreSettings, *, posture: object = None) -> KeyProvider:
+        raise make_error()
+
+    fake.build_provider = _build  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        "messagefoundry.store.keyprovider.importlib.import_module", lambda _name: fake
+    )
+
+
+def _dpapi_error() -> Exception:
+    from messagefoundry.secrets_dpapi import DpapiError
+
+    return DpapiError("synthetic")
+
+
+def _dpapi_unavailable() -> Exception:
+    from messagefoundry.secrets_dpapi import DpapiUnavailable
+
+    return DpapiUnavailable("synthetic")
+
+
+@pytest.mark.parametrize(
+    ("make_error", "index"),
+    [
+        pytest.param(lambda: InsecureHopRefused("synthetic"), 0, id="hop-refused"),
+        pytest.param(_dpapi_error, 1, id="dpapi-error"),
+        pytest.param(_dpapi_unavailable, 2, id="dpapi-unavailable"),
+    ],
+)
+def test_a_classified_refusal_from_build_provider_keeps_its_own_text(
+    monkeypatch: pytest.MonkeyPatch, make_error: Callable[[], Exception], index: int
+) -> None:
+    # Engine PR 3321 hold item 2: a refusal store.base._fresh_refusal chooses a text of its own
+    # for passes through the build arm unwrapped, so the operator reads that text, as on main,
+    # and not the generic "key source failed" one a KeyProviderError gets.
+    from messagefoundry.store.base import _KEY_SEAM_TEXTS
+
+    _plant_build_provider(monkeypatch, make_error)
+    with pytest.raises(type(make_error())):
+        resolve_key_provider(StoreSettings(key_provider="vault"))
+    with pytest.raises(Exception) as caught:
+        resolve_active_key(StoreSettings(key_provider="vault"))
+    assert str(caught.value) == _KEY_SEAM_TEXTS[index]
+    assert str(caught.value) != _KEY_SEAM_TEXTS[4]
+
+
+def test_a_refusal_the_engine_built_from_build_provider_keeps_its_recorded_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # As above, for a refusal store.base recorded as its own: its recorded text survives.
+    from messagefoundry.store.base import StoreCipherConfigError, _recorded
+
+    text = "synthetic recorded refusal"
+    _plant_build_provider(monkeypatch, lambda: _recorded(StoreCipherConfigError(text), text))
+    with pytest.raises(StoreCipherConfigError):
+        resolve_key_provider(StoreSettings(key_provider="vault"))
+    with pytest.raises(Exception) as caught:
+        resolve_active_key(StoreSettings(key_provider="vault"))
+    assert str(caught.value) == text
+
+
+def test_a_plain_value_error_from_build_provider_is_still_refused_by_class(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The control: a ValueError that is none of those is still wrapped, so it is not read as a
+    # refused key (vault BACKLOG #6709).
+    _plant_build_provider(monkeypatch, lambda: ValueError("synthetic"))
+    with pytest.raises(KeyProviderError, match="could not be built") as caught:
+        resolve_key_provider(StoreSettings(key_provider="vault"))
+    assert "synthetic" not in str(caught.value)

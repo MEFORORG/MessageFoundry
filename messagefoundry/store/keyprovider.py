@@ -324,14 +324,21 @@ def _load_external_provider(
         ) from exc
     # The provider module owns its own construction; annotate the local so mypy keeps the contract.
     # A provider's own KeyProviderError keeps its text, and a MemoryError or RecursionError
-    # propagates. Any other Exception from its construction is refused as a KeyProviderError by
-    # class (vault BACKLOG #6709): left raw, a ValueError would reach store.base, which reads a
-    # ValueError as a refused key. Chained, as the import refusal above is.
+    # propagates. So does an error store.base._fresh_refusal chooses a text of its own for (a hop
+    # refusal, a DPAPI error, one the engine built: base._is_classified_refusal), so its report is
+    # the one main gave. Any other Exception from its construction is refused as a
+    # KeyProviderError by class (vault BACKLOG #6709): left raw, a ValueError would reach
+    # store.base, which reads a ValueError as a refused key. Chained, as the import refusal above
+    # is. Imported here: store.base imports this module.
+    from messagefoundry.store.base import _is_classified_refusal
+
     try:
         provider: KeyProvider = module.build_provider(settings, posture=posture)
     except (KeyProviderError, MemoryError, RecursionError):
         raise
     except Exception as exc:
+        if _is_classified_refusal(exc):
+            raise
         raise KeyProviderError(
             f"[store].key_provider={name!r}: its provider could not be built "
             f"({type(exc).__name__}, chained below)."

@@ -349,6 +349,24 @@ def test_an_external_providers_own_refusal_from_its_build_keeps_its_text(
         resolve_secret_provider(SecretsSettings(provider="vault"))
 
 
+def test_a_hop_refusal_from_an_external_providers_build_passes_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Engine PR 3321 hold item 2: the callers that print a hop refusal in its own words read it
+    # raw, so the build arm passes it through, as main did, rather than refusing it by class.
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+
+    refusal = InsecureHopRefused("synthetic hop refusal")
+
+    def _refuse(*_a: Any, **_k: Any) -> Any:
+        raise refusal
+
+    monkeypatch.setattr(secretprovider_vault, "build_provider", _refuse)
+    with pytest.raises(InsecureHopRefused) as caught:
+        resolve_secret_provider(SecretsSettings(provider="vault"))
+    assert caught.value is refusal
+
+
 @pytest.mark.parametrize("error", [MemoryError, RecursionError])
 def test_the_processs_own_limits_from_the_lazy_hvac_import_fail_closed(
     monkeypatch: pytest.MonkeyPatch, error: type[BaseException]
