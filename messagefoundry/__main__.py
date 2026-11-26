@@ -6564,7 +6564,12 @@ def _dryrun(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import SectionNameEnvError
     from messagefoundry.config.snapshot import ConfigDirMissing
     from messagefoundry.config.wiring import WiringError, load_config
-    from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_messages
+    from messagefoundry.pipeline.dryrun import (
+        dry_run,
+        dry_run_reference_view,
+        fixture_cap,
+        read_messages,
+    )
     from messagefoundry.redaction import safe_error
 
     resolved = _resolve_offline_anchor(args, env_file_check=False)
@@ -6598,6 +6603,18 @@ def _dryrun(args: argparse.Namespace) -> int:
     except SectionNameEnvError as exc:
         return _emit_error(str(exc), as_json=args.json)
 
+    # Built once for the run, as `check` builds it, so each file-backed reference set is read once
+    # rather than once per message (BACKLOG #6820). A loader fault the builder does not turn into a
+    # skipped set ends the run naming its type alone, since it now sits outside dry_run's own guard,
+    # which reported it as each message's ERROR.
+    try:
+        reference_view = dry_run_reference_view(reg)
+    except Exception as exc:  # noqa: BLE001 - the type alone reaches the report
+        return _emit_error(
+            f"reference sets did not load for the preview ({type(exc).__name__})",
+            as_json=args.json,
+        )
+
     show_phi: bool = args.show_phi
     if not show_phi:
         print(
@@ -6620,6 +6637,7 @@ def _dryrun(args: argparse.Namespace) -> int:
                     inbound=args.inbound,
                     show_phi=show_phi,
                     snapshot_on_send=snapshot_on_send,
+                    reference_view=reference_view,
                 )
                 traced.append({"source": source, "path": path, **entry})
         except (ValueError, KeyError) as exc:  # e.g. ambiguous/unknown --inbound
@@ -6630,7 +6648,13 @@ def _dryrun(args: argparse.Namespace) -> int:
     out: list[dict[str, Any]] = []
     try:
         for source, path, raw in messages:
-            result = dry_run(reg, raw, inbound=args.inbound, snapshot_on_send=snapshot_on_send)
+            result = dry_run(
+                reg,
+                raw,
+                inbound=args.inbound,
+                snapshot_on_send=snapshot_on_send,
+                reference_view=reference_view,
+            )
             out.append(
                 {
                     "source": source,
