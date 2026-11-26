@@ -283,6 +283,30 @@ def test_nested_roots_are_refused(tmp_path: Path) -> None:
     assert proc.returncode == 2, (proc.stdout, proc.stderr)
 
 
+@pytest.mark.parametrize("prefix", ["\\\\?\\", "\\\\.\\", "//?/"])
+@pytest.mark.parametrize("which", ["-Source", "-Target"])
+def test_a_device_path_source_or_target_is_refused_with_the_message(
+    tmp_path: Path, prefix: str, which: str
+) -> None:
+    # BACKLOG #7569: a device spelling is refused as the resolver refuses one; here the nesting check
+    # also could not compare it with a plain spelling of the same tree. With -Apply, a run that got
+    # past the refusal would create the target, so its absence shows nothing was written.
+    src = _source(tmp_path)
+    dst = tmp_path / "dst"
+    args = {"-Source": str(src), "-Target": str(dst)}
+    args[which] = prefix + args[which]
+    proc = _pwsh(
+        MIGRATE, "-Source", args["-Source"], "-Target", args["-Target"], "-Apply", cwd=tmp_path
+    )
+    assert proc.returncode == 2, (proc.stdout, proc.stderr)
+    want = (
+        f"coord-migrate.ps1: {which} is a device path, which is refused: {args[which]}. Spell the root"
+        r" plainly instead, as X:\... or \\srv\share\.... Nothing was read from or written to that root."
+    )
+    assert proc.stderr.strip() == want, proc.stderr
+    assert not dst.exists()
+
+
 @pytest.mark.parametrize("script", [MIGRATE, RACE], ids=["migrate", "race"])
 def test_a_bare_call_refuses_rather_than_prompting(tmp_path: Path, script: Path) -> None:
     code, err = run_holding_stdin_open(

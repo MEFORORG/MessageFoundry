@@ -146,10 +146,14 @@ function Get-InnerException($ErrorRecord) {
 
 if (-not $Source) { Stop-Usage 'needs -Source <dir>.' }
 if (-not $Target -or -not $Target.Trim()) { Stop-Usage 'needs -Target <dir>.' }
-# Plain spellings, as the resolver holds a root, so a device-path -Target probes the server it names
-# and the nesting check below compares like with like.
-$srcRoot = Get-FullPath (ConvertTo-CoordPlainRoot $Source)
-$dstRoot = Get-FullPath (ConvertTo-CoordPlainRoot $Target)
+# A device path is refused as the resolver refuses one (Get-CoordDeviceRootRefusal says why), and
+# here also because the nesting check below cannot compare it with a plain spelling of the same tree.
+foreach ($arg in @(@('-Source', $Source), @('-Target', $Target))) {
+    $device = Get-CoordDeviceRootRefusal -What $arg[0] -Path $arg[1].Trim($script:CoordWs)
+    if ($device) { Stop-Usage $device }
+}
+$srcRoot = Get-FullPath $Source
+$dstRoot = Get-FullPath $Target
 if (-not (Test-Path -LiteralPath $srcRoot -PathType Container)) { Stop-Usage "-Source '$srcRoot' is not a directory." }
 $sep = [System.IO.Path]::DirectorySeparatorChar
 # Nested roots would copy the target into itself, or read back what this run just wrote.

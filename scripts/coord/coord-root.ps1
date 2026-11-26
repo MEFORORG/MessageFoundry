@@ -79,6 +79,8 @@ $script:CoordSharingHResults = @([int]0x80070020, [int]0x80070021)
 $script:CoordRootLine = [regex]"\A[ \t]*shared_root[ \t]*=[ \t]*'([^']*)'[ \t]*(#.*)?\z"
 $script:CoordBlankLine = [regex]'\A[ \t]*(#.*)?\z'
 $script:CoordWs = [char[]]@(' ', "`t", "`r", "`n")
+# A \\?\ or \\.\ device path, in any form; Get-CoordDeviceRootRefusal says why one is refused.
+$script:CoordDevicePrefix = '\A[\\/]{2}[?.](?:[\\/]|\z)'
 
 function ConvertFrom-CoordRootBytes {
     # UTF-16 with a BOM, UTF-8 with or without one, STRICTLY: Windows PowerShell 5.1 writes UTF-16 with
@@ -133,11 +135,12 @@ function Get-CoordSharedRoot {
     $envValue = [string][Environment]::GetEnvironmentVariable($script:CoordRootEnv)
     $envValue = $envValue.Trim($script:CoordWs)
     if ($envValue) {
-        $plain = ConvertTo-CoordPlainRoot $envValue
-        if (-not (Test-CoordAbsolutePath $plain)) {
+        $device = Get-CoordDeviceRootRefusal -What $script:CoordRootEnv -Path $envValue
+        if ($device) { return @{ Path = $null; Source = 'env'; Error = $device } }
+        if (-not (Test-CoordAbsolutePath $envValue)) {
             return @{ Path = $null; Source = 'env'; Error = "$($script:CoordRootEnv) is not an absolute path: $envValue" }
         }
-        return @{ Path = $plain; Source = 'env'; Error = $null }
+        return @{ Path = $envValue; Source = 'env'; Error = $null }
     }
     $local = if ($LocalRoot) { $LocalRoot } else { Get-CoordLocalRoot -From $From }
     if (-not $local) {
@@ -173,46 +176,26 @@ function Get-CoordSharedRoot {
         $found = $m.Groups[1].Value.Trim($script:CoordWs)
     }
     if ($null -eq $found) { return @{ Path = $null; Source = 'file'; Error = "$file names no shared_root" } }
-    $plain = ConvertTo-CoordPlainRoot $found
-    if (-not (Test-CoordAbsolutePath $plain)) {
+    $device = Get-CoordDeviceRootRefusal -What "$file shared_root" -Path $found
+    if ($device) { return @{ Path = $null; Source = 'file'; Error = $device } }
+    if (-not (Test-CoordAbsolutePath $found)) {
         return @{ Path = $null; Source = 'file'; Error = "$file names a shared_root that is not an absolute path: $found" }
     }
-    return @{ Path = $plain; Source = 'file'; Error = $null }
+    return @{ Path = $found; Source = 'file'; Error = $null }
 }
 
-function ConvertTo-CoordPlainRoot {
-    # A device-path spelling of a root, rewritten to its plain form on Windows: \\?\X:\p and \\.\X:\p
-    # become X:\p, and \\?\UNC\srv\share\p and \\.\UNC\srv\share\p become \\srv\share\p (BACKLOG
-    # #7569). Every consumer then sees a spelling it already handles: claim.ps1 reads the root with
-    # wildcard -Path cmdlets, which misread \\?\, and the 445 probe needs the server a UNC path names.
-    # A spelling is left as it is, so its '?' or '.' still reads as a server no probe reaches and it
-    # fails fast as before, when the rewrite would name another directory or lose the fast probe. At
-    # least these: any other device form, such as GLOBALROOT or a volume GUID; a bare \\?\X:, which
-    # names the volume; a remainder Win32 would respell (a '/', an empty segment, or a segment ending
-    # in '.' or a space, '.' and '..' included); a remainder holding a wildcard character, which
-    # claim.ps1's -Path cmdlets misread in a plain path too; a \\?\UNC\ remainder with no share; a
-    # plain form of MAX_PATH or more, which Python opens only with long paths enabled; and a drive
-    # Windows reports as Network, since X:\ is never probed. The Python twin, _plain, applies the
-    # same rules. NOT covered: a local directory that links to a share is rewritten, and loses the
-    # fast failure its device spelling had.
-    param([string]$Path)
-    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return $Path }
-    if ($Path -cmatch '(?s)\A[\\/]{2}[?.][\\/]([A-Za-z]:)\\(.*)\z') {
-        $drive = $Matches[1]
-        $rest = $Matches[2]
-        try {
-            if ([System.IO.DriveInfo]::new($drive + '\').DriveType -eq [System.IO.DriveType]::Network) { return $Path }
-        } catch { return $Path }
-        $plain = $drive + '\' + $rest
-    } elseif ($Path -cmatch '(?s)\A[\\/]{2}[?.][\\/][Uu][Nn][Cc]\\(.*)\z') {
-        $rest = $Matches[1]
-        if ($rest -cnotmatch '\A[^\\]+\\[^\\]') { return $Path }
-        $plain = '\\' + $rest
-    } else {
-        return $Path
-    }
-    if ($rest -cmatch '/|\\\\|\A\\|[. ](?:\\|\z)|[\[\]*?`]' -or $plain.Length -ge 260) { return $Path }
-    return $plain
+function Get-CoordDeviceRootRefusal {
+    # Why a root spelled as a device path is refused, or $null for any other spelling (BACKLOG #7569).
+    # \\?\ and \\.\, in any form and with either separator, are refused wherever a root is resolved:
+    # here for the env value and root.toml, and in coord-migrate.ps1 for -Source and -Target. Not
+    # every consumer handles one: claim.ps1 reads the root with wildcard -Path cmdlets, which misread
+    # \\?\, and the 445 probe reads '?' or '.' as the server. Rewriting one to its plain spelling
+    # named another directory, or lost the fast probe, in cases no list held, so the spelling is
+    # refused before any probe, file call or down-cache write. The Python twin,
+    # _device_root_refusal, gives the same text.
+    param([string]$What, [string]$Path)
+    if ($Path -notmatch $script:CoordDevicePrefix) { return $null }
+    return "$What is a device path, which is refused: $Path. Spell the root plainly instead, as X:\... or \\srv\share\.... Nothing was read from or written to that root."
 }
 
 function Test-CoordAbsolutePath {
@@ -229,10 +212,7 @@ function Test-CoordSharedKind {
 }
 
 function Get-CoordUncHost {
-    # The server name of a \\server\share path, or $null for anything else. A resolved root, and
-    # coord-migrate's -Target, pass through ConvertTo-CoordPlainRoot first, so a device form it left
-    # alone names its '?' or '.', which no probe reaches: it fails fast rather than risk a file call
-    # that hangs.
+    # The server name of a \\server\share path, or $null for anything else.
     param([string]$Path)
     if ($Path -match '\A[\\/]{2}([^\\/]+)[\\/]') { return $Matches[1] }
     return $null

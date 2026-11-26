@@ -49,13 +49,8 @@ _BLANK_OR_COMMENT = re.compile(r"\A[ \t]*(#.*)?\Z")
 _LINE_BREAK = re.compile(r"\r\n|\n|\r")
 # A drive letter, colon and separator, a UNC \\server\share, or (off Windows) a leading slash.
 _ABSOLUTE = re.compile(r"\A(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+|/(?![\\/]))")
-# The patterns ConvertTo-CoordPlainRoot carries; its comment says why each exists.
-_DEVICE_DRIVE = re.compile(r"\A[\\/]{2}[?.][\\/]([A-Za-z]:)\\(.*)\Z", re.S)
-_DEVICE_UNC = re.compile(r"\A[\\/]{2}[?.][\\/][Uu][Nn][Cc]\\(.*)\Z", re.S)
-_RESPELLED_REST = re.compile(r"/|\\\\|\A\\|[. ](?:\\|\Z)|[\[\]*?`]")
-_UNC_SHARE = re.compile(r"\A[^\\]+\\[^\\]")
-_MAX_PATH = 260
-_DRIVE_REMOTE = 4
+# A \\?\ or \\.\ device path, in any form; Get-CoordDeviceRootRefusal says why one is refused.
+_DEVICE_PREFIX = re.compile(r"\A[\\/]{2}[?.](?:[\\/]|\Z)")
 _UNC = re.compile(r"\A[\\/]{2}([^\\/]+)[\\/]")
 
 
@@ -103,10 +98,12 @@ def shared_root(
     """
     env = os.environ.get(ROOT_ENV, "").strip(_WS)
     if env:
-        plain = _plain(env)
-        if not _absolute(plain):
+        device = _device_root_refusal(ROOT_ENV, env)
+        if device is not None:
+            return None, "env", device
+        if not _absolute(env):
             return None, "env", f"{ROOT_ENV} is not an absolute path: {env}"
-        return Path(plain), "env", None
+        return Path(env), "env", None
     if local is None:
         local = local_root(start)
     if local is None:
@@ -140,48 +137,23 @@ def shared_root(
         found = m.group(1).strip(_WS)
     if found is None:
         return None, "file", f"{file} names no shared_root"
-    plain = _plain(found)
-    if not _absolute(plain):
+    device = _device_root_refusal(f"{file} shared_root", found)
+    if device is not None:
+        return None, "file", device
+    if not _absolute(found):
         return None, "file", f"{file} names a shared_root that is not an absolute path: {found}"
-    return Path(plain), "file", None
+    return Path(found), "file", None
 
 
-def _plain(path: str) -> str:
-    """A device-path spelling of a root in its plain form, as ConvertTo-CoordPlainRoot rewrites it,
-    and by the same rules: its comment says which spellings are left as they are, and why."""
-    if sys.platform != "win32":
-        return path
-    m = _DEVICE_DRIVE.match(path)
-    if m:
-        drive, rest = m.group(1), m.group(2)
-        if _network_drive(drive):
-            return path
-        plain = drive + "\\" + rest
-    else:
-        m = _DEVICE_UNC.match(path)
-        if not m:
-            return path
-        rest = m.group(1)
-        if not _UNC_SHARE.match(rest):
-            return path
-        plain = "\\\\" + rest
-    # UTF-16 code units, as .NET's String.Length counts them.
-    if _RESPELLED_REST.search(rest) or len(plain.encode("utf-16-le")) // 2 >= _MAX_PATH:
-        return path
-    return plain
-
-
-def _network_drive(drive: str) -> bool:
-    """True when Windows reports ``drive`` as a network drive, as DriveInfo.DriveType does, or when
-    it cannot say, as ConvertTo-CoordPlainRoot leaves the path alone when DriveInfo throws."""
-    if sys.platform != "win32":  # _plain never calls this off Windows; the type checker needs it.
-        return True
-    try:
-        import ctypes
-
-        return bool(ctypes.windll.kernel32.GetDriveTypeW(drive + "\\") == _DRIVE_REMOTE)
-    except (ImportError, AttributeError, OSError):
-        return True
+def _device_root_refusal(what: str, path: str) -> str | None:
+    """Why a root spelled as a device path is refused, or None for any other spelling, in the text
+    Get-CoordDeviceRootRefusal gives; its comment says why every such spelling is refused."""
+    if not _DEVICE_PREFIX.match(path):
+        return None
+    return (
+        f"{what} is a device path, which is refused: {path}. Spell the root plainly instead, as"
+        " X:\\... or \\\\srv\\share\\.... Nothing was read from or written to that root."
+    )
 
 
 def _absolute(path: str) -> bool:
