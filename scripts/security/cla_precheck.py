@@ -58,9 +58,9 @@ TWO CASES BACKLOG #5645 item 1 names:
     unread: the nullable committer stops null propagation there, so rule 1 still judges the
     author (BACKLOG #5644 added item 1). On the first page, such a commit with a git author is
     still left out of the first page's keys, with a fault, whether that author is linked or not,
-    as before that item; an unlinked one is also refused under rule 1. Such a commit that came back
-    with no commit object, or with no readable ``oid``, contradicts the premise and is unjudged
-    whole. The other commits on the page are judged, so a refusal they prove stands. An error with
+    as before that item; an unlinked one is also refused under rule 1. On any page, a commit
+    with a committer-only error that came back with no commit object, or with no readable
+    ``oid``, contradicts the premise and is unjudged whole. The other commits on the page are judged, so a refusal they prove stands. An error with
     no such path still faults the whole page, keeping the pages read before it.
   * A head that lags the push event. When ``CLA_HEAD_SHA`` is set and the first page's
     ``headRefOid`` is another commit, the read stops there and is repeated after each wait in
@@ -244,10 +244,11 @@ class PullRequestRead:
     head: str
     #: How many commits the first page held. Rule 2 keys that page, first commit seen per key.
     first_page: int
-    #: Indexes into ``commits`` that a GraphQL error points inside, other than an error inside the
-    #: commit's ``committer`` alone (``committer_tainted``). They are not judged.
+    #: Indexes into ``commits`` that a GraphQL error points inside, other than those in
+    #: ``committer_tainted``. They are not judged.
     tainted: frozenset[int] = frozenset()
-    #: Indexes, none in ``tainted``, whose errors all point inside the commit's ``committer``.
+    #: Indexes, none in ``tainted``, whose errors all point inside the commit's ``committer`` and
+    #: whose commit came back with a readable 40-hex ``oid``; ``evaluate`` relies on that oid.
     #: Their author is judged; their committer is not read.
     committer_tainted: frozenset[int] = frozenset()
 
@@ -608,9 +609,9 @@ def evaluate(
         if index < read.first_page and index in read.committer_tainted:
             # Left unkeyed with a fault for a linked author too (PR 3323 hold). An unlinked
             # author's commit is keyed under its committer's account, which the error may have
-            # hidden. Keying a linked one would lean on the unmeasured premise that the error
-            # nulled nothing in the author (module docstring) in the direction that passes a
-            # later-page commit, where rule 1 leans on it only in the direction that refuses.
+            # hidden. A linked author's key, its login, is not hidden by it; the commit is left
+            # unkeyed so rule 2 judges that author's later-page commits as it did before BACKLOG
+            # #5644 added item 1, when such a commit was unjudged whole.
             faults.append(
                 f"commit {oid}: GraphQL reported an error inside its committer; its key is "
                 "missing from the first page's keys"
