@@ -11900,12 +11900,18 @@ def _windows_link_target(text: str) -> str:
     """A Windows link's target, as :func:`_link_chain` joins it: its ``\\\\?\\`` prefix dropped.
     Raises ``OSError`` for a target the walk could not follow to the folder the open reaches: a
     device path, a drive with no separator after it (``D:x``), read from that drive's own working
-    directory, or a path rooted with no drive (``\\x``), which may name the object namespace."""
-    from messagefoundry.auth.anchor_path import _drive_relative, _strip_win_prefix
+    directory, or a path rooted with no drive (``\\x``), which may name the object namespace.
 
-    plain = _strip_win_prefix(text)
+    Read through the anchor walk's own reader of a link target (``anchor_path._strip_nt_target``),
+    so a device prefix that walk refuses is refused here too: any prefix but an all-backslash
+    ``\\\\?\\`` or ``\\??\\``, and a verbatim one holding a ``/``, a ``.`` or ``..`` name, or an
+    empty name. Win32 rewrites a ``\\\\.\\`` or forward-slash prefix before the open, so
+    stripping one, as this once did, walked a path the open may not reach (vault BACKLOG #5515)."""
+    from messagefoundry.auth.anchor_path import _drive_relative, _strip_nt_target
+
+    plain = _strip_nt_target(text)
     if plain is None:
-        raise OSError(errno.EINVAL, "a link leads to a device path")
+        raise OSError(errno.EINVAL, "a link leads to a device path this check does not read")
     if _drive_relative(plain):
         raise OSError(errno.EINVAL, "a link leads to a drive with no separator after it")
     if not ntpath.splitdrive(plain)[0] and plain[:1] in ("\\", "/"):
@@ -11982,8 +11988,10 @@ def _file_and_folder(
             chain, end = _link_chain(path)
             # The kernel's own answer, against the walk's, for any gap left in the walk's model:
             # a final link naming a file with a trailing separator, for one, which the open
-            # refuses (ENOTDIR) and the walk's split drops, or a ``\\?\`` target the walk normalizes and the open takes
-            # literally. Where they disagree the walk vetted another route than the open takes.
+            # refuses (ENOTDIR) and the walk's split drops. A device-prefixed link target the walk
+            # would read as another path than the open is refused before this, by
+            # _windows_link_target. Where they disagree the walk vetted another route than the
+            # open takes.
             if mode is not None and end is None:
                 raise OSError(
                     errno.EINVAL, "the open reaches an object where the walk reaches none"

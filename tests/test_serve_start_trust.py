@@ -506,6 +506,43 @@ def test_the_hop_bound_is_past_every_platform_s_own() -> None:
     assert wiring._LINK_HOPS >= 63
 
 
+@pytest.mark.parametrize(
+    "target",
+    [
+        r"\\.\C:\real",  # a normalized device prefix: Win32 rewrites the rest before the open
+        r"\\.\C:\..\UNC\host\share",  # its ``..`` climbs out of the drive, onto a share
+        "//?/C:/real",  # a verbatim prefix written with forward slashes is not verbatim
+        r"\\?/C:\real",  # nor is one with a single forward slash in it
+        r"\\?\C:/real",  # a verbatim path holding a ``/``
+    ],
+)
+def test_a_link_target_the_anchor_walk_refuses_is_refused_by_the_config_walk(target: str) -> None:
+    """A link target the anchor walk refuses as a device path (``anchor_path._strip_nt_target``)
+    is refused here too, rather than normalized and walked as a local path the open may not reach
+    (BACKLOG #5515, engine PR 2999's left list). Pure text, so it runs on every leg."""
+    from messagefoundry.config.wiring import _windows_link_target
+
+    with pytest.raises(OSError, match="device path"):
+        _windows_link_target(target)
+
+
+@pytest.mark.parametrize(
+    ("target", "plain"),
+    [
+        (r"\??\C:\real", r"C:\real"),
+        (r"\\?\C:\real", r"C:\real"),
+        (r"\\?\UNC\host\share\x", r"\\host\share\x"),
+        (r"C:\real", r"C:\real"),
+    ],
+)
+def test_a_plain_verbatim_link_target_is_still_walked(target: str, plain: str) -> None:
+    """The control for the test above: an all-backslash verbatim target naming no ``.`` or ``..``
+    is the same object as its stripped spelling, and is walked as before."""
+    from messagefoundry.config.wiring import _windows_link_target
+
+    assert _windows_link_target(target) == plain
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Win32 strips a trailing dot or space")
 @pytest.mark.parametrize("suffix", [".", " "])
 def test_a_link_target_ending_in_a_dot_or_space_refuses(suffix: str, tmp_path: Path) -> None:
