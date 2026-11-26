@@ -7373,7 +7373,7 @@ reaper's drop runs on the reaper's timer, after its purge, which deletes the row
 absolute expiry or idle window as of ten minutes before the pass, so a lapsed session's count
 usually goes within about one reaper interval plus those ten minutes. No drop is bound to reach a
 given count: while the reaper skips or fails its purges, or its drop cannot reach an account in
-the ways listed above, a count can stay in the map for any length of time past its session's
+at least the ways listed above, a count can stay in the map for any length of time past its session's
 lifetime. If the revoke fails, or never runs because an earlier write raised, the count stays, and
 the session's next re-proof is revoked unverified. A session the session reaper purges without the
 engine ending it, at least one that expired with no request, keeps its count until the reaper's
