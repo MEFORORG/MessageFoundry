@@ -307,14 +307,15 @@ def _load_external_provider(
         # Present but broken: a C extension that fails to load, or a name its SDK or the provider
         # module itself no longer has. Importing runs the module's top-level code, which can fail
         # with any class (an OSError from a native library, an AttributeError, a SyntaxError in a
-        # truncated file), so this takes any Exception (vault BACKLOG #6709 item 3), MemoryError
-        # and RecursionError included (item 11). Left raw, a ValueError would reach store.base,
+        # truncated file), so this takes any Exception (vault BACKLOG #6709 item 3). That
+        # includes MemoryError and RecursionError: item 11 proposed letting them propagate, and
+        # main's refusal was kept as the safer option (Manager decision, 2026-11-25). Left raw, a ValueError would reach store.base,
         # which reads it as a refused key and tells the operator to generate a new one; a failed
         # import is never a bad key. The error is chained, not swallowed. This seam's own text
         # does not reach an operator through resolve_active_key or resolve_decrypt_keys, which
         # replace any error with a fixed text of their own. An error raised later, inside
-        # build_provider, is refused below; one from a provider's lazy SDK import is that
-        # provider's to refuse.
+        # build_provider, is refused below unless it is a MemoryError or RecursionError; one from
+        # a provider's lazy SDK import is that provider's to refuse.
         raise KeyProviderError(
             f"[store].key_provider={name!r} could not load its provider module or backend (an "
             f"import failed: {type(exc).__name__}, chained below) — reinstall MessageFoundry "

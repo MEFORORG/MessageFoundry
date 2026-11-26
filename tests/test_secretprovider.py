@@ -349,6 +349,29 @@ def test_an_external_providers_own_refusal_from_its_build_keeps_its_text(
         resolve_secret_provider(SecretsSettings(provider="vault"))
 
 
+@pytest.mark.parametrize("error", [MemoryError, RecursionError])
+def test_the_processs_own_limits_from_the_lazy_hvac_import_fail_closed(
+    monkeypatch: pytest.MonkeyPatch, error: type[BaseException]
+) -> None:
+    # Vault BACKLOG #6709 item 11: out of memory or stack while hvac imports is refused like any
+    # other broken hvac, as on main, rather than escaping raw past callers that catch only
+    # SecretProviderError.
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "hvac":
+            raise error()
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _import)
+    provider = secretprovider_vault.build_provider(SecretsSettings())
+    with pytest.raises(SecretProviderError, match=f"did not import \({error.__name__}\)") as caught:
+        provider.resolve("mefor/ad")
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+
 # --- vault backend: mocked KV ------------------------------------------------
 
 
