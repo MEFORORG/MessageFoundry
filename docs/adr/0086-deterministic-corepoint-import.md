@@ -335,13 +335,12 @@ exactly as under step 1. Step 1's gaps stay with such a list: a send of a clone 
 where its flow-insensitive scan holds the clone, and a write to the input after a send of it still
 lands on `msg`. *Corrected 2026-11-26 (BACKLOG #5823):* this said that only `snapshot_on_send` keeps
 that write out of the message already sent. A live send of `msg` on the step 1 path now renders
-`sends.append(Send(dest, msg.copy()))`, so the message sent is the input as it stood at the send,
-whatever that setting says. The differential guard loads that change beneath every step 1 tree it
-builds, the trees this ADR calls "as vendored" included, so each bound compares two trees that
-render that line alike. A step 2 send delivers its local itself, uncopied, the input
-handle's `msg` included; step 2 declines a write after a send instead. Step 2 helps only
-straight-line lists, and the canonical-spelling rule is strict: an export whose labels are wrapped in
-spans, or whose spacing differs at all, gets no help. That is deliberate.
+`sends.append(Send(dest, msg.copy()))`. So the message sent is the input as it stood at the send,
+whatever that setting says. How the differential guard's baseline carries this is stated once, in
+the docstring of `tests/test_corepoint_import_differential.py`. A step 2 send still delivers its
+local uncopied, the input's `msg` included; step 2 declines a write after a send instead. Step 2
+helps only straight-line lists, and the canonical-spelling rule is strict: an export whose labels are
+wrapped in spans, or whose spacing differs at all, gets no help. That is deliberate.
 
 **History: why a gate, after six rounds.** Step 2 first walked every construct, tracking which local
 each handle held on each path and joining the paths. Each of six review rounds on PR 1900 built a
@@ -597,7 +596,7 @@ At least these limits remain:
   step.
 
 The differential guard compares a gate-declined list with step 1. That step 1 path now carries this
-rule. So the guard runs the vendored step 1 file with one amendment made as it loads. The file
+rule. So the guard runs the vendored step 1 file with this amendment made as it loads. The file
 itself stays as vendored and pinned. The amendment is listed in the guard's `_STEP1_AMENDMENTS`, with
 the rule copied as text, so a later change to the head's rule turns the guard red until the copy is
 amended on purpose. Two more tests run the battery against the file as vendored. They check

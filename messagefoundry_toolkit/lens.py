@@ -2558,29 +2558,17 @@ def _is_typed_return(value: ast.expr | None, ctx: _TypedCtx) -> bool:
 
 
 def _is_typed_send(call: ast.Call, ctx: _TypedCtx) -> bool:
-    """Whether ``call`` is ``Send(<inert destination>, msg)`` or ``Send(<inert destination>,
-    msg.copy())``, the form the Corepoint importer renders on its step 1 path (BACKLOG #5823)."""
+    """Whether ``call`` is ``Send(<inert destination>, msg)``."""
     return (
         isinstance(call.func, ast.Name)
         and call.func.id == "Send"
         and not _is_shadowed("Send", ctx.scope)
         and len(call.args) == 2
         and not call.keywords
-        and _is_msg_or_its_copy(call.args[1])
+        and isinstance(call.args[1], ast.Name)
+        and call.args[1].id == "msg"
         and _is_inert_value(call.args[0], reads_ok=False, scope=ctx.scope)
     )
-
-
-def _is_msg_or_its_copy(node: ast.expr) -> bool:
-    """Whether ``node`` is the bare name ``msg`` or the argument-free call ``msg.copy()``."""
-    if isinstance(node, ast.Call):
-        if node.args or node.keywords:
-            return False
-        func = node.func
-        if not (isinstance(func, ast.Attribute) and func.attr == "copy"):
-            return False
-        node = func.value
-    return isinstance(node, ast.Name) and node.id == "msg"
 
 
 def _is_typed_call(call: ast.Call, ctx: _TypedCtx, *, native: bool) -> bool:
