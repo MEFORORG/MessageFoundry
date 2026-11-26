@@ -1686,6 +1686,17 @@ def _pin_verb(spec: AnchorSpec) -> str:
 
 
 def _pin_offer(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
+    """The pin to set: none where a configured pin already matches, and no digest of a file whose
+    path was found replaceable, since those bytes may be substituted."""
+    if verdict.pin_ok is True:
+        return (
+            f"{spec.pin_setting or 'the configured pin'} already matches the bytes read; keep it."
+        )
+    if verdict.path_ok is False:
+        return (
+            f"{_pin_verb(spec)} the {ANCHOR_DIGESTS[ANCHOR_DIGEST].title} of the CA you mean to "
+            "trust, taken from that CA, since this file could have been replaced."
+        )
     return (
         f"{_pin_verb(spec)} the {ANCHOR_DIGESTS[ANCHOR_DIGEST].title} of the CA you mean to trust; "
         f"this file's is {ANCHOR_DIGEST}:{verdict.fingerprint}. Check it against the CA first. With "
@@ -1693,22 +1704,22 @@ def _pin_offer(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
     )
 
 
-def _past_the_mount(spec: AnchorSpec, mount: str, pin: str) -> str:
+def _past_the_mount(spec: AnchorSpec, verdict: AnchorVerdict, mount: str) -> str:
     """Where :func:`_mount_over_folder` found ``mount``: no folder below it, then what is left, which
-    is ``pin``, and only for an anchor whose consumer loads the verified bytes."""
+    is a pin (:func:`_pin_offer`), and only for an anchor whose consumer loads the verified bytes."""
     head = (
         f"The check cannot vouch for the mount at {mount!r}, so no location below it passes, and "
         "moving the anchor does not help."
     )
     if spec.loads_verified_bytes:
         return (
-            f"{head} What is left is a pin: {pin} Where that mount is an overlay '/' in a "
+            f"{head} What is left is a pin: {_pin_offer(spec, verdict)} Where that mount is an overlay '/' in a "
             f"container, {_OVERLAY_NOTE}, says more."
         )
     return (
-        f"{head} {_NO_PIN}, and at enforce nothing else clears it while that mount stays "
-        f"untrusted. Where that mount is an overlay '/' in a container, {_OVERLAY_NOTE}, names the "
-        "follow-up that would change this."
+        f"{head} {_NO_PIN}, so at enforce this check refuses it anywhere below that mount, and at "
+        f"warn it is used anyway. Where that mount is an overlay '/' in a container, "
+        f"{_OVERLAY_NOTE}, names the follow-up that would change this."
     )
 
 
@@ -1768,13 +1779,8 @@ def _path_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> list[str]:
             cmds.append(f"  chmod go-w {q}")
     mount = _mount_over_folder(verdict)
     if mount is not None:
-        # No digest here: the path was just found replaceable, so these bytes may be substituted.
-        pin = (
-            f"{_pin_verb(spec)} the {ANCHOR_DIGESTS[ANCHOR_DIGEST].title} of the CA you mean to "
-            "trust, taken from that CA, since this file could have been replaced."
-        )
         tail = "Once the path is fixed, the check still cannot settle the anchor. "
-        tail += _past_the_mount(spec, mount, pin)
+        tail += _past_the_mount(spec, verdict, mount)
         return (["Fix it in place:", *cmds] if cmds else []) + [tail]
     lead = move + f"can change, such as a root-owned 755 folder like {_POSIX_FOLDER}."
     return [lead + " Or, to fix it in place:", *cmds] if cmds else [lead]
@@ -1820,7 +1826,7 @@ def _indeterminate_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
     windows = check.platform == "windows" if check is not None else os.name == "nt"
     mount = _mount_over_folder(verdict)
     if mount is not None:
-        return _past_the_mount(spec, mount, _pin_offer(spec, verdict))
+        return _past_the_mount(spec, verdict, mount)
     folder = (
         "the engine's data folder under C:\\ProgramData"
         if windows

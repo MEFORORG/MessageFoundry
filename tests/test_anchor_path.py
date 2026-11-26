@@ -898,7 +898,7 @@ def test_a_mount_above_the_suggested_folder_leaves_no_folder_to_move_to(
         assert f"the mount at {mount!r}" in text, text
         order = [text.index(s) for s in (_MOUNT_NOTE, step, "docker/README.md")]
         assert order == sorted(order), text
-    assert "at enforce nothing else clears it" in by_path
+    assert "at enforce this check refuses it anywhere below that mount" in by_path
 
 
 def test_an_insecure_path_under_such_a_mount_is_not_told_to_move(
@@ -947,6 +947,50 @@ def test_the_mount_note_names_only_a_mount_the_message_lists(
     ta.enforce_anchor(AnchorSpec("t", "[x]", str(_pem(tmp_path)), None), enforcing=False)
     acl = [r.message for r in caplog.records if "could not settle" in r.message]
     assert len(acl) == 1 and "'/srv'" not in acl[0] and _MOUNT_NOTE not in acl[0], acl
+
+
+def test_a_by_path_anchor_with_an_insecure_path_under_an_overlay_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The insecure-path fix for an anchor read again by path: fix it in place, then no location
+    below the mount, no pin, and what enforce does, in that order. Red under the text that said
+    nothing else clears it."""
+    table = {**_MOUNT_TABLE, "/srv": (0, D777)}
+    v = _posix("/srv/a.pem", table, fstype={"/": "overlay"})
+    text = _refusal(tmp_path, monkeypatch, v, pin_setting="[x].pin", loads_verified_bytes=False)
+    assert "  chmod go-w /srv" in text and _FOLDER not in text and "set [x].pin to" not in text
+    steps = (_MOUNT_NOTE, "A pin does not help here", "at enforce this check refuses it")
+    order = [text.index(s) for s in (*steps, "docker/README.md")]
+    assert order == sorted(order), text
+
+
+def test_no_warning_quotes_the_digest_of_a_replaceable_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """At warn, an insecure path under an overlay root with an ACL that could not be read: the
+    ACL's warning comes after the path was found replaceable, so it quotes no digest of these
+    bytes. Red under the over-folder fix that quoted it."""
+    table = {**_MOUNT_TABLE, "/srv": (0, D777)}
+    v = _posix("/srv/a.pem", table, fstype={"/": "overlay"})
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: None)
+    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: v)
+    p = _pem(tmp_path)
+    ta.enforce_anchor(AnchorSpec("t", "[x]", str(p), None, "[x].pin"), enforcing=False)
+    acl = [r.message for r in caplog.records if "could not settle" in r.message]
+    digest = hashlib.sha256(p.read_bytes()).hexdigest()
+    assert len(acl) == 1 and digest not in caplog.text and "set [x].pin to" in acl[0], acl
+
+
+def test_a_matching_pin_is_not_offered_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An insecure path under an overlay root whose pin already matches: the fix does not tell
+    the operator to set the pin they have. Red under the pin offered whatever the pin state."""
+    table = {**_MOUNT_TABLE, "/srv": (0, D777)}
+    v = _posix("/srv/a.pem", table, fstype={"/": "overlay"})
+    digest = hashlib.sha256(_pem(tmp_path).read_bytes()).hexdigest()
+    text = _refusal(tmp_path, monkeypatch, v, pin_setting="[x].pin", pin=digest)
+    assert "set [x].pin to" not in text and "[x].pin already matches" in text, text
 
 
 def test_posix_unknown_mount_table_is_indeterminate() -> None:
@@ -1233,6 +1277,7 @@ def _refusal(
     *,
     pin_setting: str | None = None,
     loads_verified_bytes: bool = True,
+    pin: str | None = None,
 ) -> str:
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: verdict)
@@ -1240,7 +1285,7 @@ def _refusal(
         "t",
         "[x]",
         str(_pem(tmp_path)),
-        None,
+        pin,
         pin_setting,
         loads_verified_bytes=loads_verified_bytes,
     )
