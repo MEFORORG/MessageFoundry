@@ -452,8 +452,8 @@ text moved in wave 2*.
 landers to be more proactive"*). That sentence named no number. The 30-minute windows and the
 cap of two repairs here, and the 30-minute transfer and `hold-ack` expiry in the next paragraph,
 were set in the Lander's brief written under that instruction, which the owner directed the
-Manager to follow exactly (2026-11-26, in the Manager's chat); the next paragraph names the one
-window that is the Manager's reading instead. All of these must hold: the hold names one
+Manager to follow exactly (2026-11-26, in the Manager's chat); the not-live guard's question
+window in the next paragraph stays at 2 hours. All of these must hold: the hold names one
 determinate fix, such as a doc, a comment, a test, or a code change the hold spells out, and not
 a question of intent, of an owner ruling or of behaviour; the hold still names the PR's head, and
 no author answer since the hold disputes it; the PR is not queued and has no armed auto-merge
@@ -481,8 +481,9 @@ so at once is likely worse. The change removed at least two checks that also gua
 it, the mail to the author and the live-session test. The collision controls left include at
 least the head-moved check that binds repair Builders, which are briefed with it, the test that
 the hold still names the head, and the 30-minute answer exception. On a PR that looks quiet, the
-last two see nothing, so only the head-moved check bears on this risk, and only if the author
-pushes first. An author's in-flight Builder is not briefed with that check and may have none.
+last two see nothing; what still bears on this risk there includes at least the head-moved
+check, which acts only if the author pushes first. An author's in-flight Builder is not briefed
+with that check and may have none.
 **CHANGED 2026-11-26:** this rule required 2 hours of author silence, a mail to the author with
 no reply, and an author not live, and allowed one repair per PR (decision
 d20261029T165610526-c13ae6, under the owner's delegation of 2026-10-29; window cut from 4 hours to
@@ -507,9 +508,10 @@ expire 2h after it"*, the owner answered *"/driver"*). The hold then counts as u
 `scripts/coord/held_pr_turns.py` shows as the Lander's turn, flagged `ack-expired` only while the
 head is unchanged; any other head move already reads as the Lander's turn. A transfer on an expired
 `hold-ack` also needs the author to read not live: the author's claim and seat record show no live
-session, or the author's transcript ENDS on a question unanswered for more than 30 minutes, which
-counts as no live session whatever its running state. That 30 minutes is the Manager's reading of
-the 2026-11-26 brief, not a number the brief set. The Lander reads this with `list_events` or korus
+session, or the author's transcript ENDS on a question unanswered for more than 2 hours, which
+counts as no live session whatever its running state. The 2026-11-26 brief set the 30-minute windows
+in this paragraph and none for this one, so it was left at 2 hours (decided by the Manager under the
+owner's standing instruction of 2026-10-22). The Lander reads this with `list_events` or korus
 `scripts/board/seatstate.py`, and confirms the question is the transcript's last turn rather than an
 older orphaned ask. The paragraph above's repair takes no such test. An author commit or ordinary
 reply hands the turn back to the Lander, and nothing expires then. The author may also hand the PR
@@ -529,9 +531,8 @@ goes in a table. It never opens a PR, enqueues or merges. Its Builders fetch bef
 force-push, stop if the head moved, stop at any refusal, and make only the fixes the hold names; the
 paragraph above names the collision risk that leaves. Every repair head it pushes takes the Lander's
 own independent review the paragraph above requires, before the merge. The procedure is in korus
-`roles/LANDER.md` and `roles/MANAGER.md`. **CHANGED 2026-11-26:** each window here was 2 hours: the
-transfer, the `hold-ack` expiry (`ACK_TTL` in `scripts/coord/held_pr_turns.py`) and the unanswered
-question.
+`roles/LANDER.md` and `roles/MANAGER.md`. **CHANGED 2026-11-26:** the transfer and the `hold-ack`
+expiry (`ACK_TTL` in `scripts/coord/held_pr_turns.py`) were 2 hours.
 
 **Every seat but Special runs the driver and empower rules.** Each seat except Special applies the
 `driver` and `empower` skills' rules by default, in local and cloud sessions, without the owner
