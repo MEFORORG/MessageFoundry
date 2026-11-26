@@ -86,7 +86,9 @@ Two things undo this, and the engine refuses or reports each:
   reports `startup_directory_writable` when its account can write there.
 
 `GET /security/posture` carries the reading in its `interpreter` block. The `docker-smoke` CI leg
-reads it off a running container and tries the write. What each entry means is in
+is written to read it off a running container and try the write, but until the follow-up in
+[the overlay note under Residuals / gotchas](#residuals--gotchas) lands its engine would refuse at
+start, so no CI job makes either check, and no CI job exercises an enforcing container start. What each entry means is in
 [`docs/SECURITY-LOOSENING.md`](../docs/SECURITY-LOOSENING.md#interpreter_not_isolated-startup_code_unexpected-and-startup_directory_writable-what-runs-in-the-interpreter-before-the-engine-does).
 
 ## Configuration — bake it in (recommended) or mount it carefully
@@ -299,8 +301,9 @@ certificate (A) and its revocation attestation, or it **refuses to start** — b
   `enforcement = warn` in [SECURITY-LOOSENING.md](../docs/SECURITY-LOOSENING.md)), so it is no
   substitute for the follow-up. The rest of this bullet is why. The Linux path check reads the file system type of every
   directory from `/` down, and does not vouch for overlay (the `POSIX_TRUSTED_FS` comment in
-  `messagefoundry/auth/anchor_path.py` says why). So every anchor there answers *could not
-  settle*, even one on a bind-mounted ext4 volume, and moving the file does not clear it. `enforce`
+  `messagefoundry/auth/anchor_path.py` says why). So no anchor there can pass: one whose path
+  others can write is refused as replaceable, and every other answers *could not settle*, even
+  one on a bind-mounted ext4 volume, and moving the file does not clear it. `enforce`
   refuses it, unless the refusal offers a pin, naming the setting and the file's digest, and you
   set that pin; check the digest against the CA first. An anchor the engine reads again by path
   (`loads_verified_bytes=False` in `messagefoundry/auth/trust_anchors.py`) takes no pin escape, so

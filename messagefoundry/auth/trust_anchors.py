@@ -1756,21 +1756,29 @@ def _indeterminate_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
     folder = (
         "the engine's data folder under C:\\ProgramData"
         if windows
-        else "a root-owned 755 folder like /etc/messagefoundry/ on a file system the check trusts. "
-        "Where a finding above names a mount the check cannot vouch for, such as an overlay '/' "
-        "in a container, at or above the anchor, no location below that mount passes, and a "
-        "bind mount below it does not help either, since the check still reads that mount"
+        else "a root-owned 755 folder like /etc/messagefoundry/ on a file system the check trusts"
+    )
+    # Only a finding that a mount's type is untrusted makes every folder below it fail; an
+    # unread mount table or ACL does not, so moving the anchor can still help there.
+    mounts = [f.path for f in _findings(verdict, insecure=False) if f.mount]
+    note = (
+        f" The mount at {mounts[0]!r} is one the check cannot vouch for, such as an overlay '/' in "
+        "a container: no location below it passes, and a bind mount below it does not help "
+        "either, since the check still reads that mount. The overlay note under 'Residuals / "
+        "gotchas' in docker/README.md, in the MessageFoundry source, says more."
+        if mounts
+        else ""
     )
     if not spec.loads_verified_bytes:
         return (
             f"Fix: move the anchor into a folder whose permissions the engine can read, such as "
-            f"{folder}. A pin does not help here: this anchor is read again by path when it is "
-            "used, so a pin cannot vouch for the bytes loaded."
+            f"{folder}.{note} A pin does not help here: this anchor is read again by path when it "
+            "is used, so a pin cannot vouch for the bytes loaded."
         )
     pin = f"set {spec.pin_setting} to" if spec.pin_setting else "pin it to"
     return (
         f"Fix: move the anchor into a folder whose permissions the engine can read, such as "
-        f"{folder}. Or {pin} the {ANCHOR_DIGESTS[ANCHOR_DIGEST].title} of the CA you mean to "
+        f"{folder}.{note} Or {pin} the {ANCHOR_DIGESTS[ANCHOR_DIGEST].title} of the CA you mean to "
         f"trust; this file's is {ANCHOR_DIGEST}:{verdict.fingerprint}. Check it against the CA "
         "first. With a matching pin the engine "
         "loads exactly those bytes, so it may load them without this check."

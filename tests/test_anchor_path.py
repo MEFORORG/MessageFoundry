@@ -792,12 +792,21 @@ def test_posix_root_engine_trusts_only_root() -> None:
 
 def test_posix_clean_chain_on_a_network_mount_is_indeterminate() -> None:
     table = {"/srv": (0, D755), "/srv/a.pem": (0, F644)}
-    # overlay: vault BACKLOG #8390 item 31; red under ``overlay`` back in ``POSIX_TRUSTED_FS``.
-    for fs in ("nfs", "nfs4", "cifs", "fuse.sshfs", "9p", "overlay"):
+    for fs in ("nfs", "nfs4", "cifs", "fuse.sshfs", "9p"):
         v = _posix("/srv/a.pem", table, fstype={"/srv": fs})
         assert v.ok is None, fs
-        assert [f.path for f in v.findings] == ["/srv"], fs
+        assert [(f.path, f.mount) for f in v.findings] == [("/srv", True)], fs
         assert f"{fs} mount" in v.findings[0].reason, fs
+
+
+def test_posix_clean_chain_on_an_overlay_mount_is_indeterminate() -> None:
+    """vault BACKLOG #8390 item 31: an overlay answers as a network mount does (the
+    ``POSIX_TRUSTED_FS`` comment says why). Red under ``overlay`` back in ``POSIX_TRUSTED_FS``."""
+    table = {"/srv": (0, D755), "/srv/a.pem": (0, F644)}
+    v = _posix("/srv/a.pem", table, fstype={"/srv": "overlay"})
+    assert v.ok is None
+    assert [(f.path, f.mount) for f in v.findings] == [("/srv", True)]
+    assert "overlay mount" in v.findings[0].reason
 
 
 def test_posix_an_overlay_root_leaves_a_bind_mounted_anchor_indeterminate() -> None:
@@ -830,6 +839,40 @@ def test_an_overlay_anchor_refuses_at_enforce_unless_a_pin_matches(
     by_path = AnchorSpec("t", "[x]", str(p), digest, "[x].pin", loads_verified_bytes=False)
     with pytest.raises(TrustAnchorError, match="A pin does not help here"):
         ta.enforce_anchor(by_path, enforcing=True)
+
+
+_MOUNT_NOTE = "no location below it passes"
+
+
+def test_the_mount_note_is_printed_only_for_a_mount_finding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fix's mount note names the mount, and points at the README note, only where a finding
+    says a mount's type is untrusted. A chain whose mount table could not be read is indeterminate
+    too, but moving the anchor can help there, so it gets no such note. Red under a note printed
+    for every POSIX indeterminate refusal."""
+    table = {"/srv": (0, D755), "/srv/a.pem": (0, F644)}
+    overlay = _posix("/srv/a.pem", table, fstype={"/": "overlay"})
+    no_mountinfo = posix_path_verdict(
+        "/srv/a.pem",
+        cwd="/",
+        euid=10001,
+        lstat_fn=lambda q: PosixStat(*{**_ETC, **table}[q]),
+        readlink_fn=lambda q: "",
+        fstype_fn=lambda q: None,
+    )
+    assert overlay.ok is None and no_mountinfo.ok is None
+    texts = {
+        "overlay": _refusal(tmp_path, monkeypatch, overlay),
+        "no_mountinfo": _refusal(tmp_path, monkeypatch, no_mountinfo),
+    }
+    assert _MOUNT_NOTE in texts["overlay"] and "'/'" in texts["overlay"]
+    assert "docker/README.md" in texts["overlay"]
+    assert "bind mount" in texts["overlay"]
+    # The phrases the note carries; d407e986891 printed its bind-mount clause here too.
+    assert _MOUNT_NOTE not in texts["no_mountinfo"] and "bind mount" not in texts["no_mountinfo"]
+    assert "docker/README.md" not in texts["no_mountinfo"]
+    assert "/etc/messagefoundry/" in texts["no_mountinfo"]
 
 
 def test_posix_unknown_mount_table_is_indeterminate() -> None:

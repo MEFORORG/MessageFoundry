@@ -61,7 +61,9 @@ class ChainFinding:
     ``insecure`` is ``True`` for a definite finding and ``False`` for an indeterminate one. ``sids``
     names the Windows principals the finding is about, so the fix text can remove them. ``owner``
     marks a finding about who owns the object rather than about a grant. ``writable`` marks a POSIX
-    finding about group or other write bits, so its fix is the chmod alone and never a chown."""
+    finding about group or other write bits, so its fix is the chmod alone and never a chown.
+    ``mount`` marks a POSIX finding that a mount's type is outside :data:`POSIX_TRUSTED_FS`, so the
+    fix text can say that no location below that mount passes."""
 
     path: str
     kind: str
@@ -70,6 +72,7 @@ class ChainFinding:
     sids: tuple[str, ...] = ()
     owner: bool = False
     writable: bool = False
+    mount: bool = False
 
 
 @dataclass(frozen=True)
@@ -898,6 +901,7 @@ def posix_path_verdict(
                     False,
                     f"it is a {mounted[1]} mount, whose owners and mode bits this check cannot vouch "
                     "for",
+                    mount=True,
                 )
             )
 

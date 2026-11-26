@@ -121,7 +121,8 @@ x-ha-engine-env: &ha-engine-env
   # owned as ./config is, so no other account can replace it: the store login trusts the file
   # before serve's preflight checks its owner, and `store provision-schema` never checks it. A
   # managed Postgres whose certificate the system trust store already verifies needs no pin:
-  # remove this line. Then read the overlay note in README.md, "Residuals / gotchas".
+  # remove this line.
+  # Whether or not you keep this pin, read the overlay note in README.md, "Residuals / gotchas".
   MEFOR_STORE_SSL_ROOT_CERT: "/config/pki/store-ca.pem"
   # DEV-ONLY: the local Postgres image makes POSTGRES_USER a SUPERUSER, and the engines log in as it.
   # Under the shipped enforce dial an over-granted store login refuses to start (ADR 0199), so this
@@ -215,6 +216,7 @@ services:
       # MEFOR_LOGGING_FORWARD_HOST: "REPLACE-siem.example.org"
       # MEFOR_LOGGING_FORWARD_PORT: "6514"
       # MEFOR_LOGGING_FORWARD_PROTOCOL: "tls"
+      # The forwarding CA: read the overlay note in README.md, "Residuals / gotchas".
       # MEFOR_LOGGING_FORWARD_TLS_CA_FILE: "/config/pki/syslog-ca.pem"
       # MEFOR_LOGGING_FORWARD_TLS_CRL_FILE: "/config/pki/syslog-crl.pem"
       # MEFOR_EGRESS_ALLOWED_SYSLOG: "REPLACE-siem.example.org"

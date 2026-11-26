@@ -367,7 +367,8 @@ and the engine's at-rest encryption does not cover them ([`PHI.md`](PHI.md) §2,
    and push it to your private registry. Base it on the `runtime-postgres` variant
    ([`docker/README.md`](../docker/README.md), "Image variants"): the slim default carries no `asyncpg`,
    so the Postgres store cannot open on it. Bake the syslog CA and CRL and the store CRL the
-   manifest names under `/config/pki/` into the same image.
+   manifest names under `/config/pki/` into the same image, then read the overlay note under
+   *Residuals / gotchas* in [`docker/README.md`](../docker/README.md#residuals--gotchas).
 3. **Create the Secret** ([`docker/k8s/secret.example.yaml`](../docker/k8s/secret.example.yaml)) with
    `store-encryption-key`, `store-password`, `tls-revocation-attested`, and the API TLS cert/key (and
    optional `api-tls-key-password`). Both manifests, `ha-postgres.yaml` and `statefulset.yaml`, read
