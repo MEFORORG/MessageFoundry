@@ -2388,12 +2388,9 @@ does and does not reach, and where `VACUUM`'s temp copy may go. On POSIX the `-w
 files take the DB file's mode. That mode is `0600` only when the store's `0600` pre-create of a
 new DB, or its best-effort `chmod` on open, succeeds; a failed `chmod` is logged as a warning,
 and a failed pre-create is not reported. On Windows each open gives the DB, `-wal` and `-shm` a
-protected access list granting full control to the opening account alone, logged when it fails;
-a missing `-wal` or `-shm` is made and restricted before SQLite opens the DB. A `-wal` or `-shm`
-that SQLite re-creates while the store is open, or that a program other than the tee re-creates,
-takes its folder's list until the tee next opens the DB, and a handle opened meanwhile keeps its
-access, so open a tee DB only with the tee. The DB is then usable only by the account the tee
-opened it under last. Place every tee DB on a
+protected access list granting full control to the opening account alone, logged when it fails.
+A `-wal` or `-shm` that SQLite deletes and re-creates takes its folder's list again until the next
+open, and the DB is then usable only by the account that opened it last. Place every tee DB on a
 protected volume regardless.
 
 The **opt-in ADR 0087 sandbox worker** (`[sandbox].mode = "subprocess"`, default `"off"`) is **not** an
