@@ -314,9 +314,8 @@ def _load_external_provider(
         # operator to generate a new one; a failed import is never a bad key. The error is
         # chained, not swallowed. This seam's own text does not reach an operator through
         # resolve_active_key or resolve_decrypt_keys, which replace any error with a fixed text of
-        # their own. An error raised later, inside build_provider, is refused below unless it is a
-        # MemoryError or RecursionError; one from a provider's lazy SDK import is that provider's
-        # to refuse.
+        # their own. An error raised later, inside build_provider, is handled by the build arm
+        # below; one from a provider's lazy SDK import is that provider's to refuse.
         raise KeyProviderError(
             f"[store].key_provider={name!r} could not load its provider module or backend (an "
             f"import failed: {type(exc).__name__}, chained below) — reinstall MessageFoundry "
@@ -324,20 +323,20 @@ def _load_external_provider(
         ) from exc
     # The provider module owns its own construction; annotate the local so mypy keeps the contract.
     # A provider's own KeyProviderError keeps its text, and a MemoryError or RecursionError
-    # propagates. So does an error store.base._fresh_refusal chooses a text of its own for (a hop
-    # refusal, a DPAPI error, one the engine built: base._is_classified_refusal), so its report is
-    # the one main gave. Any other Exception from its construction is refused as a
-    # KeyProviderError by class (vault BACKLOG #6709): left raw, a ValueError would reach
-    # store.base, which reads a ValueError as a refused key. Chained, as the import refusal above
-    # is. Imported here: store.base imports this module.
-    from messagefoundry.store.base import _is_classified_refusal
-
+    # propagates. So does an error store.base would judge by more than its class
+    # (base._judged_apart_from_its_class names the cases), so its refusal is the one main raised.
+    # Any other Exception from its construction is refused as a KeyProviderError by class (vault
+    # BACKLOG #6709): left raw, a ValueError would reach store.base, which reads a ValueError as a
+    # refused key. Chained, as the import refusal above is.
     try:
         provider: KeyProvider = module.build_provider(settings, posture=posture)
     except (KeyProviderError, MemoryError, RecursionError):
         raise
     except Exception as exc:
-        if _is_classified_refusal(exc):
+        # Imported here, and only on a failure: store.base imports this module.
+        from messagefoundry.store.base import _judged_apart_from_its_class
+
+        if _judged_apart_from_its_class(exc):
             raise
         raise KeyProviderError(
             f"[store].key_provider={name!r}: its provider could not be built "

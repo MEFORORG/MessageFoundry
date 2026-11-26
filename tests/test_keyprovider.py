@@ -12,7 +12,6 @@ acceptance criterion). DPAPI round-trips are Windows-only, so the file branch is
 from __future__ import annotations
 
 import base64
-import sys
 from collections.abc import Callable
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -543,16 +542,22 @@ def test_the_processs_own_limits_from_the_provider_module_import_fail_closed(
 
 def _plant_build_provider(
     monkeypatch: pytest.MonkeyPatch, make_error: Callable[[], Exception]
-) -> None:
+) -> list[Exception]:
+    """Plant a provider module whose ``build_provider`` raises a fresh ``make_error()``; the
+    list it returns holds each error raised, in order."""
+    raised: list[Exception] = []
     fake = ModuleType("messagefoundry.store.keyprovider_vault")
 
     def _build(settings: StoreSettings, *, posture: object = None) -> KeyProvider:
-        raise make_error()
+        error = make_error()
+        raised.append(error)
+        raise error
 
     fake.build_provider = _build  # type: ignore[attr-defined]
     monkeypatch.setattr(
         "messagefoundry.store.keyprovider.importlib.import_module", lambda _name: fake
     )
+    return raised
 
 
 def _dpapi_error() -> Exception:
@@ -578,18 +583,22 @@ def _dpapi_unavailable() -> Exception:
 def test_a_classified_refusal_from_build_provider_keeps_its_own_text(
     monkeypatch: pytest.MonkeyPatch, make_error: Callable[[], Exception], index: int
 ) -> None:
-    # Engine PR 3321 hold item 2: a refusal store.base._fresh_refusal chooses a text of its own
-    # for passes through the build arm unwrapped, so the operator reads that text, as on main,
-    # and not the generic "key source failed" one a KeyProviderError gets.
-    from messagefoundry.store.base import _KEY_SEAM_TEXTS
+    # Engine PR 3321 hold item 2: a refusal store.base._fresh_refusal gives a slot of its own
+    # passes through the build arm unwrapped, so the operator reads that slot's text at the key
+    # seam and at the cipher build, as on main, and not the generic "key source failed" one a
+    # KeyProviderError gets.
+    from messagefoundry.store.base import _BUILD_TEXTS, _KEY_SEAM_TEXTS, build_store_cipher
 
-    _plant_build_provider(monkeypatch, make_error)
-    with pytest.raises(type(make_error())):
+    raised = _plant_build_provider(monkeypatch, make_error)
+    with pytest.raises(Exception) as direct:
         resolve_key_provider(StoreSettings(key_provider="vault"))
+    assert direct.value is raised[-1]
     with pytest.raises(Exception) as caught:
         resolve_active_key(StoreSettings(key_provider="vault"))
     assert str(caught.value) == _KEY_SEAM_TEXTS[index]
-    assert str(caught.value) != _KEY_SEAM_TEXTS[4]
+    with pytest.raises(Exception) as built:
+        build_store_cipher(StoreSettings(key_provider="vault"))
+    assert str(built.value) == _BUILD_TEXTS[index]
 
 
 def test_a_refusal_the_engine_built_from_build_provider_keeps_its_recorded_text(
@@ -599,9 +608,12 @@ def test_a_refusal_the_engine_built_from_build_provider_keeps_its_recorded_text(
     from messagefoundry.store.base import StoreCipherConfigError, _recorded
 
     text = "synthetic recorded refusal"
-    _plant_build_provider(monkeypatch, lambda: _recorded(StoreCipherConfigError(text), text))
-    with pytest.raises(StoreCipherConfigError):
+    raised = _plant_build_provider(
+        monkeypatch, lambda: _recorded(StoreCipherConfigError(text), text)
+    )
+    with pytest.raises(StoreCipherConfigError) as direct:
         resolve_key_provider(StoreSettings(key_provider="vault"))
+    assert direct.value is raised[-1]
     with pytest.raises(Exception) as caught:
         resolve_active_key(StoreSettings(key_provider="vault"))
     assert str(caught.value) == text
@@ -612,25 +624,32 @@ def test_an_error_caused_by_the_vault_hop_refusal_keeps_the_vault_hop_text(
 ) -> None:
     # As above, for an error whose cause is the Vault hop's marked refusal: wrapped, that cause
     # would sit one link further down than _fresh_refusal reads, and the Vault text would be lost.
-    from messagefoundry.config.tls_policy import _VAULT_HOP_MODULE
+    strict_requests = pytest.importorskip("messagefoundry.transports.strict_requests")
     from messagefoundry.store.base import _VAULT_HOP_TEXT
-
-    class VaultHopRefused(InsecureHopRefused):
-        pass
-
-    monkeypatch.setitem(
-        sys.modules, _VAULT_HOP_MODULE, SimpleNamespace(VaultHopRefused=VaultHopRefused)
-    )
 
     def _caused() -> Exception:
         error = RuntimeError("synthetic")
-        error.__cause__ = VaultHopRefused("synthetic hop")
+        error.__cause__ = strict_requests.VaultHopRefused("Vault test hop: fixed text")
         return error
 
     _plant_build_provider(monkeypatch, _caused)
     with pytest.raises(Exception) as caught:
         resolve_active_key(StoreSettings(key_provider="vault"))
     assert str(caught.value) == _VAULT_HOP_TEXT
+
+
+def test_a_codec_error_from_build_provider_keeps_the_codec_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # As above, for a codec error: store.base's codec judgement reads the error's own place in
+    # its chain and its class, so a wrap would change both the refusal's class and its text.
+    from messagefoundry.store.base import StoreCipherConfigError
+
+    _plant_build_provider(
+        monkeypatch, lambda: UnicodeDecodeError("utf-8", bytes([0xFF]), 0, 1, "synthetic")
+    )
+    with pytest.raises(StoreCipherConfigError, match="is or holds a codec error"):
+        resolve_active_key(StoreSettings(key_provider="vault"))
 
 
 def test_a_plain_value_error_from_build_provider_is_still_refused_by_class(

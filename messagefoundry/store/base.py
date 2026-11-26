@@ -4087,23 +4087,32 @@ def _in_place_of(
 #: refusal, a DPAPI error, DPAPI unavailable, a ``ValueError``, and any other class.
 _SiteTexts = tuple[str, str, str, str, str]
 
-#: The classes :func:`_fresh_refusal` gives a text of their own, read with ``type``. A plain
-#: ``ValueError`` is not one: its text is the generic one for a refused key.
-_CLASSIFIED_REFUSALS: Final = (InsecureHopRefused, DpapiError, DpapiUnavailable)
+#: The classes :func:`_fresh_refusal` tests for, read with ``type``, ahead of its ``ValueError``
+#: and catch-all slots. :func:`_fresh_refusal` dispatches on these, in this order.
+_CLASSIFIED_REFUSALS: Final[tuple[type[Exception], ...]] = (
+    InsecureHopRefused,
+    DpapiError,
+    DpapiUnavailable,
+)
 
 
-def _is_classified_refusal(exc: BaseException) -> bool:
-    """Whether :func:`_fresh_refusal` chooses ``exc``'s text by more than "``ValueError`` or
-    other": its class is one of :data:`_CLASSIFIED_REFUSALS`, it or its cause is the Vault hop's
-    marked refusal, or the engine built it (:func:`_recorded_text`). A seam that wraps an error
-    before ``_fresh_refusal`` sees it passes these through unwrapped, so the text stays the one
-    ``_fresh_refusal`` would have chosen (``keyprovider._load_external_provider``)."""
-    return (
+def _judged_apart_from_its_class(exc: Exception) -> bool:
+    """Whether this module's key sites judge ``exc`` by more than "a ``ValueError`` or another
+    class", so that wrapping it in a ``KeyProviderError`` would change the refusal they raise.
+    ``True`` when :func:`_codec_safe_refusal` would refuse it (a codec error on its chain, a
+    chain that cannot be read whole), or :func:`_fresh_refusal` gives it a slot of its own: its
+    class is one of :data:`_CLASSIFIED_REFUSALS` (the Vault hop's marked refusal among them), its
+    cause is the marked refusal, or the engine built it (:func:`_recorded_text`).
+    ``keyprovider._load_external_provider``'s build arm passes these through unwrapped. A
+    ``BaseException`` that is not an ``Exception`` propagates."""
+    if (
         issubclass(type(exc), _CLASSIFIED_REFUSALS)
-        or is_vault_hop_refusal(exc)
         or is_vault_hop_refusal(_CAUSE.__get__(exc))
         or _recorded_text(exc) is not None
-    )
+    ):
+        return True
+    codec, read_whole = _codec_error_on(exc)
+    return codec is not None or not read_whole
 
 
 def _fresh_refusal(
@@ -4135,12 +4144,16 @@ def _fresh_refusal(
             hop = value = other = vault
             break
     made: type[Exception]
-    if issubclass(kind, InsecureHopRefused):
-        made, text = hop_as, hop
-    elif issubclass(kind, DpapiError):
-        made, text = DpapiError, dpapi
-    elif issubclass(kind, DpapiUnavailable):
-        made, text = DpapiUnavailable, unavailable
+    # One slot per class of _CLASSIFIED_REFUSALS, in its order, which the build arm's pass-through
+    # reads (_judged_apart_from_its_class); a new slot goes in both.
+    classified = zip(
+        _CLASSIFIED_REFUSALS,
+        ((hop_as, hop), (DpapiError, dpapi), (DpapiUnavailable, unavailable)),
+        strict=True,
+    )
+    slot = next((pair for cls, pair in classified if issubclass(kind, cls)), None)
+    if slot is not None:
+        made, text = slot
     elif issubclass(kind, ValueError):
         made, text = StoreCipherConfigError, value
     else:
