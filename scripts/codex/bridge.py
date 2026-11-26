@@ -416,10 +416,12 @@ def dispatch(root: Path, payload: dict) -> dict:
     # Outside SessionStart a hook that fails other than by exit 2 no longer stops the event's later
     # hooks: they still run while the event's shared budget lasts, and once it is spent each later
     # hook is recorded as timed out without running. A hook's exit 2 still ends the event at once,
-    # as on origin/main. The first fault is raised once the event's hooks end, unless another
-    # hook's deny, ask or block stands; that keeps the exit code a lone failing hook gave on main.
-    # A fault outside a hook's own run, such as an unsupported hook or a field of the wrong type,
-    # ends them at once and takes the first fault's place; a merged deny, ask or block still stands.
+    # as on origin/main. The first fault is raised once the event's hooks end, unless a deny, ask,
+    # block or `continue: false` merged from another hook stands, as blocks() reads it; that keeps
+    # the exit code a lone failing hook gave on main. A fault outside a hook's own run, such as an
+    # unsupported hook or a field of the wrong type, ends them at once and takes the first fault's
+    # place; a merged deny, ask, block or `continue: false` still stands, one merged from the same
+    # object as the bad field included.
     fault: Exception | None = None
 
     def record(exc: Exception, label: str) -> None:
@@ -506,8 +508,9 @@ def dispatch(root: Path, payload: dict) -> dict:
                     continue
                 merge_output(result, update)
     except OUTER_FAULTS as exc:
-        # A fault outside a hook's own run ends the event's hooks. A deny, ask or block already
-        # merged still stands, below, rather than being lost to the fault's exit.
+        # A fault outside a hook's own run ends the event's hooks. A deny, ask, block or
+        # `continue: false` already merged still stands, below, rather than being lost to the
+        # fault's exit.
         if fault is not None:
             print(f"Codex bridge: a hook also failed: {fault}", file=sys.stderr)
         fault = exc

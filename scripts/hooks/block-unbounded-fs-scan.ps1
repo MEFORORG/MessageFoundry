@@ -16,8 +16,10 @@
 # program); a walk of the segment's own `cd` (`cd /proc && find .`); and a grep long option
 # abbreviation (`grep --rec x /proc`). Recognising the program is required to deny, so each of these
 # is a silent allow. Inverting that, so only provably non-walking programs are allowed, is the
-# deeper fix and is not built. Nor does it catch a walk on a line after a heredoc whose delimiter
-# bash finds only by joining a backslash-newline (`E\` then `OF`): every view reads that line as body.
+# deeper fix and is not built. Nor does it catch a walk outside a `$(...)` or backtick substitution
+# on a line after a heredoc whose delimiter bash finds only by joining a backslash-newline (`E\`
+# then `OF`): the views blank that line as body, and the heredoc pass reads only the substitutions
+# in it.
 #
 # ROOTS ARE COMPARED AS PATHS, OPTIONS AS GRAMMAR. Every bypass measured on 2026-09-20 came from
 # comparing a spelling instead of what it names: `/.`, `//`-variants, `/pro'c'`, `/pro\c`,
@@ -90,13 +92,19 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # or substitution before that line is read.
 # The bodies of a line's openers follow it in order. A body ends only at a line that is exactly its
 # delimiter, after leading tabs for `<<-`. For an unquoted delimiter, bash compares the line after
-# joining each backslash-newline. This pass ends the body only where the line is the delimiter
-# both as written and as joined, so a body bash ends at a joined delimiter (`E\` then `OF`) is read
-# on past it. Its later lines are then read as body, which can add a false deny and hides any
-# opener on them. Bash runs those lines as commands, and the other views keep them blanked, so a
-# walk on them outside a substitution (`cat <<EOF\nE\\\nOF\nfind /proc`) is allowed, as on main. A quoted delimiter's body joins no line. A delimiter with any quote or backslash in
-# it is quoted: its body takes no substitution and adds nothing, nor does a `$(` or backtick after
-# a backslash. A backslash-newline in a body is removed first, as bash removes it.
+# joining each backslash-newline; the other views compare each line as written, after .Trim().
+# The caller runs this pass twice and keeps, through $Seen, every text either run adds. With
+# -AsWritten, a body ends at the first line that is its delimiter as written, as the views end it,
+# so the lines after a raw `EOF` that follows a continued line (`x\` then `EOF`) are read as the
+# views read them, and a later opener there is read. Without it, a body ends only where the line is
+# the delimiter both as written and as joined, so that raw `EOF` stays body, as bash reads it.
+# Neither run ends a body at a delimiter bash finds only by joining (`E\` then `OF`), so both read
+# the lines after it as body, which can add a false deny and hides any opener on them. Bash runs
+# those lines as commands, and the other views keep them blanked, so a walk on them outside a
+# substitution (`cat <<EOF\nE\\\nOF\nfind /proc`) is allowed, as on main. A quoted delimiter's body
+# joins no line. A delimiter with any quote or backslash in it is quoted: its body takes no
+# substitution and adds nothing, nor does a `$(` or backtick after a backslash. A backslash-newline
+# in a body is removed first, as bash removes it.
 # A substitution's end is found by counting parens outside quotes and backticks, and a `case` in it
 # extends its text to the end of the body, since a pattern's `)` closes nothing. At least these can
 # still end it early, so the text after them is not read: a `)` in a comment, in a `${...}` or in a
@@ -104,7 +112,8 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # not read at least an opener the bash reading blanks, such as one after a body that reading ended
 # early at an indented copy of its delimiter, or never ended. Each distinct text adds its length to
 # $Spent, and once a text would pass $Cap the rest of its body is skipped.
-function Add-HeredocSubstitutions([string]$Text, [string]$Masked, $Into, $Seen, $Spent, [int]$Cap) {
+function Add-HeredocSubstitutions([string]$Text, [string]$Masked, $Into, $Seen, $Spent, [int]$Cap,
+    [switch]$AsWritten) {
     if ($Masked.IndexOf('<<') -lt 0) { return }
     $rawLines = $Text.Split([char]10)
     $maskedLines = $Masked.Split([char]10)
@@ -124,7 +133,7 @@ function Add-HeredocSubstitutions([string]$Text, [string]$Masked, $Into, $Seen, 
         if ($queue.Count -gt 0 -and $null -ne $body) {
             $cur = $queue[0]
             $own = if ($cur.Dash) { $raw.TrimStart([char]9) } else { $raw }
-            if ($cur.Bare -and $raw -cmatch '(?<!\\)(?:\\\\)*\\$') {
+            if (-not $AsWritten -and $cur.Bare -and $raw -cmatch '(?<!\\)(?:\\\\)*\\$') {
                 # Bash joins this line to the next before it compares the delimiter.
                 $continued = $continued -or $own -cne '\'
                 [void]$body.Append($raw).Append("`n")
@@ -1330,8 +1339,10 @@ try {
             $seen = [System.Collections.Generic.HashSet[string]]::new()
             $spent = @{ Value = 0 }
             $cap = 16 * $cmd.Length + 65536
-            # The bash reading the bash view was built from, so it is not built again here.
+            # The bash reading the bash view was built from, so it is not built again here. Both
+            # runs share $seen, so a text both readings find is judged once.
             Add-HeredocSubstitutions $cmd $bashMask $texts $seen $spent $cap
+            Add-HeredocSubstitutions $cmd $bashMask $texts $seen $spent $cap -AsWritten
             $heredocPending.Texts = $texts
             $heredocPending.Seen = $seen
             $heredocPending.Spent = $spent
@@ -1346,7 +1357,10 @@ try {
             $tMask = Hide-QuotedSpans $t
             $bashView = Hide-HeredocBodies $t $tMask
             # A heredoc opened inside this text has a body of its own, read the same way.
-            Add-HeredocSubstitutions $t $tMask $texts $heredocPending.Seen $heredocPending.Spent $heredocPending.Cap
+            foreach ($asWritten in $false, $true) {
+                Add-HeredocSubstitutions $t $tMask $texts $heredocPending.Seen $heredocPending.Spent `
+                    $heredocPending.Cap -AsWritten:$asWritten
+            }
             Add-ScanBounds $plain $t "heredoc $($heredocPending.Next)|"
             if ($bashView -cne $plain) { Add-ScanBounds $bashView $t "heredoc $($heredocPending.Next)|" }
             return $true

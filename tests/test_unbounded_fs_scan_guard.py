@@ -1068,6 +1068,20 @@ HEREDOC_SUBSTITUTION_DENY = [
     pytest.param(
         "echo 'hi'\ncat <<EOF\nE\\\nOF\ncat <<B\n$(find /proc)\nB", id="joined-delimiter-quoted"
     ),
+    # The views end the first body at the raw `EOF` after `x\`, so they read `<<B` as an opener and
+    # blank the walk as B's body; bash reads the walk as a command. The pass must read the lines
+    # after that `EOF` as the views do too, or nothing reads the walk.
+    pytest.param(
+        "cat <<EOF\nx\\\nEOF\ncat <<B\nEOF\n$(find /proc)\nB", id="views-end-at-raw-delimiter"
+    ),
+    pytest.param(
+        "cat <<-EOF\n\tx\\\n\tEOF\ncat <<-B\n\tEOF\n$(find /proc)\n\tB",
+        id="dash-views-end-at-raw-delimiter",
+    ),
+    pytest.param(
+        'echo "$(cat <<EOF\nx\\\nEOF\ncat <<B\nEOF\n$(find /proc)\nB\n)"',
+        id="nested-views-end-at-raw-delimiter",
+    ),
     # A quoted delimiter's body joins no line, so it ends at `EOF` and the next opener is read.
     pytest.param(
         "cat <<'EOF'\nx\\\nEOF\ncat <<B\nit's $(find /proc)\nB", id="quoted-delimiter-joins-none"
@@ -1103,6 +1117,9 @@ HEREDOC_SUBSTITUTION_ALLOW = [
     ),
     # An escaped backslash before the newline continues nothing, so the body ends at `EOF`.
     pytest.param("cat <<EOF\nx\\\\\nEOF\necho '$(find /proc)'", id="escaped-backslash-then-end"),
+    # A line that is only `\` joins nothing to the start of the next, so `EOF` after it is the
+    # delimiter both as written and as joined, and the body ends there.
+    pytest.param("cat <<EOF\n\\\nEOF\necho '$(find /proc)'", id="lone-backslash-then-end"),
 ]
 
 
@@ -1896,8 +1913,8 @@ EXPECTED_ROW_COUNTS = {
     "REFINED_FALSE_DENY_ALLOW": 14,
     "SITE_TEXT_DENY": 16,
     "SITE_TEXT_ALLOW": 21,
-    "HEREDOC_SUBSTITUTION_DENY": 29,
-    "HEREDOC_SUBSTITUTION_ALLOW": 12,
+    "HEREDOC_SUBSTITUTION_DENY": 32,
+    "HEREDOC_SUBSTITUTION_ALLOW": 13,
 }
 
 
