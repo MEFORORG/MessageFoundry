@@ -280,8 +280,9 @@ class Control:
     branches: tuple[Control, ...] = field(default_factory=tuple)
     # RAW text (escaped at the render site, like ``detail``). Only ``"send"`` sets it.
     refusal: str = ""
-    # The local a live ``"send"`` delivers: a name this module generated, never export text.
-    message: str = "msg"
+    # The local a live ``"send"`` delivers: a name this module generated, never export text. Only
+    # the step 2 binder sets it; ``""`` is the step 1 path, which delivers a copy of msg.
+    message: str = ""
     # ``"call"`` on a ``"block"`` that would have been one, had its ``@Data`` not been a statement
     # off a ``<Line>`` (BACKLOG #2632). It renders and counts as the label it is. Only the test
     # that decides the shape of the tree reads it (:func:`_structural_kind`).
@@ -3084,8 +3085,13 @@ def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[st
                 f"{pad}# TODO: Corepoint {ctrl.source_verb} — hand-finish: no destination named "
                 f"({label})"
             ]
+        # A Send holds its message object, and the step 1 path maps a write to msg that follows a
+        # send of it, so sending msg itself would let that write change the message already sent
+        # whenever [pipeline].snapshot_on_send is off or the handler is called directly (BACKLOG
+        # #5823). A step 2 local needs no copy: the binder declines a write to it after its send.
+        message = ctrl.message or "msg.copy()"
         return [
-            f"{pad}sends.append(Send({ctrl.args[0]}, {ctrl.message}))  # Corepoint {ctrl.source_verb}"
+            f"{pad}sends.append(Send({ctrl.args[0]}, {message}))  # Corepoint {ctrl.source_verb}"
         ]
     if ctrl.kind in ("clone", "create"):
         # Both halves are generated: the local is a name _Binder made from a handle the gate held to

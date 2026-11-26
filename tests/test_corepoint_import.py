@@ -995,7 +995,7 @@ def test_a_hostile_destination_name_cannot_become_a_traversal_path() -> None:
     src = _handler_source('<Line Data="MsgSend $out [../../etc/passwd]"/>')
     assert "../.." not in src
     # ONE sanitized name, used identically as the connection id, the Send target and the directory.
-    assert 'sends.append(Send("etc_passwd", msg))' in src
+    assert 'sends.append(Send("etc_passwd", msg.copy()))' in src
     assert 'outbound("etc_passwd", File(directory="./corepoint-import/IB_ACME_X/etc_passwd")' in src
 
 
@@ -1200,7 +1200,7 @@ def test_a_stray_branch_body_is_live_code_outside_the_loop_it_was_adopted_by() -
     assert "# TODO: Corepoint LoopExit outside a loop" in src
     assert "break" not in src
     assert "    sends = []" in src
-    assert '    sends.append(Send("OB_ACME_ADT", msg))' in src
+    assert '    sends.append(Send("OB_ACME_ADT", msg.copy()))' in src
     ast.parse(src)
 
     # And nested, where an enclosing loop WOULD make a ``break`` parse. It must still not be emitted:
@@ -1291,12 +1291,34 @@ def test_msgsend_becomes_an_inline_send_and_a_placeholder_outbound() -> None:
         '<List><Line Data="MsgSend $out [OB_ACME_ADT]"/></List></If>'
     )
     assert "    sends = []" in src
-    assert '        sends.append(Send("OB_ACME_ADT", msg))' in src
+    assert '        sends.append(Send("OB_ACME_ADT", msg.copy()))' in src
     assert "    return sends" in src
     # The destination is declared, as an inert placeholder (the export's connection config is not
     # modelled), so the emitted Send never dangles.
     assert 'outbound("OB_ACME_ADT", File(directory=' in src
     assert "deployed=False)" in src
+
+
+@pytest.mark.parametrize("snapshot", [False, True], ids=["snapshot-off", "snapshot-on"])
+def test_a_step1_send_of_msg_is_not_changed_by_a_later_write(
+    tmp_path: Path, snapshot: bool
+) -> None:
+    """BACKLOG #5823: the step 1 path appended a ``Send`` holding ``msg`` itself and then wrote to
+    ``msg``, so with ``[pipeline].snapshot_on_send`` off, or on a direct call, the message already
+    sent changed. The send now carries ``msg.copy()``, whatever the setting."""
+    from messagefoundry.config.send_snapshot import activated
+
+    body = _role_send("input-handle", "%ADT", "OB_IN") + '<Line Data="ItemClear %ADT/PID-3"/>'
+    with activated(snapshot):
+        result, inbound = _run_with(tmp_path, body)
+    assert isinstance(result, list) and len(result) == 1
+    sent = result[0].message
+    assert sent is not inbound
+    assert sent.field("PID-3") == "123"
+    assert not inbound.field("PID-3")  # the write landed on the input
+    src = _handler_body(_handler_source(body))
+    assert '    sends.append(Send("OB_IN", msg.copy()))  # Corepoint MsgSend' in src
+    assert '    set_field(msg, "PID-3", "")' in src  # the step 1 path: the write is mapped
 
 
 def test_msgsend_without_a_recoverable_destination_is_a_marker() -> None:
@@ -1546,7 +1568,7 @@ def test_upper_case_markup_of_the_input_handle_still_maps_and_sends() -> None:
     )
     body = _handler_body(_handler_source(write + _upper_send("input-handle", "%ADT", "OB_IN")))
     assert 'set_field(msg, "MSH-6", "X")' in body
-    assert '    sends.append(Send("OB_IN", msg))  # Corepoint MsgSend' in body
+    assert '    sends.append(Send("OB_IN", msg.copy()))  # Corepoint MsgSend' in body
     assert "raise NotImplementedError" not in body
 
 
@@ -1647,7 +1669,7 @@ def test_a_plain_text_send_still_renders_as_before() -> None:
     """The control arm, and the gap ADR 0086 §2(b″) records: a send that strip_markup leaves
     unchanged takes the flat reading and still renders as a send of msg."""
     body = _handler_body(_handler_source('<Line Data="MsgSend %OUT [OB_FLAT]"/>'))
-    assert '    sends.append(Send("OB_FLAT", msg))  # Corepoint MsgSend' in body
+    assert '    sends.append(Send("OB_FLAT", msg.copy()))  # Corepoint MsgSend' in body
 
 
 def _root_copy(
@@ -1706,7 +1728,7 @@ def test_a_try_with_no_refused_send_renders_as_before() -> None:
     )
     src = _handler_body(_handler_source(body))
     assert "except NotImplementedError" not in src
-    assert '        sends.append(Send("OB_IN", msg))' in src
+    assert '        sends.append(Send("OB_IN", msg.copy()))' in src
 
 
 @pytest.mark.parametrize(
@@ -1735,7 +1757,7 @@ def test_a_root_path_send_of_the_input_handle_still_sends() -> None:
     operand = _span("input-handle", "%ADT") + _span("path", "/")
     send = _role_line(_span("keyword", "MsgSend") + " " + operand + " to connection " + literal)
     body = _handler_body(_handler_source(_WRITE_INPUT + send))
-    assert '    sends.append(Send("OB_IN", msg))' in body
+    assert '    sends.append(Send("OB_IN", msg.copy()))' in body
     assert 'set_field(msg, "MSH-6", "X")' in body
 
 
@@ -1802,7 +1824,7 @@ def test_two_input_handle_names_refuse_even_an_input_classed_send() -> None:
     assert "no handle in this action-list is known to be msg" in body
     disabled_second = second_input.replace("<Line ", '<Line Disabled="1" ', 1)
     body = _handler_body(_handler_source(disabled_second + send))
-    assert '    sends.append(Send("OB_IN", msg))' in body
+    assert '    sends.append(Send("OB_IN", msg.copy()))' in body
 
 
 def test_a_send_with_no_destination_is_counted_unmapped() -> None:
@@ -2225,7 +2247,7 @@ def test_a_prose_block_label_stays_a_label() -> None:
     assert "    # Corepoint Block: Patient identity\n" in src
     assert _LABEL_MARKER not in src and "TODO" not in src
     assert '    set_field(msg, "MSH-6", "X")\n' in src
-    assert '    sends.append(Send("OB_IN", msg))' in src
+    assert '    sends.append(Send("OB_IN", msg.copy()))' in src
     assert _count_steps(_handler_steps(body), in_loop=False) == (2, [], 0)
 
 
@@ -2236,7 +2258,7 @@ def test_the_same_clone_on_a_line_is_still_read_as_made() -> None:
     src = _handler_body(
         _handler_source(_labelled("Block", "Patient identity", _CLONE_LINE) + _SEND_COPY)
     )
-    assert '    sends.append(Send("OB_ACME", msg))' in src
+    assert '    sends.append(Send("OB_ACME", msg.copy()))' in src
     assert "raise NotImplementedError" not in src and _LABEL_MARKER not in src
 
 
@@ -2323,7 +2345,7 @@ def test_the_scan_and_the_render_ask_one_rule(element: str, carried: bool) -> No
     held = _message_handles(_hardened_fromstring(_package(body))[0])[1]
     assert (_LABEL_MARKER in src) is carried
     assert (held == frozenset()) is carried
-    assert ('Send("OB_IN", msg)' in src) is not carried
+    assert ('Send("OB_IN", msg.copy())' in src) is not carried
     assert ("raise NotImplementedError" in src) is carried
     if carried:
         assert "Send(" not in src  # no live send at all: not the input's, not the statement's
@@ -2368,7 +2390,7 @@ def test_a_send_in_a_block_label_is_never_a_delivery() -> None:
     assert "called list inlined" not in _handler_source(call)
     # The control: the same send on a Line under a prose Block is a delivery.
     line = _labelled("Block", "Section", _role_send("input-handle", "%ADT", "OB_LABEL"))
-    assert 'sends.append(Send("OB_LABEL", msg))' in _handler_source(line)
+    assert 'sends.append(Send("OB_LABEL", msg.copy()))' in _handler_source(line)
 
 
 @pytest.mark.parametrize("verb", sorted(_STATEMENT_VERBS - {"msgsend"}))
@@ -2460,7 +2482,7 @@ def test_a_wrappers_marker_never_orphans_a_sibling_branch(pair: str, between: st
     assert not [
         line for line in src.splitlines() if line.startswith(("    sends.append", "    set_field"))
     ]
-    assert '        sends.append(Send("OB_FLAT", msg))' in src
+    assert '        sends.append(Send("OB_FLAT", msg.copy()))' in src
 
 
 @pytest.mark.parametrize("between", _FILLED_WRAPPERS)
@@ -2477,7 +2499,7 @@ def test_a_wrappers_marker_changes_nothing_where_main_already_orphans(
     template = construct + _FILLED_WRAPPERS[between] + _sibling_arm(branch)
     src = _assert_the_markers_change_no_code(template, 1)
     assert src.count(_ORPHAN) == 1
-    assert '\n        sends.append(Send("OB_FLAT", msg))' in src
+    assert '\n        sends.append(Send("OB_FLAT", msg.copy()))' in src
     assert '\n    sends.append(Send("OB_FLAT"' not in src
 
 
@@ -2511,7 +2533,7 @@ def test_a_marker_at_the_end_of_any_flattened_body_never_orphans_a_branch(
     template = frame.replace("{between}", between).replace("{arm}", _sibling_arm("Else"))
     src = _assert_the_markers_change_no_code(template, 1)
     assert _ORPHAN not in src
-    assert '        sends.append(Send("OB_FLAT", msg))' in src
+    assert '        sends.append(Send("OB_FLAT", msg.copy()))' in src
 
 
 def test_a_send_label_keeps_its_body_where_main_put_it() -> None:
@@ -2525,7 +2547,7 @@ def test_a_send_label_keeps_its_body_where_main_put_it() -> None:
     src = _handler_body(_handler_source(body))
     assert _LABEL_MARKER in src and _ORPHAN not in src
     assert 'Send("OB_LABEL"' not in src
-    assert '        sends.append(Send("OB_FLAT", msg))' in src
+    assert '        sends.append(Send("OB_FLAT", msg.copy()))' in src
     assert not [line for line in src.splitlines() if line.startswith("    sends.append")]
 
 
@@ -2540,7 +2562,7 @@ def test_a_branch_marker_holding_only_a_marked_wrapper_still_opens_its_branch(pa
     arm = _CLEAR + '<Line Data="MsgSend %ADT [OB_FLAT]"/>'
     template = construct.replace("<List/>", f"<List>{_FILLED}{opener}{arm}</List>")
     src = _assert_the_markers_change_no_code(template, 1)
-    assert '        sends.append(Send("OB_FLAT", msg))' in src
+    assert '        sends.append(Send("OB_FLAT", msg.copy()))' in src
     assert not [line for line in src.splitlines() if line.startswith("    sends.append")]
     assert next(line for line in src.splitlines() if _LABEL_MARKER in line).startswith(
         " " * 8 + "#"
@@ -2629,7 +2651,7 @@ def test_demoting_a_handlers_only_visible_send_adds_no_trailing_send() -> None:
     for handler in (marked, control):
         assert _enclosing(handler, "OB_HIDDEN").lstrip().startswith("if False:")
     assert "    return sends" in marked and "    return sends" in control
-    assert _ORPHAN in _enclosing(control, "OB_HIDDEN") and 'Send("OB_LABEL", msg)' in control
+    assert _ORPHAN in _enclosing(control, "OB_HIDDEN") and 'Send("OB_LABEL", msg.copy())' in control
 
 
 _SEND_OUT = _role_send("other-handle", "%OUT", "OB_R")
@@ -3210,7 +3232,7 @@ def test_a_send_statement_keeps_its_nested_body() -> None:
     src = _handler_source(
         '<Line Data="MsgSend $o [OB_A]"><List><Line Data="ItemClear %ADT/PID-19"/></List></Line>'
     )
-    assert 'sends.append(Send("OB_A", msg))' in src
+    assert 'sends.append(Send("OB_A", msg.copy()))' in src
     assert 'set_field(msg, "PID-19", "")' in src
     ast.parse(src)
 
@@ -3307,7 +3329,7 @@ def test_a_disabled_list_wrapper_renders_its_statements_commented_out(wrapped: s
         frozenset({"%ADT"}),
     )
     assert '    set_field(msg, "MSH-6", "X")' in handler
-    assert '    sends.append(Send("OB_IN", msg))' in handler
+    assert '    sends.append(Send("OB_IN", msg.copy()))' in handler
     assert _count_steps(_handler_steps(body), in_loop=False) == (2, [], 1)
     ast.parse(src)
 
@@ -3340,7 +3362,7 @@ def test_a_disabled_wrapper_between_a_construct_and_its_branch_orphans_nothing(p
         src = _handler_body(_handler_source(construct + wrapper + _sibling_arm(branch)))
         closed = pair == "try-catch" and "Disabled" in wrapper
         assert (_ORPHAN in src) is closed, wrapper
-        assert '        sends.append(Send("OB_FLAT", msg))' in src, wrapper
+        assert '        sends.append(Send("OB_FLAT", msg.copy()))' in src, wrapper
         assert not _send_lines(src, 1)
 
 
@@ -3961,7 +3983,7 @@ def test_an_orphans_own_branches_stay_dead() -> None:
     body = f'<Line Data="Else"><List>{_SEND_INPUT}<Line Data="Catch"/>{second}</List></Line>'
     src = _handler_source(body)
     handler = _handler_body(src)
-    assert '        sends.append(Send("OB_TWO", msg))' in handler
+    assert '        sends.append(Send("OB_TWO", msg.copy()))' in handler
     assert not _send_lines(handler, 1)
     assert "Catch" in _count_steps(_handler_steps(body), in_loop=False)[1]
     ast.parse(src)
@@ -3978,7 +4000,7 @@ def test_a_branch_with_branches_of_its_own_is_never_adopted_across_a_step() -> N
     )
     body = '<Line Data="If (a)"><List/></Line><Line Data="MsgLog %ADT"/>' + arm
     handler = _handler_body(_handler_source(body))
-    assert '        sends.append(Send("OB_TWO", msg))' in handler
+    assert '        sends.append(Send("OB_TWO", msg.copy()))' in handler
     assert not _send_lines(handler, 1)
     assert {"Else", "ElseIf"} <= set(_count_steps(_handler_steps(body), in_loop=False)[1])
 
@@ -3993,7 +4015,7 @@ def test_the_filed_repro_keeps_its_send_conditional(tmp_path: Path) -> None:
     )
     handler = _handler_body(_handler_source(body))
     assert _ORPHAN not in handler
-    assert '        sends.append(Send("OB_IN", msg))' in handler
+    assert '        sends.append(Send("OB_IN", msg.copy()))' in handler
     assert not _send_lines(handler, 1)
     assert "    elif False:  # TODO: Corepoint Else" in handler
     assert _run_handler(tmp_path, body) == []

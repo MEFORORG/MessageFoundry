@@ -22,10 +22,13 @@ by the step 1 importer, vendored byte-for-byte from main at ``bca583f2a`` (blob 
 origin/main``, because once step 2 merges ``origin/main`` IS the head, and the comparison would become
 the head against itself; and because a CI checkout need not hold that ref. The vendored file is never
 edited. The baseline the guard runs is that file plus the amendments in ``_STEP1_AMENDMENTS``, made
-as it loads: the changes the step 1 code path has gained on purpose since that tree. There are two.
-The fail-closed amendment (BACKLOG #2526) loads first: it switches off live code main rendered from
-switched-off or misplaced source, and ``test_the_fail_closed_amendment_adds_no_live_code`` bounds it
-against the file exactly as vendored. The label amendment (BACKLOG #2632) loads on top of it, and
+as it loads: the changes the step 1 code path has gained on purpose since that tree. There are three.
+The copy amendment (BACKLOG #5823) loads beneath every tree the guard loads, ``step1_as_vendored``
+included: a live send of msg renders ``msg.copy()``, which changes that one line's text and nothing
+the bounds below measure. The fail-closed amendment (BACKLOG #2526) loads next: it switches off live
+code main rendered from switched-off or misplaced source, and
+``test_the_fail_closed_amendment_adds_no_live_code`` bounds it against the file as vendored, with
+only the copy amendment. The label amendment (BACKLOG #2632) loads on top of it, and
 ``test_the_amendment_changes_only_a_list_holding_a_statement_off_a_line`` bounds what that one may
 change against the tree it loads onto (``step1_unlabelled``). That bound is one rule: the amended
 baseline, and the head wherever the gate is closed, are never QUIETER than that tree. No refusal
@@ -659,7 +662,19 @@ _FAIL_CLOSED_AMENDMENTS: tuple[tuple[str, str], ...] = (
     # which no chain renders, is an orphan at the end of the branch it was written in.
     (_HANDLER_STEPS, _HANDLER_STEPS.replace("tuple(", "_unbranch(_off_list(").replace("\n", ")\n")),
 )
-#: Every amendment the baseline carries, in the order it loads them.
+# BACKLOG #5823. A live send of msg renders ``msg.copy()``, so a later write to msg cannot change
+# the message already sent when ``[pipeline].snapshot_on_send`` is off or the handler is called
+# directly. It changes the text of that one rendered line and nothing else in the render or the
+# counts, so it is orthogonal to the rule every other amendment and bound measures: every tree the
+# guard loads carries it (:func:`_load_step1`), and the bounds compare like with like.
+_SEND_OF_MSG = (
+    '        return [f"{pad}sends.append(Send({ctrl.args[0]}, msg))  '
+    '# Corepoint {ctrl.source_verb}"]\n'
+)
+_COPY_AMENDMENTS: tuple[tuple[str, str], ...] = (
+    (_SEND_OF_MSG, _SEND_OF_MSG.replace(", msg))", ", msg.copy()))")),
+)
+#: Every amendment the baseline carries on top of the copy amendment, in the order it loads them.
 _STEP1_AMENDMENTS = (*_FAIL_CLOSED_AMENDMENTS, *_LABEL_AMENDMENTS)
 
 
@@ -667,7 +682,7 @@ def _load_step1(name: str, amendments: tuple[tuple[str, str], ...]) -> Any:
     if name in sys.modules:
         return sys.modules[name]
     source = _step1_bytes().decode("utf-8")
-    for found, replacement in amendments:
+    for found, replacement in (*_COPY_AMENDMENTS, *amendments):
         # Exactly once, so an amendment can neither miss nor land somewhere it was not meant to.
         assert source.count(found) == 1, f"the vendored step 1 file holds {found!r} other than once"
         source = source.replace(found, replacement)
@@ -676,14 +691,14 @@ def _load_step1(name: str, amendments: tuple[tuple[str, str], ...]) -> Any:
     sys.modules[name] = module
     # An amended source is compiled under its own name: a traceback must not quote the vendored
     # file's lines for code that sits at other lines once amended.
-    filename = f"<{_STEP1_PATH.name} amended>" if amendments else str(_STEP1_PATH)
+    filename = f"<{_STEP1_PATH.name} amended>"
     exec(compile(source, filename, "exec"), module.__dict__)
     return module
 
 
 #: The baseline: the step 1 code path as it stands, which a gate-declined list must match.
 step1: Any = _load_step1("_mefor_corepoint_import_step1", _STEP1_AMENDMENTS)
-#: The vendored tree exactly as main held it, with no amendment.
+#: The vendored tree as main held it, with only the copy amendment (BACKLOG #5823).
 step1_as_vendored: Any = _load_step1("_mefor_corepoint_import_step1_as_vendored", ())
 #: The tree the label amendment (BACKLOG #2632) is bounded against: the vendored tree with the
 #: amendments that load before it. Only the label amendment's own tests read it.
@@ -1585,7 +1600,10 @@ def _observed(message: object, inp: Message | None) -> str:
     return f"C{int(match.group(1))}" if match else "OTHER"
 
 
-_LIVE_SEND = re.compile(r'^(\s*)sends\.append\(Send\("([^"]+)", (\w+)\)\)')
+# The step 1 path sends ``msg.copy()`` (BACKLOG #5823), which is still a send of msg.
+_LIVE_SEND = re.compile(
+    r'^(\s*)sends\.append\(Send\("([^"]+)", (msg(?=\.copy\(\)\)\))|\w+(?=\)\)))'
+)
 # A line that binds a local other than msg, or sends one.
 _LOCAL_LINE = re.compile(
     r"^(\s*)(?:\w+_msg(?:_\d+)? = |sends\.append\(Send\(\"[^\"]+\", (?!msg\))\w+\)\))"
@@ -4172,7 +4190,7 @@ def test_the_liveness_reading_tells_the_three_paths_apart() -> None:
         (f'<Line Data="ForEach %ADT/OBX $o"><List>{send}</List></Line>', "dead"),
     ):
         ranks = _liveness(_generate(step1_scan_skips, xml)[0])
-        assert ranks['sends.append(Send("OB_X", msg))  # Corepoint MsgSend'] == [rank], xml
+        assert ranks['sends.append(Send("OB_X", msg.copy()))  # Corepoint MsgSend'] == [rank], xml
 
 
 def test_the_structure_check_sees_an_orphan_and_an_adoption() -> None:

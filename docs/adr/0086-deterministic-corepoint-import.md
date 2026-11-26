@@ -333,7 +333,11 @@ non-MSH segment kept the handle, and its send delivered the bare skeleton where 
 **The cost.** Any list holding a construct, or anything the gate does not read, is finished by hand
 exactly as under step 1. Step 1's gaps stay with such a list: a send of a clone may still send `msg`
 where its flow-insensitive scan holds the clone, and a write to the input after a send of it still
-lands on `msg`, which only `snapshot_on_send` keeps out of the sent message. Step 2 helps only
+lands on `msg`. *Corrected 2026-11-26 (BACKLOG #5823):* this said that only `snapshot_on_send` keeps
+that write out of the message already sent. A live send of `msg` on the step 1 path now renders
+`sends.append(Send(dest, msg.copy()))`, so the message sent is the input as it stood at the send,
+whatever that setting says; the differential guard's step 1 baseline carries the same change as an
+amendment. A send of a step 2 local still delivers the local itself. Step 2 helps only
 straight-line lists, and the canonical-spelling rule is strict: an export whose labels are wrapped in
 spans, or whose spacing differs at all, gets no help. That is deliberate.
 
