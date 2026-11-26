@@ -5162,10 +5162,13 @@ class SqlServerStore(ServerCipherWalk):
             # its first call, and the `finally` closes it while nothing runs on it.
             _require_call_gate(conn)
             if fail_closed:
-                # BACKLOG #5666: at an open, the state read and the re-read probes run under
-                # [store].command_timeout. The ALTERs below do not, at an open or under
-                # provision-schema: a cancel that lands after ROLLBACK IMMEDIATE has rolled back
-                # the peers leaves RCSI off, and the retry at every restart rolls them back again.
+                # BACKLOG #5666: at an open, the state read, the re-read probes and the
+                # ALLOW_SNAPSHOT_ISOLATION ALTER run under [store].command_timeout. The RCSI ALTER
+                # does not, at an open or under provision-schema: ROLLBACK IMMEDIATE ends the peers'
+                # transactions rather than waiting on them, and a cancel that lands after it has
+                # rolled them back leaves RCSI off, so the retry at every restart rolls them back
+                # again. The snapshot ALTER can wait on transactions open when it runs, and it is
+                # only warned about, so a limit there turns a stall into that warning.
                 _bound_one_shot(conn, settings.command_timeout)
             await _assert_autocommit(conn)
             # Standalone one-shot connection (NOT pooled), so the EF-6 pool-bleed race `_cursor`
@@ -5189,18 +5192,22 @@ class SqlServerStore(ServerCipherWalk):
                 log.warning("%s", message)
                 return
             off = _options_off(row)
-            swap = bool(off) and fail_closed and bool(settings.command_timeout)
+            # The statement limit `cur` was opened under: the state read's, which is unset (the
+            # driver's no limit) under provision-schema.
+            cur_limit = settings.command_timeout if fail_closed else 0
+            # At an open the snapshot ALTER keeps the state read's limit; provision-schema runs
+            # it with none, as every other statement there.
+            snapshot_limit = cur_limit
 
-            async def alter(sql: str) -> None:
-                """Run one ALTER inside its caller's try, so a failure to open its cursor reaches
-                the same handler as the ALTER's own failure: the peer re-read and the remedy."""
-                nonlocal cur, swap
-                if swap or cur is None:
-                    # The ALTERs run with no statement limit, as on a provision-schema run, so
-                    # they get a cursor opened after the limit is lifted (see the comment at the
-                    # state read). `cur` is cleared before the close, so a cancellation landing in
-                    # it does not hand the same cursor to the gate a second time.
-                    swap = False
+            async def alter(sql: str, limit: int) -> None:
+                """Run one ALTER under ``limit`` seconds (0 = none) inside its caller's try, so a
+                failure to open its cursor reaches the same handler as the ALTER's own failure:
+                the peer re-read and the remedy."""
+                nonlocal cur, cur_limit
+                if cur is None or cur_limit != limit:
+                    # pyodbc fixes a cursor's limit when the cursor opens, so a different limit
+                    # needs a new cursor. `cur` is cleared before the close, so a cancellation
+                    # landing in it does not hand the same cursor to the gate a second time.
                     old, cur = cur, None
                     if old is not None:
                         try:
@@ -5211,14 +5218,16 @@ class SqlServerStore(ServerCipherWalk):
                             log.debug(
                                 "options state-read cursor close failed: %s", _options_error(exc)
                             )
-                    _bound_one_shot(conn, 0)
+                    _bound_one_shot(conn, limit)
+                    cur_limit = limit
                     cur = await conn.cursor()
                 await cur.execute(sql)
 
             if "READ_COMMITTED_SNAPSHOT" in off:
                 try:
                     await alter(
-                        "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"
+                        "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE",
+                        0,
                     )
                     log.info("enabled READ_COMMITTED_SNAPSHOT on database %r", db)
                 except Exception as exc:
@@ -5251,7 +5260,9 @@ class SqlServerStore(ServerCipherWalk):
             if "ALLOW_SNAPSHOT_ISOLATION" in off:
                 try:
                     # ALLOW_SNAPSHOT_ISOLATION is an online change (no exclusivity required).
-                    await alter("ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON")
+                    await alter(
+                        "ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON", snapshot_limit
+                    )
                 except Exception as exc:  # noqa: BLE001 - non-fatal
                     log.warning(
                         "could not enable ALLOW_SNAPSHOT_ISOLATION on %r (%s); a DBA should run once: %s",

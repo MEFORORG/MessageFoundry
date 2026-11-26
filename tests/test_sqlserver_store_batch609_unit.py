@@ -230,16 +230,36 @@ async def test_the_open_bounds_its_reads_and_not_its_alters(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Red before #5666: the open's state read and re-read probes kept pyodbc's default of no
-    statement limit. They now run under ``[store].command_timeout``. The ALTERs keep no limit: a
-    cancel landing after ROLLBACK IMMEDIATE rolled back the peers would leave RCSI off, and the
-    retry at every restart would roll them back again."""
+    statement limit. They now run under ``[store].command_timeout``, as the snapshot ALTER does
+    (the next test). The RCSI ALTER keeps no limit: a cancel landing after ROLLBACK IMMEDIATE
+    rolled back the peers would leave RCSI off, and the retry at every restart would roll them
+    back again."""
     timeouts = _install(monkeypatch, alters_fail=False)
     await SqlServerStore._ensure_database_options(_settings())
-    assert timeouts == {_STATE_READ: 17, _ALTER_RCSI: 0, _ALTER_SNAPSHOT: 0}, timeouts
+    assert timeouts == {_STATE_READ: 17, _ALTER_RCSI: 0, _ALTER_SNAPSHOT: 17}, timeouts
     reread = _install(monkeypatch)  # the ALTER fails, so the re-read probes run
     with pytest.raises(RuntimeError, match="READ_COMMITTED_SNAPSHOT is OFF"):
         await SqlServerStore._ensure_database_options(_settings())
     assert reread == {_STATE_READ: 17, _ALTER_RCSI: 0, _REREAD: 17}, reread
+
+
+async def test_the_open_bounds_the_snapshot_alter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Red before #5666's snapshot limb: at an open the ALLOW_SNAPSHOT_ISOLATION ALTER ran with no
+    statement limit, so one waiting on a long transaction stalled the open with no end. It now
+    runs under ``[store].command_timeout``, whether or not the RCSI ALTER ran before it; a
+    timeout is only warned about, as any failure of that ALTER is."""
+    rcsi_on = _install(monkeypatch, alters_fail=False)
+
+    async def _connect(**kwargs: Any) -> _OptionsConn:
+        return _OptionsConn((1, 0), rcsi_on, False)  # RCSI already on, snapshot off
+
+    sys.modules["aioodbc"].connect = _connect  # type: ignore[attr-defined]
+    await SqlServerStore._ensure_database_options(_settings())
+    assert rcsi_on == {_STATE_READ: 17, _ALTER_SNAPSHOT: 17}, rcsi_on
+    both_off = _install(monkeypatch, alters_fail=False)
+    await SqlServerStore._ensure_database_options(_settings())
+    assert both_off[_ALTER_RCSI] == 0  # the control: the RCSI ALTER still runs with none
+    assert both_off[_ALTER_SNAPSHOT] == 17, both_off
 
 
 async def test_provision_schema_options_alters_keep_no_limit(
