@@ -517,3 +517,17 @@ def test_cross_provider_active_key_id_parity_same_mfenc_v1_fixture(
     assert cipher_info(other).active_key_id != fingerprints[0]
     with pytest.raises(CipherError):
         other.decrypt(fixture)
+
+
+@pytest.mark.parametrize("error", [MemoryError, RecursionError])
+def test_the_processs_own_limits_pass_the_provider_module_import(
+    monkeypatch: pytest.MonkeyPatch, error: type[BaseException]
+) -> None:
+    # Vault BACKLOG #6709 item 11: the dispatch's import arm refused out of memory or stack as a
+    # broken install, which its build arm no longer does.
+    def _import(_name: str) -> ModuleType:
+        raise error()
+
+    monkeypatch.setattr("messagefoundry.store.keyprovider.importlib.import_module", _import)
+    with pytest.raises(error):
+        resolve_key_provider(StoreSettings(key_provider="vault"))

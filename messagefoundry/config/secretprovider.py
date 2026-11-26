@@ -170,7 +170,8 @@ def _load_external_provider(
     ``build_provider(settings, *, posture) -> SecretProvider`` behind an optional extra; this
     dispatch imports it by name with **no edit here**. A missing provider module, a missing backend
     SDK, or a provider module that is present but whose import raises an ``Exception``, **fails
-    closed** with :class:`SecretProviderError`; the last two name the extra. The base install pulls
+    closed** with :class:`SecretProviderError`; the last two name the extra. A ``MemoryError`` or
+    ``RecursionError`` from the import propagates, as the process's own limit. The base install pulls
     **zero** external SDK. A provider that imports its SDK lazily, as ``vault`` does, refuses a
     failed SDK import itself, at its first read rather than here
     (``secretprovider_vault._import_hvac``).
@@ -193,6 +194,8 @@ def _load_external_provider(
             f"[secrets].provider={name!r} could not load its backend ({exc.name!r} is missing) — "
             f"install the optional {extra!r} extra ('messagefoundry[{extra}]')."
         ) from exc
+    except (MemoryError, RecursionError):
+        raise  # the process's own limits, not a broken install (vault BACKLOG #6709 item 11)
     except Exception as exc:  # noqa: BLE001 -- an import runs top-level code that may raise any class; refused below, logged by class
         # Present but broken: a C extension that fails to load, a name the SDK no longer has, or
         # any other error from the module's top-level code, such as an OSError, an AttributeError

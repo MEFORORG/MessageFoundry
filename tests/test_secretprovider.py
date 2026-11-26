@@ -616,3 +616,17 @@ def test_notifiers_reference_without_provider_fail_closed() -> None:
         notifier_from_settings(settings)  # secret_provider defaults to None
     with pytest.raises(SecretProviderError, match="email_password"):
         security_notifier_from_settings(settings)
+
+
+@pytest.mark.parametrize("error", [MemoryError, RecursionError])
+def test_the_processs_own_limits_pass_the_provider_module_import(
+    monkeypatch: pytest.MonkeyPatch, error: type[BaseException]
+) -> None:
+    # Vault BACKLOG #6709 item 11: the dispatch's import arm refused out of memory or stack as a
+    # broken install, which its build arm no longer does.
+    def _import(_name: str) -> Any:
+        raise error()
+
+    monkeypatch.setattr("messagefoundry.config.secretprovider.importlib.import_module", _import)
+    with pytest.raises(error):
+        resolve_secret_provider(SecretsSettings(provider="vault"))

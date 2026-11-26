@@ -869,6 +869,89 @@ def test_detached_past_its_limit_clears_a_group_nested_in_an_unvisited_member(
     assert not _frames_reach(error, "value 0")
 
 
+def test_detached_past_its_limit_cuts_when_its_warning_cannot_be_logged(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Repair item 1: the WARNING was logged before the cut and unguarded, so a raising log filter
+    # skipped the cut and returned the rest of the graph with its tracebacks attached.
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 3)
+    error = _chain(CipherError("synthetic"), 5)
+    raising = _RaisingFilter()
+    crypto._log.addFilter(raising)
+    try:
+        assert detached(error) is error
+    finally:
+        crypto._log.removeFilter(raising)
+    assert not _frames_reach(error, "value 0")
+    assert _graph_nodes(error) == 3
+    assert "could not be logged (ValueError)" in capsys.readouterr().err
+
+
+class _CountedGroup(ExceptionGroup[Exception]):
+    """An exception group that counts reads of its ``exceptions``."""
+
+    reads = 0
+
+    @property
+    def exceptions(self) -> tuple[Exception, ...]:
+        _CountedGroup.reads += 1
+        return super().exceptions
+
+
+def test_detached_past_its_limit_descends_a_shared_member_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Repair item 2: the cut's descent into unvisited groups kept no record of what it cleared, so
+    # a member shared down a stack of groups was descended into 2**depth times.
+    depth = 12
+    shared: Exception = ValueError("leaf")
+    for _ in range(depth):
+        shared = _CountedGroup("level", [shared, shared])
+    error = CipherError("synthetic")
+    error.__context__ = ExceptionGroup("top", [KeyError("a"), KeyError("b"), shared])
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 3)
+    _CountedGroup.reads = 0
+    assert detached(error) is error
+    assert _CountedGroup.reads <= depth
+
+
+def test_detached_past_its_limit_keeps_a_visited_members_links(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Repair item 2: a visited member reached again through an unvisited group had its links,
+    # which the cut keeps, set to None.
+    kept = ValueError("kept")
+    member = ValueError("member")
+    member.__context__ = kept
+    outer = ExceptionGroup("outer", [member, KeyError("q"), ExceptionGroup("again", [member])])
+    error = CipherError("synthetic")
+    error.__cause__ = kept
+    error.__context__ = outer
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 4)
+    assert detached(error) is error
+    assert member.__context__ is kept
+
+
+def test_detached_past_its_limit_keeps_a_kept_context_visible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Repair item 3: setting __cause__ to None also sets __suppress_context__, so a context the
+    # cut kept was hidden from a rendered traceback.
+    kept = ValueError("the kept context")
+    link = ValueError("link")
+    link.__cause__ = KeyError("cut")
+    link.__context__ = kept
+    link.__suppress_context__ = False
+    error = CipherError("synthetic")
+    error.__cause__ = kept
+    error.__context__ = link
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 3)
+    assert detached(error) is error
+    assert link.__cause__ is None and link.__context__ is kept
+    assert link.__suppress_context__ is False
+    assert "the kept context" in "".join(traceback.format_exception(link))
+
+
 def test_detached_under_its_limit_returns_the_same_error() -> None:
     error = _chain(CipherError("synthetic"), 3)
     assert detached(error) is error and not _frames_reach(error, "value 0")

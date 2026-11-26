@@ -117,6 +117,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, Self, runtime_checkable
 
+from messagefoundry.logging_guard import _last_resort
 from messagefoundry.redaction import json_loads_or_refusal
 
 #: An audit-chain MAC provider (ADR 0138 follow-up). Given the canonical row bytes it returns the row's
@@ -1069,8 +1070,9 @@ def detached(error: CipherError) -> CipherError:
     values' plaintext; the errors' types, texts and links are kept. Cleared in place, so a caller
     that keeps ``error`` itself keeps the cleared error.
 
-    Past :data:`_DETACH_LIMIT` exceptions it stops, logs a WARNING and cuts the graph there
-    (vault BACKLOG #6706 item 1): a visited error's link to an unvisited one is set to ``None``,
+    Past :data:`_DETACH_LIMIT` exceptions it stops, cuts the graph there and then logs a
+    WARNING, a failure to log reported on stderr by its class and never raised (vault BACKLOG
+    #6706 item 1): a visited error's link to an unvisited one is set to ``None``,
     and an unvisited member of a visited group, which its group's tuple keeps, has its traceback
     and its own links cleared, down through any group nested in it. The nearest links are visited
     first, so ``error``'s own cause, which :func:`gave_no_verdict` reads, is kept. The cut is made
@@ -1083,11 +1085,18 @@ def detached(error: CipherError) -> CipherError:
         if id(link) in seen:
             continue
         if len(seen) >= _DETACH_LIMIT:
-            _log.warning(
-                "an error's exception graph has more than %d links; the rest are cut off it",
-                _DETACH_LIMIT,
-            )
+            # Cut first: the WARNING is logged after, guarded, so a failure to log cannot skip
+            # the cut and return the rest of the graph with its tracebacks attached.
             _cut_unvisited(visited, seen)
+            try:
+                _log.warning(
+                    "an error's exception graph has more than %d links; the rest are cut off it",
+                    _DETACH_LIMIT,
+                )
+            except Exception as fault:  # noqa: BLE001 -- reported below, by class, never raised
+                _last_resort(
+                    f"a detached-error WARNING could not be logged ({type(fault).__name__})"
+                )
             break
         seen.add(id(link))
         visited.append(link)
@@ -1102,17 +1111,25 @@ def _cut_unvisited(visited: list[BaseException], seen: set[int]) -> None:
     """For :func:`detached` past its limit: unlink every exception not in ``seen`` from the
     ``visited`` ones. A group's members cannot be unlinked, so an unvisited member is cleared
     instead and its own links cut, and a member that is a group has its members cleared alike.
-    Group tuples hold no cycle, so that descent ends."""
+    Each member is cleared once, by id, so a member shared by several groups is descended into
+    once and a visited one is left as the first pass left it. Cutting a cause keeps the link's
+    ``__suppress_context__``, which setting ``__cause__`` also sets, so a kept context still
+    renders as it did. ``seen`` is extended with each cleared member."""
     members: list[BaseException] = []
     for link in visited:
         if link.__cause__ is not None and id(link.__cause__) not in seen:
+            suppress = link.__suppress_context__
             link.__cause__ = None
+            link.__suppress_context__ = suppress
         if link.__context__ is not None and id(link.__context__) not in seen:
             link.__context__ = None
         if isinstance(link, BaseExceptionGroup):
             members.extend(m for m in link.exceptions if id(m) not in seen)
     while members:
         member = members.pop()
+        if id(member) in seen:
+            continue
+        seen.add(id(member))
         member.__traceback__ = None
         member.__cause__ = None
         member.__context__ = None
