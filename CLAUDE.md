@@ -769,13 +769,17 @@ Manager's watch reached the cloud session 29 seconds after its question.
   d20261029T165623191-578690). Korus `roles/LANDER.md` *4a-quinquies*
   sends more to the owner, and governs where the two differ: false program output, and a false
   control claim in any comment, docstring or doc (the Lander's reading, decision
-  d20261110T205706609-38b347). A false statement in a record, or a false control claim, that is
-  false only in the safe direction does not weaken a control: it overstates what is stored,
-  exposed or retained, or it understates what a control guarantees. It is filed under ledger
-  ruling R2 below and does not hold the merge. This does not reach false program output, which
-  changes behaviour. It narrows the owner's 2026-10-12 ruling, was drafted under the owner
-  instruction of 2026-11-26 quoted in the repair-Builder paragraph above, which named no finding,
-  and is pending the owner's confirmation.
+  d20261110T205706609-38b347). **PENDING THE OWNER'S CONFIRMATION, and not in force until the
+  owner confirms it; until then the 2026-10-12 ruling applies unchanged:** a false statement in a
+  record, or a false control claim, that is false only in the safe direction does not weaken a
+  control. It is filed under ledger ruling R2 below and does not hold the merge. Safe direction
+  means a reader who acts on the text does more than the control needs, never less: at least, it
+  overstates what is stored, exposed or retained, or understates what a control guarantees.
+  Where storing or retaining something is itself the guarantee, overstating it is the unsafe
+  direction. This does not reach false program output, which changes behaviour, a false anchor,
+  or a present-tense claim of a live exposure, which section 0 forbids. It narrows the owner's
+  2026-10-12 ruling, and was drafted under the owner instruction of 2026-11-26 quoted in the
+  repair-Builder paragraph above, which named no finding.
   **Ledger ruling R2 (owner-signed 2026-11-04, in session: *"Sign R1-R9"*) changes how the findings
   are filed, and the Lander reads it as setting when.** A merged PR files at most one row, holding
   its open findings as numbered items. Its deferred scope becomes steps on the row it cites, or is
