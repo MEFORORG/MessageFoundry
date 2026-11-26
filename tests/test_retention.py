@@ -1244,18 +1244,45 @@ async def test_a_pass_stopped_while_writing_its_audit_row_still_writes_it(
 
     monkeypatch.setattr(store, "record_audit", slow_record)
     runner = RetentionRunner(store, RetentionSettings(messages_days=1), clock=lambda: 10 * DAY)
-    task = asyncio.create_task(runner.run_once())
-    await asyncio.wait_for(entered.wait(), 10)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    release.set()
-    for _ in range(50):
-        if await _retention_audit_details(store):
-            break
-        await asyncio.sleep(0.01)
+    runner.start()
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        stopping = asyncio.create_task(runner.stop())
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.wait_for(stopping, 10)  # stop() waits for the row still being written
+    finally:
+        release.set()
+        await runner.stop()
 
     assert [d["messages_purged"] for d in await _retention_audit_details(store)] == [1]
+
+
+async def test_a_pass_stopped_inside_a_purge_names_the_phase(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526, S07-44: a purge cancelled while its COMMIT is in flight may have committed,
+    and its count is lost with the call. The pass writes its row even with nothing else done,
+    naming the phase it ended in."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+
+    async def purge_hangs(*_a: object, **_k: object) -> int:
+        entered.set()
+        await asyncio.Event().wait()
+        return 0
+
+    monkeypatch.setattr(store, "purge_message_bodies", purge_hangs)
+    runner = RetentionRunner(store, RetentionSettings(messages_days=1), clock=lambda: 10 * DAY)
+    runner.start()
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+    finally:
+        await runner.stop()
+
+    details = await _retention_audit_details(store)
+    assert [d["interrupted_phase"] for d in details] == ["messages"]
+    assert details[0]["interrupted"] is True and details[0]["messages_purged"] == 0
 
 
 async def test_a_strip_that_raises_partway_is_audited_with_its_phase(
