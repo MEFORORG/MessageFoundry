@@ -781,3 +781,36 @@ async def test_a_padded_mrn_needle_still_audits_as_digits(enc_engine: Engine) ->
     parsed = json.loads(rows[0]["detail"])
     assert parsed["needle_shape"] == "digits"
     assert "9001" not in rows[0]["detail"]
+
+
+async def test_a_padded_needle_audits_its_unpadded_length(enc_engine: Engine) -> None:
+    """BACKLOG #6700 item 3: the audit's ``needle_len`` was taken on the needle as sent, padding
+    included, while its shape was read stripped. Both now read the stripped needle, for a substring
+    and for a field value. The control: an unpadded needle audits the same length."""
+    service = await _service(enc_engine)
+    await _add_user(service, "boss", [Role.ADMINISTRATOR.value])
+    async with _client(enc_engine, service) as c:
+        token = await _login(c, "boss")
+        for body in (
+            {"content": " 9001  "},
+            {"content": "9001"},
+            {"field_path": "PID-3", "field_value": "  MRN9001 "},
+            {"field_path": "PID-3", "field_value": "MRN9001"},
+        ):
+            r = await c.post("/messages/search", headers=_auth(token), json=body)
+            assert r.status_code == 200, r.text
+    rows = await enc_engine.store.list_audit(action="message_search")
+    lens = sorted(json.loads(r["detail"])["needle_len"] for r in rows)
+    assert lens == [4, 4, 7, 7]
+
+
+@pytest.mark.parametrize(
+    ("needle", "shape"),
+    [("DOE", "alpha"), ("DOE1", "alnum"), ("9001", "digits"), ("DOE^JANE", "mixed")],
+)
+def test_needle_shape_tells_letters_from_letters_and_digits(needle: str, shape: str) -> None:
+    """BACKLOG #6700 item 18: ``_needle_shape`` tested ``isalnum`` before ``isalpha``, so the
+    ``"alpha"`` branch was unreachable and a surname audited as ``"alnum"``."""
+    from messagefoundry.api.app import _needle_shape
+
+    assert _needle_shape(needle) == shape

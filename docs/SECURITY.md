@@ -2560,8 +2560,9 @@ the same permission set on the same method reds CI until it is listed here.
 > `restart_outbound` rule is withheld from a scoped caller too, whatever the graph holds, since
 > its action names the outbound side. So is every rule whose event type only an outbound raises,
 > a `"*"` rule included: `_ALERT_EVENT_SIDE` in `messagefoundry/api/app.py` records each type's
-> side, and an event type or action with no side recorded is withheld too. A type both sides
-> raise, and `any`, still show on a `"*"` rule, though such a rule also matches outbound events.
+> side, and an event type or action with no side recorded is withheld too. A `"*"` rule of a
+> type both sides raise, or of `any`, is withheld as well, since it also matches outbound events.
+> A rule of such a type that names an in-scope inbound passes this test.
 > The alert-instance routes were left as they were, on
 > purpose. The batch Manager decided this on 2026-11-22. It read the owner's ruling as covering
 > rules and flagging, not instances. What the ack, resolve, suspend and resume routes admit is in their bullet under
