@@ -334,10 +334,12 @@ non-MSH segment kept the handle, and its send delivered the bare skeleton where 
 exactly as under step 1. Step 1's gaps stay with such a list: a send of a clone may still send `msg`
 where its flow-insensitive scan holds the clone, and a write to the input after a send of it still
 lands on `msg`. *Corrected 2026-11-26 (BACKLOG #5823):* this said that only `snapshot_on_send` keeps
-that write out of the message already sent. A live send of `msg` on the step 1 path now renders
-`sends.append(Send(dest, msg.copy()))`. So the message sent is the input as it stood at the send,
-whatever that setting says. How the differential guard's baseline carries this is stated once, in
-the docstring of `tests/test_corepoint_import_differential.py`. A step 2 send still delivers its
+that write out of the message already sent. An inline step 1 send of `msg` now renders
+`sends.append(Send(dest, msg.copy()))`. So the message it sends is the input as it stood at the
+send, whatever that setting says. A step 1 handler with no inline send still ends on
+`return Send(dest, msg)`, or a list of such, uncopied. That return is the handler's last
+statement, so no write in the handler runs after it and none can change the message it returns.
+How the differential guard's baseline carries this is stated once, in the docstring of `tests/test_corepoint_import_differential.py`. A step 2 send still delivers its
 local uncopied, the input's `msg` included; step 2 declines a write after a send instead. Step 2
 helps only straight-line lists, and the canonical-spelling rule is strict: an export whose labels are
 wrapped in spans, or whose spacing differs at all, gets no help. That is deliberate.
@@ -596,10 +598,16 @@ At least these limits remain:
   step.
 
 The differential guard compares a gate-declined list with step 1. That step 1 path now carries this
-rule. So the guard runs the vendored step 1 file with this amendment made as it loads. The file
-itself stays as vendored and pinned. The amendment is listed in the guard's `_STEP1_AMENDMENTS`, with
-the rule copied as text, so a later change to the head's rule turns the guard red until the copy is
-amended on purpose. Two more tests run the battery against the file as vendored. They check
+rule. So the guard's baseline, `step1`, is the vendored step 1 file with three amendments made as
+it loads: the copy amendment of BACKLOG #5823, the fail-closed amendment of BACKLOG #2526, and this
+one, in that order. The file itself is never edited and its blob id stays pinned. This amendment is
+listed in the guard's `_STEP1_AMENDMENTS`, with the rule copied as text, so a later change to the
+head's rule turns the guard red until the copy is amended on purpose. Two more tests,
+`test_the_amendment_changes_only_a_list_holding_a_statement_off_a_line` and
+`test_no_raw_list_is_quieter_than_main`, compare `step1` with `step1_unlabelled`, the tree this
+amendment loads onto: the vendored file with the copy and fail-closed amendments alone. *Corrected
+2026-11-26 (BACKLOG #5823, code review):* this said the guard loads this amendment alone and that
+the two tests run against the file as vendored. They check
 that the amendment changes only lists that may carry a statement off a `<Line>`, by a wider reading
 written apart from the rule. Where it changes a list it must only narrow: no new live send, no new
 vocabulary call, and one more unmapped step, or else only comment lines and refusals change,
@@ -622,7 +630,7 @@ depth, so one of those can still hide behind another. And the unmapped names are
 counts by name, so a name main counted can go unseen where the amendment adds a marker of the
 same name.
 
-It holds the head to the same bound, against the same vendored file, wherever the
+It holds the head to the same bound, against the same tree (`step1_unlabelled`), wherever the
 gate is closed. And `test_no_raw_list_is_quieter_than_main` runs it over the 4,000 lists drawn
 with no grammar, which the next paragraphs describe. *Corrected 2026-10-02 (the Lander's second
 hold):* the bound checked none of that and read the battery alone. Every seed put a send main
@@ -645,8 +653,8 @@ wrapper inside a bare branch marker, and a demoted label inside a bare `<Call>` 
 
 Seeds cover only the routes someone thought of, and three reviews in a row found one nobody had.
 So a second test states the rule for the whole tree and draws shapes of its own.
-`test_no_branch_main_adopts_is_orphaned` parses a list with the vendored file as it is, with the
-amended baseline and with the head. It compares the shape of the three trees: every construct
+`test_no_branch_main_adopts_is_orphaned` parses a list with `step1_unlabelled` (the tree this
+amendment loads onto), with the amended baseline and with the head. It compares the shape of the three trees: every construct
 with its body and its branches, label markers left out, a demoted label read as the kind it had.
 The shapes must be equal. The head is held to that wherever the gate is closed. The test runs
 over the battery, and over 4,000 lists drawn with no grammar: any tag, any `@Data` from a pool of

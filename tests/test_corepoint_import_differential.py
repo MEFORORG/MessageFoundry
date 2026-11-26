@@ -23,14 +23,23 @@ origin/main``, because once step 2 merges ``origin/main`` IS the head, and the c
 the head against itself; and because a CI checkout need not hold that ref. The vendored file is never
 edited. The baseline the guard runs is that file plus the amendments made as it loads: the changes
 the step 1 code path has gained on purpose since that tree. There are three. The copy amendment
-(BACKLOG #5823, ``_COPY_AMENDMENTS``) loads beneath every tree :func:`_load_step1` builds: a live
-send of msg renders ``msg.copy()``. **So wherever this file says "as vendored" or "main" of a tree,
-it means the vendored file with the copy amendment**, ``step1_as_vendored`` included. Each bound
-compares two trees that both carry it, so the bounds stay blind to that one line's text; a tree
-built some other way would not compare like with like. The two in ``_STEP1_AMENDMENTS`` load on
-top. The fail-closed amendment (BACKLOG #2526) loads first: it switches off live code main rendered
-from switched-off or misplaced source, and ``test_the_fail_closed_amendment_adds_no_live_code``
-bounds it against the file as vendored. The label amendment (BACKLOG #2632) loads on top of it, and
+(BACKLOG #5823, ``_COPY_AMENDMENTS``) loads beneath every tree :func:`_load_step1` builds unless
+it is passed ``copy=False``: an inline send of msg renders ``msg.copy()``.
+
+**Three names for the trees, used so throughout this file.** *The file as vendored* is the pinned
+bytes with no amendment at all; only ``test_the_copy_amendment_changes_only_the_send_line`` loads
+it, with ``copy=False``. *The vendored tree* (``step1_as_vendored``) is that file with the copy
+amendment alone. Every other tree is the vendored tree plus amendments of its own:
+``step1_scan_skips`` (the fail-closed amendment's scan half), ``step1_unlabelled`` (the fail-closed
+amendment whole) and ``step1`` (both amendments in ``_STEP1_AMENDMENTS``). *Main*, in a bound, is
+the tree that bound compares against, and each bound's docstring names it. So every bound but the
+copy amendment's own compares two trees that both carry the copy amendment, and is blind to that
+one line's text.
+
+The two in ``_STEP1_AMENDMENTS`` load on top of it. The fail-closed amendment (BACKLOG #2526) loads
+first: it switches off live code main rendered from switched-off or misplaced source, and
+``test_the_fail_closed_amendment_adds_no_live_code`` bounds it against the vendored tree. The label
+amendment (BACKLOG #2632) loads on top of it, and
 ``test_the_amendment_changes_only_a_list_holding_a_statement_off_a_line`` bounds what that one may
 change against the tree it loads onto (``step1_unlabelled``). That bound is one rule: the amended
 baseline, and the head wherever the gate is closed, are never QUIETER than that tree. No refusal
@@ -698,10 +707,10 @@ def _load_step1(name: str, amendments: tuple[tuple[str, str], ...], *, copy: boo
 
 #: The baseline: the step 1 code path as it stands, which a gate-declined list must match.
 step1: Any = _load_step1("_mefor_corepoint_import_step1", _STEP1_AMENDMENTS)
-#: The vendored tree as main held it, with only the copy amendment (BACKLOG #5823).
+#: The vendored tree: the file as vendored with the copy amendment (BACKLOG #5823) alone.
 step1_as_vendored: Any = _load_step1("_mefor_corepoint_import_step1_as_vendored", ())
 #: The tree the label amendment (BACKLOG #2632) is bounded against: the vendored tree with the
-#: amendments that load before it. Only the label amendment's own tests read it.
+#: amendments that load before it. The fail-closed amendment's bound reads it too, as its amended side.
 step1_unlabelled: Any = _load_step1(
     "_mefor_corepoint_import_step1_unlabelled", _FAIL_CLOSED_AMENDMENTS
 )
@@ -1618,8 +1627,10 @@ def _observed(message: object, inp: Message | None) -> str:
 
 # The step 1 path sends ``msg.copy()`` (BACKLOG #5823), which is still a send of msg. A bare local,
 # ``msg`` included, also reads as a send of it; a ``<local>.copy()`` of another local does not match.
-# So a step 1 send that lost its copy reads like a correct one here; the byte-for-byte comparison
-# and test_the_copy_amendment_changes_only_the_send_line are what see that.
+# So a head step 1 send that lost its copy reads like a correct one here. What sees that is the
+# byte-for-byte comparison of the head with ``step1`` wherever the gate is closed, and, outside
+# this file, test_a_step1_send_of_msg_is_not_changed_by_a_later_write. The copy amendment's own
+# bound never loads the head, so it does not.
 _LIVE_SEND = re.compile(
     r'^(\s*)sends\.append\(Send\("([^"]+)", (msg(?=\.copy\(\)\)\))|\w+(?=\)\)))'
 )
@@ -3433,8 +3444,8 @@ def _todos(lines: Sequence[str]) -> Counter[tuple[int, str]]:
 
 
 def _quieter(was: _Out, now: _Out) -> list[str]:
-    """Every way ``now`` is QUIETER than ``was``, which is main's tree as vendored. It must be
-    none. The rule (ADR 0086 §2(b.4)):
+    """Every way ``now`` is QUIETER than ``was``, the tree its caller compares against
+    (``step1_unlabelled`` in every caller). It must be none. The rule (ADR 0086 §2(b.4)):
 
     (b) where main sends or refuses, ``now`` sends or refuses, at the same indent and to the same
         destination (:func:`_loud`). No ``try`` swallows a refusal main's does not
@@ -3528,10 +3539,10 @@ def _only_more_disabled(xml: str, was: _Out, now: _Out) -> bool:
 
 
 def _bound(name: str, xml: str) -> tuple[bool, list[str]]:
-    """Whether the amended baseline renders the list ``xml`` otherwise than the vendored tree
+    """Whether the amended baseline renders the list ``xml`` otherwise than ``step1_unlabelled``
     does, and every way it breaks the bound of :func:`_breaches`.
 
-    The head is held to the same bound, against the same vendored tree, wherever the gate is
+    The head is held to the same bound, against the same tree, wherever the gate is
     closed. On the battery that is what the head-equals-baseline check already implies. On a list
     drawn with no grammar nothing else compares the head with main. A fully understood list takes
     the step 2 path, where a refusal may become a delivery the oracle proves."""
@@ -3544,8 +3555,8 @@ def _bound(name: str, xml: str) -> tuple[bool, list[str]]:
 
 
 def _amendment_changes(shape: Shape) -> bool:
-    """Whether the amended baseline renders ``shape`` otherwise than the vendored tree does, having
-    checked that the change is one the amendment may make: see :func:`_bound`."""
+    """Whether the amended baseline renders ``shape`` otherwise than ``step1_unlabelled`` does,
+    having checked that the change is one the amendment may make: see :func:`_bound`."""
     changes, broken = _bound(shape.name, _render(shape.nodes, shape.inp))
     assert not broken, "\n".join(broken)
     return changes
@@ -3637,8 +3648,8 @@ def _adopted(steps: Sequence[Any]) -> int:
 
 def _structure_moved(name: str, xml: str) -> tuple[int, list[str]]:
     """What the label amendment, or the head, changes about the shape of the tree, against the
-    tree it loads onto (``step1_unlabelled``). It must change nothing. A statement off a ``<Line>`` is marked, and a
-    marker is no statement position. So no branch main adopts is orphaned, at any depth, none it
+    tree it loads onto (``step1_unlabelled``). It must change nothing. A statement off a
+    ``<Line>`` is marked, and a marker is no statement position. So no branch main adopts is orphaned, at any depth, none it
     orphans is adopted, and no construct appears or goes. The head is held to that wherever the
     gate is closed. A fully understood list takes the step 2 path, which builds its own tree.
 
@@ -3952,7 +3963,7 @@ _SCAN_FLOOR = 32
 
 @pytest.mark.parametrize("chunk", range(_CHUNKS))
 def test_the_fail_closed_amendment_adds_no_live_code(chunk: int) -> None:
-    """The fail-closed amendment switches live code off, against the file as vendored.
+    """The fail-closed amendment switches live code off, against the vendored tree.
 
     Its scan half may change a list only where the list holds a disabled wrapper: the scan skips
     the statements it holds, as it skips a disabled statement, so a switched-off overwrite of

@@ -16,6 +16,7 @@ import re
 from collections.abc import Callable
 from itertools import product
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1320,6 +1321,46 @@ def test_a_step1_send_of_msg_is_not_changed_by_a_later_write(
     src = _handler_body(_handler_source(body))
     assert '    sends.append(Send("OB_IN", msg.copy()))  # Corepoint MsgSend' in src
     assert '    set_field(msg, "PID-3", "")' in src  # the step 1 path: the write is mapped
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {"op": "delete_row"},
+        {"op": "move_row", "direction": "down"},
+        {"op": "move_row", "direction": "up", "offset": 1},
+    ],
+    ids=["delete-the-send", "move-the-send", "move-a-write-across-it"],
+)
+def test_a_step1_send_row_is_untyped_so_a_typed_only_edit_on_it_is_refused(
+    edit: dict[str, Any],
+) -> None:
+    """BACKLOG #5823 changed what the Steps view may edit, and this pins the change. The lens types
+    ``Send(<dest>, msg)`` and not ``Send(<dest>, msg.copy())``, so an imported step 1 send row is
+    untyped in typed-only mode, and a typed-only move or delete on or across it is refused: it fails
+    closed. Typing the copy form widens ADR 0076 G.6's typed set, which needs its own ruling. The
+    controls: the same edit applies outside typed-only mode, and in typed-only mode on the bare
+    ``msg`` render the import made before #5823; and a typed-only edit that crosses no send still
+    applies."""
+    from messagefoundry_toolkit.lens import LensRewriteError, rewrite_source
+
+    clear = '<Line Data="ItemClear %ADT/PID-3"/><Line Data="ItemClear %ADT/PID-4"/>'
+    src = _handler_source(_role_send("input-handle", "%ADT", "OB_IN") + clear)
+    lines = src.splitlines()
+    send = 1 + next(i for i, line in enumerate(lines) if "sends.append" in line)
+    assert lines[send - 1].endswith('Send("OB_IN", msg.copy()))  # Corepoint MsgSend')
+    assert lines[send].strip() == 'set_field(msg, "PID-3", "")'
+    row = send + edit.get("offset", 0)
+    spec = {k: v for k, v in edit.items() if k != "offset"} | {"line_start": row, "line_end": row}
+    with pytest.raises(LensRewriteError, match="typed-only mode") as info:
+        rewrite_source(src, spec, typed_only=True)
+    assert info.value.code == "refused"
+    assert rewrite_source(src, spec) != src
+    bare = src.replace("msg.copy()", "msg")
+    assert rewrite_source(bare, spec, typed_only=True) != bare
+    # Two writes below the send swap: nothing untyped is crossed.
+    swap = {"op": "move_row", "direction": "up", "line_start": send + 2, "line_end": send + 2}
+    assert rewrite_source(src, swap, typed_only=True) != src
 
 
 def test_msgsend_without_a_recoverable_destination_is_a_marker() -> None:
