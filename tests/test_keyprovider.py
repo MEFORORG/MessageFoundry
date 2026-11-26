@@ -12,6 +12,7 @@ acceptance criterion). DPAPI round-trips are Windows-only, so the file branch is
 from __future__ import annotations
 
 import base64
+import sys
 from collections.abc import Callable
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -540,12 +541,23 @@ def test_the_processs_own_limits_from_the_provider_module_import_fail_closed(
     assert isinstance(caught.value.__cause__, error)
 
 
+_strict_requests: ModuleType | None
+try:
+    from messagefoundry.transports import strict_requests as _strict_requests
+except ImportError:  # the optional extra that ships requests is absent
+    _strict_requests = None
+
+#: Each call of ``_mains_build_step``, so the differential can show its main sweep ran.
+_MAIN_STEP_CALLS: list[str] = []
+
+
 def _plant_build_provider(
     monkeypatch: pytest.MonkeyPatch, raise_error: Callable[[], object]
 ) -> list[Exception]:
     """Plant a provider module whose ``build_provider`` runs ``raise_error()``, which raises; the
     list it returns holds each error raised, in order. The error is re-raised bare, so its
-    ``__context__`` is the one ``raise_error`` gave it."""
+    ``__context__`` is the one ``raise_error`` gave it. The module is planted in ``sys.modules``
+    under its own name only, so no other import in the process is redirected."""
     raised: list[Exception] = []
     fake = ModuleType("messagefoundry.store.keyprovider_vault")
 
@@ -558,9 +570,7 @@ def _plant_build_provider(
         raise AssertionError("raise_error returned")
 
     fake.build_provider = _build  # type: ignore[attr-defined]
-    monkeypatch.setattr(
-        "messagefoundry.store.keyprovider.importlib.import_module", lambda _name: fake
-    )
+    monkeypatch.setitem(sys.modules, "messagefoundry.store.keyprovider_vault", fake)
     return raised
 
 
@@ -569,9 +579,10 @@ def _mains_build_step(
 ) -> KeyProvider:
     """A copy of origin/main's ``_load_external_provider`` past its import arm (at 181411d1294):
     ``build_provider`` is called bare, so whatever it raises propagates raw to ``store.base``.
-    The module comes through the patched ``importlib.import_module``, so it is the planted one."""
+    The module comes from ``sys.modules``, so it is the planted one."""
     import importlib
 
+    _MAIN_STEP_CALLS.append(name)
     module = importlib.import_module(f"messagefoundry.store.keyprovider_{name}")
     provider: KeyProvider = module.build_provider(settings, posture=posture)
     return provider
@@ -613,15 +624,18 @@ def _caused_by_codec() -> Exception:
 
 
 def _caused_by_vault_hop() -> Exception:
-    strict_requests = pytest.importorskip("messagefoundry.transports.strict_requests")
+    # Imported at module load, never inside the planted window.
+    if _strict_requests is None:
+        pytest.skip("messagefoundry.transports.strict_requests needs its optional extra")
     error = RuntimeError("synthetic")
-    error.__cause__ = strict_requests.VaultHopRefused("Vault test hop: fixed text")
+    error.__cause__ = _strict_requests.VaultHopRefused("Vault test hop: fixed text")
     return error
 
 
 def _raise_in_codec_context() -> object:
     # A ValueError raised inside a codec handler carries the codec error as its implicit
-    # __context__, which a re-raise while the caller handles another error would replace.
+    # __context__. Re-raising the instance after a dispatch's own handler has exited, while the
+    # caller handles another error, would replace it; a bare re-raise would not.
     try:
         raise _codec_error()
     except UnicodeDecodeError:
@@ -629,23 +643,26 @@ def _raise_in_codec_context() -> object:
 
 
 class _UnreadableChain(ValueError):
-    """A ValueError whose ``__cause__`` raises on its first read, so a chain walk does not finish."""
+    """A ValueError whose ``__cause__`` raises on each instance's first read, so a chain walk
+    does not finish; ``reads`` counts the reads of that instance."""
 
-    reads = 0
+    def __init__(self) -> None:
+        super().__init__("synthetic")
+        self.reads = 0
 
     @property
     def __cause__(self) -> BaseException | None:  # type: ignore[override]
-        type(self).reads += 1
-        if type(self).reads == 1:
+        self.reads += 1
+        if self.reads == 1:
             raise RuntimeError("synthetic")
         return None
 
 
 def _outcome(call: Callable[[], object]) -> list[tuple[type[BaseException], str]]:
     """The class and text ``call`` raises, read once bare and once while an unrelated error is
-    being handled. A re-raise in the dispatch while the caller handles an error replaces the
-    raised error's ``__context__`` with that error, so the second reading tells an implicit codec
-    context kept, as on main, from one replaced."""
+    being handled. Re-raising the instance after a dispatch's own handler has exited, while the
+    caller handles an error, replaces its ``__context__`` with that error, so the second reading
+    tells an implicit codec context kept, as on main, from one replaced."""
     seen: list[tuple[type[BaseException], str]] = []
     with pytest.raises(Exception) as caught:
         call()
@@ -686,6 +703,7 @@ def test_an_error_from_build_provider_reaches_the_caller_as_on_main(
     from messagefoundry.store.base import build_store_cipher
 
     settings = StoreSettings(key_provider="vault")
+    _MAIN_STEP_CALLS.clear()
     raised = _plant_build_provider(monkeypatch, raise_error)
     with pytest.raises(Exception) as direct:
         resolve_key_provider(settings)
@@ -695,9 +713,13 @@ def test_an_error_from_build_provider_reaches_the_caller_as_on_main(
         lambda: resolve_decrypt_keys(settings),
         lambda: build_store_cipher(settings),
     ]
-    _UnreadableChain.reads = 0
     head = [_outcome(call) for call in calls]
+    assert not _MAIN_STEP_CALLS
     monkeypatch.setattr(keyprovider, "_load_external_provider", _mains_build_step)
-    _UnreadableChain.reads = 0
     main = [_outcome(call) for call in calls]
+    assert _MAIN_STEP_CALLS, "main's build step never ran, so the comparison pins nothing"
+    _MAIN_STEP_CALLS.clear()
     assert head == main
+    # raised[0] is the bare resolve_key_provider call above, which reads no chain.
+    unreadable = [e for e in raised[1:] if isinstance(e, _UnreadableChain)]
+    assert all(e.reads for e in unreadable), "store.base never read the chain, so it pins nothing"

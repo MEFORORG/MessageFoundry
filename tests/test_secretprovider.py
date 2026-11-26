@@ -322,7 +322,9 @@ def test_an_error_from_an_external_providers_build_propagates_raw(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The build part of vault BACKLOG #6709 was withdrawn to main: the dispatch calls
-    # build_provider bare, so an error from a provider's construction propagates unchanged.
+    # build_provider bare, so an error from a provider's construction propagates unchanged, its
+    # text (here a path and a marker) included. That is a known open hazard, pinned as main's shape
+    # until that part is built, not as the intended contract.
     error = ValueError(_BROKEN_IMPORT_TEXT)
 
     def _boom(*_a: Any, **_k: Any) -> Any:

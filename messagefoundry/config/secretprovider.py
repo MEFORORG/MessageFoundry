@@ -181,8 +181,8 @@ def _load_external_provider(
     import name the extra. The base install pulls **zero** external SDK. A provider that imports
     its SDK lazily, as ``vault`` does, refuses a failed SDK import itself, at its first read
     rather than here (``secretprovider_vault._import_hvac``). An error ``build_provider`` raises
-    is not caught here and propagates unchanged, as on main (the build part of vault BACKLOG
-    #6709 is not built).
+    is not caught here and propagates unchanged, its text included (open: the build part of vault
+    BACKLOG #6709 is not built).
 
     ``posture`` is handed to every external provider, because each one dials a network hop that a
     posture-keyed guard may judge (vault BACKLOG #2983). A provider must read ``None`` as
