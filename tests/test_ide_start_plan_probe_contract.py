@@ -79,7 +79,7 @@ def _probe_argv() -> list[str]:
 
 
 def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
-    """If the TypeScript stops building this argv, the three tests below stop describing the IDE.
+    """If the TypeScript stops building this argv, the tests below that run the probe stop describing the IDE.
 
     The probe forwards the ``serviceConfig`` it is handed, which the mocha suite pins as undefined
     with ``messagefoundry.serviceConfig`` at its default; this file's probe runs there, where
