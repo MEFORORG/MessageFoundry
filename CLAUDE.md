@@ -464,27 +464,27 @@ commit. If the author has, the Lander reads that answer on its turn and waits fo
 30 minutes after it. A commit moves the head, so a repair after one needs a fresh hold at the new
 head. The Builder fetches before it pushes, never force-pushes, stops if the head moved, stops at
 any refusal, and makes only the fixes the hold names. At most two repairs per PR. A further hold
-then follows the next paragraph's ordinary transfer rule, with its acknowledgement and not-live
-tests. Every other non-trivial fix still goes to a spawned Manager session, as the paragraph above
-says. Before it merges a repair head, the Lander re-reads the PR's comments since the hold, and an
-author objection returns the PR to the author (fleet wiki lesson 20261124T012815379Z-wd9e1o). The
-Lander merges only once a code-review fork at `xhigh` that the Lander starts itself, on the repair
-head, covers it, its tag read with `review_tag.py`; the repair Builder's own QA does not count. That
-independent review is what keeps authoring apart from landing. This paragraph's change left it
-unchanged, along with the review proof the merge bullet below requires, and did not change what goes
-to the owner. **Repairing at once, and the shorter windows in the next paragraph, raise at least
-this risk:** an author's own Builder may already be mid-fix on a held PR that looks quiet. Fleet
-wiki lesson 20261103T145659705Z-kqwvhx found one on 2 of 4 quiet PRs, measured under the old 2-hour
-window, so at once is likely worse. The change removed at least two checks that also guarded against
-it, the mail to the author and the live-session test. The collision controls left include at least
-the head-moved check that binds repair Builders, which are briefed with it, the test that the hold
-still names the head, and the 30-minute answer exception. On a PR that looks quiet, the last two see
-nothing; what still bears on this risk there includes at least the head-moved check, which acts only
-if the author pushes first. An author's in-flight Builder is not briefed with that check and may
-have none. **CHANGED 2026-11-26:** this rule required 2 hours of author silence, a mail to the
-author with no reply, and an author not live, and allowed one repair per PR (decision
-d20261029T165610526-c13ae6, under the owner's delegation of 2026-10-29; window cut from 4 hours to 2
-by the owner ruling of 2026-11-03 in the next paragraph).
+then follows the next paragraph's ordinary transfer rule, with whatever acknowledgement and not-live
+tests that rule sets. Every other non-trivial fix still goes to a spawned Manager session, as the
+paragraph above says. Before it merges a repair head, the Lander re-reads the PR's comments since
+the hold, and an author objection returns the PR to the author (fleet wiki lesson
+20261124T012815379Z-wd9e1o). The Lander merges only once a code-review fork at `xhigh` that the
+Lander starts itself, on the repair head, covers it, its tag read with `review_tag.py`; the repair
+Builder's own QA does not count. That independent review is what keeps authoring apart from landing.
+This paragraph's change left it unchanged, along with the review proof the merge bullet below
+requires, and did not change what goes to the owner. **Repairing at once, and the shorter windows in
+the next paragraph, raise at least this risk:** an author's own Builder may already be mid-fix on a
+held PR that looks quiet. Fleet wiki lesson 20261103T145659705Z-kqwvhx found one on 2 of 4 quiet
+PRs, measured under the old 2-hour window, so at once is likely worse. The change removed at least
+two checks that also guarded against it, the mail to the author and the live-session test. The
+collision controls left include at least the head-moved check that binds repair Builders, which are
+briefed with it, the test that the hold still names the head, and the 30-minute answer exception. On
+a PR that looks quiet, the last two see nothing; what still bears on this risk there includes at
+least the head-moved check, which acts only if the author pushes first. An author's in-flight
+Builder is not briefed with that check and may have none. **CHANGED 2026-11-26:** this rule required
+2 hours of author silence, a mail to the author with no reply, and an author not live, and allowed
+one repair per PR (decision d20261029T165610526-c13ae6, under the owner's delegation of 2026-10-29;
+window cut from 4 hours to 2 by the owner ruling of 2026-11-03 in the next paragraph).
 
 **A held PR whose author has not acknowledged the hold within 30 minutes transfers to the Repair
 Manager.** The owner ruling of 2026-11-03 adopted the transfer, at 2 hours: asked *"Which tiers do
@@ -527,7 +527,7 @@ force-push, stop if the head moved, stop at any refusal, and make only the fixes
 paragraph above names the collision risk that leaves. Every repair head it pushes takes the Lander's
 own independent review the paragraph above requires, before the merge. The procedure is in korus
 `roles/LANDER.md` and `roles/MANAGER.md`. **CHANGED 2026-11-26:** the transfer and the `hold-ack`
-expiry (`ACK_TTL` in `scripts/coord/held_pr_turns.py`) were 2 hours.
+expiry (`HOLD_TTL` and `ACK_TTL` in `scripts/coord/held_pr_turns.py`) were 2 hours.
 
 **Every seat but Special runs the driver and empower rules.** Each seat except Special applies the
 `driver` and `empower` skills' rules by default, in local and cloud sessions, without the owner

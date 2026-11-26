@@ -593,8 +593,8 @@ def _hold_expired(events: Iterable[Event], now: datetime) -> bool:
     Call only on a row ``classify`` read as AUTHOR ``held`` without ``acked``: the newest Lander
     event is then the hold, and it was not edited.
     """
-    holds = [e.when for e in events if not e.bot and e.lander]
-    return bool(holds) and now - max(holds) > HOLD_TTL
+    landers = [e.when for e in events if not e.bot and e.lander]
+    return bool(landers) and now - max(landers) > HOLD_TTL
 
 
 def _earlier_transfer(turn_events: list[Event], hold: datetime) -> tuple[str | None] | None:
