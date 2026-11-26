@@ -78,9 +78,10 @@ the redactor, mirroring the "never put PHI in a log line" convention. *(Amended 
 paragraph's first sentence read, emphasis dropped: "`GET /logs/tail` reads the newest file under
 `[logging].log_dir` (one level, `.log`/`.txt`), pages back from the end (`offset`/`limit`, newest page
 first), and returns each line through `support.redact.redact_log_line` — the same redactor the support
-bundle uses, so the browser sees the identical PHI/secret coverage." The function name is corrected: the
-route already called `redact_log_record`. The identical-coverage claim is withdrawn: it held until the
-BACKLOG #5550 key-body mask, which the two paths run over different spans of text.)*
+bundle uses, so the browser sees the identical PHI/secret coverage." The function name is updated: the
+route calls `redact_log_record`, which wraps `redact_log_line`. The identical-coverage claim is
+withdrawn: it held while both paths ran each line through that per-line function alone, until the vault
+BACKLOG #5550 cross-line key-body mask (`mask_key_body_lines`); see above for how the two differ.)*
 
 ### §3 — `set_runtime_level` lands CLEAN for the S7a file-handler work to build on
 
