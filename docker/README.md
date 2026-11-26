@@ -286,6 +286,15 @@ certificate (A) and its revocation attestation, or it **refuses to start** — b
 - **Never bake `MEFOR_ALLOW_INSECURE_TLS`.** It is a dev / trusted-lab switch;
   [the escape hatch](../docs/DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) says what it
   means.
+- **A trust-anchor file is refused at `enforce` in a container whose root file system is overlay**
+  (vault BACKLOG #8390 item 31). The Linux path check reads the file system type of every
+  directory from `/` down, and does not vouch for overlay (the `POSIX_TRUSTED_FS` comment in
+  `messagefoundry/auth/anchor_path.py` says why). So where `/` is overlay, as it usually is under
+  Docker and Kubernetes, every anchor answers *could not settle*, even one on a bind-mounted ext4
+  volume. `enforce` refuses it unless the refusal names a pin setting and you set it; check the
+  printed digest against the CA first. An anchor with no pin setting, such as
+  `[logging].forward_tls_ca_file`, cannot be used there at `enforce`. Derived from the code, not
+  measured on a running container.
 - **Cert-expiry monitor skips `env()`-referenced cert paths.** Use literal paths for any cert you want the
   built-in expiry alert to watch (the `[api]` cert is always literal and covered).
 - **In-engine TLS revocation is delegated** (ADR 0002). For enforced revocation use Topology B with an

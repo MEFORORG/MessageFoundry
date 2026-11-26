@@ -833,8 +833,11 @@ class PosixStat:
 
 
 #: File systems whose owner and mode bits are real. CIFS, NFS, FUSE and 9p can show a clean ``755``
-#: chain while the server lets others replace the file, so they answer indeterminate.
-POSIX_TRUSTED_FS = frozenset({"ext2", "ext3", "ext4", "xfs", "btrfs", "tmpfs", "overlay"})
+#: chain while the server lets others replace the file, so they answer indeterminate. So does
+#: ``overlay`` (vault BACKLOG #8390 item 31): the mount table does not name its lower layers, and a
+#: lower layer on NFS or CIFS keeps that server's owners and modes. docker/README.md says what that
+#: means for a container whose root is overlay.
+POSIX_TRUSTED_FS = frozenset({"ext2", "ext3", "ext4", "xfs", "btrfs", "tmpfs"})
 
 
 def posix_path_verdict(

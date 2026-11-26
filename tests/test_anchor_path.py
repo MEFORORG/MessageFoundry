@@ -792,8 +792,40 @@ def test_posix_root_engine_trusts_only_root() -> None:
 
 def test_posix_clean_chain_on_a_network_mount_is_indeterminate() -> None:
     table = {"/srv": (0, D755), "/srv/a.pem": (0, F644)}
-    for fs in ("nfs", "nfs4", "cifs", "fuse.sshfs", "9p"):
-        assert _posix("/srv/a.pem", table, fstype={"/srv": fs}).ok is None, fs
+    # overlay: vault BACKLOG #8390 item 31; red under ``overlay`` back in ``POSIX_TRUSTED_FS``.
+    for fs in ("nfs", "nfs4", "cifs", "fuse.sshfs", "9p", "overlay"):
+        v = _posix("/srv/a.pem", table, fstype={"/srv": fs})
+        assert v.ok is None, fs
+        assert [f.path for f in v.findings] == ["/srv"], fs
+        assert f"{fs} mount" in v.findings[0].reason, fs
+
+
+def test_posix_an_overlay_root_leaves_a_bind_mounted_anchor_indeterminate() -> None:
+    """An overlay root, as in a container: the walk reads the type under ``/`` too, so an anchor
+    on a bind-mounted ext4 volume still answers indeterminate, and the finding names ``/``."""
+    table = {"/srv": (0, D755), "/srv/a.pem": (0, F644)}
+    v = _posix("/srv/a.pem", table, fstype={"/": "overlay", "/srv": "ext4"})
+    assert v.ok is None
+    assert [f.path for f in v.findings] == ["/"]
+
+
+def test_an_overlay_anchor_refuses_at_enforce_unless_a_pin_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 31's outcome at ``enforce``: an overlay verdict is refused as any indeterminate path
+    is, and a matching pin loads it. Red under ``overlay`` back in ``POSIX_TRUSTED_FS``, where the
+    unpinned anchor was accepted."""
+    p = _pem(tmp_path)
+    table = {"/srv": (0, D755), "/srv/a.pem": (0, F644)}
+    overlay = _posix("/srv/a.pem", table, fstype={"/srv": "overlay"})
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: overlay)
+    spec = AnchorSpec("t", "[x]", str(p), None, "[x].pin")
+    with pytest.raises(TrustAnchorError, match="enforce refuses it") as err:
+        ta.enforce_anchor(spec, enforcing=True)
+    assert "could not settle" in str(err.value) and "overlay mount" in str(err.value)
+    digest = hashlib.sha256(p.read_bytes()).hexdigest()
+    assert ta.enforce_anchor(AnchorSpec("t", "[x]", str(p), digest, "[x].pin"), enforcing=True)
 
 
 def test_posix_unknown_mount_table_is_indeterminate() -> None:
