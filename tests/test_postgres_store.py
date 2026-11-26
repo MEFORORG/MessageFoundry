@@ -301,6 +301,32 @@ async def test_ingest4_nul_ingress_persists_error_row(store) -> None:
         assert RawMessage(raw, "hl7v2").raw_bytes == body  # exact bytes recoverable
 
 
+#: Every C0 control but NUL, DEL and every C1 control: the control characters a sign-in name can
+#: carry past ``LoginRequest``, which bounds the name's length only (vault BACKLOG #5342).
+_SIGN_IN_CONTROLS = [chr(c) for c in (*range(0x01, 0x20), 0x7F, *range(0x80, 0xA0))]
+
+
+async def test_a_control_character_sign_in_name_reaches_no_store_error(store) -> None:
+    """Vault BACKLOG #5342, the control-characters limb. An unknown sign-in name reaches the store
+    twice: ``AuthService.login`` looks it up by name, then writes it as the ``auth.login_failed``
+    actor as typed (``_storable_actor`` escapes a NUL only). PostgreSQL text refuses a NUL and no
+    other character, so each other control character is a miss and a written, read-back actor,
+    with no error to escape the sign-in's failure pad. The NUL control shows the instrument sees
+    the refusal it is looking for."""
+    import asyncpg  # extra-gated; imported inside the (skip-guarded) test, never at module import
+
+    with pytest.raises(asyncpg.exceptions.DataError) as probe:
+        await store.get_user_by_username("s\x00up")
+    assert getattr(probe.value, "sqlstate", None) == "22021"
+
+    for ch in _SIGN_IN_CONTROLS:
+        name = f"s{ch}up"
+        assert await store.get_user_by_username(name) is None, repr(ch)
+        await store.record_audit("auth.login_failed", actor=name, detail="{}")
+    rows = await store.list_audit(action="auth.login_failed", limit=len(_SIGN_IN_CONTROLS) + 1)
+    assert sorted(r["actor"] for r in rows) == sorted(f"s{ch}up" for ch in _SIGN_IN_CONTROLS)
+
+
 async def test_record_received_filtered_and_error(store) -> None:
     f = await store.record_received(channel_id="IB", raw=RAW, status=MessageStatus.FILTERED)
     e = await store.record_received(

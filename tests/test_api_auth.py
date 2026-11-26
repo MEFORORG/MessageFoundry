@@ -3731,6 +3731,31 @@ async def test_login_answers_a_nul_username_as_an_audited_unknown_name(
     assert actors.count(username.replace("\x00", "\\u0000")) == 1, actors
 
 
+@pytest.mark.parametrize("field", ["username", "supersedes"])
+async def test_login_refuses_a_lone_surrogate_before_the_service(
+    engine: Engine, field: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lone surrogate, which JSON can spell and no store can encode, is a 422 from the request
+    model, so it never reaches the lookup (vault BACKLOG #5342). PostgreSQL's refusal of a NUL is
+    pinned on the real backend in tests/test_postgres_store.py, beside the other controls."""
+    service = await _service(engine, AuthSettings(require_mfa=False))
+    reached: list[str] = []
+
+    async def _spy(username: str, *args: Any, **kwargs: Any) -> Any:
+        reached.append(username)
+        raise AssertionError("the service was reached")
+
+    monkeypatch.setattr(service, "login", _spy)
+    body = {"username": "sup", "password": PW, field: "s\\ud800up"}
+    raw = "{" + ", ".join(f'"{k}": "{v}"' for k, v in body.items()) + "}"
+    async with _client(engine, service) as c:
+        r = await c.post(
+            "/auth/login", content=raw.encode(), headers={"content-type": "application/json"}
+        )
+    assert r.status_code == 422, r.text
+    assert reached == []
+
+
 @pytest.mark.parametrize(
     "fields",
     [{"username": "s\x01up"}, {"username": ""}, {"supersedes": "tok\x00en"}, {"supersedes": ""}],
