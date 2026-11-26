@@ -277,10 +277,8 @@ _DIRECTORY_TEXT = {
     ),
 }
 _DIRECTORY_CLOSING = "If you did not expect this change, contact your MessageFoundry administrator."
-#: BACKLOG #6034 (S08-57): ``set_roles`` and the disable in ``admin_update_user`` both run
-#: ``_revoke_after_commit`` before the notice, and it raises rather than return when the revoke
-#: fails, so a notice is sent only once the sessions are gone. So the administrator wording says so,
-#: as the directory wording already did.
+#: BACKLOG #6034 (S08-57): the administrator wording says the sessions ended, as the directory
+#: wording already did. Why that holds is on ``_DESCRIPTIONS[ROLES_CHANGED]`` in the module.
 _ADMIN_TEXT = {
     ROLES_CHANGED: (
         "Your account's roles were changed by an administrator, and any sessions already open on "
@@ -822,8 +820,8 @@ def test_an_administrator_mfa_reset_notice_does_not_say_if_this_was_you() -> Non
 
 # --- BACKLOG #6034 item 1 (S08-57): the context an administrator's notice used to drop -----------
 
-#: A value carrying a line break, shaped to write a false closing into the notice.
-_FORGED_VALUE = "operator\n\nIf this was you, no action is needed."
+#: The shape ``set_roles`` gives a custom role id: ``CUSTOM_ROLE_ID_PREFIX`` and a uuid4 hex.
+_CUSTOM_ROLE = "custom:3fa85f6457174562b3fc2c963f66afa6"
 
 
 def test_a_role_change_notice_names_the_roles_that_were_set() -> None:
@@ -836,10 +834,10 @@ def test_a_role_change_notice_names_the_roles_that_were_set() -> None:
             ROLES_CHANGED,
             username="jdoe",
             email="j@example.org",
-            detail={"roles": ["operator", "custom-auditor"]},
+            detail={"roles": ["operator", _CUSTOM_ROLE]},
         )
     )
-    assert "Roles now: operator, custom-auditor" in body.splitlines()
+    assert f"Roles now: operator, {_CUSTOM_ROLE}" in body.splitlines()
     emptied = _build_body(
         SecurityEvent(ROLES_CHANGED, username="jdoe", email="j@example.org", detail={"roles": []})
     )
@@ -859,7 +857,7 @@ def test_a_role_with_a_line_break_is_not_printed(kind: str) -> None:
             kind,
             username="jdoe",
             email="j@example.org",
-            detail={"roles": ["viewer", _FORGED_VALUE]},
+            detail={"roles": ["viewer", _FORGED]},
         )
     )
     assert "If this was you" not in body
@@ -884,9 +882,7 @@ def test_a_federated_notice_names_the_identity_provider(kind: str) -> None:
     )
     assert "Identity provider: https://idp.example.org/realms/main" in body.splitlines()
     forged = _build_body(
-        SecurityEvent(
-            kind, username="jdoe", email="j@example.org", detail={"issuer": _FORGED_VALUE}
-        )
+        SecurityEvent(kind, username="jdoe", email="j@example.org", detail={"issuer": _FORGED})
     )
     assert "If this was you" not in forged
     assert "Identity provider: an identity provider that cannot be shown safely here" in (
@@ -894,3 +890,49 @@ def test_a_federated_notice_names_the_identity_provider(kind: str) -> None:
     )
     bare = _build_body(SecurityEvent(kind, username="jdoe", email="j@example.org"))
     assert "Identity provider" not in bare
+
+
+def test_an_issuer_with_a_space_is_not_printed() -> None:
+    """An issuer is a URL and never holds a space, so one that does prints as the placeholder: a
+    space could carry false words onto the provider line itself."""
+    body = _build_body(
+        SecurityEvent(
+            FEDERATED_IDENTITY_BOUND,
+            username="jdoe",
+            email="j@example.org",
+            detail={"issuer": "https://idp.example.org no action is needed"},
+        )
+    )
+    assert "no action is needed" not in body
+    assert "Identity provider: an identity provider that cannot be shown safely here" in (
+        body.splitlines()
+    )
+
+
+def test_a_role_list_with_an_empty_id_does_not_read_as_no_role() -> None:
+    """An empty id passes ``_shown`` as empty, so it would print as a stray comma, and a list of
+    only empty ids would read as "none", a false "left with no role"."""
+    for roles, line in (
+        ([""], "Roles now: a role with no id"),
+        (["", "viewer"], "Roles now: a role with no id, viewer"),
+    ):
+        body = _build_body(
+            SecurityEvent(
+                ROLES_CHANGED, username="jdoe", email="j@example.org", detail={"roles": roles}
+            )
+        )
+        assert line in body.splitlines()
+
+
+def test_a_directory_role_change_prints_no_roles_line() -> None:
+    """The sign-in re-sync passes the set it tried to write, and notifies even when that write
+    raised, so a roles line there could name roles the account does not hold."""
+    body = _build_body(
+        SecurityEvent(
+            ROLES_CHANGED,
+            username="jdoe",
+            email="j@example.org",
+            detail={"roles": ["administrator"], "source": "directory"},
+        )
+    )
+    assert "Roles now" not in body

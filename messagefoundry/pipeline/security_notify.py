@@ -140,10 +140,11 @@ _DESCRIPTIONS = {
         "You gave another account a temporary password, and its holder has not replaced it yet."
     ),
     EMAIL_CHANGED: "Your account's email address was changed.",
-    # BACKLOG #6034 (S08-57). Both administrator senders, ``set_roles`` and the disable in
-    # ``admin_update_user``, run ``_revoke_after_commit`` first, and it raises rather than return
-    # when the revoke fails, so this notice is sent only once the sessions are gone. A new sender
-    # that does not end them must not reach these two words.
+    # BACKLOG #6034 (S08-57). The administrator senders of ROLES_CHANGED and ACCOUNT_DISABLED,
+    # ``AuthService.set_roles`` and the disable in ``AuthService.update_user``, run
+    # ``_revoke_after_commit`` first, and it raises rather than return when the revoke fails, so
+    # each notice is sent only once the sessions are gone. A new sender of either kind that does
+    # not end them first must tag its own wording, as the directory senders do with ``source``.
     ROLES_CHANGED: (
         "Your account's roles were changed by an administrator, and any sessions already open on "
         "your account were ended."
@@ -354,20 +355,27 @@ def _lock_lines(event: SecurityEvent) -> tuple[str | None, list[str], str | None
     return None, [], None
 
 
-def _shown(text: str, what: str) -> str:
-    """``text`` when every character in it is printable, else a placeholder naming ``what``.
+def _shown(text: str, what: str, *, token: bool = False) -> str:
+    """``text`` when every character in it is printable, else a placeholder naming ``what``. With
+    ``token``, a space of any kind shows the placeholder too, for a value that never holds one, such
+    as a URL (BACKLOG #6034).
 
     A value carrying a line break could write its own lines into a notice, such as a false "If this
     was you" closing (BACKLOG #2291). A directory supplies the username and the email on a
     directory notice, so neither is shaped by this engine. An ASCII space is printable and passes:
     it cannot start a line, and a directory name may hold one. Other space characters, such as a
     no-break space, fail ``isprintable`` and show the placeholder, which is the safe side."""
-    return text if text.isprintable() else f"{what} that cannot be shown safely here"
+    if text.isprintable() and not (token and any(c.isspace() for c in text)):
+        return text
+    return f"{what} that cannot be shown safely here"
 
 
 def _roles_shown(roles: list[object]) -> str:
-    """The role ids, comma-separated, each through :func:`_shown` (BACKLOG #6034)."""
-    return ", ".join(_shown(str(role), "a role") for role in roles)
+    """The role ids, comma-separated, each through :func:`_shown` (BACKLOG #6034). An empty id is
+    named as one, so it cannot print as a stray comma or make a list read as no role at all."""
+    return ", ".join(
+        _shown(text, "a role") if (text := str(role)) else "a role with no id" for role in roles
+    )
 
 
 def _holder_lines(event: SecurityEvent) -> list[str]:
@@ -543,10 +551,11 @@ def _build_body(event: SecurityEvent) -> str:
             lines.append("Notices about later changes go to the new address, not to this one.")
     if event.event_type in (FEDERATED_IDENTITY_BOUND, FEDERATED_IDENTITY_UNBOUND):
         # BACKLOG #6034 (S08-57): which provider was linked or removed. Both senders pass the
-        # issuer, never the subject (BACKLOG #1248), and it goes through ``_shown``.
+        # issuer, never the subject (BACKLOG #1248). An issuer is a URL, so it prints only as one
+        # printable token, as the #2019 address does: a space could carry false words inline.
         issuer = str(event.detail.get("issuer") or "")
         if issuer:
-            lines.append(f"Identity provider: {_shown(issuer, 'an identity provider')}")
+            lines.append(f"Identity provider: {_shown(issuer, 'an identity provider', token=True)}")
     if event.event_type == FEDERATED_IDENTITY_BOUND:
         # vault BACKLOG #2609: the bind ended the holder's sessions. The count lets a holder who
         # was signed in on several devices see that all of them went.
@@ -562,11 +571,13 @@ def _build_body(event: SecurityEvent) -> str:
             "MessageFoundry administrator."
         )
     # BACKLOG #6034: each role id goes through ``_shown`` (S08-56), and a custom role prints by its
-    # id, as no display name travels with the event. A role change carries the whole new set
-    # (S08-57), so an empty one says the account was left with none; a creation with none prints
-    # nothing, as it did.
+    # id, as no display name travels with the event. An administrator's role change carries the
+    # whole set ``set_roles`` wrote (S08-57), so an empty one says the account was left with none;
+    # a creation with none prints nothing, as it did. Not a directory role change: the sign-in
+    # re-sync passes the set it tried to write and notifies even when that write raised, so the
+    # line could name roles the account does not hold.
     roles = event.detail.get("roles")
-    if event.event_type == ROLES_CHANGED and isinstance(roles, list):
+    if event.event_type == ROLES_CHANGED and not from_directory and isinstance(roles, list):
         lines.append(f"Roles now: {_roles_shown(roles) or 'none'}")
     if event.event_type == ACCOUNT_CREATED and isinstance(roles, list) and roles:
         lines.append(f"Roles: {_roles_shown(roles)}")

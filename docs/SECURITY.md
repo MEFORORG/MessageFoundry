@@ -7065,11 +7065,12 @@ the email channel sends:
   expect this change, contact your MessageFoundry administrator", since each route refuses a
   self-target (BACKLOG #6034). The role-change and disable notices say the sessions already open
   on the account were ended: both routes end them before the notice is sent, and send none when
-  that fails. The MFA-reset notice says nothing about sessions. A role-change notice that carries
-  the new role set names it, each role by its id, and the federated link and unlink notices name
-  the identity provider. Each of those values is replaced by a placeholder when it holds a
-  character that is not printable, such as a line break. **CORRECTED 2026-11-26:** this read *"it does not say that sessions were ended"*, true
-  until BACKLOG #6034's last slice.
+  that fails. The MFA-reset notice says nothing about sessions. An administrator's role-change
+  notice names the new role set, each role by its id, and the federated link and unlink notices
+  name the identity provider when the event carries its issuer. Each of those values is replaced
+  by a placeholder when it holds a character that is not printable, such as a line break, and an
+  issuer is also replaced when it holds a space. **CORRECTED 2026-11-26:** this read *"it does
+  not say that sessions were ended"*, true until BACKLOG #6034's last slice.
   The rename notice, `username_changed`, names the old and the new name, and is sent only when
   the new name was written (BACKLOG #2017). An **unreplaced temporary password** near its deadline
   (ASVS 6.4.5, BACKLOG #2007) sends two reminders, beside the operator's `initial_credential_expiring`
