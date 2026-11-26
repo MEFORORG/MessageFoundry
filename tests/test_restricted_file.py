@@ -1183,7 +1183,7 @@ def test_an_unread_linux_mount_table_still_reports_a_broad_holding_folder(
     monkeypatch.setattr(restricted_file, "read_mounts", lambda: None)
     os.chmod(holder, 0o700)
     assert isinstance(restricted_file.broad_access_problem(key), restricted_file.UncheckedProblem)
-    os.chmod(holder, 0o777)
+    os.chmod(holder, os.stat(holder).st_mode | stat.S_IRWXG | stat.S_IRWXO)
     try:
         problem = restricted_file.broad_access_problem(key)
     finally:
@@ -1259,7 +1259,7 @@ def test_an_unread_linux_mount_table_still_reports_a_link_another_account_can_ch
     assert isinstance(
         restricted_file.broad_access_problem(linked), restricted_file.UncheckedProblem
     )
-    os.chmod(base, 0o777)
+    os.chmod(base, os.stat(base).st_mode | stat.S_IRWXG | stat.S_IRWXO)
     try:
         problem = restricted_file.broad_access_problem(linked)
     finally:
