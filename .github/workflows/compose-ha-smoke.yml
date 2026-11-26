@@ -7,18 +7,27 @@
 # This job is that run. It builds the -postgres image, mints a throwaway CA with a Postgres server
 # certificate and an API certificate, stages the files at the paths compose.yaml names, owned and
 # moded as its comments say, starts Postgres, schema-provision and the engine pair, and asserts:
-#   * both engines report healthy (the image HEALTHCHECK) and never restarted;
+#   * both engines report healthy (the image HEALTHCHECK), and neither has restarted by the end;
 #   * both answer GET /health over https, verified against the throwaway CA from the host;
-#   * every store session the engines hold on Postgres is TLS, and at least one exists.
+#   * both engines joined the cluster (two fresh rows in `nodes`) and exactly one holds a live
+#     leader lease;
+#   * every store session the engines hold on Postgres is encrypted, and at least one exists.
+#     pg_stat_ssl records encryption only. That the engines verify the server certificate rests on
+#     the shipped MEFOR_STORE_SSL_ROOT_CERT pin and the engine's own refusal; this job does not
+#     measure it.
 #
 # WHAT IT CHANGES FROM THE SHIPPED TEMPLATE, all in an override file written at run time, never in
-# compose.yaml. The engines run `serve --env dev` instead of `--env prod`, and the ha services
-# run at [security].enforcement = warn. Under enforce an exposed start also needs a site SMTP relay,
-# a syslog TLS collector and a store CRL (compose.yaml, "what an enforcing start needs"), which a
-# CI runner has no real value for, so this job does not exercise those gates. The inbound MLLP
-# listener binds loopback inside the container, because the graph it serves is the plaintext
-# docker/smoke config. It sets no MEFOR_ALLOW_INSECURE_TLS: the store hop is verified TLS at every
-# posture, and the job's last assertion reads that from Postgres itself.
+# compose.yaml, plus the inputs the template leaves to the adopter. At least these differ:
+#   * the engines run `serve --env dev` instead of `--env prod`;
+#   * the ha services run at [security].enforcement = warn, so this job does not exercise the
+#     enforcing gates. compose.yaml, "what an enforcing start needs", names at least an SMTP relay,
+#     a syslog TLS collector, retention bounds and a store CRL. ci.yml's docker-smoke runs an
+#     enforcing start with config-only values for most of them; this job follows the dev posture
+#     its owner ruling asked for instead;
+#   * the adopter config is the docker/smoke graph, whose MLLP listener is plaintext, so the
+#     inbound bind is loopback inside the container, and its File outbound needs
+#     MEFOR_EGRESS_ALLOWED_FILE_DIRS=/var/lib/mefor on the engines.
+# It sets no MEFOR_ALLOW_INSECURE_TLS.
 #
 # It starts the pair by name, as compose.yaml documents, so the default `engine` service, which
 # has no profile and needs another image, does not start beside it.
@@ -96,8 +105,10 @@ jobs:
             MEFOR_INBOUND_BIND_HOST: "127.0.0.1"
             MEFOR_EGRESS_ALLOWED_FILE_DIRS: "/var/lib/mefor"
           services:
+            # The one-shot reads only the dial: under enforce its store open needs the CRL.
             schema-provision:
-              environment: *ci-dev-env
+              environment:
+                MEFOR_SECURITY_ENFORCEMENT: "warn"
             engine-ha:
               command: ["serve", "--config", "/config", "--env", "dev"]
               environment: *ci-dev-env
@@ -127,14 +138,14 @@ jobs:
           authorityKeyIdentifier = keyid:always
           [pg]
           basicConstraints = critical, CA:FALSE
-          keyUsage = critical, digitalSignature, keyEncipherment
+          keyUsage = critical, digitalSignature
           extendedKeyUsage = serverAuth
           subjectAltName = DNS:postgres
           subjectKeyIdentifier = hash
           authorityKeyIdentifier = keyid, issuer
           [api]
           basicConstraints = critical, CA:FALSE
-          keyUsage = critical, digitalSignature, keyEncipherment
+          keyUsage = critical, digitalSignature
           extendedKeyUsage = serverAuth
           subjectAltName = DNS:localhost, IP:127.0.0.1, DNS:engine-ha, DNS:engine-standby
           subjectKeyIdentifier = hash
@@ -233,34 +244,55 @@ jobs:
             python3 -c 'import json, sys; sys.exit(0 if json.loads(sys.argv[1]).get("status") == "ok" else "FAIL: /health did not say ok")' "$body"
           done
 
-      - name: Assert the engines' store sessions are TLS
+      - name: Assert the pair formed a cluster, holds encrypted store sessions, and never restarted
         run: |
           set -euo pipefail
+          sql() { docker compose exec -T postgres psql -U mefor -d messagefoundry -XtA -F ' ' -c "$1"; }
+          # Each field is checked on its own: a failed or empty read leaves a non-number, which
+          # must fail the step rather than pass as a zero.
+          numeric() {
+            for v in "$@"; do
+              case "$v" in
+                '' | *[!0-9]*) return 1 ;;
+              esac
+            done
+          }
+          # Both engines heartbeat a `nodes` row and the leader holds the lease, both stamped with
+          # wall-clock seconds; the containers share the host clock.
+          cluster_q="select (select count(*) from nodes where last_seen > extract(epoch from now()) - 60), (select count(*) from leader_lease where owner is not null and lease_expires_at > extract(epoch from now()))"
           # Sessions from the engine containers, not the health probe on Postgres's own loopback.
-          # At least one must exist, or a zero plaintext count would mean nothing.
-          q="select count(*) filter (where s.ssl), count(*) filter (where not s.ssl), count(distinct a.client_addr) from pg_stat_activity a join pg_stat_ssl s using (pid) where a.usename = 'mefor' and a.client_addr is not null and a.client_addr <> '127.0.0.1'"
-          # A failed or empty read leaves a non-number, which the case below refuses, so it cannot
-          # pass as a zero plaintext count.
-          tls=0 plain=unread clients=unread
+          ssl_q="select count(*) filter (where s.ssl), count(*) filter (where not s.ssl), count(distinct a.client_addr) from pg_stat_activity a join pg_stat_ssl s using (pid) where a.usename = 'mefor' and a.client_addr is not null and a.client_addr <> '127.0.0.1'"
+          ok=0
           for _ in $(seq 1 12); do
-            read -r tls plain clients <<< "$(docker compose exec -T postgres psql -U mefor -d messagefoundry -XtA -F ' ' -c "$q")" || true
-            case "$tls$plain" in
-              '' | *[!0-9]*) tls=0 plain=unread ;;
-            esac
-            if [ "$tls" -ge 1 ]; then
+            nodes='' leaders='' tls='' plain='' clients=''
+            read -r nodes leaders <<< "$(sql "$cluster_q")" || true
+            read -r tls plain clients <<< "$(sql "$ssl_q")" || true
+            if numeric "$nodes" "$leaders" "$tls" "$plain" "$clients"               && [ "$nodes" -eq 2 ] && [ "$leaders" -eq 1 ] && [ "$tls" -ge 1 ] && [ "$clients" -eq 2 ]; then
+              ok=1
               break
             fi
             sleep 5
           done
-          echo "engine store sessions: tls=$tls plaintext=$plain from $clients client addresses"
-          if [ "$tls" -lt 1 ]; then
-            echo "FAIL: no engine held a store session, so the plaintext count below proves nothing"
+          echo "cluster: fresh nodes=$nodes live leader leases=$leaders"
+          echo "engine store sessions: encrypted=$tls plaintext=$plain from $clients client addresses"
+          if [ "$ok" -ne 1 ]; then
+            echo "FAIL: within 60 seconds the pair did not show two fresh nodes, one live leader lease and encrypted store sessions from both engines"
             exit 1
           fi
           if [ "$plain" -ne 0 ]; then
             echo "FAIL: an engine holds a plaintext store session"
             exit 1
           fi
+          # The health wait read the restart count only until both were healthy; read it again
+          # now, after every other assertion, so a later crash and restart cannot pass.
+          for svc in engine-ha engine-standby; do
+            read -r status restarts <<< "$(docker inspect -f '{{.State.Status}} {{.RestartCount}}' "$(docker compose ps -aq "$svc")")" || true
+            if ! numeric "$restarts" || [ "$restarts" -ne 0 ] || [ "$status" != running ]; then
+              echo "FAIL: by the end $svc is ${status:-unread} after ${restarts:-unread} restarts"
+              exit 1
+            fi
+          done
+          echo "engine-ha and engine-standby are still running with no restart"
 
       - name: Compose state and logs (on failure)
         if: failure()
