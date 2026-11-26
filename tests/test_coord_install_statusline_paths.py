@@ -530,6 +530,31 @@ def test_a_move_refused_past_its_retries_falls_back_to_the_in_place_write(
     assert not [p.name for p in root.iterdir() if p.name.endswith(".tmp")]
 
 
+@pytest.mark.parametrize("how", ["inherited preference", "-WarningAction Stop"])
+def test_an_in_place_write_under_warning_stop_still_reports_wrote(tmp_path: Path, how: str) -> None:
+    """Under -WarningAction Stop or an inherited $WarningPreference of Stop, the in-place fallback's
+    warning threw after the write had landed, so a landed write reported FAILED and exited 1."""
+    root = _root(tmp_path, {"keep": True}, name=FAULT_ROOT)
+    settings = root / "settings.json"
+    call = f"& {_q(INSTALL)} -HomeDir {_q(_home(tmp_path))} -CollectorPath {_q(COLLECT)}"
+    call += f" -SettingsPath {_q(settings)}"
+    if how == "-WarningAction Stop":
+        call += " -WarningAction Stop"
+    else:
+        call = "$WarningPreference = 'Stop'; " + call
+    proc = _spawn(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", f"{call}; exit $LASTEXITCODE"],
+        tmp_path,
+        _fault(tmp_path, "move-refused", root),
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out
+    assert "FAILED" not in out and "WROTE" in out, out
+    assert "written in place" in out, out
+    doc = json.loads(settings.read_text(encoding="utf-8"))
+    assert doc["keep"] is True and "statusLine" in doc
+
+
 def test_a_write_denied_settings_file_is_not_replaced(tmp_path: Path) -> None:
     """A rename needs only delete access through the directory, so it could replace a settings.json
     that a Deny-Write ACE protects, which the in-place write could not. The write probe sends such a

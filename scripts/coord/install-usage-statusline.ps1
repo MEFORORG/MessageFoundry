@@ -324,7 +324,11 @@ function Write-SettingsFile([string]$Path, $Data) {
             throw "$msg."
         }
         if ($tmpComplete) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
-        Write-Warning "${Path} was written in place, not swapped atomically, because $inPlaceWhy"
+        # The write has landed, so this warning must never turn it into a FAILED line: under
+        # -WarningAction Stop or an inherited $WarningPreference of Stop (or Inquire, which cannot
+        # prompt here), Write-Warning throws. Those two are shown instead; any quieter choice is kept.
+        $warnAction = if ($WarningPreference -in 'Stop', 'Inquire') { 'Continue' } else { $WarningPreference }
+        Write-Warning "${Path} was written in place, not swapped atomically, because $inPlaceWhy" -WarningAction $warnAction
     }
     return $backedTo
 }
