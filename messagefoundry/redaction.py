@@ -2094,10 +2094,10 @@ def redact(text: str) -> str:
     **A mismatched or stray JSON closer after a PHI JSON key can make the result the placeholder
     for the whole text (BACKLOG #5814)**, followed by any trailing bound note. Text shaped like such
     a key can do it too, including text inside a JSON string. This can blank text beyond the key's
-    value, including some balanced inputs. The check is a heuristic walk and misses some shapes: the
-    code of :func:`_redact_noted` and :func:`_stray_json_closer` is the definition, and
-    ``tests/test_b5814_stray_closer_before_flat_passes.py`` pins examples in its ``KNOWN_COST`` and
-    ``MISSED`` lists, neither of them a complete list."""
+    value, including some balanced inputs, and it misses some shapes. The code from
+    :func:`_redact_noted` down is the definition; the ``KNOWN_COST`` and ``MISSED`` lists in
+    ``tests/test_b5814_stray_closer_before_flat_passes.py`` pin examples, neither of them a complete
+    list."""
     return _redact_noted(text, noted=False)
 
 
@@ -2134,15 +2134,16 @@ def _redact_noted(text: str, *, noted: bool) -> str:
 
 
 def _stray_json_closer(text: str) -> bool:
-    """Whether to return the placeholder for ``text`` because a mismatched or stray JSON closer
-    follows a PHI JSON key, or text shaped like one (BACKLOG #5814, added item 2).
-    :func:`_redact_noted` calls it on the text as received and on the result.
+    """Whether this walk reads a mismatched or stray JSON closer after a PHI JSON key, or text
+    shaped like one, in ``text`` (BACKLOG #5814, added item 2). :func:`_redact_noted` returns the
+    placeholder when it does. It is one of two routes there: :class:`_MismatchedJsonCloser` is the
+    other, so a False here does not mean the text is kept.
 
-    A heuristic walk. Text shaped like a PHI JSON key counts as one, including text inside a JSON
-    string. It can blank text beyond the key's value, including some balanced inputs, and it misses
-    some shapes. The code below is the definition; this docstring does not restate it.
-    ``tests/test_b5814_stray_closer_before_flat_passes.py`` pins examples in its ``KNOWN_COST`` and
-    ``MISSED`` lists, neither of them a complete list."""
+    Text shaped like a PHI JSON key counts as one, including text inside a JSON string. It can blank
+    text beyond the key's value, including some balanced inputs, and it misses some shapes. The code
+    below is the definition; the ``KNOWN_COST`` and ``MISSED`` lists in
+    ``tests/test_b5814_stray_closer_before_flat_passes.py`` pin examples, neither of them a complete
+    list."""
     keys = [match.start() for match in _JSON_PHI_KEY.finditer(text)]
     if not keys:
         return False

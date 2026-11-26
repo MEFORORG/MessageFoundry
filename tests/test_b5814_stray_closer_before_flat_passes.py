@@ -76,7 +76,7 @@ def test_a_cut_or_quoted_string_after_a_key_keeps_its_diagnostic(text: str) -> N
         assert once != PLACEHOLDER and safe_text(once, limit=limit) != PLACEHOLDER, once
 
 
-@pytest.mark.xfail(strict=True, reason="KNOWN RESIDUAL of BACKLOG #5814: see _stray_json_closer")
+@pytest.mark.xfail(strict=True, reason="KNOWN RESIDUAL of BACKLOG #5814: see MISSED")
 @pytest.mark.parametrize("text", MISSED)
 def test_a_documented_miss_still_keeps_the_value(text: str) -> None:
     assert SECRET not in redact(text)
@@ -100,8 +100,9 @@ def test_the_rule_is_a_fixed_point_of_safe_text(text: str) -> None:
     assert safe_text(once) == once
 
 
-#: Negative controls: balanced JSON, a closer in a string, a closer in prose before the key, and a
-#: closer in prose after the key's container closed are all read as before.
+#: Negative controls, each read as before: balanced JSON, a closer in a string, a closer in prose
+#: before the key, and a closer in prose after the key's container closed. Some other balanced texts
+#: are blanked whole (KNOWN_COST).
 BALANCED = [
     (
         '{"family": ["Zqxdoe"], "status": "ok (1)", "id": f(1, [2], {"a": 3})}',
