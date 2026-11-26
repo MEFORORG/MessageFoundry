@@ -636,6 +636,21 @@ def test_a_deny_stands_over_another_hooks_fault(bridge, tmp_path, order):
     assert "a hook failed" in result["systemMessage"]
 
 
+@pytest.mark.parametrize("order", ["fault-first", "stop-first"])
+@pytest.mark.parametrize(
+    "stop",
+    [{"continue": False}, {"decision": "block"}],
+    ids=["continue-false", "decision-block"],
+)
+def test_a_stop_stands_over_another_hooks_fault(bridge, tmp_path, order, stop):
+    """docs/CODEX.md: a `continue: false` or a block from another hook keeps the fault unraised."""
+    hooks = [_EXIT_1, handler(json.dumps(stop))]
+    settings(tmp_path, hooks if order == "fault-first" else hooks[::-1])
+    result = bridge.dispatch(tmp_path, _PAYLOAD)
+    assert all(result[key] == value for key, value in stop.items())
+    assert "a hook failed" in result["systemMessage"]
+
+
 def test_a_later_exit_2_blocks_over_an_earlier_fault(bridge, tmp_path):
     settings(tmp_path, [_EXIT_1, _py("import sys; sys.exit(2)")])
     with pytest.raises(bridge.HookBlocked):

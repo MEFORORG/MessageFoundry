@@ -1070,7 +1070,7 @@ HEREDOC_SUBSTITUTION_DENY = [
     ),
     # The views end the first body at the raw `EOF` after `x\`, so they read `<<B` as an opener and
     # blank the walk as B's body; bash reads the walk as a command. The pass must read the lines
-    # after that `EOF` as the views do too, or nothing reads the walk.
+    # after that `EOF` as the views do too, or nothing reads the substitution.
     pytest.param(
         "cat <<EOF\nx\\\nEOF\ncat <<B\nEOF\n$(find /proc)\nB", id="views-end-at-raw-delimiter"
     ),
@@ -1081,6 +1081,10 @@ HEREDOC_SUBSTITUTION_DENY = [
     pytest.param(
         'echo "$(cat <<EOF\nx\\\nEOF\ncat <<B\nEOF\n$(find /proc)\nB\n)"',
         id="nested-views-end-at-raw-delimiter",
+    ),
+    # The views also end a body at a padded copy of its delimiter, as they compare after .Trim().
+    pytest.param(
+        "cat <<EOF\n EOF\ncat <<B\nEOF\n$(find /proc)\nB", id="views-end-at-padded-delimiter"
     ),
     # A quoted delimiter's body joins no line, so it ends at `EOF` and the next opener is read.
     pytest.param(
@@ -1913,7 +1917,7 @@ EXPECTED_ROW_COUNTS = {
     "REFINED_FALSE_DENY_ALLOW": 14,
     "SITE_TEXT_DENY": 16,
     "SITE_TEXT_ALLOW": 21,
-    "HEREDOC_SUBSTITUTION_DENY": 32,
+    "HEREDOC_SUBSTITUTION_DENY": 33,
     "HEREDOC_SUBSTITUTION_ALLOW": 13,
 }
 

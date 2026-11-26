@@ -54,7 +54,9 @@ Claude Code and a failure here. A hook's exit 2 still ends the event at once,
 as a block, and no later hook runs. A fault outside a hook's own run also ends
 the hooks early. Examples are an unsupported hook, or an object whose fields
 have the wrong type, such as `{"systemMessage": 5}`. That fault then takes the
-first failure's place, and a deny in that same object can be lost. Nothing is
+first failure's place, and a decision in that same object, such as a deny, a
+block or a `"continue": false`, can be lost when the bad field merges first, as
+`merge_output` orders the fields. Nothing is
 raised when a deny, an ask, a block or a `"continue": false` merged before the
 fault stands, from another hook or from the same object. The bridge then prints
 the event's output with that decision and a `systemMessage` naming the failure,

@@ -201,7 +201,7 @@ PLAIN_TEXT_CONTEXT_EVENTS = ("SessionStart", "UserPromptSubmit")
 
 
 def blocks(result: dict[str, Any]) -> bool:
-    """Whether a merged result already stops or holds the event, as a deny, ask or block does."""
+    """Whether a merged result stops or holds the event: a deny, ask, block or `continue: false`."""
     specific = result.get("hookSpecificOutput") or {}
     decision = specific.get("decision")
     return (
@@ -416,12 +416,14 @@ def dispatch(root: Path, payload: dict) -> dict:
     # Outside SessionStart a hook that fails other than by exit 2 no longer stops the event's later
     # hooks: they still run while the event's shared budget lasts, and once it is spent each later
     # hook is recorded as timed out without running. A hook's exit 2 still ends the event at once,
-    # as on origin/main. The first fault is raised once the event's hooks end, unless a deny, ask,
-    # block or `continue: false` merged from another hook stands, as blocks() reads it; that keeps
-    # the exit code a lone failing hook gave on main. A fault outside a hook's own run, such as an
-    # unsupported hook or a field of the wrong type, ends them at once and takes the first fault's
-    # place; a merged deny, ask, block or `continue: false` still stands, one merged from the same
-    # object as the bad field included.
+    # as on origin/main. The first fault is raised once the event's hooks end, unless a decision
+    # blocks() reads as standing, `continue: false` among them, was merged from another hook; that
+    # keeps the exit code a lone failing hook gave on main. A fault outside a hook's own run, such
+    # as an unsupported hook or a field of the wrong type, ends them at once and takes the first
+    # fault's place. Such a decision merged before that fault still stands, from another hook or
+    # from earlier in the same object: merge_output merges systemMessage, stopReason and reason
+    # first, then continue and decision, then hookSpecificOutput, so a bad field loses what the
+    # same object would have merged after it.
     fault: Exception | None = None
 
     def record(exc: Exception, label: str) -> None:
@@ -508,8 +510,8 @@ def dispatch(root: Path, payload: dict) -> dict:
                     continue
                 merge_output(result, update)
     except OUTER_FAULTS as exc:
-        # A fault outside a hook's own run ends the event's hooks. A deny, ask, block or
-        # `continue: false` already merged still stands, below, rather than being lost to the
+        # A fault outside a hook's own run ends the event's hooks. A decision blocks() reads as
+        # standing that was already merged still stands, below, rather than being lost to the
         # fault's exit.
         if fault is not None:
             print(f"Codex bridge: a hook also failed: {fault}", file=sys.stderr)
