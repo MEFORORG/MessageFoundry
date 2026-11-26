@@ -881,12 +881,12 @@ _FORFEIT_NOBODY_ELSE: Final[str] = (
 _UNREACHED_ROLLUP_ABOVE: Final[int] = 5
 
 
-def _unreached_rollup_key(entries: Iterable[tuple[str, str, int]]) -> str:
+def _unreached_rollup_key(user_ids: Iterable[str]) -> str:
     """The key a rollup's page carries in its source, ``ReconcilePlan.unreached_rollup``: 16 hex
     characters of a SHA-256 over the sorted user ids of the accounts entering (BACKLOG #3100 item
     14). An alert-instance key, not a secret. The ids, not the names, so the source names nobody
     and a rename keeps the key; sorted, so the order a pass probed them in does not change it."""
-    ids = "\n".join(sorted(user_id for user_id, _n, _p in entries))
+    ids = "\n".join(sorted(user_ids))
     return hashlib.sha256(ids.encode("utf-8", "surrogatepass")).hexdigest()[:16]
 
 
@@ -10470,7 +10470,9 @@ class AuthService:
         return replace(
             plan,
             unreached=tuple(written),
-            unreached_rollup=_unreached_rollup_key(written) if rollup else None,
+            unreached_rollup=_unreached_rollup_key(uid for uid, _n, _p in written)
+            if rollup
+            else None,
         )
 
     def _latch_unreached_accounts(self, plan: reconcile.ReconcilePlan) -> None:

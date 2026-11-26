@@ -376,8 +376,7 @@ class ReconcilePlan:
     #: entering rather than once per account. A directory that answers only a few probes
     #: in each pass would otherwise open an instance per signed-in account. ``None`` on a pass
     #: that does not roll up. Set, it is the key of the accounts entering, which the page's
-    #: source carries, so no earlier rollup's cooldown or suspend reaches a rollup of other
-    #: accounts (BACKLOG #3100 item 14; the API's ``_UNREACHED_ROLLUP_SOURCE`` says why).
+    #: source carries (BACKLOG #3100 item 14; the API's ``_UNREACHED_ROLLUP_SOURCE`` says why).
     unreached_rollup: str | None = None
     #: Set by the auth service after the pass, never by :func:`plan_pass` (BACKLOG #3709): how many
     #: passes running, this one included, have read the directory unreachable
