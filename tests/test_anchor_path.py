@@ -1111,7 +1111,9 @@ def test_no_fix_under_an_untrusted_mount_chowns_a_folder(
         v = _posix(anchor, full, fstype=fstype)
     assert v.ok is False
     text = _path_text(v, anchor, pin_setting="[x].pin")
-    folders = [line for line in text.splitlines() if "chown" in line and "a.pem" not in line]
+    lines = text.splitlines()
+    assert lines, text  # the message the filter reads; v.ok False above proves a finding was made
+    folders = [line for line in lines if "chown" in line and "a.pem" not in line]
     assert not folders, text
     mount = next(f.path for f in v.findings if f.mount)
     kind = (fstype or {}).get(mount, "unread mount table")
