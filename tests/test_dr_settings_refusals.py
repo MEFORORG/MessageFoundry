@@ -37,6 +37,8 @@ def test_enabled_and_activate_in_code_are_refused() -> None:
     with pytest.raises(ValidationError, match=_REMOVED) as caught:
         DrSettings.model_validate({"enabled": True, "activate": True, **_SEED})
     assert "POST /dr/activate" in str(caught.value)
+    # Run it only once the primary is confirmed down, or two sites serve.
+    assert "confirmed the primary is not serving" in str(caught.value)
 
 
 def test_enabled_and_activate_from_a_file_are_refused(tmp_path: Path) -> None:
@@ -49,6 +51,8 @@ def test_enabled_and_activate_from_a_file_are_refused(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match=_REMOVED) as caught:
         load_settings(config_path=cfg, environ={})
     assert "POST /dr/activate" in str(caught.value)
+    # Run it only once the primary is confirmed down, or two sites serve.
+    assert "confirmed the primary is not serving" in str(caught.value)
 
 
 def test_an_enabled_box_loads_passive() -> None:

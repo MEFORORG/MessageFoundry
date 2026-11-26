@@ -1039,7 +1039,9 @@ class AlertSink(Protocol):
         """A DR box **failed back** to the recovered primary (BACKLOG #145, ADR 0048) — the **inverse** of
         :meth:`dr_activated`. Emits **no** notification (a fail-back needs no page); it **auto-resolves**
         the matching open ``dr_activated`` instance (ADR 0044). ``node`` is the DR box label; ``role`` is
-        ``"primary"`` (leadership handed back). No PHI."""
+        ``"primary"`` (leadership handed back). Also raised by ``POST /dr/release`` on a restarted
+        passive box, which hands nothing back and only records that it stays passive (BACKLOG
+        #5965). No PHI."""
         ...
 
     def dr_restarted_passive(self, node: str) -> None:
@@ -1655,8 +1657,14 @@ class LoggingAlertSink:
         )
 
     def dr_released(self, node: str, *, role: str) -> None:
-        # The inverse (auto-resolve) event; a clean fail-back — logged at INFO, no page.
-        log.info("ALERT dr_released: DR box %r released, handed back to %s", node, role)
+        # The inverse (auto-resolve) event, logged at INFO, no page. Raised by a fail-back and by a
+        # release that leaves a restarted box passive (BACKLOG #5965), so the line claims no hand-back.
+        log.info(
+            "ALERT dr_released: DR box %r released: it is passive and serves nothing, and serving "
+            "is left to the %s",
+            node,
+            role,
+        )
 
     def dr_restarted_passive(self, node: str) -> None:
         log.critical(

@@ -93,7 +93,7 @@ _ACTION_RELEASE_FAILED = "dr_release_failed"
 #: operator leaves it passive. Kept apart from ``dr.release`` for the same reason as
 #: ``dr_release_failed``: no drain ran, so it is not a fail-back.
 _ACTION_STAY_PASSIVE = "dr.stay_passive"
-#: The actions a start reads to tell whether this process was last activated (BACKLOG #5965).
+#: The actions a start reads to tell whether this identity was last activated (BACKLOG #5965).
 _TRANSITIONS = (_ACTION_ACTIVATE, _ACTION_RELEASE, _ACTION_STAY_PASSIVE)
 #: How many of the newest :data:`_TRANSITIONS` rows a start reads. The engine shards of one DR
 #: box share the store, so every engine shard's rows are in the scan; an engine shard whose own
@@ -344,24 +344,24 @@ class DrCoordinator:
         return f"{self._host} {identity}" if identity else self._host
 
     def _whose(self) -> dict[str, object]:
-        """The fields a transition row carries so a later start can tell whether this process
+        """The fields a transition row carries so a later start can tell whether this identity
         wrote it: the host, and the process identity (BACKLOG #5965). The host keeps a row
         restored from another box's store from reading as this box's own."""
         return {"host": self._host, "instance": self._identity()}
 
     async def _own_last_transition(self) -> str | None:
-        """The action of the newest :data:`_TRANSITIONS` row this process wrote, by
+        """The action of the newest :data:`_TRANSITIONS` row this identity wrote, by
         :meth:`_whose`, or ``None`` when none is found. A store error raises."""
         rows = await self._store.recent_audit_of(_TRANSITIONS, limit=_RESTART_SCAN_ROWS)
         return _last_transition(rows, self._whose())
 
     async def check_restarted_passive(self) -> bool:
-        """At start: fail loud when this process was last recorded as activated (BACKLOG #5965;
+        """At start: fail loud when this identity was last recorded as activated (BACKLOG #5965;
         owner ruling 2026-11-25, decision d20261126T042906640-0b0f76).
 
         A box always starts passive, and nothing here changes that: it never re-activates itself,
         and ``POST /dr/activate`` stays the only route back to serving. When the newest
-        :data:`_TRANSITIONS` row this process wrote (same host, same identity) is a
+        :data:`_TRANSITIONS` row this identity wrote (same host, same identity) is a
         ``dr.activate``, the box may have been serving when it went down, so this logs at ERROR
         and raises the critical ``dr_restarted_passive`` alert, which also closes the open
         ``dr_activated`` for the same label. Each engine shard reads only the rows its own identity wrote, so each
@@ -396,7 +396,7 @@ class DrCoordinator:
                 "is an activation, so it may have been serving when it went down. A store "
                 "restored from a snapshot taken while it was activated, a release whose record "
                 "was never written, and an earlier start that already came back passive read "
-                "the same way, and in the first two the primary may be serving again. It has "
+                "the same way, and in at least the first two the primary may be serving again. It has "
                 "started PASSIVE, serves nothing and does not re-activate itself; once you have "
                 "confirmed the primary is not serving, re-run POST /dr/activate to serve the "
                 "priority feeds again, or POST /dr/release to record that it stays passive",
@@ -410,7 +410,7 @@ class DrCoordinator:
         return True
 
     async def _record_stay_passive(self, actor: str, now: float) -> DrResult | None:
-        """``POST /dr/release`` on a passive box this process last activated, or whose start
+        """``POST /dr/release`` on a passive box this identity last activated, or whose start
         raised ``dr_restarted_passive``: record that the operator leaves it passive, so later
         starts stop alerting, and close the alert (BACKLOG #5965). The release hook runs when
         one is set, since the takeover hook may have moved the address here. Nothing drains: the

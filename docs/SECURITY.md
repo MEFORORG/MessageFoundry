@@ -4265,7 +4265,8 @@ The complete set, as enumerated in the [route map](#route--permission-map-engine
   hook and unbinds every inbound. Each asks for the same fresh proof as the planned failover above.
   Under `serve` a DR box starts passive and no setting promotes it: `[dr].activate` is a removed
   key (BACKLOG #5965; the `[dr]` `activate` row of [CONFIGURATION.md](CONFIGURATION.md) says why).
-  So this route is the only promotion, and a restart of an activated box needs it again.
+  So this route is the only promotion, and a restart of an activated box needs it again, once
+  the operator has confirmed the primary is not serving.
 - **Dual control** -- `POST /approvals/{id}/resolve` (BACKLOG #1562). Approve and reject are not
   step-up gated; this one is, because it closes an approval record on the resolver's word alone.
   So is `POST /approvals/{id}/interrupt`, the step before a resolve for a release stranded in

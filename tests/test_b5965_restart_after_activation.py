@@ -86,7 +86,11 @@ async def _seed(tmp_path: Path) -> tuple[Path, str, StoreSettings, str]:
 
 
 def _coord(
-    store: MessageStore, ss: StoreSettings, archive: str, sink: _Sink, instance: str | None
+    store: MessageStore,
+    ss: StoreSettings,
+    archive: str,
+    sink: LoggingAlertSink,
+    instance: str | None,
 ) -> DrCoordinator:
     async def act() -> None:
         return None
@@ -279,6 +283,31 @@ async def test_a_release_on_the_restarted_box_records_that_it_stays_passive(
         later = _Sink()
         assert not await _coord(store, ss, archive, later, None).check_restarted_passive()
         assert later.events == []
+    finally:
+        await store.close()
+
+
+async def test_the_stay_passive_line_claims_no_hand_back(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A release on a restarted passive box hands nothing back, so the default sink's line for the
+    # dr_released it raises must not say it did.
+    db, archive, ss, key = await _seed(tmp_path)
+    store = await MessageStore.open(db, cipher=make_cipher(key))
+    try:
+        await _coord(store, ss, archive, _Sink(), None).activate(actor="alice")
+        restarted = _coord(store, ss, archive, LoggingAlertSink(), None)
+        assert await restarted.check_restarted_passive()
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="messagefoundry.pipeline.alerts"):
+            await restarted.release(actor="bob")
+        lines = [
+            r.getMessage() for r in caplog.records if r.getMessage().startswith("ALERT dr_released")
+        ]
+        assert len(lines) == 1
+        assert "handed back" not in lines[0]
+        assert "it is passive and serves nothing" in lines[0]
+        assert await store.list_audit(action="dr.stay_passive", limit=5) != []
     finally:
         await store.close()
 

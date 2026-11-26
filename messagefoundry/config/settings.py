@@ -9521,7 +9521,8 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
     # false, is refused with the route to use rather than loaded with the key dropped.
     ("dr", "activate"): (
         "a DR box always starts passive, and the only way to bring it up under the DR "
-        "run-profile is POST /dr/activate, which verifies the cold seed, runs the takeover hook "
+        "run-profile is POST /dr/activate, to be run only once you have confirmed the primary is "
+        "not serving; it verifies the cold seed, runs the takeover hook "
         "if one is set, and writes the dr.activate audit row; the startup latch skipped all three "
         "(BACKLOG #5965)"
     ),

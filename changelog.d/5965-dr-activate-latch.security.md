@@ -7,7 +7,8 @@
   to start active, so under `serve` a DR box always starts passive. A box that was activated and
   restarts comes back passive, logs at ERROR and raises the new `dr_restarted_passive` alert,
   critical unless a matching rule names its own severity, which closes the open `dr_activated`.
-  It never re-activates itself: `POST /dr/activate` brings it back, and `POST /dr/release` on
+  It never re-activates itself: once the operator has confirmed the primary is not serving,
+  `POST /dr/activate` brings it back, and `POST /dr/release` on
   the passive box records that it stays passive, as a `dr.stay_passive` audit row. Each engine
   shard reads its own `dr.activate`, `dr.release` and `dr.stay_passive` rows, which now name the
   host and the engine shard, and alerts on its own; the DR alerts' label adds the engine shard. An activated server-DB box with

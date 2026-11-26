@@ -2508,7 +2508,7 @@ class Engine:
                 dr_paused=self._dr_backup_paused,
             )
             self._backup_runner.start()
-        # BACKLOG #5965 (owner ruling 2026-11-25): a box this process last activated comes back up
+        # BACKLOG #5965 (owner ruling 2026-11-25): a box this identity last activated comes back up
         # passive and stays so, and says so loudly. Never an activation: POST /dr/activate is the
         # only one. Not leader-gated: each engine shard reads its own rows and alerts on its own.
         dr = self.dr_coordinator
