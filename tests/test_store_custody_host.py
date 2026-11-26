@@ -1062,6 +1062,44 @@ async def test_a_recorded_error_that_is_no_custody_refusal_is_still_replaced_at_
     assert refusal.__cause__ is None and refusal.__context__ is None
 
 
+@pytest.mark.parametrize("link", ["the error itself", "its cause"])
+async def test_a_codec_error_on_the_custody_path_is_a_host_custody_refusal_with_no_byte(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    link: str,
+) -> None:
+    """No codec judgement runs on the open's custody path: an error that is or chains a codec
+    error is replaced by a ``HostCustodyRefused``, never the cipher build's
+    ``StoreCipherConfigError``, and the byte the codec error quotes stays out of the refusal, its
+    traceback and the log (BACKLOG #4882; vault BACKLOG #8119 item 139)."""
+    import traceback
+
+    codec = UnicodeDecodeError("utf-8", b"\xfe-SENTINEL-codec", 0, 1, "invalid start byte")
+    assert "0xfe" in str(codec)  # the positive control: the codec error quotes the byte
+
+    def _raise(*args: object, **kwargs: object) -> Any:
+        if link == "the error itself":
+            raise codec
+        raise ValueError(f"built from {codec}") from codec
+
+    monkeypatch.setattr(custody_host, "check_host_custody_settings", _raise)
+    with caplog.at_level(logging.DEBUG), pytest.raises(HostCustodyRefused) as excinfo:
+        await open_store(_settings(tmp_path), create=True, custody=_proved_blob())
+    refusal = excinfo.value
+    # Exactly this class, so not the cipher build's StoreCipherConfigError, a ValueError.
+    assert type(refusal) is HostCustodyRefused
+    assert "[store].key_provider" in str(refusal)
+    assert refusal.__cause__ is None and refusal.__context__ is None
+    replaced = "UnicodeDecodeError" if link == "the error itself" else "ValueError"
+    assert f"a host custody error was replaced ({replaced})" in caplog.text
+    rendered = f"{refusal!r} {''.join(traceback.format_exception(refusal))}"
+    # "xfe" covers the 0xfe and \xfe spellings; the raw character is checked too.
+    for needle in ("xfe", "\xfe", "SENTINEL"):
+        assert needle not in rendered
+        assert needle not in caplog.text
+
+
 @pytest.mark.parametrize("raised", ["left behind", "refused"])
 def test_a_settle_refusal_holds_no_reference_to_the_master_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raised: str
