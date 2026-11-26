@@ -2132,8 +2132,8 @@ def _redact_noted(text: str, *, noted: bool) -> str:
 
 
 def _stray_json_closer(text: str) -> bool:
-    """Whether a closer in ``text``, after a PHI JSON key and before that key's container closes,
-    is of another kind than the innermost open container (BACKLOG #5814, added item 2).
+    """Whether ``text`` holds a closer, read as structure, that meets an open container of another
+    kind while the walk is armed by a PHI JSON key (BACKLOG #5814, added item 2).
 
     **Read on the text before any pass rewrites it**, and on the result. The walk in
     :func:`_scrub_json_value` reads what the flat passes left, and a field-run scrub can consume an
@@ -2143,9 +2143,22 @@ def _stray_json_closer(text: str) -> bool:
     object's ``{``.
 
     This tokenizes from the start of the text with :data:`_JSON_TOKEN`, so a closer inside a string
-    is not structure. It is armed at the depth of the first PHI key it passes and disarmed once the
-    depth falls below that, which is the key's own container closing; a key outside every container
-    is disarmed at the end of its line.
+    is not structure. The first PHI key the walk passes arms it at the key's depth, and a later key
+    at a shallower depth lowers that depth. It blanks on the first closer after the arming key whose
+    innermost open container is of another kind, and disarms when the depth falls below the armed
+    depth, which is the key's own container closing. A key outside every container disarms only at
+    a line break reached with no container open, not at the end of its line. So the check is not
+    scoped to the PHI value: a malformed sibling after a well-formed PHI value, as in
+    ``{"family": "Doe", "note": [1}}`` or ``"family": "Doe", "note": [1}``, blanks the text too.
+    And a container left open after the key keeps the walk armed across lines, so a mismatched
+    closer on any later line blanks the whole text. That is a known cost, in the safe direction: a
+    traceback whose frame line leaves a PHI-keyed dict unclosed and whose later frame holds a
+    mismatched closer is the placeholder alone, where before BACKLOG #5814 every frame was kept and
+    the value scrubbed (``tests/test_b5814_stray_closer_before_flat_passes.py`` pins it).
+
+    :func:`_brackets_mismatch` runs first as a necessary precondition: the walk blanks only at a
+    mismatch, and the precondition reads the same bracket tokens with the same stack, unarmed, so a
+    text it clears cannot blank here. It spares a well-formed text the per-token walk.
 
     It misses at least: a closer with no open container, as in a fragment whose head was cut
     (``"given": [x] y]``); a stray closer of the key's own container's kind (``{"given": [x] y}}``);
@@ -2157,8 +2170,44 @@ def _stray_json_closer(text: str) -> bool:
     broke the fixed point. A value of one token after the key's value, with no stray closer at all
     (``{"given": [x] y}``), is not this check's to catch: :func:`_scrub_json_value` keeps it."""
     keys = [match.start() for match in _JSON_PHI_KEY.finditer(text)]
-    if not keys:
+    if not keys or not _brackets_mismatch(text):
         return False
+    return _armed_mismatch(text, keys)
+
+
+#: What :func:`_brackets_mismatch` deletes: a string token exactly as :data:`_JSON_TOKEN` spells it,
+#: its prefix aside, or a run holding no bracket and no quote. A prefix only precedes a quote, and no
+#: other alternative there holds a quote, so a quote outside a string always starts a string token,
+#: and the brackets left are the walk's bracket tokens, in order. A string body is the same language
+#: as there, ``(?:[^"\\\r\n]|\\[\s\S])*+``, unrolled so a plain run is one step, not one per
+#: character: its two parts start on disjoint characters, so both read the same longest body.
+_NOT_A_BRACKET_TOKEN = re.compile(
+    r""""[^"\\\r\n]*+(?:\\[\s\S][^"\\\r\n]*+)*+\\?"?"""
+    r"""|'[^'\\\r\n]*+(?:\\[\s\S][^'\\\r\n]*+)*+\\?'?"""
+    r"""|[^{}\[\]()"']++"""
+)
+_CLOSER_OF = {"{": "}", "[": "]", "(": ")"}
+
+
+def _brackets_mismatch(text: str) -> bool:
+    """Whether a closer outside a string in ``text`` meets an open container of another kind,
+    PHI keys and line breaks aside: :func:`_stray_json_closer`'s precondition. It deletes the
+    string tokens and every other non-bracket character in one pass, which leaves the walk's
+    bracket tokens in order (:data:`_NOT_A_BRACKET_TOKEN`), and keeps the walk's stack over them.
+    Arming gates only the walk's verdict, never its stack, so ``False`` here means the walk finds no
+    mismatch to blank on."""
+    stack: list[str] = []
+    for char in _NOT_A_BRACKET_TOKEN.sub("", text):
+        if char in _CLOSER_OF:
+            stack.append(_CLOSER_OF[char])
+        elif stack and stack.pop() != char:
+            return True
+    return False
+
+
+def _armed_mismatch(text: str, keys: list[int]) -> bool:
+    """:func:`_stray_json_closer`'s walk without its precondition; ``keys`` are the PHI keys' start
+    offsets, in order."""
     stack: list[str] = []
     armed: int | None = None
     next_key = 0

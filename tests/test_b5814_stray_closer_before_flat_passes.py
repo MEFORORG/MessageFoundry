@@ -11,11 +11,24 @@ tell from a real close. In both, a single-token value after the closer walked th
 
 from __future__ import annotations
 
+import ast
+import random
+import re
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
-from messagefoundry.redaction import redact, safe_text
+from messagefoundry.redaction import (
+    _JSON_PHI_KEY,
+    _JSON_TOKEN,
+    _NOT_A_BRACKET_TOKEN,
+    _armed_mismatch,
+    _brackets_mismatch,
+    _stray_json_closer,
+    redact,
+    safe_text,
+)
 from messagefoundry.support.redact import redact_log_line
 
 SECRET = "Qzorvex"
@@ -104,3 +117,85 @@ BALANCED = [
 @pytest.mark.parametrize(("text", "expected"), BALANCED)
 def test_a_matched_or_out_of_scope_closer_reads_as_before(text: str, expected: str) -> None:
     assert redact(text) == expected
+
+
+#: A traceback whose frame line leaves a PHI-keyed dict unclosed, and whose later frame holds a
+#: mismatched closer. The open dict keeps the check armed across lines, so the whole text blanks,
+#: where before BACKLOG #5814 every frame was kept and the value scrubbed.
+TRACEBACK = (
+    "Traceback (most recent call last):\n"
+    '  File "app.py", line 12, in deliver\n'
+    f'    send({{"family": "{SECRET}", "mrn": 7\n'
+    '  File "wire.py", line 40, in send\n'
+    "    raise ValueError(]\n"
+    "ValueError: bad frame\n"
+)
+
+#: A well-formed PHI value beside a malformed non-PHI sibling: the check is not scoped to the value.
+SIBLINGS = [f'{{"family": "{SECRET}", "note": [1}}}}', f'"family": "{SECRET}", "note": [1}}']
+
+
+@pytest.mark.parametrize("text", [TRACEBACK, *SIBLINGS])
+def test_a_known_cost_blanks_the_whole_text(text: str) -> None:
+    """KNOWN COST, pinned so a change to it is deliberate (``_stray_json_closer``'s docstring and the
+    5814 changelog fragment name it). The direction is safe: more is hidden, never less."""
+    assert redact(text) == PLACEHOLDER
+
+
+def _redaction_suite_strings() -> list[str]:
+    """Every string literal in the redaction suites, the inputs and the expected outputs alike."""
+    names = re.compile(r"redact|5814|5815|safe_exc|clamp|audit_offbox|quarantine")
+    found: set[str] = set()
+    for path in sorted(Path(__file__).parent.glob("test_*.py")):
+        if names.search(path.name):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            found.update(
+                node.value
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            )
+    return sorted(found)
+
+
+def _fuzz(count: int) -> list[str]:
+    """Seeded texts drawn from what the walk reads: brackets, both quotes, a backslash, line breaks,
+    a string prefix, PHI keys and filler."""
+    rng = random.Random(5814)
+    parts = ["{", "}", "[", "]", "(", ")", '"', "'", "\\", "\n", "\r", " ", ",", ":", "x", "b'"]
+    parts += ['"family": ', "'given': ", '"name":']
+    return ["".join(rng.choices(parts, k=rng.randint(1, 40))) for _ in range(count)]
+
+
+def _corpus() -> list[str]:
+    texts = [*STRAY, *MISSED, *(text for text, _ in BALANCED), TRACEBACK, *SIBLINGS]
+    texts += _redaction_suite_strings()
+    texts += _fuzz(20_000)
+    return texts + [redact(text) for text in texts]
+
+
+def _walk_brackets(text: str) -> str:
+    """The bracket tokens ``_stray_json_closer``'s walk reads, from ``_JSON_TOKEN`` itself."""
+    out = []
+    pos = 0
+    while pos < len(text):
+        match = _JSON_TOKEN.match(text, pos)
+        assert match is not None
+        if (punct := match.group("punct")) is not None and punct in "{}[]()":
+            out.append(punct)
+        pos = match.end()
+    return "".join(out)
+
+
+def test_the_precondition_is_necessary() -> None:
+    """The guard skips the walk only where the walk would not blank. Over the redaction suites'
+    literals, their ``redact`` results, this file's cases and a seeded fuzz, the guarded verdict
+    equals the walk's, and the precondition reads exactly the walk's bracket tokens."""
+    blanked = 0
+    for text in _corpus():
+        keys = [match.start() for match in _JSON_PHI_KEY.finditer(text)]
+        walk = bool(keys) and _armed_mismatch(text, keys)
+        assert _stray_json_closer(text) == walk, text
+        assert _NOT_A_BRACKET_TOKEN.sub("", text) == _walk_brackets(text), text
+        assert not walk or _brackets_mismatch(text), text
+        blanked += walk
+    assert blanked > 100  # positive control: the corpus reaches the walk's blanking verdict
