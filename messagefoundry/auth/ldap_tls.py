@@ -118,9 +118,14 @@ class NarrowedTls(ldap3.Tls):  # type: ignore[misc]  # ldap3 ships no type infor
         ca_certs_data: str | None,
         connector: str,
         crl_file: str | None = None,
+        crl_check_chain: bool = False,
     ) -> None:
         self._context_factory = assert_ldap3_tls_suites(
-            validate=validate, ca_certs_data=ca_certs_data, connector=connector, crl_file=crl_file
+            validate=validate,
+            ca_certs_data=ca_certs_data,
+            connector=connector,
+            crl_file=crl_file,
+            crl_check_chain=crl_check_chain,
         )
         super().__init__(validate=validate, ca_certs_data=ca_certs_data)
 

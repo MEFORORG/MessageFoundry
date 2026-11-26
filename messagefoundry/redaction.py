@@ -111,6 +111,7 @@ __all__ = [
     "known_driver_error",
     "json_loads_or_refusal",
     "log_timestamp",
+    "own_message",
     "prepare_log_record",
     "prints_a_codec_error",
     "raised_by_a_driver",
@@ -3806,6 +3807,29 @@ def codec_safe_str(exc: BaseException) -> str:
     if isinstance(exc, UnicodeError):
         return safe_exc(exc)
     return _HOLDER_TEXT if prints_a_codec_error(exc) else str(exc)
+
+
+def own_message(exc: BaseException) -> str | None:
+    """The text ``str(exc)`` prints, read without running any of ``exc``'s code, or ``None`` when
+    that cannot be done (vault BACKLOG #8163 items 5 and 6).
+
+    It answers only where the ``__str__`` the class runs is ``BaseException``'s own
+    (:func:`_class_attribute`) and the arguments, read through ``BaseException``'s descriptor, are
+    exactly one ``str``: then ``str(exc)`` is that argument. A ``__str__`` of the class's own,
+    which can raise or print what the arguments do not hold, any other arguments, and a builtin
+    with a ``__str__`` of its own, such as a codec error or an ``OSError``, answer ``None``. It
+    reads what the text is, not what it holds: an argument built from a codec error's text names
+    its byte all the same."""
+    try:
+        if _class_attribute(type(exc), "__str__") is not _EXC_STR:
+            return None
+        args = _EXC_ARGS.__get__(exc)
+    except Exception:  # noqa: BLE001 -- what cannot be read is not rendered
+        return None
+    if type(args) is not tuple or len(args) != 1 or type(args[0]) is not str:
+        return None
+    text: str = args[0]
+    return text
 
 
 def codec_safe_line(exc: BaseException) -> str:
