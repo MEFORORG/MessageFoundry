@@ -323,6 +323,7 @@ async def test_forget_store_salt_ignores_a_trigger_named_like_the_salt_table(
     bare = tmp_path / "trigger-only.db"
     _sql(bare, "CREATE TABLE t (a TEXT)", trigger)
     assert forget_store_salt(bare) is False
+    await _fresh(bare)  # the premise: the trigger does not stop the writable open
     beside = tmp_path / "trigger-beside.db"
     await _fresh(beside)
     _sql(
