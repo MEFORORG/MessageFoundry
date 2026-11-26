@@ -7,14 +7,16 @@ No setting starts a box active, so a restart of an activated box drops it to pas
 now reads the newest ``dr.activate`` or ``dr.release`` row its own process identity wrote. When
 that row is a ``dr.activate``, it logs at ERROR and raises the critical ``dr_restarted_passive``
 alert, which closes the open ``dr_activated``; it never re-activates the box. Each engine shard
-reads only its own rows. While a box is activated it also writes no ``dr_backup`` row of its own,
-so a later re-activation of the same restore still passes the restore-token vintage check."""
+reads only its own rows. An activated server-DB box with ``[dr].restore_token`` set also writes no
+``dr_backup`` row of its own, so a later re-activation of the same restore still passes the
+restore-token vintage check; any other activated box keeps backing up (owner ruling 2026-11-26)."""
 
 from __future__ import annotations
 
 import json
 import logging
 import socket
+import time
 from pathlib import Path
 
 import pytest
@@ -33,7 +35,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alert_sinks import AlertRuleSet, NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.dr import DrCoordinator
-from messagefoundry.pipeline.dr_backup import BackupRunner
+from messagefoundry.pipeline.dr_backup import BackupRunner, _day_key
 from messagefoundry.store import MessageStore
 from messagefoundry.store.crypto import generate_key, make_cipher
 from tests.test_alert_failover import _drain, _RecordingStore, _RecordingTransport
@@ -307,29 +309,33 @@ async def test_each_engine_shard_alerts_on_its_own(tmp_path: Path) -> None:
         await store.close()
 
 
-async def test_an_activated_box_writes_no_dr_backup_row(
+async def test_an_activated_sqlite_box_still_backs_up_and_warns_of_no_pause(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
+    # Owner ruling 2026-11-26 (decision d20261126T095342812-893e1d): only a server-DB box with
+    # [dr].restore_token set pauses its backups while activated (tests/test_b5712_standby_backup.py
+    # covers that box). A SQLite box runs no token check, so it keeps backing up.
     db, archive, ss, key = await _seed(tmp_path)
     store = await MessageStore.open(db, cipher=make_cipher(key))
     backup = BackupSettings(enabled=True, destination=str(tmp_path / "b2"))
     engine = _engine(store, ss, archive, _Sink(), backup=backup)
     try:
         await engine.start()
+        runner = engine._backup_runner
+        assert runner is not None and runner.scheduled  # the warning's own precondition holds
+        # Today's scheduled pass counts as run, so the loop cannot race the explicit pass below.
+        runner._last_backup_day = _day_key(time.time())
         before = len(await store.list_audit(action="dr_backup", limit=50))
         coord = engine.dr_coordinator
         assert coord is not None
         with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.engine"):
             await coord.activate(actor="alice")
         assert engine.dr_active
-        runner = engine._backup_runner
-        assert runner is not None
-        assert await runner.run_once(now=5.0) is None
-        assert len(await store.list_audit(action="dr_backup", limit=50)) == before
-        paused = [
-            r for r in caplog.records if "paused while this box is activated" in r.getMessage()
+        assert await runner.run_once(now=5.0) is not None
+        assert len(await store.list_audit(action="dr_backup", limit=50)) == before + 1
+        assert not [
+            r for r in caplog.records if "DR backup: scheduled passes are paused" in r.getMessage()
         ]
-        assert len(paused) == 1 and paused[0].levelno == logging.WARNING
     finally:
         await engine.stop()
 

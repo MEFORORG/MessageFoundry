@@ -286,9 +286,11 @@ in-flight rows stranded.
 > *Amendment line (BACKLOG #5965, owner ruling 2026-11-25, "fail loud"):* a box that comes back
 > passive after it was last activated also logs at ERROR and raises the critical
 > `dr_restarted_passive` alert, which closes the open `dr_activated`; each engine shard reads its
-> own `dr.activate` and `dr.release` rows and alerts on its own, and none re-activates itself. An
-> activated box also starts no `dr_backup` pass of its own, so a later re-activation of the same
-> restore still passes the restore-token vintage check.
+> own `dr.activate`, `dr.release` and `dr.stay_passive` rows and alerts on its own, and none
+> re-activates itself. *(Owner ruling 2026-11-26, decision d20261126T095342812-893e1d.)* An
+> activated server-DB box with `[dr].restore_token` set starts no `dr_backup` pass of its own, so a
+> later re-activation of the same restore still passes the restore-token vintage check. Any other
+> activated box backs up as before.
 
 > **Amendment (vault BACKLOG #3140): a passive DR box binds no inbound listener.** A box with
 > `[dr].enabled = true` that is not activated, at start or after `POST /dr/release`, binds no inbound

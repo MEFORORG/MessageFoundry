@@ -549,16 +549,18 @@ class BackupRunner:
         self._store = store
         self._settings = settings
         # Read before each pass starts; while it answers True, none starts (vault BACKLOG #5712).
-        # The engine answers True on every DR box, passive or activated (BACKLOG #5965). A pass
-        # writes a `dr_backup` audit row, and the server-DB live seed probe
-        # reads any such row as proof the database was restored from a primary, so a standby's own
-        # row would pass that probe on an unrestored database. It would also become the latest
-        # anchor the restore-token check compares, and refuse a valid restore, including a later
-        # re-activation of the restore an activated box is running on.
+        # The engine answers True on a passive DR standby, during an activation until its reload
+        # has completed, and on an activated server-DB box with `[dr].restore_token` set (BACKLOG
+        # #5965; owner ruling 2026-11-26). A pass writes a `dr_backup` audit row, and the server-DB
+        # live seed probe reads any such row as proof the database was restored from a primary, so
+        # a standby's own row would pass that probe on an unrestored database. It would also become
+        # the latest anchor the restore-token check compares, and refuse a valid restore,
+        # including a later re-activation of the restore an activated box is running on.
         # THIS IS THE ONE STATEMENT OF WHAT STILL WRITES SUCH A ROW ON A DR BOX; the probe's
         # docstrings point here. At least: the `messagefoundry backup` command, which builds its
-        # runner without this gate. The engine's answer no longer flips on an activation, so no
-        # pass is left running across one (BACKLOG #5965).
+        # runner without this gate; a pass already running when the gate turns True, which
+        # finishes and records its row; and an activated box the engine does not pause, a SQLite
+        # box or one with no `[dr].restore_token`, which backs up as any box does.
         self._dr_paused = dr_paused
         # The store settings carry the KeyProvider seam (ADR 0019) — the archive's KEY SOURCE. Typed
         # loosely to avoid importing StoreSettings here; resolve_active_key takes it.
@@ -623,8 +625,9 @@ class BackupRunner:
         )
         if self._dr_paused():
             log.info(
-                "DR backup: no scheduled pass starts on a DR box, passive or activated (BACKLOG "
-                "#5965); the `messagefoundry backup` command still runs one"
+                "DR backup: no pass starts while this box is a passive DR standby; an activation "
+                "starts them once its reload has completed, except on a server-DB box with "
+                "[dr].restore_token set (BACKLOG #5965)"
             )
 
     async def stop(self) -> None:
@@ -689,7 +692,7 @@ class BackupRunner:
 
         Leader-gated (AC-12): a non-leader returns ``None`` without touching the store or the shared
         destination (so in a cluster exactly one node backs up), and so does an engine-gated DR
-        box, passive or activated (vault BACKLOG #5712, BACKLOG #5965). On success records a
+        box (vault BACKLOG #5712, BACKLOG #5965; which boxes, at ``dr_paused``). On success records a
         ``dr_backup`` audit
         row + returns the :class:`BackupResult`; on failure records a ``dr_backup`` ERROR row, raises
         ``AlertSink.backup_failed``, leaves any prior good archive intact, and re-raises

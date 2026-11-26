@@ -10,7 +10,8 @@
   It never re-activates itself: `POST /dr/activate` brings it back, and `POST /dr/release` on
   the passive box records that it stays passive, as a `dr.stay_passive` audit row. Each engine
   shard reads its own `dr.activate`, `dr.release` and `dr.stay_passive` rows, which now name the
-  host and the engine shard, and alerts on its own; the DR alerts' label adds the engine shard. No DR box runs a scheduled backup pass any
-  more, activated included, so a later re-activation of the same restore still passes the
-  `[dr].restore_token` vintage check.
+  host and the engine shard, and alerts on its own; the DR alerts' label adds the engine shard. An activated server-DB box with
+  `[dr].restore_token` set runs no scheduled backup pass, so a later re-activation of the same
+  restore still passes that token's vintage check; a SQLite DR box, or one with no
+  `[dr].restore_token`, backs up while activated as before.
   (`BACKLOG #5965`)

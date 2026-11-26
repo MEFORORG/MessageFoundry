@@ -17,6 +17,7 @@ imports it.
 from __future__ import annotations
 
 import json
+import socket
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -104,6 +105,13 @@ async def test_a_console_release_cut_off_by_the_deadline_still_completes(
 
     assert coord.active is False and dr_engine.dr_active is False
     assert await _audit(dr_engine, "dr.release") == [
-        {"depth_left": 0, "drained": True, "vip_hook_ran": False}
+        # host and instance name the writer, for the restart check (BACKLOG #5965).
+        {
+            "depth_left": 0,
+            "drained": True,
+            "host": socket.gethostname(),
+            "instance": None,
+            "vip_hook_ran": False,
+        }
     ]
     assert await _audit(dr_engine, "dr_release_failed") == []

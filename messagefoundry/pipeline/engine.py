@@ -44,6 +44,7 @@ from messagefoundry.config.settings import (
     SecretRotationSettings,
     SecurityEnforcement,
     ShadowSettings,
+    StoreBackend,
     StoreSettings,
     UpdateCheckSettings,
     engine_owned_dirs,
@@ -908,6 +909,9 @@ class Engine:
         # takes dr_threshold from _dr_run_threshold() when it is built, and _set_dr_active hands a
         # running one the new value on each flip (#3067).
         self._dr_active = False
+        # Whether an activation's reload has completed, so the run-profile is applied and not only
+        # latched; :meth:`_dr_backup_paused` reads it (vault BACKLOG #5712).
+        self._dr_profile_applied = False
         # This instance's environment values (DEV/PROD), shared with every runner the engine builds —
         # so env() references in a reloaded graph resolve against THIS environment (and a missing
         # value is refused here, on this engine, not on the box the graph was authored on). The
@@ -1190,12 +1194,24 @@ class Engine:
 
     def _dr_backup_paused(self) -> bool:
         """Whether the backup runner must skip its pass (vault BACKLOG #5712; the reason is at
-        :class:`~messagefoundry.pipeline.dr_backup.BackupRunner`'s ``dr_paused``): on every DR
-        box, passive or activated. An activated box's own ``dr_backup`` row would become the
-        latest anchor the restore-token check compares, so a later deliberate re-activation of
-        the same restore would be refused as a stale vintage (BACKLOG #5965; owner ruling
-        2026-11-25)."""
-        return self._dr_settings.enabled
+        :class:`~messagefoundry.pipeline.dr_backup.BackupRunner`'s ``dr_paused``): on a passive DR
+        standby, and during an activation until its reload has completed. Once applied, only
+        where :meth:`_dr_activated_backup_paused` says so. Applied implies latched, since every
+        flip of the latch to False clears it."""
+        if not self._dr_settings.enabled:
+            return False
+        return not self._dr_profile_applied or self._dr_activated_backup_paused()
+
+    def _dr_activated_backup_paused(self) -> bool:
+        """Whether an activated DR box still runs no backup pass: only a server-DB box with
+        ``[dr].restore_token`` set (BACKLOG #5965; owner ruling 2026-11-26, decision
+        d20261126T095342812-893e1d). Its own ``dr_backup`` row would become the latest anchor the
+        restore-token check compares, so a later re-activation of the same restore would be
+        refused as a stale vintage. No other box runs that check, so it keeps backing up."""
+        return bool(self._dr_settings.restore_token) and self.store.backend in (
+            StoreBackend.POSTGRES,
+            StoreBackend.SQLSERVER,
+        )
 
     @property
     def dr_active(self) -> bool:
@@ -1232,7 +1248,7 @@ class Engine:
                 self.store,
                 self._dr_settings,
                 store_settings=self._store_settings,
-                # BACKLOG #5965: each engine shard's dr.activate and dr.release rows name it.
+                # BACKLOG #5965: each engine shard's dr.activate, dr.release and dr.stay_passive rows name it.
                 instance=lambda: self.instance_identity,
                 activate_profile=self._dr_activate_profile,
                 deactivate_profile=self._dr_release_drain,
@@ -1267,6 +1283,8 @@ class Engine:
         the next reload does. A release hands the runner the passive standby's threshold, so that
         reload binds no listener (vault BACKLOG #3140)."""
         self._dr_active = active
+        if not active:
+            self._dr_profile_applied = False
         if self._registry_runner is not None:
             self._registry_runner.set_dr_threshold(
                 self._dr_run_threshold(), standby=self._dr_standby_threshold()
@@ -1368,14 +1386,25 @@ class Engine:
                 # lease without importing the runner.
                 raise DrProfileNotLeading(str(exc)) from exc
             raise
+        # Only now may a backup pass run: the latch flipped before the reload, which can still
+        # fail and roll it back (vault BACKLOG #5712).
+        self._dr_profile_applied = True
         runner = self._backup_runner
-        if runner is not None and runner.enabled and runner.scheduled:
+        if (
+            runner is not None
+            and runner.enabled
+            and runner.scheduled
+            and self._dr_activated_backup_paused()
+        ):
             # Once per activation (BACKLOG #5965): the runner itself skips each pass silently.
             log.warning(
-                "DR backup: scheduled passes are paused while this box is activated, so a later "
-                "re-activation of the same restore still passes the restore-token vintage check. "
-                "Nothing backs up what this box takes in meanwhile; the `messagefoundry backup` "
-                "command still can, and its row then becomes the token check's newest anchor"
+                "DR backup: scheduled passes are paused while this server-DB box is activated, "
+                "because [dr].restore_token is set and this box's own backup row would become "
+                "the newest anchor that token check compares, refusing a later re-activation of "
+                "the same restore. "
+                "No config-only archive of this box is written meanwhile, and the database "
+                "itself stays the DBA's to back up; the `messagefoundry backup` command still "
+                "writes one, and its row then becomes the token check's newest anchor"
             )
         if not close_failures:
             return {}
