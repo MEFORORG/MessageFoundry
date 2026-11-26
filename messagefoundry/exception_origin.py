@@ -42,6 +42,7 @@ __all__ = [
     "ExceptionChainTooLong",
     "exception_chain",
     "is_ssl_error",
+    "own_message",
     "raise_statement_file",
     "raised_by_the_engine",
     "raised_only_by_the_engine",
@@ -138,6 +139,35 @@ def raised_through(exc: BaseException, code: CodeType) -> bool:
     function ran (BACKLOG #4883). Read by code object, so a function of the same name elsewhere
     does not count, and an exception never raised has no frame and answers ``False``."""
     return any(tb.tb_frame.f_code is code for tb in _entries(exc))
+
+
+#: The builtins read in place of the error's own: a subclass can override ``args``, and a
+#: metaclass can answer ``__mro__`` as it likes.
+_ARGS_OF: Final[Any] = BaseException.__dict__["args"]
+_MRO_OF: Final[Any] = type.__dict__["__mro__"]
+
+
+def own_message(exc: BaseException) -> str | None:
+    """The text ``str(exc)`` prints, read without running any of ``exc``'s code, or ``None`` when
+    that cannot be done (vault BACKLOG #8163 items 5 and 6).
+
+    It answers only where the class's ``__str__`` is ``BaseException``'s own, found in the class
+    dictionaries along the real MRO, and the arguments, read through ``BaseException``'s
+    descriptor, are exactly one ``str``: then ``str(exc)`` is that argument. A ``__str__`` of the
+    class's own, which can raise or print what the arguments do not hold, any other arguments, and
+    a builtin with a ``__str__`` of its own, such as a codec error or an ``OSError``, answer
+    ``None``. It reads what the text is, not what it holds: an argument built from a codec
+    error's text names its byte all the same."""
+    try:
+        mro = _MRO_OF.__get__(type(exc))
+        defining = next(c for c in mro if "__str__" in type.__dict__["__dict__"].__get__(c))
+        args = _ARGS_OF.__get__(exc)
+    except Exception:  # noqa: BLE001 -- what cannot be read is not rendered
+        return None
+    if defining is not BaseException or type(args) is not tuple or len(args) != 1:
+        return None
+    text = args[0]
+    return text if type(text) is str else None
 
 
 def raise_statement_file(exc: BaseException) -> str | None:
