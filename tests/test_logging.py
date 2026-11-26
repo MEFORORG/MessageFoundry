@@ -3370,7 +3370,8 @@ def test_a_stored_hostile_access_line_costs_the_log_read_back_linear_time(
     No logging handler applies the twin. ``redact_log_line`` applies it to text that has left the
     write-time chain, at least when stored log text is read back (``GET /logs/tail`` through
     ``api.app._read_log_tail``, and the support bundle through ``support.bundle._log_tail``, both one
-    ``redact_log_record`` per line) and to store exception text. The read-back is the path an access
+    ``redact_log_record`` per line, after a cross-line PRIVATE KEY body mask) and to store
+    exception text. The read-back is the path an access
     line takes, so the hostile target is emitted through the chain production installs, exactly as
     the arm above does, the stdout it produced is stored as the newest log file, and
     ``_read_log_tail`` reads it back. Since BACKLOG #2694 that read runs BOTH patterns: the twin
