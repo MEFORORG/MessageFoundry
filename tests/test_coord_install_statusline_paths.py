@@ -41,6 +41,7 @@ def _env(extra: dict[str, str] | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env.pop("CLAUDE_CONFIG_DIR", None)
     env.pop("MEFOR_TEST_STATUSLINE_SWAP_FAULT", None)
+    env.pop("MEFOR_TEST_STATUSLINE_SWAP_FAULT_DIR", None)
     env.update(extra or {})
     return env
 
@@ -83,11 +84,20 @@ def _install(
     return _spawn(cmd, cwd, extra_env)
 
 
-def _fault(tmp_path: Path, mode: str) -> dict[str, str]:
-    """The swap fault, with TEMP pointed at ``tmp_path``. The seam fires only under the system temp
-    directory, and TEMP as the process spells it can differ from ``tmp_path``, which pytest has
-    resolved (an 8.3 ``RUNNER~1`` on a hosted runner), so the test names its own temp directory."""
-    return {"MEFOR_TEST_STATUSLINE_SWAP_FAULT": mode, "TEMP": str(tmp_path), "TMP": str(tmp_path)}
+FAULT_ROOT = "mefor-swap-fault-root"
+
+
+def _fault(temp: Path, mode: str, root: Path) -> dict[str, str]:
+    """The swap fault, fenced the way the seam requires: the root is named by the directory variable,
+    its leaf carries the seam's prefix, and it sits inside an explicit TEMP. TEMP as the process spells
+    it can differ from ``tmp_path``, which pytest has resolved (an 8.3 ``RUNNER~1`` on a hosted
+    runner), so the test names its own temp directory."""
+    return {
+        "MEFOR_TEST_STATUSLINE_SWAP_FAULT": mode,
+        "MEFOR_TEST_STATUSLINE_SWAP_FAULT_DIR": str(root),
+        "TEMP": str(temp),
+        "TMP": str(temp),
+    }
 
 
 def _free_drive() -> str:
@@ -124,8 +134,8 @@ def _install_in_session(
     )
 
 
-def _root(tmp_path: Path, settings: dict[str, Any] | None = None) -> Path:
-    root = tmp_path / "root"
+def _root(tmp_path: Path, settings: dict[str, Any] | None = None, *, name: str = "root") -> Path:
+    root = tmp_path / name
     root.mkdir()
     if settings is not None:
         (root / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
@@ -301,45 +311,47 @@ def test_status_reports_a_root_on_a_gone_drive_as_unknown(tmp_path: Path) -> Non
     assert proc.returncode == 1, proc.stdout + proc.stderr
 
 
-# --- #7576: a swap that fails part way -------------------------------------------------------------
+# --- #7576: a swap that fails ----------------------------------------------------------------------
 
 
-def test_a_swap_that_fails_part_way_puts_the_original_back(tmp_path: Path) -> None:
-    """NEITHER FILE IS THE ONE OUTCOME THAT MUST NOT HAPPEN. ReplaceFile can fail after it has moved
-    settings.json aside; with no backup name and an unconditional temp-file delete, the original was
-    gone and the only copy of the new content was deleted after it. The fault seam reproduces that
-    swap state, and the run must fail loudly with the original back in place."""
-    root = _root(tmp_path, {"keep": True})
+def test_a_failed_move_leaves_the_original_in_place(tmp_path: Path) -> None:
+    """NEITHER FILE IS THE ONE OUTCOME THAT MUST NOT HAPPEN. The swap is one rename, so a failed move
+    leaves settings.json as it was; the run fails loudly, and its temp file is gone because the
+    original is still the live copy."""
+    root = _root(tmp_path, {"keep": True}, name=FAULT_ROOT)
     settings = root / "settings.json"
     proc = _install(
         tmp_path,
         "-SettingsPath",
         str(settings),
         cwd=tmp_path,
-        extra_env=_fault(tmp_path, "original-moved-aside"),
+        extra_env=_fault(tmp_path, "move-fails", root),
     )
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "FAILED" in proc.stdout and "was not updated" in proc.stdout, proc.stdout
     assert json.loads(settings.read_text(encoding="utf-8")) == {"keep": True}
-    assert not [p.name for p in root.iterdir() if p.name.endswith((".tmp", ".swap-bak"))]
+    assert not [p.name for p in root.iterdir() if p.name.endswith(".tmp")]
 
 
-def test_a_swap_whose_restore_also_fails_keeps_both_copies_and_names_them(tmp_path: Path) -> None:
-    """When the original cannot be put back either, the temp file is the new content and the swap
-    backup is the old one; both stay, and the FAILED line names each path."""
-    root = _root(tmp_path, {"keep": True})
+def test_a_failed_move_after_a_concurrent_delete_keeps_the_new_content_and_names_it(
+    tmp_path: Path,
+) -> None:
+    """A concurrent deleter can take settings.json away, which the move itself never does. The temp
+    file is then the only copy of the new content and the pre-run backup the only copy of the old;
+    both stay, and the FAILED line names each path."""
+    root = _root(tmp_path, {"keep": True}, name=FAULT_ROOT)
     settings = root / "settings.json"
     proc = _install(
         tmp_path,
         "-SettingsPath",
         str(settings),
         cwd=tmp_path,
-        extra_env=_fault(tmp_path, "original-moved-aside-restore-fails"),
+        extra_env=_fault(tmp_path, "move-fails-target-gone", root),
     )
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert not settings.exists()
     (tmp,) = [p for p in root.iterdir() if p.name.endswith(".tmp")]
-    (bak,) = [p for p in root.iterdir() if p.name.endswith(".swap-bak")]
+    (bak,) = [p for p in root.iterdir() if ".bak-usage-" in p.name]
     assert "statusLine" in json.loads(tmp.read_text(encoding="utf-8"))
     assert json.loads(bak.read_text(encoding="utf-8")) == {"keep": True}
     flat = " ".join(proc.stdout.split())
@@ -347,40 +359,17 @@ def test_a_swap_whose_restore_also_fails_keeps_both_copies_and_names_them(tmp_pa
     assert str(tmp) in flat and str(bak) in flat, proc.stdout
 
 
-def test_the_swap_fault_seam_never_fires_outside_the_temp_directory(tmp_path: Path) -> None:
-    """THE NEGATIVE CONTROL FOR THE SEAM. With the fault set but TEMP pointed elsewhere, the target is
-    not under the temp directory, so the real swap runs: a leaked variable cannot touch a real root."""
-    root = _root(tmp_path, {"keep": True})
-    settings = root / "settings.json"
-    elsewhere = tmp_path / "other-temp"
-    elsewhere.mkdir()
-    proc = _install(
-        tmp_path,
-        "-SettingsPath",
-        str(settings),
-        cwd=tmp_path,
-        extra_env={
-            "MEFOR_TEST_STATUSLINE_SWAP_FAULT": "original-moved-aside-restore-fails",
-            "TEMP": str(elsewhere),
-            "TMP": str(elsewhere),
-        },
-    )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    doc = json.loads(settings.read_text(encoding="utf-8"))
-    assert doc["keep"] is True and "statusLine" in doc
-
-
-def test_a_failed_swap_on_a_root_with_no_settings_keeps_the_new_content(tmp_path: Path) -> None:
-    """With no settings.json before the run there is no backup to put back, so the complete temp file
-    is the only copy of the new content; it stays, and the FAILED line names it."""
-    root = _root(tmp_path)
+def test_a_failed_move_on_a_root_with_no_settings_keeps_the_new_content(tmp_path: Path) -> None:
+    """With no settings.json before the run there is no backup, so the complete temp file is the only
+    copy of the new content; it stays, and the FAILED line names it."""
+    root = _root(tmp_path, name=FAULT_ROOT)
     settings = root / "settings.json"
     proc = _install(
         tmp_path,
         "-SettingsPath",
         str(settings),
         cwd=tmp_path,
-        extra_env=_fault(tmp_path, "original-moved-aside"),
+        extra_env=_fault(tmp_path, "move-fails", root),
     )
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert not settings.exists()
@@ -388,6 +377,94 @@ def test_a_failed_swap_on_a_root_with_no_settings_keeps_the_new_content(tmp_path
     assert "statusLine" in json.loads(tmp.read_text(encoding="utf-8"))
     flat = " ".join(proc.stdout.split())
     assert "settings.json was not created" in flat and str(tmp) in flat, proc.stdout
+
+
+def test_a_security_copy_that_fails_falls_back_to_the_in_place_write(tmp_path: Path) -> None:
+    """A move would install the temp file's wider, inherited ACL, so a file whose own security cannot
+    be copied is written in place, as before the swap existed: same file, new content, no temp file."""
+    root = _root(tmp_path, {"keep": True}, name=FAULT_ROOT)
+    settings = root / "settings.json"
+    before = os.stat(settings).st_ino
+    proc = _install(
+        tmp_path,
+        "-SettingsPath",
+        str(settings),
+        cwd=tmp_path,
+        extra_env=_fault(tmp_path, "security-copy-fails", root),
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert os.stat(settings).st_ino == before
+    doc = json.loads(settings.read_text(encoding="utf-8"))
+    assert doc["keep"] is True and "statusLine" in doc
+    assert not [p.name for p in root.iterdir() if p.name.endswith(".tmp")]
+
+
+@pytest.mark.parametrize(
+    ("case", "root_name", "temp"),
+    [
+        # TMP and TEMP unset: GetTempPath falls back to USERPROFILE, the directory real roots live in.
+        ("no explicit TEMP", FAULT_ROOT, None),
+        # A real-root-shaped directory never carries the seam's leaf prefix.
+        ("a .claude* root", ".claude-account-9", "tmp"),
+        # The directory variable is required, not inferred.
+        ("no fault directory", FAULT_ROOT, "tmp"),
+        # TEMP set, but the root is not inside it.
+        ("root outside TEMP", FAULT_ROOT, "other"),
+    ],
+)
+def test_the_swap_fault_seam_never_fires_outside_its_fence(
+    tmp_path: Path, case: str, root_name: str, temp: str | None
+) -> None:
+    """THE NEGATIVE CONTROLS FOR THE SEAM. Each case breaks one condition of the fence, so the real
+    swap runs and a leaked value cannot leave a real root without its settings.json."""
+    home = tmp_path / "profile"
+    home.mkdir()
+    root = home / root_name
+    root.mkdir()
+    settings = root / "settings.json"
+    settings.write_text(json.dumps({"keep": True}), encoding="utf-8")
+    env = {"MEFOR_TEST_STATUSLINE_SWAP_FAULT": "move-fails-target-gone", "USERPROFILE": str(home)}
+    if case != "no fault directory":
+        env["MEFOR_TEST_STATUSLINE_SWAP_FAULT_DIR"] = str(root)
+    drop: tuple[str, ...] = ()
+    if temp is None:
+        drop = ("TEMP", "TMP")
+    else:
+        t = home if temp == "tmp" else tmp_path / "other"
+        t.mkdir(exist_ok=True)
+        env["TEMP"] = env["TMP"] = str(t)
+    cmd = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(INSTALL)]
+    cmd += ["-HomeDir", str(_home(tmp_path)), "-CollectorPath", str(COLLECT)]
+    cmd += ["-SettingsPath", str(settings)]
+    full = _env(env)
+    for k in drop:
+        full.pop(k, None)
+    proc = run_single(
+        cmd, capture_output=True, text=True, timeout=TIMEOUT, check=False, env=full, cwd=tmp_path
+    )
+    assert proc.returncode == 0, (case, proc.stdout + proc.stderr)
+    doc = json.loads(settings.read_text(encoding="utf-8"))
+    assert doc["keep"] is True and "statusLine" in doc
+
+
+def test_the_swap_fault_seam_fires_inside_its_fence(tmp_path: Path) -> None:
+    """THE POSITIVE CONTROL. The same setup as the negative cases, with every condition met, does
+    fault, so their passing is the fence working and not a seam that never fires."""
+    home = tmp_path / "profile"
+    home.mkdir()
+    root = home / FAULT_ROOT
+    root.mkdir()
+    settings = root / "settings.json"
+    settings.write_text(json.dumps({"keep": True}), encoding="utf-8")
+    proc = _install(
+        tmp_path,
+        "-SettingsPath",
+        str(settings),
+        cwd=tmp_path,
+        extra_env={**_fault(home, "move-fails", root), "USERPROFILE": str(home)},
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert json.loads(settings.read_text(encoding="utf-8")) == {"keep": True}
 
 
 def test_status_and_uninstall_still_report_on_a_deleted_root(tmp_path: Path) -> None:
@@ -490,7 +567,8 @@ def test_status_and_uninstall_ignore_a_low_refresh_interval(tmp_path: Path) -> N
 
 def test_a_rewrite_keeps_the_file_acl_and_attributes(tmp_path: Path) -> None:
     """A RENAME OF A FRESH TEMP FILE WIDENS A LOCKED-DOWN FILE: it carries the directory's inherited ACL
-    and default attributes. The replace keeps the old file's, as the in-place write did."""
+    and default attributes. The old file's are copied onto the temp file before the move, so the new
+    settings.json keeps them, as the in-place write did."""
     root = _root(tmp_path, {})
     settings = root / "settings.json"
     lock = (
@@ -508,6 +586,9 @@ def test_a_rewrite_keeps_the_file_acl_and_attributes(tmp_path: Path) -> None:
     assert _spawn([*pw, lock], tmp_path).returncode == 0
     before = _spawn([*pw, probe], tmp_path).stdout.strip()
     assert before == "True 1 True", before
+    ino = os.stat(settings).st_ino
     proc = _install(tmp_path, "-SettingsPath", str(settings), cwd=tmp_path)
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    # A new file, so this is the move path keeping them and not the in-place fallback.
+    assert os.stat(settings).st_ino != ino
     assert _spawn([*pw, probe], tmp_path).stdout.strip() == before

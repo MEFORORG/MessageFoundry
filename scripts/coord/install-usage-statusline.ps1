@@ -197,7 +197,7 @@ function Write-SettingsFile([string]$Path, $Data) {
         Copy-Item -LiteralPath $Path -Destination $dest -Force
         $backedTo = $dest
     }
-    # TEMP-THEN-REPLACE, the discipline account-availability.ps1 and the collector already use. Claude
+    # TEMP-THEN-MOVE, the discipline account-availability.ps1 and the collector already use. Claude
     # Code reads this file at session start, and an in-place Set-Content truncates the live file first,
     # so a crash or a concurrent session start mid-write sees a partial file that disables every
     # setting in it (BACKLOG #7576). The encoding is UTF-8 WITHOUT a BOM, which is what Set-Content
@@ -205,54 +205,60 @@ function Write-SettingsFile([string]$Path, $Data) {
     # target resolver makes it so), which matters because these .NET calls resolve a relative path
     # against the process directory, not $PWD.
     #
-    # File.Replace, NOT File.Move, OVER AN EXISTING FILE: Move gives settings.json the new temp file's
-    # inherited ACL and default attributes, while Replace keeps the old file's (measured: an owner-only
-    # protected ACL and Hidden both survive Replace, and both were lost to Move).
+    # ONE File.Move WITH overwrite, NOT File.Replace. Replace is two renames (the old file aside, the
+    # new one in), so a concurrent reader finds NO settings.json between them, and a part-way failure
+    # can leave it gone. Move with overwrite is one MoveFileEx(MOVEFILE_REPLACE_EXISTING): a single
+    # rename that swaps the directory entry, so a reader opens the old file or the new one, never
+    # nothing, and a failed move leaves the old file where it was. A rename keeps the TEMP file's own
+    # ACL and attributes, which are the directory's inherited ones (measured: a protected owner-only ACL
+    # and Hidden were both lost to a bare Move), so Copy-SettingsSecurity puts the old file's onto the
+    # temp file BEFORE the move, and no reader ever sees a widened settings.json.
     #
-    # A LINKED FILE IS STILL WRITTEN IN PLACE. Either replace swaps the directory entry, so it would cut a
+    # A LINKED FILE IS STILL WRITTEN IN PLACE. A move swaps the directory entry, so it would cut a
     # symbolic or hard link that the old Set-Content wrote through, leaving a standalone copy while the
     # shared file kept its old content. For a link, writing through matters more than atomicity, so that
-    # case keeps the old behaviour rather than gaining a new failure.
+    # case keeps the old behaviour rather than gaining a new failure. So does a file whose security
+    # cannot be copied: installing it with a wider ACL would be worse than the in-place write it
+    # replaced.
     #
-    # ONLY A SHARING VIOLATION IS RETRIED, because a file just created is often held open for a moment by
-    # a scanner. A read-only file or a missing directory fails at once.
+    # A SHARING VIOLATION OR AN ACCESS DENIAL IS RETRIED, because a file just created is often held open
+    # for a moment by a scanner, and a reader holding settings.json open without delete sharing refuses
+    # the rename (measured: a Python reader's plain open() refused most renames in a tight loop). When
+    # the retries run out, the in-place write runs instead: that reader never blocked the old write, so
+    # refusing the install there would be worse than it was. A missing directory fails at once.
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
     if ($item -and $item.LinkType) {
         Set-Content -LiteralPath $Path -Value $json -Encoding UTF8
         return $backedTo
     }
     #
-    # A FAILED SWAP MUST NEVER LEAVE NEITHER FILE (BACKLOG #7576). ReplaceFile can fail PART WAY: its
-    # documented ERROR_UNABLE_TO_MOVE_REPLACEMENT (1176, no backup name) leaves the replaced file gone,
-    # and _2 (1177) leaves it under another name. With no backup name and an unconditional temp-file
-    # delete, settings.json was gone and the only copy of its new content was deleted after it. So the
-    # replace now names its own backup, a failure puts that backup back, and a COMPLETE temp file is
-    # deleted only while settings.json exists.
+    # A FAILED SWAP MUST NEVER LEAVE NEITHER FILE (BACKLOG #7576). The move itself cannot leave
+    # settings.json gone, but a concurrent deleter can, so a COMPLETE temp file is deleted only while
+    # settings.json exists, and the failure report names every copy.
     $tmp = "$Path.$PID.tmp"
-    # A FREE NAME, so a file found there after a failure can only be this run's: a stale one left by a
-    # crashed run under a recycled PID would otherwise be "restored" as this root's settings.
-    $swapBak = $null
-    if ($item) {
-        $swapBak = "$Path.$PID.swap-bak"
-        $n = 1
-        while (Test-Path -LiteralPath $swapBak) { $swapBak = "$Path.$PID.swap-bak-$n"; $n++ }
-    }
     $tmpComplete = $false
-    $swapped = $false
+    $inPlaceWhy = $null
     try {
         [System.IO.File]::WriteAllText($tmp, $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
         $tmpComplete = $true
-        foreach ($attempt in 1..3) {
+        if ($item) { $inPlaceWhy = Copy-SettingsSecurity $item $tmp }
+        # No move when the security copy failed: the in-place write below runs instead.
+        foreach ($attempt in $(if ($inPlaceWhy) { @() } else { 1..3 })) {
             # Untyped catch: a .NET method's exception arrives wrapped in MethodInvocationException.
             try {
-                Invoke-SettingsSwap $tmp $Path $swapBak
-                $swapped = $true
+                Invoke-SettingsSwap $tmp $Path ([bool]$item)
                 break
             }
             catch {
-                $sharing = $_.Exception.GetBaseException().HResult -eq -2147024864  # ERROR_SHARING_VIOLATION
-                # A retry is only a retry while settings.json is still where it was.
-                if ($attempt -eq 3 -or -not $sharing -or ($item -and -not (Test-Path -LiteralPath $Path))) { throw }
+                $hr = $_.Exception.GetBaseException().HResult
+                $transient = $hr -eq -2147024864 -or $hr -eq -2147024891  # ERROR_SHARING_VIOLATION, ERROR_ACCESS_DENIED
+                # A retry, or the in-place write, only while settings.json is still where it was.
+                if (-not $transient -or ($item -and -not (Test-Path -LiteralPath $Path))) { throw }
+                if ($attempt -eq 3) {
+                    if (-not $item) { throw }
+                    $inPlaceWhy = "the move was refused 3 times ($($_.Exception.GetBaseException().Message))"
+                    break
+                }
                 Start-Sleep -Milliseconds (50 * $attempt)
             }
         }
@@ -260,67 +266,89 @@ function Write-SettingsFile([string]$Path, $Data) {
     catch {
         $why = $_.Exception.GetBaseException().Message
         if (-not $tmpComplete) { throw "settings.json was not touched: writing the new content to a temp file failed ($why)" }
-        throw (Get-FailedSwapReport $Path $tmp $swapBak $backedTo $why)
+        throw (Get-FailedSwapReport $Path $tmp ([bool]$item) $backedTo $why)
     }
     finally {
         # A temp file that was never completely written is never anyone's only copy.
         if (-not $tmpComplete -or (Test-Path -LiteralPath $Path)) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
-        # The swap's backup is the old content, already kept under $backedTo; after a success it is spare.
-        if ($swapped -and $swapBak) { Remove-Item -LiteralPath $swapBak -Force -ErrorAction SilentlyContinue }
+    }
+    if ($inPlaceWhy) {
+        Write-Verbose "in-place write of ${Path}: $inPlaceWhy"
+        Set-Content -LiteralPath $Path -Value $json -Encoding UTF8
     }
     return $backedTo
 }
 
-# TEST SEAM, AND THE ONLY WAY TO REACH THE PATH IT GUARDS. A part-way ReplaceFile failure cannot be
-# provoked on demand, so MEFOR_TEST_STATUSLINE_SWAP_FAULT, set to a value starting with
-# 'original-moved-aside', makes this swap do what 1177 leaves behind -- the replaced file moved to the
-# backup name and the replacement not moved -- then throw. It fires ONLY for a file under the system
-# temp directory, so a value leaked into an operator's environment cannot touch a real config root.
-# Any other value, or none, is the real swap.
+# THE OLD FILE'S OWNER, GROUP, DACL AND VISIBLE ATTRIBUTES, ONTO THE TEMP FILE. Returns $null on
+# success, or why it could not, and the caller then writes in place. The DACL travels as SDDL, so its
+# protection flag goes with it. Setting an owner other than this user needs a privilege the run may
+# lack, which is one of the cases that falls back. ReadOnly is not copied: a move over a read-only file
+# fails anyway, as the in-place write did.
+function Copy-SettingsSecurity([System.IO.FileSystemInfo]$Item, [string]$Tmp) {
+    try {
+        if (Test-SwapFault $Item.FullName 'security-copy-fails') { throw "simulated security copy failure" }
+        $sections = [System.Security.AccessControl.AccessControlSections]'Owner, Group, Access'
+        $src = [System.IO.FileSystemAclExtensions]::GetAccessControl([System.IO.FileInfo]$Item.FullName, $sections)
+        $dst = [System.Security.AccessControl.FileSecurity]::new()
+        $dst.SetSecurityDescriptorSddlForm($src.GetSecurityDescriptorSddlForm($sections), $sections)
+        [System.IO.FileSystemAclExtensions]::SetAccessControl([System.IO.FileInfo]$Tmp, $dst)
+        $want = $Item.Attributes -band [System.IO.FileAttributes]'Hidden, System, Archive, NotContentIndexed'
+        if ($want) { [System.IO.File]::SetAttributes($Tmp, $want) }
+        return $null
+    }
+    catch { return "its security could not be copied onto the temp file ($($_.Exception.GetBaseException().Message))" }
+}
+
+# TEST SEAM, FENCED SO IT CANNOT REACH A REAL CONFIG ROOT. MEFOR_TEST_STATUSLINE_SWAP_FAULT names a
+# failure to simulate, and it fires ONLY when ALL of these hold, so a value leaked into an operator's
+# environment does nothing:
+#   - MEFOR_TEST_STATUSLINE_SWAP_FAULT_DIR names a directory whose leaf starts 'mefor-swap-fault-',
+#     a name no Claude config root (~/.claude*) carries;
+#   - the settings file sits DIRECTLY in that directory;
+#   - that directory is strictly inside an explicitly set, absolute TEMP. GetTempPath is not consulted:
+#     with TMP and TEMP unset it falls back to USERPROFILE, the directory real roots live in.
+# Modes: 'move-fails' throws where the move would run; 'move-fails-target-gone' first deletes the
+# target, standing in for a concurrent deleter; 'security-copy-fails' fails the security copy.
 function Test-SwapFault([string]$Path, [string]$Mode) {
-    return $env:MEFOR_TEST_STATUSLINE_SWAP_FAULT -like $Mode -and
-    $Path.StartsWith([System.IO.Path]::GetTempPath(), [System.StringComparison]::OrdinalIgnoreCase)
+    if ($env:MEFOR_TEST_STATUSLINE_SWAP_FAULT -cne $Mode) { return $false }
+    $dir = $env:MEFOR_TEST_STATUSLINE_SWAP_FAULT_DIR
+    $temp = $env:TEMP
+    if (-not $dir -or -not $temp) { return $false }
+    if (-not [System.IO.Path]::IsPathFullyQualified($dir) -or -not [System.IO.Path]::IsPathFullyQualified($temp)) { return $false }
+    $ic = [System.StringComparison]::OrdinalIgnoreCase
+    $dir = [System.IO.Path]::GetFullPath($dir).TrimEnd('\', '/')
+    $temp = [System.IO.Path]::GetFullPath($temp).TrimEnd('\', '/')
+    if (-not [System.IO.Path]::GetFileName($dir).StartsWith('mefor-swap-fault-', $ic)) { return $false }
+    if (-not [string]::Equals([System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($Path)), $dir, $ic)) { return $false }
+    return $dir.StartsWith($temp + '\', $ic)
 }
 
-function Invoke-SettingsSwap([string]$Tmp, [string]$Path, [string]$Backup) {
-    if (Test-SwapFault $Path 'original-moved-aside*') {
-        if ($Backup -and (Test-Path -LiteralPath $Path)) { Move-Item -LiteralPath $Path -Destination $Backup }
-        throw [System.IO.IOException]::new("simulated part-way replace failure (ERROR_UNABLE_TO_MOVE_REPLACEMENT_2)", -2147023719)
+function Invoke-SettingsSwap([string]$Tmp, [string]$Path, [bool]$Exists) {
+    if (Test-SwapFault $Path 'move-fails-target-gone') {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        throw [System.IO.IOException]::new("simulated move failure after a concurrent delete")
     }
-    if ($Backup) { [System.IO.File]::Replace($Tmp, $Path, $Backup) }
-    else { [System.IO.File]::Move($Tmp, $Path, $false) }
+    if (Test-SwapFault $Path 'move-fails') { throw [System.IO.IOException]::new("simulated move failure") }
+    # Overwrite only a file this run saw: a root that had none must not clobber one a concurrent writer
+    # created meanwhile.
+    [System.IO.File]::Move($Tmp, $Path, $Exists)
 }
 
-# PUTS THE ORIGINAL BACK IF THE SWAP TOOK IT AWAY, THEN SAYS WHERE EVERY COPY IS. The returned text
-# is the FAILED line's reason, so an operator reads the paths without opening a log. It never says
-# what settings.json now HOLDS: a concurrent writer can have put anything there.
-function Get-FailedSwapReport([string]$Path, [string]$Tmp, [string]$SwapBak, [string]$BackedTo, [string]$Why) {
-    $restoreErr = $null; $restored = $false
-    # $SwapBak is set only when settings.json existed, and it was a free name, so a file there is ours.
-    if ($SwapBak -and -not (Test-Path -LiteralPath $Path) -and (Test-Path -LiteralPath $SwapBak)) {
-        try {
-            # Second seam value: the restore fails too, the case that must still keep the temp file.
-            if (Test-SwapFault $Path 'original-moved-aside-restore-fails') { throw "simulated restore failure" }
-            Move-Item -LiteralPath $SwapBak -Destination $Path
-            $restored = $true
-        }
-        catch { $restoreErr = "$_" }
-    }
-    $msg = if (Test-Path -LiteralPath $Path) {
-        "settings.json was not updated ($Why); the new content was not installed"
-    }
-    elseif ($SwapBak) { "settings.json is MISSING after a failed swap ($Why)" }
+# SAYS WHERE EVERY COPY IS. The returned text is the FAILED line's reason, so an operator reads the
+# paths without opening a log. It never says what settings.json now HOLDS: a concurrent writer can have
+# put anything there.
+function Get-FailedSwapReport([string]$Path, [string]$Tmp, [bool]$Existed, [string]$BackedTo, [string]$Why) {
+    $present = Test-Path -LiteralPath $Path
+    $msg = if ($present) { "settings.json was not updated ($Why); the new content was not installed" }
+    elseif ($Existed) { "settings.json is MISSING after a failed swap ($Why)" }
     else { "settings.json was not created ($Why)" }
-    if (-not (Test-Path -LiteralPath $Path)) {
+    if (-not $present) {
         $msg += $(if (Test-Path -LiteralPath $Tmp) { ". The new content is in $Tmp" } else { ". The new content's temp file $Tmp is gone too" })
     }
-    if ($restored) { $msg += "; the previous content was put back from the swap's backup" }
-    if ($SwapBak -and (Test-Path -LiteralPath $SwapBak)) { $msg += "; the previous content is in $SwapBak" }
-    if ($restoreErr) { $msg += "; putting it back failed: $restoreErr" }
     if ($BackedTo) { $msg += "; a copy of the previous content is in $BackedTo" }
     # Re-running first would read the missing file as empty and write a settings.json holding only
     # the statusLine, so the restore comes first.
-    if (-not (Test-Path -LiteralPath $Path)) { $msg += ". Rename one of them to $Path before running this installer again" }
+    if (-not $present) { $msg += ". Rename one of them to $Path before running this installer again" }
     return "$msg."
 }
 
