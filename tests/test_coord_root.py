@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import locale
 import os
 import re
 import shutil
@@ -646,20 +647,38 @@ def _non_ascii_repo(tmp_path: Path) -> Path:
     return r
 
 
+@pytest.mark.xfail(
+    locale.getpreferredencoding(False).lower().replace("-", "") != "utf8",
+    reason=(
+        "BACKLOG #7571, open in both twins: local_root keeps origin/main's text=True read, which "
+        "decodes git's UTF-8 with the locale code page, as Get-CoordLocalRoot keeps its `& git` "
+        "read; a fix in one twin alone made the twins disagree on such a checkout"
+    ),
+    strict=True,
+    raises=AssertionError,
+)
+# The failed decode kills subprocess's reader thread; that is the defect under test, not noise.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
 def test_a_non_ascii_checkout_path_reads_right_in_python(tmp_path: Path) -> None:
-    # BACKLOG #7571: git writes the common dir as UTF-8, and text=True decoded it with the ANSI code
-    # page. U+0101 is C4 81 in UTF-8, and cp1252 has no 0x81, so the decode failed outright.
+    # git writes the common dir as UTF-8. U+0101 is C4 81 in UTF-8, and cp1252 has no 0x81, so under
+    # cp1252 the decode fails outright and local_root raises rather than returning a path.
     r = _non_ascii_repo(tmp_path)
-    assert coord_root.local_root(r) == r / ".git" / "mefor-coord"
+    got: object
+    try:
+        got = coord_root.local_root(r)
+    except Exception as exc:  # noqa: BLE001 - any raise is the wrong answer, read as a mismatch
+        got = exc
+    assert got == r / ".git" / "mefor-coord"
 
 
 @pytest.mark.xfail(
     reason=(
-        "BACKLOG #7571, PowerShell half, open: Get-CoordLocalRoot keeps origin/main's `& git` read, "
+        "BACKLOG #7571, open in both twins: Get-CoordLocalRoot keeps origin/main's `& git` read, "
         "which decodes with the console code page, so that every PowerShell caller that reads "
         "--git-common-dir with `& git` itself names the same local root"
     ),
-    strict=False,
+    strict=True,
+    raises=AssertionError,
 )
 def test_a_non_ascii_checkout_path_reads_right_in_powershell(tmp_path: Path) -> None:
     r = _non_ascii_repo(tmp_path)

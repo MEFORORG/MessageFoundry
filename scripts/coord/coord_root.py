@@ -68,23 +68,16 @@ def local_root(start: str | os.PathLike[str] | None = None) -> Path | None:
     if start:
         args += ["-C", str(start)]
     args += ["rev-parse", "--path-format=absolute", "--git-common-dir"]
-    # Bytes, decoded here: text=True decodes with the ANSI code page on Windows, where git writes
-    # UTF-8, so a non-ASCII checkout path read as mojibake or killed the reader thread (BACKLOG #7571).
-    # Strict UTF-8 on Windows. Get-CoordLocalRoot still reads it with `& git`, so the PowerShell half of
-    # #7571 stays open and the twins disagree on a non-ASCII checkout, as on main.
+    # text=True decodes git's UTF-8 output with the ANSI code page on Windows, so a non-ASCII checkout
+    # path can read wrong or fail to decode here (BACKLOG #7571, OPEN in both twins). It keeps
+    # origin/main's read, as Get-CoordLocalRoot keeps its `& git` read: a fix in one twin alone made
+    # the two disagree on such a checkout.
     try:
-        proc = subprocess.run(args, capture_output=True, check=False)  # nosec B603 B607 - fixed argv, no shell
+        proc = subprocess.run(args, capture_output=True, text=True, check=False)  # nosec B603 B607 - fixed argv, no shell
     except OSError:
         return None
-    if proc.returncode != 0:
-        return None
-    try:
-        out = proc.stdout.decode("utf-8") if os.name == "nt" else os.fsdecode(proc.stdout)
-    except UnicodeDecodeError as exc:
-        print(f"coord_root: git named a common dir that is not UTF-8 ({exc})", file=sys.stderr)
-        return None
-    common = out.strip(_WS)
-    if not common:
+    common = proc.stdout.strip()
+    if proc.returncode != 0 or not common:
         return None
     return Path(common) / "mefor-coord"
 
