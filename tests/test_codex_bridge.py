@@ -633,7 +633,12 @@ def test_a_deny_stands_over_another_hooks_fault(bridge, tmp_path, order):
     settings(tmp_path, hooks if order == "fault-first" else hooks[::-1])
     result = bridge.dispatch(tmp_path, _PAYLOAD)
     assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert "a hook failed" in result["systemMessage"]
+    # The deny is merged before the fault in one order and after it in the other, so the message
+    # names neither order.
+    assert (
+        "a hook failed; the decision merged from the hooks' output stands"
+        in result["systemMessage"]
+    )
 
 
 @pytest.mark.parametrize("order", ["fault-first", "stop-first"])

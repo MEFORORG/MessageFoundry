@@ -20,12 +20,20 @@
 # heredoc body that bash runs as a command. Such a line can follow a delimiter bash finds only by
 # joining a backslash-newline (`E\` then `OF`), or sit in a later heredoc the views open after
 # ending a body early, at a raw delimiter bash joins to the line before it (`x\` then `EOF`) or at
-# a padded copy (` EOF`), since the views compare after .Trim(). The heredoc pass reads a `$(...)`
-# or backtick substitution there only where one of its readings puts the line in a body whose
-# delimiter is unquoted, so at least these are missed: a walk outside a substitution, as in
+# a padded copy (` EOF`), since the views compare after .Trim(). It can also sit in a heredoc the
+# views open inside a body they never saw, because they read one opener per line: in a command
+# with no quote, at least, a second opener on a line (`cat <<A <<B`) and a glued one (`cat<<EOF`)
+# leave that body visible to them. The heredoc pass reads a `$(...)` or backtick substitution
+# there only where one of its readings puts the line in a body whose delimiter is unquoted, so at
+# least these are missed: a walk outside a substitution, as in
 # `cat <<EOF\nx\\\nEOF\ncat <<B\nEOF\nfind /proc\nB`; a substitution in a later heredoc whose
-# delimiter is quoted; and a line neither reading puts in a body, such as one after a delimiter the
-# views capture only part of (`<<END-X`), or in a heredoc opened after a `((` on its line.
+# delimiter is quoted; a substitution in a heredoc the views open after a padded copy of a QUOTED
+# delimiter, since the pass ends a quoted body where bash ends it and so opens nothing there, as in
+# `cat <<'EOF'\n EOF\ncat <<B\nEOF\n$(find /proc)\nB`; a walk in a heredoc the views open inside
+# the body of a second opener on a line, as in `cat <<A <<B\nA\ncat <<C\nB\nfind /proc\nC`, which
+# the pass reads as bash does and so finds in no body; and a line neither reading puts in a body,
+# such as one after a delimiter the views capture only part of (`<<END-X`), or in a heredoc opened
+# after a `((` on its line.
 #
 # ROOTS ARE COMPARED AS PATHS, OPTIONS AS GRAMMAR. Every bypass measured on 2026-09-20 came from
 # comparing a spelling instead of what it names: `/.`, `//`-variants, `/pro'c'`, `/pro\c`,
@@ -53,8 +61,10 @@ function Deny {
 # in program position. The opener is found on the quote-masked text and its delimiter read from the
 # raw text, at the same offset. Raw-only let `grep "x << y"` open a heredoc that never ends, and
 # blank the real walk after it; masked-only loses `<<'EOF'`. `<<<` opens nothing, and the delimiter
-# must start with a letter or underscore, so `$((1<<2))` opens nothing either. A missed opener such
-# as `cat<<EOF` can only add a false deny.
+# must start with a letter or underscore, so `$((1<<2))` opens nothing either. Only the first opener
+# on a line is read. A missed opener, such as `cat<<EOF` or the second in `cat <<A <<B`, leaves its
+# body visible, which can add a false deny, and an opener in that body then blanks lines bash runs, a
+# miss the header names.
 # DEBT: this and Hide-QuotedSpans are second copies of block-blanket-git-stage.ps1's helpers, and
 # have already diverged in error posture. Extracting them needs a library entry in the unwired list
 # of tests/test_claude_settings_contract.py, which globs every scripts/hooks/*.ps1.
@@ -105,9 +115,14 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # and as joined, so a raw `EOF` after a continued line (`x\` then `EOF`) stays body, as bash reads
 # it. The second ends an unquoted delimiter's body at the first line that is the delimiter after
 # .Trim(), as the views end it, so the lines after that raw `EOF`, or after a padded ` EOF`, are
-# read as the views read them, and a later opener there is read. A quoted delimiter's body it ends
-# as the first reading does, since bash takes every line before that end as data, a heredoc the
-# views open in it included. That second reading can open a heredoc bash never opens, and
+# read as the views read them, and a later opener there can be read. A quoted delimiter's body it
+# ends as the first reading does, where bash ends it, so it takes no heredoc the views open in that
+# body. That leaves known gaps, at least these, which the header lists as missed: a heredoc the
+# views open after a padded copy of a quoted delimiter is opened by neither reading, so a
+# substitution in its body that bash runs as a command is not read, as in
+# `cat <<'EOF'\n EOF\ncat <<B\nEOF\n$(find /proc)\nB`; and both readings read every opener on a
+# line, as bash does, so neither reads a heredoc the views open inside the body of a second opener
+# they miss, as in `cat <<A <<B\nA\ncat <<C\nB\nfind /proc\nC`. That second reading can open a heredoc bash never opens, and
 # read lines bash runs as commands as its body, so it adds false denies main did not have, such as
 # `cat <<EOF\nx\\\nEOF\ncat <<B\nEOF\necho '$(find /proc)'\nB`. Neither reading ends a body at a
 # delimiter bash finds only by joining (`E\` then `OF`), so both read the lines after it as body,

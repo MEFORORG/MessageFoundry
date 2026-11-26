@@ -1142,6 +1142,29 @@ def test_the_heredoc_pass_adds_no_deny_for_data(command: str) -> None:
     assert_allowed(run_guard(bash(command)))
 
 
+# KNOWN GAPS, PINNED AS THEY ARE: bash runs the walk in each of these, and the guard allows it. The
+# guard's header lists them as missed. A fix that starts denying one fails this test on purpose:
+# move the row to HEREDOC_SUBSTITUTION_DENY then, and drop the shape from the header.
+HEREDOC_KNOWN_GAP_ALLOW = [
+    # The quoted body ends at the raw `EOF`, so `cat <<B` is data and `$(find /proc)` a command.
+    # The views end it at the padded ` EOF` and open B, and the heredoc pass opens nothing there.
+    pytest.param(
+        "cat <<'EOF'\n EOF\ncat <<B\nEOF\n$(find /proc)\nB",
+        id="known-gap-padded-copy-of-a-quoted-delimiter",
+    ),
+    # B's body is `cat <<C`, so `find /proc` is a command. The views read only the first opener,
+    # so they open C in B's body and blank the walk.
+    pytest.param(
+        "cat <<A <<B\nA\ncat <<C\nB\nfind /proc\nC", id="known-gap-second-opener-on-a-line"
+    ),
+]
+
+
+@pytest.mark.parametrize("command", HEREDOC_KNOWN_GAP_ALLOW)
+def test_known_gap_a_walk_bash_runs_after_a_misread_heredoc_is_allowed(command: str) -> None:
+    assert_allowed(run_guard(bash(command)))
+
+
 def _guard_seconds(command: str) -> float:
     started = time.monotonic()
     run_guard(bash(command))
@@ -1929,6 +1952,7 @@ EXPECTED_ROW_COUNTS = {
     "SITE_TEXT_ALLOW": 21,
     "HEREDOC_SUBSTITUTION_DENY": 33,
     "HEREDOC_SUBSTITUTION_ALLOW": 15,
+    "HEREDOC_KNOWN_GAP_ALLOW": 2,
 }
 
 
