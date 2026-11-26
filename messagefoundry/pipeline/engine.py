@@ -909,9 +909,6 @@ class Engine:
         # takes dr_threshold from _dr_run_threshold() when it is built, and _set_dr_active hands a
         # running one the new value on each flip (#3067).
         self._dr_active = False
-        # Whether an activation's reload has completed, so the run-profile is applied and not only
-        # latched; :meth:`_dr_backup_paused` reads it.
-        self._dr_profile_applied = False
         # This instance's environment values (DEV/PROD), shared with every runner the engine builds —
         # so env() references in a reloaded graph resolve against THIS environment (and a missing
         # value is refused here, on this engine, not on the box the graph was authored on). The
@@ -1194,10 +1191,12 @@ class Engine:
 
     def _dr_backup_paused(self) -> bool:
         """Whether the backup runner must skip its pass (vault BACKLOG #5712; the reason is at
-        :class:`~messagefoundry.pipeline.dr_backup.BackupRunner`'s ``dr_paused``): on a
-        passive DR standby, and during an activation until its reload has completed. Applied
-        implies latched, since every flip of the latch to False clears it."""
-        return self._dr_settings.enabled and not self._dr_profile_applied
+        :class:`~messagefoundry.pipeline.dr_backup.BackupRunner`'s ``dr_paused``): on every DR
+        box, passive or activated. An activated box's own ``dr_backup`` row would become the
+        latest anchor the restore-token check compares, so a later deliberate re-activation of
+        the same restore would be refused as a stale vintage (BACKLOG #5965; owner ruling
+        2026-11-25)."""
+        return self._dr_settings.enabled
 
     @property
     def dr_active(self) -> bool:
@@ -1234,6 +1233,8 @@ class Engine:
                 self.store,
                 self._dr_settings,
                 store_settings=self._store_settings,
+                # BACKLOG #5965: each engine shard's dr.activate and dr.release rows name it.
+                instance=lambda: self.instance_identity,
                 activate_profile=self._dr_activate_profile,
                 deactivate_profile=self._dr_release_drain,
                 profile_provenance=self._dr_config_drift,
@@ -1267,8 +1268,6 @@ class Engine:
         the next reload does. A release hands the runner the passive standby's threshold, so that
         reload binds no listener (vault BACKLOG #3140)."""
         self._dr_active = active
-        if not active:
-            self._dr_profile_applied = False
         if self._registry_runner is not None:
             self._registry_runner.set_dr_threshold(
                 self._dr_run_threshold(), standby=self._dr_standby_threshold()
@@ -1370,9 +1369,13 @@ class Engine:
                 # lease without importing the runner.
                 raise DrProfileNotLeading(str(exc)) from exc
             raise
-        # Only now may a backup pass run: the latch flipped before the reload, which can still
-        # fail and roll it back (vault BACKLOG #5712).
-        self._dr_profile_applied = True
+        if self._backup_runner is not None and self._backup_runner.enabled:
+            # Once per activation (BACKLOG #5965): the runner itself skips each pass silently.
+            log.warning(
+                "DR backup: paused while this box is activated, so a later re-activation of the "
+                "same restore still passes the restore-token vintage check; the primary's backups "
+                "are the ones a restore uses"
+            )
         if not close_failures:
             return {}
         failure = _outbound_close_failure(close_failures)
@@ -2458,6 +2461,12 @@ class Engine:
                 dr_paused=self._dr_backup_paused,
             )
             self._backup_runner.start()
+        # BACKLOG #5965 (owner ruling 2026-11-25): a box this process last activated comes back up
+        # passive and stays so, and says so loudly. Never an activation: POST /dr/activate is the
+        # only one. Not leader-gated: each engine shard reads its own rows and alerts on its own.
+        dr = self.dr_coordinator
+        if dr is not None:
+            await dr.check_restarted_passive()
         # [cert_monitor] TLS-cert expiry monitor (Q5c) — a maintenance task like retention, independent
         # of the message graph and surviving reloads; a no-op when warn_days=0. NOT leader-gated: certs
         # are node-local files, so each node alerts on its own (the per-cert realert throttle bounds

@@ -549,15 +549,16 @@ class BackupRunner:
         self._store = store
         self._settings = settings
         # Read before each pass starts; while it answers True, none starts (vault BACKLOG #5712).
-        # The engine answers True on a passive DR standby, and during an activation until its reload
-        # has completed. A pass writes a `dr_backup` audit row, and the server-DB live seed probe
+        # The engine answers True on every DR box, passive or activated (BACKLOG #5965). A pass
+        # writes a `dr_backup` audit row, and the server-DB live seed probe
         # reads any such row as proof the database was restored from a primary, so a standby's own
         # row would pass that probe on an unrestored database. It would also become the latest
-        # anchor the restore-token check compares, and refuse a valid restore.
+        # anchor the restore-token check compares, and refuse a valid restore, including a later
+        # re-activation of the restore an activated box is running on.
         # THIS IS THE ONE STATEMENT OF WHAT STILL WRITES SUCH A ROW ON A DR BOX; the probe's
         # docstrings point here. At least: the `messagefoundry backup` command, which builds its
-        # runner without this gate; and a pass already running when the gate turns True, which
-        # finishes and records its row.
+        # runner without this gate. The engine's answer no longer flips on an activation, so no
+        # pass is left running across one (BACKLOG #5965).
         self._dr_paused = dr_paused
         # The store settings carry the KeyProvider seam (ADR 0019) — the archive's KEY SOURCE. Typed
         # loosely to avoid importing StoreSettings here; resolve_active_key takes it.
@@ -617,8 +618,8 @@ class BackupRunner:
         )
         if self._dr_paused():
             log.info(
-                "DR backup: no pass starts while this box is a passive DR standby; an activation "
-                "starts them once its reload has completed"
+                "DR backup: no pass starts on a DR box, passive or activated (BACKLOG #5965); the "
+                "primary's backups are the ones a restore uses"
             )
 
     async def stop(self) -> None:

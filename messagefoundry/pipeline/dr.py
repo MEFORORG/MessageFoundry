@@ -89,6 +89,11 @@ _ACTION_ABORTED = "dr_activation_aborted"
 #: #2752). The box stays active and the release can be retried. Kept apart from ``dr.release``, which
 #: only a completed hand-back writes, so a filter on that action still finds only fail-backs.
 _ACTION_RELEASE_FAILED = "dr_release_failed"
+#: How many of the newest ``dr.activate`` and ``dr.release`` rows a start reads to tell whether
+#: this process was last activated (BACKLOG #5965). The engine shards of one DR box share the
+#: store, so the rows of every shard are in the scan; a shard whose own newest row is older than
+#: this many is not found, and raises nothing.
+_RESTART_SCAN_ROWS = 500
 
 
 def _vip_note(cause: str) -> str:
@@ -242,9 +247,15 @@ class DrCoordinator:
         profile_provenance: Callable[[], Awaitable[Mapping[str, object]]] | None = None,
         after_release: Callable[[], Awaitable[None]] | None = None,
         hop_posture: HopPosture | None = None,
+        instance: Callable[[], str | None] | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
+        # The engine's process identity, ``shard:<id>`` or ``node:<id>``, or None for a lone
+        # engine (Engine.instance_identity). Read at each use: it is known once the engine holds
+        # its graph. It goes on the dr.activate and dr.release rows, so a start finds its own
+        # process's newest transition among its sibling shards' (BACKLOG #5965).
+        self._instance = instance
         # The instance posture, for the Vault hop the cold-seed verify can dial (vault BACKLOG
         # #2983). The engine passes its own. `None` counts as enforcing on that hop.
         self._hop_posture = hop_posture
@@ -264,10 +275,11 @@ class DrCoordinator:
         # Awaited per activation, so building the coordinator reads no file (vault BACKLOG #2839).
         self._config_fingerprint_provider = config_fingerprint_provider
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
-        # #145: the DR box label carried in dr_activated / dr_released alerts (also the throttle /
-        # auto-resolve key). The hostname is stable across an activate/release pair (same box), so the
-        # fail-back resolves the promotion instance. PHI-free (a host label only).
-        self._node = socket.gethostname()
+        # #145: the DR box's host, the first part of the label the dr_activated, dr_released and
+        # dr_restarted_passive alerts carry (also the throttle / auto-resolve key); _label() adds
+        # the process. Stable across an activate/release pair (same box), so the fail-back
+        # resolves the promotion instance. PHI-free (a host label only).
+        self._host = socket.gethostname()
         self._clock = clock
         # ADR 0073: the engine's ownership scope for the activation recovery reset. On a SHARDED DR
         # fleet the shards activate one by one against the SAME restored store, so a global reset on
@@ -312,6 +324,62 @@ class DrCoordinator:
     @property
     def settings(self) -> DrSettings:
         return self._settings
+
+    def _identity(self) -> str | None:
+        return self._instance() if self._instance is not None else None
+
+    def _label(self) -> str:
+        """The DR alerts' label: the host, and the process identity where it has one, so each
+        engine shard of a box raises and resolves its own instance (BACKLOG #5965)."""
+        identity = self._identity()
+        return f"{self._host} {identity}" if identity else self._host
+
+    async def check_restarted_passive(self) -> bool:
+        """At start: fail loud when this process was last recorded as activated (BACKLOG #5965;
+        owner ruling 2026-11-25, decision d20261126T042906640-0b0f76).
+
+        A box always starts passive, and nothing here changes that: it never re-activates itself,
+        and ``POST /dr/activate`` stays the only route back to serving. When the newest
+        ``dr.activate`` or ``dr.release`` row written by this process's identity is a
+        ``dr.activate``, the box was serving when it went down, so this logs at ERROR and raises
+        the critical ``dr_restarted_passive`` alert, which also closes the open ``dr_activated``
+        for the same label. Each engine shard reads only the rows its own identity wrote, so each
+        alerts on its own. Returns whether it alerted.
+
+        It misses at least: an activation whose ``dr.activate`` row was never written (the owed
+        row is held in memory only), and a process whose own newest row is older than the
+        :data:`_RESTART_SCAN_ROWS` newest. The other way round, a hand-back whose ``dr.release``
+        row was never written alerts, though the box had handed back. A store that cannot be read
+        is logged at ERROR and raises nothing. ``[dr]`` is refused with ``[cluster]``, so the
+        identity is a shard's or none."""
+        if self._settings.enabled is False or self._active:
+            return False
+        identity = self._identity()
+        try:
+            rows = await self._store.recent_audit_of(
+                (_ACTION_ACTIVATE, _ACTION_RELEASE), limit=_RESTART_SCAN_ROWS
+            )
+        except Exception as exc:
+            log.error(
+                "DR: could not read the dr.activate and dr.release audit rows at start, so whether "
+                "this box was serving when it went down is unknown: %s",
+                safe_exc(exc),
+            )
+            return False
+        if _last_transition(rows, identity) != _ACTION_ACTIVATE:
+            return False
+        label = self._label()
+        log.error(
+            "DR: this box (%s) was last ACTIVATED and has come back up PASSIVE after a restart. "
+            "It serves nothing and does not re-activate itself; re-run POST /dr/activate to serve "
+            "the priority feeds again",
+            label,
+        )
+        try:
+            self._alert_sink.dr_restarted_passive(label)
+        except Exception:  # pragma: no cover - defensive; a sink must never break DR
+            log.warning("DR: dr_restarted_passive alert failed", exc_info=True)
+        return True
 
     def note_profile_preflight(self, running: bool) -> None:
         """Record whether the ``activate_profile`` callback is inside its preflight.
@@ -551,6 +619,8 @@ class DrCoordinator:
         # Owed from here: a write cut short is made good by the next activate or release call.
         detail: dict[str, object] = {
             "archive": _basename(seed),
+            # Read back at the next start (check_restarted_passive, BACKLOG #5965).
+            "instance": self._identity(),
             "verify": verify.status,
             "threshold": self._settings.priority_threshold.value,
             "seed_segment": progress.seed_segment,
@@ -647,6 +717,7 @@ class DrCoordinator:
                 phase = "record"
                 self._active = False
                 detail = _release_detail(hook_ran, drain)
+                detail["instance"] = self._identity()  # BACKLOG #5965, as on dr.activate
                 self._last_release = self._release_result(detail)
                 # Owed from here: a write cut short is made good by the next activate or release.
                 self._unrecorded_release = (detail, actor, now)
@@ -1429,9 +1500,9 @@ class DrCoordinator:
         carries only the box label + role (no PHI)."""
         try:
             if event == "dr_activated":
-                self._alert_sink.dr_activated(self._node, role="dr_standby")
+                self._alert_sink.dr_activated(self._label(), role="dr_standby")
             else:
-                self._alert_sink.dr_released(self._node, role="primary")
+                self._alert_sink.dr_released(self._label(), role="primary")
         except Exception:  # pragma: no cover - defensive; a sink must never break DR
             log.warning("DR: %s alert failed", event, exc_info=True)
 
@@ -1629,6 +1700,24 @@ def _release_detail(hook_ran: bool, drain: Mapping[str, object] | None) -> dict[
     if held is not None:
         detail["held_on_parked_outbounds"] = held
     return detail
+
+
+def _last_transition(rows: Collection[Mapping[str, object]], identity: str | None) -> str | None:
+    """The action of the newest row in ``rows`` whose detail names ``identity`` as its
+    ``instance``, or ``None`` when none does. A row whose detail is not a JSON object is passed
+    over (BACKLOG #5965)."""
+    for row in sorted(rows, key=lambda r: _count(r.get("id")) or 0, reverse=True):
+        raw = row.get("detail")
+        if not isinstance(raw, str):
+            continue
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict) and parsed.get("instance") == identity:
+            action = row.get("action")
+            return action if isinstance(action, str) else None
+    return None
 
 
 def _basename(path: str) -> str:

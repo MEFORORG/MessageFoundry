@@ -314,6 +314,8 @@ async def test_a_release_whose_drain_gives_up_inside_the_deadline_answers_with_t
             "depth_left": depth,
             "drained": False,
             "held_on_parked_outbounds": 0,
+            # BACKLOG #5965: the process identity, read back at the next start; a lone engine's.
+            "instance": None,
             "vip_hook_ran": False,
         }
     ]

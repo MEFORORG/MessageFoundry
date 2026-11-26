@@ -66,26 +66,41 @@ async def test_a_passive_standby_writes_no_dr_backup_row(standby_engine: Engine)
     assert await engine.store.has_prior_backup_history() is False
 
 
-async def test_an_activated_standby_backs_up_and_a_released_one_stops(
+async def test_an_activated_standby_backs_up_nothing_either(
     standby_engine: Engine,
 ) -> None:
+    # BACKLOG #5965: an activated box's own row would become the restore-token check's latest
+    # anchor and refuse a later re-activation of the same restore, so no pass runs at any step.
     engine = standby_engine
     runner = engine._backup_runner
     assert runner is not None
-    # The latch alone, as an activation sets it before its reload, which may still fail and
-    # roll it back: no pass yet.
     engine._set_dr_active(True)
     assert await runner.run_once(now=1.0) is None
-    # Control: once the activation's profile is applied, the same runner backs up.
     assert await engine._dr_activate_profile() == {}
-    assert await runner.run_once(now=2.0) is not None
-    assert len(await engine.store.list_audit(action="dr_backup")) == 1
-    # A release (or a rolled-back activation) puts the latch back, and the passes stop.
+    assert await runner.run_once(now=2.0) is None
     engine._set_dr_active(False)
     assert await runner.run_once(now=3.0) is None
-    engine._set_dr_active(True)
-    assert await runner.run_once(now=4.0) is None
-    assert len(await engine.store.list_audit(action="dr_backup")) == 1
+    assert await engine.store.list_audit(action="dr_backup") == []
+
+
+async def test_a_non_dr_engine_still_backs_up(tmp_path: Path) -> None:
+    # Control for the test above: the same runner on a box that is not a DR standby backs up.
+    db = tmp_path / "p.db"
+    engine = Engine(
+        await MessageStore.open(db),
+        poll_interval=0.05,
+        store_settings=StoreSettings(path=str(db)),
+        backup_settings=_backup_settings(tmp_path),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        await engine.start()
+        runner = engine._backup_runner
+        assert runner is not None
+        assert await runner.run_once(now=1.0) is not None
+        assert len(await engine.store.list_audit(action="dr_backup")) == 1
+    finally:
+        await engine.stop()
 
 
 class _RefusingRunner:
