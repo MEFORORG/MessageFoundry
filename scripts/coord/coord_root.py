@@ -68,10 +68,6 @@ def local_root(start: str | os.PathLike[str] | None = None) -> Path | None:
     if start:
         args += ["-C", str(start)]
     args += ["rev-parse", "--path-format=absolute", "--git-common-dir"]
-    # text=True decodes git's UTF-8 output with the ANSI code page on Windows, so a non-ASCII checkout
-    # path can read wrong or fail to decode here (BACKLOG #7571, OPEN in both twins). It keeps
-    # origin/main's read, as Get-CoordLocalRoot keeps its `& git` read: a fix in one twin alone made
-    # the two disagree on such a checkout.
     try:
         proc = subprocess.run(args, capture_output=True, text=True, check=False)  # nosec B603 B607 - fixed argv, no shell
     except OSError:

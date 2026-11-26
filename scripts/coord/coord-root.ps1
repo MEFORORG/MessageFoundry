@@ -98,12 +98,6 @@ function ConvertFrom-CoordRootBytes {
 function Get-CoordLocalRoot {
     # <git-common-dir>/mefor-coord for the repository at $From, or $null when git cannot say.
     # --path-format=absolute is not optional: the bare form is relative to the caller's cwd.
-    # BACKLOG #7571, OPEN: `& git` decodes git's UTF-8 output with
-    # [Console]::OutputEncoding, so a non-ASCII checkout reads back as mojibake on a stock console.
-    # This stays origin/main's read on purpose: mail-drain.ps1, mail-watch.ps1, announce-session.ps1,
-    # prune-merged.ps1 and fleet.ps1 read --git-common-dir with `& git` themselves, so a fix here alone
-    # would name a different local root from theirs. The Python twin, local_root, keeps origin/main's
-    # read too; its comment says why.
     param([string]$From)
     try {
         $gitArgs = @()

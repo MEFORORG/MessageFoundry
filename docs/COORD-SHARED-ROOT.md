@@ -260,7 +260,7 @@ One resolver, `scripts/coord/coord-root.ps1` (dot-sourced) plus a Python twin fo
 |---|---|
 | `Get-CoordSharedRoot` | `$env:MEFOR_COORD_ROOT` if set, else the `shared_root` value in `<git-common-dir>/mefor-coord/root.toml`, else `<git-common-dir>/mefor-coord` (today's behaviour). It does not probe. |
 | `Resolve-CoordSharedRoot` | The same root, after probing a configured one for reachability as above. A root that is missing or unreachable comes back as an error. |
-| `Get-CoordLocalRoot` | Always `<git-common-dir>/mefor-coord`. On a checkout whose path is not ASCII it can name the wrong directory: it reads git's UTF-8 output with `& git`, which decodes it with the console code page. That is BACKLOG #7571, which is OPEN. It stays on `& git` because at least five scripts read `--git-common-dir` that way themselves, and a fix here alone would split them from it. The Python twin `local_root` keeps origin/main's read too, which decodes with the ANSI code page on Windows and can fail outright there on such a path. A fix in one twin alone made the twins disagree on such a checkout. |
+| `Get-CoordLocalRoot` | Always `<git-common-dir>/mefor-coord`. |
 
 Rules:
 

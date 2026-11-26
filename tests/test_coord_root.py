@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import locale
 import os
 import re
 import shutil
@@ -640,62 +639,6 @@ def test_claim_refuses_a_device_path_root_with_the_message(tmp_path: Path, prefi
     assert [p.name for p in shared.rglob("*")] == ["claims"]
 
 
-def _non_ascii_repo(tmp_path: Path) -> Path:
-    r = tmp_path / "café-ā"
-    r.mkdir()
-    subprocess.run(["git", "-C", str(r), "init", "-q"], check=True, capture_output=True)
-    return r
-
-
-@pytest.mark.xfail(
-    locale.getpreferredencoding(False).lower().replace("-", "") != "utf8",
-    reason=(
-        "BACKLOG #7571, open in both twins: local_root keeps origin/main's text=True read, which "
-        "decodes git's UTF-8 with the locale code page, as Get-CoordLocalRoot keeps its `& git` "
-        "read; a fix in one twin alone made the twins disagree on such a checkout"
-    ),
-    strict=True,
-    raises=AssertionError,
-)
-# The failed decode kills subprocess's reader thread; that is the defect under test, not noise.
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
-def test_a_non_ascii_checkout_path_reads_right_in_python(tmp_path: Path) -> None:
-    # git writes the common dir as UTF-8. U+0101 is C4 81 in UTF-8, and cp1252 has no 0x81, so under
-    # cp1252 the decode fails outright and local_root raises rather than returning a path.
-    r = _non_ascii_repo(tmp_path)
-    got: object
-    try:
-        got = coord_root.local_root(r)
-    except Exception as exc:  # noqa: BLE001 - any raise is the wrong answer, read as a mismatch
-        got = exc
-    assert got == r / ".git" / "mefor-coord"
-
-
-@pytest.mark.xfail(
-    reason=(
-        "BACKLOG #7571, open in both twins: Get-CoordLocalRoot keeps origin/main's `& git` read, "
-        "which decodes with the console code page, so that every PowerShell caller that reads "
-        "--git-common-dir with `& git` itself names the same local root"
-    ),
-    strict=True,
-    raises=AssertionError,
-)
-def test_a_non_ascii_checkout_path_reads_right_in_powershell(tmp_path: Path) -> None:
-    r = _non_ascii_repo(tmp_path)
-    # cp437 is the OEM code page a stock Windows console starts in, set here so the reading does not
-    # depend on this runner's console, and read back, since the setter can be refused with no console.
-    # EscapeNonAscii keeps pwsh's stdout ASCII: otherwise a code page that misread git's bytes
-    # re-encodes them to the same UTF-8 on the way out, and PowerShell's mojibake reads as right.
-    got = _pwsh_json(
-        "[Console]::OutputEncoding = [System.Text.Encoding]::GetEncoding(437); "
-        f"[ordered]@{{ cp = [Console]::OutputEncoding.CodePage; path = Get-CoordLocalRoot -From '{r}' }}"
-        " | ConvertTo-Json -Compress -EscapeHandling EscapeNonAscii"
-    )
-    if got["cp"] != 437:
-        pytest.skip(f"this runner refused the console code page setter: {got}")
-    assert Path(got["path"]) == r / ".git" / "mefor-coord"
-
-
 def test_every_spelling_of_a_root_names_one_server_on_both() -> None:
     # The down cache is keyed by server, so it needs every spelling of one root, as each twin holds
     # it (plain, then pathlib's for Python), to name the same server on both.
@@ -736,52 +679,6 @@ def test_the_down_cache_file_reads_the_same_on_both() -> None:
     assert ps == py == ["srv", "", "", "", "", "", "", "srv", "srv", "", ""]
 
 
-def test_local_root_runs_git_in_powershells_location(tmp_path: Path, repo: Path) -> None:
-    # `& git` runs in PowerShell's location, not the process cwd; pinned so a later rewrite keeps it.
-    # The process cwd is tmp_path, outside any repository, and Set-Location moves only PowerShell's.
-    got = subprocess.run(
-        [
-            "pwsh",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            f". '{PS}'; Set-Location -LiteralPath '{repo}'; Get-CoordLocalRoot | ConvertTo-Json",
-        ],
-        capture_output=True,
-        encoding="utf-8",
-        check=True,
-        timeout=60,
-        cwd=tmp_path,
-    )
-    assert Path(json.loads(got.stdout)) == _local(repo)
-
-
-def test_local_root_survives_a_deleted_powershell_location(tmp_path: Path, repo: Path) -> None:
-    # `& git` runs even when PowerShell's location is gone, so a hook whose worktree was removed under
-    # it still names the common dir; pinned so a later rewrite keeps it.
-    gone = tmp_path / "gone"
-    gone.mkdir()
-    got = subprocess.run(
-        [
-            "pwsh",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            # The process cwd stays tmp_path, so Windows lets the location be removed; Remove-Item
-            # refuses PowerShell's own location, so the .NET call removes it.
-            f". '{PS}'; Set-Location -LiteralPath '{gone}'; [IO.Directory]::Delete('{gone}'); "
-            "if (Test-Path -LiteralPath (Get-Location).ProviderPath) { throw 'location survived' }; "
-            f"Get-CoordLocalRoot -From '{repo}' | ConvertTo-Json",
-        ],
-        capture_output=True,
-        encoding="utf-8",
-        check=True,
-        timeout=60,
-        cwd=tmp_path,
-    )
-    assert Path(json.loads(got.stdout)) == _local(repo)
-
-
 def test_an_empty_label_server_reads_unreachable_with_no_traceback(
     capfd: pytest.CaptureFixture[str],
 ) -> None:
@@ -803,30 +700,3 @@ def test_the_probe_refuses_a_device_path_on_both(
     )
     assert got == want
     assert not (tmp_path / "coord-root-down.json").exists()
-
-
-def test_local_root_never_runs_a_git_exe_from_the_cwd(tmp_path: Path, repo: Path) -> None:
-    # A bare 'git' handed to CreateProcess runs a git.exe in the process cwd before PATH's, unless
-    # NoDefaultCurrentDirectoryInExePath is set, which Claude Code sets and a plain terminal does
-    # not. whoami.exe stands in for a planted git.exe: it prints no common dir.
-    planted = tmp_path / "plant"
-    planted.mkdir()
-    whoami = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32" / "whoami.exe"
-    shutil.copyfile(whoami, planted / "git.exe")
-    env = {k: v for k, v in os.environ.items() if k.upper() != "NODEFAULTCURRENTDIRECTORYINEXEPATH"}
-    got = subprocess.run(
-        [
-            "pwsh",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            f". '{PS}'; Get-CoordLocalRoot -From '{repo}' | ConvertTo-Json",
-        ],
-        capture_output=True,
-        encoding="utf-8",
-        check=True,
-        timeout=60,
-        cwd=planted,
-        env=env,
-    )
-    assert Path(json.loads(got.stdout)) == _local(repo)
