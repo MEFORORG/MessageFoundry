@@ -801,18 +801,18 @@ Manager's watch reached the cloud session 29 seconds after its question.
   as a void-or-correction question, and under the 2026-11-15 ruling below it holds the merge like
   any owner finding. A falsehood in draft register row text that is false only in the safe
   direction must be fixed, or disclosed in the signing guide, before the row is put up for
-  signature. It blocks the signing, not the merge: this is the record's alternative to *"A as first
-  put, holding every merge on it"*. Every other falsehood in draft register row text, at least one
-  false in the unsafe direction, a false score and a false anchor, keeps this bullet's route to the
-  owner, and the PR waits; ledger ruling R2.4 and the 2026-11-15 ruling stand. The fix is ASVS
-  record work, a Manager's (owner ruling 2026-09-23). A PR that records an owner signature holds on
-  a falsehood in the row text whose signature it records. A dated marker on a register row stays
-  under the safe-direction exception, except a marker that reads an acceptance as void or fired,
-  which goes to the owner. A marker that wrongly reads a fired or void acceptance as in force is
-  false in the unsafe direction, so this bullet's route to the owner applies. Voiding or correcting
-  signed register text, and the question a void-or-fired marker raises, are signing or re-signing
-  the register, which the 2026-10-22 ruling above reserves to the owner in person (*"Still mine in
-  person"*).
+  signature. It blocks the signing, not the merge: this is what the Lander's record chose over
+  *"A as first put, holding every merge on it"*. Every other falsehood in draft register row text
+  keeps the route this bullet already gives it: at least one false in the unsafe direction, a false
+  score and a false anchor go to the owner, and the PR waits; ledger ruling R2.4 and the 2026-11-15
+  ruling stand. The fix is ASVS record work, a Manager's (owner ruling 2026-09-23). A PR that
+  records an owner signature holds on a falsehood in the row text whose signature it records. A
+  dated marker on a register row is not register row text here. It stays under the safe-direction
+  exception, except a marker that reads an acceptance as void or fired, which goes to the owner. A
+  marker that wrongly reads a fired or void acceptance as in force is false in the unsafe
+  direction, so this bullet's route to the owner applies. Voiding or correcting signed register
+  text, and the question a void-or-fired marker raises, are signing or re-signing the register,
+  which the 2026-10-22 ruling above reserves to the owner in person (*"Still mine in person"*).
   **Ledger ruling R2 (owner-signed 2026-11-04, in session: *"Sign R1-R9"*) changes how the findings
   are filed, and the Lander reads it as setting when.** A merged PR files at most one row, holding
   its open findings as numbered items. Its deferred scope becomes steps on the row it cites, or is
