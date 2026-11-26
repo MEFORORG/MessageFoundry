@@ -1226,8 +1226,9 @@ bind-guard ladder above:
   `[ai].endpoint` whose host does not read as loopback is refused under `enforce` unless a
   `[tls].crl_file` reaches it, as it can since BACKLOG #5527 on an engine started by
   `messagefoundry serve`, or `[ai].endpoint_revocation_attested = true` is set with an
-  `[ai].endpoint_revocation_attested_reason`. The host is read as spelled, so a gateway on this
-  machine can be refused; the `[ai].endpoint_revocation_attested` entry in
+  `[ai].endpoint_revocation_attested_reason`. The host is read as spelled, apart from case and
+  IPv6 brackets, so an endpoint URL holding `[::1]` reads as loopback and a gateway on this
+  machine spelled `localhost.` can be refused; the `[ai].endpoint_revocation_attested` entry in
   [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says how it is read. On that engine the broker
   also verifies a non-loopback endpoint against `[tls].internal_ca_file` under `augment` or
   `pinned`. An app built by `create_managed_app` hands the broker no `[tls]` policy unless its

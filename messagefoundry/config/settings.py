@@ -5046,8 +5046,9 @@ class AiSettings(_Section):
     # (BACKLOG #2193 slice (e), on the ADR 0173 section 12 pattern). The broker verifies that
     # certificate and checks no OCSP, and no CRL unless [tls].crl_file is set, the [tls] section
     # reaches the app serving POST /ai/chat, and the endpoint host does not read as loopback
-    # (BACKLOG #5527). That reading is stated once, on
-    # transports.ai_broker._refuse_an_unrevoked_ai_hop: config.tls_policy.is_loopback_hop_host on
+    # (BACKLOG #5527). In code that reading is stated on
+    # transports.ai_broker._refuse_an_unrevoked_ai_hop, and in full in docs/SECURITY-LOOSENING.md,
+    # the [ai].endpoint_revocation_attested entry: config.tls_policy.is_loopback_hop_host on
     # the host config.tls_policy.hop_url_host takes from the URL, lowercased and without the
     # brackets of an IPv6 host, so an endpoint URL holding [::1] reads as loopback. So without
     # that CRL an endpoint whose host reads as remote there is REFUSED under
@@ -11558,7 +11559,8 @@ def security_loosenings(
                 "config.tls_policy.hop_url_host takes from the URL, lowercased and without the "
                 "brackets of an IPv6 host. Under that reading an endpoint URL holding [::1] and "
                 "the bare name localhost read as loopback, and at least the name localhost with a "
-                "trailing dot reads as remote and gets the CRL. So "
+                "trailing dot reads as remote, so it gets the CRL where the other two conditions "
+                "hold. So "
                 "at least "
                 "a loopback endpoint, and an app the [tls] section never reached, check no CRL "
                 "whatever [tls].crl_file says. The "

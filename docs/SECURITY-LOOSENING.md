@@ -1681,8 +1681,8 @@ count is above `0` (vault BACKLOG #2613).
   unexpired endpoint certificate is then accepted unless something outside the engine stops it, and the API key
   crosses to whoever holds it. **Setting the flag adds no check on the wire.**
 - **What the attestation can truthfully rest on:** not on the engine. Since BACKLOG #5527 a set
-  `[tls].crl_file` is checked on this hop where the first bullet says, for example an off-box
-  endpoint on an engine started by `serve`, and there it is the other way across under
+  `[tls].crl_file` is checked on this hop where the first bullet says, for example a
+  non-loopback endpoint on an engine started by `serve`, and there it is the other way across under
   `enforce`, so prefer it where you hold the CRL of the endpoint certificate's
   issuer. It is instance-wide: once set, a non-loopback endpoint it reaches whose issuer has no CRL
   in that file fails its handshake, and this flag does not change that.

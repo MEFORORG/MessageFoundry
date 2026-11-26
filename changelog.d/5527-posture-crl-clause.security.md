@@ -3,7 +3,8 @@
   loopback relay gets no CRL whatever that file says, and nor does a sink whose caller hands it no
   `[tls]` policy. `GET /security/posture`, the serve-start warning and `security show` now print
   the three conditions. The `ai.endpoint_revocation_attested` entry now says how it reads
-  loopback, under which `localhost.` is remote and gets the CRL. See
+  loopback, under which an endpoint URL holding `[::1]` is loopback and `localhost.` is remote,
+  so it gets the CRL where the other two conditions hold. See
   [SECURITY-LOOSENING.md](../docs/SECURITY-LOOSENING.md). (`BACKLOG #5527`)
 - **The `[alerts]` SMTP login refusal no longer offers `[tls].crl_file` on its own to a sink
   built with no `[tls]` policy.** Such a sink gets no CRL whatever that file says. Its refusal

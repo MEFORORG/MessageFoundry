@@ -232,10 +232,12 @@ def _ai_endpoint_opener(
     The anchor is resolved by ``rest.http_family_trust_anchor``, as for every HTTP-family hop, here
     with no ``tls_ca_file`` of its own: ``[tls].internal_ca_file`` under ``augment`` or ``pinned``,
     and ``[tls].crl_file`` in any mode, each only for an endpoint whose host does not read as
-    loopback in the reading :func:`_refuse_an_unrevoked_ai_hop` states, so an endpoint URL holding
-    ``[::1]`` takes neither. So this is where a CRL reaches this hop. An anchor that narrows gets an anchored opener. One that narrows
-    nothing gets rest.py's shared opener, which is never mutated: callers compare an opener to it
-    by identity to learn that.
+    loopback. ``rest.http_family_trust_anchor`` takes the host with ``hop_url_host`` and
+    ``tls_policy.resolve_trust_anchor`` asks ``is_loopback_hop_host`` of it, the same two steps as
+    the reading :func:`_refuse_an_unrevoked_ai_hop` states, so an endpoint URL holding ``[::1]``
+    takes neither file. So this is where a CRL reaches this hop. An anchor that narrows gets an
+    anchored opener. One that narrows nothing gets rest.py's shared opener, which is never
+    mutated: callers compare an opener to it by identity to learn that.
 
     **The anchored opener is held in ``slot``**, though the broker is built for each request: the
     slot holds one, keyed on the resolved anchor. A call whose anchor differs from the one held

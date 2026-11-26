@@ -8,7 +8,8 @@ by a caller that hands it no ``[tls]`` policy gets none either, so ``GET /securi
 the serve-start warning and ``security show`` stated a check that does not run on those paths.
 Item 55 finding 8: the ``[ai]`` entry's loopback condition means the engine's own reading of
 loopback, the one ``ai_broker._refuse_an_unrevoked_ai_hop`` states, under which an endpoint URL
-holding ``[::1]`` is loopback and ``localhost.`` is remote and gets the CRL.
+holding ``[::1]`` is loopback and ``localhost.`` is remote, so it gets the CRL where the other
+two conditions hold.
 
 The text tests pin the entries, the SMTP bullet of docs/SECURITY-LOOSENING.md, and the loopback
 wording of the ``ai_broker`` docstring and the ``AiSettings`` comment. The anchor tests pin,
@@ -114,7 +115,8 @@ def test_the_ai_entry_says_how_loopback_is_read() -> None:
     )
     assert (
         "an endpoint URL holding [::1] and the bare name localhost read as loopback, and at least "
-        "the name localhost with a trailing dot reads as remote and gets the CRL" in entry
+        "the name localhost with a trailing dot reads as remote, so it gets the CRL where the "
+        "other two conditions hold" in entry
     )
     assert "the endpoint host is not loopback as" not in entry
 
@@ -152,10 +154,15 @@ def test_the_ai_source_text_reads_loopback_as_the_code_does() -> None:
     ) in broker
     settings = (_ROOT / "messagefoundry" / "config" / "settings.py").read_text(encoding="utf-8")
     start = settings.index("# Attest that revocation of the AI endpoint's server certificate")
-    comment = settings[start : settings.index("endpoint_revocation_attested:", start)]
+    raw = settings[start : settings.index("endpoint_revocation_attested:", start)]
+    # Joined into one line, so a reflow of the comment does not move a pin.
+    comment = " ".join(line.strip().removeprefix("#").strip() for line in raw.splitlines())
     assert "the endpoint is not loopback" not in comment
     assert "config.tls_policy.is_loopback_hop_host reads it" not in comment
-    assert "transports.ai_broker._refuse_an_unrevoked_ai_hop: config.tls_policy." in comment
+    assert (
+        "In code that reading is stated on transports.ai_broker._refuse_an_unrevoked_ai_hop, and "
+        "in full in docs/SECURITY-LOOSENING.md" in comment
+    )
     assert "the host config.tls_policy.hop_url_host takes from the URL" in comment
     assert "an endpoint URL holding [::1] reads as loopback" in comment
 
