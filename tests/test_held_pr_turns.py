@@ -409,31 +409,31 @@ def test_only_a_lander_seat_id_signs_a_hold(
 def test_a_hold_ack_naming_the_head_keeps_the_turn_the_authors(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    full = _held(110, _ack("2026-10-28T17:00:00Z", _sha(110)))
+    full = _held(110, _ack("2026-10-28T17:45:00Z", _sha(110)))
     # A short, upper-cased SHA with a trailing space and CR, in the hold's own second.
     odd = f"<!-- hold-ack head={_sha(111)[:9].upper()} --> \r\nfixing"
-    at = "2026-10-28T17:00:00Z"
+    at = "2026-10-28T17:45:00Z"
     short = _pr(111, comments=[_hold(at, _sha(111)), _comment(odd, at)])
     rows = _engine_rows(tmp_path, capsys, full, short)
     assert _turn(rows[110]) == ("AUTHOR", ["held", "acked"])
     assert _turn(rows[111]) == ("AUTHOR", ["held", "acked"])
 
 
-def test_an_ack_more_than_two_hours_old_hands_the_turn_to_the_lander(
+def test_an_ack_more_than_thirty_minutes_old_hands_the_turn_to_the_lander(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """NOW is 18:00. An ack 2h+1s old has expired; one 1h59m old, or exactly 2h old, has not. The
-    newest ack decides, and an expired ack on a cut page carries both flags."""
+    """NOW is 18:00. An ack 30m+1s old has expired; one 29m59s old, or exactly 30m old, has not.
+    The newest ack decides, and an expired ack on a cut page carries both flags."""
     rows = _engine_rows(
         tmp_path,
         capsys,
-        _held(115, _ack("2026-10-28T15:59:59Z", _sha(115))),
-        _held(116, _ack("2026-10-28T16:01:00Z", _sha(116))),
-        _held(117, _ack("2026-10-28T16:00:00Z", _sha(117))),
+        _held(115, _ack("2026-10-28T17:29:59Z", _sha(115))),
+        _held(116, _ack("2026-10-28T17:30:01Z", _sha(116))),
+        _held(117, _ack("2026-10-28T17:30:00Z", _sha(117))),
         _held(
             118,
             _ack("2026-10-28T12:30:00Z", _sha(118)),
-            _ack("2026-10-28T17:00:00Z", _sha(118)),
+            _ack("2026-10-28T17:45:00Z", _sha(118)),
         ),
         _cut(_held(119, _ack("2026-10-28T15:00:00Z", _sha(119)))),
         # Controls: rows that would not read AUTHOR acked do not change.

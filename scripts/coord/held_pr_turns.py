@@ -96,10 +96,10 @@ plain-prose acknowledgement, with no marker, is a reply and the Lander's turn. T
 only "still my move"; anything the Lander must read or answer goes in a comment WITHOUT the
 marker, which hands the turn back.
 
-AN ACK EXPIRES 2 HOURS AFTER IT. A row that would read AUTHOR with ``acked`` reads LANDER, flagged
-``ack-expired`` after ``acked``, when its newest qualifying ack is more than ``ACK_TTL`` (2 hours)
-older than the run's ``now``. The hold then counts as unacknowledged. AUTHOR already requires the
-head to start with the hold's SHA, which is how "no author commit since" is read.
+AN ACK EXPIRES 30 MINUTES AFTER IT. A row that would read AUTHOR with ``acked`` reads LANDER,
+flagged ``ack-expired`` after ``acked``, when its newest qualifying ack is more than ``ACK_TTL``
+(30 minutes) older than the run's ``now``. The hold then counts as unacknowledged. AUTHOR already
+requires the head to start with the hold's SHA, which is how "no author commit since" is read.
 
 AUTHOR's turn only when ALL of these hold: the newest Lander event is a marker hold (a same-second
 tie with a non-hold Lander event is no hold); the PR's ``headRefOid`` starts with the marker's SHA,
@@ -246,7 +246,7 @@ after the hold; alone, it kept the turn the author's; beside ``repair``, it came
 transfer; beside ``repair-rehold``, it did not keep the turn, which is still the Lander's);
 ``no-new-commit`` (replied or edited, but the head still matches the marker: the Lander must read
 the reply or edit, but can bounce it fast); ``ack-expired`` (beside ``acked``: the row would read
-AUTHOR, but the newest ack is over 2 hours old, so it is the Lander's; AN ACK EXPIRES);
+AUTHOR, but the newest ack is over 30 minutes old, so it is the Lander's; AN ACK EXPIRES);
 ``page-cut`` (beside ``held``: the row would read AUTHOR or REPAIR, but a comment or review page
 was cut, so it is the Lander's; THE REPAIR CONTRACT);
 ``in-queue`` / ``auto-armed`` (the PR is already in the merge queue or has auto-merge armed).
@@ -291,8 +291,8 @@ CONTEXT_PAGE = 100
 COMMENT_PAGE = 100
 REVIEW_PAGE = 50
 TITLE_WIDTH = 50
-#: How long an author's hold-ack keeps the turn the author's (AN ACK EXPIRES 2 HOURS AFTER IT).
-ACK_TTL = timedelta(hours=2)
+#: How long an author's hold-ack keeps the turn the author's (AN ACK EXPIRES 30 MINUTES AFTER IT).
+ACK_TTL = timedelta(minutes=30)
 
 #: How every Lander comment begins: ``Lander (session <id>)``, or ``Lander (lander-<id>), ``. A
 #: Manager's ``Lander (<id>): ...`` matches neither; WHY THE SIGNATURE IS NARROW says why. Bounded,
@@ -719,7 +719,7 @@ def _row(repo: str, pr: dict[str, Any], read: RepoRead, now: datetime) -> dict[s
     turn, flags, owner = classify(head_oid, events)
     would = turn
     if would == AUTHOR and "acked" in flags and _ack_expired(head_oid, events, now):
-        # An ack says "still my move" for 2 hours; after that the hold reads unacknowledged.
+        # An ack says "still my move" for 30 minutes; after that the hold reads unacknowledged.
         turn = LANDER
         flags.append("ack-expired")
     if would in (AUTHOR, REPAIR) and page_cut(pr):
