@@ -11,9 +11,9 @@ PHI posture: the log stores message **identifiers** (MSH-10 control id, MSH-9 ty
 the partner's MSA-3 ACK text or a transport error string, and either can name a patient, so **every**
 tee DB holds PHI at rest, capture on or off, and must live on a protected volume (on open the file
 and its -wal and -shm are restricted, best-effort and logged when it fails: chmod 0600 on POSIX, a
-DACL granting the opening account alone on Windows; ``_secure_file`` says where what that leaves
-is stated). The optional body capture (``--capture-bodies``) adds raw HL7
-in a separate table and is **off by default**.
+DACL granting the opening account alone on Windows; what that leaves open is stated in
+docs/PHI.md, *Logging inventory*, the tee relay paragraph). The optional body capture
+(``--capture-bodies``) adds raw HL7 in a separate table and is **off by default**.
 """
 
 from __future__ import annotations
