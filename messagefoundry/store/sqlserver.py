@@ -5164,11 +5164,12 @@ class SqlServerStore(ServerCipherWalk):
             if fail_closed:
                 # BACKLOG #5666: at an open, the state read, the re-read probes and the
                 # ALLOW_SNAPSHOT_ISOLATION ALTER run under [store].command_timeout. The RCSI ALTER
-                # does not, at an open or under provision-schema: ROLLBACK IMMEDIATE ends the peers'
-                # transactions rather than waiting on them, and a cancel that lands after it has
-                # rolled them back leaves RCSI off, so the retry at every restart rolls them back
-                # again. The snapshot ALTER can wait on transactions open when it runs, and it is
-                # only warned about, so a limit there turns a stall into that warning.
+                # does not, at an open or under provision-schema. ROLLBACK IMMEDIATE ends the peers'
+                # transactions, but the ALTER still waits for their rollback, so it can stall for
+                # as long as a large rollback takes. It stays unbounded anyway: a cancel that lands
+                # after the rollback leaves RCSI off, so the retry at every restart rolls the peers
+                # back again. The snapshot ALTER can wait on transactions open when it runs, and it
+                # is only warned about, so a limit there turns a stall into that warning.
                 _bound_one_shot(conn, settings.command_timeout)
             await _assert_autocommit(conn)
             # Standalone one-shot connection (NOT pooled), so the EF-6 pool-bleed race `_cursor`
@@ -5192,12 +5193,10 @@ class SqlServerStore(ServerCipherWalk):
                 log.warning("%s", message)
                 return
             off = _options_off(row)
-            # The statement limit `cur` was opened under: the state read's, which is unset (the
-            # driver's no limit) under provision-schema.
-            cur_limit = settings.command_timeout if fail_closed else 0
-            # At an open the snapshot ALTER keeps the state read's limit; provision-schema runs
-            # it with none, as every other statement there.
-            snapshot_limit = cur_limit
+            # The state read's limit, which is unset (the driver's no limit) under
+            # provision-schema. The snapshot ALTER keeps it; `cur_limit` tracks the open cursor's.
+            bounded = settings.command_timeout if fail_closed else 0
+            cur_limit = bounded
 
             async def alter(sql: str, limit: int) -> None:
                 """Run one ALTER under ``limit`` seconds (0 = none) inside its caller's try, so a
@@ -5215,9 +5214,7 @@ class SqlServerStore(ServerCipherWalk):
                         except Exception as exc:  # noqa: BLE001 - the ALTER meets a dead session
                             # A peer's ROLLBACK IMMEDIATE may have killed the session; the cursor
                             # open or the ALTER then fails in the caller's handler.
-                            log.debug(
-                                "options state-read cursor close failed: %s", _options_error(exc)
-                            )
+                            log.debug("options cursor close failed: %s", _options_error(exc))
                     _bound_one_shot(conn, limit)
                     cur_limit = limit
                     cur = await conn.cursor()
@@ -5260,9 +5257,7 @@ class SqlServerStore(ServerCipherWalk):
             if "ALLOW_SNAPSHOT_ISOLATION" in off:
                 try:
                     # ALLOW_SNAPSHOT_ISOLATION is an online change (no exclusivity required).
-                    await alter(
-                        "ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON", snapshot_limit
-                    )
+                    await alter("ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON", bounded)
                 except Exception as exc:  # noqa: BLE001 - non-fatal
                     log.warning(
                         "could not enable ALLOW_SNAPSHOT_ISOLATION on %r (%s); a DBA should run once: %s",
@@ -5756,7 +5751,7 @@ class SqlServerStore(ServerCipherWalk):
         Raises :class:`ServerSchemaMismatchError` naming each one, and logs it at ERROR first. Extras
         are tolerated. :mod:`messagefoundry.store.server_schema_verify` says what is compared and
         what is not. Reads only."""
-        expected = await asyncio.to_thread(_declared_schema)
+        expected = _declared_schema()  # a cache hit: the pre-lock read parsed it off the loop
         tables = sorted(expected.columns)
         column_rows: list[tuple[str, str | None, str | None, ColumnShape | None]] = []
         # `VALUES ()` is a syntax error, so a batch that declared nothing reads nothing.

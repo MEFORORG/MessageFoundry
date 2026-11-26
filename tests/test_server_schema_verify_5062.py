@@ -876,3 +876,6 @@ def test_a_metacharacter_in_an_exec_variable_matches_only_itself() -> None:
     assert not _assigned_and_run(text, spans, "a+", 0)
     assert _assigned_and_run("EXEC(@a+)", _string_spans("EXEC(@a+)"), "a+", 0)  # the control
     assert _assigned_and_run(text, spans, "aaa", 0)  # the control: a plain name still matches
+    for run in ("sp_executesql @a+", "sp_executesql @a+;"):  # the second form matches itself too
+        assert _assigned_and_run(run, _string_spans(run), "a+", 0), run
+    assert not _assigned_and_run("sp_executesql @a+b", _string_spans("sp_executesql @a+b"), "a+", 0)

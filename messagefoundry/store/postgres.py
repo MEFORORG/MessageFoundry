@@ -2795,7 +2795,7 @@ class PostgresStore(ServerCipherWalk):
         Raises :class:`ServerSchemaMismatchError` naming each one, and logs it at ERROR first. Extras
         are tolerated. :mod:`messagefoundry.store.server_schema_verify` says what is compared and
         what is not. Reads only."""
-        expected = await asyncio.to_thread(_declared_schema)
+        expected = _declared_schema()  # a cache hit: the pre-lock read parsed it off the loop
         column_rows: list[tuple[str, str | None, str | None, ColumnShape | None]] = []
         live_columns = await conn.fetch(_LIVE_COLUMNS_SQL, sorted(expected.columns))
         schema = live_columns[0]["schema_name"] if live_columns else None

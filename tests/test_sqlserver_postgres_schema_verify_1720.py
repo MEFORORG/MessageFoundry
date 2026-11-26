@@ -1647,8 +1647,9 @@ async def test_the_batch_is_parsed_off_the_event_loop(
     backend: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Red before #5062's event-loop item: the open parsed the batch on the event loop, tens of
-    milliseconds on a first call that every other task on the loop waited out. Each read the open
-    makes now runs on a worker thread."""
+    milliseconds on a first call that every other task on the loop waited out. The open's first
+    read, the one before the lock, now runs on a worker thread; the live check's read after it is a
+    cache hit and stays on the loop, inside the lock."""
     import sys
     import threading
 
@@ -1670,9 +1671,10 @@ async def test_the_batch_is_parsed_off_the_event_loop(
         assert await _pg_store(_PgConn())._ensure_schema() is True
     else:
         assert await _ms_store(_MsConn())._ensure_schema() is True
-    off_loop = [caller for thread, caller in calls if thread != loop_thread]
-    assert len(off_loop) >= 2, calls  # the control: the pre-lock read and the live check ran
-    assert (loop_thread, module.__name__) not in calls, calls
+    # Off the loop, the caller frame is the executor's; on it, the store's own module.
+    store_reads = [thread for thread, caller in calls if caller != "tests._server_schema_rows"]
+    assert len(store_reads) >= 2, calls  # the control: the pre-lock read and the live check ran
+    assert store_reads[0] != loop_thread, calls
 
 
 def test_a_nextval_default_reads_as_numbered_without_not_null() -> None:
