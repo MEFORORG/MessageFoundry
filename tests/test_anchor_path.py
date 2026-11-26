@@ -842,37 +842,104 @@ def test_an_overlay_anchor_refuses_at_enforce_unless_a_pin_matches(
 
 
 _MOUNT_NOTE = "no location below it passes"
+_FOLDER = "/etc/messagefoundry/"
+_MOUNT_TABLE = {
+    "/srv": (0, D755),
+    "/srv/a.pem": (0, F644),
+    "/etc/x": (0, D755),
+    "/etc/x/a.pem": (0, F644),
+    "/etc/messagefoundry": (0, D755),
+    "/etc/messagefoundry/ca.pem": (0, F644),
+}
 
 
-def test_the_mount_note_is_printed_only_for_a_mount_finding(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The fix's mount note names the mount, and points at the README note, only where a finding
-    says a mount's type is untrusted. A chain whose mount table could not be read is indeterminate
-    too, but moving the anchor can help there, so it gets no such note. Red under a note printed
-    for every POSIX indeterminate refusal."""
-    table = {"/srv": (0, D755), "/srv/a.pem": (0, F644)}
-    overlay = _posix("/srv/a.pem", table, fstype={"/": "overlay"})
-    no_mountinfo = posix_path_verdict(
-        "/srv/a.pem",
+def _no_mountinfo(anchor: str) -> ap.PathVerdict:
+    """The host reader with no mount table: it answers no type for any path."""
+    return posix_path_verdict(
+        anchor,
         cwd="/",
         euid=10001,
-        lstat_fn=lambda q: PosixStat(*{**_ETC, **table}[q]),
+        lstat_fn=lambda q: PosixStat(*{**_ETC, **_MOUNT_TABLE}[q]),
         readlink_fn=lambda q: "",
         fstype_fn=lambda q: None,
     )
-    assert overlay.ok is None and no_mountinfo.ok is None
-    texts = {
-        "overlay": _refusal(tmp_path, monkeypatch, overlay),
-        "no_mountinfo": _refusal(tmp_path, monkeypatch, no_mountinfo),
-    }
-    assert _MOUNT_NOTE in texts["overlay"] and "'/'" in texts["overlay"]
-    assert "docker/README.md" in texts["overlay"]
-    assert "bind mount" in texts["overlay"]
-    # The phrases the note carries; d407e986891 printed its bind-mount clause here too.
-    assert _MOUNT_NOTE not in texts["no_mountinfo"] and "bind mount" not in texts["no_mountinfo"]
-    assert "docker/README.md" not in texts["no_mountinfo"]
-    assert "/etc/messagefoundry/" in texts["no_mountinfo"]
+
+
+@pytest.mark.parametrize(
+    ("mount", "anchor", "fstype"),
+    [
+        ("/", "/srv/a.pem", {"/": "overlay"}),
+        ("/etc", "/etc/x/a.pem", {"/etc": "nfs"}),
+        ("/", "/srv/a.pem", None),
+        ("/", _FOLDER + "ca.pem", None),
+    ],
+    ids=["overlay-root", "nfs-etc", "no-mountinfo", "no-mountinfo-in-the-folder"],
+)
+def test_a_mount_above_the_suggested_folder_leaves_no_folder_to_move_to(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mount: str,
+    anchor: str,
+    fstype: dict[str, str] | None,
+) -> None:
+    """Where the mount the check cannot vouch for also holds /etc/messagefoundry/, as an overlay
+    '/' does, the fix says no location below that mount passes, then the pin for an anchor whose
+    consumer loads the verified bytes, then that a by-path anchor has no fix at enforce, with the
+    README pointer, and never offers that folder. An unread mount table (``fstype`` None) is the
+    same case: the host reader then answers no type for any path, so the folder answers
+    indeterminate too, and the finding names '/'. Red under the fix that led with
+    /etc/messagefoundry/ for each of them."""
+    v = _no_mountinfo(anchor) if fstype is None else _posix(anchor, _MOUNT_TABLE, fstype=fstype)
+    assert v.ok is None and [(f.path, f.mount) for f in v.findings] == [(mount, True)]
+    pinned = _refusal(tmp_path, monkeypatch, v, pin_setting="[x].pin")
+    by_path = _refusal(tmp_path, monkeypatch, v, loads_verified_bytes=False)
+    for text, step in ((pinned, "set [x].pin to"), (by_path, "A pin does not help here")):
+        assert _FOLDER not in text and "move the anchor into" not in text, text
+        assert f"the mount at {mount!r}" in text, text
+        order = [text.index(s) for s in (_MOUNT_NOTE, step, "docker/README.md")]
+        assert order == sorted(order), text
+    assert "at enforce it has no fix" in by_path
+
+
+def test_an_insecure_path_under_such_a_mount_is_not_told_to_move(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same rule for an insecure finding: fix it in place, and say why moving cannot help.
+    Red under the fix that led with /etc/messagefoundry/."""
+    table = {**_MOUNT_TABLE, "/srv": (0, D777)}
+    v = _posix("/srv/a.pem", table, fstype={"/": "overlay"})
+    assert v.ok is False
+    text = _refusal(tmp_path, monkeypatch, v, pin_setting="[x].pin")
+    assert "  chmod go-w /srv" in text and _FOLDER not in text
+    assert "the mount at '/'" in text
+    order = [text.index(s) for s in (_MOUNT_NOTE, "set [x].pin to", "docker/README.md")]
+    assert order == sorted(order), text
+
+
+def test_a_mount_below_the_suggested_folder_names_itself_and_keeps_the_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mount that does not hold /etc/messagefoundry/: moving the anchor can still help, so the
+    fix offers that folder, and its note names the mount."""
+    v = _posix("/srv/a.pem", _MOUNT_TABLE, fstype={"/srv": "nfs"})
+    text = _refusal(tmp_path, monkeypatch, v)
+    assert "The mount at '/srv'" in text and _MOUNT_NOTE in text and _FOLDER in text
+    assert "docker/README.md" in text and "bind mount" in text
+
+
+def test_the_mount_note_names_only_a_mount_the_message_lists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """At warn, an insecure path whose chain also crosses an untrusted mount, with an ACL that
+    could not be read: the ACL's warning lists no path finding, so its fix names no mount. Red
+    under the note built from every finding."""
+    table = {**_MOUNT_TABLE, "/srv": (0, D777)}
+    v = _posix("/srv/a.pem", table, fstype={"/srv": "nfs"})
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: None)
+    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: v)
+    ta.enforce_anchor(AnchorSpec("t", "[x]", str(_pem(tmp_path)), None), enforcing=False)
+    acl = [r.message for r in caplog.records if "could not settle" in r.message]
+    assert len(acl) == 1 and "'/srv'" not in acl[0] and _MOUNT_NOTE not in acl[0], acl
 
 
 def test_posix_unknown_mount_table_is_indeterminate() -> None:
@@ -1152,11 +1219,26 @@ def test_path_arm_runs_beside_the_file_arm(tmp_path: Path, monkeypatch: pytest.M
         ta.enforce_anchor(spec, enforcing=True)
 
 
-def _refusal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verdict: ap.PathVerdict) -> str:
+def _refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    verdict: ap.PathVerdict,
+    *,
+    pin_setting: str | None = None,
+    loads_verified_bytes: bool = True,
+) -> str:
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: verdict)
+    spec = AnchorSpec(
+        "t",
+        "[x]",
+        str(_pem(tmp_path)),
+        None,
+        pin_setting,
+        loads_verified_bytes=loads_verified_bytes,
+    )
     with pytest.raises(TrustAnchorError) as err:
-        ta.enforce_anchor(AnchorSpec("t", "[x]", str(_pem(tmp_path)), None), enforcing=True)
+        ta.enforce_anchor(spec, enforcing=True)
     return str(err.value)
 
 

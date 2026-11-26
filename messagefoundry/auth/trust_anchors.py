@@ -1658,7 +1658,49 @@ def _ps_quote(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
-def _path_fix(verdict: AnchorVerdict) -> list[str]:
+#: The folder a POSIX fix suggests moving an anchor into.
+_POSIX_FOLDER = "/etc/messagefoundry/"
+_OVERLAY_NOTE = (
+    "the overlay note under 'Residuals / gotchas' in docker/README.md, in the MessageFoundry source"
+)
+
+
+def _mount_over_folder(verdict: AnchorVerdict) -> str | None:
+    """A mount a finding says the check cannot vouch for that also holds :data:`_POSIX_FOLDER`,
+    such as an overlay ``/`` in a container, or ``/`` where the mount table could not be read. No
+    location below it passes, so a fix must not offer to move the anchor there."""
+    for f in _findings(verdict, insecure=False):
+        if f.mount and (f.path == "/" or _POSIX_FOLDER.startswith(f.path.rstrip("/") + "/")):
+            return f.path
+    return None
+
+
+def _pin_offer(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
+    pin = f"set {spec.pin_setting} to" if spec.pin_setting else "pin it to"
+    return (
+        f"{pin} the {ANCHOR_DIGESTS[ANCHOR_DIGEST].title} of the CA you mean to trust; this file's "
+        f"is {ANCHOR_DIGEST}:{verdict.fingerprint}. Check it against the CA first. With a matching "
+        "pin the engine loads exactly those bytes, so it may load them without this check."
+    )
+
+
+def _past_the_mount(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
+    """What is left where :func:`_mount_over_folder` found a mount: a pin, and only for an anchor
+    whose consumer loads the verified bytes."""
+    if spec.loads_verified_bytes:
+        return (
+            f"What is left is a pin: {_pin_offer(spec, verdict)} Where that mount is an overlay '/' "
+            f"in a container, {_OVERLAY_NOTE}, says more."
+        )
+    return (
+        "A pin does not help here: this anchor is read again by path when it is used, so a pin "
+        "cannot vouch for the bytes loaded, and at enforce it has no fix while that mount stays "
+        f"untrusted. Where that mount is an overlay '/' in a container, {_OVERLAY_NOTE}, names the "
+        "follow-up that would change this."
+    )
+
+
+def _path_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> list[str]:
     """The fix, as commands, for each insecure finding that a command can fix. The message must
     carry its own fix, as the file arm's (:func:`_acl_message`) does: the runbook that message once
     cited ships in neither a checkout nor a wheel.
@@ -1712,7 +1754,15 @@ def _path_fix(verdict: AnchorVerdict) -> list[str]:
             cmds.append(f"  chown -h root {q}")
         if any(f.writable for f in here):
             cmds.append(f"  chmod go-w {q}")
-    lead = move + "can change, such as a root-owned 755 folder like /etc/messagefoundry/."
+    mount = _mount_over_folder(verdict)
+    if mount is not None:
+        return [
+            f"Fix it in place, since the check cannot vouch for the mount at {mount!r}, so no "
+            "location below it passes:",
+            *cmds,
+            f"Even then the check cannot settle the anchor. {_past_the_mount(spec, verdict)}",
+        ]
+    lead = move + f"can change, such as a root-owned 755 folder like {_POSIX_FOLDER}."
     return [lead + " Or, to fix it in place:", *cmds] if cmds else [lead]
 
 
@@ -1728,7 +1778,7 @@ def _path_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
             f"The check trusted the account it ran as ({check.engine}) as the engine's own. Run "
             "it as the account the service runs as, or it can answer differently."
         )
-    return "\n".join(lines + _path_fix(verdict))
+    return "\n".join(lines + _path_fix(spec, verdict))
 
 
 def _indeterminate_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
@@ -1748,24 +1798,31 @@ def _indeterminate_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
 
 
 def _indeterminate_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
-    """The two ways out of an indeterminate read: a folder the engine can read, or a pin. The pin is
+    """The two ways out of an indeterminate read: a folder the engine can read, or a pin. Under a
+    mount :func:`_mount_over_folder` finds, no folder is offered. The pin is
     offered with this file's own digest, and with the warning that goes with it: pinning bytes the
     engine could not vouch for is only as good as the operator's check of them."""
     check = verdict.path_check
     windows = check.platform == "windows" if check is not None else os.name == "nt"
+    mount = _mount_over_folder(verdict)
+    if mount is not None:
+        return (
+            f"Fix: the check cannot vouch for the mount at {mount!r}, so no location below it "
+            f"passes, and moving the anchor does not help. {_past_the_mount(spec, verdict)}"
+        )
     folder = (
         "the engine's data folder under C:\\ProgramData"
         if windows
-        else "a root-owned 755 folder like /etc/messagefoundry/ on a file system the check trusts"
+        else f"a root-owned 755 folder like {_POSIX_FOLDER} on a file system the check trusts"
     )
-    # Only a finding that a mount's type is untrusted makes every folder below it fail; an
-    # unread mount table or ACL does not, so moving the anchor can still help there.
-    mounts = [f.path for f in _findings(verdict, insecure=False) if f.mount]
+    # A mount below the suggested folder: moving can help, and this note names that mount. It is
+    # printed only where the message lists the path's findings, so it names no mount it never did.
+    listed = _findings(verdict, insecure=False) if verdict.path_ok is None else []
+    mounts = [f.path for f in listed if f.mount]
     note = (
-        f" The mount at {mounts[0]!r} is one the check cannot vouch for, such as an overlay '/' in "
-        "a container: no location below it passes, and a bind mount below it does not help "
-        "either, since the check still reads that mount. The overlay note under 'Residuals / "
-        "gotchas' in docker/README.md, in the MessageFoundry source, says more."
+        f" The mount at {mounts[0]!r} is one the check cannot vouch for: no location below it "
+        "passes, and a bind mount below it does not help either, since the check still reads that "
+        f"mount. For an overlay mount, {_OVERLAY_NOTE}, says more."
         if mounts
         else ""
     )
@@ -1775,13 +1832,9 @@ def _indeterminate_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
             f"{folder}.{note} A pin does not help here: this anchor is read again by path when it "
             "is used, so a pin cannot vouch for the bytes loaded."
         )
-    pin = f"set {spec.pin_setting} to" if spec.pin_setting else "pin it to"
     return (
         f"Fix: move the anchor into a folder whose permissions the engine can read, such as "
-        f"{folder}.{note} Or {pin} the {ANCHOR_DIGESTS[ANCHOR_DIGEST].title} of the CA you mean to "
-        f"trust; this file's is {ANCHOR_DIGEST}:{verdict.fingerprint}. Check it against the CA "
-        "first. With a matching pin the engine "
-        "loads exactly those bytes, so it may load them without this check."
+        f"{folder}.{note} Or {_pin_offer(spec, verdict)}"
     )
 
 

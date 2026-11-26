@@ -62,8 +62,10 @@ class ChainFinding:
     names the Windows principals the finding is about, so the fix text can remove them. ``owner``
     marks a finding about who owns the object rather than about a grant. ``writable`` marks a POSIX
     finding about group or other write bits, so its fix is the chmod alone and never a chown.
-    ``mount`` marks a POSIX finding that a mount's type is outside :data:`POSIX_TRUSTED_FS`, so the
-    fix text can say that no location below that mount passes."""
+    ``mount`` marks a POSIX finding that a mount's type is outside :data:`POSIX_TRUSTED_FS`, or
+    could not be read, so the fix text can say that no location below it passes. A type that could
+    not be read names the first object the walk reached, ``/`` on a host with no mount table, where
+    no path's type can be read."""
 
     path: str
     kind: str
@@ -889,7 +891,11 @@ def posix_path_verdict(
                 fs_seen.add("?")
                 findings.append(
                     ChainFinding(
-                        obj, kind, False, "the type of the file system under it is unknown"
+                        obj,
+                        kind,
+                        False,
+                        "the type of the file system under it is unknown",
+                        mount=True,
                     )
                 )
         elif mounted[1] not in POSIX_TRUSTED_FS and mounted[0] not in fs_seen:
