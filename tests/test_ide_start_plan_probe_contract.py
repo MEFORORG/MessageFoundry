@@ -47,9 +47,15 @@ def _code_view(text: str) -> str:
     return " ".join(blank_js_comments(text).split())
 
 
+# A declaration of ``name`` in the code view: a function, const, let or var of that name.
+_DECLARES = r"\b(?:function|const|let|var)\s+{name}\b"
+
+
 def _ts_string_const(name: str) -> str:
-    """The value of ``export const <name> = "...";`` in the IDE's control model."""
-    m = re.search(rf'export const {name} = "([^"]+)";', _MODEL.read_text(encoding="utf-8"))
+    """The value of ``export const <name> = "...";`` in the IDE's control model, read from the code
+    view so a comment quoting the constant cannot supply it."""
+    code = _code_view(_MODEL.read_text(encoding="utf-8"))
+    m = re.search(rf'export const {name} = "([^"]+)";', code)
     assert m, f"{name} is not a plain string constant in {_MODEL.name}"
     return m.group(1)
 
@@ -72,10 +78,10 @@ def _probe_argv() -> list[str]:
 def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
     """If the TypeScript stops building this argv, the three tests below stop describing the IDE.
 
-    The probe gets ``--service-config`` only when ``connectionServiceConfig`` gives it a value, which
-    it does not with ``messagefoundry.serviceConfig`` at its default; this file's probe runs there,
-    where ``serviceConfigFlag`` (an alias of ``connectionWizardModel.ts``'s ``serviceConfigArgs``)
-    is handed undefined and adds nothing. Comments are blanked first in both files, so a comment
+    The probe forwards the ``serviceConfig`` it is handed, which the mocha suite pins as undefined
+    with ``messagefoundry.serviceConfig`` at its default; this file's probe runs there, where
+    ``serviceConfigFlag`` (an alias of ``connectionWizardModel.ts``'s ``serviceConfigArgs``) is
+    handed undefined and adds nothing. Comments are blanked first in both files, so a comment
     quoting the code cannot satisfy a pin (a string literal still could), and the pin ends at the
     array's close, so an element added after the flag reds it. The array is handed to ``cliArgv``
     (BACKLOG #5409), so its body is pinned too: the interpreter options, then ``-m messagefoundry``,
@@ -99,27 +105,31 @@ def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
         "function cliArgv(module: string, args: readonly string[]): string[] { "
         'return [...INTERPRETER_OPTIONS, "-m", module, ...args]; }' in src
     )
+    assert len(re.findall(_DECLARES.format(name="cliArgv"), src)) == 1, "a second cliArgv"
     # serviceConfigFlag is an alias of connectionWizardModel's serviceConfigArgs, so follow it there:
     # the alias and its import here, and the body there, where undefined (this probe) adds nothing.
-    # Every other mention of either name here must be a call: a second declaration, a parameter, an
-    # `as` rename or a local serviceConfigArgs would each add a mention that is not one.
+    # serviceConfigArgs appears only in the import, unrenamed in either direction, and the alias;
+    # serviceConfigFlag is declared once, by the alias, and is otherwise only called. These catch at
+    # least a const or function shadow, a parameter of that name and a local serviceConfigArgs.
     assert re.search(
-        r'import \{[^}]*\bserviceConfigArgs\b(?! as\b)[^}]*\} from "\./connectionWizardModel";',
+        r"import \{[^}]*(?<!\bas )\bserviceConfigArgs\b(?! as\b)[^}]*\} "
+        r'from "\./connectionWizardModel";',
         src,
     )
     assert "const serviceConfigFlag = serviceConfigArgs;" in src
     assert len(re.findall(r"\bserviceConfigArgs\b", src)) == 2, "only the import and the alias"
-    assert len(re.findall(r"\bserviceConfigFlag\b(?!\()", src)) == 1, "only the alias declares it"
+    assert len(re.findall(_DECLARES.format(name="serviceConfigFlag"), src)) == 1, "a second one"
+    assert len(re.findall(r"\bserviceConfigFlag\b(?!\()", src)) == 1, "a non-call mention"
     wizard_raw = _WIZARD.read_text(encoding="utf-8")
     wizard = _code_view(wizard_raw)
-    # Control: the JSDoc right above serviceConfigArgs is in the file and is blanked from the code.
-    assert "so a value that starts with" in wizard_raw
-    assert "so a value that starts with" not in wizard
+    # Control: the wizard has comments, and comment blanking removed them from the code view.
+    assert "/**" in wizard_raw
+    assert "/**" not in wizard
     assert (
         "export function serviceConfigArgs(serviceConfig: string | undefined): string[] { "
         "return serviceConfig === undefined ? [] :" in wizard
     )
-    assert "username: PROBE_USERNAME, email: PROBE_EMAIL" in src
+    assert "serviceConfig: opts.serviceConfig, username: PROBE_USERNAME, email: PROBE_EMAIL" in src
     assert '[...inv.args, "--json"]' in src
 
 
