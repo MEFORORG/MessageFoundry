@@ -125,6 +125,11 @@ ACCEPTED = [
     "a\u3000b",
     "cl" + chr(0x0131) + ":root",
     chr(0x02F1) + "oidc" + chr(0x02F2),
+    # Letters the module docstring says the reserved-form key does not fold: a t with stroke and a
+    # y with hook, which NFKD does not split into a base and a mark, and a Cyrillic small u.
+    "sys" + chr(0x0167) + "em",
+    "s" + chr(0x01B4) + "stem",
+    "s" + chr(0x0443) + "stem",
     # Controls for LOOKALIKE_DELIMITERS: a lookalike delimiter outside a reserved form.
     "sys\u2236tem",
     "\u2039bob",
@@ -172,6 +177,8 @@ ACCENTED_RESERVED = [
     "cl\xed:root",
     "CL\u0130:root",  # LATIN CAPITAL LETTER I WITH DOT ABOVE
     "<oidc>\u0332",  # trailing COMBINING LOW LINE
+    "s\xffstem",  # precomposed y with diaeresis
+    "syst\xebm",  # precomposed e with diaeresis
 ]
 
 #: What username_refusal answers for a reserved form, and for nothing else.
