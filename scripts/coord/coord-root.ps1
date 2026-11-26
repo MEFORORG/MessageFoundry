@@ -98,34 +98,18 @@ function ConvertFrom-CoordRootBytes {
 function Get-CoordLocalRoot {
     # <git-common-dir>/mefor-coord for the repository at $From, or $null when git cannot say.
     # --path-format=absolute is not optional: the bare form is relative to the caller's cwd.
-    # Git writes the path as UTF-8, and `& git` decodes it with [Console]::OutputEncoding, an OEM code
-    # page on a stock console, so a non-ASCII checkout read back as mojibake (BACKLOG #7571). Reading
-    # the process's own stream as strict UTF-8 matches local_root in the Python twin, and changes no
-    # process-wide encoding. Two things `& git` gave for free are kept by hand: git is found the way
-    # PowerShell finds it, never a git.exe in the process cwd, which a bare name lets CreateProcess
-    # run first; and it runs in PowerShell's location, which is not the process cwd after Set-Location.
+    # BACKLOG #7571, PowerShell half, OPEN: `& git` decodes git's UTF-8 output with
+    # [Console]::OutputEncoding, so a non-ASCII checkout reads back as mojibake on a stock console.
+    # This stays origin/main's read on purpose: mail-drain.ps1, mail-watch.ps1, announce-session.ps1,
+    # prune-merged.ps1 and fleet.ps1 read --git-common-dir with `& git` themselves, so a fix here alone
+    # would name a different local root from theirs. The Python twin, local_root, already decodes strict UTF-8.
     param([string]$From)
     try {
-        $git = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
-        $psi = [System.Diagnostics.ProcessStartInfo]::new($git.Source)
-        # A location deleted under this process is left to the process cwd, as `& git` left it.
-        $loc = (Get-Location -PSProvider FileSystem).ProviderPath
-        if (Test-Path -LiteralPath $loc -PathType Container) { $psi.WorkingDirectory = $loc }
-        if ($From) { $psi.ArgumentList.Add('-C'); $psi.ArgumentList.Add($From) }
-        foreach ($a in 'rev-parse', '--path-format=absolute', '--git-common-dir') { $psi.ArgumentList.Add($a) }
-        $psi.UseShellExecute = $false
-        $psi.RedirectStandardOutput = $true
-        $psi.RedirectStandardError = $true
-        $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false, $true)
-        $proc = [System.Diagnostics.Process]::Start($psi)
-        try {
-            $stderr = $proc.StandardError.ReadToEndAsync()
-            $common = $proc.StandardOutput.ReadToEnd().Trim($script:CoordWs)
-            $proc.WaitForExit()
-            [void]$stderr.GetAwaiter().GetResult()
-            if ($proc.ExitCode -ne 0 -or -not $common) { return $null }
-        } finally { $proc.Dispose() }
-        return (Join-Path $common 'mefor-coord')
+        $gitArgs = @()
+        if ($From) { $gitArgs = @('-C', $From) }
+        $common = & git @gitArgs rev-parse --path-format=absolute --git-common-dir 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $common) { return $null }
+        return (Join-Path ([string]$common).Trim() 'mefor-coord')
     } catch { return $null }
 }
 
@@ -224,11 +208,13 @@ function Get-CoordUncHost {
 function Get-CoordDownServer {
     # The server a down-cache file names, or $null for any other shape. Strict, so this twin reads the
     # file exactly as probe_root does: a JSON object with a string `server`, that key in that case.
-    # -NoEnumerate keeps a top-level array an array, and -ceq never filters one. A file with no
+    # A top-level array is refused by its text, since -NoEnumerate does not exist on Windows PowerShell
+    # 5.1 and pwsh 7 unwraps a one-element array without it; -ceq never filters one. A file with no
     # `server` key is origin/main's shape, which a stale installed hook copy of coord_root.py still
     # writes; its server is read from its string `root`, so its verdict still answers here.
     param([string]$Text)
-    $obj = ConvertFrom-Json -InputObject $Text -NoEnumerate -ErrorAction Stop
+    if ($Text.TrimStart($script:CoordWs).StartsWith('[')) { return $null }
+    $obj = ConvertFrom-Json -InputObject $Text -ErrorAction Stop
     if ($obj -isnot [System.Management.Automation.PSCustomObject]) { return $null }
     $p = @($obj.PSObject.Properties | Where-Object { $_.Name -ceq 'server' })
     if ($p.Count -eq 0) {

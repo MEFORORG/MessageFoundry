@@ -70,7 +70,8 @@ def local_root(start: str | os.PathLike[str] | None = None) -> Path | None:
     args += ["rev-parse", "--path-format=absolute", "--git-common-dir"]
     # Bytes, decoded here: text=True decodes with the ANSI code page on Windows, where git writes
     # UTF-8, so a non-ASCII checkout path read as mojibake or killed the reader thread (BACKLOG #7571).
-    # Strict UTF-8 on Windows, as Get-CoordLocalRoot reads it.
+    # Strict UTF-8 on Windows. Get-CoordLocalRoot still reads it with `& git`, so the PowerShell half of
+    # #7571 stays open and the twins disagree on a non-ASCII checkout, as on main.
     try:
         proc = subprocess.run(args, capture_output=True, check=False)  # nosec B603 B607 - fixed argv, no shell
     except OSError:
