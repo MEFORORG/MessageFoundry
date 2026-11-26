@@ -6797,9 +6797,8 @@ class AuditAnchorError(ValueError):
 
 def read_audit_anchor_file(path: str | Path) -> str:
     """Read an anchor file into the text :func:`parse_audit_anchor` takes. Raises at least
-    ``OSError``, ``UnicodeDecodeError``, and ``ValueError`` for a path carrying a NUL character.
-    Both callers catch only the first two, so the third escapes each of them;
-    ``Engine._load_audit_anchor`` says what that does at startup.
+    ``OSError``, ``UnicodeDecodeError``, and ``ValueError`` for a path carrying a NUL character;
+    ``Engine._load_audit_anchor`` says what the third does at startup.
 
     ``utf-8-sig`` absorbs a leading BOM: PowerShell 5.1's ``Set-Content -Encoding utf8`` writes UTF-8
     WITH one, and this product deploys as a Windows service, so that is a first-class way an operator

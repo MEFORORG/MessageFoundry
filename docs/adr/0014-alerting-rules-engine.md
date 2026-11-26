@@ -237,11 +237,11 @@ install. All three shipped defaults are unchanged and byte-identical.
   after which keying is automatic. **Residual (accepted):** lever (B) depends on store encryption being
   on (off by default), so 16.4.2 is **Partial** until the WP #243 needle-mover turns encryption on —
   tamper-evident today, forgery-evident once keyed. **A second residual on lever (A), added 2026-08-04
-  ([BACKLOG #328](../BACKLOG.md)):** without `[integrity].audit_anchor_file` it is a *bare* walk, so it
-  cannot see a truncated tail (the surviving prefix still chains cleanly), whatever the keying state.
-  Setting that file gives the startup walk an anchor, compared as a prefix (`docs/CONFIGURATION.md`,
-  `[integrity]`); `messagefoundry audit-verify --expected-anchor` compares one against a quiesced chain.
-  Do not read (A) with no anchor file as covering deletion of the newest rows.
+  ([BACKLOG #328](../BACKLOG.md)):** it is a *bare* walk unless `[integrity].audit_anchor_file` supplies an
+  anchor it can use (`docs/CONFIGURATION.md`, `[integrity]`), and a bare walk cannot see a truncated
+  tail (the surviving prefix still chains cleanly), whatever the keying state. The operator lever for
+  an exact seal is `messagefoundry audit-verify --expected-anchor`, run against a quiesced chain. Do
+  not read (A) as covering deletion of the newest rows.
 
 Each control is **A → Partial (accepted) / B → Pass** — none reaches an unconditional loopback
 (Posture-A) Pass; the exposed-deployment Pass is the instructed configuration above. This ADR does not
