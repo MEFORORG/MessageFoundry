@@ -1410,8 +1410,7 @@ on the store-file ACL plus the volume/whole-DB layer for the rest.
   30 min / absolute 12 h), not by the RetentionRunner. The same pass deletes `session_lineage` links
   (two token hashes and a time, vault BACKLOG #3028) whose age on the store's clock is past the
   window the sign-in supersession follows them for plus the reaper's step tolerance (600 s). That
-  is a minimum age, not a deadline: passes run about hourly, and one that skips or fails deletes no
-  link.
+  is a minimum age, not a deadline.
 - `processed_files` — an age/count prune driven from the wiring runner, also outside the RetentionRunner.
 - `state.namespace` / `state.key` — removed with their value on `[retention].state_max_age_days`.
 - `reference.*` — **no purge path**; replaced only by the next sync's build-new-then-flip.

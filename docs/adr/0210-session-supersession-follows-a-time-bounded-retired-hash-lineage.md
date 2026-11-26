@@ -79,8 +79,7 @@ record as accepted.
 - **AC-5** -- THE SYSTEM SHALL read the lineage only from the supersession, on every backend.
   -> `tests/test_session_supersession_lineage.py::test_only_the_rotation_the_supersession_and_the_purge_touch_the_lineage`
 - **AC-6** -- THE SYSTEM SHALL NOT delete a link until its age on the store's clock exceeds the
-  window plus the reaper's step tolerance (Amendment B). A reaper pass deletes the older links its
-  purge sees, and a pass that skips or fails can delete none.
+  window plus the reaper's step tolerance (Amendment B).
   -> `tests/_session_rotation_contract.py` (`assert_session_lineage_contract`, run on all three
   backends),
   `tests/test_session_supersession_lineage.py::test_the_reaper_purges_links_by_the_window_it_is_given`,
@@ -108,7 +107,7 @@ so `logout` and `revoke_own_session` (#3029) can follow the same links by passin
 **Negative** -- For the length of the window, a retired token gains one power: presented at a
 sign-in that succeeds, it ends the session it became. It cannot open or extend one.
 `docs/SECURITY.md` states this. Each rotation writes one more row, for the reaper to delete
-(AC-6); while every pass skips or fails, the rows accumulate.
+(AC-6).
 
 **Stated limits** -- An elevation that finished longer ago than the window, such as one a second
 holder of the token completed earlier, is not followed, and neither is a sign-in that runs past the
