@@ -2006,11 +2006,8 @@ async def test_a_non_uv_passkey_is_never_weaker_than_a_code_completing_the_same_
             "grant_spendable_from_b": True,
         }
         # The non-UV passkey matches it on everything but the window, which it shuts: stricter.
+        # The two exact matches pin every key, so no key can read more permissive for the tap.
         assert by_tap == {**by_code, "window_open": False}
-        for key in ("window_open", "grant_spendable_from_b"):
-            assert not (by_tap[key] and not by_code[key]), key  # never more permissive
-        signal = "new_address_signal_from_b"  # here the permissive answer is False
-        assert not (by_code[signal] and not by_tap[signal]), signal
     finally:
         await store.close()
 

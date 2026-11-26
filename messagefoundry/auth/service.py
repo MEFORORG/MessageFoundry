@@ -4327,9 +4327,13 @@ class _SealCheck:
         return self.user is not None or self.failed
 
 
-#: How many times :meth:`AuthService.checked_user` and :meth:`AuthService.list_checked_users` check
-#: an account by id while each check races a write that deletes or re-keys the row (BACKLOG #5520).
-#: What happens once every pass has raced is :meth:`AuthService._checked_by_id`'s to say.
+#: How many times a checked read of an account by id checks it while each check races a write that
+#: deletes or re-keys the row (BACKLOG #5520). Read by at least :meth:`AuthService.checked_user`,
+#: :meth:`AuthService.list_checked_users` and the directory sign-in's settled read,
+#: ``AuthService._lookup_user_settled`` (vault BACKLOG #3085 item 7), which reads again on a failed
+#: check too. What happens once every pass has raced is each reader's to say: the settled read
+#: answers refused and reports only what each ``_verified`` check reported, while
+#: :meth:`AuthService._checked_by_id` reports a seal failure.
 _CHECKED_READ_PASSES: Final = 3
 
 
@@ -8695,12 +8699,21 @@ class AuthService:
         return synced.result, held
 
     async def _lookup_user_settled(self, user_id: str) -> _UserLookup:
-        """:meth:`_lookup_user`, read once more when the first read is refused: ``_lookup_user``
-        also reads a row deleted or re-keyed between its row and role reads as refused, so the
-        second read decides."""
-        stored = await self._lookup_user(user_id)
-        if stored.refused:
+        """:meth:`_lookup_user`, read again while it is refused, up to
+        :data:`_CHECKED_READ_PASSES` reads in all: ``_lookup_user`` also reads a row deleted or
+        re-keyed between its row and role reads as refused, and two honest role writes committing
+        across one check's reads can fail it, so a later read decides. Refused on every read is
+        refused, which fails closed.
+
+        It backs at least the directory sign-in's role re-read and pre-mint read, and the role
+        read-back the sign-in and the reconciler share (:meth:`_roles_read_back`). Vault BACKLOG
+        #3085 item 7: this read at most twice, so contention on two reads refused the sign-in as a
+        seal failure; :meth:`_checked_by_id`, which the admin reads use, allows
+        :data:`_CHECKED_READ_PASSES` checks. What each read raises still raises."""
+        for _pass in range(_CHECKED_READ_PASSES):
             stored = await self._lookup_user(user_id)
+            if not stored.refused:
+                break
         return stored
 
     async def _roles_read_back(
@@ -18660,8 +18673,12 @@ class AuthService:
     ) -> Elevation:
         """Validate a TOTP code (or a single-use recovery code) for the caller's session and, on
         success, mark the session's second factor satisfied and re-key the session (ASVS 7.2.4).
-        Always audited; the API gates this behind the login rate limiter. Returns a not-``ok``
-        :class:`Elevation` (never raises) for any invalid input.
+        Not every refusal writes an ``auth.mfa_failed`` row: at least a missing token, and at the
+        first read a session or account gone, an account disabled or an account with TOTP off (the
+        ``totp_enabled`` check), return before any such row. The JSON route gates this behind the
+        login rate limiter; the console's code legs draw the per-actor ceremony budget
+        (``allow_reauth_attempt``) instead. Returns a not-``ok`` :class:`Elevation` (never raises)
+        for any invalid input.
 
         This is the leg the 7.2.4 verb is really about: without the rotation, a pre-MFA token captured
         before the second factor would be elevated in place to a fully authenticated session on a
@@ -18697,7 +18714,8 @@ class AuthService:
         #2142, ADR 0142 Amendment F). It still marks a pending factor met and rotates the session,
         but it neither stamps ``reauth_at`` nor re-anchors the session's address: that session steps
         up, and moves its anchor, only at the IdP (:meth:`complete_oidc_step_up`). On such a session
-        that has already met its factor the code would do nothing, so it is refused unread with
+        that has already met its factor, on an account with TOTP on (the ``totp_enabled`` check
+        comes first), the code would do nothing, so it is refused unread with
         ``idp_step_up_required`` (:meth:`_code_owes_nothing_to_oidc_session`). Every other
         session's code opens the window as before.
 

@@ -303,6 +303,15 @@ this line.**
 
 ### Fixed
 
+- **A refused code on a verified session no longer lands as a success does, except at least for a
+  code within the length bound on an `oidc` session with TOTP enrolled (vault BACKLOG #2964 item
+  21).**
+  `POST /ui/mfa` on a session that had already met its second factor sent a refused code to `/ui`,
+  the same landing a success gets, so the refusal showed nothing. It now lands on
+  `/ui?m=mfa_code_refused`, whose banner says the session needed no code and the code was not
+  accepted. An `oidc` session that met its factor, on an account with TOTP enrolled, does not get
+  the notice for a code within the form's length bound: that code is refused unread
+  (`idp_step_up_required`, ADR 0142 Amendment F) and still lands on a bare `/ui`.
 - **A passkey whose stored id cannot be read gets its own notice.** The engine's passkey begin leg
   now raises `StoredPasskeysUnreadable` for an account whose passkeys under this origin all have a
   stored credential id that does not decode; before, the decode error escaped as a 500. Every

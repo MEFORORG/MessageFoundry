@@ -2019,17 +2019,22 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return RedirectResponse("/ui", status_code=303)
         if await auth.mfa_satisfied(token):
             # A session that already met its factor owes this page nothing, as the GET says, so
-            # its refused code lands on /ui rather than on a gate re-rendered for it. verify_mfa
-            # has already audited and charged any code within the bound. The re-render below is
-            # pending-only.
-            return RedirectResponse("/ui", status_code=303)
+            # its refused code lands on /ui rather than on a gate re-rendered for it. The re-render
+            # below is pending-only. The notice says the code was not accepted (vault BACKLOG #2964
+            # item 21): a bare /ui is what a success lands on, so the refusal read as one. It does
+            # not say the code changed nothing, since verify_mfa above may have audited it and
+            # charged it to the second-step lockout, nor that the code was checked, since at least
+            # a lock, a directory refusal or an account with no TOTP checks none.
+            return RedirectResponse("/ui?m=mfa_code_refused", status_code=303)
         mfa = await auth.mfa_status(identity)
         wa_options, wa_notice = await _reauth_webauthn_state(request, auth, token, mfa, False)
-        # The submitted code is NOT echoed back — it is a bearer credential, and verify_mfa has
-        # already audited the failure of any code within the bound. Generic copy: the form cannot
-        # say whether the code was wrong or expired without narrowing a guess. A directory refusal
-        # narrows nothing, because the code was never checked (BACKLOG #2023), so it says what did
-        # happen.
+        # The submitted code is NOT echoed back — it is a bearer credential. verify_mfa has audited
+        # the failure of a code within the bound, except at least on an account it found with TOTP
+        # off at its first read, for example a passkey-only one, where it returned before any
+        # audit. Generic copy: the
+        # form cannot say whether the code was wrong or expired without narrowing a guess. A
+        # directory refusal narrows nothing, because the code was never checked (BACKLOG #2023),
+        # so it says what did happen.
         return HTMLResponse(
             pages.mfa_gate(
                 totp_enrolled=mfa.enabled,
