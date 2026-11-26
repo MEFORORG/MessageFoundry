@@ -1150,12 +1150,13 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
     # Vault BACKLOG #2964 items 19, 26 and 28: the JSON route has no pre-code ask (pinned above),
     # GET /ui/mfa renders no gate for a satisfied session, and only a passkey that completes the
     # pending factor stamps the window (the anchor pin above).
+    text = " ".join(_doc_text().split())
     for stated in (
         "`POST /auth/mfa-verify` has no such must-change ask",
         "`GET /ui/mfa` sends a session that has met its factor to `/ui`",
         "a user-verified passkey that completes the pending factor, or a step-up",
     ):
-        assert stated in " ".join(_doc_text().split()), f"the doc no longer states: {stated}"
+        assert stated in text, f"the doc no longer states: {stated}"
 
     ceremony = sorted(r for r, fn in routes.items() if _called(fn, "allow_reauth_attempt"))
     assert ceremony == [
@@ -1170,7 +1171,6 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
         "POST /ui/reauth/webauthn",
     ], f"the console routes charging the per-actor ceremony budget changed: {ceremony}"
 
-    text = " ".join(_doc_text().split())
     for retired in (
         # Item 1 of the vault re-read: the console sign-in section named an AD form.
         "shows a sign-in form (Local / Active Directory)",
