@@ -290,7 +290,8 @@ _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 #: beside it is still hidden. The price is that run's own: where such a DSN sits in the run's token,
 #: the run takes it, as it did before #5386. The query arm is ``logging_setup._CREDENTIAL_QUERY_KEYS``.
 #:
-#: **A source with no arm: no arm reads ``secretscrub._CONNECTION_STRING_MEMBER`` (BACKLOG #5030).**
+#: **A source with no arm: no arm reads ``secretscrub._CONNECTION_STRING_MEMBER`` or
+#: ``secretscrub._CONNECTION_STRING_FIRST_MEMBER`` (BACKLOG #5030).**
 #: A draft that did switched the run off on every text holding ``;<key>=`` with a key ending in one
 #: of that pattern's words (``password``, ``pass``, ``pwd``, ``token`` and the rest), ``;Bypass=1``
 #: among them, so an encoded PHI run beside one printed where the run hid it. Without the arm the

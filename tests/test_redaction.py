@@ -3787,12 +3787,14 @@ def test_the_credential_pattern_matches_every_text_a_credential_filter_changes(
     with monkeypatch.context() as patched:
         patched.setattr(secretscrub, "_CONNECTION_STRING_MEMBER", re.compile(r"(?!)"))
         patched.setattr(secretscrub, "_CONNECTION_STRING_FIRST_MEMBER", re.compile(r"(?!)"))
+        patched.setattr(secretscrub, "_NARROW_MEMBER", re.compile(r"(?!)"))
         without_member = [secretscrub.scrub_credentials(text) != text for text in texts]
     changed = unmatched = escape_only = member_only = 0
     with monkeypatch.context() as patched:
         _start_labels_at_a_word_boundary_alone(patched)
         patched.setattr(secretscrub, "_CONNECTION_STRING_MEMBER", re.compile(r"(?!)"))
         patched.setattr(secretscrub, "_CONNECTION_STRING_FIRST_MEMBER", re.compile(r"(?!)"))
+        patched.setattr(secretscrub, "_NARROW_MEMBER", re.compile(r"(?!)"))
         for text, shipped_changed, escape_changed in zip(
             texts, shipped, without_member, strict=True
         ):

@@ -175,7 +175,6 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from itertools import chain
 
 __all__ = [
     "CREDENTIAL_PLACEHOLDER",
@@ -2032,9 +2031,12 @@ _MEMBER_EXTRA_WORDS = ("token",)
 #   two word characters, and one that holds a key another member could start at
 #   (``Password=a b token=c;``). Its value is left to ``_CREDENTIAL_KV``, so its tail after a space
 #   prints;
-# * a key that holds a word followed by something other than the qualifiers above, such as
-#   ``PasswordHint``, and a key-material label such as ``AccountKey``, which is not one of the
-#   words: ``_KEY_MATERIAL`` hides its value up to a space, and the tail after that space prints;
+# * a key that holds a word followed by something other than one of the qualifiers above, at
+#   least ``PasswordHint``, ``PasswordHash``, ``PasswordEncrypted``, ``TokenKey``, ``Password__2``
+#   (two "_") and ``Password_`` (a "_" and no qualifier), whose whole value prints unless another
+#   pass reads its label, as on ``origin/main``; and a key-material label such as ``AccountKey``,
+#   which is not one of the words: ``_KEY_MATERIAL`` hides its value up to a space, and the tail
+#   after that space prints;
 # * a key holding "." or "-", or a space before its "=" (``;PWD =x``), left to ``_CREDENTIAL_KV``;
 # * on the write-time chain, a member glued to a percent-encoded HL7 run in one token
 #   (``a%7Cb%7Cc;sslpassword=x y``). :mod:`messagefoundry.redaction` runs first and replaces the
@@ -2096,7 +2098,7 @@ _CONNECTION_STRING_MEMBER = re.compile(r"(?i)(;[ \t]*+" + _MEMBER_KEY_RUN + r")=
 _CONNECTION_STRING_FIRST_MEMBER = re.compile(
     r"(?i)(?<![A-Za-z0-9_.\-;])("
     + _MEMBER_KEY_RUN
-    + r")=(?=(?:(?!(?<![\w.\-])"
+    + r")=(?=(?:(?!(?<![A-Za-z0-9_.\-])"
     + _MEMBER_KEY_RUN
     + r"=)(?:[^;'\"\r\n]|(?<=\w)['\"](?=\w)))++;[ \t]*+[A-Za-z0-9_]++=)"
     + _MEMBER_VALUE
@@ -3008,11 +3010,24 @@ def _run(
 #: The group :func:`_keep_label` and ``_AUTH_SCHEME``'s replacement write back masked at their end.
 _BRACED = "braced_tail"
 
-#: A connection-string member's key, ``;<key>=``, as :data:`_CONNECTION_STRING_MEMBER` opens it, for
-#: :func:`_union`, which reads a first member's key where :data:`_CONNECTION_STRING_FIRST_MEMBER`
-#: matches. Built from the same named constants, which the regex scanner resolves;
+#: The member pass as it read before BACKLOG #5030 added item 4: a key right after a ";" that ENDS
+#: in a word. :func:`_union` decides its shortcut on the reading with this pass in place of the two
+#: above (:func:`_narrow_probe_sub`), and reads its key in the member-key fallback
+#: (:data:`_MEMBER_KEY`). Read with the item 4 shapes there, a line that took the shortcut before
+#: reached the fallback, which returned the reading before whole, and a camelCase value printed:
+#: ``accessToken=Abc9;w=1,userPwd='Sec_77;PWD='`` printed ``Sec_77`` (found by code review).
+#: Spelled literally, so the regex scanner reads it.
+_NARROW_MEMBER = re.compile(
+    r"(?i)(;[A-Za-z0-9_]++(?:(?<=password)|(?<=passwd)|(?<=passphrase)|(?<=pass)|(?<=pwd)"
+    r"|(?<=secret)|(?<=credential)|(?<=token)))=" + _MEMBER_VALUE
+)
+#: A connection-string member's key, ``;<key>=``, as :data:`_NARROW_MEMBER` opens it, for
+#: :func:`_union`. Spelled literally, so the regex scanner reads it;
 #: ``tests/test_secretscrub_camelcase_label.py`` holds it to that pattern's own head.
-_MEMBER_KEY = re.compile(r"(?i);[ \t]*+" + _MEMBER_KEY_RUN + "=")
+_MEMBER_KEY = re.compile(
+    r"(?i);[A-Za-z0-9_]++(?:(?<=password)|(?<=passwd)|(?<=passphrase)|(?<=pass)|(?<=pwd)"
+    r"|(?<=secret)|(?<=credential)|(?<=token))="
+)
 
 #: What the reading before did with a character of the line, in :func:`_union`.
 _HIDDEN = b"\x00"
@@ -3146,6 +3161,19 @@ def _probe_sub(pattern: re.Pattern[str], _repl: _Repl, text: str, _tail: str | i
     return text
 
 
+def _narrow_probe_sub(
+    pattern: re.Pattern[str], repl: _Repl, text: str, tail: str | int | None
+) -> str:
+    """:func:`_probe_sub` with the member pass as it read before BACKLOG #5030 added item 4: the
+    first-member pattern skipped, and :data:`_NARROW_MEMBER` probed for the member pattern. The
+    comment on :data:`_NARROW_MEMBER` says why the shortcut is decided on that reading."""
+    if pattern is _CONNECTION_STRING_FIRST_MEMBER:
+        return text
+    if pattern is _CONNECTION_STRING_MEMBER:
+        pattern = _NARROW_MEMBER
+    return _probe_sub(pattern, repl, text, tail)
+
+
 class _Untraceable(Exception):
     """A replacement whose shape :class:`_Trace` does not read."""
 
@@ -3276,14 +3304,14 @@ def _union(
     try:
         # The shortcut is decided on the reading before WITHOUT the widened DSN pass, as it was
         # before BACKLOG #5386 widened that reading. Decided on the widened one, a line where that
-        # pass is the only change, ``redis://:Pw@h failed; userPwd='Sec;PWD='``, left the shortcut,
+        # pass is the only change, ``redis://:Pw@h failed, userPwd='Sec;PWD='``, left the shortcut,
         # reached the member-key branch below and kept the reading before whole, which reads no
         # camelCase label, so ``Sec`` printed where the shipped reading hid it. Unchanged, the
         # shipped reading, which runs the widened pass itself, is the whole answer. The question is
         # whether any pattern matches: until one does the text is unchanged, so a search per
         # pattern, stopping at the first that finds anything, answers it without rewriting.
         try:
-            _run(text, placeholder, folded, _probe_sub, wide=False)
+            _run(text, placeholder, folded, _narrow_probe_sub, wide=False)
         except _Changed:
             pass
         else:
@@ -3307,17 +3335,21 @@ def _union(
         # support bundle's member mask runs over the joined line. Where the shipped reading hid a
         # member key's ";" the reading before printed, that pass would lose the key and print the
         # value it masked on origin/main (found by code review), so the line keeps the reading
-        # before. A first member's key has no ";", so its first character is read instead. Only a
-        # member key: any other ";" a value holds costs the line nothing.
+        # before. Only a member key: any other ";" a value holds costs the line nothing. The key is
+        # the one :data:`_NARROW_MEMBER` reads: read with the shapes BACKLOG #5030 added item 4
+        # admits, a ";" inside a camelCase value (``userPwd='Abc9; PWD=Zz7'``) or a first member a
+        # camelCase value took (``accessToken=Abc9,pwd=Zz7;Server=h``) returned the reading before
+        # whole, which reads no camelCase label, so ``Abc9`` printed (found by code review). Those
+        # shapes masked nothing before item 4, so the bundle reading their key on the shipped
+        # reading or not prints nothing ``origin/main`` hid.
         carried = bytearray(len(text))
         for start, end, origin, _masked in shipped.runs:
             carried[origin : origin + end - start] = b"\x01" * (end - start)
-        for key in chain(
-            _MEMBER_KEY.finditer(text), _CONNECTION_STRING_FIRST_MEMBER.finditer(text)
-        ):
-            at = key.start()
-            if state[at] == _PRINTED[0] and not carried[at]:
+        at = text.find(";")
+        while at != -1:
+            if state[at] == _PRINTED[0] and not carried[at] and _MEMBER_KEY.match(text, at):
                 return old
+            at = text.find(";", at + 1)
     out: list[str] = []
     pos = 0
     hiding = False

@@ -517,6 +517,7 @@ def _without_member_pass(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in ("_CONNECTION_STRING_MEMBER", "_CONNECTION_STRING_FIRST_MEMBER"):
         monkeypatch.setattr(secretscrub, name, _NEVER)
         monkeypatch.setattr(bundle_redact, name, _NEVER)
+    monkeypatch.setattr(secretscrub, "_NARROW_MEMBER", _NEVER)
 
 
 def _printed_where_the_baseline_hid(
@@ -1046,14 +1047,80 @@ def test_the_new_shapes_keep_what_a_later_pass_reads(line: str, masked: str) -> 
         ";password" + "value" * 3,
         " secretvalue",
         "a" + "pass" * 4,
+        # A key glued after a non-ASCII letter: a first-member start, and so a stop too. When the
+        # stop read a Unicode class and the start an ASCII one, this was quadratic (code review).
+        "\u00e9pass=a ",
+        "\u0436pwd=1,",
     ],
 )
 def test_the_new_shapes_scrub_in_linear_time(unit: str) -> None:
-    """About 400 KB of one unit, with and without a ";" after it. The first-member walk stops at the
-    next key a member could start at, so failed starts do not re-read the line."""
-    for tail in ("", ";Server=h"):
+    """About 400 KB of one unit, then a ";" and a second member, or a lone ";", so the member passes
+    run. The first-member walk stops at the next key a member could start at, so failed starts do
+    not re-read the line."""
+    for tail in (";", ";Server=h"):
         line = unit * (400_000 // len(unit)) + tail
         started = time.perf_counter()
         scrub_credentials(line)
         redact_log_line(line)
         assert time.perf_counter() - started < 10.0, (unit, tail)
+
+
+#: Lines where a camelCase label's value holds an item 4 shape, each with what must not print.
+#: Read with the item 4 shapes, the union's member-key fallback or its shortcut probe returned the
+#: reading before whole, which reads no camelCase label, so each printed (found by code review).
+_CAMEL_LINES_ITEM_4_MUST_NOT_PRINT = (
+    ("cfg accessToken=Abc9,pwd=Zz7;Server=h", ("Abc9", "Zz7")),
+    ("cfg accessToken=Abc9,sslpassword=Zz7 Yy8;Server=h", ("Abc9", "Zz7", "Yy8")),
+    ("cfg accessToken=Abc9&sslpassword=Zz7;Server=h", ("Abc9", "Zz7")),
+    ("cfg apiToken=Abc9:pass=Zz7 Yy8;UID=u", ("Abc9", "Zz7", "Yy8")),
+    ("accessToken=Abc9;w=1,userPwd='Sec_77;PWD='", ("Abc9", "Sec_77")),
+    ("x;PasswordOld=Abc9 x,clientSecret='Sec_77;PWD='", ("Abc9", "Sec_77")),
+    ("sslpassword=Abc9;w=1,userPwd='Sec_77;PWD='", ("Abc9", "Sec_77")),
+    ("cfg userPwd='Abc9;PasswordOld=Zz7' rest", ("Abc9", "Zz7")),
+    ("cfg userPwd='Abc9; PWD=Zz7' rest", ("Abc9", "Zz7")),
+    ("cfg userPwd='Abc9;Password2=Zz7' rest", ("Abc9", "Zz7")),
+    ("cfg accessToken='Abc9;\tsslpassword=Zz7' rest", ("Abc9", "Zz7")),
+    ('cfg clientSecret="Abc9; Token=Zz7" rest', ("Abc9", "Zz7")),
+)
+
+
+def _write_time_chain(line: str) -> str:
+    return logging_setup.scrub_log_text(line)
+
+
+@pytest.mark.parametrize(("line", "secrets"), _CAMEL_LINES_ITEM_4_MUST_NOT_PRINT)
+@pytest.mark.parametrize(
+    "apply",
+    [
+        scrub_credentials,
+        _write_time_chain,
+        redact_log_line,
+        lambda line: redact_log_line(_write_time_chain(line)),
+    ],
+    ids=["scrub_credentials", "write-time chain", "redact_log_line", "chain then bundle"],
+)
+def test_a_camelcase_value_holding_an_item_4_shape_prints_nothing(
+    apply: Callable[[str], str], line: str, secrets: tuple[str, ...]
+) -> None:
+    out = apply(line)
+    assert not [secret for secret in secrets if secret in out], out
+
+
+def test_the_union_reads_the_member_key_it_read_before_item_4() -> None:
+    """The fallback and the shortcut probe read :data:`secretscrub._NARROW_MEMBER`'s key, a ";"
+    then a key that ENDS in a word, and not the item 4 shapes, which the control shows they would
+    read if widened."""
+    for key in ("; PWD=", ";\tsslpassword=", ";PasswordOld=", ";Password2="):
+        assert secretscrub._MEMBER_KEY.match(key) is None, key
+        assert secretscrub._CONNECTION_STRING_MEMBER.match(key + "x") is not None, key
+    assert secretscrub._MEMBER_KEY.match(";sslpassword=") is not None
+
+
+@pytest.mark.parametrize(("surface", "apply"), _SURFACES, ids=[name for name, _ in _SURFACES])
+def test_a_mefor_label_after_a_first_member_no_longer_prints(
+    surface: str, apply: Callable[[str], str]
+) -> None:
+    """The open cascade defect ``swallowed-mefor`` printed " pw-A2"; the first-member pass masks
+    it now, so it left that list, and this pins it hidden."""
+    out = apply("cfg password='pw-A1 pw-A2;MEFOR_A=x;MEFOR_B='pw-B1'")
+    assert not [atom for atom in ("pw-A1", "pw-A2", "pw-B1") if atom in out], f"{surface}: {out!r}"

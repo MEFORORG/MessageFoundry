@@ -3658,6 +3658,7 @@ def _secret_passes_only(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in ("_CONNECTION_STRING_MEMBER", "_CONNECTION_STRING_FIRST_MEMBER"):
         monkeypatch.setattr(redact_mod, name, NEVER_MATCHES)
         monkeypatch.setattr(scrub_mod, name, NEVER_MATCHES)
+    monkeypatch.setattr(scrub_mod, "_NARROW_MEMBER", NEVER_MATCHES)
 
 
 #: The two surfaces the differential compares. ``CredentialScrubFilter`` is left out because it runs
