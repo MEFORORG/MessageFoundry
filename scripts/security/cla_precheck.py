@@ -56,10 +56,12 @@ TWO CASES BACKLOG #5645 item 1 names:
     nulls the field it could not resolve and a nulled ``author.user`` would read as an unlinked
     author. One whose path stays inside that commit's ``committer`` leaves only the committer
     unread: the nullable committer stops null propagation there, so rule 1 still judges the
-    author (BACKLOG #5644 added item 1). On the first page, a commit with a git author is still
-    left out of the first page's keys, with a fault, whether that author is linked or not, as
-    before that item. The other commits on the page are judged, so a refusal they prove stands. An error with no such path still faults the whole page, keeping the
-    pages read before it.
+    author (BACKLOG #5644 added item 1). On the first page, such a commit with a git author is
+    still left out of the first page's keys, with a fault, whether that author is linked or not,
+    as before that item; an unlinked one is also refused under rule 1. Such a commit that came back
+    with no commit object, or with no readable ``oid``, contradicts the premise and is unjudged
+    whole. The other commits on the page are judged, so a refusal they prove stands. An error with
+    no such path still faults the whole page, keeping the pages read before it.
   * A head that lags the push event. When ``CLA_HEAD_SHA`` is set and the first page's
     ``headRefOid`` is another commit, the read stops there and is repeated after each wait in
     ``HEAD_RETRY_DELAYS``. If every first page shows another head, the run is a fault and nothing
@@ -134,10 +136,11 @@ EXIT CODES: 0 nothing refused and no fault; 1 refused, with a ``CLA pre-check re
 annotation, whatever fault is reported beside it; 3 a fault caught by this script with nothing
 refused, at least: bad input, network, a reply in the wrong shape, a short read, a head still
 stale after the re-reads, a commit list that does not include ``CLA_HEAD_SHA`` or cannot show that
-it does, a commit with a GraphQL error inside it (inside its ``committer`` alone, only on the
-first page and with a git author), or an exception raised inside ``run``. At least one other path
-exits 1 with no refusal annotation: an error before ``main`` runs, such as at import. The
-interpreter itself exits 2 when it cannot open the script. The workflow tells these apart by the annotation, not the code alone.
+it does, a commit with a GraphQL error inside it (for one inside its ``committer`` alone, the
+partial-error case above says which are faults), or an exception raised inside ``run``. At least
+one other path exits 1 with no refusal annotation: an error before ``main`` runs, such as at
+import. The interpreter itself exits 2 when it cannot open the script. The workflow tells these
+apart by the annotation, not the code alone.
 """
 
 from __future__ import annotations
@@ -467,12 +470,14 @@ def _fetch_pages(
             raise PrecheckFault(
                 "GraphQL returned an error for a commit node the page does not hold"
             )
-        # A committer-only error on a node that came back with no commit object contradicts the
-        # premise the carve-out rests on, so that node is unjudged whole, as before the carve-out,
-        # and its siblings are still judged.
+        # A committer-only error on a node that came back with no commit object, or with no
+        # readable oid (non-null, and outside the committer), contradicts the premise the carve-out
+        # rests on, so that node is unjudged whole, as before the carve-out, and its siblings are
+        # still judged.
         for index in list(committer_errored):
             node = nodes[index]
-            if not isinstance(node, Mapping) or not isinstance(node.get("commit"), Mapping):
+            commit = node.get("commit") if isinstance(node, Mapping) else None
+            if not isinstance(commit, Mapping) or not _SHA.fullmatch(str(commit.get("oid", ""))):
                 committer_errored.discard(index)
                 errored.add(index)
         page: list[Mapping[str, Any]] = []
@@ -564,8 +569,7 @@ def evaluate(
     oids: set[str] = set()
     for index, commit in enumerate(read.commits):
         oid = str(commit.get("oid", ""))
-        unjudged = index in read.tainted or index in read.committer_tainted
-        oids.add(f"slot {index}" if unjudged and not _SHA.fullmatch(oid) else oid)
+        oids.add(f"slot {index}" if index in read.tainted and not _SHA.fullmatch(oid) else oid)
     distinct = len(oids)
     # A FAULT, not a refusal (owner rulings 2026-11-13 and 2026-11-23): GitHub stops the connection
     # at 250 commits while totalCount reports them all (measured; module docstring), so refusing
@@ -602,13 +606,13 @@ def evaluate(
                 slots.append(None)
                 continue
         if index < read.first_page and index in read.committer_tainted:
-            # Left unkeyed with a fault for a linked author too, as origin/main left every errored
-            # first-page commit (PR 3323 hold): an unlinked author's commit is keyed under its
-            # committer's account, which GraphQL could not resolve, and keeping a linked one out
-            # of the keys keeps rule 2's verdict on that author's later-page commits as it was.
-            where = f"commit {oid}" if oid else f"the commit at position {index + 1}"
+            # Left unkeyed with a fault for a linked author too (PR 3323 hold). An unlinked
+            # author's commit is keyed under its committer's account, which the error may have
+            # hidden. Keying a linked one would lean on the unmeasured premise that the error
+            # nulled nothing in the author (module docstring) in the direction that passes a
+            # later-page commit, where rule 1 leans on it only in the direction that refuses.
             faults.append(
-                f"{where}: GraphQL reported an error inside its committer; its key is "
+                f"commit {oid}: GraphQL reported an error inside its committer; its key is "
                 "missing from the first page's keys"
             )
             slots.append(None)

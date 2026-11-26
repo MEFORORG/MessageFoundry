@@ -759,22 +759,43 @@ def test_a_committer_error_past_page_one_still_lets_rule_two_refuse_its_linked_a
     assert verdict.fault is None
 
 
-def test_committer_errored_commits_with_no_oid_count_by_their_slot() -> None:
-    """As for any errored commit, a committer-errored one whose oid is unreadable counts once by its
-    slot, so two of them do not read as one commit and trip the count check."""
+def test_committer_errored_commits_with_no_oid_are_unjudged_and_count_by_their_slot() -> None:
+    """A committer-only error on a commit with no readable oid contradicts the carve-out's premise
+    (oid is non-null and outside the committer), so, as on origin/main, the commit is unjudged with
+    a fault, past page one too, and two of them count once each rather than tripping the count."""
+    octo = {"oid": f"{1:040x}", "author": _OCTO, "committer": _OCTO}
     nodes: list[Mapping[str, Any]] = [
-        {"author": _UNLINKED, "committer": None},
-        {"author": _UNLINKED, "committer": None},
+        {"author": _OCTO, "committer": None},
+        {"author": _OCTO, "committer": None},
     ]
-    page = {
-        **_page(nodes, 2, False),
+    page_two = {
+        **_page(nodes, 3, False),
         "errors": [_node_error(0, "commit", "committer"), _node_error(1, "commit", "committer")],
     }
-    verdict = evaluate(fetch_commits(_serve([page]), "MEFORORG", "MessageFoundry", 7), _ALLOWLIST)
+    read = fetch_commits(
+        _serve([_page([octo], 3, True), page_two]), "MEFORORG", "MessageFoundry", 7
+    )
+    assert read.tainted == frozenset({1, 2}) and read.committer_tainted == frozenset()
+    verdict = evaluate(read, _ALLOWLIST, _no_signatures)
+    assert verdict.refusals == ()
     assert verdict.fault is not None and "distinct commits" not in verdict.fault
-    assert "the commit at position 1: GraphQL reported an error inside its committer" in (
+    assert "the commit at position 2: GraphQL reported an error inside it; not judged" in (
         verdict.fault
     )
+
+
+def test_committer_errored_commits_that_share_an_oid_still_trip_the_count() -> None:
+    """The negative control: committer-errored commits with a readable oid count by that oid, so a
+    repeated one still shows as a short read."""
+    same = {"oid": f"{1:040x}", "author": _OCTO, "committer": None}
+    page = {
+        **_page([same, same], 2, False),
+        "errors": [_node_error(0, "commit", "committer"), _node_error(1, "commit", "committer")],
+    }
+    read = fetch_commits(_serve([page]), "MEFORORG", "MessageFoundry", 7)
+    assert read.committer_tainted == frozenset({0, 1})
+    verdict = evaluate(read, _ALLOWLIST, _no_signatures)
+    assert verdict.fault is not None and "read 1 distinct commits" in verdict.fault
 
 
 @pytest.mark.parametrize("rest", [("user",), ("user", "login"), ()])
