@@ -229,7 +229,8 @@ def build_idp_opener_from_settings(
         enforcing=enforcing,
         crl_file=settings.oidc_tls_crl_file,
         # Vault BACKLOG #5511: the chain check needs the anchor, so it is left out with it. The
-        # leaf flag it carries is still set by the CRL file, which is all that row reads.
+        # leaf flag is still set by the CRL file, which is all that row's guards read; the row
+        # words the chain check from the setting itself (verify.federation.idp_revocation_result).
         crl_check_chain=settings.oidc_tls_crl_check_chain if anchor else False,
     )
 

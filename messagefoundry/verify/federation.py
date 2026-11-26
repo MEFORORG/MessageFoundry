@@ -467,7 +467,10 @@ _REVOCATION_ROW = ("fed.idp_revocation", "IdP hop revocation guard (token + JWKS
 
 
 def _revocation_row(
-    settings: ServiceSettings, opener: urllib.request.OpenerDirector | None
+    settings: ServiceSettings,
+    opener: urllib.request.OpenerDirector | None,
+    *,
+    chain: bool | None = None,
 ) -> CheckResult:
     """Report what the engine's OIDC revocation guard decides for each leg (BACKLOG #1923).
 
@@ -517,9 +520,12 @@ def _revocation_row(
     notes: list[str] = []
     try:
         # Vault BACKLOG #5511: read off the opener's own context, as each guard's crl_checked is,
-        # so the row words the check the engine built rather than the setting.
-        context = opener_tls_context(opener, connector="OIDC identity provider (token + JWKS)")
-        chain = context is not None and context_checks_chain_revocation(context)
+        # so the row words the check the engine built rather than the setting. A caller whose
+        # opener is not the engine's (`check`, built without the anchor and so without the chain
+        # check) passes the engine's chain setting instead.
+        if chain is None:
+            context = opener_tls_context(opener, connector="OIDC identity provider (token + JWKS)")
+            chain = context is not None and context_checks_chain_revocation(context)
         for guard in idp_revocation_guards(settings.auth, opener, posture):
             leg = f"{guard.cell.split(' (', 1)[0]} at {guard.host}"
             disposition = guard.disposition()
@@ -587,7 +593,9 @@ def idp_revocation_result(settings: ServiceSettings) -> CheckResult:
     With no anchor, this context is the engine's, so the failure is the engine's refusal."""
     built = _idp_opener(settings, anchor=False)
     if not isinstance(built, CheckResult):
-        return _revocation_row(settings, built)
+        # The opener left the chain check out with the anchor; the engine's own context sets it
+        # from this setting (vault BACKLOG #5511), so the row words the check from it.
+        return _revocation_row(settings, built, chain=settings.auth.oidc_tls_crl_check_chain)
     if built.status is Status.FAIL and settings.auth.oidc_tls_ca_cert_file:
         return CheckResult(
             *_REVOCATION_ROW,

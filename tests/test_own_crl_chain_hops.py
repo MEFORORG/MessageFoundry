@@ -301,3 +301,26 @@ def test_the_verify_revocation_row_says_the_oidc_legs_check_the_whole_chain(
     assert chained.count("every certificate in its chain") == 2
     assert chained.count("each intermediate") == 2
     assert row_detail(chain=False).count("checks the leaf certificate") == 2
+
+
+def test_the_check_revocation_row_says_the_oidc_legs_check_the_whole_chain(
+    two_tier: _TwoTier,
+) -> None:
+    """``messagefoundry check`` builds its ``fed.idp_revocation`` opener without the anchor, and so
+    without the chain check. The row must still word the check the engine runs from the setting,
+    not the leaf-only context it built for itself."""
+    from messagefoundry.verify.federation import idp_revocation_result
+    from tests.test_verify_federation import _settings
+
+    def row_detail(*, chain: bool) -> str:
+        settings = _settings(
+            oidc_tls_ca_cert_file=str(two_tier.root_file),
+            oidc_tls_crl_file=str(two_tier.revokes_nothing),
+            oidc_tls_crl_check_chain=chain,
+        )
+        return idp_revocation_result(settings).detail
+
+    chained = row_detail(chain=True)
+    assert "leaf" not in chained
+    assert chained.count("every certificate in its chain") == 2
+    assert row_detail(chain=False).count("checks the leaf certificate") == 2
