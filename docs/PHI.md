@@ -434,8 +434,9 @@ than a path is not checked
   local Users group and the logon classes such as INTERACTIVE. It is a list of known groups. It
   does not prove that only the accounts you meant can reach the file. `protect-key
   --grant-account` refuses the same list. A name it is given must resolve to a user account, a
-  well-known account or a computer account; a group, an alias or a domain is refused, and the
-  refusal names the kind the name resolved to. A well-known account here includes SYSTEM, a
+  well-known account or a computer account; a name of any other kind is refused, at least a group,
+  an alias, a domain and one that resolves to no live account, and for a name that resolved the
+  refusal names its kind. A well-known account here includes SYSTEM, a
   virtual service account, and well-known groups Windows reports the same way. Among those, at
   least the broad groups on the list above and an application package are refused, and other
   well-known groups are admitted. A computer account is admitted
@@ -491,9 +492,19 @@ than a path is not checked
 - On POSIX the check refuses at least a key file whose own name is a link, one owned by an account
   other than the engine's own or root, one whose mode has a group or other read or write bit,
   whoever is in the group, and one held in a directory that such an account owns or that a group or
-  other may write without the sticky bit (vault BACKLOG #5636). It reads the owner and mode bits a
-  file system reports and reads no access list itself, so it can pass a key that a network or FUSE
-  file system, or an access list such as an NFSv4 or macOS one, lets another account reach. Check
+  other may write without the sticky bit (vault BACKLOG #5636). Where it can read
+  `/proc/self/mountinfo`, as on Linux, its walk of the key file's path also refuses a path on at
+  least an NFS, CIFS or SMB, 9p, virtiofs or FUSE mount, where something other than the owner and
+  mode bits decides who reaches the file (vault BACKLOG #5657); on Linux, where that file cannot be
+  read, the path is refused. It does not judge mount types where it cannot read that file, for
+  example on macOS and the BSDs, whose mount tables it does not read. The secrets directory's own
+  check refuses such a mount on its path too, under either enforcement setting. The list of types
+  is open: it does not judge at least a type it does not name, the mount at `/`, a mount
+  `/proc/self/mountinfo` does not list, as in a chroot whose root is not a mount, a mount an
+  automounter has not made yet, a network file system beneath an overlay mount, or a file in the
+  secrets directory that is a mount of its own. Keep key files on a local file system. It reads no
+  access list itself, so it can pass a key that a file system of a type it does not judge, or an
+  access list such as an NFSv4 or macOS one, lets another account reach. Check
   those yourself. A directory a group or other account may write is accepted
   when it has the sticky bit, since that bit keeps them from deleting or renaming a file they do
   not own. The engine

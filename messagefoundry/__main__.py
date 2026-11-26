@@ -8937,10 +8937,14 @@ def _store_key_file_gate(settings: ServiceSettings, *, enforcing: bool) -> bool:
     key_file = provider_key_file(settings.store)
     # Off Windows the file cannot be used at all: the key provider refuses it at store open and says
     # so, which is the fault the operator needs to hear about.
-    if key_file is None or not dpapi_available() or not Path(key_file).exists():
+    if key_file is None or not dpapi_available():
         return True
+    # absent_ok, not Path.exists(): a missing name is left to the key provider, but a link to a
+    # missing file, a share that cannot be reached and a file whose status cannot be read are
+    # judged, and refused (vault BACKLOG #5657).
     return _key_file_access_gate(
         key_file,
+        absent_ok=True,
         what="the store key file named by [store].encryption_key_file",
         remedy=(
             "Restrict it to the account the engine runs as, SYSTEM and Administrators, or write "
@@ -8989,7 +8993,9 @@ def _generated_tls_key_remedy(state_dir: Path) -> str:
             "Where it names a link on its path, keep the store where no link above it, or folder "
             "holding or above one, is owned by an account other than root or the engine's own "
             "or may be written by a group or other without the sticky bit, since a new pair would be "
-            "minted in the same place. "
+            "minted in the same place. Where it names a mount type, a part of the key's path is on that "
+            "mount, and a new pair would be minted on it again: set [api].tls_cert_file and "
+            "[api].tls_key_file to a pair of your own on a local file system. "
         )
     else:
         remedy += (

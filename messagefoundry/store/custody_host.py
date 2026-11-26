@@ -230,11 +230,15 @@ def _own_directory_refusal(environ: Mapping[str, str]) -> str | None:
     if not raw or not os.path.lexists(raw):
         # Nothing there: a read finds no file, and a mint refuses the missing directory itself.
         return None
-    from messagefoundry.restricted_file import broad_access_problem
+    from messagefoundry.restricted_file import UncheckedProblem, broad_access_problem
 
     problem = broad_access_problem(Path(raw), directory=True)
     if problem is None:
         return None
+    if isinstance(problem, UncheckedProblem):
+        # The check was not completed, and the owner-and-mode remedy would not clear it (vault
+        # BACKLOG #5657).
+        return f"the custody directory MEFOR_CUSTODY_DIRECTORY names could not be fully checked: {problem}"
     remedy = (
         "Restrict it to SYSTEM and Administrators, with the account the engine runs as allowed to "
         "read it and add a file to it, as docs/SERVICE.md shows"

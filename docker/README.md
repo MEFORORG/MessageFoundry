@@ -117,6 +117,15 @@ docker run --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privile
   -v "$PWD/config:/config:ro" -v mefor-store:/var/lib/mefor ... messagefoundry:<version> serve --config /config --env prod
 ```
 A **Docker-Desktop-on-Windows** bind mount surfaces as `0o777` and **will be refused** — bake instead.
+A **Docker Desktop for Mac** bind mount reports an owner and mode the Mac does not enforce. The
+key-file check finds a key file, such as the TLS key, not restricted on one that surfaces as a
+mount of at least these types: `virtiofs`, `fakeowner`, and `fuse` with its subtypes such as
+`fuse.grpcfuse`. Under the default `enforce` the engine then refuses to start; under `warn` the
+TLS and connection key-file gates print a warning and it starts. `chown` or `chmod` on the Mac
+does not clear the finding. Bake config in there, and
+put TLS material on a named volume, as the `./tls` comment in [`compose.yaml`](compose.yaml) shows.
+The config-source check reads the owner and mode the container sees, so a config mount that passes
+it on a Mac is not thereby shown to be protected.
 Under **rootless Docker or Podman, or userns-remap**, a host root owner appears inside the container
 as an unprivileged uid and is refused; leave the files owned by your own user there, which maps to
 root inside.

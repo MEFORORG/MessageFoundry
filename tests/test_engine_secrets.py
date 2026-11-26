@@ -652,6 +652,33 @@ def test_a_posix_secrets_directory_whose_parent_others_may_write_is_refused(
         open_secrets_directory(_env(directory))
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="a POSIX walk; the mount list is patched")
+def test_a_posix_secrets_directory_on_nfs_is_refused_naming_that_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A secrets directory on an NFS mount is refused, and the refusal names the secrets directory
+    and tells the operator to keep that directory on a local file system. It once told them to
+    move "its store directory", which a secrets directory has none of (vault BACKLOG #5657)."""
+    from messagefoundry import restricted_file
+
+    directory = _directory(tmp_path)
+    assert open_secrets_directory(_env(directory)) is not None  # the control
+    monkeypatch.setattr(
+        restricted_file,
+        "read_mounts",
+        lambda: [("/", "ext4"), (os.path.realpath(tmp_path), "nfs4")],
+    )
+    with pytest.raises(SecretsDirectoryError) as refused:
+        open_secrets_directory(_env(directory))
+    text = str(refused.value)
+    assert text.startswith(
+        f"the secrets directory {SECRETS_DIRECTORY_VARIABLE} names is not restricted: its path is "
+        "on a mount of type nfs4,"
+    ), text
+    assert "keep it, and the folders its path runs through, on a local file system" in text, text
+    assert "store directory" not in text, text
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="a directory junction is a Windows link")
 def test_a_real_directory_junction_on_windows_is_refused_before_anything_follows_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1118,3 +1145,38 @@ def test_a_moved_module_reads_no_secret_straight_from_the_environment(relative: 
 )
 def test_the_census_sees_a_direct_read(planted: str) -> None:
     assert _direct_reads(planted) == ["MEFOR_STORE_VAULT_TOKEN"]
+
+
+def test_a_secrets_directory_that_could_not_be_checked_says_so_with_its_own_remedy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Where the check of the secrets directory could not be made, the refusal says the directory
+    could not be checked, not that it is not restricted, and carries the refusal's own remedy, not
+    the owner-and-mode remedy, which would not clear it (vault BACKLOG #5657). The control is an
+    ordinary finding, which keeps "is not restricted" and that remedy."""
+    from messagefoundry import engine_secrets, restricted_file
+
+    directory = _directory(tmp_path)
+    reason = restricted_file.MOUNT_TABLE_UNREAD
+    monkeypatch.setattr(
+        restricted_file,
+        "broad_access_problem",
+        lambda *a, **k: restricted_file.UncheckedProblem(reason),
+    )
+    with pytest.raises(SecretsDirectoryError) as refused:
+        open_secrets_directory(_env(directory))
+    text = str(refused.value)
+    assert text == (
+        f"the secrets directory {SECRETS_DIRECTORY_VARIABLE} names could not be fully checked: {reason}"
+    ), text
+    assert engine_secrets._REMEDY not in text, text
+
+    monkeypatch.setattr(
+        restricted_file, "broad_access_problem", lambda *a, **k: "Everyone may read it"
+    )
+    with pytest.raises(SecretsDirectoryError) as control:
+        open_secrets_directory(_env(directory))
+    assert str(control.value) == (
+        f"the secrets directory {SECRETS_DIRECTORY_VARIABLE} names is not restricted: "
+        f"Everyone may read it. {engine_secrets._REMEDY}"
+    ), str(control.value)
