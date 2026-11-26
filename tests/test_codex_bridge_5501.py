@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #5501: the Codex bridge over the TRACKED .claude/settings.json, and exit 2 vs exit 1.
+"""Codex bridge tests that pass against origin/main's bridge, kept apart from test_codex_bridge.py.
 
-The dispatch tests use the repository's own settings file rather than a synthetic one, with the
-hook process stubbed, so every hook the repo registers is reached with the argv Claude Code would
-run, a command-only hook with no args included. Exit 1 stays a failed hook, apart from exit 2,
-which blocks and ends the event before any later hook runs.
+BACKLOG #5501: the tracked-settings tests dispatch over the repository's own .claude/settings.json
+rather than a synthetic one, with the hook process stubbed. For each tracked group, probed with a
+Claude Code tool name or event the test picks, they check that the bridge runs exactly the hooks of
+the groups that match, each with the argv Claude Code would run, a command-only hook with no args
+included. A stubbed exit 1 raises CalledProcessError and a stubbed exit 2 raises HookBlocked, so
+the two stay distinct. On this bridge both end the event at once: no later hook runs.
+
+The exit-2 test uses synthetic settings and real hook processes. It came from the withdrawn
+BACKLOG #5496 section of this branch, where it pinned the one fault that change did not let later
+hooks run past.
 """
 
 from __future__ import annotations
@@ -53,12 +59,20 @@ def _settings(root: Path, handlers: list[dict[str, object]]) -> None:
 
 
 def test_a_hooks_exit_2_still_ends_the_event_at_once(bridge: ModuleType, tmp_path: Path) -> None:
-    """As on main: nothing a later hook does outranks a block, so none runs to delay it."""
+    """As on main: an exit 2 raises HookBlocked before the event's later hooks run."""
     ran = tmp_path / "later-hook-ran"
     _settings(tmp_path, [_py("import sys; sys.exit(2)"), _marker(ran)])
     with pytest.raises(bridge.HookBlocked):
-        bridge.dispatch(tmp_path, _PAYLOAD)
+        bridge.dispatch(tmp_path, dict(_PAYLOAD))
     assert not ran.exists()
+
+
+def test_the_marker_hook_is_live_after_a_clean_hook(bridge: ModuleType, tmp_path: Path) -> None:
+    """Positive control for the test above: the same marker runs when the first hook exits 0."""
+    ran = tmp_path / "later-hook-ran"
+    _settings(tmp_path, [_py("import sys; sys.exit(0)"), _marker(ran)])
+    bridge.dispatch(tmp_path, dict(_PAYLOAD))
+    assert ran.exists()
 
 
 _TRACKED: dict[str, Any] = json.loads(
@@ -85,17 +99,38 @@ def _expected_argv(root: Path, hook: dict[str, Any]) -> list[str]:
     return [_BASH, "-c", hook["command"]]
 
 
+_TOOL_EVENTS = ("PreToolUse", "PostToolUse", "PermissionRequest")
+
+
+def _accepts(matcher: str, tool: str) -> bool:
+    return matcher in ("", "*") or re.search(matcher, tool) is not None
+
+
 def _tracked_payloads() -> Iterator[tuple[str, dict[str, Any], dict[str, str]]]:
     """One payload per tracked group, with a tool name its matcher accepts."""
     for event, groups in _TRACKED["hooks"].items():
         for group in groups:
             payload = {"session_id": "x", "hook_event_name": event}
-            if event in ("PreToolUse", "PostToolUse", "PermissionRequest"):
-                matcher = group.get("matcher", "")
-                tools = [t for t in _PROBE_TOOLS if matcher in ("", "*") or re.search(matcher, t)]
+            matcher = group.get("matcher", "")
+            if event in _TOOL_EVENTS:
+                tools = [t for t in _PROBE_TOOLS if _accepts(matcher, t)]
                 assert tools, f"no probe tool name matches {event} matcher {matcher!r}"
                 payload["tool_name"] = tools[0]
+            else:
+                assert matcher in ("", "*"), (
+                    f"give the {event} probe a field matcher {matcher!r} reads"
+                )
             yield event, group, payload
+
+
+def _matched_argvs(root: Path, event: str, payload: dict[str, str]) -> list[list[str]]:
+    """The argv of every hook in every group of the event that the probe's tool name matches."""
+    return [
+        _expected_argv(root, hook)
+        for group in _TRACKED["hooks"][event]
+        if event not in _TOOL_EVENTS or _accepts(group.get("matcher", ""), payload["tool_name"])
+        for hook in group["hooks"]
+    ]
 
 
 def _stub_hooks(
@@ -125,11 +160,13 @@ def test_every_tracked_hook_is_dispatched_with_its_claude_argv(
 ) -> None:
     root = _tracked_repo(tmp_path)
     calls = _stub_hooks(bridge, monkeypatch)
-    for _event, group, payload in _tracked_payloads():
+    for event, group, payload in _tracked_payloads():
         calls.clear()
         bridge.dispatch(root, payload)
         for hook in group["hooks"]:
             assert _expected_argv(root, hook) in calls, (payload, hook)
+        # Exactly the matching groups' hooks, once each: a bridge that over-matches fails here.
+        assert sorted(calls) == sorted(_matched_argvs(root, event, payload)), payload
 
 
 @pytest.mark.parametrize(
