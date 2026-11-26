@@ -1550,8 +1550,8 @@ _RAISE_PATH_AUDIT_FAULTS: dict[str, Callable[[], Exception]] = {
 async def test_a_raise_whose_audit_row_is_refused_still_raises_the_read_fault(
     audit_case: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #3775 added item 9. The ``read_raised`` row is soft: whatever its write raises, the
-    read fault is what raises, and the write's failure is logged. RED when: the audit write's
+    """BACKLOG #3775 added item 9. The ``read_raised`` row is soft: for each ``Exception`` its
+    write raises here, the read fault is what raises, and the write's failure is logged. RED when: the audit write's
     exception replaces the read fault (the helper's ``raised.value is read_fault`` check), turns
     the raise into a return, or goes unlogged; or the logged failure carries the read fault's
     message. Before added item 9 every case failed the logged-failure check: no row was tried.

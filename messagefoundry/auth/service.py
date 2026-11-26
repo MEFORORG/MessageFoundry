@@ -420,10 +420,11 @@ def _passkey_read_errors() -> tuple[type[Exception], ...]:
     :func:`~messagefoundry.store.base.store_call_errors` and
     :func:`~messagefoundry.store.base.store_connect_errors`. Wider than
     :func:`_session_write_errors` by ``ValueError`` and ``RuntimeError``; of the two sets, only the
-    connect set takes pyodbc's ``Error`` root, which pyodbc raises for a deadlock victim. The caller
-    raises ``AUDIT_WRITE_DEFECTS`` although these sets take them, and so does every other class
-    that reaches the catch, ``sqlite3.InterfaceError`` among them; what it audits on the way is
-    :meth:`AuthService._passkey_standing`'s to say. These classes do not tell a store fault from a
+    connect set takes pyodbc's ``Error`` root, which pyodbc raises for a deadlock victim.
+    :meth:`AuthService._passkey_standing` raises ``AUDIT_WRITE_DEFECTS`` although these sets take
+    them, and so does every other class that reaches its catch, ``sqlite3.InterfaceError`` among
+    them; its docstring says what it audits on the way. At least two other sites catch this set
+    too, and audit nothing. These classes do not tell a store fault from a
     bug, so a bug that raises one of them refuses too. Cached, as ``store_call_errors`` is, so a
     refusal does not run the driver import on the event loop. Each class once: both sets name
     ``OSError`` (BACKLOG #3775 added item 19)."""
@@ -20414,8 +20415,8 @@ class AuthService:
         is the holder re-read, with no other await between it and the write (BACKLOG #3068). An
         exception in the passkey re-read that :func:`_passkey_read_errors` takes refuses, unless
         it is one of ``AUDIT_WRITE_DEFECTS``, and the refusal is audited with
-        ``reason=store_error`` unless the store refuses that row too. Every other exception raises;
-        :meth:`_passkey_standing` says which of those it audits first (BACKLOG #3775)."""
+        ``reason=store_error`` unless the store refuses that row too; every other exception raises
+        (BACKLOG #3775)."""
         if not token:
             return Elevation()
         session = await self._load_session(hash_token(token))
@@ -20605,23 +20606,28 @@ class AuthService:
         """:meth:`_passkey_held`, as :meth:`finish_webauthn_assertion` asks it after the sign-count
         write, or ``None`` when it raised one of :func:`_passkey_read_errors` that is not one of
         ``AUDIT_WRITE_DEFECTS``. The refusal is then logged by exception type, and audited
-        ``reason=store_error`` unless the store refuses that row too; an audit write that raises a
-        defect class raises in its place.
+        ``reason=store_error`` unless the store refuses that row too; an audit write that raises
+        a class outside :func:`~messagefoundry.store.base.audit_write_errors`, or one of
+        ``AUDIT_WRITE_DEFECTS``, raises in its place, at least.
 
-        Any other exception raises. Since BACKLOG #3775 added item 9, an ``Exception`` from this
-        read is first logged by type and audited ``reason=read_raised``, so a raise from this read
-        is not left with no ``auth.*`` row; at least ``sqlite3.InterfaceError``, ``CipherError`` and
-        the ``AUDIT_WRITE_DEFECTS`` classes but ``RecursionError`` take that path. That row is soft:
-        an ``Exception`` its write raises is logged and the read's exception raises, but a
-        ``MemoryError``, ``RecursionError`` or cancel during the write raises in its place. A
-        ``MemoryError``, a ``RecursionError`` or a ``BaseException`` that is not an ``Exception``,
-        a cancel among them, from the read itself raises with no row."""
+        Any other exception raises. Since BACKLOG #3775 added item 9, an exception from this read
+        other than a ``MemoryError``, a ``RecursionError`` or a ``BaseException`` that is not an
+        ``Exception`` is first logged by type, and a row naming ``reason=read_raised`` is tried; at
+        least ``sqlite3.InterfaceError``, ``CipherError`` and the ``AUDIT_WRITE_DEFECTS`` classes
+        but ``RecursionError`` take that path. That row is soft, so it can be missing: an
+        ``Exception`` its write raises is logged and the read's exception raises, but at least a
+        ``MemoryError``, a ``RecursionError`` or any ``BaseException`` that is not an ``Exception``,
+        a cancel among them, raised during the write raises in its place. The excluded classes from
+        the read itself raise with no row."""
         try:
             return await self._passkey_held(user, cred)
         except (MemoryError, RecursionError):
             raise  # nothing more is asked of a process that has run out of memory or stack
         except AUDIT_WRITE_DEFECTS as exc:
-            fault: Exception | None = exc  # a defect, never a refusal: audited below, then raised
+            # SQLite's bad statement or bind is a defect, never a refusal: audited below, then
+            # raised. On PostgreSQL and SQL Server a bad statement is a driver DatabaseError, so it
+            # is refused below as a store error.
+            fault: Exception | None = exc
         except _passkey_read_errors() as exc:
             # BACKLOG #3775: after the sign-count write, an exception the set takes refuses with an
             # audit row rather than raising past the ceremony with none. The type only at ERROR,
@@ -20655,8 +20661,9 @@ class AuthService:
         try:
             # BACKLOG #3775 added item 9. The type only at ERROR, as above; the raise carries its
             # own traceback and message. The row is written outside the except block for the same
-            # reason as above, and no class an audit write raises is a defect here, so the read's
-            # own exception is what raises, but for what this method's docstring names.
+            # reason as above. Only the classes named in ``defects`` here, and any BaseException
+            # that is not an Exception, raise out of the write; otherwise the read's own exception
+            # is what raises, as this method's docstring says.
             kind = type(fault)
             _log.error(
                 "finish_webauthn_assertion: the passkey re-read raised %s.%s, for %s; the "

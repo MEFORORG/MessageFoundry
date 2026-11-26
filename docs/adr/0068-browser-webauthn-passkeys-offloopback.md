@@ -690,8 +690,8 @@ until then it left the attempt with no audit row. At least `sqlite3.InterfaceErr
 and the `AUDIT_WRITE_DEFECTS` classes other than `RecursionError` take that path; a
 `MemoryError`, a `RecursionError` and a cancel from the read write no row. That row is soft: a
 store that refuses it, or whose audit write raises another `Exception`, leaves no row and the
-read's exception raises, but a `MemoryError`, `RecursionError` or cancel during the write raises
-in its place. `AuthService._passkey_standing` holds the rule. The session, account and lock re-read, which since 2026-11-05 follows that set read
+read's exception raises, but at least a `MemoryError`, a `RecursionError` or a cancel during the
+write raises in its place. `AuthService._passkey_standing`'s docstring is the source of record. The session, account and lock re-read, which since 2026-11-05 follows that set read
 rather than preceding it (BACKLOG #3068), is outside this catch, so an exception there raises.
 
 **Why a gone passkey still raises the signal.** A self-service passkey delete takes no account

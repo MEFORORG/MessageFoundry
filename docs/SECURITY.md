@@ -4613,8 +4613,8 @@ an MFA reset gives `reason=session_lost` once its revocation has landed, and
 `reason=factor_removed` before. In the passkey set read after the write, on any sign-count answer,
 an exception of a class the read refuses ends with `reason=store_error` and leaves the factor
 unmarked, and at least some exceptions of other classes raise after a row naming
-`reason=read_raised` (BACKLOG #3775). Which classes it refuses, and which raises write that row,
-are in [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md), amendment
+`reason=read_raised` is tried; that row is soft, so it can be missing (BACKLOG #3775). Which
+classes it refuses, which raises try that row, and when it is missing, are in [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md), amendment
 of 2026-10-17.
 Assertion failures are audited but deliberately do **not** feed the
 account lockout (signatures aren't guessable secrets). Unless a setting turns it off or loosens it (at least
