@@ -6,6 +6,12 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.3] — 2026-11-27 — Early Access
+
+This engine moved the UI seam, so the published web console 0.5.0 wheel refuses it; see the caution
+in [INSTALL-GUIDE.md](https://github.com/MEFORORG/MessageFoundry/blob/v0.5.3/docs/INSTALL-GUIDE.md#launching-the-admin-console-in-a-browser).
+A `BACKLOG #N` number cites the project's private planning ledger, so it has no public page.
+
 ### Added
 - **A slow credential-reminder rescan is a named security loosening.** `[cert_monitor]` and
   `[secret_rotation]` `check_interval_seconds` above the shipped default (`43200` and `86400`
@@ -21,12 +27,92 @@ All notable changes to MessageFoundry are documented here. The format follows
   engine reads it as before, refusing it
   when a broad group can reach it. `uninstall-service.ps1` names it and leaves it. See the secrets
   directory bullet in [SERVICE.md](docs/SERVICE.md). (`BACKLOG #2595`)
-
-### Removed
-- **`[store].key_provider` no longer accepts `aws_kms`, `azure_kv`, `gcp_kms` or `pkcs11`.** None
-  was ever built, and each already failed closed at store open. Each is now refused as an unknown
-  name, and the keyless-store gate no longer counts one as a configured key. `vault` is the one
-  external provider. (`BACKLOG #2595`)
+- **Gate-only check routes, a read-only step-up status route, and two refusal headers on the JSON
+  plane** (ADR 0215 slice 2, first half). `GET /auth/check` and one
+  `GET /auth/check/<permission>` per permission answer 200 once the `require()` ladder admits the
+  caller, and write the grant row wherever a grant of that permission is audited, the PHI views
+  included. `GET /me/step-up` reports whether the session's step-up window is live and, with
+  `?action=`, whether that action's step-up check would accept the caller's proof now, without
+  spending it; it is paced, refused from a host the session has not verified from, and audited. It
+  is a hint, not an authorization: the action's own gate decides. A must-change refusal now carries
+  `X-Password-Change-Next` (`verify-factor`, `enrol-factor` or `change-password`), and its detail
+  ends with the same step, which adds `; verify your second factor first` for a session that owes
+  its factor. Every step-up refusal carries `X-Step-Up-Reason` (`new-address`, `verify-factor` or
+  `reverify`). See [SECURITY.md](docs/SECURITY.md). (`BACKLOG #2603`)
+- On a cluster, a convergence reload's `config_reload` row now carries `initiator_digest`, parsed
+  from unsigned text read from the shared `cluster_config` row, beside the row's own
+  `fingerprint`. The shared `cluster_config` table gains `config_digest` and
+  `config_digest_version` columns for it, added in place on an existing table.
+  [CONFIGURATION.md](docs/CONFIGURATION.md), under `[alerts]`, says how to compare the two and
+  when the key is absent. (`vault BACKLOG #3109`)
+- **`[sandbox].mode = "isolated"`: the subprocess sandbox worker, with `db_lookup` and
+  `fhir_lookup` brokered through the engine.** A Handler's lookup is sent to the engine over the
+  worker pipe and answered by the same lookup runner `mode = "off"` uses, so it meets the same
+  checks. The engine refuses a brokered lookup bound to a Router or an `accepts=` predicate, and one
+  whose `[egress].allowed_db` or `[egress].allowed_http` list is empty, even under the audited
+  opt-out `[security].block_unlisted_outbound = false`. `wall_seconds` bounds the whole call,
+  the time the engine spends serving its lookups included.
+  This mode adds no operating-system confinement yet: an `isolated` worker can open files and
+  sockets exactly as a `subprocess` worker can. See [CONFIGURATION.md](docs/CONFIGURATION.md),
+  section `[sandbox]`. (vault `BACKLOG #3131`)
+- **Every sandbox worker mode now disables `[pipeline].fuse_thread_hops`,** not only
+  `subprocess`. Under `isolated`, a runner whose graph has no config directory refuses at
+  construction, rather than run its Handlers in the engine process with unbrokered lookups.
+  (vault `BACKLOG #3131`)
+- **The web console's supported browser versions are published, derived from the features it
+  uses.** [BROWSER-SUPPORT.md](docs/BROWSER-SUPPORT.md#supported-browser-versions) gains a
+  table with one row per browser feature the console relies on, giving the desktop Chrome, Edge,
+  Firefox and Safari version from which each supports it and the dataset entry each number was
+  read from (MDN browser-compat-data 8.1.9, and caniuse-db for CSP nonce sources). Each browser's
+  floor is the latest version in its column, with the features it leaves out named: Chrome 89,
+  Edge 89, Firefox 138 and Safari 17. Nothing enforces these versions, and no browser is refused
+  for being older. The page's `Clear-Site-Data` row no longer says Safari lacks it: the dataset
+  records Safari support for the `"cache"` value from 17, and marks every Chrome and Edge version
+  it records for that value partial. A test holds the table to the features the code uses and
+  recomputes each floor from the rows. (`BACKLOG #3316`, `#1124`)
+- **The tee says when no site prefix loaded.** `python -m tee anonymize-captures` now prints a
+  warning on stderr when no site-code prefix loaded: at least with no token file at the one path,
+  a file that cannot be opened, a `MEFOR_FORBIDDEN_TOKENS` value that names no file or is empty,
+  and a source with no two-digit entry under `[site_prefix]`. The site-code scrub matches nothing
+  then. It is a warning, not a refusal: a token-less build loads none. A token file that cannot be
+  decoded still stops the tee at import, as before. The new `site_prefixes_loaded()` in both
+  `surrogates.py` copies reads the state. (`BACKLOG #3516`)
+- **The DATABASE connector bounds each statement with `statement_timeout`.** `Database(...)`,
+  `DatabasePoll(...)` and `DatabaseLookup(...)` take `statement_timeout`, in whole seconds,
+  `0` for no limit. Unset, it is 30 on the SQL Server preset and on a generic connection using
+  Microsoft's ODBC driver, and `0` on every other generic driver, psqlODBC and MySQL among
+  them, where nothing is bounded until it is set. A non-zero value is applied on every borrow as
+  pyodbc's connection `timeout`, so a hung statement fails transiently with `HYT00` rather than
+  holding its connection, lane, poll or a stop without bound; a driver that refuses the value fails the borrow as a configuration fault naming
+  the setting, whatever the driver; a transient driver state from that write retries and discards
+  the connection instead. Each DATABASE pool also runs its driver calls on its own thread pool,
+  sized `pool_max + 4`, rather than the event loop's default executor: aioodbc's, and at least
+  the connector's own `statement_timeout` write, autocommit set and cursor closes. See
+  [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #5756`)
+- When connection events are captured, the MLLP, raw-TCP and X12 listeners send a
+  `reply_replaced` connection event when characters the inbound's charset cannot encode were
+  replaced in a reply: the first at once, then at most one a minute per listener, carrying the
+  count of replaced replies since the last one. The WARNING log line for a replacement is still
+  written once per connection per process.
+  [PHI.md](docs/PHI.md) section 7 says what the event carries. (`BACKLOG #5799`)
+- **`Message.delete_segments` can remove one segment.** Pass `occurrence=i` to delete only the
+  i-th segment of that id, numbered as `field()` and `count_segments()` number it; it returns 1, or 0
+  when that occurrence is absent. The `results_relay` porting template now uses it to drop a
+  cancelled OBX (with its NTE, PRT and Z rows) and edits the rest in place, so a feed copied from it keeps
+  every OBX field, escape and the OBX-to-OBR grouping. Before, the template rebuilt each OBX from a
+  fixed subset of fields joined by hand, and every OBX was re-inserted under the first OBR.
+  (`BACKLOG #5826`)
+- **`SegmentGroup.set` and `SegmentGroup.set_data` write a field within one order group.** Their
+  `occurrence` counts within the group, as `SegmentGroup.field` does. A group's `ordinal` counts a fieldless bare boundary line
+  and `Message.set` does not, so `Message.set(..., occurrence=group.ordinal)` after a bare `OBR`
+  could write to another order. (`BACKLOG #5917`)
+- **The DICOM C-STORE SCP takes `min_message_bytes_per_second`, so a link of at least 16 KiB a
+  second can deliver a large object.** At the unchanged default of 64 KiB a second, a link slower
+  than that would have an object over a size set by the link cut at the same point on every
+  attempt. On a link at or above 16 KiB a second, set the rate at or under the link's. The least
+  it takes is 16 KiB a second, and no value turns the per-message deadline off, so a slower link
+  also needs `timeout_seconds` raised. It is refused on an outbound connection. The C-STORE client
+  also dead-letters an object it can never propose instead of retrying it. (`BACKLOG #6637`)
 
 ### Changed
 - **A `[dr]` takeover or release hook now gets an allowlisted environment.** It used to get the
@@ -39,6 +125,742 @@ All notable changes to MessageFoundry are documented here. The format follows
 - On Windows, a generic DATABASE file keyword is now also refused when a best-effort check finds
   its path leads to another host, or cannot finish reading the path; see the Generic ODBC section of
   [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #2705`)
+- **The engine's `messagefoundry` command carries only production commands.** ADR 0201 slice 4
+  moves `init`, `import corepoint`, `impact`, `generate`, `lens` (`parse`, `rewrite`, `schema`),
+  `hl7schema` and `hl7structures` to the separate `messagefoundry-toolkit` command, beside
+  `adr-analyze`, and moves `scaffold.py`, `lens.py`, `lens_schema.py` and `corepoint_import.py` out
+  of the engine wheel into `messagefoundry_toolkit/`. Install the toolkit at the engine's own version
+  on an authoring machine (`pip install "messagefoundry-toolkit==<version>"`); a production host
+  needs the engine alone. The engine refuses a moved command with exit 2 and a line naming
+  `messagefoundry-toolkit <command>` and its install command; a refused `lens rewrite` still carries
+  the `"code"` the IDE branches on. `messagefoundry-toolkit init` also writes a
+  `requirements-dev.txt` pinning the toolkit, so a deploy that installs `requirements.txt` carries no
+  toolkit. The VS Code extension runs the Steps view and Generate Samples through
+  `python -m messagefoundry_toolkit`, and says so by name when the interpreter has no toolkit. The
+  release smoke now asserts that the built engine registers exactly the production rows of
+  `CLI_TIERS`. `generators/`, `hl7schema.py` and `hl7structures.py` stay in the engine until a later
+  slice. (BACKLOG #1192)
+- **The de-identification package leaves the engine wheel.** ADR 0201 slice 6 moves
+  `messagefoundry/anon/` to `messagefoundry_toolkit/anon/`, so it ships in the
+  `messagefoundry-toolkit` distribution and an engine-only install no longer carries it. Import it
+  as `messagefoundry_toolkit.anon`. What it does is unchanged: the rules, the keying, the
+  fail-closed leak-check and its limits are the same, and the tee keeps its vendored copy in
+  `tee/anon/`, so `python -m tee anonymize-captures` is unaffected. The release member gate now
+  refuses an engine wheel or sdist that carries a member under `messagefoundry/anon/`. (BACKLOG #1192)
+- **The synthetic HL7 generators and the HL7 schema emitters leave the engine wheel.** ADR 0201
+  slice 7 moves `messagefoundry/generators/`, `messagefoundry/hl7schema.py` and
+  `messagefoundry/hl7structures.py` into `messagefoundry_toolkit/`, so they ship in the
+  `messagefoundry-toolkit` distribution and an engine-only install no longer carries them. Import
+  them as `messagefoundry_toolkit.generators`, `messagefoundry_toolkit.hl7schema` and
+  `messagefoundry_toolkit.hl7structures`, and run the ADT corpus writer as
+  `python -m messagefoundry_toolkit.generators.adt`. What they produce is unchanged, and so are
+  `messagefoundry-toolkit generate`, `hl7schema` and `hl7structures`. The test harness now depends
+  on `messagefoundry-toolkit` at its own version, beside its engine pin. The release member gate
+  now refuses an engine wheel or sdist that carries a member under `messagefoundry/generators/`, or
+  `messagefoundry/hl7schema.py` or `messagefoundry/hl7structures.py`. (BACKLOG #1192)
+- **`SetState` refuses a namespace or key that ends in a space, on every store backend.** SQL
+  Server ignores trailing spaces when it compares keys, under every collation, so `k` and `k `
+  would be one row there and two everywhere else. The error names the field and never its value. A
+  Handler that sets such a key now fails at the `SetState(...)` call, so strip padding from a
+  fixed-width field before keying on it. (`BACKLOG #1588`)
+- **A connection-event kind outside the one declared vocabulary is refused.** The kinds live in
+  the new `messagefoundry.connection_events` module, which `transports/base.py` re-exports and the
+  web console's event-log filter reads, so the console no longer keeps its own list. While the
+  runner's connection-event queue exists, the runner drops an undeclared kind before the event is
+  queued, so it never joins a burst and the declared events around it are all written. It logs a
+  WARNING naming the connection and the kind (redacted, then bounded), at most once a minute per
+  pair and within a cap across pairs, and each line reports how many such events the runner has
+  dropped so far. At least one configuration has no queue (the `[diagnostics].connection_events`
+  master switch off, with one inbound's `capture_connection_errors` on); there every event from
+  that inbound is discarded with no row and no warning. All three store backends also raise
+  `ValueError` on an undeclared kind, as the backstop for any other writer. CI asserts that every
+  literal emit site of the shapes it walks uses a declared kind. The `SourceConnector` and
+  `DestinationConnector` docstrings now state the never-accept-and-drop rule and what a source
+  does when its inbound handler raises. (BACKLOG #1624)
+- **Every connector reads its `port` by one rule, and a TCP delimiter byte by the count rule.** An
+  uncast `env()` hands a connector the environment's value as it stands, and a bare `int()` read a
+  `true` as port 1 and `2575.9` as port 2575. A bool, a fraction, text that is not a whole number and
+  a number outside 0 to 65535 are now refused when the connector is built, at start and in
+  `messagefoundry check`, naming the setting and withholding the value. A host-and-port `[egress]` list that pins a port
+  refuses a value it does not match before the connector is built, and that refusal still names the
+  value. The listener port pre-flight reads a port by the connectors' rule. `start`, `end` and
+  `trailer` on `Tcp()` take the count rule, so a whole float such as `2.0` now passes there, and a
+  value that is not a byte is refused without being quoted. (`BACKLOG #1650`)
+- **`cast = "int"` and `env(..., cast=int)` refuse a bool and a number that is not whole.** A TOML
+  `true` in `environments/<env>.toml` used to cast to 1 and `2575.9` to 2575, before the
+  connector's own port check saw the value, so an `env()` port could dial a port nobody named.
+  Either value from the environment is now refused when the reference is resolved, naming the setting and the key and
+  withholding the value. Text is still read by `int()`, and a whole float such as `2575.0` passes.
+  `cast = "float"` and `env(..., cast=float)` refuse a bool too, where the builtin read `true` as
+  1.0. They also refuse at least `nan`, an infinity, an integer too large for a float, and
+  text that reads as zero but is not zero in plain digits, such as `"1e-400"` or `"0e0"`. A cast
+  of the author's own still runs as given. An `env()` with `cast=int` on a
+  boolean setting now refuses a TOML `true` or `false`, which used to read as on or off.
+  (`BACKLOG #1650`)
+- **`messagefoundry dryrun` and `messagefoundry check` now apply an inbound's strict-validation
+  timeout, as the listener does.** A strict validate that takes longer than
+  `validation.strict_timeout_s` previews as `ERROR` with the listener's own text,
+  `strict-validation timed out after <N>s`, where before the preview reported whatever hl7apy found.
+  The preview validates inline and measures the time, so a slow fixture still runs its full validate
+  time rather than being abandoned at the timeout, and a validate that raises after the timeout
+  previews as the timeout too, as on the listener. A `strict_timeout_s` of zero or below still
+  validates with no timeout. (`BACKLOG #1689`)
+- **A streaming inbound's body at or over `stream_threshold_bytes` is no longer strict-validated
+  whole in a preview.** The listener validates only such a body's header, which the parse already
+  covers, so a preview could refuse, or time out on, a message the engine takes. (`BACKLOG #1689`)
+- **A Router, `accepts=` predicate or Handler that calls `sys.exit()` previews as `ERROR`.** The
+  `SystemExit` used to leave the dry run, so `messagefoundry check` could exit with the script's own
+  code, 0 included. The error names an integer exit code and nothing else. (`BACKLOG #1689`)
+- **A dry run logs a warning when it skips a file-backed reference set.** A set whose file did not
+  load is left out of the preview, as before, and a WARNING now names the set, once per set per
+  process, without quoting the file's content or guessing the cause. Before, a later read of the set
+  reported it missing with nothing to say why. (`BACKLOG #3340`)
+- **Postgres and SQL Server stores gain the received-at index `ix_messages_received`, and the
+  connections dashboard's last-received read on SQLite and Postgres becomes a walk over the
+  channel index.** On SQLite a test pins that the read no longer scans every message; on Postgres
+  only its result is tested, and its plan is not measured. Both server schema hashes move, so
+  under the server default `[store].schema_management`, `external`, the engine refuses to open
+  until `provision-schema` has run. Under `auto`, the first open after the upgrade builds the
+  index over the whole `messages` table before it serves, which on a large store takes time. On
+  both server backends that build is exempt from `[store].command_timeout`. Any other open, such
+  as a peer engine shard or cluster node, waits for the schema lock while the build runs for up to
+  the new `[store].schema_lock_timeout` (seconds, default 600) rather than `command_timeout`. Past
+  that it fails with `SchemaLockTimeout`, naming the lock and the setting, with nothing applied;
+  the next start retries. The open that holds the schema lock bounds its own DDL statements' waits
+  for their table locks by the same setting (on Postgres a stricter role or database
+  `lock_timeout` is kept), so a build queued behind an open transaction cannot hold the schema
+  lock forever; the bound never limits how long a build runs once it has its lock.
+  Past it the open fails with `SchemaDdlLockTimeout`, a `SchemaLockTimeout`, with nothing applied.
+  On SQL Server the open's re-read of the schema marker once it holds the lock keeps
+  `command_timeout`, and a timeout there fails with the driver's own error.
+  (`BACKLOG #1726`)
+- **The `Http()` listener answers a body refused at ingress by kind, and names its `ERROR` row.** A
+  temporary refusal, such as the streaming detach's in-flight budget held by other detaches, is
+  answered `503` with `Retry-After` instead of `422`, so a sender that treats every `4xx` as final, or the
+  engine's own `Rest()` outbound on an engine-to-engine hop, would re-send it rather than give up. A body over a size
+  ceiling now answers `413` on every path, the code a body over `max_body_bytes` already got. A
+  permanent refusal stays `422`: at least one about the body itself, a strict-validation timeout
+  whose validate had begun, even one that load slowed, and a store that cannot stream a body over
+  its streaming threshold. Two other entries say what else answers `503`: a
+  configuration refusal, without `Retry-After` (`BACKLOG #5102`), and a strict-validation timeout
+  that never began (`BACKLOG #5078`). Each refusal's body now names the `ERROR` row recorded for it as `refused_message_id`, and that
+  row's error text names the refusal's kind.
+  The DICOM C-STORE SCP maps the same kinds. An HL7 body
+  over the size cap is now stored with the reason type `HL7MessageTooLarge` rather than
+  `HL7PeekError`. (`BACKLOG #2105`)
+- **The IDE's "MessageFoundry Engine" output now carries UTC time stamps the extension sets.**
+  Every line starts with an ISO 8601 UTC instant with milliseconds, then its level word, `INFO`,
+  `WARNING` or `ERROR`, as in `2026-01-02T03:04:05.678Z WARNING ...`. A line break inside a message
+  is written as an escape, so one record is one line. It was a log output channel, which the editor
+  stamped in its own format and zone; it is now a plain output channel, so the editor's log-level
+  filter no longer applies to it. (vault `BACKLOG #2349`)
+- **`messagefoundry check --env` names the instance as `serve --env` does.** Before, `check` used
+  the flag only to look for `environments/<env>.toml` under `--project-root`, so a site naming its
+  environment only on `serve --env` got a skip from every settings check, and the retention checks
+  printed a placeholder name. Every settings check now reads `--env` as an override of
+  `[ai].environment`, above the file and `MEFOR_AI_ENVIRONMENT`, so a custom name with no
+  production tier fails the `posture` check as it stops `serve`. With no `messagefoundry.toml`,
+  `--env` now counts as declaring the instance, so those checks grade the environment's settings
+  instead of skipping, and can fail where they skipped before. The dry run's Handlers still run
+  with no active environment. ADR 0050 AC-6 is amended for `check --env` alone: with no `--env`,
+  `check` still skips, where `serve` refuses, an instance that names no environment, and
+  `validate`, `graph` and `dryrun` adopt no refusal; what they read `--env` for is the
+  `BACKLOG #5554` entry. (`BACKLOG #2355`)
+- **A `--service-config` that names no file fails `messagefoundry check`.** `serve` exits 2 on it;
+  `check` skipped every settings check and passed. (`BACKLOG #2355`)
+- **The offline value-file check reads `MEFOR_ENVIRONMENTS_DIR`.** Under `--project-root` with
+  `--env`, `check`, `validate`, `graph` and `dryrun` looked for `<env>.toml` under the file's
+  `[environments].dir` alone, where `serve` lets the variable beat the file. (`BACKLOG #2355`)
+- **An inbound connection's `encoding` must be a literal codec name; an `env()` reference is
+  refused when the config loads.** The ingress decode reads the inbound's own settings, where an
+  `env()` reference is never resolved, so a text inbound would have refused every message. The
+  refusal applies to a binary inbound too, names the connection and the reference's key, and
+  resolves nothing, so it covers a not-deployed inbound and `connections.toml` too. Set an inbound
+  encoding per environment by editing the connection. An outbound connection, a lookup and a
+  reference set still take an `env()` encoding. (`BACKLOG #2431`)
+- **An `encoding` of `None` is refused everywhere but on an inbound connection.** An inbound reads
+  `None` as `utf-8`; most outbound connectors read the value as the codec name, so `None`, or an
+  `env()` value resolving to `None` or an empty string, would have failed every send on them.
+  Config load refuses a literal `None`. The build check refuses an `env()` value resolving to one,
+  at a reload, a connection upsert, and the `build-check` line of `messagefoundry check`, which
+  that line skips on a config dir with no service settings. (`BACKLOG #2431`)
+- **An inbound `encoding` naming no text codec is not a permanent refusal.** Such a name refuses
+  every non-empty body until it is fixed, and the body is not at fault. The MLLP listener answers `AE`, where a
+  body invalid in a usable charset gets `AR`, and `Http()` answers `503`, naming the `ERROR` row as
+  `refused_message_id`, where that body gets `422`. The `BACKLOG #5102` entry says why that `503`
+  carries no `Retry-After`. Each refused attempt is still its own `ERROR` row. (`BACKLOG #2431`)
+- **The connection flag moved to the store, and the engine no longer writes config.** `POST
+  /connections/{name}/flag` used to rewrite `connections.toml` and run `load_config` on the live
+  directory to validate it, so one toggle ran every config module in the engine's process, and it
+  needed the service account to write the directory it executes code from. A toggle now writes a new
+  `connection_flag` table, on all three store backends, and its `connection_flag_set` audit row in one
+  transaction. It runs no config module, changes no file and moves no config digest. Any connection in
+  the running graph takes the flag, code-first ones included, and a cluster node no longer refuses
+  it, since the store is what the nodes share. A name the graph does not have answers 409, as does
+  a toggle that arrives once a shutdown's drain has begun, and a toggle the store did not confirm
+  answers 503, which does not say the flag is unchanged: a commit cut off at the store call's
+  10-second bound may still land. A request deadline or a shutdown ends the caller's wait and not
+  the write, and a shutdown waits for a running write, for a bounded time, as it did for the old
+  one; a write still running when the store closes may not land. One engine's toggles land one at a
+  time, in arrival order. The wait for that turn and the store call each get the 10-second bound, so
+  past the auth gate a toggle's wall-clock ceiling is about two bounds plus the store's unwind. A
+  toggle still queued behind a stuck one after 10 seconds gets the same 503, having written nothing.
+  If the stuck one gives way first, the queued toggle reaches the store and can be cut off there,
+  close to 20 seconds after it arrived, with a commit that may still land. A toggle that reaches the
+  front once a drain has begun gets the 409, and one whose wait runs out first gets the 503. Unlike
+  the old write, a toggle whose caller leaves while it queues can still land. Between engine shards
+  and cluster nodes, on Postgres and SQL Server, each toggle takes the store's audit lock before it
+  changes the flag and holds it to the commit, so their toggles never overlap, though not always
+  in arrival order, and the flag matches the newest audit row. SQLite's single writer already did that.
+  On Postgres and SQL Server a toggle holds the audit lock while it waits for a lock on
+  `connection_flag`, so each such lock wait is bounded at 5 seconds: a lock another session holds on
+  the table then costs the toggle a 503, and the store writes nothing. The bound is per lock wait,
+  not per statement. Where a non-zero `[store].command_timeout` is at or under 5 seconds, the
+  driver's own timeout ends the wait first, and SQL Server's retry then takes the audit lock and
+  waits again. Without the bound, every audit append could stall until the driver's query timeout,
+  30 s by default, or for ever with `command_timeout = 0`, and on SQL Server the retry re-runs that
+  timeout, for up to five attempts of 30 s each in one store call. ADR 0007's amendment of
+  2026-10-31 records at least what the bound does not cover. The 503 still reads as an outcome that
+  may have landed. The route stays on `config:deploy`. (`BACKLOG #2623`)
+- **`flagged` is gone from `connections.toml` and from `inbound()` and `outbound()`.** The store is
+  the only source, so the loader refuses the key and the argument rather than ignoring them. Remove
+  either from a config that carries it. `auto_start` and `deployed` are unchanged. (`BACKLOG #2623`)
+- **`connection_flag_set` is no longer a start's config baseline.** Its row carries no digest, so a
+  start compares with the last `config_loaded` or `config_reload` row. `baseline_unchecked` on a
+  flag row went with the write it served, and `GET /connections` no longer returns `toml_managed`.
+  (`BACKLOG #2623`)
+- **`docs/SECURITY.md` records that a dry-run reload executes config code,** with no approver, until
+  it can run in a throwaway worker. (`BACKLOG #2623`)
+- **The store's flag is unsealed, and it reaches a bulk action.** No engine path reads the flag, but
+  the console's Flagged-only filter does, and select-all honours that filter, so a database writer
+  could shape a bulk action's target set. An operator still presses Go. Accepted by the owner's
+  ruling of 2026-11-01; ADR 0007's amendment of 2026-10-31 records what bounds it. (`BACKLOG #2623`)
+- **`ConnectionRow.flagged` is `null` when the flag read fails.** `GET /connections` and the stats
+  socket no longer read a failed read as unflagged. A client should treat `null` as unknown.
+  (`BACKLOG #2623`)
+- **The store's `replay`, `replay_dead`, `resend_to` and `reingress` now require `audit=`.** It is
+  keyword-only with no default on the Store protocol and on the SQLite, PostgreSQL and SQL Server
+  stores, as `cancel_queued` already was, so a direct caller can no longer run one and record no
+  operator row by leaving the argument out. The 0.5.2 entry's contrast, that the store methods take
+  `audit=` while the Engine methods require it, still holds for `enqueue_ingress`, one of the store
+  methods it named: it keeps an optional `audit`, because it is also the partner receipt path. At
+  least three store methods keep one: `enqueue_ingress` and the approval gate's
+  `create_pending_approval` and `decide_pending_approval`. (`BACKLOG #2624`)
+- **An over-granted or unreadable Vault token now raises a `vault_privilege_warning` alert at
+  start.** The Vault privilege preflight already logged and audited each finding. It now also fires
+  the alert through the configured notifier, keyed on `vault:store` or `vault:secrets`, before any
+  refusal, so a refused start still pages. An alert rule can match the new event type, and a later
+  start that reads that hop's token clean can resolve the open alert; `docs/SECURITY.md`, *A warning
+  still open after a clean start*, says what to do with one. ADR 0216 Amendment A says what
+  the payload holds. (`BACKLOG #2903`)
+- **A mail relay that refuses every recipient with a `5xx` reply now fails the delivery for good.**
+  On the Email and Direct destinations the row dead-letters on its first attempt, as a partial
+  refusal already did, rather than being retried to the attempt ceiling. A refusal with any `4xx`
+  reply, such as greylisting, or with `552`, is still retried. The error names the relay, a count
+  and the reply codes, never an address or the relay's reply text, and the `[alerts]` mail logs it
+  the same way. (`BACKLOG #2924`, `#2884`)
+- **The reconciler's referral and probe-fault alerts now say what they cost inside the 200
+  characters an alert instance keeps.** Each said, past that point, that the account it names is
+  not revoked while the condition lasts. The warning a forfeited alert logs when a later trip,
+  referral or hold opens now also says that a `[cluster]` node or an engine of more than one
+  engine shard resolves none of these alerts itself, so the line no longer reads as though another
+  engine would (vault BACKLOG #3083, #3100).
+- **An approval audit row that is in the store but missing from the off-box copy pages its own
+  alert.** When the gate reads back that a write's COMMIT landed though the write reported an
+  error, a request that reads back as held or an outcome that reads back as written, it now pages
+  `audit_offbox_copy_missing` rather than `audit_write_failed`, which said the row was not written.
+  Rules can target the new type. `audit_write_failed`'s reason now says the row was not written
+  or its write's outcome is unknown, since a COMMIT can land despite the error. (vault
+  `BACKLOG #3193`)
+- The 0.5.2 entry said that where the event loop runs a TLS handshake, the peer's address is not
+  known. More exactly, the loop's hook does not read it. On the stdlib Proactor loop on Windows,
+  the hook could reach it through the loop's private state, and uvloop was not measured. The
+  records still name no peer there; the module docstring of
+  `messagefoundry/tls_handshake_failures.py` says what was measured. (vault `BACKLOG #3302`)
+- **A lane's trust-anchor refusal is worded by one rule, and its advice is no longer cut.** A
+  connection's status keeps the whole fixed line, so the advice at its end survives a long
+  connection name. A stored `connection_stopped` alert is still cut at 200 characters,
+  so it can lose that advice. Only the lane check's own setting refusal, such as a blank `tls_ca_pin`, an `env()`
+  pin that does not parse, or a CA path holding a NUL, is told to fix the setting; any other
+  refusal is a file to fix. A DR activation that a trust anchor refuses names the setting and
+  connection it refused wherever the refusal carries them, at least for a lane's CA, still with
+  no part of the CA's path. A config reload stopped by the store further down the cause chain is
+  audited with reason `store_unavailable`, and one a trust anchor refused under more than one
+  wrapper with `trust_anchor`. A typo in a literal `tls_ca_pin` is still audited
+  `invalid_config`. A refused CRL file is named by one spelling of its path, an absolute one
+  first, whatever order the engine met its hops in. (`BACKLOG #3498`)
+- 0.5.2 shipped two changes its notes left out. A CRL file the reload refused as one to fix stays
+  refused until the file changes, and the refusal keeps one label across retries. A DR activation
+  that a trust anchor refused stopped quoting the CA's path in its 503 and its audit row.
+  (`BACKLOG #2866`, `BACKLOG #3099`, `BACKLOG #3224`)
+- **A refused CRL reload now says which signature finding held the file back.** The reload's
+  signature check used to give one remedy, `bad_signature`, for a CRL proven badly signed and for
+  one it could not confirm, so its words hedged across both and could not say which one held. A
+  proof keeps `bad_signature`: fix the file, which a start that finds the same proof refuses at any
+  time, so that refusal carries neither `start_refuses` nor the "at least until" caveat for a file
+  not yet in effect. While some issuer in the file has no CRL in effect yet, the reload still
+  judges that refusal again every pass. So a `lapses_first` it finds for the same file later is
+  reported, such as once the hop lists a CA that the CRL names by key identifier and that verifies
+  it. A CRL that names no key of the CA its issuer matches, and that CA's key does not verify, now
+  reads `unproven_signature`. One whose signature the engine cannot check with the key of a CA it
+  judges, the one the CRL names or, where it names none, one that fits it, such as a signature of
+  another kind than the key, now reads `uncheckable_signature`. Both ask you to check the file and
+  then restart, and both carry `start_refuses` while the file is not yet in effect. Both rank under
+  every class that fixes the file, so a `lapses_first` refusal for the same file is no longer
+  hidden behind them. Where a CA file holds the same CRL file, the CRL expiry alert still orders
+  the CA-file hop's restart after either, as after `bad_signature`.
+  Which CRL the reload reports is unchanged: the first in the file that a listed CA matches and
+  does not verify, or failing that the first no listed CA matches. It judges none after the one it
+  reports, so both new remedies ask you to check every CRL in the file: a start refuses the file
+  where it proves any of them badly signed. (vault BACKLOG #3506)
+- **The docs now warn against pinning SQL Server's own self-signed certificate.** Microsoft
+  documents that SQL Server on Windows generates one during startup when it has no trusted or
+  valid certificate. If a restart generates a new one, a `[store].ssl_root_cert` pin of the old one
+  stops matching, and the store refuses every connection. Microsoft also lists an installed
+  certificate as a prerequisite of strict encryption, so a strict connection may fail at once.
+  Neither outcome has been measured. The warning is in the `ssl_root_cert` row of
+  [CONFIGURATION.md](docs/CONFIGURATION.md) and in
+  [DEPLOY-SERVER-DB.md](docs/DEPLOY-SERVER-DB.md) section 5.1. (vault `BACKLOG #3714`)
+- **The SQL Server store, the DATABASE connector and the test harness build their TLS keywords in
+  one place.** Each used to carry its own brace quoting and its own `Encrypt` and
+  `TrustServerCertificate` tail. All three now call `messagefoundry/odbc_dsn.py`, and each builds
+  the same strings as before. Only the store sends a `ServerCertificate` pin. The shared code
+  refuses a pin beside `encrypt = false` or `trust_server_certificate = true`, a shape no current
+  caller sends: a pin goes out with `Encrypt=strict`, which would quietly override the weakened
+  posture the caller asked for. (`BACKLOG #3714`)
+- **`Engine.create`, `Engine.__init__` and `create_managed_app` take `settings_monitored_files`
+  in place of `settings_crls`.** The rows passed there include the SQL Server store pin, a
+  certificate, as well as the settings-level CRL files, so the old name said CRLs for a list that
+  is not only CRLs. `serve` and `cert inventory` now build that list with one helper,
+  `monitored_files_from_settings`, and the `cert inventory` help names the pin files too. The same
+  rows reach the same expiry monitor. (`BACKLOG #3714` item 5)
+- **The capture and `no_ack` checks read an `env()` flag once it resolves.** A reference is truthy
+  whatever it resolves to, so `no_ack=env(...)` beside `capture_response=True` was refused at load
+  even when it resolved False, `capture_out_params=env(...)` left capture on when it resolved False,
+  `Tcp(capture_response=True, expect_reply=env(...))` passed with no reply to capture when it
+  resolved False, and `Http(reply_from=...)` passed an outbound whose capture flag resolved False. A
+  literal is still refused at load. A flag behind `env()` no longer is: it is judged when the
+  connection's settings resolve. The `build-check` leg of `messagefoundry check` refuses it, for the
+  one environment `check` runs under, and so does a reload. At start it fails that connection's lane
+  (ADR 0031) rather than stopping the engine. At least two paths no longer refuse a conflict behind
+  `env()`: `check` on a config dir that declares no instance (no `messagefoundry.toml`, no
+  `MEFOR_AI_ENVIRONMENT`), where `build-check` skips, and `messagefoundry dryrun`, which builds no
+  connector. (`BACKLOG #3724`)
+- **`Store.release_upload_quota` takes the uploader, and the upload-quota reserve reads its
+  budget in one aggregate.** The release is now `release_upload_quota(*, uploader_id,
+  reservation_id)`, keyword-only so the two ids cannot be swapped, and on every backend it deletes
+  the reservation only when it belongs to that uploader. On SQL Server the release used to read
+  the row's uploader under `READCOMMITTEDLOCK` only to name the applock it takes; it now takes the
+  named uploader's applock with no such read, opening its transaction with the same statement the
+  reserve does. A release whose row exists makes as many round trips as before. One with no row
+  now makes four rather than two, and can wait for a sibling's reserve of the same uploader; in
+  exchange it waits out a reserve that holds the lock but has not yet inserted. The PostgreSQL and
+  SQLite releases take no such lock. The reserve's
+  in-flight file count and byte total, two subqueries over the same rows, are one aggregate on
+  SQLite, PostgreSQL and SQL Server, with the same budget decision. (vault `BACKLOG #3740` items
+  10 and 12)
+- **`create_managed_app` built with `allow_no_auth=True` now logs one WARNING.** A build with no
+  `auth_settings` now names its mode either way, and it reads the mode from `open_mode`, as the
+  request gates do. (`BACKLOG #3746`)
+- **The refusal of a zoned `[api].trusted_proxies` host now says what its advice leaves open.**
+  After advising the zoneless host, such as `fe80::1`, both refusal paths add that a hop an inner
+  proxy writes into `X-Forwarded-For` with a zone will not match that entry and becomes the client
+  address. The `trusted_proxies` row of [CONFIGURATION.md](docs/CONFIGURATION.md) says what that
+  costs and which entry matches such a hop. The `serve` startup line for a TLS-terminating proxy
+  now says which entries gain a twin spelling: an IPv4 entry its `::ffff:`-mapped one, and an entry
+  inside `::ffff:0:0/96` its plain IPv4 one. ADR 0151 D-1 is amended to match. (`BACKLOG #3764`)
+- **A failed-handshake report now says "since the last report".** The `tls_handshake_failed`
+  connection event and the API's WARNING line read "N failed handshake(s) since the last report;
+  last cause ...". They said "since the last event", which did not fit the API, since it writes a
+  log line and no event. The throttle is unchanged, and is now stated once, in
+  [PHI.md section 7, row 7](docs/PHI.md#7-logging--phi-redaction), which the other pages link
+  to. A listener and its TLS context no longer keep each other alive, so dropping a listener frees
+  it without waiting for the cyclic garbage collector. (`BACKLOG #3785`)
+- **`supervise` refuses on the interpreter's remote debugging before it logs the residual, with
+  one exception below.**
+  The supervisor now logs its `remote_debug_enabled` or `remote_debug_unguarded` WARNING only once
+  its start has passed its own remote-debugging gate. So a fleet refused under
+  `enforcement = enforce` because remote debugging is on in the supervisor's own process, or
+  refused at any gate before that one under any enforcement setting, no longer logs that line. A
+  fleet refused at a later gate has still logged it. One exception: where the engine's hook did
+  not answer, the remote-debugging refusal logs `remote_debug_unguarded`, in `serve` too, because
+  the relaunch it names turns the interface off and says nothing of
+  what stopped the hook. `supervise` logs that line to stdout and the refusal to stderr. Where the
+  acceptance lifts the refusal, the residual line follows the remote-debugging `AUDIT:` line, and
+  does so again in the off-box forwarder's copy once the start goes on to install that forwarder.
+  (`BACKLOG #3795`)
+- **The connection flag route's store refusal is a typed 503.** `POST /connections/{name}/flag`
+  answers 503 when the store did not confirm the toggle, raised as
+  `api.security.ConfigWriteNotRecorded`, so the web console names that refusal by its type rather
+  than by any 503. The web console seam digest moved; a console pinned to the previous seam is
+  refused at start. (`BACKLOG #3811`)
+- **The "too predictable" anonymizer salt refusal now names the floor that binds.** It used to
+  cite the 32-bit total, but every salt that reaches that check is at least 32 characters, so the
+  per-character floor of 2.0 bits refuses it as well, which is 64 bits at 32 characters. The
+  message now states the salt's per-character estimate and that floor, and no longer states its
+  total. No threshold or check changed. Both the toolkit keyer and the copy vendored into the
+  tee changed (BACKLOG #4652).
+- **The DICOM C-STORE client (SCU) now defaults `max_object_bytes` to 32 MiB, and stops re-sending an
+  object over that which the peer keeps aborting.** Before, the client's default was 128 MiB, the
+  same constant the server (SCP) reads, while every engine SCP aborts an object past twice its
+  effective cap, 32 MiB at most, with no status (owner ruling B462-R3). The client read that abort
+  as transient and re-sent the object at the head of its lane until the retry policy ran out, or
+  without end under `max_attempts=None`, so the messages behind it would have waited. Now the
+  client's default is 32 MiB, on a connection built by `DICOM(...)` and on one built from raw
+  settings, and a larger object is refused before the association, as an over-cap object always
+  was. The cap also bounds the inflate of a deflated object, so that default bound is 32 MiB too.
+  Where a site raises or removes the cap, an object over 32 MiB whose store ends with no
+  response three times in a row is dead-lettered as final (`unanswered-over-ceiling`), whatever the
+  retry policy. The client cannot tell this abort from any other, so a timeout of such an object
+  counts too, and the refusal names no cause. The count is keyed by the object's length and two
+  checksums of all its bytes, computed off the event loop with the GIL released, so identical bytes
+  share one count and two objects that differ, with no SOP instance UID or not, share one only by a
+  checksum collision; the client remembers up
+  to 65,536 of them, about 7 MiB once the map churns at that bound. A row the retry policy dead-letters, or one refused permanently, has its count dropped, so a replay of it gets
+  all three sends. An unanswered store of a smaller object is still re-sent. `DICOM(...)` no longer
+  writes `max_object_bytes` when it is not given, so each role applies its own default. The SCP's
+  default is unchanged: 128 MiB configured, 16 MiB in effect. (vault BACKLOG #4908)
+- **`SetState` refuses a namespace or key that a store backend could not hold exactly.** Beside the
+  existing empty and trailing-space rules, it now refuses a NUL (U+0000), which Postgres text cannot
+  store; a lone surrogate (U+D800 to U+DFFF), which no backend stores; and a namespace or key over
+  256 UTF-16 code units, or a pair over 450, which SQL Server's `state` columns and clustered
+  primary key cannot hold. The refusal is a `StateKeyError`, a `WiringError`, raised at the
+  `SetState(...)` call on every backend, and it names the field and its length, never its value. A
+  value nested too deeply to serialize now raises the documented `WiringError` rather than a bare
+  `RecursionError`. (`BACKLOG #4917`)
+- **The `sqlserver` extra now pins `aioodbc==0.5.0`, and the ODBC call gate reports what it
+  cannot gate once.** The gate reads aioodbc 0.5.0's private names, and `aioodbc>=0.5` let a
+  release that renamed one turn the gate off. The DATABASE connector and the SQL Server store's
+  pooled cursor now read a cursor's raw handle through one function, which reports a missing one.
+  An aioodbc connection or cursor the gate cannot use is logged at ERROR once per process for its
+  type, instead of on every borrow. (`BACKLOG #5005`)
+- **A fault in the inbound handler on the raw-TCP and X12 listeners is recorded as
+  `handler_error`, not `framing_error`, and a sender that waits for no reply no longer loses frames
+  to a fault that clears.** Both listeners caught the fault in their last-resort arm, recorded
+  `framing_error` though the frame had been read cleanly, and dropped the connection. A sender that
+  waits for no reply never resends, so that would have lost the frame and every frame already sent
+  behind it. Now an HL7 inbound with acknowledgements on records `handler_error` and closes with no
+  reply, as before, so its sender resends. Any other inbound holds the frame and retries the
+  handler, backing off to one attempt every 30 seconds, until it is recorded or the listener stops;
+  the sender is stalled meanwhile. A fault the first retries clear logs WARNING lines and records no
+  event; `handler_error` and one ERROR line mark a fault still failing after four attempts. A stop
+  during the hold gets one last attempt at once. If that fails too, or stop cancels it past its
+  grace, the held frame and every frame behind it on that connection are lost, and one ERROR line
+  says so; the held frames are only in memory, so the process dying during the hold loses them too,
+  with no line; a cancel that cuts off an attempt mid-handler says the frame may or may not
+  be recorded. A fault after the commit can leave a copy per attempt, which at-least-once delivery
+  allows. An `OSError` raised by the handler
+  is now `handler_error` too, not `peer_reset`. (`BACKLOG #5022`)
+- **A SQL Server lease renew's statement timeout now expires within its clamp.** The claim's wait
+  for a pooled connection and its statement share one deadline of
+  `[cluster].lease_renew_timeout_seconds`, as on Postgres: the wait gets at most the clamp less
+  1 s, never under 1 s, the statement the whole seconds the wait left, and a wait that leaves under
+  1 s issues no statement and fails the renew with `StoreAcquireTimeout`. Before, each got the
+  whole clamp. Under a 2 s clamp the whole-second statement can still overrun it by up to a second,
+  and the cursor's creation and the COMMIT stay outside the deadline. The heartbeat, refresh and
+  release keep their two windows, and the load check and start-up warning are unchanged.
+  (vault `BACKLOG #5064`)
+- **An operator mutation given no audit is refused at runtime, before it writes anything.** The
+  store's `replay`, `replay_dead`, `resend_to`, `reingress` and `cancel_queued` raise `TypeError`
+  on an explicit `audit=None`, or on anything not callable, on all three backends. Before, the
+  requirement was type-level only, so a caller mypy does not check would have run the mutation and
+  recorded no operator row. The operator alert mutations and the connection flag refuse a `None`
+  row the same way, and their change rolls back. On `replay`, `replay_dead`, `resend_to`,
+  `reingress` and `cancel_queued`, an audit that RETURNS `None` for a result that changed the
+  store, such as a replay that re-queued a row, now raises `TypeError` inside the transaction, so
+  the change does not commit. A `None` return for a zero count or a
+  duplicate resend or re-ingress still records nothing: it is how a caller says the result needs
+  no row. The check reads the result the mutation returns, not every write it made. (`BACKLOG #5069`)
+- **`enqueue_ingress` refuses an operator origin with no audit.** A call naming `operator_upload`
+  or `operator_edit` as its `origin`, with no `audit`, raises `TypeError` before anything is
+  written, on all three backends. So does an operator inject whose audit builds no row, inside
+  the transaction, which rolls the inject back: an inject always writes a message. An `audit`
+  given with any other origin is refused before any write too, as an inject that forgot its
+  origin. A live receipt, the default `partner` origin, still passes none. The refusal keys on the origin, so an
+  inject written with the default `partner` origin is not caught, and the store's `audit` stays
+  optional in the type; the engine's `inject_message`, whose `audit` is required, always names
+  `operator_upload`. (`BACKLOG #5071`)
+- **`create_user`, `set_user_username`, `update_user_profile` and
+  `reject_seal_failed_approval` now require `audits=`.** It is keyword-only with no default on the
+  Store protocol and all three backends, so a caller states what commits with the write, `()`
+  included, rather than leave it out. The three engine callers that pass `()` say where their
+  record is written instead. (`BACKLOG #5070`)
+- **An MLLP or TCP inbound answers a strict-validation failure `AR`, not `AE`.** The body fails the
+  same way on every re-send, which `Http()` already answered as final (`422`, or `413` for strict
+  validation's own size cap). An `AE` invited a sender, the engine's own MLLP outbound included, to
+  retry it until its retry policy gave up. Every strict failure answers `AR`, whatever raised inside
+  the validator. (`BACKLOG #5078`)
+- **A strict-validation timeout whose validate had begun answers `AR` on MLLP or TCP, not `AE`.** It
+  was already final on `Http()` (`422`); the owner ruled on 2026-11-03 (decision log
+  d20261104T032854299-7235a9, stamped in UTC) that it is final on both listeners. (`BACKLOG #5078`)
+- **An MLLP or TCP streaming inbound answers a final detach refusal `AR`, not `AE`.** A body alone
+  over the whole `stream_inflight_budget_bytes`, a store backend that cannot stream and a malformed
+  document handle each refuse the same body on every re-send, which `Http()` already answered as
+  final (`413` or `422`). Only a budget held by concurrent detaches still answers `AE`, as `Http()`
+  answers it `503`. (`BACKLOG #5078`)
+- **A strict-validation timeout that fired before any worker thread began the validate is answered
+  as temporary: `503` with `Retry-After` on `Http()`, not `422`, and `AE` on MLLP or TCP.** Nothing
+  is known of such a body and no validate thread was left running, so a re-send costs nothing the
+  timeout guards against. Its `ERROR` row reads
+  `strict-validation timed out after <N>s before the validate began`. ADR 0154's amendment of
+  2026-11-03 says what was measured. (`BACKLOG #5078`)
+- **The docs now say plainly that strict validation's size cap does not follow
+  `max_message_bytes`.** It stays at the engine's 16 MiB, so a strict inbound that raises
+  `max_message_bytes` refuses a body between 16 MiB and its limit as over-size, unless the body is
+  at or over `stream_threshold_bytes`. See `docs/HL7-VALIDATION.md`. (`BACKLOG #5078`)
+- **An operator-only fault at intake is a configuration refusal, answered `503` with no
+  `Retry-After`.** At least an inbound `encoding` that sets up no decode is classed so. It refuses
+  every non-empty body until an operator edits the connection, so `Http()` no longer tells a sender to re-send
+  in 5 seconds; it answers `503` alone, and the `ERROR` row's error text opens
+  `[refusal kind: configuration]`. MLLP and TCP still answer `AE` where they send HL7 replies. A
+  DICOM inbound that declares a text `content_type`, the default `hl7v2` included, is now refused
+  when the config loads: it decodes each object as text, so it refused every object it received.
+  Declare `content_type="dicom"`. Should a configuration refusal reach the DICOM C-STORE SCP all the
+  same, it answers Cannot Understand (`0xC000`), not a status that invites a re-send. A file or remote-file source still
+  records the `ERROR` row and consumes its input, which that row stores whole; a name such as
+  `undefined`, which refuses every conversion, now reaches that row too, where it used to escape
+  the source's batch split and leave the file to be retried every scan with no row. What each
+  source does is listed in
+  [CONNECTIONS.md](docs/CONNECTIONS.md#an-inbound-encoding-follows-one-rule-on-every-source).
+  The decision is ADR 0154's amendment of 2026-11-04. (`BACKLOG #5102`)
+- **`messagefoundry check` no longer passes a fixture that expects a plain `ERROR` on a
+  strict-validation timeout alone.** A timeout says the validator was slow on that machine, not
+  that the content is invalid, so the gate now fails that run and says it got a timeout. A content
+  refusal the validator returned after the timeout still counts, so a slow runner does not fail a
+  fixture whose expected `ERROR` is that refusal. A `.expect` sidecar may now read
+  `ERROR <reason>`, which passes only when the reason appears, case-sensitively, in the run's error
+  or in the validator's content refusal. Past the timeout the run's error is the timeout text, and
+  it counts only for a reason holding `timed out`, so a fixture can still pin the DoS backstop;
+  [`docs/ADOPTER-CI.md`](docs/ADOPTER-CI.md) section 3 has the whole rule. A plain `ERROR` still
+  passes on every other `ERROR`. The dry run's strict-validation clock also starts after `hl7apy`
+  is warmed, so a preview does not count the process's cold import or its choice-group probe, nor,
+  when the warm-up can parse the body's MSH, the version's library or the structure's reference
+  table. The live listener is unchanged: its first validate of each after a start still counts
+  them. (`BACKLOG #5107`)
+- **The engine AI broker's anchored opener is held by each app, not once for the process.** The
+  opener `POST /ai/chat` dials where the `[tls]` anchor narrows was kept in one slot for the whole
+  process, so two apps in one process with different `[tls]` policies would have evicted each
+  other's opener on alternate requests and re-read the CA and CRL files each time, and the opener,
+  with its `loaded_crls` record, outlived the app that built it. `create_app` now gives each app
+  its own slot, the route holds the opener there, and the next assist call whose anchor narrows
+  nothing empties it. A broker built directly, with no slot, holds no opener. Each refusal
+  remedy is now written out in the source, so a grep for its opening words finds it.
+  (`BACKLOG #5527`)
+- **The cluster maintenance loop renews the lease first, on a fixed cadence, with the heartbeat and
+  the config-version refresh beside it.** They used to run in series with the renew, so a slow
+  heartbeat or refresh could push the next renew past `leader_fence_timeout_seconds` and make a
+  healthy leader self-fence. Each tick now starts `heartbeat_seconds` after the last one started,
+  the heartbeat runs on its own timer at the same interval, and the refresh runs once the renew
+  returns. A heartbeat or refresh
+  that never returns is cancelled after three times `lease_renew_timeout_seconds`, and one that a
+  tick finds still running is run again as soon as it ends, with a warning in the log.
+  **`node_timeout_seconds` now affects leadership:** a node whose own last heartbeat to land was
+  issued longer ago than that stops leading, and claims no lease, until a heartbeat lands, because
+  its siblings already read it as dead. See `docs/CONFIGURATION.md`, `[cluster]`, for how far above
+  `heartbeat_seconds` to keep it. (`BACKLOG #5710`)
+- **The session limits are bounded at load.** `[security].sign_out_after_idle_minutes` must be 1
+  to 525600 (a year) and `[security].max_session_hours` 1 to 8760 (a year); a value outside that
+  range is refused at load. The `[auth]` fields they desugar into take the same bounds. A value of
+  0 or less used to load and end every session at sign-in. The IDE Security Settings editor gives
+  both limits a minimum of 1, so Save refuses a lower value by name. The second-factor floor
+  refusal now names `[auth].mfa_verify_min_elapsed_seconds` and
+  `[security].sign_out_after_idle_minutes`, the keys an operator sets, rather than the refused
+  `[auth]` spelling of the idle limit. (`BACKLOG #5772`)
+- **Programmatic entry points default copy-on-Send on, as `[pipeline]` does.** `snapshot_on_send`
+  now defaults to `True` in `Engine`, `Engine.create`, `create_managed_app`, `RegistryRunner`,
+  `dry_run`, `route_message`, `trace_dry_run` and `smoke_self`, and `batch_handoff_statements` to
+  `True` in the first four. Both used to default to `False` there while `[pipeline]` defaults both to
+  `true`, so an embedder relying on keyword defaults ran without copy-on-Send isolation. `serve` and
+  the CLI previews are unchanged, because they pass the resolved settings. `messagefoundry verify`'s
+  self smoke now previews copy-on-Send when no service settings load. Pass `snapshot_on_send=False`
+  for the earlier last-write behaviour. (`BACKLOG #5794`)
+- **A log record the sink's formatter cannot format is replaced by a notice, where the formatter
+  can format one.** Before this change such a record rolled the sink and always went to stage 2: the re-write
+  formats the same record, so it failed too. Now, when the
+  sink takes a fixed notice naming the record's logger and level in its place, the engine keeps
+  processing: only that record's content is replaced by the notice, and the fault is reported on a
+  rate-limited stderr line only. No alert is raised and nothing shows on `GET /status`. **This is
+  weaker than before. Keeping it was decided by the Manager under the owner's delegation of
+  2026-11-17 (decision d20261118T002722950-fa0f70).** A formatter that cannot format even that
+  notice still records the sink
+  unwritable. [ADR 0162](docs/adr/0162-fail-closed-application-log-write-guard-detect-roll-and-stop.md)
+  amendment C states the rule. (`BACKLOG #5813`)
+- **An alert rule's `control_action` restart runs on its own throttle.** Its window, per event
+  type and connection, is now kept apart from the notification's, and only a restart the sink
+  actually schedules starts it. So a restart can fire on an alert whose page is throttled, when no
+  earlier alert in the window ran a restart. The 2026-11-19 amendment to ADR 0128 section 4 states the bound and at least its
+  limits, a zero cooldown and a `schedule` switch (owner ruling 2026-11-19, on PR 3069).
+  (`BACKLOG #5910`)
+- **A `host[:port]` allowlist entry with a bad shape, host or port is refused at config load,
+  ports compare as numbers, and an `http(s)://` URL with no port is matched at the
+  port it dials.** At least `[egress]` `allowed_mllp`, `allowed_tcp`, `allowed_http`, `allowed_db`,
+  `allowed_remote`, `allowed_smtp`, `allowed_direct`, `allowed_proxy`, `allowed_syslog` and
+  `[ai].allowed_endpoints` now refuse such an entry, at least a malformed one, a URL, a `*`
+  pattern and a port outside 1 to 65535, naming the list and the entry's
+  position and never its text; in the shipped code it loaded without error. A blank entry in
+  a TOML list is refused too; the comma-separated environment form of the `[egress]` lists still
+  drops blank items, as before. A JSON list given in one of those environment variables is refused:
+  write it comma-separated. An `allowed_db` entry naming an IPv6 address is refused too, and a
+  DATABASE `server` holding a colon is still refused as unlisted, now saying why. A port that
+  reaches the check as text, such as `06661`, matches `host:6661`, and `host:443` admits
+  `https://host/`, though at least a `proxy_url` with no port still matches only an entry that names
+  no port. [CONFIGURATION.md](docs/CONFIGURATION.md) says how an entry is read. (`BACKLOG #5915`)
+- **The `tcp` and `tls` syslog forwarders send octet-counted frames.** Each record goes as
+  `MSG-LEN SP <PRI>msg`, MSG-LEN being the number of bytes after the space: the `<PRI>`, the
+  handler's ident (which the engine leaves empty) and the rendered record, UTF-8 encoded (RFC
+  6587, RFC 5425), not as a NUL-terminated line. A collector that splits a raw TCP stream on LF
+  alone cannot parse either form, and one set to split on NUL, which parsed the old form, cannot
+  parse the new one; point either at an octet-counting listener. `udp` is unchanged. See
+  `forward_protocol` in [CONFIGURATION.md](docs/CONFIGURATION.md). (`BACKLOG #5924`)
+- **Some store paths are refused rather than anchored.** For a SQLite store, at least a
+  `[store].path` or `--db` whose last part is empty, `.` or `..` (it named a directory, which an
+  offline command's exists() guard took for a store) is refused, and on Windows one whose last
+  part ends in a dot or a space, or one with a colon anywhere except right after the drive letter
+  of a fully-qualified path, such as the drive-relative `C:mf.db`. `[store].path` is refused when
+  the settings load, and a `serve` or `supervise --db` before it is anchored. See the `[store]`
+  `path` row in [CONFIGURATION.md](docs/CONFIGURATION.md). (`BACKLOG #5926`)
+- **A `Message` reads and writes in the delimiters the parser split it on.** `Message` used to read
+  its delimiters from `MSH-1` and `MSH-2` and raise on an `MSH-2` shorter than four characters, or
+  on a `BHS`- or `FHS`-led message with no `MSH`, though the parser had already split it and
+  `Peek.field` read it; in a batch whose `MSH` names other delimiters than its header, a write
+  escaped by the `MSH`'s while every line was split on the header's. It now uses the delimiters the
+  parser read from the first line, a short `MSH-2` filled with `^`, `~`, `\` and `&` as the parser
+  fills it. A write that would change a header's delimiter fields, `MSH-1` and `MSH-2` and fields 1
+  and 2 of `BHS` and `FHS`, raises `ValueError`, and `add_segment` refuses a `BHS` or `FHS` line.
+  A streaming body with an `OBX` under a short `MSH-2` whose filled defaults do not collide, as
+  below, is now detached rather than refused, the handle marker in one, raw or escaped, is
+  judged under the filled delimiters as under a four-character `MSH-2`, and the retention
+  document-strip pass strips such a stored body. `UnreadableDelimitersError`, which nothing raises
+  any more, is removed from `messagefoundry.parsing`. `strip_documents`' `on_unreadable` keyword
+  becomes `on_unwritable`, `messagefoundry.store.document_strip.log_unreadable_skips` becomes
+  `log_unwritable_skips`, and `StripBatch.unreadable` becomes `StripBatch.unwritable`; the
+  callback now fires only for a body whose header collides, as below, and holds an OBX whose
+  `OBX-2` is `ED`, where it fired for any body whose delimiters could not be read. A short `MSH-2` whose filled default is already another of its
+  delimiters, such as `MSH|^~&|`, still parses and reads, so an outbound reads a partner ACK
+  under one as before, but every `Message` write to it, and `encode_batch` on it as a head,
+  raises `CollidingDelimitersRefused`, a `ValueError`; `extract_obx_document` raises it too for
+  an OBX whose `OBX-2` is `ED`. A batching outbound dead-letters such a member alone and frames
+  the rest: where it would head the envelope, and on an outbound that rewrites delimiters
+  (`encoding_characters`) wherever it sits; an outbound that sends each member's own bytes
+  carries a later one as before, and so does one with `hl7_raw_separators`, which is not
+  byte-for-byte: it re-emits a member's structural escapes as the head's raw delimiters. Both
+  listeners, the dry-run and the loopback re-ingress refuse such a body of any size that holds
+  the handle marker, raw or as a header's delimiters escape it, wherever it sits, and so does
+  the streaming detach (`InboundDocRefError`), since under `MSH|~|` a handle in `OBX-5.5` is not
+  read as one. Those checks look for the marker in as many distinct forms as later headers'
+  delimiters give, up to a fixed limit. A body whose later
+  headers give more, and whose first line's forms are not found, is refused without those scans,
+  so the check stays linear in the body: at least by both listeners, the dry-run and the loopback
+  re-ingress under such a header, and by the streaming detach, under such a header before it
+  reads any `OBX` and under any other where it would detach a document (`HeaderFormsLimitError`,
+  an `InboundDocRefError`). Both listeners, the dry-run and the loopback re-ingress refuse a
+  body past that limit under any other header too, whatever it holds, and so do the upload
+  resend and both edit-resend paths; the delivery re-attach looks for at most the same limit
+  and refuses a payload past it, such as a child a Handler built. The MLLP listener answers such a refusal with an `AR` naming too many header delimiter
+  sets to check; the HTTP listener refuses it as a permanent failure, and the dry-run and the
+  loopback re-ingress send no HL7 reply. The
+  detach refuses a body under such a header too when any
+  `OBX` has `OBX-2` `ED`, whether or not it reads a document there, since under `MSH|~|` no
+  `OBX-5` component reads as written (`CollidingDelimitersError`, a `NonVerbatimDocumentError` and
+  a `CollidingDelimitersRefused`), the re-attach refuses a handle in it, a child message whose
+  body is such a payload inherits no document from its parent, and the retention
+  document-strip pass leaves it as stored and logs one warning per call naming the count and
+  the first message id. The leading `BHS` or `FHS` header cannot be deleted, a
+  group delete changes nothing when it refuses, and the delivery
+  re-attach gate reads every header line, not only the first `MSH`. (`BACKLOG #5972`)
+- **On a SQL Server cluster the renew clamp is checked against both of the lease claim's
+  windows.** There the claim's wait for a pooled connection and its statement each get their own
+  window, so a clamp inside the detection margin could still let a renew land past it. A
+  `lease_renew_timeout_seconds` you set whose two windows reach the margin is now refused at load,
+  where it used to load with a start-up warning; a derived one is stepped down to the largest
+  whole number of seconds that fits; a fence/TTL pair that no clamp of at least 1 s fits is
+  refused, which at the stock `[store].acquire_timeout` is at least every pair whose margin is 2 s
+  or less. `[store].acquire_timeout` caps the claim's pool wait, so on a SQL Server cluster it now
+  feeds this check. The SQL Server failover profiles get wider TTLs so that they load there
+  (`harness/load/profiles/failover-sqlserver.toml`, TTL 8.0; the CI profile, TTL 6.0); the
+  Postgres failover profiles keep their TTLs. See the `lease_renew_timeout_seconds` row of
+  [CONFIGURATION.md](docs/CONFIGURATION.md). (`BACKLOG #5979`)
+- **`[store].acquire_timeout` refuses `nan` and `inf` at config load.** It must now be a finite
+  number above 0; neither value bounds the pool wait. (`BACKLOG #5979`)
+- **The operator alert mutations and the connection flag refuse a missing audit row before they
+  write anything.** `ack_alert_instance`, `resolve_alert_instance`, `suspend_alert_instance`,
+  `resume_alert_instance` and `set_connection_flag` raise `TypeError` on `audit=None` as their
+  first statement, on all three backends. Before, the refusal came after the write, and the
+  change rolled back. (`BACKLOG #6589`)
+- **`enqueue_ingress` now reads `origin_actor`.** An operator origin with no `origin_actor`, a
+  blank one or one with surrounding whitespace raises `TypeError` before anything is written, as
+  an `origin_actor` given with any other origin does: the column names the user behind an
+  operator origin only. The engine's `inject_message` types its `audit` as `InjectAudit`, whose
+  return admits no `None`, since the store refuses a `None` row for an inject; so does the
+  store's `enqueue_ingress`. The check is on `enqueue_ingress` alone: `reingress` and an edited
+  `resend_to` still take an optional `actor`. `POST /uploads/{id}/resend` refuses such a
+  username with a 403, after its channel check and before it reads the upload or injects
+  anything, since a directory name is not held to the local username rule. (`BACKLOG #6589`)
+- **A directory sign-in that creates the account's row records it.** The row commits with an
+  `auth.ad_user_created` audit row, in the same transaction, naming the new row's id, the
+  username and whether the sign-in was federated. Before, a first sign-in created the row with no
+  audit row unless the directory's mail was not adopted, so a first sign-in now also needs the
+  audit append to succeed, or it fails and creates nothing. On every directory birth, an
+  administrator's create included, the birth's row now precedes the not-adopted row in the audit
+  chain, and the administrator's `user.created` row for a directory account now names the new
+  row's id too. (`BACKLOG #6589`)
+- **The PostgreSQL and SQL Server at-open seal of legacy plaintext sends its cells to a batching
+  cipher in batches, as the SQLite seal already does.** Under `vault_transit`, a surface of 200
+  short legacy values was 200 Transit encrypt requests on these backends and is now 2, counted
+  against a fake Transit in `tests/test_server_seal_transit_batch.py`. A batch of more than one
+  value holds at most 128 values and 512 KiB of base64. A larger value is sent alone. The Transit
+  cipher can still send values one at a time in some cases; `TransitCipher.encrypt_many` states
+  when. A chunk cut after it starts sending every value alone holds one value, so that value's row
+  is written before the next request.
+  All three stores now write each batch's rows before encrypting the next. An in-process cipher,
+  such as AES-GCM, keeps each store's shape from before: SQLite writes a page per call, and the
+  server stores write each value before encrypting the next. The seal's transaction,
+  marker and rollback are unchanged. (vault `BACKLOG #6706`)
+- **`messagefoundry check` reads each reference file once per run.** `check` previewed each
+  fixture against each inbound it runs on, and each preview re-read and re-parsed every
+  file-backed reference set. It now builds the reference view once per run, with the new public
+  `dry_run_reference_view`, and passes it to every preview through a new `reference_view`
+  keyword on `dry_run` and `route_message`. Every read of a value decodes its own copy, as a read
+  of the live engine's reference cache does, so a Handler that edits a value it read changes no
+  later read, in the same preview or a later fixture's. The `dryrun` command, plain and traced,
+  builds the view once per run too, and `trace_dry_run` takes the same `reference_view` keyword.
+  A loader fault that does not skip the set now ends a `dryrun` run with a non-zero exit, naming
+  the fault's type alone, as it fails `check`'s dry-run leg. A caller that passes no view still
+  reads the files on every call. (`BACKLOG #6820`)
+- **`messagefoundry check`'s `url-query-credential` line reads an `env()` URL against the instance's
+  environment values,** the ones `build-check` loads, where a settings file or an environment
+  declaration resolves; before, it read the literal `default=` only, so an `env()` URL with no
+  default was never read. With no settings, settings that are refused, or values that do not
+  load, it still reads the defaults and names why. Its detail now says which reading ran on a hit
+  too, not only on a clean graph. (`BACKLOG #3766`)
+- **Strict X12 validation moves past pyx12 4.0.0, and some `X12SegmentError.code` values change.**
+  The `[x12]` extra now needs pyx12 4.1.0 or later, for the security reasons in the pyx12 4.1.0
+  entry; these codes changed in 4.0.1. `code` is the X12 error code from one code list. That is
+  the 997 AK list when the last group's GS08 is 004010, with or without an ack. Otherwise it is
+  the 999 IK list. Where that list has no code, `code` is pyx12's own error name.
+  Against pyx12 4.0.0, at least these differ:
+  - a data element error now also adds a segment-level row with code `8` for its segment;
+  - an HL count error reports pyx12's name `SEG_8_hl_count_mismatch` where 4.0.0 gave `HL1`;
+  - a not-used element reports `I10` on a 999 pass where 4.0.0 gave `10`. On a 997 pass, where the
+    997 has no code for it, it reports pyx12's name `ELE_I10_NOT_USED`, never a 999-only code.
+- **`X12ValidationResult.ack` is `None` for an incomplete ack.** pyx12 catches a failure in its
+  ack writer and leaves a fragment. A fragment is an ack whose last write by pyx12 was not its IEA.
+  Its text can still end in an IEA's text, echoed from a sender value: a whole IEA segment under
+  pyx12 4.0.1, and under 4.1.0 the same text after a `?`. That fragment is no longer returned or
+  labelled: `ack` and `ack_transaction` are both `None`, and a WARNING is logged.
+
+### Removed
+- **`[store].key_provider` no longer accepts `aws_kms`, `azure_kv`, `gcp_kms` or `pkcs11`.** None
+  was ever built, and each already failed closed at store open. Each is now refused as an unknown
+  name, and the keyless-store gate no longer counts one as a configured key. `vault` is the one
+  external provider. (`BACKLOG #2595`)
+- **`anonymize` and `anonymize_checked` take no `overlay` path.** Load the overlay once with
+  `load_rules` and pass `rules=` to each message. They used to read and parse it for every
+  message, and a process-wide record of warnings hid the overlay warnings from every later load.
+  That record is gone too: `load_rules` warns on every call. (`BACKLOG #3493`)
+- **The revocation refusal's unused egress-terminator input is gone.** `revocation_hop_disposition`
+  and `RevocationHopGuard` no longer take `proxy_proven`. No engine call site ever set it True (at
+  least two passed False), so no hop's decision changes. (`BACKLOG #3514`)
 
 ### Fixed
 - **The `supervise` process's own TLS log forwarder now picks up a replaced CRL without a
@@ -52,6 +874,6087 @@ All notable changes to MessageFoundry are documented here. The format follows
   reload: it is a WARNING line in the supervisor's own log. A shutdown signal sent while a reload
   pass is stuck cuts the supervisor's wait on that pass; the process can still wait at exit for
   the stuck read's worker thread to return. (`BACKLOG #3314`)
+- **Correction to the 0.4.0 entry for `[integrity].audit_anchor_file`.** That entry says a missing,
+  unreadable or malformed anchor never blocks startup. The read does not catch every error the
+  reader raises: at least a path carrying a NUL character raises, and `serve` does not start. The
+  entry also says such an anchor never fires the tamper alert, but a `vault:v` anchor with a valid
+  count and a malformed head is compared rather than refused, and can fire it. The
+  `audit_anchor_file` row in [CONFIGURATION.md](docs/CONFIGURATION.md) says both. (`BACKLOG #328`)
+- **The SQL Server cluster lease claim/renew now runs under `[cluster].lease_renew_timeout_seconds`.**
+  It inherited `[store].acquire_timeout` and `[store].command_timeout` (30 s each by default) while
+  it held the leadership lock, so a hung claim could hold a stepdown past that lock's fence-length
+  wait. The claim's wait for a pooled connection and its statement are now each bounded by the
+  clamp; the statement's bound is its own ODBC timeout, in whole seconds rounded down, and a shorter
+  `command_timeout` still wins. A clamp under 1 s is refused on the SQL Server backend, because the
+  driver cannot apply one. Unlike Postgres, the two bounds do not share one deadline, so a renew can
+  land up to about twice the clamp after it is issued, while the config check compares the clamp
+  alone with the detection margin; `serve` logs a warning at start-up when twice the clamp reaches
+  that margin, which the shipped 10/20/30 timings do. Neither the clamp nor `command_timeout` is
+  known to bound the COMMIT after the statement; that is a reading of pyodbc's documentation, not a
+  measurement, and `docs/CONFIGURATION.md` says why. The rollback after a failed claim has its own
+  bound at the clamp (`BACKLOG #5066`). ADR 0157 Inc 0, deviation 3. (`BACKLOG #1497`)
+- **A replay can no longer re-ingress a captured reply that retention erased.** The dead re-ingress
+  row kept its reference after the reply was gone, so a replay would have produced a child message
+  with an empty body. `purge_message_bodies` now blanks the reference with the reply, which the
+  replay paths already refuse, and a re-ingress that finds its reply gone dead-letters the row and
+  leaves the origin `ERROR`. (`BACKLOG #1560`)
+- **SQL Server transform state keeps keys that differ only in case apart.** The `state` table's
+  `namespace` and `key` columns are now declared `COLLATE Latin1_General_100_BIN2`. Before this, on
+  a database with a case-insensitive default collation, writing `MRN-abc` and then `mrn-ABC` merged
+  them into one row under the first spelling. The engine's in-memory copy kept two entries, and with
+  store encryption on, the next open failed to decrypt the merged row. The change applies only where
+  the `state` table is created, so a database that already holds one keeps its old collation. The
+  SQL Server schema hash also moves, so with `schema_management = external` the engine will not open
+  until `provision-schema` runs again. (`BACKLOG #1588`)
+- **A row whose re-pend fails after a store fault is recovered without a restart, and no later row
+  on its lane overtakes it.** A store fault between a committed claim and its handoff leaves the
+  row `inflight`, and the worker's re-pend of it can fail too. Before, that re-pend was tried once,
+  and the lane went on claiming past the stranded row until the next start. Now a per-lane worker,
+  or a pooled lane serializer, whose re-pend fails retries it on a backoff that doubles from 1 s to
+  30 s while it holds the lane, claiming nothing newer until the row is pending again, so per-lane
+  order holds. The first re-pend is always sent; a retry only while this node leads under the lease
+  it held at the fault, so a node that regains the lead after another node led sends none. The
+  trade: a re-pend that keeps failing now holds its lane, where before the lane moved on out of
+  order; the in-flight watch added in 0.5.0 pages such a lane in both claim modes while
+  `buildup_max_oldest_seconds` is on (300 s by default). At least these end a hold before the
+  write lands, leaving the row in flight as one failed re-pend did before, after which the lane
+  goes on as it did then. A stop or pause of an outbound, by an operator, a schedule window or a
+  DR park, read about once a second, so the purge that waits for the lane to quiesce is not held
+  until the store heals. The fail-closed halt when the application log cannot be written, which
+  also ends a router, transform or response lane's hold, in both claim modes. Another node having led since the rows were claimed. In the pooled
+  claim mode under `infra_fault_policy = stop`, `infra_fault_stop_after` failed re-pends, after
+  which the lane STOPs with `connection_stopped`; under `retry_forever` the hold goes on and raises
+  one `lane_stuck` there. A batching outbound's hold on its coalesced rows ends at that count
+  under `stop` without a STOP of its own, and raises no `lane_stuck` under `retry_forever`. A
+  per-lane worker never reads `infra_fault_policy`. A stop of the engine
+  leaves the row in flight for the next start, as before. At least these are not covered. A worker
+  killed by an error that is not an `Exception` still leaves its row in flight until the next
+  start, and its replacement claims past it, as before; in the pooled claim mode a serializer
+  killed that way is not respawned. A claim that committed but whose reply never reached the
+  worker leaves it no record of the row, which stays in flight until a store recovery path
+  re-pends it, at least the next start. A node that loses and regains the lead inside one store
+  write can still send that one retry. (`BACKLOG #1611`)
+- **A detached document's sender-controlled OBX-5.2 label is bounded to what every store backend
+  holds.** When an inbound sets `stream_threshold_bytes`, a large embedded document is written to
+  the attachment store before the ingress commit. A label wider than 256 UTF-16 code units would
+  have failed that write on SQL Server on every resend, and one holding a NUL would have failed it
+  on PostgreSQL; either is now stored as `application/octet-stream` on every backend, as a
+  mislabelled one already was. A fault from the
+  attachment write still propagates with no message row, as before; only a refusal the detach already answered, such as a backend without streaming support,
+  is still recorded as an `ERROR`. (`BACKLOG #1619`)
+- **A Postgres or SQL Server store open now checks the live schema before it marks the schema
+  current.** The DDL batch skips a CREATE whose name is already held, whatever the shape of what
+  holds it. On Postgres any relation of the name in the store's schema counts, a view or a sequence
+  as much as a table or an index. On SQL Server a table's guard counts only a user table of the
+  name, so another kind of object there makes the batch fail on that `CREATE TABLE` instead, and an
+  index's guard counts an index or a statistics object of the name on its table. So a relation named
+  `ix_queue_fifo_in_seq` on Postgres, or an index of that name with another key on SQL Server, left
+  the index unbuilt while the `schema_meta` marker recorded the batch as applied, and every later
+  open skipped the batch. After the batch and its migrations, and before the marker, each backend
+  now reads its catalog and compares it with the tables, columns and named
+  indexes the batch declares. The open refuses with `ServerSchemaMismatchError`, naming each one,
+  and rolls the batch back with no marker written, so the next open runs it again, for at least: a
+  missing table, column or index; an index of the declared name on another table, or with other
+  keys, direction or uniqueness, or with or without a `WHERE` where the batch declares the other;
+  an index name held by a table or other relation on Postgres, or by a statistics object on SQL
+  Server; and an index that exists under the name but cannot serve, invalid or not btree on
+  Postgres, disabled or hypothetical on SQL Server. Where a later statement in the batch fails on
+  an object first, the open fails with that statement's own error instead. Extra columns and
+  indexes are tolerated. What is not compared includes at least a column default (BACKLOG #5085
+  reads a Postgres `nextval()` default as numbering), constraint indexes and the text of a partial
+  index's predicate. This covers `provision-schema` too. The refusal names
+  the Postgres schema, and says "the connection's default database" when `[store].database` is
+  unset. The Postgres upgrade step's column checks now read only the store's own schema, so a second
+  store in another schema of the same database no longer makes it skip a column this one lacks.
+  The refusal lists the differences first, so a path that shortens the message keeps them. The
+  `schema_meta` marker moves on both backends (Postgres `_MIGRATION_REV` 7 to 8, and a new SQL
+  Server check revision in the hash input), so a store marked by an earlier build takes the full
+  run once, through the check and the scoped upgrade step. At least these CLI commands that open
+  the store writable report this refusal as could not start, exit 2, with its text whole:
+  `rotate-key`, `backup`, `admin-unlock`, `admin-set-notify-email`, `admin-reset-totp` and
+  `provision-admin`. Each would have reached the dispatch floor's exit 1, which `rotate-key` gives
+  an aborted rotation and `provision-admin` a refusal about the account, though the open had
+  rolled its batch back and written no store row. (`BACKLOG #1720`)
+- **A value file may no longer hold a table inside an array.** `env()` hands a value over whole, so
+  an env marker in such a table would never have been resolved, and on a first deployment its
+  fallback could have reached a connector inside a stringified item. Reading
+  `environments/<env>.toml` now refuses a table anywhere inside an array value, in the inline and the
+  `[[tables]]` spelling, on the disk read and on a reload's snapshot read, even for a key nothing
+  references. The message names the key and index only. A mapping handed to the engine directly is
+  not checked. See [CONFIGURATION.md](docs/CONFIGURATION.md). (`BACKLOG #1820`)
+- **Every connection an autocommit database pool hands out is put in autocommit first.** The
+  DATABASE poll source's mark pool, the `db_lookup` pool and the `DatabaseRef` reference-sync pool
+  asked for autocommit at creation only, which pyodbc does not send to the driver. Now each
+  physical connection has autocommit set through the driver, off the event loop, before its first
+  statement, and a set that does not take refuses the borrow. A borrow abandoned during that set,
+  or during a cursor close, returns its connection only once that driver call has ended. A
+  cancellation during cursor creation, `execute` or a fetch is not covered by this change. The
+  suspected cause, ODBC driver-manager pooling, was already turned off by `BACKLOG #2049` and was
+  never reproduced. (`BACKLOG #2148`)
+- **A DATABASE source refuses at least a `poll_statement` of a writing shape.** The test reads
+  the statement's shape only, so at least a `SELECT` that calls a function which writes, and a
+  T-SQL second statement with no `;` whose verb the test does not list, still pass it, and would
+  write when the poll runs (`BACKLOG #4957`). The poll runs on an
+  autocommit connection, so a claiming poll such as `UPDATE ... RETURNING` would mark rows it never
+  hands off: at least those past `poll_max_rows`, a row whose hand-off failed, and those left behind
+  a stop. A statement that fails the `db_lookup` read-only test is now refused, a literal one when
+  `DatabasePoll` is declared and every one when the source is built, whatever `poll_max_rows` is.
+  At least a write keyword, `EXEC` or `{CALL ...}`, a second statement after a `;` and a
+  `FOR UPDATE` locking read are refused.
+  Poll with a `SELECT` and mark rows with `mark_statement`. With no `mark_statement`, a full
+  ceiling now logs a WARNING once per run of full polls instead of the "deferred" line. See
+  [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #2178`)
+- **A DR backup, restore-verify and restore check the real snapshot when a staging path holds `#`,
+  `?` or `%`.** The row counts and `integrity_check` opened the snapshot through a bare `file:`
+  URI, which SQLite cuts at a `#` or `?` and decodes at a `%`. With such a character anywhere in a
+  staging path, at least the store's data directory, the OS temp directory or the restore
+  destination's directory, the open went wrong in one of two ways. A `#`, or a `?` on POSIX, could
+  drop `mode=ro` and read an empty database it created at the cut path. The backup then recorded no
+  row counts in its manifest, and a verify of that archive compared nothing and passed. A `%XX`
+  sequence instead named a different, missing file, so the check failed to open the snapshot at
+  all, with "unable to open database file". Both checks now open the snapshot read-only through
+  the store's own URI builder, as the full verify's decrypt pass already did. A test refuses a new
+  `file:` URI built by an f-string, `+`, `%` or `.format` in the engine's packages, outside the two
+  builders that encode the path. (`BACKLOG #2186`)
+- **An unreadable CA file is the named refusal on the `tls_verify=false` arms too.** The SMTP
+  context (at least Email, Direct and the alerts sink, which the security notifier and the alerts
+  test send also use), the MLLP destination and the FTPS context loaded the CA file themselves
+  when `tls_verify=false`, so a missing file was a bare `FileNotFoundError`, and one with no
+  usable PEM a raw `ssl.SSLError`, naming nothing. They now raise `CaFileUnreadable`, naming the
+  setting and, where there is one, the connection, and not the path, as the verifying arms
+  already did. The same holds for an MLLP, DICOM C-STORE SCU or FTPS context built directly with
+  no `[tls]` policy, which the engine itself never does. Such a hop still refuses a CA file it
+  cannot read. Nothing else changes: a verifying hop trusts the CA it did, and a
+  `tls_verify=false` hop still accepts any certificate. (`BACKLOG #2370`)
+- **The ODBC call gate now covers more of the cancel exits it missed.** A driver call whose task was
+  cancelled before the call reached the gate no longer runs later, so it can no longer run after a
+  cleanup closed its handle, or on a connection already lent to its next borrower; a cancelled close
+  still runs, inside the gate. A cursor made by a cancelled `cursor()` call is now closed as that
+  call returns, before its connection closes, instead of being left for the garbage collector. A
+  DATABASE borrow cancelled while its cursor was being made now goes back to its pool only once that
+  call has returned. A cancelled DATABASE borrow on a connection the gate could not wrap no longer
+  closes its cursor beside the running statement: the connection is discarded unclosed, and the
+  driver frees it once the statement returns and nothing else holds it, which can be on the event
+  loop. The SQL Server store's dedicated
+  claim connections now leave as the open-time connections do: a cancelled open hands the
+  connection to the gate without waiting for the running driver call, the discard after a cancelled
+  claim no longer waits for the claim statement itself, and a second cancellation during an
+  ordinary discard no longer waits for the close. A cancelled claim still waits for its statement
+  in the claim's own shielded lock-timeout reset, which runs before the discard. At least this is
+  not covered: a cancellation that lands after a `cursor()` call returned but before its result was
+  delivered, which leaves that cursor for the collector. The store's own connections the gate could
+  not wrap are refused instead; the entry for that refusal says how. (`BACKLOG #2394`,
+  `BACKLOG #2395`)
+- **The DATABASE connector's pooled connections now go through the ODBC call gate.** A destination
+  send, a source poll or mark, a `db_lookup` and a `DatabaseRef` sync borrow their connections with
+  the gate the SQL Server store uses, and the autocommit set and the cursor close run through it. A
+  cancellation during a statement no longer closes the cursor on another thread while the statement
+  still runs, which on a real driver frees the handle the statement returns to and can crash the
+  process. The cursor now closes once the statement returns, on the statement's own thread, and the
+  same step rolls back what the cancelled statement left open, so a destination's connection no
+  longer goes back holding a cancelled INSERT for the next send to commit, unless that rollback
+  fails while the session is still alive; the failure is logged. The connection then goes
+  back to its pool. The cancelled task does not wait for the statement, but the connection keeps
+  its pool slot until the statement returns, which nothing in the engine bounds. While a pool holds
+  such a connection back, its close waits at most 2 s for it, then goes on by itself: the
+  destination's, the lookup's, a `DatabaseRef` sync's and a source's stop, so the connection test of
+  a source no longer hangs behind a `SELECT 1` its own timeout cancelled. With no connection held
+  back, a close waits for in-flight calls as before. After the 2 s a new pool can open beside the
+  one still closing. (`BACKLOG #2394`)
+- **The DATABASE connector now refuses an aioodbc connection the ODBC call gate cannot wrap.**
+  Before, such a connection was borrowed ungated, and a cancellation during a driver call on it
+  left its handles unclosed, for pyodbc to free with a rollback and a disconnect wherever the last
+  reference dropped, which could be the event loop thread. Every pooled borrow, at least an
+  outbound send, an inbound poll or mark, a `db_lookup`, the login role probe and a `DatabaseRef`
+  sync, now checks the gate before the connector makes any driver call on the connection. A
+  connection that fails the check is closed while nothing runs on it, and the borrow fails with
+  `UngatedConnectionError`, which each caller handles as it does any other failed borrow: an
+  outbound send reports it as a transient connect failure. The pool gets the connection back
+  closed, except on an aioodbc that also renamed the connection's handle: there the connection
+  goes back only once its own close has returned, and goes back open if that close failed, to be
+  refused and closed again on its next borrow. Under the pinned `aioodbc` release every connection
+  can be gated, so this changes nothing there. (`BACKLOG #2394`)
+- **The SQL Server call gate now covers the store's open-time connections and the cluster table
+  setup.** The gate from `BACKLOG #2049` covered only pooled store connections and claim holders. It
+  now also covers at least the connection the open uses to check `READ_COMMITTED_SNAPSHOT`. It
+  covers the fresh connections that re-read it after a failed `ALTER`, and the explicit autocommit
+  set. A cancellation during a statement there hands the cursor and the connection to the gate,
+  which closes them once the running driver call returns. Those connections now close in one job,
+  their cursor first. Where the connection and its cursor both carry their driver handles, a
+  cancellation during that close lets it finish and closes each handle once, on a gated or an
+  ungated connection. A connection or cursor without its handle is closed through its own methods
+  instead, and a cancellation can cut that short. A real connection of the SQL Server store's that the gate cannot
+  wrap is now refused; the entry for that refusal says how. On a gated connection, neither
+  cancellation waits for the driver call. The cluster coordinator's table setup now uses the store's cursor helper. Its cursor
+  closes before the connection returns to the pool, and goes to the gate on a cancellation. The gate
+  moved to the leaf module `messagefoundry.odbc_call_gate`, and the one-shot connection exits live
+  there too. The DATABASE connector's entry for `BACKLOG #2394` covers that connector. The entry
+  for the cancel exits covers the claim holder and a cancellation while a cursor is being created,
+  and says what it leaves open. (`BACKLOG #2394`)
+- **The SQL Server store now refuses an aioodbc connection the ODBC call gate cannot wrap.** Before,
+  such a connection was used ungated, and a cancellation during a driver call on it closed its
+  handles beside that call: in the pooled quarantine and its cursor helper, on the open-time
+  connections that check `READ_COMMITTED_SNAPSHOT`, and on the dedicated claim connections. Each of
+  those now checks the gate when it opens or borrows the connection, before the store makes any
+  driver call on it. A connection that fails the check is closed at once, while nothing runs on it, and the
+  open or the borrow fails with an error that names the cause. Under the pinned `aioodbc` release
+  every connection can be gated, so this changes nothing there. The DATABASE connector is not
+  covered by this entry. (`BACKLOG #2394`)
+- **An OpenSSL build that refuses a TLS list the engine sets on every context is now reported as
+  a configuration refusal where the shared HTTPS opener is first used, not as a failed import.**
+  The verifying, no-redirect opener shared by at least the REST, SOAP, FHIR, DICOMweb, SMART,
+  OAuth2 token and AI-broker hops, and the one shared by alert webhooks, were built when their modules were imported, so
+  on such a build importing either module raised. Both are now built on first use, so a hop that
+  uses one is refused with the error that names the refused list and the linked OpenSSL.
+  The AI broker reports it as its own error. Accepted and refused handshakes do not change.
+- **An `env()` default may no longer hold another `env()` reference.** Only one link is resolved, so
+  such a default would have reached the connector unresolved, with any `default=` of its own, and
+  on a first deployment a fallback could have reached a partner in a header. `env()`, `EnvRef` and
+  the `connections.toml` decoder now refuse it when the reference is made, naming the key and
+  withholding the default. That covers a default that is a reference and a table or list that holds
+  one, down to the scan's depth, including a whole-table `headers` default. A table with an `env` key and no other key but
+  `default` or `cast` counts as a reference inside a default, so a default header table with one
+  header named `env` is refused too. The decoder's refusals of a bad `env` key or `cast` now name a
+  non-text value by its type. See [CONFIGURATION.md](docs/CONFIGURATION.md). (`BACKLOG #2519`)
+- **The firewall guide gains four outbound rows.**
+  [ANTIVIRUS-FIREWALL.md](docs/ANTIVIRUS-FIREWALL.md) now has rows for `Email()`, `Direct()`, a
+  forward proxy and the syslog forwarder, and its REMOTEFILE row names `[egress].allowed_remote`.
+  Its opening says at least, points at the table's gate column, and links to
+  [CONFIGURATION.md](docs/CONFIGURATION.md#egress). (vault `BACKLOG #2621`)
+- **The text on a generic-ODBC hop's credential now matches the code.** `odbc_params` takes a fixed
+  keyword list, and the only credential that list can carry is a client certificate. What
+  `messagefoundry check` and `GET /security/posture` report does not change.
+  (vault `BACKLOG #2621`)
+- **CONNECTIONS.md states what the generic ODBC keyword list covers.** It said no `odbc_params`
+  keyword can give the driver another host, with no condition. It now says the list is hand-chosen,
+  no keyword is on it in order to name a host, and a file keyword's value is screened
+  separately by spelling. The list covers keywords only, and relies on at least a driver named on
+  the escape list reading the `}}` escape in a braced password, and the driver reading `SERVER` as
+  its target. Behaviour is unchanged. See [CONNECTIONS.md](docs/CONNECTIONS.md).
+  (`BACKLOG #2621`)
+- **A passkey enrolment that the store refuses is called a label clash only when the label is
+  taken.** A label differing only by case from one the account holds is now refused after the
+  ceremony is verified and before the passkey is stored, on every backend, as SQL Server's
+  collation already refused it; two enrolments racing such labels can still both land on SQLite
+  and Postgres. A label's 100-character cap counts UTF-16 code units, as SQL Server's column
+  does, so a label of characters outside the Basic Multilingual Plane no longer passes the check
+  and then fails on that store. Any other refusal now says the passkey could not be stored. (`vault BACKLOG #2733`)
+- **A local sign-in whose account is deleted before its session is written is refused, not
+  answered with a 500.**
+  `create_session` now returns `False` for an account row it cannot find, on SQLite, PostgreSQL and
+  SQL Server, guarded or not, instead of letting the session INSERT fail its foreign key. The
+  password sign-in answers that as it answers an unknown account: `invalid credentials`, held to
+  the same failure pad, with an `unknown_or_disabled` failure row. (`BACKLOG #2733`)
+- **A federated bind and a user delete can no longer deadlock on the Postgres store.** Deleting a
+  user now locks the account's row before its sessions, the order a bind, an unbind and a
+  whole-account session revoke already use. SQL Server has done so since BACKLOG #2733. An
+  internal federated sign-in call with no verified identity-provider pair is now refused as a
+  programming error; no shipped caller makes one. [SECURITY.md](docs/SECURITY.md) now says
+  that a session the SQL Server sweep misses is, with at least one exception, refused on its
+  next use, and that ending it raises a known false seal-failure alert. (`BACKLOG #2738`)
+- **`extract_obx_document`, `embed_obx_document` and `strip_documents_in_hl7` no longer let out a
+  bare `ValueError` that quotes `MSH-1` and `MSH-2`** on an `MSH-2` shorter than four encoding
+  characters or a body with no `MSH`. Such a message is now read under the delimiters the parser
+  read for it (`BACKLOG #5972`), so the helpers read, write and strip it as any other.
+  (`BACKLOG #2873`)
+- **`EngineClient.change_password` waits as long as the sign-in for its reply, and a client built
+  with a longer timeout keeps it on every queued call.** The current-password proof queues behind
+  the account's re-proof lock, as `reauth` does, so it now gets the sign-in's read instead
+  of the 5 second default. The sign-in read is now a floor, not a ceiling: a client built
+  with a timeout above the sign-in read used to get a shorter read on `login`, `reauth`, `verify_mfa`
+  and `confirm_mfa` than on any other request. `change_password` also refuses, before sending,
+  to put its two passwords on a cleartext non-loopback hop, as `login` does.
+  (`vault BACKLOG #2950`, `vault BACKLOG #3751` items 4 and 6)
+- **The IDE's step-up re-proof now times out, and `messagefoundry check` reads the service
+  settings once per run.** The IDE posted `/me/reauth` with no timeout, so an engine that stopped
+  answering could hold the step-up request open with no bound of the IDE's own; it now takes the sign-in's 150
+  second timeout, as the Python client's `reauth` already did. `check` used to resolve and load
+  `messagefoundry.toml` again for each settings leg; one run now resolves it once and loads it once
+  per distinct set of overrides, and the settings legs that report a refused file report it with
+  the same line.
+  (`vault BACKLOG #2950`)
+- **An OAuth2 or SMART token hop behind an ECH sidecar posts through a plain opener.** (`BACKLOG
+  #2977`) The engine sends the token request to the loopback sidecar, not to the token host. Where
+  the token host's trust anchor narrowed (a `tls_ca_file`, an internal CA, or a `crl_file`), the
+  opener it went through carried that host's CA and CRL, so an `https://` sidecar would have been
+  verified against them. With the default system anchor it already used the shared opener. It now
+  always uses the opener the REST destination's own ECH hop uses. The token hop's revocation
+  refusal is unchanged.
+- **An OAuth2 or SMART connection whose `https://` token endpoint sits behind a web proxy set up
+  for Digest is refused when it is built.** (`BACKLOG #2989`) urllib cannot answer a proxy's 407
+  to the `CONNECT` with Digest, so that setup could never answer a challenge there. Before, such a
+  connection built: its lane stopped at the first send if the proxy challenged the `CONNECT`, and
+  it minted tokens if the proxy let the `CONNECT` through unchallenged. Both cases are now refused
+  at load. The refusal keys on the proxy resolved for the token host. On some REST and FHIR outbounds it runs before the proxy credential's hop
+  is judged; the docstring of `refuse_a_digest_proxy_on_the_token_hop` says which. The static-credential report no longer lists the proxy hop of a Digest proxy on a
+  connection whose own `url` is `https`, or on one that mints a bearer from a literal token URL with
+  no `env()` value turning a token provider on or off; the docstring of `_digest_proxy_refused` says
+  why. Other Digest proxy hops are listed as before. A `CONNECT` 407 on a proxy with no Digest set
+  up, and any other `CONNECT` refusal, still retry.
+  [ADR 0095](docs/adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md)
+  Amendment B.1 has the detail and the remedy.
+- **A directory rename whose account record's seal is refused at the write no longer ends the
+  reconcile pass.** The record verified when the refresh read it, then the store refused the write
+  over its seal: the record no longer passed it, or Vault transit could not verify it or did not
+  answer. That refusal ended the pass, so the renames after it were skipped and the pass's
+  refused-row pages were lost. The reconciler now logs a seal failure or an unverifiable record at
+  ERROR, reports it as an admin read reports the same answer, and goes on. A Vault transit outage,
+  at the write or at one of the rename's reads, is paged once and stops the pass's renames; the
+  rest of the pass still runs and returns its plan. An unverifiable record at one of the rename's
+  reads skips that rename, logged at ERROR. A sign-in that meets the same refusal still fails.
+  (`vault BACKLOG #3069`)
+- **A directory rename refresh no longer reports a record that fails its integrity check as gone,
+  or as nobody holding the name.** When the renamed account's own record failed its seal, the
+  refresh filed an `auth.ad_username_refresh_conflict` row saying the row was removed. It now
+  writes nothing, files nothing more than the loader's own seal-failure report, and logs a warning
+  that names the integrity failure. When the account that holds the new name fails its seal, the
+  write path used to warn that no row held the name and that a later pass would retry, which is
+  false while that holder stays refused. It now gives the lockout warning, and the conflict row
+  carries `held_by_refused: true` in place of an unverified id. (`vault BACKLOG #3069`)
+- **Two directory reconcilers that apply one role change report it once.** Each pass read the
+  account's roles, then wrote its planned roles unconditionally, so two that both read the old
+  roles both counted a change, and both alerted and told the user; and a write landing between
+  that read and the pass's write was overwritten. The role write is now a compare-and-set on the
+  roles the pass read, on all three stores (`set_user_roles_if_held`): only the first of two writes,
+  and a write that finds the roles moved writes nothing. A pass that wrote no role and ended no
+  session is quiet, and still writes its `auth.ad_session_revoked` row with `sessions: 0`; the next
+  pass plans from what is stored. The second of two reconcilers still reports when it ends a session
+  the first had not yet ended, and a sign-in that wrote between the pass's plan and its apply is
+  still overwritten. See [SECURITY.md](docs/SECURITY.md). (`vault BACKLOG #3085`)
+- **A `sys.exit()` while a Router, `accepts=` predicate or Handler runs no longer ends the sandbox
+  worker.** At `[sandbox].mode = "subprocess"` or `"isolated"` the worker caught only `Exception`,
+  so the `SystemExit` ended it. The message still dead-lettered, but its reason read as a worker
+  crash, the next message waited for a fresh worker to start, and `sys.exit("...")` had the worker
+  print the author's text to its stderr. The worker now reports it as that Router's or Handler's
+  error, in the words `mode = "off"` uses, naming an integer exit code and nothing else, and goes on
+  serving. A generator Router's body is now run inside the same boundary, and so is the rendering
+  of an exception whose `__str__` calls `sys.exit()`. (`BACKLOG #3134`)
+- **`rotate-key` no longer brings back an upload that a running engine deletes while it runs, while
+  both hold the uploads lock.** The command refuses a running engine only on SQLite, so on
+  PostgreSQL or SQL Server an engine could delete or prune an upload between the re-seal's read and
+  its write, and the write re-created the file. The engine's removals of an upload and each re-seal
+  write now hold one lock file in the uploads directory, `.mefor-edit.lock`, and the re-seal
+  replaces a file only while it is still the one it read. Such an upload is a skip, so the run exits
+  non-zero. Run `rotate-key` as the engine's account: an engine that cannot take the lock still
+  removes uploads, without it. See [PHI.md](docs/PHI.md). (`BACKLOG #3181`)
+- **The dialling CA check of a lane reads the CA once per check, and a reload that removes or
+  renames a lane forgets it.** The check read the file, its ACL and its path twice, so on
+  Windows each check ran `icacls` twice, and what it remembered could come from another read
+  than the one it judged. A reload that removes or renames a lane now drops that lane's refusal
+  mark and the check's memory of it. The check now also remembers a clean pass, one whose ACL
+  reads as owner-only and whose path no other account can replace it through, once its rows are
+  written. A repeat of it skips only the content check (the private-key and encryption-header
+  refusal), for the same setting, bytes, pin result and path findings, with the ACL read again
+  found owner-only (the result of that read is compared, not the ACL itself), while the audited
+  baseline still names those bytes. It still reads the CA, its ACL, its path and that baseline,
+  and writes no row either way. A pass that wrote a violation row, such as `acl_insecure`, which
+  a lane CA passes with only under `warn`, is never remembered: every check writes that row
+  again and logs its warning, as before. (`BACKLOG #3188`)
+- **`engine.stop()` now holds its CRL, watch and alert waits to the shutdown's budget, to keep a
+  stop inside NSSM's stop window.** Before, each kept a fixed bound of up to 10 s whatever the
+  stop had left. The graph supervisor's wait and the other stop steps are not held to the budget,
+  so a slow one can still carry the stop past the window. On a tight stop these waits are cut
+  short, and a cut can lose at least a remote-debug audit row, an alert-instance write, or a CRL
+  reload pass in flight.
+  [SERVICE.md](docs/SERVICE.md#start--stop--status) says how short and what is lost.
+  (vault `BACKLOG #3191`)
+- **The approvals queue no longer offers Approve on a held reload that names no config digest.**
+  Such a release could only be refused, since a reload bound to no digest matches no config, and
+  it was refused only after the gate claimed it, so the request ended `failed`. A digest not of
+  the form the engine writes now counts as none. `GET /approvals`
+  now marks it `release_blocked: "params_no_fingerprint"`, and the gate refuses it before its claim
+  with 409 and an `approval.params_no_fingerprint` row, so it stays pending for a reject. The web
+  console's Approvals page offers it only Reject or Withdraw, with a note. A queue with no identity
+  resolver already showed every request as `requester_not_authorized`; a test now pins it.
+  `PendingApprovalInfo.gated` is removed: `release_blocked: "not_gated"` says the same, and the
+  console never read it. The web console seam digest moved. (vault `BACKLOG #3192`, `#3193`)
+- **An intake-pause alert whose engine process never returns under its name now expires.** The
+  subject is `intake:<reason>@<process>`, so at least an unpinned cluster node that crashed while
+  paused, a lone engine that became several engine shards, a dropped engine shard, and a renamed
+  `[cluster].node_id` left an alert nobody could clear. Every engine process with an alert sink now
+  sweeps the open `intake_paused` alerts of other processes once a minute and resolves one whose
+  occurrence count has not moved for four reminder intervals (20 minutes) of its own clock. The
+  resolve is bounded by the count it read, so a paused process that is alive, and whose reminder
+  every five minutes reaches the store, keeps its alert open, and no clock is compared across
+  processes. A paused process cut off from the store has its alert expired while still paused. (`BACKLOG #3269`)
+- **Every CLI subcommand but `serve` and `supervise` sends a `print()` in an author's config
+  module, Router or Handler to stderr, at least through the config loader and the dry-run
+  preview.** Before, only `dryrun`, `validate` and `graph` did, each
+  by its own wrap, so a debugging print still came ahead of the JSON on stdout under at least
+  `check` (its later loads, and the Router and Handlers its dry-run leg runs), `connection`,
+  `impact` and `cert inventory`. The CLI shell now marks each subcommand it dispatches, and the
+  config loader and the dry-run preview send a print to stderr while the mark is set, so a new
+  subcommand is covered without a wrap of its own. Nothing redacts what an author's own print
+  writes, so stderr is no safer than stdout. (vault `BACKLOG #3474`)
+- **Adding a key to a keyless store no longer dead-letters a live empty message.** A keyless store
+  holds an empty body as a blank, which a keyed claim refuses, so such a row would have raised a
+  false `integrity_drift` alarm. The first keyed open now seals it, and it is delivered as an empty
+  body. A blank live row on a surface that is already keyed stays refused. (`BACKLOG #3495`)
+- **A CRL expiry alert about a CA-file CRL no longer claims more than the engine proved.** The
+  engine may be unable to confirm the signature of a CRL now in a hop's CA file. The alert's
+  `detail` then asks you to check the CRL. It used to say that every handshake would fail, and
+  handshakes can still pass in that case. After the check, it says to restart. Only a hop that
+  still holds a stale copy through a CRL setting makes the restart wait for the reload's verdict.
+  The scan may log that it could not check the signature of a later CRL in the file. That follows
+  only a CRL it would ask you to check. Then `detail` says to replace the CRL, not to check it. For
+  a CRL proven badly signed, `detail` now uses a start's words. It also says the CRL may be removed
+  when a good one from that issuer is already in the file. A CA-file step no longer drops a refused
+  reload's remedy. `detail` gives that remedy and its reason after the step, as it does elsewhere.
+  The CA-file hop's restart follows, unless the remedy is a plain restart of the engine. The
+  certificate monitor also keeps a CRL row's alert when it cannot work out which rows share the
+  file. When grouping the rows, a path it cannot key costs only that path's rows their
+  `shared_with`, and is logged as an error.
+  (`BACKLOG #3512`)
+- **A failure logging the held-copy warning no longer costs a CRL row its date.** The certificate
+  monitor logs `a running TLS hop still holds a copy of ...`, usually once a pass for each file.
+  That bookkeeping ran inside the guard around the held-copy verdict. A failure in it would have
+  reset the verdict, so the row would have been judged by the file alone. A copy inside the warn
+  window could then have raised no `crl_expiry` alert. The line is now logged after the verdict,
+  under its own guard, and a failure there is logged as an error. No failure of this kind is known
+  to happen. (`vault BACKLOG #3548`)
+- **A byte-order mark no longer hides the anonymizer's site prefix.** A token file saved with a
+  byte-order mark, whose first line is `[site_prefix]`, loaded no site prefix, so a site code left
+  the anonymizer unchanged while the publish guard, which drops the mark, still called the token
+  tables live. Both `surrogates.py` copies now drop the mark the way the guard does, on a file and
+  on inline `MEFOR_FORBIDDEN_TOKENS` content alike, and take only ASCII digits as a prefix, as the
+  guard does. `kept_defaults` no longer lists a path that a rule set built in code both keeps and
+  rewrites, because the anonymizer rewrites it. The 0.5.2 note that the overlay warnings are
+  logged "once per process" is superseded by the `anonymize` entry for `BACKLOG #3493`.
+  (`BACKLOG #3609`)
+- **A Vault Transit outage on an uploaded file answers 503, not 423.** Under
+  `[store].cipher_provider = "vault_transit"`, a Transit call on the data key that got no verdict
+  now raises `CipherUnavailableError`, a `CipherError` subclass. At least a connection that failed,
+  timed out or was dropped, a reply cut off mid-body, and Vault answering 429, 500, 502 or 503 count
+  as no verdict. The upload routes answer it **503** with `Retry-After`, where they answered 423 and
+  named `rotate-key` for a file that was fine, and an upload during the outage answers 503 rather
+  than 500. Each such 503 is logged at WARNING. Nothing is stored or removed. A value Transit
+  refuses, a failed tag among them, still answers 423, and a caller who would get 404 still gets
+  404. See [PHI.md](docs/PHI.md) section 3. (`BACKLOG #3734`)
+- **A hung removal of a cancelled upload's file no longer queues every upload in the process.**
+  An upload cancelled after its file landed starts removing that file, and the next upload in
+  that process waits for the removal before it counts the uploader's files, so it does not count
+  a file about to go. That wait used to be the cancelled upload's own, under the upload quota
+  lock, with no bound, so one unlink the filesystem never answered held every later upload. The
+  wait is now bounded at 5 seconds, and the cancelled upload no longer spins on it when its
+  request deadline cancels it again on every pass. Past the bound the removal goes on, an ERROR
+  names the file's id as a stored file with no `upload.create` row, and the file counts against
+  its uploader's quota until the removal lands, which can refuse an upload at the quota edge but
+  never admits one too many. A removal that lands later logs a WARNING that withdraws the ERROR.
+  These removals run on their own pool of two threads, so unlinks that hang cannot take the
+  threads the rest of the engine shares. The removal that follows a failed `upload.create` row is
+  not changed by this. (vault `BACKLOG #3740`)
+- **Correction to the 0.5.2 notes on the upload reservation table.** They said the old
+  `upload_quota` table is dropped at open. The schema DDL drops it, so that happens at open on
+  SQLite and under `[store].schema_management = "auto"`, and only when a DBA runs
+  `messagefoundry store provision-schema` under the `external` default on SQL Server and
+  PostgreSQL. (vault `BACKLOG #3740`)
+- **The shutdown's upload straggler drain now waits for the `upload.create` rows still running
+  before it looks.** An `upload.create` row that the long-operations drain cancelled could still
+  be unwinding when that drain stopped waiting. Its removal of the stored file then started after
+  the upload drain had returned, and only the event loop's final cancel ended it. The upload
+  drain now spends its wait on those operations first, so a removal they start is held and
+  drained. One whose operation is still running when that wait ends
+  can still start late.
+  Where the long-operations drain cancelled that operation, a WARNING named it and an ERROR
+  counted it.
+  (vault `BACKLOG #3740` item 6)
+- **The upload straggler drain no longer waits for a reservation heartbeat's touch.** A touch only
+  refreshes a reservation whose save does not outlive the shutdown, so the drain cancels it rather
+  than spending its wait or its grace on it. (vault `BACKLOG #3740` item 14)
+- **A TCP connection whose `trailer` byte equals its `start` byte is refused when it is built.**
+  Such a codec built before, and its decoder took each frame's trailer as the start of the next
+  frame, so every message after the first arrived with a stray leading byte and a frame was left
+  open. Now `FrameCodec` raises `ValueError`, which a TCP source or destination reports as
+  `TCP framing misconfigured`, at `check`, dry-run or start. A trailer equal to `end` is still
+  allowed. (`BACKLOG #3742`)
+- **A store fault in a trust-anchor check no longer reads as a refused anchor or a failed build.**
+  An operator start or restart the store stopped answers 503, on an inbound rather than the 409 of
+  a refused CA, and on an outbound rather than a 200. Its `connection_control` row carries `reason`
+  `store_unavailable`, and a restart's answer says it left the connection stopped until its next
+  start. A connector-less outbound that was paused, whose CA check the store stopped at an operator
+  start, stays paused with its rows pending until its next start, rather than resuming and charging
+  each row an attempt. See [SECURITY.md](docs/SECURITY.md) for the limits of that hold. A
+  connection test reports one fixed store line, not "connector build failed", and its row carries
+  the same `reason`. Three rows are now fail-soft: that `connection_control` row, the same row for
+  any refused inbound start or restart, and the `connection_test` row of a test stopped in its CA
+  check step. A store that also refuses one leaves the answer standing rather than a 500. A refused
+  start's or restart's row now carries `refused` true beside the lane's true `running`. The fingerprint
+  look-back pages on `id`, so it reads no `ts`: a malformed one no longer raises `ValueError`, and a
+  page all at one instant no longer reads as a first observation. `refused_connection_anchor` is
+  now `connection_anchor_failure`, since it also answers a store fault. (`BACKLOG #3746`)
+- **A released config reload now answers the same shape as an inline one.** Its `result`, in the
+  approve response and the `approval.approved` audit row, is a whole `ReloadResult`, so it gains
+  `routers`, `handlers`, `running` and `dry_run`. [SECURITY.md](docs/SECURITY.md) now states what
+  the `restart_required` list leaves out, and corrects which refusals write `not_found`. (vault
+  `BACKLOG #3746`)
+- **The VS Code promote now reports the trust anchors the reload's `restart_required` list names.**
+  Where the list holds a setting, the promote's message becomes a warning that leads with the
+  restart and the setting names: the engine trusts the old CA for those settings until it restarts.
+  The promote and its counts follow, since the graph is still live. The list is not complete, so a
+  promote without this warning does not prove that no restart is needed: see "What a reload's
+  `restart_required` list covers" in [SECURITY.md](docs/SECURITY.md). A list that is null, missing
+  or unreadable also leads with a warning, because this engine always sends one on an applied
+  reload. An empty list adds nothing. (`BACKLOG #3746`)
+- **Corrected: the 0.5.2 note on `create_managed_app` denying by default named one status for every
+  protected route.** That note said an app built with no `auth_settings` and no `allow_no_auth`
+  refuses every protected route with `503`. It does not answer them all alike. At least the JSON
+  routes, such as `/stats`, answer `503`. With `serve_ui=True`, at least the web console's pages,
+  such as `/ui` and `/ui/connections`, redirect to sign-in with `303`, though `/ui/account` answers
+  `503`. `GET /service/identity`, which takes only a client certificate, answers `401`. The code did
+  not change; only the record did. (`BACKLOG #3746`)
+- **A CRL whose issuer name differs only in ASCII letter case now counts as the same issuer.**
+  OpenSSL folds the case of the letters A to Z in a text string type, such as a UTF8String or a
+  PrintableString, when it compares names. So it takes `CN=PARTNER CA` and `CN=Partner CA` for
+  one issuer. The engine grouped CRLs by the exact issuer text. So a running-hop reload refused
+  such a replacement with a restart, and said it superseded nothing. A start refused a future CRL
+  beside a current one in other case as not in effect, and so did the expiry monitor's check of a
+  CA file. All three now group by the issuer name as OpenSSL compares it, in at least two more
+  ways. A case change in a NumericString, or outside ASCII, is another issuer. A one-byte text
+  type, such as a T61String or an IA5String, is read as Latin-1, as OpenSSL reads it. Before, a
+  reload could record such a replacement as applied while the hop went on checking the CRL it
+  held. Bytes there that are not valid UTF-8 still fail to parse, so that file is refused.
+- **At least one gap is left, and it groups apart.** OpenSSL takes two names that differ only in
+  white space for one issuer, and the engine does not. So such a replacement still asks for a
+  restart. The grouping reads a private attribute of the `cryptography` package. If a release
+  drops it, every CRL is refused. A start and a reload name that cause in the message.
+  (`BACKLOG #3755`)
+- **An alert's auto-resolve now retries a failed store write, and logs an ERROR when it gives
+  up.** A recovery signal such as `connection_restored` resolves the matching open alert instance
+  in a background write. Before, one failed write left the alert open with only a WARNING. Now the
+  resolve is retried a few times with short waits, while it holds that alert's write order, so a
+  raise emitted after it still lands after it. If every try fails, an ERROR names the alert type
+  and connection, and the alert stays open until a later recovery signal or an operator resolves
+  it; several recovery signals fire once per transition, so a later one may never come. At engine
+  stop, once the alert-state drain ends no write starts a retry, and a resolve then waiting to
+  retry is cancelled and logged at ERROR. Not covered, at least: the raise-side write (upsert) is
+  still tried once, the retry does not survive a restart, and an emit with no running event loop
+  still drops the write. (`BACKLOG #3756`)
+- **A config edit the file system denies (`EACCES`, `EPERM` or `EROFS`) is a refused edit at more
+  steps.** At least the lock, the read, the candidate, its companion copy and the replace now raise
+  the editor's own refusal, and each of them leaves the file as it was. For `connections.toml` and
+  code sets that is `WiringError`; the alert and security editors use their own types. None
+  raises `OSError`. An error after the replace still propagates, because the
+  edit has landed, and what a `validate` callback raises is its own. (`BACKLOG #3765`)
+- **A config file that may be there no longer reads as absent.** The four editors and their
+  listings now share one stat gate, and so does the copy of a code set's policy sidecar into an
+  edit's candidate. A stat that fails for any reason but "nothing is there", a link on the path that
+  cannot be followed, such as one to an unmounted share, and a share Windows says it cannot reach
+  are each a refused read. Before, an edit would have started from an empty document and replaced
+  the link with it, a code-set create could have passed its collision check, an edit could have
+  overwritten a table it could not stat, a listing would have answered empty, and a candidate could
+  have validated without its policy. A path with nothing at it, or a name no file can have, still
+  reads as absent. So does a link to a directory or to anything else that is not a file, and a share
+  that Windows reports as a plain missing path. `codeset show` still reads a policy sidecar it cannot
+  stat as no policy, and a config load does so for a dangling one. (`BACKLOG #3765`)
+- **The edit lock's handle is read-write off Windows.** An NFS client's exclusive `flock` fails
+  `EBADF` on a read-only handle, which would have failed every edit on an NFS mount with working
+  locks. This rests on `flock(2)` and a modelled test, not on a real NFS mount. A mount with no
+  lock daemon still edits unlocked, with a warning. The cost is that a lock file this account cannot
+  write now refuses the edit. (`BACKLOG #3765`)
+- **A Windows hold on a config file no longer reads only as a permission problem.** A replace, and
+  a code-set rename or remove, rides out a momentary hold, such as a virus scanner reading the new
+  file, and a refusal on Windows now says another program may have the file open.
+  (`BACKLOG #3765`)
+- **The `url_query_credential` reading now reads an `env()` URL.** It read a literal `url` only, so
+  a credential in the query of a URL given as `env()` was missing from `messagefoundry check` and
+  from `GET /security/posture`, even when the `env()` carried a literal `default=`. The posture
+  entry now reads it against the values the graph builds with, falling back to the `default=`. The
+  `check` line does not load the instance's environment values, so it reads the `default=` only. A
+  `deployed=False` outbound with an `env()` URL is skipped by both, since its values are never
+  resolved. See [SECURITY-LOOSENING.md](docs/SECURITY-LOOSENING.md). (`BACKLOG #3766`)
+- **The URL query-credential WARNING now appears once on two more paths.** A reload into an engine
+  started without a graph logged it twice, once from its build check and once from the start that
+  follows. A start where one `FhirLookup` failed to build logged it up to three times for a lookup
+  that did build. Each now logs it once. A `FhirLookup` that fails to build at a start still logs it
+  once when its `url` resolved, so the URL is named while the lookup is down; its failure is
+  recorded and alerted as before. The egress check now logs it before its refusals, so a connection
+  it refuses, for example over an unlisted forward proxy, still logs it. Every refusal still runs on every build. See
+  [SECURITY-LOOSENING.md](docs/SECURITY-LOOSENING.md). (`BACKLOG #3766`, `BACKLOG #2910`)
+- **The `host.ciphers` verify row on Linux now reads the OpenSSL file that `openssl` loads, and
+  reads it the way OpenSSL does.** Without `OPENSSL_CONF`, it asks `openssl version -d` for the
+  binary's `OPENSSLDIR` and reads `openssl.cnf` there. It still reads `/etc/ssl/openssl.cnf`
+  too, and the worse of the two readings stands. A program named `openssl` earlier on the `PATH`
+  can print any folder, so this keeps it from hiding that file's floor FAIL. It still supplies the
+  suite verdict, and the file check counts `CipherString` lines without judging them. With no
+  `/etc/ssl/openssl.cnf`, a PASS on the binary's file reads MANUAL. A missing file that `openssl`
+  loads now reads FAIL, because OpenSSL then applies no policy. A name that starts with `.include`, such as `.include_x`, now reads as
+  an include. Only a space, a tab or a carriage return counts as space. A backtick now quotes a
+  value, as in OpenSSL. A line the row cannot read as OpenSSL does now reads MANUAL, because
+  OpenSSL may apply none of such a file. So does a `$name` that no earlier line defines. So do a
+  NUL, a lone carriage return and a line-end backslash, and outside a comment line, any backslash
+  or non-ASCII character. Before, a missing file read MANUAL and a backtick-quoted floor read
+  FAIL; each of the others could read PASS. See
+  [DEPLOY-SERVER-DB.md](docs/DEPLOY-SERVER-DB.md) section 5.4. (`BACKLOG #3803`)
+- **The `host.odbc` verify row checks the driver each configured ODBC hop needs, and no longer
+  fails a host that takes no such hop.** It read FAIL wherever `pyodbc` was installed without ODBC
+  Driver 18, so `verify` exited 1 on a host with no SQL Server store and no DATABASE connection,
+  `DatabaseRef` or `DatabaseLookup`. It now reads every hop from the graph load the `host.ciphers`
+  row reads: a hop that names a registered SQL Server driver, Driver 18 or another, FAILs where
+  `pyodbc` does not list that driver, and a hop that names the driver library by an absolute path FAILs
+  where that file is not there; the row names each hop and driver. A driver list that cannot be read is
+  ERROR where the configuration takes an ODBC hop, one with an `env()` driver included. The row is now titled "SQL
+  Server ODBC drivers". `host.ciphers` counts every SQL Server preset entry, since the preset builds
+  only on a Microsoft driver, and an entry on another dialect where its `odbc_driver` is a Microsoft
+  driver: a generic-dialect connection on Microsoft's driver is now a hop of `host.ciphers`, where
+  it read MANUAL. Neither row counts an entry the build refuses, on its dialect or its driver, or a
+  connection that is not deployed. The `--config` graph is now loaded once per run, and the hop
+  census and the self smoke share that load. See [testing/VERIFY.md](docs/testing/VERIFY.md).
+  (`BACKLOG #3803`)
+- **A failed restart of a running listener would now read `failed`, and send one alert.** A
+  restart unbinds the listener before it starts it again. In the shipped code, when a start gate,
+  a hop guard, the startup directory check, a constructor's CRL or key check, or the bind refused
+  that start, the listener would stay down. It would read `stopped`, with no failed record and no
+  alert, so nothing would tell an operator that a feed that had been running was down. The start
+  path now records such a failure, with one `connection_stopped` alert, as a refused trust anchor
+  already was. It catches what a start at boot catches, so a failed operator start is recorded
+  too. A second refused restart sends no second alert, so an alert rule that restarts the inbound
+  cannot loop. A start that binds clears the record. A start of a connection that is not
+  deployed, or not declared, is still refused with no failed record. (`BACKLOG #3859`)
+- **A row that keeps killing its stage worker is now dead-lettered.** A custom `BaseException` that
+  is not an `Exception` ends a router, transform, response or delivery worker, or a pooled
+  serializer. Before this nothing counted it: the row stayed in flight, came back at the next start
+  and killed the next worker too, without end. An ingress, routed or response row now counts each
+  death in a new per-row `worker_deaths` column, and the third dead-letters it, its message
+  `ERROR`. No claim raises that count, so a row claimed in the same batch as the dying one is never
+  counted, and a crash or stop mid-row never adds to it. Below the cap nothing else is written:
+  a row still in flight stays there, paged by the in-flight watch, until the next start.
+  "Every time" means across passes that each
+  claim the row anew, after a restart or a Postgres lease reclaim: a respawned worker does not yet
+  re-claim the row its predecessor died on. An outbound row counts a death as a failed send under its lane's
+  retry policy, so a lane set to retry forever never dead-letters on a death; a batching outbound
+  lane does not count deaths yet. A death on a lane a
+  pooled dispatcher drains fires `connection_stopped`. `KeyboardInterrupt`, `SystemExit`,
+  `CancelledError` and `GeneratorExit` are never counted, and the worker still dies. A replay resets
+  the count with `attempts`. `mark_failed` at its cap now leaves a row already DONE, DEAD or
+  CANCELLED as it is (ADR 0157 Amendment C). (`BACKLOG #4607` step 6; owner rulings 2026-11-04
+  and 2026-11-11)
+- **An MLLP outbound with `verify_ack_control_id` on correlates the ACK for a body over a parser
+  cap.** The send site read the outgoing MSH-10 by parsing the whole body, so a body over 16 MiB,
+  over 10,000 segments, or past the counted-escape scan was refused by that parse, and ACK
+  correlation switched off with no log line although MSH-10 was readable. It now parses the MSH
+  segment alone. A payload that leads with `MSH` and whose header still cannot be read now logs a
+  WARNING naming the refusal's type, never its text; a payload that is not HL7 at all still skips
+  correlation quietly. (`BACKLOG #4905`)
+- **An alert's auto-resolve no longer closes a newer raise of the same alert from another engine
+  shard or node.** A resolve waits behind the earlier writes for its alert and its own retries, and
+  a raise from another process on the same store in that window was closed by it, so a live
+  condition would read as cleared until it fired again. Each raise now records which process wrote
+  it, and a resolve closes the alert only when its newest raise is this process's own or it has
+  taken no raise since the resolve read it, which happens when the resolve's write task first runs.
+  No clock is compared, so clock skew between nodes cannot leave an alert open, and when two
+  processes raise and clear the same alert at once, the one that raised last clears it. A resolve
+  a newer raise kept open is not reported as landed. The `alert_instance` table gains a nullable
+  `raised_by` column on all three store backends, added in place at start. (`BACKLOG #4916`)
+- **SQL Server reports a non-binary `state` table and refuses reference keys that would collide.** At
+  every open the engine reads the collation of the `state` table's key columns and logs a WARNING
+  when it is not binary, as in a table made before `BACKLOG #1588` under a case-insensitive
+  default, naming the collation and the remedy. It repairs nothing, and a row that then fails to
+  decrypt carries a note naming that collation as a possible cause. A reference snapshot holding two
+  keys that differ only by trailing spaces, which SQL Server compares as equal, is now refused
+  before its transaction as a `ReferenceKeyCollision`, naming the keys by ordinal only, and logged
+  whole; before, the second INSERT raised a primary-key duplicate mid-transaction. The last-good
+  snapshot stays active either way, and the sync fails every interval until the source changes.
+  (`BACKLOG #4917`)
+- **A DATABASE source with a `mark_statement` stops a poll at the first row whose handler fails.**
+  The shipped code went on to the next row, so with a high-water-mark `mark_statement` that row's
+  mark advanced the cursor past the failed row, and no later poll would read it again. Now no later
+  row of that poll is handed off or marked, and the next poll starts from what is still unmarked; a
+  high-water mark relies on `poll_statement` returning rows in cursor order, over a unique cursor
+  column, for this. With no `mark_statement` the poll goes on as before. The trade-off is head-of-line blocking: a row whose
+  handler fails every time holds back the rows behind it, so each failure now also emits a
+  `handler_error` connection event, whose reason renders the error as the log line does: a driver
+  error as its type, SQLSTATE and native error number. This closes the handler-failure path of
+  high-water-mark loss, not high-water-mark loss outright: a row skipped as `row_undecodable` still
+  lets a later row's mark move the cursor past it. That now includes a body the configured
+  `encoding` cannot carry, which is skipped where an undecodable row is, so it neither spends a
+  `poll_max_rows` slot nor escapes the per-poll skip cap. Its reason never carries the codec's own
+  message. A codec fault that is no conversion failure, such as
+  an unregistered codec name or a `RuntimeError`, is not skipped: it ends that poll as a poll
+  failure.
+  See [CONNECTIONS.md](docs/CONNECTIONS.md#database-source--databasepoll). (`BACKLOG #4921`)
+- **`rotate-key` refuses a configured uploads directory it cannot list.** A configured
+  `[store].uploads_dir` that did not exist, such as one on a volume that is not mounted, read as
+  zero uploads, so the run printed OK, stamped the key's rotation date and closed the rotation
+  record while every upload behind it could still be under the prior key. The command now checks
+  the directory before it writes anything, and refuses with exit 2 and nothing changed. A directory
+  that its uploads pass cannot list after that check aborts the run with exit 1 before the audit
+  chain step, so the chain does not roll, nothing is stamped and the rotation record stays open.
+  The uploads directory is created on the first upload, so a site that set `uploads_dir` and never
+  stored an upload has none either; [PHI.md](docs/PHI.md) says how to create it. The check
+  refuses only a path it cannot list, so a listable directory that is not the one holding the
+  uploads still completes; PHI.md says which cases that leaves.
+  (vault `BACKLOG #4940`)
+- **The read-only statement test refuses at least `RECEIVE`, `UPDATETEXT`, `WRITETEXT` and
+  `BEGIN`.** The test is shared by `db_lookup`, a `DatabaseRef` statement and a DATABASE source's
+  `poll_statement`, so the widening reaches all three. T-SQL needs no `;` before most second
+  statements, so a statement opening with `SELECT` could chain a `WAITFOR (RECEIVE ...)` that
+  would dequeue a Service Broker message, an `UPDATETEXT` or `WRITETEXT` that would write a text column, or a
+  `BEGIN TRAN` that would leave `@@TRANCOUNT` at 1 on a pooled autocommit connection, and each
+  passed the test. `BEGIN` is refused as a bare word, so every `BEGIN TRAN` and
+  `BEGIN TRANSACTION` form is. An unquoted name spelled like one of these words is refused too:
+  at least a PostgreSQL column `begin` on `dialect='generic'`, and on any dialect a column
+  `receive`, which T-SQL does not reserve. Quote such a name the way the database quotes one
+  (at least backticks on MySQL, where a double-quoted word is a string by default). The test is
+  still a shape test and not read-only authority: the account should be read-only (see
+  [CONNECTIONS.md](docs/CONNECTIONS.md)). (`BACKLOG #4954`)
+- **A captured reply whose body does not decrypt would no longer hold its loopback lane.** In the
+  shipped code, a reply owed to a `Loopback()` inbound whose stored body failed to decrypt (at
+  least a tampered or misplaced cell, or a corrupt one) raised out of the re-ingress step, and the
+  worker handed the token back to the head of the lane on every pass. No later reply on that
+  loopback would then have re-ingressed. The re-ingress step now dead-letters that token at once,
+  as a claim already does an unopenable payload: the token keeps its reference, so it can be
+  replayed, the origin message finalizes `ERROR` with a `dead` event, and the lane moves on to the
+  next reply. A key service that gives no verdict on that read is not dead-lettered: the token is
+  re-pended with a backoff and holds its lane until the service answers, and a pooled lane under
+  `infra_fault_policy = "stop"` can go `STOPPED` with the token left pending (`BACKLOG #5727`).
+  (`BACKLOG #4995`)
+- **The dead-letter purge no longer counts a row it only clears an error on.** `purge_dead_letters`
+  on all three backends no longer counts a dead row that was already blank and only loses its
+  `last_error`, so the retention audit's purged count leaves out rows whose payload it did not blank.
+  On SQL Server a whitespace-only dead body is counted as a body, and blanked even with no
+  `last_error`, where the padded comparison read it as blank. It returns the cleared-error count
+  apart, recorded as `dead_errors_cleared`, so a retention pass whose only change was clearing
+  dead-letter error text still writes its audit row. A re-ingress token whose `response` row is
+  missing is now dead-lettered under its own error, `re-ingress reply row is missing`, apart from a
+  reference that did not open. (`BACKLOG #4996`)
+- **The URL query-credential WARNING now reaches the log intact when a connection's name ends in a
+  credential word.** It read `FhirLookup 'LK_TOKEN': the endpoint url ...`, and the log scrubber
+  read the quoted name and its colon as a credential label, so every configured sink would have
+  received `FhirLookup 'LK_TOKEN=<redacted> endpoint url ...`. It now reads `the endpoint url of
+  FhirLookup 'LK_TOKEN' carries a credential in its query string ...`, with nothing after the name
+  that the scrubber reads as a label. A test now reads the line from a handler carrying the
+  configured filters, since `caplog` reads a record before they run. (BACKLOG #4998)
+- **A store open that refuses the hop's own TLS settings would now be "could not start", exit 2.**
+  At least a weakened store hop (`trust_server_certificate` on or `encrypt` off, on PostgreSQL or
+  SQL Server) the escape does not cover, a SQL Server `[store].ssl_root_cert` pin the engine must
+  not send, and a PostgreSQL `[store].ssl_root_cert` or `[store].ssl_crl_file` the open judges
+  unusable were refused with a bare `ValueError`. In the shipped code that reached the CLI's error
+  floor and exited 1, the code `audit-verify` keeps for a broken audit chain, so a job reading only
+  the code would have reported a refused hop as tampering. Each is now a typed refusal, which at
+  least `audit-verify` reports as could not start, exit 2, when the open raises it. Not every store
+  command reports it that way: at least `store provision-schema` and `check-privileges` report it
+  in their own words. A PostgreSQL pin file the engine may not read is typed, and at least a
+  `ValueError` from the context builder that is a codec error, holds one, has one still on its
+  chain, or has a chain that cannot be read whole is typed with a fixed text that quotes no byte
+  and names no class. Two kinds are not judged: an `InsecureHopRefused`, and an `OSError` that is
+  also a `ValueError`. Each is replaced by a new error of that kind with a fixed text and no chain,
+  so neither passes through with its own text. That class test reads the class with `type`, which
+  runs none of the error's own code, so a `__class__` that answers `OSError` does not pass it. At
+  least a CRL file it may not read and a refusal on a later pool connection, the open's first
+  included, are not typed. A broken chain still exits 1. (`BACKLOG #5000`)
+- **The DATABASE connector would now tell a cancelled borrow from one in a task that once
+  absorbed a cancel.** In the shipped code the close read `Task.cancelling()` with no baseline. A
+  task that had absorbed a cancel without `uncancel()` took the cancel path on every later borrow:
+  an extra rollback, a detached return and a held-back count. An `uncancel()` before the borrow's
+  `finally` made its close wait, with no bound, on a statement that has no time limit. The close
+  now reads the exception unwinding through the caller instead. (`BACKLOG #5004`)
+- **A DATABASE send whose rollback fails would now discard its connection.** In the shipped code,
+  when the rollback after a cancelled send failed, or the send's own rollback after a failed
+  statement did, the connection went back to its pool. On a session still alive the INSERT stayed
+  open, and the next send's commit would have committed it with its own: a row the engine counts
+  as not sent, which a retry would write again. The connection is now closed after its cursor, on
+  a worker thread and inside the call gate where it has one, and the pool gets it back closed and
+  is woken for it, so a waiting borrower or pool close is not left asleep. The discard happens
+  only where a rollback ran and failed. At least a cancelled send on a connection with no call
+  gate, one whose cursor has no raw pyodbc cursor, and one whose close finds the executor shut
+  down run no rollback, so they discard nothing and return the connection as before. Where the
+  executor is shut down after the handle was dropped, the handle is left for pyodbc to close when
+  it is collected. The close does not guarantee the server drops the transaction: a disconnect
+  after a failed rollback can leave the session, and its locks, open until the server ends it
+  (ADR 0159). A send that failed with a driver error is classified by that error, as it would be
+  had the rollback passed, and never by the rollback's: a send whose own error carries a
+  transient SQLSTATE retries rather than reaching the internal-error arm, which dead-letters by
+  default, and a permanent one still dead-letters. A send that failed with no SQLSTATE still
+  raises the rollback's error, so a dropped link reported that way still reaches that arm.
+  (`BACKLOG #5010`)
+- **An X12 TA1 reject with a padded TA1-04 now dead-letters.** TA1-04 was upper-cased but not
+  trimmed, so a TA1 whose code read `R ` fell through to the accepted default and a rejected
+  interchange would have been recorded as delivered, and a padded `E ` skipped its
+  accepted-with-errors warning. The code is now trimmed before it is compared. An empty TA1-04, or
+  one outside A, E and R, stays accepted and is not retried, since a retry could re-send an
+  interchange the partner accepted (ADR 0016), but it now logs a WARNING with a fixed phrase that
+  carries none of the partner's text. (`BACKLOG #5018`)
+- **The MLLP listener no longer drops a frame its inbound handler faulted on when the inbound sends
+  no reply.** On an inbound with acknowledgements off, or one that is not HL7 v2, it recorded
+  `handler_error` and read on, so a sender that never resends would have lost that frame. Now it
+  holds the frame and retries the handler, as the raw-TCP and X12 listeners do: backing off to one
+  attempt every 30 seconds until the frame is recorded or the listener stops. The frames behind it
+  on that connection keep their order, and the sender is stalled meanwhile; a frame the sender
+  sends on another connection is not ordered against them. A fault the first retries clear logs
+  WARNING lines and records no event; `handler_error` and one ERROR line mark a fault still failing
+  after four attempts. A stop during the hold gets one last attempt. If that fails too, or stop
+  cancels it past its grace, the held frame and every frame behind it on that connection are lost,
+  and one ERROR line says so; a cancel that cuts off an attempt says the frame may or may not be
+  recorded. The held frames are only in memory, so the process dying during the hold loses them
+  too, with no line. A sender the `tls_client_subjects` allowlist refuses is not held: its frame
+  gets one attempt and its connection closes after the read, as before. An inbound that replies in
+  HL7 still answers `AE` (`CE` in enhanced mode) and closes. (`BACKLOG #5022`)
+- **The `sslmode` refusal no longer steers a driver the engine cannot place to a libpq value.**
+  Under a MySQL driver with a name the engine does not place, such as RHEL's bare `MySQL` section
+  or a library path, `VERIFY_IDENTITY` was refused with a message offering only libpq's spellings,
+  `verify-full` among them, which MySQL ignores. The refusal for such a name now advises no value:
+  it leads with the engine being unable to place the `odbc_driver` family and names the psqlODBC
+  and MySQL registered names, inside the part of the message a stored failure keeps. Microsoft's
+  `ODBC Driver <n> for SQL Server`, which reads no `sslmode`, now refuses any `sslmode` and points
+  at `Encrypt`, where it built a libpq value it would ignore. The construction warning gives each
+  driver family's own example. See *The `SSLmode` spelling* in
+  [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #5029`)
+- **At least three store-archive shapes whose row-count compare read nothing now fail verify.**
+  The compare is keyed off the manifest's own tables, so `restore-verify`, the verify after a
+  backup and `restore` passed a manifest with empty or missing `row_counts`, and an all-zero
+  manifest sharing no table with the archive's `store.db` (a `store.db` with no table at all is one
+  such case), on counts nobody compared. Each is now a FAIL, and `restore` refuses before it places
+  anything, with a reason that says the compare read nothing. A `row_counts` that is not a mapping,
+  or a count that is not a non-negative integer, also refuses now, rather than being coerced (`3.9`
+  read as `3`) or raising out of the verify. A full archive's manifest shares tables with its store
+  (even the oldest, four-table manifest names `messages`), and a config-only archive returns before
+  the compare, so neither is affected. (`BACKLOG #5056`)
+- **The server-DB live-schema check reads more DDL forms, and raises on a form it cannot read
+  instead of misreading it.** A multi-target `DROP TABLE` or `DROP INDEX` drops each name; a column
+  rename (`RENAME COLUMN`, `sp_rename ... 'COLUMN'`) moves the column; a key written `(col)` reads
+  as the column. `DROP INDEX CONCURRENTLY` is read, and a word before an `IF EXISTS` is no longer
+  taken for the index's name. An `ALTER TABLE` with more than one clause or an action it does not
+  know, a table or index rename, a `--` or `/*` inside a quoted string, a `/*` inside a block
+  comment the check finds, and a line comment it finds holding a NUL, or a CR or other line break
+  that is not part of a run of CRs reaching the LF that closes the comment or the end of the comment's entry in the batch,
+  now raise in the unit test that reads each shipped batch. The Postgres index read now prints a column key's collation,
+  operator class and NULLS order, and an expression key's operator class and NULLS order, so an
+  index built with one no longer passes as the bare key; a key in the batch that carries one raises,
+  and so does an expression key that names a collation, which is not compared. The expected shape
+  now follows the indexes the Postgres migration drops; none of them was expected before either. A table that exists with no columns lists the columns it
+  lacks instead of reading as missing. SQL Server runs neither catalog read for zero names. On both
+  backends the batch is read before the schema lock and the batch run, so DDL the check cannot read
+  fails with no peer queued behind it. The refusal is logged without a doubled prefix, and the
+  check's revision is one constant both backends hash, so a store marked by an earlier build takes
+  the full run once more. (`BACKLOG #5062`)
+- **The SQL Server cluster heartbeat, config-version refresh and stepdown lease release run under
+  the renew clamp.** `[cluster].lease_renew_timeout_seconds` now bounds their wait for a pooled
+  connection and their statement, as it already bounded the lease claim, so a slow statement
+  among them cannot delay the next renew by up to `[store].command_timeout`. Each can still take
+  up to about twice the clamp, and about three times when its rollback runs.
+  `stop()`'s lease release and `left` write run under its own shutdown bound, applied to the
+  driver as well. Whether anything bounds the COMMIT after the statement is not known: by a
+  reading of pyodbc's documentation the statement timeout does not, and that is not a
+  measurement. At least the start-up registration, the engine's start-up config-version seed, an
+  operator's config-version bump and the API's membership and lease reads still run under
+  `[store].command_timeout`. The paused tick's owner read is clamped at the driver too, at the
+  smaller of the clamp and half its own budget. A clamped borrow whose clamp, floored at 1 s, is no
+  longer than `[store].acquire_timeout` no longer advises `[store].acquire_timeout` when it times out. It
+  points instead to a new paragraph under `[cluster]` in docs/CONFIGURATION.md, which says which
+  setting sets each clamp. At least a SQL Server
+  statement through the store's single-statement write and read helpers, the lease claim
+  included, now keeps its result when it committed and only the pool release afterwards fails,
+  logged as a warning; other borrowers, such as `_execute_output` and multi-statement
+  transactions, still raise then, so a stepdown whose release landed no longer answers `503 release-unconfirmed` and a
+  renew that landed no longer reads as failed.
+  (vault `BACKLOG #5064`)
+- **A failed SQL Server read through the store's shared read helper no longer returns its
+  connection to the pool with a transaction open.** When the rollback after such a read fails,
+  the store now discards the connection instead of recycling it, and raises the read's own error
+  rather than the rollback's. On the cluster lease claim and renew, which hold the coordinator's
+  leadership lock, the rollback is also bounded by `[cluster].lease_renew_timeout_seconds`
+  (floored at 1 s); one that runs past it discards the connection, so a stalled rollback no
+  longer holds that lock unbounded. The server keeps a discarded session's locks until its close
+  lands, so a stepdown's release write can still wait on them. The store's two single-statement
+  write helpers, which the coordinator's heartbeat and a stepdown's release write use among
+  others, also discard their connection when the rollback after a failed write fails, instead of
+  recycling it with the write's locks still held. On a clamped write, the heartbeat and the
+  stepdown's release write among them, that rollback is bounded by the write's clamp, floored at
+  1 s; on an unclamped write it has no bound. The COMMIT after a
+  claim is still not bounded, and other SQL Server read and write paths with their own rollback
+  are unchanged. The WARNING these failed-rollback discards write names only the rollback error's
+  class and SQLSTATE, with no traceback, and so does the WARNING when such a close cannot be
+  scheduled: driver text can quote stored values, as SQL Server's duplicate-key and truncation
+  errors do. The tracebacks go to DEBUG. Other discards still log a traceback at WARNING, at
+  least those after a failed schema batch and a failed LOCK_TIMEOUT reset. (`BACKLOG #5066`)
+- **`provision-admin` and `admin-reset-totp` would now say only what a refused store open left
+  behind.** For a server store whose schema falls short of this build's, both said "nothing was
+  written". The open rolls its schema batch back and writes no marker, but on SQL Server under
+  `[store].schema_management = auto` it may already have switched the database's
+  READ_COMMITTED_SNAPSHOT and ALLOW_SNAPSHOT_ISOLATION options on, before that batch. That refusal
+  now says so. When `provision-admin` is refused after the authenticator key was shown and before
+  its write, for the key, cipher, store hop or schema or by a keyless check, it also says to delete
+  the entry the operator may have added, as `admin-reset-totp` already did; at least a driver or
+  connection failure of the write's open does not say so. A key or cipher refusal there is now
+  could not start, exit 2, as it was before the prompt. A key-resolution, hop, schema or keyless
+  refusal raised once the write has started says the Administrator may be missing or incomplete,
+  never to delete the entry. The command names the OS user for the audit row before it shows the
+  key, not after. `provision-admin` now prints its key, cipher, hop and schema refusals through
+  the same codec-safe rendering as the other store commands. (`BACKLOG #5067`)
+- **`provision-admin` would now tell a refusal before its first account write from one after
+  it, and the store commands would say what an open may have left.** `provision-admin` counted
+  the write as started before the account reads that come first, so a cipher refusal from those
+  reads exited 1 and never said to delete the authenticator entry it showed; it now exits 2 and
+  says to delete it. A refused first INSERT of a new account also says to delete it, since no
+  seed was stored. Once the write has started, the refusals that report it in words, at least a
+  key-resolution, hop, integrity or SQLite store refusal such as "database is locked", now say
+  to keep that entry until a later run of the command completes. A SQLite store refusal after
+  the store opened no longer reads as "cannot open the store". A `StoreKeylessError` or `CipherError` raised once the
+  write has started still reaches the command's last-resort exit 1, which names no entry.
+- **These store refusals that follow a store open no longer say "nothing was written" where the
+  open may already have run its own writing steps**, in `provision-admin`, `admin-reset-totp`,
+  `admin-unlock` and `admin-set-notify-email`: a `StoreKeylessError`, `CipherError`,
+  keyless-chain or unauditable-write refusal, `admin-unlock`'s refused account read,
+  `admin-set-notify-email`'s refused audit append, in `admin-reset-totp` a store failure raised
+  after an open returned, and in `provision-admin` a key-resolution, hop or SQLite store refusal
+  raised after its pre-check or write open returned. A store keyed by the `vault_transit` cipher
+  counts as keyed here. It says the change the command makes did not land, and names what the open may have
+  changed, such as the schema, the salt record, the audit chain's genesis record and, on SQL
+  Server under `[store].schema_management = auto`, the snapshot options. Where the command
+  cannot tell whether the open reached its writing steps, as for a cipher refusal that can come
+  before the open connects, it says the open may or may not have reached them and names those
+  changes only as possible. The same holds for `provision-admin`'s OS-user and authenticator-enrolment refusals
+  over an existing store, `admin-reset-totp`'s OS-user, enrolment and code-mismatch refusals, and
+  `admin-unlock`'s refused row seal. A keyless-chain, keyless-provision or unauditable-write
+  refusal is raised only after a full open, so it says the open may already have changed the
+  database. In `admin-reset-totp` a store refusal or store failure raised at the
+  replacement's own open, or after it but before the replacement is tried, names the earlier
+  open, the one that checked the account before the key was shown, apart from the replacement's
+  own, and names the open's one-time steps, such as the genesis record, for the earlier open
+  alone. `provision-admin` now also names its pre-check's open apart from its write's own, over
+  an existing store and before its write starts, for a key-resolution, hop, short-schema, key,
+  cipher, keyless-chain, keyless-provision or unauditable-write refusal at or after its write's
+  open, for a SQLite store failure other than an integrity refusal at or after that open, and for
+  that open failing the AES-GCM invocation bound's pass, which no longer says no audit row was
+  written. Since each of its opens resolves the key itself, a keyless or unauditable-write
+  refusal at the write's open does not show the pre-check's open was keyless, so keyed settings
+  still describe that open as a keyed one, which may have bound a salt and written the genesis
+  record. Other refusals after an open still say nothing was written,
+  at least a store pin refusal under the host key provider, a refusal about the account itself
+  such as a disabled Administrator, and `admin-reset-totp`'s refusals of the replacement itself. (`BACKLOG #5067`)
+- **`provision-admin` would now keep its result when the store fails to close after the grant
+  committed.** The failed close is a warning, so the recovery codes are still shown and the
+  administrator_granted page still sent. (`BACKLOG #5067`)
+- **The Postgres and SQL Server live-schema check now compares each column's type, nullability and
+  numbering, and on SQL Server a collation the batch declares.** A guarded `CREATE TABLE` skips a
+  table that already exists, so a type widening or a `NOT NULL` change a later build declares would
+  have reached an existing table with nothing to apply it, and the check passed and marked the
+  schema current. The open now refuses, naming the column, its live shape and the declared one, in
+  lower-case words that the service log's redaction leaves readable, with a remedy for a column
+  numbered differently. A Postgres `DEFAULT nextval(...)` reads as numbered on both sides. A
+  column a guarded `ADD` would build differently from its `CREATE TABLE`, with no later
+  `ALTER COLUMN` to settle it, fails the unit test that reads each shipped batch. A column's default
+  is otherwise still not compared. (`BACKLOG #5085`)
+- **The attested revocation line on a `tls_allow_expired` hop says what the hop lacks.** On the
+  MLLP destination, the DICOM C-STORE SCU and both FTPS directions, the line, and the refusal,
+  said "NO certificate revocation checking", though a CRL that reaches such a hop still refuses a
+  leaf certificate it lists. They now say the hop has no revocation check the guard credits, and
+  why, and the hop's own description there no longer leads with "(no revocation check)". No
+  disposition changes. [ADR 0173](docs/adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md),
+  [PHI.md](docs/PHI.md) rows 10 and 11, and [CONFIGURATION.md](docs/CONFIGURATION.md)'s
+  expired-CRL rule now say what the code does. (`BACKLOG #5089`)
+- **`RevocationHopGuard.capture(expiry_relaxed=True)` settles both halves of the
+  `tls_allow_expired` rule by itself:** the context's CRL earns no credit, and the record names
+  the relaxed remedy unless the caller passes its own. The MLLP, DICOM SCU and FTPS call sites
+  now pass the context they dial with and the flag, where each used to withhold the context and
+  pass the remedy itself; their dispositions are unchanged. A caller that hands the guard such a
+  context without the flag earns no CRL credit either since `BACKLOG #5086`. (`BACKLOG #5089`)
+- **The `tls_allow_expired` construction WARNING no longer says the whole chain is still
+  verified.** The relaxation also skips at least the validity periods of the intermediates and
+  the trust anchor, and a CRL's own validity window; the WARNING now names those and claims only
+  the chain's signatures, key usage and, where it is checked, the hostname.
+  [CONNECTIONS.md](docs/CONNECTIONS.md)'s `tls_allow_expired` rows say the same, and so do
+  the `tls-allow-expired` line in `messagefoundry check`, the `tls_allow_expired` entry in
+  `security_loosenings()` (and so `GET /security/posture`), the revocation record on an MLLP,
+  DICOM SCU or FTPS hop that sets it (the REST, SOAP and FHIR records are unchanged),
+  [DEPLOYMENT.md](docs/DEPLOYMENT.md) and the ADR 0094 index row. (`BACKLOG #5089`)
+- **connscale's warm-up first-delivery figures count each send's first arrival only,** and the
+  warning for a short warm-up names the silent inbound by its port. (`BACKLOG #5089`)
+- **A `sys.exit()` inside an `env(cast=fn)` is refused as a bad setting, not obeyed.** The cast
+  runs at every load, reload and `messagefoundry check`, and its `SystemExit` passed the
+  setting-reader's handler: a reload left with it, and `check` ended with the cast's own exit code,
+  0 included, which reads as a pass. It is now refused like any other cast that fails, naming the
+  setting and the key and withholding the value and the exit text. That holds at least in the
+  setting reader and in the listener-port and `encoding` pre-flights that run before it. The
+  listener-port pre-flight now also skips any other failing cast, a lookup table's `KeyError`
+  among them, instead of letting its text out, as the `encoding` one already did. A `KeyboardInterrupt` still
+  stops the work. The reason a Router's or Handler's `sys.exit()` dead-letters with now names its
+  exit code as a plain integer, never an `int` subclass's own text, and names none when the code is
+  too long to print. (`BACKLOG #5105`)
+- **A DR backup records what its config walk did not archive.** The manifest, the `dr_backup`
+  audit row and the `messagefoundry backup` summary carry `config_skipped_files`, naming at least
+  each config file the walk did not add as a regular file, such as a symlinked `connections.toml`
+  the config digest read through, each directory link it did not follow, and each folder it could
+  not list, with `config_skipped_count` the total. A second hard link to a file the walk added is
+  not named: the archive carries it as a link member, and a restore writes it as a copy. The walk logs them in WARNINGs; a directory
+  link it lists as a folder keeps the WARNING it had. Before this, `config_bundled: true`
+  and a digest covering a file did not mean the archive held it. (vault `BACKLOG #5233`)
+- **`messagefoundry security set` refuses a null reset of a key `[security]` does not define, and
+  says when an edit changed nothing.** A reset of a misspelled key would have exited 0 and reported
+  the key as set, leaving the loosening the operator meant to reset in place. It now exits non-zero
+  and writes nothing. It names each such key, with its nearest spelling where one is close, or for a
+  removed key the decision that removed it; a key the file does carry can still be removed. The
+  JSON result's `keys` lists only the keys written or removed, a new `unchanged` list names the
+  resets that found nothing and the values the file already held, and `op` is `unchanged` when no
+  key changed. A new `rewritten` field says whether the file was written: an edit that changes no
+  key still goes through the same validated replace as any set, so the file is rewritten and the
+  replace restricts it as any set does: on POSIX to its owner afterwards, the editing account
+  unless root keeps the previous owner; on Windows to the editing account or, where another
+  account owned it, to that account and the editing account; logging a warning where it cannot.
+  `detail` says so. That rewrite turns mixed
+  line endings into LF, as any set does. A reset that finds nothing where no file exists, in a
+  folder that does, creates none, exits 0 and reports `rewritten` false. It takes no edit lock when
+  the file is absent at its first check; if the file is deleted between that check and the lock,
+  the lock is taken and its lock file left as any edit leaves it. A reset whose folder, or drive,
+  is missing exits non-zero and creates nothing, so a mistyped path does not read as a successful
+  reset. Like `security show` on an absent file, a reset that finds no file runs no
+  whole-file load, so it names no session limit a `MEFOR_*` variable sets. (`BACKLOG #5327`)
+- **`support-bundle` reads at most the last 4 MiB of the app log.** It used to read the whole
+  file, so a large enough log could exhaust memory and leave no zip. The tail can now hold fewer
+  lines than `--log-tail-lines`. When the bytes kept, less the line the bound cuts into, hold
+  nothing but line breaks, as when a line longer than the bound is followed only by blank lines
+  or by nothing, `app-log.txt` reports `MF-BUNDLE-LOG-003 _LogLineTooLong`. A log truncated in place on both
+  reads reports `MF-BUNDLE-LOG-002 _LogFileShrank`. (`BACKLOG #5385`)
+- **An uploaded log's part swapped for a folder or a socket after its check now answers as damaged
+  on a by-id metadata read or download**, as the other not-a-file cases do. (`BACKLOG #5388`)
+- **The compose `ha` engines now log in to Postgres with the password the Postgres service reads.**
+  `docker/compose.yaml`'s `postgres` service read `POSTGRES_PASSWORD` by compose substitution of
+  `MEFOR_STORE_PASSWORD`, while `engine-ha`, `engine-standby` and `schema-provision` took
+  `MEFOR_STORE_PASSWORD` only from `env_file: ./secrets.env`, so the two could differ and the
+  engines would then fail at store login. All four now alias one required substitution, the new
+  `x-store-password` anchor, with no default, and a `MEFOR_STORE_PASSWORD` line in `secrets.env`
+  feeds only the default `engine`. The `x-ha-engine-env` comment in `compose.yaml` names at least
+  some of what can still split them. The `compose-ha-smoke` job now writes a different decoy password into
+  `secrets.env`, so an `ha` engine that read it would fail the job. (BACKLOG #5400)
+- **A revocation attestation that does not read as true now stops a `docker compose up` run
+  without `--no-deps` before any engine starts.** The compose file required `MEFOR_TLS_REVOCATION_ATTESTED` but
+  refused only an unset or empty value, so a value such as `0` would have started engines that
+  exit 2 at the API revocation gate and restart forever. A one-shot `revocation-attestation-check`
+  service now reads the value with the engine's own parser, from the same image, and every serving
+  engine waits on it or on its copy in the engine's own image.
+  At least `docker compose up --no-deps <engine>` and `docker compose run --no-deps` skip that
+  check, so an engine started with `up --no-deps` and a false value would still restart forever.
+  The Postgres password's missing-value message now says that `--env-file` reads its file instead of
+  the `.env` beside `compose.yaml`. Both Kubernetes manifests,
+  `docker/k8s/statefulset.yaml` and `docker/k8s/ha-postgres.yaml`, now run the same check as a
+  first `revocation-attestation-check` initContainer on the value they read from the Secret's
+  `tls-revocation-attested` key, so a value such as `0` there passes the kubelet and then holds
+  the pod in Init instead of crash-looping the engine; their deploy docs say so. Every value in
+  `docker/k8s/secret.example.yaml` now ships commented out, so applying it unedited creates a
+  Secret the kubelet refuses the pod over rather than one holding placeholders. The compose
+  `engine` and `ha` engines now carry the k8s manifests' block of commented inputs an enforcing
+  `serve --env prod` start needs, and each `ha` engine gets its own named volume for the log
+  spool. See docs/CLOUD-DEPLOYMENT.md, section 7. (BACKLOG #5400)
+- **`install-service.ps1` now counts a "Log on as a service" holder written as an account name.**
+  It compared the exported `SeServiceLogonRight` holders with the account's SID only, so a row that
+  named the account would have read as missing and the policy would have been re-imported with the
+  account added again. A name is now matched as given, then resolved and its SID compared.
+  `uninstall-service.ps1` removes such a holder the same way. It also removes the account's own
+  name when that no longer resolves, as after the service is deleted; any other name that does not
+  resolve is kept. Of the lookups that fail, only one that finds no account now counts as another
+  account. A lookup that fails any other way, a trust failure for example, is named in a warning: the installer adds the
+  SID anyway, so the row may then name the account twice, and the uninstaller keeps the name and
+  reports the right as unproven rather than as removed or not held. (BACKLOG #5401)
+- **The service scripts read `-DataDir` literally and validate one more service name.**
+  `uninstall-service.ps1` tests the data directory and reads the config directory's ACL with
+  `-LiteralPath`, so a `[` in the path would no longer read an existing directory as gone and leave
+  its ACE. `measure-store-access.ps1 -ServiceName` now takes the same name pattern as
+  `uninstall-service.ps1`. (BACKLOG #5402)
+- **A Test Bench collection case fails when its rerun ends somewhere else.** A case that expects no
+  delivery used to pass on an errored rerun, because the error also delivers nothing. A saved case
+  now records its disposition, and a rerun passes only with the same one and, unless that is
+  `error`, no error text. A case saved earlier fails on any errored rerun.
+- **At least `RetryPolicy` `max_attempts`, `ActiveWindow` `days` and `BatchConfig` `max_wait_ms`
+  refuse a boolean when validated in code-first config, where main read it as 0 or 1.** A boolean
+  in a `connections.toml` schedule window's `days` is refused too, where it was read as a weekday.
+  (`BACKLOG #5509`)
+- **A layered search refuses a blanked preset rather than widening, and no longer answers 500 on a
+  cipher error reading a preset.** `GET /search/layered` read a preset whose stored criteria were
+  NULL or empty as an empty filter, so a narrowing preset blanked outside the store dropped out and
+  the search matched rows it would have excluded. The store now refuses such a cell on every
+  backend, before the preset is stamped as used: it logs a WARNING, writes the
+  `integrity.preset_tag_failed` audit row, raises the `integrity_drift` alert on a keyed store, and
+  the route answers **423**. A non-text cell, such as a planted BLOB, is refused the same way. It
+  answered 500 on a keyed store, and on a keyless store it could be read as a filter. A cipher
+  error on the preset's criteria that is not a failed tag, for example a value Vault Transit
+  refused, answers **423** where it answered 500, and is logged at ERROR with the error's type
+  name alone. A Transit outage answers **503** with `Retry-After`, as the upload routes do since
+  `BACKLOG #3734`, and is logged at WARNING. A refusal while loading a stored preset, malformed
+  criteria included, also tries to write the route's `preset.layered_search` audit row with at
+  least the number of presets layered, the preset id, the status and the refusal cause, an error
+  class name or `malformed`; that write is best effort. A preset write refuses empty or non-text
+  criteria, and a marked cell that opens to an empty string is refused as a blank one. For a repeated refusal the store rate-limits its WARNING, alert and
+  `integrity.preset_tag_failed` row, and the route rate-limits some of its refusal logs. The limits are best effort and held in memory per engine process,
+  and the AlertSink's per-subject re-alert cooldown applies on top, so the operator may see fewer
+  notifications than refusals. A cipher error on a message row the search then scans is not
+  covered by this change. A layered search that returns rows now also feeds the coalesced
+  `summary_access` audit, as `/messages/search` does. (`BACKLOG #5523`)
+- **An HTTP listener's `trusted_proxies` handling changes in four ways** (BACKLOG #5525). One
+  failed request whose ambiguous bare IPv6 hop keys two per-peer budgets now spends one unit of
+  the global budget, not two. One trust path widens: a listed inner proxy whose bare hop misreads,
+  without its last group, to an address no host can hold is now skipped as its plain hop is,
+  rather than taken for the client; a hop whose whole-address reading is that unholdable address
+  is still the client. A refused entry is named by the form the parse refused, so a zoned network
+  is no longer worded as a zoned address. `messagefoundry check` gains an advisory
+  `listener-trusted-proxies` line naming every listener with a non-empty list, as
+  `GET /security/posture` does.
+- **A refused message no longer adds to the anonymizer's `blanked` list.** The `blanked` list
+  names each field the `date` kind scrubbed to empty. Both the toolkit and the tee recorded that
+  address before the checks that refuse a field had run, so a caller that kept one list across a
+  run and went on past an `AnonError` held an address for a message that was never emitted. Both
+  now add the addresses only once the message has been written. (`BACKLOG #5540`)
+- **`validate`, `graph` and `dryrun` evaluate the environment `--env` names.** They used the flag
+  only for the value-file check under `--project-root`, and without `--project-root` it had no
+  effect, so a gate given `--env prod` could exit 0 on a graph whose `env()` values `serve --env
+  prod` cannot resolve. Given `--env`, they now run the service settings load `serve` runs, with
+  `--env` as `[ai].environment` and `--project-root` as `[environments].base_dir`, then read the
+  value file with `serve`'s reader, so overrides such as `MEFOR_VALUE_*` apply. For `validate`
+  and `dryrun` that load also names the file the missing-value-file check looks for, and the check
+  now fires under a `base_dir` from the settings file or the environment too, as it does for
+  `serve`. Where their settings do not load, they run the check they ran before instead, under
+  `--project-root`, so it still exits 2 ahead of the settings failure. `graph` keeps the check it
+  ran before, which still exits 2. Each `env()` reference of a deployed connection or lookup that
+  does not resolve is reported by its key, never its value. Settings that do not load are reported
+  as one fixed line with no text of the failure, and a `--service-config` that does not exist by
+  a line naming the path the load looked for; ADR 0050's 2026-11-20 note quotes both. A value file
+  that cannot be read is reported naming that file. `validate` lists these with its other problems
+  and `dryrun` stops on them, so both now exit 1 on settings that do not load where they exited 0
+  before, for example an unparseable settings file with the value file present; `graph` lists
+  them under `env_problems` beside the graph without failing. An absent value file reads as no
+  values, with a note naming it. With no `--env`, nothing changes. They build no
+  connector, so at least the build and posture checks stay `check --env`'s. ADR 0050 records where
+  they still differ from `serve`. (`BACKLOG #5554`)
+- **A deeply nested service settings file is reported, not raised, by more reads.** The shared
+  settings load, behind at least `serve`, `supervise` and `validate`, `graph` and `dryrun` under
+  `--env`, now reports the `RecursionError` the TOML parser raises on such a file, as it reports
+  any other settings that do not load. The settings-free value-folder read behind the
+  missing-value-file check, which `check` and `graph` run under `--project-root`, and `validate`
+  and `dryrun` there only when their settings do not load, now takes a deeply nested or non-UTF-8 file as naming the default folder, where
+  it raised, and leaves the file to the settings load. Other settings reads, at least `dryrun`'s
+  `[pipeline].snapshot_on_send` read and `check`'s settings checks, still raise it.
+  (`BACKLOG #5554`)
+- **`shardcert-driver` now checks every outbound copy, and the two-box shardcert drives poll the
+  engine box over https.** `shardcert-driver`'s verdict would pass a broadcast run that lost most of its outbound
+  copies, because its loss check counted distinct messages only. The verdict now checks each
+  accepted message: it must arrive at every destination the served router picks for it, on a kill
+  run too. The routing, fan-out and destination count come from SHARDS_READY, and each copy's
+  destination is read from the MSH-6 lane label the harness stamps, not from the sink port. A
+  surplus, a re-delivery or a copy at a destination the message was never routed to cannot stand in
+  for a lost copy. The total
+  sink count against accepted intake times the fan-out is still reported, and is not part of the
+  verdict. `shardcert-driver`, `shardcert-drive` and `shardcert-drive-ladder` now poll the engine
+  box's API over https by default, signed in as the rig Administrator, and take `--cacert` for the
+  engine box's certificate. `shardcert-driver` and `shardcert-drive` sign in before they offer any
+  load, and a refusal exits 2 with a hint, because the poll's drain wait is what holds their tally
+  until the engine has delivered. Each `shardcert-drive-ladder` rung waits on the engine half's own
+  drain signal instead, so there a refusal is recorded as a note and the rung runs on; once the
+  engine box has refused the sign-in, later rungs and the soak do not try it again, since each retry
+  of a refused credential counts toward locking the rig Administrator out. An empty `--cacert` is
+  refused rather than read as unset. `shardcert-driver` refuses a SHARDS_READY routing it does not
+  know, or a partitioned fan-out above the destination count, with a note that fails the copy
+  check, and a lane label whose destination is not ASCII digits names no destination.
+  `--insecure` keeps the plaintext poll, with no credential.
+- **A planted non-text value in a message cell is refused as integrity drift, not a 500.** A BLOB
+  written into a `messages` cell outside the store reached the cipher: a keyed store raised a
+  `TypeError`, so a list read answered 500 and a stage handoff re-pended the row on every pass, and
+  a keyless store returned the bytes. The store now refuses it as drift on every key mode: a list
+  withholds the row's tagged cells and a handoff dead-letters it, with the tag-failed audit row.
+  (`BACKLOG #5650`)
+- **The embedded-document strip ends a call after three consecutive batches fail their
+  writes.** A write
+  fault that hits every batch, such as a full disk or a read-only store, used to have the strip
+  re-seal every candidate in the store on every pass, each seal counting toward the AES-GCM
+  invocation ceiling, and log one ERROR per batch. The call now ends early instead, flagged
+  `write_failed`, and the retention pass skips the rest of its strip phase. A write that commits,
+  or a batch with nothing to write, resets the count, so failures far apart do not add up and one
+  or two failing batches in a row still do not stop the rows after them; three in a row at the
+  oldest rows stop every pass there while the fault lasts. The strip also
+  releases each batch's bodies before it reads the next. (`BACKLOG #5651`)
+- **A failed batch write in the embedded-document strip is now logged at ERROR and recorded.** The
+  strip still passes over a batch whose write failed and rolled back, and goes on to the rows after
+  it, but each such failure is now logged at ERROR rather than WARNING, and the retention pass's
+  audit row carries a new `documents_strip_write_failed` flag when the pass writes one. A failed
+  write alone does not make the pass write that row, since a read-only store or a full disk would
+  refuse it too. A refused cell found before a store-wide cipher error in the same batch is still
+  audited, and a failed batch read logs its traceback at DEBUG. (`BACKLOG #5651`)
+- **`measure-store-access.ps1` counts a start as refused only on a line that carries both
+  "refusing to start" and "no enabled Administrator".** It used to count any line naming "no
+  enabled Administrator", and the gate's skipped-gate and warn-mode warnings carry that too while
+  the start goes on. When a step that waits for the refusal sees one of the gate's let-start lines
+  (`$GateLetStart`), the run logs a reading quoting it, and that step's red carries no store-access
+  attribution. (`BACKLOG #5658`)
+- **A stray MLLP reject for another message no longer dead-letters the current one.** With
+  `verify_ack_control_id` on, a reject (`AR`/`CR`) whose MSA-2 names another message is now a
+  retryable correlation failure, and a persistent connection discards its desynchronized socket. A
+  reject that echoes the sent control id, or has an empty MSA-2, is still final, and `AE`/`CE` is
+  still retried. (`BACKLOG #5681`)
+- **An HTTP inbound handler fault is recorded as `handler_error` and answered `503` or `500`.** A
+  store or handler fault during intake was recorded as `peer_reset` (with no log line and no
+  answer) or as `framing_error`. It now logs at ERROR, emits `handler_error`, and answers `503` with
+  `Retry-After` for an `OSError` or `500` for any other exception, most store outages included;
+  `docs/CONNECTIONS.md` Table B states the split. (`BACKLOG #5680`)
+- **The HTTP intake-auth failed-attempt budgets are validated.** A negative, bool or fractional
+  `intake_auth_rate_limit` or `intake_auth_rate_limit_global`, or text other than plain digits
+  (such as `""`, `"0.0"` or `" 0 "`), is refused at load, so text can no longer turn a budget
+  off. An `env()` budget is checked by the same rule on its resolved value, and one that resolves
+  to no value is refused rather than turning the budget off. Only `None`, `0`, or plain-digit text
+  that spells zero, such as an `env()` that resolves to `"0"`, disables a budget. This replaces a
+  bare `TypeError` or a budget that refuses every request. (`BACKLOG #5677`)
+- **A reload that adds or rotates an `env()` value used by a Reference source now reaches the next
+  reference sync.** The reference sync runner is built once and kept across reloads, and it copied
+  the engine's environment values when it was built, so it would have synced against the old values
+  until a restart. It now reads the values the engine last applied, at each set's sync.
+  (`BACKLOG #5698`)
+- **A reload that runs while a log-write halt waits for the reload lock no longer rebinds a listener
+  over internal stages the halt shut down.** The halt marked its inbounds only once it held the
+  reload lock, and the rebind gate refused only a marked inbound, so a reload holding the lock
+  rebound the listener and the halt, which read its bound list before the lock, left it bound. The
+  halt of the router, transform and response stages is now a claim gate, as the delivery tier's
+  already was (ADR 0189): it reads the halt latch as well as the per-inbound marks, in the per_lane
+  workers' loop top and, under pooled, before the claim: a gated pooled lane parks with no claim
+  and no row write until the gate lifts, so it makes no per-backoff claim or reschedule and
+  cannot reach the infra-fault STOP while parked. The halt marks every inbound as it latches, before it waits, and the rebind gate probes
+  the log whenever the latch is set, so an inbound a reload adds is gated and refused too. The halt
+  pauses no internal lane, and STOPs one only through its hand-back of a prefix claimed before the
+  gate shut (on leadership loss, or at the T17 infra-fault bound). A lane can still STOP for other
+  causes, at least under its own fault policy. A latch a probe clears does not itself re-arm a
+  STOP, and the per-connection restart that recovers an inbound does, in both claim modes, except
+  a pooled lane that still holds claimed rows whose re-pend never landed. A
+  per_lane internal worker now waits at the gate rather than returning, re-reads it once its claim
+  returns and hands that batch back unrun if the gate shut meanwhile, and while the gate holds an
+  inbound whose worker a content STOP ended does not get that worker respawned. The pooled
+  hand-back of a router, transform or response row no longer resets the lane's infra-fault count when the hand-back made no progress. A raise from the first page no longer
+  aborts the halt, and an outbound whose ownership check raises is paused with the rest, at
+  the mid-run halt and at a start into a dead log.
+  (`BACKLOG #5704`)
+- **An injected message records its control id, type and summary.** `Engine.inject_message` stored
+  none of the three, so an operator upload or resend read blank in the message list. A control id
+  over 256 or a type over 64 UTF-16 units, the narrowest backend's columns, is stored as none on
+  every backend, and the inject still succeeds. The summary is not built when a PID, ORC or OBR
+  line or the fields it can read run over 16,384 characters, or their escapes could add over 4,096.
+  Pass-through connections and operator edit-resubmit are unchanged by this entry. (BACKLOG #5707)
+- **A loopback row whose correlation cannot be read is now dead-lettered rather than wedging its
+  lane, and a reload during its transform no longer reads as a Handler error.** The transform
+  stage read a re-ingressed row's metadata before its error handling, so metadata that did not
+  decrypt, was not JSON or was nested too deep, or a captured reply that did not decrypt, would
+  have been taken as an infrastructure fault and re-pended at the head of the strict-FIFO lane on
+  every pass. A correlation id that was not a string, and not empty, zero or false, could do the
+  same. On SQLite, a number or boolean id ran the Handler instead. Each case now dead-letters the
+  row, which stays replayable, on the split and the fused (SQL Server) paths alike. So does a keyed
+  store whose keyring lacks the key the metadata was encrypted under, such as a dropped retired
+  key. At least these faults still re-pend the row: a store read failure, a key service that gave
+  no verdict, such as an unreachable Vault Transit, and a store opened with no key at all whose
+  metadata is encrypted. The stage also read the graph live after those reads, so a reload that
+  dropped the inbound or the handler in that window would have reached the internal-error policy as
+  a Handler fault and dead-lettered an ACKed message. It now settles those rows as it already
+  settles them before the read: a dropped inbound reverts the row to retry once the inbound is
+  back, and a dropped handler dead-letters it. A row whose inbound and handler a later reload put
+  back before that settlement was written runs under the restored graph instead.
+  (`BACKLOG #5708`)
+- **A cluster lease claim that returns after the fence timeout no longer promotes the node.** On SQL
+  Server nothing is known to bound the COMMIT after the claim, so a claim could hold the lease but
+  return more than `leader_fence_timeout_seconds` after it was issued, and the node promoted on a
+  baseline the fence watchdog already counted as expired. The node now demotes, or stays a standby,
+  and logs a warning. When another promotable node has a fresh heartbeat, it then declines to claim
+  for the lease TTL plus two heartbeats, so that node can take the lease; when none has, it
+  claims again on its next tick. It sends no lease write, so the lease expires as after a
+  self-fence. (`BACKLOG #5711`)
+- **The engine no longer starts a backup pass on a passive DR standby.** A lone DR box always
+  leads its own cluster coordinator, so with `[backup].enabled` it would have backed up its own
+  store and written `dr_backup` audit rows. On a server-DB standby such a row would satisfy the
+  live seed probe on a database nobody restored, and would become the latest anchor the
+  `[dr].restore_token` check compares, refusing a valid restore. The engine's scheduled pass now
+  waits until an activation's reload has completed, and stops again on a release. Other writers
+  of such a row remain, at least the `messagefoundry backup` command, which is not gated.
+  (`BACKLOG #5712`)
+- **An HTTP inbound now writes the answer to a request it has read in full before it closes on stop
+  or HA demotion.** `stop()` woke the turns blocked on a captured reply and then closed every client
+  writer at once, so a woken `reply_from` turn wrote its `503` with `Retry-After` to a closing
+  transport, and a request whose commit was still running lost its `202` the same way. Either
+  caller would have seen a bare connection close, and would resend a body already committed.
+  `stop()` now closes at once only the connections still reading a request; the rest close
+  themselves once their answer is written, inside the same shutdown grace as before. A `reply_from`
+  turn whose commit finishes after `stop()` began answers the same `503` with `Retry-After`, not
+  `degraded`. A request read in full as `stop()` closed its connection is not committed, since no
+  answer could reach the sender, and a WARNING records it; a request read in full while the listener
+  serves is committed even when the peer has already closed. (`BACKLOG #5715`)
+- **A `File(...)` source under `after_read` `move` or `delete` reaches healthy drops behind rejects it
+  cannot quarantine.** A rejected file whose move to `.error` failed was read and charged against
+  `poll_max_files` again on later scans, so enough of them sorting first could hold back the files
+  behind them. Such a file is now remembered and retried in a bounded pass of its own after the
+  other files, outside `poll_max_files`. This narrows that gap rather than closing it; the
+  back-off rule at `STUCK_RETRY_SECONDS` in `transports/file.py` says when a retry falls due.
+  `after_read = "leave"` is unchanged, and so is `Sftp(...)`/`Ftp(...)`. (`BACKLOG #5717`)
+- **A `File(...)` source's remembered reject that has not changed costs no stat of its own.** The
+  scan judges it from the stat the directory listing already took, which under a share credential
+  saves a logon per remembered reject per scan. A reject that changes after the listing, while
+  earlier files in the scan are handed off, is noticed on the next scan rather than this one.
+  (`BACKLOG #5717`)
+- **An X12 outbound's send-time cleartext-hop refusal now stops the lane and keeps the queue,
+  and closing a replaced X12 connector now ends its send in flight.** The refusal is now the
+  permanent configuration fault (`insecure-hop-refused`) MLLP and the HTTP family raise, where it
+  was a bare `InsecureHopRefused` the delivery worker would have dead-lettered row by row. A send
+  that reaches an X12 connector a reload already closed, or that is still dialing when the reload
+  closes it, retries on the replacement, and closing the connector also closes a connect-per-send
+  in flight, as it closed the persistent connection, with an error that names the close rather
+  than the partner. A send the close cuts after its interchange was written is reported as an
+  indeterminate delivery, and its retry may reach the partner twice, as on the persistent path.
+  The runner still does not cancel the old connector's send task on reload.
+  (`BACKLOG #5718`)
+- **An MLLP outbound's send-time cleartext-hop refusal now stops the lane and keeps the queue.**
+  The send-time re-check raised a bare `InsecureHopRefused`, which the delivery worker would have
+  filed as an internal error and, under the default policy, dead-lettered row by row. It is now the
+  permanent configuration fault (`insecure-hop-refused`) the HTTP family already raises, so under
+  the default `credential_fault_policy` the lane stops and its rows stay queued. A send that
+  reaches an MLLP connector a reload already closed retries on the replacement before the hop
+  check runs, so a replaced connector never stops the lane, and a persistent MLLP send whose dial
+  a reload closed retries too, where it would have delivered on the replaced connector.
+  (`BACKLOG #5719`)
+- **A store open that fails or is cancelled now releases at least its pool, its SQL Server executor
+  and its SQLite connections, a cancel included.** On PostgreSQL and SQL Server a cancel skipped the
+  failed open's cleanup, which caught `Exception` only, so the pool stayed open, and on SQL Server
+  the pool's executor threads stayed too, a cancel while the pool connected included. A cancel no
+  longer cuts the cleanup short: it gets up to 5 seconds more to finish, then a forced release runs
+  without waiting for it, and the cancel is still raised. On SQLite a read connection whose first
+  PRAGMA failed was not tracked, so its non-daemon worker thread outlived the failed open, and a
+  cancel during the failed open's cleanup could skip closing the writer. Some cases are still open,
+  at least these: after a forced release on SQL Server the pool's free connections are not closed;
+  on SQLite a statement that ignores the interrupt keeps its worker thread running; and on the
+  one-connection store's error path, with no cancel, the wait for the store's own close has no
+  bound. On PostgreSQL and SQL Server a failed open still forfeits the AES-GCM invocation block it
+  reserved, as before, and each forfeited block counts toward the key's fail-closed ceiling. On
+  SQLite the cleanup settles the reserved block only once the open has bound the cipher to the
+  store's salt, and never before. (`BACKLOG #5720`)
+- **More of a failed store open's cleanup holds against a cancel.** On PostgreSQL and SQL Server a
+  failure while the store object is built no longer leaks the pool, and on SQL Server the executor.
+  At least the one-connection store's error path outside `aclose()`, which at least
+  `provision-schema` and `check-privileges` run on, and the close when `open_store` refuses to start
+  a keyless audit chain now run their close as a task a cancel does not cut short. On the
+  one-connection store's error path a close failure is logged by class rather than replacing the
+  error. On SQL Server, when the one-connection store's close fails before its pool step on that
+  path, the pool is closed and waited on for at most 5 seconds. A `GeneratorExit` thrown while the
+  cleanup waits now runs the forced release and is re-raised. A loop holds at most 64 unfinished
+  abandoned cleanups. A failed open's cleanup that ends cancelled is now logged at WARNING, where it
+  was logged at ERROR. `MessageStore.close()` now logs a failed settle, a failed group-commit close
+  and a failed read-pool connection close by class at WARNING, the traceback at DEBUG only, and the
+  PostgreSQL and SQL Server closes log a failed settle the same way. The `aiosqlite` floor is now
+  0.22.1, the first release with the `Connection.stop()` the SQLite forced release calls. (`BACKLOG
+  #5720`)
+- **A failed store open's cleanup no longer logs that a forced release released what the open
+  built.** It now says a forced release ran, since on SQL Server that release marks the pool
+  closing and shuts its executor down, which leaves the free connections open, and on SQLite a
+  statement that ignores the interrupt keeps its worker running. It says the release failed when
+  the release, or one of its steps on SQLite, raised. With no forced release, the bound-expiry
+  WARNING now says what the open built is left to the cleanup until it finishes, if it does, where
+  it said it was left to finish on its own. The AES-GCM invocation
+  bound's two WARNINGs for a failed add, the one a later pass retries and the one logged before a
+  cancel is raised, now name the failure by class, with its traceback at DEBUG only. (`BACKLOG
+  #5720`)
+- **The SQL Server pooled claim compares lane names exactly, on the batch, the stored procedure and
+  the prepared text alike.** A connection name is case-sensitive everywhere else in the engine, but
+  the claim compared lane names in the database collation. On a case-insensitive database two
+  connections whose names differ only in case would have failed the ad-hoc batch on a primary-key
+  violation, while the claim procedure merged the two names into one lane. Every lane comparison in
+  the claim now pins a binary collation, and the lane-column index seek is kept. The pooled sweep's
+  lane discovery tells the two names apart the same way, so neither lane is left without its
+  backstop. Other queries that filter the queue by lane, the per-lane claim among them, still
+  compare in the database collation. (`BACKLOG #5721`)
+- **The SQL Server claim procedures are deployed, gated and called in the store's schema, not in
+  `dbo`.** A store provisioned under a login whose default schema is not `dbo` keeps its tables in
+  that schema, but with `[store].fifo_claim_proc = true` the procedures were created as `dbo.`,
+  guarded on `ALTER` over `dbo`, and called as `dbo.`, apart from the `queue` table they claim from.
+  The procedures are now created unqualified, which puts them in the provisioning login's default
+  schema with the tables, and the guard probes `ALTER` on that schema. The startup gate looks for
+  them in the schema of the `queue` table the engine resolves and the claim calls them there; when
+  that table does not resolve, the gate degrades to the ad-hoc batch and says why. A procedure
+  stored under a schema-qualified head now reads to the gate as a hand deploy. The retained `_v1`
+  procedures keep their `dbo` head. (`BACKLOG #5722`)
+- **On SQL Server the AD group-to-role map no longer seals in a role id that names no role.** SQLite
+  and PostgreSQL refuse such an id with a roles foreign key; SQL Server's map declared none, so a
+  map write that raced a role delete, or named a case or trailing-space variant of a live role id,
+  would have committed and sealed it. The map now carries the roles foreign key, the writer checks
+  every role id it adds exactly inside its transaction and refuses an unknown one, and the map read
+  counts a pair as live only on an exact role id. A custom role edit or delete also takes only the
+  role's exact id: any other spelling SQL Server's lookup finds, at least a case or trailing-space
+  variant, is refused as not found, and a delete the store refuses writes no `role.deleted` audit
+  row. (`BACKLOG #5725`)
+- **The audit lookups behind keyed audit evidence and the transit-bound attestation match exactly on
+  SQL Server.** Each took `MAX(seq)` over a filter that compares in the database collation, which on
+  SQL Server folds case and pads trailing spaces, so a variant row, for example a newer row by an
+  account whose name differs only in case, would have shadowed the row the lookup wanted, and the
+  exact recheck after it would have refused genuine evidence. Each lookup now checks the row it
+  finds exactly and steps past a variant, on every backend. (`BACKLOG #5726`)
+- The state purge on SQL Server and Postgres deletes and names its rows in one statement, and on
+  SQLite reads and deletes them in one write transaction, so a key refreshed between the purge's
+  read and its delete is no longer dropped from the state cache while its row survives.
+  (`BACKLOG #5734`)
+- `rotate-key`'s user re-seal pass charges the AES-GCM invocation bound after each record, under
+  the SQLite writer lock, and compares seal and secret prefixes byte-exact, so no record is skipped
+  for a prefix that differs only in case. (`BACKLOG #5738`)
+- **The Postgres and SQL Server dead-letter purge releases attachments from one statement.** The
+  decref now counts exactly the links its delete removed, and the purge releases the shared body
+  of a restored dead row and clears its `body_ref`, as SQLite does, so neither outlives its
+  retention window. (`BACKLOG #5740`)
+- A sign-out-everywhere-else handed another account's session as the one to keep leaves that row
+  untouched, instead of seal-checking and re-sealing it and failing the revoke on its seal.
+  (`BACKLOG #5742`)
+- A pooled lane whose re-pend of its claimed head or tail was ended by a pause or by the stop
+  policy's bound, with the rows still in flight, now re-pends them before its next claim, so a
+  resume, a park timer or a re-arm no longer claims a later row ahead of them. Rows left by a hold
+  that ended on a moved lease are still not re-pended by this node, so a claim can still pass
+  them, as can a claim after rows a coalesced batch's own hold left in flight. (`BACKLOG #5744`)
+- A cluster leader whose lease claim holds at a different epoch than the one it led on, as when
+  another node held the lease while it was paused, now demotes and promotes again on both
+  coordinators, so the engine tears its graph down and runs the promotion recovery. Before, a
+  node whose heartbeat check did not already stand it down kept leading. (`BACKLOG #5746`)
+- **A DATABASE connection that fails with SQLSTATE class 08 is discarded.** At least a send, poll,
+  mark, lookup, connection test, login role probe or autocommit set whose connection failed with a connection
+  exception used to return it to its pool, so the dead handle was lent again and failed the next call the same way. It is now
+  closed instead, and the next borrow opens a fresh one. (`BACKLOG #5748`)
+- **A DATABASE send whose cursor the driver refuses retries.** A driver error from allocating the
+  statement's cursor on a borrowed connection used to escape the send unclassified. It is now
+  classified as a connect failure, since nothing ran: retried, or a stopped lane on a refused
+  login or a missing driver, never a dead-lettered message, and the connection is discarded
+  rather than lent again. A poll, mark, `db_lookup` and `DatabaseRef` sync classify the same
+  refusal the same way, and each acts on it as on any of its failures: a poll logs it and polls
+  again next interval, a mark leaves its row to re-emit, a lookup fails its message with an
+  error naming the connect failure, and a sync keeps its last-good snapshot. At least these sites
+  and the login role probe now discard that connection too, except on a configuration or credential
+  fault, which a fresh connection would meet as well. (`BACKLOG #5749`)
+- **A captured-reply completion no longer writes twice.** On SQLite, Postgres and SQL Server, a
+  second completion of an outbound row already marked done writes nothing, so it no longer mints
+  a second reply and a second re-ingress child. The server backends also
+  serialize the reply sequence, so two rows of one message to one destination no longer collide
+  and roll back a delivery the partner already accepted. (`BACKLOG #5752`)
+- **A detached document is deduplicated before it is sealed.** On all three backends a re-put of
+  stored content seals nothing, a new document reserves its seals in the persisted AES-GCM
+  invocation bound before the first one, and a concurrent identical upload returns the same ref
+  instead of failing on the primary key. (`BACKLOG #5753`)
+- **A reload that fails or is cancelled before its outbound reconcile changes a lane now leaves
+  every outbound lane as it was.** The rollback restored the registry and intake but left each
+  outbound lane the reconcile had reached as the refused graph had it: its connector, retry,
+  simulate and pause state, until a restart. A reload now builds every outbound connector before
+  it changes any lane, then makes every lane change with no await, and closes the connectors it
+  takes out of a lane only once its swap commits, even if the rest of the commit raises or is
+  cancelled. A connector a not-deployed, `auto_start` or DR park retired, and that failed to
+  close, rolled the reload back; it is now reported as a close failure, as a rebuilt lane's is.
+  The rollback's sandbox close and inbound stops no longer stop it partway. The reload's lane CA
+  check judges an inbound schedule window at the time its build check and listener loop share.
+  The builds for the lanes a DR activation takes out of the park run together under one 30-second
+  bound, and a lane whose build and startup check have not finished by then fails with a timeout.
+  When the default executor refuses a worker-thread hop, some reload hops, such as the reload's
+  target check, now run on a thread of their own, or on the event loop when no thread can start,
+  with a WARNING, rather than failing at that hop or stopping the rollback; other hops still fail.
+  Which hops fall back and which do not, what a refused hop still fails, a DR activation among
+  them, and what an inbound whose rollback restart meets one is left as, are stated once in
+  `docs/SECURITY.md`, in the refused-executor hop list under the `reload_fault` reason. A refused
+  or cancelled sandbox close hop no longer drops its sessions unclosed, except in the case the
+  `_close_sandbox_sessions` docstring records.
+  (`BACKLOG #5755`)
+- `GET /connections/{name}/metadata` reads an outbound's `running` from the lane. It read only the
+  graph's running flag, so an outbound that was at least stopping, stopped, STOP-held, log-halted,
+  failed, DR-parked or not deployed read `running: true`; a failed or parked one did so beside the
+  `error` naming why. It now reads `true` only where `/graph/edges` shows the outbound node
+  `running`. (`BACKLOG #5762`)
+- **A key-service failure during a claim no longer dead-letters the row or raises a false
+  integrity alert.** On a `vault_transit` store, a queue payload that could not be opened because
+  Vault gave no verdict on it was read as the row failing its queue tag: the claim dead-lettered a
+  healthy message and wrote an `integrity_drift` alert and audit row. Which failures are a verdict
+  on the row is stated once, in `_key_service_gave_no_verdict` in `store/queue_tag.py`. A failure
+  that gives none, a failed read of the store on SQLite, and a dead-letter write that fails are
+  now treated as infrastructure faults. Only the pooled FIFO claim, `claim_fifo_heads`, hands the
+  row to the existing infra-fault path, which retries it with backoff and, if the fault lasts,
+  stops the lane with a `connection_stopped` alert (`infra_fault_policy = "stop"`) or raises
+  `lane_stuck` (`retry_forever`). Every other claim puts the row back to `pending` five seconds
+  after the fault, and it is retried with no cap and no alert of its own while the fault lasts. At
+  least these claims do that: every claim under `claim_mode = "per_lane"`, an unordered outbound
+  lane's claim under `pooled`, and the extra rows a batch window claims. A FIFO claim sets aside
+  every later row it claimed with the row, and an unordered claim sets aside only that row. A tag
+  failure whose dead-letter write fails is still alerted, and its audit row is attempted on every
+  retry. A refusal Vault did give a verdict on is dead-lettered and reported as before.
+  (`BACKLOG #5765`, `BACKLOG #5735`)
+- **One arrival on an idle lane no longer raises a saturation alert.** A lane's backlog must now
+  rise by `[delivery].saturation_min_growth` messages (default 5, from 1 to 1000000) above the
+  lowest depth sampled since the engine started watching it before `saturation` fires. Only a fall
+  below that lowest depth restarts the count. A lane that keeps growing past that still pages,
+  flat steps and slow growth included, and so does one whose small dips are spaced more than
+  `saturation_sustain_samples` samples apart. Once a lane has risen that far above its lowest
+  depth, its later small rises page as they did before. `saturation_sustain_samples` now refuses a
+  value below 2 at load. (`BACKLOG #5768`)
+- **The `[alerts]` send timeouts, cooldowns and SMTP port load only in range.** `webhook_timeout`
+  and `email_timeout` must be above 0 and at most 300 seconds, `realert_seconds` 0 to seven days, a
+  rule's `cooldown_seconds` above 0 to seven days, a rule's `min_oldest_seconds` 0 or more, and
+  `email_smtp_port` 0 to 65535, where 0 is smtplib's default, port 25. Infinity is refused for each
+  float, and NaN too where a range check did not already refuse it. A value out of range is refused
+  at load rather than breaking the alert path at send time; an infinite cooldown, for one, would
+  silence every repeat alert. Each timeout bounds each socket wait, not a whole send.
+  (`BACKLOG #5770`)
+- **`[cluster]` timing settings refuse `nan` and `inf` at config load.** `heartbeat_seconds`,
+  `node_timeout_seconds`, `reclaim_interval_seconds`, `leader_lease_ttl_seconds`,
+  `leader_fence_timeout_seconds` and `lease_renew_timeout_seconds` must now be finite numbers
+  above 0. (`BACKLOG #5771`)
+- **`GET /ai/policy` and `messagefoundry ai-policy` report `code_only` under `managed_endpoint`.** On
+  a non-production instance they used to report the configured scope up to `synthetic`, while
+  `POST /ai/chat`, the route that mode serves, refuses any scope but `code_only` with a 403. The
+  effective policy now pins `managed_endpoint` to `code_only` and says why in its `reason`.
+  (`BACKLOG #5773`)
+- **`alert add` now appends to an inline `[alerts].rules` array.** It appended a table into the
+  array, which wrote TOML that does not parse, so the add was refused. The new rule is now one more
+  inline table, and the array's comments are kept. At least one spelling is still refused, as
+  before: a last rule with no trailing comma followed by a comment line before `]`.
+  (`BACKLOG #5774`)
+- **An `env()` on a `deployed=False` connection no longer fails the ADR 0050 AC-3 value-file
+  check, except in a directory setting.** Under an explicit project root with no `<env>.toml`,
+  `serve` and the offline commands that run the check (at least `validate`, `graph`, `dryrun` and
+  `check`, given `--project-root` and `--env`) exited 2 because of a connection that is switched
+  off and never built. The check now counts the `env()` references of deployed connections,
+  lookups and reference sets, and, on a switched-off connection, only those in the settings its
+  guarded directories come from, which the `.processed` archive sweep's guard still resolves. So
+  that turning such a connection on cannot slip past the check, a managed engine given an explicit
+  `[environments].base_dir` and a value provider that names a value file, as `serve` gives it, now
+  runs it as a registry guard at its first load and on every reload,
+  a dry run included, and refuses a graph that references `env()` when the value file is absent.
+  (`BACKLOG #5775`)
+- **Queue buildup and stall alert thresholds load only when greater than zero, and `inf` means off.**
+  `[delivery]` `buildup_max_depth` must be at least 1, and `buildup_max_oldest_seconds` and
+  `stall_max_oldest_seconds` above 0. The per-outbound `buildup=` / `stall=` thresholds, and their
+  `[outbound.buildup]` / `[outbound.stall]` tables in `connections.toml`, take the same bounds. NaN
+  is refused too. A zero or negative threshold was crossed by every lane holding a message, and NaN
+  was never crossed. The per-outbound threshold models also refuse a boolean, which they read as 1;
+  the `[delivery]` keys already refused one. An `inf` age, in `[delivery]` or a per-outbound table,
+  now loads as unset (`None`), the dimension off, since TOML has no null. `messagefoundry connection
+  list --json` prints a non-finite TOML float as the tag `{"$toml": "inf"}` (or `"-inf"`, `"nan"`,
+  `"-nan"`) rather than a bare `Infinity` token a strict JSON parser refuses, and `connection
+  upsert` reads the tag back as the float. A plain string is never decoded as the tag. A
+  hand-written table whose only key is `$toml` is listed escaped, as `{"$toml": {"$toml": ...}}`,
+  and upsert reads it back as the same table. (`BACKLOG #5778`)
+- **An active-window schedule refuses a start or end time that carries a timezone.** A time with a UTC
+  offset, such as `08:00:00+02:00`, used to load, then raise `TypeError` at every schedule check. A
+  start or end with any tzinfo is now refused at load; set the window's zone with its `timezone`
+  field. (`BACKLOG #5779`)
+- **An account name an administrator sends is checked before it is stored.** A display name that
+  is blank once white space and characters that draw nothing are set aside, or that holds a
+  control character (NUL included), a line or paragraph separator or a bidirectional control character, is
+  refused with a 422 on `POST /users` and `PATCH /users/{user_id}`, and the console's user save
+  shows the refusal; such a `username` is refused with a 422 on `POST /users/directory` too. An
+  edit that re-sends the name already stored, or that name as a console form posts it back, is
+  exempt, so a name another writer stored does not block a save of another field, and a repair to
+  a clean name is accepted. (`BACKLOG #5784`)
+- **A custom role name is checked before it is stored.** `POST` and `PUT /roles/custom` answer
+  422 for a name the account name rule refuses, or one that folds to a built-in role's id or
+  label, such as `ADMINISTRATOR`. The fold drops characters that draw nothing, then applies NFKC
+  and case folding. It does not catch at least a letter that only looks alike, from another
+  script or the same one, or a combining mark that draws little over a letter. A save that
+  re-sends the stored name is exempt, so a role stored under a refused name can still have its
+  permissions edited. (`BACKLOG #5785`)
+- **An upload with no closing boundary delimiter is refused.** A `multipart/form-data` upload body
+  with no closing delimiter `--<boundary>--` was parsed, so a body that ended early was stored as a
+  shorter file. It is now refused, with HTTP **400** where no size or part limit refuses it first.
+  A boundary delimiter now counts only at the start of a line (at the start of the body, or after a
+  CR or an LF), so delimiter text in the middle of a content line stays in the file, and a body
+  whose only close marker sits mid-line is refused. A body whose first delimiter text does not
+  start a line (a stray space or BOM before it, a preamble ending mid-line, or delimiter text
+  mid-line in a preamble) is now refused with HTTP **400**; a size or part limit can refuse it
+  first, and `_LineStartDelimiters` in `messagefoundry/api/multipart.py` says which. Such bodies
+  were parsed before unless a limit refused them, though the upload route already refused some of
+  them, with another message, for holding no file part or more than one. A line before the epilogue
+  that starts with a delimiter and has anything after it other than spaces or tabs, or a close's
+  `--` and then spaces or tabs, such as `--<boundary>note`, `--<boundary>--note` or
+  `--<boundary>--epilogue`, is no longer read as a delimiter or as the close, and the body is
+  refused with HTTP **400** where no size or part limit refuses it first. The epilogue, after the
+  close, is still not read. Before, such a line in a file cut the file there. A bare CR counts as
+  the end of a line. A content line that is `--<boundary>` or `--<boundary>--` followed only by
+  spaces or tabs is still read as a delimiter or as the close. (`BACKLOG #5787`)
+- **The peer-certificate fallback reads a TLS connection once.** For a server that puts the
+  transport in the request scope (stock uvicorn does not), `peer_cert_from_request` parsed the
+  client certificate and checked its issuer on the event loop on every request. The verified read
+  is now kept per connection, keyed on its `ssl_object`, and reused while the peer presents the
+  same leaf. A read with no certificate or no verified issuer is not kept. The trusted-proxy check
+  still runs on every request. (`BACKLOG #5788`)
+- **The self-signed certificate the engine generates for a loopback bind names 127.0.0.1, ::1 and
+  localhost.** A pair the engine mints, renews or re-mints for a bind the engine treats as
+  loopback (`127.0.0.1`, `::1`, `localhost`) names all three, so a client on the engine's machine
+  verifies it at whichever of the three it dials, where the engine listens at that address. A
+  first-run mint for a wildcard bind names itself and its own family's loopback, and for a bind
+  that is neither one of those three nor a wildcard names the bind's own address or name alone;
+  docs/SERVICE.md says what a renewal or re-mint keeps. The pair never adds the machine's host
+  name beyond the bind host. A reused pair for a loopback bind that lacks any of the three, such
+  as one minted for `0.0.0.0` after a move to `127.0.0.1` or one minted before this change, is
+  replaced at the next start, with at least the exceptions docs/SERVICE.md lists, audited with
+  reason `bind_changed`, or `renewal` when it is also due. (`BACKLOG #5790`)
+- A listener reply whose characters the inbound charset cannot encode is now refused, not sent
+  with `?` written in, when `?` is a delimiter its header declares, or a declared delimiter is a
+  character the charset cannot encode, in more of the shapes an HL7 reply takes: a reply led by
+  `MSH`, `BHS` or `FHS`, where every segment that starts with one of those is read, so a batch
+  member's own `MSH` counts. Until now only the text before the first CR of an `MSH`-led reply
+  was read. HL7 segments end at CR when the reply holds one, and at LF only in a reply with no
+  CR; in such a reply an `MSH` first line shorter than its MSH-1 and MSH-2 span is read past its
+  LF, as the read before the first CR did. Not covered, so a `?` can still be written in: at least the shapes the
+  docstring of `_reply_delimiters` in `messagefoundry/transports/framing.py` lists, an X12 reply
+  led by `ISA` among them.
+  (`BACKLOG #5799`)
+- **A copy-on-write copy no longer raises while another thread reads the shared message.** When a
+  `Message` and its `copy()` were read on two threads, the first write copied the shared tree with
+  `copy.deepcopy`. A lazy segment split on the other thread could change the map that copy was
+  walking, and the write raised `RuntimeError`. The copy now takes that map in one call, so the
+  split lands before or after it. (`BACKLOG #5801`)
+- **The outbound delimiter override now writes a `BHS` or `FHS` header correctly.** It wrote the
+  header's field separator as an extra field and changed only the escape character of its old
+  encoding characters, so every batch or file header field moved one place. With a new delimiter
+  set, field 2 of a `BHS` or `FHS` header now advertises the target encoding characters, as
+  `MSH-2` does. A `BHS` or `FHS` line whose fields 1 and 2 the rewrite cannot carry is refused,
+  which fails the delivery; the docstring of `_header_encoding` says which. With the message's own
+  delimiter set, `BHS` and `FHS` lines are written as they came. `MSH` lines are rewritten as
+  before. (`BACKLOG #5802`)
+- **The batch split drops the envelope trailer lines that end a message.** Every other cut is the
+  one the split made before. (`BACKLOG #5806`)
+- **The dry run splits where byte order marks lead a later `MSH`**, as the live split of a UTF-8
+  decode does. Under a single-byte charset the live sources do not cut there. (`BACKLOG #5918`)
+- **`copy_field` and `split_field` no longer escape a whole field's escapes a second time.** A
+  whole-field source copied or split into a component or subcomponent reads back there as
+  `copy_field`'s docstring sets out, so a field sent as `O\S\Brien` reads back as `O^Brien`. A
+  whole-field destination still takes the raw text as it is. Both now raise `ValueError` on a
+  component or subcomponent destination in field 1 or 2 of `MSH`, `BHS` or `FHS`, whatever the
+  source. (`BACKLOG #5821`)
+- **`date_diff_field` reads a coarser degree-of-precision code and trailing empty parts.** A
+  whole-field `TS` whose component 2 code is coarser than its time, such as `198807051200^D`, is
+  read at that precision rather than refused, and trailing empty components and repetitions, as
+  in `20260101^` and `20260101~`, are ignored. Once both fields are present, a component path now
+  raises on more than one repetition, as a whole-field path does, so `20260101~~20270101` and
+  `~20270101` raise there too. (`BACKLOG #5822`)
+- **The compose `ha` profile's Postgres now serves TLS, and no compose service sets
+  `MEFOR_ALLOW_INSECURE_TLS`.** The `ha` engines set that escape against a Postgres with no TLS, but
+  the engine refuses a weakened store login at every posture, so the shipped HA template could not
+  open its store. Postgres now serves your certificate and unencrypted key from `docker/pg-tls/`,
+  and the engines pin its CA at `/config/pki/store-ca.pem`; `docker/compose.yaml` says what each
+  file must hold. (`BACKLOG #5827`)
+- **`docker compose --profile ha up` no longer fails on a host port collision.** The default
+  `engine`, which has no profile and so starts under `--profile ha` too, and `engine-ha` both
+  published host port 2575. `engine-ha` now publishes its MLLP listener on host port 2578.
+  (`BACKLOG #5828`)
+- **The tee relay refuses a Corepoint attempt count or shadow-queue bound below one.**
+  `--corepoint-attempts` and `--mefor-queue-max` (and the matching `RelayConfig` fields) now take
+  only a positive integer, where one attempt means no retry, and a bad value stops the relay before
+  any listener binds. Before, zero attempts would have let the relay ACK an Epic message and then
+  fail without forwarding it or tripping fail-closed, and a bound of zero or less would have made
+  the shadow queue unbounded. (`BACKLOG #5829`)
+- **The harness message detail panel no longer acts on, or shows, the previous message while a new
+  one opens.** Selecting a row now clears the panel and withdraws Replay and Show body until that
+  message's open lands. Before, Replay pressed in that window would replay the previously shown
+  message. An open that fails with an error other than an API error is now reported and clears the
+  panel, where before it left the previous message on screen with nothing said. A row selected
+  while Replay's step-up prompt is open is kept: the refresh after the replay no longer reopens the
+  replayed message over it.
+- **The harness acceptance A5 probe now reports the raw-TCP listener port.** Row A5 names the MLLP,
+  DICOM, TCP and API listeners, but the probe reported bindability only for MLLP, DICOM and API. It
+  now also reports TCP port 2580, the default of the harness's `IB_Harness_TCP` inbound.
+- **A `DatabaseRef` reference sync bounds each statement call and refuses a result that does not fit its
+  columns.** `DatabaseRef(statement_timeout=...)`, whole seconds, `0` for no limit, defaults to 30
+  as the DATABASE connector's SQL Server preset does, and bounds each statement call, the execute
+  and each fetch, not the pass. A call that runs past a non-zero value fails that sync as
+  `ReferenceStatementTimedOut` at least on `HYT00`, the one state read as this timeout; the
+  last-good snapshot keeps serving, and a set that never synced stays unloaded. Nothing bounds a
+  call in at least these cases: at `0`, on a pool the engine could not track, or on a driver
+  connection that carries no timeout, the last two logged at WARNING. In those cases an
+  uncancelled statement holds the sync pass until it returns. The 30 s default is the same value as the `[store].command_timeout` default, not read
+  from it, and a large set's statement can need more. A result that did not fit its columns used to
+  replace the last-good snapshot: a missing `value_column` gave `None` values, a NULL key a
+  `"None"` key, two rows with one key whichever came last, and a column the result held twice, as a
+  join can, whichever of the two came last. Now a `key_column` or `value_column` the result lacks
+  or holds twice, or, with no `value_column` set, any column name the result holds twice, fails the
+  sync as `ReferenceColumnMismatch`; a missing `key_column` always failed the sync, and now fails
+  it as this class. With a `value_column` set, another column held twice is still accepted. A NULL
+  or duplicate key fails it as `ReferenceKeyRefused`. [CONNECTIONS.md](docs/CONNECTIONS.md)
+  lists at least these refusals. (`BACKLOG #5891`)
+- **Stopping one `reply_from` HTTP listener no longer drains its siblings.** Every such listener
+  shared one reply rendezvous, so in the shipped code stopping any one of them, including the stop
+  of every source that a reload runs, would have woken every other listener's waiting turns with
+  `shutting_down` and left the rendezvous draining. Every later synchronous-reply turn on every
+  listener would then have resolved `degraded` without waiting for its reply until the process
+  restarted. Each listener start now gets its own drain scope: stopping that start wakes only its
+  own turns, and the next start of the listener waits for replies again. Delivery hints still
+  reach a waiter whichever listener armed it, and the waiter cap stays one per runner.
+  [ADR 0154](docs/adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md)
+  records the change. (`BACKLOG #5893`)
+- `messagefoundry connection remove` takes `--direction inbound|outbound`. An inbound and an
+  outbound may share a name, and `remove` used to delete the first match, the inbound, even when
+  the outbound was meant. A shared name without `--direction` is now refused and nothing is
+  removed. The VS Code editors always send the direction, and refuse a delete of a shared
+  name, since they look a connection up by name and cannot tell the two apart.
+- **`connections.toml` retry, buildup, stall and batch tables refuse a wrong-typed value, and retry,
+  buildup and stall refuse an unknown key.** An unknown key in `[outbound.retry]`,
+  `[outbound.buildup]` or `[outbound.stall]` was dropped with the default kept, so a typo could
+  leave the stall alert off or the retry cap unchanged with no error. Those tables and
+  `[outbound.batch]` also coerced a quoted number, a boolean, or a float where an integer is
+  declared. Both now fail the load. The `schedule` table gains no type checking: it refuses an
+  unknown key, as it already did, and its values are still coerced, not strictly typed. An unknown
+  top-level key in any of these tables is now named without its value; an unknown key inside a
+  nested schedule window is still refused, with its value quoted. `max_attempts = "forever"` still
+  loads. (`BACKLOG #5899`)
+- **An operation the shutdown drain cancels under a waiting request now answers 503.** A DR
+  activation, DR release, config reload, approval release or uploaded-log write whose outliving
+  operation was cancelled while its request still waited raised a bare cancellation into that
+  request, past every API exception handler. It now answers 503, saying the outcome is unknown,
+  and an approval release cut off that way is recorded `interrupted`. (`BACKLOG #5903`)
+- **A cluster node whose coordinator no longer reads it as leader now refuses more of the sends
+  and reloads it would have run in that window.** "The lease" below is the coordinator's cached
+  `is_leader()` flag, which can lag the lease row. A single-row delivery now asks the lane gate
+  again right before its send, as the coalesced batch already did. That gate covers the lease, a
+  pause and the log-write halt. A row it refuses is not sent and is charged no attempt; a flag
+  that goes false during the send itself is not caught. An applied (not dry-run) reload, on a node
+  whose graph still runs, reads the flag twice: once the runner holds the reload lock, which is
+  after the engine has loaded the config and run its preflights, and again before it stops any
+  listener. It is refused with no lane changed when either read is false; a flag that goes false
+  after the second read is not refused. On such a node an ungated `POST /config/reload` answers
+  503 and writes a `config_reload_failed` row with reason `lease_lost`. A gated one files its
+  hold, which reads no lease. Approving that hold on such a node answers 503 before the request is
+  claimed, writes `approval.node_refused` against the approver, and leaves the request to be
+  approved on the leader. A flag that goes false after that check and before the runner's second
+  read is refused by the reload itself, and that approval is then marked failed; after the second
+  read the release runs. A cluster convergence pass there is refused before it loads the config
+  and retried; through a run of such passes only the first logs at INFO, with no traceback. A DR
+  activation's abort row names the lease, a case only an embedder that skips the settings check
+  refusing `[dr]` with `[cluster]` reaches. A dry run there is not refused for the lease.
+  (`BACKLOG #5906`)
+- **A cluster node that lost its lease no longer says its graph is down, or points at a start it
+  refuses.** On a node whose lease is gone while its graph still runs, an alert rule's restart is
+  logged as not run because the node no longer holds the cluster lease, where it said the graph
+  was not running. A resend into a stopped outbound is refused with a 409 that says to resend
+  through the leader, where it said to start the connection first, a start that node refuses. An
+  upload resend into a stopped inbound on such a node, or on one whose graph is down, is refused
+  with a 409 saying that this node refuses the resend, where it said to start the inbound.
+  (`BACKLOG #5906`)
+- **The OIDC token and JWKS reads name a content-coded reply for its coding.** They used to say
+  the reply "framed its body length ambiguously"; they still refuse it. (`BACKLOG #5910`)
+- **A content-coded egress reply body is refused instead of read as text.** The deliveries this
+  fixed include at least SOAP, REST, FHIR and DICOMweb: a reply whose `Content-Encoding` named
+  anything but `identity`, such as `gzip`, was decoded as text, so a SOAP Fault or a STOW-RS
+  failure inside a 2xx would have been recorded as delivered. On those deliveries a coded 2xx body
+  is now the `reply-misframed` refusal where the body is needed, and is dropped with a
+  `reply_dropped` event where it is not. A SOAP or FHIR delivery that reads a coded non-2xx body
+  logs a WARNING and classifies on the status alone; REST and DICOMweb do not read a non-2xx
+  body. Other reads that check reply framing refuse a coded body too, at least the OIDC token
+  and JWKS reads and `fhir_lookup` with their own error. On a coded 2xx token reply, as `smart.request_token` scopes it,
+  the SMART and OAuth2 token reads raise a permanent configuration fault with the code
+  `token-reply-coded`: a delivery that mints its bearer does not retry, and under the default
+  `credential_fault_policy` stops the lane and keeps the queue (owner ruling "Stop the lane",
+  2026-11-18, on PR 3069); under `credential_fault_policy = "dead_letter"` the rows dead-letter;
+  and a
+  probe that mints one fails. The replies the
+  coding check skips are listed on `reply_framing_fault`; they include at least a `204`, a
+  `Content-Length: 0` reply and a reply to `HEAD`. (`BACKLOG #5910`)
+- **The lane alert for a configuration fault that dead-letters under
+  `credential_fault_policy = "dead_letter"`:** see ADR 0095 Amendment B.2.
+- **At least these static request values now fail at build.** A FHIR destination or
+  `FhirLookup` whose static `url` is not ASCII or holds whitespace or a `#`, or whose static
+  header `http.client` would not send, and a FHIR destination whose `conditional_query` is all
+  whitespace, used to build and then fail every message. They are refused at build now. So are: a
+  REST, SOAP or DICOMweb destination whose `url` (for DICOMweb, its STOW-RS target), once the
+  whitespace around it is stripped, is not ASCII or holds whitespace or a control character; a
+  `smart_token_url` or `oauth2_token_url` of that shape; and, on each of these connections, a
+  static header whose name is not an RFC 9110 token or whose value holds a control character
+  other than HTAB. A `#` is refused where a setting reads the URL as written: on a SOAP
+  destination with `ws_addressing` on, whose `wsa:To` carries it, and in a `smart_token_url` with
+  no `smart_audience`, whose default `aud` is it. On a REST or SOAP destination with HTTP Digest,
+  a URL ending in whitespace that the Digest password lookup keeps, such as a space, is refused,
+  since the password would be stored under it and never found. The RFC 9110 name check leaves a
+  proxy-credential-shaped header name, such as one that reads as `Proxy-Authorization`, to the
+  proxy-header rule. A refusal names the setting and, for a header, its key, never a value.
+  (`BACKLOG #5911`)
+- **A DICOMweb STOW-RS 202 is now confirmed by the instance that was sent, not by any instance, except where nothing can be compared after a data set read fault.**
+  The ReferencedSOPInstanceUID the reply names is compared with the Media Storage SOP Instance UID
+  (0002,0003) in the File Meta group of the object sent, read without `pydicom`, and, with the
+  `[dicom]` extra installed, with the data set's SOP Instance UID (0008,0018). A 202 that the
+  earlier reply rules do not refuse, and that names neither, or that is for an object with neither
+  UID to compare, is a permanent refusal (`unconfirmed-202`), not a delivery, except as below
+  where the data set read raised a fault the codec does not wrap; the reason names why the File Meta has no UID. Both UIDs are read before the POST, whatever the partner then answers.
+  An object the codec cannot parse is still sent, and so is one whose read raised a fault of a
+  class the codec takes as a parse failure, even from a broken extra. An installed extra that does
+  not load is taken as absent, so only the File Meta UID is compared, and one WARNING per process
+  says to repair or remove it. Any other fault in that read, except a `MemoryError`, reads as no
+  data set UID too, with one WARNING per process naming its class; where the object also has no
+  File Meta UID, a 202 is confirmed as the BACKLOG #5914 reply check did before the UID comparison, by any UID it names. A 200 is not compared. The
+  refusal text names no UID. The
+  rule in full is docs/CONNECTIONS.md *DICOMweb*, *Status classification*. (`BACKLOG #5914`)
+- **A DICOMweb STOW-RS 2xx reply that does not parse, or a 202 that names no stored instance, is no
+  longer recorded as delivered.** Each is a permanent refusal (`unparseable-reply`,
+  `unconfirmed-202`), and a malformed FailedSOPSequence is `unparseable-reply`, since it proves no
+  rejection. Not every 2xx that fails to confirm the store is refused: an empty 200, or one of only
+  JSON whitespace after any leading BOMs, is still delivered, and so is a 200 dataset that
+  confirms nothing unless one of those rules refuses it. The rule in full is docs/CONNECTIONS.md
+  *DICOMweb*, *Status classification*. The refusal text names no reply content. (`BACKLOG #5914`)
+- **`Message` now agrees with `Peek` on a fieldless bare segment.** **BREAKING:** A line such as `PID`, with no
+  field separator, is no longer an occurrence to the `Message` by-occurrence API: at least
+  `field`, `repetitions`, `count_segments`, `set`, `set_data`, `add_repetition` and a group's
+  member occurrences skip it, as `Peek.field` always has. Before, reads and counts called the bare
+  line occurrence 1 while an occurrence-1 whole-field write skipped it, so on `PID` followed by
+  `PID|1||X^Y~Q` a component write copied the bare line's empty field over the populated `PID`,
+  and a write to a lone bare `PID` raised `KeyError` while `count_segments` reported it present.
+  A `Message` write now lands on the segment a Router reading with `Peek` sees, so a bare line can
+  no longer make the two disagree. A line with one empty field (`PID|`) is still an occurrence to
+  both, so a Handler that must scrub every patient segment still loops over `count_segments`. A
+  lone bare `PID` reads and counts as absent, and a write to it raises the normal missing-segment
+  `KeyError`. `segments()` still lists every line, `delete_segments` still removes a bare one, and
+  a bare `OBR` still opens a group, as it opens a `split_by_obr` part. (`BACKLOG #5917`)
+- **The UDP syslog forwarder counts a send that raises an error on this host, and no forwarder
+  prints a traceback to stderr.** A `sendto` that raises a network error on this host, such as
+  `ENETUNREACH`, now reads as failing: with a spool the record is kept on disk instead of being
+  lost or deleted as sent, and without one it is counted as unsent. A datagram too large to send
+  (`EMSGSIZE`) is instead dropped as undeliverable: it is counted in `undeliverable`, is not
+  kept for a retry, and never sets `send_failing`; a copy already in the spool for another
+  reason, such as backoff, is dropped the same way when replay reaches it. A UDP forwarder can
+  therefore now read `degraded` and raise the forwarding alerts. With a spool, a UDP collector
+  whose name lookup fails for a temporary reason at start is deferred instead of leaving the
+  process without a forwarder. On any arm, a network send error and an undeliverable record are
+  each reported in a throttled ERROR line naming the error type, and its number where it has
+  one, with no record content, where the standard library printed a traceback and the record to
+  stderr each time. Delivery over UDP is still not confirmed; see `[logging]` in
+  [CONFIGURATION.md](docs/CONFIGURATION.md). (`BACKLOG #5923`)
+- **`[logging].forward_host` refuses the IPv4 limited broadcast address at load.** The forwarder
+  never enables broadcast on its socket, so every send to `255.255.255.255` failed and, with a
+  spool, held every later record behind it. With forwarding on, the start now refuses that value,
+  its IPv4-mapped IPv6 spelling included, with a message naming the setting. The check reads only
+  IP literals and does no DNS, so at least these are not refused: a directed subnet broadcast
+  address, a multicast address (IPv4 `224.0.0.0/4`, IPv6 `ff00::/8`), and a host name that
+  resolves to the broadcast address. (`BACKLOG #5923`)
+- **A UDP log forwarder's socket is rebuilt after a failed send.** A UDP socket was never rebuilt
+  after a failed send, so one that went bad stayed bad. After a send that fails with a network
+  error other than a failed name lookup, the next send now builds a new socket when the old one is
+  at least 30 seconds old. (`BACKLOG #5923`)
+- **`convert_case`, `substring_field`, `pad_field` and `replace_literal` now work on a field's
+  decoded value and keep its escapes.** They transformed a field's raw wire text, so they cased,
+  sliced, counted and matched escape sequences as if they were data: upper-casing `\.br\` made
+  `\.BR\`, which no decoder maps, a slice could cut `\S\` in half, and a leaf holding `\.br\`
+  raised, because its decoded line break cannot be written back. They now transform only the
+  literal text and keep every escape they do not cut as sent, an escape that decodes to nothing,
+  such as `\.fi\`, included. `convert_case` and `replace_literal` work leaf by leaf and keep a whole
+  field's components, repetitions and subcomponents. **BREAKING:** `replace_literal` writes `new` as
+  data, so a `new` holding `^` writes an escaped `^` rather than a new component, and an `old`
+  holding a separator matches only an escaped one inside one leaf, so on a whole field such as
+  `PID-5` an `old` of `^` no longer matches between components. `old` is matched against decoded
+  text, so an `old` spelling an escape, such as `\.br\`, no longer matches; pass `"\r"` to replace
+  a line break. `substring_field` and `pad_field`
+  raise `ValueError` on a field or component that holds a component, repetition or subcomponent
+  separator, where they cut or padded its raw text; address the one part instead, such as
+  `PID-5.1`. All four raise `ValueError` on field 1 or 2 of `MSH`, `BHS` or `FHS`, and on a cut or
+  match that would leave a bare CR or LF from an escape such as `\.sp2\`. `copy_segment` now numbers
+  occurrences as `Message` and `Peek` do, so a fieldless bare line such as `PID` is no occurrence,
+  and a `count_segments` loop copies every segment it counts. (`BACKLOG #5928`)
+- **`trim_field` and `append_to_field` keep a component's escapes.** On a component or
+  subcomponent path they read the decoded value and wrote it back, so a `\.br\` inside the value
+  raised and a `\H\` was lost. `trim_field` now strips the decoded whitespace at the ends of the
+  value, drops an escape sequence that lies wholly inside that whitespace, treats one the strip
+  cuts as its docstring says, and keeps every other escape as sent; on a whole field it now also
+  strips an escape that decodes to whitespace at an end, such as a trailing `\.br\`. It raises
+  `ValueError` on field 1 or 2 of `MSH`, `BHS` or `FHS` when a read of it finds a value, and
+  `append_to_field` raises on any component of one. `append_to_field` writes the suffix as data
+  after the component's last leaf. The edits these actions make to a value's wire text now
+  decode it with the encoding characters a `Message.field` read decodes with, which in a batch are
+  the `BHS` or `FHS` header's rather than `MSH-2`'s. (`BACKLOG #5928`)
+- **The container image has a Postgres variant.** `docker/Dockerfile` gains a `runtime-postgres`
+  target that installs the new hash-locked `docker/locks/requirements-postgres.lock`, which carries
+  `asyncpg`. The slim default carries none, so the `ha` compose profile and
+  `docker/k8s/ha-postgres.yaml`, which run the Postgres store, could not open it. The `ha` profile now
+  runs `messagefoundry:postgres`, and its engines wait on `revocation-attestation-check-ha`, the
+  revocation attestation check run in that image, so they read the value with their own parser. The
+  HA manifest names that base, and the DEP-1 export, the Dependabot
+  resync and the Windows lock install cover the new lock. `security/runtime-closure-postgres.txt`
+  records the extra's closure, held to that lock, and the scheduled Trivy scan reads the variant
+  beside the slim image. The `ha` profile still sets none of the alert, log-forwarding and retention
+  inputs an enforcing start needs. (`BACKLOG #5933`)
+- **The X12 listener answers when its reply does not fit the listener's charset.** It encoded its
+  reply strictly after the commit, so a character outside a narrow `encoding`, or a charset name
+  naming no text codec, closed the connection unanswered and the sender would resend a message
+  already stored. It now encodes the reply as the MLLP and TCP listeners do: an unusable charset name
+  sends it in utf-8, and each character the charset cannot hold is replaced, unless the replacement
+  would collide with one of the reply's own delimiters. (BACKLOG #5958)
+- **A zero or negative request timeout is refused when the connection is built.** The SOAP, FHIR
+  and DICOMweb destinations' `timeout_seconds`, a `fhir_lookup` connection's `timeout_seconds`,
+  `smart_timeout_seconds` and `oauth2_timeout_seconds` now refuse a value that is not above zero,
+  naming the key and withholding the value, as the REST destination's `timeout_seconds` already
+  did. Before, each built a connection whose every request failed. (`BACKLOG #5959`)
+- **A self-signed certificate the engine mints for a wildcard `serve --host` bind names the
+  loopback the tray dials.** A pair minted for a `0.0.0.0` or `::` bind also names the loopback of
+  its family, the address the tray dials for that bind, so the tray's pinned probe verifies it. An
+  operator certificate on a wildcard bind must name that loopback too. (`BACKLOG #5973`)
+- **A generated pair that does not name the current bind is re-minted at the next start.** When the
+  engine reuses the self-signed pair it generated, and that certificate does not name the address
+  a client dials for the current bind, for example after the bind moved from `0.0.0.0` to `::`,
+  the engine replaces the pair with one for that bind, keeping the loopback names docs/SERVICE.md
+  lists, rather than serving the old one until its renewal. A bracketed `[::1]` bind is named by
+  the address `::1`. A key replace that fails after the certificate replace puts the old
+  certificate back, so the previous pair is on disk again and the start can serve it. The replacement is audited with reason `bind_changed`, and the new
+  certificate must be imported again; docs/SERVICE.md states the rule. An
+  operator `[api].tls_cert_file` is never touched. Known limit: the tray does not read the bind
+  from the engine's settings TOML, so a bind set only through `[security].listen_address` or
+  `[api].port` is not discovered; set it with `serve --host` and `--port`, which
+  `install-service.ps1` always writes. (`BACKLOG #5973`)
+- **A malformed or unset Vault Transit key name is refused with its own text.** The refusals of a
+  malformed `MEFOR_STORE_VAULT_TRANSIT_KEY`, `MEFOR_STORE_TRANSIT_KEY` or
+  `MEFOR_STORE_TRANSIT_AUDIT_KEY`, of an unset `MEFOR_STORE_TRANSIT_KEY`, and of an unwrapped DEK
+  that is not base64 of 32 bytes under `key_provider = "vault"` now reach the operator as written, naming the variable to fix, where a store open used to
+  show a generic "the key source failed" or "the Vault Transit cipher could not be built". A data
+  key name and an audit key name that are both wrong are named in one refusal. The Transit key
+  type check, the Transit cipher itself and the row seal verify now check the key name too.
+  (`BACKLOG #6010`, `BACKLOG #6710`)
+- **A retention stop that joins one already under way returns within its own timeout.** A stop whose budget runs out before the
+  retention loop has ended now says the pass may still be running and its interrupted
+  `retention_purge` audit row may not be written, which [SERVICE.md](docs/SERVICE.md) and
+  [PHI.md](docs/PHI.md) now state as an accepted loss under the stop budget. A loop failure that
+  reaches a cancelled `stop()` caller is logged by retention. (`BACKLOG #6526`)
+- **A retention pass that raises or is stopped partway writes its `retention_purge` audit row for
+  the phases that finished**, marked `interrupted`, and names the phase it ended in as
+  `interrupted_phase`. (`BACKLOG #6526`)
+- **Retention reads cluster leadership again before each shared-store phase.** A node demoted
+  mid-pass skips the shared-store phases left, audits what it had already purged, and marks the row
+  `leadership_lost`. (`BACKLOG #6526`)
+- **A cluster standby sweeps and compresses its own application logs** on its `[logging].log_dir`,
+  and audits a pass that deleted or compressed a file, with the row marked `standby`. It purges
+  nothing in the shared store. (`BACKLOG #6526`)
+- **The engine's stop holds the retention stop to its stop budget.** A stop the budget cuts can
+  return with the pass still running and lose its interrupted audit row; the owner ruled on
+  2026-11-22 that the stop budget wins. (`BACKLOG #6526`)
+- A `.mfbak` source read that returns a `memoryview` or `bytearray` is copied, one that returns
+  anything else that is not bytes is refused, and each source refusal names what was being read.
+  (`BACKLOG #6687`)
+- A metadata cell a driver returns as a `memoryview` is read rather than treated as empty. A
+  released one still reads as empty. (`BACKLOG #6712`)
+- The unreadable metadata-cell WARNING names its message, a non-text cell is logged by its type,
+  and a failed cell-tag audit write names its cell and row reference, with a programming error's
+  frames.
+  (`BACKLOG #6697`, `#6712`)
+- The dead-letter wrapper refuses a handoff when a layer of its `functools.wraps` chain that has
+  a code object takes `routed_id` positionally or with a default. Where the layers' code cannot
+  show the signature the call reaches, `inspect.signature` decides, as before. See its docstring
+  for the rule.
+  (`BACKLOG #6698`)
+- A `SearchSpec` built directly is held to the same needle rules as `make_spec`. (`BACKLOG #6700`)
+- A no-key DR backup's archive copy, a plaintext verify's copy and a config-bundle restore refuse a
+  read that returns `None` (a non-blocking source with no data ready), naming the copy, instead of
+  ending the copy short. So do the store-member copy of a verify and a restore, a restore's copy of
+  a plaintext archive, and the copy fallback that places the restored store. These sources are
+  blocking files or tar members, which do not answer `None` in the shipped code, so the change is
+  defence in depth: no earlier restore is known to have placed a short store. The refusal is an
+  `OSError`, reported as each site reports any `OSError` in that copy: a `write` failure at backup,
+  a verify `FAIL`, and a restore refusal. (`BACKLOG #6687`)
+- **A Transit audit MAC 400 takes the refused label only when the probe under the latest
+  version answers a well-formed MAC naming another version.** For a 400 hvac raises as
+  `InvalidRequest`, a probe answer that is no well-formed MAC, at least an empty, versionless or
+  non-text one, now takes the unconfirmed label (`AuditKeyVersionUnverifiedError`) whatever the
+  reply's wording, and reads as a break at the row: the startup walk reports it and raises its
+  `audit-chain` alert, and a planted genesis row opens with an ERROR naming that row. Two such
+  answers, a text one starting `vault:v<the row's version>:` and a non-text one, gave a plain
+  cipher error before: the walk could not run, with no alert, and an open checking the genesis row
+  failed. They are a break now too, and a pinned open reads them as a genesis row that does not
+  verify. (vault `BACKLOG #6707`)
+- **The text of a Transit audit MAC 400 not read as a version refusal now says its cause is
+  unknown**, and names a refusal for another reason beside the two version causes. The Transit
+  attestation's audit gap still says Transit refused the check when the reply's wording reads as a
+  version refusal and the probe answers a well-formed MAC naming another version (wording a
+  proxy can imitate), and now
+  says the MAC could not be checked for at least an unconfirmed 400 and an outage the cipher
+  raises, where it said Transit refused each. (vault `BACKLOG #6707`)
+- **A Transit audit MAC 400 reads "refused" only when its errors list names a version refusal.**
+  At least unknown Vault wording, an empty list and a body past the re-parse bound that hvac
+  parsed now take the unconfirmed text instead. Only the text changes, not the
+  row's verdict. The warning logged beside such a 400 is logged at most once an hour per process
+  for each audit key and stated cause, unless logging it raises; it names neither the body's
+  length nor a suppressed 400's key version. (vault `BACKLOG #6707`)
+- **The data-key decrypt's warning about an unread oversized 400 body is reported when its log
+  call raises.** Its exception class goes to stderr, rate-limited, where it can be written, and a
+  later such decrypt tries the warning again rather than holding it back for the interval. Out of
+  memory or stack, that report can itself raise. (vault `BACKLOG #6707`)
+- **In the store's Vault key provider and Transit cipher, a fault while rendering a Vault
+  failure's text gives the failure's type name instead.** (vault `BACKLOG #6707`)
+- **An audit row check outside the walk that timed out is still read as a MAC that does not
+  verify when the log call beside it raises.** The failure's class goes to stderr, where it can be
+  written. Out of memory or stack, that report can itself raise out of the check. The store open
+  can still fail when a failing filter meets `settle_audit_ranges`' own `log.error`.
+  (vault `BACKLOG #6707`)
+- **A keyless SQLite store, one with no row-seal key, now refuses a new NaN or infinity in the
+  fields a session, user or approval seal covers, unless a stored value of the same kind already
+  sits under that field name.** A store sealed through Transit gets no check from this change. The
+  store wrote the value unchecked, and SQLite stores a NaN as NULL. The check runs
+  where the SQLite store mints a session or account, writes an approval, or rewrites a session or
+  account record, and raises `NonFiniteSealValueError`, the type the local row sealer raises. Because a user's
+  role grants share the field name `assigned_at`, a new grant's non-finite `assigned_at` is
+  admitted when another grant already stores the same kind. At least these are not checked: the
+  revoke statements that set `revoked_at`, the approval tombstone's `decided_at`, columns a seal
+  leaves out such as a session's `last_used_at`, and the Postgres and SQL Server stores.
+  (`BACKLOG #6717`)
+- **The Vault Transit row sealer refuses a non-finite float, and reads a non-text seal as
+  malformed.** It now refuses to seal a float that is a NaN or an infinity, as the local sealer
+  already did, and both raise `NonFiniteSealValueError`, a `ValueError` subclass. A stored seal
+  that is not text (a blob or a number) reads as malformed under Transit rather than raising: a
+  session read with one fails its seal check, and a write over such a row is refused as a failed
+  seal. The bytes a seal covers are unchanged. (`BACKLOG #6717`, `BACKLOG #6718`)
+- **A session row's seal cell now reads back as a string.** `SessionRecord.from_mapping` passed the
+  cell through, so a seal cell holding a BLOB, written outside the store, left a seal that was not
+  a string; it now reads it with `str()`, as the role and approval readers do, though unlike them
+  the session compare-and-set binds the cell as it was read. On a keyed store, `_write_session`
+  refuses such a row as a failed seal before it rewrites it, as it did before this change; at least the revoke, supersede,
+  user-session revoke and touch paths still rewrite a session row without a seal check. On a keyless
+  SQLite store the session rewrite's compare binds the cell as read, so a row with a non-empty BLOB
+  seal is rewritten, as on main, and a row with an empty BLOB seal is not rewritten, also as on
+  main. (`BACKLOG #6718`)
+- **A SQLite store whose upgrade is stopped by a view or trigger another tool left can now name
+  that object.** When SQLite's re-check after a migration's `ALTER` fails on such a view or trigger
+  with an error that names the store's shape, such as "no such module", and the error's text fits
+  exactly one such object, the open refuses the store with the remedy to save that object's CREATE
+  statement, drop it and restart, not to recreate the store. The object is named only when that
+  remedy survives the 200-character cut and the redaction of a printed error whole; otherwise,
+  and whenever the text fits more than one object, the store gets the plain remedy. A
+  failure on the store's shape raised by the check's own read of the live store, after the schema
+  script and the migrations of a writable open, is now refused with the recreate remedy rather
+  than escaping as SQLite's bare error. (`BACKLOG #6719`, `BACKLOG #6720`)
+- **A SQL Server stepdown no longer reports a drain it did not make.** The lease release read
+  `cursor.rowcount`. A session-wide `SET NOCOUNT ON` turns that into `-1` for an `UPDATE` that
+  matched nothing, and `-1` reads as released. The release now counts the rows its `OUTPUT` clause
+  returns. (`BACKLOG #6795`)
+- **A per-connection retention window takes effect without a restart.** When the engine started
+  with nothing for retention to do, a config reload that set `messages_days`, `dead_letter_days`
+  or `prune_documents_after` on a connection left retention off until the next restart. The
+  retention loop now runs whenever `[retention]` settings are passed and idles while nothing is
+  set. A reload that gives an idle loop something to do wakes it, so the first pass runs, and
+  purges, as soon as that reload applies. A reload while retention is already active does not
+  add a pass. A per-connection `messages_days` or `dead_letter_days` above 0 also counts at
+  startup, even with every global window off; `0` (keep forever) does not. (`BACKLOG #6804`)
+- **App-log compression keeps a log that changed while it was being compressed, in most cases.** The
+  retention runner now pins the file it reads (file id, size, mtime and ctime, taken on the read
+  handle before and after the read and checked against the scan's mtime) and checks the path again
+  before placing the archive and before removing the original. A log appended to, rewritten, or
+  rotated into the same path during compression is then left in place and not counted as
+  compressed. It also skips placement when an archive appeared at the destination since the scan;
+  that check narrows, and does not close, the window in which a concurrent compressor's archive can
+  be renamed over. Where the platform has `O_NOFOLLOW` and `O_NONBLOCK` (not Windows), the open no
+  longer follows a symlink or blocks on a FIFO at the path. When the change lands after the archive
+  is placed and the kept log is still the same file and still starts with every archived byte (an
+  append, or a metadata-only change), the runner tries to remove the archive so the path is retried
+  later. It first claims the archive under a unique `.mfclaim` name and repeats both checks; if the
+  source or the claimed archive changed meanwhile, the archive is put back. If the put-back or the
+  removal of the claim fails, a WARNING names the `.mfclaim` file (or says it is already gone),
+  which stays until an operator acts or, while compression is on, the `app_log_days` sweep ages it
+  out on the archive's own mtime, as it does the archives. Otherwise the archive stays beside the
+  log, since under a replace it may be the only copy of the old content, and without an
+  `app_log_days` window that path is not compressed again until an operator acts. None of the checks
+  is atomic with the act it gates, so at least these can still lose data: a change landing between
+  the last check and the removal of the original; a peer's archive renamed over between the
+  destination check and the rename; and a log truncated or removed after the re-check of a claimed
+  archive and before its removal. (`BACKLOG #6805`)
+- **The sandbox worker reads a two-component Linux kernel release with a suffixed minor.** Stock
+  kernels report three components, so this affects custom builds. A release such as `6.12-rc4` or
+  `5.15-aws` used to read as unparseable, so `[sandbox].mem_mb` became an absolute `RLIMIT_AS`
+  cap. It is now `RLIMIT_DATA` headroom above the loaded graph. The worker also now checks that
+  `uname` names Linux before it reads the release as a Linux version. Before, a non-Linux release
+  that began with two plain numbers from 4.7 up, such as Darwin `23.1.0`, passed that version
+  check, and only a missing `VmData` in `/proc/self/status` sent it to `RLIMIT_AS`. Darwin has no
+  procfs, so it got `RLIMIT_AS` either way, and a release such as FreeBSD `14.0-RELEASE` already
+  read as unparseable. Now a POSIX kernel whose `uname` does not name Linux is given the
+  `RLIMIT_AS` cap whatever its procfs holds. Windows still gets no memory cap, and a `setrlimit`
+  that fails is still logged and sets no cap of the worker's own; a limit the worker inherited
+  still applies. A release with no leading `major.minor` keeps the
+  `RLIMIT_AS` fallback. (`BACKLOG #6811`)
+- **The sandbox worker lets go of the failed request and its frames before it builds an
+  out-of-memory reply, and a torn reply frame is not followed by another.** A worker that ran out
+  of memory built its `memory` reply while it still held the raw request frame, the decoded
+  request and any garbage that only a cycle kept alive, so the reply could fail for want of memory
+  and the parent read a crash instead. It now drops the frame and the request and collects cycles
+  first, and keeps the error only with its traceback and chain cleared. That cannot free all the call
+  left held, at least not a global, a cache or a thread, so the reply can still fail there. A reply
+  write that failed with `OSError` was followed by a second, error frame, which could land after a
+  partly written one; the worker now logs the failure and exits without writing another. The
+  parent then reads EOF and fails the message, or takes the whole frame where the flush at the
+  worker's exit completes it, and finds the worker gone at a later message. (`BACKLOG #6813`)
+- **A bytes body reaches the dry run's public entry points carried or decoded for its inbound.**
+  `route_message`, `route_only` and `transform_one` took `bytes` but decoded them as UTF-8, so a
+  DICOM or latin-1 body raised a bare `UnicodeDecodeError`, a binary body that happened to be
+  UTF-8 reached the Handler without its base64 carriage (ADR 0028), and a latin-1 HL7 body reached
+  it with its accented letters replaced. `route_message` and `route_only` now base64-carry a
+  binary type's `bytes` and decode any other type's with the inbound's declared charset, raising
+  `IngressGuardError` for a body that carriage or decode refuses. They do not run every listener
+  guard. `transform_one` has no inbound: it carries a binary type's bytes, and refuses bytes for a
+  text type, HL7 included, with a `TypeError`, since it cannot know their charset.
+  (`BACKLOG #6819`)
+- **A dry run records a fault in a peek read as ERROR, as the listener does.** `dry_run` caught
+  only `HL7PeekError` around the parse, and read the message type, control id, summary and
+  document-marker check outside that guard, so a parser fault in one raised out of the preview
+  and out of `messagefoundry check`. They now sit inside the guard, and a fault is an ERROR
+  reading `parse error: peek read failed (<type>)`, the listener's text, naming the type alone.
+  (`BACKLOG #6821`)
+- **`dryrun --trace --show-phi` now always writes valid JSON.** A traced value that was a NaN or
+  Infinity float came out as the bare token `NaN` or `Infinity`, which JSON does not allow, and an
+  int past the interpreter's 4300-digit conversion limit made the command fail with a `ValueError`.
+  Such a float is now shown as `"<float: nan>"`, `"<float: inf>"` or `"<float: -inf>"`, an int past
+  that limit as `"<int: too large>"`, and any other int longer than 120 characters is cut to 120
+  like a long string. (`BACKLOG #6822`)
+- **A traced dry run no longer drains a Handler's single-pass iterable of `Send`s by walking it.**
+  A Handler returning an object whose `__iter__` hands back a stored generator (iterable, but not
+  an iterator) was walked by the trace observer before the dry run partitioned it, so the traced
+  run reported `FILTERED` with zero deliveries where the untraced run delivered. The observer now
+  walks a Handler return only when its exact type is `list`/`tuple`/`set`/`frozenset`. Any other
+  iterable Handler return, except `str`/`bytes`/`bytearray` (which are single values), is marked
+  `lazy_result` instead of read, so such an invocation reports no per-invocation sends.
+  (`BACKLOG #6823`)
+- **A traced dry-run no longer keeps the Message writes made past its event cap.** Once an
+  invocation hit the 5,000-event cap, `dryrun --trace` stopped emitting lines but went on holding
+  every later `msg[...]` write in memory, so a long mutating loop grew without bound. A write past
+  that cap is now dropped, under the invocation's existing `truncated` flag. A separate cap of
+  5,000 kept writes per invocation also bounds the writes a Handler's helper makes on a single
+  traced line; a write past it is dropped, and the invocation carries `truncated` and a new
+  `writes_truncated` flag. Some kept writes are still never emitted, as before: at least a write a
+  wrapper makes before a traced function longer than one line starts, a write made when no
+  function could be traced, and a wrapper's write after the traced function returns.
+  They now count against the 5,000-write cap. (`BACKLOG #6824`)
+- **Concurrent traced dry-runs no longer lose each other's Message writes.** Two threads running
+  `trace_dry_run` at once shared one class-level patch of `Message._write`, and the first to
+  finish restored the original under the other, whose `msg[...]` writes then went unrecorded with
+  no sign in its trace. The patch is now counted under a lock: installed on the first entry,
+  restored on the last exit. (`BACKLOG #6825`)
+- **A sandbox session's refusal cache and the runner's refusal alert both match the engine graph
+  by value.** A `SandboxSession` built directly with a graph callable that returns an equal but new
+  shape at each call now refuses from its cache with no worker started, instead of starting a
+  worker and raising a first refusal per spawn. The runner raises `sandbox_worker_refused` for a
+  first refusal from the session still serving the inbound, against a graph equal to the one
+  served. A refusal a reload or its rollback overtook, from a session the reload discarded or
+  against a graph unequal to the one served, now neither alerts nor dead-letters: it is handled as
+  a closed session is, so the dispatch is retried at once on a fresh session while the same
+  registry is served and the runner is not stopping, and the message is re-pended otherwise. The
+  fresh session compares again, and its refusal, if the cause stands, raises the alert. Before,
+  such a refusal dead-lettered its message, with no alert, or, after a reload that kept the same
+  registry, with an alert that the next message on a fresh session raised again.
+  Under both claim modes the re-pend of an overtaken refusal is logged at INFO with no traceback,
+  and still backs off; under `pooled` it still counts toward `infra_fault_stop_after`. A
+  session discarded because only the graph changed is closed in a detached task, which a stop
+  waits for, except that a demotion waits only within its budget and a later stop cancels
+  what it abandoned, so a slow close no longer holds up that inbound's routing or transform.
+  (`BACKLOG #6830`)
+- **A reaped sandbox worker's pipes are closed by the engine.** The engine's end of the worker's
+  request pipe is closed when the worker is reaped, or, while a lookup helper the dispatch gave up
+  on still holds it, by that helper when it ends. Each drain thread closes the response or stderr
+  pipe it reads when it ends. Before, all three were left to the garbage collector, which raised a
+  `ResourceWarning` for each. A worker still running when the reap stops waiting on it, after 5
+  seconds, now logs a `WARNING` naming the inbound and the worker's pid, where before nothing was
+  logged. (`BACKLOG #6831`)
+- **A cut close of the security notifier records the notices it left unsent.** When the shutdown
+  cut `SecurityEventNotifier.aclose` while a send waited on a slow relay, the notices still queued
+  got no audit row, and on a full queue the drain ran on past the close. The close still drains
+  for the whole of the shutdown step's bound. When the step cuts it, the close now cancels the
+  drain, records the cut send with `reason: interrupted` and each queued notice with
+  `reason: abandoned`, and logs a WARNING line counting the queued notices when any but lock
+  notices are queued. A send still waiting
+  for a worker thread at the cut is skipped, never mailed, and recorded `abandoned`. The writes are
+  not bounded, so under a full queue many can still be lost to the store's close;
+  [SECURITY.md](docs/SECURITY.md) keeps that as an open residual. (`BACKLOG #6832`)
+- **The `ha` Postgres in `docker/compose.yaml` refuses a first start with `./pg-tls` empty,
+  and its health check waits for the real server.** With `./pg-tls` empty, or a key Postgres
+  would refuse, the first start used to initialize the `mefor-pg` volume without creating the
+  `messagefoundry` database, and every later start skipped initialization. The service's
+  entrypoint now checks that the certificate and key its command names exist, are not empty
+  and are readable by the postgres account, and that the key is not encrypted and has an owner
+  and mode Postgres accepts. It exits naming what is wrong before the image's entrypoint runs,
+  so that start initializes nothing. A command that does not start the server passes straight
+  through. The health check now probes over TCP on
+  127.0.0.1 and queries the `messagefoundry` database, where it used to probe the Unix socket,
+  which the image's temporary initialization server answers on, and passed with the database
+  missing, and it has a start period for the first initialization. A fault the check does not
+  catch still half-initializes the volume, and the health check then keeps every engine from
+  starting against it; the postgres service's comment in `docker/compose.yaml` names at least
+  those faults and the recovery. (`BACKLOG #8298`)
+- **A `FhirLookup` refused for a setting leaves no crossing record from another lookup first, in
+  at least these cases.** Its url and header screens, the length limits on its static url and
+  headers, its `timeout_seconds` and its hop declarations are now checked for every lookup before
+  any lookup reaches a hop gate, and so are the `BACKLOG #5800` SMART refusals of an unencodable
+  `smart_scope`, `smart_private_key` or `smart_private_key_password` and an over-length
+  `smart_token_url`, and the `[tls].crl_check_chain` refusal of an `http` lookup. The `#5800`
+  refusal of an over-length proxy header on the token hop, the `crl_check_chain` refusal of an
+  `https` lookup and the SMART provider's other checks still run later in the build. A lookup's bearer is judged against a
+  cleartext `http` read before its SMART token provider is built. A length refusal now names the
+  lookup. A refusal from
+  a check that runs later in the build can still follow such a record. A FHIR destination or
+  `FhirLookup` whose `headers` is not a table, which sets one of `basic_user` and
+  `basic_password` without the other, puts a `:` in `basic_user`, or sets `bearer_token` beside a
+  Basic pair is refused at build. These used to build and then send no headers, no Basic
+  credential, a Basic credential split at the wrong colon, or Basic in place of the bearer.
+  (`BACKLOG #8299`)
+- **`messagefoundry check` reports a missing `--config` directory instead of crashing.** With
+  `--messages` fixtures, the dry-run leg let the loader's `ConfigDirMissing` escape, so the gate
+  ended in a traceback, ran no later leg and wrote no `--json` report. The dry-run leg now fails
+  with `config did not load`, and the rest of the report runs. (`BACKLOG #5810`)
+- **An inbound body that decodes to a UTF-16 surrogate code point is refused at decode.** At least
+  `utf-7` decodes `+2D8-` to one with no error, and strict UTF-8 cannot encode it, so on at least
+  the SQLite store the ingress write or a document detach failed on it and the body got no row.
+  Both listeners and the dry run now refuse it as a `decode` error naming the position, with an
+  `AR` where an HL7 reply is owed, and the `ERROR` row stores the bytes as received.
+  (`BACKLOG #1619`)
+- **The HA Postgres Kubernetes manifest names what an enforcing start needs.**
+  `docker/k8s/ha-postgres.yaml` runs `serve --env prod` under the default `enforce`, and set none of
+  the inputs at least six start gates read, and named none of them. It now takes the API revocation
+  attestation from the required `tls-revocation-attested` Secret key, names the alert channel,
+  verified-TLS log forwarding with its egress entry, the store CRL and the two retention tiers that
+  need a window or an acknowledgement as commented entries a site fills in, and mounts a writable
+  `log-spool` volume for the forwarder, since the pods have no PVC. The entries ship commented, so an
+  unedited manifest is still refused rather than started with placeholder channels. (`BACKLOG #5934`)
+- **The single-node Kubernetes manifest names what an enforcing start needs.**
+  `docker/k8s/statefulset.yaml` runs `serve --env prod` under the default `enforce`, and set none of
+  the inputs at least five start gates read, and named none of them. It now takes the API revocation
+  attestation from a required `tls-revocation-attested` Secret key, and names the alert channel,
+  verified-TLS log forwarding with its egress entry, and the two retention tiers that need a window or
+  an acknowledgement as commented entries a site fills in. They ship commented, so an unedited
+  manifest is still refused rather than started with placeholder channels. (`BACKLOG #5935`)
+- **The `vault_transit` cipher gives each thread its own Vault client.** The event loop and the
+  store's worker threads used to share one hvac client and its one `requests` session. The thread
+  that builds the cipher uses the client built with it; any other thread builds its own when it
+  first needs one, with the same address, token and CA anchor. The cipher never closes a thread's
+  client from another thread. Closing a SQLite, SQL Server or Postgres store, even after an
+  earlier close step raised, closes the closing thread's client and marks the others stale. Each
+  other thread releases its own at least on its next Transit request, which builds a fresh client,
+  or when it ends before interpreter shutdown. The cipher stays usable, since stores can share
+  it.
+  Where a thread's client cannot be built, a data-key decrypt gets the no-verdict outage error and
+  a data-key encrypt the error the cipher's failure classifier reads the build failure as.
+  (`BACKLOG #5963`)
+- **Every Transit request the cipher sends now times out at 5 seconds to connect and 30 seconds
+  per socket read,** set by the engine rather than left at hvac's 30-second default for both; the
+  read figure is unchanged and only the connect bound is tighter. This does not
+  bound how long a stalled Vault can hold the event loop, which the cipher still runs on: at least
+  name resolution is untimed, the read figure applies to each socket read, and one cipher call can
+  send several requests. A request the timeout ends is an outage that gave no verdict on the
+  value. (`BACKLOG #5983`)
+- **The tray probes a partly named or wildcard engine bind.** When `serve` in the service entry names
+  only one of `--host` and `--port`, the tray now keeps the engine's default for the other, and it
+  follows the engine's scheme when neither is named. Before, a port-only bind was probed on the
+  default port, a host-only bind on a non-loopback, non-wildcard address was probed on loopback, and
+  an engine serving http with neither part named was probed over https, so each showed a running
+  engine as down. A wildcard `--host` (`0.0.0.0`, `::`) is now probed on loopback, and the tray is
+  monitor-only for it; with `--port` also named, the tray used to probe the wildcard address, which
+  no client can connect to. Service control tightens for a host-only bind: a `--host` naming a
+  non-loopback address, a wildcard included, with no `--port`, is now monitor-only, where the tray
+  used to fall back to the loopback default and keep service control. A relative
+  `--service-config` now resolves under `--project-root`, as `serve` resolves it, so the tray reads
+  the scheme from the settings file the engine loads. Known limit: the tray takes no host or port
+  from that file, so a LAN bind set only through `[security].listen_address` is still probed on the
+  loopback default and keeps service control. (`BACKLOG #5936`)
+- **X12 `check_integrity` reports more envelope breaks.** Besides the control-number pairs and
+  counts, it now also reports an `SE` with no open `ST`, a `GE` with no open `GS`, and an `ST`
+  outside any `GS`. Those interchanges used to tie out with no problems. (`BACKLOG #5808`)
+- **More malformed DICOM objects dead-letter as a `DicomError`.** The DICOM parse-error tuple now
+  covers `zlib.error`, `ArithmeticError` and `LookupError`. A Deflated Explicit VR Little Endian
+  object with a corrupt body used to raise `zlib.error` straight out of `DicomPeek.parse` and
+  `DicomDataset.parse`. (`BACKLOG #5803`)
+- **`person_name_components` and `pid_from_dataset` write PID-5 in XPN order.** The DICOM name
+  prefix now goes to XPN-5 and the suffix to XPN-4; they were swapped. A name is cut to its five
+  DICOM components, and a blank (spaces-only) component is written empty. When the alphabetic
+  group has no family, given or middle name, an ideographic or phonetic group is used and marked
+  `I` or `P` in XPN-8; such a name used to come back empty. This helper sets no character set, so
+  a Handler sending a non-ASCII name must declare it in MSH-18 and match the outbound connection's
+  `encoding`. (`BACKLOG #5804`)
+
+### Security
+- **The VS Code extension refuses a DHE key exchange over a group under 2048 bits.** Its https
+  client to the engine sets `minDHSize` to 2048, where Node's default is 1024. The one DHE suite it
+  offers, `DHE-RSA-AES256-GCM-SHA384`, stays in its list. OpenSSL 3.2 and later already refuse such
+  a group by default. The option holds the floor where OpenSSL's security level is lower, as it is
+  by default before 3.2. (`BACKLOG #300`)
+- **Corrected: the 0.5.2 entry "websockets moves to 17.2 under the protocol header floor"
+  understated a test.** It said no test covers a name uvicorn still assigns and has stopped
+  reading. A shutdown test covers one such read, of `close_sent`; the module docstring of
+  `messagefoundry/api/protocol_headers.py`, under "Refuse at startup", says what it does and does
+  not catch. (`BACKLOG #1120`)
+- **A pending session on an account with no second factor no longer ends sessions.** Under
+  `[security].require_mfa`, such a session is MFA-pending, and it is now treated like any other
+  pending session: it reaches at least enrolment and sign-out, and the self-service terminate routes
+  (`DELETE /me/sessions`, `DELETE /me/sessions/{session_id}` and their console twins) refuse it.
+  No password re-proof mints it a `session_terminate`, `save_ends_own_sessions` or
+  `revoke_all_sessions` grant, so none can be carried through its first enrolment. The terminate
+  routes used to answer such a session `403` + `X-Step-Up-Required` until it re-proved its password;
+  they now answer `403` + `X-MFA-Required` whatever it proves, with a detail that names enrolment,
+  and the access gate's own refusal names enrolment to it too. A client that prompts for a code on
+  `X-MFA-Required` will prompt for one this session does not have. The console sends the session to
+  `/ui/account?m=enroll_first`, from the terminate POSTs and from `/ui/reauth`. The enrolment that
+  binds the first factor satisfies the session, and ending sessions then works as before, so for a
+  local account a password holder can still enrol a factor of its own and then end sessions: this
+  adds a step, not a bar. (`BACKLOG #1149`)
+- **Six `monitoring:read` GETs are paced per account.** `GET /graph/edges`, `/status`, `/stats`,
+  `/metrics`, `/metrics/history` and `/connections` share one budget per account: past 600 reads per
+  60 s across the six, the shipped default of the new `[auth].monitoring_read_rate_limit_*`
+  settings, a read is answered 429 with a `Retry-After`. The budget is per API process, so N engine
+  shards multiply it by N; the all-accounts count ships off. The web console's in-process reads of
+  the same handlers are not charged, and neither are at least `/ws/stats`, `/events`,
+  `/connections/{name}/events` and `/config/provenance`. The key and the basis of the default are in
+  [SECURITY.md](docs/SECURITY.md), *Monitoring-read pacing*. (vault `BACKLOG #1191`)
+- **A JSON gate that adds checks of its own now writes its `auth.permission_granted` row only once
+  those checks pass, and writes `auth.gate_refused` when one refuses.** At least `require_paced`,
+  `require_phi_read` and the four step-up gates checked the permission, wrote the grant row, and
+  only then ran their pacing, new-address and step-up checks. So in the shipped code a request one
+  of those checks refused would have left a grant row and no refusal row. The refusal row names the
+  same permission and a `reason` of `throttled` or `step_up`, and is written only where the grant
+  row would have been, so it adds no rows. A second-factor refusal in one of those gates writes
+  `auth.mfa_denied`, as the base gate's does. No request is allowed or refused differently. A
+  refusal a route body makes after its gate has passed, such as a step-up proof the route spends
+  itself, still follows a grant row. [SECURITY.md](docs/SECURITY.md) says which gates do this.
+  (`BACKLOG #1197`)
+- **The step-up refusals of `spend_step_up_action` and `refuse_unless_step_up_window_live`, made
+  in a route body after its `proof_in_route` gate admitted the request, can now write an
+  `auth.gate_refused` row.** In the shipped code they wrote no row of their own.
+  `_record_route_refusal` in `messagefoundry/api/security.py` says when the row is written. No
+  request is allowed that was refused before. (`BACKLOG #1197`)
+- **A second app over the same engine no longer interrupts the first app's live releases.** No
+  startup or put-off reconcile of `executing` approval rows moves, and `POST
+  /approvals/{id}/interrupt` refuses with 409, a release any approval gate in the same process is
+  running. (`BACKLOG #1562`)
+- **A release stranded in `executing` now has a way out.**
+  `GET /approvals/executing` lists every release still claimed as `executing`, with its claim owner
+  and what an interrupt would judge of that owner. `POST /approvals/{id}/interrupt`, with
+  `approvals:approve` and a fresh step-up, moves one to `interrupted` for the ordinary resolve. It is
+  refused to the original requester, while this process runs the release, or while the owning
+  cluster node still heartbeats, and an owner with no heartbeat to read needs the operator's
+  recorded `attest_owner_stopped`, a JSON `true` only. A restart keeps the claim time in
+  `decided_at` when it moves its own leftover release to `interrupted`, and reads other owners'
+  rows apart from its own. See [SECURITY.md](docs/SECURITY.md). (`BACKLOG #1562`)
+- **An `MLLP()` listener with `tls = true` admits each socket before its TLS handshake on every
+  event loop, uvloop included.** Under uvloop the loop used to run the handshake, so
+  `source_ip_allowlist`, `max_connections` and `max_connections_per_host` applied only after it,
+  and a socket that never sent a ClientHello sat outside them for up to the 10 s handshake bound.
+  On a loop other than the stdlib's own, the listener now runs its own accept loop: it refuses or
+  admits each socket in plain TCP, then hands an admitted one to the loop's TLS layer before
+  anything reads it. stop() closes a socket still in its handshake at once there too, and a failed
+  handshake is reported with its peer. The stdlib path is unchanged. For the `MLLP()` listener, a
+  loop that subclasses a stdlib loop now takes the same path as an unknown loop. The `Http()`
+  listener takes the same accept loop since BACKLOG #2479; its own entry says what that changes.
+  See
+  [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #1606`, `vault BACKLOG #4552`)
+- **A code-first `env()` with some numeric builtin casts refuses a TOML bool.** At least
+  `cast=abs`, `cast=round`, `math.floor`, `math.ceil`, `math.trunc`, `math.fabs`,
+  `operator.index`, and a number type such as `decimal.Decimal`, `fractions.Fraction` or `complex`,
+  read a `true` in `environments/<env>.toml` as 1, so a setting got a number nobody wrote. For
+  those casts a bool read from the environment is now refused before the cast runs, with the value
+  withheld, as `cast=int` and `cast=float` already refuse it. A `default=` is neither cast nor
+  checked by that refusal, so `env("p", cast=Decimal, default=True)` with the key unset still
+  returns `True`. The list is partial: other numeric functions, at least
+  `operator.abs`, `operator.neg`, `operator.pos`, `math.sqrt`, `math.isqrt`, `math.factorial` and
+  `math.exp`, still read `true` as 1, and so does a type only registered with `numbers.Number`,
+  such as `numpy.int64`. A class you write whose bases include `int`, `float`, `complex`,
+  `decimal.Decimal`, `fractions.Fraction` or `numbers.Number`, such as `class Port(int)` or an
+  `enum.IntEnum`, is refused a bool too. Such a class is refused only a bool: any other value is
+  passed to it unchecked, so `class Port(int)` still cuts `2575.9` to 2575. Any other cast you
+  write runs as given, a TOML bool included. (`BACKLOG #1650`)
+- **An asyncpg error's message is no longer named as a SQLSTATE by the DATABASE connector or the
+  traceback line.** An asyncpg error keeps its message in `args[0]`. When that message had five
+  SQLSTATE characters, such as an identifier, and the error's `sqlstate` attribute did not name
+  that state, the connector named the message as the state. That happened on at least its connect
+  and send errors, their `code`, the stored `last_error` and its log lines. They now name no
+  state: for example a rejected send reads `[SQLSTATE withheld]` with the code `db`, and a log
+  line reads `<type> [message withheld]`. The traceback line did the same when the
+  attribute was absent or None, and now prints `[driver message withheld]`. The error is still
+  classified by that shape, as before, so its disposition is unchanged. The store's own SQLSTATE
+  readers are unchanged. (vault `BACKLOG #1661`)
+- **`rotate-key` refuses `vault_transit` mode before it touches anything.** Under
+  `[store].cipher_provider = "vault_transit"` no run of the command can rotate a value, because the
+  store's re-encrypt pass refuses the Transit cipher. The command used to learn that late. With a
+  local key set, it resolved the key, dialled Vault and opened the store writable, and only then
+  exited 2. With none, it told the operator to set `MEFOR_STORE_ENCRYPTION_KEY`, which the Transit
+  cipher never reads. It now exits 2 right after the settings load, with no key resolved or
+  unwrapped, no Vault call and no store open. The refusal says to rotate the Transit data key's
+  version in Vault instead, and not to retire a version that still seals a value or MACs an audit
+  row. The Transit cipher's refusal of an in-process value no longer tells the operator to rotate
+  the store into Transit: no command does that, or moves Transit ciphertext between keys, yet.
+  (vault `BACKLOG #2109`)
+- **The engine AI broker's endpoint hop now takes a revocation guard, with an `[ai]` attestation
+  pair.** Every assist call sends `[ai].api_key` over https that verifies the endpoint's
+  certificate, but stdlib `ssl` checks no CRL or OCSP, so the shipped code would have accepted a
+  revoked endpoint certificate with no refusal and no record. On an instance at `[security].enforcement = enforce`,
+  an `[ai].endpoint` whose host does not read as loopback (in the reading the
+  `[ai].endpoint_revocation_attested` entry of SECURITY-LOOSENING.md states, under which an
+  endpoint URL holding `[::1]` is loopback) is now refused at `POST /ai/chat`, answered 503,
+  unless `[ai].endpoint_revocation_attested = true` is set with an
+  `[ai].endpoint_revocation_attested_reason`, or, since BACKLOG #5527, on a set `[tls].crl_file`
+  where the `[tls]` section reaches the app (the `[ai].endpoint_revocation_attested` entry of
+  [SECURITY-LOOSENING.md](docs/SECURITY-LOOSENING.md) says which apps it reaches). `MEFOR_TLS_REVOCATION_ATTESTED` does not cross
+  it under `enforce`. A broker built with no instance posture is judged as enforcing. A non-enforcing
+  instance warns, once per process for each endpoint host. The pair is a loosening that
+  `security show`, `GET /security/posture` and the serve-time warning name, with the reason. See
+  [DEPLOYMENT.md](docs/DEPLOYMENT.md#revocation-guard-behavior). (`BACKLOG #2193`)
+- **The `[alerts]` SMTP login and the alert webhook now take the revocation-hop guard.** Both
+  verify a peer certificate, but stdlib `ssl` checks no CRL or OCSP, so the shipped code would have
+  accepted a revoked relay or webhook certificate with no refusal and no record. On an instance at
+  `[security].enforcement = enforce`, an off-box SMTP relay with `[alerts].email_username` set is
+  now refused when `serve` builds the alert notifier and the per-user security notifier, and the
+  alerts test send reports it, unless `[tls].crl_file` reaches the hop or
+  `[alerts].email_tls_revocation_attested` is set with its mandatory reason. A relay with no login
+  takes no guard. An off-box https `[alerts].webhook_url` is refused the same way unless
+  `[alerts].webhook_tls_revocation_attested` is set with its reason; no CRL can reach that hop.
+  A transport or notifier built with no instance posture is judged as enforcing, as the AI broker
+  is, and one built directly with an attestation but no reason is refused. Each set pair is
+  reported as a loosening. A non-enforcing instance warns. See
+  [DEPLOYMENT.md](docs/DEPLOYMENT.md#revocation-guard-behavior). (`BACKLOG #2193`)
+- **The inbound FTPS poll now takes the revocation-hop guard the FTPS upload takes.** An
+  `Ftp(tls=True)` poller verifies its partner's server certificate and sends the FTP login, but
+  stdlib `ssl` checks no CRL or OCSP, so a revoked certificate was accepted there with no refusal
+  and no record. On an instance at `[security].enforcement = enforce`, an off-box poll is now
+  refused at construction (`messagefoundry check`, dry-run, reload, and the start, where it is
+  recorded failed and the rest of the graph starts) unless a `[tls].crl_file` reaches its context
+  or the inbound declares `tls_revocation_attested` with a reason. A CRL that is set but cannot be
+  loaded still refuses the poll. A non-enforcing instance warns. On either FTPS direction, a hop
+  that sets `tls_allow_expired` is no longer admitted by a CRL, since the relaxation also skips
+  the CRL's validity window: only its attestation crosses. An FTPS upload with that setting and
+  a CRL was admitted before. See
+  [DEPLOYMENT.md](docs/DEPLOYMENT.md#revocation-guard-behavior). (`BACKLOG #2193`)
+- **The LDAPS AD bind now takes the revocation-hop guard, and a CRL setting of its own,
+  `[auth].ad_tls_crl_file`.** Every AD bind sends a password over a context that verifies the
+  domain controller, but stdlib `ssl` checks no CRL or OCSP, so a revoked DC certificate was
+  accepted there with no refusal and no record. On an instance at `[security].enforcement =
+  enforce`, an off-box `ad_server` is now refused when `serve` or `provision-admin` builds the
+  auth service, and `messagefoundry check-privileges` reports its AD probe as not run, unless
+  `ad_tls_crl_file`
+  names a CRL that loads onto the bind's context. The file is loaded again on every bind; one that
+  is missing, unloadable or past `nextUpdate` refuses the start or fails that bind. No attestation
+  exists for this hop. A non-enforcing instance warns. The CRL expiry monitor watches the file as
+  `auth.ad_tls_crl_file`. See
+  [DEPLOYMENT.md](docs/DEPLOYMENT.md#revocation-guard-behavior). (`BACKLOG #2193`)
+- **A directory role change now commits with its audit row.** The `auth.ad_roles_resynced` row
+  that a directory sign-in or a directory reconciler pass writes, and the reconciler's
+  `auth.ad_session_revoked` row, now commit in the role write's or the revoke's own transaction.
+  If the store refuses the row there, the write is applied again without it and the row is then
+  written on its own. On a sign-in, a row the store refuses on its own too is lost and pages
+  `audit_write_failed`, keyed `directory-sign-in:<action>`. A reconciler pass that ends without
+  raising pages it once for each action whose row the store refused during the pass, keyed
+  `directory-reconciler:<action>`; a pass used to only log a refused row. On a directory sign-in,
+  any error from writing the roles and their row still leaves the engine trying to end the
+  account's other sessions and sending the roles-changed notice before the error is raised, and
+  when the account's directory groups newly map it to Administrator, `administrator_granted`
+  pages before the sign-in fails. (`BACKLOG #2221`, `BACKLOG #3018`)
+- **A connection's own keep-forever retention override now writes an `AUDIT:` line under
+  `enforcement = warn` too.** With no `[security].allow_keeping_phi_indefinitely`, an inbound
+  `messages_days = 0` or an outbound `dead_letter_days = 0` passed the graph with a plain warning, so
+  a site on that dial would have kept those bodies forever with no `AUDIT:` line. The registry guard
+  now writes a WARNING-level `AUDIT:` log line naming each connection, with the remedy, and still
+  passes the graph (owner ruling 2026-11-01). The graph still loads with no acknowledgement, and
+  those bodies are still kept forever. The global body-window gate still writes its line only under
+  `enforce`. The `delete_message_bodies_after_days` posture entry no longer says a PHI instance still
+  auto-bounds or refuses, which `allow_keeping_phi_indefinitely` stops, and the `enforcement` entry no
+  longer calls every weakening audited. (`BACKLOG #2368`)
+- **A backup's sweep of its own DR staging root takes only this account's directories.** A
+  server-DB store stages in `.mefor-staging` under `[backup].destination`, which inherits whatever
+  the destination grants. The backup swept it with no owner filter, so another account able to
+  write there could plant a `mefor-backup-*` directory holding a lock file and a marker, and have
+  the teardown run on a tree it controls. The backup now sweeps only directories with the owner a
+  new directory of its account gets, as its sweep of the OS temp dir and a standalone verify
+  already did, and logs each directory it leaves for another owner. It still sweeps before it
+  creates its own staging directory, so where that sweep can learn the owner, a killed run's
+  leftover is freed first. A run short of space whose early probe answered nothing, even where
+  the fallback then learned the owner, probes the staging root once more, sweeps by the owner a new
+  entry there gets when no sweep has gone by it yet, then checks again. Where that
+  probe cannot be created either, as on a full share whose server sets the owner, the run still
+  refuses with kind `space` until someone deletes the leftover by hand.
+- **The staging teardown's truncate fail-safe empties the file it checked, never a name.** It
+  used to check each file with `lstat` and then open it by path, so a name swapped for a link or a
+  hard link, or a parent directory swapped for a junction, between the check and the open would
+  have had the engine truncate a file outside the directory. It now walks by directory descriptor
+  and opens with `O_NOFOLLOW` on POSIX, opens without following a link or junction and checks
+  final paths on Windows, and checks the open handle on both before it truncates.
+- What both changes leave open is listed in [`docs/PHI.md`](docs/PHI.md), section 2's
+  `mefor-backup-*` / `mefor-verify-*` staging row.
+- **The DR staging truncate fail-safe no longer calls a file empty that it never reached.** On
+  Windows, Win32 rewrites a path before it opens it: at least it drops a trailing dot or space
+  from a name, and opens a reserved device name such as `NUL` as the device. A staging file named
+  `a.tar.` was therefore checked and truncated as `a.tar`, or found missing and read as nothing to
+  empty, while the listed file kept its plaintext, and the teardown called the directory clean. A
+  directory named that way was walked, or removed, as another directory. The fail-safe now
+  reports such a name for a file or a subdirectory and does not open it, and the teardown leaves
+  a staging directory with such a name untouched and reports it. On both Windows and
+  POSIX, a listed file that is gone from its name by the time it is checked or opened is now
+  reported rather than read as nothing to empty, since a rename leaves its bytes under another
+  name. Where the directory then still cannot be removed, the teardown names what it could not
+  empty rather than saying every file was emptied. A sweep of a shared staging root still reads a
+  candidate's lock and owner through such a name, and what else stays open is listed in
+  [`docs/PHI.md`](docs/PHI.md), section 2's staging row. (`BACKLOG #2420`)
+- **An `Http()` listener with `tls = true` admits each socket before its TLS handshake on every
+  event loop, uvloop included.** Under uvloop, or any other loop that is not an
+  `asyncio.BaseEventLoop`, the loop used to run the handshake, so `source_ip_allowlist`,
+  `max_connections` and `max_connections_per_host` applied only after it, and
+  `max_handshakes_per_host` never applied. On any loop that is not exactly a stdlib loop class the
+  listener now runs the `MLLP()` listener's own accept loop: it refuses or admits each
+  socket in plain TCP, then hands an admitted one to the loop's TLS layer before anything reads it,
+  with the 10 s handshake bound. A socket refused there is closed with no answer, since a TLS
+  client cannot read a plaintext `403` or `503`. stop() closes a socket still in its handshake at
+  once, and a failed handshake is reported with its peer, including one that runs past its bound.
+  A loop that subclasses a stdlib loop now takes this path too, as it does for `MLLP()`; it
+  already applied these controls before the handshake, through the listener's own upgrade. On
+  every path, stop() waits, within its grace, for a connection that is still closing. See
+  [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #2479`)
+- **A generic-ODBC hop now needs a TLS mode, not just a TLS-named keyword.** Only `sslmode` or
+  `encrypt` with a string value that is non-blank, has no blank at either end, and is off the no-TLS
+  deny-list counts as the operator owning TLS on `dialect='generic'`. Any other TLS keyword alone,
+  at least `sslkey`, `sslcert`, `sslca`, `sslcapath` or `sslcipher`, or a mode given as a number,
+  used to be read as ownership although a driver's own default need not require TLS. Such a hop now
+  warns, is reported, and is refused off-loopback on an enforcing instance unless it declares
+  `tls_hop_attested` or, outbound only, `cleartext_accepted`. A blank, padded, boolean or `None`
+  mode does not reach that gate: since `BACKLOG #2705` the build refuses it on every posture, and no
+  declaration lifts that. `Encrypt=optional` is now on the no-TLS deny-list, since Microsoft
+  documents it as a synonym for `no`. A mode value outside that list stays delegated;
+  [CONNECTIONS.md](docs/CONNECTIONS.md) records the limits of that, for `encrypt` and for
+  `sslmode` on MySQL Connector/ODBC. (`BACKLOG #2483`)
+- **A DATABASE `dialect` given as `env()` is no longer missed by the security inventories.**
+  `GET /security/posture` resolves it against the running engine's values, as the build does, and
+  lists the hop in the generic-ODBC TLS entry and the static-credential inventory by the dialect it
+  resolves to; a name those values do not resolve is marked *possibly generic*. `messagefoundry
+  check` has no values, so it lists such a hop as possibly generic and names the reference's key,
+  never its value. Both used to compare the reference's text with `generic`, never match, and skip
+  a hop the build then gated. (`BACKLOG #2483`)
+- **`admin-unlock`, `admin-set-notify-email`, `admin-reset-totp`, `store attest-transit-bound`,
+  `store withdraw-transit-bound`, `audit-verify`, `audit-anchor`, `rotate-key` and `backup` now
+  judge the store hop at least as strictly as `serve`, and never more loosely than before.** They
+  passed no posture. With none, the PostgreSQL store's revocation guard never ran, so on a first
+  deployment at `[security].enforcement = enforce` each would have crossed an off-box PostgreSQL
+  hop with no revocation check, which `serve` refuses. At `enforce` each now passes the instance
+  posture, refuses that hop, and exits 2, could not start. At `warn` each still passes none, so a
+  weakened store stays refused even with `MEFOR_ALLOW_INSECURE_TLS` and an unattested off-box
+  Vault stays refused, as before; each also logs the WARNING `serve` logs for an unrevoked
+  off-box PostgreSQL hop, where it crossed silently. That WARNING is logged before the open, at
+  least once per open, so also when the open then refuses for its key, cipher or driver. This
+  change moves no exit code of a refusal these commands already made: a Vault hop refusal at the
+  open already arrived as a key-provider error, exit 2, and a weakened-TLS refusal stayed at exit 1
+  until `BACKLOG #5000` moved it to exit 2. A key or hop refusal at the open prints
+  through `codec_safe_str`, so a key source's codec error does not quote a byte it decoded.
+  ([SECURITY.md](docs/SECURITY.md), `BACKLOG #2532`)
+- **A FHIR connection that takes `update_url_form` from `env()` is now named as a loosening.**
+  `messagefoundry check` and `GET /security/posture` name it, marked possibly where the value is not
+  resolved. Neither names a `deployed=False` connection whose `update_url_form` is an `env()` value,
+  and a posture read with no loaded graph names no connection. The rule and the cases it leaves off
+  are in the `update_url_form` entry of [SECURITY-LOOSENING.md](docs/SECURITY-LOOSENING.md).
+  (`BACKLOG #2571`)
+- **The dependency auditor's `pip` and `pip-audit` get an allowlist environment.**
+  `messagefoundry.security.audit_all_platforms` used to hand them everything outside the engine's
+  `MEFOR_*` namespace, so a CI token or a secret under any other name reached them. They now get
+  what a Python child needs to start, pip's own `PIP_*` variables, and the proxy, certificate,
+  `NETRC` and XDG folder variables pip and pip-audit read to reach an index. A variable a keyring
+  backend or a cloud credential helper needs is named with `--pass-environment <name>`, given before
+  the lock. The deny-list builder `non_engine_environment` is removed. (`BACKLOG #2587`)
+- **`[sandbox].pass_environment` and `[dr].pass_environment` refuse `PYTHONINSPECT` at load**, as
+  the auditor's `--pass-environment` does: a child started with it set waits at a prompt instead of
+  exiting. `PYTHONBREAKPOINT` may still be named,
+  so `PYTHONBREAKPOINT=0` reaches the child. (`BACKLOG #2587`)
+- **The dependency auditor refuses, without quoting it, a word that pip-audit's or its own usage
+  error would print with a value typed into it.** After the lock: its own `--skip-private` and
+  `--pass-environment`, in full or by an abbreviation that is not also one of a pip-audit option
+  (`--pas` and `--skip-p` are refused; `--pa` and `--skip` reach pip-audit as `--path` and
+  `--skip-editable`), with or without `=`, which go before the lock; and any other word holding `=`
+  that is not a pip-audit option taking a value, named in full and given as `--option=value`.
+  Before the lock: a lock path or `--skip-private` entry holding `=`. Once any word holds `=`, an
+  argparse usage error prints no reason, since its reason can quote that word. A free-text value
+  that holds `=`, such as `--index-url=URL` or `--ignore-vuln=ID`, still reaches pip-audit, which
+  can print it in its own output, at least in its `--verbose` debug line of the arguments it
+  parsed. (`BACKLOG #2587`)
+- **The dependency auditor refuses, after the lock, pip-audit's `--dry-run`, `-d`, `--fix`,
+  `--help`, `-h`, `--version` and `-V`**, in full, abbreviated, or inside a cluster of short flags.
+  A dry run without `--fix`, help and version audit nothing and exit 0. `--fix` rewrites the
+  requirements files pip-audit was given and can exit 0 on a vulnerable lock. The refusal names the word's position.
+  (`BACKLOG #2587`)
+- **The sandbox worker no longer receives `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` or the
+  `MEFOR_SECURITY_ENFORCEMENT` dial.** The engine decides the config-source check when it reads the
+  config, and the worker runs those bytes with no check of its own, so no `MEFOR_*` variable is in
+  its environment now. Config code that read either variable in a sandbox worker, under
+  `[sandbox].mode` `"subprocess"` or `"isolated"`, finds it unset. (`BACKLOG #2587`)
+- **An engine secret other than a store key that the machine-wide environment sets now refuses
+  the start of a Windows service under `[security].enforcement = "enforce"`, and is named as
+  `secret_from_outside_service_lists` under `"warn"`.** This applies where the engine finds its
+  service and reads its lists, and the secret, such as `MEFOR_STORE_PASSWORD`, is in the
+  engine's environment, not in those lists, and set in the machine-wide environment's registry
+  key. `serve`, `supervise`, `create_app` and `create_managed_app` apply it. Such a secret from
+  anywhere else, such as a `python.exe` wrapper between NSSM and the engine, is named and not refused, and a store key from
+  outside the lists is still named as `store_key_in_service_environment` and not refused.
+  Where the engine finds its service but cannot read its lists, such a secret in its environment
+  now refuses the start under every enforcement setting, as a store key there already did. Move
+  it to the secrets directory. See [SECURITY-LOOSENING.md](docs/SECURITY-LOOSENING.md).
+  (`BACKLOG #2595`)
+- **An engine secret setting in the Windows service's NSSM environment now refuses the start,
+  where the engine finds its service and reads its lists.** At least the store password, the AD
+  bind password, the OIDC client secret, an inline OIDC signing key and its passphrase, the SMTP
+  password, the API TLS key passphrase, both Vault tokens and the AI key joined the store key:
+  where the engine finds its service and reads its `AppEnvironmentExtra`, `AppEnvironment` and
+  `Environment` values, `serve` and `supervise` refuse to start when one is in any of them, under
+  every `[security].enforcement` setting. For these settings the refusal names the secrets
+  directory as the way in. Where the engine knows its service but cannot read those values, they
+  refuse only a store key or retired store key found in their own environment, never another
+  secret setting. The `service_environment_secret` loosening, which only named them, is gone.
+  See [SERVICE.md](docs/SERVICE.md). (`BACKLOG #2595`)
+- **A config load reads the directory once and runs only the bytes it read.** Each start and
+  reload reads its config into one snapshot after the config source's trust check, and the loader
+  compiles every config module, and each `_` helper imported with an `import` statement, from it,
+  so neither runs from `__pycache__`. A
+  released reload checks its approval's digest against that same snapshot before any module runs,
+  so an edit to a module, helper or table made while it loads is neither run nor recorded, and the
+  second digest check after the load is gone. Where the environment value file sits in the config
+  directory's `environments/` folder, `serve` parses the values a reload applies from the same
+  snapshot, so an edit to it during a release never applies under its digest, and a value file
+  created or removed there since the snapshot is refused.
+  Where the values are read from disk instead, a release takes a second digest after that read. See
+  [SECURITY.md](docs/SECURITY.md). (vault `BACKLOG #2596`)
+- **BREAKING: an unreadable `_` helper refuses a start or reload, even when no module imports
+  it.** Every file the load reads must be readable. (vault `BACKLOG #2596`)
+- **A release that also loosens a config module's permissions is audited as `invalid_config`.**
+  The trust check runs before the digest check, so where it refuses, such a tamper is refused
+  there, not as `digest_mismatch`. A release refused as a `WiringError` before the digest check now
+  writes a `config_reload_failed` row carrying `approved_fingerprint` and `approval_digest_check`
+  set to `not_reached`. (vault `BACKLOG #2596`)
+- **The config load's trust check walks each linked member as the start check walks its files.**
+  A config module, `__pycache__`, `connections.toml`, `codesets` or code-set table that is a link,
+  or a config directory that is one, was checked at what it resolves to and that object's folder
+  only. The link in between, for a link to a link, the folder holding it outside the config
+  directory, and on Windows each link's own access list went unchecked, so a writer of one could
+  re-point the link to other code. The load now also checks what the start check's link walk
+  names, and refuses where that walk cannot run, reaches nothing, or reaches another object than
+  an open of the link does. The folders above each target's folder stay unchecked, as the folders above
+  the config directory are. (`BACKLOG #2596`)
+- **A start applies the `environments/` value-file bytes its `config_loaded` digest names.** A
+  start resolved its `env()` values from disk when the engine was built, and its digest read the
+  config directory's `environments/` folder later, in the load's snapshot, so an edit in between
+  was named and not applied. `serve` now parses the value file there from that snapshot. It vets
+  the file and its folder first, as a reload does, and applies the snapshot's bytes only where the
+  file, read again after that vet, still holds them. The start refuses at least a malformed value
+  file, one created, removed or edited since the load read it, and a file or folder the vet
+  refuses, the folder even where the value file is absent. A value file the load could not read,
+  or whose folder it could not list, as under an antivirus lock, does not refuse the start, and
+  that start runs no vet beyond the build's: it keeps the values read when the engine was built,
+  and the digest leaves the file, or the folder holding it, out. A value file anywhere but
+  `environments/` is parsed as values from no start snapshot, one inside the config directory under
+  another `[environments].dir` included, so no digest names it as the start's values; at least one
+  in `codesets/` can still be loaded and folded, as a code-set table. (vault `BACKLOG #2596`)
+- **A released reload checks the environment value file wherever `[environments].base_dir` puts
+  it.** In the default layout the value file sits outside the config directory, so a released
+  reload read it from disk after the digest check, and an edit to it applied under the approved
+  digest. A reload now reads that value file into its snapshot, after vetting the file, its folder
+  and the folder of each link along a chain of file links from it, and `serve` parses the values
+  from those bytes. Where it alone cannot be read, the reload is refused, released or not, rather
+  than reading it again from disk. On a store that holds an in-process key, a dual-control hold
+  binds the file with an HMAC-SHA256 under a key derived from the store key, and the release
+  refuses a value file edited, created or removed since the request. No published config digest folds that file, since it can hold credentials and
+  those digests are unkeyed; the fingerprint scheme stays `mefor-cfg-fp:v3`. A store with no
+  in-process key binds nothing, and the release logs a WARNING. A start refuses a value file it
+  cannot stat rather than reading no values. (vault `BACKLOG #2596`)
+- **The start check walks the links an open of a value file or settings file follows, as a model
+  of the open; `docs/SECURITY.md` names where the model and the open can differ.** It
+  vetted the file and its folder, and a reload also vetted the folder of each link along a chain of
+  file links from the value file. Now each check vets, along a walk that models the open, the real
+  folder holding each link, a folder link anywhere in the path included, each link itself on
+  Windows, and the real file and folder the links lead to, or, for a dangling link, the last
+  folder the walk reaches on the way to the missing name. On Windows a relative link target
+  holding `..` met after a junction is refused, because the open can resolve that `..` against
+  the path through the junction (measured); the refusal also catches some layouts the open would
+  land on safely, such as one with an absolute link between the two, so it fails closed. A path
+  is also refused where only one of the walk and the open reaches anything, such as one whose
+  final link names a file with a trailing separator, or where `os.path.samefile` says they reach
+  two different ones. A reload vets the engine's own value file before it reads the config
+  directory, so one in its `environments/` folder is vetted before its bytes are read; the other
+  `environments/*.toml` files the snapshot reads are not. A file or folder the check cannot stat,
+  or a link it cannot read, is refused rather than skipped. `docs/SECURITY.md` names what else
+  the check refuses and misses. (vault `BACKLOG #2596`, `#6654` items 2 and 5)
+- **A longer directory-outage run is now a named loosening.** While the directory session
+  reconciler runs, `[auth].ad_reconcile_outage_passes` above its default of 3 is reported by the
+  serve-time warning, `messagefoundry security show` and `GET /security/posture`: it delays the
+  page about an outage during which no directory disable or deletion reaches a signed-in session.
+  The entry gives the least delay at the configured interval, measured from the first outage pass,
+  and the `ad_session_recheck_seconds` entry now says a longer interval delays that page too. See
+  [SECURITY-LOOSENING.md](docs/SECURITY-LOOSENING.md). (`BACKLOG #2600`)
+- **`dryrun`, the `check` dry-run leg and `alert add` report the section-name refusal instead of
+  falling back.** A `MEFOR_*` variable that is a config section's name alone refuses the load. Other
+  than `dryrun --env`, these callers used to read that refusal as "no settings": the previews ran
+  with the default `[pipeline].snapshot_on_send` rather than the file's; `alert add` refused a
+  routed rule as naming an unconfigured transport, and skipped its recipient-override check on a
+  rule that overrides recipients (its post-write settings check then refused that edit). They now
+  refuse, or fail the leg, naming the variable, when they reach their settings load; the
+  `SectionNameEnvError` docstring in `messagefoundry/config/settings.py` lists what stops them
+  first. Under `--env`, `dryrun` already refused at its earlier settings load with a fixed line
+  that does not name the variable; only its stderr warning names it. (`BACKLOG #2600`)
+- **A `MEFOR_*` variable that is the name of a config section and nothing else now refuses the
+  load.** `MEFOR_STORE` or `MEFOR_UPDATE_CHECK=false` sets no setting, and it used to start the
+  engine with only a WARNING; `MEFOR_STORE_`, with a trailing underscore, was dropped with no
+  message at all. The refusal names the variable, never its value. For a section with an
+  environment layer it says how a setting in that section is spelled (`MEFOR_STORE_<KEY>`); for a
+  section with none, such as `[update_check]`, it says to set the section in the file. The WARNING
+  is still logged first, so a refused file key does not hide it. This change refuses no other new
+  name. Which names with a typo in the section part are warned about, refused as another section,
+  or dropped with no message is in `docs/CONFIGURATION.md`. (`BACKLOG #2600`)
+- **A refused inbound body is stored whole only inside a per-inbound allowance.** A body an
+  inbound listener refuses before ingress, at least from decode to strict validation, is still recorded as an `ERROR` row, and
+  the sender still gets its AR or AE. Its length is now always stored, with a digest of it keyed
+  from the store's audit key (`body_hmac`, never a plain hash; `null` on a store with no in-heap
+  key), and the whole body only while its inbound's rolling allowance covers it. Past it, the first 8 KiB are stored and
+  the row's error says so, so a flood still stores up to one head per refusal. A poll source's
+  refusals are always stored whole, since the engine holds their only copy. The new `[inbound]` keys `refused_body_allowance_bytes` (default 32 MiB),
+  `refused_body_window_seconds` (default 3600) and `refused_body_head_bytes` (default 8192) set it.
+  It ships on and never pauses intake. Edit-and-resubmit, in either mode, refuses with `409` a
+  row whose metadata records that only its head was stored. See [CONFIGURATION.md](docs/CONFIGURATION.md).
+  (`BACKLOG #2608`)
+- **A directory account's first engine factor binds only with a single-use enrolment code.** Before
+  this, whoever held a directory password could sign in by Windows SSO and enrol the account's first
+  authenticator, shutting the real holder out of it. Now the TOTP confirm and the passkey finish ask
+  an issued code whenever the session is not stamped MFA-verified, with
+  `[security].require_mfa` on or off. An Administrator issues it from `POST /users/{id}/enrolment-code`
+  or the console's user page (revoked with `DELETE`), an MFA reset of an enabled directory account
+  issues one in its reply, and `messagefoundry issue-enrolment-code` issues one from the host. The
+  code lives 24 hours, is stored only as a digest, and must be handed over after confirming who is
+  asking, never through the account's own mail or chat
+  ([ADR 0207](docs/adr/0207-a-single-use-enrolment-code-for-a-directory-account-s-first-engine-factor.md),
+  [SECURITY.md](docs/SECURITY.md#directory-account-enrolment-codes-adr-0207)). (`BACKLOG #2609`)
+- **Windows SSO accepts a ticket from one Kerberos realm only, named by a new required
+  `[auth].kerberos_realm`.** The engine used to keep the text before the first `@` of the ticket's
+  client principal and drop the realm unread, so on a KDC that trusts another realm,
+  `admin@PARTNER` would have signed in as the local `admin`. The realm, after the last `@`, must
+  now equal `kerberos_realm` up to ASCII case. A principal with no realm, or an account part
+  holding `@`, `/` or `\`, is refused too, audited as `no_principal` with a `refusal` field that
+  names the case and none of the principal's text. `kerberos_enabled` without
+  `kerberos_realm` is refused at load, and the realm is never taken from `ad_domain`. A principal
+  in the `DOMAIN\user` form is refused; whether Windows SSPI reports that form is unverified
+  against a real domain. See [CONFIGURATION.md](docs/CONFIGURATION.md) and
+  [SECURITY.md](docs/SECURITY.md#local-vs-active-directory). (`BACKLOG #2610`)
+- **Refused peers, a switched-off signal layer and a restored posture now reach the alert sink.**
+  A new `peer_refused_burst` security signal fires when one inbound listener (at least MLLP, raw
+  TCP, X12, HTTP and the DICOM server) refuses `[alerts].security_peer_refusals` connections
+  (default `100`, at most `100000`) at its `source_ip_allowlist` or a connection cap inside the
+  window, whether or not connection-event capture is on, and then stays quiet for that listener
+  for the window, at most 300 s. It is keyed `inbound:<name>`, never the peer's address.
+  `[alerts].security_signals = false`, a detector count of `0` or above its default, and a
+  shorter `security_window_seconds` while any count is above `0`, are now loosenings that
+  `GET /security/posture` names; with the layer off the posture detector still runs, so the start
+  raises `posture_loosened`, whose list of names is cut when long. A start that records no loosening, in a row marked
+  neither `superseded` nor `baseline_unchecked`, and with a clean live posture read, raises the new
+  `posture_restored` inverse, which resolves the open `posture_loosened` alert for the same engine
+  process; that alert's key now carries `@node:<id>` or `@shard:<id>` where several engine
+  processes share the store, and an unpinned cluster node raises the inverse for its own as it
+  shuts down. When that alert can still stay open, and how an operator resolves it, is in
+  [SECURITY.md](docs/SECURITY.md). See [CONFIGURATION.md](docs/CONFIGURATION.md).
+  (`BACKLOG #2613`)
+- **Sessions can now be ended in bulk, and a restored store ends them on its first start.**
+  `DELETE /sessions` ends the sessions it finds, of any account, and keeps the caller's current
+  session. It needs `users:manage` and, while `[auth].require_action_step_up` is on (the
+  default), a single-use re-authentication bound to `revoke_all_sessions`; with it off, the
+  session's step-up window serves instead.
+  `messagefoundry admin-revoke-sessions` does the same from the host, for when the API is not
+  trusted. Both then write an `auth.session_revoked` audit row with the count, after the revoke
+  commits, so a store that refuses that row leaves the sessions ended with no row: the route fails
+  the request, and the command says to record the act by hand. Either may miss a session;
+  SECURITY.md's *Limits of the session sweep* says which. `admin-revoke-sessions`
+  judges the store hop as the BACKLOG #2532 commands do; the CLI row of SECURITY.md's hop table
+  says how. `messagefoundry restore` now ends every session in the store it places and marks it,
+  and the first `serve` on that store revokes every session again, writes a `store_restored`
+  audit row naming the archive's SHA-256, its age and its newest audit row, and
+  raises a `store_restored` alert. `restore` refuses an archive older than 7 days unless
+  `--allow-old-archive` is given or `--max-age-days` is raised. It refuses an archive that does not
+  say when it was taken, or that is dated more than an hour in the future, unless
+  `--allow-old-archive` is given: raising `--max-age-days` does not restore it. It prints the
+  archive's newest audit time, because every change made after it is undone. The restore
+  section of [EARLY-ADOPTER-GUIDE.md](docs/EARLY-ADOPTER-GUIDE.md) lists what to re-apply by
+  hand; see also [SECURITY.md](docs/SECURITY.md). (`BACKLOG #2614`)
+- **A `DatabaseRef` statement passes the `db_lookup` read-only statement test, and a row ceiling
+  bounds each sync.** The statement must open with `SELECT` or `WITH`, carry no write, `EXEC` or DDL
+  keyword, and chain no second statement, so a stored-procedure `DatabaseRef` is now refused. A
+  literal statement is tested when declared, an `env()` statement by the build check, and every
+  statement at every sync. The sync connection now advertises `ApplicationIntent=ReadOnly`, so a
+  read-only replica can serve it, with lagging data, and an availability-group primary set to
+  `ALLOW_CONNECTIONS = READ_WRITE` refuses it. New `DatabaseRef(max_rows=…)`, default `100000`,
+  refuses a larger result and keeps the last-good snapshot; an explicit zero in any spelling turns
+  it off, as for every other cap, and the `db_lookup` `max_rows` now reads zero the same way. An
+  empty `env()` value is refused for both, not read as off. Neither control
+  is read-only authority: give the login `SELECT` only. See
+  [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #2617`)
+- **An endpoint URL whose host holds a `:` written as `%3A` is refused at construction.** No host
+  name holds a colon, and a password head written as `%3A` then `%5D` hid its port from the
+  earlier checks, so the URL constructed and allowlist refusals printed the username and part of
+  the password. The refusal names the setting and never the URL. A URL the parser cannot read is
+  now refused the same way wherever a scheme is read first, including `proxy_url` and
+  `ech_sidecar`, instead of raising a parser error that quoted the whole host part. An
+  `[egress]` or `[ai].allowed_endpoints` refusal now prints
+  `(withheld: an '@' or encoded ':' in the URL may hide a credential)` in place of the host
+  whenever the URL has an `@` after the host, an email in a query or an `@` in a path included,
+  because the host read there can be a username or a token head. Such a refusal used to print the
+  host. At least these also withhold it: a `%40` in the host or the port field, and a `%3A` in a
+  host not written in brackets. This covers the HTTP-family `[egress]` arms (`url`, the token URLs, `proxy_url`, a
+  FhirLookup `url`) and `[ai].endpoint`; the `[alerts]` and `[auth]` allowlist refusals are not
+  changed by this.
+  (`BACKLOG #2686`)
+- **A port in an `[egress].allowed_db` entry is compared with the port a generic ODBC connection
+  string sends.** The check read the `port` setting on both dialects, but the generic dialect never
+  sends it: its connection string carries the `PORT` keyword from `odbc_params`. So an entry pinned
+  to one port admitted a generic connection sending another port to the same host, and refused the
+  documented `PORT` shape on the pinned port. On the generic dialect the check now reads `PORT`
+  alone and ignores `port`. For a listed host it refuses at least a `server` holding a comma,
+  `PORT` given twice or with a leading zero, and a connection that names no readable port against a
+  pinned entry. That includes an `odbc_driver` whose name, as written, is not one the engine knows
+  reads `PORT`; the default SQL Server driver ignores it. The check reads the driver name, not the
+  library it loads. A pin is read as a number. The SQL Server preset reads `port` as before, now as
+  a number. What a driver does with `PORT` is outside the check; see
+  [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #2704`)
+- **The generic ODBC dialect sends its checked values without braces, and refuses the `SSLmode`
+  spellings psqlODBC would misread.** Measured against real drivers, psqlODBC did not honour a
+  braced `SSLmode`: `SSLmode={verify-full}` and `SSLmode={require}` connected with no TLS at all.
+  It also kept the braces as part of `UID` and `DATABASE`, and psqlODBC and MySQL Connector/ODBC
+  both refused a braced port. `database`, `username` and every `odbc_params` value are now sent
+  plain; the `odbc_driver` name stays braced. Those values, and `server`, refuse at least `;`,
+  `{`, `}`, `=` and both quote characters, and an empty, blank or padded value, `None` and a
+  boolean are refused rather than sent as text. For every driver but MySQL Connector/ODBC, an
+  `SSLmode` value must be one of libpq's six modes in lower case, since psqlODBC's source reads
+  `Require` or `True` as `disable`. The password is still always braced, with the `}}` escape,
+  when `odbc_driver` names psqlODBC (the bare `PostgreSQL` included) or MySQL, both measured to
+  read that escape, or `ODBC Driver <n> for SQL Server`; psqlODBC URL-decodes an unbraced
+  password. For any other driver it is sent plain when it can be and refused otherwise. The rules
+  are in [CONNECTIONS.md, *Values on the generic dialect*](docs/CONNECTIONS.md#values-on-the-generic-dialect).
+  (`BACKLOG #2705`)
+- **A generic ODBC connection's login is bounded by `connect_timeout`.** The setting reached the
+  driver as pyodbc's `timeout=` on the SQL Server preset only. It now does on the generic dialect
+  too, with the same 15 s default; measured, it bounded a psqlODBC and a MySQL connect to an
+  unreachable host at about 5 s with `timeout=5`, against about 21 s without it.
+  (`BACKLOG #2705`)
+- **The DICOM C-STORE SCP now caps connections that have no association yet, and gives each one a
+  deadline for its association request.** Before, a peer inside `source_ip_allowlist` that connected
+  and did not finish asking for an association had an `Association` of its own. It counted against
+  `max_associations` while nothing capped how many there were, and one that had sent even a single
+  byte was never ended. Now the SCP holds at most 256 such connections, and at most 32 from one
+  address, on cleartext and on TLS. A peer has `timeout_seconds` to deliver its whole request, and
+  a stalled one never starts an `Association`, so it no longer turns a real sender away from
+  `max_associations`. The first PDU must be a well-formed A-ASSOCIATE-RQ of at most 256 KiB that
+  the association could negotiate; anything else is closed. A whole request refused that way is
+  answered first: a rejected-permanent A-ASSOCIATE-RJ for one that decodes, and an A-ABORT for one
+  that does not. Every later read has the same deadline, and so does each whole send, so a peer
+  that stops part way through a PDU, or stops reading, is ended too. The `[dicom]` extra now pins
+  `pynetdicom==3.0.4`, because these bounds rest on behaviour measured at that release.
+  [DICOM.md](docs/DICOM.md) section 3 states what these bounds leave open. (vault BACKLOG #2712)
+- **The DICOM C-STORE SCP now bounds what it holds of a PDU and of an object on an association it
+  accepted.** Before, it read whatever length a PDU declared, up to 4 GiB, and held every fragment of
+  an object until its last one arrived, whatever its size, before `max_object_bytes` refused it.
+  Now a P-DATA-TF longer than the `max_pdu_size` the SCP offered, or any other PDU longer than an
+  association request, gets an A-ABORT before its body is read. A P-DATA-TF that pynetdicom would
+  fail on, that carries a command other than a C-STORE or C-ECHO request, or that carries a request
+  lacking a field pynetdicom needs to serve it, gets an A-ABORT once its body is read. While one whole object waits to be served, the SCP reads no more on
+  that association. An object over the effective
+  `max_object_bytes` is still refused with the final status `0xC010`, up to twice that cap; past
+  twice it the SCP sends an A-ABORT as the fragments arrive (owner ruling B462-R3), so a sender that
+  retries a failed association would retry such an object. The count starts again at each object's
+  last fragment, so a long association of objects under the cap is never charged as one. A whole send
+  now has the `timeout_seconds` deadline, rather than each system call, and a send ends within 1.5
+  seconds once the SCP is stopping. The SCP will not run while pynetdicom's
+  `STORE_RECV_CHUNKED_DATASET` is set, since that writes each received object to a plaintext file. A request whose protocol version sets bit 0 alongside others is
+  accepted, as PS3.8 asks. `timeout_seconds` must now be at least 1 second, and `max_pdu_size`
+  from 4096 to 1 MiB. (vault BACKLOG #2712)
+- **SQL Server now has every `users(id)` foreign key the other two stores have, and trusts them.**
+  `sessions.user_id` and `user_roles.user_id` gain the keys SQLite and Postgres already declare, so
+  a sign-in there can no longer write a session for an account that does not exist.
+  `fk_webauthn_credentials_user`, which an earlier release added `WITH NOCHECK`, is rebuilt
+  `WITH CHECK`. On the first open after an upgrade, the store deletes the passkey, session and role
+  grant rows that name an account that no longer exists, logs a warning with how many it deleted
+  from each table it deleted any from, naming no account, then adds each key; nothing can use such
+  a row. A sign-in started while an account is being deleted waits for the delete and then
+  fails, rather than leave a session behind or fail the delete.
+  (`vault BACKLOG #2733`)
+- **XML-DSig `verify()` raises a body-free `XmlError` for a signature it cannot process.**
+  Malformed content inside `ds:Signature`, such as a non-base64 or empty `ds:SignatureValue` or
+  unreadable key data, used to escape as whatever signxml, lxml or `cryptography` raised, and
+  several of those messages quote the document. It now raises `XmlError` naming only the
+  exception type, and the library's exception is on neither `__cause__` nor `__context__`. A
+  document the coverage check cannot canonicalize fails with `UnsignedContent`. The anchor
+  `verify()` uses is now read before the document, and one that cannot be read is refused there;
+  `verify()`'s docstring names at least some of the exceptions that raises, and what the read
+  checks. The CA file is read at most once per call, before the document, and signxml's chain
+  check uses that read, so a CA file changed or deleted during the call is not reported as an
+  `XmlError`. (`BACKLOG #2816`, `BACKLOG #5372`)
+- **A SOAP partner's fault reply is classified in time linear in its length, off the event loop.**
+  The fault-code patterns rescanned to the end of the reply from every start tag with no close, so
+  a reply of repeated start tags cost the square of its length, and a 2xx reply was classified on
+  the event loop. On a first deployment, one such reply near the 16 MiB cap could have stalled the
+  whole engine for hours. The patterns now match only the start tag's name and the code text is
+  taken with `str.find`; the 2xx classification and the capture scrub run in the worker thread
+  that made the POST. That thread can still hold the loop up; the `_post_and_classify` docstring
+  in [soap.py](messagefoundry/transports/soap.py) says how, and for how long it measured.
+  The code is now read from the matched Fault's first code element. An empty code element yields
+  no code. So at least a Header Value, and the text after an empty `<faultcode/>`, no longer make
+  a permanent fault retry until the attempt limit. The Fault, and a WS-Security code, are searched
+  for from the first SOAP Body start tag where a Fault follows it, else in the whole reply, so a
+  Fault-named element before that tag no longer decides the Body's fault. The tag is the first
+  one anywhere, a Header or comment included; `_find_fault` in
+  [soap.py](messagefoundry/transports/soap.py) says so.
+  (`BACKLOG #2827`)
+- **The `[backup]` and `[dr]` URL refusals now quote no part of the value.** The refusals of
+  `[backup].destination`, `[dr].seed_archive`, `[dr].seed_dir` and `[dr].restore_token` printed the
+  text in front of `://` as the scheme, and that text is the value's own. The refused value is a
+  URL, and they now name the setting and say it must be a local or UNC path. This reverses the
+  scheme quote added under `BACKLOG #2600`. What they refuse is unchanged. The check strips
+  surrounding whitespace and ignores case, then refuses a value that starts with `<scheme>://`,
+  where the scheme is a letter and then at least one more letter, digit, `+`, `.` or `-`. A value
+  with any other shape once stripped is not refused by this check, and can load as a path.
+  (`BACKLOG #2850`)
+- **BREAKING: the Vault clients no longer fall back to `VAULT_ADDR`, `VAULT_TOKEN` or
+  `~/.vault-token`.** The store key provider (`[store].key_provider = "vault"`), the Transit
+  cipher (`[store].cipher_provider = "vault_transit"`) and the KV secret provider
+  (`[secrets].provider = "vault"`) each refuse to build their client when `MEFOR_STORE_VAULT_ADDR`
+  or `MEFOR_STORE_VAULT_TOKEN` (store) or `MEFOR_SECRETS_VAULT_ADDR` or
+  `MEFOR_SECRETS_VAULT_TOKEN` (secrets) is unset or empty, with fixed text naming the variable.
+  Both values are always passed to hvac, so an operator's own Vault address and token can no
+  longer stand in for the engine's. A token is still read from the secrets directory before the
+  environment; on Windows, supply it only in that directory. A Vault Agent sink can write it there,
+  except under the default virtual account or any other Windows account but a dedicated engine
+  account the site already chose; see
+  [CONFIGURATION.md](docs/CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory).
+  Supply the address and the token of each Vault hop you use. (`BACKLOG #2851`)
+- `check-privileges` quotes each Vault policy name in its `token policies [...]` line, so one
+  server-chosen name holding `, ` or `]` cannot read as several names in that list; it prints a
+  control character in the store principal or database name escaped once, not twice (the
+  summary's `repr` escape was escaped again by the terminal rule); and `messagefoundry-toolkit
+  adr-analyze` escapes the controls in its stderr `error:` line through the shared terminal
+  escape, printing a non-ASCII letter as itself. The shared terminal escape's
+  `keep_printable_unicode` mode now prints a non-ASCII space separator, such as a no-break or
+  ideographic space, as a visible escape rather than a blank, on the console and in a Markdown
+  report cell (BACKLOG #2891).
+- **BREAKING: `serve` now probes each Vault token it uses at start, and the gravest grants refuse
+  the start under `[security].enforcement = enforce`.** The store Vault token and the
+  connector-secret Vault token are each read with the probe `check-privileges` runs. A token holding
+  the root policy, a grant on an administrative path, or a Transit key's `config`, `rotate`,
+  `export` or `backup` refuses the start unless `[security].allow_over_granted_vault_token = true`
+  accepts it, which is audited and reported as a loosening. Every other over-grant, and a probe
+  stopped by a network failure, a timeout or a 403, logs a warning and writes a
+  `vault_privilege_preflight` audit row. A probe that failed for any other reason, such as a code
+  defect, refuses the start under `enforce`, and the opt-out does not lift that. See [ADR 0216](docs/adr/0216-the-gravest-vault-token-grants-refuse-start-under-enforce-with-an-audited-opt-out.md).
+  (`BACKLOG #2903`)
+- **`EngineClient.confirm_mfa` refuses, before sending, to put its code on a cleartext
+  non-loopback hop, and the sign-in read now outlasts the engine's request deadline.**
+  `confirm_mfa` had no entry-point refusal, so with no token held it would have sent the second
+  factor over a permitted plaintext hop; it now refuses as `verify_mfa` does. The Python
+  client's read on `login`, `reauth`, `verify_mfa` and `confirm_mfa`, and the IDE's sign-in
+  timeout, go from 30 to 150 seconds, and the read on `change_password` from the client's 5 second
+  default to 150 seconds, 30 seconds past the engine's default 120 second
+  request deadline, so a sign-in waiting in the per-account queue no longer outlasts the client at
+  that default. A lost reply is rarer, not impossible. Every other Python client request keeps its timeout.
+  (`vault BACKLOG #2950`)
+- **The engine refuses `accept()` on a WebSocket whose latest recorded gate answer is a refusal, or one with no recorded answer and neither a gate dependency nor a `public_route` mark.** `authorize_ws` records on the
+  handshake whether it admitted the caller, `authorize_ui_ws` only on a browser handshake (one with an Origin), and the engine refuses `accept()`, and
+  any denial response, on a socket whose latest recorded answer is a refusal, and on one with no
+  recorded answer that no gate dependency or `public_route` mark declares. The client gets a
+  bodyless 403. See [`docs/SECURITY.md`](docs/SECURITY.md). (vault `BACKLOG #2955`)
+- **A forward-proxy URL is parsed once, so `[egress].allowed_proxy` judges the host the engine
+  dials.** Before this change the allow-list read one host from a `proxy_url` and urllib could
+  dial another, when the URL's path, query or fragment held an `@` and a second host. On a first
+  deployment, such a value would have passed the allow-list for a listed proxy while the engine
+  sent its requests, and any `Proxy-Authorization` credential, to a host the list does not name.
+  The connector now dials the address rebuilt from that one parse.
+- **BREAKING: some `proxy_url` values are now refused at config load.** A deploying site would
+  see a refusal for a path (a bare trailing `/` is still accepted), a query, a fragment, a host
+  that is not an ASCII DNS name, a canonical dotted-quad IPv4 address or a bracketed IPv6 address,
+  a port outside 1 to 65535 or with a leading zero, and any value the two URL parsers read
+  differently. A user and password in the URL now fail the build for their own reason (vault
+  `BACKLOG #3007`); a proxy login goes in `proxy_user` and `proxy_password`. See
+  [CONFIGURATION.md](docs/CONFIGURATION.md). (vault `BACKLOG #2965`)
+- **A credential value masks a later braced password's tail, when that tail is only lower case
+  letters and spaces.** A plain value under a `MEFOR_*`, token, session or `api_key` label ran on over
+  a later `PWD=` (or other password-word label) whose braced value held a space, and stopped at that
+  space, so the shipped log scrub and the support bundle would print the tail, for example
+  `MEFOR_STORE_DSN=Server=h;PWD={p w}` gave ` w}`. The value now takes that label and its braced
+  value, and writes the tail back with each letter masked, so that line gives ` x}`: the tail's
+  spaces, word lengths and closer still print. That is the only shape the change was built to hide.
+  A braced tail holding anything else, at least a digit, a capital letter, punctuation or a tab, so
+  `PWD={p w Summer2024}`, prints exactly as before, and so do the other shapes the conditions on
+  `_BRACED_RUN_ON` in `messagefoundry/secretscrub.py` refuse, among them `PWD= {p w}`, an unclosed
+  `PWD={p w`, and a key-material or token label with a braced value. On the installed log chain a
+  query-key line, at least `token=`, `code=` and `state=`, still prints the tail, because the query
+  filter runs first. Code review found shapes where an earlier form of the change, which refused
+  characters one by one, printed a value the previous code hid in the bundle and on the store path,
+  among them `Bearer abcd.PWD={pp 2024-01-01t09:15private_key=vq9}vq10 rest` and
+  `token=a;PWD={pp mrn[vq7code=x}`; those now print exactly as before. A random differential and a
+  shape grid against the previous code are evidence on a sample, not a proof that no such line is
+  left. (`BACKLOG #2966`)
+- **The credential scrubber hides one more braced `MEFOR_` shape, in both the write-time pass and
+  the support bundle.** A `MEFOR_` value in braces that holds a space, with lower case text glued
+  after its closer, as `MEFOR_X={pp ww}x rest`, is now hidden up to the end of that text, where the
+  part after the space printed before. The shape is narrow. Before the first plain space (U+0020)
+  the braces may hold any character except white space, a quote, ";", "&", "{" and "}" (a doubled
+  "}}" is allowed), so a tab or a U+00A0 there refuses it. After that space, the braces may hold only
+  lower case ASCII letters and spaces; the glued text, only lower case ASCII letters, ";", "," and
+  "&"; and neither may hold a word from a fixed list of words other passes read, at least `mrn`,
+  `nonnumeric` and the scheme words. The glued text must end at white space or the end of the
+  text, and the branch is refused when white space and then ":", "=" or a quote follows it, or
+  white space, `bearer`, `basic` or `digest`, and white space. Anything else prints as before, and
+  so does a key-material value of the same shape (BACKLOG #2966).
+- **A REST destination with `ech_egress` and `verify_tls = false` is now refused at construction,**
+  as `proxy_url` beside `ech_egress` already is, in every posture and whatever the connection
+  attests. With an ECH sidecar the sidecar, not the engine, makes the TLS connection to the
+  destination, so `verify_tls = false` turned off no verification the engine does. It did turn off
+  the revocation guard, which runs only when `verify_tls` is on: with `tls_hop_attested` such a hop
+  built on an enforcing instance with no revocation attestation, while the same hop with
+  `verify_tls` on was refused unless `tls_revocation_attested` was set. A direct
+  `verify_tls = false` hop, with no sidecar, is unchanged. (vault BACKLOG #2977)
+- **A refused `tls_allow_expired` hop on REST, SOAP or FHIR names a remedy that can admit it.**
+  The revocation refusal on those three destinations offered `[tls].crl_file`, which cannot admit a
+  hop that sets `tls_allow_expired`, and did not name that setting as the cause. It now names it and
+  offers the per-connection attestation, or removing the setting, as MLLP, the DICOM SCU and FTPS
+  already did. On a REST hop with an ECH sidecar the ECH remedy stands. The refusal, the WARNING and
+  the attested-crossing audit line on such a hop now use the expiry-relaxed record's words, so a log
+  search for "verified TLS hop that skips validity-period checks crossed" finds these crossings
+  (it read "with tls_allow_expired" until vault BACKLOG #4912), and one for
+  "crossed without certificate revocation checking" no longer does. The requests-based CRL refusal
+  no longer offers a revocation-checking proxy, which cannot clear it. No decision changes: the same
+  hops are refused, warned on or admitted as before. (`BACKLOG #2977`)
+- **A `[tls].crl_file` no longer admits an MLLP destination or a DICOM C-STORE SCU that sets
+  `tls_allow_expired`.** That setting also makes OpenSSL accept a CRL past its `nextUpdate`, so a
+  CRL on that hop cannot vouch for the revocation check. Off the box on an enforcing instance the
+  hop is now refused unless the connection sets `tls_revocation_attested` with a reason, as REST,
+  SOAP, FHIR and FTPS already were. On an instance that does not enforce, the hop now logs the
+  revocation WARNING at each build instead of crossing without it. At least three cases still cross
+  there without the revocation WARNING: `MEFOR_TLS_REVOCATION_ATTESTED` set, the connection's own
+  `tls_revocation_attested`, and a loopback hop. The refusal on these two hops names the
+  attestation, and offers the CRL only once `tls_allow_expired` is removed. A hop without
+  `tls_allow_expired` is unchanged. See
+  [ADR 0173](docs/adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)
+  §13. (`BACKLOG #2978`)
+- **The store now scrubs a captured reply's `detail`.** `complete_with_response` ran no scrub over
+  `detail` on any backend, while an `ack_sent` row's `detail` went through `safe_text(detail,
+  limit=200)`. Both row kinds now get that scrub and bound before the cipher, so the store is the
+  chokepoint [PHI.md](docs/PHI.md) names, whatever a connector puts in the field. X12's `TA1*`
+  detail carried the partner's TA1-04 element verbatim, and the shipped code wrote it unscrubbed and
+  unbounded on every backend. The scrub does not know that shape, so `TA1*MRN7731` would pass it
+  unchanged: the X12 connector now records `TA1*A` only for a TA1-04 that upper-cases to `A`, and
+  writes a fixed phrase carrying none of the partner's text for an empty TA1-04 or any other value
+  it accepts. An empty
+  TA1-04 used to read back as `TA1*A`, a code the partner never sent. The scrub redacts the PHI
+  shapes it knows and bounds the length; it does not catch every identifier. The scrub can change
+  an in-tree detail. At least the fixed phrases and status codes such as `MSA-1=AA`, `HTTP 201` and
+  `TA1*E accepted-with-errors` pass it unchanged. At least two kinds do not: the MLLP and X12
+  unparseable-reply details embed `safe_exc` text that was already cut at 200, so one near that
+  bound is cut again here, and a database connector's `capture_max_bytes` cap detail whose number
+  the scrubber reads as a date, such as `capture_max_bytes=20971520`, reads back as
+  `capture_max_bytes=[redacted]`.
+  Both methods now scrub before the SQLite writer lock, or the Postgres and SQL Server pooled
+  connection and its transaction, is taken. `resp_headers` is deliberately not scrubbed, so a
+  Handler reads back the values it was captured with. The connector's per-connection allow-list
+  bounds which header NAMES are captured, not what their values hold: the store applies no bound to
+  an allow-listed value, such as a `Location` naming a patient resource. What each connector does
+  to a captured value, and what covers it at rest, is stated once in
+  [PHI.md section 3](docs/PHI.md#3-encryption-at-rest), which now says so for each column and
+  row kind. The item's fourth
+  finding, that a value bounded twice carries a count note naming only the second cut, was
+  reproduced and is kept: vault BACKLOG #3034 counts per call by decision, so the store never parses
+  a count back out of text a peer can write. (`BACKLOG #2984`)
+- **An `anon.toml` overlay that points a default-scrubbed field at a different surrogate kind is
+  refused unless it lists that field under `[hl7].retarget_acknowledged`.** Such a retarget can
+  leave part of the value in the dataset, and the leak-check scans what is left only for a dashed
+  SSN or a punctuated phone number. It used to load with a warning. A retarget to the same kind,
+  to `drop` or to `freetext` needs no entry, and an entry that names no such retarget is refused.
+  A listed retarget still warns. The refusal names at most three retargets and counts the rest,
+  and a `keep`, `drop` or `retarget_acknowledged` key written under `[hl7.fields]` is refused
+  with a hint that it belongs under `[hl7]`. See [PHI.md](docs/PHI.md) section 9.
+  (`BACKLOG #3000`)
+- **The anonymizers' coverage record for a bare line now gives its position, and a bare line
+  under a header with no readable HL7 version is refused.** A passed bare line is recorded in
+  each message's report as, for example, `PV2 at line 3 (line with no fields)` rather than
+  `PV2 (line with no fields)`, on the engine and the tee. The position counts only lines that
+  hold something. The run summary counts such lines by segment id alone, once per message. A
+  header of only `MSH|^~\&` is refused as a line no rule can reach. When the header's MSH-12 holds
+  no readable version (at least: empty, not digits joined by single dots, or older than 2.1), at
+  any field count, a bare line used to be judged against the segment ids of every HL7 version;
+  both anonymizers now refuse it unless a rule that rewrites a field names its segment. The
+  text of a line no rule can reach, in the `AnonError`, the leak report's hits and the tee's
+  output, changed, so a caller that matches the old text must change. See
+  [PHI.md](docs/PHI.md) section 9. (`BACKLOG #3001`)
+- **A proxy credential has one declared way across, and no declaration lifts one in a URL.**
+  `tls_hop_attested` no
+  longer admits a `proxy_user` credential; `cleartext_accepted` with a `cleartext_reason` still
+  does, and a proxy on this machine needs no declaration. A `Destination` or `FhirLookupExecutor`
+  built directly now refuses `tls_hop_attested` beside `cleartext_accepted`, as the factories
+  already did, whether the `Destination` declares it as a field or in its settings, where the
+  anonymous-FTP guard reads it. A `Destination` also holds an attestation in its settings, and a `Source` or `Destination` its
+  typed reason, to the factories' flag, reason and control-character rules, as the anonymous-FTP
+  guard now does on both sides, and the executor refuses
+  `cleartext_accepted` or `tls_revocation_attested` with no reason, as `FhirLookup()` does. These
+  checks run at construction; a field changed on a built `Destination` is not re-checked. On a
+  cleartext body hop that pair let the attestation stand in for the acceptance, so the hop crossed
+  with no acceptance record. A user and a password together in a connection's
+  own `proxy_url` now fail its build, at every
+  `[security].enforcement` setting and under every declaration, where each send used to meet a
+  retryable refusal. A user with no password and a password with no user now fail the same way,
+  where each used to build and dial the proxy with no header and no refusal. The refusal names no
+  part of the URL. In `[egress].proxy_url` either one is refused at config load instead, naming
+  the setting, and the static-credential report no longer lists a credential in a proxy URL as a
+  hop to accept. A `Destination`, `Source`, `OutboundSigning` or `WindowsCredential` refusal no longer echoes
+  the model's input, so a secret in its
+  settings stays out of the error however it is rendered. A credential from `HTTP_PROXY`,
+  `HTTPS_PROXY` or the system proxy settings still meets the send-time rule on
+  `ProxyCredentialsRefusedError`, which states the legs it refuses. The Vault hop's refusal no
+  longer suggests an `https://` proxy as a fix that holds for every hop. Owner rulings of
+  2026-10-30, stated in [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #3007`, `BACKLOG #3416`)
+- **A passkey registration finish on a session that owes a factor can no longer bind past one
+  gained on another session during the finish.** The insert is now conditional: the store asks
+  the factor-binding rule again inside the insert's own transaction, so a TOTP or passkey bound on
+  another session after the service's own checks is refused with `400` `this account already has
+  a second factor`, audited `auth.mfa_denied`, with no passkey stored and the session not stamped
+  MFA-verified. On SQLite a write from another process landing in that window fails the finish
+  with an error instead, storing nothing. A session already stamped MFA-verified still adds a
+  passkey beside the account's factors, and an account with no factor still binds its first one.
+  The TOTP confirm keeps its read-then-act window. See [SECURITY.md](docs/SECURITY.md). (vault
+  `BACKLOG #3014`, `#3690`)
+- **A failed AD service-account bind no longer leaves its socket open, at least in the cases
+  `_close_without_sending` in `messagefoundry/auth/ldap.py` names.** The service connection was
+  built with ldap3's `auto_bind`, which binds inside the connection's constructor, so a bind that
+  raised after the socket opened, such as on a service password that SASLprep refuses, left the
+  engine holding no connection to close, and the socket stayed open until the object was collected.
+  The engine now builds the connection unbound, binds it itself, and closes the socket without
+  sending when the bind fails. A user or decoy bind whose open fails now has the socket left on
+  its connection closed the same way when the connection is released, where ldap3's unbind did
+  nothing on the closed connection. That function's docstring states the rule, the cases it
+  covers, and that a socket ldap3 opened for an earlier address and replaced while trying a later
+  one is not reached by that function.
+  As hardening, every LDAPS bind refused on its host name after a completed handshake
+  now has its TLS socket closed by `NarrowedTls` itself, rather than relying on ldap3 dropping the
+  error's traceback. A service-account bind the directory refused, with `invalidCredentials` or a
+  code that points at the configured DN, now reads `which refused the bind` in its message, not
+  `which is not an answer`, which is kept for a bind ended by any other code and for a search the
+  directory did not finish. (`BACKLOG #3017`)
+- **A directory rename now commits with its audit row, or not at all.** The
+  `auth.ad_username_refreshed` row used to be written after the rename had committed, so a refused
+  write left the account under its new name with no row, and no later refresh wrote one. The row
+  now commits in the rename's own transaction on all three store backends, and only when the rename
+  lands. If the row is refused, the rename rolls back. On a sign-in that refusal still fails the
+  sign-in. On a reconciler pass it is logged at ERROR and the pass goes on. The engine would apply
+  it on a pass or sign-in that reaches the rename and is not refused, with its row and its notice.
+- **The session revoke that follows a committed auth change is retried, and a miss is audited.**
+  At least a password change or reset, an MFA reset, a disable, a role, scope or custom-role edit,
+  a directory map save or resync and the `provision-admin` repair end the account's sessions after
+  their own change commits. A store refusal there, such as a pool shortage, a statement timeout or
+  a lost connection, is now run again within a bounded budget, and one the service gives up on is
+  logged at ERROR and written as an `auth.sessions_revoke_failed` row naming the account and the
+  change; before, the request failed with the change committed, the other sessions live and nothing
+  recorded. The directory reconciler's revoke gets the same attempts, budget and row, counting its
+  first attempt, which carries its `auth.ad_session_revoked` row, and the row counts the
+  revocations of the pass it did not reach. A custom-role delete, which revokes before it deletes,
+  and a cancellation are not covered. [SECURITY.md](docs/SECURITY.md) states the attempts and
+  the budget. (`vault BACKLOG #3023`)
+- **`provision-admin` re-runs some of its repair revokes for longer when the store refuses them.**
+  On the repair branch, at least the session revoke before it sets the password and the one after
+  an Administrator grant the store reported as made each re-run on a five-minute budget, since the
+  command has no request deadline; request callers keep the 15-second request budget. A revoke it
+  gives up on after such a grant still tries to page the `administrator_granted` alert, as a
+  granted run does, and the command exits with an error naming
+  `messagefoundry admin-revoke-sessions`. A run refused after it wrote to the account may leave that
+  account's sessions live; `messagefoundry admin-revoke-sessions`, run once the store answers, with
+  the `--service-config` or `--db` the command used, ends the sessions it finds, of any account.
+  (`vault BACKLOG #3023`)
+- **A refused TOTP enrolment confirm retries its revoke of the rotated session once.** A confirm
+  whose conditional enable matches no row revokes the session it just rotated, which is already
+  stamped MFA-verified. A store refusal of the revoke used to leave it live until its own timers
+  ended it. The confirm now tries the revoke once more. Which raises are retried, and when the
+  session can still stay live, is in `docs/SECURITY.md` under the heading "Multi-factor
+  authentication (TOTP, WP-14)". (`BACKLOG #3025`)
+- **The off-box audit tee scrubs a text field holding a C0 control in the window it scans before
+  it encodes the field.**
+  `json.dumps` escaped the control first, so the log filters could miss a name, a credential or
+  a date beside it, as in a typed sign-in name. The `emit_audit_tee` docstring states the cases
+  and what is left. (`BACKLOG #3045`)
+- **A directory account's passkey would ask the directory only once its assertion has verified.**
+  The lookup used to run before the assertion was checked, so a session that had staged a
+  ceremony could post a response that proved nothing and still read whether the directory still
+  confirmed its account. Now a response that does not verify gets the leg's ordinary failure and
+  causes no lookup. A directory refusal still leaves the ceremony in flight, the sign count
+  unmoved and nothing charged, so the same assertion verifies once the directory confirms the
+  account.
+- **The passkey leg reads its passkey set before the session, account and lock re-read, not
+  after it.** A lock, a disable or a revocation landing while the set was read again used to
+  reach the factor write unseen. The re-read is now the last read before the write. A passkey
+  deleted during that re-read is still seen, through the account row's passkey digest, and a set
+  that keeps changing is refused after three passes. (`BACKLOG #3068`)
+- **TOTP enrolment enables only the secret that was verified.** A second enrolment start inside
+  the confirm window used to replace the staged secret, so the confirm could enable a factor
+  nobody had proved. Staging a secret now writes only while TOTP is off, and the enable is a
+  compare-and-set on the staged secret the confirm verified, on all three stores. A re-stage inside
+  the window fails closed, audited with the reason `secret_replaced`; a lost write is audited as
+  `write_lost`. (`vault BACKLOG #3025`; shipped in 0.5.2, whose release notes left it out, and
+  recorded here under `vault BACKLOG #3069`.)
+- **A stale directory reconciler rename no longer overwrites a newer sign-in rename.** The
+  reconciler carries a rename it planned earlier in its pass. When a sign-in renamed the account
+  after that plan, the pass wrote its older name over the newer one and told the holder. It now
+  skips a rename whose row holds neither the planned old name nor the new one, and writes, audits
+  and sends nothing for it; an INFO line says why. A later pass that probes the account, or its
+  next sign-in, copies the directory's name down. (`vault BACKLOG #3069`; shipped in 0.5.2, whose
+  release notes left it out.)
+- **The first-administrator grant refuses an account holding a passkey, and on SQLite it takes the
+  write lock before it reads.** `provision-admin` enrols no passkey and clears an earlier holder's
+  before it writes, so a passkey on the account when the role is granted was enrolled by that holder
+  meanwhile; the grant now writes no role beside it, on all three stores, and a re-run clears it.
+  On SQLite the grant opens with `BEGIN IMMEDIATE`, so a `provision-admin` run waits for a busy
+  engine's write rather than failing busy at once and using up its re-runs. (`vault BACKLOG #3078`)
+- **A directory account whose channel scope the directory narrowed can no longer step up with the
+  old scope.** The code, passkey, enrolment, IdP and password re-bind step-up legs compared the
+  account's roles with its current directory groups, but not its channel scope, so an account
+  that lost a scope-mapped group renewed its window, or was minted an action-bound grant, with
+  channels it no longer held until the reconciliation pass revoked it. Once the roles pass, each
+  leg now refuses an account whose scope the groups would narrow, by the reconciliation pass's own
+  scope rule, audited as `directory_scope_narrowed`. It charges nothing, writes no scope, and is
+  answered as a demotion: sign out and sign in again, which writes the scope the groups grant now.
+  An account whose groups grant Administrator is not asked. When the AD group-to-channel map fails
+  its seal, an account holding a scope is refused as `directory_scope_map_unsealed` instead and is
+  told to try again later or ask an administrator, as for a failing role map. A new sign-in
+  reads the same failing map: it keeps a scope an administrator set, so that refusal stands, and
+  withdraws a directory-set scope to NULL, which grants no channel, so the step-up then passes
+  with no channels. See
+  [SECURITY.md](docs/SECURITY.md). (`vault BACKLOG #3081`)
+- **A psqlODBC connection's default libpq root certificate is now checked in both homes libpq
+  may read it from** (BACKLOG #3090). Off Windows, whenever `HOME` was set the check read
+  `root.crt` under it alone, so it could clear one file while an older libpq loaded another from
+  the password-file home. When the two homes differ, both are now checked, and an encryption
+  header or a private key in either refuses the build. `docs/CONNECTIONS.md`, Generic ODBC, says
+  which libpq reads which home. On Windows the folder is now asked for through the ANSI shell
+  call libpq makes, and a `ctypes` import or call failure in that shell-folder call refuses the
+  build with a `ValueError` rather than escaping it.
+
+  A host would now refuse where it would have built before, in at least these cases:
+  - off Windows, when the password-file home differs from `HOME` and its `root.crt` cannot be
+    opened or read, is over 1 MiB, or meets a stat fault such as `EIO`, as any checked file is
+    refused;
+  - off Windows, when `pwd` cannot be imported, even with `HOME` set;
+  - on Windows, when the ANSI shell call returns a `?` past the drive of the roaming folder,
+    which it writes for a character the code page cannot hold: the engine cannot say which file
+    libpq reads there;
+  - on Windows, when the roaming folder's name holds a character the ANSI code page maps by best
+    fit to one no Windows name can hold, at least a fullwidth `*`, `<`, `|` or `"`: the check
+    cannot read that path;
+  - on Windows, when the ANSI folder's bytes do not decode in the code page.
+
+  On Windows, a roaming folder whose name the ANSI code page holds only by best fit would now be
+  checked at its best-fit path, the one libpq is given, not at its real name.
+- **The directory session reconciler now pages for one account the directory keeps failing to
+  answer for.** A probe that fails with an LDAP error is fail-open: it neither strikes nor revokes.
+  Where the directory answered for the other accounts, nothing bounded that before, so such an
+  account's sessions could run to the absolute session cap with nobody told. Once
+  `[auth].ad_reconcile_outage_passes` of that account's last twice that many, less one, probes
+  fail this way, the pass
+  raises one `ad_reconcile_aborted` alert with reason `account_unreachable`, under the source
+  `directory-reconciler-unreached:<username>`, and writes an `auth.ad_reconcile_unreached` audit
+  row. On a rolled-up pass, those entering page as one alert under
+  `directory-reconciler-unreached-rollup:<key>`, keyed by those accounts. A whole-directory
+  outage keeps its own alert.
+  CONFIGURATION.md, the `ad_reconcile_outage_passes` row, has the full rule (vault BACKLOG #3100).
+- **One rollup of unreachable accounts cannot silence a later one.** The notifier keys its
+  re-alert cooldown and an operator's suspend by type and source. Under one shared rollup source,
+  inside the cooldown of the last rollup sent, or while any rollup was suspended, a later rollup
+  would page nobody: at least one account entering after five or more were paged, and a later
+  rollup of other accounts. A rollup now counts only the accounts entering on its own pass, so
+  one account entering after a rollup pages under its own name. Each rollup pages under
+  `directory-reconciler-unreached-rollup:<key>`, keyed by the accounts entering, so it is its
+  own instance, and an INFO line logs the key. A cooldown or suspend reaches only a later
+  rollup of the same accounts; a set that differs, even one of accounts paged before, pages.
+  These instances have no inverse, so the notifier keeps a rollup's in-memory cooldown and
+  occurrence count for the 1024 rollups emitted most recently only; an older one pages on its next
+  emit at the base escalation tier, as after a restart. At startup the notifier seeds suspends from
+  the live instances suspended past now, so unsuspended instances no longer crowd one out of its
+  read; that read still holds at most 1000, and one that fails seeds none. To match every
+  unreachable-account alert, an `[alerts]` rule names `directory-reconciler-unreached*` (vault
+  BACKLOG #3100 item 14).
+- **The subprocess sandbox narrows two forged-answer routes.** Under `[sandbox].mode` `subprocess`
+  or `isolated`, the engine now checks again, right before it writes a request, for a frame the
+  worker was not asked for. A frame already queued while the request was encoded is found there
+  and handled as one found before the request, so the message is retried on a fresh worker
+  unless the dispatch has spent its one retry. The worker also moves its request pipe off fd 0
+  before it reads its boot frame, so a process a Handler starts with `subprocess` no longer
+  inherits the pipe on fd 0. Other routes to the pipe remain, at least a POSIX `fork` with no
+  `exec`, `/proc/<pid>/fd` on Linux, handle duplication on Windows, and on Windows a second
+  inheritable handle a virtual environment's `python.exe` launcher gives the worker; see
+  [ADR 0087](docs/adr/0087-sandbox-subprocess-isolation.md). (`BACKLOG #3135`)
+- **The 0.5.2 notes listed only some of the directory grants of Administrator that raise no
+  `administrator_granted` alert.** The directory can make an account an Administrator by adding it
+  to a group already mapped to that role. Its next sign-in, or a directory reconciler pass when the
+  account holds a live session, raises the alert, but at least these cases raise none. A sign-in
+  that sees the grant first and fails with a server error after the revoke and the notice, for
+  example in the session mint, loses the alert, because the retry gains nothing. A reconciler pass
+  that the mass-revoke breaker aborts writes no roles. An account that never signs in again raises
+  nothing when no pass reaches it, for example because it holds no live session or
+  `[auth].ad_session_recheck_seconds` is 0. The 0.5.2 entries for vault BACKLOG #2610 and #3141
+  both missed the `ad_session_recheck_seconds = 0` case. A site that relies on this alert should
+  also watch membership of the mapped group in the directory itself. The list is kept in
+  [SECURITY.md](docs/SECURITY.md#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235),
+  *A directory grant*. (`vault BACKLOG #3141`)
+- **A directory error at a Kerberos or federated sign-in no longer writes its text into the audit
+  trail.** The `auth.login_error` row both sign-ins write for a directory error stored the error's
+  text, which can carry what the caller or the directory chose, such as a referral's host or a value
+  read after the Kerberos step accepted the caller's token. The row now holds the closed reason
+  `directory_error`, and no text: at least the error's type, the type of any error behind it and the
+  interpreter error an ldap3 socket error merges in, and for an unanswered operation its integer
+  result code, ldap3's name for that code and the engine's own name for the operation, such as
+  `service-account bind` or `user search`. A fault raised during a directory lookup, other than one
+  ldap3 raised while reading the directory's response or a network error saying the directory was
+  not reached, is now logged at ERROR as an engine defect, naming the module, line and function,
+  where it read as a plain outage at WARNING; it still fails the sign-in closed. (`BACKLOG #3196`,
+  `BACKLOG #3727`, `BACKLOG #3017`)
+- **A federated callback's age stops when its flow is consumed.** The ASVS 2.4.2 floor on the
+  step-up's start-to-callback pair read the callback's age only after the two store reads that
+  name the refusal's account, so a slow store counted as the person's time and could carry a
+  too-early callback past the floor. The flow cache now stamps the instant it consumes a flow, and
+  the age on both federated legs runs to that instant, so at least the store reads after the
+  consume no longer count. The code exchange never counted: both legs read the age before it.
+  (`BACKLOG #3221`)
+- **An `env()` value of `false` now turns off `Ftp(tls=...)` and the `with_*` composers'
+  `enabled` flags.** On `with_smart_backend` and `with_oauth2_client_credentials`, an uncast or
+  `str`-cast `env()` handed the reader the text `false`, which it took as true. `Ftp(tls=env(...))`
+  chose FTPS whatever the value said, `cast=bool` included. Both now read the strict boolean
+  spellings, as does `with_signing`'s flag. An `Ftp` `tls` that resolves to `None` still chooses
+  FTPS: only a false spelling turns TLS off. An unknown spelling is refused when the connection is
+  built, with the value withheld. So is a CA beside a plain-FTP hop that the resolved `tls` turned
+  off. See
+  [CONFIGURATION.md](docs/CONFIGURATION.md). (vault `BACKLOG #3234`, `#3724` item 1)
+- **A code-first boolean setting written as a string or a number now stops the load.** A
+  connector read `persistent="false"` or `tls_allow_expired="no"` with `bool()`, as true. Any
+  setting a factory types `bool`, and a `with_*` composer's `enabled` flag, must be `True` or
+  `False` in a graph the loader validates; most also take an `env()` reference, and most take
+  `None` for the setting's default. The SMART
+  and OAuth2 composers' `enabled` now refuse `None`, which had read as off; `with_signing`'s had
+  always refused it. `Ftp(tls=None)`, which had meant plain FTP, is refused too, and the
+  hop-policy flags refuse `None` as they did before. A `capture_response` written beside
+  `reingress_to` is judged as written, before the desugar sets it on. A DICOM listener's
+  `require_called_ae_title=None` now reads as its default, on. (vault `BACKLOG #3234`)
+- **A flag `inbound()` or `outbound()` takes itself, written as anything but a real bool, now
+  stops the load.** At least `simulate`, `deployed`, `auto_start`, `inline`, `capture_ack` and
+  `capture_connection_errors` were read by truthiness, so `simulate="false"` turned on simulate
+  mode and suppressed every send. `strict` was stored through a model that read `"false"` as
+  false, but the checks on a non-HL7 inbound and on a `Loopback()` or `PassThrough()` inbound read
+  it by truthiness and refused the connection as if strict were on. Any value that is not `True`
+  or `False`, such as a string, a number or an `env()` reference, is now refused when the
+  connection is declared. `None` is refused too, except on `capture_ack` and
+  `capture_connection_errors`, where it means inherit. `connections.toml` already refused a quoted
+  value for the ones it takes; `inline` is not one of them. (vault `BACKLOG #3234`)
+- **A boolean setting changed after the load, or in a graph built in code, now stops its build.**
+  A connection's, lookup's or reference set's build refuses a non-bool literal on a boolean
+  setting before its `env()` references resolve, as the load does. A raw `cleartext_accepted`,
+  `tls_revocation_attested` or either reason in a connection's transport settings is refused, at
+  the declaration and at the build; an outbound's build had dropped it without a word. (vault
+  `BACKLOG #3234`, `#8253` item 2)
+- **Edit-resend spends its proof when the engine refuses it with a 403, 404 or 409.** These
+  refusals used to give the action proof back when they came before the message-store write, so
+  one proof could try any number of targets and learn from each answer whether the target was out
+  of scope, unknown or unable to take the write. They now keep the spend, and the next request
+  needs a new re-authentication. Any other refusal before the store write, such as a 400 or an
+  ingress guard's 413, 415 or 422, still gives the proof back. In direct mode the guard now runs
+  before the target's registry checks.
+  [ADR 0197](docs/adr/0197-cap-repeated-lock-cycles-on-one-account-without-making-malicious-lockout-cheaper.md)
+  Amendment D records the owner's ruling and, under *The order of the checks*, the order of the
+  checks in each mode. (vault `BACKLOG #3241`)
+- **Three more routes from a codec error to a log line are closed, within the attribute budget.**
+  An exception whose own `__str__` or `__repr__` printed a dunder-named slot, an attribute of a
+  plain exception it held, or a link of its `__cause__` and `__context__` chain would have printed
+  a codec error, whose text names the character or byte the codec could not handle and whose
+  `repr()` carries the whole input, either of which can be message content. The walk now reads
+  those too, after the reads it made before, so an error the earlier reads found still gets the
+  fixed note, except on a traceback link that takes a verdict handed on to it instead. The new
+  reads run on what budget the earlier reads left and, in a traceback, also within a budget that
+  the new reads of all its links share, approximately; the `_ScanShare` docstring gives the exact
+  accounting. In a traceback, a verdict that one link's scan reached about a later link can be
+  handed on to that link, which then makes no reads of its own. Where the new reads
+  take an exception's instance `__dict__` and its class puts a property or `None` under that name,
+  which the earlier reads skip, they read it through the builtin descriptor, so an error held
+  there that its own code prints would get the note within the budget those reads left. Past the
+  budget, an error only the new reads would reach still prints raw. An exception found holding one
+  prints as its class and a fixed note in a traceback, as a log argument and in `safe_exc()`, so
+  one whose `__str__` or `__repr__` is not a builtin exception's can lose its message when it is
+  raised from a codec error or while one is being handled, `from None` included. A
+  `UnicodeError`'s traceback now prints those of its own notes that read exactly like the note a
+  codec adds itself, each naming the codec only when its name is one `safe_exc()` can print, where
+  before it printed none of its notes; every other note is still dropped, plain text included,
+  since a caller can build one from the failing input. (`BACKLOG #3340`)
+- **A passkey is now a way past a sign-in lock.** Passkey registration requires a
+  discoverable credential and records whether the browser made one. A local account whose passkey
+  is discoverable can sign in with its password and the passkey together, through a usernameless
+  ceremony on the sign-in page, while a lock that wrong passwords set is live, as an account with an
+  authenticator app already could with its code. Under `[security].require_mfa` such a passkey may
+  now be an account's first factor and counts as its way past the lock, so a holder no longer has to
+  enrol an authenticator app to change a password, and may remove the app while a discoverable
+  passkey remains; the last discoverable passkey cannot be removed while no app remains. Breaking,
+  stated because it is: an authenticator that cannot store a discoverable passkey, such as an older
+  security key, can no longer be registered. Passkeys registered earlier are not discoverable and
+  give no such way past.
+  (`BACKLOG #3373`)
+- **A federated step-up flow names the user who started it.** The flow staged by
+  `begin_oidc_step_up` now carries that session's user id, and `PendingFlow` refuses a step-up
+  flow that has a session hash and no user id, or the reverse. `AuthService.oidc_step_up_flow`
+  returns the user id and the staged continuation, as an `OidcStepUpFlow`, without consuming the
+  flow. It replaces `oidc_flow_is_step_up`. The console's OIDC callback uses it to charge an IdP
+  step-up's return to a per-user key of the re-authentication limiter rather than the shared
+  sign-in budget, so a sign-in flood could no longer refuse a federated step-up's return on a
+  deploying site. (`BACKLOG #3374`)
+- **`GET /alerts/rules` gives a channel-scoped caller every rule's `id` as null.** The id is the
+  operator's free-text label, so an `[alerts]` rule the caller may see could carry a connection
+  name outside its scope, and on a first deployment the caller would have read it there. An
+  all-channels caller still reads every id. The web console's flag route now answers a scoped
+  caller's bad direction with the audited 403 rather than an unaudited 404; that entry is in the
+  console's own changelog. A scoped caller's flag request refused for its direction now writes its
+  `auth.channel_denied` row with `"flag_direction_not_inbound": true` in the detail, so a row
+  naming an in-scope inbound is told apart from one asked of the wrong engine shard. The JSON
+  route still answers a direction other than `inbound` or `outbound` with a 422 and no row.
+  (`BACKLOG #3378`)
+- **`GET /alerts/rules` shows a channel-scoped caller only rules on its in-scope inbounds.** The
+  filter used to test only whether each name was in the scope. It never asked which side of the
+  graph a name was on. So a scope naming an outbound read that outbound's rules, while the flag
+  route refuses every outbound to such a caller. On a first deployment that would have shown
+  them. The route now shows such a caller a rule only when each name it carries is in its scope
+  and in the config's inbound names, and is not also an outbound the runner knows, a draining one
+  included. It never shows it a `restart_outbound` rule, or a rule whose event type only an
+  outbound raises, such as `message_stall`, a `"*"` rule included, nor a `"*"` rule of a type
+  both sides raise, or of `any`. An event type or action with no recorded side is withheld
+  too. With no graph loaded it shows it no rule that names a connection. The alert-instance routes are unchanged. [SECURITY.md](docs/SECURITY.md), in
+  the `GET /alerts/rules` paragraph, says what such a caller reads and who decided it.
+  (`BACKLOG #3378`)
+- **The channel-scope write's self-target refusal is reachable on its own, so the web console runs
+  it before its form checks.** The engine's console seam gains
+  `AdminHandlers.refuse_own_channel_scope`, the same refusal `PUT /users/{id}/channel-scope` runs.
+  The console's `/ui/users/{id}/channel-scope` calls it first, so a malformed post aimed at the
+  caller's own account is refused and written to the audit log as `auth.self_target_refused`,
+  rather than answered by a form error with no row. The JSON route is unchanged: a body that fails
+  `ChannelScope` is still answered 422 before the guard runs, with no row. The seam digest moved,
+  so a console from either side of this change is refused at mount. (`BACKLOG #3393`)
+- **The JSON API carries the offer to end your other sessions after a factor change.**
+  `POST /me/mfa/confirm` returns `other_sessions` beside the recovery codes, and `DELETE /me/mfa`
+  now answers with `MfaDisableResponse`, `detail` and `other_sessions`, where it answered
+  `SimpleMessage`. The number is how many sessions `DELETE /me/sessions` would end, read after
+  the change, and 0 for a disable of TOTP that was never on (ASVS 7.4.3, BACKLOG #1147). Nothing
+  ends unless the client asks. `EngineClient.confirm_mfa` returns `MfaConfirmed`, the codes and
+  the count, where it returned the codes alone, and `EngineClient.disable_mfa` returns the reply.
+  The count is the store's own `count_user_sessions`, which reads the clause the revoke runs, so
+  it includes a session gone idle that was never revoked; the console's offer now uses it too.
+  `AuthService.disable_mfa` returns whether TOTP was on. The seam digest moved. (`BACKLOG #3393`)
+- **A group-wide save that would end your own sessions now asks you to re-authenticate for it.**
+  Saving either AD group map, and editing or deleting a custom role, ends the sessions of every
+  account the save reaches, which can include your own. On the login window alone that was a mass
+  sign-out with no fresh proof (ASVS 7.5.2). Such a save now takes a single-use re-authentication
+  bound to `save_ends_own_sessions`, on the JSON API and the console. A re-proof from a session
+  that has not yet passed its second factor does not count. A save that ends none of your own
+  sessions keeps the session window, as before. The save still ends your own sessions, so the
+  change applies to you at once; the console then sends you to the sign-in page with a note. The
+  saves are not refused, so an Administrator whose only account is a directory one can still edit
+  the maps. See [SECURITY.md](docs/SECURITY.md). (`BACKLOG #3401`)
+- **Under `[security].enforcement = "enforce"`, `serve` and `supervise` would now refuse an
+  operator's own key file that a broad group can read, or on POSIX any group or other account.**
+  That is `[api].tls_key_file`, or `[api].tls_cert_file` when the key is in the certificate PEM,
+  beside the store key file and the generated TLS key they already checked. A connection's key file
+  is graph data, so the engine checks it each time it is about to run a graph: at the start, on
+  every reload that applies one, and on a DR activation. The check uses the `env()` values that load
+  resolves and reads the files off the event loop. It covers at least `tls_key_file` on MLLP, the
+  HTTP listener, DICOM and FTPS, and `Soap(client_key_file=...)`. A refused reload or activation
+  would keep the running graph, and `supervise` would refuse such a graph before it starts an engine
+  shard. A dry-run reload checks nothing, since it starts no connection. Under `"warn"` each finding
+  is a warning. A Kubernetes Secret volume serves its files group-readable through `fsGroup`, so
+  the shipped manifests `docker/k8s/statefulset.yaml` and `docker/k8s/ha-postgres.yaml` now mount
+  the Secret on a `copy-tls` initContainer only, which copies the API pair into a memory-backed
+  `emptyDir` at `0600` for the engine. A rotated Secret then reaches the engine on a new pod, not on
+  a restart of the engine container. `docker/compose.yaml` says a bind-mounted key must be owned
+  by uid 10001 at `0600`. See [PHI.md](docs/PHI.md), *Key files*. (`BACKLOG #3402`)
+- **A channel-scoped read of `GET /alerts/rules` that withholds at least one rule would now write an
+  `alert_rules_withheld` audit row.** The row holds two counts, shown and withheld, and no rule
+  contents. The console's alerts page reads the rules through the same handler, so its loads write
+  the row too. The write is best-effort: a lost row is logged at ERROR, and a store refusal
+  leaves the read answering. See [SECURITY.md](docs/SECURITY.md). (`BACKLOG #3403`)
+- **The `/ws/stats` live feed would now record why its per-frame re-check stopped it.** The feed
+  asks again about the caller's standing before every frame and closes with 1008 on a refusal. That
+  close used to write no audit row, so a feed ended by an unmet second factor or a missing
+  notification address left no trail. Now, after the close, the feed writes one `ws_stats.stopped`
+  row. The row holds the frames sent and a reason such as `mfa_unmet`, `notify_email_due` or
+  `session_ended`, and never the token. A row the store refuses is logged at ERROR. A sign-out or a
+  step-up with the dashboard open usually records `session_ended`. A feed that ends another way
+  writes no row: at least a client disconnect, a failed stats read and a cancellation. See
+  [SECURITY.md](docs/SECURITY.md). (`BACKLOG #3404`)
+- **The send-time proxy credential rule reads one more spelling of `Proxy-Authorization`.** A
+  header name of the plain name, then a character no header name can hold (at least a NUL, a
+  space, a tab, a slash or a comma), then more text, was another header to the rule. `http.client` sends such a name as written, so a static header keyed that way
+  would have reached a cleartext proxy, a `CONNECT` tunnel or the destination with no refusal.
+  It is now read as the proxy header and refused like any other spelling, and the build-time
+  refusal of a static `Proxy-Authorization` beside `proxy_user` refuses it too. Text around the
+  plain name may be a credential typed into the key, so that refusal withholds at least the
+  letters, digits and punctuation other than a colon beside it, and names them as more text;
+  `proxy_credential_header_name_shown` in the same file says what it shows. No proxy product
+  was measured reading such a name; RFC 9112 section 5.1 puts the colon straight after the field
+  name, so a parser that stops a name at the first character a name cannot hold reads the plain
+  name there. The rule is stated on
+  [`ProxyCredentialsRefusedError`](messagefoundry/transports/bounded_read.py).
+- **Proxy credential refusals say what is wrong.** A header spelled other than plainly is
+  refused in its own words, which say to remove or rename the header, rather than in the
+  cleartext text,
+  which named cleartext on a verified TLS leg and pointed at the proxy URL. The text for a header
+  `http.client` can never send no longer says to correct the name when the value may be at
+  fault. A plain `Proxy-Authorization` whose value `http.client` refuses with a `ValueError` now
+  fails, still as a `ValueError`, in fixed text, where that library's own text quoted the value,
+  which is the credential. A kept verdict on a header no longer prints its name or its value in
+  its `repr`.
+- **The Vault hop refuses an encrypted client key before the TLS library reads it.** hvac takes a
+  client certificate from `VAULT_CLIENT_CERT`, and a key from `VAULT_CLIENT_KEY` when that is set.
+  With no key file, OpenSSL read the key out of the certificate file. An encrypted key there made
+  it ask for a passphrase and wait. Each new Vault connection now checks the key first. It refuses
+  a key that is encrypted, unreadable or over 1 MiB, with fixed text that names no path. An
+  unencrypted key loads as before, now with an empty passphrase, so a key swapped in after the
+  check fails at once instead of waiting. (`BACKLOG #3458`)
+- **The leak-check refuses a dashed SSN or phone that the field separator cut across fields.**
+  Under a field separator of `-`, a line such as `ZZZ-1-123-45-6789` holds the number as three
+  fields, none of which holds the shape, so `anonymize_checked` emitted it on both anonymizers.
+  Both `leak.py` copies now also read each line as written, and refuse such a shape when at least
+  one field it spans is one no rule maps. Under `-`, numeric fields side by side that read as such
+  a shape are refused too. What still passes, at least: the rest of a shape whose first or last
+  part a rule scrubbed, an escaped separator (`\F\`), a digit field separator, and the header
+  line. [PHI.md](docs/PHI.md) section 9 lists them. (`BACKLOG #3465`)
+- **The hops built before the trust-anchor start check now take it first.** `serve` and
+  `supervise` check `[logging].forward_tls_ca_file` before they build the log forwarder. A CA
+  another account could replace, or one the engine cannot read, now builds no forwarder, so no
+  record is sent. `serve` logs that forwarding is off, and its audited start check then refuses
+  the start, with an audit row when it can read the file. `supervise` did not check the CA
+  before. It now refuses on stderr before any engine shard spawns. `serve` also checks the CA its
+  alert email reads before it builds the alert notifier. That is `[alerts].email_tls_ca_file`, or
+  the `[tls].internal_ca_file` it falls back to. A refused CA builds no email transport, and no
+  alert is suppressed for it. A rule that sent only by email uses the other transports, or, with
+  none, the log. The audited start check then refuses the start. The offline recovery commands
+  check the relay's CA too. A refusal there drops the security notice with a WARNING, and the
+  recovery goes on. Under `[security].enforcement = warn` an exposed or unjudged CA warns and goes
+  on, but a file that cannot be read still refuses. (`BACKLOG #3470`)
+- **A store key file that unprotects to bytes that are not ASCII is refused without printing any
+  of them.** The refusal quoted the first such byte, so `audit-verify`, `audit-anchor`,
+  `admin-unlock` and `admin-set-notify-email` would have printed a byte of the key. The key file
+  now refuses with fixed text that names the file, and the store cipher build renders a
+  `ValueError` that is or carries a codec error without its bytes and without its chain. A store
+  key with a character that is not ASCII no longer carries the codec error naming it on the
+  cipher build's refusal either. `restore` and `restore-verify` decode their keyring separately and
+  are not covered by that. (`BACKLOG #3471`)
+- **A Vault client the store key provider cannot build is a key-provider refusal, and `backup`,
+  `restore-verify` and `restore` exit 2 on a key-provider, key-file or cipher-settings error.** A
+  bare `ValueError`, `OSError` or `re.error` from the build left the provider as itself, and those
+  three commands had no arm for such an error at all, so each reached the dispatch floor and
+  exited 1, which `restore-verify` gives a failed archive. The store's key resolution then raises a
+  new refusal with a fixed text that names the key settings, raised after its handler has exited, so
+  neither the build error's own text nor its cause is printed there. The KV secret provider's and
+  the Transit cipher's client builds are not changed. (`BACKLOG #3471`)
+- **Only the Vault hop's own marked refusal keeps its text** in `provision-admin`'s secret
+  provider arm, in both Vault client builds and in `check-privileges`' Vault probe. Any other hop
+  refusal is named by its type there, as the Vault providers' other handlers already did. The AD
+  bind probe names an LDAPS revocation refusal with a fixed text and no longer prints it
+  (`BACKLOG #4883`). (`BACKLOG #3471`)
+- **`restore` and `restore-verify` exit 2 on a hop refusal at the store key seam.** That refusal
+  was a plain hop refusal, which neither command's key arm caught, so each reached the dispatch
+  floor and exited 1. It is now also a key-provider refusal, with the same fixed text, so it takes
+  the key arm. (`BACKLOG #3471`)
+- **`check-privileges` reads a refusal's text without running the error's own code.** A class
+  with its own `__str__`, or a refusal whose arguments are not one string, is named by its type.
+  The AD bind probe gives the LDAPS revocation guard's fixed text only to a refusal raised by the
+  guard's own call. (`BACKLOG #3471`)
+- **`[store].encryption_key` and `[store].encryption_keys_retired` are out of the store settings'
+  printed form**, and the store cipher build keeps no key in its frame once it fails, so a
+  renderer that prints a traceback's locals prints neither key. `[store].password` is still in
+  that form. (`BACKLOG #3471`)
+- **A store key rotation no longer moves the secret-rotation fingerprints.** Each fingerprint of a
+  non-DEK secret is now a store-cipher cell holding a random key per row and the secret's keyed MAC
+  under it, and `messagefoundry rotate-key` re-seals it under the new store key. Before this, the MAC
+  key was derived from the store key, so the first engine start after a rotation could not tell an
+  unchanged secret from a rotated one unless it still held the retired key, which the Windows service
+  never does. A secret rotated together with the store key then kept its old date, and under
+  `[security].enforcement = enforce` with that secret in
+  `[secret_rotation].enforce_secret_expiry_classes` it could still refuse the start. That start no
+  longer needs the retired key. A fingerprint written by an earlier release, or one the engine cannot
+  open, keeps its secret's dates and is replaced by a sealed cell, so it never resets a clock.
+  `vault_transit` stores still fingerprint no secret. See ADR 0213.
+  (`BACKLOG #3472`)
+- **`serve`'s dual-control advisory also fires for a narrowed held list.** On an exposed instance
+  it warned only while `[approvals].enabled` was off. With dual control on and an
+  `[approvals].operations` list that leaves out a default operation, or holds none, the left-out
+  actions still complete on one caller's authority, and it said nothing. It now warns there too,
+  naming what was left out, in the words `security show` and `GET /security/posture` use. It still
+  only warns. (vault `BACKLOG #3474`)
+- **An identity holding `messages:view_raw` without `messages:view_summary` is refused when it is
+  built.** The rule that a role reading whole bodies also reads the summary is judged per role, so
+  it reaches a user only while each identity is built from whole roles. Nothing checked that.
+  `Identity.build` now refuses a set of that shape, which whole roles cannot produce, and a test
+  pins its callers to whole roles. No built-in role and no role the engine mints has that shape.
+  (vault `BACKLOG #3474`)
+- **The anonymizer's leak-check now scans what a retarget of a default field leaves past its
+  first component.** A punctuated phone number or a dashed SSN left there refuses the message,
+  including in a segment the message's HL7 version does not define; a name, a city or a year
+  left there still passes. `python -m tee anonymize-captures` tells such a refusal to point the
+  field back at its default kind, not to add a keep. An overlay field number now has at most
+  three digits, and the overlay's file path is printed with unprintable characters escaped.
+  (`BACKLOG #3493`)
+- **No `OBX-5` value is kept under a whitespace separator.** A space is how words and digit groups
+  are written apart. So a message that declared a space as its repetition separator split
+  `000 12 3456` into three valid numbers under `NM`, and a sentence into bare tokens under `ID`,
+  `IS`, `CE` or `CWE`, and either would have left whole. A message whose component, repetition or
+  subcomponent separator is a whitespace character now keeps no numeric or coded `OBX-5` value.
+  A `DT` or `TS` value still takes the `date` kind, which [PHI.md](docs/PHI.md) section 9
+  describes under that separator. The vendored `tee/anon/surrogates.py` copy changes the same
+  way. (vault `BACKLOG #3493`)
+- **A `TM` value in `OBX-5` with a time-zone offset is no longer kept.** The `TM` grammar took an
+  offset after the time, so a date written `YYYY-MMDD`, such as `1945-0612`, read as 19:45 at
+  -06:12, and a phone number written `212555-0100` read as a time and an offset. Both would have
+  left whole. An offset can also name a small region, which is why the `date` and `dob` kinds
+  never keep one (vault `BACKLOG #2767`). A `TM` value with an offset now becomes `[REDACTED]`;
+  a time of day without one is kept as before. The vendored `tee/anon/surrogates.py` copy changes
+  the same way. (vault `BACKLOG #3493`)
+- **The CRL signature check at start keeps a proof it has reached, and the reload warns before a
+  restart that would fail.** For each class whose remedy names a restart, `restart`,
+  `unproven_signature` and `uncheckable_signature` among them, the reload's reason and the alert's
+  `start_refuses` now say a start refuses a CRL file not yet in effect "at least until" its CRL
+  takes effect: a start can still refuse it after then for another reason.
+  If the check fails part way through a file, a CRL it already proved badly signed
+  still refuses the start, beside the ERROR; before, the whole judgment was dropped and that CRL
+  loaded. A listed CA whose serial number is not positive, as at least some system roots have, is
+  now read by the signature check with no `cryptography` warning, including one that names that
+  serial again in its own authority key identifier, and so is a CRL whose authority key
+  identifier carries such a serial. Where warnings are errors, that warning used to end the
+  check, and later made the check skip that CA; such a CRL made a start fail with the raw warning
+  rather than a refusal that names the file. So a proof against that CA's key now refuses the
+  start, at least where the engine can read both the CA and the CRL. A CRL file naming a general
+  name `cryptography` does not support, such as its CA's issuer as an x400Address, now refuses
+  the start with a reason that names the file; before, the start failed with the library's own
+  error. The reload now refuses such a file as one to fix, where it retried it every pass. Such a
+  CRL inside a CA file is still loaded unjudged at a start, and the expiry check of that CA file
+  is unchanged; `docs/CONFIGURATION.md`, under `[cert_monitor]`, says what it reports.
+  The issuer name the
+  signature check and the reload's not-in-effect caveat quote is bounded: its quoted form,
+  escapes included, holds at most 200 characters, and a note of the name's full length follows a
+  cut one. The 0.5.2 entry said a start refuses a CRL whose named key "did not sign it": it
+  refuses only where the engine ran the check with that key and it failed, so a signature of
+  another kind than the key loads with a WARNING. (vault BACKLOG #3506)
+- **No declaration carries a recognized HTTP-family credential across cleartext http.** `Rest`,
+  `Soap`, `FHIR`, `DICOMweb` and `FhirLookup` refuse a credential over plain `http` to a host off this
+  machine, with no escape. Neither `tls_hop_attested` nor `cleartext_accepted` lifts it; a
+  loopback host still does. The rule covers the OAuth2 and SMART token requests, HTTP Digest and
+  SOAP WS-Security as well. Its credential test now counts the credentials the
+  `verify_tls = false` refusal counts, header names in any case, so a static API-key header or a
+  credential-shaped value under a neutral name is refused too. It does not take that refusal's
+  header-name allowlist. So a header with a neutral name, such as `X-Session`, still crosses a
+  declared cleartext hop. That includes a secret in it that is not credential-shaped. The owner
+  ruled on 2026-10-28 to accept that limit, and
+  [SECURITY-LOOSENING.md](docs/SECURITY-LOOSENING.md#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine)
+  says why and defines which values are credential-shaped.
+  A static `Proxy-Authorization` is left to the send-time proxy rule only when the connection's
+  own proxy setting takes the request. A hop can bypass a configured `proxy_url` through at least
+  `proxy_no_proxy`, urllib's own bypass list, or a `"default"` with no system proxy for the
+  request's scheme. The refusal above then judges the header too. A header key that holds
+  whitespace or is shaped like a credential is not shown as written in the refusal text. Owner ruling
+  2026-10-26, recorded as a dated amendment to
+  [ADR 0153](docs/adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md).
+  The forward-proxy login stays under one declaration, `cleartext_accepted` with a reason, by the
+  owner's rulings on that credential; `docs/CONNECTIONS.md` states them. (`BACKLOG #3533`)
+- **A Handler's per-message headers meet the hop's header rule at send.** On a
+  `verify_tls = false` hop, a header stamped under `dynamic_headers` must be `Accept`,
+  `Content-Type`, `User-Agent` or `X-Request-ID` with no credential in it. Over plain `http` off
+  this machine, it must hold no credential the refusal recognizes. Otherwise that one message is refused permanently and
+  dead-lettered, and the lane goes on. The send-time hop check runs first, so a hop that is no
+  longer permitted still stops the lane and keeps the row. The refusal names the connection and
+  how many headers it refused, never a header's name or value. (`BACKLOG #3533`)
+- **A `verify_tls = false` HTTP-family hop now refuses any static header outside a short
+  allowlist.** The allowed names are `Accept`, `Content-Type`, `User-Agent` and `X-Request-ID`.
+  Until now a secret under a neutral name, such as `X-Session`, crossed that hop, because the
+  refusal read only names that look like a credential. The REST, SOAP, FHIR, DICOMweb and
+  `FhirLookup` hops all apply it, and a credential-shaped value under an allowed name is still
+  refused. A secret in the URL still crosses where the refusal cannot see it. A secret in the
+  path crosses, because the engine cannot tell it apart from a legitimate path. A secret in a
+  query parameter with a neutral name, such as `?sid=`, crosses too. See
+  [SECURITY-LOOSENING.md](docs/SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer).
+  (`BACKLOG #3533`)
+- **The AI broker refuses a plain `http` endpoint in every case.** Every call sends
+  `[ai].api_key`, and `MEFOR_ALLOW_INSECURE_TLS` at `[security].enforcement = warn` used to
+  release that key over `http`. No escape does now; use an `https` endpoint. (`BACKLOG #3533`)
+- **A plain `ldap://` AD bind is refused at every posture, and `[auth].ad_allow_insecure_ldap`
+  is removed.** The opt-in released that bind at `[security].enforcement = warn`, which sent the
+  service-account and user passwords in cleartext, while verify-off LDAPS was already refused with
+  no escape. A config that still sets the key is refused at load, by name. Use an `ldaps://`
+  `ad_server`, and pin a private CA with `ad_tls_ca_cert_file` if the directory needs one. See
+  [SECURITY-LOOSENING.md](docs/SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer).
+  (`BACKLOG #3533`)
+- **An `[alerts]` SMTP login never crosses a hop that does not authenticate the relay.** With
+  `[alerts].email_username` set, `email_use_tls = false` or `email_tls_verify = false` is now
+  refused at load, at every posture. `[security].allow_unverified_alert_smtp_tls` still permits
+  such a hop with no login, but it no longer lets the SMTP AUTH password cross. See
+  [ADR 0029](docs/adr/0029-email-smtp-destination.md). (`BACKLOG #3533`)
+- **An SFTP password login would no longer trust a host key the escape accepted for another
+  login.** Under `MEFOR_ALLOW_INSECURE_TLS`, a key-only login accepts an unknown host key. In the
+  shipped code, paramiko also saves that key into the connection's `known_hosts` file. A password
+  login naming the same file would then trust that server and send it the password, though it
+  never takes the escape. The connector now only reads `known_hosts` and never writes it. The
+  accepted key is pinned in memory for that connector's later logins, so a changed key is still
+  refused, and a `known_hosts` entry for the host wins over the pin. A new connector starts with
+  no pin; [CONNECTIONS.md](docs/CONNECTIONS.md) says when one is built. (`BACKLOG #3533`)
+- **An alert webhook over plain `http` is refused, with no escape, in every posture.** The URL can
+  carry the hop's credential as a path token, so `[alerts].webhook_url` must be `https`.
+  `MEFOR_ALLOW_INSECURE_TLS` at `[security].enforcement = warn` used to let an `http` URL build.
+  A `?code=` query parameter, such as an Azure Functions function key, now counts as a credential
+  for the HTTP-family `verify_tls = false` refusal and the off-box plain `http` refusal. The
+  query-credential warning and `check` still leave it out. A boolean transport setting written as
+  an empty string, such as `tls_verify = ""`, no longer turns a default-on TLS check off: a literal
+  one, or an `env()` value that resolves to one, is refused at load (vault BACKLOG #3533 items 5, 7 and 11).
+- **Settings load now refuses an `[alerts].webhook_url` the alert notifier's build would refuse**
+  on the checks that need no posture, so `messagefoundry check` and the `serve` pre-flight refuse it
+  too. That covers at least a non-https scheme, a credential in the URL, a URL that does not parse
+  or holds a space, control character or non-ASCII character inside it (before the last `#`,
+  after which nothing is sent), a URL that names no host,
+  a host off a non-empty `webhook_allowed_hosts`, and an over-length URL; the load check and the
+  build call one function for those checks. A command that loads settings, such as
+  `provision-admin`, now stops on such a URL; before, `provision-admin` dropped an http webhook
+  with a WARNING and ran. These refusals do not repeat the URL, whose path can carry the webhook's
+  token; the allowlist judges, and its refusal names, the host percent-decoded and lower-cased, as urllib decodes it before it dials, against entries decoded the same way; a decoded host holding a space, control or non-ASCII character is refused. The WARNING the
+  alert notifier logs for a failed webhook send now names the exception's class, and for an
+  `HTTPError` its integer status code, with no message and no traceback, since a send's exception text can quote the webhook URL; the other
+  transports still log their exception and traceback. The static-credential
+  report now lists `settings:alerts.webhook` as a static credential rather than as none (vault
+  BACKLOG #3533 items 14 and 24).
+- **A config snapshot treats a Windows share it cannot reach as a fault, not an absent path.**
+  Windows errors 53 and 67 reach Python as a `FileNotFoundError`, so a config directory, a
+  `codesets/` or `environments/` folder, or a module on such a share read as absent. A digest that
+  gates a dual-control release would then have gone on without those files. A strict read now
+  raises. An ordinary read records the path in the snapshot's `unreadable`, and the fingerprint
+  detail reports that as `unreadable_files`. A start or reload refuses when that path is one the
+  load reads, a `codesets/` folder included. Where the target directory still answers, a folder or
+  file on such a share refuses a release as `digest_unavailable`. A reload whose target directory
+  is on such a share answers 422 `unreadable` at the target check, where it answered 404
+  `not_found`. A value file read from disk still reads as absent there. (vault `BACKLOG #3535`)
+- **A load judges its config directory by listing it, so a share lost after a reload's target check
+  is no longer called missing.** The load's own directory check, and `validate_config`, which
+  `messagefoundry check` runs, asked `Path.is_dir`, which answers `False` for a share Windows cannot
+  reach as it does for a parent the service account cannot traverse. The load's check then dropped a
+  fault the read had recorded. Now a load refuses such a directory with `could not read .`, a strict
+  read raises the fault, and `validate_config` reports a read that failed, not a missing directory.
+  So at least a share lost after the target check, at the directory's own listing or access read,
+  that stays lost refuses a released reload as `digest_unavailable` and an ungated reload as
+  `unreadable` (vault `BACKLOG #5248`), where each answered `not_found`. At least a directory that
+  is absent, or a file in its place, still answers `config directory not found`. So does a drive
+  letter this process does not have, even where it is mapped in another session. A directory that
+  lists while `Path.is_dir` says no is refused too, since the trust check vets nothing there. A
+  load whose trust check cannot list a folder is refused the same way, where a reload answered
+  500. (vault `BACKLOG #3535`)
+- **BREAKING: a reverse proxy named in `[api].trusted_proxies` with no declared terminator is now
+  probed at start, and owes the proxy TLS-floor attestation.** That shape is a proxy that
+  re-encrypts to your `[api].tls_cert_file`. The browser's TLS ends at the proxy, so the engine's
+  own `[api].tls_min_version` covers only the proxy-to-engine hop. The rules apply on a PHI
+  instance under `[security].enforcement = enforce`. There `serve` exits 2 without
+  `[security].web_console_public_address`, on a loopback bind too. It also exits 2 when the ASVS
+  12.1.1 probe at that address fails or cannot reach the proxy. On a non-loopback bind it exits 2
+  without `[api].proxy_tls_min_version`, and on loopback or under `warn` it warns.
+  `[api].proxy_intra_service_auth` stays required only behind a declared terminator. A Manager
+  decision under the driver rule, not an owner ruling on the substance. See
+  [CONFIGURATION.md](docs/CONFIGURATION.md#api) and
+  [EXPOSURE-SURFACE.md](docs/EXPOSURE-SURFACE.md). (vault `BACKLOG #3538`, closes `#3102` item 9)
+- **A `FhirLookup()` whose `tls_ca_file` fails its pin, permission or path check no longer stops
+  the whole start.** It is isolated as a lookup that fails to build already is: recorded failed,
+  alerted under `fhir_lookup:<name>`, and every Handler call to it fails closed, while the other
+  feeds start. Nothing is dialled for it, and the check still writes its `auth.trust_anchor`
+  audit rows. A reload or a DR activation still refuses whole while the CA is refused
+  ([ADR 0031](docs/adr/0031-startup-connection-fault-isolation.md), amendment of 2026-11-11).
+  (`BACKLOG #3582`)
+- **A dual-control request that fails its integrity seal can now be rejected, and the approvals
+  list shows it flagged.** Before, such a request could be neither released nor rejected, and with
+  `[approvals].expiry_hours = 0` nothing closed it: it would have stayed open and hidden for good.
+  A reject now moves it to `rejected` through a narrow store write
+  on SQLite, SQL Server and PostgreSQL, guarded in SQL on `status = 'pending'`, so it can never
+  move a row to `executing` or `approved`. The write sets a tombstone seal over the id, the status,
+  the approver and the time only, so the row's changed values are never sealed in, and it commits
+  the `integrity.authority_seal_failed` and `approval.rejected` audit rows in the same transaction.
+  The `integrity_drift` alert follows the commit, once per reject, under its own subject
+  `authority-seal-rejected:<approval id>`. `rotate-key` moves such a tombstone to the
+  active key, so a closed request is not counted as a failed seal on every rotation. `GET /approvals` and the web console list such a
+  request flagged `release_blocked = "seal_failed"`, with its parameters withheld. Owner ruling
+  2026-10-26. See [SECURITY.md](docs/SECURITY.md). (`BACKLOG #3638`, `BACKLOG #3639`)
+- **A directory that stays unreachable now pages.** A directory session reconcile pass whose every
+  probe fails to reach the directory is fail-open: it revokes nothing, so a directory disable or
+  deletion reaches no signed-in session while it lasts. One such pass still pages nobody. A run of
+  `[auth].ad_reconcile_outage_passes` of them (3 by default, at least 2) now raises one
+  `ad_reconcile_aborted` alert with reason `directory_unavailable` under the source
+  `directory-reconciler-outage`, and the first pass that reaches the directory resolves it. The
+  count is in memory, per engine process, and each `auth.ad_reconcile_skipped` row now carries it
+  as `passes`. Before, an outage of any length paged nobody. See
+  [CONFIGURATION.md](docs/CONFIGURATION.md#auth--authentication--rbac). (`BACKLOG #3709`)
+- **An account whose directory probes alternate between answering and failing now pages.** The
+  page for one account the directory keeps failing to answer for counted its probes running, and
+  any answer ended the count, so an account served by one domain controller that answers and one
+  that does not, behind at least DNS round-robin or a VIP, never paged. It now pages once
+  `[auth].ad_reconcile_outage_passes` (K) of the account's last `2K - 1` probes fail, three of the
+  last five at the default, in a row or not: only a failing probe can page, once the window holds
+  K or more failures and the account is not already paged. A lone flake pages only when the
+  window already holds at least K - 1 earlier failures, an outage's or any other. Once
+  paged, the account re-arms when its window holds no failure; its latch also ends when the
+  account signs out of its last session, or the engine restarts, since the latch is in memory.
+  A value above the default does not simply delay this page: some patterns that page at 3 never
+  page at 4, and some page sooner at 4. The page and the
+  WARNING now say how many failed "of up to the last 2K - 1" probes, faults aside, since a window
+  can hold fewer probes and a fault adds nothing to it, and the
+  `auth.ad_reconcile_unreached` row carries that bound as `window_up_to`. No new setting; the
+  knob's meaning for the per-account page changes.
+  CONFIGURATION.md, the `ad_reconcile_outage_passes` row, has the full rule (vault BACKLOG #3709).
+- **The rolled-up unreachable-account alert no longer reads as a total.** Where the accounts
+  entering on one pass whose audit row was written are more than five, they page as one
+  `ad_reconcile_aborted` alert. Its text
+  read "N accounts' sessions are not revoked", counting only the accounts entering on that pass,
+  so a later rollup that updated the open alert replaced the count with a smaller one while more
+  accounts stood. It now names the count as accounts newly unreachable, and counts failures in
+  probes rather than passes. Where refused audit rows leave that count at five or fewer,
+  each written one now pages under its own source rather than in the rollup, and a refused
+  row no longer logs the per-account WARNING. The security
+  loosenings for a longer `[auth].ad_session_recheck_seconds` and a smaller
+  `ad_session_recheck_max_users` now also name the delay to the per-account page.
+  (`BACKLOG #3709`)
+- **The SQL Server store pin takes the audited trust-anchor checks.** On SQL Server,
+  `[store].ssl_root_cert` is sent as the ODBC `ServerCertificate` pin under `Encrypt=strict`, so
+  it is the store hop's only trust anchor. It now joins the settings preflight under the label
+  `store_sqlserver_pin`, at start and at every real reload (a dry-run reload runs no settings
+  preflight). That check writes `auth.trust_anchor` rows, and a file others can write refuses at
+  `[security].enforcement = enforce`. Those rows travel the hop this pin secures; item 11 of the
+  `messagefoundry/auth/trust_anchors.py` module docstring says what that cannot catch. At a
+  settings check, such as a reload, a pin the store open would refuse for its content warns with
+  an audited row instead of refusing, except a private-key label, which refuses; see item 11 of
+  that docstring for the rule. The store's check now reads the file once, so its certificate and
+  anchor checks judge the same bytes, and a pin file larger than 1 MiB is refused at load and at
+  store open. (`BACKLOG #3714`)
+- **A SQL Server pin beside a weakened store posture is refused at load.** With `encrypt = false`
+  or `trust_server_certificate = true`, the store sends no pin, so a set `ssl_root_cert` used to
+  be dropped with nothing said. Load now refuses that shape, as `ssl_crl_file` refuses its own.
+  (`BACKLOG #3714`)
+- **A trust-anchor refusal names what it refuses.** The ACL and path messages said a writer could
+  "substitute the CA and defeat authentication", and ended "refuses to start" or "starting
+  anyway", which was wrong for a dialling CA, the store pin and a reload. They now say a writer
+  can substitute the anchor and defeat the TLS check that trusts it, and end "refuses it" or
+  "using it anyway". (`BACKLOG #3714`)
+- **The SQL Server store pin is also compared with an in-process baseline.** Each settings
+  check of `[store].ssl_root_cert` on SQL Server, which runs at least at start and at a real
+  reload, compares the file with the first pin bytes the engine process checked and passed, at
+  a store open or else at a check, and logs a WARNING when they differ. The compare reads no store row, so a server a
+  swapped pin admits cannot answer it away. It writes no audit row and refuses nothing, and a
+  restart starts a new baseline. The module docstring of `messagefoundry/auth/trust_anchors.py`,
+  item 11, states its limits. (`BACKLOG #3714`)
+- **A sign-out that races an elevation would now end the session under its new token.** An
+  elevation in another tab re-keys the session, so a sign-out in flight used to match nothing and
+  leave the session live while the user was told they had signed out. The sign-out now follows the
+  rotation's link, as the sign-in supersession does, for links written up to 5 seconds before the
+  token was proven live: for `POST /auth/logout`, its request's arrival, which its sign-in check
+  proved, so the route gains no reach; for `/ui/logout`, which carries no credential, the call
+  itself. That second case is a new, end-only power of a retired token, stated in
+  [SECURITY.md](docs/SECURITY.md) and ADR 0210 Amendment A. The `auth.logout` row then names
+  the session's owner, where a console sign-out kept a NULL actor, and a `presented` field holds
+  the hash that was sent. `AuthService.logout` takes a required `proven_at`.
+  (`BACKLOG #3715`, `BACKLOG #3339`, `BACKLOG #3749`)
+- **A sign-out that ends a session past its idle or absolute limit, or one whose admin-issued
+  temporary credential is past its deadline, is recorded as `lapsed`, not `revoked`.** The row
+  still names the owner, so the user sees it in their security-events feed. The temporary-credential
+  case also writes the `auth.temp_password_expired` row a gate writes, with `"at": "logout"`. As at
+  the gate, a disabled account is not judged for that case, and nor is any account whose record
+  the sign-out could not read. (`BACKLOG #3749`)
+- **A sign-in that supersedes a session whose owner's admin-issued temporary credential is past its
+  deadline writes the gate's `auth.temp_password_expired` row, not `auth.session_revoked`,** with
+  `"at": "superseded"` and the same session references. (`BACKLOG #3749`)
+- **A sign-out's failed audit row is logged rather than raised.** `/ui/logout` used to answer 500
+  then, without clearing the cookie or sending Clear-Site-Data. A fault in the revoke itself still
+  raises. (`BACKLOG #3884`)
+- **A directory lock refusal has its own audit action, `auth.directory_login_locked`.** A Kerberos
+  or OIDC sign-in refused by a live lock used to write `auth.login_failed` and be hidden from readers
+  without `users:manage` by its exact detail text, so it could carry no
+  `callback_floor_exempt_amr` marker. The whole row is now hidden from those readers by its action,
+  it stays out of the sign-in burst signal, and it carries the marker when the OIDC callback floor
+  exemption applied. A reviewer holding `users:manage`, such as an Administrator, therefore sees an
+  exempted attempt against a locked account in the review
+  [SECURITY-LOOSENING.md](docs/SECURITY-LOOSENING.md) asks for. An Auditor still does not see
+  that row (owner ruling 2026-09-28). (`BACKLOG #3726`)
+- **A too-early OIDC step-up whose code exchange fails now records that its floor decision was
+  deferred.** With `[auth].oidc_callback_floor_exempt_amr` set, a too-early step-up's code is
+  redeemed before the floor is decided, so a failed exchange was refused with its own reason and
+  nothing on its row said the floor had waited for it. The outcome rows of such a step-up now
+  carry `callback_floor_deferred: true`, at least each refusal and the success row. The sign-in success row now carries
+  `callback_floor_exempt_amr` at its top level, as the refusal and step-up rows do, rather than
+  under `evidence`. A test reads the sign-in and step-up code and fails on an outcome writer, in
+  the shapes it names, that does not pass the marker. Nothing changes whether a callback is
+  refused. (`BACKLOG #3728`)
+- **`rotate-key` keeps a rotation record in `secret_rotation_meta`, and a `serve` start does not
+  stamp a changed store key while that record names it or cannot be read.** **Once a run
+  has rolled a keyed audit chain to a new key there is no way back to the prior key**, and a run that skipped an uploaded file rolls like any other. **The upload
+  pass opens only a regular file, and reads whole only one of a size an upload can be.** A FIFO no
+  longer blocks it, a symlink is a skip and is not followed, and a file too large for an upload is a
+  skip rather than an abort, unless it starts with the active key's marker, which reads as already
+  current. Its log now says whether the key a skipped value names is configured. See
+  [PHI.md](docs/PHI.md). (`BACKLOG #3737`)
+- **Under dual control, a requester who is renamed while their purge is held now joins that hold
+  when they ask for the same purge again.** Before this, the second request filed a second hold.
+  The purge hold records the requester's display name, so the rename made the two requests look
+  different. The route and the console now look first for the caller's open purge hold, matched on
+  their user id. The hold keeps the display name it was filed under. That name is shown to the
+  approver, and the released purge's audit row records it, even if the name has since passed to
+  someone else. A different person who later gets the freed name still files their own hold. The
+  replay and reload holds still file a second hold after a rename. The lookup's limits are in
+  [SECURITY.md](docs/SECURITY.md). (`BACKLOG #3740` item 9)
+- **An uploaded-file delete that the shutdown drain cancels now still writes its `upload.delete`
+  audit row, and a row it cannot land is logged at ERROR by `file_id`.** The drain's cancel used
+  to cut the delete short between its unlink and its row, or inside the row's write, which would
+  leave a removed file with no row and no log line. The cancel now waits for both as long as the
+  drain's grace allows. A delete refused as missing or unreadable, which removed nothing, logs no
+  lost row. (vault BACKLOG #3740 item 1)
+- **An upload whose `upload.create` call failed now gets an `upload.delete` row when its file is
+  removed.** The failed call cannot tell a row that never landed from one that committed and then
+  raised, so before, a committed row could name a file that was removed with no row saying so. The
+  row is attributed to `system`; the uploads row of [PHI.md](docs/PHI.md) says where its
+  contents and limits are stated. (vault BACKLOG #3740 item 2)
+- **A trust-anchor file that holds a private key would now be refused.** A CA file is public trust
+  material, but a PEM block labelled `PRIVATE KEY`, `ENCRYPTED PRIVATE KEY` (PKCS#8),
+  `RSA PRIVATE KEY` or `EC PRIVATE KEY` beside the certificate used to pass every check, because
+  the TLS load skips the key and trusts the certificate. The engine now refuses such a file,
+  naming the setting and never the content. It covers every trust anchor checked at start and
+  reload, the SQL Server `[store].ssl_root_cert` pin, a generic DATABASE connection's `sslca`
+  file and a Vault hop's CA text, which nothing shipped sets yet. The PostgreSQL `ssl_root_cert`
+  takes it only in `serve`'s settings check, at least at start, reload and DR activation, after
+  the store has opened with the file (`BACKLOG #4203`). It does not cover at least the Vault CA files. See [SECURITY.md](docs/SECURITY.md). (`BACKLOG #3745`)
+- **A trust anchor's `cadata=` text now splits lines at LF alone, as OpenSSL's reader does.** It
+  also split at a lone CR, so on a first deployment the text could have differed from what `cafile=`
+  reads. A line holding `-----BEGIN ` anywhere now opens a block for the non-ASCII check, except a
+  lone BEGIN straight behind a byte-order mark that stays on the line, and the full marker
+  `-----BEGIN TRUSTED CERTIFICATE-----` now refuses anywhere on a line, even outside a block, as in
+  a comment. A byte-order mark is stripped at the start of the file and after an `-----END ` line
+  that closes a block in this check's own line model. That model is not OpenSSL's reader: it is
+  stricter than `cafile=` in at least three shapes, and at least some shapes can still trust more than `cafile=`.
+  The header and private-key refusals now run ahead of the non-ASCII refusal, whose text now says
+  what to remove. The encryption-header refusal now quotes `"Proc-Type:"` and `"DEK-Info:"` and says
+  it matches them in any case. Later in this release, `BACKLOG #5229` replaced this entry's line
+  model and its byte-order-mark rule; that entry says what the text does now. (`BACKLOG #3746`)
+- **A queue listing that shows a requester lost their authority now writes an audit row.**
+  `GET /approvals` and the console's `/ui/approvals` tell an `approvals:approve` holder, with no
+  step-up, that a held request is `requester_not_authorized`. Each listing that shows the value now
+  writes one `approval.standing_shown` row naming the caller, their address and those requests. A
+  failed write of this row is logged and paged, and does not fail the listing. A store that refuses
+  every audit write still answers `GET /approvals` 500 at its grant row first, with no page, while
+  that grant audit is on. The row records the listing's disclosure, not every route to the fact: the same audience can learn much of it from
+  `GET /users`, and the console's gates write no grant row. See
+  [SECURITY.md](docs/SECURITY.md). (`BACKLOG #3747`)
+- **At least some `auth.channel_denied` rows that name no channel now say which operation they
+  refused.** A channel-scoped caller refused a config reload, its dry run, a reset of every
+  statistic or a replay of every channel's dead letters gets a row whose detail carries
+  `"operation"`, the name of the audit action the operation writes when it runs. Before, such
+  rows from one actor could not be told apart. A core handler such as `_dual_role_control` in
+  `messagefoundry/api/app.py` passes no operation, so it would write a row with no channel and no
+  operation only if called directly with a malformed name; no shipped route does. No request is allowed or refused differently. (vault BACKLOG #3748 item 7)
+- **The audit trail withholds the stored channel lists and scope sources of four actions from a
+  reader without `users:manage`.** `GET /audit`, its console page and `GET /audit/export` narrow
+  these four: `user.channel_scope_changed`, `auth.ad_scope_resynced`, `auth.ad_session_revoked` (its
+  `scope_from` and `scope_to`, on a scope-delta row) and `user.channel_scope_change_refused` (its `owner`, `read_source`,
+  `expected_source` and `reason`), as `GET /users` already withholds every account's scope. Those
+  four are what a census of the writers found; a new action that names a scope is shown whole until
+  it is added to the list. Rows left whole can still let such a reader infer a scope, at least
+  `auth.channel_denied` and channel-attributed access rows, and `/me/security-events` is not
+  narrowed; `docs/SECURITY.md` names what is left open. The engine's user summary now withholds the
+  scope unless its caller asks for it, the console's copy needs every page to say which, and the
+  console's Approvals note for `requester_not_authorized` names the causes it covers, a deleted
+  requester and an unbound auth service among them.
+- **A SQLite store in a hardened data directory now admits one named run-as user account.** An
+  install with `-ServiceAccount` naming a local user or a gMSA left a data directory the store
+  refused, so the store fell back (see ADR 0163, *Note (2026-11-05)*) and the service and the
+  operator who provisions the first Administrator would have locked each other out on first
+  deployment. The store now admits a per-service virtual account as before, or an account with a
+  machine- or domain-relative SID (`S-1-5-21-...`) that `LookupAccountSid` resolves to a user with
+  a RID of 1000 or more. It does
+  not check that this account is the one the service runs as. What is still refused, and what a
+  refused directory gets, are stated in ADR 0163, *Note (2026-11-05)*. What a gMSA resolves
+  to is unmeasured. See [SERVICE.md](docs/SERVICE.md), "Restrict the service token".
+  (`vault BACKLOG #3760`, `vault BACKLOG #2234`)
+- **An address draws one sign-in limiter bucket in its IPv4-mapped and plain spellings.** The
+  per-address sign-in limiter, the passkey sign-in's begin leg and the repeated-credential audit
+  budget now key a client through the same folding as the new-address signals: an IPv4-mapped
+  address such as `::ffff:203.0.113.5` shares the bucket of `203.0.113.5`. Before this, one engine
+  process that saw a host in both spellings, for example as a dual-stack direct peer and as a
+  trusted proxy's plain forwarded hop, would have given it the per-address budget twice. Every
+  loopback address now shares one bucket too, so `127.0.0.1` and `::1` together get one budget,
+  which is stricter than before. A request with no address still counts as `"unknown"`. At least
+  these still split one host: an IPv6 host that changes address, a zone id on an address that is
+  neither loopback nor IPv4-mapped, and the IPv4-compatible form `::203.0.113.5`; the sign-in
+  failure-burst signal and the HTTP intake limiter key the raw address. ([SECURITY.md](docs/SECURITY.md), *Per-IP limiter caveat*)
+  (`BACKLOG #3764`)
+- **`[api].ws_allowed_origins` entries are checked at load.** The handshake compares each entry
+  to the `Origin` header exactly, so an entry in another form used to load and match nothing. A
+  `;`-joined list loaded as one such origin. Now an entry must be spelled as a browser sends
+  `Origin`, or the engine refuses to load. A `;` list is refused with a message naming the
+  comma-separated form. A real origin in another spelling, such as `https://ops.example:443/`, is
+  refused with the spelling to list. A refusal names the entry by position and never quotes it
+  whole, on the message or on the exception chain. [CONFIGURATION.md](docs/CONFIGURATION.md) lists what is refused. (`BACKLOG #3764`)
+- **A config load error quotes fewer values, and a factory typo is named.** An engine refusal raised
+  while a config module loads now keeps its text when a `raise` statement in the engine wrote it and
+  its class renders through a builtin's `__str__` and `__repr__`, and otherwise has it withheld; the
+  end of this entry lists what that does not catch. An exact `MemoryError` or `RecursionError` in
+  engine code keeps its fixed text. A builtin's other failures in engine code, such as `int(value)`,
+  are withheld like a module's own text. So is a class with its own `__str__` or `__repr__`, whoever
+  raised it, which covers a module that catches a refusal and assigns such a class to its
+  `__class__`. Only an exact `WiringError` stands as raised: any subclass comes back as a plain one,
+  so a subclass's own `__format__` no longer reaches a formatted diagnostic. Where a refusal was raised from a builtin, a
+  library or author code, the whole text of that exception is replaced by its type name, and the
+  refusal is rebuilt as a plain `WiringError`: every note and its whole chain go, engine links
+  included, and an `ImportError` cause stays only as a textless stand-in. A refusal with a note on
+  it, or on anything it wraps, is rebuilt the same way. A slice of the text, text copied before
+  the raise, or text of any length made only of letters, digits, `_` and `-` with such a character
+  from outside the quoted text touching it, is not caught: that last is what keeps an argument such
+  as `tls` from rewriting the connection name `IB_tls`. Text of three characters or more with any
+  other character
+  in it, such as `'tls'` with its quotes or a value of several words, is replaced wherever it appears;
+  text under three characters is not replaced at all, so `p@x` goes and `p@` prints. A chain of more
+  than 1024 exceptions is not read to its end, so that refusal's whole text is withheld and the module
+  is refused. Text of three characters or more that equals a whole identifier or word of the
+  refusal, such as a connection named `tls` or the setting `source_ip_allowlist`, is replaced too,
+  so the refusal loses that identifier or word. Quotations that overlap or touch become one marker
+  and are judged as one text, so two values side by side, or one value twice, go like one value. In
+  a config module, at least the `tls_ca_pin`, `intake_auth`,
+  `intake_auth_health`, `reply_on_timeout`, `reply_on_empty`, `reply_content_type`,
+  `source_ip_allowlist`, `content_type` and `ws_password_type` refusals, an `intake_client_subjects`
+  subject and an issuer that is not a DN no longer quote the value. An issuer key that does parse as a
+  DN is still quoted by the later `intake_client_subjects` refusals, so that check withholds only a
+  key that fails its first test. A call with an unexpected or
+  repeated keyword now reads `TypeError at line N naming 'keyword'`, when the source line spells
+  that keyword. A config module that raises a `BaseException` that is not an `Exception` is now
+  refused as a failed module, with no text, and a `SystemExit` of any class is refused the same way
+  on every thread, with nothing it was raised from. An exact `KeyboardInterrupt` that can be Ctrl-C
+  stops the load as a new, bare `KeyboardInterrupt` that carries none of the original's arguments,
+  notes or chain, and one WARNING line names the config module that was loading, not a helper it
+  imported, and quotes nothing of the exception. That means on the main thread, with Python's own
+  SIGINT handler in force, and with the traceback's innermost entry not stopped on a `raise`
+  statement in a config file. Any other is treated as code, whether or not a signal raised it, and
+  is refused like the rest. So a `raise KeyboardInterrupt` in a config file is normally a failed
+  module, and so is one under another handler, which includes `serve`'s load in the API lifespan:
+  uvicorn holds SIGINT there, so a real Ctrl-C only asks the server to exit. A handler that raises
+  one itself is refused the same way while it is still in force when the loader judges it, and
+  `validate` then goes on to its next module. asyncio's does so at a second Ctrl-C, but that is
+  refused only under a runner around the load: a module's own `asyncio.run` puts Python's handler
+  back as it leaves, so that one stops the load. What that entry does not show cannot be told from
+  Ctrl-C and stops the load with that line: at least a module that calls
+  `signal.default_int_handler()`, throws one into a generator, clears the traceback before a bare
+  `raise`, or has a library raise one. A module can
+  also put Python's handler back first, even under uvicorn. A fault in that judgement refuses the
+  module. The loader's read of a failed module's exception
+  runs the module's code, so a real Ctrl-C can land in it, and an interrupt there is judged the same
+  way, with no exception chained to it. Any other fault in
+  that read is absorbed and that module is refused, a `SystemExit` of any class on every thread
+  included, because a `SystemExit(0)` leaving there would end `validate` or `check` with exit 0 and
+  no output on a module that failed. The WARNING that reports such a fault runs any log handler the
+  module added, so what that handler raises is treated the same way. At least a faulting handler,
+  or logging a module turned off, loses that WARNING and the line that names the module at a stop,
+  so their absence proves nothing. An exact `WiringError` also stands only while its arguments
+  are exact text, because a caller's `str()` of an object there would run the module's code past
+  that guard. An exception's text counts as engine wording only when its frame is in the package's
+  own files, so a module that sets `__name__` to look like the engine is withheld, and so is
+  vendored code. It also does not count when a `raise` statement outside the
+  engine put it onto an existing traceback, so `raise X(text).with_traceback(exc.__traceback__)` in
+  a module is withheld. So, at a small cost to the author, is `raise exc` of a refusal the module
+  caught, which the traceback cannot tell from that idiom, and `raise Cls` whose constructor was
+  refused; a bare `raise` keeps the text. At least these are not caught: a module that catches a
+  refusal and rewrites its `args`, with text or with an object whose own `__str__` returns a value;
+  one that puts text on a refusal's traceback with `gen.throw`, or by assigning `__traceback__`
+  before a bare `raise`; one that changes a refusal's class while the loader reads it, or patches
+  `WiringError` itself; one that builds a class whose name holds a value; one that compiles code
+  under an engine file name to forge a frame; the frames on an interrupt's traceback,
+  which still hold the withheld exception; and the traceback of a refusal, whose module frames hold
+  that module's globals. That traceback is kept on a refusal that stands as raised, and on the
+  original that an engine exception other than a `WiringError` keeps as its cause, because a logged
+  start failure reads it to name the module and line, and because the loader's own frames on it would
+  still reach those values through the load's snapshot of the files and through its registry. Any
+  other refusal the loader rebuilds has no frame of the module on it, so its text opens with
+  `error loading config module <file>:`, which is how a logged start failure and the reload WARNING
+  name it. That is the module being loaded: not its line, nor a helper the refusal came from. A
+  refusal that stands as raised has no such opening, so that WARNING does not name its module.
+- **`organization_domains` and `external_link_allowlist` refuse all of `0.0.0.0/8`.** They already
+  refused `0.0.0.0`, but `ipaddress` reads most of that block as neither unspecified nor reserved,
+  so `0.1.2.3` loaded. A loopback entry still loads, and a single label such as `com` still loads
+  and covers every host under it; [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) now says both.
+  (BACKLOG #3765)
+- **The OIDC username check compares a non-ASCII UPN suffix as written.** It lower-cased both sides
+  with `str.lower()`, which turns the Kelvin sign into an ASCII `k`, so a claim could pass as a
+  suffix the allow-list names and the claim does not. It also removed non-ASCII white space from
+  the claim. An ASCII suffix still matches without regard to case. A suffix with any non-ASCII
+  character now matches only as written, on both sides, so this refuses some pairs it accepted
+  before and accepts none it refused. (BACKLOG #3765)
+- **A blank `[auth].ad_domain` is not a UPN suffix source.** It produced the empty suffix, which
+  passed the load refusal and let a claim of `jdoe@` through the check. With OIDC enabled, stripping
+  on and no allow-list, such a config is now refused at load. (BACKLOG #3765)
+- **A literal `encoding` that names no codec is refused without quoting it.** The load's encoding
+  check quoted the value it refused, so config-module text reached the load error, the operator
+  log and a 422 body. It now names the connection and says the value is withheld, as the
+  environment-value pass already did. (`BACKLOG #3765`)
+- **A warning logged before a `messagefoundry` subcommand's log handlers exist is now redacted.**
+  The PHI-filtered stand-in for the standard library's `logging.lastResort` used to be installed
+  near the start of `serve` only. The `main()` of `messagefoundry` and of `messagefoundry-toolkit`
+  now installs it before it parses the arguments, so argument parsing and the start of `supervise`
+  are covered too. A record logged while the modules import, before `main()` runs, still meets the
+  standard library's own; `docs/PHI.md` section 7 row 1 lists what stays unfiltered. For a caller
+  that runs `main()` in process on a root logger with no handler, the process-wide `lastResort`
+  stays replaced after `main()` returns. Assigning a stream to the filtered one, as `setStream`
+  does, now raises `AttributeError`, as it does on the standard library's, instead of being
+  ignored.
+- **A passkey sign-in whose passkey re-read raises would now be refused with an audit row, for the
+  exception classes the read catches.** The account's passkeys are read again after the sign-count
+  write and before the factor is marked. An exception there used to raise out of the ceremony with
+  no `auth.webauthn_failed` row. Now an exception of a class the read catches is refused, the
+  factor stays unmarked, the account and the exception's type are logged, and the row names
+  `reason=store_error`. The caught classes take in at least SQLite's `DatabaseError` and any
+  `RuntimeError`, `OSError` or `ValueError`, except the defect classes, which raise and include
+  at least `sqlite3.ProgrammingError`, a `DatabaseError`; `sqlite3.InterfaceError`, among others,
+  still raises. At least some such raises, `sqlite3.InterfaceError` among them, would now first
+  try a row naming `reason=read_raised`, which is soft and can be missing. ADR 0068's amendment of 2026-10-17 lists the classes,
+  and which raises write that row, with an at-least. The caught classes do not tell
+  a store fault from a bug, so a bug that raises one is refused the same way. If the store refuses
+  that row too, the refusal still comes back. Not covered, at least: the session, account and lock
+  re-read beside it. (`BACKLOG #3775`)
+- **A directory account's TOTP or recovery-code attempt reads its session once between the
+  directory lookup and the code check, not twice, and its account twice, not three times.**
+  `verify_mfa` no longer re-reads the session, the account and its lock right after the lookup. The
+  re-read inside the account's queue, which already ran before any code is checked, is now that
+  read. The directory check's role test still reads the account once, right after the lookup, and
+  that row now keys the account's queue. The directory check carries on only with that vouched row:
+  any other answer refuses as `directory_unconfirmed`, and an answer of a shape it does not know is
+  recorded under the fixed outcome `unknown_answer`.
+  The dropped read answered `session_lost` when its account read came back empty, which a rename,
+  rebind or re-key racing the seal check's second read could cause. So for a directory account the
+  in-queue read now refuses as `session_lost`, with the same `auth.mfa_failed` row, whenever the
+  account's lookup keys (its id, username, OIDC issuer and subject, and directory object id) moved
+  after the role test read it and no second-step lock is live; with a live lock it answers `locked`
+  with the locked row, as the dropped read did whenever it found the row. With TOTP on, a lapsed
+  temporary credential still ends the session first and writes `auth.temp_password_expired`.
+  Otherwise the session is not ended, so its token may still authenticate. Before, such a move
+  refused only when it lost that race; otherwise a rename while the attempt waited carried on in
+  the old name's queue. A session
+  lost during the lookup is now named with the account's current name, read in the queue, while
+  its row is still there; before, it was named with the name read before the lookup.
+  Inside the queue, a live second-step lock on a directory account is now asked right after the
+  session read, and writes its `auth.mfa_failed` locked row before the TOTP and lapse checks. For a
+  lock that lands during the lookup, the attempt used to answer `locked` and leave the session live,
+  without asking whether the temporary credential had lapsed; it still writes the locked row, and
+  while TOTP is still on, a lapsed credential now also ends the session and writes
+  `auth.temp_password_expired`. For a lock and a lapse that land while the attempt waits in the
+  queue, the lapse still ends the session and writes `auth.temp_password_expired`, and the locked
+  row is now written as well. For a lock that lands while the attempt waits, with TOTP turned off,
+  the attempt now answers `locked` and writes the locked row, where it used to give the plain
+  refusal with no row; as before, it asks no lapse and the session stays live. A local account
+  keeps its order: TOTP, then the lapse, then the lock.
+  A change reversed between the lookup and the queue read no longer refuses the attempt where the
+  dropped read refused it: at least a lock or a disable, a rename, rebind or re-key put back, and a
+  record that failed its seal and was repaired. A reversal is at least an administrator's or the
+  directory's act, the lock's own expiry, or the account holder's own passkey, Kerberos or OIDC
+  success clearing the second-step lock while the attempt waited. The re-reads after the code
+  check are unchanged. A local account's in-queue read now runs its TOTP, lapse and lock checks
+  before the attempt leaves its queue on a rename. A rename of a local account that lands while the
+  attempt waits in the queue makes it, once, let its queue go, then take the queue of the name it
+  first joined and the queue of the new name together, and read and check again. While it waits
+  for them it holds neither. (`BACKLOG #3780`)
+- **A failed TLS handshake on the DICOM C-STORE SCP now leaves a record above DEBUG.** The SCP
+  counts a TLS error, such as a wrong certificate or plaintext, and a handshake that runs past its
+  bound, as the MLLP listener counts the handshakes it runs itself. It logs them as a throttled
+  WARNING, which names the peer when it covers one failure, and the count is on the SCP as
+  `tls_handshake_failures`. A close_notify after the ClientHello is counted, as on MLLP. A peer
+  that closes or resets the socket mid-handshake is not counted, as on MLLP. Before, each
+  failure was a DEBUG line only. The SCP still writes no connection event.
+  [PHI.md section 7, row 7](docs/PHI.md#7-logging--phi-redaction) states the throttle.
+  (`BACKLOG #3784`)
+- **`audit_all_platforms --skip-private <name>` leaves a private package's pin out of the audit.**
+  Given before the lock and repeatable, it is for a package no advisory database can look up,
+  which `pip-audit --strict` otherwise fails; the pin is printed as not audited, and every other
+  pin is still looked up. It refuses the engine's own name and each MessageFoundry package the
+  release records as published, at least `messagefoundry-webconsole`, `messagefoundry-harness`
+  and `messagefoundry-toolkit`, since an advisory database can look each one up. It also refuses a
+  name the lock does not pin, a list that skips every pin, and the flag after the lock. See
+  [ADOPTER-CI.md](docs/ADOPTER-CI.md). (`BACKLOG #3786`)
+- **A FHIR update reply that repeats a JSON key is compared as JSON values, at every occurrence.**
+  An occurrence of a repeated key that itself reads two ways, at any depth below it, now fails
+  closed as `reply-repeats-a-key`. So does a third occurrence that differs from the first and last
+  only as `1` against `true`, `1` against `1.0` or `0.0` against `-0.0`, and such a difference in
+  a value the two readings are compared on. A key seen only twice, with `1` then `true` in a value
+  nothing reads, is still delivered. Before, a middle `response` that read `404 Not Found` only
+  keeping the last key was delivered. Every `NaN` token now reads as one value, so a `NaN` beside
+  a repeat no longer refuses. Only the occurrences of repeated keys and the compared values are
+  given ids, so the rest of the reply does not count toward the bound below; it is still parsed
+  twice, as before, and both readings are held while they are compared. A reply whose repeated
+  occurrences are too large to judge fails closed with the same code; ADR 0095 states the bound.
+  See [ADR 0095](docs/adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md),
+  Amendment B.1, the 2026-10-17 entry. (vault `BACKLOG #3796`)
+- **A released purge now re-reads the refusals the purge route makes about its target, and a
+  released purge with an unknown stored scope no longer purges everything.** Before this, a purge released with no graph loaded
+  skipped its checks and cancelled the outbound's queue, and any stored scope other than `top` was
+  read as `all`. The release now cancels nothing when no graph is loaded or the outbound has left
+  the graph, and its `approval.approved` row records the same text the route would answer. That
+  text replaces the former short skip reasons, such as `outbound running`. With no graph loaded,
+  the route's own 404 now says so. A stored scope that is neither `top` nor `all`, or a stored
+  outbound name the route would not admit, answers 422 and moves the request to `failed`, because
+  no operator action can clear it. (`BACKLOG #3798`)
+- **The `host.ciphers` verify row no longer SKIPs on a store it cannot see, and its probes get a
+  narrower environment.** `MEFOR_STORE_BACKEND` overrides the service config file, and the shell
+  that runs `verify` need not carry the service's own environment. So when that shell does not
+  set it, the row no longer reads "no ODBC hop" from a file that says `sqlite`: a FAIL or ERROR
+  policy reading is now reported as MANUAL, with the reason in its detail. Set
+  `MEFOR_STORE_BACKEND` as the service sets it to get a reading that counts. On Windows, the
+  PowerShell the row starts now gets a `PATH` and `PSModulePath` fixed to the system folders, so
+  a program or module planted where the operator can write is not found through either. On
+  Linux, `openssl` no longer gets the Python interpreter's `PYTHON*` variables, which it never
+  reads. See [DEPLOY-SERVER-DB.md](docs/DEPLOY-SERVER-DB.md) section 5.4 and
+  [DANGEROUS-FUNCTIONALITY.md](docs/DANGEROUS-FUNCTIONALITY.md) section 4. (`BACKLOG #3803`)
+- **A cluster convergence reload's audit row names the loosenings it brings in.** The
+  `config_reload` row a node writes under `system:cluster-convergence` now carries `loosenings`,
+  the switch names of the graph it converged on, as a start's `config_loaded` row does, or `null`
+  when they are unknown. Before, no row named a loosening that a convergence brought in until a
+  later start's row did. An operator reload's row still carries no such key.
+- **A wrong password at the directory step-up re-bind is counted even when the unbind fails.** A
+  re-bind the directory refused with `invalidCredentials` (49), followed by an ldap3 error from the
+  connection's unbind, used to read as the directory being unavailable, so it was charged to
+  neither the account lockout nor the per-session re-proof cap. An ldap3 error from the unbind is
+  now logged at debug level and never raised over a refusal, and the socket is then closed without
+  sending, where a failed unbind send used to leave it open. An unbind error never upgrades an
+  answer toward a pass: a correct password whose unbind fails is still refused as the directory
+  being unavailable, and not counted, as before. When the account is absent, disabled or
+  unreadable, the same fault now keeps the lookup's own `auth.reauth` reason (such as
+  `not_in_directory`) where it used to read `directory_unavailable`; neither is counted. A bind the
+  directory ended busy or unavailable is still not counted. (`BACKLOG #3848`)
+- **`provision-admin` raises the `administrator_granted` alert on every Administrator it grants.**
+  Since vault BACKLOG #2711 the command can add a local Administrator beside directory ones that
+  still sign in, and nobody was paged. It now builds the `[alerts]` notifier as `serve` does, and
+  raises the alert keyed `user:<username>`, with `via` set to `provision_admin` and `granted_by`
+  set to `cli:<OS user>`, after the recovery codes are shown. It also tries, best effort, to record
+  the alert as an open alert the web console lists once the engine runs. Unless at least one
+  transport confirms delivery, the relay accepting it or the webhook answering 2xx, it goes to the
+  command's log output, and the command says so, as a WARNING naming the other Administrators when
+  there are any. That covers no `[alerts]` transport, one the command's shell cannot build, a send
+  the relay or webhook refuses, a rule that routes the alert to no transport, and a step that has not
+  answered within its bound. The command prints its result once the step answers or its bound runs
+  out; the process can still wait at exit for a send already under way. `--json` output carries
+  `administrator_granted_alerted` ([SECURITY.md](docs/SECURITY.md), *Keep a local
+  Administrator*). (`vault BACKLOG #3849`)
+- **A `provision-admin` takeover clears the account's known sign-in addresses.** The repair of a
+  roleless local account already removed the earlier holder's factors and sessions. Their sign-in
+  addresses now go too, as after an administrator's reset, so a sign-in from one of them faces the
+  first-seen challenge. (`vault BACKLOG #3849`)
+- **A reset can no longer leave the known sign-in address record empty.** The delete and the
+  marker row it leaves are now one store transaction, and the prune each later sign-in runs never
+  deletes the marker. Before, a failure between the two writes, or a sign-in's prune that raced the
+  reset, could empty the record, and an account that never stamped a sign-in then failed open as
+  `no_baseline`. The marker now stays until the account is deleted or reset again.
+  (`vault BACKLOG #3849`)
+- **On linux/amd64, the engine image's base moved (engine PR 2558) to a digest inspected on
+  2026-10-26 not to trust "emSign ECC Root CA - G3", the root
+  [GHSA-6q48-6c7w-9gw2](https://github.com/advisories/GHSA-6q48-6c7w-9gw2) covers; the digest the
+  base is pinned to now was not inspected.** Two digests were inspected, `sha256:48b13b00...` and
+  `sha256:9974e245...`, on linux/amd64 only. No other platform was inspected, and no digest the
+  pin moved to later. There, the digest the base moved from, `sha256:48b13b00...`,
+  carried the root in at least three CA bundles the base holds outside any lock: Debian's
+  `ca-certificates` in `/etc/ssl/certs`, which OpenSSL's default verify paths read, and the
+  certifi pip vendors, in the system pip and in the bundled ensurepip wheel that the pip under
+  `/opt/venv` comes from. The digest inspected on 2026-10-26,
+  `sha256:9974e24551f9e7ca172cf284d85b8ab3e031d22d945f7026ede7a8279118c9f1`, ships
+  `ca-certificates` 20250419~deb12u2 and pip 26.2.2, and none of those three carries the root.
+  That move also took the image's Python from 3.14.8 to 3.14.10. The certifi installed into
+  `/opt/venv` is the locked one in `docker/locks/`. Engine PR 2778 (Dependabot, 2026-11-04) then
+  moved the pin to `sha256:516b51cb...`, whose CA bundles were not inspected on any platform;
+  its only record is a linux/amd64 package comparison in the
+  [engine PR 2778 hold comment](https://github.com/MEFORORG/MessageFoundry/pull/2778#issuecomment-6629228552),
+  which holds no CA-bundle reading. Engine PR 2943 (Dependabot, 2026-11-14) then moved the pin to
+  `sha256:3fe1a0b6...`; neither the Dockerfile header nor that PR's hold comment records a
+  CA-bundle reading or a package comparison of it, on any platform. Rebuild an image built from a
+  checkout that pins `sha256:48b13b00...`; a rebuild lands on the digest its checkout pins, and
+  no record shows that any digest after `sha256:9974e245...` drops the root. See the
+  [`Dockerfile`](docker/Dockerfile) header for the digests. (`BACKLOG #3905`)
+- **A stopped bulk or audit export now reaches the client as a failed download.** When its
+  re-check stops `GET`/`POST /messages/export` or `GET /audit/export` after the 200 has started,
+  the server now drops the connection with the body unfinished, so the client sees a transfer that
+  failed. It used to receive a cleanly ended 200 holding only the rows sent before the stop, a
+  short file it could not tell from a complete export. The engine's security-header and
+  request-body-limit middleware are now pure ASGI: Starlette's `@app.middleware("http")` layer
+  they replace sent the final body message before the stop's raise left it. The registration order
+  is unchanged, and the existing header-floor, no-store and body-limit tests pass unchanged.
+  Measured for an HTTP/1.1 client over cleartext loopback; see SECURITY.md for what is not.
+  (`BACKLOG #3907`)
+- **A passkey counts as a way past the sign-in lock only under the configured relying party.**
+  The factor-drop gates (at least TOTP removal, passkey removal, the rotation gate and the store's
+  conditional writes behind them) and the census's `no_way_past` count a discoverable passkey only
+  under `[api].public_origin`'s host, since the sign-in accepts only a passkey under the request's
+  `rp_id`. With `public_origin` unset they count none as what remains, so a covered account keeps
+  its TOTP rather than drop it for a passkey that might not sign it in. `messagefoundry verify` reads the same
+  host. (`BACKLOG #3937`)
+- **A passkey sign-in costs one unit of the sign-in limiter, not two.** The sign-in moves the
+  begin leg's limiter hit to the moment it is spent rather than charging again
+  ([SECURITY.md](docs/SECURITY.md), *The combined passkey sign-in*). The seal refusal's
+  `auth.login_failed` row says `combined` only where the sign-in was one. (`BACKLOG #3937`)
+- **The sign-in lock now escalates on an account whose way past is a discoverable passkey.** A
+  local account with no TOTP and a discoverable passkey under the configured relying party
+  (`[api].public_origin`'s host) doubles its sign-in lock per cycle up to `lockout_max_minutes`,
+  as a TOTP account's does. With no relying party configured it keeps the fixed length. Each
+  backend reads the passkey set inside the same atomic increment as the count. (`BACKLOG #3937`)
+- **A passkey cell that cannot be read no longer stops a failed sign-in from counting.** The
+  escalation reads the passkey set inside the failure's own increment. A cell the driver cannot
+  decode while fetching (SQLite raised `OperationalError`, which rolled the count back, so after
+  its first lock the account never locked again) now leaves the failure counted at the fixed
+  length, as a row that does not parse already did, with a WARNING naming the account and none of
+  the cell. (`BACKLOG #3937`)
+- **The audit rows an IdP step-up's return writes on its repeatable refusals have a budget per
+  source and a paging backstop across all sources.** A `state` mismatch on a step-up return, on
+  the completion or the abandon leg, and a non-navigation fetch of `GET /ui/oidc/callback` consume
+  nothing, so they repeat while the flow lives. Their rows were bounded only per user, so many
+  users' flows could write about 10 rows a window each. `AuthService.allow_step_up_return_audit`
+  now draws a budget of its own, on the login knobs: 10 rows a window per source, the staged user
+  or, for a flow that names no user, the client address, so one source spending its budget costs
+  no other source a row. Behind it a backstop of 60 rows a window across all sources; past it each
+  account still writes one row a window, and a row it stops pages `audit_write_failed` keyed
+  `step_up_return:audit_budget:<action>`. It gates the row only. Past the budget the refusal answers as
+  before and writes a WARNING line instead, so a flood across many users cannot refuse anyone's
+  step-up return. It never draws the sign-in window or the ceremony budget, and
+  `[auth].login_rate_limit_enabled = false` removes it with them. (`BACKLOG #3965`)
+- **A Vault client names an environment proxy it picks for a send.** When a Vault or OpenBao
+  client's adapter picks a proxy from the environment or the system settings for a send, it logs
+  one WARNING naming that proxy, never a credential. The WARNING means the proxy was picked, not
+  that the request went through it, since a refusal can still follow. It logs once per hop and
+  distinct proxy value in a process. At least `serve`, `supervise`, `check-privileges` and
+  `verify` log it, and a proxy set after start is named on the first send that picks it. A log
+  level above WARNING hides it. A value the two URL parsers read differently is named "an
+  unreadable value". Before, only `serve` and `supervise` named a proxy, once, at start. See
+  [CONFIGURATION.md](docs/CONFIGURATION.md#the-vault-and-openbao-clients-also-name-a-proxy-where-they-use-it).
+  (`BACKLOG #4028`)
+- **A start now refuses a CRL that the CA it names by key identifier proves badly signed, even
+  beside a CA of the same name that has no subject key identifier.** Before, that second CA could
+  rescue the CRL: where its key verified the CRL, the start loaded the file with no warning, and
+  where the engine could not check its key, the start loaded the file with a WARNING. Now such a
+  CA counts for nothing once the CRL names another listed CA's key, and the running-hop reload
+  holds such a file back too. A CA the CRL names that cannot be checked still warns, and so does a
+  lone CA with no subject key identifier that cannot be checked. An RSA signature over SHA-1 that
+  a CA counted here made still reads as one the engine cannot check, as before: a start warns,
+  and the reload holds it back until a restart. That trades revocation freshness on a host that
+  accepts SHA-1 against applying live a CRL that a host refusing SHA-1 would fail every handshake
+  on; `docs/CONFIGURATION.md`, in the bullet on a signature the engine cannot check, states the
+  trade-off. The premise, that the engine's verifying
+  contexts use strict verification, and the cases where the start can refuse a CRL a handshake
+  could pass are stated in `docs/CONFIGURATION.md`, in the paragraph that starts "Why a CA with no
+  subject key identifier counts for nothing there". (vault BACKLOG #4159)
+- **The PostgreSQL store CA takes the audited trust-anchor checks in `serve`.** On PostgreSQL,
+  `[store].ssl_root_cert` now joins the settings preflight under the label `store_postgres_ca`,
+  at start and at every real reload (a dry-run reload runs no settings preflight): at least the
+  ACL and path checks, a change check, the private-key refusal and a refusal of a file larger
+  than 16 MiB. See docs/SECURITY.md for when the check runs. The store runs none of these checks when it opens, so the start check
+  runs after the store has opened with the file, and a command that opens the store without the
+  preflight does not check it. (`BACKLOG #4203`)
+- **`serve` refuses a plaintext proxy-to-engine hop on a non-loopback bind, acknowledged or not.**
+  With `[api].tls_terminated_upstream` and no `[api].tls_cert_file`, the engine serves the hop from
+  the proxy in plaintext, and `[api].plaintext_upstream_hop_acknowledged` now covers that hop only
+  when the engine binds `127.0.0.1`, `::1` or `localhost`, with the proxy on the same machine. On any
+  other bind host `serve` exits 2 in every enforcement mode and names the host, and the required
+  `upstream-hop-ack` leg of `messagefoundry check` fails on the same test. The recipes in
+  `REMOTE-CONSOLE.md` and `CONTAINER-EXPOSURE-EVALUATION.md` that bound `0.0.0.0` behind a plaintext
+  terminator were changed to match. The rule and the ways out are stated once, in
+  [SECURITY.md, Plaintext proxy hop](docs/SECURITY.md#plaintext-proxy-hop). (`BACKLOG #4636`)
+- **A declared upstream terminator no longer exempts an off-loopback bind from the certificate
+  revocation gate.** With the plaintext hop refused off loopback, a proxy in front of a
+  non-loopback bind reaches the engine over the engine's own TLS on `[api].tls_cert_file`. The
+  declaration does not attest that the proxy checks that certificate's revocation, and the engine
+  cannot observe whether it does. `serve` now refuses that bind (exit 2) unless
+  `MEFOR_TLS_REVOCATION_ATTESTED=1` is set, as it does any other off-loopback in-process TLS bind.
+  A loopback bind behind a proxy on the same machine still never reaches the gate.
+  [SECURITY.md, API revocation gate](docs/SECURITY.md#api-revocation-gate) states the rule.
+  (`BACKLOG #4636`)
+- **The anonymizer salt must be at least 32 characters, up from 16.** `secrets.token_hex(16)`
+  (32 characters, 128 bits) and the recommended `secrets.token_urlsafe(24)` pass;
+  `secrets.token_hex(8)` (16 characters, 64 bits) is now refused. This is a length floor, not an
+  entropy measurement: `secrets.token_urlsafe(16)` carries 128 bits in 22 characters and is
+  refused, and a guessable 32-character string can pass. The existing entropy screen stays as
+  the low-entropy check. The too-short refusal now names the generator.
+- **An anonymizer salt UTF-8 cannot encode is refused without quoting the salt in the message or
+  carrying it on the exception chain.** An undecodable byte in an environment variable becomes
+  such a character on POSIX, and Windows can hold an unpaired surrogate. The keyer used to let
+  the codec's own error through, which quoted that character and kept the whole salt on its
+  `object` attribute. It now raises a `ValueError` that quotes none of it and chains no exception.
+  The frames its traceback carries can still hold the salt as a local, so a traceback renderer
+  that captures locals would print it.
+- `python -m tee anonymize-captures` names the variable the salt came from when the keyer refuses
+  it. Both the toolkit keyer and the copy vendored into the tee changed (BACKLOG #4652).
+- **`/ui/logout` audit rows for sign-outs that end no session are now bounded.** The route needs no
+  credential, so any caller that could reach it could append `auth.logout` rows with `outcome`
+  `nothing_to_revoke` without limit. For each engine process, in any 60 seconds, each source now
+  begins at most 3 such row writes, all sources together at most 120, and the route at most one
+  count row. A sign-out past the per-source or all-sources limit is counted, and only a sign-out that
+  names no caller and ends nothing writes the count, in a row with `outcome` `unrecorded` and
+  `"count": N`. The bound never stops the row of a sign-out that ends a session, or that names its
+  caller as `POST /auth/logout` does. The bound is on the row, not the request: each request that
+  passes the route's origin check (`assert_same_origin`) and carries a non-empty session cookie
+  still runs a store write, the sign-out's revoke.
+  [SECURITY.md](docs/SECURITY.md#session-inventory--targeted-revocation-wp-10) states the bound
+  and what the count can miss. (`BACKLOG #4735`, `BACKLOG #3749`)
+- **A refused loopback re-ingress is bounded by the refused-body allowance too.** A captured reply
+  that fails its peek or size check on re-ingress is still recorded as an `ERROR` child of its
+  origin, but it is now charged to the loopback's `[inbound].refused_body_allowance_bytes` like a
+  listener's refusal: inside the allowance it is stored whole, past it only the head is, the error
+  opens with the allowance note, and the child's metadata records the reply's length and keyed
+  digest. The whole reply stays in the origin's captured response until retention erases it, and
+  edit-and-resubmit of a head-only child points there without naming the origin's id. See
+  [CONFIGURATION.md](docs/CONFIGURATION.md). (`BACKLOG #4796`)
+- **Windows SSO now resolves a ticket only to the account it proves.** The ticket's realm was
+  checked against `[auth].kerberos_realm` and dropped, and the directory was then asked the
+  password sign-in's wider question. So in the shipped code, under a forest-wide base or the global
+  catalog, `alice@CORP.EXAMPLE` would have signed in as a child domain's `alice`; one entry holding
+  only the UPN `alice@<ad_domain>` would have answered a ticket for `alice`; and a machine's ticket
+  (`WS01$`) was looked up like a person's. The Kerberos lookup now asks for a person account whose
+  own `sAMAccountName` is the ticket's name and whose DN's whole trailing run of `DC=` RDNs equals
+  the realm's domain, and looks up no name ending in `$`. A realm whose users are not under its own
+  `DC=` RDNs, as on a directory other than Active Directory, now finds no account, and neither does
+  a ticket naming the account by an implicit UPN, which a client that does not ask for name
+  canonicalization may present. The password sign-in is unchanged. See
+  [SECURITY.md](docs/SECURITY.md#local-vs-active-directory). (`BACKLOG #4846`)
+- **The SQL Server preset refuses a driver that is not a Microsoft SQL Server driver, and a
+  `server` holding a comma or a backslash.** The preset sent `SERVER=<server>,<port>` with any
+  `odbc_driver`, so with another driver the port `[egress].allowed_db` compared could bind
+  nothing, and a comma in `server` could name a host the check never saw. The `odbc_driver`, as
+  written, must now be one of Microsoft's ODBC Driver or SQL Server Native Client names, whole
+  and spelled with single spaces, or a local path whose file name is the Microsoft ODBC Driver
+  library, holding no `;`, `{`, `}` or `=`. The engine reads the name, not the library it
+  loads. FreeTDS and the bare legacy
+  `SQL Server` are refused. The connection-string build refuses, on every factory that builds the
+  preset, and so does the egress check for a host an `[egress].allowed_db` entry names. Why, the
+  exact names accepted, and when each refusal runs are in
+  [CONNECTIONS.md](docs/CONNECTIONS.md), *The port an `allowed_db` entry binds*. For another
+  driver, use `dialect="generic"` on `Database` or `DatabasePoll`; `DatabaseLookup` and
+  `DatabaseRef` take only a Microsoft driver. (`BACKLOG #4873`)
+- **A generic DATABASE `server` holding a comma is no longer judged on-box by its first element.**
+  The cleartext-hop guard read the host from the text before the first comma, so
+  `127.0.0.1,remote` with no TLS keyword would have counted as a loopback hop and crossed under
+  the empty `[egress].allowed_db` opt-out. libpq reads a comma in a host as a list of hosts, so the
+  guard now reads such a `server` whole, as a remote host. `127.0.0.1,5432` is remote too now; on
+  psqlODBC and MySQL put the port in the `PORT` keyword, as the `allowed_db` check already
+  requires. On Microsoft's `ODBC Driver <n> for SQL Server`, which reads `host,port` and ignores
+  `PORT`, a host, one comma and a port in digits with no leading zero, such as `127.0.0.1,1433`, is read as that host
+  and port; anything else holding a comma is read whole there too. (`BACKLOG #4874`)
+- **`restore-verify` and `restore` refuse a malformed store key with exit 2 and no key byte.** Each
+  decoded the store keyring with a bare base64 decode, so a key that was not base64, or held a
+  character that is not ASCII, reached the last-resort handler and exited 1. For the second, the
+  raised error chained a codec error that names the character and holds the whole key. Both
+  commands, and a backup's own key resolve, now decode as the store open does and refuse with fixed
+  text and no chain; the two commands report it as "could not start" and exit 2.
+- **The store key resolution and the store cipher build refuse an `Exception` of any class with a
+  codec error still on its chain, at least as the error itself, its cause, its context, one of its
+  arguments or a group member, with a fixed text and no chain. The store open runs its own key
+  custody step before the cipher build, under every key provider, and an error that step's guard
+  replaces is a `HostCustodyRefused`, as the end of the next bullet says. Under
+  `key_provider = host` the `aesgcm` cipher build at the store open takes its key from that step
+  rather than the key resolution, and the cipher build at that open is still judged as this bullet
+  says.** The text names the settings the key comes from and which case it is, and reads nothing
+  from the error or the codec error: no text, no argument, no class name. At the key resolution and
+  the cipher build, a `ValueError` is refused as `StoreCipherConfigError`, any other class as
+  `KeyProviderError`, which at least every CLI command with a key arm, `rotate-key` among them,
+  reports as a key that could not be resolved, exit 2. Before, a key source error whose own text was
+  built from a codec error still on its chain, one whose codec error was a context beside a cause,
+  and a `RuntimeError` such as a `KeyProviderError` or `DpapiError` that chained one each kept the
+  byte the codec error quotes. The judgement that finds the codec error does read the error: it
+  walks the chain, reads each link's arguments and at least its `reason` and `original_error`, and
+  tests each link's class with `isinstance`, so a link's own properties run. An error whose chain
+  cannot be read whole, too long or raising as it is read, is refused the same way, and says so,
+  whether or not it holds a codec error. One whose judgement raised is refused as the same two
+  classes with another fixed text, unless that fallback refusal itself raises; what the judgement
+  raised is logged as a WARNING by its class name alone, with no `exc_info`, once the site has left
+  its handler, so an error the log call raises is not chained to the judged one. If that log call
+  fails, a fixed ERROR line with no argument is logged instead. At least these are not detected, and
+  keep the byte in their own text: an error whose text was built from a codec error that has since
+  left the chain; one that holds a codec error deep inside a container argument, past the scan's
+  budget; and a provider `BaseException` that is not an `Exception`, such as a `SystemExit`, which
+  is never judged. A `BaseException` that is not an `Exception`, such as a `KeyboardInterrupt` or
+  `SystemExit`, raised by the judgement's own code, and anything the fallback refusal itself raises,
+  such as a `RecursionError` at the recursion limit, still propagate, in place of the refusal, with
+  no cause and no context. That cuts only those two links: at least one whose own arguments or group
+  members hold the judged error still prints it, its traceback's frame locals still hold it for a
+  renderer that prints locals, and an interrupt delivered in the handler outside the judgement's
+  code, or before the links are cleared, keeps it as its context. The links are cleared through
+  `BaseException`'s own descriptors, so an interrupt class's own `__setattr__` does not run.
+  (`BACKLOG #4882`, `BACKLOG #3471`)
+- **Every other error from the store cipher build or the store key resolution is replaced by a new
+  refusal with a fixed text the site chooses, raised after the handler has exited, and nothing from
+  the provider or the build is passed through at either site; the store open's custody guard, at
+  this bullet's end, passes a recorded `KeyProviderError` through. What runs once the provider has
+  answered is not judged: the key check at `resolve_active_key`, whose refusals the engine built and
+  raises as built, and the keyring's assembly at `resolve_decrypt_keys`.** The class of every
+  refusal that replaces an error at the cipher build or the key resolution, the previous bullet's
+  included, depends on the codec judgement. An error the judgement refuses, one with a codec error
+  on it, one whose chain cannot be read whole or one whose judgement raised, takes the previous
+  bullet's two classes, so a hop refusal holding a codec error is a `StoreCipherConfigError` and a
+  `DpapiError` holding one a `KeyProviderError`. Otherwise the new refusal's class follows the
+  error's: an `InsecureHopRefused`, a `DpapiError` or a `DpapiUnavailable` is replaced by one of
+  that base class, not of a subclass it may be, any other `ValueError` by a
+  `StoreCipherConfigError`, and any other `Exception` by a `KeyProviderError`; at the cipher build a
+  hop refusal is a `StoreCipherConfigError` too, as every `ValueError` there. Its text names the
+  settings for that case, such as `[store].cipher_provider`, `[store].key_provider`,
+  `[store].encryption_key_file` or, under `vault_transit`, the Transit cipher's own settings, and
+  reads nothing from the error: an exact `StoreCipherConfigError` or `KeyProviderError` is replaced
+  too, since its arguments could have been reassigned, and so is a subclass, since its own `__str__`
+  could print a byte. A refusal the key resolution raised keeps the text it recorded when it was
+  built, the key check's refusals built from the settings alone among them, and one whose error or
+  cause is exactly the Vault hop's marked refusal gets a fixed text naming the store's Vault
+  settings. Which of two fixed texts it gets is chosen by also reading that marked refusal's
+  argument. Only the store's revocation refusals, of the Vault leg or the proxy leg, get a text
+  offering `[store].vault_revocation_attested` with its reason, after the loopback remedy and on the
+  condition, for the operator to judge, that revocation for the hop is covered outside the engine;
+  every other marked refusal, at least an http:// address or a proxy's cleartext credentials, gets
+  none. The refusal keeps no cause and no context, so a traceback of it does not print the error's
+  own text, and the site drops the error, so no frame local of the refusal's traceback holds the
+  error itself. The class of a replaced error the engine did not build, and of its cause, is logged
+  as a WARNING by name alone. Before, a `ValueError` from the build was refused with its own text,
+  and an error of any other class passed through as it was. At the open, under every key provider,
+  the key custody step runs inside one guard: a `KeyProviderError` the engine built and recorded is
+  re-raised as it is, and any other `Exception` from the step, a `ValueError` included, is replaced
+  by a `HostCustodyRefused`, raised with no cause or context, unless building that refusal raises,
+  which then leaves in its place. No codec judgement runs in that guard: the replacing refusal is a
+  `HostCustodyRefused` whether or not the replaced error is or chains a codec error, never a
+  `StoreCipherConfigError`, and the guard reads only the replaced error's identity and class, never
+  its text, its arguments or its chain. Its text is a fixed text naming the custody settings, then
+  either the text the engine recorded, by the error's identity, when it built that error, or else a
+  fixed reason chosen by its class. So a codec error's byte stays out of a refusal that replaces an
+  error; a recorded `KeyProviderError` is not replaced, and passes through as it was raised, with
+  whatever chain it carries. Of the replaced error, the guard logs at most its class name. A
+  `BaseException` that is not an `Exception` is not caught there, and a check before the guard
+  raises a `ValueError` with a fixed text where a caller passes a host blob or a recovery wrap under
+  any key provider but `host`. What the step itself reads, converts, settles and refuses is defined
+  by `load_host_custody` and `_host_custody_steps` (`messagefoundry/store/custody_host.py`,
+  `messagefoundry/store/base.py`); this entry does not restate it. (`BACKLOG #4882`)
+- **The PostgreSQL store's TLS context refusal at the open, `StoreTlsRefused`, carries a fixed text
+  that names `[store].ssl_root_cert`, `[store].ssl_crl_file` and the hop's suites, and reads
+  nothing from the context builder's `ValueError`.** Before, it carried that error's text, which
+  can quote the `ssl` or `cryptography` library's message. The refusal is built and raised after the
+  handler has exited, so neither of its chain links holds that error and a traceback no longer
+  prints it. An `InsecureHopRefused` is replaced by a new one with a fixed text, and an `OSError`
+  that is also a `ValueError` by a new error that is both, with a fixed text; neither passes through
+  as it is. At least an error from the builder that is not a `ValueError`, such as a plain `OSError`
+  or an `ssl.SSLError`, is not caught there and still leaves with its own text. At least one leak
+  remains: a `[store].ssl_crl_file` that does not parse puts the `cryptography` asn1 parse error's
+  text into the CRL judge's own `ValueError` (`pki.judge_every_crl`, `tls_policy.judge_crl_bytes`),
+  which the pool's per-connection rebuild raises untyped and whole.
+  (`BACKLOG #4882`, `BACKLOG #5000`)
+- **`check-privileges`' AD bind probe names a hop refusal raised through the LDAPS revocation
+  guard, by the guard or by anything it calls, with a fixed text naming the guard and
+  `[auth].ad_tls_crl_file`.** It reads nothing from the refusal, so the domain controller's host it
+  names is shown only by `serve` and `provision-admin`. Any other hop refusal on that probe, at
+  least one from resolving a Vault-held bind password, is named by its type, as on the Vault probe.
+  (`BACKLOG #4883`, `BACKLOG #3471`)
+- **An `Http()` listener with `tls = true` bounds how many slots one address may hold in its TLS
+  handshake.** A socket takes a `max_connections` slot before its handshake, on every event loop
+  since BACKLOG #2479. With `max_connections_per_host` off, as it ships on
+  `Http()`, one address that stalled its handshakes could have held all 256 slots for up to 10 s
+  each. Any peer that reaches the port can stall, even on an mTLS listener without a client
+  certificate. The new `max_handshakes_per_host` (default 32, `None` or `0` turns it off) caps only
+  the sockets one address holds while still in their handshake. Over it, the socket is closed
+  unanswered with an `at_capacity` event whose reason reads `max_handshakes_per_host`. A socket
+  leaves the count when its handshake ends, so the cap does not bound how many requests one
+  address holds once their handshakes are done. It does bound how many can start at once:
+  `Http()` answers every request with `Connection: close`, so each request opens a new connection
+  and runs its own handshake, and one address could have at most 32 requests in their handshakes
+  together. `max_connections_per_host` still ships off. The new budget does not bound a peer that
+  completes its handshake and then sends nothing; `max_connections_per_host`, where it is set,
+  does. Behind an L4 load balancer that collapses source addresses the
+  32 bound every client's handshakes together; see
+  [DEPLOYMENT.md](docs/DEPLOYMENT.md#per-address-listener-caps-behind-the-vip).
+  (`BACKLOG #4888`)
+- **An MLLP listener can now name the senders it expects, bound to the CA that issued each one.**
+  With `tls_ca_file` alone, an MLLP listener admits any certificate its CAs ever signed as any
+  sender. The new inbound setting `tls_client_subjects` takes the table the HTTP listener's
+  `intake_client_subjects` takes: issuing-CA DN to qualified `SAN:<type>:<value>` or `CN:<value>`
+  names, matched exactly, and only under the loaded CA whose key signed the leaf, so a second CA in
+  `tls_ca_file` cannot issue a listed name. A verified certificate with no listed name has each
+  message of its first read recorded as an `ERROR` row, then answered `AR` (`sender not
+  permitted`) on an HL7 v2 inbound that acknowledges, and the connection closes; on any other
+  inbound it closes with no reply. Nothing from the certificate reaches the row, the reply or the
+  log. Each refusal is audited and evented as the HTTP listener's `mtls_subject` refusal is
+  (`intake.auth_subject_denied`), and charged to the same per-address failed-attempt budget, at
+  the `Http()` defaults; an address that has spent its own budget is closed unread
+  (`intake.auth_rate_limited`). The global arm is read only once a sender's certificate has been
+  refused, so refusals from other addresses would never close a listed sender.
+  The listener refuses TLS renegotiation while the setting is on. The factory refuses a SAN entry
+  no certificate could present as written: a type spelled other than as Python's `ssl` spells it
+  (`SAN:IP:` for `SAN:IP Address:`, `SAN:dns:` for `SAN:DNS:`), an IP address in another spelling,
+  and a placeholder `ssl` reports for a name it cannot render, such as
+  `SAN:othername:<unsupported>`, which would otherwise admit every certificate carrying such a
+  name. The shared matcher now skips those placeholders on a certificate, so the operator API and
+  the HTTP listener's `intake_client_subjects` never match one either, in any case (`ssl` writes
+  `<INVALID>` in upper case for a Registered ID). An `othername` holding a NUL byte is never
+  matched on any of the three: `ssl` stops an otherName at its first NUL, so the matcher reads the
+  certificate's DER and drops every `othername` of a certificate whose otherName holds one, and an
+  MLLP entry holding a NUL is refused at build. Unset, which is the default, the
+  listener behaves as before. An outbound that sets it is refused. The other listeners are not
+  covered yet. See
+  [CONNECTIONS.md](docs/CONNECTIONS.md#expected-senders-tls_client_subjects). (`BACKLOG #4907`)
+- **On the engine's urllib openers, a proxy credential from the environment no longer crosses a
+  verified TLS leg to the proxy.** An `http` target sent to a credentialed `https://` proxy from
+  `HTTP_PROXY` or the system proxy settings reached the proxy over TLS that fully verified it,
+  with the credential inside, in at least two shapes: with no `HTTPS_PROXY` set, and with
+  `NO_PROXY` naming the proxy's own host. Each opener `build_strict_opener` makes now refuses that
+  send before it dials, with `ProxyCredentialsRefusedError` and fixed text naming the TLS leg. So
+  does a plainly spelled `Proxy-Authorization` header a caller set that no connection admitted, on
+  the same leg. The environment half rests on decision d20261031T213402506-5d928c; the caller-set
+  half is a proposed scope, not yet ruled. A credential-free proxy is still used on that leg, and
+  a `proxy_user` credential its connection admitted is unchanged. Hops measured, at least: REST,
+  SOAP, FHIR, DICOMweb, `FhirLookup`, the alert webhook under its escape and the OIDC legs. The
+  committed tests pin each opener family and a REST send; the per-hop measurement of SOAP, FHIR,
+  DICOMweb and `FhirLookup` is in the pull request, not a committed test. The AI broker and the
+  OIDC configuration refuse an `http` target before any proxy is chosen. The OAuth2 and SMART
+  token hops refuse an off-box `http` token URL at build, and accept one on loopback, which no
+  opener sends through a proxy.
+  **Known exception:** the requests-based Vault/OpenBao hop is not a urllib opener, and it would
+  still send a proxy credential, at least one in `HTTPS_PROXY`, to an `https://` proxy over TLS.
+  (`BACKLOG #4909`)
+- **The Vault and proxy legs read the revocation guard's CRL rule.** `crl_no_credit` in
+  `config/tls_policy.py` gives no CRL credit to a context whose `verify_mode` is `CERT_NONE` or
+  that skips validity-period checks; its docstring states the conditions, and
+  `RevocationHopGuard.capture` reads it too. Where the guard is handed a `CERT_NONE` context, its
+  records and the AI broker's do not call the hop verified, and its default remedy does not offer
+  the attestation. (vault BACKLOG #4912)
+- **A `rotate-key` run killed inside its store open, after the open's new `before_first_write`
+  hook has opened the rotation record, now leaves that record open, so a later `serve` start does
+  not stamp the new key.** A writable open runs the hook before its first write under the store
+  key; a read-only open does not run it. (`BACKLOG #4936`)
+- **A `serve` start no longer stamps a changed store key that the audit chain has not been rolled
+  to.** On a store with a keyed audit chain, `rotate-key` rolls the chain only after both data
+  passes, so a start that finds a changed key and a chain not yet rolled to it opens the rotation
+  record for that key itself, writes no stamp, and logs a WARNING. A record already open for
+  another key is kept rather than replaced, so that key stays held when it comes back, and a
+  changed key is held while a record stands open for another key, even one the chain has rolled
+  to. That covers at least a start before the first `rotate-key` run, a run killed inside the store open
+  before it opened the record, and a key changed by hand. A store with no keyed chain to ask, such
+  as one whose audit rows open with no genesis row, still stamps a changed key with no record.
+  **A `rotate-key` audit step that refuses for good now names ways out**, at least
+  `[secret_rotation].store_key_last_rotated` and `[secret_rotation].enforce_store_key_expiry =
+  false`. It does so when no run can roll the chain, as with a broken chain or one with no genesis
+  row, and the run's rotation record stays open. A run with the key already stamped opens no
+  record and prints no such note, and neither does a refusal a re-run or a restored key clears.
+  See [PHI.md](docs/PHI.md).
+  (`BACKLOG #4942`, `BACKLOG #4936`, `BACKLOG #4934`, `BACKLOG #4935`)
+- **The mTLS issuer index reads a CA written under the legacy `X509 CERTIFICATE` PEM label, and,
+  where an identity map is configured, a client CA file whose CA certificates it cannot match, by
+  identity, to those the TLS library loaded now refuses the start; certificates that are not CAs
+  are compared only by count.** The index names the loaded CA that issued a client certificate.
+  It is built only where an identity map is configured, at least: the API when
+  `[api].tls_client_ca_file` and `[api].tls_client_cert_identities` are both set, an inbound `Http`
+  listener with `intake_auth = "mtls_subject"`, and an inbound MLLP listener with
+  `tls_client_subjects` set. Where none is configured the index is not built, so none of the
+  checks below runs. The TLS library
+  loads the legacy label from the CA file each of them reads, so the handshake verified a client
+  under such a CA, but the index read only `BEGIN CERTIFICATE` blocks. On a first deployment every
+  client under that CA would have been refused, and the start warning would have said the issuer
+  key named no loaded CA. A second CA with the same DN and a different key under the legacy label
+  would have been missed too, so a client under the other one would have been admitted although
+  the two cannot be told apart. The index now reads both labels, so two such CAs name no issuer,
+  as with the standard label. The index also read a `CERTIFICATE` block nested inside a block of
+  another label, such as a CRL, which OpenSSL skips whole, so a client that sent that nested CA as
+  its intermediate would have verified through a CA OpenSSL did load and been named under the
+  nested CA. It now skips such a body. **The index is now checked against the TLS library
+  itself.** It finds the certificates by modelling OpenSSL's PEM reader, and that model still
+  differs from OpenSSL on some shapes: OpenSSL silently stops loading a file at some blocks, such
+  as an empty block, a label holding a `:`, or a blank body line before a data line over 64
+  characters, while the model reads on. So after the index is built, the same bytes are loaded
+  into a scratch TLS context, one that serves no handshake and is discarded, and the start is
+  refused, naming the setting, unless the CA certificates the index holds are exactly the ones
+  that context lists, every other certificate the index holds loads, in a second scratch context
+  holding only those, as no CA, and the first context loaded as many of those, a certificate
+  listed more than once counting from once to as often as it is listed, as OpenSSL may keep each
+  copy. A certificate the library reads as no CA, a pinned client certificate for example, names
+  only a client leaf that is that certificate, since OpenSSL never accepts it as the issuer of
+  another. So one that does not sign itself is named for no leaf: it no longer makes a CA with its
+  DN ambiguous, which would have refused every client under that CA on a first deployment. An
+  issuer key naming only such certificates is now warned about at start, and so is any
+  certificate the index read that is not a CA and has a loaded CA's subject, naming the blocks:
+  OpenSSL may take it as the issuer of a client certificate that CA issued and then refuse the
+  chain. Which clients that can refuse, including a version-1 client certificate that strict
+  verification accepts, and when the warning names the CA itself as the cause instead, are stated
+  under *The issuer map's start checks* in the HTTP intake row of
+  [SECURITY.md](docs/SECURITY.md#table-b--data-plane-ingest-listeners). A certificate block
+  `cryptography` cannot parse also refuses the start, naming the setting. In the shipped code one
+  it refused with a `ValueError`, at least one
+  with bytes after its DER or a NUL and more text in a base64 line, both of which OpenSSL loads,
+  was counted and skipped with a warning. Skipped, such a CA left a same-DN twin with a different
+  key looking unambiguous, so a client under the twin would have been named. `cryptography`
+  refuses a CA with an unknown version with `InvalidVersion`, which is not a `ValueError`, so the
+  shipped code did not skip it: it raised out of the context build, refusing the start without
+  naming the setting. It now refuses as the others do. A client leaf with an unknown version
+  raised out of the issuer lookup in the shipped code; the lookup now names no issuer for it. A
+  file the TLS library refuses, such as one with a block missing its END line, refuses the start
+  as before.
+  (`BACKLOG #4948`)
+- **A session rotated while its account's sessions are being ended is ended too, on SQL
+  Server.** A bind, an unbind, a TOTP re-enrolment or a revoke of an account's sessions could
+  miss a session whose token was rotated in that instant, because the re-key moves the row to a
+  new key. A rotation now takes the account's row before the session's, in the order those
+  sweeps take them, so it either commits before the sweep reads the account's sessions or waits
+  for the sweep and then finds the session ended. PostgreSQL already followed the rotated row,
+  and a test now runs that on both server stores. See [SECURITY.md](docs/SECURITY.md),
+  *Limits of the session sweep*. (`BACKLOG #4974`)
+- **Signing out everywhere else no longer makes a missed session usable again.** A revoke that
+  keeps the caller's session, per account or across every account, now stamps the new epochs onto
+  that session only when it carried the epochs the revoke's own raises replaced: its account's,
+  taken from the record the raise read under the account's lock, and on the every-account revoke
+  the store's global session epoch too. A session an earlier sweep missed is behind on at least
+  one of them, so it stays refused; where the account's record fails its seal, nothing is
+  stamped. Same on SQLite, PostgreSQL and SQL Server. Each revoke now reports whether it stamped
+  the kept session, from the same transaction, and the "kept" answer of `DELETE /sessions` and
+  the scope of the `auth.session_revoked` audit row for it and for signing out everywhere else
+  follow that report, so a session left unstamped is not called kept. See
+  [SECURITY.md](docs/SECURITY.md), *Limits of the session sweep*. (`BACKLOG #4975`)
+- **A revoke that declines to keep the caller's session now ends it.** Where signing out
+  everywhere else, or the every-account revoke, does not re-stamp the caller's session, as the
+  `BACKLOG #4975` entry describes, the revoke now ends that session in the same transaction and
+  counts it, instead of leaving it unrevoked to be refused when next presented. It declines at
+  least where the session is behind on its account's epoch or the
+  global one, where its account's record fails its seal, and, on signing out everywhere else,
+  where the store's global epoch row is missing, which that revoke logs at WARNING. Same on
+  SQLite, PostgreSQL and SQL Server. The per-account revoke also reads the global epoch in its
+  own transaction, so a session behind on that epoch alone is no longer stamped and called kept.
+  So `DELETE /sessions` replying "this session was ended too" is true, the session cap no longer
+  counts such a row, and presenting it again is refused as an ended session rather than reported
+  as a seal failure. The reply to `DELETE /me/sessions` still counts
+  only the other sessions. See [SECURITY.md](docs/SECURITY.md), *Limits of the session sweep*.
+  (follow-up to `BACKLOG #4975`)
+- **A backup's early sweep of its DR staging root goes by the owner a new entry there gets.** It
+  went by the process's own owner. On a share whose server sets the owner, a directory carrying the
+  process's owner may have been made by another principal, such as SYSTEM on the file server, and
+  the sweep would have removed it. The backup now learns the owner from a probe it makes in the
+  staging root and removes again, and sweeps by that owner. The probe is an empty file created with
+  `O_EXCL`, whose owner is read through the descriptor that created it (`fstat` on POSIX,
+  `GetSecurityInfo` on its handle on Windows), so a rename in the staging root cannot choose the
+  owner. On Windows the probe carries, from its creation, a protected access list naming only
+  SYSTEM, Administrators and the creating account, so no entry inherited from the staging root lets
+  another account re-own it before its owner is read, and a probe whose list does not read back that
+  way is refused. The sweep a run makes once its own staging directory is open goes by the owner of
+  the lock file it created there, read the same way, and so does a standalone verify's sweep of the
+  OS temp dir, which read its own directory's owner by path. When the probe cannot be created, as
+  on a volume out of inodes, or its owner cannot be read, the run logs a warning and sweeps by the
+  process's owner only when the staging root itself carries that owner, read through a descriptor
+  opened on the root; otherwise that sweep is off for the run. A staging root that is itself the OS
+  temp dir, such as a SQLite store kept there, is also swept by the backup's sweep of the OS temp
+  dir, which goes by the process's own owner. What this leaves open is listed in
+  [`docs/PHI.md`](docs/PHI.md), section 2's `mefor-backup-*` / `mefor-verify-*` staging row.
+- **The staging teardown reports a directory its walk could not type.** An entry whose type
+  could not be read was taken for a file, so a directory there was never walked, nothing in it
+  was emptied, and the teardown still logged that every file was emptied and raised no cleanup
+  alert. Such a directory is now reported as not walked, so a backup raises its `cleanup` alert and
+  a verify names the directory.
+- **On Windows, the DR staging truncate fail-safe now holds each directory open while it lists and
+  empties it, and checks a cloud or deduplicated file as itself before its own open lets that
+  file's filter serve it.**
+  Before, it closed each directory's handle before opening that directory's files by path, so a local
+  account able to rename entries in the staging directory had a window to swap one for a junction,
+  and it opened such a file through its filter, which can recall or hydrate it, before checking the
+  file had one link. It now uses the file connector's own Windows helpers. Error 1, 50 or 87 from an
+  open is no longer logged as a volume that cannot report a file's final path, and a subdirectory
+  that cannot be opened is reported by its own name, not the staging root's. What the fail-safe still
+  leaves open is listed in docs/PHI.md section 2's `mefor-backup-*` / `mefor-verify-*` staging
+  row. On a first deployment, these defects would have applied to a backup or verify whose
+  staging directory could not be removed (BACKLOG #4992).
+- **An outbound that fails to build before its egress check now logs the URL query-credential
+  WARNING.** An outbound logged it only from the egress check, inside its build, so an outbound
+  whose `env()` setting did not resolve, or that failed another check first, would have been down
+  with no ASVS 14.2.1 record, while a `FhirLookup` failing the same way logged one. Both now take
+  one step before the build, at a start and, for an outbound, at least an operator start and a
+  schedule window's opening: it resolves the
+  `url` alone and logs the WARNING once, or an INFO line where the `url` itself does not resolve.
+  A build check and a connection test still log it from the egress check alone.
+  `docs/SECURITY-LOOSENING.md` holds where it fires. (BACKLOG #4997)
+- **A `connection_error` alert no longer hands its reason to any notifier transport.** The
+  webhook and email notifier bodies carried the outbound failure's `safe_exc` reason, which can
+  echo a partner's reply text. In its place the webhook body and the default email body carry the
+  exception class, or the fixed token `unnamed error` for a class that is not a plain identifier,
+  beside at least the connection and the kind. An email body or HTML part rendered from an
+  `[alerts]` template (BACKLOG #138) cannot show the kind or the class, because neither is a
+  template variable. Where the
+  notifier has an alert store wired, the reason is still stored as the alert instance's masked,
+  revealable reason; with none, the notifier keeps it nowhere. See
+  [PHI.md](docs/PHI.md) rows 10 and 11.
+  (BACKLOG #5021)
+- **A REMOTEFILE error now reports the server's reply code, never its reply text.** A refusal can
+  quote the path it refused, and on an upload that path ends in a name rendered from message
+  fields. Before, the upload scrubbed only an exact copy of each rendered name out of the reply, so
+  a server that cut the name short or percent-encoded it kept the identifier in `last_error` and
+  the alert detail. Now an FTP or FTPS error carries the reply code and a fixed meaning, such as
+  `FTP rejected the operation: reply 550 (file unavailable, such as not found or no access)`, and an
+  SFTP error carries the exception's type and errno. The classification of a refusal is unchanged.
+  An FTP reply the client cannot read, such as a `SIZE` or `MLSD` size or an `EPSV` port that is
+  no number, or a reply that is not UTF-8, now fails transient by its type alone, where its
+  `ValueError` quoting the reply escaped as an internal error. The exceptions are at the session's
+  start: a login reply that is not UTF-8 is a credential fault, since a retry of a refusal nobody
+  could read would lock the partner account (ADR 0095), and an `AUTH TLS` reply that is not UTF-8
+  is a TLS configuration fault. A `ValueError` from this side's own
+  input, such as a CR or LF in a credential or a path, still escapes as itself, since every retry
+  would meet it again. Each client also raises the error
+  outside the handler that caught the reply, and the upload removes its temp file outside its
+  handlers, so neither the error's chain nor a cleanup failure's chain carries the reply. An SFTP
+  connect refusal keeps paramiko's text; `_SftpClient._connect` says why. (vault BACKLOG #5026)
+- **A credential a generic ODBC connection string sends without braces is masked character by
+  character in a log line, at least where its key ends in a credential word and follows a `;`.**
+  Every `odbc_params` value, `sslpassword` among them, is sent plain and may hold a space, `,` or
+  `&`, and a plain password echoed by another route, at least a driver's own error text, may also
+  hold `=`; the builder braces every password it sends. The log scrubbers
+  stopped at the first three, so an echoed `;PWD=...;` would have printed the tail of the password,
+  and `;sslpassword=...;` would have printed whole, since `ssl` glued to `password` gave the label
+  no word boundary. A member right after a `;` whose key ends in a credential word or in `token`,
+  such as `AccessToken`, now has each word of its value, to the next `;`, quote or line break,
+  masked character for character, each letter to `x` and each digit to `0`, except the words listed below, on
+  at least the write-time log filters, the support bundle and `GET /logs/tail`. It is a pass of its
+  own that runs last of the credential passes. The text keeps its length and every character
+  outside the words, because the same text is redacted again: a record two or three handlers
+  filter, a log line the bundle reads back, and store error text. A draft that replaced the whole
+  value, and a mask that wrote `redacted` for each word, took a separator, label, segment ID, name
+  run or base64 length a later pass reads, and printed values the scrubbers hid before on those
+  paths. A seeded differential over nine redaction paths, recorded beside the pattern in
+  `messagefoundry/secretscrub.py`, is a fuzz result, not a proof. Its large run predates two
+  later changes, the kept words below and a hex escape kept before a segment ID; what covers
+  those is a far smaller set of fixed cases and a seeded sample in the tests. What still prints, at least: every
+  character of the value outside a word, its spaces, punctuation, symbols such as `@` and non-ASCII
+  ones, and combining marks, so its word count; each word's length, where its digits, `_`, `.`
+  and `-` sat, and where a name-shaped piece had its capitals; a word that holds a credential, key-label
+  (such as `masterkey` or `AccountKey`), write-time query-filter or PHI anchor word anywhere inside it, whole, when a `=` or `:` follows it (a `#` only after a word
+  ending in `MRN`), such as the `pass` of `pass=word`, and a word ending in a scheme word or `MRN`
+  before a space; a segment ID before a `|`; a FIRST member, with no `;` before it, whose value
+  does not run to a `;` that another `<key>=` follows, whose tail after a space prints as before
+  where a label pass reads its key, and whose whole value prints where none does; a
+  key that holds a credential word followed by anything but one qualifier, such as `PasswordHint`;
+  the text after a `;` inside a quoted value; and, on the write-time chain, a member glued into the
+  same token as a percent-encoded HL7 run, which the PHI pass takes first, so its tail after a
+  space prints as before. The cost, at least: text after a glued `;password=` in prose or a URL's
+  matrix parameters is masked to the next `;`, quote or the end of the line. A URL
+  query-credential word, such as `key`, `sig`, `auth` or `jwt`, is not a kept word, so
+  `;sslpassword=Monkey:Banana42;` is masked whole; a word that holds a kept word, such as
+  `Hotkeymasterkey`, `Codename` or `Passage`, prints whole before a `:` or `=`. (BACKLOG #5030)
+- **Three more connection-string shapes are masked in a log line: a first member with no `;`
+  before it, a key with a qualifier after its credential word, and a member after `; `.** A first
+  member, as in `Password=a b;Server=h`, is read where its value runs to a `;` that another
+  `<key>=` follows. A key such as `ClientSecretValue`, `PasswordOld` or `Password2` holds a
+  credential word followed by one qualifier: `value`, `primary`, `secondary`, `old`, `new`,
+  `next`, `current`, `previous`, `prev`, `plaintext`, `plain`, `raw`, `text`, `string` or a run of
+  digits, each after an optional `_`. A member may follow its `;` after spaces or tabs. Each value
+  is masked as a member after `;` is, on the write-time log filters and the support bundle. Before,
+  at least the tail after a space printed, and for a key no label pass reads, such as `sslpassword`
+  or `ClientSecretValue`, the whole value. What still prints, at least: a key with any other suffix
+  after its word, such as `PasswordHint`, `PasswordHash` or `TokenKey`, whose value prints as
+  before; and a first member whose value does not reach such a `;`, whose whole value prints where
+  no label pass reads its key. The cost: prose after `; password=` is now masked to the next `;`,
+  quote or the end of the line, as after a glued `;password=`, so
+  `login failed; password=wrong for user bob` loses the words after `password=`; and a first
+  member's mask runs to its `;` over other labels' names and values, so
+  `login failed user=bob password=wrong role=admin host=db1;session=1` loses `role=admin` and
+  `host=db1` too. A key such as
+  `PasswordPolicy` or `TokenEndpoint` keeps its value. (BACKLOG #5030)
+- **A MySQL Connector/ODBC `SSLMODE` must now be one of the spellings MySQL documents.** Under a
+  registered MySQL driver name the build accepted any value, so `verify-full`, `require` and `yes`
+  counted as TLS addressed while, per engine PR 2691, MySQL would fall back to `PREFERRED`, which
+  can send in plaintext. The build now refuses any value but `DISABLED`, `PREFERRED`, `REQUIRED`,
+  `VERIFY_CA` or `VERIFY_IDENTITY`, in that upper case, and the cleartext-hop classifier counts no
+  other value as a mode. No MySQL driver was run for this change: the spellings are the
+  documentation's, and whether the driver reads another case was not measured. See *The `SSLmode`
+  spelling* in [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #5035`)
+- **The generic DATABASE dialect now refuses any `odbc_driver` off its driver allowlist.** The
+  generic connection string sends its target as `SERVER` alone, and `[egress].allowed_db` and the
+  cleartext-hop guard's on-box test read that host, so a driver that takes its target from another
+  keyword, a file-based driver among them, would dial a host neither judged. A free name could also
+  be a library path a driver manager loads as given. The shipped code built any name. It also let
+  the hop guard allow such a driver on-box from the host in `server`. A generic `Database` or
+  `DatabasePoll` connection would now be refused unless `odbc_driver` names psqlODBC, MySQL
+  Connector/ODBC or Microsoft's `ODBC Driver <n> for SQL Server` by a whole registered name. With a
+  literal dialect and driver it is refused where it is declared, so `messagefoundry check` fails
+  even with no `messagefoundry.toml`. Otherwise it is refused when the connection is built. No
+  declaration lifts that. The `[egress].allowed_db` check refuses the same names. The engine's two
+  driver classifiers, one for the TLS gate and one for the egress port, are now one. At least
+  MariaDB Connector/ODBC, library paths, odbcinst aliases such as RHEL's bare `MySQL`, and
+  `ODBC Driver 13.1 for SQL Server` are refused. This replaces the unreleased BACKLOG #5163 work: its
+  construction WARNING is gone, and its advisory `generic-db-server` line is now `generic-db-driver`,
+  which lists the hops whose `env()` dialect or driver the build may refuse. Such a driver is no
+  longer reported as a TLS loosening on `generic-db-tls` or `GET /security/posture`, since no
+  declaration lets it build. See *The generic driver allowlist* in
+  [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #5041`, `BACKLOG #5163`)
+- **A generic DATABASE hop's TLS mode now counts only on the keyword its driver family reads.**
+  The engine places the `odbc_driver` name, by whole registered name, as psqlODBC, MySQL
+  Connector/ODBC or Microsoft's ODBC Driver for SQL Server. Only `sslmode` counts as a mode on the
+  first two, and only `Encrypt` on the third. The shipped code counted either keyword on any driver,
+  so `Encrypt=yes` on psqlODBC, which has no such keyword, would have cleared the cleartext-hop
+  guard with no TLS attempted. A name the engine cannot place, at least a library path, an
+  odbcinst alias such as RHEL's bare `MySQL` and another vendor's driver, now has no keyword that
+  counts, so its hop is reported and, off-loopback on an enforcing instance, refused unless the
+  connection declares `tls_hop_attested` or, on an outbound, `cleartext_accepted`. A mode set on
+  the other family's keyword or spelling is reported with the keyword its driver reads. The
+  construction warning now gives each family's own example, and for a name it cannot place points
+  at the registered names and `tls_hop_attested`. See *Generic ODBC* in
+  [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #5053`)
+- **A CRL on a context that skips time validity no longer crosses a revocation guard, with or
+  without `expiry_relaxed`.** `RevocationHopGuard` now decides on one field, `crl_checked`, which
+  is True only when the hop's context checks a CRL, does not skip the validity-period check, and
+  the caller did not pass `expiry_relaxed=True`. Before, a caller that handed `capture` such a
+  context without the flag had the hop admitted on its CRL, with no attestation and no line,
+  though the relaxation lets a CRL past its `nextUpdate` through. Such a hop is now refused
+  off-box under an enforcing posture unless the connection attests it, and warned off-box under
+  WARN unless it attests or `MEFOR_TLS_REVOCATION_ATTESTED` is set; a record that passes no remedy
+  of its own names the `tls_allow_expired` one. The flag can only take the credit away. No shipped call site's
+  disposition moves: at least the MLLP destination, the DICOM C-STORE SCU and both FTPS directions
+  already pass the flag, and at least REST, SOAP and FHIR hand the guard no context there. The guard's
+  `crl_is_a_check` property and `context_skips_validity` field are gone. (`BACKLOG #5086`)
+- **An `[alerts]` host off its allowlist now refuses at build, and `serve` refuses a security
+  channel whose relay the allowlist omits.** Before, a webhook or SMTP relay off a non-empty
+  `[alerts].webhook_allowed_hosts` or `[alerts].smtp_allowed_hosts` built with no revocation
+  check, then failed every send. So an enforcing instance could start with a security channel
+  that sent no notice at all. Now every build of those transports refuses that host, with or
+  without an SMTP login, and before the revocation guard runs. That covers at least the alert
+  notifier, the per-user security notifier, the alerts test send, and the offline notifiers that
+  `provision-admin` and `admin reset-totp` build, which drop the notice with a WARNING when the
+  build fails. `serve` treats a relay off the allowlist as no channel. It
+  refuses to start (exit 2) at every enforcement level, because
+  `[alerts].security_notifications_required = false` does not admit the relay. A config that used
+  to start with such a host now refuses. An allowlist of `[""]` names no host and refuses every
+  host; an empty list still admits any. `messagefoundry check` does not catch this case.
+  (`BACKLOG #5088`)
+- **The docs now say that only `messagefoundry restore` onto SQLite is recorded at start.** A
+  PostgreSQL or SQL Server store restored with the database's own tools, or a SQLite store put
+  back by copying its files, carries no restore marker, so the first `serve` ends no session,
+  writes no `store_restored` audit row and raises no alert. The early-adopter guide's restore
+  paragraph read as if any restore were covered. [SECURITY.md](docs/SECURITY.md) gains a
+  section naming what is and is not recorded and the steps an operator takes by hand after such a
+  restore: `messagefoundry admin-revoke-sessions`, then re-applying account changes made after the
+  backup. No detection was added. (`BACKLOG #5092`)
+- **`messagefoundry admin-revoke-sessions` no longer says nothing was revoked when it cannot
+  know.** On a server store, a connection lost during the commit, or an asyncpg command timeout
+  that fires on the commit, may come after the revoke committed; a pyodbc query timeout
+  (`HYT00`) still reads as a refusal. For either of the first two the command now says
+  the outcome is unknown, as the transit-bound commands do, and writes an `auth.session_revoked` row with
+  `"outcome": "unknown"` and no count, or says to record the attempt by hand where the store
+  refuses that row too. A re-run also ends every session signed in since the first attempt. Its
+  success line now says the count is the unrevoked session rows it ended, expired ones included,
+  and that the global session epoch it raised refuses the sessions signed in before it unless
+  someone with write access to the database lowers or deletes that row. Its help now says to run it with the engine
+  stopped, as ADR 0171 says for the commands on admin-unlock's gate. (`BACKLOG #5093`,
+  `BACKLOG #5095`)
+- **Every restore notice now names what a restore rolls back, from one statement.** The
+  `store_restored` alert, the `restore` summary, its age refusal and the `--allow-old-archive` help
+  named only disables, deletes, role changes and resets, so an operator acting on them after a
+  restore would have left out at least password changes, MFA and passkey removals, notify-email
+  changes, AD maps, custom roles and channel scopes. A factor removed after the archive would then
+  stay live on the restored store. The statement, kept in `messagefoundry/restore_notice.py`, also
+  names the `vault_transit` bound attestation a restore brings back or drops, the duplicates a
+  restore can send, and how to keep users off the engine while re-applying. The `restore` summary
+  and `restore --json` (as `rollback_notice`) carry it whole, and `messagefoundry restore --help`
+  prints it at its end on any installed engine. The `store_restored` alert carries it as its own
+  `rollback_notice` key; its
+  detail keeps the archive's age and the session count first, then names `messagefoundry restore
+  --help`, all within the 200 characters the alert's stored reason keeps. The age refusal opens
+  with `Nothing was written` and names the same command. The restore section of
+  [EARLY-ADOPTER-GUIDE.md](docs/EARLY-ADOPTER-GUIDE.md) lists the classes. (`BACKLOG #5094`)
+- **A document handle now resolves only to an attachment its own message holds.** At delivery the
+  re-attach of a detached document checks each `OBX-5.5` handle against the attachments the row's
+  message is linked to, so a handle a sender wrote cannot name another message's document. A handle
+  that is malformed or unlinked dead-letters that row at once instead of re-pending on the lane, and
+  so does a copy of the handle, raw or escaped, where the re-attach does not splice (`NTE-3`, a
+  second `OBX-5.5` repetition) in a message that holds a document. A streaming inbound now refuses
+  a received body at or over its streaming threshold whose `OBX-5.5` already holds a handle, or
+  which would have a document detached while it holds the handle marker anywhere else, a
+  document's value included, with an `ERROR` row, an `AR` on an MLLP listener and a permanent
+  refusal on HTTP; at a smaller body, a handle whose marker is in the raw text or escaped only by
+  the payload's own delimiters is refused at delivery instead.
+  A payload whose `MSH-2` escapes the engine's own handle is re-attached rather than sent with it.
+  A pass-through, edit-and-resubmit or edit-and-resend child holds its own reference to each of
+  its parent's documents a handle in its `OBX-5.5` names, so it still delivers them and either purge
+  keeps the count. An address its body carries anywhere else is not inherited. An inherited link
+  grants no download: a user scoped only to the child's channel cannot download, or see listed,
+  through the child, a document the parent's channel stored.
+  A message whose `MSH-1` or first four `MSH-2` characters include a base64 character (`A-Za-z`,
+  a digit, `+`, `/` or `=`) is refused wherever a document would be detached or set back: both
+  listeners refuse such a body before the ACK if a document would be detached or it holds the
+  handle marker, and delivery refuses a handle or marker in it, so the engine's own splice does
+  not send a document with its base64 escaped. An outbound `encoding_characters` override is
+  outside this rule. A copy whose content address is in uppercase now counts as a copy.
+  Ordinary delimiters are unaffected by that delimiter rule.
+  Under any delimiters, ordinary ones included, a document is now detached only if delivery would
+  set it back verbatim: a streaming body whose `ED` Base64 value the splice would escape, such as
+  a non-base64 value holding `&` or a control character under `|^~\&`, is refused at the detach
+  the same way, and a stored value holding a delimiter the payload's `MSH-1` or `MSH-2` names dead-letters at
+  delivery rather than reaching the partner altered.
+  See [ADR 0105](docs/adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md).
+  (`BACKLOG #5099`)
+- **The config-source trust check now refuses a config directory it cannot list.** It listed the
+  directory's modules with a glob, which drops a listing error, and it returned at once where
+  `Path.is_dir` said no, which it says for a share Windows cannot reach. So a config directory on a
+  share that dropped at the wrong moment, or one this account could not list, would have passed the
+  check with no module vetted, while the load listed and ran them. The listing now raises, and a
+  load, a reload and `messagefoundry check`'s validate leg refuse the directory. At least a load
+  judges it again by listing it: one gone is missing, one that still does not list refuses with
+  `could not read .`, and one that lists again is refused as a source it could not vet (vault
+  `BACKLOG #5248`). The `check` lint legs that scan the config modules (`raise-fstring`,
+  `accepts-candidate`, `handler-security`) now say they could not list the directory instead of
+  reporting a clean scan, and `--strict-handler-security` fails there. A rename that has to find a
+  code-first declaration refuses instead of leaving the definition out of its plan. (`BACKLOG #5117`)
+- **A trust anchor's `cadata=` text now keeps the file's bytes where they stand.** It used to drop
+  non-ASCII lines and model OpenSSL's PEM reader line by line, and that model did not match what
+  `cafile=` reads in every shape, so on a first deployment the text could have trusted a
+  certificate that `cafile=` does not show. Now each byte at or above 0x80 becomes `?` where it
+  stands, so every line break stays where it is and OpenSSL reads the text in the same pieces as
+  the file. On OpenSSL 3.5 and later a UTF-8 byte-order mark is dropped only where OpenSSL's own
+  reader drops one, as measured on OpenSSL 3.5.7; a different OpenSSL may differ. On an OpenSSL
+  older than 3.5, a file where one would be dropped in front of a BEGIN line refuses. At least a
+  non-ASCII byte inside a PEM block refuses, and so does a NUL byte anywhere. This changes what
+  the trust-anchor check admits: some files it refused now load, as `cafile=` loads them in the
+  shapes measured on OpenSSL 3.5.7, and some it loaded now refuse. This replaces the line model and
+  the byte-order-mark rule the `BACKLOG #3746` entry in this release describes. The
+  encryption-header check now reads non-ASCII comment lines too, so a `Proc-Type:` or `DEK-Info:`
+  name on one after the first `-----BEGIN ` refuses, as on an ASCII line. That replaces the
+  `BACKLOG #2270` entry's statement that a comment line that is not ASCII is dropped before the
+  check. [CONFIGURATION.md](docs/CONFIGURATION.md) states the rules under `tls_client_ca_file`.
+  (`BACKLOG #5229`)
+- **A trust anchor at which the TLS library stops reading without an error now refuses.** At some
+  damaged PEM blocks, at least a block that decodes to no data or holds a header line OpenSSL
+  cannot use, the in-memory load stopped there and kept the certificates before that block, while
+  a load of the same file by path refuses it. So on a first deployment the engine could have
+  trusted certificates from a file `cafile=` refuses. The check now appends a throwaway probe
+  certificate to the text in a scratch context, and refuses the file when the load never reaches
+  it. A file that already holds that probe certificate refuses too. Not every damaged
+  block refuses: at least an `X509 CRL` block whose base64 decodes to bytes that are not
+  a CRL still loads.
+  (`BACKLOG #5229`)
+- **A reload names the fault when its config directory goes during the load.** A share lost after
+  the reload's target check was audited as `invalid_config`, which would send an operator looking
+  for a config to fix, though the target check audits the same fault as `unreadable`. A load that
+  cannot read the config directory itself now refuses with its own `WiringError`, and an ungated
+  reload audits that as `unreadable` with the target check's 422. That includes a directory that
+  lists while `Path.is_dir` says no, and a listing fault in the trust check, which the load judges
+  again by listing the directory: one gone is missing, and one that lists is still refused as a
+  source the check could not vet. A released reload of a directory it cannot list is still refused
+  as `digest_unavailable`. A config directory moved away before the Windows trust check read its
+  owner and access list is now missing, audited `not_found`, where it was refused as a source the
+  check could not vet and audited `invalid_config`; the refusal is logged at WARNING. A share lost
+  during that read (Win32 error 53 or 67) whose directory then does not list refuses as a
+  directory the load cannot read: an ungated reload audits it `unreadable`, and a released reload
+  `digest_unavailable`, where each was audited `invalid_config`, the release with
+  `approval_digest_check: not_reached`. One that still lists is still refused as a source the
+  check could not vet. Only a refusal that came from that read finding the directory gone, or its
+  share unreachable, is judged again. A policy refusal, such as a directory others can write or
+  one with a foreign owner, stands whatever happens to the directory afterwards: it stays
+  `invalid_config`, and a released reload keeps `approval_digest_check: not_reached`, even where
+  the directory has since moved away or stopped listing. (vault `BACKLOG #5248`)
+- **The `env` secret provider refuses a whitespace-only variable, and its refusal no longer repeats
+  the reference.** In the shipped code a variable a reference named, holding only spaces, would have
+  been accepted as a credential, and a secret placed in a `*_secret` or `*_ref` reference by mistake would have been
+  quoted in the error text and the log. The refusal now names the credential whose reference to
+  correct instead. The `vault` provider is unchanged. (`BACKLOG #5326`)
+- **OIDC sign-in refuses an id_token whose `azp` is present and is not exactly the configured
+  client id, whatever its audience count.** That includes at least another client's id, null, an
+  empty string and any non-string value. The check used to run only on a token with more than one
+  audience. An `aud` array with a non-string or empty element is refused too, even when it also
+  names the configured client. Refusing a non-string element is consistent with the type RFC 7519
+  gives `aud`; refusing an empty one goes beyond it. The engine still has no trusted-audience list,
+  so a token whose `aud` names the client and another audience is accepted when `azp` is the client
+  id; OpenID Connect Core ID Token Validation item 3 says to reject an untrusted extra audience,
+  and this release does not close that gap. (`BACKLOG #5339`)
+- **The API's request body limit refuses any `Transfer-Encoding`, and a `Content-Length` that is not
+  one plain number.** The limit matched `chunked` in the first `Transfer-Encoding` line only. A
+  request carrying `Transfer-Encoding: gzip` and then a second `Transfer-Encoding: chunked` line is
+  framed as chunked by the llhttp parser `serve` pins, so with no `Content-Length` the limit admitted
+  the chunked body at any size: a public route that reads a body, such as `POST /auth/login`, would
+  read it unbounded before any authentication; a gated route refuses a caller with no identity
+  before reading the body. Under `serve`, an empty `Transfer-Encoding` ahead of a `Content-Length`
+  also reached a route. On a server other than the one `serve` pins, which refuses these first, the
+  limit also took `+2`, `-5` and `0_2` as lengths through `int()`, and read only the first of
+  several `Content-Length` lines. Now the limit refuses, and closes
+  the connection on, any request carrying `Transfer-Encoding` and any `Content-Length` that is not
+  one line of plain decimal digits, where llhttp under `serve` has not refused them first; the
+  cap on the declared length is unchanged, and its 413 now closes the connection too.
+  [SECURITY.md](docs/SECURITY.md) control 5 states the rule and its statuses, and [DEPLOYMENT.md](docs/DEPLOYMENT.md) tells a proxy in front of the
+  engine to refuse a `Transfer-Encoding` on more than one line. (vault `BACKLOG #5345`)
+- **The API body limit now counts every HTTP request body.** A request with neither
+  `Content-Length` nor `Transfer-Encoding` passed the limit uncounted, and a body longer than its
+  `Content-Length` was judged by that header alone, so a host that frames a request another way (at
+  least HTTP/2, HTTP/3 and an in-process ASGI call) could have buffered a body of any size. Each
+  body is now counted as the route reads it and refused with `413` at the first chunk past the same
+  cap, including the upload routes' larger one, which now applies only to their exact paths. If
+  the route has already started a response, no `413` is sent: its read gets a disconnect, and the
+  log says so. A call with no body is still
+  admitted. Under `serve`, which ends a body at its `Content-Length` and frames a request with
+  neither header as empty, the count cannot pass the cap. A body-limit refusal over HTTP/2 or
+  HTTP/3 no longer carries the `Connection` field those protocols forbid, so only on HTTP/1.x does
+  it ask for the connection to close. (`BACKLOG #5345`)
+- **The DATABASE read-only statement gate refuses more T-SQL verbs, and a DATABASE error with no
+  SQLSTATE no longer has its text quoted where it could carry DSN attributes.** A `db_lookup`,
+  `DatabaseRef` or `poll_statement` that opens with `SELECT` or `WITH` is now refused when it
+  carries, outside a literal or comment, at least `SET`, `USE`, `DECLARE`, `OPEN`, `CLOSE`,
+  `COMMIT`, `ROLLBACK`, `SEND`, `BACKUP`, `RESTORE`, `KILL`, `DBCC` or `RAISERROR`, since T-SQL
+  runs such a verb as a second statement with no `;`. It also refuses `OPENQUERY`, `OPENROWSET`
+  and `OPENDATASOURCE` inside a read's `FROM`, because each sends a pass-through query the gate
+  cannot read to another server or provider. This refuses some valid reads, at least an
+  `OPENQUERY` read, a `USE HINT`, `USE PLAN` or `DISABLE EXTERNALPUSHDOWN` query hint and an
+  unquoted column named `send` or `move`; [CONNECTIONS.md](docs/CONNECTIONS.md) lists them.
+  An error with no SQLSTATE that no driver raised, a connect failure or any other, is now named
+  by its type alone in the connect and connection-test errors and in the mark-failure,
+  poll-failure and stopped-poll-task logs, so a DSN echoed in its text would not reach the log,
+  the queue or an alert on a first deployment. The engine's own fixed-text errors keep their text
+  there, at least the pool-acquire timeout, the `statement_timeout` refusal and the autocommit and
+  call-gate borrow refusals. In the poll-failure log a bug's message is withheld the same way;
+  its frames still print. (`BACKLOG #5346`, `BACKLOG #5348`)
+- The Direct outbound now applies the Email outbound's subject rule when the outbound is built (vault BACKLOG #3206, #2842).
+- **A REST or SOAP outbound that names a signing key but leaves it empty is refused instead of
+  sending unsigned.** An empty `sign_private_key` read as signing off whatever `sign_enabled` said,
+  so such an outbound would have delivered every message unsigned. `with_signing` now refuses a
+  literal `""` or `None` key unless `enabled` is the literal `False`; an `env()` flag is refused
+  there whatever it resolves to. Building the outbound refuses a key that resolves empty when
+  `sign_private_key` or `sign_enabled` is named, unless `sign_enabled` resolves to a value read
+  as false. (`BACKLOG #5364`)
+- **A non-capturing X12 outbound's unparseable-reply error is scrubbed and unchained.** Its text
+  goes through the same scrub as the captured arm's detail, and the parse error is no longer its
+  cause or context. (`BACKLOG #5365`)
+- **BREAKING: `zip_decompress` refuses more member names, on every platform.** An archive with a
+  member name holding a colon (an NTFS alternate data stream on Windows), such as an ISO 8601
+  timestamp name like `2026-11-17T10:30:00.hl7` that POSIX systems allow, or a path component
+  ending in a dot or space (which Windows drops), now raises `CompressionError`. So does a
+  component `ntpath.isreserved` names: a reserved device name, bare or with any extension, such
+  as `NUL`, `COM1`, `con.hl7` or `aux.json`, or a character Windows refuses in a name. That check
+  is the running Python's own list, so ordinary names such as `con.hl7` and `aux.json` are refused
+  on every platform. A `.hl7v2` member is now checked as HL7 v2 instead of accepted unchecked.
+  (`BACKLOG #5369`)
+- **Strict X12 validation keeps more interchange text out of tracebacks and logs.** A refusal no
+  longer chains the pyx12 exception, whose message can quote a whole ISA, so a traceback would have
+  carried ISA02 and ISA04 on a deploying site. `X12ValidationError` now keeps only that exception's
+  class name. `X12ValidationResult`'s repr leaves out `ack`, which echoes sender values.
+  `X12SegmentError.segment_id` is `None` unless the value has an X12 segment id's shape and a map
+  in pyx12's bundled index defines it. So a wrongly delimited segment, or a name's tail standing
+  where the id goes, no longer lands in `segment_id` or `message`, unless it equals an indexed id,
+  for example `LIN`, `PAT`, or the `LE` of a name written `O~LE`. Such a value is kept in both even
+  in a transaction whose own map does not define it. A failure building pyx12's params, which
+  raised pyx12's raw exception before, now raises `RuntimeError`. Only a walk failure of a type a
+  sender's bytes cannot raise in pyx12 4.1.0 (`OSError`, `ImportError`, an XML `ParseError` or a
+  defusedxml refusal) moved from `X12ValidationError` to `RuntimeError`. A Handler's
+  `except ValueError` catches neither `RuntimeError`, but left uncaught each takes the
+  `internal_error` policy, whose default also dead-letters the row. An `X12ValidationError` from a
+  walk that raised logs its exception class at WARNING, rate-limited, with no message or sender
+  text. The refusals for a missing or unreadable pyx12 report log nothing. A refusal for an
+  interchange pyx12 has no map for now says so, since it may follow a guide pyx12 does not bundle.
+  A map whose content is wrong but still parses can produce a wrong validation result, with no
+  exception or log line. (`BACKLOG #5370`)
+- **Startup attestation reports an emptied package as drift, hashes a linked package directory at
+  its `RECORD` place, and counts a file only once it is read.** The read-back of `RECORD` rows that
+  no listed file matched gains a second trigger, stated in `messagefoundry/integrity.py`, so a
+  loaded web console whose every file was deleted, or swapped for a FIFO or socket, is `missing`
+  drift for each row instead of attested-nothing. A console or engine package directory swapped for
+  a link out of the install root is walked at its `RECORD` place and read through the link: a changed
+  file the arm attests is `hash_mismatch`, and a gone one whose row it reads back is `missing`.
+  Intact, it is still attested-nothing, now under the new `unattested_reason` value
+  `package_directory_links_out_of_install_root`. The console walk also names a directory it cannot
+  list as drift. On either arm, a file that fails to open is drift and is no longer counted as
+  checked. A pass that listed a file under the install root, or ran the read-back, and read none
+  carries the new `unattested_reason` value `no_file_read_under_install_root`, unless a loaded
+  package directory is a link out of the install root, which carries
+  `package_directory_links_out_of_install_root`. The `startup_integrity` audit row of a pass that
+  verified nothing and found no drift now reads `attested: false` and `checked: 0`; a pass with
+  drift keeps both as compared. A row for a pass with a package directory linked out of the
+  install root also carries `linked_out_paths` and `read_through_link`, the count of files read
+  through the link. (vault `BACKLOG #5376`)
+- **`cert import` refuses a PBMAC1 MAC whose PBKDF2 keyLength is absent or is not its HMAC's
+  output size.** RFC 9579 requires keyLength and asks for that size. Before, the length was never
+  checked, so a bundle whose MAC key was one octet long would have passed, and that key could be
+  found from the file's own MAC with no passphrase. A PBKDF2 parameter block with a field
+  repeated or out of order is now refused as malformed. A bundle exported with
+  `openssl pkcs12 -pbmac1_pbkdf2` passes. (`BACKLOG #5377`)
+- **The URL query credential detector reads bracket-keyed names.** It now drops every trailing index
+  and reads each bracket key with the piece before it, so `user[password]`, `token[0][0]` and
+  `user[password][x]` are named. Before, they passed at least the construction warning, `check`, the
+  posture entry, the HTTP family's no-escape refusals and the rotation watcher's URL credential
+  fingerprint unnamed. The change also names ordinary bracket keys that end in a credential word,
+  such as `filter[key]`, `include[auth]` and `meta[sig]`. A deploying site with such a URL on a hop
+  that turns off TLS verification, or that sends plain `http` off the machine, would have that hop
+  refused with no escape, as `filter_key` already is. The settings views now withhold a URL whose
+  query holds such a bracket-keyed name, `filter[key]` among them, as they withhold one holding
+  `filter_key`. (`BACKLOG #5379`)
+- **On each line below, the values `tests/test_b532r_redaction_bracket_tail.py` names for it are now
+  hidden on every entry point that test checks.**
+  - `connect postgres://svc:Kv9x@Zq7;w@db.example.invalid/x failed`
+  - `connect postgres://svc:Kv9x@Zq7;w;Mx4@db failed`
+  - `connect postgres://svc:Kv9x@;Wq4@db failed`
+  - `connect postgres://svc:Kv9x@Zq7;;Wq4@db failed`
+  - `connect postgres://svc:Kv9x@Zq7;Wq4;@db failed`
+  - `connect postgres://svc:Kv9@Aa1;Bb2@Cc3;Dd4@h2 failed`
+  - `connect postgres://svc:Kv9x@Zq7@Wq4;Mx5@db failed`
+
+  What still prints is stated in the comment on `_WIDE_DSN_PASSWORD` in
+  `messagefoundry/secretscrub.py`. (`BACKLOG #5386`)
+- **A trust anchor `serve` refuses before its API lifespan runs is now reported in a WARNING,
+  for at least two kinds of refusal.** A start refused before the lifespan writes no
+  `auth.trust_anchor` row: it opens no store. It now logs a WARNING with the refusal's reason, at
+  any `[logging].level`, for at least the collector CA (`[logging].forward_tls_ca_file`) and an
+  API client CA (`[api].tls_client_ca_file`) the TLS build refused as an anchor refusal or as an
+  `OSError` naming that file. Other refusals may log nothing, at least a client CA path that is
+  a directory, pipe or device, a path the OS rejects, and other CRL build refusals. So may at
+  least an interrupt, an exit uvicorn takes before the lifespan starts, and an exit inside the
+  lifespan before its audited check runs. (`BACKLOG #5391`)
+- **Names that differ only in case are refused, and a source allow-list is judged as a whole.**
+  Within each registry table `CASE_TWIN_TABLES` in
+  [config/wiring.py](messagefoundry/config/wiring.py) lists, a config with two names that differ
+  only in case now refuses to load, and a rename onto such a name is refused, because a SQL Server
+  store column that compares without case would read the two as one. A `DatabaseLookup` or
+  reference-set name is also refused beside one that differs from it only in trailing spaces, or
+  in the width of the full-width forms `case_twins` there folds; that function says what width
+  differences the check still misses. A name of a kind the tables do not list, at least a router,
+  handler or code-set name, is not checked. Separately, the HTTP intake gate and the DICOM
+  SCP gate now cap the IPv4 addresses a `source_ip_allowlist`'s entries count together, so entries
+  that each meet the prefix floors no longer pass as narrow when together they exceed the cap.
+  Both gates quote one rule, `ALLOWLIST_RULE_TEXT` in [netaddr.py](messagefoundry/netaddr.py),
+  which defines the count, and the refusal names the rule the list failed.
+  (`BACKLOG #5392`, vault `BACKLOG #5393`)
+- **The Windows service start now refuses a store key written below an empty secret under a name
+  Windows sets, where the key is the next item, the empty secret is on a later line of its
+  string, or the secret's name stands alone.** In the service's registry environment, below an
+  empty secret such as `MEFOR_STORE_ENCRYPTION_KEY=`, a line or item under a name Windows itself
+  sets, spelled as Windows spells it, or under `MEFOR_SECRETS_DIRECTORY`, whose whole value is
+  one key or a comma list of keys, such as `Path=<key>`, a blank entry from a trailing or doubled
+  comma skipped as the engine's own retired-keys reading skips it, now reads as that secret's
+  value, and the
+  start is refused. That is new at least in the next item of a multi-string value, below the
+  secret's name written alone with no equals sign, as `nssm set ... NAME =value` writes it, and
+  below an empty secret on a later line of its registry string. In those three forms, under such
+  a name, at least a value holding key text beside other text, such as `Path=C:\x;<key>`, still
+  ends the empty value. An empty secret set with
+  its equals sign on a string's first line still refuses when such a line follows it, as it
+  already did.
+  (`BACKLOG #5394`)
+- **`[auth].password_min_length` may not exceed 1020.** A larger floor is refused when the
+  settings load, whether or not a character-class rule is on. Before, it loaded, and the engine
+  could mint a temporary password longer than the 1024 characters the sign-in, step-up and
+  password-change requests accept: one at least that long, which gains a 4-character class suffix
+  when a class rule is on and the random part misses a class. Both numbers live in one leaf module,
+  `messagefoundry/password_bounds.py`, which the request models and the settings read.
+  (`BACKLOG #5397`)
+- **The engine refuses an enrolment code longer than 64 characters where a binding step reads it,
+  as a refused code, without normalising or hashing it.** The TOTP enrolment confirm and the
+  passkey registration both read it there, after every refusal the service gave before that read.
+  The JSON `MfaConfirmRequest` bounds it at the same 64 characters. (`BACKLOG #5399`)
+- **The password policy refuses a password longer than 1024 characters.** Before, `provision-admin`
+  accepted one. The JSON sign-in request then refused that password, while the console's sign-in
+  form accepted it. This release bounds the console's sign-in form at the same 1024 characters, and
+  adds the policy clause, so the policy refuses such a password at set time on every path that
+  screens a password with it, at least `provision-admin`, the service's first-administrator
+  provisioning and the password change. (`BACKLOG #5397`)
+- **The IDE refuses a Windows device name in a path setting.** On Windows, the writer check and
+  the security editor now refuse a folder or file name such as `nul`, `con` or `com1`, with or
+  without an extension, which Windows can open as the device. (`BACKLOG #5404`)
+- **The IDE Test Bench Debug launch no longer has the debugger itself put the workspace on the
+  import path.** debugpy before 1.8.22 ignores `-P` when it runs a module. So the launch now runs a
+  small program the extension writes into its own global storage folder, under `testbench-debug`.
+  Under a debugpy before 1.8.22, that folder goes at `sys.path[0]` instead. It is not pruned, and
+  nothing checks its contents. Not covered: the debuggee's environment. The Python Debugger loads
+  an env file into it. That file is the workspace `.env` by default, or the file `python.envFile`
+  names. The process environment applies too. A variable set in either can still put workspace
+  code ahead of the installed package under Debug. At least `PYTHONPATH`, `PYTHONHOME` and
+  `PYTHONUSERBASE` can do that. (`BACKLOG #5409`)
+- **The IDE Security Settings editor checks the file it writes and the numbers it saves.** In an
+  untrusted workspace it refuses before any file-system call. A `messagefoundry.serviceConfig` set
+  in workspace settings must name a file inside the workspace folder, and any path inside the
+  folder, at either scope, is refused if it passes through a link it can detect; a user-set path
+  elsewhere is accepted as written. The workspace folder itself is taken as given, a link
+  included: it is the first folder the workspace opens, which a repository's `.code-workspace` file
+  can set to any folder, the repository's own or not, so a value that file sets can name a file
+  outside the repository. Open limit: a user-set alias into the folder, at least a subst drive or a
+  junction, is not caught. The rules are in the `securityConfigTarget` docblock in
+  `ide/src/securityEditorModel.ts`. Each CLI value is bound to its flag with `=`, and the host
+  checks a save message's shape before it writes. A cleared number field now resets the switch to
+  its secure default instead of saving 0, which for message-body retention meant keep
+  indefinitely, and Save refuses a fraction, unparseable text or a retention value below 0.
+  (`BACKLOG #5411`, `BACKLOG #5412`)
+- **A Test Bench collection run writes its case bodies owner-only on POSIX, and a later sweep can
+  remove the files a run left.** The run's temp directory is mode `0700` and each case file `0600`,
+  created exclusively; on Windows those modes do nothing and the temp directory's own ACL governs.
+  A run tries to delete its directory when it ends, and a sweep, run when the Test Bench panel is
+  created and before a collection run writes its directory, tries to delete one last modified over
+  an hour ago, on POSIX one this user owns. Neither always removes it, so case files can stay on disk; the `deleteCaseDir`
+  and `sweepStaleCaseDirs` docblocks in `ide/src/collectionCaseFiles.ts` say what stays and when,
+  and the races that can get past those checks. The
+  dry-run is handed that directory rather than one path per case, so a large collection no longer
+  fails on the length of the command line.
+- **New opt-in `[auth].ad_tls_crl_check_chain` and `[auth].oidc_tls_crl_check_chain` check a
+  server's whole chain against the hop's own CRL file** on the LDAPS bind and on both OIDC legs, so
+  a revoked intermediate CA refuses the domain controller or the IdP. Each needs the hop's CRL file
+  and its own CA file, and is refused at load without either. The CA file must hold self-signed
+  roots and any intermediates that chain to them, and the CRL file a CRL from each CA in the
+  server's chain, an intermediate the server sends included. Off by default, so each hop keeps the
+  leaf check. At least the log forwarder and the Postgres store still check the leaf only. See [CONFIGURATION.md](docs/CONFIGURATION.md).
+- **New opt-in `[tls].crl_check_chain` checks a server's whole chain against `[tls].crl_file`**
+  on the outbound hops that block reaches, other than a REST connection's ECH sidecar hop and a connection whose url is `http`, which make no TLS connection of the engine's own to the partner, so a revoked intermediate CA refuses the servers under
+  it. It needs `crl_file` and a hop that trusts operator CAs alone, such as one pinned by a connection's
+  `tls_ca_file` or a pinned `[tls].internal_ca_file`, whose CA file holds self-signed roots and any intermediates that chain to them. A hop on the OS trust
+  store refuses at build, an `http` connection or an ECH sidecar hop on it included, though that
+  hop checks no CRL against the partner. Off by default, so each hop keeps the leaf check. See
+  [CONFIGURATION.md](docs/CONFIGURATION.md#tls--outbound-client-trust-anchors).
+- **An empty host no longer counts as loopback on the cleartext, revocation and trust-anchor
+  checks.** The shared on-box check read `""` as this machine, so in the shipped code a hop with an
+  unset host would have skipped those checks while its real destination was unknown. Each caller
+  now says what an empty host means. A blank HTTP listener host binds `127.0.0.1`, so the
+  peer-control gate reads it as on-box. A log forwarder with no host has no hop to judge. The
+  log-forwarding and key-share checks still count a blank value as this host. A generic ODBC
+  `server`, and the `server` of the SQL Server preset (`Database`, `DatabasePoll`,
+  `DatabaseLookup`, `DatabaseRef`), that names no host is refused at every posture, and neither
+  `tls_hop_attested` nor `cleartext_accepted` crosses it. A preset `server` of `None`, as a
+  `DatabaseRef` can carry, is refused too, and is never sent as the host `None`. At least a blank
+  value, a bare `:port`, `[]`, an empty entry beside a comma, and a host made only of brackets,
+  colons and digits that is neither all digits nor an IPv6 literal, such as `[,]` or `:1433:`,
+  name no host. A plain number, bare or before a port (`1433`, `[1433]`, `12:34`), and the IPv6
+  literals `::` and `[::]` are accepted. A protocol prefix with nothing after it, such as `tcp:`,
+  is not caught. The same values are refused at load in a SQL Server
+  `[store].server`, and a value of spaces in a PostgreSQL one. An empty PostgreSQL `server` still loads, and that hop is judged off-box.
+  (`BACKLOG #5512`)
+- **The `accepts=` load-time walk follows more of the routes to `state_get` and `response_get`.**
+  A predicate that reaches either accessor through a class or instance attribute
+  (`Readers.get`), a module-level tuple, list, dict or set holding the accessor or a helper that
+  reads it, a bound method's `self.getter`, or `staticmethod(state_get)` now fails `validate` and
+  `check`, as a direct read does. Before, a suppression filter built that way passed the walk and
+  would see an empty view in the router phase, passing every message. The walk still misses at
+  least these shapes, and a predicate built from one still passes it: a module-level instance's
+  method called unbound (`FILTER.check(msg)`, `partial(Cls.m, obj)`), Python 3.14's combined
+  load of two locals, `self` read through `EXTENDED_ARG` or `LOAD_DEREF`, an attribute held in
+  `__slots__`, a classmethod's `cls.reader`, and a `@property` read through `self.reader`.
+  (`BACKLOG #5514`)
+- **Two Windows path checks read a device-prefixed spelling as Windows opens it.** The start
+  check's link walk stripped a `\\.\` or forward-slash prefix from a link target and walked the
+  rest as a local path, which Win32 may open as another object; it now refuses any link target the
+  trust-anchor walk refuses as a device path. The key-file check collapsed `.` and `..` with
+  `os.path.abspath` before its walk saw the text, so `\\?\C:\x\..\k` was judged as `C:\k`, which the
+  open never reads, and `\\.\C:\..\UNC\h\s\k` as the local `C:\UNC\h\s`; such a spelling is now
+  refused before that step. (`BACKLOG #5515`)
+- **The inbound HTTP listener's failed-attempt budget can key on the client behind a proxy.**
+  `Http(trusted_proxies=[...])`, under `intake_auth = "api_key"` or `"bearer"` only, names the
+  HTTP reverse proxies in front of the listener. From a listed peer the per-peer budget keys on the
+  client address in `X-Forwarded-For`, read right to left as uvicorn reads it, so one client's
+  failed attempts no longer `429` every partner behind the same proxy. The default is an empty
+  list, which keys on the socket peer. On every HTTP listener, `mtls_subject` included, an IPv6
+  socket peer now keys on its `/64` and an IPv4-mapped one on its IPv4 address, as a forwarded
+  client does, except in a prefix that carries an IPv4 client, such as NAT64's, where it keys on
+  that IPv4 client or on the whole address. Hosts that share a `/64` therefore share one budget,
+  among them link-local peers and the clients of a network-specific NAT64 gateway. At least these
+  are refused at load: the setting under `none` and `mtls_subject`, with either budget off or not
+  an integer of at least 1, and for `'*'`, entries that together span a whole address family
+  or more than a `/16` of IPv4 or a `/48` of IPv6, and each form `[api].trusted_proxies` refuses.
+  See [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #5525`)
+- **A SOAP credential pair is both halves or neither, and the UsernameToken no longer borrows
+  HTTP Basic.** A SOAP outbound refuses at construction, on its resolved settings, `basic_user`
+  without `basic_password`, or the reverse, and with `ws_security` on, `ws_username` without
+  `ws_password`, or the reverse. One half used to build and send no Basic header, or stamp an
+  empty UsernameToken password. `ws_username` and `ws_password` no longer fall back to
+  `basic_user` and `basic_password`, so `ws_security` with only the Basic pair now stamps the
+  `Timestamp` alone and sends the password once, as HTTP Basic. A configured or minted credential
+  replaces a static `Authorization` header of any spelling, and the connection test presents the
+  minted bearer a send presents. See
+  [ADR 0015](docs/adr/0015-ws-soap-outbound-mtls-wssecurity.md), amendment of 2026-11-10.
+  (`BACKLOG #5526`)
+- **A detached-JWS signing header named `Authorization` no longer replaces the credential on a SOAP, REST or FHIR outbound, and a SOAP outbound refuses a `bearer_token` beside a Basic pair.**
+  A SOAP outbound now refuses at construction a `bearer_token` beside a Basic pair, as REST and DICOMweb already
+  did; it used to send Basic and drop the token without a word. A SOAP, REST or FHIR outbound
+  refuses a detached-JWS signing header named `Authorization`, in any spelling, beside a
+  configured or minted credential for that header, at least HTTP Basic, a `bearer_token`, an
+  OAuth2 or SMART provider, or an `Authorization` entry in `headers`. The signature is written
+  after the credential, so it replaced the credential on every send; beside HTTP Digest it was
+  already refused. The static-credential
+  inventory lists HTTP Basic alone where both a `bearer_token` and a Basic pair are set. It reads
+  an `env()` `http_auth` as the build resolves it, and one it cannot resolve as HTTP Digest,
+  except beside an OAuth2 or SMART provider whose enabled flags, and SMART token URL, are
+  literal. The build refuses Digest beside a bearer provider, but at least an `env()` OAuth2
+  token URL with no `oauth2_enabled` key can still resolve the provider off, and the inventory
+  does not list Digest there.
+  (`BACKLOG #5526`)
+- **The engine AI broker now honours the `[tls]` trust-anchor policy, and `[tls].crl_file` is a
+  way across its revocation refusal.** The broker dialled one shared opener on the OS trust store,
+  so in the shipped code `[tls].internal_ca_file` did not reach the `[ai].endpoint` hop and
+  `[tls].crl_file` was never checked on it: under `pinned` the endpoint would still have been
+  verified against every public root, and a revoked certificate would have been accepted wherever
+  the hop crossed on warn or on its attestation. On an engine started by `messagefoundry serve`,
+  `POST /ai/chat` now hands the broker the instance `[tls]` policy, and an endpoint whose host
+  does not read as loopback is verified against the internal CA under `augment` or `pinned` and, where
+  `[tls].crl_file` is set, checked against it in any mode, on an anchored opener the engine
+  holds, so `crl_reload` can bring its CRL current; a replacement it refuses takes a restart, as
+  on a connection. With that CRL such an endpoint crosses `enforce` with no attestation, and
+  the refusal text now offers `[tls].crl_file` beside `[ai].endpoint_revocation_attested`. No CRL
+  is checked unless `[tls].crl_file` is set, the `[tls]` section reaches the app, and the
+  endpoint host does not read as loopback; [SECURITY-LOOSENING.md](docs/SECURITY-LOOSENING.md)
+  states that reading, under which an endpoint URL holding `[::1]` is loopback, and says which
+  apps that leaves out. What the instance-wide CRL costs this hop:
+  [CONFIGURATION.md](docs/CONFIGURATION.md#tls--outbound-client-trust-anchors).
+  (`BACKLOG #5527`)
+- **The AI-broker revocation refusal says which endpoint hosts read as loopback.** Its last remedy
+  now asks for an endpoint URL whose host reads as loopback, such as `localhost`, `127.0.0.1` or
+  `[::1]`, listed in `[ai].allowed_endpoints` as the URL writes it, says such an endpoint is
+  verified against the OS trust store alone, with neither `[tls]` file, and says that the host is
+  not resolved: at least a spelling with a trailing dot or a shortened IPv4 address
+  such as `127.1` reads as remote, so a gateway on this machine spelled that way is judged as any
+  non-loopback endpoint is. See
+  [SECURITY-LOOSENING.md](docs/SECURITY-LOOSENING.md). (`BACKLOG #5527`)
+- **The `alerts.email_tls_revocation_attested` posture entry names when a CRL is checked.** It
+  said the SMTP relay checks "no CRL unless [tls].crl_file is set", which overstated the check: a
+  loopback relay gets no CRL whatever that file says, and nor does a sink whose caller hands it no
+  `[tls]` policy. `GET /security/posture`, the serve-start warning and `security show` now print
+  the three conditions. The `ai.endpoint_revocation_attested` entry now says how it reads
+  loopback, under which an endpoint URL holding `[::1]` is loopback and `localhost.` is remote,
+  so it gets the CRL where the other two conditions hold. See
+  [SECURITY-LOOSENING.md](docs/SECURITY-LOOSENING.md). (`BACKLOG #5527`)
+- **The `[alerts]` SMTP login refusal no longer offers `[tls].crl_file` on its own to a sink
+  built with no `[tls]` policy.** Such a sink gets no CRL whatever that file says. Its refusal
+  now says so, and names the attestation pair, or handing the sink the policy with that file. (`BACKLOG #5527`)
+- **An ECH sidecar address must now be listed in `[egress].allowed_ech_sidecar`.** A REST
+  connection that sets `ech_egress` sends every request, credential headers included, to its
+  loopback sidecar, and the egress check judged only the upstream `url`. So any port on this host
+  could have been named as the sidecar. The new list takes `host:port` entries, port required, and
+  is deny-by-default even under `[security].block_unlisted_outbound = false`: an `ech_egress`
+  connection whose sidecar is not on it is refused at config load. List the sidecar, for example
+  `allowed_ech_sidecar = ["127.0.0.1:8123"]`. The sidecar URL itself is refused at least when it
+  carries a user, a password, a query or a fragment. See the key's row under `[egress]` in
+  [CONFIGURATION.md](docs/CONFIGURATION.md#egress).
+- **HTTP Digest runs as configured or the connection does not build.** A REST, SOAP or FHIR
+  outbound with Digest now refuses at construction a static `bearer_token`, `basic_user`,
+  `basic_password` or `Authorization` header beside it, or a signing header named
+  `Authorization`: beside Digest, a connection configures exactly one HTTP credential. Where such
+  a credential is sent, it would have replaced the Digest response on the wire, because urllib
+  lets a request header override the one the Digest handler adds. A lone Basic half sends nothing
+  on REST or FHIR, and is refused under the same rule. A REST outbound refuses `ech_egress` with
+  Digest, which used to drop the Digest handler. An `http_auth` value other than `digest`, such as
+  a typo, is refused instead of read as no auth. (`BACKLOG #5529`)
+- **The default anonymization rule map scrubs more identity, contact and location fields, and a
+  driver's licence takes a kind of its own.** `PID-2`, `PID-21`, `PID-23`,
+  `NK1-13/30/31/32/33/37`, `GT1-2` and `PV1-6/11/42/43` had no default rule; each now takes a
+  kind in both copies of `DEFAULT_RULES`. `PID-20` moves from `id` to a new `dln` kind: the
+  licence number is fabricated, the issuing state kept and the expiry date blanked. An
+  `anon.toml` overlay with `"PID-20" = "id"`, which loaded before, is now a retarget of a
+  default, so `load_rules` refuses it unless `PID-20` is listed under
+  `[hl7].retarget_acknowledged`. The `id`, `mrn` and `ssn` surrogates now keep only the CX
+  components that name the id's scheme, type and issuer, which [PHI.md](docs/PHI.md) section
+  9 lists, and blank the rest, the check digit and the effective and expiration dates among them.
+  They used to keep every component past the first as captured. The leak-check scans the
+  components the `id`, `mrn`, `ssn` and `dln` kinds keep for the shapes it knows. (`BACKLOG #5533`, `#5534`)
+- **The default anonymization rule map scrubs twenty more identity, contact, date and location
+  fields.** Inside segments the map already scrubbed, `GT1-4/19/21/24/29/42/45/46/51/56`,
+  `NK1-12/26/38`, `MRG-2/5/6` and `PV1-5/37/50/52` had no rule. Plain `anonymize` passed them
+  through, apart from what the site-code pass rewrites. `anonymize_checked` refused at least a
+  dashed SSN, a phone written `NNN-NNN-NNNN` or `(NNN) NNN-NNNN`, or an `MR`- or `MRN`-typed id
+  in them. Under the default rules, only `require_full_coverage` refused a message with any value
+  in them. Each now takes a kind in both copies of `DEFAULT_RULES`. A field
+  that takes the `id` kind, at least `GT1-19/29`, `NK1-12`, `MRG-2/5/6` and `PV1-5/50`, gets a
+  fabricated id but keeps its CX.3 to CX.6, CX.9 and CX.10 components as captured, CX.4 the
+  assigning authority and CX.6 the assigning facility among them. In `GT1-19` and `NK1-12`, the
+  guarantor's and the next of kin's employee ids, that means an employer named in CX.4 or CX.6
+  survives, and `anonymize_checked` does not refuse a name there. An `anon.toml` overlay that
+  points one of these fields at a kind other than its new default, `drop`, `freetext` or a keep
+  is now a retarget of a default, so `load_rules` refuses it unless the field is listed under
+  `[hl7].retarget_acknowledged`. A keep on one of them still loads, and turns the new scrub off
+  with a warning. See [PHI.md](docs/PHI.md). (`BACKLOG #5533`)
+- **The default anonymization rule map scrubs twelve more dates and job titles.** Inside segments
+  the map already scrubbed, the dates `PID-33`, `NK1-8/9`, `GT1-13/14/31/32` and `PV1-25/30/35`
+  and the job titles `NK1-10` and `GT1-49` had no rule, so plain `anonymize` passed them through
+  as captured. Each date now takes the `date` kind, which keeps the year, and each job title
+  takes `freetext`, in both copies of `DEFAULT_RULES`. An `anon.toml` overlay that points one of
+  these fields at a kind other than its new default, `drop`, `freetext` or a keep is now a
+  retarget of a default, so `load_rules` refuses it unless the field is listed under
+  `[hl7].retarget_acknowledged`. See [PHI.md](docs/PHI.md). (`BACKLOG #5533`)
+- **BREAKING: `zip_decompress` reads only STORED and DEFLATED entries.** An archive with a BZIP2,
+  LZMA or Zstandard entry, or any other method, directory entries included, now raises
+  `CompressionError` before any member is read, with or without `max_output_bytes`. Stdlib
+  `zipfile` does not bound one read's output for those methods, so a tiny archive could expand far
+  past the ceiling before it was checked; ADR 0123's 2026-11-10 amendment records the measurement.
+  `zip_compress` writes only DEFLATED, so its archives are unaffected. (`BACKLOG #5535`)
+- **Both anonymizers refuse a surrogate that could write a delimiter the message declares.**
+  What a surrogate writes itself could hold the field separator, or the component, repetition or
+  subcomponent separator or the escape character a custom `MSH-2` declares. That includes at
+  least a pool name or street, the free-text redaction, the digits of a fabricated phone number
+  or date of birth, a phone number's dashes, and a date's fill and offset placeholder. Under a
+  space component separator, every street in the address pool held one. Both the toolkit and the
+  tee emitted the field with an extra component, repetition or subcomponent, or an escape
+  sequence the sender never wrote, which moved what followed. Both now refuse the message with an
+  `AnonError` that names the rule and the cause and no value. What a surrogate could write is
+  judged, not the one value the salt picked, so the same message is refused under every salt.
+  Text a surrogate copies from the sender, such as a kept CX component, is not checked, except
+  at least the date of birth's fraction dot, which is checked. A keep on the field would emit the
+  captured value; an overlay that points the field at `drop` clears it. See
+  [PHI.md](docs/PHI.md). (`BACKLOG #5540`)
+- **Uploaded logs: the text-only check reads the whole body, and a sidecar tag failure is reported
+  while a tag-failure hook is armed.** The 415 text-only check on POST `/uploads` now reads every
+  byte of the body rather than a leading sample. What it refuses, and what it still lets through,
+  are stated in [CONNECTIONS.md](docs/CONNECTIONS.md), under the uploaded-logs "Permitted types".
+  An upload whose body or sidecar is a symbolic link or a junction when it is checked is refused by
+  at least a read, a delete and the retention prune, and is left for an operator to remove; a link
+  planted after that check is not caught. A sidecar refusal no longer logs an unbounded part of the
+  stored text, and a sidecar that the listing, quota check or retention prune finds failing its
+  integrity tag under a key the store holds raises the cipher's tag-failure alert while a
+  tag-failure hook is armed. (`BACKLOG #5551`, `BACKLOG #5552`, `BACKLOG #5553`)
+- **Uploaded logs: a body that fails its integrity tag is reported too.** A read of an uploaded
+  file's body that was sealed under a key the store holds, but fails its integrity tag, is now
+  logged with the upload's id and raises the cipher's tag-failure alert while a tag-failure hook
+  is armed, under its own alert subject, `uploaded_file_body-tag`, apart from a sidecar's
+  `uploaded_file-tag`. Each engine process raises it at most about once per part per upload per
+  hour, so several engine shards can each raise it. A sidecar is still reported only by the
+  listing, quota check and retention prune scan, not by a read of one upload. (`BACKLOG #5552`)
+- **The release tag gate no longer lets a green check run hide a red or still-running one of the
+  same name.** It kept only the newest run per required check, so a green from another workflow or
+  trigger, such as a dispatched run, would have cleared a red merge-queue or push run on the tagged
+  commit. Now the latest run of every workflow and trigger that ran a required check must pass. A
+  re-run of the failed jobs, or a later run of the same workflow on the same trigger, still clears
+  a red. A fresh dispatch no longer does. GitHub re-runs a workflow run only within 30 days of it.
+  The gate reads every run, not only the newest, and its job gains the `actions: read` scope. This
+  supersedes the 0.5.2 note that each check is judged on its latest run.
+  [SUPPLY-CHAIN.md](docs/SUPPLY-CHAIN.md) says how to clear a refusal. (`BACKLOG #5591`)
+- **The Windows config-source check refuses delete-child on a folder.** An account other than the
+  owner, the run-as account or an administrator that holds `FILE_DELETE_CHILD` on the config
+  directory, its `__pycache__` or its `codesets` folder can delete any file in it whatever that
+  file's own access list says, so it could drop a module from the graph the engine runs. Such an
+  entry now refuses the load and the `serve` start check, as a write right does. On a file the bit
+  means nothing; it is refused there too, which costs nothing real. (`BACKLOG #5622`)
+- **The Direct destination's recipient trust check now refuses more than an untrusted issuer.**
+  Construction used to check only that the `recipient_cert` was directly issued by a supplied
+  `trust_anchor`. It now also checks that the issuing anchor is a CA and the recipient cert is
+  not, the recipient cert's key usages where present, and that the recipient cert names every
+  `recipients` address in its `subjectAltName`. A cert naming any `rfc822Name` binds only those
+  mailboxes, so a cert the same CA issued to another subscriber that names that subscriber's
+  `rfc822Name` is no longer an encryption target, even beside a `dNSName` for the domain. A cert
+  naming no `rfc822Name` still binds every mailbox at a domain one of its `dNSName`s equals. An
+  X.509 version 1 root that carries no extensions has no `basicConstraints`, so it is still
+  refused as not a CA. The validity windows of the recipient cert, its issuing anchors and the
+  signing cert are read at every send: an expired or not-yet-valid one is a permanent
+  configuration fault (code `direct-cert-validity:<setting>:<bound>`), which stops the lane and
+  keeps the queue under the default `credential_fault_policy`. A recipient cert or anchor whose
+  `notBefore` is up to five minutes ahead of the host's clock is allowed; the signing cert gets no
+  such allowance. Construction only warns on the window, once per process for the same connection and
+  certificates, so check, reload and start still build the connection.
+  What is checked, at
+  least, is in
+  [CONNECTIONS.md](docs/CONNECTIONS.md#direct-project--direct-smime-over-smtp-outbound-send-adr-0085),
+  *Recipient trust*. (`BACKLOG #5631`)
+- **On POSIX the key-file access check now refuses at least a key file whose own name is a link,
+  whoever owns it, one owned by an account other than the engine's own or root, and one held in
+  a directory, or reached through a link held in or below a folder, that such an account owns or
+  that a group or other account may write without the sticky bit.** Before, it judged the
+  mode bits of the file a link named, so a mode `0600` key another account owned, or one in a
+  directory others could replace it in, would have passed. The check applies at least to the
+  generated and the operator's API TLS key and the connection key files that `serve` and
+  `supervise` judge, which [PHI.md](docs/PHI.md), *Key files*, names, and to the secrets
+  directory and its files. Under `[security].enforcement = "warn"` the start gates and the
+  connection key-file check warn about the key files they judge rather than refuse them; the
+  secrets directory and its files are refused under either. A dangling
+  link to a key is now judged as a link rather than passed as a missing file. The directory that holds the file is judged by
+  its owner and mode. The folders above it are not, except those that hold a link on the path or
+  lie above one, which `_posix_link_problem` in `messagefoundry/restricted_file.py` judges, and,
+  since the secrets directory is checked as a path of its own, the folder that holds that
+  directory. A part of the path whose owner and mode cannot be read is refused, the root folder
+  `/` included.
+  When the engine mints its own TLS pair and the store directory does not exist yet, it creates
+  that directory on POSIX with no group or other write bit (`0755` at most), and only then; with
+  an operator certificate or an upstream terminator it creates none. The `cert self-signed` and
+  `cert import` commands create `--out-dir` at `0700` on POSIX, so other local accounts can no
+  longer read the public certificate files in a directory those commands create. An existing
+  directory keeps its mode; how the engine reports a store directory a group may write, and what
+  to do about it, is in [PHI.md](docs/PHI.md), *Key files*. On Windows these
+  directories inherit their parent's access list, as before. The shipped manifests
+  `docker/k8s/statefulset.yaml` and `docker/k8s/ha-postgres.yaml` add a `tls-dir` initContainer
+  that makes `/etc/mefor/tls/engine` at `0700` as uid 10001, and `copy-tls` copies the API pair
+  there, because the kubelet makes the `emptyDir`'s root and sets its mode. (`BACKLOG #5636`,
+  `BACKLOG #5656`)
+- **The anonymizer's leak-check and site-code scrub read escaped and IPv6 values.** In both the
+  toolkit and the tee:
+  - The MRN-typed check reads an `MR` or `MRN` id type in any component, whole or as its first
+    subcomponent, as before, and now also in any subcomponent of CX.5, each as written or
+    decoded, with invisible characters (Unicode Cc and Cf) dropped, and trimmed. Component 5 of any field
+    it reads is read as CX.5 whatever the field's type, so `70553^MRI^C4^^PET&MR` in `OBR-4`, a
+    coded field and not a CX, is refused. An `MR` in a later subcomponent of any other component, such as
+    `70553^PET&MR^C4`, passes.
+  - A routable IPv6 address in a field no rule maps, the MSH header's fields included, is refused, while at least the loopback, link-local, unique-local and
+    documentation ranges pass, and text such as `Note::` or a colon-written EUI-64 is refused
+    though it holds no address.
+  - The site-code check and scrub find a site code joined to an escaped delimiter, written with
+    a hex escape or inside an escape body, though not in the argument of a well-formed hex or
+    multi-byte character-set escape such as `\X414243\` or `\M242844\`, which passes even
+    when it holds a site code, and the scrub replaces the part, escapes and, where a
+    whitespace-separated code is found in an escaped part, free text included, with digits of
+    the same width.
+  - The check for a shape cut across fields reads each field decoded too.
+
+  [PHI.md](docs/PHI.md) section 9 states each rule, under *Field-anchored site-code scrub* and
+  *What the leak-check refuses, and what it lets through*. (`BACKLOG #5654`, `BACKLOG #5632`,
+  `BACKLOG #5533`)
+- **The anonymizer's leak-check finds more routable IPv6 addresses and reads kept header
+  components.** The IPv6 check reads an address joined by a dot to an allowed one, such as
+  `fe80::1.4000:a1::5`, and an address written with fullwidth hex digits or colons. The dashed
+  SSN, phone and IPv6 checks now read the components an `id`, `mrn`, `ssn` or `dln` rule keeps
+  in a header field from MSH-3 on, as they read them in other fields. docs/PHI.md section 9 names forms the IPv6 check still misses. (`BACKLOG #5654`)
+- **The anonymizer's leak-check finds more shapes in fields no rule rewrites, and its denylist
+  reads live only when the site-code table holds the guard's two-digit prefixes.** An `MR` or `MRN` subcomponent past
+  the first in components 7 and 13 is now an MRN-typed hit, as one in component 5 was. The
+  leak-check reads more values with their invisible characters and their `\H\` and `\N\` escapes
+  removed, so it finds more dashed SSNs, phone numbers and denylisted tokens hidden that way. It
+  counts a default-ignorable character outside Unicode Cc and Cf as invisible, and the
+  MRN-typed and site-code checks read a fullwidth digit or letter folded. docs/PHI.md section 9
+  names hidden forms these checks still miss. The IPv6 check
+  finds more addresses followed by dotted groups; docs/PHI.md section 9 names forms it still
+  misses. A report no longer calls the denylist live when the site-code check's prefixes differ
+  from the two-digit entries of the publish guard's `[site_prefix]` table.
+  (`BACKLOG #5654`, `#5541`)
+- **The anonymizer's site-code pass writes no separator digit, and an identifier surrogate
+  invents no id.** The site-code pass writes no digit the message declares as a separator or
+  escape character. An identifier or SSN surrogate fabricates every digit of its first component, and an
+  identifier surrogate every letter, non-ASCII character and escape character too, a declared
+  separator that is a letter or not ASCII among them; neither writes a letter or digit the
+  message declares as a separator or escape character. An
+  identifier surrogate leaves an empty id empty and turns an escape sequence in an id into
+  letters of the same width. The tee's `anonymize-captures` names a field-separator or site-code
+  refusal and its fix instead of advising a keep. (`BACKLOG #5534`, `#5540`)
+- **On Windows, the key-file access check now also reads the folder that holds a key file.** It
+  reads that folder's owner and access list, in most cases where the path resolves to, after any
+  junction, link or `subst` drive, and refuses the key file when a broad group or an application
+  package may delete a file in that folder, change its access list or take it over, or when that
+  folder's owner is such a group or cannot be read. Where that folder is read, and what is
+  refused when the path is on a network share or a mapped network drive, is in the 2026-11-17
+  entry of the
+  [ADR 0214 amendments](docs/adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md#amendments),
+  under *The share rule*. It also refuses, at least, a key file whose own owner is such a group or
+  cannot be read, a key at the path where the engine mints its TLS key, when it mints or reuses
+  its own pair, that is not owned by the engine's own account, SYSTEM or Administrators, and a
+  junction or link its walk finds on the path that an account it does not trust could change;
+  [PHI.md](docs/PHI.md), *Key files*, names accounts it trusts. Under
+  `[security].enforcement = "warn"` the start gates and the connection key-file check warn about
+  the key files they judge rather than refuse them. It is not a complete check of the file's
+  surroundings. (`BACKLOG #5657`, `BACKLOG #5656`)
+- **On Linux the key-file access check now refuses a key file whose path, as its link walk
+  follows it, is on at least an NFS, CIFS or SMB, 9p, virtiofs or FUSE mount**, read from
+  `/proc/self/mountinfo`, and refuses where that file cannot be read (vault BACKLOG #5657). On
+  those file systems something other than the owner and mode bits the check reads decides who may
+  read or replace the file, so a clean `0600` key under clean folders on one would have passed.
+  Under `[security].enforcement = "warn"` the key-file start gates warn rather than refuse, as for
+  the check's other refusals. The same walk judges at least the secrets directory, which is
+  refused on such a mount under either setting, and the key custody directory. Mount types are
+  judged only where `/proc/self/mountinfo` can be read, and not elsewhere, for example on macOS and
+  the BSDs, whose mount tables the check does not read. At least a type the list does not name, the
+  mount at `/`, and a network file system beneath an overlay mount are not judged; [PHI.md](docs/PHI.md), *Key files*, says what else the check leaves to the
+  operator. The store key gate also judges a link to a missing file, and a key file whose status
+  cannot be read, rather than leaving them to the key provider.
+- **Unrevealed message metadata is masked whole.** It went through the summary mask, which reads
+  any comma as a `FAMILY, GIVEN` name and keeps initials, so JSON metadata on list, search and
+  detail responses kept initials, digits and structure. It is now the fixed `****` mask until
+  revealed. (`BACKLOG #5786`)
+- **The WebSocket Origin check refuses a blank or repeated `Origin`.** The engine's handshake check
+  read only the first `Origin` header and took an empty one for a native client's absent header,
+  so a handshake with a blank `Origin` skipped the `[api].ws_allowed_origins` check. It now reads
+  every copy: an absent header is still a native client, but a blank `Origin`, or more than one, is
+  refused before the allow-list. The web console's cookie handshake gate applies the same rule.
+  (`BACKLOG #5789`)
+- **A connection purge is refused on a cluster node that does not hold the leader lease.** An
+  inline purge answers 409 there, and a purge released under dual control cancels nothing and
+  records the refusal as its skip. A node that lost the lease could read a stopped outbound as
+  quiesced while the new leader delivered it. (`BACKLOG #5792`)
+- **`redact` can return the placeholder for a whole text that holds a mismatched or stray JSON
+  closer after a PHI JSON key.** A field-run scrub could consume an opener so a later closer looked
+  matched to the JSON walk, and a stray closer of the same kind as an open array ended a PHI-keyed
+  value early, so a single-token value after it was kept. Such a text can now be returned as the
+  placeholder, followed by any trailing bound note. Text shaped like a PHI JSON key can do it too,
+  including text inside a JSON string. **Known cost, in the safe direction:** this can blank text
+  beyond the key's value, including some balanced inputs. The check is a heuristic walk and misses
+  some shapes. For the exact behaviour, read the code from `_redact_noted` in
+  [messagefoundry/redaction.py](messagefoundry/redaction.py); the `KNOWN_COST` and `MISSED`
+  lists in `tests/test_b5814_stray_closer_before_flat_passes.py` pin examples, neither of them a
+  complete list.
+  (vault `BACKLOG #5814`)
+- **`safe_exc` swaps a file name in more of the forms an error renders it in.** The part of the name
+  after the last `/` is swapped too, so a POSIX or SFTP name holding a backslash no longer keeps its
+  head; a bytes path in the locale's encoding or cp1252, and an escape written with uppercase hex,
+  are swapped; and no form can match across a label another form wrote, unless the text and the
+  forms between them hold every private-use character, where the forms are swapped for the label
+  directly, as before. A subdirectory a partner made under a recursive File source still stays in
+  the message, as the docstring and `docs/PHI.md` now say. (vault `BACKLOG #5815`)
+- **A correct re-auth password on a session the ceremony loses no longer clears the account's
+  lockout counters or raises a login-after-failures notice.** The lost sessions covered include at
+  least one revoked under the ceremony, one whose stamp fails its seal, and one whose rotation
+  fails. On a kept session the clear is now a compare-and-set in the store, and its audit rows
+  commit with it. What it compares, what it denies and what it leaves open is stated once in
+  `docs/SECURITY.md`, under *The password re-auth leg's lockout clear is a compare-and-set*.
+  (`BACKLOG #5900`)
+- **A SOAP fault's Sender or Receiver class is read first from its code element.** The code is now
+  read first from the Fault's first child, a terminated comment, CDATA section or processing
+  instruction before it stepped over whole: SOAP 1.1's `faultcode`, or SOAP 1.2's `Code` and the
+  `Value` that is the Code's own first child. The shipped code took the Fault's first `Value` ahead
+  of any `faultcode`. Where the first-child read yields a code, a `Value` inside a comment, CDATA
+  section or processing instruction ahead of it no longer decides the class; on a first deployment
+  that could have made a Sender fault read as a Receiver one and retry until the attempt limit.
+  Where that read yields no code, the code falls back to the shipped search, which steps over no
+  markup, so there a `Value` outside the Code, or inside a comment, still decides the class as in
+  the shipped code, and a Sender fault of such a shape may still retry. A code element that holds
+  only whitespace now falls back as an empty one does. The read, its fallback and the one shape
+  read again are stated once, in the `_fault_code` and `_child_code_text` docstrings in
+  `messagefoundry/transports/soap.py`.
+  The Fault search, the Body start-tag search it starts from, and the Fault and Code close-tag
+  searches that bound the first-child read step over terminated comments, CDATA sections and
+  processing instructions, so a Body or Fault start tag, or a `</Fault>` or `</Code>`, inside such
+  markup no longer decides which Fault is read or where the read ends; `_find_fault` and
+  `_fault_code` say where that does not hold. Where every Fault start tag after the Body start
+  tag is inside such markup, the first of them is still read as the Fault, so such a reply never
+  newly reads as delivered. A Fault where neither read finds a code reads as a permanent fault,
+  as one with no code always did. The WS-Security check still searches the reply from where the
+  Fault search starts, so a WS-Security code ahead of the real Body start tag, behind a Body start
+  tag inside such markup, no longer dead-letters a reply whose Body holds a Receiver fault; that
+  reply now retries. Unchanged: whether a Fault counts.
+  (`BACKLOG #5912`)
+- **A SOAP send wraps the WS-* envelope and substitutes its body secrets off the event loop.**
+  The wrap's well-formedness check SAX-parses the Handler's fragment, and the body-secret
+  substitution counts and replaces each placeholder over the whole payload; both ran on the event
+  loop before the POST's worker thread started, so a large document would have stalled other
+  connections and API routes on a first deployment. Both now run in the same worker thread as the
+  POST and the reply classification, in the same order, so a refused fragment or a placeholder
+  that does not appear exactly once still raises before anything is sent. That thread can still
+  hold the loop up while one C-level pass runs; the `_post_and_classify` docstring in
+  [soap.py](messagefoundry/transports/soap.py) says how. (`BACKLOG #5913`)
+- **Strict validation refuses six more dropped segments in an "any HL7 segment" structure.** In a
+  structure such as `MFN_M01`, an `MSH`, `DSC`, `MSA`, `ERR`, `QAK` or `MFA` line that `hl7apy`
+  could not place was passed and listed in `unvalidated_segments`. It is now refused. Other defined
+  segments keep the exemption. (`BACKLOG #5920`)
+- **Strict validation checks MSH-9.2 against MSH-9.3 before a borrowed "any HL7 segment"
+  structure keeps its exemption.** This is a consistency check on what a message says about
+  itself, not a barrier: a sender controls all of MSH-9, and one that names a structure's own
+  event keeps the exemption. A message that names such a structure in MSH-9.3 under its own
+  message code, as `MFN^M02^MFN_M01` does, had dropped defined segments passed and listed in
+  `unvalidated_segments`. Where MSH-9.2, stripped and upper-cased, names the borrowed structure's
+  own event, that is unchanged. Otherwise the dropped segments are now refused where `hl7apy`'s
+  tables have a structure named for MSH-9.1 and MSH-9.2 (`MFN_M02`, or `QBP_Z73` in 2.5), or
+  where MSH-9.2 neither starts with Z nor is in the version's HL7 table 0003 as `hl7apy` ships
+  it. A site-defined Z event (`QBP^Z44^QBP_Q15`), an event in that table with no structure of
+  that name, and a message with no MSH-9.3 are unchanged. (`BACKLOG #5920`)
+- **The redactor masks some plain words after the name of a malformed XML end tag.** Inside a
+  `<family>`, `<given>`, `<name>` or other vocabulary element, the words after an end tag's name,
+  as in `</family Doe>` or a `</family Doe` that never got its `>`, could print as they stood; so
+  could those after a vocabulary end tag outside such an element. Where the rules allow it, such
+  words of ASCII letters, digits and spaces are now masked in place, each letter and digit to `X`,
+  `x` or `0`, keeping the text's length.
+  Where an HL7 field run took a vocabulary end tag's name first, as in
+  `a|b|<family>Smith</family Zqxdoe>`, the run now masks the words after it with the same rules,
+  and keeps them where they would open the run's next token. It reads them before the later
+  passes, where the walk inside an element reads what those passes left, so the two can answer
+  differently, at least these ways: a run masks digits the walk keeps once a name pass has
+  replaced the words before them, as in `a|b|</family Zq Doe Vandt 4455>`; and a run keeps every
+  such word in a text holding the credential backstop's opener when it reads it, where the walk
+  can still mask them once the JSON pass has replaced the opener. The words after any other end
+  tag a run took still print, as in `<name>a|b|<b>c</b Zqxdoe></name>`.
+  Some plain words after a malformed end tag still print, at least these: words either rule set
+  refuses, such as a rest holding punctuation, and some surnames that end the text, as
+  `<family>Smith</family Kim` prints `Kim`. The docstring of `_end_tag_rest` in
+  `messagefoundry/redaction.py` lists, at least, the cases kept.
+  Differential tests compare answers, alone and with raw text joined after the input or after an
+  earlier answer, with a stand-in for the earlier redactor (this one with the mask and its round
+  gate patched out); on their inputs, no value the stand-in hid printed. That is a measurement of
+  those inputs, not a proof for every input.
+  Also fixed, a defect older than this change: behind a clamp, a value glued to an HL7 field run
+  after a label the run took, such as `x^y^token= Kplm7abc` or `a|b|mrn: zqxdoe`, printed whole
+  when the clamp's note followed it on the next line. Such values are now masked where the rules
+  for glued values allow it.
+  A value or end-tag rest that a bound note in the redacted text follows is no longer judged as
+  ending the text, since no caller's text can be glued to it there. Before, at least a PHI value
+  holding a digit, a credential value opening with one, and rests such as `</family Kim` printed
+  whole right before the note, as in `a|b|mrn: 12345` cut by the log handler chain's clamp right
+  after it. `safe_text` (and `safe_exc`, which renders through it) and `messagefoundry verify`'s
+  detail bound now redact their bounded text told that their note follows it, with any
+  whitespace the cut left after the text dropped first, so a value their bound leaves last is
+  masked the same way. Dropping that whitespace can also change a gate that reads the whole text:
+  at least an encoded field run before a final `bearer` and a tab, which printed, is now
+  scrubbed. Some such values still print, at least these: one in a field the off-box audit tee
+  bounds, the detail included, each of which is redacted before its note is appended; on the
+  handler chain, a value glued to a field run and followed by a carriage return, a tab or another
+  line break before the cut; and one before an earlier note when the handler chain's clamp
+  stacks a second note after it.
+  (`BACKLOG #5925`)
+- **On Windows, a key file's read grant may name a computer account, and more well-known groups
+  count as broad.** `protect-key --grant-account` takes a name Windows resolves as a computer
+  account, as a group managed service account may resolve; a plain computer account passes too, so
+  name the account the service runs as rather than the host's own machine account, as the key
+  files paragraph of [PHI.md](docs/PHI.md) says. An owner given by name must still resolve to a
+  user or a well-known account. The key-file broad-group screen now also counts
+  Enterprise Domain Controllers (S-1-5-9), the legacy Enterprise Read-only Domain Controllers Beta
+  group (S-1-5-22),
+  Pre-Windows 2000 Compatible Access (S-1-5-32-554), Cloud Account Authentication
+  (S-1-5-64-36), Other Organization (S-1-5-1000), This Organization Certificate (S-1-5-65-1),
+  Virtual Machines (S-1-5-83-0), USER MODE DRIVERS (S-1-5-84-0-0-0-0-0), Window Manager Group
+  (S-1-5-90-0), S-1-18-3 to S-1-18-6, and a domain's Domain Controllers (516), Read-only Domain
+  Controllers (521) and Enterprise Read-only Domain Controllers (498) beside Domain Computers,
+  so a read grant naming one is refused and a key file one of them can read is reported.
+  (`BACKLOG #5929`)
+- **[RISKY-COMPONENTS.md](docs/RISKY-COMPONENTS.md) assesses the `postgres` extra.** Its one
+  added name, `asyncpg`, is designated on tiers 1, 2 and 3, native, in a new `postgres` section, and
+  the extra leaves the page's list of unassessed extras. The public-data readings in
+  `security/risky-component-readings.json` were re-read on 2026-11-27 for all 42 assessed
+  distributions. 17 pins had moved since the last snapshot, through lock bumps that landed after
+  it, so those 17 wheels were surveyed again by hand in `security/bundled-code-survey.json`, and
+  `asyncpg` for the first time. 16 of those 18 wheels were fetched and read; `pyside6-addons` and
+  `pyside6-essentials` were again not fetched, and their answers rest on PyPI project metadata.
+  `hl7apy` leaves the poorly-maintained table: a 1.4.0b1 pre-release was uploaded on 2026-10-26.
+  `messagefoundry verify` and the early-adopter guide no longer call `asyncpg` pure-Python; its
+  protocol and codec code is compiled. (`BACKLOG #5933`)
+- **`[dr].activate` is removed, and a DR box always starts passive.** With `[dr].enabled` it
+  latched the DR run-profile at engine construction and bound the priority feeds without the
+  seed verification, the takeover hook (when one is set) or the `dr.activate` audit row that
+  `POST /dr/activate` runs. The key is now refused at load as a removed key, `true` or `false`,
+  from the file, the environment (`MEFOR_DR_ACTIVATE`) or code, and its refusal names
+  `POST /dr/activate` as the route. The engine and the DR coordinator no longer read any setting
+  to start active, so under `serve` a DR box always starts passive. A box that was activated and
+  restarts comes back passive, logs at ERROR and raises the new `dr_restarted_passive` alert,
+  critical unless a matching rule names its own severity, which closes the open `dr_activated`.
+  It never re-activates itself: once the operator has confirmed the primary is not serving,
+  `POST /dr/activate` brings it back, and `POST /dr/release` on
+  the passive box records that it stays passive, as a `dr.stay_passive` audit row. Each engine
+  shard reads its own `dr.activate`, `dr.release` and `dr.stay_passive` rows, which now name the
+  host and the engine shard, and alerts on its own; the DR alerts' label adds the engine shard. An activated server-DB box with
+  `[dr].restore_token` set runs no scheduled backup pass, so a later re-activation of the same
+  restore still passes that token's vintage check; a SQLite DR box, or one with no
+  `[dr].restore_token`, backs up while activated as before.
+  (`BACKLOG #5965`)
+- **A queue row refused when its sealed cell is opened no longer carries the cipher's refusal
+  text.** This covers a cell sealed for another row, a corrupt cell, for example bad base64 or a
+  ciphertext too short for a tag, a cell under a key the store does not hold, and a marker this
+  build cannot parse. The error raised for it is the class it was before, a queue-tag refusal or
+  the cipher's own class. Its message holds fixed wording, the cipher error's class and a fixed
+  code, such as `bad_base64`, `tag_mismatch`, `unknown_key` or `unparseable_marker`, and the
+  cipher's error is neither its cause nor its context. So none of these carries the cipher's
+  text: a claim's WARNING, uvicorn's ERROR traceback for a read the API does not handle, and a
+  dead-lettered row's `last_error` and `dead` event detail. The refusal is handled as before: a
+  claim dead-letters it, auditing and alerting a queue-tag refusal, and a read is refused. A
+  claim's dead-letter WARNING names a queue-tag refusal by its class and cause, and any other
+  error by its class alone. What is lost is diagnostic, at least: the key id the cipher's text
+  echoed, the marker version or algorithm id an unparseable marker named, the remedy named for a
+  retired key that is not supplied, and, under Vault Transit, the Transit key name, the hvac
+  error's class and which kind of non-AEAD refusal it was. Known limits, at least: a key service
+  that gave no verdict is raised as the cipher gave it, since a claim reads its cause to set the
+  row aside, so its text still reaches the fault a claim logs at ERROR, and, for a read the API
+  does not handle during a key-service outage, uvicorn's ERROR traceback, since that path
+  re-raises the cipher's error unchanged; an unmarked value's refusal keeps its text, which names
+  a column and a remedy and no value; a store-once row's shared body, which the store opens with
+  its own `_adecrypt` after the queue cell has opened, keeps the cipher's text in its refusal, and
+  a claim that dead-letters the row on that refusal writes that text into its `last_error`; and
+  the SQLite store's `response_body_for_work_row` still holds a refused token's error in its local
+  `refused` and raises it from there (`refused = err`, then `raise refused`), so that error's
+  traceback and the method's frame form a reference cycle until the next cyclic collection.
+  (`BACKLOG #5982`)
+- **On SQL Server, a store over-grant that was read now refuses under enforce even when a
+  neighbouring grant could not be read.** A SQL Server probe answer that is NULL, or any value but
+  0 or 1, is not read. Under `[security].enforcement = "enforce"` (the default) with
+  `[store].require_least_privilege` unset, an over-grant the store privilege preflight read as
+  held, such as `sysadmin`, `db_owner` or a `CONTROL`, used to be demoted to an unobserved
+  warning when a fixed role, `CONTROL SERVER` or database `CONTROL` was not read. The report now
+  stays OBSERVED with that over-grant in the excess, so the start refuses unless the audited
+  over-grant opt-out, `[security].allow_over_granted_store_principal`, accepts it. Whatever the
+  enforcement dial and `[store].require_least_privilege` say, `check-privileges` now exits 3
+  (over-grant) on such a report where it used to exit 4 (could not read). Under
+  `schema_management = "external"` the grants counted only there, at least `CREATE TABLE`,
+  `ALTER` on the default schema, `VIEW DEFINITION` and the audit-table rights, count as read
+  over-grants the same way. With `[store].require_least_privilege` set, the start refused before
+  and still does. At least the fixed roles and grants that were not read are named in the log
+  line, the over-grant posture entry and a new `unread` field in the preflight's audit row. On
+  that path a user-defined database role is not read, so it is not named either. The PostgreSQL
+  store probe fills the `unread` field too, but the two backends differ: an unread audit-table
+  grant beside a read over-grant stays OBSERVED and refuses, while under external a
+  `current_schema()` that resolves to NULL still reports unobserved before any over-grant is
+  weighed, so with `[store].require_least_privilege` unset a read `SUPERUSER` there only warns
+  under enforce. Under external,
+  `db_securityadmin` no longer adds a separate `VIEW DEFINITION` finding, since the role carries
+  that right. (`BACKLOG #6015`, `BACKLOG #6714`)
+- **The temporary-password reminder, the issuer's reminder and the enrolment-code-spent notice
+  now print the username in their opening line only when every character in it is printable.**
+  A username holding any non-printable character, a line break among them, shows a placeholder
+  instead. A boolean detail value no longer prints as a count or a timestamp. The notices for an
+  administrator's role change, account disable and MFA reset no longer close with "If this was
+  you": they close with "If you did not expect this change, contact your MessageFoundry
+  administrator".
+- **A role-change or account-disable security notice now says only what its sender confirmed.**
+  It says the roles were changed only when the role write is known to have committed, and that
+  the sessions already open on the account were ended only when the session revoke returned.
+  Otherwise it says that this could not be confirmed, and an unconfirmed role change closes with
+  "If you did not expect this notice". This holds for an administrator's change and a directory
+  one alike: before, a directory role notice could say the roles changed and the sessions ended
+  after a role write or a revoke that raised. An administrator's role-change notice now names the
+  roles set, each by its id, and the federated link and unlink notices name the identity
+  provider. A directory reconcile that ended sessions but wrote no role now sends
+  the "sessions were ended" notice instead of a role-change notice. The client address on a
+  notice is printed only as one printable token, and a directory notice no longer says the
+  address belonged to a sign-in. (`BACKLOG #6034`)
+- **A federated `id_token` whose JOSE header carries `crit` is now refused.** RFC 7515
+  section 4.1.11 makes a JWS invalid when `crit` names an extension the recipient does not
+  process, and the engine implements none, so the sign-in is refused under the new audit
+  reason `unsupported_crit`, before any JWKS fetch. `verify_compact_jws` and
+  `verify_detached_jws` refuse it too. A JWKS that gives two usable keys one `kid` is now audited as
+  `ambiguous_kid` on the sign-in whose fetch returned it, rather than as `unknown_kid`.
+  (`BACKLOG #6065`)
+- **pynetdicom's and pydicom's log lines are now default-deny.** The rule, what stays, what is
+  lost and its limits are in [DICOM.md](docs/DICOM.md) section 5. (`BACKLOG #6637`)
+- **A `.mfbak` header is accepted only in the exact form the writer emits.** `read_header` now
+  refuses a header re-spelled with the same fields, an extra key or a coerced value. The frames'
+  AAD hashes the header bytes as read. (`BACKLOG #6686`)
+- A reference value json refuses with a `TypeError`, `ValueError` or `RecursionError` is refused
+  with a new `TypeError` that carries no json notes, which could name a reference key, no cause or
+  context, and no text from a foreign error. Any other exception propagates as raised.
+  (`BACKLOG #6711`)
+- **A federated sign-in no longer waits out a stalled JWKS refresh, and one that gives up says
+  why.** A key within its TTL is now read from the JWKS cache without waiting on a refresh another
+  sign-in has in progress, for the first 10 s of that refresh. Any other lookup waits at most 10 s
+  for that refresh, then is refused under the new audit reason `jwks_refresh_busy` rather than
+  `unknown_kid`, since the identity provider was slow and the token's `kid` was never judged. The
+  10 s bounds that wait, not the refresh, whose fetch is bounded per socket operation only. The
+  key cache also refuses a non-finite, negative, bool or text `ttl_seconds` or
+  `min_refetch_seconds`, or one too large for a float, when it is built, and the settings load now
+  refuses an `[auth].oidc_jwks_ttl_seconds` or `oidc_jwks_min_refetch_seconds` too large for a
+  float. (`BACKLOG #6905`, `BACKLOG #6904`)
+- **An API app built without `serve` or `supervise` now refuses on the same Windows service
+  environment finding they refuse on.** `create_app` and `create_managed_app` raise
+  `ServiceEnvironmentRefused` (`messagefoundry.serviceenv`), not a `RuntimeError`, as they are
+  built, with the `serve` refusal's own text, where the engine finds its
+  NSSM service and an engine secret is in that service's environment lists, or where it knows the
+  service, cannot read the lists and has a store key in its own environment. Where neither holds,
+  for example under a console-script launcher the engine cannot see past, an app builds as before.
+  The factories refuse the app, not an engine the caller built and started before calling
+  `create_app(engine)`, and an engine embedded with no API is not refused.
+  See [SERVICE.md](docs/SERVICE.md). (`BACKLOG #8212`)
+- **A `MEFOR_VALUE_*` variable in the Windows service's NSSM environment now refuses the start,
+  where the engine finds its service and reads its lists.** Every one is refused, an empty one and
+  a host name as well as a password, since the engine cannot tell which `env()` value is a secret: `serve`,
+  `supervise`, `create_app` and `create_managed_app` refuse on it as they already do on an engine
+  secret setting there, under every `[security].enforcement` setting. The refusal counts them
+  without printing a name, and says where they go. Among its steps: a variable that holds a
+  value goes to the secrets directory, as a file named as its variable, or, where the value is
+  not a secret and is the same for every instance, to the active environment's value file; the
+  bare name `MEFOR_VALUE_`, which sets no `env()` key, is to be deleted; and an empty or blank
+  one is to be deleted, or written in the value file where an empty override is really wanted,
+  since the secrets directory refuses an empty file. See [SERVICE.md](docs/SERVICE.md). (`BACKLOG #8212`)
+- **Under `vault_transit`, in the audit chain walk, an HTTP 504 or 408 on both asks of one row's
+  verify is a check that could not run, and a malformed Transit reply to a range row's handover
+  tag is a break.** In the walk, when both asks of one row's verify fail with HTTP 504 or 408 while
+  a verify over fixed input succeeds, the walk could not run and no tamper alert fires, where the
+  row read as a tamper break. Every other pair of failures keeps ADR 0193's 2026-11-11 item 4 path.
+  Outside the walk, the store open among them, a 504 or 408 on both asks while the fixed input
+  verifies still reads as a MAC that does not verify. The store's Vault client now records each failed reply's HTTP status on hvac's error,
+  since hvac raises one class for 408, 413 and 504. In the walk, a non-empty Transit reply to a
+  handover tag that is not a well-formed MAC, such as one naming no key version, is logged and read
+  as a tag that does not match, a break at that range row. The store open refuses on such a reply;
+  where its check reaches such a row, no walk runs to read it. (`BACKLOG #8222`)
+- **The Linux trust-anchor path check no longer trusts an overlay mount.** `overlay` was on the
+  list of file systems whose owners and modes the check takes as real, but the check reads only a
+  mount's type, never an overlay's lower layers, and one on NFS or CIFS keeps that server's owners
+  and modes. So a trust anchor, the SQL Server `[store].ssl_root_cert` pin among them, on an
+  overlay over a network share would have passed the path check and been accepted at `enforce` on
+  first deployment. An overlay mount now answers *could not settle*, as NFS, CIFS, FUSE and 9p do,
+  which `enforce` refuses, unless the anchor's consumer loads the bytes the check read and its
+  pin setting matches them; an anchor read again by path has no such escape. A chain on overlay
+  that another account can write or owns, such as a group-writable folder, still answers
+  *replaceable*, which `enforce` refuses even with a matching pin. An enforcing PHI
+  start where `/` is overlay, as in nearly every container, would therefore refuse; read the
+  overlay note in [docker/README.md](docker/README.md#residuals--gotchas). (vault `BACKLOG #8390` item 31)
+- **The all-platforms lock auditor reads a line of backslashes as pip does, and refuses `-r` after
+  the lock.** A line holding only a backslash was counted as a requirement, and an include such as
+  `-r other.txt` after one escaped the pip-option-line refusal; only the copy's count check refused
+  either. pip strips such a line's backslashes when it joins it, so no requirement starts there;
+  the auditor now reads it that way too, and refuses that include as a pip option line. `-r` or `--requirement` after
+  the lock, short, abbreviated or in the `=` form, is refused with exit 2, since pip-audit would
+  read that file with its markers in place. The printed count no longer counts one pin twice where
+  the lock pins one version under two markers, and a lock character the console cannot encode is
+  printed in UTF-8 instead of ending the run with a traceback.
+- **A planted unmarked cell, and a cell Vault Transit refuses for its tag, are now integrity
+  refusals.** A message or preset cell read through its row tag re-raised the cipher's plain error
+  in both cases, so a list view, a scope check or a stage handoff that contains only the tag error
+  would have answered a 500, written no audit row and left the row in flight. The Transit cipher
+  now gives its authenticated-decrypt error where every reason Vault gives for refusing a value is
+  the AEAD library's own authentication-failure text, unwrapped, on a single decrypt's HTTP 400. A
+  batch result's per-value error with that text changes only the error's class. That text was not
+  read from Vault's or OpenBao's source, so a release that wraps it would leave such a refusal the
+  cipher's plain error. At least a key-version refusal, a 403, a 404 and an outage keep their own
+  error. Transit gives the same refusal for a data key that is not the one that sealed the cell, so
+  a recreated key reads as drift too. An unmarked value refused in a tagged cell is drift: audited
+  per row and contained, with the cipher's existing unmarked-value alert as its only alert, and its
+  WARNING logged once an hour per cell column.
+- **A REST connection that sends through an `http://` ECH sidecar is now named, at build and
+  in review.** The sidecar must be loopback, so no cleartext-hop gate refused the hop to it, and
+  nothing said it carries the request body and every request header, any credential included,
+  unencrypted on the host. The engine now logs a WARNING for each such connection at every
+  construction, naming the connection and never a header value. `messagefoundry check` prints an
+  advisory `ech-sidecar-cleartext` line, and `security_loosenings()`, and so
+  `GET /security/posture`, lists an `ech_sidecar` entry. An `https://` sidecar listener encrypts
+  the hop and is not listed. A sidecar off this host was already refused at build, whatever the
+  connection declares. See
+  [SECURITY-LOOSENING.md](docs/SECURITY-LOOSENING.md#ech_sidecar-at-an-http-url--the-hop-to-the-ech-sidecar-is-cleartext).
+- **Nothing goes out after the API parser's `400` when the bad body arrives with the head.** A
+  chunked request whose body the parser then refused could get two responses: the `400` with
+  `connection: close`, then the app's `411`. CPython 3.14.9 made this show on Windows, and the
+  selector loop could do it too. The engine now mutes every open request on that connection after
+  the `400`. It closes the connection when the server's own `400` writer fails, and the startup
+  self-test checks the step. A request read in the same pass as the bad bytes now gets
+  `http.disconnect`, and its answer is never written. See [DEPLOYMENT.md](docs/DEPLOYMENT.md).
+- **`npm run package` in `ide/` runs vsce through `npx` at a pinned top-level version,
+  `@vscode/vsce@4.1.0`.** vsce's dependencies are not locked. Neither vsce nor its dependencies are
+  in the extension SBOM or read by npm audit or Dependabot, and the `overrides` in `ide/package.json`
+  do not reach them. Read 2026-11-17 with `npm audit`, a fresh lock-only resolve of
+  `@vscode/vsce@4.1.0` carries
+  [GHSA-fc5q-39xc-vjpf](https://github.com/advisories/GHSA-fc5q-39xc-vjpf) (picomatch) and
+  [GHSA-g3hv-75wg-m249](https://github.com/advisories/GHSA-g3hv-75wg-m249) (minimatch); the tree npx
+  runs may come from its cache instead. The
+  `@azure/msal-node` override, which only vsce's tree used, is removed.
+- **The `ide/` extension's locked build tree no longer holds `@vscode/vsce`, and with it picomatch,
+  which carries [GHSA-fc5q-39xc-vjpf](https://github.com/advisories/GHSA-fc5q-39xc-vjpf) with no
+  fixed release.** The advisory still applies when the extension is packaged: `npm run package` now
+  fetches vsce with `npx`, and that copy still pulls picomatch. It runs outside the lock,
+  so the npm audit gate, Dependabot and the `overrides` in `ide/package.json` do not reach it. The
+  extension's own code and bundle are unchanged.
+- **`provision-admin` and `admin-reset-totp` now record a security notice whose send failed.** The
+  notifier these offline commands build had no audit sink, so a takeover or authenticator notice
+  that the relay refused left only a WARNING on stderr, while `provision-admin`'s audit row still
+  read `holder_notice: dispatched`. Both commands now give it an audit sink, and a failed send
+  writes the `auth.security_notice_undelivered` row the running engine writes, with the account's
+  username as the actor. `provision-admin` passes the store it holds open. `admin-reset-totp`,
+  whose store has closed by then, passes a sink that opens the store again for that row, and only
+  when a send failed. `provision-admin` also says in its result when the send of the notice it
+  queued raised, so its delivery is unconfirmed: a new `holder_notice_send_failed` field in
+  `--json`, and a WARNING line in text output.
+- **The repository's locks pin opentelemetry-api 1.45.2, past CVE-2026-126360.** In 1.45.1 and
+  earlier, a crafted `traceparent` value could cost quadratic CPU in
+  `TraceContextTextMapPropagator.extract()`, the W3C trace-context propagator. 1.45.2 refuses a
+  `traceparent` longer than 512 characters before matching it. fastapi depends on opentelemetry-api,
+  so every engine install carries it, and an install built from the 0.5.2 lock would otherwise keep
+  1.45.1. The fix is in the locks only: the engine wheel declares no opentelemetry-api floor, and
+  fastapi requires only 1.44.0 or later, so `pip install "messagefoundry==0.5.3"` into a venv that
+  already holds 1.45.1 would keep it. Install from the release's `requirements.lock`, or upgrade
+  opentelemetry-api to 1.45.2 or later yourself. The engine turns fastapi's own telemetry off; this
+  entry does not claim that any engine path passes untrusted input to that propagator.
+- **A passkey assertion now re-anchors the session, as a TOTP code does.** After a verified
+  assertion at `POST /ui/reauth/webauthn` that completes a factor the session had not yet met,
+  the session's address anchor moves to the address that proved it, on any session but an
+  `oidc` one, whose window and anchor move only at the IdP. So the new-address signal and the
+  sign-in address record agree after such a passkey. The step-up window opens too, but only when
+  the authenticator reports user verification (the UV flag in the signed authenticator data);
+  a passkey without it re-anchors and shuts the window, including one that was already open.
+  An assertion on a session that had already met its factor neither re-anchors nor opens a
+  window; the store decides that inside the factor write. A refused code at `POST /ui/mfa` on a
+  session that already met its factor now lands on `/ui`, as the page's GET does, instead of a
+  re-rendered gate. Enrolling a passkey or a TOTP still moves no anchor. See
+  [SECURITY.md](docs/SECURITY.md) (vault BACKLOG #2964 item 14).
+- **The repository's locks pin pyasn1 0.6.5, past CVE-2026-119194, CVE-2026-119195, CVE-2026-119196
+  and CVE-2026-119197.** In 0.6.4 and earlier, crafted BER, CER or DER input could cost quadratic CPU
+  in `decode()`, through schema-less containers, constructed strings, indefinite-length `ANY` or binary
+  `REAL`. A site using the optional `[webauthn]` extra has pyasn1's BER decoder on its passkey
+  registration path, for Android Key attestation, so it would otherwise keep the old decoder there.
+- **The `ide/` extension's locked build toolchain moves to glob 14.0.3 and minimatch 11.0.3, past
+  [GHSA-3g3m-2fjr-6pw4](https://github.com/advisories/GHSA-3g3m-2fjr-6pw4) and
+  [GHSA-g3hv-75wg-m249](https://github.com/advisories/GHSA-g3hv-75wg-m249).** Both are development
+  dependencies, so the packaged extension's file list is unchanged. The `overrides` entries in
+  `ide/package.json` hold mocha to the fixed versions, because it has not released a version that
+  requires them. They do not reach vsce, which has left the lock (see the entry on `@vscode/vsce` leaving the extension's locked build tree).
+- **The `[x12]` extra now needs pyx12 4.1.0.** Under pyx12 4.0.1 a 997/999 ack copied the ack's
+  own separators as they came in the sender values it echoed, so a hostile value holding them
+  could forge ack structure, and pyx12's error log records carried the offending data value.
+  4.1.0 writes `?` for the ack separators, control characters and non-ASCII in most values it
+  echoes, and shortens a long echoed bad value, so an ack can differ from the sender's text in
+  more places, an echoed sender ID included. Its error log records carry no data value unless
+  `log_data_values` is on, which the engine does not set and a pyx12 config file can.
+  4.1.0 does not close either class. At least these remain: a 997 copies the sender's ISA11 as-is;
+  a 997 splits an `*` in an echoed GS06 into extra AK1 elements, and both writers split one in an
+  echoed segment ID; and an error pyx12 raises can quote input, a whole ISA segment included. The
+  engine's `X12ValidationError` does not chain that error and keeps only its class name. The
+  engine's other guards are narrower. Among them, it reads the ack type from pyx12's report rather
+  than the ack text, returns no ack whose last write was not its IEA, and mutes the `pyx12` logger
+  tree.
+- **Long X12 segments read differently.** pyx12 4.0.1 could stop reading at a segment longer than
+  about 8K characters. `validate()` then returned `valid=False` with interchange error `023` among
+  its errors, and that segment and everything after it went unvalidated. 4.1.0 reads much longer
+  segments, but `validate()` can raise `X12ValidationError` for a segment longer than about
+  1,040,000 characters, and then returns no result and no ack.
+- **A start's config fingerprint now names the bytes its load read.** A start read the config directory
+  for a fingerprint twice around its load and recorded the later read, so an edit after the load
+  was recorded as loaded, and the next start saw no change. A file locked after the load left a
+  partial loaded fingerprint. The fingerprint now comes from the load's own read, as a reload's
+  does, and one read of the directory after the load is compared beside it. `config_changed` fires
+  when either differs from the baseline, and on a change after the load the next start raises it
+  again. `GET /config/provenance` and a DR activation's `disk_config` verdict now treat two
+  fingerprints as equal only over the same files, and name what was left out: `left_out_files`
+  counts it and `disk_config_left_out` lists it. With a graph running, `drift` is now `null` when
+  either fingerprint could not be taken, where it read as clean, and the IDE says so, as does the console
+  when a graph is loaded. A backup
+  compares nothing; its manifest and audit row now record what its `config_fingerprint` left out,
+  as `config_unreadable_files`. The alert's reason now leads with its marker, such as
+  `changed_during_load`, and the logging sink carries the baseline node whole. See
+  [CONFIGURATION.md](docs/CONFIGURATION.md).
+- **The embedded-document strip no longer writes a stripped body back over a purge or key
+  rotation that landed after its read.** On SQLite, PostgreSQL and SQL Server, the strip read
+  candidate bodies outside its write transaction and wrote each one back by message id alone, so
+  a body purge or a re-seal committed in between could have been overwritten with the old body's
+  content. Each write-back is now a compare-and-swap on the stored cell the strip read, the
+  unpruned flag and the message's in-flight state, and a row counts as stripped only when its own
+  update changed it. The guard and its limit on PostgreSQL and SQL Server are stated once, in the
+  `messagefoundry/store/document_strip.py` module docstring. The pass also reads candidates in
+  keyset batches ordered by received time and message id instead of all at once, and runs the
+  decrypt, strip and encrypt in a worker thread with no store connection held, rather than on the
+  event loop. A failing row is skipped and a failing batch is rolled back and passed over, while a
+  store-wide cipher error, such as the encryption invocation ceiling, still stops the pass as
+  before; a key-service outage ends the strip phase early with a WARNING, and the rest of the
+  retention pass still runs.
+- **From CPython 3.14.9, the off-box syslog forwarder again reports a failed start when the
+  collector's name does not resolve.** That release made the standard library's syslog handler
+  swallow the lookup error, so the forwarder read as started and the failure surfaced only at the
+  first send. The engine now connects once the handler is built, outside that swallow, on the UDP,
+  TCP and TLS arms, with one lookup, so a name that does not exist is reported as a permanent
+  failure at ERROR, as on earlier interpreters. A temporary lookup failure is deferred to the spool
+  when one is configured and, as on earlier interpreters, skips the forwarder when none is. The
+  engine itself still starts, without the forwarder.
 
 ## [0.5.2] — 2026-10-20 — Early Access
 
@@ -10165,7 +17068,8 @@ tests, but the external code review + penetration test (the bar for a security-c
 - Releases are built, SBOM'd (CycloneDX), and signed with [Sigstore](https://www.sigstore.dev/) — see the
   `release` workflow.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/MEFORORG/MessageFoundry/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/MEFORORG/MessageFoundry/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/MEFORORG/MessageFoundry/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/MEFORORG/MessageFoundry/compare/v0.4.0...v0.5.0
