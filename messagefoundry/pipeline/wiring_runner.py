@@ -1767,19 +1767,30 @@ def _reply_step_boundary(body: _ItemBody) -> _ItemBody:
         self: RegistryRunner, name: str, item: OutboxItem
     ) -> tuple[_ItemOutcome, float | None]:
         fault: Exception | None
+        unnamed: tuple[str, str] | None = None
         try:
             return await body(self, name, item)
         except Exception as exc:  # noqa: BLE001 -- replaced, never swallowed; see the docstring
             try:
                 fault = _reply_step_fault(exc)
-            except Exception:  # noqa: BLE001 -- the fixed-text fault below stands in for it
+            except Exception as build_exc:  # noqa: BLE001 -- logged by type, and stood in for
                 # Building the replacement failed. Its error would carry ``exc``, and so the raw
-                # key-service chain, as its context, so it is dropped (the Lander's hold on PR
-                # 3155, the last loop).
+                # key-service chain, as its context, so it is dropped and only the two type names
+                # are kept, which carry no content (the Lander's hold on PR 3155).
                 fault = None
+                unnamed = (type(exc).__name__, type(build_exc).__name__)
         if fault is None:
+            original, build = unnamed or ("unknown", "unknown")
+            log.warning(
+                "re-ingress step fault could not be named (%s; building its fault raised %s)",
+                original,
+                build,
+            )
             # Raised outside the handler, so it carries no context and needs no ``from None``.
-            raise QueueOpenFault("re-ingress step fault could not be named")
+            raise QueueOpenFault(
+                f"re-ingress step fault could not be named ({original}; building its fault"
+                f" raised {build})"
+            )
         try:
             raise fault
         finally:

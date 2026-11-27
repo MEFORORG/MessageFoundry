@@ -101,11 +101,12 @@ async def test_a_failed_seal_in_the_missing_inbound_revert_leaves_clean(
 
 
 async def test_a_failure_to_build_the_replacement_leaves_a_fixed_text_fault(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The last loop's item 1: if building the replacement raises, its error would carry the raw
     seal error, and its key-service chain, as context. The boundary drops it and raises a
-    fixed-text QueueOpenFault outside the handler instead, so the fault has no chain."""
+    fixed-text QueueOpenFault outside the handler instead, so the fault has no chain. It logs one
+    WARNING, and names in the fault, only the two type names: the step's error and the build's."""
     import messagefoundry.pipeline.wiring_runner as wiring_runner
 
     def _broken(exc: Exception) -> Exception:
@@ -117,13 +118,20 @@ async def test_a_failure_to_build_the_replacement_leaves_a_fixed_text_fault(
     del step.registry.inbound[LOOP]
     with contract.faulting_cipher(store) as fault:
         fault.seal_error = _seal_error(outage=False)
-        with pytest.raises(Exception) as caught:
+        with caplog.at_level(logging.WARNING), pytest.raises(Exception) as caught:
             await step._process_response_item(LOOP, item)
     raised = caught.value
     assert isinstance(raised, QueueOpenFault), type(raised)
     assert raised.__cause__ is None and raised.__context__ is None
+    names = "CipherError; building its fault raised RuntimeError"
+    assert str(raised) == f"re-ingress step fault could not be named ({names})", str(raised)
     rendered = logging.Formatter().formatException((type(raised), raised, raised.__traceback__))
     assert contract.KEY_SERVICE_TEXT not in rendered and REPLY_MARK not in rendered, rendered
+    [record] = [r for r in caplog.records if "could not be named" in r.getMessage()]
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == f"re-ingress step fault could not be named ({names})"
+    logged = logging.Formatter().format(record)
+    assert contract.KEY_SERVICE_TEXT not in logged and REPLY_MARK not in logged, logged
 
 
 @pytest.mark.parametrize("outage", [True, False], ids=["outage", "verdict"])
