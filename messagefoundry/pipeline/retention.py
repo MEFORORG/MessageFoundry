@@ -547,11 +547,11 @@ class RetentionPass:
     # of `did_work`: each only says how a pass ended.
     interrupted: bool = False
     # When `interrupted`, the phase that was working when the pass ended; None if it ended outside
-    # any phase's work, before the first or between two. What that running call itself changed is
-    # not in the row's counts: a phase that works in steps (the embedded-document strip's batches,
-    # the `.processed` sweep, the app-log sweep and compression) may have changed part of its set,
-    # and a single-transaction purge cancelled while its COMMIT was in flight may have committed. A
-    # strip threshold call that finished before the one that ended the pass is counted.
+    # any phase's work, before the first or between two. A phase that works in steps (the
+    # embedded-document strip's batches, the `.processed` sweep, the app-log sweep and compression)
+    # may have changed part of its set, and a single-transaction purge cancelled while its COMMIT
+    # was in flight may have committed. A strip threshold call that finished before the one that
+    # ended the pass is counted, and the `.processed` sweep's row counts the archives it finished.
     interrupted_phase: str | None = None
     # Leadership was lost during the pass (BACKLOG #6526, S07-45), so the shared-store phases after
     # the one that was running were skipped and left for the new leader.
@@ -1048,7 +1048,7 @@ class RetentionRunner:
         (``stop()``) partway writes its audit row for the phases that finished, marked
         ``interrupted`` (BACKLOG #6526, S07-44). A pass that ends inside a phase that changes its
         set in steps writes the row even with nothing else done, naming that phase in
-        ``interrupted_phase``, since its count is lost, unless that phase changes no data
+        ``interrupted_phase``, unless that phase changes no data
         (``_PHASES_THAT_CHANGE_NO_DATA``), which is logged instead. A purge that runs in one
         transaction and raises an error is taken to have rolled back, so a pass that ends on one
         with nothing else done writes no row (``_SINGLE_TRANSACTION_PHASES``); one cancelled inside
@@ -1367,17 +1367,21 @@ class RetentionRunner:
                 _raise_if_stopped()
                 plan = await self._plan_processed_archives()
                 if plan is not None:
-                    with _running("processed_archives"):
-                        processed_archives_deleted = await self._prune_processed_archives(
-                            plan,
-                            now - s.processed_archive_days * _SECONDS_PER_DAY,
-                            _archive_halt,
-                            on_progress=_archive_tally,
-                        )
-                        # A stop the sweep broke on ends the pass inside the phase it cut.
-                        _raise_if_stopped()
-                if archive_saw_demotion:
-                    _demoted(seen=True)
+                    try:
+                        with _running("processed_archives"):
+                            processed_archives_deleted = await self._prune_processed_archives(
+                                plan,
+                                now - s.processed_archive_days * _SECONDS_PER_DAY,
+                                _archive_halt,
+                                on_progress=_archive_tally,
+                            )
+                            # A stop the sweep broke on ends the pass inside the phase it cut.
+                            _raise_if_stopped()
+                    finally:
+                        # Latched on the way out too, so a stop that ends the pass here still
+                        # records a demotion the worker saw before it.
+                        if archive_saw_demotion:
+                            _demoted(seen=True)
 
             # Maintenance phases (WAL-checkpoint, then daily VACUUM). Their cadence markers advance ONLY
             # when the phase actually runs, so a phase SKIPPED by the cap stays due for the next pass

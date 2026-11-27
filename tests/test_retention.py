@@ -9,6 +9,7 @@ for determinism."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import gzip
 import json
 import logging
@@ -2072,6 +2073,108 @@ async def test_a_late_demotion_seen_by_the_archive_worker_matches_the_row(
     assert [d["interrupted_phase"] for d in details] == ["processed_archives"]
     logged = [r for r in caplog.records if "lost cluster leadership" in r.getMessage()]
     assert bool(logged) == details[0]["leadership_lost"], (logged, details)
+
+
+async def _stop_a_sweep_whose_archive_absorbs_it(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    coordinator: NullCoordinator | None = None,
+    *,
+    then: int = 0,
+) -> list[dict[str, Any]]:
+    """Stop the loop while its first archive's sweep runs; that sweep reads its stop callable on a
+    worker thread, swallows the cancel and reports 2 deleted. ``then`` more archives follow it,
+    which must never be swept. Returns the retention audit rows."""
+    entered = asyncio.Event()
+    later: list[str] = []
+    sources = [
+        FileSource(
+            Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path / f"in{i}")})
+        )
+        for i in range(1 + then)
+    ]
+
+    async def absorbs_the_cancel(
+        _older_than: float, *, protected: object, deadline_hit: Callable[[], bool]
+    ) -> int:
+        await asyncio.to_thread(deadline_hit)
+        entered.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.Event().wait()
+        return 2
+
+    async def records(*_a: object, **_k: object) -> int:
+        later.append("later archive")
+        return 0
+
+    monkeypatch.setattr(sources[0], "prune_processed_archive", absorbs_the_cancel)
+    for src in sources[1:]:
+        monkeypatch.setattr(src, "prune_processed_archive", records)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(processed_archive_days=30),
+        clock=lambda: 100 * DAY,
+        coordinator=coordinator,
+        archive_source=lambda: tuple(sources),
+    )
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        await runner.stop(timeout=2)
+        assert loop_task.done()
+    finally:
+        loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+    assert later == []
+    return await _retention_audit_details(store)
+
+
+async def test_a_sweep_whose_only_archive_absorbed_the_stop_ends_the_pass_in_that_phase(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #6526: when the last archive's sweep swallows the cancel, the stop is re-read once
+    the sweep returns, so the pass ends inside the `.processed` phase with its count, rather than
+    at whichever later phase reads the stop next.
+
+    Mutation: delete the `_raise_if_stopped()` after `_prune_processed_archives` in `run_once`.
+    Red: the row names no phase."""
+    details = await _stop_a_sweep_whose_archive_absorbs_it(store, monkeypatch, tmp_path)
+    assert [
+        (d["interrupted"], d["interrupted_phase"], d["processed_archives_deleted"]) for d in details
+    ] == [(True, "processed_archives", 2)]
+
+
+@pytest.mark.parametrize("then", [0, 1], ids=["after-the-sweep", "before-the-next-archive"])
+async def test_a_demotion_the_archive_worker_saw_before_the_stop_is_in_the_row(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    then: int,
+) -> None:
+    """BACKLOG #6526: a demotion the `.processed` sweep's worker read before the stop that ends the
+    pass inside that phase is latched on the way out, whether the stop is read once the sweep
+    returns or before its next archive, so the interrupted row records the loss and the loss is
+    logged."""
+    loop_thread = threading.get_ident()
+
+    class _WorkerSeesDemotion(_FollowerCoordinator):
+        def is_leader(self) -> bool:
+            return threading.get_ident() == loop_thread
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        details = await _stop_a_sweep_whose_archive_absorbs_it(
+            store, monkeypatch, tmp_path, _WorkerSeesDemotion(), then=then
+        )
+    assert [
+        (d["interrupted"], d["interrupted_phase"], d["processed_archives_deleted"]) for d in details
+    ] == [(True, "processed_archives", 2)]
+    assert details[0]["leadership_lost"] is True
+    assert any("lost cluster leadership" in r.getMessage() for r in caplog.records)
 
 
 async def test_a_sweep_whose_archive_absorbed_the_cancel_starts_no_further_archive(
