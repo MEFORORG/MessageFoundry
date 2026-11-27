@@ -390,8 +390,9 @@ class DrCoordinator:
                 "DR: could not read the activation audit rows at start (%s), so this box may have "
                 "been serving when it went down. It stays PASSIVE and holds no DR role; run POST "
                 "/dr/activate, only once the primary is confirmed not serving, to serve the "
-                "priority feeds. " + DR_RESTART_CLOSE_GUIDANCE,
+                "priority feeds. %s",
                 safe_exc(exc),
+                DR_RESTART_CLOSE_GUIDANCE,
             )
         else:
             if last != _ACTION_ACTIVATE:
@@ -404,8 +405,9 @@ class DrCoordinator:
                 "the same way, and in at least the first two the primary may be serving again. It has "
                 "started PASSIVE, holds no DR role and does not re-activate itself; once you have "
                 "confirmed the primary is not serving, re-run POST /dr/activate to serve the "
-                "priority feeds again. " + DR_RESTART_CLOSE_GUIDANCE,
+                "priority feeds again. %s",
                 self._label(),
+                DR_RESTART_CLOSE_GUIDANCE,
             )
         self._restart_alerted = True
         try:

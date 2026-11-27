@@ -28,6 +28,7 @@ from messagefoundry.redaction import log_timestamp
 from messagefoundry.restore_notice import RESTORE_NOTICE_POINTER, RESTORE_ROLLBACK_NOTICE
 
 __all__ = [
+    "DR_RESTART_CLOSE_GUIDANCE",
     "INTAKE_DEPTH_REASON",
     "INTAKE_DISK_REASON",
     "REMINDER_SECONDS",
@@ -68,15 +69,19 @@ UNREACHED_ROLLUP_SOURCE = "directory-reconciler-unreached-rollup"
 #: throttles some reminders, by that operator's choice.
 REMINDER_SECONDS = 300.0
 
-#: How an operator closes ``dr_restarted_passive``. Both restart ERROR lines in ``dr`` and this
-#: sink's CRITICAL line carry it, one spelling (BACKLOG #5965). A refused release records nothing
-#: and the close is best effort, so only the close is conditional and the hand route is not.
+#: How an operator closes ``dr_restarted_passive`` (BACKLOG #5965). Both restart ERROR lines in
+#: ``dr`` carry it because they print under every alert sink, where a sink's own CRITICAL line may
+#: not; ``LoggingAlertSink``'s CRITICAL line carries it too. A refused release records no
+#: ``dr.stay_passive`` row, so the next start alerts again and only a retried release ends that;
+#: the close is best effort and needs alert instances, so the hand route names that condition.
+#: Passed as a ``%s`` argument, never joined into a format string, so a ``%`` here stays text.
 DR_RESTART_CLOSE_GUIDANCE = (
     "To leave it passive instead, a POST /dr/release on this start runs the release_hook when one "
     "is set, records that the box stays passive and, where [alerts] keeps alert instances, closes "
-    "the dr_restarted_passive alert. If the release is refused, or the alert is still open "
-    "afterwards, resolve it by hand (POST /alerts/{alert_id}/resolve, or Resolve in the web "
-    "console)."
+    "the dr_restarted_passive alert. If the release is refused, retry it; nothing is recorded "
+    "until one succeeds. Where [alerts] keeps alert instances and the alert is still open after "
+    "a release, or a later start leaves it open, resolve it by hand "
+    "(POST /alerts/{alert_id}/resolve, or Resolve in the web console)."
 )
 
 
@@ -1695,9 +1700,9 @@ class LoggingAlertSink:
             "ALERT dr_restarted_passive: DR box %r started PASSIVE and may have been serving when "
             "it went down -- the ERROR line before this says what its store shows. It holds no "
             "DR role until POST /dr/activate, to be run only once you have confirmed the "
-            "primary is not serving; an inbound an operator starts on it still binds. "
-            + DR_RESTART_CLOSE_GUIDANCE,
+            "primary is not serving; an inbound an operator starts on it still binds. %s",
             node,
+            DR_RESTART_CLOSE_GUIDANCE,
         )
 
     # --- vault BACKLOG #2613: the security-signal rule layer -----------------------------------
