@@ -4,13 +4,19 @@
 
 Verifies the asyncio loop handler + sys.excepthook + threading.excepthook route an otherwise-unhandled
 exception through ``safe_exc`` (PHI-redacted, type-preserving) → the log, and that a framed listener
-(MLLP) survives a handler that raises — the error is logged redacted, the connection drops, the server
-stays up.
+(MLLP) survives a handler that raises. A handler fault no longer reaches the listener's last-resort
+arm: on an inbound that owes a reply, the listener's handler-fault arm logs it redacted, records
+``handler_error``, answers ``AE`` and closes the connection (BACKLOG #1619), and the server stays
+up. A no-reply inbound holds the frame instead (BACKLOG #5022), as tests/test_mllp_handler_failure.py
+pins. That file's ``test_a_codec_fault_in_the_listener_still_drops_as_framing_error`` pins that a
+codec fault still reaches the last-resort arm and records ``framing_error``; it does not check that
+arm's redaction.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
 from collections.abc import Iterator
@@ -26,6 +32,7 @@ from messagefoundry.last_resort import (
     install_loop_exception_handler,
     install_thread_excepthook,
 )
+from messagefoundry.transports import mllp as mllp_mod
 from messagefoundry.transports.mllp import MLLPSource, frame
 
 # A PHI-bearing HL7 fragment to embed in raised exceptions; must never reach a log line.
@@ -156,29 +163,53 @@ async def test_mllp_handler_exception_is_caught_and_redacted(
     async def boom(raw: bytes) -> str:
         raise ValueError(PHI)  # an unexpected handler failure carrying PHI
 
+    events: list[tuple[str, str | None]] = []
+
+    async def capture(kind: str, peer_host: str | None, reason: str | None) -> None:
+        events.append((kind, reason))
+
     source = MLLPSource(Source(type=ConnectorType.MLLP, settings={"host": "127.0.0.1", "port": 0}))
+    source.on_connection_event = capture
     await source.start(boom)
     try:
-        with caplog.at_level(logging.ERROR):
+        with caplog.at_level(logging.WARNING):
             reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
             writer.write(frame("MSH|^~\\&|s|f|r|rf|20260616||ADT^A01|1|P|2.5.1\rPID|1||x"))
             await writer.drain()
             # the listener catches the handler error, logs it, answers AE, then closes (BACKLOG
             # #1619; it used to close with no reply). The NAK text is fixed, so no PHI.
-            nak = await asyncio.wait_for(reader.readuntil(b"\x1c"), timeout=5)
-            assert b"MSA|AE|1|" in nak
+            nak = await asyncio.wait_for(reader.readuntil(b"\x1c\r"), timeout=5)
+            assert nak.startswith(b"\x0b")  # one whole MLLP frame
+            msa = f"MSA|AE|1|{mllp_mod._HANDLER_FAILURE_NAK_TEXT}".encode()
+            assert msa in nak[1:-2].split(b"\r"), nak  # the whole MSA segment, text included
             assert b"DOE" not in nak and b"JANE" not in nak
+            # then the connection closes; a reset is a close too, as on the Windows Proactor
+            tail = b""
+            with contextlib.suppress(ConnectionResetError):
+                tail = await asyncio.wait_for(reader.read(), timeout=5)
+            assert tail == b"", tail  # nothing after the NAK
             writer.close()
-            await writer.wait_closed()
-        # the server survived — it still accepts a fresh connection
+            with contextlib.suppress(ConnectionResetError):
+                await writer.wait_closed()
+        # the server survived: a fresh connection is served, and answered the same way
         r2, w2 = await asyncio.open_connection("127.0.0.1", source.sockport)
+        w2.write(frame("MSH|^~\\&|s|f|r|rf|20260616||ADT^A01|2|P|2.5.1\rPID|1||x"))
+        await w2.drain()
+        assert b"MSA|AE|2|" in await asyncio.wait_for(r2.readuntil(b"\x1c\r"), timeout=5)
         w2.close()
-        await w2.wait_closed()
+        with contextlib.suppress(ConnectionResetError):
+            await w2.wait_closed()
     finally:
         await source.stop()
     logged = " ".join(r.getMessage() for r in caplog.records)
     assert "failed unexpectedly" in logged and "ValueError" in logged  # caught + type kept
     assert "DOE" not in logged and "JANE" not in logged  # PHI redacted
+    # BACKLOG #1619 step 3: the fault is recorded as the handler's, never blamed on framing.
+    kinds = [kind for kind, _ in events]
+    assert "handler_error" in kinds and "framing_error" not in kinds, kinds
+    reason = next(r for k, r in events if k == "handler_error")
+    assert reason is not None and "ValueError" in reason
+    assert "DOE" not in reason and "JANE" not in reason and "100^^^H^MR" not in reason
 
 
 # --- every loop outside `serve` carries the handler (BACKLOG #1789) ---------------------------------

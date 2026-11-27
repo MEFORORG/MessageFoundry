@@ -65,7 +65,7 @@ def _item(seq: int) -> SendItem:
 # --- Send tab (BACKLOG #5949) ---------------------------------------------------------------------
 
 
-def test_send_generates_on_the_worker_and_stops_inside_a_pause(
+def test_send_generates_on_the_worker_and_stops_inside_the_ack_read(
     qapp: Any, off_gui_generation: list[threading.Thread]
 ) -> None:
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -74,7 +74,7 @@ def test_send_generates_on_the_worker_and_stops_inside_a_pause(
     port = server.getsockname()[1]
     panel = send.SendPanel()
     panel._count.setValue(1_000_000)
-    panel._rate.setValue(0.1)  # a ten-second pause after each message
+    panel._rate.setValue(0.1)  # a ten-second pause between two messages
     panel._host.setText("127.0.0.1")
     panel._port.setValue(port)
     conn: socket.socket | None = None
@@ -82,8 +82,9 @@ def test_send_generates_on_the_worker_and_stops_inside_a_pause(
         started = time.monotonic()
         panel._start()
         assert time.monotonic() - started < 2, "the batch was built before the worker started"
-        # Accept and answer nothing: the worker waits for an ACK, which stop() interrupts, and
-        # then would pause ten seconds before the next message.
+        # Accept and answer nothing: the worker waits for an ACK, which stop() interrupts; the
+        # worker then sees the stop before it draws the next message, so no pause starts. A stop
+        # inside the pause itself is tested in tests/test_harness_trailing_pause.py.
         server.settimeout(10)
         conn, _ = server.accept()
         assert off_gui_generation
@@ -91,7 +92,7 @@ def test_send_generates_on_the_worker_and_stops_inside_a_pause(
         assert thread is not None
         started = time.monotonic()
         panel.shutdown()
-        assert time.monotonic() - started < 3, "shutdown waited out the read or the pause"
+        assert time.monotonic() - started < 3, "shutdown waited out the ACK read"
         assert thread.isFinished()
     finally:
         panel.shutdown()

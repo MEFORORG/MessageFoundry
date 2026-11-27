@@ -18,11 +18,13 @@ from typing import Any
 import pytest
 
 from messagefoundry.api import app as app_module
-from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.settings import EgressSettings, RetentionSettings
 from messagefoundry.pipeline import engine as engine_module
 from messagefoundry.pipeline import remote_debug_watch
+from messagefoundry.pipeline import retention as retention_module
 from messagefoundry.pipeline.crl_reload import CrlReloadRunner
 from messagefoundry.pipeline.engine import Engine
+from messagefoundry.pipeline.retention import RetentionRunner
 
 
 class _DrainRecorder:
@@ -176,13 +178,108 @@ def test_the_budget_never_lengthens_a_wait_past_its_fixed_bound() -> None:
 
 
 def test_the_time_kept_after_the_crl_wait_fits_the_engine_reserve() -> None:
-    """The CRL runner's wait is the first budgeted one, so what it keeps back is the most any wait
-    keeps. With the managed lifespan's closed gate and a write still running, the late drain's
-    fixed bound is kept; the CRL wait must still get more than its floor inside the reserve."""
+    """The CRL runner's wait comes second, after the retention runner's (see the retention test
+    below), so it keeps back the most of the waits after it. With the managed lifespan's closed gate
+    and a write still running, the late drain's fixed bound is kept; the CRL wait must still get
+    more than its floor inside the reserve."""
     kept = (
         engine_module._STOP_CLOSE_ALLOWANCE_SECONDS
         + engine_module._CONFIG_WRITE_LATE_DRAIN_SECONDS
         + 2 * engine_module._STOP_WAIT_SHARE_SECONDS
+        + remote_debug_watch.STOP_FLOOR_SECONDS
+    )
+    assert kept + engine_module._STOP_WAIT_FLOOR_SECONDS < app_module._ENGINE_STOP_RESERVE_SECONDS
+
+
+class _RetentionRecorder:
+    stop_timeout_seconds = 5.0
+
+    def __init__(self) -> None:
+        self.timeouts: list[float | None] = []
+
+    async def stop(self, *, timeout: float | None = None) -> None:
+        self.timeouts.append(timeout)
+
+
+async def test_the_retention_stop_is_held_inside_the_budget(tmp_path: Path) -> None:
+    """BACKLOG #6526: the retention runner's stop is the first budgeted wait, so it keeps back
+    the CRL wait's share and everything that wait keeps."""
+    eng = await _engine(tmp_path)
+    _attach(eng)
+    retention = _RetentionRecorder()
+    eng._retention_runner = retention  # type: ignore[assignment]
+    await eng.drain_config_writes(0.0)
+    await _stop(eng, budget_seconds=3.0)
+    [wait] = retention.timeouts
+    kept = (
+        engine_module._STOP_CLOSE_ALLOWANCE_SECONDS
+        + 3 * engine_module._STOP_WAIT_SHARE_SECONDS
+        + remote_debug_watch.STOP_FLOOR_SECONDS
+    )
+    assert wait is not None
+    # 3 s, so the lower bound is above zero and the assertion can fail on a wait cut to the floor.
+    assert 0.0 < 3.0 - kept - 0.5 <= wait <= 3.0 - kept
+
+
+async def test_with_no_budget_the_retention_stop_keeps_its_fixed_bound(tmp_path: Path) -> None:
+    eng = await _engine(tmp_path)
+    _attach(eng)
+    retention = _RetentionRecorder()
+    eng._retention_runner = retention  # type: ignore[assignment]
+    await _stop(eng)
+    assert retention.timeouts == [retention.stop_timeout_seconds]
+
+
+async def test_a_cancel_during_the_retention_wait_still_closes_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: the retention stop passes a cancel of its caller on once its bounded wait
+    ends. engine.stop() must still reach the store's close, and raise the cancel after it."""
+    monkeypatch.setattr(retention_module, "_STOP_WAIT_SECONDS", 0.3)
+    eng = await _engine(tmp_path)
+    runner = RetentionRunner(eng.store, RetentionSettings(messages_days=1))
+    entered = asyncio.Event()
+
+    async def pass_hangs(now: float | None = None) -> None:
+        entered.set()
+        await _ignores_one_cancel()
+
+    monkeypatch.setattr(runner, "run_once", pass_hangs)
+    eng._retention_runner = runner
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    closed: list[bool] = []
+    real_close = eng.store.close
+
+    async def _close() -> None:
+        closed.append(True)
+        await real_close()
+
+    monkeypatch.setattr(eng.store, "close", _close)
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        stopping = asyncio.ensure_future(eng.stop())
+        await asyncio.sleep(0.1)
+        assert not stopping.done()
+        stopping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+        assert closed == [True]
+    finally:
+        loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+        if not closed:
+            await real_close()
+
+
+def test_the_time_kept_after_the_retention_wait_fits_the_engine_reserve() -> None:
+    """The retention wait now comes first, so it keeps back the most: the CRL wait's share on
+    top of what the CRL wait keeps. It must still get more than its floor inside the reserve."""
+    kept = (
+        engine_module._STOP_CLOSE_ALLOWANCE_SECONDS
+        + engine_module._CONFIG_WRITE_LATE_DRAIN_SECONDS
+        + 3 * engine_module._STOP_WAIT_SHARE_SECONDS
         + remote_debug_watch.STOP_FLOOR_SECONDS
     )
     assert kept + engine_module._STOP_WAIT_FLOOR_SECONDS < app_module._ENGINE_STOP_RESERVE_SECONDS

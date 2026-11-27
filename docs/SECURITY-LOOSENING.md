@@ -241,7 +241,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `[auth].mfa_recovery_code_count` | `10` (more codes is named. `0` mints none, which is stricter. The load refuses a value outside `0` to `50`) |
 | | `[auth].password_min_length` | `15` (a shorter floor is named, and `0` sets none; a negative floor is refused at load) |
 | | `[auth].oidc_clock_skew_seconds`, `oidc_jwks_ttl_seconds`, `oidc_flow_ttl_seconds`, `oidc_max_age_seconds` | `60` s / `3600` s / `300` s / `43200` s (*conditional* — a loosening only while OIDC is on; a value above its default is named) |
-| | `[auth].oidc_jwks_min_refetch_seconds` | `300` s (*conditional* — a loosening only while OIDC is on; a value below `300` s, or above the default JWKS lifetime of `3600` s, is named, and `0` removes the bound; a negative value is refused at load) |
+| | `[auth].oidc_jwks_min_refetch_seconds` | `300` s (*conditional* — a loosening only while OIDC is on; a value below `300` s, or above the default JWKS lifetime of `3600` s, is named, and `0` removes the bound; what the load refuses is in [SECURITY.md](SECURITY.md#the-documented-protection-set-asvs-611), control 9) |
 | | `[approvals].min_dwell_seconds`, `expiry_hours` | `2.0` s / `72` h (*conditional* — a loosening only while `[approvals].enabled` holds at least one operation; a floor below `2.0` s or an expiry above `72` h, and `0` turns either off) |
 | | `[approvals].operations` | `["connection_purge", "dead_letter_replay"]` (*conditional* — a loosening only while `[approvals].enabled` is on; a list that leaves out either default operation is named, and so is an empty list, which holds nothing; named as `approvals.operations`) |
 | | `[api].trusted_proxies` | `[]` (any network covering more than one address is named, once, a `/31` or `/127` included, because every host inside it may set `X-Forwarded-For`. Entries covering every address, such as `0.0.0.0/0` or `::/0`, trust it from every peer, as the refused `*` would, and get their own wording) |
@@ -1040,12 +1040,21 @@ count is above `0` (vault BACKLOG #2613).
 - **What you lose:** a fixed set of routes asks for a fresh proof bound to that one action, used
   once. The `require_action_step_up` row of [CONFIGURATION.md](CONFIGURATION.md), under `[auth]`, lists them.
   With the switch off, those routes accept the session-wide step-up window instead. At least a
-  sign-in, a TOTP or recovery code on any session but an `oidc` one, and a passkey assertion that
+  local sign-in that owes no further factor, unless the first-seen address check withholds the
+  window, a combined sign-in (a passkey one included) from any address, a TOTP
+  or recovery code on any session but an `oidc` one, and a passkey assertion that
   completes a pending factor with the user-verification flag, on any session but an `oidc` one,
   can open that window; that flag is
   the authenticator's own report ([ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md),
-  2026-11-14 amendment). So a session taken over inside it can bind an authenticator, inject a message
-  or export bodies in bulk with no fresh proof.
+  2026-11-14 amendment). The `step_up_max_age_seconds` row of [CONFIGURATION.md](CONFIGURATION.md)
+  says when that check withholds the window, and that it fails open, so the window opens, when the
+  sign-in carries no client address or the known-address record cannot be read. So a session taken over inside it can, with no fresh proof, at
+  least bind an authenticator, disable MFA where `[security].require_mfa` does not refuse the
+  disable, end the account's other sessions, reset another
+  account's password or factor, inject a message, export bodies in bulk, purge a queue or reload
+  config. CORRECTED 2026-11-26 (vault BACKLOG #8391): this read "At least a sign-in" and gave the
+  three consequences "bind an authenticator, inject a message or export bodies in bulk" as the
+  whole list.
 - **When acceptable:** a site that has chosen the earlier session-window behaviour, for example
   while a client that cannot send the bound proof is updated.
 - **Compensating controls:** keep `[auth].step_up_max_age_seconds` short, keep
@@ -1387,7 +1396,7 @@ count is above `0` (vault BACKLOG #2613).
 
 ### `[auth].oidc_*` lifetimes and skew looser than their defaults **with OIDC on** — federated sign-in accepts more
 > **Conditional** on `[auth].oidc_enabled` (vault BACKLOG #2600). With it off nothing reads these.
-> Each is named alone. Every entry but the `0`-or-less refetch one quotes the configured value and a
+> Each is named alone. Every entry but the `0` refetch one quotes the configured value and a
 > default.
 - **What you lose:**
   - `oidc_clock_skew_seconds` above `60` s accepts an expired id_token for that much longer, and lets

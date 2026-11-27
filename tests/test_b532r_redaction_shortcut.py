@@ -22,11 +22,13 @@ from messagefoundry.logging_setup import CredentialScrubFilter, scrub_log_text
 from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, scrub_credentials
 from messagefoundry.support.redact import redact_log_line
 
+# "failed, userPwd": after "; " the key would open a connection-string member, which the
+# reading before masks too (BACKLOG #5030 added item 4), and the line would leave this class.
 _SHORTCUT_LINES = (
-    ("connect redis://:Zq-Pw_1@h failed; userPwd='Kv9q;PWD='", "Kv9q"),
+    ("connect redis://:Zq-Pw_1@h failed, userPwd='Kv9q;PWD='", "Kv9q"),
     ('connect redis://:Zq@h clientSecret="Kv9q;AccessToken="', "Kv9q"),
     ("connect smtp://:Pw@h:587 apiSecret='Kv9q;UID=u;PWD='", "Kv9q"),
-    ("connect redis://:Zq-Pw_1@db.example.invalid:5432/x failed; userPwd='Kv9q;PWD='", "Kv9q"),
+    ("connect redis://:Zq-Pw_1@db.example.invalid:5432/x failed, userPwd='Kv9q;PWD='", "Kv9q"),
 )
 
 
@@ -72,7 +74,7 @@ def test_a_line_the_widened_pass_alone_changes_takes_the_shortcut(line: str, sec
 #: Lines that took the shortcut on ``origin/main`` and still do: the reading before changes nothing
 #: with or without the widened pass, here because no DSN password is read at all.
 _PLAIN_SHORTCUT_LINES = (
-    "connect redis://h failed; userPwd='Kv9q;PWD='",
+    "connect redis://h failed, userPwd='Kv9q;PWD='",
     'connect clientSecret="Kv9q;AccessToken="',
     "store apiSecret='Kv9q;UID=u;PWD='",
 )

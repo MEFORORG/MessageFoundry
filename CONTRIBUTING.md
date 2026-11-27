@@ -199,8 +199,10 @@ Building two changes in parallel? Don't share one checkout — give each its own
 ### If you use Claude Code: what the tracked settings file actually wires
 
 [`.claude/settings.json`](.claude/settings.json) is **tracked**, so cloning this repo configures
-Claude Code, and you should read it before you trust it. It is the only tracked file under
-`.claude/`; everything else there is session state and stays ignored.
+Claude Code, and you should read it before you trust it. It and
+`.claude/skills/e2e-smoke/SKILL.md`, a project skill that tells an agent to start an engine on the
+sample config, are the only tracked files under `.claude/`; read the skill too. Everything else
+there is session state and stays ignored.
 
 - **It wires one PowerShell script to run automatically**, and the count is asserted by a test
   rather than by this sentence:

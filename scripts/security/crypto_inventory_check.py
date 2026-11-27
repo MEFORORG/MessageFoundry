@@ -352,6 +352,7 @@ INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #3772: hashlib for the SHA-256 that bounds over-long client-address text in the
     # new-address signal's dedupe keys and rows. A dedupe key over caller text, not a secret. And
     # (BACKLOG #3770) the keyed digest of the past-cap log line, prefixed with a per-process secret.
+    # And (BACKLOG #3100 item 14) a rollup alert's instance key over user ids, not a secret.
     "messagefoundry/auth/service.py": frozenset(
         {"hashlib", "messagefoundry.config.tls_policy", "messagefoundry.store.crypto", "secrets"}
     ),
@@ -1090,6 +1091,19 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:ssl.create_default_context",
         }
     ),
+    # The end-to-end smoke mints a throwaway loopback API certificate per run (messagefoundry.pki),
+    # provisions the rig Administrator (its password from rigadmin's CSPRNG draw) and signs in
+    # through rigadmin.sign_in (its pinned TLS context, and the TOTP code where a rig supplies a
+    # key). Its MLLP frame goes in the clear to a loopback inbound.
+    "harness/e2e_smoke.py": frozenset(
+        {
+            "csprng:via harness.load.rigadmin",
+            "mac:via harness.load.rigadmin",
+            "tls_context:via harness.load.rigadmin",
+            "key_cert:via messagefoundry.pki",
+            "sign_verify:via messagefoundry.pki",
+        }
+    ),
     # ADR 0201 slice 4: the toolkit's `impact` loads the config graph with load_config, which digests
     # each module it loads (vault BACKLOG #2724). The toolkit computes no digest of its own.
     "messagefoundry_toolkit/__main__.py": frozenset({"hash:via messagefoundry.config.wiring"}),
@@ -1283,6 +1297,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # BACKLOG #3770: _address_log_field, a SHA-256 over a per-process secret prefix
             # (_ADDRESS_LOG_KEY, from secrets.token_urlsafe) and the text, a keyed digest that keeps
             # an unparsed address out of the log; a reading aid, not an authenticator.
+            # BACKLOG #3100 item 14: _unreached_rollup_key, a SHA-256 over the sorted user ids of
+            # the accounts a rollup pages for, the key its alert instance's source carries.
             "hash:hashlib.sha256",
             # BACKLOG #2592: the passkey set is checked against the digest the account's integrity
             # seal covers (store.passkey_digest, a SHA-256 the seal authenticates).

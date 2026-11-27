@@ -30,8 +30,8 @@
 
     REACHABILITY. A dead SMB server does not answer "no"; it hangs a file call for up to the client's
     session timeout (60 s measured). Test-CoordRoot answers fast instead: a TCP connect to port 445
-    with a short timeout, before any file call. A DOWN verdict is cached in <LOCAL>/coord-root-down.json
-    for 60 s, so a dead share costs one timeout per minute per clone, not one per hook process.
+    with a short timeout, before any file call. A DOWN verdict, keyed by server, is cached in
+    <LOCAL>/coord-root-down.json for 60 s, so a dead share costs one timeout per minute per clone, not one per hook process.
 
     CONSTRAINTS, the same four config-roots.ps1 states, because hooks dot-source this:
       1. NO top-level param() block.
@@ -79,6 +79,8 @@ $script:CoordSharingHResults = @([int]0x80070020, [int]0x80070021)
 $script:CoordRootLine = [regex]"\A[ \t]*shared_root[ \t]*=[ \t]*'([^']*)'[ \t]*(#.*)?\z"
 $script:CoordBlankLine = [regex]'\A[ \t]*(#.*)?\z'
 $script:CoordWs = [char[]]@(' ', "`t", "`r", "`n")
+# A \\?\ or \\.\ device path, in any form; Get-CoordDeviceRootRefusal says why one is refused.
+$script:CoordDevicePrefix = '\A[\\/]{2}[?.](?:[\\/]|\z)'
 
 function ConvertFrom-CoordRootBytes {
     # UTF-16 with a BOM, UTF-8 with or without one, STRICTLY: Windows PowerShell 5.1 writes UTF-16 with
@@ -114,6 +116,8 @@ function Get-CoordSharedRoot {
     $envValue = [string][Environment]::GetEnvironmentVariable($script:CoordRootEnv)
     $envValue = $envValue.Trim($script:CoordWs)
     if ($envValue) {
+        $device = Get-CoordDeviceRootRefusal -What $script:CoordRootEnv -Path $envValue
+        if ($device) { return @{ Path = $null; Source = 'env'; Error = $device } }
         if (-not (Test-CoordAbsolutePath $envValue)) {
             return @{ Path = $null; Source = 'env'; Error = "$($script:CoordRootEnv) is not an absolute path: $envValue" }
         }
@@ -153,10 +157,27 @@ function Get-CoordSharedRoot {
         $found = $m.Groups[1].Value.Trim($script:CoordWs)
     }
     if ($null -eq $found) { return @{ Path = $null; Source = 'file'; Error = "$file names no shared_root" } }
+    $device = Get-CoordDeviceRootRefusal -What "$file shared_root" -Path $found
+    if ($device) { return @{ Path = $null; Source = 'file'; Error = $device } }
     if (-not (Test-CoordAbsolutePath $found)) {
         return @{ Path = $null; Source = 'file'; Error = "$file names a shared_root that is not an absolute path: $found" }
     }
     return @{ Path = $found; Source = 'file'; Error = $null }
+}
+
+function Get-CoordDeviceRootRefusal {
+    # Why a root spelled as a device path is refused, or $null for any other spelling (BACKLOG #7569).
+    # \\?\ and \\.\, in any form and with either separator, are refused where a root is resolved, at
+    # least here for the env value and root.toml, in Test-CoordRoot for a caller that probes a path
+    # itself, and in coord-migrate.ps1 for -Source and -Target. Not
+    # every consumer handles one: claim.ps1 reads the root with wildcard -Path cmdlets, which misread
+    # \\?\, and the 445 probe reads '?' or '.' as the server. Rewriting one to its plain spelling
+    # named another directory, or lost the fast probe, in cases no list held, so the spelling is
+    # refused before any probe, file call or down-cache write. The Python twin,
+    # _device_root_refusal, gives the same text.
+    param([string]$What, [string]$Path)
+    if ($Path -notmatch $script:CoordDevicePrefix) { return $null }
+    return "$What is a device path, which is refused: $Path. Spell the root plainly instead, as X:\... or \\srv\share\.... Nothing was read from or written to that root."
 }
 
 function Test-CoordAbsolutePath {
@@ -179,21 +200,46 @@ function Get-CoordUncHost {
     return $null
 }
 
+function Get-CoordDownServer {
+    # The server a down-cache file names, or $null for any other shape. Strict, so this twin reads the
+    # file exactly as probe_root does: a JSON object with a string `server`, that key in that case.
+    # A top-level array is refused by its text, since -NoEnumerate does not exist on Windows PowerShell
+    # 5.1 and pwsh 7 unwraps a one-element array without it; -ceq never filters one. A file with no
+    # `server` key is origin/main's shape, which a stale installed hook copy of coord_root.py still
+    # writes; its server is read from its string `root`, so its verdict still answers here.
+    param([string]$Text)
+    if ($Text.TrimStart($script:CoordWs).StartsWith('[')) { return $null }
+    $obj = ConvertFrom-Json -InputObject $Text -ErrorAction Stop
+    if ($obj -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+    $p = @($obj.PSObject.Properties | Where-Object { $_.Name -ceq 'server' })
+    if ($p.Count -eq 0) {
+        $r = @($obj.PSObject.Properties | Where-Object { $_.Name -ceq 'root' })
+        if ($r.Count -ne 1 -or $r[0].Value -isnot [string]) { return $null }
+        return Get-CoordUncHost -Path $r[0].Value
+    }
+    if ($p.Count -ne 1 -or $p[0].Value -isnot [string]) { return $null }
+    return $p[0].Value
+}
+
 function Test-CoordRoot {
     # Returns @{ Ok; Error }. Fast on a dead server; see the header for why.
     param([string]$Path, [string]$LocalRoot)
     if (-not $Path) { return @{ Ok = $false; Error = 'no path' } }
+    $device = Get-CoordDeviceRootRefusal -What 'shared root' -Path $Path
+    if ($device) { return @{ Ok = $false; Error = $device } }
     $server = Get-CoordUncHost -Path $Path
     if ($server) {
         $down = if ($LocalRoot) { Join-Path $LocalRoot $script:CoordDownFile } else { $null }
-        # The verdict is about ONE root. A cache written for another root, or stamped in the future by a
-        # skewed clock or a copied file, is ignored rather than trusted.
+        # The verdict is about ONE server: what it records is that nothing answered on 445, and both
+        # twins read the same server out of every spelling of a root, where pathlib respells the
+        # rest (BACKLOG #7569). A cache naming another server, or stamped in the future by a skewed
+        # clock or a copied file, is ignored rather than trusted.
         try {
             if ($down -and (Test-Path -LiteralPath $down -PathType Leaf)) {
                 $age = ([DateTime]::UtcNow - (Get-Item -LiteralPath $down).LastWriteTimeUtc).TotalSeconds
-                $cached = ([System.IO.File]::ReadAllText($down) | ConvertFrom-Json -ErrorAction Stop).root
-                if ($cached -ceq $Path -and $age -ge 0 -and $age -lt $script:CoordDownTtlSeconds) {
-                    return @{ Ok = $false; Error = "shared root $Path was unreachable $([int]$age) s ago (cached in $down)" }
+                $cached = Get-CoordDownServer -Text ([System.IO.File]::ReadAllText($down))
+                if ($null -ne $cached -and $cached -ceq $server -and $age -ge 0 -and $age -lt $script:CoordDownTtlSeconds) {
+                    return @{ Ok = $false; Error = "server $server, for shared root $Path, was unreachable $([int]$age) s ago (cached in $down)" }
                 }
             }
         } catch { }
@@ -206,7 +252,7 @@ function Test-CoordRoot {
             try {
                 if ($down) {
                     New-Item -ItemType Directory -Force -Path $LocalRoot | Out-Null
-                    [System.IO.File]::WriteAllText($down, (@{ root = $Path; at = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json -Compress))
+                    [System.IO.File]::WriteAllText($down, (@{ server = $server; root = $Path; at = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json -Compress))
                 }
             } catch { }
             return @{ Ok = $false; Error = "shared root $Path is unreachable: no answer from ${server}:445 within $($script:CoordProbeTimeoutMs) ms" }
@@ -395,6 +441,8 @@ function Read-CoordText {
             try { $reader.ReadToEnd() } finally { $reader.Dispose() }
         } finally { $stream.Dispose() }
     }
-    if ($text.Length -eq 0) { return }
+    # The null test first: a silenced caller's $text is AutomationNull, and under strict mode its
+    # .Length raises PropertyNotFoundException, which that caller's SilentlyContinue only hides.
+    if ($null -eq $text -or $text.Length -eq 0) { return }
     return $text
 }

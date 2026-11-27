@@ -48,6 +48,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import NamedTuple
@@ -1119,14 +1120,15 @@ def _fixture_age_hours(payload: str | None) -> int | None:
     """The age the step must compute from ``payload``, or None when the fixture dates nothing.
 
     Derived FROM the payload rather than passed in beside it, so the expected age and the fixture
-    cannot drift apart. ``min()`` mirrors the step's own ``sort | .[0]``.
+    cannot drift apart. ``max()`` mirrors the step, which dates a release by its NEWEST file
+    (BACKLOG #5474; this read ``min()`` while the step took the oldest).
     """
     if payload is None:
         return None
     stamps = re.findall(r'"upload_time_iso_8601"\s*:\s*"([^"]+)"', payload)
     if not stamps:
         return None
-    when = dt.datetime.strptime(min(stamps), "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=dt.UTC)
+    when = max(dt.datetime.fromisoformat(stamp) for stamp in stamps)
     return int((dt.datetime.now(dt.UTC) - when).total_seconds() // 3600)
 
 
@@ -1909,3 +1911,132 @@ def test_the_advisory_gate_asks_only_about_a_pip_ecosystem(
     assert run.rc == 0, f"the ghsa body aborted (rc={run.rc}){_diagnostic(run)}"
     assert run.outputs.get("security_track") == "true", _diagnostic(run)
     assert run.outputs.get("advisory_ok") == expected, f"{ecosystem!r} {_diagnostic(run)}"
+
+
+# ======================================================== mutated workflow copies (BACKLOG #5605)
+#
+# The checks above read the shipped workflow. These run the SAME checks against a copy of it that
+# carries one weakening the row names, written to tmp_path, so the claim that they refuse each one is
+# a run rather than a commit message. The real workflow is never edited. Each mutation must apply to
+# the workflow text exactly once, so an edit to the workflow that moves the text fails here loudly
+# instead of leaving a mutation that changes nothing. Each also names the message its catcher must
+# fail with, so a copy refused for another reason (an expression the evaluator cannot parse, say)
+# does not count as the weakening being seen.
+
+_SHIPPED_WORKFLOW = _WORKFLOW
+
+_POLICY_DISAGREES = "the merge condition disagrees with the policy"
+_ARM_BODY_CHANGED = "the arm body changed"
+
+_WORKFLOW_MUTATIONS: dict[str, tuple[str, str, str, str]] = {
+    # label: (old text, new text, the check that must refuse the copy, its failure message)
+    "operator swapped: allow-set or sole author": (
+        """          steps.allowset.outputs.eligible == 'true' &&
+          steps.authors.outputs.sole_author == 'true' &&""",
+        """          steps.allowset.outputs.eligible == 'true' ||
+          steps.authors.outputs.sole_author == 'true' &&""",
+        "test_the_merge_condition_evaluates_to_the_policy_over_every_input",
+        _POLICY_DISAGREES,
+    ),
+    "operator swapped: advisory or aged release": (
+        """           (steps.ghsa.outputs.advisory_ok == 'true' &&
+            steps.age.outputs.age_ok == 'true')) &&""",
+        """           (steps.ghsa.outputs.advisory_ok == 'true' ||
+            steps.age.outputs.age_ok == 'true')) &&""",
+        "test_the_merge_condition_evaluates_to_the_policy_over_every_input",
+        _POLICY_DISAGREES,
+    ),
+    "dev-only minor scoping dropped": (
+        """           (steps.meta.outputs.update-type == 'version-update:semver-minor' &&
+            steps.meta.outputs.dependency-type == 'direct:development'))""",
+        """           steps.meta.outputs.update-type == 'version-update:semver-minor')""",
+        "test_the_merge_condition_evaluates_to_the_policy_over_every_input",
+        _POLICY_DISAGREES,
+    ),
+    "job-level bot check dropped": (
+        """    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    # An arm only ever follows this run's own disarm""",
+        """    # An arm only ever follows this run's own disarm""",
+        "test_the_job_runs_only_for_dependabot_authored_prs",
+        "the auto-merge job has no if:",
+    ),
+    "squash dropped": (
+        'if gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"; then',
+        'if gh pr merge --auto --match-head-commit "$HEAD_SHA" "$PR_URL"; then',
+        "test_the_merge_step_squashes_the_triggering_pr_and_nothing_else",
+        _ARM_BODY_CHANGED,
+    ),
+    "PR URL dropped": (
+        'if gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"; then',
+        'if gh pr merge --auto --squash --match-head-commit "$HEAD_SHA"; then',
+        "test_the_merge_step_squashes_the_triggering_pr_and_nothing_else",
+        _ARM_BODY_CHANGED,
+    ),
+    "arming job granted another permission": (
+        "      security-events: read # read Dependabot alerts for the published-GHSA gate (#2)\n",
+        "      security-events: read # read Dependabot alerts for the published-GHSA gate (#2)\n"
+        "      actions: write\n",
+        "test_the_token_permissions_are_exactly_what_each_job_needs",
+        "'actions': 'write'",
+    ),
+}
+
+#: The structural checks a mutated copy is run through, each mutation's catcher among them. Not
+#: every check that reads the workflow is here, so a mutation whose catcher is not listed must add it.
+_STRUCTURAL_CHECKS: tuple[Callable[[], None], ...] = (
+    test_workflow_is_valid_yaml_and_has_the_automerge_job,
+    test_enable_automerge_gates_on_all_three_guards_and_preserves_auto_merge,
+    test_one_step_arms_in_the_arming_job_and_the_disarm_step_only_disarms,
+    test_the_arming_job_runs_only_its_known_steps,
+    test_the_merge_condition_evaluates_to_the_policy_over_every_input,
+    test_the_job_runs_only_for_dependabot_authored_prs,
+    test_the_merge_step_squashes_the_triggering_pr_and_nothing_else,
+    test_the_token_permissions_are_exactly_what_each_job_needs,
+    test_merge_step_pins_the_evaluated_head,
+    test_every_run_disarms_in_its_own_ungrouped_job_before_any_arm,
+)
+
+
+def _checks_refusing(workflow_text: str, tmp_path: Path) -> dict[str, str]:
+    """Run every structural check against ``workflow_text`` as the workflow; each failing check's
+    name, with its failure message."""
+    copy_path = tmp_path / "dependabot-auto-merge.yml"
+    copy_path.write_text(workflow_text, encoding="utf-8", newline="\n")
+    refused: dict[str, str] = {}
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(sys.modules[__name__], "_WORKFLOW", copy_path)
+            _parsed.cache_clear()
+            for check in _STRUCTURAL_CHECKS:
+                try:
+                    check()
+                except AssertionError as exc:
+                    refused[check.__name__] = str(exc)
+    finally:
+        # After the path is restored: the parse is cached, so a clear before it would leave every
+        # later test reading the copy.
+        _parsed.cache_clear()
+    return refused
+
+
+def test_the_structural_checks_pass_an_unmutated_copy(tmp_path: Path) -> None:
+    """The control for the test below: the copy mechanism itself refuses nothing, so a refusal there
+    is the mutation's and not the harness's."""
+    assert _checks_refusing(_WORKFLOW.read_text(encoding="utf-8"), tmp_path) == {}
+    assert _WORKFLOW == _SHIPPED_WORKFLOW
+    assert {c for _, _, c, _ in _WORKFLOW_MUTATIONS.values()} <= {
+        c.__name__ for c in _STRUCTURAL_CHECKS
+    }, "a mutation's catcher is not among the checks a copy is run through"
+
+
+@pytest.mark.parametrize("label", sorted(_WORKFLOW_MUTATIONS))
+def test_each_named_weakening_of_a_workflow_copy_is_refused(label: str, tmp_path: Path) -> None:
+    old, new, catcher, message = _WORKFLOW_MUTATIONS[label]
+    text = _WORKFLOW.read_text(encoding="utf-8")
+    assert text.count(old) == 1, f"the {label} mutation no longer applies once to the workflow"
+    refused = _checks_refusing(text.replace(old, new, 1), tmp_path)
+    # Restored after a MUTATED run, where a missed restore would leave later tests reading the copy.
+    assert _WORKFLOW == _SHIPPED_WORKFLOW
+    assert _parsed() == yaml.safe_load(_SHIPPED_WORKFLOW.read_text(encoding="utf-8"))
+    assert catcher in refused, f"{label}: {catcher} passed a weakened copy; refused: {refused}"
+    assert message in refused[catcher], f"{label}: refused for another reason: {refused[catcher]}"

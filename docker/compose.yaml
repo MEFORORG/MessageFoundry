@@ -122,6 +122,7 @@ x-ha-engine-env: &ha-engine-env
   # before serve's preflight checks its owner, and `store provision-schema` never checks it. A
   # managed Postgres whose certificate the system trust store already verifies needs no pin:
   # remove this line.
+  # Whether or not you keep this pin, read the overlay note in README.md, "Residuals / gotchas".
   MEFOR_STORE_SSL_ROOT_CERT: "/config/pki/store-ca.pem"
   # DEV-ONLY: the local Postgres image makes POSTGRES_USER a SUPERUSER, and the engines log in as it.
   # Under the shipped enforce dial an over-granted store login refuses to start (ADR 0199), so this
@@ -143,7 +144,8 @@ x-ha-engine-env: &ha-engine-env
   # Off-box log forwarding: verified TLS to a collector that is not this host (ADR 0200), on
   # the egress allowlist block_unlisted_outbound requires. Put the CA and CRL under
   # ./config/pki/, owned as ./config is, because the engine refuses a CA another account could
-  # replace. Replace the CRL before its nextUpdate.
+  # replace. Replace the CRL before its nextUpdate. Then read the overlay note in README.md,
+  # "Residuals / gotchas".
   # MEFOR_LOGGING_FORWARD_HOST: "REPLACE-siem.example.org"
   # MEFOR_LOGGING_FORWARD_PORT: "6514"
   # MEFOR_LOGGING_FORWARD_PROTOCOL: "tls"
@@ -214,6 +216,7 @@ services:
       # MEFOR_LOGGING_FORWARD_HOST: "REPLACE-siem.example.org"
       # MEFOR_LOGGING_FORWARD_PORT: "6514"
       # MEFOR_LOGGING_FORWARD_PROTOCOL: "tls"
+      # The forwarding CA: read the overlay note in README.md, "Residuals / gotchas".
       # MEFOR_LOGGING_FORWARD_TLS_CA_FILE: "/config/pki/syslog-ca.pem"
       # MEFOR_LOGGING_FORWARD_TLS_CRL_FILE: "/config/pki/syslog-crl.pem"
       # MEFOR_EGRESS_ALLOWED_SYSLOG: "REPLACE-siem.example.org"
@@ -258,7 +261,10 @@ services:
       # safer choice, since the engine's own account cannot rewrite it. On Linux:
       #   chmod -R a+rX,go-w ./config && sudo chown -R root:root ./config
       # The robust production alternative is to BAKE config into a derived image (see docker/README.md);
-      # a Docker-Desktop-on-Windows bind mount surfaces as 0o777 and will be refused.
+      # a Docker-Desktop-on-Windows bind mount surfaces as 0o777 and will be refused. A Docker Desktop
+      # for Mac bind mount reports an owner and mode the Mac does not enforce, and the config check
+      # reads those bits, so a pass there does not show the config is protected. Bake it there too
+      # (docker/README.md).
       - ./config:/config:ro
       # TLS material, read-only. The MLLP key must be UNENCRYPTED unless the MLLP() sets tls_key_password
       # (env-sourced); the API key may be encrypted (MEFOR_API_TLS_KEY_PASSWORD).
@@ -269,7 +275,19 @@ services:
       #   sudo chown -R 10001:10001 ./tls && sudo find ./tls -type f -exec chmod 0600 {} + && sudo chmod 0700 ./tls
       # Under rootless Docker, Podman or userns-remap, chown to the host uid that container uid 10001
       # maps to instead. A Docker-Desktop-on-Windows bind mount surfaces as 0o777 and would be
-      # refused, as config is.
+      # refused, as config is. A Docker Desktop for Mac bind mount of a key file in ./tls is refused
+      # too, where it surfaces as a mount of a type the key-file check refuses (docker/README.md
+      # names at least some): the owner and mode bits do not decide who reaches the file there, so
+      # chown and chmod on the Mac do not clear it.
+      # There, mount a named volume at /etc/mefor/tls in place of ./tls (on this service and the
+      # `ha` engines), filled and owned inside Docker's Linux VM, for example:
+      #   docker volume create mefor-tls
+      #   docker run --rm --network none --user 0 --entrypoint sh --mount type=bind,src="$PWD/tls",dst=/src,readonly -v mefor-tls:/dst messagefoundry:latest -c 'mkdir /tmp/n && cp -RL /src/. /tmp/n/ && find /dst -mindepth 1 -delete && cp -R /tmp/n/. /dst/ && chown -R 10001:10001 /dst && chmod 0700 /dst && find /dst -type f -exec chmod 0600 {} +'
+      # run from the directory that holds ./tls, using the engine image built above, and declare
+      # mefor-tls under the top-level volumes: as external: true. --mount refuses a missing ./tls.
+      # -L copies the file a link names where that file is inside ./tls; a link that leaves ./tls
+      # fails the copy, and the volume is emptied only after the copy succeeds, so a retired key
+      # does not stay in it and a failed copy keeps the old keys. Run it again after each rotation.
       - ./tls:/etc/mefor/tls:ro
       # OPTIONAL secrets directory (vault BACKLOG #2595, ADR 0214), an alternative to env_file for
       # the engine's own secret settings other than the store key, and env() values: one file per
@@ -279,6 +297,8 @@ services:
       # group or other read or write bit, and a bind mount keeps the host's modes, so own it as ./tls
       # is owned, the directory 0700 and each file 0600. On Linux:
       #   sudo chown -R 10001:10001 ./secrets && sudo chmod 0700 ./secrets && sudo find ./secrets -type f -exec chmod 0600 {} +
+      # A Docker Desktop for Mac bind mount of ./secrets is refused too, at least where it surfaces
+      # as a mount of a type the check refuses, as for ./tls; use a named volume filled the same way.
       # docs/CONFIGURATION.md "The secrets directory" holds the rules.
       # - ./secrets:/run/mefor/secrets:ro
 

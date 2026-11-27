@@ -262,6 +262,24 @@ class _CacheState:
     fetched_at: float
 
 
+def _require_interval(name: str, value: float) -> float:
+    """``value`` as a number of seconds at or above 0, or :class:`ValueError` (BACKLOG #6904).
+
+    The type must be an int or a float; a bool, text or any other type is refused. The number is
+    then read by the rule :func:`~messagefoundry.transports.base.float_setting` holds. That matters
+    here because a NaN or infinite floor wedges key rotation for good. A negative is
+    refused too, the floor the settings load sets for both knobs (``ge=0``, BACKLOG #5318). Zero
+    stays legal: ``min_refetch_seconds`` of 0 removes the amplification bound, a choice the
+    security-loosening report names. The refusal withholds the value.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"JwksCache {name} must be an int or a float (value withheld)")
+    seconds = float_setting(value, knob=name, transport="JwksCache")
+    if seconds < 0:
+        raise ValueError(f"JwksCache {name} must not be negative (value withheld)")
+    return seconds
+
+
 def _require_gate_wait(value: float) -> float:
     """``value`` as a gate wait above 0 and at most ``threading.TIMEOUT_MAX``, or
     :class:`ValueError` (BACKLOG #6905). Zero would refuse every lookup that meets a refresh in
@@ -300,6 +318,11 @@ class JwksCache:
       later fails and leaves the old keys in place. A key past the TTL is never served instead
       (BACKLOG #6905). The wait is bounded; the fetch is bounded only per socket operation;
     * a fetch that fails leaves the previous good keys in place (fail-static within the TTL).
+
+    ``ttl_seconds`` and ``min_refetch_seconds`` must be an int or a float that is finite, within
+    the float range and not negative, and
+    ``gate_wait_seconds`` a number above 0 and at most ``threading.TIMEOUT_MAX``, or construction
+    raises :class:`ValueError` (BACKLOG #6904).
     """
 
     def __init__(
@@ -312,8 +335,8 @@ class JwksCache:
         gate_wait_seconds: float = DEFAULT_JWKS_GATE_WAIT_SECONDS,
     ) -> None:
         self._fetch = fetch
-        self._ttl = ttl_seconds
-        self._min_refetch = min_refetch_seconds
+        self._ttl = _require_interval("ttl_seconds", ttl_seconds)
+        self._min_refetch = _require_interval("min_refetch_seconds", min_refetch_seconds)
         self._gate_wait = _require_gate_wait(gate_wait_seconds)
         self._clock = clock
         self._state: _CacheState | None = None

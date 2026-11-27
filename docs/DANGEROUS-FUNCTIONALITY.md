@@ -764,7 +764,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 | Identity provider replies | The OpenID Connect token response and key set, and an ID token's header and claims | `auth/oidc/flow.py`, `auth/oidc/jwks.py`, `transports/signing.py` |
 | An HTTP 400 on the Transit audit MAC hop | The body of an HTTP 400 answering the audit chain's check of a stored row MAC (Transit `verify`, BACKLOG #2720), from whatever answers on that hop: at least Vault or OpenBao at `MEFOR_STORE_VAULT_ADDR`, or a proxy or firewall in front of it. The strict reply reader refuses a body over `MAX_VAULT_REPLY_BYTES`. What is read, and which error each outcome raises, is in at least `verify_audit_hmac`, `_refuses_only_version`, `_names_no_version_reason` and `_reply_errors`, which parses the body and holds the size bound it shares with the data-key decrypt (vault BACKLOG #6707). | `store/crypto_transit.py` |
 | An HTTP 400 on the Transit data-key decrypt | The `errors` list of an HTTP 400 answering a decrypt of the store's data key, and the per-value `error` text of a 2xx batch reply (a batch Vault refuses is asked for value by value, and its body is not read), from whatever answers at `MEFOR_STORE_VAULT_ADDR`, a proxy or firewall in front of Vault included. Every entry of that list is read and compared, and the refusal counts as a tag refusal only when every entry is an AEAD authentication failure text. For a single decrypt, that reading decides at least whether the refusal is a cell tag failure or the cipher's plain refusal, and so whether the cell is audited and alerted, its row withheld from a list and its in-flight handoff dead-lettered rather than re-pended. So whatever answers on that hop can dead-letter the messages it is asked about. A batch result's per-value `error` changes only the class of the error the cipher-cell walk records, and so the class name its reason line shows, never containment, audit or alert. The strict reply reader refuses a body over `MAX_VAULT_REPLY_BYTES`, so the engine holds a body up to that bound; for a body hvac did not parse, only the JSON parse is skipped past `_REPARSED_BODY_MAX_CHARS`. The read is in at least `_reply_errors`, `_names_aead_failure`, `_is_aead_failure_text` and `TransitCipher._decrypt_batch` (BACKLOG #5650). | `store/crypto_transit.py` |
-| A Transit batch reply | The `batch_results` list answering a batch encrypt or decrypt of the store's data key, from whatever answers at `MEFOR_STORE_VAULT_ADDR`. The strict reply reader refuses a body over `MAX_VAULT_REPLY_BYTES`. A request of more than one value carries at most `BATCH_MAX_ITEMS` values and `BATCH_MAX_CHARS` characters of them (`store/crypto.py`); one larger value goes alone. The reply is checked in at least `_batch_replies`, `TransitCipher._decrypt_batch` and `TransitCipher._encrypt_batch` (vault BACKLOG #6706). | `store/crypto_transit.py` |
+| A Transit batch reply | The `batch_results` list answering a batch encrypt or decrypt of stored values under the store's Transit data key, from whatever answers at `MEFOR_STORE_VAULT_ADDR`. The strict reply reader refuses a body over `MAX_VAULT_REPLY_BYTES`. A request of more than one value carries at most `BATCH_MAX_ITEMS` values and `BATCH_MAX_CHARS` characters of them (`store/crypto.py`); one larger value goes alone. The reply is checked in at least `_batch_replies`, `TransitCipher._decrypt_batch` and `TransitCipher._encrypt_batch` (vault BACKLOG #6706). | `store/crypto_transit.py` |
 | A passkey response | A browser sends JSON with CBOR (Concise Binary Object Representation) inside. The `webauthn` library, from the optional `[webauthn]` extra, decodes the CBOR. | `auth/webauthn.py`, `messagefoundry_webconsole/routes/account.py` |
 | A Kerberos sign-in token | The token a browser sends for Windows single sign-on, in its `Authorization: Negotiate` header. The API route decodes its base64, as the web console's `routes/sso.py` does, and pyspnego decodes the token. Kerberos sign-in is off unless configured. | `api/auth_routes.py`, `auth/ldap.py` |
 | A TLS client's certificate | The certificate a TLS client presents, read again to find its issuer. The same module also decodes an operator's PKCS #12 file and certificate revocation lists. | `pki.py` |
@@ -1168,12 +1168,13 @@ full list. No harness module imports `ctypes`, or an archive or compression libr
 is a claim about imports only. At least `sinks/dimse.py` inflates a compressed data set a peer
 sends it, through the engine's own bounded inflate helper.
 
-**Process starts.** 7 harness modules start a process, each from an argument list:
+**Process starts.** 8 harness modules start a process, each from an argument list:
 
 | Module | What it runs | When | Form |
 |---|---|---|---|
 | `__main__.py` | `git rev-parse HEAD` | Stamping a load report with the commit it ran at | argument list |
 | `acceptance/runner.py` | `pytest`, under the harness's own interpreter | `python -m harness.acceptance`, unless `--no-pytest` is given | argument list |
+| `e2e_smoke.py` | A probe of the harness's own interpreter that asks where it imports `messagefoundry` from, then `messagefoundry serve` | `python -m harness.e2e_smoke`, the end-to-end smoke | argument list |
 | `load/failover.py` | `messagefoundry serve`, once per engine node | A run that starts its own engine, at least the failover and connection-scale runs | argument list |
 | `load/shardcert.py` | `messagefoundry serve --shard`, and the harness again as a sender or a sink | The engine-shard certification runs | argument list |
 | `load/connscale/batchbox.py` | The harness again, as `connscale-remote` | A batch drive split over several sender processes | argument list |
@@ -1190,11 +1191,15 @@ them. At least five things are open:
   Windows may find a copy in the working directory before the one on `PATH`.
 - Each Python child starts as `python -m <module>` with no `-P`. So the child's working directory
   comes first on its import path, unless the caller's environment sets `PYTHONSAFEPATH`. A file
-  there named like a module the child imports would load in its place. One start differs: the
-  provisioning child runs `load/rigadmin.py` by file path with `-P`.
-- No start takes its environment from `messagefoundry/childenv.py`, and
+  there named like a module the child imports would load in its place. At least two starts differ:
+  the provisioning child runs `load/rigadmin.py` by file path with `-P`, and `e2e_smoke.py` starts
+  its probe and its engine with `-P -X disable-remote-debug`, the `CHILD_INTERPRETER_FLAGS` of
+  `messagefoundry/childenv.py`.
+- No start takes its environment from `messagefoundry/childenv.py`'s builders, and
   `tests/test_child_process_environment.py` does not read the harness. So the check that holds
-  every engine start to that module does not reach a harness start. Some harness tests do check
+  every engine start to that module does not reach a harness start. For its engine's environment,
+  `e2e_smoke.py` uses only that module's `outside_engine_namespace`, to drop the caller's engine
+  variables before it adds its own. Some harness tests do check
   what one child is handed, at least `tests/test_rig_admin.py` for the provisioning child and the
   `rigadmin run` child.
 - `rigadmin run` signs in, then starts the command its caller names with `--token=<session>`
@@ -1208,7 +1213,10 @@ node at least these, unless the run sets them itself: `MEFOR_SECURITY_ENFORCEMEN
 passes `--allow-insecure-bind` when the run binds the inbound listener off loopback. Some runs go
 further. `load/multishard.py` and `load/shardcert.py` set `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1`
 and `MEFOR_ALLOW_INSECURE_TLS=1` for their engines on every platform, whatever the run's own
-environment says. These suit a synthetic load graph. An engine started this way would not protect
+environment says. `e2e_smoke.py` sets the same three `MEFOR_SECURITY_*` relaxations,
+`MEFOR_SECURITY_REQUIRE_MFA=false`, and on Windows `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1`, for the
+engine it starts on whatever graph `--config` names, the sample graph by default. It drops every
+`MEFOR_*` variable the caller set, so a run cannot keep the enforcing posture. These suit a synthetic load graph. An engine started this way would not protect
 real messages, so never point one at them.
 
 **Import by name.** 2 harness modules import a module named at run time:

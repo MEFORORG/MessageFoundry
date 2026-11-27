@@ -40,8 +40,10 @@ _QUOTED_FORMS: list[tuple[str, str, str, bool]] = [
     ("decomposed_unicode", "JOS\u00c9_ADT.hl7", "JOSE\u0301_ADT.hl7", True),
     # The ascii() form, which safe_exc replaces as it does the name (BACKLOG #5815).
     ("escaped_unicode", "JOS\u00c9_ADT.hl7", "JOS\\xc9_ADT.hl7", False),
-    # A JSON escape with uppercase hex, a spelling none of those forms produces.
-    ("escaped_json_upper_hex", "JOS\u00c9_ADT.hl7", "JOS\\u00C9_ADT.hl7", True),
+    # A JSON escape with uppercase hex, which safe_exc also replaces (BACKLOG #5815, PR 3070 finding 3).
+    ("escaped_json_upper_hex", "JOS\u00c9_ADT.hl7", "JOS\\u00C9_ADT.hl7", False),
+    # A JSON escape of a decomposed spelling, which none of those forms produces.
+    ("escaped_json_decomposed", "JOS\u00c9_ADT.hl7", "JOSE\\u0301_ADT.hl7", True),
 ]
 
 

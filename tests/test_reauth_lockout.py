@@ -35,6 +35,7 @@ from _totp_clock import fresh_totp
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
+from messagefoundry.auth import service as service_module
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind, LdapError
 from messagefoundry.auth.notifications import (
@@ -49,6 +50,7 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.base import AuthStore
+from messagefoundry.store.row_seal import RowSealError
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_admin, create_local_user_chosen
 
@@ -1341,3 +1343,164 @@ def test_the_admin_unlock_cli_clears_a_lock_set_by_reauth(
             await store.close()
 
     assert asyncio.run(sign_in_after_unlock()), "admin-unlock must lift a lock that re-auth set"
+
+
+_FAR_FUTURE = 10 * 365 * 86400.0
+
+
+async def test_the_reapers_purged_sessions_lose_their_counts() -> None:
+    """BACKLOG #5336: the session reaper ends rows without naming them by hash, so its follow-up
+    drops the counts of the sessions it took and keeps a live session's. Without it, many accounts'
+    purged sessions would hold the whole map, which no drop at one account's cap reaches."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        await _local_user(store, "ann")
+        identity, purged = await _signed_in(service, "ann")
+        assert not (await service.reauth(identity, WRONG, token=purged)).ok
+        assert await store.purge_expired_sessions(now=time.time() + _FAR_FUTURE) >= 1
+        await _local_user(store, "ben")
+        identity, live = await _signed_in(service, "ben")
+        assert not (await service.reauth(identity, WRONG, token=live)).ok
+        assert hash_token(purged) in service._reproof_session_failures
+        await service.drop_reaped_reproof_counts()
+        assert hash_token(purged) not in service._reproof_session_failures
+        assert service._session_reproof_failures(hash_token(live)) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_refused_read_keeps_the_reaped_counts(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5336: the drop after a purge is housekeeping, so a store that refuses the read
+    leaves the counts in place (fail closed), logged, rather than failing the reaper's pass. Three
+    refusals in a row end the pass, so an outage costs three reads, not one per account."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        tokens = []
+        for name in ("ann", "ben", "cat", "dan", "eve"):
+            await _local_user(store, name)
+            identity, token = await _signed_in(service, name)
+            assert not (await service.reauth(identity, WRONG, token=token)).ok
+            tokens.append(token)
+        await store.purge_expired_sessions(now=time.time() + _FAR_FUTURE)
+        reads = []
+
+        async def refused(*args: object, **_kwargs: object) -> object:
+            reads.append(args)
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(store, "list_sessions", refused)
+        with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
+            await service.drop_reaped_reproof_counts()
+        assert all(service._session_reproof_failures(hash_token(t)) == 1 for t in tokens)
+        assert len(reads) == service_module._REAPED_DROP_REFUSALS
+        assert any("this pass drops no more" in r.getMessage() for r in caplog.records)
+    finally:
+        await store.close()
+
+
+async def test_an_unparseable_account_between_refusals_resets_the_refused_run(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5336: pins one case of the reset as built. An account whose row does not parse
+    keeps its counts and still starts the run of refusals again, so refused, unparseable, refused,
+    refused is not three in a run while the bound is three, and the account after them is read."""
+    # The walk below discriminates reset from no reset only at a bound of three.
+    assert service_module._REAPED_DROP_REFUSALS == 3
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        tokens = {}
+        for name in ("ann", "ben", "cat", "dan", "eve"):
+            await _local_user(store, name)
+            identity, token = await _signed_in(service, name)
+            assert not (await service.reauth(identity, WRONG, token=token)).ok
+            tokens[name] = token
+        await store.purge_expired_sessions(now=time.time() + _FAR_FUTURE)
+        real = store.list_sessions
+        reads: list[str] = []
+
+        async def walk(user_id: str, *args: Any, **kwargs: Any) -> Any:
+            reads.append(user_id)
+            if user_id == "u-ben":
+                raise RowSealError("session")
+            if user_id in {"u-ann", "u-cat", "u-dan"}:
+                raise sqlite3.OperationalError("database is locked")
+            return await real(user_id, *args, **kwargs)
+
+        monkeypatch.setattr(store, "list_sessions", walk)
+        with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
+            await service.drop_reaped_reproof_counts()
+        assert reads == ["u-ann", "u-ben", "u-cat", "u-dan", "u-eve"]
+        assert not any("this pass drops no more" in r.getMessage() for r in caplog.records)
+        for name in ("ann", "ben", "cat", "dan"):
+            assert service._session_reproof_failures(hash_token(tokens[name])) == 1
+        assert hash_token(tokens["eve"]) not in service._reproof_session_failures
+    finally:
+        await store.close()
+
+
+async def test_one_accounts_refused_read_does_not_starve_the_rest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: an account whose read the store keeps refusing, such as one with a row the
+    driver cannot decode, keeps its own counts, and the drop still reaches every other account,
+    on every pass and whatever order the accounts come in."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        tokens = {}
+        for name in ("ann", "ben", "cat"):
+            await _local_user(store, name)
+            identity, token = await _signed_in(service, name)
+            assert not (await service.reauth(identity, WRONG, token=token)).ok
+            tokens[name] = token
+        await store.purge_expired_sessions(now=time.time() + _FAR_FUTURE)
+        real = store.list_sessions
+
+        async def flaky(user_id: str, *args: Any, **kwargs: Any) -> Any:
+            if user_id == "u-ann":
+                raise sqlite3.OperationalError("Could not decode to UTF-8 column 'user_id'")
+            return await real(user_id, *args, **kwargs)
+
+        monkeypatch.setattr(store, "list_sessions", flaky)
+        await service.drop_reaped_reproof_counts()
+        assert service._session_reproof_failures(hash_token(tokens["ann"])) == 1
+        assert hash_token(tokens["ben"]) not in service._reproof_session_failures
+        assert hash_token(tokens["cat"]) not in service._reproof_session_failures
+    finally:
+        await store.close()
+
+
+async def test_a_defect_for_one_account_does_not_starve_the_next(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: a defect reading one account's sessions is raised only after the other
+    accounts were tried, so one bad account cannot keep every account after it from its drop."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        tokens = {}
+        for name in ("ann", "ben"):
+            await _local_user(store, name)
+            identity, token = await _signed_in(service, name)
+            assert not (await service.reauth(identity, WRONG, token=token)).ok
+            tokens[name] = token
+        await store.purge_expired_sessions(now=time.time() + _FAR_FUTURE)
+        real = store.list_sessions
+
+        async def flaky(user_id: str, *args: Any, **kwargs: Any) -> Any:
+            if user_id == "u-ann":
+                raise sqlite3.ProgrammingError("synthetic defect")
+            return await real(user_id, *args, **kwargs)
+
+        monkeypatch.setattr(store, "list_sessions", flaky)
+        with pytest.raises(sqlite3.ProgrammingError):
+            await service.drop_reaped_reproof_counts()
+        assert service._session_reproof_failures(hash_token(tokens["ann"])) == 1
+        assert hash_token(tokens["ben"]) not in service._reproof_session_failures
+    finally:
+        await store.close()

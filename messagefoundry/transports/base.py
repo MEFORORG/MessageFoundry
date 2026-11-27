@@ -68,6 +68,7 @@ __all__ = [
     "HANDLER_RETRY_DELAYS",
     "HANDLER_FAULT_REPORT_AFTER",
     "HandlerFaultUnrecovered",
+    "HeldFrameRecorder",
     "hold_and_retry",
     "owes_hl7_reply",
     "recover_handler_fault",
@@ -459,6 +460,13 @@ InboundHandler = Callable[[bytes], Awaitable[str | None]]
 # scrubs again (#120).
 ConnectionEventSink = Callable[[str, str | None, str | None], Awaitable[None]]
 
+# A listener whose sender waits for no reply hands a held frame it is about to lose to this
+# OPTIONAL, store-agnostic recorder (BACKLOG #1619 item 6): ``(frame, reason)``, where ``reason`` is
+# value-free text built from a ``safe_exc``-scrubbed fault. The runner injects one that records the
+# frame as an ``ERROR`` row and returns its message id; ``None`` (the default) records nothing, so a
+# direct build or test is byte-identical. :func:`hold_and_retry` says when it is called.
+HeldFrameRecorder = Callable[[bytes, str], Awaitable[str]]
+
 # A source reports an intake-authentication refusal to this OPTIONAL, store-agnostic sink (ADR 0154
 # D6): ``(action, client, detail)``. The runner injects an adapter that writes a tamper-evident
 # ``audit_log`` row binding the connection; the source knows only the wire-level facts.
@@ -652,8 +660,9 @@ HANDLER_FAULT_REPORT_AFTER = 4
 #: grace for its client tasks.
 _HOLD_STOP_POLL_SECONDS = 0.25
 
-#: The bound on the ``handler_error`` report a cancelled hold still makes. The store may be what is
-#: hung, and stop() waits for the task it cancelled, so the report must not hold stop() open.
+#: The bound on the ``handler_error`` report a cancelled hold still makes, and, separately, on its
+#: write of the held frame's ``ERROR`` row (BACKLOG #1619 item 6). The store may be what is hung,
+#: and stop() waits for the task it cancelled, so neither may hold stop() open.
 _CANCELLED_REPORT_SECONDS = 1.0
 
 
@@ -668,8 +677,9 @@ def owes_hl7_reply(ack_mode: AckMode, content_type: ContentType | None) -> bool:
 
 
 class HandlerFaultUnrecovered(Exception):
-    """The frame the inbound handler faulted on is not recorded, and the caller closes the
-    connection. :func:`recover_handler_fault` has already logged it and reported ``handler_error``."""
+    """The inbound handler did not record the frame it faulted on, and the caller closes the
+    connection. :func:`recover_handler_fault` has already logged it and reported ``handler_error``;
+    a held frame may by then be an ``ERROR`` row, through the hold's ``record_loss``."""
 
 
 async def recover_handler_fault(
@@ -683,6 +693,7 @@ async def recover_handler_fault(
     log: logging.Logger,
     stopped: Callable[[], bool],
     report: Callable[[str], Awaitable[None]],
+    record_loss: HeldFrameRecorder | None = None,
 ) -> str | None:
     """What the raw-TCP and X12 listeners do when ``handler`` faults on a frame their decoder read
     cleanly (BACKLOG #5022). Returns the handler's reply once an attempt records the frame, or
@@ -697,7 +708,7 @@ async def recover_handler_fault(
     so this logs at ERROR, calls ``report`` with ``reason`` for the caller's ``handler_error`` event,
     and raises at once: the sender resends this frame and those behind it, in order, and a retry
     would hold it past its own reply timeout. Otherwise the sender never resends, and
-    :func:`hold_and_retry` holds the frame.
+    :func:`hold_and_retry` holds the frame, with ``record_loss`` for a hold that ends without it.
     """
     if not owes_reply:
         return await hold_and_retry(
@@ -709,6 +720,7 @@ async def recover_handler_fault(
             log=log,
             stopped=stopped,
             report=report,
+            record_loss=record_loss,
         )
     log.error(
         "%s message from %s failed in the inbound handler: %s (this inbound sends a reply, so "
@@ -742,6 +754,8 @@ async def hold_and_retry(
     log: logging.Logger,
     stopped: Callable[[], bool],
     report: Callable[[str], Awaitable[None]],
+    record_loss: HeldFrameRecorder | None = None,
+    slot: Callable[[], contextlib.AbstractAsyncContextManager[object]] | None = None,
 ) -> str | None:
     """Retry ``handler`` on a frame it faulted on, for a listener whose sender waits for no reply
     (BACKLOG #5022), and return its reply once one attempt succeeds. ``reason`` is the first fault,
@@ -767,6 +781,21 @@ async def hold_and_retry(
     that came after the commit means a retry commits another copy, which at-least-once delivery
     allows. Nothing is acknowledged here, so the ACK-after-commit rule holds. Every line carries
     the ``safe_exc`` text, never the frame.
+
+    Where the hold ends without the frame, the held frame is handed to ``record_loss`` first, so it
+    is counted and logged as an ``ERROR`` row rather than lost uncounted (BACKLOG #1619 item 6). The
+    frames behind it are still lost: the listener never handed them to the handler. The reason it
+    is given is fixed text and the scrubbed fault, never a byte of the frame. It is best-effort: a
+    write that raises logs a WARNING, and the ERROR line then still says the frame is not recorded.
+    After a cancel it is bounded by :data:`_CANCELLED_REPORT_SECONDS`, as the report is. A cancel
+    inside an attempt records it too, and its reason says the cut-off attempt may also have
+    recorded it, since a second row is a lesser fault than a frame that may be lost uncounted. It
+    is called only once the hold has ended, so the hold itself still has no attempt cap.
+
+    ``slot``, where given, names the context each attempt waits in before it calls ``handler``, such
+    as the MLLP listener's in-flight bound. A cancel while an attempt waits there did not cut off
+    ``handler``, so it is recorded as a cancel, not as an attempt that may have committed. That
+    wait need not end at once, so a stop seen once the slot is held also makes the attempt the last.
     """
     failed = 1  # attempts that ended in a fault
     reported = False
@@ -810,9 +839,11 @@ async def hold_and_retry(
                 )
                 await _pause(delay, stopped)
                 last = stopped()  # a stop during the pause makes this attempt the last
-            in_attempt = True
             try:
-                reply = await handler(frame)
+                async with slot() if slot is not None else contextlib.nullcontext():
+                    last = last or stopped()  # a stop during the slot wait makes this the last
+                    in_attempt = True
+                    reply = await handler(frame)
             except Exception as exc:  # noqa: BLE001 -- any escape is a handler fault; see the docstring
                 in_attempt = False
                 reason = safe_exc(exc)
@@ -830,7 +861,103 @@ async def hold_and_retry(
                 )
             return reply
     except asyncio.CancelledError:
-        if in_attempt:
+        await _end_hold(
+            frame,
+            reason,
+            failed=failed,
+            why="the listener task was cancelled",
+            cut_off=in_attempt,
+            bound=_CANCELLED_REPORT_SECONDS,
+            reported=reported,
+            transport=transport,
+            peer=peer,
+            log=log,
+            report=report,
+            record_loss=record_loss,
+        )
+        raise
+    await _end_hold(
+        frame,
+        reason,
+        failed=failed,
+        why="the listener is stopping",
+        cut_off=False,
+        bound=None,
+        reported=reported,
+        transport=transport,
+        peer=peer,
+        log=log,
+        report=report,
+        record_loss=record_loss,
+    )
+    raise HandlerFaultUnrecovered
+
+
+async def _end_hold(
+    frame: bytes,
+    reason: str,
+    *,
+    failed: int,
+    why: str,
+    cut_off: bool,
+    bound: float | None,
+    reported: bool,
+    transport: str,
+    peer: object,
+    log: logging.Logger,
+    report: Callable[[str], Awaitable[None]],
+    record_loss: HeldFrameRecorder | None,
+) -> None:
+    """End a hold without its frame: report it unless already reported, hand the frame to
+    ``record_loss``, then log one ERROR line saying what became of it. ``cut_off`` says a cancel cut
+    off an attempt inside the handler. ``bound``, after a cancel, bounds the report and the write
+    each, since stop() waits for the task it cancelled.
+
+    The report goes first because it is a non-blocking enqueue, and the write may be what hangs.
+    The ERROR line is written in a ``finally``, so a further cancel during either still logs it."""
+    mid: str | None = None
+    writing = False
+    try:
+        if not reported:
+            if bound is None:
+                await report(reason)
+            else:
+                try:
+                    await asyncio.wait_for(report(reason), bound)
+                except TimeoutError:
+                    log.warning(
+                        "%s handler_error event for %s not written within %.1fs of the cancel",
+                        transport,
+                        peer,
+                        bound,
+                    )
+        if record_loss is not None:
+            writing = True
+            mid = await _record_held_frame(
+                record_loss,
+                frame,
+                _held_loss_reason(failed, reason, cut_off=cut_off),
+                transport=transport,
+                peer=peer,
+                log=log,
+                bound=bound,
+            )
+            writing = False
+    finally:
+        if cut_off and mid is not None:
+            log.error(
+                "%s message from %s is recorded as ERROR message %s, which may duplicate a row "
+                "the cut-off attempt committed: the listener task was cancelled inside attempt %d, "
+                "after %d failed with: %s. No frame behind it on this connection is recorded "
+                "(closing the connection)",
+                transport,
+                peer,
+                mid,
+                failed + 1,
+                failed,
+                reason,
+            )
+        elif cut_off:
             log.error(
                 "%s message from %s may or may not be recorded: the listener task was cancelled "
                 "inside attempt %d, after %d failed with: %s. No frame behind it on this connection "
@@ -841,23 +968,89 @@ async def hold_and_retry(
                 failed,
                 reason,
             )
+        elif mid is not None:
+            _log_hold_recorded(log, transport, peer, failed, reason, why, mid)
         else:
-            _log_hold_loss(log, transport, peer, failed, reason, "the listener task was cancelled")
-        if not reported:
-            try:
-                await asyncio.wait_for(report(reason), _CANCELLED_REPORT_SECONDS)
-            except TimeoutError:
-                log.warning(
-                    "%s handler_error event for %s not written within %.1fs of the cancel",
-                    transport,
-                    peer,
-                    _CANCELLED_REPORT_SECONDS,
-                )
-        raise
-    _log_hold_loss(log, transport, peer, failed, reason, "the listener is stopping")
-    if not reported:
-        await report(reason)
-    raise HandlerFaultUnrecovered
+            _log_hold_loss(log, transport, peer, failed, reason, why)
+        if writing:
+            # A cancel landed during the ERROR write, which may have committed before it.
+            log.warning(
+                "%s ERROR row for the held message from %s may or may not be written: the write "
+                "was cancelled",
+                transport,
+                peer,
+            )
+
+
+def _held_loss_reason(failed: int, reason: str, *, cut_off: bool) -> str:
+    """The value-free ``ERROR`` reason for a held frame the hold ends without: fixed text, a count
+    and the ``safe_exc`` text of the last fault. Kept short, since the store bounds the column to
+    200 characters and a head note goes in front of it. "copies may exist" because an
+    attempt whose fault came after its commit, or one a cancel cut off, may have recorded the frame,
+    and that copy may since have moved to any status, so the text names none."""
+    cut = "last attempt cancelled; " if cut_off else ""
+    return (
+        f"held until the listener stopped; {cut}handler failed {failed} times "
+        f"(copies may exist): {reason}"
+    )
+
+
+async def _record_held_frame(
+    record_loss: HeldFrameRecorder,
+    frame: bytes,
+    reason: str,
+    *,
+    transport: str,
+    peer: object,
+    log: logging.Logger,
+    bound: float | None,
+) -> str | None:
+    """Hand the held frame to ``record_loss`` and return the ``ERROR`` row's message id, or ``None``
+    when its write failed. A failure is logged, never raised: the caller's loss line is the record
+    then. ``CancelledError`` is not a write failure and propagates."""
+    try:
+        if bound is None:
+            return await record_loss(frame, reason)
+        return await asyncio.wait_for(record_loss(frame, reason), bound)
+    except Exception as exc:  # noqa: BLE001 -- best effort: the caller's loss line records the frame
+        if isinstance(exc, TimeoutError) and bound is not None:
+            log.warning(
+                "%s ERROR row for the held message from %s not written within %.1fs of the "
+                "cancel; a write cut off at its commit may still have committed",
+                transport,
+                peer,
+                bound,
+            )
+        else:
+            log.warning(
+                "%s ERROR row for the held message from %s not written: %s",
+                transport,
+                peer,
+                safe_exc(exc),
+            )
+    return None
+
+
+def _log_hold_recorded(
+    log: logging.Logger,
+    transport: str,
+    peer: object,
+    failed: int,
+    reason: str,
+    why: str,
+    message_id: str,
+) -> None:
+    # The held frame is counted as an ERROR row; the frames behind it are lost, as before.
+    log.error(
+        "%s message from %s is recorded as ERROR message %s, but no frame behind it on this "
+        "connection is: the inbound handler failed %d times and %s: %s (closing the connection)",
+        transport,
+        peer,
+        message_id,
+        failed,
+        why,
+        reason,
+    )
 
 
 def _log_hold_loss(
@@ -1612,10 +1805,12 @@ class SourceConnector(abc.ABC):
     states (BACKLOG #5680). A sender that
     waits for none cannot be told to resend, so the frame in hand is its only copy. The MLLP,
     raw-TCP and X12 listeners hold the frame and retry the handler until it is recorded or the
-    listener stops (:func:`hold_and_retry`, BACKLOG #5022). At least two things lose it, together
-    with every frame behind it on that connection: a stop during the hold whose last attempt also
-    fails or is cancelled, which logs the loss at ERROR, and the process dying during the hold,
-    which logs nothing, since the held frames are only in memory.
+    listener stops (:func:`hold_and_retry`, BACKLOG #5022). A stop during the hold whose last
+    attempt also fails or is cancelled hands the held frame to the runner-injected
+    :attr:`record_lost_frame`, which records it as an ``ERROR`` row (BACKLOG #1619 item 6), and
+    loses every frame behind it on that connection, logging that at ERROR. At least two things lose
+    the held frame too: that ``ERROR`` write failing as well, which logs the loss at ERROR, and the
+    process dying during the hold, which logs nothing, since the held frames are only in memory.
 
     The MLLP listener does not hold the frame of a sender the ``tls_client_subjects`` allowlist
     refuses (BACKLOG #4907). Its connection closes after the read either way, and a hold would keep a refused peer's
@@ -1709,6 +1904,13 @@ class SourceConnector(abc.ABC):
     #: ``None`` (a direct build) means nothing can record such a message, and a listener that
     #: refuses a sender then reads none of its messages.
     refuse_unlisted_sender: InboundHandler | None = None
+
+    #: Optional recorder for a held frame a no-reply listener is about to lose (BACKLOG #1619 item
+    #: 6), **injected by the runner after build**, the same runtime-injection shape as
+    #: :attr:`on_connection_event`. The MLLP, raw-TCP and X12 listeners pass it to
+    #: :func:`hold_and_retry`, which says when it is called. ``None`` (a direct build) records
+    #: nothing, so the frame is lost with an ERROR line, as before this seam existed.
+    record_lost_frame: HeldFrameRecorder | None = None
 
     @abc.abstractmethod
     async def start(

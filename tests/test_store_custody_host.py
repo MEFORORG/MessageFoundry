@@ -1062,6 +1062,53 @@ async def test_a_recorded_error_that_is_no_custody_refusal_is_still_replaced_at_
     assert refusal.__cause__ is None and refusal.__context__ is None
 
 
+@pytest.mark.parametrize("link", ["the error itself", "its cause", "its context"])
+async def test_a_codec_error_on_the_custody_path_is_a_host_custody_refusal_with_no_byte(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    link: str,
+) -> None:
+    """At the open's custody guard, a codec error the custody settings check raises, or a
+    ``ValueError`` it raises with one as its cause or context, is replaced by a
+    ``HostCustodyRefused``, never the cipher build's ``StoreCipherConfigError``, and the byte the
+    codec error quotes stays out of the refusal, its traceback and the log (BACKLOG #4882; vault
+    BACKLOG #8119 item 139)."""
+    import traceback
+
+    codec = UnicodeDecodeError("utf-8", b"\xfe-SENTINEL-codec", 0, 1, "invalid start byte")
+    built = ValueError(f"built from {codec} {codec!r}")
+    needles = ("0xfe", "\\xfe", "SENTINEL")
+    # The positive controls: the error built from the codec error quotes every needle.
+    for needle in needles:
+        assert needle in str(built)
+
+    def _raise(*args: object, **kwargs: object) -> Any:
+        if link == "the error itself":
+            raise codec
+        if link == "its cause":
+            raise built from codec
+        try:
+            raise codec
+        except UnicodeDecodeError:
+            raise built  # noqa: B904 - the codec error is its context, not its cause
+
+    monkeypatch.setattr(custody_host, "check_host_custody_settings", _raise)
+    with caplog.at_level(logging.DEBUG), pytest.raises(HostCustodyRefused) as excinfo:
+        await open_store(_settings(tmp_path), create=True, custody=_proved_blob())
+    refusal = excinfo.value
+    # Exactly this class, so not the cipher build's StoreCipherConfigError, a ValueError.
+    assert type(refusal) is HostCustodyRefused
+    assert "[store].key_provider" in str(refusal)
+    assert refusal.__cause__ is None and refusal.__context__ is None
+    replaced = "UnicodeDecodeError" if link == "the error itself" else "ValueError"
+    assert f"a host custody error was replaced ({replaced})" in caplog.text
+    rendered = f"{refusal!r} {''.join(traceback.format_exception(refusal))}"
+    for needle in needles:
+        assert needle not in rendered
+        assert needle not in caplog.text
+
+
 @pytest.mark.parametrize("raised", ["left behind", "refused"])
 def test_a_settle_refusal_holds_no_reference_to_the_master_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raised: str
@@ -4371,3 +4418,37 @@ def test_a_server_create_that_fails_before_connecting_removes_the_minted_key(
     else:
         assert not host_file.exists(), err
         assert "was removed from" in err and "Keep both" not in err, err
+
+
+def test_a_custody_directory_that_could_not_be_checked_says_so_with_its_own_remedy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Where the check of the custody directory could not be made, the refusal says it could not
+    be checked, not that it is not restricted, and carries the refusal's own remedy, not the
+    owner-and-mode remedy, which would not clear it (vault BACKLOG #5657). The control is an
+    ordinary finding, which keeps "is not restricted" and that remedy."""
+    custody_dir = tmp_path / "custody"
+    custody_dir.mkdir()
+    environ = {"MEFOR_CUSTODY_DIRECTORY": str(custody_dir)}
+    reason = restricted_file.MOUNT_TABLE_UNREAD
+    monkeypatch.setattr(
+        restricted_file,
+        "broad_access_problem",
+        lambda *a, **k: restricted_file.UncheckedProblem(reason),
+    )
+    refusal = custody_host._own_directory_refusal(environ)
+    assert refusal == (
+        f"the custody directory MEFOR_CUSTODY_DIRECTORY names could not be fully checked: {reason}"
+    ), refusal
+    assert "mode 0700" not in refusal and "Restrict it" not in refusal, refusal
+
+    monkeypatch.setattr(
+        restricted_file, "broad_access_problem", lambda *a, **k: "Everyone may read it"
+    )
+    control = custody_host._own_directory_refusal(environ)
+    assert control is not None
+    assert control.startswith(
+        "the custody directory MEFOR_CUSTODY_DIRECTORY names is not restricted: "
+        "Everyone may read it. "
+    ), control
+    assert "mode 0700" in control or "Restrict it" in control, control

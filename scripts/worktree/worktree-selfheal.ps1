@@ -9,15 +9,17 @@
     anthropics/claude-code#76590.
 
 .DESCRIPTION
-    Installed at USER scope as a SessionStart hook into EVERY Claude config dir a session can use
-    on this box -- ~/.claude (the Desktop app) and each .claude-account-N (the CLAUDE_CONFIG_DIR
-    VS Code launchers). It therefore fires at the start of every session, INCLUDING a ghost stub
+    Installed at USER scope as a SessionStart hook by install-selfheal.ps1, which wires the one
+    config dir it is given per run -- ~/.claude (the Desktop app) or a .claude-account-N (the
+    CLAUDE_CONFIG_DIR VS Code launchers); it has no loop over every config dir
+    (docs/SESSION-DRIFT-CONTROLS.md, B10). In each config dir it was run for, it fires at the start of
+    every session, INCLUDING a ghost stub
     session whose cwd is an unregistered .claude/worktrees/<name> dir that resolves up to the
     primary -- a case a PROJECT-scoped hook can never see (the stub has no project .claude/).
 
-    For each governed primary (from the shared allowlist), if its HEAD has drifted off the home
-    branch AND its tree is clean, it invokes the repo's own restore-primary.ps1 to un-flip it
-    (that script refuses a dirty tree, so uncommitted work is never lost). If THIS session is
+    For each governed primary (from the shared allowlist), if its HEAD is on another branch than the
+    home branch (a detached HEAD is left alone) AND `git status --porcelain` printed nothing for it, it runs `git checkout <home branch>`
+    on it itself rather than calling restore-primary.ps1 (step 1 below says why). If THIS session is
     sitting in a stub worktree, it injects a heads-up telling the model to spin up a real worktree
     with new.ps1 before editing.
 
@@ -25,11 +27,16 @@
     ripped out, and then it protects nothing. The critical action (repairing the primary) is a side
     effect that does not depend on the additionalContext output shape being recognized.
 
-    Kill switch: delete the shared allowlist (worktree-gate.repos.txt) -> the hook no-ops everywhere.
+    Off switch: the hook no-ops when the allowlist it reads names no root. It reads the gate's
+    ~/.claude/hooks/worktree-gate.repos.txt whenever that file exists, even empty, and the legacy
+    ~/.claude-hooks/worktree-gate.repos.txt only when it does not. So deleting the gate's file turns
+    this hook off only where no legacy file lists a root; where one does, the hook stays armed on it.
+    docs/SESSION-DRIFT-CONTROLS.md G8 is the source of record for the two files.
 #>
 param(
     # Shared allowlist of primary checkouts to guard (one absolute path per line, '#' comments).
-    # Absent or empty => the backstop is OFF.
+    # When passed, absent or empty => the backstop is OFF. When not passed, the file is chosen below,
+    # and the Off switch paragraph above says when that leaves the backstop on.
     #
     # ONE allowlist, shared with the PreToolUse gate. There used to be two -- the gate read
     # ~/.claude/hooks/worktree-gate.repos.txt and this backstop read ~/.claude-hooks/worktree-gate.repos.txt
@@ -38,9 +45,12 @@ param(
     # the backstop, and `install-gate.ps1 -Uninstall` left this hook armed and still willing to run
     # `git checkout` on the primary long after the gate was gone. They agreed only by luck.
     #
-    # The legacy path is still read as a FALLBACK, because this script is installed as a copy: an older
-    # installed copy paired with a newer allowlist (or the reverse) must not silently turn the backstop
-    # off. Whichever file exists wins, gate location first.
+    # The legacy path is still read as a FALLBACK, because this script is installed as a copy: this
+    # copy, on a box whose only allowlist is the legacy one, keeps the backstop on. Whichever file exists
+    # wins, gate location first. It does NOT cover the reverse skew: once the gate's file exists the
+    # legacy one is never read, so a root only the legacy file lists loses the backstop with no message.
+    # An installed copy taken before 98c9cc91ec9 reads only the legacy file whatever this one does
+    # (docs/SESSION-DRIFT-CONTROLS.md, G8).
     [string]$ReposFile
 )
 
@@ -120,12 +130,11 @@ foreach ($root in $roots) {
     }
 }
 
-# 3) Has THIS session's own LINKED worktree been SWITCHED off its home branch -- the worktree-hijack?
-#    A session with no worktree of its own runs `git checkout <a-branch>` inside somebody else's worktree,
-#    yanking its files onto another branch mid-task (docs/WORKTREES.md). The worktree gate (rule 3b) blocks
-#    that pre-emptively, but ONLY where the gate is installed -- and it is wired into ~/.claude only, not the
-#    per-account VS Code config dirs. THIS backstop is wired into every account, so it is the cross-account
-#    safety net. WARN ONLY: never auto-switch a linked worktree under the session that is using it.
+# 3) Record THIS session's own LINKED worktree's current branch as its home branch. This step once
+#    warned when the branch had been SWITCHED (the worktree hijack); since the 2026-08-26 ruling below it
+#    detects nothing and warns about nothing. Gate rule 3b blocks at least some hijacks, and only in the
+#    config dirs install-gate.ps1 wired; nothing here backs it up. It never switches a linked worktree
+#    under the session that is using it.
 if ($cwd -and (Test-Path -LiteralPath $cwd)) {
     # A linked worktree's private git dir is <repo>/.git/worktrees/<id>/; the main worktree's is <repo>/.git.
     # Only a linked worktree can be hijacked away from an assigned branch, so act only on those.

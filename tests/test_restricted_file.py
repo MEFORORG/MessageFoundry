@@ -18,6 +18,7 @@ import errno
 import os
 import stat
 import sys
+import types
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -1026,6 +1027,266 @@ def test_a_posix_root_that_could_not_be_read_is_refused() -> None:
         readlink_fn=lambda _part: "",
     )
     assert problem is not None and "could not be read, so no link on it was judged" in problem
+
+
+def _typed_link_problem(path: str, mounts: list[tuple[str, str]] | None) -> str | None:
+    """:func:`_posix_link_problem` over :data:`_KEY_TREE`, every object root's or the engine's and
+    no folder others may write without the sticky bit, so only the mount type can refuse. With
+    ``mounts`` ``None`` no table was read, so ``fstype_fn`` answers ``None`` for every part, as
+    :func:`_posix_host_link_problem` passes it off Linux."""
+
+    def lstat_fn(part: str) -> PosixStat:
+        if part not in _KEY_TREE:
+            raise OSError(errno.ENOENT, "No such file or directory")
+        uid, mode = _KEY_TREE[part]
+        return PosixStat(uid, mode)
+
+    from messagefoundry.auth.anchor_path import mount_of
+
+    return restricted_file._posix_link_problem(
+        path,
+        cwd="/",
+        euid=_ENGINE_UID,
+        lstat_fn=lstat_fn,
+        readlink_fn=lambda _part: "",
+        fstype_fn=lambda part: None if mounts is None else mount_of(part, mounts),
+    )
+
+
+@pytest.mark.parametrize(
+    "fstype",
+    [
+        *sorted(restricted_file._POSIX_DELEGATED_FILE_SYSTEMS),
+        "fuse.sshfs",
+        "fuseblk.ntfs-3g",
+    ],
+)
+def test_a_posix_key_on_a_delegated_file_system_is_refused(fstype: str) -> None:
+    """Vault BACKLOG #5657 step 6 (f), #5636: the owner and mode bits of an NFS, CIFS, 9p or FUSE
+    mount are not what decides who may reach the file, so a clean 0600 key under clean folders on
+    one was passed. The refusal names the type and no path."""
+    mounts = [("/", "ext4"), ("/private/tmp", fstype)]
+    problem = _typed_link_problem("/private/tmp/keys/k.key", mounts)
+    assert problem is not None and f"its path is on a mount of type {fstype}," in problem
+    assert "/private" not in problem
+
+
+def test_a_posix_mount_refusal_names_no_role_its_caller_does_not_hold() -> None:
+    """The reason is spliced after whatever the caller names, a key file, the secrets directory or
+    the custody directory, so its remedy must work for each: it once told a secrets-directory
+    refusal to move "its store directory", which that directory has none of (vault BACKLOG #5657)."""
+    mounts = [("/", "ext4"), ("/private/tmp", "nfs")]
+    problem = _typed_link_problem("/private/tmp/keys", mounts)
+    assert problem is not None
+    assert "store directory" not in problem and "the engine mints" not in problem
+    assert problem.endswith(
+        "keep it, and the folders its path runs through, on a local file system"
+    )
+
+
+@pytest.mark.parametrize("fstype", ["9p", "virtiofs", "nfs4"])
+def test_a_posix_root_mount_is_not_judged_by_its_type(fstype: str) -> None:
+    """A sandbox whose ``/`` is a 9p or virtiofs share would otherwise refuse every key file; a
+    delegated mount below ``/`` on the same path is still refused."""
+    assert _typed_link_problem("/private/tmp/keys/k.key", [("/", fstype)]) is None
+    below = [("/", fstype), ("/private", "nfs")]
+    assert "mount of type nfs," in str(_typed_link_problem("/private/tmp/keys/k.key", below))
+
+
+@pytest.mark.parametrize("fstype", ["ext4", "xfs", "tmpfs", "overlay", "zfs", "vfat"])
+def test_a_posix_key_on_a_type_not_named_is_not_judged_by_its_type(fstype: str) -> None:
+    """A local type, and any type the rule does not name, is left as before: the negative
+    control for the test above."""
+    mounts = [("/", "ext4"), ("/private/tmp", fstype)]
+    assert _typed_link_problem("/private/tmp/keys/k.key", mounts) is None
+
+
+def test_a_posix_mount_type_the_refusal_cannot_print_is_not_quoted() -> None:
+    """A FUSE subtype is chosen by whoever mounts it, so one with characters outside a type name's
+    is replaced in the refusal rather than copied into the start error and the log."""
+    mounts = [("/", "ext4"), ("/private/tmp", "fuse.\x1b[2Jodd")]
+    problem = _typed_link_problem("/private/tmp/keys/k.key", mounts)
+    assert problem is not None and "on a mount of type network or FUSE," in problem
+    assert "\x1b" not in problem
+
+
+def test_a_posix_mount_table_that_could_not_be_read_judges_no_type() -> None:
+    """With no mount table read (``fstype_fn`` answers ``None``, as off Linux) nothing is refused
+    for its type, and the walk is otherwise unchanged."""
+    assert _typed_link_problem("/private/tmp/keys/k.key", None) is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the POSIX key-file check runs off Windows")
+def test_broad_access_problem_refuses_a_key_the_mount_table_puts_on_nfs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end on this host: a 0600 key in a 0700 folder passes, until the mount table says
+    the folder is an NFS mount (vault BACKLOG #5657 step 6 (f))."""
+    os.chmod(tmp_path, 0o700)
+    key = tmp_path / "k.key"
+    key.write_bytes(b"synthetic")
+    os.chmod(key, 0o600)
+    # The control: a CI runner's temporary folder is on a local file system.
+    assert restricted_file.broad_access_problem(key) is None
+    monkeypatch.setattr(
+        restricted_file,
+        "read_mounts",
+        lambda: [("/", "ext4"), (os.path.realpath(tmp_path), "nfs4")],
+        raising=False,
+    )
+    problem = restricted_file.broad_access_problem(key)
+    assert problem is not None and "its path is on a mount of type nfs4," in problem
+    assert not isinstance(problem, restricted_file.UncheckedProblem)  # a finding, judged
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux has a mount table to read")
+def test_broad_access_problem_refuses_where_the_linux_mount_table_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Linux an unreadable ``/proc/self/mountinfo`` means no type on the path was judged, so it
+    is refused rather than passed as if it had been. It is typed, so the key-file,
+    secrets-directory and custody-directory callers say the path could not be fully checked and
+    append no owner-and-mode remedy, which does not clear it. The answer names its own remedy, says
+    that changing owner or mode, or replacing what is at the path, does not clear it, and gives no
+    chmod or chown of its own."""
+    os.chmod(tmp_path, 0o700)
+    key = tmp_path / "k.key"
+    key.write_bytes(b"synthetic")
+    os.chmod(key, 0o600)
+    monkeypatch.setattr(restricted_file, "read_mounts", lambda: None)
+    problem = restricted_file.broad_access_problem(key)
+    assert problem is not None and "/proc/self/mountinfo could not be read" in problem
+    # Typed, so a caller says the file could not be checked rather than that it is not restricted.
+    assert isinstance(problem, restricted_file.UncheckedProblem)
+    assert "This clears once the engine can read /proc/self/mountinfo" in problem
+    assert "and of the folders its path runs through, was not judged" in problem
+    assert "Changing the owner or mode of the checked path" in problem
+    assert problem.endswith("or replacing what is at that path, does not clear it")
+    # Worded for a warning as well as a refusal, since warn prints it and the start goes on.
+    assert "refus" not in problem
+    assert "chmod" not in problem and "chown" not in problem
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux has a mount table to read")
+def test_an_unread_linux_mount_table_still_reports_a_broad_holding_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The holding folder's owner and mode are one stat, read whether or not the mount table can
+    be: a folder others may write is a finding, so a caller that only warns prints it rather than
+    the not-fully-checked answer (vault BACKLOG #5657). The control is the same key in a 0700
+    folder, which is answered as not fully checked."""
+    holder = tmp_path / "holder"
+    holder.mkdir()
+    key = holder / "k.key"
+    key.write_bytes(b"synthetic")
+    os.chmod(key, 0o600)
+    monkeypatch.setattr(restricted_file, "read_mounts", lambda: None)
+    os.chmod(holder, 0o700)
+    assert isinstance(restricted_file.broad_access_problem(key), restricted_file.UncheckedProblem)
+    os.chmod(holder, os.stat(holder).st_mode | stat.S_IRWXG | stat.S_IRWXO)
+    try:
+        problem = restricted_file.broad_access_problem(key)
+    finally:
+        os.chmod(holder, 0o700)
+    assert problem is not None and "the directory that holds it has mode 0777" in problem
+    assert not isinstance(problem, restricted_file.UncheckedProblem)
+
+
+@pytest.mark.skipif(sys.platform.startswith("linux"), reason="the Linux test above runs there")
+def test_an_unread_mount_table_still_reports_a_broad_holding_folder_off_linux(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Linux test above, run where no Linux host runs: the POSIX branch of
+    :func:`broad_access_problem` with the platform, the stats and the walk's answer faked, the walk
+    answering the unread table. A 0777 holder, and one another account owns, are answered as
+    findings; a 0700 one, the control, as not fully checked; a holder whose stat fails is answered
+    as that failure, as on main."""
+    euid = 1000
+    holder: dict[str, Any] = {"mode": stat.S_IFDIR | 0o777, "uid": euid, "fails": False}
+
+    def fake_lstat(_path: object) -> os.stat_result:
+        return os.stat_result((stat.S_IFREG | 0o600, 0, 0, 1, euid, euid, 9, 0, 0, 0))
+
+    def fake_stat(_path: object) -> os.stat_result:
+        if holder["fails"]:
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return os.stat_result((holder["mode"], 0, 0, 2, holder["uid"], euid, 0, 0, 0, 0))
+
+    fake_os = types.SimpleNamespace(lstat=fake_lstat, stat=fake_stat, geteuid=lambda: euid)
+    monkeypatch.setattr(restricted_file, "os", fake_os)
+    monkeypatch.setattr(restricted_file, "sys", types.SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(
+        restricted_file,
+        "_posix_host_link_problem",
+        lambda _path: restricted_file.UncheckedProblem(restricted_file.MOUNT_TABLE_UNREAD),
+    )
+    key = Path("/srv/keys/k.key")
+    problem = restricted_file.broad_access_problem(key)
+    assert problem is not None and "the directory that holds it has mode 0777" in problem
+    assert not isinstance(problem, restricted_file.UncheckedProblem)
+    holder.update(mode=stat.S_IFDIR | 0o700, uid=1001)
+    problem = restricted_file.broad_access_problem(key)
+    assert problem is not None and "is owned by uid 1001" in problem
+    assert not isinstance(problem, restricted_file.UncheckedProblem)
+    holder.update(fails=True)
+    problem = restricted_file.broad_access_problem(key)
+    assert problem is not None and "could not be examined (Permission denied)" in problem
+    holder.update(uid=euid, fails=False)
+    unchecked = restricted_file.broad_access_problem(key)
+    assert isinstance(unchecked, restricted_file.UncheckedProblem)
+    assert unchecked == restricted_file.MOUNT_TABLE_UNREAD
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux has a mount table to read")
+def test_an_unread_linux_mount_table_still_reports_a_link_another_account_can_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk runs with no type judged where the table cannot be read, so a link on the path in
+    a folder others may write, which main reported, is still a finding (vault BACKLOG #5657). The
+    control is the same layout with the folder at 0700, answered as not fully checked."""
+    base = tmp_path / "base"
+    base.mkdir()
+    real = tmp_path / "real"
+    real.mkdir()
+    os.chmod(real, 0o700)
+    key = real / "k.key"
+    key.write_bytes(b"synthetic")
+    os.chmod(key, 0o600)
+    (base / "keys").symlink_to(real)
+    linked = base / "keys" / "k.key"
+    monkeypatch.setattr(restricted_file, "read_mounts", lambda: None)
+    os.chmod(base, 0o700)
+    assert isinstance(
+        restricted_file.broad_access_problem(linked), restricted_file.UncheckedProblem
+    )
+    os.chmod(base, os.stat(base).st_mode | stat.S_IRWXG | stat.S_IRWXO)
+    try:
+        problem = restricted_file.broad_access_problem(linked)
+    finally:
+        os.chmod(base, 0o700)
+    assert problem is not None
+    assert "can be changed by an account this check does not trust" in problem
+    assert not isinstance(problem, restricted_file.UncheckedProblem)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux has a mount table to read")
+def test_a_known_gap_a_linux_mount_table_covering_no_part_of_the_path_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A KNOWN GAP, not a requirement: a table that reads but lists no mount covering the path, as
+    one read inside a chroot whose root is not a mount can, judges no type and passes, unlike one
+    that cannot be read. Pinned at the layer that tells the two apart so a change is seen; a fix
+    that closes the gap should flip this test. The last step is the control that the patched
+    table is the one read."""
+    os.chmod(tmp_path, 0o700)
+    key = tmp_path / "k.key"
+    key.write_bytes(b"synthetic")
+    os.chmod(key, 0o600)
+    monkeypatch.setattr(restricted_file, "read_mounts", lambda: [("/no/such/mount", "nfs")])
+    assert restricted_file.broad_access_problem(key) is None
+    covering = [("/no/such/mount", "nfs"), (os.path.realpath(tmp_path), "nfs")]
+    monkeypatch.setattr(restricted_file, "read_mounts", lambda: covering)
+    assert "on a mount of type nfs," in str(restricted_file.broad_access_problem(key))
 
 
 def test_a_posix_link_another_account_can_change_is_refused() -> None:
@@ -2038,6 +2299,47 @@ def test_windows_an_unknown_drive_type_is_unreadable(monkeypatch: pytest.MonkeyP
 
 
 @windows_only
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "\\\\?\\{real}\\x\\..\\store.key",  # verbatim: the open reads the ``..`` as a name
+        "\\\\.\\{drive}\\..\\UNC\\host\\share\\store.key",  # Win32 climbs out onto a share
+    ],
+)
+def test_windows_a_device_spelling_the_walk_refuses_is_refused_before_abspath(
+    tmp_path: Path, spelling: str
+) -> None:
+    """``os.path.abspath`` collapsed ``..`` before the walk saw the text: a verbatim
+    ``\\\\?\\C:\\x\\..\\k`` was walked as ``C:\\k``, which the open never reads, and
+    ``\\\\.\\C:\\..\\UNC\\h\\s\\k`` as the local ``C:\\UNC\\h\\s``, where Win32 opens the share.
+    The walk's own rule for a device prefix (vault BACKLOG #5515) now reads the text as written.
+    The first spelling's control is the same key named plainly, which passes."""
+    real = tmp_path / "real"
+    real.mkdir()
+    key = real / "store.key"
+    write_restricted_file(key, b"KEY-MATERIAL-STAND-IN")
+    host = _host_judging_only_under(tmp_path)
+    surroundings = restricted_file._windows_surroundings_problem
+    assert surroundings(key, host) is None  # the control
+    path = Path(spelling.format(real=real, drive=tmp_path.drive))
+    problem = surroundings(path, host)
+    assert problem is not None and "device path" in problem
+
+
+@windows_only
+@pytest.mark.parametrize("prefix", ["\\\\?\\", "\\\\.\\"])
+def test_windows_a_plain_device_spelling_is_still_walked(tmp_path: Path, prefix: str) -> None:
+    """The control for the test above: a device prefix naming the same object as its plain
+    spelling is walked as before."""
+    real = tmp_path / "real"
+    real.mkdir()
+    key = real / "store.key"
+    write_restricted_file(key, b"KEY-MATERIAL-STAND-IN")
+    host = _host_judging_only_under(tmp_path)
+    assert restricted_file._windows_surroundings_problem(Path(prefix + str(key)), host) is None
+
+
+@windows_only
 def test_windows_a_volume_the_host_cannot_judge_is_judged_as_before(tmp_path: Path) -> None:
     """The walk asked ``host.volume_cause``, which refuses a volume whose file system is neither
     NTFS nor ReFS, such as CSVFS or FAT, or cannot be read, so a key file on such a volume that the
@@ -2996,6 +3298,27 @@ def test_the_store_key_file_check_is_left_to_the_provider_where_dpapi_is_absent(
     assert capsys.readouterr().err == ""
     monkeypatch.setattr(dpapi_mod, "dpapi_available", lambda: True)  # the control
     assert cli._store_key_file_gate(settings, enforcing=True) is False
+
+
+def test_the_store_key_file_gate_judges_a_dangling_link_rather_than_skipping_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #5657 step 10 (g): the gate skipped a path ``Path.exists()`` denied, and that
+    follows a link, so a link to a missing file was never judged. It is refused as a link now."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.config.settings import load_settings
+
+    link = tmp_path / "store.key.dpapi"
+    try:
+        os.symlink(tmp_path / "missing.dpapi", link)
+    except OSError as exc:  # Windows without the symbolic-link privilege
+        pytest.skip(f"no symbolic link could be made here ({exc.strerror})")
+    settings = load_settings(environ={"MEFOR_STORE_ENCRYPTION_KEY_FILE": str(link)})
+    monkeypatch.setattr(dpapi_mod, "dpapi_available", lambda: True)
+    assert cli._store_key_file_gate(settings, enforcing=True) is False
+    assert "is a link" in capsys.readouterr().err
+    link.unlink()  # the control: a name nothing is at is still left to the key provider
+    assert cli._store_key_file_gate(settings, enforcing=True) is True
 
 
 def test_supervise_exits_cleanly_when_the_tls_key_cannot_be_created_restricted(

@@ -243,7 +243,7 @@ def test_the_down_cache_answers_only_for_its_own_root(
 ) -> None:
     down = _local(repo) / "coord-root-down.json"
     down.parent.mkdir(parents=True)
-    down.write_text(json.dumps({"root": r"\elsewhere\x", "at": "now"}), encoding="utf-8")
+    down.write_text(json.dumps({"server": "elsewhere", "at": "now"}), encoding="utf-8")
     monkeypatch.setenv("MEFOR_COORD_ROOT", _DEAD_UNC)
     py = coord_root.resolve("claims", repo)
     assert py.error is not None and "cached" not in py.error
@@ -254,7 +254,7 @@ def test_a_future_stamped_down_cache_is_ignored(
 ) -> None:
     down = _local(repo) / "coord-root-down.json"
     down.parent.mkdir(parents=True)
-    down.write_text(json.dumps({"root": _DEAD_UNC, "at": "later"}), encoding="utf-8")
+    down.write_text(json.dumps({"server": "192.0.2.1", "at": "later"}), encoding="utf-8")
     future = time.time() + 86400
     os.utime(down, (future, future))
     monkeypatch.setenv("MEFOR_COORD_ROOT", _DEAD_UNC)
@@ -452,3 +452,251 @@ def test_a_form_feed_line_reads_the_same_on_both(repo: Path, tmp_path: Path) -> 
     (local / "root.toml").write_text(f"shared_root = '{shared}'\x0c\n", encoding="utf-8")
     ps, py = _both(repo, "claims")
     assert py.error is not None
+
+
+# BACKLOG #7569: pathlib respells a root (//srv/share/dir/ reads back as \\srv\share\dir) and
+# PowerShell keeps the configured text, so each twin missed the down verdict the other wrote, and
+# re-probed and overwrote it, whenever the root carried a forward or trailing slash.
+_DEAD_UNC_SLASHED = "//192.0.2.1/nothing/./mefor-coord/"
+
+
+def test_each_twin_reads_the_down_verdict_the_other_wrote(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MEFOR_COORD_ROOT", _DEAD_UNC_SLASHED)
+    down = _local(repo) / "coord-root-down.json"
+    py = coord_root.resolve("claims", repo)
+    assert py.error is not None and "cached" not in py.error
+    ps = _ps(repo, "claims")
+    assert ps["Error"] is not None and "cached" in str(ps["Error"]), ps
+    down.unlink()
+    ps = _ps(repo, "claims")
+    assert ps["Error"] is not None and "cached" not in str(ps["Error"]), ps
+    py = coord_root.resolve("claims", repo)
+    assert py.error is not None and "cached" in py.error, py
+
+
+def _pwsh_json(body: str) -> Any:
+    """Dot-source the PowerShell twin, run ``body``, and parse the JSON it prints (read as UTF-8)."""
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", f". '{PS}'; {body}"],
+        capture_output=True,
+        encoding="utf-8",
+        check=True,
+        timeout=60,
+    )
+    return json.loads(proc.stdout)
+
+
+def _ps_unc_hosts(paths: list[str]) -> list[object]:
+    quoted = ", ".join("'" + p.replace("'", "''") + "'" for p in paths)
+    out: list[object] = _pwsh_json(
+        f"ConvertTo-Json -Compress -InputObject @(foreach ($p in @({quoted})) "
+        "{ $h = Get-CoordUncHost $p; if ($null -eq $h) { '' } else { $h } })"
+    )
+    return out
+
+
+def _device_refusal(what: str, path: str) -> str:
+    return (
+        f"{what} is a device path, which is refused: {path}. Spell the root plainly instead, as"
+        r" X:\... or \\srv\share\.... Nothing was read from or written to that root."
+    )
+
+
+# BACKLOG #7569: a device-path root is refused, in any form, on both twins. Rewriting one to its
+# plain spelling named another directory or lost the fast probe in cases no list held; refusing it
+# leaves the reader one clear message where origin/main read '?' or '.' as the server.
+_DEVICE_FORMS = [
+    "\\\\?\\{dir}",
+    "\\\\.\\{dir}",
+    "//?/{dir}",
+    "\\\\?/{dir}",
+    "/\\?\\{dir}",
+    r"\\?\UNC\192.0.2.1\nothing\mefor-coord",
+    r"\\.\UNC\192.0.2.1\nothing\mefor-coord",
+    r"\\?\unc\192.0.2.1\nothing",
+    r"\\?\UNC\192.0.2.1",
+    r"\\?\GLOBALROOT\Device\Mup\192.0.2.1\nothing",
+    r"\\?\Volume{{00000000-0000-0000-0000-000000000000}}\coord",
+    "\\\\?\\",
+    "\\\\?",
+    "\\\\.",
+]
+
+
+def _no_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(server: str) -> bool:
+        raise AssertionError(f"probed {server}")
+
+    monkeypatch.setattr(coord_root, "_reachable", refuse)
+
+
+@pytest.mark.parametrize("form", _DEVICE_FORMS)
+def test_a_device_path_env_root_is_refused_on_both_with_no_probe(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, form: str
+) -> None:
+    shared = tmp_path / "shared"
+    (shared / "claims").mkdir(parents=True)
+    spelling = form.format(dir=shared)
+    monkeypatch.setenv("MEFOR_COORD_ROOT", spelling)
+    _no_probe(monkeypatch)
+    want = _device_refusal("MEFOR_COORD_ROOT", spelling)
+    t0 = time.monotonic()
+    ps, py = _both(repo, "claims")
+    assert time.monotonic() - t0 < 30
+    assert py.error == want and ps["Error"] == want, (ps, py)
+    assert py.source == "env"
+    # Test-CoordRoot and probe_root write this file on a dead server; a refusal runs neither.
+    assert not (_local(repo) / "coord-root-down.json").exists()
+
+
+@pytest.mark.parametrize("form", _DEVICE_FORMS)
+def test_a_device_path_root_toml_value_is_refused_on_both_with_no_probe(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, form: str
+) -> None:
+    shared = tmp_path / "shared"
+    (shared / "claims").mkdir(parents=True)
+    spelling = form.format(dir=shared)
+    local = _local(repo)
+    local.mkdir(parents=True)
+    (local / "root.toml").write_text(f"shared_root = '{spelling}'\n", encoding="utf-8")
+    _no_probe(monkeypatch)
+    ps, py = _both(repo, "claims")
+    want = _device_refusal(f"{local / 'root.toml'} shared_root", spelling)
+    assert py.error == want and ps["Error"] == want, (ps, py)
+    assert py.source == "file"
+    assert not (local / "coord-root-down.json").exists()
+
+
+@pytest.mark.parametrize(
+    "spelling", [r"\\?x\share\dir", r"\\..\share\dir", r"\\srv\share\dir", "//srv/share/dir"]
+)
+def test_a_server_name_that_only_starts_like_a_device_path_is_not_refused(spelling: str) -> None:
+    # The refusal is for the \\?\ and \\.\ prefixes; a UNC whose server merely starts with '?' or
+    # '.' reads as it did on origin/main, on both twins.
+    assert coord_root._device_root_refusal("x", spelling) is None
+    got = _pwsh_json(
+        "ConvertTo-Json -Compress -InputObject "
+        f"($null -eq (Get-CoordDeviceRootRefusal -What 'x' -Path '{spelling}'))"
+    )
+    assert got is True
+
+
+def _claim_checkout(path: Path) -> Path:
+    """A git checkout carrying claim.ps1 and the resolver it dot-sources, as claim.ps1 runs anywhere."""
+    (path / "scripts" / "coord").mkdir(parents=True)
+    for name in ("claim.ps1", "coord-root.ps1"):
+        shutil.copy2(ROOT / "scripts" / "coord" / name, path / "scripts" / "coord" / name)
+    subprocess.run(
+        ["git", "-C", str(path), "init", "-q"], check=True, capture_output=True, env=_no_git_env()
+    )
+    return path
+
+
+def _no_git_env() -> dict[str, str]:
+    """os.environ without GIT_* (a hook's GIT_DIR would aim git at the live repository) or a root."""
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if not k.upper().startswith("GIT_") and k != "MEFOR_COORD_ROOT"
+    }
+
+
+def _run_claim(tree: Path, env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(tree / "scripts" / "coord" / "claim.ps1"),
+            *args,
+        ],
+        cwd=str(tree),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=env,
+    )
+
+
+@pytest.mark.parametrize("prefix", ["\\\\?\\", "\\\\.\\"])
+def test_claim_refuses_a_device_path_root_with_the_message(tmp_path: Path, prefix: str) -> None:
+    # Round 3 of #7569: claim.ps1 reads the root with wildcard -Path cmdlets, which misread \\?\, so
+    # a root that resolved listed nothing and -Release was a silent no-op. It is refused instead.
+    tree = _claim_checkout(tmp_path / "tree")
+    shared = tmp_path / "shared"
+    (shared / "claims").mkdir(parents=True)
+    env = _no_git_env()
+    spelling = prefix + str(shared)
+    env["MEFOR_COORD_ROOT"] = spelling
+    want = _device_refusal("MEFOR_COORD_ROOT", spelling)
+    for args in (("-Take", "device-root-key", "-Note", "device-path fixture"), ("-List",)):
+        got = _run_claim(tree, env, *args)
+        assert got.returncode != 0, got.stdout + got.stderr
+        assert want in got.stdout + got.stderr, got.stdout + got.stderr
+    assert [p.name for p in shared.rglob("*")] == ["claims"]
+
+
+def test_every_spelling_of_a_root_names_one_server_on_both() -> None:
+    # The down cache is keyed by server, so it needs every spelling of one root, as each twin holds
+    # it (plain, then pathlib's for Python), to name the same server on both.
+    spellings = [
+        "//srv/share/./dir//",
+        r"\\srv\share\dir",
+        r"\\srv\share\dir\\",
+        "//srv/share/dir",
+    ]
+    held = [str(Path(p)) for p in spellings]
+    assert {coord_root.unc_host(p) for p in held} == {"srv"}
+    assert set(_ps_unc_hosts(spellings)) == {"srv"}
+
+
+def test_the_down_cache_file_reads_the_same_on_both() -> None:
+    # Two readers of one file must give one answer. PowerShell unwrapped a one-element top-level
+    # array, matched a key in any case, and let -ceq filter an array value; Python rejects all three.
+    texts = [
+        '{"server": "srv"}',
+        '{"server": ["srv"]}',
+        '[{"server": "srv"}]',
+        '{"SERVER": "srv"}',
+        '{"server": 5}',
+        '{"root": "srv"}',
+        '"srv"',
+        # origin/main's shape, which a stale installed hook copy writes: the server is its root's.
+        json.dumps({"root": r"\\srv\share\x", "at": "now"}),
+        '{"root": "//srv/share/x"}',
+        '{"root": 5}',
+        json.dumps({"server": 5, "root": r"\\srv\share"}),
+    ]
+    quoted = ", ".join("'" + t.replace("'", "''") + "'" for t in texts)
+    ps = _pwsh_json(
+        f"ConvertTo-Json -Compress -InputObject @(foreach ($t in @({quoted})) "
+        "{ $s = Get-CoordDownServer -Text $t; if ($null -eq $s) { '' } else { $s } })"
+    )
+    py = [coord_root._down_server(t) or "" for t in texts]
+    assert ps == py == ["srv", "", "", "", "", "", "", "srv", "srv", "", ""]
+
+
+def test_an_empty_label_server_reads_unreachable_with_no_traceback(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    # The idna codec raises UnicodeError for '..', which the probe thread once let escape.
+    assert coord_root._reachable("..") is False
+    assert "Traceback" not in capfd.readouterr().err
+
+
+def test_the_probe_refuses_a_device_path_on_both(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A caller that probes a path itself, as coord-migrate.ps1 probes -Target, gets the refusal too.
+    _no_probe(monkeypatch)
+    spelling = r"\\?\UNC\192.0.2.1\nothing\mefor-coord"
+    want = _device_refusal("shared root", spelling)
+    assert coord_root.probe_root(Path(spelling), tmp_path) == want
+    got = _pwsh_json(
+        f"(Test-CoordRoot -Path '{spelling}' -LocalRoot '{tmp_path}').Error | ConvertTo-Json"
+    )
+    assert got == want
+    assert not (tmp_path / "coord-root-down.json").exists()

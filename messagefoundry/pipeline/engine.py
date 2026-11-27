@@ -44,6 +44,7 @@ from messagefoundry.config.settings import (
     SecretRotationSettings,
     SecurityEnforcement,
     ShadowSettings,
+    StoreBackend,
     StoreSettings,
     UpdateCheckSettings,
     engine_owned_dirs,
@@ -185,10 +186,11 @@ _GRAPH_SUPERVISOR_STOP_SECONDS = 10.0
 #: Under a stop budget (BACKLOG #3191, :class:`_StopBudget`): the least any budgeted wait is given,
 #: however little of the budget is left.
 _STOP_WAIT_FLOOR_SECONDS = 0.1
-#: Under a stop budget: what an earlier budgeted wait keeps back for each later one, so the CRL
-#: runner's wait alone does not cut the remote-debug watch's last audit pass or the alert-state
-#: drain to the floor. The unbudgeted steps between them can still spend it, and then those waits
-#: get the floor. tests/test_engine_stop_budget.py sums it against the engine's reserve.
+#: Under a stop budget: what an earlier budgeted wait keeps back for each later one, so the
+#: retention runner's or the CRL runner's wait alone does not cut a later wait, such as the
+#: remote-debug watch's last audit pass or the alert-state drain, to the floor. The unbudgeted
+#: steps between them can still spend it, and then those waits get the floor.
+#: tests/test_engine_stop_budget.py sums it against the engine's reserve.
 _STOP_WAIT_SHARE_SECONDS = 0.3
 #: Under a stop budget: what is kept back for the store's close, which no budget cuts, since a
 #: store left open keeps a non-daemon worker thread alive (BACKLOG #2087). An estimate, not a bound.
@@ -198,14 +200,15 @@ _STOP_CLOSE_ALLOWANCE_SECONDS = 0.5
 class _StopBudget:
     """What each of :meth:`Engine.stop`'s budgeted waits may spend (BACKLOG #3191).
 
-    The budgeted waits are the CRL reload runner's stop, the remote-debug refusal watch's stop and
-    the alert-state drain. With no budget each keeps its fixed bound. Under one, a wait gets the
-    shorter of its fixed bound and what is left of the budget once the time kept for the steps after
-    it is taken out, and never less than :data:`_STOP_WAIT_FLOOR_SECONDS` unless its fixed bound is
-    less. So a wait is shortened only when its fixed bound would run into the time kept for the
-    later steps. The budget ends the wait, not what follows it: a wait that runs out does what it
-    does at its fixed bound. The CRL runner's wait then cancels the pass it waited for and waits for
-    that cancel to land with no bound, as before. The graph supervisor's wait and the other stop
+    The budgeted waits are the retention runner's stop (BACKLOG #6526), the CRL reload runner's
+    stop, the remote-debug refusal watch's stop and the alert-state drain. With no budget each
+    keeps its fixed bound. Under one, a wait gets the shorter of its fixed bound and what is left
+    of the budget once the time kept for the steps after it is taken out, and never less than
+    :data:`_STOP_WAIT_FLOOR_SECONDS` unless its fixed bound is less. So a wait is shortened only
+    when its fixed bound would run into the time kept for the later steps. The budget ends the
+    wait, not what follows it: a wait that runs out does what it does at its fixed bound. The CRL
+    runner's wait then cancels the pass it waited for and waits for that cancel to land with no
+    bound, as before. The graph supervisor's wait and the other stop
     steps are not budgeted, so they can still run past the budget."""
 
     def __init__(self, seconds: float | None) -> None:
@@ -891,29 +894,29 @@ class Engine:
         self._intake_monitor: IntakeBoundMonitor | None = None
         # DR run-profile (#61, ADR 0048). The global [delivery].priority default a connection inherits
         # when it declares no priority= (every runner inherits it). The DR run-profile THRESHOLD is
-        # active only when this box is a DR standby that has been activated for THIS boot (dr.enabled
-        # AND dr.activate): then the runner binds only connections whose resolved tier rank >=
-        # dr.priority_threshold. A non-DR deployment (the default) passes dr_threshold=None to the runner
-        # → no filtering, byte-identical to before. Held so reload re-applies the same threshold.
-        # A DR box that is not activated passes dr_standby instead, and binds no inbound listener
-        # until it is (vault BACKLOG #3140).
+        # active only once POST /dr/activate has promoted this DR box: then the runner binds only
+        # connections whose resolved tier rank >= dr.priority_threshold. A non-DR deployment (the
+        # default) passes dr_threshold=None to the runner → no filtering, byte-identical to before.
+        # Held so reload re-applies the same threshold. A DR box that is not activated passes
+        # dr_standby instead, and binds no inbound listener until it is (vault BACKLOG #3140).
         self._priority_default = priority_default
         self._dr_settings = dr_settings or DrSettings()
         if self._dr_settings.enabled and (
             self._dr_settings.takeover_hook or self._dr_settings.release_hook
         ):
-            # At start, not only when a hook runs, which on a DR box is during the disaster: the
-            # coordinator that runs hooks is built only at the first activate or release.
+            # At construction, not only when a hook runs, which on a DR box is during the disaster.
             warn_unset_pass_environment(self._dr_settings.pass_environment)
-        # Whether THIS boot runs under the DR run-profile (#61, ADR 0048). Latched from
-        # [dr].enabled AND [dr].activate at construction; flipped True by the DR coordinator on a
-        # successful POST /dr/activate (which then reloads the graph so the run-profile filter applies)
-        # and back False on POST /dr/release. A runner takes dr_threshold from _dr_run_threshold() when
-        # it is built, and _set_dr_active hands a running one the new value on each flip (#3067).
-        self._dr_active = bool(self._dr_settings.enabled and self._dr_settings.activate)
+        # Whether the engine runs under the DR run-profile (#61, ADR 0048). Always False at
+        # construction: no configuration brings a box up active, so every activation runs the
+        # seed verification, takeover hook and audit row of POST /dr/activate (BACKLOG #5965).
+        # Flipped True by the DR coordinator on a successful POST /dr/activate (which then reloads
+        # the graph so the run-profile filter applies) and back False on POST /dr/release. A runner
+        # takes dr_threshold from _dr_run_threshold() when it is built, and _set_dr_active hands a
+        # running one the new value on each flip (#3067).
+        self._dr_active = False
         # Whether an activation's reload has completed, so the run-profile is applied and not only
-        # latched; :meth:`_dr_backup_paused` reads it. A boot latched active needs no reload.
-        self._dr_profile_applied = self._dr_active
+        # latched; :meth:`_dr_backup_paused` reads it (vault BACKLOG #5712).
+        self._dr_profile_applied = False
         # This instance's environment values (DEV/PROD), shared with every runner the engine builds —
         # so env() references in a reloaded graph resolve against THIS environment (and a missing
         # value is refused here, on this engine, not on the box the graph was authored on). The
@@ -1178,7 +1181,7 @@ class Engine:
 
     def _dr_run_threshold(self) -> Priority | None:
         """The DR run-profile threshold for the runner (#61, ADR 0048): ``[dr].priority_threshold`` when
-        this boot is running under the DR profile (``_dr_active``), else ``None`` (no DR filtering — a
+        the engine is running under the DR profile (``_dr_active``), else ``None`` (no DR filtering — a
         normal deployment is byte-identical). Read at every runner construction (start + reload) so the
         threshold is consistently applied across reloads."""
         return self._dr_settings.priority_threshold if self._dr_active else None
@@ -1196,14 +1199,29 @@ class Engine:
 
     def _dr_backup_paused(self) -> bool:
         """Whether the backup runner must skip its pass (vault BACKLOG #5712; the reason is at
-        :class:`~messagefoundry.pipeline.dr_backup.BackupRunner`'s ``dr_paused``): on a
-        passive DR standby, and during an activation until its reload has completed. Applied
-        implies latched, since every flip of the latch to False clears it."""
-        return self._dr_settings.enabled and not self._dr_profile_applied
+        :class:`~messagefoundry.pipeline.dr_backup.BackupRunner`'s ``dr_paused``): on a passive DR
+        standby, and during an activation until its reload has completed. Once applied, only
+        where :meth:`_dr_activated_backup_paused` says so. Applied implies latched, since every
+        flip of the latch to False clears it."""
+        if not self._dr_settings.enabled:
+            return False
+        return not self._dr_profile_applied or self._dr_activated_backup_paused()
+
+    def _dr_activated_backup_paused(self) -> bool:
+        """Whether an activated DR box still runs no backup pass: only a server-DB box with
+        ``[dr].restore_token`` set (BACKLOG #5965; owner ruling 2026-11-26, decision
+        d20261126T095342812-893e1d). Its own ``dr_backup`` row would become the latest anchor the
+        restore-token check compares, so a later re-activation of the same restore would be
+        refused as a stale vintage. No other box runs that check, so it keeps backing up."""
+        return bool(self._dr_settings.restore_token) and self.store.backend in (
+            StoreBackend.POSTGRES,
+            StoreBackend.SQLSERVER,
+        )
 
     @property
     def dr_active(self) -> bool:
-        """Whether the engine is running under the DR run-profile this boot (#61, ADR 0048)."""
+        """Whether the engine is running under the DR run-profile, which only ``POST /dr/activate``
+        turns on (#61, ADR 0048; BACKLOG #5965)."""
         return self._dr_active
 
     @property
@@ -1235,6 +1253,9 @@ class Engine:
                 self.store,
                 self._dr_settings,
                 store_settings=self._store_settings,
+                # BACKLOG #5965: each engine shard's dr.activate, dr.release and dr.stay_passive
+                # rows name it.
+                instance=lambda: self.instance_identity,
                 activate_profile=self._dr_activate_profile,
                 deactivate_profile=self._dr_release_drain,
                 profile_provenance=self._dr_config_drift,
@@ -1374,6 +1395,23 @@ class Engine:
         # Only now may a backup pass run: the latch flipped before the reload, which can still
         # fail and roll it back (vault BACKLOG #5712).
         self._dr_profile_applied = True
+        runner = self._backup_runner
+        if (
+            runner is not None
+            and runner.enabled
+            and runner.scheduled
+            and self._dr_activated_backup_paused()
+        ):
+            # Once per activation (BACKLOG #5965): the runner itself skips each pass silently.
+            log.warning(
+                "DR backup: scheduled passes are paused while this server-DB box is activated, "
+                "because [dr].restore_token is set and this box's own backup row would become "
+                "the newest anchor that token check compares, refusing a later re-activation of "
+                "the same restore. "
+                "No config-only archive of this box is written meanwhile, and the database "
+                "itself stays the DBA's to back up; the `messagefoundry backup` command still "
+                "writes one, and its row then becomes the token check's newest anchor"
+            )
         if not close_failures:
             return {}
         failure = _outbound_close_failure(close_failures)
@@ -2409,9 +2447,8 @@ class Engine:
         # Retention/purge is independent of the message graph (a store-level maintenance task), so it
         # runs whether or not a graph is wired and survives config reloads. Per-connection windows come
         # from the live graph, so the loop is spawned even when nothing is configured yet, and idles
-        # until a reload sets one (BACKLOG #6804); a pass runs only while something is set. It is a
-        # leader-only WRITE singleton (purges bodies + writes audit rows), so it is gated on the
-        # coordinator: in a cluster a follower's runner ticks but no-ops; single-node always leads.
+        # until a reload sets one (BACKLOG #6804); a pass runs only while something is set. It is
+        # gated on the coordinator: single-node always leads.
         if self._retention_settings is not None:
             engine_dirs, engine_trees = self._engine_owned_dirs()
             self._retention_runner = RetentionRunner(
@@ -2472,6 +2509,12 @@ class Engine:
                 dr_paused=self._dr_backup_paused,
             )
             self._backup_runner.start()
+        # BACKLOG #5965 (owner ruling 2026-11-25): a box this identity last activated comes back up
+        # passive and stays so, and says so loudly. Never an activation: POST /dr/activate is the
+        # only one. Not leader-gated: each engine shard reads its own rows and alerts on its own.
+        dr = self.dr_coordinator
+        if dr is not None:
+            await dr.check_restarted_passive()
         # [cert_monitor] TLS-cert expiry monitor (Q5c) — a maintenance task like retention, independent
         # of the message graph and surviving reloads; a no-op when warn_days=0. NOT leader-gated: certs
         # are node-local files, so each node alerts on its own (the per-cert realert throttle bounds
@@ -4347,6 +4390,7 @@ class Engine:
         alert_kept = _STOP_CLOSE_ALLOWANCE_SECONDS
         watch_kept = alert_kept + _STOP_WAIT_SHARE_SECONDS + config_kept
         crl_kept = watch_kept + _STOP_WAIT_SHARE_SECONDS + STOP_FLOOR_SECONDS
+        retention_kept = crl_kept + _STOP_WAIT_SHARE_SECONDS
         # Quiesce the active-passive graph supervisor FIRST (Workstream A1) so it can't reconcile (and
         # re-start the graph) while we tear down. A no-op single-node (never spawned). Cooperative: set
         # the stop event and let any in-flight reconcile finish under the lock (so we never abandon a
@@ -4366,8 +4410,19 @@ class Engine:
             except TimeoutError:
                 # wait_for already cancelled the task on timeout; absorb its cancellation.
                 await asyncio.gather(supervisor, return_exceptions=True)
+        retention_cancelled = False
         if self._retention_runner is not None:
-            await self._retention_runner.stop()
+            retention = self._retention_runner
+            try:
+                await retention.stop(
+                    timeout=budget.wait(retention.stop_timeout_seconds, kept=retention_kept)
+                )
+            except asyncio.CancelledError:
+                # BACKLOG #6526: the retention stop passes a cancel of this stop on once its own
+                # bounded wait ends. It is held, as the intake monitor's below is, so this stop
+                # still closes the store, and raised once the store has closed. A cancel that
+                # lands in a later step before the guarded teardown still leaves at once.
+                retention_cancelled = True
         if self._backup_runner is not None:
             await self._backup_runner.stop()
         if self._cert_expiry_runner is not None:
@@ -4418,7 +4473,7 @@ class Engine:
         # The rest of the teardown is guarded (BACKLOG #3269): the store closes even if a later step
         # raises or is cancelled. A pending cancel is raised last, in place of any error a step or the
         # close raised, which is then logged. A SystemExit or KeyboardInterrupt is never replaced.
-        cancelled = monitor_cancelled
+        cancelled = monitor_cancelled or retention_cancelled
         failure: BaseException | None = None
         try:
             # Vault BACKLOG #2613: after the graph, so a clear raised here does not say a graph that is

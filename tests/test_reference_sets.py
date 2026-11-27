@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from pathlib import Path
 from types import MappingProxyType
@@ -1342,3 +1343,89 @@ def test_check_fails_the_leg_when_the_reference_view_faults(
     result = checks._check_dryrun(cfg, msgs, suppress_search=True)
     assert not result.ok and result.required and not result.skipped
     assert result.detail == "reference sets did not load for the preview (RecursionError)"
+
+
+def test_trace_dry_run_reads_a_passed_reference_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``trace_dry_run`` threads a passed ``reference_view`` to the dry run, so no file is read;
+    with none passed, each call builds the view and reads the file again (BACKLOG #6820)."""
+    from messagefoundry.pipeline.dryrun_trace import trace_dry_run
+
+    loads = _counting_loader(monkeypatch)
+    csv = _csv(tmp_path / "npi.csv", "code,npi\nMED1,9991\n")
+    reg = _ref_graph(csv)
+    read: list[str] = []
+
+    def handle(m: Any) -> list[Send]:
+        read.append(reference("provider_npi")["MED1"])
+        return [Send("OB_REF", m)]
+
+    reg.handlers["h"] = handle
+
+    view = {"provider_npi": {"MED1": "PASSED"}}
+    for _ in range(2):
+        assert trace_dry_run(reg, _REF_RAW, reference_view=view)["error"] is None
+    assert read == ["PASSED", "PASSED"]
+    assert loads == []
+
+    for _ in range(2):
+        assert trace_dry_run(reg, _REF_RAW)["error"] is None
+    assert read[2:] == ["9991", "9991"]
+    assert loads == [str(csv), str(csv)]
+
+
+@pytest.mark.parametrize("trace", [[], ["--trace"]])
+def test_dryrun_cli_reads_each_reference_file_once_per_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    trace: list[str],
+) -> None:
+    """The ``dryrun`` CLI, plain and traced, builds the view once per run, as ``check`` does: three
+    fixtures read the file once, and each still reads the set (BACKLOG #6820). Each fixture used
+    to build the view, and read the file, again."""
+    from messagefoundry.__main__ import main
+
+    loads = _counting_loader(monkeypatch)
+    csv = _csv(tmp_path / "npi.csv", "code,npi\nMED1,9991\n")
+    body = "    return Send('OB_REF', reference('provider_npi')['MED1'])\n"
+    cfg, msgs = _check_repo(tmp_path, csv, body)
+
+    rc = main(
+        ["dryrun", "--config", str(cfg), "--messages", str(msgs), "--json", "--show-phi", *trace]
+    )
+    assert rc == 0
+    assert loads == [str(csv)]
+    entries = json.loads(capsys.readouterr().out)
+    assert len(entries) == 3
+    assert [e["error"] for e in entries] == [None, None, None]
+    if not trace:
+        assert [[d["payload"] for d in e["deliveries"]] for e in entries] == [["9991"]] * 3
+
+
+@pytest.mark.parametrize("trace", [[], ["--trace"]])
+def test_dryrun_cli_refuses_a_reference_view_fault_by_type(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    trace: list[str],
+) -> None:
+    """A loader fault the view builder does not turn into a skipped set ends the run naming its
+    type alone, as ``check``'s leg does, since the view is built outside each fixture's guard
+    (BACKLOG #6820)."""
+    from messagefoundry.__main__ import main
+    from messagefoundry.pipeline import dryrun
+
+    def faulting(path: str) -> Any:
+        raise RecursionError("MRN999SECRET")
+
+    monkeypatch.setattr(dryrun, "load_code_set", faulting)
+    csv = _csv(tmp_path / "npi.csv", "code,npi\nMED1,9991\n")
+    cfg, msgs = _check_repo(tmp_path, csv, "    return Send('OB_REF', m)\n")
+
+    rc = main(["dryrun", "--config", str(cfg), "--messages", str(msgs), "--json", *trace])
+    printed = "".join(capsys.readouterr())
+    assert rc != 0
+    assert "reference sets did not load for the preview (RecursionError)" in printed
+    assert "MRN999SECRET" not in printed

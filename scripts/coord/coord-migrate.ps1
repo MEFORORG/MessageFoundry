@@ -87,7 +87,8 @@
       0  clean.
       1  at least one read or write failed. Wins over 3, because the report is then incomplete.
       2  bad arguments: a missing or non-directory -Source, a -Target that is missing, unreachable or
-         not a directory, or nested roots. Nothing was read past the arguments.
+         not a directory, a device-path (\\?\ or \\.\) -Source or -Target, or nested roots. Nothing
+         was read past the arguments.
       3  at least one CONFLICT, COLLISION, UNSTAMPED record or FOREIGN HOST. With -Apply every other
          file was still copied, except after a FOREIGN HOST, which holds back every write. Also the
          cloud-session refusal, which prints only its one stderr line.
@@ -146,8 +147,20 @@ function Get-InnerException($ErrorRecord) {
 
 if (-not $Source) { Stop-Usage 'needs -Source <dir>.' }
 if (-not $Target -or -not $Target.Trim()) { Stop-Usage 'needs -Target <dir>.' }
+# A device path is refused as the resolver refuses one (Get-CoordDeviceRootRefusal says why), and
+# here also because the nesting check below cannot compare it with a plain spelling of the same tree.
+# Checked as given and again once resolved: a provider-qualified spelling such as
+# FileSystem::\\?\C:\p is not a device path as typed, and resolves to one.
+foreach ($arg in @(@('-Source', $Source), @('-Target', $Target))) {
+    $device = Get-CoordDeviceRootRefusal -What $arg[0] -Path $arg[1].Trim($script:CoordWs)
+    if ($device) { Stop-Usage $device }
+}
 $srcRoot = Get-FullPath $Source
 $dstRoot = Get-FullPath $Target
+foreach ($arg in @(@('-Source', $srcRoot), @('-Target', $dstRoot))) {
+    $device = Get-CoordDeviceRootRefusal -What $arg[0] -Path $arg[1]
+    if ($device) { Stop-Usage $device }
+}
 if (-not (Test-Path -LiteralPath $srcRoot -PathType Container)) { Stop-Usage "-Source '$srcRoot' is not a directory." }
 $sep = [System.IO.Path]::DirectorySeparatorChar
 # Nested roots would copy the target into itself, or read back what this run just wrote.

@@ -1133,6 +1133,7 @@ other verdict is a question the instrument could not close, not a finding that t
 - **BLOCKING** — nothing on `origin/main` protects the item, so the key is stuck in the worst way:
   unclaimable *and* unbuilt. These are **grouped by branch**, because that is where the decision
   lives — one *land it or abandon it* call cleared nine keys at once on the day this was written.
+  A claim that records no branch has no such decision, so those keys are listed one by one.
 - **NO-ITEM** — the key is outside the backlog namespace (`ha-recheck-inc145`, `usage-forecast` on
   the live registry). The instrument does not reach it. That is not a finding about the work.
 - **STRANDED-REGISTERED** — half a removal. `prune-merged.ps1` owns it and releases as it removes.
@@ -2001,14 +2002,13 @@ blocked.
 > cure, then decide whether you still want the prohibition.
 
 **The gate's write rule (rule 1) keys on the write's resolved target path, not on where the session
-sits.** A relative path is resolved against the session's cwd first, so for a relative path the cwd
-does decide the verdict; give the absolute path into your worktree. Not every rule is path-keyed: rule 2 keys on the cwd.
-In the 30-day window measured above, **29% of the writes made by those same 166 primary-seated
-sessions landed inside a sibling worktree by absolute path** — already correct. A cwd-keyed write rule
-would have denied every one of them. So for writes, a session may stay where it is and write into its
-worktree by absolute path, with no need to `cd`, relocate, or restart. A fan-out is different: rule 2
+sits.** [WORKTREE-GATE.md](WORKTREE-GATE.md), *Why it exists*, states once what the cwd decides,
+including for a relative path and for the rules keyed on the cwd. For writes, a session may stay
+where it is and write into its worktree by absolute path, with no need to `cd`, relocate, or
+restart. A fan-out is different: rule 2
 denies a dispatch made while the session's cwd is the primary. Whether the session must then be
-started in a worktree depends on rule 3, as the blockquote above says.
+started in a worktree depends on the gate's rule 4, the `EnterWorktree` rule this section calls rule 3,
+as the blockquote above says.
 
 ### Recovering a relocated session — `sessions.ps1`
 

@@ -199,7 +199,8 @@ def _install(
     later_row: tuple[int, int] = (0, 0),
 ) -> dict[str, int]:
     """``alter_cursor_fails`` makes the first connection's second cursor open raise: the cursor
-    the ALTERs get. ``later_row`` is what every connection after the first reads."""
+    the RCSI ALTER gets, the first ALTER with a limit other than the state read's.
+    ``later_row`` is what every connection after the first reads."""
     timeouts: dict[str, int] = {}
     connects = 0
 
@@ -226,20 +227,56 @@ _STATE_READ = (
 _REREAD = "SELECT is_read_committed_snapshot_on FROM sys.databases WHERE name = DB_NAME()"
 
 
-async def test_the_open_bounds_its_reads_and_not_its_alters(
+async def test_the_open_bounds_its_reads_and_the_snapshot_alter_not_the_rcsi_alter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Red before #5666: the open's state read and re-read probes kept pyodbc's default of no
-    statement limit. They now run under ``[store].command_timeout``. The ALTERs keep no limit: a
-    cancel landing after ROLLBACK IMMEDIATE rolled back the peers would leave RCSI off, and the
-    retry at every restart would roll them back again."""
+    statement limit. They now run under ``[store].command_timeout``, as the snapshot ALTER does
+    (the next test). The RCSI ALTER keeps no limit, for the reason the comment at the state read
+    in ``_ensure_database_options`` gives."""
     timeouts = _install(monkeypatch, alters_fail=False)
     await SqlServerStore._ensure_database_options(_settings())
-    assert timeouts == {_STATE_READ: 17, _ALTER_RCSI: 0, _ALTER_SNAPSHOT: 0}, timeouts
+    assert timeouts == {_STATE_READ: 17, _ALTER_RCSI: 0, _ALTER_SNAPSHOT: 17}, timeouts
     reread = _install(monkeypatch)  # the ALTER fails, so the re-read probes run
     with pytest.raises(RuntimeError, match="READ_COMMITTED_SNAPSHOT is OFF"):
         await SqlServerStore._ensure_database_options(_settings())
     assert reread == {_STATE_READ: 17, _ALTER_RCSI: 0, _REREAD: 17}, reread
+
+
+async def test_the_open_bounds_the_snapshot_alter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Red before #5666's snapshot limb: at an open the ALLOW_SNAPSHOT_ISOLATION ALTER ran with no
+    statement limit, so one waiting on a long transaction stalled the open with no end. It now
+    runs under ``[store].command_timeout``, whether or not the RCSI ALTER ran before it; a
+    timeout is only warned about, as any failure of that ALTER is."""
+    rcsi_on = _install(monkeypatch, alters_fail=False)
+
+    async def _connect(**kwargs: Any) -> _OptionsConn:
+        return _OptionsConn((1, 0), rcsi_on, False)  # RCSI already on, snapshot off
+
+    monkeypatch.setattr(sys.modules["aioodbc"], "connect", _connect)
+    await SqlServerStore._ensure_database_options(_settings())
+    assert rcsi_on == {_STATE_READ: 17, _ALTER_SNAPSHOT: 17}, rcsi_on
+    both_off = _install(monkeypatch, alters_fail=False)
+    await SqlServerStore._ensure_database_options(_settings())
+    assert both_off[_ALTER_RCSI] == 0  # the control: the RCSI ALTER still runs with none
+    assert both_off[_ALTER_SNAPSHOT] == 17, both_off
+
+
+async def test_a_failed_snapshot_alter_at_an_open_warns_and_the_open_goes_on(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The bound's other half: a snapshot ALTER that fails, as one past its limit does, is a
+    warning, and the open does not fail on it."""
+    timeouts = _install(monkeypatch)  # every ALTER raises
+
+    async def _connect(**kwargs: Any) -> _OptionsConn:
+        return _OptionsConn((1, 0), timeouts, True)  # RCSI already on, snapshot off
+
+    monkeypatch.setattr(sys.modules["aioodbc"], "connect", _connect)
+    caplog.set_level(logging.WARNING, logger=sqlserver_module.log.name)
+    await SqlServerStore._ensure_database_options(_settings())
+    assert timeouts[_ALTER_SNAPSHOT] == 17
+    assert any("ALLOW_SNAPSHOT_ISOLATION" in r.getMessage() for r in caplog.records)
 
 
 async def test_provision_schema_options_alters_keep_no_limit(

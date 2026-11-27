@@ -656,6 +656,9 @@ _CONTEXTUAL_REVIEWED_NON_INPUTS = frozenset(
         # trusts the IdP's certificate, not what the engine decides about a request it receives. A
         # certificate it rejects never yields an identity at all.
         "oidc_tls_crl_file",
+        # Vault BACKLOG #5511: whether that CRL is checked against the IdP's whole chain, not only
+        # its leaf. The same trust-material decision as the CRL file itself, so the same reason.
+        "oidc_tls_crl_check_chain",
         # ASVS 3.7.3: destinations exempted from the "you are leaving this site" interstitial. It
         # decides whether the operator is SHOWN A NOTIFICATION before an outbound navigation — not
         # whether any request is authorized. No login, session, permission or authorization outcome

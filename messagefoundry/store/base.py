@@ -1598,11 +1598,14 @@ class QueueStore(StoreLifecycle, Protocol):
         *,
         limit: int = 200,
         allowed_channels: Sequence[str] | None,
+        suspended_until_after: float | None = None,
     ) -> list[AlertInstance]:
         """Read **open + acknowledged** alert instances newest-``last_seen`` first — the read accessor for
         the ``GET /alerts/active`` route. Runs on the lockfree read path; ``limit`` clamped server-side.
         ``allowed_channels`` applies the same per-channel RBAC scope as :meth:`list_connection_events`
-        (``None`` = all; a set restricts to instances whose ``connection`` is in the allow-set)."""
+        (``None`` = all; a set restricts to instances whose ``connection`` is in the allow-set).
+        ``suspended_until_after`` set reads only those whose ``suspended_until`` is later than it, so the
+        notifier's suspend prime is not crowded out by unsuspended rows (vault BACKLOG #3100 item 14)."""
         ...
 
     async def summarize_active_alert_instances(
@@ -3913,7 +3916,7 @@ def resolve_active_key(settings: StoreSettings, *, posture: HopPosture | None = 
         # caught error as its context; and the caught error is dropped, so the refusal's traceback
         # holds no frame local that reaches it.
         try:
-            refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, InsecureHopRefused)
+            refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, KeySeamHopRefused)
         finally:
             del caught  # dropped even where the call raises, at the recursion limit included
         raise refusal from None
@@ -4035,7 +4038,7 @@ def resolve_decrypt_keys(
         # As at :func:`resolve_active_key`, and with neither the caught error nor the refusal left
         # bound, even where the call raises, so no cycle through this frame keeps either.
         try:
-            refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, InsecureHopRefused)
+            refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, KeySeamHopRefused)
             raise refusal from None
         finally:
             del caught, refusal
@@ -4511,6 +4514,14 @@ class StoreCipherConfigError(ValueError):
     not it holds a codec error, and one whose judgement raised an ``Exception``."""
 
 
+class KeySeamHopRefused(InsecureHopRefused, KeyProviderError):
+    """A hop refusal at the key seam, :func:`resolve_active_key` and :func:`resolve_decrypt_keys`
+    (vault BACKLOG #8163 item 11). Still an ``InsecureHopRefused``, so a caller that reports a hop
+    refusal still does, and a ``KeyProviderError`` too, so a CLI key arm that catches a key that
+    could not be resolved reports it: ``restore`` and ``restore-verify`` exit 2 on it, where a
+    plain hop refusal reached the dispatch floor and exited 1."""
+
+
 def _build_store_cipher(
     settings: StoreSettings, posture: HopPosture | None, host_key: str | None = None
 ) -> Cipher:
@@ -4527,20 +4538,30 @@ def _build_store_cipher(
             "(expected 'aesgcm' or 'vault_transit')"
         )
     retired = _split_retired(settings.encryption_keys_retired)
-    # A host key passes the same key check a resolved one does (BACKLOG #5310, #5308), so a
-    # refusal ``make_cipher`` would raise unrecorded, and the build's fixed-text replacement would
-    # print as :data:`_UNTEXTED`, is raised recorded there instead.
-    active = (
-        _checked_active_key(host_key, settings)
-        if host_key is not None
-        else resolve_active_key(settings, posture=posture)
-    )
-    return make_cipher(
-        active,
-        retired,
-        write_v2=settings.aad_bind,
-        allow_unmarked=settings.allow_unmarked_ciphertext,
-    )
+    try:
+        # A host key passes the same key check a resolved one does (BACKLOG #5310, #5308), so a
+        # refusal ``make_cipher`` would raise unrecorded, and the build's fixed-text replacement
+        # would print as :data:`_UNTEXTED`, is raised recorded there instead.
+        active = (
+            _checked_active_key(host_key, settings)
+            if host_key is not None
+            else resolve_active_key(settings, posture=posture)
+        )
+        return make_cipher(
+            active,
+            retired,
+            write_v2=settings.aad_bind,
+            allow_unmarked=settings.allow_unmarked_ciphertext,
+        )
+    finally:
+        # Vault BACKLOG #8163 item 21: an error leaving here keeps this frame on its traceback, so
+        # the key text it holds is dropped first, whatever raised. That matters where
+        # build_store_cipher does not replace the error, a BaseException that is not an Exception,
+        # and there the frames below this one, make_cipher's among them, still hold the key they
+        # were passed. Assigned, not deleted, since the call that raised may have left ``active``
+        # unset.
+        active = host_key = None
+        retired = []
 
 
 class StoreNotFoundError(RuntimeError):

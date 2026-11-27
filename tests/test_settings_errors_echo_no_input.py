@@ -260,11 +260,11 @@ _AUTH_CASES: dict[str, tuple[dict[str, Any], dict[str, Any], str]] = {
         },
         "[dr].enabled cannot be combined",
     ),
-    # BACKLOG #5965: the three [dr] refusals added at load.
-    "dr_activate_without_enabled": (
+    # BACKLOG #5965: the [dr] refusals added at load. activate is a removed key.
+    "dr_activate_removed": (
         _auth(),
-        {"dr": {"activate": True}},
-        "[dr].activate = true needs [dr].enabled",
+        {"dr": {"enabled": True, "activate": True, "seed_archive": "seed.mfbak"}},
+        "[dr].activate was REMOVED",
     ),
     "dr_enabled_without_a_seed": (_auth(), {"dr": {"enabled": True}}, "needs [dr].seed_archive"),
     "dr_restore_token_on_sqlite": (

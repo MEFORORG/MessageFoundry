@@ -203,6 +203,7 @@ from messagefoundry.store.queue_tag import (
     report_queue_tag_failure,
     reseal_unless_tag_failure,
     set_aside_deadline,
+    unopenable_log_text,
 )
 from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
@@ -4499,10 +4500,10 @@ class SqlServerStore(ServerCipherWalk):
                 # build must find a store here before it runs, not after.
                 await cls._refuse_a_database_with_no_store(settings, posture=posture)
             # RCSI must be enabled BEFORE the pool exists: its one-time ALTER ... WITH ROLLBACK
-            # IMMEDIATE takes momentary exclusivity, and with no MEFOR pool session open yet it has
-            # nothing of ours to terminate (concurrency_fixes (a)). #305: under external schema
-            # management the runtime login issues no ALTER DATABASE, so there is nothing to do before
-            # the pool; _verify_schema_external reads the two options on a pooled connection instead.
+            # IMMEDIATE takes exclusivity once the transactions it ends have rolled back, and with
+            # no MEFOR pool session open yet it has nothing of ours to terminate (concurrency_fixes
+            # (a)). #305: under external schema management the runtime login issues no ALTER
+            # DATABASE, so there is nothing to do before the pool; _verify_schema_external reads the two options on a pooled connection instead.
             # A read-only open issues no ALTER either (#1780).
             await cls._ensure_database_options(settings)
         pool, executor = await cls._create_pool(settings, maxsize=settings.pool_size)
@@ -5056,8 +5057,9 @@ class SqlServerStore(ServerCipherWalk):
         """Enable READ_COMMITTED_SNAPSHOT (RCSI) so the staged claim/finalize paths read on a
         row-version snapshot rather than taking shared locks that deadlock writers under concurrent
         load (concurrency_fixes (a)). Runs on its OWN autocommit connection BEFORE the pool is
-        created, so the momentary exclusivity of ``WITH ROLLBACK IMMEDIATE`` has no sibling MEFOR
-        session to terminate; IF-guarded on the live state, so the disruptive ALTER fires at most ONCE
+        created, so the exclusivity of ``WITH ROLLBACK IMMEDIATE`` has no sibling MEFOR session to
+        terminate (how long it can wait, and why it has no statement limit: the comment at the state
+        read); IF-guarded on the live state, so the disruptive ALTER fires at most ONCE
         (greenfield first boot) and every later open()/failover is a detect-and-skip no-op.
 
         **FAILS CLOSED when RCSI is off and cannot be turned on (BACKLOG #1628).** This used to degrade
@@ -5162,10 +5164,15 @@ class SqlServerStore(ServerCipherWalk):
             # its first call, and the `finally` closes it while nothing runs on it.
             _require_call_gate(conn)
             if fail_closed:
-                # BACKLOG #5666: at an open, the state read and the re-read probes run under
-                # [store].command_timeout. The ALTERs below do not, at an open or under
-                # provision-schema: a cancel that lands after ROLLBACK IMMEDIATE has rolled back
-                # the peers leaves RCSI off, and the retry at every restart rolls them back again.
+                # BACKLOG #5666: at an open, the state read, the re-read probes and the
+                # ALLOW_SNAPSHOT_ISOLATION ALTER run under [store].command_timeout. The RCSI ALTER
+                # does not, at an open or under provision-schema. ROLLBACK IMMEDIATE ends the peers'
+                # transactions, but the ALTER still waits for their rollback and for the database
+                # lock, with no statement limit, so it can stall at least as long as a large
+                # rollback takes. It stays unbounded anyway: a cancel that lands
+                # after the rollback leaves RCSI off, so the retry at every restart rolls the peers
+                # back again. The snapshot ALTER can wait on transactions open when it runs, and it
+                # is only warned about, so a limit there turns a stall into that warning.
                 _bound_one_shot(conn, settings.command_timeout)
             await _assert_autocommit(conn)
             # Standalone one-shot connection (NOT pooled), so the EF-6 pool-bleed race `_cursor`
@@ -5189,18 +5196,20 @@ class SqlServerStore(ServerCipherWalk):
                 log.warning("%s", message)
                 return
             off = _options_off(row)
-            swap = bool(off) and fail_closed and bool(settings.command_timeout)
+            # The state read's limit, which is unset (the driver's no limit) under
+            # provision-schema. The snapshot ALTER keeps it; `cur_limit` tracks the open cursor's.
+            bounded = settings.command_timeout if fail_closed else 0
+            cur_limit = bounded
 
-            async def alter(sql: str) -> None:
-                """Run one ALTER inside its caller's try, so a failure to open its cursor reaches
-                the same handler as the ALTER's own failure: the peer re-read and the remedy."""
-                nonlocal cur, swap
-                if swap or cur is None:
-                    # The ALTERs run with no statement limit, as on a provision-schema run, so
-                    # they get a cursor opened after the limit is lifted (see the comment at the
-                    # state read). `cur` is cleared before the close, so a cancellation landing in
-                    # it does not hand the same cursor to the gate a second time.
-                    swap = False
+            async def alter(sql: str, limit: int) -> None:
+                """Run one ALTER under ``limit`` seconds (0 = none) inside its caller's try, so a
+                failure to open its cursor reaches the same handler as the ALTER's own failure:
+                the peer re-read and the remedy."""
+                nonlocal cur, cur_limit
+                if cur is None or cur_limit != limit:
+                    # pyodbc fixes a cursor's limit when the cursor opens, so a different limit
+                    # needs a new cursor. `cur` is cleared before the close, so a cancellation
+                    # landing in it does not hand the same cursor to the gate a second time.
                     old, cur = cur, None
                     if old is not None:
                         try:
@@ -5208,17 +5217,17 @@ class SqlServerStore(ServerCipherWalk):
                         except Exception as exc:  # noqa: BLE001 - the ALTER meets a dead session
                             # A peer's ROLLBACK IMMEDIATE may have killed the session; the cursor
                             # open or the ALTER then fails in the caller's handler.
-                            log.debug(
-                                "options state-read cursor close failed: %s", _options_error(exc)
-                            )
-                    _bound_one_shot(conn, 0)
+                            log.debug("options cursor close failed (%s)", type(exc).__name__)
+                    _bound_one_shot(conn, limit)
+                    cur_limit = limit
                     cur = await conn.cursor()
                 await cur.execute(sql)
 
             if "READ_COMMITTED_SNAPSHOT" in off:
                 try:
                     await alter(
-                        "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"
+                        "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE",
+                        0,
                     )
                     log.info("enabled READ_COMMITTED_SNAPSHOT on database %r", db)
                 except Exception as exc:
@@ -5251,7 +5260,7 @@ class SqlServerStore(ServerCipherWalk):
             if "ALLOW_SNAPSHOT_ISOLATION" in off:
                 try:
                     # ALLOW_SNAPSHOT_ISOLATION is an online change (no exclusivity required).
-                    await alter("ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON")
+                    await alter("ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON", bounded)
                 except Exception as exc:  # noqa: BLE001 - non-fatal
                     log.warning(
                         "could not enable ALLOW_SNAPSHOT_ISOLATION on %r (%s); a DBA should run once: %s",
@@ -5610,8 +5619,9 @@ class SqlServerStore(ServerCipherWalk):
                             self.backend, self._settings.database
                         )
                 # Read before the applock and the batch, so DDL the live-schema check cannot read
-                # fails here, with no peer queued behind it (BACKLOG #5062). Cached per process.
-                _declared_schema()
+                # fails here, with no peer queued behind it (BACKLOG #5062). Cached per process; the
+                # first parse takes tens of milliseconds, so it runs off the event loop.
+                await asyncio.to_thread(_declared_schema)
                 # pyodbc copies the connection timeout into a cursor only when it creates the cursor,
                 # so each step below runs on its own cursor, opened after the connection timeout is set
                 # for that step, and closed before the next opens (no MARS: one active statement per
@@ -5744,7 +5754,7 @@ class SqlServerStore(ServerCipherWalk):
         Raises :class:`ServerSchemaMismatchError` naming each one, and logs it at ERROR first. Extras
         are tolerated. :mod:`messagefoundry.store.server_schema_verify` says what is compared and
         what is not. Reads only."""
-        expected = _declared_schema()
+        expected = _declared_schema()  # a cache hit: the pre-lock read parsed it off the loop
         tables = sorted(expected.columns)
         column_rows: list[tuple[str, str | None, str | None, ColumnShape | None]] = []
         # `VALUES ()` is a syntax error, so a batch that declared nothing reads nothing.
@@ -6122,7 +6132,8 @@ class SqlServerStore(ServerCipherWalk):
         found: bool | None = None
         # A named constraint is a schema-wide object, so its name collides as a table's does.
         constraints = {name for each in _SCHEMA for name in _NAMED_CONSTRAINT.findall(each)}
-        tables = tuple(sorted({*_declared_schema().columns, *constraints}))
+        declared = await asyncio.to_thread(_declared_schema)
+        tables = tuple(sorted({*declared.columns, *constraints}))
         if not tables:
             return None
         async with (
@@ -9442,12 +9453,16 @@ class SqlServerStore(ServerCipherWalk):
         *,
         limit: int = 200,
         allowed_channels: Sequence[str] | None,
+        suspended_until_after: float | None = None,
     ) -> list[AlertInstance]:
         limit = max(1, min(limit, 1000))  # server-side clamp
         where = [_ACTIVE_ALERT_STATUS_SQL]
         params: list[Any] = [limit]  # TOP (?) is the first placeholder
         if allowed_channels is not None:
             _append_channel_scope(where, params, "connection", allowed_channels)
+        if suspended_until_after is not None:  # vault BACKLOG #3100 item 14: see the SQLite twin
+            where.append("suspended_until > ?")
+            params.append(suspended_until_after)
         clause = " WHERE " + " AND ".join(where)
         rows = await self._fetchall(
             "SELECT TOP (?) id, event_type, connection, severity, status, first_seen, last_seen,"
@@ -11751,9 +11766,11 @@ class SqlServerStore(ServerCipherWalk):
         the caller does with it."""
         if is_transient_open_failure(exc):
             return queue_open_fault(exc)
-        # The text, not the error: a record keeps its args, and the error's traceback holds the
+        # A string, never the error: a record keeps its args, and the error's traceback holds the
         # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884).
-        log.warning("dead-lettering undecryptable queue row %s: %s", d["id"], str(exc))
+        log.warning(
+            "dead-lettering undecryptable queue row %s: %s", d["id"], unopenable_log_text(exc)
+        )
         row = {**d, "stage": stage}
         try:
             await self.dead_letter_now(d["id"], f"undecryptable payload: {exc}")

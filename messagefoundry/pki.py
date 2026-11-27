@@ -25,7 +25,7 @@ import string
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping, Set
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
@@ -1518,17 +1518,51 @@ OUTBOUND_NO_PARTNER_TLS_CASE = (
 )
 
 
+class OwnCrlChainHop(NamedTuple):
+    """The settings of a hop in :data:`OWN_CRL_CHAIN_HOPS`, besides its CRL setting."""
+
+    chain: str  # the opt-in whole-chain setting
+    ca: str  # the CA setting whose CAs the start rule reads
+
+
+#: The server-auth hops with a CRL setting of their own and an opt-in whole-chain check (vault
+#: BACKLOG #5511): each hop's CRL setting, mapped to its chain setting and to the CA setting the
+#: start rule reads its CAs from. Each chain setting is refused at load without both files, and
+#: each builder refuses it with no CA, so the CAs come from the operator's own CA file and never
+#: from the OS trust store.
+OWN_CRL_CHAIN_HOPS: Mapping[str, OwnCrlChainHop] = {
+    "[auth].oidc_tls_crl_file": OwnCrlChainHop(
+        "[auth].oidc_tls_crl_check_chain", "[auth].oidc_tls_ca_cert_file"
+    ),
+    "[auth].ad_tls_crl_file": OwnCrlChainHop(
+        "[auth].ad_tls_crl_check_chain", "[auth].ad_tls_ca_cert_file"
+    ),
+}
+
+
 def own_crl_reason(
-    ca_ders: Iterable[bytes], crl_pem: bytes, *, outbound: bool = False
+    ca_ders: Iterable[bytes],
+    crl_pem: bytes,
+    *,
+    outbound: bool = False,
+    setting: str | None = None,
 ) -> str | None:
     """Why a whole-chain CRL check on a hop listing ``ca_ders`` refuses ``crl_pem``, after the
     setting or the file, or ``None`` when every CA has a CRL of its own (vault BACKLOG #5627,
     #5511). A start and the running-hop reload both ask this, so the rule and its words are one.
     ``outbound`` words it for an outbound hop under ``[tls].crl_check_chain``, which on a hop
-    that sends over TLS checks a server's chain against CAs from its own CA setting."""
+    that sends over TLS checks a server's chain against CAs from its own CA setting. A ``setting``
+    in :data:`OWN_CRL_CHAIN_HOPS` words it for that hop's server chain, naming its own chain and
+    CA settings, whatever ``outbound`` says."""
     try:
         missing = cas_without_own_crl(ca_ders, crl_pem)
     except ValueError as exc:
+        own = OWN_CRL_CHAIN_HOPS.get(setting) if setting is not None else None
+        if own is not None:
+            return (
+                f"it could not be checked against the CAs the hop loaded from {own.ca}: "
+                f"{str(exc).replace('loaded client CA', 'loaded CA')}"
+            )
         if outbound:
             return (
                 "it could not be checked against the CAs the hop loaded from its CA setting, "
@@ -1538,19 +1572,27 @@ def own_crl_reason(
             "it could not be checked against the client CAs the hop loaded from its client-CA "
             f"setting, such as tls_ca_file or [api].tls_client_ca_file: {exc}"
         )
-    return own_crl_refusal(missing, outbound=outbound) if missing else None
+    return own_crl_refusal(missing, outbound=outbound, setting=setting) if missing else None
 
 
-def own_crl_refusal(missing: Iterable[tuple[str, int]], *, outbound: bool = False) -> str:
+def own_crl_refusal(
+    missing: Iterable[tuple[str, int]], *, outbound: bool = False, setting: str | None = None
+) -> str:
     """What a start and the running-hop reload say of the CAs :func:`cas_without_own_crl` found,
     after the setting or the file, so the two cannot drift apart (vault BACKLOG #5627). Each CA is
     named with its serial number, since two CAs can share a name, in one order whatever order the
-    caller read them in. ``outbound`` is :func:`own_crl_reason`'s."""
+    caller read them in. ``outbound`` and ``setting`` are :func:`own_crl_reason`'s."""
     named = ", ".join(
         f"{quoted_issuer(subject)} (serial number {serial:#x})"
         for subject, serial in sorted(missing)
     )
-    if outbound:
+    own = OWN_CRL_CHAIN_HOPS.get(setting) if setting is not None else None
+    if own is not None:
+        who = f"the CA(s) {named}, loaded from {own.ca},"
+        peers = "servers"
+        checked = f"{own.chain} checks the whole server chain against this file"
+        http_case = ""
+    elif outbound:
         who = f"the CA(s) {named}, loaded from this hop's CA setting ({_OUTBOUND_CA_SETTINGS}),"
         peers = "servers"
         checked = (

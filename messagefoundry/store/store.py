@@ -203,6 +203,7 @@ from messagefoundry.store.queue_tag import (
     report_queue_tag_failure,
     reseal_unless_tag_failure,
     set_aside_deadline,
+    unopenable_log_text,
 )
 from messagefoundry.store.row_seal import (
     ADSET_KIND,
@@ -16065,9 +16066,11 @@ class MessageStore:
         (:meth:`_set_aside_claimed`)."""
         if is_transient_open_failure(exc) or isinstance(exc, (sqlite3.OperationalError, OSError)):
             return queue_open_fault(exc)
-        # The text, not the error: a record keeps its args, and the error's traceback holds the
+        # A string, never the error: a record keeps its args, and the error's traceback holds the
         # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884).
-        log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], str(exc))
+        log.warning(
+            "dead-lettering undecryptable queue row %s: %s", row["id"], unopenable_log_text(exc)
+        )
         try:
             await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}", _standalone=True)
         except PROGRAMMING_ERRORS:
@@ -19479,6 +19482,7 @@ class MessageStore:
         *,
         limit: int = 200,
         allowed_channels: Sequence[str] | None,
+        suspended_until_after: float | None = None,
     ) -> list[AlertInstance]:
         # The read accessor for GET /alerts/active: open + acknowledged instances, newest last_seen
         # first. Runs on the lockfree read path. `allowed_channels` applies the SAME per-channel RBAC
@@ -19489,6 +19493,9 @@ class MessageStore:
         params: list[Any] = []
         if allowed_channels is not None:
             _append_channel_scope(where, params, "connection", allowed_channels)
+        if suspended_until_after is not None:  # vault BACKLOG #3100 item 14: the suspend prime
+            where.append("suspended_until > ?")
+            params.append(suspended_until_after)
         clause = " WHERE " + " AND ".join(where)
         params.append(limit)
         async with self._read() as db:

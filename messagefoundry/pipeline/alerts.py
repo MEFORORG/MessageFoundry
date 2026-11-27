@@ -28,10 +28,12 @@ from messagefoundry.redaction import log_timestamp
 from messagefoundry.restore_notice import RESTORE_NOTICE_POINTER, RESTORE_ROLLBACK_NOTICE
 
 __all__ = [
+    "DR_RESTART_CLOSE_GUIDANCE",
     "INTAKE_DEPTH_REASON",
     "INTAKE_DISK_REASON",
     "REMINDER_SECONDS",
     "STORE_RESTORED_SUBJECT",
+    "UNREACHED_ROLLUP_SOURCE",
     "AlertSink",
     "HELD_COPY_NOTE",
     "LoggingAlertSink",
@@ -54,12 +56,29 @@ log = logging.getLogger(__name__)
 INTAKE_DEPTH_REASON = "staged_depth"
 INTAKE_DISK_REASON = "disk_floor"
 
+#: The source label prefix of a rollup of unreachable directory accounts' ``ad_reconcile_aborted``
+#: instance, ``<this>:<key>`` (vault BACKLOG #3100 item 14). The API raises it; why each rollup is
+#: keyed by its accounts is said there, at ``_UNREACHED_ROLLUP_SOURCE``. Defined here so the
+#: notifier, which bounds its in-memory state for these instances, shares the one spelling.
+UNREACHED_ROLLUP_SOURCE = "directory-reconciler-unreached-rollup"
+
 #: How often an emitter raises a condition that persists again: ``queue_buildup``, ``message_stall``
 #: and ``saturation`` in ``wiring_runner``, and ``intake_paused`` in ``intake_bound``. One value, so
 #: the emitters' cadences cannot drift apart (BACKLOG #2272). It does not set the notifier's own
 #: cooldown, ``[alerts].realert_seconds``, which an operator can raise; a cooldown longer than this
 #: throttles some reminders, by that operator's choice.
 REMINDER_SECONDS = 300.0
+
+#: How an operator closes ``dr_restarted_passive`` (BACKLOG #5965). Both restart ERROR lines in
+#: ``dr`` carry it because they print under every alert sink, where a sink's own CRITICAL line may
+#: not; ``LoggingAlertSink``'s CRITICAL line carries it too. The close is best effort and needs alert instances, so the hand route names that condition.
+#: Passed as a ``%s`` argument, never joined into a format string, so a ``%`` here stays text.
+DR_RESTART_CLOSE_GUIDANCE = (
+    "How to end this state, by activating or by recording that the box stays passive, is in "
+    "docs/CONFIGURATION.md, the [dr] enabled row. Where [alerts] configures a webhook or email "
+    "transport and this alert is still open once you have decided, resolve it by hand "
+    "(POST /alerts/{alert_id}/resolve, or Resolve in the web console)."
+)
 
 
 def intake_pause_detail(*, reason: str, value: int, limit: int, store_kind: str) -> str:
@@ -792,9 +811,10 @@ class AlertSink(Protocol):
         for a probe fault, ``"directory-reconciler-misconfigured"`` for a configuration refusal,
         ``"directory-reconciler-paging:<username>"`` for a paging refusal,
         ``"directory-reconciler-outage"`` for a lasting outage, and
-        ``"directory-reconciler-unreached:<username>"`` for an unreached account, or the bare
-        ``"directory-reconciler-unreached"`` for a rollup of those entering on one pass
-        (``AuthService._record_unreached_accounts`` decides when), so each
+        ``"directory-reconciler-unreached:<username>"`` for an unreached account, or
+        ``"directory-reconciler-unreached-rollup:<key>"`` for a rollup of those entering on one
+        pass, keyed by those accounts (``AuthService._record_unreached_accounts`` decides when,
+        and the API's ``_UNREACHED_ROLLUP_SOURCE`` says why), so each
         is its own instance and throttle. ``reason`` is one of those eight closed-set slugs.
         ``probed`` is, for
         the breaker, how many principals the pass judged, its denominator, and a paging refusal
@@ -1039,7 +1059,24 @@ class AlertSink(Protocol):
         """A DR box **failed back** to the recovered primary (BACKLOG #145, ADR 0048) — the **inverse** of
         :meth:`dr_activated`. Emits **no** notification (a fail-back needs no page); it **auto-resolves**
         the matching open ``dr_activated`` instance (ADR 0044). ``node`` is the DR box label; ``role`` is
-        ``"primary"`` (leadership handed back). No PHI."""
+        ``"primary"`` (leadership handed back). Also raised by ``POST /dr/release`` on a restarted
+        passive box, which hands nothing back and only records that it stays passive (BACKLOG
+        #5965). No PHI."""
+        ...
+
+    def dr_restarted_passive(self, node: str) -> None:
+        """A DR box whose newest own activate or release record is an **activation** started
+        **passive** (BACKLOG #5965, ADR 0048), so it may have been serving when it went down; a
+        store restored from a snapshot taken while it was activated reads the same. It holds no
+        DR role and never re-activates itself: once the operator has confirmed the primary is not
+        serving, the operator runs ``POST /dr/activate``. Also raised when the start could not
+        read whether the box was activated. Page-worthy, and CRITICAL unless a matching rule names
+        its own severity. It closes the open ``dr_activated`` instance for ``node``, which no
+        longer describes this passive box; the next ``dr_activated`` or ``dr_released`` for
+        ``node`` closes this one. What a release does here is stated once, in
+        docs/CONFIGURATION.md, the [dr] enabled row.
+        ``node`` is the label the coordinator's ``dr_activated`` carries: the host, and on an
+        engine shard the engine shard identity too. No PHI."""
         ...
 
     # --- vault BACKLOG #2613: the security-signal rule layer -----------------------------------
@@ -1642,8 +1679,22 @@ class LoggingAlertSink:
         )
 
     def dr_released(self, node: str, *, role: str) -> None:
-        # The inverse (auto-resolve) event; a clean fail-back — logged at INFO, no page.
-        log.info("ALERT dr_released: DR box %r released, handed back to %s", node, role)
+        # The inverse (auto-resolve) event, logged at INFO, no page. Raised by a fail-back and by a
+        # release that leaves a restarted box passive (BACKLOG #5965), so the line claims no hand-back.
+        log.info(
+            "ALERT dr_released: DR box %r released; it is not activated as DR",
+            node,
+        )
+
+    def dr_restarted_passive(self, node: str) -> None:
+        log.critical(
+            "ALERT dr_restarted_passive: DR box %r started PASSIVE and may have been serving when "
+            "it went down -- the ERROR line before this says what this start found. It holds no "
+            "DR role until POST /dr/activate, to be run only once you have confirmed the "
+            "primary is not serving; an inbound an operator starts on it still binds. %s",
+            node,
+            DR_RESTART_CLOSE_GUIDANCE,
+        )
 
     # --- vault BACKLOG #2613: the security-signal rule layer -----------------------------------
 

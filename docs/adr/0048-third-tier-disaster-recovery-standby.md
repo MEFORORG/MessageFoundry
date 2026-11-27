@@ -271,6 +271,27 @@ in-flight rows stranded.
 > operator start still overrides the profile, as `tests/test_connection_scheduler.py` pins. An alert
 > rule's restart of a parked inbound does nothing.
 
+> **Amendment (BACKLOG #5965, 2026-11-25): no box starts under the DR run-profile.** The
+> `[dr].activate` startup latch let a box configured with `enabled` and `activate` both true come
+> up under the profile at engine construction, binding the priority feeds without the seed
+> verification, the takeover hook (when one is set) or the `dr.activate` audit row that
+> `POST /dr/activate` runs. By owner ruling of 2026-11-25 the key is removed and refused at load
+> as a removed key, `true` or `false`, and the engine and the DR coordinator start every DR box
+> passive. `POST /dr/activate` is the only activation. The Decision's "startup decision"
+> paragraph, before the #3067 amendment, now holds only of `[dr].enabled`, whether the box is a
+> DR box at all. An activated box that restarts comes back passive until it is activated again.
+> This narrows the Decision rather than replacing it, so it is an amendment, not a superseding
+> ADR.
+>
+> *Amendment line (BACKLOG #5965, owner ruling 2026-11-25, "fail loud"):* a box that comes back
+> passive after it was last activated also logs at ERROR and raises the critical
+> `dr_restarted_passive` alert, which closes the open `dr_activated`; each engine shard reads its
+> own `dr.activate`, `dr.release` and `dr.stay_passive` rows and alerts on its own, and none
+> re-activates itself. *(Owner ruling 2026-11-26, decision d20261126T095342812-893e1d.)* An
+> activated server-DB box with `[dr].restore_token` set starts no `dr_backup` pass of its own, so a
+> later re-activation of the same restore still passes the restore-token vintage check. Any other
+> activated box backs up as before.
+
 > **Amendment (vault BACKLOG #3140): a passive DR box binds no inbound listener.** A box with
 > `[dr].enabled = true` that is not activated, at start or after `POST /dr/release`, binds no inbound
 > listener of any tier, and each reads `status: "filtered"`. The VIP fence below needs it: the load balancer
@@ -416,6 +437,7 @@ in-flight rows stranded.
 > lane, and a build that fails holds its rows as it does at the activation.
 >
 > **`[dr].enabled` with `[cluster].enabled` is refused at load**, as `[dr].activate` already was.
+> *(The `[dr].activate` key itself was later removed; see the BACKLOG #5965 amendment above.)*
 > A cluster member that is a passive DR box could win the lease and serve nothing.
 >
 > **Left as it is, deliberately.** The ACTIVE profile's parks of feeds below the threshold are

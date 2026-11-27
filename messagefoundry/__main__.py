@@ -1207,8 +1207,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "the cipher inventory expects, at least through a missing grant, so those cells were not "
         "read), 4 KEY_MISMATCH. Run it with the service's own key: a shell "
         "without it resolves keyless and reports KEY_MISMATCH. Under [store].cipher_provider = "
-        "'vault_transit' values go to Transit in batches of up to BATCH_MAX_ITEMS "
-        "(store/crypto.py; BACKLOG #1719, #6706)",
+        "'vault_transit' values go to Transit in batches of up to 128 values and 524,288 "
+        "characters of them, and a value past that bound alone (BACKLOG #1719, #6706)",
     )
     cipher_audit.add_argument(
         "--service-config",
@@ -6564,7 +6564,12 @@ def _dryrun(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import SectionNameEnvError
     from messagefoundry.config.snapshot import ConfigDirMissing
     from messagefoundry.config.wiring import WiringError, load_config
-    from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_messages
+    from messagefoundry.pipeline.dryrun import (
+        dry_run,
+        dry_run_reference_view,
+        fixture_cap,
+        read_messages,
+    )
     from messagefoundry.redaction import safe_error
 
     resolved = _resolve_offline_anchor(args, env_file_check=False)
@@ -6598,6 +6603,18 @@ def _dryrun(args: argparse.Namespace) -> int:
     except SectionNameEnvError as exc:
         return _emit_error(str(exc), as_json=args.json)
 
+    # Built once for the run, as `check` builds it, so each file-backed reference set is read once
+    # rather than once per message (BACKLOG #6820). A loader fault the builder does not turn into a
+    # skipped set ends the run naming its type alone, since it now sits outside dry_run's own guard,
+    # which reported it as each message's ERROR.
+    try:
+        reference_view = dry_run_reference_view(reg)
+    except Exception as exc:  # noqa: BLE001 - the type alone reaches the report
+        return _emit_error(
+            f"reference sets did not load for the preview ({type(exc).__name__})",
+            as_json=args.json,
+        )
+
     show_phi: bool = args.show_phi
     if not show_phi:
         print(
@@ -6620,6 +6637,7 @@ def _dryrun(args: argparse.Namespace) -> int:
                     inbound=args.inbound,
                     show_phi=show_phi,
                     snapshot_on_send=snapshot_on_send,
+                    reference_view=reference_view,
                 )
                 traced.append({"source": source, "path": path, **entry})
         except (ValueError, KeyError) as exc:  # e.g. ambiguous/unknown --inbound
@@ -6630,7 +6648,13 @@ def _dryrun(args: argparse.Namespace) -> int:
     out: list[dict[str, Any]] = []
     try:
         for source, path, raw in messages:
-            result = dry_run(reg, raw, inbound=args.inbound, snapshot_on_send=snapshot_on_send)
+            result = dry_run(
+                reg,
+                raw,
+                inbound=args.inbound,
+                snapshot_on_send=snapshot_on_send,
+                reference_view=reference_view,
+            )
             out.append(
                 {
                     "source": source,
@@ -8937,10 +8961,14 @@ def _store_key_file_gate(settings: ServiceSettings, *, enforcing: bool) -> bool:
     key_file = provider_key_file(settings.store)
     # Off Windows the file cannot be used at all: the key provider refuses it at store open and says
     # so, which is the fault the operator needs to hear about.
-    if key_file is None or not dpapi_available() or not Path(key_file).exists():
+    if key_file is None or not dpapi_available():
         return True
+    # absent_ok, not Path.exists(): a missing name is left to the key provider, but a link to a
+    # missing file, a share that cannot be reached and a file whose status cannot be read are
+    # judged, and refused (vault BACKLOG #5657).
     return _key_file_access_gate(
         key_file,
+        absent_ok=True,
         what="the store key file named by [store].encryption_key_file",
         remedy=(
             "Restrict it to the account the engine runs as, SYSTEM and Administrators, or write "
@@ -8989,7 +9017,9 @@ def _generated_tls_key_remedy(state_dir: Path) -> str:
             "Where it names a link on its path, keep the store where no link above it, or folder "
             "holding or above one, is owned by an account other than root or the engine's own "
             "or may be written by a group or other without the sticky bit, since a new pair would be "
-            "minted in the same place. "
+            "minted in the same place. Where it names a mount type, a part of the key's path is on that "
+            "mount, and a new pair would be minted on it again: set [api].tls_cert_file and "
+            "[api].tls_key_file to a pair of your own on a local file system. "
         )
     else:
         remedy += (

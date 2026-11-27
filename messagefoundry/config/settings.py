@@ -837,11 +837,13 @@ class StoreSettings(_Section):
     # + the response/payload bodies; its error/last_error/detail stay plaintext — see sqlserver.py.)
     # Secret — supply via MEFOR_STORE_ENCRYPTION_KEY, never the file.
     # Empty = off (values stored as-is).
-    encryption_key: str | None = None
+    # Out of the repr (vault BACKLOG #8163 item 21): a frame on a store refusal's traceback holds
+    # `settings`, so a renderer that prints locals would print the key. Reads are unchanged.
+    encryption_key: str | None = Field(default=None, repr=False)
     # Comma-separated base64 RETIRED keys, kept available for *decrypt only* during a key rotation
     # (ASVS 11.2.2) until `messagefoundry rotate-key` finishes re-encrypting under the active key.
-    # Secret — env-only (MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). Empty = none.
-    encryption_keys_retired: str = ""
+    # Secret — env-only (MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). Empty = none. Out of the repr too.
+    encryption_keys_retired: str = Field(default="", repr=False)
     # When true, `serve` refuses to start without an encryption key even when the audited opt-out
     # below is set. Off by default. See docs/PHI.md §3.
     require_encryption: bool = False
@@ -3831,6 +3833,11 @@ class AuthSettings(_Section):
     # nextUpdate at start and at every bind. With it unset, an off-box LDAPS bind on an enforcing
     # instance is refused when serve builds the auth service.
     ad_tls_crl_file: str | None = None
+    # Opt-in (vault BACKLOG #5511): check ad_tls_crl_file against every certificate in the domain
+    # controller's chain, not only the leaf, so a revoked intermediate CA refuses the controller. It
+    # needs ad_tls_crl_file and ad_tls_ca_cert_file, and refuses at load without either: on the OS
+    # trust store the start rule could not be met. Default False keeps the leaf check.
+    ad_tls_crl_check_chain: bool = False
     # A plain ldap:// bind is refused at every posture (vault BACKLOG #3533 item 1). The opt-in that once
     # released it at [security].enforcement = warn, ad_allow_insecure_ldap, is a REMOVED key
     # (_REMOVED_KEYS), so a config that still sets it is refused by name rather than ignored.
@@ -4011,6 +4018,11 @@ class AuthSettings(_Section):
     # leg carrying the client secret, the authorization code and the identity assertion. Same
     # fail-closed refusals as every other CRL (absent / unloadable / past nextUpdate refuses at start).
     oidc_tls_crl_file: str | None = None
+    # Opt-in (vault BACKLOG #5511): check oidc_tls_crl_file against every certificate in the IdP's
+    # chain on both legs, not only the leaf, so a revoked intermediate CA refuses the IdP. It needs
+    # oidc_tls_crl_file and oidc_tls_ca_cert_file, and refuses at load without either: on the OS
+    # trust store the start rule could not be met. Default False keeps the leaf check.
+    oidc_tls_crl_check_chain: bool = False
     oidc_redirect_path: str = "/ui/oidc/callback"  # full URI derived from [api].public_origin
     oidc_scopes: list[str] = Field(default_factory=lambda: ["openid", "profile"])
     oidc_signing_algorithms: list[str] = Field(default_factory=lambda: ["RS256"])
@@ -4038,8 +4050,9 @@ class AuthSettings(_Section):
     oidc_acr_values: str | None = None
     oidc_prompt: str | None = None  # requested `prompt` authorize param; blank loads as None
     # 0 serves no key as fresh, so each unknown or stale lookup asks for a fetch, still throttled by
-    # the refetch bound below; 0 there removes that bound. A negative is refused for both (BACKLOG
-    # #5318): the consumers read it as 0.
+    # the refetch bound below; 0 there removes that bound. The load refuses for both at least a
+    # negative (BACKLOG #5318) and a value too large for a float (_check_oidc_jwks_interval), and
+    # JwksCache refuses both at construction too.
     oidc_jwks_ttl_seconds: int = Field(default=3600, ge=0)
     oidc_jwks_min_refetch_seconds: int = Field(default=300, ge=0)  # the amplification bound
     oidc_flow_ttl_seconds: int = 300  # single-use flow window; validator-capped 30..1800
@@ -4377,6 +4390,35 @@ class AuthSettings(_Section):
     def _auth_crl_file_exists(cls, v: str | None, info: ValidationInfo) -> str | None:
         return _refuse_a_missing_crl_file(v, f"[auth].{info.field_name}")
 
+    @model_validator(mode="after")
+    def _check_chain_needs_crl_and_ca(self) -> AuthSettings:
+        # Vault BACKLOG #5511. With no CRL file the flag would read as a control that is on while
+        # nothing is checked. With no CA file the hop trusts the OS store, where the whole-chain
+        # start rule would need a CRL from every root it loads, so the builder would refuse it at
+        # start; refusing here says so at load, even with the hop off.
+        # Each value read as an attribute, so a renamed field fails type checking, not a load.
+        hops = (
+            (
+                "oidc",
+                self.oidc_tls_crl_check_chain,
+                self.oidc_tls_crl_file,
+                self.oidc_tls_ca_cert_file,
+            ),
+            ("ad", self.ad_tls_crl_check_chain, self.ad_tls_crl_file, self.ad_tls_ca_cert_file),
+        )
+        for prefix, chain, crl_file, ca_file in hops:
+            if not chain:
+                continue
+            for needed, value in (("crl_file", crl_file), ("ca_cert_file", ca_file)):
+                if not value:
+                    raise ValueError(
+                        f"[auth].{prefix}_tls_crl_check_chain = true requires "
+                        f"[auth].{prefix}_tls_{needed}: the whole-chain check reads the CRLs in "
+                        f"[auth].{prefix}_tls_crl_file against the CAs in "
+                        f"[auth].{prefix}_tls_ca_cert_file alone"
+                    )
+        return self
+
     @field_validator("kerberos_spn")
     @classmethod
     def _check_kerberos_spn(cls, value: str | None) -> str | None:
@@ -4401,6 +4443,20 @@ class AuthSettings(_Section):
             raise ValueError("oidc_clock_skew_seconds must be between 0 and 300")
         return value
 
+    @field_validator("oidc_jwks_ttl_seconds", "oidc_jwks_min_refetch_seconds")
+    @classmethod
+    def _check_oidc_jwks_interval(cls, value: int, info: ValidationInfo) -> int:
+        # JwksCache reads both as floats and refuses an int past the float range at construction
+        # (BACKLOG #6904), so the load refuses it too: `check` and `verify` then refuse what
+        # `serve` would. The value is withheld.
+        try:
+            float(value)
+        except OverflowError:
+            raise ValueError(
+                f"{info.field_name} is too large for a float (value withheld)"
+            ) from None
+        return value
+
     @field_validator("oidc_flow_ttl_seconds")
     @classmethod
     def _check_oidc_flow_ttl(cls, value: int) -> int:
@@ -4412,8 +4468,7 @@ class AuthSettings(_Section):
         # `oidc_flow_cache_max` slot -- see that field for why the cache rejects rather than evicts.
         #
         # The endpoints are a JUDGMENT with no measured anchor, and no neighbouring field supplies
-        # one: every other lifetime and size in this OIDC block is itself unbounded (verified by
-        # execution -- `oidc_jwks_ttl_seconds` accepts 10_000_000). What is NOT a judgment is that
+        # one. What is NOT a judgment is that
         # an unbounded value is wrong in both directions.
         if not 30 <= value <= 1800:
             raise ValueError("oidc_flow_ttl_seconds must be between 30 and 1800")
@@ -6029,6 +6084,9 @@ _ALERT_EVENT_TYPES = frozenset(
         "vault_privilege_warning",
         "leadership_acquired",  # #145 (ADR 0014 amendment): a node went non-leader→leader (HA failover / election)
         "dr_activated",  # #145 (ADR 0014 amendment, ADR 0048): a third-tier DR standby was promoted
+        # BACKLOG #5965 (ADR 0048): a DR box last recorded as activated came back up passive after a
+        # restart. AlertSink.dr_restarted_passive states its severity and what resolves it.
+        "dr_restarted_passive",
         # ASVS 6.4.5 (BACKLOG #1141): an admin-issued temporary password is UNCLAIMED and near the
         # instant the login gate stops accepting it (keyed on the holder's username; PHI-free)
         "initial_credential_expiring",
@@ -6954,8 +7012,8 @@ class ClusterSettings(_Section):
     leader election (Step 4 — exactly one node drains the graph; a standby takes over on failover),
     leader-gated poll-source intake (Step 4b), cross-node reference + config-reload + transform-state
     convergence (Steps 6/6b), and the read-only observability API (Step 7 — ``/cluster/status`` +
-    ``/cluster/nodes``). Exactly one node runs the leader-only WRITE singletons (retention, the
-    lease-reclaim sweep) and re-reads each reference source while followers read-through the shared
+    ``/cluster/nodes``). Exactly one node runs the leader-only WRITE work (retention's shared-store
+    phases, the lease-reclaim sweep) and re-reads each reference source while followers read-through the shared
     snapshot; an operator config reload propagates cluster-wide via a version token; and operators can
     see membership + leadership over the API. Operators must keep node clocks synced (NTP — the
     failover-recovery leases are wall-clock), run identical config dirs on every node, and apply config
@@ -7823,21 +7881,20 @@ class DrSettings(_Section):
     the fence; ``takeover_hook`` is optional belt-and-braces for non-LB topologies). **Activation is
     MANUAL** (``POST /dr/activate``, gated by the ``dr:operate`` permission); ``auto`` is rejected at load.
 
-    ``enabled``/``activate`` are read at engine start (the DR run-profile is a startup decision, ADR
-    0048); a deployment is either a DR box (``enabled = true``) or it is not. ``activate = true`` (or
-    the operator endpoint) declares this box should run under the DR profile this boot. Without
-    ``enabled``, ``activate = true`` is refused at load, where it was silently ignored (BACKLOG
-    #5965).
+    ``enabled`` is read at engine start; a deployment is either a DR box (``enabled = true``) or it
+    is not. No setting brings a DR box up under the DR run-profile: ``POST /dr/activate`` is the
+    only way, and that route verifies the cold seed, runs the takeover hook if one is set, and writes
+    the ``dr.activate`` audit row. The former ``activate`` startup latch skipped all three, so it was
+    removed and is refused at load as a removed key (owner ruling 2026-11-25, BACKLOG #5965). So
+    under ``serve`` a DR box always starts PASSIVE, and an activated box that restarts comes back
+    passive until it is activated again. An engine an embedder builds with no store settings has no
+    coordinator, so it does not park its graph at all (``Engine._dr_standby_threshold``).
     """
 
     # Opt-in master switch: is this deployment a DR standby box at all? false = the engine runs the
-    # NORMAL run-profile (every connection starts subject only to ADR 0031), byte-unchanged.
+    # NORMAL run-profile (every connection starts subject only to ADR 0031), byte-unchanged. true =
+    # a provisioned-but-passive box: it binds no priority feed until POST /dr/activate promotes it.
     enabled: bool = False
-    # Whether this DR box should come up UNDER the DR run-profile on this boot (the startup activation
-    # latch — distinct from the runtime POST /dr/activate endpoint, which re-evaluates the graph). When
-    # enabled but activate=false the box is provisioned-but-passive: it does NOT bind the priority feeds
-    # until an operator activates it. Refused at load unless enabled (BACKLOG #5965).
-    activate: bool = False
     activation_mode: DrActivationMode = DrActivationMode.MANUAL
     # The DR run-profile threshold: start ONLY connections whose resolved priority rank >= this tier's
     # rank. CRITICAL (the default, owner-locked) starts only the critical feeds; NORMAL would also start
@@ -7862,16 +7919,14 @@ class DrSettings(_Section):
     # The #60 .mfbak backup archive to cold-seed the DR store from on activation. "" = the operator
     # supplies the archive path in the POST /dr/activate request body instead (the runbook path),
     # which needs seed_dir below. A URL is rejected (the seed is local/UNC only, like the
-    # backup destination — no new egress). With seed_dir also empty, a passive box (enabled, with
-    # activate = false) is refused at load: no activation could ever name a seed (BACKLOG #5965 item
-    # 1). A box latched with activate = true loads with neither set; what that means after POST
-    # /dr/release is stated once, in the [dr] enabled row of docs/CONFIGURATION.md. Whitespace-only
-    # is refused too.
+    # backup destination — no new egress). With seed_dir also empty, an enabled box is refused at
+    # load: no activation could ever name a seed (BACKLOG #5965 item 1). Whitespace-only is refused
+    # too.
     seed_archive: str = ""
     # The one directory a POST /dr/activate request body may name an archive under (vault BACKLOG
     # #2581). "" (the default) = a request may name NO archive, and activation uses seed_archive,
     # which is operator configuration and is not confined. Must be absolute. A URL is
-    # rejected, like seed_archive. With seed_archive also empty, a passive box is refused at load;
+    # rejected, like seed_archive. With seed_archive also empty, an enabled box is refused at load;
     # see seed_archive above (BACKLOG #5965). Whitespace-only is refused too.
     seed_dir: str = ""
     # OPT-IN server-DB DR restore-token (BACKLOG #223, ADR 0102 — option b). A LOCAL/UNC path to a small
@@ -7981,25 +8036,11 @@ class DrSettings(_Section):
         return self
 
     @model_validator(mode="after")
-    def _activate_needs_enabled(self) -> DrSettings:
-        # BACKLOG #5965: without enabled the engine never read activate, so a box an operator
-        # meant to bring up under the DR run-profile came up as an ordinary engine with nothing
-        # said. With enabled it is the startup latch, unchanged.
-        if self.activate and not self.enabled:
-            raise ValueError(
-                "[dr].activate = true needs [dr].enabled = true: it brings a DR box up under the "
-                "DR run-profile, and has no meaning on a box that is not a DR box"
-            )
-        return self
-
-    @model_validator(mode="after")
     def _enabled_names_a_seed(self) -> DrSettings:
-        # BACKLOG #5965 item 1: on a passive box with neither set, every activation aborts for
-        # want of a seed, and that is found only during the disaster. seed_archive names one;
-        # seed_dir lets the POST /dr/activate request name one. A box under activate = true is
-        # exempt: it takes the startup latch, which reads no seed, and that path is unchanged
-        # here (its routing through a seeded activation is the open part of BACKLOG #5965).
-        if self.enabled and not self.activate and not self.seed_archive and not self.seed_dir:
+        # BACKLOG #5965 item 1: on a DR box with neither set, every activation aborts for want of
+        # a seed, and that is found only during the disaster. seed_archive names one; seed_dir
+        # lets the POST /dr/activate request name one.
+        if self.enabled and not self.seed_archive and not self.seed_dir:
             raise ValueError(
                 "[dr].enabled = true needs [dr].seed_archive or [dr].seed_dir: with neither, "
                 "POST /dr/activate could never name the cold seed it verifies, so every activation "
@@ -8688,16 +8729,13 @@ class ServiceSettings(_InputHidingModel):
         moment it activates. Refuse the combination at config load rather than let it silently co-elect.
         Spans two sections, so it lives here (not on either section, which can't see the other).
 
-        ``[dr].enabled`` is refused with ``[cluster].enabled`` as well, whatever ``activate`` says
-        (vault BACKLOG #3263); ``activate`` without ``enabled`` is refused on its own (BACKLOG
-        #5965). A provisioned DR box that is not activated is passive: it binds no listener and
-        delivers nothing (ADR 0048). As a cluster member it could win the lease and then serve
-        nothing, and ``POST /dr/activate`` would make it the lease-contending DR box described
-        above."""
+        ``[dr].enabled`` is refused with ``[cluster].enabled`` (vault BACKLOG #3263). A DR box
+        starts passive (BACKLOG #5965): it binds no listener and delivers nothing (ADR 0048). As a
+        cluster member it could win the lease and then serve nothing, and ``POST /dr/activate``
+        would make it the lease-contending DR box described above."""
         if self.dr.enabled and self.cluster.enabled:
-            key = "[dr].activate" if self.dr.activate else "[dr].enabled"
             raise ValueError(
-                f"{key} cannot be combined with [cluster].enabled: the DR run-profile gates which "
+                "[dr].enabled cannot be combined with [cluster].enabled: the DR run-profile gates which "
                 "connections start, not leadership acquisition, so a DR box that also contends for the "
                 "cluster lease could win leadership and drive the primary store cross-WAN, and one "
                 "that is not activated is passive, so as leader it would serve nothing. Run the DR "
@@ -9520,6 +9558,15 @@ _REMOVED_KEYS: dict[tuple[str, str], str] = {
         "ADR 0066 section 12). To run pooled on SQL Server, turn READ_COMMITTED_SNAPSHOT on for "
         "the database"
     ),
+    # BACKLOG #5965 (owner ruling 2026-11-25). Named here so a config still setting it, true or
+    # false, is refused with the route to use rather than loaded with the key dropped.
+    ("dr", "activate"): (
+        "a DR box always starts passive, and the only way to bring it up under the DR "
+        "run-profile is POST /dr/activate, to be run only once you have confirmed the primary is "
+        "not serving; it verifies the cold seed, runs the takeover hook "
+        "if one is set, and writes the dr.activate audit row; the startup latch skipped all three "
+        "(BACKLOG #5965)"
+    ),
 }
 
 
@@ -9953,10 +10000,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       test. ``oidc_jwks_ttl_seconds`` above its default keeps a withdrawn signing key verifying for
       longer. ``JwksCache`` also serves a cached key until it may fetch again, so an
       ``oidc_jwks_min_refetch_seconds`` above the DEFAULT TTL is named for the same reason; below
-      its own default it weakens the bound on fetches an unknown key id can force, and 0 or less
+      its own default it weakens the bound on fetches an unknown key id can force, and 0
       removes it. ``oidc_flow_ttl_seconds`` above its default keeps a staged flow redeemable for
       longer, and ``oidc_max_age_seconds`` above its default accepts an older identity-provider
-      sign-in. The load bounds all but the JWKS pair, each above its default.
+      sign-in.
     * ``oidc_session_max_hours`` is never named: the sign-in takes the minimum of it and the
       token's own expiry, so any value only ends a session sooner.
 
@@ -11572,9 +11619,11 @@ def security_loosenings(
                 "require_action_step_up",
                 "the routes that need a fresh proof bound to one action (docs/CONFIGURATION.md "
                 "lists them) accept the session-wide step-up window instead -- a session taken over "
-                "inside that window ([auth].step_up_max_age_seconds, which a sign-in can open) "
-                "can bind an authenticator, inject a message or export bodies in bulk with no "
-                "fresh proof",
+                "inside that window ([auth].step_up_max_age_seconds, which at least some sign-ins "
+                "open) can, with no fresh proof, at least bind an authenticator, disable MFA "
+                "where [security].require_mfa does not refuse it, end "
+                "the account's other sessions, reset another account's password or factor, "
+                "inject a message, export bodies in bulk, purge a queue or reload config",
             )
         )
     # Vault BACKLOG #2600: the three local-password screens ship ON, and no gate refuses one off.

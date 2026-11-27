@@ -36,11 +36,14 @@ KeyProvider's no-oracle contract and PHI.md never-log rules).
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import logging
 import os
 import re
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+from messagefoundry.logging_guard import _last_resort
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import SecretsSettings
@@ -125,22 +128,44 @@ _log = logging.getLogger(__name__)
 _MODULE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,199}")
 
 
-def log_import_failure(label: str, exc: BaseException) -> None:
+def log_import_failure(
+    label: str, exc: BaseException, *, logger: logging.Logger | None = None
+) -> None:
     """Log at WARNING that an import behind ``label`` failed, by the error's class (vault BACKLOG
     #6709). The refusal the caller raises drops the error, so this line is what is left to
     diagnose from. The error's text is not logged: neither the engine's PHI redaction nor its
     credential scrub removes a filesystem path, and an import error's text can carry one, or a
-    source line. An ``ImportError``'s module name is logged when it is a plain dotted name."""
+    source line. An ``ImportError``'s module name is logged when it is a plain dotted name.
+    ``logger`` is the caller's own module logger, so the line names the module that refused; this
+    module's logger when ``None``. A failure to log that raises an ``Exception`` is reported on
+    stderr, by its class where that can be read and not at all where there is no writable stderr,
+    and is not raised: a caller logs this inside its own handler, where a raised
+    error would replace its refusal and chain the import error, text and all. Any other
+    ``BaseException`` from the log step, such as a ``KeyboardInterrupt``, propagates."""
     module = getattr(exc, "name", None) if isinstance(exc, ImportError) else None
     named = (
         f", module {module!r}" if isinstance(module, str) and _MODULE_NAME.fullmatch(module) else ""
     )
-    _log.warning(
+    _warn_or_report(
+        logger or _log,
         "%s: an import failed (%s%s); its text is not logged, as it can carry a filesystem path",
         label,
         type(exc).__name__,
         named,
     )
+
+
+def _warn_or_report(logger: logging.Logger, message: str, *args: object) -> None:
+    """``logger.warning(message, *args)``. A failure to log that raises an ``Exception`` is
+    reported on stderr (``logging_guard._last_resort``), by its class (``ascii``-escaped) where
+    that can be read, and not raised; any other ``BaseException`` is raised."""
+    try:
+        logger.warning(message, *args)
+    except Exception as fault:  # noqa: BLE001 -- an Exception is reported below, not raised
+        text = "a provider WARNING could not be logged"
+        with contextlib.suppress(Exception):
+            text = f"{text} ({ascii(type(fault).__name__)})"
+        _last_resort(text)
 
 
 def _load_external_provider(
@@ -152,10 +177,12 @@ def _load_external_provider(
     ``build_provider(settings, *, posture) -> SecretProvider`` behind an optional extra; this
     dispatch imports it by name with **no edit here**. A missing provider module, a missing backend
     SDK, or a provider module that is present but whose import raises an ``Exception``, **fails
-    closed** with :class:`SecretProviderError`; the last two name the extra. The base install pulls
-    **zero** external SDK. A provider that imports its SDK lazily, as ``vault`` does, refuses a
-    failed SDK import itself, at its first read rather than here
-    (``secretprovider_vault._import_hvac``).
+    closed** with :class:`SecretProviderError`; the refusals for a missing SDK and for a broken
+    import name the extra. The base install pulls **zero** external SDK. A provider that imports
+    its SDK lazily, as ``vault`` does, refuses a failed SDK import itself, at its first read
+    rather than here (``secretprovider_vault._import_hvac``). An error ``build_provider`` raises
+    is not caught here and propagates unchanged, its text included (open: the build part of vault
+    BACKLOG #6709 is not built).
 
     ``posture`` is handed to every external provider, because each one dials a network hop that a
     posture-keyed guard may judge (vault BACKLOG #2983). A provider must read ``None`` as

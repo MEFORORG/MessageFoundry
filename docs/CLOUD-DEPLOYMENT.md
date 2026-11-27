@@ -348,7 +348,8 @@ in `forward_tls_ca_file` and a revocation check in `forward_tls_crl_file`) to a 
 on this host, and on the `[egress].allowed_syslog` list.
 The HA manifest names these inputs in its block *what an enforcing start needs*, but ships them
 commented out, so an unedited manifest is refused rather than started with a placeholder collector.
-Uncomment them with your own collector. The `log-spool` emptyDir holds the records the collector has
+Uncomment them with your own collector, then read the overlay note under *Residuals / gotchas* in
+[`docker/README.md`](../docker/README.md#residuals--gotchas). The `log-spool` emptyDir holds the records the collector has
 not yet taken, as plaintext on the node's disk. Their redaction is best-effort, so they may hold PHI,
 and the engine's at-rest encryption does not cover them ([`PHI.md`](PHI.md) §2, the spool row).
 
@@ -366,7 +367,8 @@ and the engine's at-rest encryption does not cover them ([`PHI.md`](PHI.md) §2,
    and push it to your private registry. Base it on the `runtime-postgres` variant
    ([`docker/README.md`](../docker/README.md), "Image variants"): the slim default carries no `asyncpg`,
    so the Postgres store cannot open on it. Bake the syslog CA and CRL and the store CRL the
-   manifest names under `/config/pki/` into the same image.
+   manifest names under `/config/pki/` into the same image, then read the overlay note under
+   *Residuals / gotchas* in [`docker/README.md`](../docker/README.md#residuals--gotchas).
 3. **Create the Secret** ([`docker/k8s/secret.example.yaml`](../docker/k8s/secret.example.yaml)) with
    `store-encryption-key`, `store-password`, `tls-revocation-attested`, and the API TLS cert/key (and
    optional `api-tls-key-password`). Both manifests, `ha-postgres.yaml` and `statefulset.yaml`, read

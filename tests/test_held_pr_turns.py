@@ -13,7 +13,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -44,6 +44,20 @@ LOGIN = "wshallwshall"  # every seat posts under this one login
 SESSION = "Lander (session 8a04c9f3), 2026-10-28. "
 #: The seat-id signature the Lander also writes.
 SEAT = "Lander (lander-1028), 2026-10-29. "
+
+
+@pytest.fixture(autouse=True)
+def _lift_hold_ttl(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Most rows here hold at noon and run at 18:00, which would expire every unacknowledged hold.
+    The contracts they pin are not the hold's age, so HOLD_TTL is lifted unless a test asks for the
+    script's own with ``real_hold_ttl``."""
+    if "real_hold_ttl" not in request.fixturenames:
+        monkeypatch.setattr(hpt, "HOLD_TTL", timedelta(days=3650))
+
+
+@pytest.fixture
+def real_hold_ttl() -> None:
+    """Request this to run with the script's own HOLD_TTL."""
 
 
 def _sha(n: int) -> str:
@@ -409,31 +423,32 @@ def test_only_a_lander_seat_id_signs_a_hold(
 def test_a_hold_ack_naming_the_head_keeps_the_turn_the_authors(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    full = _held(110, _ack("2026-10-28T17:00:00Z", _sha(110)))
+    full = _held(110, _ack("2026-10-28T17:45:00Z", _sha(110)))
     # A short, upper-cased SHA with a trailing space and CR, in the hold's own second.
     odd = f"<!-- hold-ack head={_sha(111)[:9].upper()} --> \r\nfixing"
-    at = "2026-10-28T17:00:00Z"
+    at = "2026-10-28T17:45:00Z"
     short = _pr(111, comments=[_hold(at, _sha(111)), _comment(odd, at)])
     rows = _engine_rows(tmp_path, capsys, full, short)
     assert _turn(rows[110]) == ("AUTHOR", ["held", "acked"])
     assert _turn(rows[111]) == ("AUTHOR", ["held", "acked"])
 
 
-def test_an_ack_more_than_two_hours_old_hands_the_turn_to_the_lander(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+def test_an_ack_more_than_thirty_minutes_old_hands_the_turn_to_the_lander(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], real_hold_ttl: None
 ) -> None:
-    """NOW is 18:00. An ack 2h+1s old has expired; one 1h59m old, or exactly 2h old, has not. The
-    newest ack decides, and an expired ack on a cut page carries both flags."""
+    """NOW is 18:00. An ack 30m+1s old has expired; one 29m59s old, or exactly 30m old, has not.
+    The newest ack decides, and an expired ack on a cut page carries both flags. The holds are at
+    noon, and an acked hold never reads ``hold-expired``."""
     rows = _engine_rows(
         tmp_path,
         capsys,
-        _held(115, _ack("2026-10-28T15:59:59Z", _sha(115))),
-        _held(116, _ack("2026-10-28T16:01:00Z", _sha(116))),
-        _held(117, _ack("2026-10-28T16:00:00Z", _sha(117))),
+        _held(115, _ack("2026-10-28T17:29:59Z", _sha(115))),
+        _held(116, _ack("2026-10-28T17:30:01Z", _sha(116))),
+        _held(117, _ack("2026-10-28T17:30:00Z", _sha(117))),
         _held(
             118,
             _ack("2026-10-28T12:30:00Z", _sha(118)),
-            _ack("2026-10-28T17:00:00Z", _sha(118)),
+            _ack("2026-10-28T17:45:00Z", _sha(118)),
         ),
         _cut(_held(119, _ack("2026-10-28T15:00:00Z", _sha(119)))),
         # Controls: rows that would not read AUTHOR acked do not change.
@@ -449,6 +464,47 @@ def test_an_ack_more_than_two_hours_old_hands_the_turn_to_the_lander(
         None,
     )
     assert _repair_row(rows[114]) == ("REPAIR", ["held", "acked", "repair"], OWNER_ID)
+
+
+def _held_at(n: int, at: str) -> dict[str, Any]:
+    """PR ``n`` with only a marker hold on its own head, at ``at``."""
+    return _pr(n, comments=[_hold(at, _sha(n))])
+
+
+def test_an_unacknowledged_hold_more_than_thirty_minutes_old_is_the_landers(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], real_hold_ttl: None
+) -> None:
+    """NOW is 18:00. A hold nobody answered that is 30m+1s old has expired; one 29m59s old, or
+    exactly 30m old, has not. Rows that would not read AUTHOR ``held`` without ``acked`` do not
+    change their turn."""
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        _held_at(300, "2026-10-28T17:29:59Z"),
+        _held_at(301, "2026-10-28T17:30:01Z"),
+        _held_at(302, "2026-10-28T17:30:00Z"),
+        _held(303),
+        # Controls, every hold at noon.
+        _held(304, _ack("2026-10-28T17:45:00Z", _sha(304))),
+        _held(305, _ack("2026-10-28T12:30:00Z", _sha(305))),
+        _held(306, _repair()),
+        _held(307, _comment("Manager: fixed.", "2026-10-28T13:00:00Z")),
+        _held(308, head=_sha(999)),
+        _cut(_held_at(309, "2026-10-28T17:45:00Z")),
+        _cut(_held(310)),
+    )
+    assert _repair_row(rows[300]) == ("LANDER", ["held", "hold-expired"], None)
+    assert _repair_row(rows[301]) == ("AUTHOR", ["held"], None)
+    assert _repair_row(rows[302]) == ("AUTHOR", ["held"], None)
+    assert _repair_row(rows[303]) == ("LANDER", ["held", "hold-expired"], None)
+    assert _repair_row(rows[304]) == ("AUTHOR", ["held", "acked"], None)
+    assert _repair_row(rows[305]) == ("LANDER", ["held", "acked", "ack-expired"], None)
+    assert _repair_row(rows[306]) == ("REPAIR", ["held", "repair"], OWNER_ID)
+    assert _repair_row(rows[307]) == ("LANDER", ["replied", "no-new-commit"], None)
+    assert _repair_row(rows[308]) == ("LANDER", ["new-commit"], None)
+    assert _repair_row(rows[309]) == ("LANDER", ["held", "page-cut"], None)
+    # A cut page on an expired hold is the Lander's either way, and carries both flags.
+    assert _repair_row(rows[310]) == ("LANDER", ["held", "hold-expired", "page-cut"], None)
 
 
 def test_anything_but_a_valid_ack_still_hands_the_turn_back(
@@ -866,7 +922,7 @@ def test_a_cut_page_never_reads_author(tmp_path: Path, capsys: pytest.CaptureFix
         # The transfer that told the author to stand down is off the page: only the re-hold shows.
         _cut(_pr(200, comments=[_hold(rehold, _sha(200))])),
         _cut(_held(201), "reviews"),
-        _cut(_held(202, _ack("2026-10-28T17:30:00Z", _sha(202)))),
+        _cut(_held(202, _ack("2026-10-28T17:45:00Z", _sha(202)))),
         # A pageInfo that cannot say is no proof the page is whole.
         _cut(_held(203), info="absent"),
         _cut(_held(204), info={"hasPreviousPage": None}),

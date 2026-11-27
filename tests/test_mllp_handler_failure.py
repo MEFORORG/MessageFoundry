@@ -400,7 +400,7 @@ async def test_no_reply_a_retry_runs_outside_the_first_faults_except_clause() ->
 
 @pytest.mark.usefixtures("no_retry_pauses")
 async def test_no_reply_a_retry_still_takes_an_in_flight_slot() -> None:
-    # Each attempt runs through _handle_bounded, so the listener's in-flight bound still applies
+    # Each attempt takes a slot through MLLPSource._slot, so the listener's in-flight bound applies
     # to a retry, and the slot is given back between attempts rather than held across the pause.
     source = _no_reply()
     slots = asyncio.Semaphore(1)

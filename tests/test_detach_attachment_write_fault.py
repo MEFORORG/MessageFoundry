@@ -27,6 +27,7 @@ Synthetic HL7 only, never real PHI.
 from __future__ import annotations
 
 import base64
+import logging
 import sqlite3
 from collections.abc import AsyncIterator, Callable, Iterable
 from functools import partial
@@ -45,10 +46,14 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, StreamingAttachmentsUnsupported
 from messagefoundry.store.base import ATTACHMENT_CONTENT_TYPE_MAX
 from messagefoundry.store.crypto import CipherError
+from messagefoundry.store.metadata import intake_of
 from messagefoundry.transports.file import FileSource
+from messagefoundry.transports.mllp import frame
 from messagefoundry.transports.receipt import RefusalKind
 from tests.test_database_transport import _src, _SrcConn, _SrcCursor, _SrcPool
 from tests.test_ingress_document_detach import _ack_code
+from tests.test_mllp_handler_failure import _drive as _drive_mllp
+from tests.test_mllp_handler_failure import _no_reply
 from tests.test_tcp_x12_handler_failure import _ThenEof
 from tests.test_x12_connection_events import _drive, _kinds, _Peer, _tcp
 
@@ -541,3 +546,40 @@ async def test_a_tcp_inbound_with_no_reply_holds_the_frame_through_the_fault(
     assert put.calls == 3, "the frame was not held and retried (BACKLOG #5022)"
     assert [r["status"] for r in await _rows(store)] == [MessageStatus.RECEIVED.value]
     assert kinds == ["established", "closed"]
+
+
+async def test_an_mllp_inbound_with_no_reply_holds_the_frame_through_the_fault(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # BACKLOG #1619 added item 6: on a streaming MLLP inbound with ack_mode=NONE, a passing store
+    # fault in put_attachment would lose the frame with no message row, since the sender never
+    # resends. The listener holds the frame and retries it (BACKLOG #5022), so the body is counted
+    # once the store recovers. The handler is the one production binds, intake context included.
+    faults = 2
+    # Fewer faults than the hold reports after, so a recovered hold is no handler_error event.
+    assert faults < base_mod.HANDLER_FAULT_REPORT_AFTER
+    runner, ic = _runner(store, ConnectorType.MLLP, ack_mode=AckMode.NONE)
+    put = _FaultingPut(store, fault=_locked, faults=faults)
+    monkeypatch.setattr(store, "put_attachment", put)
+    source = _no_reply()
+    source.content_type = ContentType.HL7V2  # as the runner injects it
+    peer = _Peer()
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.mllp"):
+        events = await _drive_mllp(
+            source, _ThenEof(frame(_doc_hl7())), peer, runner._make_handler(ic)
+        )
+
+    # The listener's hold retried, not something inside the runner: one WARNING per fault.
+    retries = [r for r in caplog.records if "retrying in" in r.getMessage()]
+    assert len(retries) == faults, "the frame was not held and retried (BACKLOG #5022)"
+    assert put.calls == faults + 1
+    rows = await _rows(store)
+    assert [r["status"] for r in rows] == [MessageStatus.RECEIVED.value]
+    # The retry carried the listener's intake context into the ingress row (vault BACKLOG #2607).
+    intake = intake_of(await store.message_metadata_json(rows[0]["id"]))
+    assert intake is not None and intake["transport"] == "mllp", intake
+    assert await _attachment_types(store) == ["Application"]
+    assert runner._stream_inflight_bytes == 0  # every attempt released its reservation
+    assert _kinds(events) == ["established", "closed"]
+    assert not peer.written, "a no-reply inbound sends nothing to the sender"

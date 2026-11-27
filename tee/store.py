@@ -250,8 +250,9 @@ def _summarize(rows: list[aiosqlite.Row]) -> dict[str, Any]:
 
 
 def _precreate_secure(path: str) -> None:
-    """Create the DB file with owner-only permissions *before* SQLite opens it, closing the brief
-    window where SQLite would otherwise create it world-readable (POSIX umask). No-op if it exists."""
+    """Create the DB file before SQLite opens it, with mode 0600, which restricts it on POSIX only,
+    closing the brief window where SQLite would otherwise create it world-readable (POSIX umask).
+    On Windows the file takes its folder's access list. No-op if it exists."""
     if os.path.exists(path):
         return
     try:
@@ -441,9 +442,7 @@ class RelayStore:
     @classmethod
     async def open(cls, path: str) -> RelayStore:
         if path != ":memory:":
-            _precreate_secure(
-                path
-            )  # create 0600 before SQLite opens it (closes the readable window)
+            _precreate_secure(path)
         db = await aiosqlite.connect(path)
         db.row_factory = aiosqlite.Row
         await db.execute("PRAGMA journal_mode=WAL")

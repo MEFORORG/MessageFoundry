@@ -48,7 +48,7 @@ from messagefoundry.auth.oidc.jwks import _MAX_JWKS_BYTES, IDP_TIMEOUT_SECONDS
 from messagefoundry.auth.trust_anchors import oidc_anchor_spec, verified_anchor_cadata
 from messagefoundry.config.tls_policy import (
     harden_cipher_suites,
-    harden_crl_check,
+    harden_own_crl_check,
     narrow_to_approved_suites,
 )
 from messagefoundry.transports.bounded_read import (
@@ -133,6 +133,7 @@ def build_idp_opener(
     pin: str | None = None,
     enforcing: bool = True,
     crl_file: str | None = None,
+    crl_check_chain: bool = False,
 ) -> urllib.request.OpenerDirector:
     """Build the verifying, no-redirect opener used for BOTH IdP legs (token endpoint + JWKS).
 
@@ -168,6 +169,11 @@ def build_idp_opener(
     ``tests/test_hop_refusal_revocation.py::test_a_crl_that_misses_one_legs_issuer_fails_that_leg_closed``.
     The cost is availability: the gap shows at the first login on that leg, not at start. So
     ``crl_file`` must hold a CRL from the CA of each leg.
+
+    ``crl_check_chain`` is ``[auth].oidc_tls_crl_check_chain`` (vault BACKLOG #5511): the CRL is
+    then checked against each leg's whole server chain, on CAs from ``ca_cert_file`` alone
+    (:func:`~messagefoundry.config.tls_policy.harden_own_crl_check`). Set with no ``crl_file``, or
+    with no ``ca_cert_file``, the build refuses.
     """
     # Both branches are plain stdlib contexts: no shared mutable verification state, so this opener is
     # safe to share across the asyncio.to_thread workers that drive the two IdP legs. See the module
@@ -188,8 +194,13 @@ def build_idp_opener(
     # BACKLOG #299: revocation checking, loaded after the trust store is final so harden_crl_check's
     # "the CRL really landed" assertion answers for the store this handshake uses. Both branches above
     # verify, so there is no CERT_NONE arm to guard against here.
-    if crl_file:
-        harden_crl_check(ctx, crl_file, setting="[auth].oidc_tls_crl_file")
+    harden_own_crl_check(
+        ctx,
+        crl_file,
+        setting="[auth].oidc_tls_crl_file",
+        chain=crl_check_chain,
+        has_own_ca=bool(ca_cert_file),
+    )
     # Assert forward secrecy on the FINAL context (ASVS 12.1.2): this hop carries the client secret,
     # the authorization code and the identity assertion, so a recorded session that a future key
     # compromise could decrypt is an authentication-material exposure, not just a confidentiality one.
@@ -207,7 +218,7 @@ def build_idp_opener_from_settings(
     refused start in ``AuthService`` and a check row in ``verify.federation``.
 
     ``anchor=False`` leaves the anchor and its pin out, for the federation check's revocation row
-    alone. The CRL file is the hop's own knob (BACKLOG #299) and is passed either way.
+    alone, and with them ``[auth].oidc_tls_crl_check_chain``, which needs the anchor. The CRL file is the hop's own knob (BACKLOG #299) and is passed either way.
 
     At least ten check legs in ``messagefoundry/checks.py`` load their settings through one shared
     ``_leg_settings`` helper (vault BACKLOG #3145). That loading is not done here: this function
@@ -217,6 +228,10 @@ def build_idp_opener_from_settings(
         pin=settings.oidc_tls_ca_cert_pin if anchor else None,
         enforcing=enforcing,
         crl_file=settings.oidc_tls_crl_file,
+        # Vault BACKLOG #5511: the chain check needs the anchor, so it is left out with it. The
+        # leaf flag is still set by the CRL file, which is all that row's guards read; the row
+        # words the chain check from the setting itself (verify.federation.idp_revocation_result).
+        crl_check_chain=settings.oidc_tls_crl_check_chain if anchor else False,
     )
 
 

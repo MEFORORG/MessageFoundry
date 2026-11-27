@@ -29,10 +29,10 @@
     IT NEVER FAILS A TURN. Every path exits 0, as the other hooks here do. A hook that can break a
     session is a worse fault than an undeclared seat, and this one runs in every worktree.
 
-    WHY THE MARKER CANNOT RIDE INTO A COMMIT. This repository's .gitignore carries `/.claude/*`
-    with ONE negation, `!/.claude/settings.json`, and the comment above that negation warns that a
-    second one would expose nested checkouts carrying `.venv` and the local database. So the marker
-    and the injected copy are ignored by the wildcard, and NOTHING here should be added to make
+    WHY THE MARKER CANNOT RIDE INTO A COMMIT. This repository's .gitignore carries `/.claude/*`,
+    and its negations re-include `settings.json` and `skills/e2e-smoke/SKILL.md` alone; its comments
+    warn that a wider one would expose nested checkouts carrying `.venv` and the local database.
+    So the marker and the injected copy are ignored by the wildcard, and NOTHING here should be added to make
     them so. Measured with `git check-ignore -v`, and pinned by `TheMarkerCannotRideIntoACommit`.
 
     THE IGNORE RULE IS INVERTED FROM KORUS, where this hook came from. There `.claude/` is
