@@ -26,6 +26,7 @@ Synthetic HL7 only, never real PHI.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import sqlite3
 from collections.abc import AsyncIterator, Callable, Iterable
@@ -46,6 +47,7 @@ from messagefoundry.store import MessageStatus, MessageStore, StreamingAttachmen
 from messagefoundry.store.base import ATTACHMENT_CONTENT_TYPE_MAX
 from messagefoundry.store.crypto import CipherError
 from messagefoundry.transports.file import FileSource
+from messagefoundry.transports.mllp import MLLPSource, frame
 from messagefoundry.transports.receipt import RefusalKind
 from tests.test_database_transport import _src, _SrcConn, _SrcCursor, _SrcPool
 from tests.test_ingress_document_detach import _ack_code
@@ -541,3 +543,41 @@ async def test_a_tcp_inbound_with_no_reply_holds_the_frame_through_the_fault(
     assert put.calls == 3, "the frame was not held and retried (BACKLOG #5022)"
     assert [r["status"] for r in await _rows(store)] == [MessageStatus.RECEIVED.value]
     assert kinds == ["established", "closed"]
+
+
+async def test_an_mllp_inbound_with_no_reply_holds_the_frame_through_the_fault(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #1619 added item 6: on a streaming MLLP inbound with ack_mode=NONE, a passing store
+    # fault in put_attachment would lose the frame with no message row, since the sender never
+    # resends. The listener holds the frame and retries it (BACKLOG #5022), so the body is counted
+    # once the store recovers, and nothing is acknowledged before the commit.
+    runner, ic = _runner(store, ConnectorType.MLLP, ack_mode=AckMode.NONE)
+    put = _FaultingPut(store, fault=_locked, faults=2)
+    monkeypatch.setattr(store, "put_attachment", put)
+    source = MLLPSource(
+        Source(
+            type=ConnectorType.MLLP,
+            settings={"host": "127.0.0.1", "port": 0},
+            ack_mode=AckMode.NONE,
+        )
+    )
+    source.content_type = ContentType.HL7V2
+    events: list[str] = []
+
+    async def sink(kind: str, peer_host: str | None, reason: str | None) -> None:
+        events.append(kind)
+
+    source.on_connection_event = sink
+    source._handler = partial(runner._handle_inbound, ic)
+    peer = _Peer()
+
+    await asyncio.wait_for(
+        source._on_client(_ThenEof(frame(_doc_hl7())), peer),  # type: ignore[arg-type]
+        timeout=5.0,
+    )
+
+    assert put.calls == 3, "the frame was not held and retried (BACKLOG #5022)"
+    assert [r["status"] for r in await _rows(store)] == [MessageStatus.RECEIVED.value]
+    assert events == ["established", "closed"]
+    assert not peer.written, "a no-reply inbound sends nothing"
