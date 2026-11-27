@@ -512,14 +512,14 @@ older orphaned ask. The paragraph above's repair takes no such test. An author c
 reply hands the turn back to the Lander, and nothing expires then. The author may also hand the PR
 over sooner. The explicit form is a comment whose first line is
 `<!-- author-session-closed session=<id> -->`, posted only by the original author session, `<id>`
-being its own CCD `local_` id; `scripts/coord/held_pr_turns.py` reads it and flags
-`author-closed`. It makes the PR transfer-eligible at once, without the 30-minute window or the
-not-live test, and the transfer's other conditions still hold, at least the next sentence's and
-the transfer steps in order (owner approval 2026-11-27, in the Manager's chat). The PR must not be
-queued or carry an armed auto-merge request. The Lander spawns one Manager for repairs in its own
-CCD instance, so `send_message` can wake it, and keeps it alive, respawning it if it dies. The
-transfer is, in order: the hold's URL sent to the Repair Manager with `send_message` as its brief;
-no transfer unless the send reports delivered, not queued or an error;
+being its own session id; `scripts/coord/held_pr_turns.py` flags `author-closed` only where it
+counts, which the script's header states. A flagged PR is transfer-eligible at once, without the
+30-minute window or the not-live test, and the transfer's other conditions still hold, at least
+the next sentence's and the transfer steps in order (owner approval 2026-11-27, in the Manager's
+chat). The PR must not be queued or carry an armed auto-merge request. The Lander spawns one
+Manager for repairs in its own CCD instance, so `send_message` can wake it, and keeps it alive,
+respawning it if it dies. The transfer is, in order: the hold's URL sent to the Repair Manager with
+`send_message` as its brief; no transfer unless the send reports delivered, not queued or an error;
 the repair-owner marker `<!-- repair-owner session=<id> -->` on the PR, `<id>` being the Repair
 Manager's CCD `local_` id copied whole; the hold's URL sent to it again; and mail to the original
 author's seat-record worktree where it has one, naming the PR URL and that id. A Repair Manager that

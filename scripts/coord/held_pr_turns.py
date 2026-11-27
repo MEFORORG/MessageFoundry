@@ -244,9 +244,13 @@ when ALL of these hold:
   as AUTHOR's turn reads it; a same-second marker is not provably after the hold);
 * the PR's ``headRefOid`` starts with the hold's SHA, which is how "no author commit after the
   marker" is read, and is stricter, since it also catches a push between the hold and the marker;
-* nothing but a qualifying repair-owner marker or another unedited closed marker is at or after
-  the newest such marker's second, by its latest edit: an ack of any SHA, a comment, a review or
-  an edit after it, the marker's own edit included, says the author is not gone;
+* nothing but an unedited qualifying repair-owner marker, an unedited closed marker or a
+  cancelled (minimized) transfer is at or after the newest such marker's second, by its latest
+  edit: an ack of any SHA, a comment, a review or an edit after it, the marker's own edit
+  included, says the author is not gone;
+* no qualifying repair-owner marker falls strictly between the hold and the newest such marker:
+  a closed marker after a transfer already standing is an ordinary reply, as it was before this
+  contract;
 * the PR is not in the merge queue and has no armed auto-merge request, and neither comment nor
   review page was cut (``_row`` drops the flag on such a PR, keeping ``in-queue``, ``auto-armed``
   or ``page-cut``, and the row otherwise reads as it would with the marker counted).
@@ -289,14 +293,16 @@ not start with the marker's SHA); ``replied`` (a non-Lander event at or after th
 than an ack naming the head); ``edited`` (a comment or review, of any author, the hold included,
 edited at or after the hold); ``acked`` (beside ``held``: an author's ack naming the head stands
 after the hold; alone, it kept the turn the author's; beside ``repair``, it came before the
-transfer; beside ``repair-rehold``, it did not keep the turn, which is still the Lander's);
+transfer; beside ``repair-rehold`` or ``author-closed``, it did not keep the turn, which is still
+the Lander's);
 ``no-new-commit`` (replied or edited, but the head still matches the marker: the Lander must read
 the reply or edit, but can bounce it fast); ``ack-expired`` (beside ``acked``: the row would read
 AUTHOR, but the newest ack is over 30 minutes old, so it is the Lander's; AN ACK EXPIRES);
 ``hold-expired`` (beside ``held``, with no ``acked``: the row would read AUTHOR, but the hold is
 over 30 minutes old and unacknowledged, so it is the Lander's; AN UNACKNOWLEDGED HOLD EXPIRES);
-``page-cut`` (beside ``held``: the row would read AUTHOR or REPAIR, but a comment or review page
-was cut, so it is the Lander's; THE REPAIR CONTRACT);
+``page-cut`` (a comment or review page was cut, and the row would read AUTHOR or REPAIR, beside
+``held``, so it is the Lander's, or would carry ``author-closed``, which it replaces, beside any
+other LANDER flags; THE REPAIR CONTRACT);
 ``author-closed`` (a counting author-session-closed marker stands after the hold: the Lander's
 turn, transfer-eligible now; THE AUTHOR-CLOSED CONTRACT);
 ``in-queue`` / ``auto-armed`` (the PR is already in the merge queue or has auto-merge armed).
@@ -464,7 +470,7 @@ def _signed_marker(pattern: re.Pattern[str], body: str) -> re.Match[str] | None:
     lines = body.split("\n", 2)
     if len(lines) < 2 or not _LANDER_SIGNATURE.match(lines[1]):
         return None
-    return _first_line_marker(pattern, body)
+    return _first_line_marker(pattern, lines[0])
 
 
 def hold_head(body: str) -> str | None:
@@ -722,22 +728,24 @@ def classify(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str], st
     after = [e for e in turn_events if e.latest >= when and not e.lander and not e.cancelled]
     # An ack naming the head says "still my move", not a reply; any other event after it is one.
     acks = [e for e in after if (a := e.acked_at) is not None and head.startswith(a)]
-    # An author's closing hand-over strictly after the hold, on the hold's head, with nothing but a
-    # transfer from its second on, is neither a reply nor a Lander event (THE AUTHOR-CLOSED
-    # CONTRACT).
+    # An author's closing hand-over strictly after the hold, on the hold's head, with nothing but an
+    # unedited transfer from its second on, is neither a reply nor a Lander event (THE
+    # AUTHOR-CLOSED CONTRACT).
     closed = [] if new_commit else [e for e in after if e.when > when and e.closed_by is not None]
     if closed:
         newest_closed = max(e.when for e in closed)
-        # Any other event or edit from the marker's second on shows the author is not gone.
+        # Any other event or edit from the marker's second on shows the author is not gone. A
+        # cancelled transfer is set aside entirely, as it is in ``after``.
         if any(
             e.latest >= newest_closed
-            and e.repair_by is None
-            and (e.closed_by is None or e.edited is not None)
+            and not e.cancelled
+            and ((e.repair_by is None and e.closed_by is None) or e.edited is not None)
             for e in turn_events
-        ):
+        ) or any(e.repair_by is not None and when < e.when < newest_closed for e in after):
+            # A marker after a transfer already standing is an ordinary reply, as before.
             closed = []
-    closed_ids = {id(e) for e in closed}
-    after = [e for e in after if id(e) not in closed_ids]
+        else:
+            after = [e for e in after if not (e.when > when and e.closed_by is not None)]
     replied = len(acks) < len(after)
     # Every seat posts under one login, so who edited cannot be told: any edit from the hold's
     # second on, of the hold itself or of an older Lander comment too, hands the turn back.

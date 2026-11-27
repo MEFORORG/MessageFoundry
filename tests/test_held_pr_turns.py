@@ -1809,6 +1809,33 @@ def test_anything_after_the_author_closed_marker_voids_it(
     assert _turn(rows[454]) == ("LANDER", ["replied", "edited", "no-new-commit"])
 
 
+def test_the_author_closed_void_check_edges(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A cancelled transfer after the marker is set aside and does not void it; an edited repair
+    marker does; a second closed marker does not; a closed marker after a standing transfer is an
+    ordinary reply, as it was before the contract."""
+    edited_repair = _repair("2026-10-28T11:00:00Z")
+    edited_repair["lastEditedAt"] = "2026-10-28T14:00:00Z"
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        _held(460, _closed(), _minimized(_repair("2026-10-28T14:00:00Z"))),
+        _pr(
+            461,
+            comments=[edited_repair, _hold("2026-10-28T12:00:00Z", _sha(461)), _closed()],
+        ),
+        _held(462, _closed(), _closed("2026-10-28T14:00:00Z")),
+        _held(463, _repair("2026-10-28T13:00:00Z"), _closed("2026-10-28T14:00:00Z")),
+        _cut(_held(464, _comment("Manager: answered.", "2026-10-28T12:30:00Z"), _closed())),
+    )
+    assert _turn(rows[460]) == ("LANDER", ["held", "author-closed"])
+    assert _turn(rows[461]) == ("LANDER", ["replied", "edited", "no-new-commit"])
+    assert _turn(rows[462]) == ("LANDER", ["held", "author-closed"])
+    assert _turn(rows[463]) == ("LANDER", ["replied", "no-new-commit"])
+    assert _turn(rows[464]) == ("LANDER", ["replied", "no-new-commit", "page-cut"])
+
+
 def test_an_author_closed_marker_beside_other_lander_flags(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
