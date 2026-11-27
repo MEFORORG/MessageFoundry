@@ -20,6 +20,10 @@ the current primary mid-load**, and measures what a failover actually costs:
   the MLLP connector opens a fresh connection per delivery, so the lane is the destination, not the
   socket) stay monotonic. The single hub at ``pool_size = 1`` makes harness send order == engine
   insertion order, so a new seq arriving below a lane's high-water is a genuine ordering break.
+  Fewer than two lanes fails it, and the ``lanes_observed`` check names that cause;
+* **accepted load**, ``messages_acked``: a run the engine ACKed nothing from proves none of the above.
+
+A NaN or infinite ``[load.failover]`` knob or ``drain_timeout_s`` is refused before anything starts.
 
 This run is also the **first live proof** of the on-promotion in-flight recovery path
 (``reset_stale_inflight`` for SQL Server, the lease-reclaim sweep for Postgres) under a real crash — see
@@ -39,12 +43,13 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import sys
 import tempfile
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import IO, Any
 
@@ -63,6 +68,7 @@ from harness.load.sender import ConnectionPool, Dispatcher
 from harness.load.sink import CorrelationSink
 from harness.load.tlsmat import harness_ssl_context, harness_tls_material
 from messagefoundry.proctree import ADOPT_CREATIONFLAGS, resume_into_job, terminate_job
+from messagefoundry.terminal_text import escape_for_terminal
 
 log = logging.getLogger(__name__)
 
@@ -557,9 +563,12 @@ class FailoverReport:
 
     def render_console(self) -> str:
         lines: list[str] = []
-        lines.append(
-            f"Failover-load report -- profile {self.profile!r} (backend {self.db_backend or '?'})"
-        )
+        # The profile name and the backend are the operator's own text, so both are escaped before
+        # they reach the terminal: to ASCII, so a cp1252 console can print the line too. The name
+        # keeps repr's quoting, so a quote inside it cannot end the quoted name early.
+        name = escape_for_terminal(repr(self.profile), single_line=True)
+        backend = escape_for_terminal(self.db_backend or "?", single_line=True)
+        lines.append(f"Failover-load report -- profile {name} (backend {backend})")
         lines.append("")
         prom = "n/a" if self.promotion_seconds is None else f"{self.promotion_seconds:.2f}s"
         rec = "TIMEOUT" if self.recovery_seconds is None else f"{self.recovery_seconds:.2f}s"
@@ -624,6 +633,7 @@ async def run_failover_load(
     fo = profile.failover
     if fo is None:
         raise FailoverError("the profile has no [load.failover] table — not a failover profile")
+    _refuse_non_finite(fo, profile.drain_timeout_s)
     if len(profile.targets) != 1:
         raise FailoverError(
             "a failover profile must declare exactly one [[load.target]] (single-stream FIFO ordering)"
@@ -718,7 +728,7 @@ async def run_failover_load(
             notes.append(f"SIGKILLed primary {primary.node_id} at kill time")
             # Measure promotion + functional recovery in the BACKGROUND so a slow-but-successful recovery
             # (e.g. delivery that only resumes during the post-load drain) is MEASURED, not a false timeout.
-            monitor_deadline = 4.0 * fo.leader_lease_ttl_seconds + profile.drain_timeout_s + 30.0
+            monitor_deadline = _monitor_deadline(fo, profile.drain_timeout_s)
             monitor = asyncio.create_task(
                 _monitor_failover(primary, survivor, client, kill_ns, monitor_deadline, notes)
             )
@@ -879,6 +889,16 @@ def _build_report(
     acked_not_delivered = tracker.acked_not_delivered()
     intake_gap = max(0, c.sent - c.acked)
     no_loss_ok = acked_not_delivered == 0 and final.in_pipeline == 0 and final.dead == 0
+    # Only where the engine accepted load: with no ACK the cause is intake, which the
+    # messages_acked check and its warning name.
+    if tracker.lanes_observed < 2 and c.acked > 0:
+        notes.append(
+            f"per-lane ordering observed {tracker.lanes_observed} lane(s); the failover graph fans "
+            "out to MEFOR_LOAD_FANOUT destinations, so fewer than two means a fan-out set below "
+            "two, deliveries that reached too few destinations, or a lane key that collapsed onto "
+            "one label, and the check fails rather than certify order across the destinations "
+            "from it"
+        )
     recovery_bound = fo.recovery_ttl_multiple * fo.leader_lease_ttl_seconds
 
     slos = [
@@ -904,8 +924,23 @@ def _build_report(
             outcome.leader_samples > 0 and outcome.max_concurrent_leaders <= 1,
         ),
         SloCheck("no_acknowledged_loss", 0, acked_not_delivered, no_loss_ok),
-        SloCheck("per_lane_ordering", 0, tracker.lane_inversions, tracker.lane_inversions == 0),
+        # Non-vacuous like single_leader (S26-62). One lane is still checked for FIFO, but the graph
+        # fans out to several destinations, so fewer than two lanes means a lane key that collapsed
+        # (MSH-6 not stamped, every destination on one label) or too few destinations reached. Zero
+        # inversions then does not show per-destination order, so the check FAILS. The lane count is
+        # also its own named check below, which names the cause: this line alone would read FAIL
+        # with observed equal to its bar.
+        SloCheck(
+            "per_lane_ordering",
+            0,
+            tracker.lane_inversions,
+            tracker.lanes_observed >= 2 and tracker.lane_inversions == 0,
+        ),
+        SloCheck("lanes_observed", 2, tracker.lanes_observed, tracker.lanes_observed >= 2),
         SloCheck("max_dup_rate", fo.max_dup_rate, round(dup_rate, 5), dup_rate <= fo.max_dup_rate),
+        # A run the engine accepted nothing from proves none of the above, so it is a violation of
+        # its own, which the console then counts (S26-62).
+        SloCheck("messages_acked", 1, c.acked, c.acked > 0),
     ]
     if fo.max_promotion_seconds is not None:
         slos.append(
@@ -919,7 +954,7 @@ def _build_report(
         )
     if c.acked == 0:
         notes.append("WARNING: zero messages were ACKed — the run sent no load the engine accepted")
-    result_ok = all(s.ok for s in slos) and c.acked > 0
+    result_ok = all(s.ok for s in slos)
     return FailoverReport(
         profile=profile.name,
         db_backend=db_backend,
@@ -1082,6 +1117,57 @@ async def _opening_stats(nodes: list[EngineNode], client: httpx.AsyncClient) -> 
         f"could not read the opening /stats baseline in {_OPENING_STATS_ATTEMPTS} attempts; "
         "no load was offered"
     )
+
+
+#: The monitor's deadline is this many lease TTLs, plus the drain timeout, plus a margin.
+_MONITOR_LEASE_MULTIPLE = 4.0
+_MONITOR_MARGIN_S = 30.0
+
+
+def _monitor_deadline(fo: Failover, drain_timeout_s: float) -> float:
+    """How long the failover monitor watches for promotion and recovery after the kill."""
+    return (
+        _MONITOR_LEASE_MULTIPLE * fo.leader_lease_ttl_seconds + drain_timeout_s + _MONITOR_MARGIN_S
+    )
+
+
+def _refuse_non_finite(fo: Failover, drain_timeout_s: float) -> None:
+    """Refuse a ``[load.failover]`` knob that is NaN or infinite, before anything starts (S26-62).
+
+    The profile's range checks pass NaN, which fails every comparison, and pass infinity wherever a
+    knob has no maximum. At least ``recovery_ttl_multiple`` and ``max_dup_rate`` reach here as NaN,
+    and ``max_promotion_seconds`` and ``leader_lease_ttl_seconds`` as infinity. Each lands in the
+    JSON report, and ``NaN`` and ``Infinity`` are not JSON. The recovery bound is checked too: two
+    finite knobs can multiply past the float range, so a lease near ``1e308`` would still print
+    ``Infinity``.
+
+    ``drain_timeout_s`` is a ``[load]`` knob, but this run's drain wait and monitor deadline are
+    computed from it, so it is checked here too: infinity would never end the drain wait of a run
+    whose survivor never drains, and NaN would skip that wait outright.
+
+    This refuses non-finite values only. A finite but huge lease or drain timeout still makes a
+    run that never ends, and a phase's ``duration_s`` or rate is not checked here at all: the
+    profile loader passes NaN and infinity there too, and bounding them is its job, not this
+    module's. The refusal names the knob, never its value."""
+    for f in fields(fo):
+        value = getattr(fo, f.name)
+        if isinstance(value, float) and not math.isfinite(value):
+            raise FailoverError(f"[load.failover] {f.name} must be a finite number")
+    # Every lease multiple the run computes: the recovery bound's, which the profile allows up to
+    # 100, and the monitor deadline's.
+    for derived in (fo.recovery_ttl_multiple, _MONITOR_LEASE_MULTIPLE):
+        if not math.isfinite(derived * fo.leader_lease_ttl_seconds):
+            raise FailoverError(
+                "[load.failover] leader_lease_ttl_seconds is too large: a bound computed from it "
+                "is not a finite number"
+            )
+    if not math.isfinite(drain_timeout_s):
+        raise FailoverError("[load] drain_timeout_s must be a finite number")
+    if not math.isfinite(_monitor_deadline(fo, drain_timeout_s)):
+        raise FailoverError(
+            "[load] drain_timeout_s is too large: the monitor deadline computed from it and "
+            "[load.failover] leader_lease_ttl_seconds is not a finite number"
+        )
 
 
 async def _await_drain(node: EngineNode, client: httpx.AsyncClient, *, timeout: float) -> None:
