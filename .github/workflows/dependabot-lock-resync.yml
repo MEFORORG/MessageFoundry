@@ -36,11 +36,14 @@ name: Dependabot lock resync
 #    is handed one. (Whether the service ever delivers an unreferenced secret to a job's runner is
 #    not measured here.) It hands its output to `push` as an artifact. `push` mints the App token
 #    and pushes, and runs no code from the Dependabot-changed tree: it checks the tree out as data,
-#    copies the artifact's files over a fixed list of paths, and runs only an allowlist of commands
-#    (tests/test_dep1_lock_resync_lockstep.py). Each job is its own GitHub-hosted runner, so nothing
-#    `export` writes to $GITHUB_ENV, $GITHUB_PATH, BASH_ENV, .git/config or its filesystem reaches
-#    `push`. What does cross is untrusted, and at least this: the artifact (its entry names and file
-#    contents, which the copy step checks), the `closure` job output (read only in an `if:`), and
+#    stages the artifact's files by content into git's index at a fixed list of paths, writing
+#    nothing through the checkout's filesystem, and commits and pushes. Every step of `push` and of
+#    `preflight` is pinned by content hash in tests/test_dep1_lock_resync_lockstep.py, so any edit to
+#    one turns that test red until a reviewer re-pins it; the same file also screens their run
+#    blocks against a command allowlist, a best-effort check whose known gaps it lists. Each job is
+#    its own GitHub-hosted runner, so nothing `export` writes to $GITHUB_ENV, $GITHUB_PATH,
+#    BASH_ENV, .git/config or its filesystem reaches `push`. What does cross is untrusted, and at least this: the artifact (its entry names and file
+#    contents, which the staging step checks), the `closure` job output (read only in an `if:`), and
 #    whether `export` succeeded (which gates `push`). The read-only GITHUB_TOKEN is in the export and
 #    push jobs; preflight's carries no permission.
 #  - NO project install/tests/build runs here, and "uv lock --check" (validate-only, never builds an
@@ -199,7 +202,7 @@ jobs:
       # any lock, which needs a human, or a PR head from before the script existed. Either way the
       # re-exported locks must still be pushed, so a failure here does not fail this job. The push
       # job's last step reads this step's outcome through the `closure` output and marks THE RUN red,
-      # unless the run its own push fires cancels this one first (the concurrency group below).
+      # unless the run its own push fires cancels this one first (the concurrency group above).
       # That red sits on the pre-push commit; on the new head, the signal is the closure test failing
       # in the required test legs.
       - name: Regenerate the runtime-closure inventories from the core, sqlserver, postgres and harness locks
@@ -209,8 +212,8 @@ jobs:
           set -euo pipefail
           python3 scripts/security/runtime_closure.py
 
-      # The same paths the push job copies, checks with `git diff --quiet` and stages. A file missing
-      # here makes the push job's copy step fail rather than push an incomplete set.
+      # The same paths the push job stages and checks with `git diff --cached --quiet`. A file missing
+      # here makes the push job's staging step fail rather than push an incomplete set.
       - name: Hand the re-exported files to the push job
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -236,11 +239,15 @@ jobs:
 
   push:
     # THE ONLY JOB THAT HOLDS THE APP KEY OR TOKEN (BACKLOG #5477), and it runs no code from the
-    # Dependabot-changed tree: no uv, no interpreter, no repository script. Its steps are at least
-    # three actions and run blocks held to a command allowlist (git, cp, find, realpath and shell
-    # builtins; tests/test_dep1_lock_resync_lockstep.py), over a checkout read as data and the files
-    # the export job handed over. A fresh runner, so nothing the export job planted in its own
-    # environment or git config is here.
+    # Dependabot-changed tree: no uv, no interpreter, no repository script. Its steps are three
+    # actions (checkout, download-artifact, create-github-app-token) and four run blocks, over a
+    # checkout read as data and the files the export job handed over. What holds that is
+    # tests/test_dep1_lock_resync_lockstep.py: it pins every step of this job, each by a hash of its
+    # whole content (run, env, if, with and every other key), so an edit is red until re-pinned
+    # after review. It also screens the run blocks against a command allowlist (git with a fixed set
+    # of subcommands, find without -exec/-ok/-delete, realpath, base64 and shell builtins), which is
+    # best-effort: the test names the shell forms it does not parse. A fresh runner, so nothing the
+    # export job planted in its own environment or git config is here.
     name: Push the re-exported lock files to the PR branch
     needs: [preflight, export]
     if: >-
@@ -268,13 +275,20 @@ jobs:
           path: ${{ runner.temp }}/lock-resync-exports
 
       # The artifact was written by a job that ran code from the Dependabot-changed tree, so it is
-      # untrusted data. Only the fixed list below is copied, only as regular files, and only onto
-      # destinations inside this checkout: a destination the tree made a symlink (or put under a
-      # symlinked directory) could otherwise point outside it, at a file git or the shell reads later.
-      # Any other file in the artifact fails the step, and so does a failed listing of it.
-      - name: Copy the re-exported files into the checkout
+      # untrusted data. Only the fixed list below is staged, and only from regular files. Each file
+      # goes into git's object store and index by content (hash-object, then update-index), so
+      # nothing is written through a path in the checkout: a lock path the tree made a symlink, a
+      # directory (even one holding a same-named symlink), or a path under a symlinked directory
+      # cannot redirect a write outside it. Such a path is refused all the same, and git itself
+      # refuses an index entry that collides with a tracked directory or symlink. Any other file in
+      # the artifact fails the step, and so does a failed listing of it.
+      - name: Stage the re-exported files by content
         run: |
           set -euo pipefail
+          # The same hooks and fsmonitor lockout the commit step sets, for the git commands here.
+          export GIT_CONFIG_COUNT=2
+          export GIT_CONFIG_KEY_0='core.hooksPath' GIT_CONFIG_VALUE_0='/dev/null'
+          export GIT_CONFIG_KEY_1='core.fsmonitor' GIT_CONFIG_VALUE_1='false'
           src="${RUNNER_TEMP}/lock-resync-exports"
           files='requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock docker/locks/requirements-postgres.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt security/runtime-closure-postgres.txt security/runtime-closure-harness.txt'
           entries="${RUNNER_TEMP}/lock-resync-entries"
@@ -297,15 +311,17 @@ jobs:
               echo "::error title=lock-resync artifact::${rel} is missing from the artifact or is not a regular file"
               exit 1
             fi
-            if [ -L "${rel}" ] || [ "$(realpath -m -- "${rel}")" != "${root}/${rel}" ]; then
-              echo "::error title=lock-resync checkout::${rel} resolves outside the checkout"
+            if [ -L "${rel}" ] || { [ -e "${rel}" ] && [ ! -f "${rel}" ]; } || [ "$(realpath -m -- "${rel}")" != "${root}/${rel}" ]; then
+              echo "::error title=lock-resync checkout::${rel} is not a regular file inside the checkout"
               exit 1
             fi
-            cp -- "${src}/${rel}" "${rel}"
+            # --no-filters: no .gitattributes filter or eol rule from the tree touches the bytes.
+            oid="$(git hash-object -w --no-filters -- "${src}/${rel}")"
+            git update-index --add --cacheinfo "100644,${oid},${rel}"
           done
 
       # MINTED LAST, directly before the one step that uses it, so the token does not exist while the
-      # untrusted artifact is fetched and copied, and a refused artifact mints nothing. No step of this
+      # untrusted artifact is fetched and staged, and a refused artifact mints nothing. No step of this
       # job runs code from the Dependabot-changed tree. create-github-app-token's post step revokes
       # the token at job end. The token is handed to the push step alone and written to no .git/config.
       - name: Mint a scoped GitHub App token
@@ -334,11 +350,12 @@ jobs:
           export GIT_CONFIG_KEY_1='core.fsmonitor' GIT_CONFIG_VALUE_1='false'
           git config user.name 'dependabot[bot]'
           git config user.email '49699333+dependabot[bot]@users.noreply.github.com'
-          if git diff --quiet -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock docker/locks/requirements-postgres.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt security/runtime-closure-postgres.txt security/runtime-closure-harness.txt; then
+          if git diff --cached --quiet -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock docker/locks/requirements-postgres.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt security/runtime-closure-postgres.txt security/runtime-closure-harness.txt; then
             echo 'Exported lock files and the closure files already in sync; nothing to push.'
             exit 0
           fi
-          git add requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock docker/locks/requirements-postgres.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt security/runtime-closure-postgres.txt security/runtime-closure-harness.txt
+          # No `git add`: the staging step already put each file in the index by content, and
+          # the working tree still holds the PR head's bytes, so adding from it would undo that.
           git commit -m 'chore(deps): resync exported lock files (DEP-1)'
           # Push with the App token (NOT GITHUB_TOKEN). An App-token push emits a synchronize event so
           # the required checks (DEP-1, ci.yml) re-run on the new commit; a GITHUB_TOKEN push would

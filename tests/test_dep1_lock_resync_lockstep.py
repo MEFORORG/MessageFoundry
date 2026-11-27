@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import ast
 import functools
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -53,12 +55,11 @@ _REGENERATOR = "python3 scripts/security/runtime_closure.py"
 _EXPORT_RE = re.compile(r"^\s*uv export\s+(?P<flags>.*?)\s+-o\s+(?P<path>\S+)\s*$", re.MULTILINE)
 # The gate's own verification list.
 _DIFF_EXIT_RE = re.compile(r"^\s*git diff --exit-code --\s+(?P<paths>.+?)\s*$", re.MULTILINE)
-# The resync's "nothing changed, skip the push" short-circuit (inside `if ...; then`).
+# The resync's "nothing changed, skip the push" short-circuit (inside `if ...; then`). It compares the
+# index, which the staging step writes by content, with HEAD.
 _DIFF_QUIET_RE = re.compile(
-    r"^\s*if git diff --quiet --\s+(?P<paths>.+?);\s*then\s*$", re.MULTILINE
+    r"^\s*if git diff --cached --quiet --\s+(?P<paths>.+?);\s*then\s*$", re.MULTILINE
 )
-# The resync's staging list.
-_GIT_ADD_RE = re.compile(r"^\s*git add\s+(?P<paths>.+?)\s*$", re.MULTILINE)
 
 
 @functools.cache
@@ -135,12 +136,20 @@ def test_every_exported_lock_is_verified_and_staged() -> None:
     staged = exported | _CLOSURES
     assert set(_paths(_DIFF_EXIT_RE, _GATE)) == exported, "DEP-1 exports a lock it never diffs"
     assert set(_paths(_DIFF_QUIET_RE, _RESYNC)) == staged, (
-        "the resync's `git diff --quiet` short-circuit omits an exported lock or a closure file "
-        "-- it would report 'already in sync' and skip the push while that file is stale"
+        "the resync's `git diff --cached --quiet` short-circuit omits an exported lock or a closure "
+        "file -- it would report 'already in sync' and skip the push while that file is stale"
     )
-    assert set(_paths(_GIT_ADD_RE, _RESYNC)) == staged, (
-        "the resync writes a file it never `git add`s -- the push would carry an incomplete set"
-    )
+    # The staging step's list is checked against the same set in
+    # test_the_lock_files_cross_jobs_as_one_artifact_of_the_staged_set. A `git add` after it would
+    # stage the PR head's working-tree bytes back over the staged content.
+    from tests.test_ci_venv_pinning import _executed_shell
+
+    adders = [
+        (job, step.get("name"))
+        for job, step in _all_steps()
+        if re.search(r"\bgit\s+add\b", _executed_shell(str(step.get("run") or "")))
+    ]
+    assert not adders, f"the resync runs `git add`: {adders}"
 
 
 def test_the_resync_regenerates_the_closure_file() -> None:
@@ -466,7 +475,7 @@ def test_the_app_key_is_used_only_by_the_mint_step_of_the_push_job() -> None:
 
     The push job runs no code from the Dependabot-changed tree (pinned below). Minting directly
     before the commit means the token does not exist while the untrusted artifact is fetched and
-    copied, and a refused artifact mints nothing. The key is a secret of the push job only; the
+    staged, and a refused artifact mints nothing. The key is a secret of the push job only; the
     export job, which runs uv and the repository script, references no secret at all (pinned below).
     """
     steps = _job_steps("push")
@@ -474,7 +483,9 @@ def test_the_app_key_is_used_only_by_the_mint_step_of_the_push_job() -> None:
     assert position["app-token"] + 1 == position["Commit and push the resynced locks"], (
         "the App token must be minted directly before the commit step"
     )
-    assert position["app-token"] > position[_COPY_STEP], "the token is minted before the copy"
+    assert position["app-token"] > position[_COPY_STEP], (
+        "the token is minted before the staging step"
+    )
     key_readers = _steps_naming(_KEY_NEEDLES)
     assert key_readers == [("push", "app-token")], (
         f"steps handed the App private key: {key_readers}"
@@ -484,9 +495,17 @@ def test_the_app_key_is_used_only_by_the_mint_step_of_the_push_job() -> None:
 #: The actions a job that holds the App key or token may use. None of them runs code from the checkout.
 _CREDENTIAL_JOB_ACTIONS = ("actions/checkout@", _DOWNLOAD, _MINT)
 #: The commands such a job's run blocks may invoke. An ALLOWLIST, so a command nobody listed is
-#: refused; the argument rules in ``_disallowed_commands`` narrow git and cp further.
+#: refused; the argument rules in ``_disallowed_commands`` narrow git and find further.
+#:
+#: BEST-EFFORT, AND NOT THE CONTROL THAT HOLDS THE PUSH JOB. ``_shell_words`` is not a shell parser,
+#: so at least these get past it: a ``(`` or ``)`` inside quotes inside a substitution (the body is
+#: cut by counting parentheses), a variable assigned by ``printf -v`` or ``read``, a redirect target
+#: (skipped, never checked), and options of an allowed git subcommand such as
+#: ``git push --receive-pack``. What holds the credential jobs is
+#: ``test_the_credential_job_steps_are_pinned_by_content``: any edit to one of their steps is red
+#: until a reviewer re-pins it. This screen is kept as a reviewer's aid that names the obvious cases.
 _CREDENTIAL_COMMANDS = frozenset(
-    {":", "[", "[[", "base64", "cp", "echo", "exit", "export", "find", "git", "printf", "pwd"}
+    {":", "[", "[[", "base64", "echo", "exit", "export", "find", "git", "printf", "pwd"}
     | {"read", "realpath", "set", "test", "true"}
 )
 #: Words that may stand ahead of a command name without being one.
@@ -494,8 +513,15 @@ _SHELL_KEYWORDS = frozenset({"!", "{", "}", "if", "then", "elif", "else", "fi", 
 _SHELL_KEYWORDS |= {"do", "done", "esac"}
 #: The git subcommands the push may run, and the git config keys it may set. git reads others as
 #: programs to run (an alias, a submodule foreach, a rebase --exec, core.fsmonitor, diff drivers).
-_GIT_SUBCOMMANDS = frozenset({"add", "commit", "config", "diff", "push"})
+_GIT_SUBCOMMANDS = frozenset({"commit", "config", "diff", "hash-object", "push", "update-index"})
 _GIT_CONFIG_SET = frozenset({"user.name", "user.email"})
+#: The two git subcommands that stage by content, each with the only argument list it may take.
+#: hash-object without ``--no-filters`` runs a tree-named filter; update-index has
+#: ``--index-info`` and other forms that read arbitrary entries.
+_GIT_EXACT_ARGS = {
+    "hash-object": ["hash-object", "-w", "--no-filters", "--", "${src}/${rel}"],
+    "update-index": ["update-index", "--add", "--cacheinfo", "100644,${oid},${rel}"],
+}
 #: The git config the push may set through GIT_CONFIG_*, each key with the exact value it must
 #: carry. Any other key, or the same key with another value (core.fsmonitor naming a program), is
 #: refused.
@@ -602,10 +628,10 @@ def _disallowed_commands(script: str) -> list[str]:
                     bad.append(f"git {args[:1]} in {shown!r}")
                 elif args[0] == "config" and (len(args) != 3 or args[1] not in _GIT_CONFIG_SET):
                     bad.append(f"git config {args[1:2]} in {shown!r}")
+                elif args[0] in _GIT_EXACT_ARGS and args != _GIT_EXACT_ARGS[args[0]]:
+                    bad.append(f"git {args[0]} with other arguments: {shown!r}")
             elif name == "find" and any(a.startswith(("-exec", "-ok", "-delete")) for a in args):
                 bad.append(f"find runs or deletes: {shown!r}")
-            elif name == "cp" and (args[:1] != ["--"] or len(args) != 3 or args[2] != "${rel}"):
-                bad.append(f"cp other than `cp -- <src> ${{rel}}`: {shown!r}")
     return bad
 
 
@@ -658,6 +684,12 @@ def test_the_command_allowlist_refuses_what_it_must() -> None:
         'echo "BASH_ENV=${PWD}/evil.sh" >> "$GITHUB_ENV"',
         'echo "${PWD}/bin" >> "$GITHUB_PATH"',
         "cp scripts/evil ~/.local/bin/git",
+        'cp -- "${src}/${rel}" "${rel}"',
+        "git add requirements.lock",
+        'git hash-object -w -- "${src}/${rel}"',
+        "git hash-object --stdin-paths -w",
+        "git update-index --index-info",
+        'git update-index --add --cacheinfo "100755,${oid},${rel}"',
         "awk 1 f",
         "while python3 x.py; do :; done",
     ):
@@ -668,7 +700,8 @@ def test_the_command_allowlist_refuses_what_it_must() -> None:
     for run in (
         "git push origin HEAD",
         'echo "::error::scripts/security/runtime_closure.py failed"',
-        'cp -- "${src}/${rel}" "${rel}"',
+        'oid="$(git hash-object -w --no-filters -- "${src}/${rel}")"',
+        'git update-index --add --cacheinfo "100644,${oid},${rel}"',
         "# python3 scripts/x.py",
         'root="$(pwd -P)"',
         "export GIT_CONFIG_KEY_0='core.hooksPath' GIT_CONFIG_VALUE_0='/dev/null'",
@@ -729,6 +762,107 @@ def test_the_credential_jobs_run_no_code_from_the_pr_tree() -> None:
             assert not offences, f"{job}: step {label!r}: {offences}"
 
 
+def _content_hash(value: object) -> str:
+    """A sha256 over ``value``'s whole parsed content, every key and value, in a stable spelling."""
+    canonical = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+#: Each credential job's own keys (everything but ``steps``), then each of its steps in order, by
+#: the sha256 of its whole parsed content. RE-PIN ONLY AFTER A REVIEW OF THE EDIT: these jobs hold
+#: the App key or the minted token, and a pinned step is how an edit to one is forced past a
+#: reviewer rather than past the best-effort command screen above (BACKLOG #5477).
+_PINNED_CREDENTIAL_JOBS: dict[str, list[tuple[str, str]]] = {
+    "preflight": [
+        ("preflight job keys", "16a15909e2be5bd198d7f324dcbeed055d5eda7e2c80cdcf2836b7e1bade574f"),
+        (
+            "Are the App credentials visible to this run?",
+            "85adb327a30b388ea8083c49df0d2189cd90bc8d79af657621684053e6bddd35",
+        ),
+    ],
+    "push": [
+        ("push job keys", "2e5e3a208d0ada173fe5ae457147ded7e9626fcd4fa88e9b9a9f758770ead824"),
+        (
+            "Check out the PR head",
+            "f36cbff787264dab548f958844c7301c22784222bc369e8b14a97d40f972fb53",
+        ),
+        (
+            "Fetch the re-exported files from the export job",
+            "a37c41ec1d1329abd46bec1aa351d182042177cc1630a73305748ad66df399e4",
+        ),
+        (
+            "Stage the re-exported files by content",
+            "7236617111b8afd5f87dd94e6cd6d80f2ecf41500eb60171f7c566db921735ea",
+        ),
+        (
+            "Mint a scoped GitHub App token",
+            "1477ed810174635ac856a9e68b1b0b969050f4f914f7adfc3b88f953d3fecb10",
+        ),
+        (
+            "Commit and push the resynced locks",
+            "0ce48d206c74c0a1e2a4d797c84443f35309b1fefcf16979fabe75145702097d",
+        ),
+        (
+            "Fail if the closure inventory could not be regenerated",
+            "1cea2d429629c458fff71587a8943fc7426e9f5afd9d44aae485e8af124ff130",
+        ),
+    ],
+}
+
+
+def _credential_job_pins() -> dict[str, list[tuple[str, str]]]:
+    pins: dict[str, list[tuple[str, str]]] = {}
+    for job in _PINNED_CREDENTIAL_JOBS:
+        body = _job(job)
+        rows = [(f"{job} job keys", _content_hash({k: v for k, v in body.items() if k != "steps"}))]
+        rows += [(str(s.get("name") or s.get("uses")), _content_hash(s)) for s in _job_steps(job)]
+        pins[job] = rows
+    return pins
+
+
+def test_the_credential_job_steps_are_pinned_by_content() -> None:
+    """RED when: any step of the preflight or push job changes at all, or a step is added, removed
+    or reordered, or either job's own keys (``if:``, ``needs``, ``permissions``, ...) change
+    (BACKLOG #5477).
+
+    The command screen above parses shell with a word splitter, so a run block can be written to get
+    past it. Pinning each step's whole content (its run body, env, with, if, continue-on-error and
+    every other key) means no edit to a job that holds the App key or token gets past this test
+    unseen: the failure prints the new pins, and copying them in is the reviewed act.
+    """
+    actual = _credential_job_pins()
+    assert actual == _PINNED_CREDENTIAL_JOBS, (
+        "a credential job's content changed; review the edit, then re-pin with:\n"
+        + json.dumps(actual, indent=4)
+    )
+
+
+#: Environment names the shell, git, the dynamic loader or an interpreter reads as configuration or
+#: as code to run. Set at workflow or job level, one would reach every step of that scope.
+_CONFIG_ENV = re.compile(
+    r"BASH_ENV|ENV|BASHOPTS|SHELLOPTS|PS4|IFS|CDPATH|PATH|HOME|XDG_CONFIG_HOME|PROMPT_COMMAND"
+    r"|GIT_\w*|LD_\w*|PYTHON\w*|PERL5?\w*|RUBY\w*|NODE_\w*|UV_\w*|PIP_\w*",
+    re.IGNORECASE,
+)
+
+
+def test_no_workflow_or_job_env_sets_shell_or_git_configuration() -> None:
+    """RED when: the workflow sets an ``env:`` at all, or any job sets a job-level env naming a
+    variable the shell, git, the loader or an interpreter reads (at least BASH_ENV, GIT_CONFIG_*,
+    PATH, LD_PRELOAD) (BACKLOG #5477).
+
+    A workflow-level env reaches every step of the credential jobs, beside the token. The step-level
+    env of those jobs is held to ``_CREDENTIAL_STEP_ENV`` above, and their steps are pinned.
+    """
+    workflow = load_workflow(_RESYNC.name)
+    assert "env" not in workflow, f"the resync sets a workflow-level env: {workflow.get('env')}"
+    assert _CONFIG_ENV.fullmatch("GIT_CONFIG_PARAMETERS") and _CONFIG_ENV.fullmatch("BASH_ENV")
+    assert not _CONFIG_ENV.fullmatch("APP_TOKEN") and not _CONFIG_ENV.fullmatch("HEAD_REF")
+    for job, body in _jobs().items():
+        named = [str(n) for n in body.get("env") or {} if _CONFIG_ENV.fullmatch(str(n))]
+        assert not named, f"the {job} job's env sets {named}"
+
+
 def test_the_push_job_reads_the_export_job_only_through_the_artifact_and_an_if() -> None:
     """RED when: the push job does not need the export job, or puts anything the export job produced
     into a shell or an environment rather than an ``if:`` (BACKLOG #5477).
@@ -760,11 +894,11 @@ def _copy_step() -> dict[str, Any]:
     return steps[0]
 
 
-_COPY_STEP = "Copy the re-exported files into the checkout"
+_COPY_STEP = "Stage the re-exported files by content"
 
 
 def _artifact_dir() -> str:
-    """Where the push job downloads the artifact, as the copy step's shell spells it."""
+    """Where the push job downloads the artifact, as the staging step's shell spells it."""
     [(_, download)] = _steps_using(_DOWNLOAD)
     path = str(download["with"]["path"])
     assert path.startswith("${{ runner.temp }}/"), f"the artifact downloads to {path}"
@@ -778,9 +912,9 @@ def test_the_lock_files_cross_jobs_as_one_artifact_of_the_staged_set() -> None:
     """RED when: the export job hands over a set other than what the push job stages, or the push job
     copies anything but that set (BACKLOG #5477).
 
-    The four lists (upload, copy, ``git diff --quiet``, ``git add``) must agree: a file uploaded but
-    not copied would be pushed stale, and a path copied from the artifact but not in the list would
-    let the export job write anywhere in the checkout.
+    The three lists (upload, staging, ``git diff --cached --quiet``) must agree: a file uploaded but
+    not staged would be pushed stale, and a path staged from the artifact but not in the list would
+    let the export job write anywhere in the commit.
     """
     staged = set(_exports(_GATE)) | _CLOSURES
     uploads, downloads = _steps_using(_UPLOAD), _steps_using(_DOWNLOAD)
@@ -797,10 +931,12 @@ def test_the_lock_files_cross_jobs_as_one_artifact_of_the_staged_set() -> None:
     assert set(str(up["path"]).split()) == staged, "the uploaded set is not the staged set"
     assert up.get("include-hidden-files") in (None, False)
     assert f'src="{_artifact_dir()}"' in str(_copy_step()["run"]), (
-        "the copy step reads a directory other than the one the download step writes"
+        "the staging step reads a directory other than the one the download step writes"
     )
     copy = _COPY_LIST_RE.findall(str(_copy_step()["run"]))
-    assert len(copy) == 1 and set(copy[0].split()) == staged, "the copied set is not the staged set"
+    assert len(copy) == 1 and set(copy[0].split()) == staged, (
+        "the staging step's list is not the staged set"
+    )
     push = _job_steps("push")
     order = [str(s.get("name") or s.get("uses")) for s in push]
     download_at = next(
@@ -810,6 +946,30 @@ def test_the_lock_files_cross_jobs_as_one_artifact_of_the_staged_set() -> None:
     assert download_at < order.index(_COPY_STEP) < commit_at, f"push job order: {order}"
 
 
+_GIT_TEST_CONFIG = (
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "user.name=t",
+    "-c",
+    "user.email=t@example.invalid",
+    "-c",
+    "commit.gpgsign=false",
+    "-c",
+    "core.symlinks=true",
+)
+
+
+def _git(workspace: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *_GIT_TEST_CONFIG, "-C", str(workspace), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    ).stdout
+
+
 def _run_copy(
     tmp_path: Path,
     build: Callable[[Path, Path], None],
@@ -817,7 +977,11 @@ def _run_copy(
     script: str,
     bash: str,
 ) -> subprocess.CompletedProcess[str]:
-    """Run the shipped copy step verbatim in a scratch checkout and artifact directory."""
+    """Run the shipped staging step verbatim in a scratch checkout and artifact directory.
+
+    The checkout is a git repository whose HEAD holds whatever ``build`` made of the tree, the way
+    actions/checkout would have written a PR head carrying it.
+    """
     workspace, temp = tmp_path / "ws", tmp_path / "rt"
     artifact = temp / _artifact_dir().removeprefix("${RUNNER_TEMP}/")
     for rel in staged:
@@ -825,6 +989,9 @@ def _run_copy(
             (base / rel).parent.mkdir(parents=True, exist_ok=True)
             (base / rel).write_text(body, encoding="utf-8")
     build(workspace, artifact)
+    _git(workspace, "init", "-q")
+    _git(workspace, "add", "-A")
+    _git(workspace, "commit", "-q", "-m", "PR head")
     return subprocess.run(
         [bash, "-c", script],
         cwd=workspace,
@@ -841,23 +1008,30 @@ def _run_copy(
     reason="the step runs on an ubuntu runner; GNU realpath and POSIX symlinks are needed",
 )
 def test_the_copy_step_refuses_what_the_artifact_or_tree_could_plant(tmp_path: Path) -> None:
-    """RED when: the copy step writes outside the checkout or copies anything off its list.
+    """RED when: the staging step writes through a checkout path, writes outside the checkout, or
+    stages anything off its list (BACKLOG #5477).
 
-    Executes the step's own script. A clean artifact copies every file; an extra artifact entry, a
-    missing file, a symlink in the artifact, a destination the tree made a symlink and a destination
-    under a symlinked directory each fail the step before anything lands outside the checkout.
+    Executes the step's own script against a git checkout. A clean artifact stages every file by
+    content and leaves the working tree as checked out. An extra artifact entry, a missing file, a
+    symlink in the artifact, a lock path the tree made a symlink, a lock path under a symlinked
+    directory, and a lock path the tree made a directory holding a same-named symlink each fail the
+    step before anything lands outside the checkout. The last case is what a `cp` onto the lock path
+    wrote straight through to the symlink's target (review of dffb12aeaaf, measured in WSL).
     """
     staged = sorted(set(_exports(_GATE)) | _CLOSURES)
     script = str(_copy_step()["run"])
     bash = require_bash(tmp_path)
     clean = _run_copy(tmp_path / "clean", lambda ws, art: None, staged, script, bash)
     assert clean.returncode == 0, clean.stdout + clean.stderr
-    stale = [
-        r for r in staged if (tmp_path / "clean" / "ws" / r).read_text(encoding="utf-8") != "new\n"
-    ]
-    assert not stale, f"the copy step left these uncopied: {stale}"
+    ws = tmp_path / "clean" / "ws"
+    stale = [r for r in staged if _git(ws, "show", f":{r}") != "new\n"]
+    assert not stale, f"the staging step left these unstaged: {stale}"
+    written = [r for r in staged if (ws / r).read_text(encoding="utf-8") != "old\n"]
+    assert not written, f"the staging step wrote through these checkout paths: {written}"
+    changed = sorted(_git(ws, "diff", "--cached", "--name-only").split())
+    assert changed == staged, f"the index differs from HEAD at {changed}, not the staged set"
 
-    # A runner file the tree or the artifact could point at: it exists, so cp would follow a link.
+    # A runner file the tree or the artifact could point at: it exists, so a write would follow a link.
     outside = tmp_path / "outside"
     outside.mkdir()
     victim = outside / "victim"
@@ -882,6 +1056,12 @@ def test_the_copy_step_refuses_what_the_artifact_or_tree_could_plant(tmp_path: P
         shutil.rmtree(ws / "ci" / "locks")
         (ws / "ci" / "locks").symlink_to(outside, target_is_directory=True)
 
+    def dir_holding_link(ws: Path, art: Path) -> None:
+        # `cp -- src constraints.lock` copies INTO a directory, through the same-named link inside.
+        (ws / "constraints.lock").unlink()
+        (ws / "constraints.lock").mkdir()
+        (ws / "constraints.lock" / "constraints.lock").symlink_to(victim)
+
     def unlisted(ws: Path, art: Path) -> None:
         # A directory find cannot read: the listing fails, and the step must fail with it rather
         # than check part of the artifact. (Root reads it anyway, so the case is skipped there.)
@@ -890,14 +1070,14 @@ def test_the_copy_step_refuses_what_the_artifact_or_tree_could_plant(tmp_path: P
         (hidden / "extra").write_text("x", encoding="utf-8")
         hidden.chmod(0)
 
-    cases = [extra, missing, artifact_link, dest_link, dir_link]
+    cases = [extra, missing, artifact_link, dest_link, dir_link, dir_holding_link]
     if os.geteuid() != 0:
         cases.append(unlisted)
     for build in cases:
         result = _run_copy(tmp_path / build.__name__, build, staged, script, bash)
         if build is unlisted:
             (tmp_path / build.__name__ / "rt" / "lock-resync-exports" / "hidden").chmod(0o700)
-        assert result.returncode != 0, f"{build.__name__}: the copy step accepted it"
+        assert result.returncode != 0, f"{build.__name__}: the staging step accepted it"
         if build is not unlisted:  # find reports its own error; the step prints no annotation
             assert "::error" in result.stdout, f"{build.__name__}: {result.stdout}{result.stderr}"
         assert victim.read_text(encoding="utf-8") == "victim\n", f"{build.__name__} wrote outside"
@@ -907,4 +1087,4 @@ def test_the_copy_step_refuses_what_the_artifact_or_tree_could_plant(tmp_path: P
             landed.is_symlink()
             or not landed.is_file()
             or landed.read_text(encoding="utf-8") != "victim\n"
-        ), f"{build.__name__}: a file from outside the artifact was copied into the checkout"
+        ), f"{build.__name__}: a file from outside the artifact was written into the checkout"
