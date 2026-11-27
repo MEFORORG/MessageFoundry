@@ -57,6 +57,7 @@ BOTH figures.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import enum
 import logging
@@ -186,7 +187,7 @@ _CLAIM_RE = re.compile(
     r"rearm=(?P<rearm>\d+) empty=(?P<empty>\d+) claimers=(?P<claimers>\d+)"
 )
 
-#: The LANE EPISODE timing line the SAME ``MEFOR_DELIVERY_PHASE_TIMING`` lever emits per window (from
+#: The LANE EPISODE timing line the SEPARATE ``MEFOR_PIPELINE_LANE_EPISODE_TIMING`` lever emits per window (from
 #: ``messagefoundry.pipeline.phase_timing.LaneEpisodeTiming``) — ``S_lane``, the pooled dispatcher's per-lane
 #: SERVICE TIME (STEP 4 ARM 1). Disjoint from ``_PHASE_RE`` and ``_CLAIM_RE`` (distinct "lane episode timing"
 #: substring, distinct fields), so the three phase lines can never cross-match.
@@ -606,7 +607,10 @@ class EpisodeTiming:
 
     def render(self) -> str:
         if self.is_empty:
-            return "lane episode (S_lane): (none captured — MEFOR_DELIVERY_PHASE_TIMING off or no episodes)"
+            return (
+                "lane episode (S_lane): (none captured — MEFOR_PIPELINE_LANE_EPISODE_TIMING off or no "
+                "episodes)"
+            )
         return (
             f"lane episode (S_lane): episodes={self.episodes} windows={self.windows} | "
             f"S_lane mean/max={self.episode_mean_ms:.2f}/{self.episode_max_ms:.2f}ms | "
@@ -660,7 +664,7 @@ class EpisodeTiming:
 
 
 #: An empty :class:`EpisodeTiming` — the default when a rung's ENGINE_RUNG_REPORT carried no episode
-#: aggregate (report absent, or the MEFOR_DELIVERY_PHASE_TIMING lever off).
+#: aggregate (report absent, or the MEFOR_PIPELINE_LANE_EPISODE_TIMING lever off).
 _EMPTY_EPISODE_TIMING = EpisodeTiming(0, 0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0)
 
 
@@ -3518,13 +3522,24 @@ def _attach_rung_timings(payload: dict[str, object], rung_logs: Sequence[Path]) 
     """Attach ALL THREE phase-timing aggregates to an ENGINE_RUNG_REPORT payload from the rung's per-shard
     node logs: the delivery ``send_ack``/``mark_done`` split (``phase_timing``), the CLAIM store round-trip
     (``claim_timing``, D6 — the phase #842 could not see), and the LANE EPISODE (``episode_timing`` —
-    ``S_lane``, STEP 4 ARM 1). All three are SIBLINGS gated by the same ``MEFOR_DELIVERY_PHASE_TIMING`` lever;
-    every one must be attached or the drive box's aggregate stays empty despite the node logs carrying the
-    lines — which for ``S_lane`` would mean ARM 1's headline number exists only as an INFO line to be
-    hand-grepped per rung, per shard, with no n-weighting and no ramp-window drop."""
+    ``S_lane``, STEP 4 ARM 1). The first two are gated by ``MEFOR_DELIVERY_PHASE_TIMING``; the episode by
+    its own ``MEFOR_PIPELINE_LANE_EPISODE_TIMING`` (kept separate so an instrument-OFF control rung stays
+    possible; see ``messagefoundry.pipeline.phase_timing``). Both levers are off by default, and a block
+    whose lever is off is empty. Every one must be attached or the drive box's aggregate stays empty
+    despite the node logs carrying the lines — which for ``S_lane`` would mean ARM 1's headline number
+    exists only as an INFO line to be hand-grepped per rung, per shard, with no n-weighting and no
+    ramp-window drop."""
     payload["phase_timing"] = aggregate_phase_timing(rung_logs).to_json_dict()
     payload["claim_timing"] = aggregate_claim_timing(rung_logs).to_json_dict()
     payload["episode_timing"] = aggregate_episode_timing(rung_logs).to_json_dict()
+
+
+async def _attach_rung_timings_off_loop(
+    payload: dict[str, object], keep_dir: Path, shards: Sequence[str]
+) -> None:
+    """:func:`_attach_rung_timings` on a worker thread: it reads every shard's node log, which can be large,
+    and the engine ladder runs on the event loop."""
+    await asyncio.to_thread(_attach_rung_timings, payload, _rung_log_paths(keep_dir, shards))
 
 
 async def run_engine_ladder(
@@ -3668,7 +3683,7 @@ async def run_engine_ladder(
                 )
             break
         payload = _engine_rung_payload(report)
-        _attach_rung_timings(payload, _rung_log_paths(keep_dir, report.shards))
+        await _attach_rung_timings_off_loop(payload, keep_dir, report.shards)
         rung_coord.post(ENGINE_RUNG_REPORT, payload)
         result.rungs_armed.append(rung.run_suffix)
         if report.aborted:
@@ -3767,7 +3782,7 @@ async def run_engine_ladder(
         result.notes.append("soak: no DRIVE_START from the drive")
         return result
     payload = _engine_rung_payload(report)
-    _attach_rung_timings(payload, _rung_log_paths(keep_dir, report.shards))
+    await _attach_rung_timings_off_loop(payload, keep_dir, report.shards)
     soak_coord.post(ENGINE_RUNG_REPORT, payload)
     result.rungs_armed.append("soak")
     return result

@@ -1922,7 +1922,8 @@ def _run_shardcert_engine_ladder(argv: list[str]) -> int:
         "the fixed rung plan (fresh store + run_id per rung), post each rung's store-truth drain gate + "
         "phase timing, honour the drive's LADDER_STOP, and arm the soak rung. Reuses the merged "
         "shardcert-engine primitive per rung. Pair with shardcert-drive-ladder on the load-gen box. Set "
-        "MEFOR_DELIVERY_PHASE_TIMING=1 for the send_ack/mark_done split.",
+        "MEFOR_DELIVERY_PHASE_TIMING=1 for the send_ack/mark_done split and the claim timing, and "
+        "MEFOR_PIPELINE_LANE_EPISODE_TIMING=1 for the lane episode (S_lane); both are off by default.",
     )
     parser.add_argument(
         "--shards", default="a,b,c,d", help="comma list of shard ids (default a,b,c,d)"

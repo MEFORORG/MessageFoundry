@@ -7,7 +7,13 @@ Unit tests over synthetic counters: no load run, no database, no fleet.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import threading
+from pathlib import Path
+from typing import Any
+
+import pytest
 
 from harness.load.shardcert_ladder import (
     LadderRung,
@@ -105,3 +111,47 @@ def test_soak_break_under_a_drive_side_soak_abort_stays_setup_degraded() -> None
         soak_aborted=True,
     )
     assert rep.exit_code == 2
+
+
+# --- BACKLOG #5953 (S27-75): the timing blocks name the lever that fills them, and are read off the loop ---
+
+
+def test_empty_episode_block_names_its_own_lever() -> None:
+    """S_lane is gated by MEFOR_PIPELINE_LANE_EPISODE_TIMING, not MEFOR_DELIVERY_PHASE_TIMING
+    (messagefoundry.pipeline.phase_timing). An operator told the wrong lever turns on only the delivery one
+    and still gets an empty episode block."""
+    from harness.load.shardcert_ladder import _EMPTY_EPISODE_TIMING
+    from messagefoundry.pipeline.phase_timing import LANE_EPISODE_TIMING_ENV
+
+    rendered = _EMPTY_EPISODE_TIMING.render()
+    assert LANE_EPISODE_TIMING_ENV in rendered
+    assert "MEFOR_DELIVERY_PHASE_TIMING" not in rendered
+
+
+async def test_engine_ladder_reads_the_node_logs_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Aggregating a rung's node logs is file I/O over every shard's log; it runs on a worker thread, not
+    on the event loop the engine ladder awaits its coord on."""
+    import harness.load.shardcert_ladder as ladder
+    from harness.load.coord import FileDropCoord
+    from tests.test_shardcert_two_box import _engine_ladder_kwargs, _fake_engine_report
+
+    loop_thread = threading.get_ident()
+    attach_threads: list[int] = []
+
+    async def fake_engine(**kwargs: Any) -> Any:
+        return _fake_engine_report(aborted=True)
+
+    def record_attach(payload: dict[str, object], logs: Any) -> None:
+        attach_threads.append(threading.get_ident())
+
+    monkeypatch.setattr(ladder, "run_shardcert_engine", fake_engine)
+    monkeypatch.setattr(ladder, "_engine_rung_payload", lambda report: {})
+    monkeypatch.setattr(ladder, "_attach_rung_timings", record_attach)
+    coord = FileDropCoord(tmp_path / "coord", run_id="offloop")
+    await asyncio.wait_for(
+        ladder.run_engine_ladder(**_engine_ladder_kwargs(coord, tmp_path)), timeout=10.0
+    )
+    assert len(attach_threads) == 1
+    assert attach_threads[0] != loop_thread

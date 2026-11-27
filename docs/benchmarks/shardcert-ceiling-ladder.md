@@ -203,7 +203,10 @@ engine ceiling. To model the reference `H=20, D=4` ADT hub, pass `--handlers 20 
 
 Both boxes share a coord dir (a mount/synced folder) and use the **same** `--rate-ladder` and `--run-id`.
 Restart + store rebuild first (`RESTART-AND-SIZING-runbook.md` STEP 1–2), and set
-`MEFOR_DELIVERY_PHASE_TIMING=1` on the **engine** box for the `send_ack`/`mark_done` split.
+`MEFOR_DELIVERY_PHASE_TIMING=1` on the **engine** box for the `send_ack`/`mark_done` split. The lane
+episode (`S_lane`, `episode_timing`) has its own lever, `MEFOR_PIPELINE_LANE_EPISODE_TIMING=1`, kept
+separate so a rung can run with that instrument off as a control; without it the episode block is empty.
+The ladder sets neither lever itself.
 
 ```pwsh
 # ENGINE box (MEFOR_STORE_* + the escapes per the restart runbook; phase timing on):
