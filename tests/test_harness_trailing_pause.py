@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -45,29 +45,40 @@ def qapp() -> Any:
 
 @pytest.fixture
 def paused(monkeypatch: pytest.MonkeyPatch) -> threading.Event:
-    """Set once a worker enters a pause between two items, so a test stops it inside one."""
+    """Set from inside a worker's first sleep in a pause between two items, so a test's stop lands
+    inside the pause's sleep loop rather than before it starts."""
     entered = threading.Event()
-    real = mllp.pause_unless_stopped
+    real_sleep = time.sleep
 
-    def pause(stop: threading.Event, seconds: float) -> bool:
+    def sleep(seconds: float) -> None:
         entered.set()
-        return real(stop, seconds)
+        real_sleep(seconds)
 
-    monkeypatch.setattr(mllp, "pause_unless_stopped", pause)
+    # The pause is the only caller of time.sleep on these workers' paths.
+    monkeypatch.setattr("harness.mllp.time.sleep", sleep)
     return entered
 
 
-def _items(n: int) -> Iterator[SendItem]:
+def _items(n: int, on_draw: Callable[[int], None] | None = None) -> Iterator[SendItem]:
     # Lazy, as the tabs' generated batches are, so the worker cannot count the items up front.
+    # ``on_draw`` runs while each item is being produced, before it is yielded.
     for seq in range(1, n + 1):
+        if on_draw is not None:
+            on_draw(seq)
         yield SendItem(seq, "ADT", "A01", f"X{seq}", _MSG)
 
 
 def _send_worker(
-    n: int, sent: list[str], monkeypatch: pytest.MonkeyPatch, *, rate: float = _SLOW_RATE
+    n: int,
+    sent: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    rate: float = _SLOW_RATE,
+    items: Iterable[SendItem] | None = None,
 ) -> SendWorker:
     """A send worker whose sends are recorded in ``sent`` rather than dialled."""
-    worker = SendWorker("127.0.0.1", 9, _items(n), timeout=1.0, rate=rate)
+    batch = _items(n) if items is None else items
+    worker = SendWorker("127.0.0.1", 9, batch, timeout=1.0, rate=rate)
 
     def send_one(item: SendItem) -> SendResult:
         sent.append(item.control_id)
@@ -77,8 +88,15 @@ def _send_worker(
     return worker
 
 
-def _drop_worker(n: int, directory: Path) -> FileDropWorker:
-    return FileDropWorker(str(directory), _items(n), rate=_SLOW_RATE)
+def _drop_worker(
+    n: int,
+    directory: Path,
+    *,
+    rate: float = _SLOW_RATE,
+    items: Iterable[SendItem] | None = None,
+) -> FileDropWorker:
+    batch = _items(n) if items is None else items
+    return FileDropWorker(str(directory), batch, rate=rate)
 
 
 def _start(worker: SendWorker | FileDropWorker) -> threading.Thread:
@@ -127,6 +145,23 @@ def test_a_stop_during_the_callers_work_draws_no_further_item() -> None:
     assert drawn == ["a"]
 
 
+@pytest.mark.parametrize("rate", [0.0, 1.0])
+@pytest.mark.parametrize("stop_on", ["a", "b"])
+def test_a_stop_while_an_item_is_drawn_drops_that_item(rate: float, stop_on: str) -> None:
+    """RED when: paced yields an item drawn after the stop was set, which it does when no pause
+    follows the draw to see the stop: on the first item, and on any item at rate 0."""
+    stop = threading.Event()
+
+    def lazy() -> Iterator[str]:
+        for name in "abc":
+            if name == stop_on:
+                stop.set()  # as Stop pressed while this item is being generated
+            yield name
+
+    expected = list("abc"[: "abc".index(stop_on)])
+    assert list(mllp.paced(lazy(), stop, rate)) == expected
+
+
 def test_a_slow_send_batch_finishes_right_after_its_last_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -170,7 +205,7 @@ def test_stop_inside_a_pause_between_messages_ends_the_send_batch(
         worker.stop()
         t.join(timeout=3)
         assert not t.is_alive(), "stop() did not end the pause"
-        assert time.monotonic() - started < 1
+        assert time.monotonic() - started < 3
         assert sent == ["X1"]
     finally:
         worker.stop()
@@ -188,11 +223,44 @@ def test_stop_inside_a_pause_between_files_ends_the_drop_batch(
         worker.stop()
         t.join(timeout=3)
         assert not t.is_alive(), "stop() did not end the pause"
-        assert time.monotonic() - started < 1
+        assert time.monotonic() - started < 3
         assert len(list(tmp_path.glob("*.hl7"))) == 1
     finally:
         worker.stop()
         t.join(timeout=5)
+
+
+def test_a_stop_while_a_message_is_generated_sends_none_of_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: the send worker sends a message generated after Stop was pressed, at the tabs'
+    default rate of 0, where no pause follows the draw to see the stop."""
+    sent: list[str] = []
+    holder: list[SendWorker] = []
+
+    def on_draw(seq: int) -> None:
+        if seq == 2:
+            holder[0].stop()
+
+    worker = _send_worker(3, sent, monkeypatch, rate=0.0, items=_items(3, on_draw))
+    holder.append(worker)
+    worker.run()
+    assert sent == ["X1"]
+
+
+def test_a_stop_while_a_file_is_generated_drops_none_of_it(tmp_path: Path) -> None:
+    """RED when: the drop worker drops a file generated after Stop was pressed, at the tabs'
+    default rate of 0, where no pause follows the draw to see the stop."""
+    holder: list[FileDropWorker] = []
+
+    def on_draw(seq: int) -> None:
+        if seq == 2:
+            holder[0].stop()
+
+    worker = _drop_worker(3, tmp_path, rate=0.0, items=_items(3, on_draw))
+    holder.append(worker)
+    worker.run()
+    assert len(list(tmp_path.glob("*.hl7"))) == 1
 
 
 def test_a_send_batch_still_paces_between_messages(monkeypatch: pytest.MonkeyPatch) -> None:

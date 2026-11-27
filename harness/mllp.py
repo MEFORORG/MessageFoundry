@@ -145,9 +145,10 @@ def paced[T](items: Iterable[T], stop: threading.Event, rate: float) -> Iterator
     a pause after the last would hold the batch open a whole pause with nothing left to send,
     10 seconds at the tabs' lowest rate of 0.1 a second (BACKLOG #5855, #5856). The next item is
     drawn before the pause, because a lazy ``items`` only tells there is none left once it is
-    asked for one; so a stop during the pause drops that drawn item unyielded, as it does every
-    item after it. A stop set before then, during the caller's work, ends the batch before the
-    next item is drawn, so a lazy ``items`` is not asked for one the batch will never send."""
+    asked for one; so a stop while that item is drawn, or during the pause, drops it unyielded,
+    as it does every item after it. A stop set before then, during the caller's work, ends the
+    batch before the next item is drawn, so a lazy ``items`` is not asked for one the batch will
+    never send."""
     delay = 1.0 / rate if rate > 0 else 0.0
     iterator = iter(items)
     first = True
@@ -155,6 +156,10 @@ def paced[T](items: Iterable[T], stop: threading.Event, rate: float) -> Iterator
         try:
             item = next(iterator)
         except StopIteration:
+            return
+        # Drawing a lazy item can take a while, and there may be no pause after it to see a stop
+        # set meanwhile: none before the first item, and none at all at a rate of 0.
+        if stop.is_set():
             return
         if not first and delay and pause_unless_stopped(stop, delay):
             return

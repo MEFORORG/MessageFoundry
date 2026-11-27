@@ -65,7 +65,7 @@ def _item(seq: int) -> SendItem:
 # --- Send tab (BACKLOG #5949) ---------------------------------------------------------------------
 
 
-def test_send_generates_on_the_worker_and_stops_inside_a_pause(
+def test_send_generates_on_the_worker_and_stops_inside_the_ack_read(
     qapp: Any, off_gui_generation: list[threading.Thread]
 ) -> None:
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -92,7 +92,7 @@ def test_send_generates_on_the_worker_and_stops_inside_a_pause(
         assert thread is not None
         started = time.monotonic()
         panel.shutdown()
-        assert time.monotonic() - started < 3, "shutdown waited out the read or the pause"
+        assert time.monotonic() - started < 3, "shutdown waited out the ACK read"
         assert thread.isFinished()
     finally:
         panel.shutdown()
