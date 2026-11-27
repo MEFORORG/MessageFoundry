@@ -38,7 +38,7 @@ import json
 import logging
 import math
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -221,32 +221,47 @@ def check_engine_layout(
 
     Raises :class:`ConnScaleError` naming the first fault: a sink-process count below 1, a port
     block that runs outside 1..65535 (the largest cell's inbound block, the API ports the cells
-    step through, or the agreed sink band), or an API block that overlaps the inbound block. Each
-    of these used to start the cells' engines and fail them later, at a port bind, a health wait,
-    or the driver's band plan, one cell at a time. An empty cell list has no layout to refuse.
-    The claim mode is :func:`iter_batch_cells`'s to refuse, since the cell ids carry it."""
+    step through, or the agreed sink band), a cell whose API port falls in its own inbound block,
+    or a driver band whose sink port falls in that band's inbound sub-range, which
+    connscale-remote's ``check_remote_bands`` refuses. Each of these used to start the cells'
+    engines and fail them later, at a port bind, a health wait, or the driver's band plan, one cell
+    at a time. An empty cell list has no layout to refuse. The claim mode is
+    :func:`iter_batch_cells`'s to refuse, since the cell ids carry it.
+
+    Only ports one cell binds at once are compared: a later cell may bind a port an earlier
+    cell's engine bound and released. A sink band on the engine's own box is not compared with
+    the engine's ports, since nothing here says the boxes are one."""
     if not cells:
         return
     if sink_procs < 1:
         raise ConnScaleError(f"sink_procs must be >= 1, got {sink_procs}")
     top_count = max(c.count for c in cells)
-    inbound_last = inbound_base + top_count - 1
-    api_last = api_base + len(cells) - 1
     blocks = (
-        ("inbound", inbound_base, inbound_last),
-        ("API", api_base, api_last),
-        ("sink", sink_base, sink_base + min(sink_procs, top_count) - 1),
+        ("inbound", inbound_base, top_count),
+        ("API", api_base, len(cells)),
+        ("sink", sink_base, min(sink_procs, top_count)),
     )
-    for what, first, last in blocks:
+    for what, first, span in blocks:
+        last = first + span - 1
         if first < 1 or last > _PORT_MAX:
             raise ConnScaleError(f"the {what} ports {first}..{last} run outside 1..{_PORT_MAX}")
-    # Disjoint whole blocks, not only each cell's own pair: a later, larger cell binds the whole
-    # inbound block on the box an earlier cell's API port was just released on.
-    if api_base <= inbound_last and inbound_base <= api_last:
-        raise ConnScaleError(
-            f"the API ports {api_base}..{api_last} overlap the inbound ports "
-            f"{inbound_base}..{inbound_last}"
+    for step, cell in enumerate(cells):
+        api_port = api_base + step
+        if inbound_base <= api_port < inbound_base + cell.count:
+            raise ConnScaleError(
+                f"cell {cell.cell_id}: API port {api_port} falls in its inbound ports "
+                f"{inbound_base}..{inbound_base + cell.count - 1}"
+            )
+        bands = plan_driver_bands(
+            inbound_base=inbound_base, count=cell.count, sink_base=sink_base, sink_procs=sink_procs
         )
+        for band in bands:
+            band_last = band.inbound_base + band.conn_count - 1
+            if band.inbound_base <= band.sink_base <= band_last:
+                raise ConnScaleError(
+                    f"cell {cell.cell_id}: driver band {band.index}'s sink port {band.sink_base} "
+                    f"falls in its inbound ports {band.inbound_base}..{band_last}"
+                )
 
 
 def _refusal_before_any_cell(
@@ -263,29 +278,20 @@ def _refusal_before_any_cell(
     every smaller one."""
     if not cells:
         return None
-    checks: tuple[tuple[str, Callable[[], None]], ...] = (
-        (
-            "ENGINE LAYOUT REFUSED",
-            lambda: check_engine_layout(
-                cells,
-                sink_procs=sink_procs,
-                inbound_base=inbound_base,
-                api_base=api_base,
-                sink_base=sink_base,
-            ),
-        ),
-        (
-            "SIGN-IN LIMIT REFUSED",
-            lambda: check_operator_sign_in_limits(
-                min(sink_procs, max(c.count for c in cells)), environ
-            ),
-        ),
-    )
-    for label, check in checks:
-        try:
-            check()
-        except ConnScaleError as exc:
-            return label, exc
+    try:
+        check_engine_layout(
+            cells,
+            sink_procs=sink_procs,
+            inbound_base=inbound_base,
+            api_base=api_base,
+            sink_base=sink_base,
+        )
+    except ConnScaleError as exc:
+        return "ENGINE LAYOUT REFUSED", exc
+    try:
+        check_operator_sign_in_limits(min(sink_procs, max(c.count for c in cells)), environ)
+    except ConnScaleError as exc:
+        return "SIGN-IN LIMIT REFUSED", exc
     return None
 
 
@@ -1105,6 +1111,10 @@ async def run_batch_engine(
                 )
                 report.cells.append(info)
                 report.notes.append(f"CELL {cell.cell_id} ENGINE START FAILED: {reason}")
+                # Its result is decided, so its engine goes now, not after the driver's DONE.
+                if node is not None:
+                    await _stop_cell_node(node, cell.cell_id, report)
+                    node = None
                 # Tell the driver this cell is unusable so it skips + posts DONE (keeps the matrix
                 # in lockstep instead of hanging both boxes on a READY that never comes).
                 cell_coord.post(BATCH_CELL_READY, {"cell_id": cell.cell_id, "error": info.error})

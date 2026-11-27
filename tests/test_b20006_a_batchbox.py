@@ -194,7 +194,13 @@ async def _engine_alone(
         ({"inbound_base": 65530}, "the inbound ports 65530..65537 run outside 1..65535"),
         ({"api_base": 0}, "the API ports 0..0 run outside 1..65535"),
         ({"sink_base": 65533}, "the sink ports 65533..65538 run outside 1..65535"),
-        ({"api_base": 2603}, "the API ports 2603..2603 overlap the inbound ports 2600..2607"),
+        ({"api_base": 2603}, "API port 2603 falls in its inbound ports 2600..2607"),
+        # Two driver bands of four: band 1 binds inbound 2604..2607 beside its sink port 2605,
+        # which connscale-remote's check_remote_bands refuses on the driver box.
+        (
+            {"sink_procs": 2, "sink_base": 2604},
+            "driver band 1's sink port 2605 falls in its inbound ports 2604..2607",
+        ),
     ],
 )
 async def test_a_layout_no_cell_could_run_starts_no_engine(
@@ -212,17 +218,21 @@ async def test_a_layout_no_cell_could_run_starts_no_engine(
     assert any(n.startswith("ENGINE LAYOUT REFUSED, NO CELL RAN") for n in report.notes)
 
 
-async def test_an_api_port_inside_a_later_cells_inbound_block_is_refused(
+async def test_only_ports_one_cell_binds_at_once_are_compared(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Cell 0 (3 connections) binds 2600..2602 beside API 2605; cell 1 (8) binds 2600..2607, which
-    # holds the API port cell 0 just released.
+    # Counts [3, 8] at inbound 2600: API 2607 beside cell 0's 2600..2602, then 2608 beside cell 1's
+    # 2600..2607, so no cell's own ports collide. A later cell may bind a port an earlier cell
+    # released, so this runs.
     rec = _install_engine_fakes(monkeypatch)
-    report, readies = await _engine_alone(
-        _BATCH.replace("counts = [8]", "counts = [3, 8]"), sink_procs=6, api_base=2605
-    )
-    assert rec.started == [] and len(readies) == 2
-    said = "the API ports 2605..2606 overlap the inbound ports 2600..2607"
+    two_cells = _BATCH.replace("counts = [8]", "counts = [3, 8]")
+    report, readies = await _engine_alone(two_cells, sink_procs=6, api_base=2607)
+    assert report.ok, report.notes
+    assert len(rec.started) == 2 and all("error" not in r for r in readies)
+    # API 2605 then 2606: cell 1's own block 2600..2607 holds its API port.
+    report, readies = await _engine_alone(two_cells, sink_procs=6, api_base=2605)
+    said = "API port 2606 falls in its inbound ports 2600..2607"
+    assert len(rec.started) == 2 and len(readies) == 2
     assert all(c.error and said in c.error for c in report.cells)
 
 
@@ -324,6 +334,27 @@ async def test_a_failed_error_ready_post_still_stops_the_engine(
             cell_timeout=10.0,
         )
     assert rec.started and rec.stopped == rec.started
+
+
+async def test_a_failed_start_stops_its_engine_before_the_done_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The cell's result is decided once its start fails, so its engine does not wait out the
+    # driver's DONE, up to cell_timeout.
+    rec = _install_engine_fakes(monkeypatch)
+    monkeypatch.setattr(bb, "_await_node_healthy", _raiser(ConnScaleError("not healthy")))
+    real_wait = FileDropCoord.await_message
+    stopped_at_wait: list[list[str]] = []
+
+    async def wait(self: FileDropCoord, name: str, **kwargs: Any) -> dict[str, Any]:
+        if name == BATCH_CELL_DONE:
+            stopped_at_wait.append(list(rec.stopped))
+        return await real_wait(self, name, **kwargs)
+
+    monkeypatch.setattr(FileDropCoord, "await_message", wait)
+    report, readies = await _engine_alone(sink_procs=6)
+    assert stopped_at_wait == [rec.started] and rec.stopped == rec.started
+    assert readies and all("not healthy" in r.get("error", "") for r in readies)
 
 
 async def _walk_is_cancelled() -> None:
