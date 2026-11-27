@@ -1,0 +1,27 @@
+{
+  "comment": "The serve argv the IDE builds (BACKLOG #5566, #5939). serve has serviceConfig set; serveDefault has messagefoundry.serviceConfig at its default; copyLine is the copied start command with serviceConfig set. ide/src/test/suite/b20008-b-serve-argv.test.ts pins buildServeInvocation and serveCommandLine against these, and b20008-b-start-wiring.test.ts pins the argv the real status bar Start launches serve with. tests/test_b20008_b_ide_serve_argv.py reads serve and serveDefault with the engine's own parser.",
+  "serviceConfig": "deploy/prod/messagefoundry.toml",
+  "configDir": "samples/config",
+  "serve": [
+    "-P",
+    "-X",
+    "disable-remote-debug",
+    "-m",
+    "messagefoundry",
+    "serve",
+    "--config",
+    "samples/config",
+    "--service-config=deploy/prod/messagefoundry.toml"
+  ],
+  "serveDefault": [
+    "-P",
+    "-X",
+    "disable-remote-debug",
+    "-m",
+    "messagefoundry",
+    "serve",
+    "--config",
+    "samples/config"
+  ],
+  "copyLine": "python -P -X disable-remote-debug -m messagefoundry serve --config samples/config --service-config=deploy/prod/messagefoundry.toml"
+}
