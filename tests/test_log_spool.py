@@ -1820,28 +1820,38 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
     _, sep, facts = message.partition("off-box log forwarding runs without an on-disk spool")
     assert sep, message
     assert facts == _SPOOL_IN_USE_FACTS  # the constant the control below looks for
-    # ``_try_lock`` reads any lock fault as contention, so a holder is only one possible cause.
-    assert "whether another process holds the lock or taking the lock failed." in facts
-    # ``_open_forward_spool`` runs once, at configure time, so only a restart retries the lock.
-    assert "runs without an on-disk spool until it restarts with a spool it can lock." in facts
-    # The stranding fact, and at least these inputs to the directory ``__main__._forward_spool_dir``
-    # derives: the setting and its variable, the working directory under a relative setting (the
-    # root is ``Path(base)``, never anchored), the shard id, and the store path under no setting.
+    # Every cause ``_try_lock`` returns False for: ``lock_exclusive`` reports contention by any
+    # handle, this process's own included, and ``_try_lock`` reads any other lock fault as
+    # contention.
     assert (
-        "Only the process holding a spool directory's lock sends that directory's segments."
-        in facts
+        "whether another process holds the lock, this process already holds it on another handle, "
+        "or taking the lock failed." in facts
     )
+    # ``_open_forward_spool`` runs once, at configure time, so only a restart retries the lock; and
+    # a process that returned ``None`` here has no spool object, so it reads nothing from there.
     assert (
-        "any change to a process's spool directory leaves the segments in its old directory unsent "
+        "Until it restarts with a spool it can lock, this process runs without an on-disk spool "
+        "and sends nothing from that directory." in facts
+    )
+    # The stranding fact belongs to the lock holder, never to this process, which holds nothing.
+    assert (
+        "Only the process holding a spool directory's lock sends that directory's segments, so a "
+        "change to that process's spool directory leaves the segments in its old directory unsent "
         "until a process opens that directory again." in facts
     )
+    assert "any change to a process's spool directory" not in facts
+    # At least these inputs to the directory ``__main__._forward_spool_dir`` derives: the setting
+    # and its variable, the working directory under a relative setting (the root is ``Path(base)``,
+    # never anchored), the engine shard's shard id, and under no setting the directory holding the
+    # store (the next test ties that one to the code).
     assert (
         "[logging].forward_spool_dir (environment variable MEFOR_LOGGING_FORWARD_SPOOL_DIR)"
         in facts
     )
     assert "the working directory when that setting is a relative path" in facts
     assert "and an engine shard's shard id." in facts
-    assert "it also changes with the store path the default directory is derived from." in facts
+    assert "With no setting, it also changes with the directory that holds the store." in facts
+    assert "the store path the default directory is derived from" not in facts
     assert 'One directory serves one process (ADR 0200, "One process per directory").' in facts
     # No branch of a procedure: each of these was wrong for some deployment.
     lowered = facts.lower()
@@ -1856,7 +1866,6 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
         "Leave the process",
     ):
         assert imperative.lower() not in lowered, imperative
-    assert message.endswith(".")
 
     def _deny_lock(path: Any, flags: int, mode: int = 0o777) -> int:
         raise PermissionError(13, "read-only directory")
@@ -1874,6 +1883,22 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
     # The control: an unusable directory gets none of the in-use facts.
     assert "MEFOR_LOGGING_FORWARD_SPOOL_DIR" not in caplog.text
     assert _SPOOL_IN_USE_FACTS not in caplog.text
+
+
+def test_the_default_spool_directory_follows_the_directory_that_holds_the_store(
+    tmp_path: Path,
+) -> None:
+    """The in-use WARNING says the default directory changes with the directory that holds the
+    store, not with the store path: two stores in one directory share a default (BACKLOG #5400)."""
+    from messagefoundry.__main__ import _forward_spool_dir
+    from messagefoundry.config.settings import ServiceSettings, StoreSettings
+
+    def default(store: Path) -> str:
+        return _forward_spool_dir(ServiceSettings(store=StoreSettings(path=str(store))), None)
+
+    beside_a = default(tmp_path / "a.db")
+    assert beside_a == default(tmp_path / "b.db")
+    assert beside_a != default(tmp_path / "other" / "a.db")
 
 
 def test_open_removes_only_the_directories_it_made_when_it_fails_partway(
