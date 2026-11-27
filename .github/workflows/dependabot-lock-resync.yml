@@ -47,11 +47,18 @@ name: Dependabot lock resync
 #    (which gates `push`). GITHUB_TOKEN is read-only in export and push; preflight's has no scope.
 #  - WHAT HOLDS THE CREDENTIAL JOBS TO THAT. tests/test_dep1_lock_resync_lockstep.py pins every step
 #    of `preflight` and `push`, and each job's own keys, by a hash of their whole content (an
-#    action's `uses:` by its name, so a Dependabot SHA bump does not re-pin; the ref is held only to
-#    the owner/repo@<40-hex SHA> form, so a swap to another commit SHA is not red). That holds them
-#    unchanged, but for an action's SHA, since they were last pinned: an edit is red until the same
-#    change re-pins it, so the re-pin shows in the diff, and it is reviewed only as the rest of the
-#    diff is. It does not judge whether the edit runs tree code. The same file pins the workflow's
+#    action's `uses:` by its name only, so that hash does not move on a Dependabot SHA bump). The
+#    same file's test_the_credential_job_actions_are_pinned_to_exact_shas pins each action ref those
+#    two jobs use to its exact owner/repo@<40-hex SHA>, so a swap to any other commit SHA, a
+#    Dependabot bump included, is red until the same PR re-pins it; that test's failure message
+#    gives the recipe. The export job's refs are held only to the owner/repo@<40-hex SHA> form, so a
+#    swap of one of them to another commit SHA is not red. The two pin tests hold `preflight` and
+#    `push` unchanged since they were last pinned: an edit is red until the same change re-pins it,
+#    so the re-pin shows in the diff, and it is reviewed only as the rest of the diff is. They do
+#    not judge whether the edit runs tree code. The costs of the exact pin include at least those
+#    the test's comment states: the re-pin is a second commit on the Dependabot PR, not
+#    Dependabot's, so dependabot-auto-merge.yml's single-Dependabot-commit check sends the PR to
+#    manual review where it would otherwise arm auto-merge. The same file pins the workflow's
 #    on:, permissions: and concurrency: by content, and screens the credential jobs' run blocks
 #    against a command allowlist, a best-effort word-level check whose known gaps it lists.
 #  - NO project install/tests/build runs here, and "uv lock --check" (validate-only, never builds an
