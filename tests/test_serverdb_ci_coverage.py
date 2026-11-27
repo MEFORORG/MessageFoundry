@@ -20,9 +20,10 @@ The mechanical invariants, at least these:
    the leg first runs on it in the merge queue (``merge_group``) or on the nightly cron, after
    review rather than beside it. The regex's own comment already demands this
    ("Keep this in sync with those steps"); nothing enforced it.
-3. **It also admits the engine SOURCES those suites import** (BACKLOG #1322), as far as a
-   static read of the suites' own import statements finds them; the scan's docstring names at
-   least four routes it does not follow. Invariant 2 binds the
+3. **It also admits the ``tests/`` helpers those suites import, and the engine SOURCES the suites
+   and those helpers import** (BACKLOG #1322, and #5472's S31-23 for the helpers), as far as a
+   static read of their import statements finds them; the scan's docstring names at least four
+   routes it does not follow. Invariant 2 binds the
    ASSERTING file and not the ASSERTED-ON file, so it is structurally blind to a source change that
    breaks a server-DB assertion. That is not hypothetical: a PR added a key to the ``summary_access``
    audit detail built in ``messagefoundry/api/app.py``, touched ``api/`` only, so ``serverdb`` was
@@ -259,8 +260,9 @@ def _engine_modules_imported_by(text: str) -> dict[str, str]:
 
     Not recorded, by at least these routes, though Python runs or reaches the source: the ancestor
     packages' ``__init__`` files above the one a statement names, which run for every spelling; the
-    modules an imported engine module itself imports; a re-exported attribute's defining module; the
-    helper modules a suite imports from ``tests/``; and ``importlib.import_module``. Measured
+    modules an imported engine module itself imports; a re-exported attribute's defining module; and
+    ``importlib.import_module``. The ``tests/`` helpers a suite imports are not followed HERE: this
+    reads one source, and ``_helpers_reached_by_server_db_suites`` hands it each helper. Measured
     2026-11-23: ``messagefoundry/__init__.py``, ``messagefoundry/auth/__init__.py`` and
     ``messagefoundry/config/__init__.py`` run in server-DB suites by the first route, and the
     ``serverdb`` regex admits none of them. Closing that is a ``ci.yml`` edit, not made here.
@@ -278,14 +280,105 @@ def _engine_modules_imported_by(text: str) -> dict[str, str]:
     return {module: path for module in modules if (path := _module_path(module)) is not None}
 
 
+def _server_db_suite_files() -> set[str]:
+    """The repo-relative files of the suites the server-DB steps run."""
+    return {
+        f"tests/{name}.py"
+        for name in _files_run_by_server_db_steps()
+        if (TESTS_DIR / f"{name}.py").is_file()
+    }
+
+
+@functools.cache
+def _repo_test_sources() -> frozenset[str]:
+    """Every source under ``tests/``, repo-relative, case as the tree spells it."""
+    return frozenset(p.relative_to(REPO_ROOT).as_posix() for p in TESTS_DIR.rglob("*.py"))
+
+
+def _test_helpers_imported_by(text: str) -> set[str]:
+    """The ``tests/`` files one source's ``tests.*`` imports name, as repo-relative paths.
+
+    ``from tests.pkg import name`` names ``pkg`` and, when it is a file, ``pkg.name``, as the
+    engine scan above does. A relative import is not read: no file under ``tests/`` uses one, and
+    ``tests`` has no ``__init__.py``. ``importlib.import_module`` is not followed either.
+    """
+    names: list[str] = []
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, ast.ImportFrom):
+            if node.level or (node.module or "").split(".")[0] != "tests":
+                continue
+            names += [str(node.module)] + [f"{node.module}.{alias.name}" for alias in node.names]
+        elif isinstance(node, ast.Import):
+            names += [a.name for a in node.names if a.name.split(".")[0] == "tests"]
+    found: set[str] = set()
+    for module in names:
+        base = module.replace(".", "/")
+        found.update(c for c in (f"{base}.py", f"{base}/__init__.py") if c in _repo_test_sources())
+    return found
+
+
+def _helpers_reached_by_server_db_suites() -> set[str]:
+    """The ``tests/`` files the server-DB suites import, and the files those import, to a fixed point.
+
+    A step-run suite is left out: invariant 2 already binds it. A helper runs inside the leg as
+    surely as the suite does, so an edit to one alone must pull the leg too (#5472, S31-23).
+    """
+    suites = _server_db_suite_files()
+    reached: set[str] = set()
+    todo = sorted(suites)
+    while todo:
+        path = todo.pop()
+        text = (REPO_ROOT / path).read_text(encoding="utf-8")
+        new = _test_helpers_imported_by(text) - reached - suites
+        reached |= new
+        todo.extend(sorted(new))
+    return reached
+
+
 def _engine_modules_imported_by_server_db_suites() -> dict[str, str]:
-    """Each ``messagefoundry`` module those suites import, mapped to its repo-relative path."""
+    """Each ``messagefoundry`` module those suites, or the helpers they reach, import, by path."""
     paths: dict[str, str] = {}
-    for name in sorted(_files_run_by_server_db_steps()):
-        source = REPO_ROOT / "tests" / f"{name}.py"
-        if source.is_file():
-            paths.update(_engine_modules_imported_by(source.read_text(encoding="utf-8")))
+    for path in sorted(_server_db_suite_files() | _helpers_reached_by_server_db_suites()):
+        text = (REPO_ROOT / path).read_text(encoding="utf-8")
+        paths.update(_engine_modules_imported_by(text))
     return paths
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("from tests._session_seal_contract import run", {"tests/_session_seal_contract.py"}),
+        ("from tests import _session_seal_contract", {"tests/_session_seal_contract.py"}),
+        ("import tests._live_scratch as scratch", {"tests/_live_scratch.py"}),
+        ("from tests.test_alert_sinks import _sink", {"tests/test_alert_sinks.py"}),
+        ("from messagefoundry import pki\nimport os", set()),
+        ("from ._session_seal_contract import run", set()),
+    ],
+)
+def test_the_helper_scan_resolves_tests_imports(source: str, expected: set[str]) -> None:
+    assert _test_helpers_imported_by(source) == expected
+
+
+def test_serverdb_path_gate_admits_every_tests_helper_those_suites_import() -> None:
+    """A ``tests/`` helper a server-DB suite imports must pull the leg when edited (S31-23).
+
+    Before #5472's S31-23 fix the gate named eight such helpers by file and missed at least 41
+    others and 12 ``tests/test_*.py`` modules the suites import, among them
+    ``tests/_session_seal_contract.py``, through which the suites reach ``auth/tokens``.
+    """
+    pattern = _serverdb_full_pattern()
+    helpers = _helpers_reached_by_server_db_suites()
+    assert len(helpers) >= 50, (
+        f"the helper scan reached {len(helpers)} files, under the 64 measured on 2026-11-26; "
+        "either it or the step parsing in _files_run_by_server_db_steps has drifted"
+    )
+    assert "tests/_session_seal_contract.py" in helpers, sorted(helpers)
+    missed = sorted(path for path in helpers if not pattern.match(path))
+    assert not missed, (
+        f"{len(missed)} tests/ file(s) a SQL Server / PostgreSQL suite imports are not matched by "
+        "the `serverdb` regex in .github/workflows/ci.yml, so editing one does NOT pull the leg "
+        "that runs it on the PR:\n  " + "\n  ".join(missed)
+    )
 
 
 @pytest.mark.parametrize(
@@ -410,7 +503,8 @@ def test_serverdb_path_gate_admits_every_source_those_suites_import() -> None:
     IMPORT-REACHABILITY IS A PROXY FOR "ASSERTS AGAINST". It is what a machine can check without
     running anything. It is wider than the assertion set in some ways, for example a module a suite
     imports and asserts nothing about, which costs extra leg-runs. It is NARROWER in others: it
-    reads only the static import statements in the suites themselves, and
+    reads only the static import statements in the suites and the ``tests/`` helpers they reach,
+    and
     ``_engine_modules_imported_by`` names at least four routes to a source it does not record. A
     green here does not show that every source a server-DB leg exercises pulls that leg.
     """

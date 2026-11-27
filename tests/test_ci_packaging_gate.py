@@ -5,9 +5,10 @@
 `ci.yml`'s `changes` job decides whether `packaging-build` runs on a pull request. That job is the
 only one outside a release tag that builds every distribution, and `ci-gate` reads a skipped need
 as a pass, so a file the build reads that no arm names merges green unbuilt. Before #5472 the arm
-missed `ci/locks/release-tools.lock`, which the job installs its `build` frontend from, and the
-files the engine build reads by name: README.md, CHANGELOG.md, LICENSE, NOTICE and the vendored
-defusedxml LICENSE.
+missed `ci/locks/release-tools.lock`, which the job installs its `build` frontend from, and at
+least these files the engine build reads by name: README.md, CHANGELOG.md, LICENSE, NOTICE and the
+vendored defusedxml LICENSE. CORRECTED 2026-11-26 (BACKLOG #5472): "at least" was missing, so the
+list read as complete.
 
 Both sides are READ, never copied: the regex out of `ci.yml`, and the inputs out of the job's own
 `-r` installs and the root `pyproject.toml`, so a new lock or a new shipped root file is met here.
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import functools
 import re
+import shlex
 import tomllib
 from pathlib import Path
 
@@ -50,12 +52,13 @@ def _locks_the_job_installs() -> set[str]:
 
 
 def _root_files_the_engine_build_reads() -> set[str]:
-    """The repo-ROOT files the engine build reads by name, from pyproject.toml.
+    """The files the engine build reads by name, from pyproject.toml: root files, nested licences.
 
     The sdist's ``only-include``, the ``readme`` and the ``license-files``. A directory (the
     package) is left out: the packaged trees are not this arm's by design, as the comment above
     it in ci.yml says. A nested path is left out of the sdist/readme roots, but a nested
-    ``license-files`` entry (the vendored defusedxml LICENSE) is included.
+    ``license-files`` entry (the vendored defusedxml LICENSE) is included. CORRECTED 2026-11-26
+    (BACKLOG #5472): the first line read "The repo-ROOT files".
     """
     project = tomllib.loads(_PYPROJECT.read_text(encoding="utf-8"))["project"]
     sdist = hatch_build(_PYPROJECT)["targets"]["sdist"]
@@ -66,21 +69,21 @@ def _root_files_the_engine_build_reads() -> set[str]:
 
 def test_every_lock_the_job_installs_trips_the_gate() -> None:
     locks = _locks_the_job_installs()
+    assert len(locks) >= 1, "the lock reader found nothing, so the absence check below is vacuous"
     assert "ci/locks/release-tools.lock" in locks, (
         f"the job's lock reader found {sorted(locks)}; it has drifted from the job"
     )
     missed = sorted(lock for lock in locks if not gate([lock]))
-    assert len(locks) >= 1, "the lock reader found nothing, so the absence check below is vacuous"
     assert not missed, f"packaging-build installs from these, yet a bump to one skips it: {missed}"
 
 
 def test_every_root_file_the_engine_build_reads_trips_the_gate() -> None:
     files = _root_files_the_engine_build_reads()
+    assert len(files) >= 4, f"the pyproject reader found only {sorted(files)}; it has gone blind"
     assert {"README.md", "CHANGELOG.md", "LICENSE", "NOTICE"} <= files, (
         f"the pyproject reader found {sorted(files)}; it has drifted from pyproject.toml"
     )
     missed = sorted(path for path in files if not gate([path]))
-    assert len(files) >= 4, "the pyproject reader found too little, so the check below is vacuous"
     assert not missed, (
         f"the engine build reads these, yet a PR touching one skips the build: {missed}"
     )
@@ -109,7 +112,8 @@ def test_the_existing_arms_still_trip_the_gate(path: str) -> None:
         ("messagefoundry/pipeline/engine.py", "a packaged tree, left to push-to-main by design"),
         ("docs/ARCHITECTURE.md", "a docs file no build reads"),
         ("ci/locks/ci-quality.lock", "a lock this job does not install"),
-        ("COMMERCIAL-LICENSE.md", "SHAPE: matches only if `LICENSE` loses its `^`"),
+        ("COMMERCIAL-LICENSE.md", "a root licence file no build reads"),
+        ("COMMERCIAL-LICENSE", "SHAPE: matches only if `LICENSE` loses its `^`"),
         ("LICENSE.md", "SHAPE: matches only if `LICENSE` loses its `$`"),
         ("NOTICE.txt", "SHAPE: matches only if `NOTICE` loses its `$`"),
         ("hatch.toml.bak", "SHAPE: matches only if `hatch` loses its `$`"),
@@ -121,6 +125,42 @@ def test_the_gate_refuses(path: str, why: str) -> None:
     assert not gate([path]), f"the packaging arm admits {path}: {why}"
 
 
+#: The one shape a ``changed=`` assignment may take: a single ``git diff`` in a command
+#: substitution, nothing before or after it on the line.
+_CHANGED = re.compile(r'^changed=\$\((?P<cmd>git diff [^()$;|&#`]*"\$BASE_SHA\.\.\.HEAD")\)$')
+
+
+def _diff_lists_both_sides(line: str) -> bool:
+    """A ``changed=`` line runs one ``git diff`` with ``--no-renames`` among its own options.
+
+    A substring check passed a ``--no-renames`` in a shell comment after the diff, in another
+    command on the line, or beside a later ``-M`` or ``--find-renames`` that turns it back on.
+    """
+    match = _CHANGED.match(line.strip())
+    if not match:
+        return False
+    options = shlex.split(match.group("cmd"))[2:-1]
+    renames_on = [o for o in options if o.startswith(("-M", "--find-renames", "--renames"))]
+    return "--no-renames" in options and not renames_on
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ('changed=$(git diff --name-only --no-renames "$BASE_SHA...HEAD")', True),
+        ('changed=$(git diff --no-renames --name-only "$BASE_SHA...HEAD")', True),
+        ('changed=$(git diff --name-only "$BASE_SHA...HEAD")', False),
+        ('changed=$(git diff --name-only "$BASE_SHA...HEAD") # --no-renames', False),
+        ('changed=$(git diff --name-only --no-renames -M "$BASE_SHA...HEAD")', False),
+        ('changed=$(git diff --name-only --no-renames --find-renames "$BASE_SHA...HEAD")', False),
+        ('changed=$(echo --no-renames; git diff --name-only "$BASE_SHA...HEAD")', False),
+        ('changed=$(git diff --name-only "$BASE_SHA...HEAD" | grep -v --no-renames)', False),
+    ],
+)
+def test_the_rename_reader_on_planted_lines(line: str, expected: bool) -> None:
+    assert _diff_lists_both_sides(line) is expected
+
+
 def test_the_changes_diff_lists_both_sides_of_a_rename() -> None:
     """With rename detection on, ``git diff --name-only`` lists only a rename's NEW path, so
     ``git mv LICENSE LICENSE.md`` would trip no ``LICENSE$`` arm. Every arm reads this one list."""
@@ -128,5 +168,5 @@ def test_the_changes_diff_lists_both_sides_of_a_rename() -> None:
     run = next(str(step["run"]) for step in doc if step.get("id") == "f")
     lines = [line.strip() for line in run.splitlines() if line.strip().startswith("changed=")]
     assert lines, "the changes step no longer assigns `changed`"
-    missing = [line for line in lines if "--no-renames" not in line]
-    assert not missing, f"the changes diff detects renames again: {missing}"
+    missing = [line for line in lines if not _diff_lists_both_sides(line)]
+    assert not missing, f"the changes diff detects renames again, or is not one git diff: {missing}"

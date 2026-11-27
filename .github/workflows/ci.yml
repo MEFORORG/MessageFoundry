@@ -3340,12 +3340,9 @@ jobs:
           # modules and config/models. The source arms below admitted all 36 then, and
           # tests/test_serverdb_ci_coverage.py::test_serverdb_path_gate_admits_every_source_those_suites_import
           # DERIVES that set from the suites' own imports and fails if one stops being admitted.
-          # It reads only the DIRECT imports of the test files the steps name. It does not follow the
-          # tests.* helpers they import, so a source reached only through a helper is NOT checked
-          # unless a gated suite also imports it directly. auth/tokens was such a source (measured
-          # 2026-10-15, via tests/_session_seal_contract.py); test_postgres_store.py now imports it
-          # directly and the auth arm admits it. Other helper-only sources were not censused, so assume
-          # at least some remain unchecked.
+          # It follows the tests/ helpers those files import, to a fixed point, and reads their
+          # imports too (S31-23); `tests/_[^/]*\.py$` admits every root helper, wider than those
+          # reached, for the file size limit. It does not follow an engine module's own imports.
           # Import-reachability is a PROXY for
           # "asserts against": it is what a machine can check, and it is deliberately wider than the
           # assertion set rather than narrower.
@@ -3388,7 +3385,7 @@ jobs:
           # must meet them on its own PR rather than first on the nightly after the merge.
           # scripts/ci/db-tls-cert.sh makes the certificate these legs' databases serve and the engine
           # verifies (vault BACKLOG #3533 item 2), so an edit to it alone must pull them.
-          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__init__|messagefoundry/__main__|messagefoundry/pki|messagefoundry/api/(__init__|app|approvals)|messagefoundry/auth/(__init__|service|tokens|trust_anchors|anchor_path)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|reference_sync|retention|sharding|stage_dispatcher|wiring_runner)|messagefoundry/connection_events|messagefoundry/sqlserver_roles|messagefoundry/(logging_setup|redaction)|messagefoundry/odbc_(call_gate|env|dsn)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|store_pin_connect_refusal|uploads_shard_quota|embedded_document_pruning)|tests/_live_scratch\.py|tests/_claim_lock_helpers\.py|tests/audit_chain_cases\.py|tests/_replay_settle_contract\.py|tests/_finalize_race_contract\.py|tests/_pending_approval_store_contract\.py|tests/_ad_group_map_store_contract\.py|tests/_keyed_reopen_contract\.py|tests/_lockout_store_contract\.py|tests/test_store_cipher_sweep_parity\.py|tests/test_transit_bound_attestation_server_backends\.py|ci/python-version|scripts/ci/db-tls-cert\.sh|\.github/workflows/ci\.yml)'; then
+          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__init__|messagefoundry/__main__|messagefoundry/pki|messagefoundry/api/(__init__|app|approvals|security)|messagefoundry/auth/(__init__|service|tokens|trust_anchors|anchor_path|audit_visibility|identity|ldap|passwords|permissions|totp)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|reference_sync|retention|sharding|stage_dispatcher|wiring_runner|alert_sinks|engine|ingress_guards|refused_body|security_signals)|messagefoundry/connection_(events|names)|messagefoundry/sqlserver_roles|messagefoundry/(logging_setup|redaction|integrity|security/__init__)|messagefoundry/odbc_(call_gate|env|dsn)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring|fingerprint|snapshot|tls_policy)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12|admission|dicom|receipt)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|store_pin_connect_refusal|uploads_shard_quota|embedded_document_pruning|alert_sinks|alert_state|auth_hardening|b2614_revoke_all|b5091_global_session_epoch|config_fingerprint|custom_roles|processed_files_ledger|reload_dir_only_moves_on_apply|security_signals|start_config_change_alert|startup_attestation)|tests/_[^/]*\.py$|tests/audit_chain_cases\.py|tests/test_store_cipher_sweep_parity\.py|tests/test_transit_bound_attestation_server_backends\.py|ci/python-version|scripts/ci/db-tls-cert\.sh|\.github/workflows/ci\.yml)'; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
@@ -3396,7 +3393,8 @@ jobs:
           # The container image smoke runs on PRs that touch the image, the per-profile locks, pyproject,
           # this workflow, an engine module on the image's start path, or a rig file its steps run.
           # ci/locks/release-tools.lock is in because the image's builder stage installs from it
-          # (BACKLOG #1193), so a bump to it can break the image build. #5472: root COPY sources.
+          # (BACKLOG #1193), so a bump to it can break the image build. #5472: root COPY sources and
+          # the vendored licence the image's wheel build reads.
           #
           # THE START-PATH ARM (vault BACKLOG #3455). The image's ENTRYPOINT is `python -m
           # messagefoundry` (docker/Dockerfile), and this job is the only one that starts `serve` the
@@ -3428,7 +3426,7 @@ jobs:
           # not in ci-gate's needs (see the note above ci-gate). The merge_group and push arms are
           # unchanged (#1830). tests/test_ci_docker_gate.py pins this alternation, and the measured
           # run rate is in that file's docstring.
-          if echo "$changed" | grep -qE '^(docker/|\.dockerignore|ci/locks/release-tools\.lock|pyproject\.toml|requirements\.lock|(README\.md|LICENSE|NOTICE)$|messagefoundry/(__init__|__main__|serviceenv|terminal_text|api/(__init__|app|models|tls)|auth/(trust_anchors|anchor_path|passwords)|pki|config/(anchor|retention_classification|settings|tls_policy|wiring)|transports/egress|logging_setup|startupcode|remotedebug)\.py$|harness/load/rigadmin\.py$|scripts/ci/make_syslog_ca_crl\.py$|tests/_phi_gate_provisions\.py$|\.github/workflows/ci\.yml)'; then
+          if echo "$changed" | grep -qE '^(docker/|\.dockerignore|ci/locks/release-tools\.lock|pyproject\.toml|requirements\.lock|(README\.md|LICENSE|NOTICE)$|messagefoundry/(__init__|__main__|serviceenv|terminal_text|api/(__init__|app|models|tls)|auth/(trust_anchors|anchor_path|passwords)|pki|config/(anchor|retention_classification|settings|tls_policy|wiring)|transports/egress|logging_setup|startupcode|remotedebug)\.py$|messagefoundry/_vendor/defusedxml/LICENSE$|harness/load/rigadmin\.py$|scripts/ci/make_syslog_ca_crl\.py$|tests/_phi_gate_provisions\.py$|\.github/workflows/ci\.yml)'; then
             echo "docker=true" >> "$GITHUB_OUTPUT"
           else
             echo "docker=false" >> "$GITHUB_OUTPUT"

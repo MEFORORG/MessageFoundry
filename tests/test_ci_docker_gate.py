@@ -34,6 +34,7 @@ import ast
 import functools
 import json
 import re
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -297,25 +298,85 @@ def test_the_existing_arms_still_trip_the_gate(path: str) -> None:
     assert gate([path]), f"the docker arm no longer admits {path}"
 
 
-#: A COPY line's arguments. The last source-shaped token is the destination.
-_COPY = re.compile(r"^COPY\s+(?P<args>.+)$", re.M)
+#: A COPY or ADD instruction, any case, after line continuations are joined: its leading
+#: ``--flag`` options, then its arguments, the last of which is the destination.
+_COPY = re.compile(
+    r"^[ \t]*(?:COPY|ADD)[ \t]+(?P<flags>(?:--\S+[ \t]+)*)(?P<args>.+)$", re.M | re.I
+)
+
+
+def _checkout_sources_copied(dockerfile: str) -> list[str]:
+    """Each source a COPY or ADD instruction reads from the build context, in file order.
+
+    Reads the shell form and the JSON form, and an instruction continued over several lines with
+    a trailing backslash, the default escape character. A ``--from`` copy reads another build
+    stage, not the checkout, so it is skipped. A heredoc source is not read, and neither is a
+    ``# escape=`` directive that changes the escape character.
+    """
+    joined = re.sub(r"\\[ \t]*\r?\n", " ", dockerfile)
+    found: list[str] = []
+    for match in _COPY.finditer(joined):
+        if "--from" in match.group("flags"):
+            continue
+        args = match.group("args").strip()
+        if args.startswith("["):
+            try:
+                tokens = [str(t) for t in json.loads(args)]
+            except json.JSONDecodeError:
+                pytest.fail(f"a JSON-form COPY does not parse, so its sources are unread: {args}")
+        else:
+            tokens = args.split()
+        found += tokens[:-1]
+    return found
 
 
 def _root_files_the_image_copies() -> set[str]:
     """Every repo-ROOT file a Dockerfile COPY line reads from the checkout (BACKLOG #5472).
 
     A root file only: a directory source (``messagefoundry``) is the start-path set above, and a
-    nested source (``docker/locks/...``) sits under an arm of its own. A ``--from`` copy reads
-    another build stage, not the checkout, so it is skipped.
+    nested source (``docker/locks/...``) sits under an arm of its own.
     """
-    found: set[str] = set()
-    for match in _COPY.finditer(_DOCKERFILE.read_text(encoding="utf-8")):
-        tokens = match.group("args").split()
-        if any(token.startswith("--from") for token in tokens):
-            continue
-        sources = [token for token in tokens if not token.startswith("--")][:-1]
-        found |= {s for s in sources if "/" not in s and (_ROOT / s).is_file()}
-    return found
+    sources = _checkout_sources_copied(_DOCKERFILE.read_text(encoding="utf-8"))
+    return {s for s in sources if "/" not in s and (_ROOT / s).is_file()}
+
+
+@pytest.mark.parametrize(
+    ("dockerfile", "expected"),
+    [
+        ("COPY pyproject.toml README.md ./\n", ["pyproject.toml", "README.md"]),
+        ("COPY pyproject.toml \\\n    README.md \\\n    ./\n", ["pyproject.toml", "README.md"]),
+        ('COPY ["LICENSE", "NOTICE", "./"]\n', ["LICENSE", "NOTICE"]),
+        ('COPY --chown=0:0 ["LICENSE", "./"]\n', ["LICENSE"]),
+        ("copy --chmod=644 NOTICE /src/\n", ["NOTICE"]),
+        ("ADD README.md /src/\n", ["README.md"]),
+        ("COPY --from=builder /opt/venv /opt/venv\n", []),
+        ("RUN echo COPY LICENSE ./\n", []),
+    ],
+)
+def test_the_copy_reader_on_planted_dockerfiles(dockerfile: str, expected: list[str]) -> None:
+    """The shapes a COPY may take, so a source spelled across lines or as JSON is not missed."""
+    assert _checkout_sources_copied(dockerfile) == expected
+
+
+def test_every_licence_and_readme_the_image_build_reads_trips_the_gate() -> None:
+    """The image builds the engine wheel, which reads pyproject's ``readme`` and every
+    ``license-files`` entry by name, so a rename or a removal fails the image build. Each one the
+    image COPYs, as a file or inside a copied directory, must run the smoke. Before #5472's fix the
+    vendored defusedxml LICENSE, inside the copied ``messagefoundry`` tree, did not."""
+    project = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    named = {project["readme"], *project["license-files"]}
+    sources = _checkout_sources_copied(_DOCKERFILE.read_text(encoding="utf-8"))
+    copied = sorted(
+        path
+        for path in named
+        if any(path == s or path.startswith(s.rstrip("/") + "/") for s in sources)
+    )
+    assert copied, f"the readers found none of {sorted(named)} copied; they have gone blind"
+    assert "messagefoundry/_vendor/defusedxml/LICENSE" in copied, (
+        f"the readers found {copied} copied of {sorted(named)}; they have drifted"
+    )
+    missed = [path for path in copied if not gate([path])]
+    assert not missed, f"the image's wheel build reads these, yet editing one skips it: {missed}"
 
 
 def test_every_root_file_the_image_copies_trips_the_gate() -> None:
@@ -323,17 +384,27 @@ def test_every_root_file_the_image_copies_trips_the_gate() -> None:
     build reads them by name, so a rename or a removal fails the image build. Before BACKLOG #5472
     only pyproject.toml matched, so a PR touching only one of the other three skipped this job."""
     copied = _root_files_the_image_copies()
+    assert len(copied) >= 4, f"the COPY reader found only {sorted(copied)}; it has gone blind"
     assert {"pyproject.toml", "README.md", "LICENSE", "NOTICE"} <= copied, (
         f"the Dockerfile COPY reader found {sorted(copied)}; it has drifted from the Dockerfile"
     )
     missed = sorted(path for path in copied if not gate([path]))
-    assert len(copied) >= 4, "the COPY reader found too little, so the check below is vacuous"
     assert not missed, (
         f"the image COPYs these root files, yet editing one skips the smoke: {missed}"
     )
 
 
-@pytest.mark.parametrize("path", ["README.md.orig", "LICENSE-3RD", "NOTICE.txt", "docs/README.md"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "README.md.orig",
+        "LICENSE-3RD",
+        "NOTICE.txt",
+        "docs/README.md",
+        "COMMERCIAL-LICENSE",
+        "messagefoundry/_vendor/defusedxml/LICENSE.txt",
+    ],
+)
 def test_the_root_file_arm_is_anchored(path: str) -> None:
     """SHAPE: each matches only if the root-file alternation loses its ``$`` or its ``^``."""
     assert not gate([path]), f"the docker arm admits {path}"
