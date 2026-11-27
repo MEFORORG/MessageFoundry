@@ -6889,7 +6889,7 @@ ledger, so it has no public page.
   earlier, a crafted `traceparent` value could cost quadratic CPU in
   `TraceContextTextMapPropagator.extract()`, the W3C trace-context propagator. 1.45.2 refuses a
   `traceparent` longer than 512 characters before matching it. fastapi depends on opentelemetry-api,
-  so every engine install carries it, but fastapi requires only 1.44.0 or later. The engine wheel
+  so every engine install carries it, but the fastapi the locks pin requires only 1.44.0 or later. The engine wheel
   now declares its own floor, `opentelemetry-api>=1.45.2`, so `pip install "messagefoundry==0.5.3"`
   upgrades an older copy, and the locks pin 1.45.2. The engine turns fastapi's own telemetry off,
   and [RISKY-COMPONENTS.md](docs/RISKY-COMPONENTS.md) says what that keeps from the propagators.

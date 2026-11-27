@@ -291,14 +291,14 @@ that package's build code may run in CI:
   - It needs an engine release that ships the module; 0.5.1 and earlier do not, and the job fails
     rather than fall back to an audit that skips pins.
   - It runs `pip-audit --strict`, so a pin no advisory database can look up (a private package)
-    fails the job, and `--ignore-vuln` does not cover that case. From the first engine release
-    after 0.5.2, name such a package with `--skip-private <name>` before `requirements.lock` on the
+    fails the job, and `--ignore-vuln` does not cover that case. From engine 0.5.3 on, name such a
+    package with `--skip-private <name>` before `requirements.lock` on the
     audit line: that one pin is left out of the audit and printed as not audited, and every other
     pin is still looked up. The dry-run still downloads it, so pip must be configured with the
     index that serves it. It refuses the engine's own name, and the name of each other MessageFoundry
     package your engine release records as published: at least `messagefoundry-webconsole`,
     `messagefoundry-harness` and `messagefoundry-toolkit`.
-  - From the first engine release after 0.5.2, pip and pip-audit get an allowlist environment, not
+  - From engine 0.5.3 on, pip and pip-audit get an allowlist environment, not
     the job's whole one: what Python needs to start, pip's own `PIP_*` variables, and the proxy,
     certificate, `NETRC` and XDG folder variables. A CI token the job sets is then not in their
     environment. That is not isolation: they run as the job's account and can still read the
