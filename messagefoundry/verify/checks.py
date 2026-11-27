@@ -361,7 +361,7 @@ def check_postgres_driver() -> CheckResult:
         "host.asyncpg",
         "PostgreSQL driver (asyncpg)",
         Status.PASS,
-        f"asyncpg {ver} (pure-Python; no libpq needed)",
+        f"asyncpg {ver} (no libpq needed)",
     )
 
 

@@ -92,6 +92,7 @@ CORE = runtime_closure.CLOSURE
 #: core closure plus what each of these adds to it (``population``).
 EXTRAS: dict[str, Path] = {
     "sqlserver": runtime_closure.SQLSERVER_CLOSURE,
+    "postgres": runtime_closure.POSTGRES_CLOSURE,
     "harness": runtime_closure.HARNESS_CLOSURE,
 }
 SNAPSHOT = ROOT / "security" / "risky-component-readings.json"
