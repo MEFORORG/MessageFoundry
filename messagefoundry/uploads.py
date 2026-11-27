@@ -437,12 +437,14 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
     unreached: str | None = None
     try:
         before = path.lstat()
-    except FileNotFoundError as exc:
-        if is_absent(exc):
+    except OSError as exc:
+        # Whatever class it arrives as: a FileNotFoundError on Windows, and at least the ESTALE of
+        # a stale NFS handle, which was re-raised and answered a server error (BACKLOG #5388).
+        unreached = _unreachable_fault(exc)
+        if unreached is None:
             raise
-        unreached = codec_safe_str(exc)
     if unreached is not None:
-        raise _UnreachableError(errno.ENOENT, f"{path.name} could not be reached: {unreached}")
+        raise _unreached(path, unreached)
     refused = _plain_refusal(before)
     if refused is not None:
         raise _RefusedBeforeOpen(f"{path.name} is not a plain file", refused)
@@ -478,8 +480,10 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
                 errno.ENOENT, f"{path.name} went after it was checked: {text}", str(path)
             )
         if seen == "unreachable":
-            raise _UnreachableError(errno.ENOENT, f"{path.name} could not be reached: {text}")
+            raise _unreached(path, text)
         raise _NotPlainError(f"{path.name} changed after it was checked: {text}")
+    # Each step after the open classes a share that went away as the open does, so no caller
+    # re-raises it as a server error (BACKLOG #5388).
     try:
         # Before the fdopen, which answers a directory swapped in after the lstat with its own
         # IsADirectoryError, naming the descriptor rather than the path (BACKLOG #5388 added
@@ -489,9 +493,13 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
         if not S_ISREG(after.st_mode):
             raise _NotPlainError(f"{path.name} changed after it was checked")
         handle = os.fdopen(fd, "rb")
-    except BaseException:
+    except BaseException as exc:
         os.close(fd)
-        raise
+        unreached = _unreachable_fault(exc)
+        if unreached is None:
+            raise
+    if unreached is not None:
+        raise _unreached(path, unreached)
     try:
         if not _O_NOFOLLOW:
             again = path.lstat()
@@ -501,9 +509,13 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
             # A regular file, so a blocking read is safe, and some filesystems would otherwise
             # answer a read with EAGAIN.
             os.set_blocking(handle.fileno(), True)
-    except BaseException:
+    except BaseException as exc:
         handle.close()
-        raise
+        unreached = _unreachable_fault(exc)
+        if unreached is None:
+            raise
+    if unreached is not None:
+        raise _unreached(path, unreached)
     return handle, after
 
 
@@ -511,22 +523,31 @@ def _read_plain_text(path: Path, limit: int | None = None) -> str:
     """The text of the regular file ``path``, opened by :func:`_open_plain`, with no more than
     ``limit`` bytes read when one is given (BACKLOG #5387 added item 1). Raises what that raises,
     :class:`_OversizedFileError` for a file over ``limit``, and ``UnicodeDecodeError`` for one
-    that is not UTF-8."""
+    that is not UTF-8. A read that meets the share going away raises :class:`_UnreachableError`,
+    as the open does (BACKLOG #5388)."""
     handle, info = _open_plain(path)
     with handle:
-        if limit is None:
-            data = handle.read()
-        else:
-            if info.st_size > limit:
-                raise _OversizedFileError(limit)
-            # Sized by the file, not the limit, so a small file costs a small buffer. A file
-            # that grew since the fstat is read on, up to one byte past the limit, so it is
-            # either read whole or refused, never cut short.
-            data = handle.read(info.st_size + 1)
-            if info.st_size < len(data) <= limit:
-                data += handle.read(limit + 1 - len(data))
-            if len(data) > limit:
-                raise _OversizedFileError(limit)
+        if limit is not None and info.st_size > limit:
+            raise _OversizedFileError(limit)
+        unreached: str | None = None
+        try:
+            if limit is None:
+                data = handle.read()
+            else:
+                # Sized by the file, not the limit, so a small file costs a small buffer. A file
+                # that grew since the fstat is read on, up to one byte past the limit, so it is
+                # either read whole or refused, never cut short.
+                data = handle.read(info.st_size + 1)
+                if info.st_size < len(data) <= limit:
+                    data += handle.read(limit + 1 - len(data))
+        except OSError as exc:
+            unreached = _unreachable_fault(exc)
+            if unreached is None:
+                raise
+        if unreached is not None:
+            raise _unreached(path, unreached)
+        if limit is not None and len(data) > limit:
+            raise _OversizedFileError(limit)
     return data.decode("utf-8")
 
 
@@ -598,6 +619,23 @@ class _UnreachableError(OSError):
     """A part whose share or directory could not be reached, so nothing is known about it
     (BACKLOG #5388 added item 3). Never a ``FileNotFoundError``, so no caller reads it as an upload
     that is gone; the by-id reads and the delete answer it as :class:`UploadStorageUnreachableError`."""
+
+
+def _unreached(path: Path, fault: str) -> _UnreachableError:
+    """The :class:`_UnreachableError` for part ``path``, whose access met ``fault``, already
+    rendered. ENOENT, not the errno met, so no caller classes it by errno; its type says what it
+    is."""
+    return _UnreachableError(errno.ENOENT, f"{path.name} could not be reached: {fault}")
+
+
+def _unreachable_fault(exc: BaseException) -> str | None:
+    """``exc`` rendered when it is an ``OSError`` saying a part's share cannot be reached
+    (:func:`~messagefoundry.path_reach.is_unreachable`), whatever its class, else ``None``
+    (BACKLOG #5388). The one test each step of a part's read applies, so the caller raises
+    :func:`_unreached` after its handler."""
+    if isinstance(exc, OSError) and is_unreachable(exc):
+        return codec_safe_str(exc)
+    return None
 
 
 def _recheck(name: object, cause: OSError) -> _Recheck:
@@ -713,10 +751,24 @@ def _unlink_retrying(path: Path) -> bool:
         if unreached is not None:
             # After the handler, so the error is on no chain. ENOENT, not the errno met, so no
             # caller classes it by errno; its type says what it is.
-            raise _UnreachableError(errno.ENOENT, f"{path.name} could not be reached: {unreached}")
+            raise _unreached(path, unreached)
         time.sleep(pause)
         pause *= 2
     return False  # unreachable: the last try returned or raised
+
+
+def _unlink_if_present(path: Path) -> bool:
+    """Unlink ``path``, and whether this call removed it: ``False`` only when nothing was there
+    (:func:`~messagefoundry.path_reach.is_absent`). A share that cannot be reached raises a
+    ``FileNotFoundError`` too on Windows; that, and any other error, is raised as it is, so an
+    outage never reads as a part already gone (BACKLOG #5388)."""
+    try:
+        path.unlink()
+    except FileNotFoundError as exc:
+        if not is_absent(exc):
+            raise
+        return False
+    return True
 
 
 def _unpadded(text: str) -> str:
@@ -2095,7 +2147,11 @@ class UploadStore:
             modified = sidecar.lstat().st_mtime
             try:
                 body = blob_path.lstat()
-            except FileNotFoundError:
+            except FileNotFoundError as exc:
+                # Only a body that is absent is size 0. One whose share cannot be reached raises
+                # to the handler below, so the pair waits for the next pass (BACKLOG #5388).
+                if not is_absent(exc):
+                    raise
                 size = 0
             else:
                 modified = max(modified, body.st_mtime)
@@ -2134,9 +2190,12 @@ class UploadStore:
         check is not opened at all."""
         try:
             before = blob.lstat()
-        except FileNotFoundError:
-            return 0
         except OSError as exc:
+            # Only an absent body is a lost one. A share that cannot be reached raises a
+            # FileNotFoundError too on Windows, and that body is not known to be lost (BACKLOG
+            # #5388), so it waits as an unread one does.
+            if is_absent(exc):
+                return 0
             self._body_unread(blob, exc)
             return None
         if _names_a_link(before) or not _is_regular(before):
@@ -2452,10 +2511,8 @@ class UploadStore:
         try:
             # Under the pair lock, so a rotate-key re-seal cannot put either back (BACKLOG #3181).
             with _pair_lock(meta_path):
-                blob_path.unlink(missing_ok=True)
-                try:
-                    meta_path.unlink()
-                except FileNotFoundError:
+                _unlink_if_present(blob_path)
+                if not _unlink_if_present(meta_path):
                     return False
         except OSError as exc:
             _log.error(
@@ -3291,11 +3348,15 @@ class UploadStore:
                             raise UploadNotFoundError(file_id) from exc
                         unreached = codec_safe_str(exc)
                     except OSError as exc:
-                        refused = _refused_read(exc)
-                        if refused is None:
-                            raise
-                        kind = refused
-                        defect = codec_safe_str(exc)
+                        # A share that went away is unreachable, as the read above answers it,
+                        # never a server error (BACKLOG #5388).
+                        unreached = _unreachable_fault(exc)
+                        if unreached is None:
+                            refused = _refused_read(exc)
+                            if refused is None:
+                                raise
+                            kind = refused
+                            defect = codec_safe_str(exc)
                     if unreached is not None:
                         raise _unreachable(file_id, unreached)
                     if defect is not None:
@@ -3733,7 +3794,11 @@ class UploadStore:
                 # before decrypting (_read_sidecar), so it is a skip over any body, a lost one too.
                 return self._refused_meta(fid, "it is plaintext too long to seal")
         except (OSError, UnicodeDecodeError) as exc:
-            if kind == "body" and isinstance(exc, FileNotFoundError | UnicodeDecodeError):
+            # Only an absent body is missing. One whose share cannot be reached raises a
+            # FileNotFoundError too on Windows; it may still be under the OLD key, so it is a
+            # skip below, never a lost one a re-run would not count (BACKLOG #5388).
+            missing = isinstance(exc, OSError) and is_absent(exc)
+            if kind == "body" and (missing or isinstance(exc, UnicodeDecodeError)):
                 # BACKLOG #3181: the body is missing or is not text, so no key reads it and no
                 # re-run changes that. It holds nothing under the OLD key, so it is not a skip;
                 # counting one would fail every later run for good. The sidecar is still handled,
@@ -4174,12 +4239,16 @@ class UploadStore:
             # can overlap), so only its leftover sidecar is cleared, with no second report.
             try:
                 blob_path.unlink()
-            except FileNotFoundError:
+            except OSError as exc:
+                # Only an absent body was removed before. One whose share cannot be reached raises
+                # a FileNotFoundError too on Windows, and its sidecar is kept (BACKLOG #5388).
+                if not is_absent(exc):
+                    _log.warning(
+                        "uploaded-logs prune left %s for the next pass: %s", meta.file_id, exc
+                    )
+                    return False
                 with contextlib.suppress(OSError):
                     meta_path.unlink(missing_ok=True)
-                return False
-            except OSError as exc:
-                _log.warning("uploaded-logs prune left %s for the next pass: %s", meta.file_id, exc)
                 return False
             # A refused sidecar unlink leaves a sidecar with no body. The next pass finds the
             # body gone and clears the sidecar without reporting the pair again.
@@ -5167,6 +5236,10 @@ def _replace_if_unchanged(tmp: Path, path: Path, seen: os.stat_result) -> None:
         try:
             now = path.lstat()
         except FileNotFoundError as exc:
+            # Only an absent file was removed. One whose share cannot be reached is raised as the
+            # error it is, so the caller skips it and never counts a body as lost (BACKLOG #5388).
+            if not is_absent(exc):
+                raise
             raise _ChangedUnderReseal(gone=True) from exc
         if not _same_file(now, seen):
             raise _ChangedUnderReseal(gone=False)
