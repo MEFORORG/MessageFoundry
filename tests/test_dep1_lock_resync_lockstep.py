@@ -22,6 +22,7 @@ import functools
 import hashlib
 import json
 import os
+import pprint
 import re
 import shutil
 import subprocess
@@ -144,12 +145,15 @@ def test_every_exported_lock_is_verified_and_staged() -> None:
     # stage the PR head's working-tree bytes back over the staged content.
     from tests.test_ci_venv_pinning import _executed_shell
 
+    porcelain = re.compile(r"\bgit\s+(?:add|stage|commit)(?![\w-])")
+    assert porcelain.search("git commit -a -m x") and porcelain.search("git stage x")
+    assert not porcelain.search('git commit-tree "${tree}"')
     adders = [
         (job, step.get("name"))
         for job, step in _all_steps()
-        if re.search(r"\bgit\s+add\b", _executed_shell(str(step.get("run") or "")))
+        if porcelain.search(_executed_shell(str(step.get("run") or "")))
     ]
-    assert not adders, f"the resync runs `git add`: {adders}"
+    assert not adders, f"the resync stages or commits from the working tree: {adders}"
 
 
 def test_the_resync_regenerates_the_closure_file() -> None:
@@ -500,10 +504,10 @@ _CREDENTIAL_JOB_ACTIONS = ("actions/checkout@", _DOWNLOAD, _MINT)
 #: BEST-EFFORT, AND NOT THE CONTROL THAT HOLDS THE PUSH JOB. ``_shell_words`` is not a shell parser,
 #: so at least these get past it: a ``(`` or ``)`` inside quotes inside a substitution (the body is
 #: cut by counting parentheses), a variable assigned by ``printf -v`` or ``read``, a redirect target
-#: (skipped, never checked), and options of an allowed git subcommand such as
-#: ``git push --receive-pack``. What holds the credential jobs is
-#: ``test_the_credential_job_steps_are_pinned_by_content``: any edit to one of their steps is red
-#: until a reviewer re-pins it. This screen is kept as a reviewer's aid that names the obvious cases.
+#: (skipped, never checked), and the path arguments after ``git diff --cached --quiet --``. What
+#: holds the credential jobs is ``test_the_credential_job_steps_are_pinned_by_content``: any edit to
+#: one of their steps is red until the same change re-pins it. This screen is kept as a reviewer's
+#: aid that names the obvious cases.
 _CREDENTIAL_COMMANDS = frozenset(
     {":", "[", "[[", "base64", "echo", "exit", "export", "find", "git", "printf", "pwd"}
     | {"read", "realpath", "set", "test", "true"}
@@ -513,15 +517,30 @@ _SHELL_KEYWORDS = frozenset({"!", "{", "}", "if", "then", "elif", "else", "fi", 
 _SHELL_KEYWORDS |= {"do", "done", "esac"}
 #: The git subcommands the push may run, and the git config keys it may set. git reads others as
 #: programs to run (an alias, a submodule foreach, a rebase --exec, core.fsmonitor, diff drivers).
-_GIT_SUBCOMMANDS = frozenset({"commit", "config", "diff", "hash-object", "push", "update-index"})
+_GIT_SUBCOMMANDS = frozenset(
+    {"commit-tree", "config", "diff", "hash-object", "push", "update-index", "write-tree"}
+)
 _GIT_CONFIG_SET = frozenset({"user.name", "user.email"})
-#: The two git subcommands that stage by content, each with the only argument list it may take.
-#: hash-object without ``--no-filters`` runs a tree-named filter; update-index has
-#: ``--index-info`` and other forms that read arbitrary entries.
+#: The git subcommands that stage, commit and push, each with the only argument list it may take.
+#: hash-object without ``--no-filters`` runs the filter driver the tree's .gitattributes names;
+#: update-index has ``--index-info`` and other forms that read arbitrary entries; push has
+#: ``--receive-pack`` and ``--exec``, which name a program.
 _GIT_EXACT_ARGS = {
     "hash-object": ["hash-object", "-w", "--no-filters", "--", "${src}/${rel}"],
     "update-index": ["update-index", "--add", "--cacheinfo", "100644,${oid},${rel}"],
+    "write-tree": ["write-tree"],
+    "commit-tree": [
+        "commit-tree",
+        "${tree}",
+        "-p",
+        "HEAD",
+        "-m",
+        "chore(deps): resync exported lock files (DEP-1)",
+    ],
+    "push": ["push", "origin", "${commit}:refs/heads/${HEAD_REF}"],
 }
+#: ``git diff`` may take only this prefix, then paths. ``--ext-diff`` or ``--textconv`` run programs.
+_GIT_DIFF_PREFIX = ["diff", "--cached", "--quiet", "--"]
 #: The git config the push may set through GIT_CONFIG_*, each key with the exact value it must
 #: carry. Any other key, or the same key with another value (core.fsmonitor naming a program), is
 #: refused.
@@ -630,6 +649,12 @@ def _disallowed_commands(script: str) -> list[str]:
                     bad.append(f"git config {args[1:2]} in {shown!r}")
                 elif args[0] in _GIT_EXACT_ARGS and args != _GIT_EXACT_ARGS[args[0]]:
                     bad.append(f"git {args[0]} with other arguments: {shown!r}")
+                elif args[0] == "diff" and (
+                    args[:4] != _GIT_DIFF_PREFIX or any(a.startswith("-") for a in args[4:])
+                ):
+                    bad.append(
+                        f"git diff other than `git diff --cached --quiet -- <paths>`: {shown!r}"
+                    )
             elif name == "find" and any(a.startswith(("-exec", "-ok", "-delete")) for a in args):
                 bad.append(f"find runs or deletes: {shown!r}")
     return bad
@@ -686,6 +711,12 @@ def test_the_command_allowlist_refuses_what_it_must() -> None:
         "cp scripts/evil ~/.local/bin/git",
         'cp -- "${src}/${rel}" "${rel}"',
         "git add requirements.lock",
+        "git commit -a -m x",
+        "git stage requirements.lock",
+        'git push --receive-pack=./evil origin "${commit}:refs/heads/${HEAD_REF}"',
+        'git push origin "HEAD:refs/heads/${HEAD_REF}"',
+        "git diff --ext-diff --cached --quiet -- a",
+        "git diff --cached --quiet -- a --textconv",
         'git hash-object -w -- "${src}/${rel}"',
         "git hash-object --stdin-paths -w",
         "git update-index --index-info",
@@ -698,7 +729,9 @@ def test_the_command_allowlist_refuses_what_it_must() -> None:
     assert _step_offences({"run": "print(1)", "shell": "python {0}"})
     assert _step_offences({"run": "git push", "env": {"BASH_ENV": "scripts/evil.sh"}})
     for run in (
-        "git push origin HEAD",
+        'git push origin "${commit}:refs/heads/${HEAD_REF}"',
+        'tree="$(git write-tree)"',
+        "git diff --cached --quiet -- requirements.lock constraints.lock",
         'echo "::error::scripts/security/runtime_closure.py failed"',
         'oid="$(git hash-object -w --no-filters -- "${src}/${rel}")"',
         'git update-index --add --cacheinfo "100644,${oid},${rel}"',
@@ -762,6 +795,14 @@ def test_the_credential_jobs_run_no_code_from_the_pr_tree() -> None:
             assert not offences, f"{job}: step {label!r}: {offences}"
 
 
+def _pinned_form(step: dict[str, Any]) -> dict[str, Any]:
+    """``step`` with an action's ``uses:`` cut to its name. A Dependabot SHA bump of that action then
+    needs no re-pin; which actions a credential job may use is held by ``_CREDENTIAL_JOB_ACTIONS``."""
+    if "uses" not in step:
+        return step
+    return {**step, "uses": str(step["uses"]).partition("@")[0]}
+
+
 def _content_hash(value: object) -> str:
     """A sha256 over ``value``'s whole parsed content, every key and value, in a stable spelling."""
     canonical = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
@@ -784,23 +825,23 @@ _PINNED_CREDENTIAL_JOBS: dict[str, list[tuple[str, str]]] = {
         ("push job keys", "2e5e3a208d0ada173fe5ae457147ded7e9626fcd4fa88e9b9a9f758770ead824"),
         (
             "Check out the PR head",
-            "f36cbff787264dab548f958844c7301c22784222bc369e8b14a97d40f972fb53",
+            "6fa7fb3f00652e59f28b00f18630c7055b48d7e1918e873833a30f13d5774c00",
         ),
         (
             "Fetch the re-exported files from the export job",
-            "a37c41ec1d1329abd46bec1aa351d182042177cc1630a73305748ad66df399e4",
+            "878ce3b1dd270c684ec38c64958955e4828dc186446cafb0b731282403a46aae",
         ),
         (
             "Stage the re-exported files by content",
-            "7236617111b8afd5f87dd94e6cd6d80f2ecf41500eb60171f7c566db921735ea",
+            "1db538a0bc3e036c0a9fbf9d72e41e03e53c55bb3957f450f4a33ec91f5514b7",
         ),
         (
             "Mint a scoped GitHub App token",
-            "1477ed810174635ac856a9e68b1b0b969050f4f914f7adfc3b88f953d3fecb10",
+            "87a5155a5cc00447acc0b9c47a68ad90ebfc4d2202ec231240f9753116888d85",
         ),
         (
             "Commit and push the resynced locks",
-            "0ce48d206c74c0a1e2a4d797c84443f35309b1fefcf16979fabe75145702097d",
+            "03992f0faf7d08e33b9578e3847192932885184ff50efcc36c63e521680c9012",
         ),
         (
             "Fail if the closure inventory could not be regenerated",
@@ -815,52 +856,45 @@ def _credential_job_pins() -> dict[str, list[tuple[str, str]]]:
     for job in _PINNED_CREDENTIAL_JOBS:
         body = _job(job)
         rows = [(f"{job} job keys", _content_hash({k: v for k, v in body.items() if k != "steps"}))]
-        rows += [(str(s.get("name") or s.get("uses")), _content_hash(s)) for s in _job_steps(job)]
+        rows += [
+            (str(s.get("name") or s.get("uses")), _content_hash(_pinned_form(s)))
+            for s in _job_steps(job)
+        ]
         pins[job] = rows
     return pins
 
 
 def test_the_credential_job_steps_are_pinned_by_content() -> None:
-    """RED when: any step of the preflight or push job changes at all, or a step is added, removed
-    or reordered, or either job's own keys (``if:``, ``needs``, ``permissions``, ...) change
-    (BACKLOG #5477).
+    """RED when: any step of the preflight or push job changes at all, other than an action's
+    pinned SHA, or a step is added, removed or reordered, or either job's own keys (``if:``,
+    ``needs``, ``permissions``, ...) change (BACKLOG #5477).
 
     The command screen above parses shell with a word splitter, so a run block can be written to get
     past it. Pinning each step's whole content (its run body, env, with, if, continue-on-error and
-    every other key) means no edit to a job that holds the App key or token gets past this test
-    unseen: the failure prints the new pins, and copying them in is the reviewed act.
+    every other key) holds the jobs that hold the App key or token unchanged since they were last
+    pinned: an edit is red until the same change re-pins it, so the re-pin shows in the diff. That is
+    reviewed only as the rest of the diff is; the pin does not judge whether the edit is safe. The
+    failure prints the new pins as a literal to paste in.
     """
     actual = _credential_job_pins()
     assert actual == _PINNED_CREDENTIAL_JOBS, (
         "a credential job's content changed; review the edit, then re-pin with:\n"
-        + json.dumps(actual, indent=4)
+        + pprint.pformat(actual, width=100)
     )
 
 
-#: Environment names the shell, git, the dynamic loader or an interpreter reads as configuration or
-#: as code to run. Set at workflow or job level, one would reach every step of that scope.
-_CONFIG_ENV = re.compile(
-    r"BASH_ENV|ENV|BASHOPTS|SHELLOPTS|PS4|IFS|CDPATH|PATH|HOME|XDG_CONFIG_HOME|PROMPT_COMMAND"
-    r"|GIT_\w*|LD_\w*|PYTHON\w*|PERL5?\w*|RUBY\w*|NODE_\w*|UV_\w*|PIP_\w*",
-    re.IGNORECASE,
-)
+def test_no_workflow_or_job_env_is_set() -> None:
+    """RED when: the workflow or any of its jobs sets an ``env:`` block (BACKLOG #5477).
 
-
-def test_no_workflow_or_job_env_sets_shell_or_git_configuration() -> None:
-    """RED when: the workflow sets an ``env:`` at all, or any job sets a job-level env naming a
-    variable the shell, git, the loader or an interpreter reads (at least BASH_ENV, GIT_CONFIG_*,
-    PATH, LD_PRELOAD) (BACKLOG #5477).
-
-    A workflow-level env reaches every step of the credential jobs, beside the token. The step-level
-    env of those jobs is held to ``_CREDENTIAL_STEP_ENV`` above, and their steps are pinned.
+    A workflow-level env reaches every step of the credential jobs, beside the token, and a job-level
+    one every step of its job; either could set BASH_ENV, GIT_CONFIG_*, PATH or LD_PRELOAD. No job
+    needs one, so none is allowed, rather than a denylist of names to keep complete. Step-level env
+    in the credential jobs is held to ``_CREDENTIAL_STEP_ENV`` above, and their steps are pinned.
     """
     workflow = load_workflow(_RESYNC.name)
     assert "env" not in workflow, f"the resync sets a workflow-level env: {workflow.get('env')}"
-    assert _CONFIG_ENV.fullmatch("GIT_CONFIG_PARAMETERS") and _CONFIG_ENV.fullmatch("BASH_ENV")
-    assert not _CONFIG_ENV.fullmatch("APP_TOKEN") and not _CONFIG_ENV.fullmatch("HEAD_REF")
-    for job, body in _jobs().items():
-        named = [str(n) for n in body.get("env") or {} if _CONFIG_ENV.fullmatch(str(n))]
-        assert not named, f"the {job} job's env sets {named}"
+    with_env = [job for job, body in _jobs().items() if "env" in body]
+    assert not with_env, f"these resync jobs set a job-level env: {with_env}"
 
 
 def test_the_push_job_reads_the_export_job_only_through_the_artifact_and_an_if() -> None:
@@ -960,6 +994,13 @@ _GIT_TEST_CONFIG = (
 )
 
 
+def _scratch_env(**extra: str) -> dict[str, str]:
+    """The environment with every GIT_* variable removed. A hook or ``rebase -x`` that runs pytest
+    exports GIT_DIR and GIT_INDEX_FILE, which would point these scratch git commands at the live
+    repository."""
+    return {**{k: v for k, v in os.environ.items() if not k.startswith("GIT_")}, **extra}
+
+
 def _git(workspace: Path, *args: str) -> str:
     return subprocess.run(
         ["git", *_GIT_TEST_CONFIG, "-C", str(workspace), *args],
@@ -967,6 +1008,7 @@ def _git(workspace: Path, *args: str) -> str:
         capture_output=True,
         text=True,
         timeout=60,
+        env=_scratch_env(),
     ).stdout
 
 
@@ -992,10 +1034,18 @@ def _run_copy(
     _git(workspace, "init", "-q")
     _git(workspace, "add", "-A")
     _git(workspace, "commit", "-q", "-m", "PR head")
+    _git(tmp_path, "init", "-q", "--bare", "origin.git")
+    _git(workspace, "remote", "add", "origin", str(tmp_path / "origin.git"))
+    return _run_step(workspace, script, bash, RUNNER_TEMP=str(temp))
+
+
+def _run_step(
+    workspace: Path, script: str, bash: str, **env: str
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [bash, "-c", script],
         cwd=workspace,
-        env={**os.environ, "RUNNER_TEMP": str(temp)},
+        env=_scratch_env(**env),
         capture_output=True,
         text=True,
         check=False,
@@ -1088,3 +1138,51 @@ def test_the_copy_step_refuses_what_the_artifact_or_tree_could_plant(tmp_path: P
             or not landed.is_file()
             or landed.read_text(encoding="utf-8") != "victim\n"
         ), f"{build.__name__}: a file from outside the artifact was written into the checkout"
+
+
+def _commit_step() -> dict[str, Any]:
+    steps = [s for s in _job_steps("push") if "git push" in str(s.get("run", ""))]
+    assert len(steps) == 1, "expected one push job step that runs git push"
+    return steps[0]
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="the steps run on an ubuntu runner; GNU realpath and base64 -w0 are needed",
+)
+def test_the_commit_step_commits_the_staged_content_or_nothing(tmp_path: Path) -> None:
+    """RED when: the commit step does not commit exactly what the staging step put in the index,
+    on top of the PR head, or pushes when the artifact already matches the PR head (BACKLOG #5477).
+
+    Executes the staging step and then the commit step verbatim against a local bare ``origin``.
+    The file remote ignores the http.extraheader the step sets, so the push needs no token.
+    """
+    staged = sorted(set(_exports(_GATE)) | _CLOSURES)
+    stage, commit = str(_copy_step()["run"]), str(_commit_step()["run"])
+    bash = require_bash(tmp_path)
+    ref = "refs/heads/dependabot/uv/resync-probe"
+    env = {"HEAD_REF": ref.removeprefix("refs/heads/"), "APP_TOKEN": "not-a-token"}
+
+    def in_sync(ws: Path, art: Path) -> None:
+        for rel in staged:
+            (art / rel).write_text("old\n", encoding="utf-8")
+
+    for build, changes in ((lambda ws, art: None, True), (in_sync, False)):
+        case = tmp_path / ("changed" if changes else "in-sync")
+        staging = _run_copy(case, build, staged, stage, bash)
+        assert staging.returncode == 0, staging.stdout + staging.stderr
+        ws, origin = case / "ws", case / "origin.git"
+        result = _run_step(ws, commit, bash, **env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        pushed = _git(origin, "for-each-ref", "--format=%(objectname)", ref).strip()
+        if not changes:
+            assert not pushed, "the commit step pushed although the artifact matches the PR head"
+            assert "already in sync" in result.stdout, result.stdout
+            continue
+        assert pushed, f"the commit step pushed nothing: {result.stdout}{result.stderr}"
+        head = _git(ws, "rev-parse", "HEAD").strip()
+        assert _git(origin, "rev-parse", f"{pushed}^").strip() == head, "not committed on the head"
+        changed = sorted(_git(origin, "diff", "--name-only", head, pushed).split())
+        assert changed == staged, f"the pushed commit changes {changed}, not the staged set"
+        stale = [r for r in staged if _git(origin, "show", f"{pushed}:{r}") != "new\n"]
+        assert not stale, f"the pushed commit carries the PR head's bytes at {stale}"

@@ -36,16 +36,22 @@ name: Dependabot lock resync
 #    is handed one. (Whether the service ever delivers an unreferenced secret to a job's runner is
 #    not measured here.) It hands its output to `push` as an artifact. `push` mints the App token
 #    and pushes, and runs no code from the Dependabot-changed tree: it checks the tree out as data,
-#    stages the artifact's files by content into git's index at a fixed list of paths, writing
-#    nothing through the checkout's filesystem, and commits and pushes. Every step of `push` and of
-#    `preflight` is pinned by content hash in tests/test_dep1_lock_resync_lockstep.py, so any edit to
-#    one turns that test red until a reviewer re-pins it; the same file also screens their run
-#    blocks against a command allowlist, a best-effort check whose known gaps it lists. Each job is
+#    puts the artifact's files into git's object store and index at a fixed list of paths, writing
+#    no file in the working tree (only git's own .git/objects and .git/index), and commits from the
+#    index with plumbing (write-tree, commit-tree), which reads no working-tree file. Each job is
 #    its own GitHub-hosted runner, so nothing `export` writes to $GITHUB_ENV, $GITHUB_PATH,
-#    BASH_ENV, .git/config or its filesystem reaches `push`. What does cross is untrusted, and at least this: the artifact (its entry names and file
-#    contents, which the staging step checks), the `closure` job output (read only in an `if:`), and
-#    whether `export` succeeded (which gates `push`). The read-only GITHUB_TOKEN is in the export and
-#    push jobs; preflight's carries no permission.
+#    BASH_ENV, .git/config or its filesystem reaches `push`. What does cross is untrusted, and at
+#    least this: the artifact (its entry names and file contents, which the staging step checks),
+#    the `closure` job output (read only in an `if:`), and whether `export` succeeded (which gates
+#    `push`). The read-only GITHUB_TOKEN is in the export and push jobs; preflight's carries no
+#    permission.
+#  - WHAT HOLDS THE CREDENTIAL JOBS TO THAT. tests/test_dep1_lock_resync_lockstep.py pins every step
+#    of `preflight` and `push`, and each job's own keys, by a hash of their whole content (an
+#    action's `uses:` by its name, so a Dependabot SHA bump does not re-pin). That holds them
+#    unchanged since they were last pinned: an edit is red until the same change re-pins it, so the
+#    re-pin shows in the diff, and it is reviewed only as the rest of the diff is. It does not judge
+#    whether the edit runs tree code. The same file screens their run blocks against a command
+#    allowlist, a best-effort word-level check whose known gaps it lists.
 #  - NO project install/tests/build runs here, and "uv lock --check" (validate-only, never builds an
 #    sdist) + "uv export" (serializes the existing lock) execute NO package code.
 #  - ONE repository script runs: scripts/security/runtime_closure.py (BACKLOG #1812, #1955), in the
@@ -239,15 +245,9 @@ jobs:
 
   push:
     # THE ONLY JOB THAT HOLDS THE APP KEY OR TOKEN (BACKLOG #5477), and it runs no code from the
-    # Dependabot-changed tree: no uv, no interpreter, no repository script. Its steps are three
-    # actions (checkout, download-artifact, create-github-app-token) and four run blocks, over a
-    # checkout read as data and the files the export job handed over. What holds that is
-    # tests/test_dep1_lock_resync_lockstep.py: it pins every step of this job, each by a hash of its
-    # whole content (run, env, if, with and every other key), so an edit is red until re-pinned
-    # after review. It also screens the run blocks against a command allowlist (git with a fixed set
-    # of subcommands, find without -exec/-ok/-delete, realpath, base64 and shell builtins), which is
-    # best-effort: the test names the shell forms it does not parse. A fresh runner, so nothing the
-    # export job planted in its own environment or git config is here.
+    # Dependabot-changed tree: no uv, no interpreter, no repository script, over a checkout read as
+    # data and the files the export job handed over. What holds that is in the SECURITY MODEL above.
+    # A fresh runner, so nothing the export job planted in its own environment or git config is here.
     name: Push the re-exported lock files to the PR branch
     needs: [preflight, export]
     if: >-
@@ -276,12 +276,14 @@ jobs:
 
       # The artifact was written by a job that ran code from the Dependabot-changed tree, so it is
       # untrusted data. Only the fixed list below is staged, and only from regular files. Each file
-      # goes into git's object store and index by content (hash-object, then update-index), so
-      # nothing is written through a path in the checkout: a lock path the tree made a symlink, a
+      # goes into git's object store and index by content (hash-object, then update-index), so no
+      # file is written through a path in the working tree: a lock path the tree made a symlink, a
       # directory (even one holding a same-named symlink), or a path under a symlinked directory
-      # cannot redirect a write outside it. Such a path is refused all the same, and git itself
-      # refuses an index entry that collides with a tracked directory or symlink. Any other file in
-      # the artifact fails the step, and so does a failed listing of it.
+      # cannot redirect a write outside it. The shell checks refuse each of those. git refuses only
+      # some on its own: an entry under a tracked directory or a symlinked parent (exit 128), but NOT
+      # a tracked symlink at the lock path itself, which update-index silently replaces; the `-L`
+      # check is what refuses that one. Every entry is staged as 100644, whatever mode the tree
+      # tracked it with. Any other file in the artifact fails the step, and so does a failed listing.
       - name: Stage the re-exported files by content
         run: |
           set -euo pipefail
@@ -315,7 +317,9 @@ jobs:
               echo "::error title=lock-resync checkout::${rel} is not a regular file inside the checkout"
               exit 1
             fi
-            # --no-filters: no .gitattributes filter or eol rule from the tree touches the bytes.
+            # --no-filters: no filter driver the tree's .gitattributes names runs here. It also skips
+            # the eol=lf rule, so the artifact's own bytes are committed; uv and the closure script
+            # write LF on the ubuntu export runner.
             oid="$(git hash-object -w --no-filters -- "${src}/${rel}")"
             git update-index --add --cacheinfo "100644,${oid},${rel}"
           done
@@ -356,7 +360,12 @@ jobs:
           fi
           # No `git add`: the staging step already put each file in the index by content, and
           # the working tree still holds the PR head's bytes, so adding from it would undo that.
-          git commit -m 'chore(deps): resync exported lock files (DEP-1)'
+          # Committed from the index with plumbing. `git commit` refreshes the index first, and for
+          # an entry staged with --cacheinfo that runs the clean filter the tree's .gitattributes
+          # selects over the working-tree copy, in this token-holding step; write-tree and
+          # commit-tree read no working-tree file.
+          tree="$(git write-tree)"
+          commit="$(git commit-tree "${tree}" -p HEAD -m 'chore(deps): resync exported lock files (DEP-1)')"
           # Push with the App token (NOT GITHUB_TOKEN). An App-token push emits a synchronize event so
           # the required checks (DEP-1, ci.yml) re-run on the new commit; a GITHUB_TOKEN push would
           # leave them pending and the PR unmergeable.
@@ -370,11 +379,11 @@ jobs:
           # secret masker happens to register.
           auth="$(printf 'x-access-token:%s' "${APP_TOKEN}" | base64 -w0)"
           echo "::add-mask::${auth}"
-          # Fully qualified: the checkout is a detached SHA, so HEAD has no branch to infer a name from.
+          # Fully qualified: the commit is on no branch, so there is no name to infer.
           GIT_CONFIG_COUNT=3 \
           GIT_CONFIG_KEY_2='http.https://github.com/.extraheader' \
           GIT_CONFIG_VALUE_2="AUTHORIZATION: basic ${auth}" \
-            git push origin "HEAD:refs/heads/${HEAD_REF}"
+            git push origin "${commit}:refs/heads/${HEAD_REF}"
 
       # The export job's closure step may fail without failing that job, so the locks are still
       # pushed. Its outcome arrives here as a job output and is read only in this `if:`, never in a
