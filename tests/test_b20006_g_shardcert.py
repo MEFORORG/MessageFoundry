@@ -217,6 +217,7 @@ def _sizes(**over: Any) -> dict[str, Any]:
     [
         pytest.param({"kill_at_fraction": 1.0}, id="fraction-1"),
         pytest.param({"kill_at_fraction": 1.5}, id="fraction-above-1"),
+        pytest.param({"kill_at_fraction": 0.0}, id="fraction-0-kills-before-any-load"),
         pytest.param({"kill_at_fraction": -0.1}, id="fraction-negative"),
         pytest.param({"kill_at_fraction": float("nan")}, id="fraction-nan"),
         pytest.param({"kill_shard": "zz"}, id="unknown-shard"),
@@ -226,7 +227,7 @@ async def test_colocated_kill_leg_that_cannot_kill_under_load_is_refused_before_
     fleet: types.SimpleNamespace, over: dict[str, Any]
 ) -> None:
     """S27-55 (1) and (2). Before the fix a fraction of 1 never fired the kill, then started a second
-    process over the live shard; an unknown shard raised KeyError mid-hold after the whole fleet ran."""
+    process over the live engine shard; an unknown one raised KeyError mid-hold after the whole fleet ran."""
     with pytest.raises(ValueError, match="kill_(at_fraction|shard)") as refused:
         await sc.run_shardcert(**_sizes(kill=True, **over))
     assert isinstance(refused.value, sc.KillLegError)
@@ -237,6 +238,7 @@ async def test_colocated_kill_leg_that_cannot_kill_under_load_is_refused_before_
 async def test_engine_kill_leg_with_an_unknown_shard_is_refused_before_launch(
     fleet: types.SimpleNamespace, tmp_path: Path
 ) -> None:
+    coord = FileDropCoord(tmp_path, run_id="unknown")
     with pytest.raises(ValueError, match="kill_(at_fraction|shard)") as refused:
         await sc.run_shardcert_engine(
             dests=2,
@@ -246,27 +248,32 @@ async def test_engine_kill_leg_with_an_unknown_shard_is_refused_before_launch(
             drain_timeout=2.0,
             sink_port=47100,
             store_env={},
-            coord=FileDropCoord(tmp_path, run_id="unknown"),
+            coord=coord,
             inbound_bind_host="127.0.0.1",
             post_drain_grace=0.0,
         )
     assert isinstance(refused.value, sc.KillLegError)
     assert fleet.nodes == []
     assert fleet.resets == []
+    # The drive half is told at once rather than waiting out its SHARDS_READY timeout.
+    assert coord.read(sc.ENGINE_SETUP_FAILED) is not None
 
 
 def test_kill_leg_settings_are_not_read_without_a_kill() -> None:
-    sc.require_kill_leg(False, "zz", 7.0, ["a", "b"])
-    sc.require_kill_leg(True, None, 0.0, ["a", "b"])
+    sc.require_kill_leg(False, "zz", 7.0, [])
+    sc.require_kill_leg(True, None, 0.01, ["a", "b"])
     sc.require_kill_leg(True, "b", 0.99, ["a", "b"])
+    with pytest.raises(sc.KillLegError, match="no engine shard"):
+        sc.require_kill_leg(True, None, 0.5, [])
 
 
-async def test_colocated_kill_fires_even_when_the_hold_ends_before_a_tick_reaches_it(
+async def test_colocated_kill_fires_inside_the_hold_when_ticks_are_far_apart(
     fleet: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """S27-55 (1), the in-range case: ticks further apart than the hold's remainder. The first tick is
-    before the deadline and the next is past the hold, so the loop ends unkilled. Before the fix the restart
-    then started over the live shard and the report still named it killed."""
+    before the deadline and the next is past the hold, so before the fix the loop ended unkilled, the
+    restart started over the live engine shard, and the report still named it killed. The tick now wakes at
+    the kill instant."""
     monkeypatch.setattr(sc, "_MAX_TICK_SLEEP", 0.3)
     rep = await sc.run_shardcert(
         **_sizes(aggregate_rate=1.0, hold_seconds=0.1, kill=True, kill_at_fraction=0.5)
@@ -277,6 +284,7 @@ async def test_colocated_kill_fires_even_when_the_hold_ends_before_a_tick_reache
     assert fleet.nodes[killed[0]].shard == rep.killed_shard
     assert fleet.events.index(("kill", killed[0])) < fleet.events.index(("start", restart.index))
     assert rep.recovery_seconds is not None
+    assert not any("after the load" in note for note in rep.notes)
 
 
 async def test_colocated_kill_leg_stops_the_killed_node_and_keeps_its_log(
@@ -427,3 +435,17 @@ def test_kept_log_is_set_aside_only_under_the_keep_setting(tmp_path: Path) -> No
     assert not (tmp_path / "shard-a.log").exists()
     assert (tmp_path / "shard-a.prekill.log").read_bytes() == b"before the kill"
     sc._set_aside_kept_log("shard-missing", {"MEFOR_BENCH_KEEP_NODE_LOGS": str(tmp_path)})
+
+
+def test_kept_log_that_cannot_be_moved_does_not_stop_the_kill_leg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A diagnostic log held open elsewhere (a Windows sharing violation) is logged, not raised."""
+    (tmp_path / "shard-a.log").write_bytes(b"before the kill")
+
+    def refuse(self: Path, target: object) -> Path:
+        raise PermissionError("held open")
+
+    monkeypatch.setattr(Path, "replace", refuse)
+    sc._set_aside_kept_log("shard-a", {"MEFOR_BENCH_KEEP_NODE_LOGS": str(tmp_path)})
+    assert "could not keep the pre-kill log of shard-a" in caplog.text

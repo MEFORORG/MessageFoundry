@@ -82,7 +82,7 @@ def test_routed_stage_dead_letters_fail_the_single_box_report() -> None:
     js = rep.to_json_dict()
     assert js["verdict"] == "FAIL"
     assert js["correctness"]["dead_total"] == 1000  # type: ignore[index]
-    assert js["schema_version"] == 6
+    assert js["schema_version"] == 7
 
 
 def test_unmeasured_dead_total_fails_closed() -> None:

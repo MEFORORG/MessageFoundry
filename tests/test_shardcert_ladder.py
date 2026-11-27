@@ -1475,7 +1475,8 @@ def test_colocated_ladder_report_rolls_up_the_void_rates(monkeypatch: pytest.Mon
     assert report.fidelity_void_rates == [80.0, 120.0]  # the shortfall AND the intake bind
     js = report.to_json_dict()
     # v2: +sent +fidelity per record; v3 (#5575/#5576): copies, abort; v4 (#5441): full pass bar
-    assert js["schema_version"] == 4
+    # v5 (#5440 S27-57): engine_dead is the store count, not the engine-shard sum
+    assert js["schema_version"] == 5
     fid = js["fidelity"]
     assert isinstance(fid, dict)
     assert fid["all_admissible"] is False
@@ -1499,7 +1500,8 @@ def test_colocated_report_records_the_pool_and_the_inbound_bands() -> None:
     assert rep.inbound_bands == 4  # G = 4 shards x 1 lane
     js = rep.to_json_dict()
     # v4: +store_pool, +topology G; v5 (#5575): +gated copy check; v6 (#5440): +gated dead_total
-    assert js["schema_version"] == 6
+    # v7 (#5440 S27-57): engine_dead is the store count, not the engine-shard sum
+    assert js["schema_version"] == 7
 
     topo = js["topology"]
     assert isinstance(topo, dict)
