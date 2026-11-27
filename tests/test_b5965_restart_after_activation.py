@@ -19,6 +19,7 @@ import logging
 import socket
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -291,6 +292,36 @@ async def test_a_release_on_the_restarted_box_records_that_it_stays_passive(
         await store.close()
 
 
+async def test_a_refused_release_writes_no_stay_passive_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A release whose audit write fails is refused: it writes no dr.stay_passive row and raises
+    # no dr_released, so the next start alerts again.
+    db, archive, ss, key = await _seed(tmp_path)
+    store = await MessageStore.open(db, cipher=make_cipher(key))
+    try:
+        await _coord(store, ss, archive, _Sink(), None).activate(actor="alice")
+        restarted_sink = _Sink()
+        restarted = _coord(store, ss, archive, restarted_sink, None)
+        assert await restarted.check_restarted_passive()
+        real = store.record_audit
+
+        async def refuse(action: str, *args: Any, **kwargs: Any) -> Any:
+            if action == "dr.stay_passive":
+                raise OSError("audit log refused the write")
+            return await real(action, *args, **kwargs)
+
+        monkeypatch.setattr(store, "record_audit", refuse)
+        with pytest.raises(DrActivationError):
+            await restarted.release(actor="bob")
+        monkeypatch.setattr(store, "record_audit", real)
+        assert await store.list_audit(action="dr.stay_passive", limit=5) == []
+        assert ("dr_released", socket.gethostname()) not in restarted_sink.events
+        assert await _coord(store, ss, archive, _Sink(), None).check_restarted_passive()
+    finally:
+        await store.close()
+
+
 async def test_the_stay_passive_line_claims_no_hand_back(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -320,19 +351,24 @@ async def test_the_stay_passive_line_claims_no_hand_back(
 
 
 def test_the_restart_alert_line_says_how_to_close_it(caplog: pytest.LogCaptureFixture) -> None:
-    # The CRITICAL line says how the alert closes, in the one spelling the ERROR lines share. This
-    # sink keeps no alert instances, so the close and the hand resolve are both conditioned on
-    # [alerts] keeping them, and a refused release is retried, since it recorded nothing.
+    # The CRITICAL line carries the one spelling the ERROR lines share. It describes no release:
+    # it points to the [dr] enabled row, which states what a release does, and conditions the
+    # hand resolve on [alerts] configuring a webhook or email transport.
     with caplog.at_level(logging.CRITICAL, logger="messagefoundry.pipeline.alerts"):
         LoggingAlertSink().dr_restarted_passive("dr-box")
     (line,) = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
     assert DR_RESTART_CLOSE_GUIDANCE in line
-    assert "a POST /dr/release on this start runs the release_hook when one is set" in line
-    assert "where [alerts] keeps alert instances, closes the dr_restarted_passive alert" in line
-    assert "If the release is refused, retry it; nothing is recorded until one succeeds" in line
-    assert "Where [alerts] keeps alert instances and the alert is still open after" in line
-    assert "or a later start leaves it open, resolve it by hand" in line
+    assert "the ERROR line before this says what this start found" in line
+    assert (
+        "How to end this state, by activating or by recording that the box stays passive, is in "
+        "docs/CONFIGURATION.md, the [dr] enabled row." in line
+    )
+    assert (
+        "Where [alerts] configures a webhook or email transport and this alert is still open "
+        "once you have decided, resolve it by hand" in line
+    )
     assert "POST /alerts/{alert_id}/resolve" in line and "Resolve in the web console" in line
+    assert "release_hook" not in line and "retry" not in line
     assert "serves nothing" not in line and "an operator starts on it still binds" in line
 
 

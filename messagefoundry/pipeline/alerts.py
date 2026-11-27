@@ -71,16 +71,12 @@ REMINDER_SECONDS = 300.0
 
 #: How an operator closes ``dr_restarted_passive`` (BACKLOG #5965). Both restart ERROR lines in
 #: ``dr`` carry it because they print under every alert sink, where a sink's own CRITICAL line may
-#: not; ``LoggingAlertSink``'s CRITICAL line carries it too. A refused release records no
-#: ``dr.stay_passive`` row, so the next start alerts again and only a retried release ends that;
-#: the close is best effort and needs alert instances, so the hand route names that condition.
+#: not; ``LoggingAlertSink``'s CRITICAL line carries it too. The close is best effort and needs alert instances, so the hand route names that condition.
 #: Passed as a ``%s`` argument, never joined into a format string, so a ``%`` here stays text.
 DR_RESTART_CLOSE_GUIDANCE = (
-    "To leave it passive instead, a POST /dr/release on this start runs the release_hook when one "
-    "is set, records that the box stays passive and, where [alerts] keeps alert instances, closes "
-    "the dr_restarted_passive alert. If the release is refused, retry it; nothing is recorded "
-    "until one succeeds. Where [alerts] keeps alert instances and the alert is still open after "
-    "a release, or a later start leaves it open, resolve it by hand "
+    "How to end this state, by activating or by recording that the box stays passive, is in "
+    "docs/CONFIGURATION.md, the [dr] enabled row. Where [alerts] configures a webhook or email "
+    "transport and this alert is still open once you have decided, resolve it by hand "
     "(POST /alerts/{alert_id}/resolve, or Resolve in the web console)."
 )
 
@@ -1073,17 +1069,12 @@ class AlertSink(Protocol):
         **passive** (BACKLOG #5965, ADR 0048), so it may have been serving when it went down; a
         store restored from a snapshot taken while it was activated reads the same. It holds no
         DR role and never re-activates itself: once the operator has confirmed the primary is not
-        serving, the operator re-runs ``POST /dr/activate``. Also raised when the start could not
+        serving, the operator runs ``POST /dr/activate``. Also raised when the start could not
         read whether the box was activated. Page-worthy, and CRITICAL unless a matching rule names
         its own severity. It closes the open ``dr_activated`` instance for ``node``, which no
         longer describes this passive box; the next ``dr_activated`` or ``dr_released`` for
-        ``node`` closes this one. On a passive box, ``POST /dr/release`` raises ``dr_released``
-        only when its start raised this alert or the box's newest own activate or release record
-        is an activation. So an instance an earlier start left open, on a start that raised none,
-        stays open until an operator resolves it by hand, with ``POST /alerts/{alert_id}/resolve`` or
-        the web console's Resolve on the alert, or a later ``POST /dr/activate`` under the same
-        ``node``, run only once the operator has confirmed the primary is not serving, closes it;
-        a release there changes nothing and does not close it.
+        ``node`` closes this one. What a release does here is stated once, in
+        docs/CONFIGURATION.md, the [dr] enabled row.
         ``node`` is the label the coordinator's ``dr_activated`` carries: the host, and on an
         engine shard the engine shard identity too. No PHI."""
         ...
@@ -1698,7 +1689,7 @@ class LoggingAlertSink:
     def dr_restarted_passive(self, node: str) -> None:
         log.critical(
             "ALERT dr_restarted_passive: DR box %r started PASSIVE and may have been serving when "
-            "it went down -- the ERROR line before this says what its store shows. It holds no "
+            "it went down -- the ERROR line before this says what this start found. It holds no "
             "DR role until POST /dr/activate, to be run only once you have confirmed the "
             "primary is not serving; an inbound an operator starts on it still binds. %s",
             node,

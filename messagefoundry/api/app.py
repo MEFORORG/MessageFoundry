@@ -12044,7 +12044,7 @@ def create_app(
         tell that case from a stay-passive release: both answer ``active=false``, and a call that
         changed nothing can answer an earlier release's outcome, its drain fields and
         ``vip_hook_ran`` included. Read the alert list to see whether the alert closed. Only a
-        stay-passive release writes a ``dr.stay_passive`` audit row, but an earlier release's row
+        successful stay-passive release writes a ``dr.stay_passive`` audit row, but an earlier release's row
         reads the same, so match its host, actor and time to the call."""
         coord = engine.dr_coordinator
         if coord is None:

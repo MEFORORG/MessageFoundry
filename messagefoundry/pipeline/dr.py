@@ -366,12 +366,8 @@ class DrCoordinator:
         and raises the critical ``dr_restarted_passive`` alert, which also closes the open
         ``dr_activated`` for the same label. Each engine shard reads only the rows its own identity wrote, so each
         alerts on its own. A store that cannot be read is the same loud outcome, since the box may
-        have been serving. ``POST /dr/release`` on the passive box records that the operator
-        leaves it passive, and closes the open alert (:meth:`_record_stay_passive`). On a start
-        that raised none, a release closes nothing, so an alert an earlier start left open stays
-        open until an operator resolves it by hand, or a later activation under the same label,
-        run only once the operator has confirmed the primary is not serving, closes it. Returns
-        whether it alerted.
+        have been serving. What a release does here is stated once, in docs/CONFIGURATION.md, the
+        [dr] enabled row. Returns whether it alerted.
 
         It misses at least: an activation whose ``dr.activate`` row was never written (the owed
         row is held in memory only); a box whose host name changed between the activation and

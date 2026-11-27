@@ -4278,8 +4278,9 @@ The complete set, as enumerated in the [route map](#route--permission-map-engine
   writes no row.
   Otherwise, where its own newest activate or release record is an activation, or its start
   raised the `dr_restarted_passive` alert with no activation recorded since, it is a stay-passive
-  release: it runs the release hook when one is set, writes a `dr.stay_passive` row and closes
-  that alert. In every other case, as on a box never activated or one whose activation aborted
+  release: it runs the release hook when one is set, writes a `dr.stay_passive` audit row and
+  asks the alert to close, which is best effort, so read the alert list afterwards. A refused
+  release, for example one whose audit write fails, writes no such row. In every other case, as on a box never activated or one whose activation aborted
   after a hand-back, the release changes nothing: it writes no row and closes no alert. So a
   `dr_restarted_passive` alert an earlier start left open, on a start that raised none, stays
   open until an operator resolves it by hand, with `POST /alerts/{alert_id}/resolve` or the web
