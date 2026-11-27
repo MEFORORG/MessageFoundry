@@ -666,6 +666,7 @@ opentelemetry-api==1.45.2 ; (python_full_version < '3.15' and platform_python_im
     --hash=sha256:d7b0008e21e5fd61cbe7a7f34ca3b6905a78ab677d9bc395e299359c75cda6b4
     # via
     #   fastapi
+    #   messagefoundry
     #   opentelemetry-exporter-http-transport
     #   opentelemetry-exporter-otlp-proto-grpc
     #   opentelemetry-exporter-otlp-proto-http
@@ -769,6 +770,7 @@ pyasn1==0.6.5 ; (python_full_version < '3.15' and platform_python_implementation
     --hash=sha256:6b11616a6bcf3a40e635f082bb232fa57b5e0dd7f517bd7ddd69ec3794508a47
     # via
     #   ldap3
+    #   messagefoundry
     #   pyasn1-modules
     #   webauthn
 pyasn1-modules==0.4.2 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32') \
