@@ -12827,8 +12827,8 @@ _UNREACHED_ALERT_TEXT: Final[str] = (
 #: that account, so each rollup is resolved or suspended on its own; the outage page covers a whole
 #: directory. A later rollup of a different set pages, even one holding accounts paged before, such
 #: as those of several rollups re-entering together after a restart, as a per-account page does
-#: after one. An INFO line logs the key with the pass's count. Not under ``directory-reconciler-unreached:``, where
-#: a username could spell the label.
+#: after one. An INFO line logs the key with the pass's count. Not under
+#: ``directory-reconciler-unreached:``, where a username could spell the label.
 _UNREACHED_ROLLUP_SOURCE = UNREACHED_ROLLUP_SOURCE
 #: What one page for many such accounts says, on a pass that rolls them up
 #: (``AuthService._record_unreached_accounts`` decides when), so a flapping directory opens one

@@ -1598,13 +1598,13 @@ class QueueStore(StoreLifecycle, Protocol):
         *,
         limit: int = 200,
         allowed_channels: Sequence[str] | None,
-        suspended_after: float | None = None,
+        suspended_until_after: float | None = None,
     ) -> list[AlertInstance]:
         """Read **open + acknowledged** alert instances newest-``last_seen`` first — the read accessor for
         the ``GET /alerts/active`` route. Runs on the lockfree read path; ``limit`` clamped server-side.
         ``allowed_channels`` applies the same per-channel RBAC scope as :meth:`list_connection_events`
         (``None`` = all; a set restricts to instances whose ``connection`` is in the allow-set).
-        ``suspended_after`` set reads only those whose ``suspended_until`` is later than it, so the
+        ``suspended_until_after`` set reads only those whose ``suspended_until`` is later than it, so the
         notifier's suspend prime is not crowded out by unsuspended rows (vault BACKLOG #3100 item 14)."""
         ...
 

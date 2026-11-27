@@ -422,6 +422,78 @@ async def test_escalation_tier_persisted_monotonic(tmp_path: Path) -> None:
         await store.close()
 
 
+async def _assert_suspended_until_after_reads_only_open_suspends(store: Any) -> None:
+    """Vault BACKLOG #3100 item 14, the suspend prime's read, run on each backend: with
+    ``suspended_until_after`` set, only live instances suspended past it are read, under the
+    channel scope and the limit, so newer unsuspended ones cannot crowd one out."""
+    for connection, now in (("OB_X", 100.0), ("OB_Y", 200.0), ("OB_Z", 300.0)):
+        await store.upsert_alert_instance(
+            event_type="connection_error", connection=connection, severity="critical", now=now
+        )
+    rows = {r.connection: r for r in await store.list_active_alert_instances(allowed_channels=None)}
+    assert await store.suspend_alert_instance(rows["OB_X"].id, until=9.0e9, audit=ALERT_AUDIT)
+    assert await store.suspend_alert_instance(rows["OB_Z"].id, until=500.0, audit=ALERT_AUDIT)
+    [newest] = await store.list_active_alert_instances(limit=1, allowed_channels=None)
+    assert newest.connection == "OB_Z"  # the control: unfiltered, the cap keeps only the newest
+    for scope in (None, ["OB_X", "OB_Y"]):
+        got = await store.list_active_alert_instances(
+            limit=1, allowed_channels=scope, suspended_until_after=1000.0
+        )
+        assert [r.connection for r in got] == ["OB_X"], scope
+    assert (
+        await store.list_active_alert_instances(
+            allowed_channels=["OB_Y", "OB_Z"], suspended_until_after=1000.0
+        )
+        == []
+    )
+
+
+async def test_suspended_until_after_reads_only_open_suspends(tmp_path: Path) -> None:
+    store = await MessageStore.open(tmp_path / "a.db")
+    try:
+        await _assert_suspended_until_after_reads_only_open_suspends(store)
+    finally:
+        await store.close()
+
+
+async def test_suspended_until_after_binds_in_order_on_the_server_stores() -> None:
+    """Vault BACKLOG #3100 item 14. The Postgres and SQL Server reads are run for real only on
+    their hosted legs, so this pins, with no server, that the filter's value is bound where its
+    placeholder sits: Postgres numbers ``$n`` from the params, and SQL Server's ``TOP (?)`` keeps
+    the first one. A misbound value would fail the read, and the prime would seed no suspend."""
+    from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    seen: list[tuple[str, tuple[Any, ...]]] = []
+
+    class _Pool:
+        async def fetch(self, sql: str, *params: Any) -> list[Any]:
+            seen.append((sql, params))
+            return []
+
+    pg = PostgresStore.__new__(PostgresStore)
+    pg._pool = _Pool()
+    await pg.list_active_alert_instances(
+        limit=5, allowed_channels=["OB_X"], suspended_until_after=1000.0
+    )
+    sql, params = seen.pop()
+    assert params == (["OB_X"], 1000.0, 5)  # the scope binds as one array
+    assert "suspended_until > $2" in sql and "LIMIT $3" in sql
+
+    async def _fetchall(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+        seen.append((sql, params))
+        return []
+
+    ss = SqlServerStore.__new__(SqlServerStore)
+    ss._fetchall = _fetchall  # type: ignore[method-assign]
+    await ss.list_active_alert_instances(
+        limit=5, allowed_channels=["OB_X"], suspended_until_after=1000.0
+    )
+    sql, params = seen.pop()
+    assert params == (5, "OB_X", 1000.0)
+    assert sql.count("?") == 3 and sql.index("connection IN") < sql.index("suspended_until > ?")
+
+
 async def test_suspend_and_resume_instance(tmp_path: Path) -> None:
     # #143 (store half): suspend sets suspended_until (NOTIFICATION-only — status/count/visibility
     # untouched, so the instance stays on the active list); resume clears it.
@@ -507,7 +579,11 @@ class _RecordingStore:
         return 1
 
     async def list_active_alert_instances(
-        self, *, limit: int = 1000, allowed_channels: object, suspended_after: float | None = None
+        self,
+        *,
+        limit: int = 1000,
+        allowed_channels: object,
+        suspended_until_after: float | None = None,
     ) -> list[Any]:
         return []
 

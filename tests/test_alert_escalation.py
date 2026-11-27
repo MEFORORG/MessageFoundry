@@ -72,7 +72,11 @@ class _EscStore:
         return 0
 
     async def list_active_alert_instances(
-        self, *, limit: int = 200, allowed_channels: object, suspended_after: float | None = None
+        self,
+        *,
+        limit: int = 200,
+        allowed_channels: object,
+        suspended_until_after: float | None = None,
     ) -> list[Any]:
         return []
 

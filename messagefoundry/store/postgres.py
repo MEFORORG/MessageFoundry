@@ -7445,15 +7445,15 @@ class PostgresStore(ServerCipherWalk):
         *,
         limit: int = 200,
         allowed_channels: Sequence[str] | None,
-        suspended_after: float | None = None,
+        suspended_until_after: float | None = None,
     ) -> list[AlertInstance]:
         limit = max(1, min(limit, 1000))  # server-side clamp
         where = [_ACTIVE_ALERT_STATUS_SQL]
         params: list[Any] = []
         if allowed_channels is not None:
             _append_channel_scope_pg(where, params, "connection", allowed_channels)
-        if suspended_after is not None:  # vault BACKLOG #3100 item 14: see the SQLite twin
-            params.append(suspended_after)
+        if suspended_until_after is not None:  # vault BACKLOG #3100 item 14: see the SQLite twin
+            params.append(suspended_until_after)
             where.append(f"suspended_until > ${len(params)}")
         clause = " WHERE " + " AND ".join(where)
         params.append(limit)

@@ -808,38 +808,44 @@ def _kept(entries: dict[str, Any], prefix: str) -> int:
     return sum(1 for key in entries if key.startswith(f"ad_reconcile_aborted:{prefix}:"))
 
 
-def test_rollup_cooldown_state_is_dropped_once_its_cooldown_ends(
+def test_rollup_state_is_kept_for_the_most_recent_rollups_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Vault BACKLOG #3100 item 14. Each rollup of unreachable accounts is its own instance, keyed
     by its accounts, and none has an inverse, so on a flapping directory the notifier's cooldown
-    and occurrence entries grew with every distinct set. A rollup's entries are dropped once its
-    cooldown has passed with no emit, so the two maps hold only the rollups still inside their
-    cooldown. A rollup inside its cooldown is still throttled, and a per-account source keeps its
-    entries as before.
+    and occurrence entries grew with every distinct set. They are now kept for the most recently
+    emitted rollups only, a fixed number (3 here). Within that number nothing changes: a rollup
+    inside its cooldown is still throttled, and its count still builds across a quiet spell far
+    longer than the cooldown, so its escalation does too. A per-account source keeps its entries
+    as before.
 
     RED when: the notifier keeps an entry for every rollup it ever paged."""
     clock = _Clock()
     monkeypatch.setattr(alert_sinks, "time", clock)
+    monkeypatch.setattr(alert_sinks, "_ROLLUP_KEYS_KEPT", 3, raising=False)
     sink = NotifierAlertSink([], realert_seconds=300.0)
     for i in range(50):
         _page(sink, f"{_ROLLUP}:{i:016x}")
-        clock.mono += 301.0
-    assert _kept(sink._last_sent, _ROLLUP) <= 1, "a cooldown entry was kept for every rollup"
-    assert _kept(sink._occurrences, _ROLLUP) <= 1, "a count was kept for every rollup"
-    # The control: inside its cooldown a rollup is still throttled, and still counted.
-    _page(sink, f"{_ROLLUP}:{'a' * 16}")
+        clock.mono += 1.0
+    assert _kept(sink._last_sent, _ROLLUP) <= 3, "a cooldown entry was kept for every rollup"
+    assert _kept(sink._occurrences, _ROLLUP) <= 3, "a count was kept for every rollup"
+    # The control: a rollup among those kept is still throttled inside its cooldown, and counted.
+    same = f"{_ROLLUP}:{'a' * 16}"
+    _page(sink, same)
     queued = sink._queue.qsize()
+    _page(sink, f"{_ROLLUP}:{'b' * 16}")
     clock.mono += 299.0
-    _page(sink, f"{_ROLLUP}:{'a' * 16}")
-    assert sink._queue.qsize() == queued, "a rollup inside its cooldown paged again"
-    assert sink._occurrences[f"ad_reconcile_aborted:{_ROLLUP}:{'a' * 16}"] == 2
+    _page(sink, same)
+    assert sink._queue.qsize() == queued + 1, "a rollup inside its cooldown paged again"
+    clock.mono += 10_000.0  # quiet far past its cooldown: its count still builds
+    _page(sink, same)
+    assert sink._occurrences[f"ad_reconcile_aborted:{same}"] == 3
     # A per-account source is untouched: each keeps its cooldown and count.
     unreached = "directory-reconciler-unreached"
     for i in range(20):
         _page(sink, f"{unreached}:user{i}")
         clock.mono += 301.0
-    _page(sink, f"{_ROLLUP}:{'b' * 16}")
+    _page(sink, f"{_ROLLUP}:{'c' * 16}")
     assert _kept(sink._last_sent, unreached) == 20
     assert _kept(sink._occurrences, unreached) == 20
 

@@ -127,10 +127,13 @@ _DRAIN_CANCEL_GRACE_SECONDS = 0.05
 # Vault BACKLOG #3100 item 14: the instance-key prefix of a rollup of unreachable directory
 # accounts, which opens an instance per set of accounts and has no inverse. Each new set is a new
 # key, so on a flapping directory the per-key cooldown and occurrence entries would grow without
-# bound. For these keys only, both entries go once the key's cooldown has passed with no emit
-# (NotifierAlertSink._expire_rollups): the throttle no longer holds it back by then, and its
-# escalation count restarts, as after a restart, while the durable tier keeps its highest.
+# bound. For these keys only, the notifier keeps both entries for the most recently emitted
+# _ROLLUP_KEYS_KEPT keys and drops those of the least recent (NotifierAlertSink._keep_rollup). A
+# key dropped that way pages on its next emit at the base escalation tier, as after a restart,
+# while the durable tier keeps its highest. Bounded by count, not by cooldown, so no rollup's
+# throttle or escalation changes until that many other sets have paged since it.
 _ROLLUP_KEY_PREFIX = f"ad_reconcile_aborted:{UNREACHED_ROLLUP_SOURCE}:"
+_ROLLUP_KEYS_KEPT = 1024
 
 
 class _AlertStateStore(Protocol):
@@ -158,7 +161,7 @@ class _AlertStateStore(Protocol):
         *,
         limit: int = ...,
         allowed_channels: Sequence[str] | None,
-        suspended_after: float | None = ...,
+        suspended_until_after: float | None = ...,
     ) -> Sequence[Any]: ...
 
 
@@ -1397,10 +1400,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # pick the escalation tier. In-memory + per-node (advisory, like _last_sent); reset on auto-resolve
         # + operator resolve (the durable count/escalation_tier is the cross-restart record).
         self._occurrences: dict[str, int] = {}
-        # Vault BACKLOG #3100 item 14: per rollup key (_ROLLUP_KEY_PREFIX), the monotonic time its
-        # last emit's cooldown ends, so _expire_rollups can drop its _last_sent and _occurrences
-        # entries once it has.
-        self._rollup_deadline: dict[str, float] = {}
+        # Vault BACKLOG #3100 item 14: the rollup keys (_ROLLUP_KEY_PREFIX) whose _last_sent and
+        # _occurrences entries are kept, least recently emitted first (_keep_rollup).
+        self._rollup_keys: dict[str, None] = {}
         # BACKLOG #1741: the state each connection_started cleared, per key, in the order its durable
         # resolve was scheduled, kept until that resolve lands or fails (_resolve_settled).
         self._pending_clears: dict[str, list[_ClearedState]] = {}
@@ -2166,7 +2168,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         now = time.time()
         try:
             rows = await store.list_active_alert_instances(
-                limit=1000, allowed_channels=None, suspended_after=now
+                limit=1000, allowed_channels=None, suspended_until_after=now
             )
         except Exception:
             log.warning("alert suspend-cache prime failed", exc_info=True)
@@ -2278,14 +2280,11 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     def _emit(self, event: dict[str, Any]) -> None:
         now_wall = time.time()
-        now = time.monotonic()
         # #81: schedule-aware decide is time-dependent, so pass the wall clock.
         decision = self._rules.decide(event, now_wall)
         key = f"{_instance_type(event)}:{event['connection']}"
-        rollup = key.startswith(_ROLLUP_KEY_PREFIX)
-        if rollup:
-            # Before the count below, so a key of its own that has gone quiet starts afresh.
-            self._expire_rollups(now)
+        if key.startswith(_ROLLUP_KEY_PREFIX):
+            self._keep_rollup(key)
         # #81 (ADR 0133): occurrence-driven escalation. The in-memory occurrence count mirrors the store's
         # `count` (both bump once per emit); apply the highest tier the count has crossed. tier is persisted
         # to alert_instance.escalation_tier via _record_state below.
@@ -2301,8 +2300,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             if decision.cooldown_seconds is not None
             else self._realert_seconds
         )
-        if rollup:
-            self._rollup_deadline[key] = now + cooldown
+        now = time.monotonic()
         last = self._last_sent.get(key)
         throttled = last is not None and now - last < cooldown
         if not throttled:
@@ -2388,17 +2386,18 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         event["_cooldown_seconds"] = cooldown
         self._enqueue(event, dropped=f"{event['type']} for {event['connection']!r}")
 
-    def _expire_rollups(self, now: float) -> None:
-        """Drop the cooldown and occurrence entries of each rollup key whose last emit's cooldown
-        has ended (vault BACKLOG #3100 item 14; :data:`_ROLLUP_KEY_PREFIX` says why). Run on each
-        rollup emit, so the entries held are those of the rollups emitted within their cooldown.
-        A suspend entry stays: an operator's act, not an emit, adds one."""
-        for key, deadline in list(self._rollup_deadline.items()):
-            if now < deadline:
-                continue
-            del self._rollup_deadline[key]
-            self._last_sent.pop(key, None)
-            self._occurrences.pop(key, None)
+    def _keep_rollup(self, key: str) -> None:
+        """Mark a rollup key as the most recently emitted, and drop the cooldown and occurrence
+        entries of the least recent beyond :data:`_ROLLUP_KEYS_KEPT` (vault BACKLOG #3100 item 14;
+        :data:`_ROLLUP_KEY_PREFIX` says why). A suspend entry stays: an operator's act, or the
+        startup prime's bounded read, adds one, not an emit."""
+        self._rollup_keys.pop(key, None)
+        self._rollup_keys[key] = None
+        while len(self._rollup_keys) > _ROLLUP_KEYS_KEPT:
+            oldest = next(iter(self._rollup_keys))
+            del self._rollup_keys[oldest]
+            self._last_sent.pop(oldest, None)
+            self._occurrences.pop(oldest, None)
 
     # --- durable alert-state side observer (ADR 0044, #56) -------------------
 
