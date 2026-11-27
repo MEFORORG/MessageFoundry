@@ -12038,7 +12038,8 @@ def create_app(
         ``dr_restarted_passive``, it changes nothing: it writes no row and closes no alert, so a
         ``dr_restarted_passive`` an earlier start left open stays open until an operator resolves it by
         hand, with ``POST /alerts/{id}/resolve`` or the web console's Resolve on the alert, or a later
-        ``POST /dr/activate`` under the same box label closes it. The response does not reliably
+        ``POST /dr/activate`` under the same box label, run only once the operator has confirmed
+        the primary is not serving, closes it. The response does not reliably
         tell that case from a stay-passive release: both answer ``active=false``, and a call that
         changed nothing can answer an earlier release's outcome, its drain fields and
         ``vip_hook_ran`` included. Read the alert list to see whether the alert closed."""

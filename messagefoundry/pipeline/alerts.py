@@ -1058,7 +1058,8 @@ class AlertSink(Protocol):
         is an activation. So an instance an earlier start left open, on a start that raised none,
         stays open until an operator resolves it by hand, with ``POST /alerts/{id}/resolve`` or
         the web console's Resolve on the alert, or a later ``POST /dr/activate`` under the same
-        ``node`` closes it; a release there changes nothing and does not close it.
+        ``node``, run only once the operator has confirmed the primary is not serving, closes it;
+        a release there changes nothing and does not close it.
         ``node`` is the label the coordinator's ``dr_activated`` carries: the host, and on an
         engine shard the engine shard identity too. No PHI."""
         ...
@@ -1666,10 +1667,8 @@ class LoggingAlertSink:
         # The inverse (auto-resolve) event, logged at INFO, no page. Raised by a fail-back and by a
         # release that leaves a restarted box passive (BACKLOG #5965), so the line claims no hand-back.
         log.info(
-            "ALERT dr_released: DR box %r released: this box is not activated as DR; serving is "
-            "left to the %s",
+            "ALERT dr_released: DR box %r released; it is not activated as DR",
             node,
-            role,
         )
 
     def dr_restarted_passive(self, node: str) -> None:
@@ -1677,8 +1676,9 @@ class LoggingAlertSink:
             "ALERT dr_restarted_passive: DR box %r started PASSIVE and may have been serving when "
             "it went down -- the ERROR line before this says what its store shows. It serves "
             "nothing until POST /dr/activate, to be run only once you have confirmed the "
-            "primary is not serving; POST /dr/release on this start records that it stays "
-            "passive",
+            "primary is not serving. POST /dr/release on this start records that it stays "
+            "passive and closes this alert; an alert an earlier start left open is resolved by "
+            "hand, with POST /alerts/{alert_id}/resolve or Resolve in the web console",
             node,
         )
 

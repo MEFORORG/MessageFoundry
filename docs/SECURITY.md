@@ -4273,9 +4273,10 @@ The complete set, as enumerated in the [route map](#route--permission-map-engine
   after a hand-back, the release changes nothing: it writes no row and closes no alert. So a
   `dr_restarted_passive` alert an earlier start left open, on a start that raised none, stays
   open until an operator resolves it by hand, with `POST /alerts/{id}/resolve` or the web
-  console's Resolve on the alert, or a later `POST /dr/activate` under the same box label closes
-  it. The release's response does not reliably tell the two apart, so read the alert list. Each
-  asks for the same fresh proof as the planned failover above.
+  console's Resolve on the alert, or a later `POST /dr/activate` under the same box label, run
+  only once the operator has confirmed the primary is not serving, closes it. The release's
+  response does not reliably tell the two apart, so read the alert list. Both DR routes ask for
+  the same fresh proof as the planned failover above.
   Under `serve` a DR box starts passive and no setting promotes it: `[dr].activate` is a removed
   key (BACKLOG #5965; the `[dr]` `activate` row of [CONFIGURATION.md](CONFIGURATION.md) says why).
   So this route is the only promotion, and a restart of an activated box needs it again, once

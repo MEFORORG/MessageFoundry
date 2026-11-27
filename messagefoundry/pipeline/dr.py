@@ -420,7 +420,8 @@ class DrCoordinator:
         operator to reconcile, as after a release. ``None`` when there is nothing to record: then
         it writes no row and closes no alert, so a ``dr_restarted_passive`` an earlier start left
         open stays open until an operator resolves it by hand (``POST /alerts/{id}/resolve``), or
-        a later activation under the same label closes it. A write error refuses the release."""
+        a later activation under the same label, run only once the operator has confirmed the
+        primary is not serving, closes it. A write error refuses the release."""
         try:
             last = await self._own_last_transition()
         except Exception:
@@ -757,7 +758,8 @@ class DrCoordinator:
         the release writes no row and closes no alert. So a ``dr_restarted_passive`` an earlier
         start left open, on a start that raised none, stays open until an operator resolves it by
         hand, with ``POST /alerts/{id}/resolve`` or the web console's Resolve on the alert, or a
-        later activation under the same label closes it.
+        later activation under the same label, run only once the operator has confirmed the
+        primary is not serving, closes it.
         **Within the DR store** at-least-once + idempotency are preserved on drain;
         **cross-store** reconciliation with the recovered primary is operator-verified per the runbook
         (the engine gives no cross-store loss/duplicate guarantee — documented, not an engine AC)."""
