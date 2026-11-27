@@ -215,7 +215,9 @@ ldap3==2.9.1 ; (python_full_version < '3.15' and platform_python_implementation 
 opentelemetry-api==1.45.2 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32') \
     --hash=sha256:2cbd737377e710ee740d261c94e93fa0f08e6d037c18f17513cc0a2d94479a34 \
     --hash=sha256:d7b0008e21e5fd61cbe7a7f34ca3b6905a78ab677d9bc395e299359c75cda6b4
-    # via fastapi
+    # via
+    #   fastapi
+    #   messagefoundry
 psutil==7.2.2 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32') \
     --hash=sha256:0746f5f8d406af344fd547f1c8daa5f5c33dbc293bb8d6a16d80b4bb88f59372 \
     --hash=sha256:076a2d2f923fd4821644f5ba89f059523da90dc9014e85f8e45a5774ca5bc6f9 \
@@ -232,7 +234,9 @@ psutil==7.2.2 ; (python_full_version < '3.15' and platform_python_implementation
 pyasn1==0.6.5 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32') \
     --hash=sha256:4017b0fce125096b8573b39c989fdb1a4b19cf761e683398184550fea0e66587 \
     --hash=sha256:6b11616a6bcf3a40e635f082bb232fa57b5e0dd7f517bd7ddd69ec3794508a47
-    # via ldap3
+    # via
+    #   ldap3
+    #   messagefoundry
 pycparser==3.0 ; (python_full_version < '3.15' and implementation_name != 'PyPy' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and implementation_name != 'PyPy' and platform_python_implementation == 'CPython' and sys_platform == 'win32') \
     --hash=sha256:600f49d217304a5902ac3c37e1281c9fe94e4d0489de643a9504c5cdfdfc6b29 \
     --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992

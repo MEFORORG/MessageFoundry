@@ -6868,16 +6868,14 @@ ledger, so it has no public page.
   when a send failed. `provision-admin` also says in its result when the send of the notice it
   queued raised, so its delivery is unconfirmed: a new `holder_notice_send_failed` field in
   `--json`, and a WARNING line in text output.
-- **The repository's locks pin opentelemetry-api 1.45.2, past CVE-2026-126360.** In 1.45.1 and
+- **The engine requires opentelemetry-api 1.45.2 or later, past CVE-2026-126360.** In 1.45.1 and
   earlier, a crafted `traceparent` value could cost quadratic CPU in
   `TraceContextTextMapPropagator.extract()`, the W3C trace-context propagator. 1.45.2 refuses a
   `traceparent` longer than 512 characters before matching it. fastapi depends on opentelemetry-api,
-  so every engine install carries it, and an install built from the 0.5.2 lock would otherwise keep
-  1.45.1. The fix is in the locks only: the engine wheel declares no opentelemetry-api floor, and
-  fastapi requires only 1.44.0 or later, so `pip install "messagefoundry==0.5.3"` into a venv that
-  already holds 1.45.1 would keep it. Install from the release's `requirements.lock`, or upgrade
-  opentelemetry-api to 1.45.2 or later yourself. The engine turns fastapi's own telemetry off; this
-  entry does not claim that any engine path passes untrusted input to that propagator.
+  so every engine install carries it, but fastapi requires only 1.44.0 or later. The engine wheel
+  now declares its own floor, `opentelemetry-api>=1.45.2`, so `pip install "messagefoundry==0.5.3"`
+  upgrades an older copy, and the locks pin 1.45.2. The engine turns fastapi's own telemetry off;
+  this entry does not claim that any engine path passes untrusted input to that propagator.
 - **A passkey assertion now re-anchors the session, as a TOTP code does.** After a verified
   assertion at `POST /ui/reauth/webauthn` that completes a factor the session had not yet met,
   the session's address anchor moves to the address that proved it, on any session but an
@@ -6890,11 +6888,14 @@ ledger, so it has no public page.
   session that already met its factor now lands on `/ui`, as the page's GET does, instead of a
   re-rendered gate. Enrolling a passkey or a TOTP still moves no anchor. See
   [SECURITY.md](docs/SECURITY.md) (vault BACKLOG #2964 item 14).
-- **The repository's locks pin pyasn1 0.6.5, past CVE-2026-119194, CVE-2026-119195, CVE-2026-119196
-  and CVE-2026-119197.** In 0.6.4 and earlier, crafted BER, CER or DER input could cost quadratic CPU
-  in `decode()`, through schema-less containers, constructed strings, indefinite-length `ANY` or binary
-  `REAL`. A site using the optional `[webauthn]` extra has pyasn1's BER decoder on its passkey
-  registration path, for Android Key attestation, so it would otherwise keep the old decoder there.
+- **The engine requires pyasn1 0.6.5 or later, past CVE-2026-119194, CVE-2026-119195,
+  CVE-2026-119196 and CVE-2026-119197.** In 0.6.4 and earlier, crafted BER, CER or DER input could
+  cost quadratic CPU in `decode()`, through schema-less containers, constructed strings,
+  indefinite-length `ANY` or binary `REAL`. pyasn1 comes in through ldap3 on every engine install,
+  and no package that depends on it excludes those releases, so the engine wheel now declares its
+  own floor, `pyasn1>=0.6.5`, and the locks pin 0.6.5. A site using the optional `[webauthn]` extra
+  has pyasn1's BER decoder on its passkey registration path, for Android Key attestation, so without
+  the floor it could keep the old decoder there.
 - **The `ide/` extension's locked build toolchain moves to glob 14.0.3 and minimatch 11.0.3, past
   [GHSA-3g3m-2fjr-6pw4](https://github.com/advisories/GHSA-3g3m-2fjr-6pw4) and
   [GHSA-g3hv-75wg-m249](https://github.com/advisories/GHSA-g3hv-75wg-m249).** Both are development
