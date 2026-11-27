@@ -83,14 +83,15 @@ TWO CASES BACKLOG #5645 item 1 names:
     nothing is judged: a read of another head proves nothing about this one. A read whose
     ``headRefOid`` is ``CLA_HEAD_SHA`` is judged; if it is complete and its commits do not include
     that head, or cannot show that they do, it is read again on the same waits while its verdict
-    refuses nothing (BACKLOG #8335 item 3). A later read of the head replaces it; if every later
-    read faults or shows another head, it is reported with those faults. Once the waits run out
-    the last such read is judged with a fault beside the verdict, which warns and passes: a list
-    trailing the head for longer than the waits is still not checked past what it holds. A
-    verdict that already refuses is not re-read, since the run fails already, so the refusals it
-    reports may not be all a caught-up list would show. A read cut short by a fault carries its
-    own fault and is not checked for the head, and one GitHub's commit stop cut short is not
-    re-read. A
+    refuses nothing (BACKLOG #8335 item 3). The budget of waits is one, shared with the case
+    above. A re-read that refuses, or whose commits include the head, is the verdict. A re-read
+    that still lacks the head replaces the read kept. A re-read that faults, is cut short
+    refusing nothing, or shows another head ends the re-reads. Then, or once the waits run out,
+    the read kept is judged, with its fault and any later one beside the verdict, which warns
+    and passes: a list trailing the head for longer than the waits is still not checked past
+    what it holds. A verdict that already refuses is not re-read, since the run fails already, so
+    the refusals it reports may not be all a caught-up list would show. A first read cut short
+    by a fault carries its own fault and is not checked for the head. A
     head that moves after the first page is not re-read: the pages before the move, which are of
     ``CLA_HEAD_SHA``, are judged, with a fault. Without ``CLA_HEAD_SHA`` (a comment event) nothing
     is re-read.
@@ -128,9 +129,9 @@ pass for an author who never signed.
 UNMEASURED: whether GitHub's GraphQL ``headRefOid`` or commit list trails the push event, and by
 how long. The waits in ``HEAD_RETRY_DELAYS`` are a guess. A ``headRefOid`` that still shows another
 head after them leaves the run a fault that warns and passes. A commit list that trails a current
-``headRefOid`` is waited for on the same delays only while it refuses nothing, and warns and
-passes if it still trails after them; one that refuses is judged at once, so after a force-push it
-can refuse a commit the pull request no longer holds.
+``headRefOid`` is re-read as the paragraph on a head that lags the push event says; one that
+refuses is judged at once, so after a force-push it can refuse a commit the pull request no longer
+holds.
 
 UNMEASURED: that every field a partial error nulled lies on the ``path`` of an error naming its
 commit node. The GraphQL specification implies it: an error's path names the field that raised it,
@@ -150,8 +151,8 @@ so a workflow step can pass event data through ``env:`` (zizmor's template-injec
   CLA_PR_NUMBER       the pull request number
   CLA_ALLOWLIST       the same comma-separated list cla.yml passes the action
   CLA_HEAD_SHA        optional; the head commit the run judges. A first page showing another
-                      head is re-read, then a fault; so is a list of that head lacking it while
-                      it refuses nothing; a head that moves on a later page is not re-read.
+                      head, or a list of it lacking it, is re-read; see the paragraph on a
+                      head that lags the push event.
   GITHUB_GRAPHQL_URL  optional; defaults to https://api.github.com/graphql
   GITHUB_API_URL      optional; defaults to https://api.github.com
   CLA_SIGNATURES_PATH the action's ``path-to-signatures``
@@ -170,6 +171,7 @@ apart by the annotation, not the code alone.
 
 from __future__ import annotations
 
+import functools
 import http.client
 import io
 import itertools
@@ -198,14 +200,10 @@ ACTIONS_BOT_ID = 41898282
 DEFAULT_GRAPHQL_URL = "https://api.github.com/graphql"
 DEFAULT_API_URL = "https://api.github.com"
 
-# Seconds to wait before each re-read when the head read is not the head the run judges, or its
-# commit list lacks that head; one budget, shared by both. That GitHub's GraphQL view trails the
-# push event, and by how much, is unmeasured (module docstring).
+# Seconds to wait before each re-read for the head the run judges; when, is the module docstring's
+# paragraph on a head that lags the push event. That GitHub's GraphQL view trails the push event,
+# and by how much, is unmeasured.
 HEAD_RETRY_DELAYS = (5.0, 10.0)
-
-# Where GitHub stopped a pull request's commit list, measured once (module docstring). A read that
-# long and short of totalCount is not re-read for its head, which lies past the stop every time.
-GITHUB_COMMIT_STOP = 250
 
 # Where a commit node sits in the reply, as a GraphQL error ``path`` names it.
 _NODES_PATH = ("repository", "pullRequest", "commits", "nodes")
@@ -828,19 +826,6 @@ def rest_signatures(
     return read
 
 
-def _read_once(signatures: Signatures) -> Signatures:
-    """``signatures``, read from GitHub at most once successfully per run, however many times a
-    re-read of the pull request judges it. A fault is not kept, so a later judgement tries again."""
-    cache: list[frozenset[int]] = []
-
-    def read() -> frozenset[int]:
-        if not cache:
-            cache.append(signatures())
-        return cache[0]
-
-    return read
-
-
 def _https_url(env: Mapping[str, str], key: str, default: str) -> str:
     url = env.get(key, "") or default
     try:
@@ -865,49 +850,54 @@ def read_judged_head(
     """Read and judge the pull request, re-reading while the read is not yet of its head.
 
     Returns the read, ``judge``'s verdict on it (called with whether the read is complete), and a
-    fault to report beside that verdict, if any. With ``expected_head`` set, a first page of
-    another head is read again after each wait in ``HEAD_RETRY_DELAYS``, and is a fault that
-    judges nothing once the waits run out. A complete read of that head whose commits do not
-    include it, or cannot show that they do, is read again on the same waits while its verdict
-    refuses nothing (BACKLOG #5645 item 1, #8335 item 3). That narrows, and does not close, the
-    pass on a commit list trailing a current ``headRefOid``: a list that still lacks the head when
-    the waits run out is judged with a fault, which warns and passes. A verdict that already
-    refuses is not re-read: the run fails already. Nor is a read that GitHub's commit stop cut
-    short, whose head lies past the stop on every read. Once a read of the head was judged, a
-    later re-read that faults returns that judged read, with both faults.
+    fault to report beside that verdict, if any. When it re-reads, and what it reports then, is
+    stated once, in the module docstring's paragraph on a head that lags the push event.
     """
     delays = iter(HEAD_RETRY_DELAYS)
+    # The last judged read of the head that refused nothing, and the faults of the re-reads after it.
     kept: tuple[PullRequestRead, Verdict, str] | None = None
+    later: list[str] = []
+    stale_reads = 0
     while True:
         try:
             read = fetch_commits(transport, owner, name, number, expected_head)
         except _StaleHead as exc:
+            if kept is not None:
+                # GitHub has moved past this head, so a newer run judges it; waiting cannot help.
+                later.append("a re-read showed another head than CLA_HEAD_SHA")
+                break
+            stale_reads += 1
             delay = next(delays, None)
             if delay is None:
-                stale = f"{exc} after {len(HEAD_RETRY_DELAYS)} re-reads; this run is stale"
-                if kept is not None:
-                    return kept[0], kept[1], f"{kept[2]}; then {stale}"
-                raise PrecheckFault(stale) from exc
+                raise PrecheckFault(
+                    f"{exc} after {stale_reads - 1} re-reads; this run is stale"
+                ) from exc
             sleep(delay)
             continue
         except PrecheckFault as exc:
-            # A page failed after whole pages were kept. Those pages still prove what they prove.
             if exc.partial is None:
-                if kept is not None:
-                    return kept[0], kept[1], f"{kept[2]}; then a re-read faulted: {exc}"
-                raise
-            return exc.partial, judge(exc.partial, False), str(exc)
+                if kept is None:
+                    raise
+                later.append(f"a re-read faulted: {exc}")
+                break
+            # A page failed after whole pages were kept. Those pages still prove what they prove.
+            verdict = judge(exc.partial, False)
+            if kept is None or verdict.refusals:
+                return exc.partial, verdict, str(exc)
+            later.append(f"a re-read was cut short: {exc}")
+            break
         verdict = judge(read, True)
         missing = _missing_head(read, expected_head)
         if missing is None or verdict.refusals:
             return read, verdict, missing
-        if len(read.commits) >= GITHUB_COMMIT_STOP and len(read.commits) < read.total:
-            return read, verdict, missing
+        kept, later = (read, verdict, missing), []
         delay = next(delays, None)
         if delay is None:
-            return read, verdict, missing
-        kept = (read, verdict, missing)
+            break
         sleep(delay)
+    if kept is None:  # every break above follows a judged read
+        raise PrecheckFault("no read of CLA_HEAD_SHA was judged")
+    return kept[0], kept[1], "; then ".join([kept[2], *later])
 
 
 def _missing_head(read: PullRequestRead, expected_head: str) -> str | None:
@@ -971,7 +961,9 @@ def run(
                     raise PrecheckFault("CLA_SIGNATURES_PATH or CLA_SIGNATURES_BRANCH is not set")
                 api = _https_url(env, "GITHUB_API_URL", DEFAULT_API_URL)
                 signatures = rest_signatures(api, token, owner, name, path, branch)
-        signatures = _read_once(signatures)
+        # Read at most once successfully across re-reads; functools.cache keeps no exception,
+        # so a judgement after a faulted read tries again.
+        signatures = functools.cache(signatures)
         read, verdict, read_fault = read_judged_head(
             transport,
             owner,

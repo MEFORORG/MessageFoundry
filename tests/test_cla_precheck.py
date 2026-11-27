@@ -1083,7 +1083,11 @@ def test_a_commit_list_without_its_head_is_judged_with_a_fault(
     # A complete read short of totalCount may have stopped before the head, so the fault names the
     # commits it returned, never the pull request's.
     short = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 5, False)
-    assert run(env, _serve([short] * tries), _no_signatures, lambda _s: None) == EXIT_FAULT
+    waits = []
+    replies = [short] * tries
+    assert run(env, lambda _q, _v: replies.pop(0), _no_signatures, waits.append) == EXIT_FAULT
+    # A complete read short of totalCount is re-read like any other that lacks the head.
+    assert waits == list(cla_precheck.HEAD_RETRY_DELAYS) and replies == []
     out = capsys.readouterr().out
     assert "the commits this read returned do not include CLA_HEAD_SHA" in out
     assert "the pull request's commits do not include" not in out
@@ -1143,15 +1147,16 @@ def test_a_trailing_list_whose_re_read_moves_to_a_newer_head_is_a_fault(
     env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
     trailing = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 1, False)
     newer = _page([_commit(2, "Anon")], 1, False, head="cd" * 20)
-    replies = [trailing, newer, newer]
+    replies = [trailing, newer]
     waits: list[float] = []
     signed = frozenset({90000001})
     assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, waits.append) == EXIT_FAULT
-    assert waits == list(cla_precheck.HEAD_RETRY_DELAYS) and replies == []
+    # GitHub moved past this head, so the re-reads end there rather than wait again.
+    assert waits == [cla_precheck.HEAD_RETRY_DELAYS[0]] and replies == []
     # The judged read of CLA_HEAD_SHA is still the one reported, beside the stale re-reads.
     out = capsys.readouterr().out
     assert "the commits this read returned do not include CLA_HEAD_SHA" in out
-    assert "this run is stale" in out
+    assert "a re-read showed another head than CLA_HEAD_SHA" in out
 
 
 def test_a_trailing_re_read_that_now_refuses_stops_there() -> None:
@@ -1187,20 +1192,6 @@ def test_a_trailing_re_read_that_faults_outright_reports_the_judged_read(
     out = capsys.readouterr().out
     assert "the commits this read returned do not include CLA_HEAD_SHA" in out
     assert "then a re-read faulted" in out
-
-
-def test_a_read_cut_short_by_the_commit_stop_is_not_re_read_for_its_head() -> None:
-    """GitHub stops the list at 250 (module docstring), so the newest commit, the head, is past
-    the stop on every read and a re-read cannot change the verdict."""
-    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
-    octo = {"name": "Octo", "user": {"databaseId": 90000001, "login": "octo-contributor"}}
-    stop = cla_precheck.GITHUB_COMMIT_STOP
-    commits: list[Mapping[str, Any]] = [
-        {"oid": f"{i:040x}", "author": octo, "committer": octo} for i in range(1, stop + 1)
-    ]
-    page = _page(commits, stop + 50, False)
-    signed = frozenset({90000001})
-    assert run(env, _serve([page]), lambda: signed, _no_sleep) == EXIT_FAULT
 
 
 def test_the_signature_file_is_read_once_across_re_reads() -> None:
@@ -1395,3 +1386,47 @@ def test_the_script_reads_event_data_from_the_environment_only() -> None:
     source = Path(cla_precheck.__file__).read_text(encoding="utf-8")
     for reader in ("argv", "argparse", "getopt", "optparse", "fileinput"):
         assert reader not in source, f"cla_precheck.py names {reader!r}"
+
+
+def test_a_trailing_re_read_cut_short_reports_the_judged_read(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    replies = [_page([octo], 2, False), _page([octo], 2, True), {"errors": [{}]}]
+    waits: list[float] = []
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, waits.append) == EXIT_FAULT
+    assert waits == [cla_precheck.HEAD_RETRY_DELAYS[0]] and replies == []
+    out = capsys.readouterr().out
+    assert "the commits this read returned do not include CLA_HEAD_SHA" in out
+    assert "then a re-read was cut short" in out
+
+
+def test_a_signature_fault_is_read_again_on_a_re_read() -> None:
+    """functools.cache keeps no exception, so a re-read after a faulted signature read reads it
+    again, and the unsigned author past the first page is refused there."""
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    page_one = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 2, True)
+    late = _page([_commit(2, "Late", "late-contributor", 90000002)], 2, False)
+    caught_up = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 3, True)
+    rest = _page(
+        [
+            _commit(2, "Late", "late-contributor", 90000002),
+            _commit(_HEAD, "Octo", "octo-contributor", 90000001),
+        ],
+        3,
+        False,
+    )
+    replies = [page_one, late, caught_up, rest]
+    answers: list[object] = [PrecheckFault("the signature file could not be read"), frozenset()]
+
+    def signatures() -> frozenset[int]:
+        answer = answers.pop(0)
+        if isinstance(answer, PrecheckFault):
+            raise answer
+        assert isinstance(answer, frozenset)
+        return answer
+
+    assert run(env, lambda _q, _v: replies.pop(0), signatures, lambda _s: None) == EXIT_REFUSED
+    assert replies == [] and answers == []
