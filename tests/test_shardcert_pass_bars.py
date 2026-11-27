@@ -194,10 +194,13 @@ async def test_reset_store_clears_every_table(monkeypatch: pytest.MonkeyPatch) -
 
 def test_reset_store_covers_every_table_the_scanned_sql_names() -> None:
     """BACKLOG #5576: a table a verdict reads that the reset does not empty would carry an earlier
-    run's rows into this one. This scans the SQL of this module and of the two store methods the
+    run's rows into this one. This scans the SQL of this module, of the two store methods the
     engine's ``/stats`` answer is built from (``SqlServerStore.stats`` and ``in_pipeline_depth``),
-    and every table a ``FROM`` or ``JOIN`` there names must be reset. SQL elsewhere, such as what
-    the poller's other routes read, is not scanned."""
+    and of ``SqlServerStore.connection_metrics``, which the poller's ``/connections`` read counts
+    from, and every table a ``FROM`` or ``JOIN`` there names must be reset. SQL elsewhere is not
+    scanned. That includes the ``/status`` read's ``db_status``, whose row counts name their table
+    through a variable and include ``message_events`` and ``audit_log``, which the reset leaves; the
+    poller's sample takes only the database size and journal settings from it."""
     import ast
     import inspect
     import re
@@ -236,9 +239,14 @@ def test_reset_store_covers_every_table_the_scanned_sql_names() -> None:
     assert tables('"""DELETE the rows: a docstring that reads from a table."""') == set()
 
     read = tables(Path(inspect.getfile(shardcert)).read_text(encoding="utf-8"))
-    for method in (SqlServerStore.stats, SqlServerStore.in_pipeline_depth):
+    for method in (
+        SqlServerStore.stats,
+        SqlServerStore.in_pipeline_depth,
+        SqlServerStore.connection_metrics,
+    ):
         read |= tables(textwrap.dedent(inspect.getsource(method)))
-    assert "queue" in read, read  # the instrument finds the store-truth scan it is meant to see
+    # The instrument finds the store-truth scan and the /connections counts it is meant to see.
+    assert {"queue", "messages"} <= read, read
     assert read <= set(shardcert._RESET_TABLES), read - set(shardcert._RESET_TABLES)
 
 

@@ -15,7 +15,9 @@
 >    the drive box's disk). It would have commissioned an engine rewrite against a harness artifact.
 >    * The pool is now an **explicit, recorded, sweepable** variable: **`--store-pool-size N`** (defaults to
 >      the product 40; an ambient `MEFOR_STORE_POOL_SIZE` still wins over the default, as the old
->      `setdefault` did).
+>      `setdefault` did). A size at or over ADR 0062's collapse cliff (`POOL_SIZE_CLIFF`, per process) is
+>      **refused** before the store reset, exit 2, unless **`--force-store-pool-size`** is passed (BACKLOG
+>      #5953); the engine half tells a waiting drive half at once.
 >    * The **effective** value is printed to **stderr at fleet launch** and recorded in the report JSON at
 >      **`store_pool.requested_pool_size`** — beside the engine's own **`engine_max_size`** (`/status`), so a
 >      requested-vs-observed mismatch is a finding rather than a silent 8.
@@ -203,11 +205,17 @@ engine ceiling. To model the reference `H=20, D=4` ADT hub, pass `--handlers 20 
 
 Both boxes share a coord dir (a mount/synced folder) and use the **same** `--rate-ladder` and `--run-id`.
 Restart + store rebuild first (`RESTART-AND-SIZING-runbook.md` STEP 1–2), and set
-`MEFOR_DELIVERY_PHASE_TIMING=1` on the **engine** box for the `send_ack`/`mark_done` split.
+`MEFOR_DELIVERY_PHASE_TIMING=1` on the **engine** box for the `send_ack`/`mark_done` split and the
+claim timing. The lane
+episode (`S_lane`, `episode_timing`) has its own lever, `MEFOR_PIPELINE_LANE_EPISODE_TIMING=1`, kept
+separate so a rung can run with that instrument off as a control; without it the episode block is empty.
+The ladder sets neither lever itself.
 
 ```pwsh
 # ENGINE box (MEFOR_STORE_* + the escapes per the restart runbook; phase timing on):
 $env:MEFOR_DELIVERY_PHASE_TIMING = "1"
+# S_lane (episode_timing); leave it unset for an instrument-OFF control run:
+$env:MEFOR_PIPELINE_LANE_EPISODE_TIMING = "1"
 # --dests is TOPOLOGY (destination CONNECTIONS = sink port-band width). --sink-ports defaults to --dests.
 # To model an H!=D hub add --handlers 20 --delivering 4 (both default to --dests ⇒ the H=D=dests graph).
 python -m harness shardcert-engine-ladder --shards a,b,c,d --dests 8 `
