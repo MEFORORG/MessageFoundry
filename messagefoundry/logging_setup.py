@@ -2150,17 +2150,15 @@ def _warn_leftover_segments(spool_dir: str, why: str) -> None:
         )
 
 
-_SPOOL_IN_USE_REMEDY = (
-    ". If this is a second start of the same service, stop one of them; if you stop the other "
-    "one, restart this one once it has exited, because until it restarts this process runs "
-    "without a spool. Stop one rather than give either a different [logging].forward_spool_dir: "
-    "moving the one holding the lock would strand the segments already in this directory, and "
-    "moving this one would leave both starts running. If a different service or deployment "
-    "shares this directory, give this process its own [logging].forward_spool_dir (environment "
-    "variable MEFOR_LOGGING_FORWARD_SPOOL_DIR), the root its spool subdirectories are made under, "
-    "as an absolute path, and restart it. Leave the process holding the lock where it is, because "
-    "moving that one would strand its unsent segments. Never change the root of a running "
-    "supervise deployment, whose engine shards and supervisor share that root."
+_SPOOL_IN_USE_FACTS = (
+    ". Another process usually holds the lock, but a fault taking the lock reads the same way. "
+    "This process runs without an on-disk spool until it restarts with a spool it can lock. "
+    "Only the process holding a spool directory's lock sends that directory's segments. "
+    "So any change to a process's spool directory leaves the segments in its old directory unsent "
+    "until a process opens that directory again. That includes a change to "
+    "[logging].forward_spool_dir (environment variable MEFOR_LOGGING_FORWARD_SPOOL_DIR), and a "
+    "change to the store path or the shard id the default directory is derived from. "
+    'One directory serves one process (ADR 0200, "One process per directory").'
 )
 
 
@@ -2182,15 +2180,16 @@ def _open_forward_spool(forward: SyslogForward) -> LogSpool | None:
     try:
         spool.open()
     except SpoolUnavailable as exc:
-        # Only the in-use case names the remedy: a directory of its own does not cure an unusable
-        # one. The remedy is conditional because ``in_use`` is also set on a lock fault and when
-        # this process still holds the lock (``_try_lock``; ADR 0200). Keying the default
-        # directory by HA node id was declined instead (BACKLOG #5400), because an unset node id
-        # is new on every start and would strand the last run's records.
+        # Only the in-use case gets the extra facts. They are facts, not a procedure: the WARNING
+        # cannot say who holds the lock, and ``in_use`` is also set on a lock fault and when this
+        # process holds the lock on another handle (``_try_lock``), so any instruction would be
+        # wrong for some deployment (BACKLOG #5400). Keying the default directory by HA node id
+        # was declined, because an unset node id is new on every start and would strand the last
+        # run's records.
         _log.warning(
             "%s; off-box log forwarding runs without an on-disk spool%s",
             exc,
-            _SPOOL_IN_USE_REMEDY if exc.in_use else "",
+            _SPOOL_IN_USE_FACTS if exc.in_use else "",
         )
         if not exc.in_use:  # the process that holds it sends what it holds
             _warn_leftover_segments(forward.spool_dir, "the on-disk log spool could not be opened")

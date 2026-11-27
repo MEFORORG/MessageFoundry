@@ -28,6 +28,7 @@ import pytest
 from messagefoundry import log_spool, logging_setup
 from messagefoundry.log_spool import SPOOL_FORMAT_VERSION, LogSpool, SpoolEntry, SpoolUnavailable
 from messagefoundry.logging_setup import (
+    _SPOOL_IN_USE_FACTS,
     SyslogForward,
     _build_queued_forwarder,
     _build_syslog_handler,
@@ -1796,14 +1797,13 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
     spool_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """And the control: a directory another process holds is NOT named, because that process sends
-    what it holds. Its WARNING names the remedy instead (BACKLOG #5400): for a second start of the
-    same service, stop one of them; for a different service, give THIS process, not the one holding
-    the lock, its own ``[logging].forward_spool_dir``. An unusable directory's does not, since a
-    directory of its own does not cure that. Either way the opener returns ``None``, so the
-    forwarder runs without a spool (#1966)."""
+    what it holds. Its WARNING adds facts instead, never a procedure (BACKLOG #5400): it cannot say
+    who holds the lock, so any instruction would be wrong for some deployment. An unusable
+    directory's WARNING adds none of them. Either way the opener returns ``None``, so the forwarder
+    runs without a spool (#1966)."""
     from messagefoundry.config.settings import load_settings
 
-    # The names the remedy gives are the real ones: the variable reaches the setting.
+    # The names the WARNING gives are the real ones: the variable reaches the setting.
     named = load_settings(environ={"MEFOR_LOGGING_FORWARD_SPOOL_DIR": "other"}, default_file=False)
     assert named.logging.forward_spool_dir == "other"
 
@@ -1815,43 +1815,44 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
     assert "in use by another process" in caplog.text and "still holds" not in caplog.text
     [in_use] = [r for r in caplog.records if "in use by another process" in r.getMessage()]
     assert in_use.levelno == logging.WARNING
-    assert "[logging].forward_spool_dir" in in_use.getMessage()
-    assert "MEFOR_LOGGING_FORWARD_SPOOL_DIR" in in_use.getMessage()
     message = in_use.getMessage()
-    _, prefix, remedy = message.partition("off-box log forwarding runs without an on-disk spool")
+    _, prefix, facts = message.partition("off-box log forwarding runs without an on-disk spool")
     assert prefix, message
-    # For a second start of one service, moving the lock holder would strand its segments and
-    # moving this one would leave both starts running, so that case says stop one of them, and it
-    # comes first, ahead of the remedy that moves a directory. Nothing in it tells the operator to
-    # move every process but one: "each of the others" was the wording that did.
-    assert remedy.startswith(
-        ". If this is a second start of the same service, stop one of them; if you stop the other "
-        "one, restart this one once it has exited"
-    )
-    assert "each of the others" not in remedy
-    assert "until it restarts this process runs without a spool" in remedy
+    assert facts == _SPOOL_IN_USE_FACTS  # the constant the control below looks for
+    # ``_try_lock`` reads any lock fault as contention, so the holder is only the usual cause.
+    assert "Another process usually holds the lock, but a fault taking the lock reads" in facts
+    # ``_open_forward_spool`` runs once, at configure time, so only a restart retries the lock.
+    assert "runs without an on-disk spool until it restarts with a spool it can lock." in facts
+    # The stranding fact, over every way a process's directory can change: the setting, its
+    # variable, and the default ``__main__._forward_spool_dir`` derives.
     assert (
-        "moving the one holding the lock would strand the segments already in this directory, and "
-        "moving this one would leave both starts running." in remedy
+        "Only the process holding a spool directory's lock sends that directory's segments."
+        in facts
     )
-    # A different service: THIS process could not take the lock, so this run wrote no segments
-    # there, and moving it strands nothing of the other's. Moving the one holding the lock would
-    # strand its unsent ones.
     assert (
-        "If a different service or deployment shares this directory, give this process its own "
-        "[logging].forward_spool_dir" in remedy
+        "any change to a process's spool directory leaves the segments in its old directory unsent "
+        "until a process opens that directory again." in facts
     )
-    assert "as an absolute path, and restart it." in remedy
     assert (
-        "Leave the process holding the lock where it is, because moving that one would strand "
-        "its unsent segments." in remedy
+        "[logging].forward_spool_dir (environment variable MEFOR_LOGGING_FORWARD_SPOOL_DIR)"
+        in facts
     )
-    # In a supervise deployment the setting is the root every process's directory sits under
-    # (``__main__._forward_spool_root``), so changing it under a running one strands the others.
-    assert (
-        "Never change the root of a running supervise deployment, whose engine shards and "
-        "supervisor share that root." in remedy
-    )
+    assert "the store path or the shard id the default directory is derived from." in facts
+    assert 'One directory serves one process (ADR 0200, "One process per directory").' in facts
+    # No branch of a procedure: each of these was wrong for some deployment.
+    lowered = facts.lower()
+    for imperative in (
+        "stop one",
+        "stop the duplicate",
+        "give this process",
+        "give that one",
+        "restart this one",
+        "each of the others",
+        "Never change",
+        "Leave the process",
+        "where it is",
+    ):
+        assert imperative.lower() not in lowered, imperative
     assert message.endswith(".")
     earlier.close()
 
@@ -1868,7 +1869,9 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
         and "still holds 1 spool segment(s)" in caplog.text
     )
     assert "is not usable" in caplog.text
+    # The positive control: an unusable directory gets none of the in-use facts.
     assert "MEFOR_LOGGING_FORWARD_SPOOL_DIR" not in caplog.text
+    assert _SPOOL_IN_USE_FACTS not in caplog.text
 
 
 def test_open_removes_only_the_directories_it_made_when_it_fails_partway(
