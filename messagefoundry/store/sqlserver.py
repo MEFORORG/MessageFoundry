@@ -319,6 +319,7 @@ from messagefoundry.store.store import (
     PendingFactorAnchor,
     ReingressOriginMissing,
     ReingressOutcome,
+    ReingressTokenRefusal,
     ReplyWaitState,
     ResendKeyConflict,
     ResendKeyRecord,
@@ -9971,7 +9972,7 @@ class SqlServerStore(ServerCipherWalk):
                 # token is retried; any other failure consumes and dead-letters it.
                 # BACKLOG #5727: each dead-letter on the reference runs after the try, as on SQLite.
                 ref_fault: QueueOpenFault | None = None
-                ref_refusal: tuple[str, str] | None = None
+                ref_refusal: ReingressTokenRefusal | None = None
                 ref_corrupt = False
                 try:
                     ref = (
@@ -9993,7 +9994,7 @@ class SqlServerStore(ServerCipherWalk):
                     ref_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
                     ref_corrupt = ref_fault is None
                 if ref_refusal is not None:
-                    return await _consume_dead("ingress_handoff(tag-failed)", *ref_refusal)
+                    return await _consume_dead(*ref_refusal)
                 if ref_fault is not None:
                     raise ref_fault
                 if ref_corrupt:

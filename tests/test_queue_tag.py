@@ -496,6 +496,7 @@ async def test_the_response_worker_labels_a_corrupt_token_corrupt_not_tag_drift(
         QUEUE_TAG_FAILED_ACTION,
     )
     from messagefoundry.store.store import (  # noqa: PLC0415
+        REINGRESS_TOKEN_CORRUPT,
         REINGRESS_TOKEN_TAG_FAILED,
         MessageStatus,
         OutboxStatus,
@@ -505,8 +506,6 @@ async def test_the_response_worker_labels_a_corrupt_token_corrupt_not_tag_drift(
     from tests._erased_reply_contract import LOOP, children, status_of  # noqa: PLC0415
 
     caplog.set_level(logging.WARNING, logger="messagefoundry.pipeline.wiring_runner")
-    from messagefoundry.store.crypto import AesGcmCipher  # noqa: PLC0415
-
     cipher = make_cipher(generate_key(), write_v2=True)
     assert isinstance(cipher, AesGcmCipher)
     alerts: list[tuple[str, str]] = []
@@ -535,6 +534,7 @@ async def test_the_response_worker_labels_a_corrupt_token_corrupt_not_tag_drift(
         last_error = store.cipher().decrypt(
             row["last_error"], aad=cell_aad("queue", "last_error", item.id)
         )
+        assert last_error == REINGRESS_TOKEN_CORRUPT, last_error
         assert last_error != REINGRESS_TOKEN_TAG_FAILED
         assert "corrupt" in last_error and "queue tag" not in last_error, last_error
         assert await status_of(store, mid) == MessageStatus.ERROR.value

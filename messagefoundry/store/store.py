@@ -1167,9 +1167,10 @@ REINGRESS_ARTIFACT_ERASED: Final = "re-ingress reply was erased by retention"
 REINGRESS_ARTIFACT_MISSING: Final = "re-ingress reply row is missing"
 #: The ``last_error`` of a re-ingress token whose own ``payload`` failed its queue tag after its
 #: claim had opened it (BACKLOG #5982), at the reply read or at the handoff: at least a routing
-#: column or the payload cell changed outside the store, or the payload was blanked. Named apart
+#: column or the sealed cell changed outside the store, or the payload was blanked. Named apart
 #: from a corrupt reference or an undecryptable reply, because it is audited and alerted as a tag
-#: failure. The server backends and the re-ingress worker import it.
+#: failure. A corrupt cell under a key the store holds is :data:`REINGRESS_TOKEN_CORRUPT` instead;
+#: :func:`reingress_token_refusal` picks between them for every backend and the re-ingress worker.
 REINGRESS_TOKEN_TAG_FAILED: Final = "integrity: the re-ingress work-row failed its queue tag"
 #: The ``last_error`` of a re-ingress token whose own ``payload`` is a corrupt cell under a key the
 #: store holds (:class:`~messagefoundry.store.queue_tag.CorruptQueueCellError`), at the reply read or
@@ -1178,14 +1179,34 @@ REINGRESS_TOKEN_TAG_FAILED: Final = "integrity: the re-ingress work-row failed i
 REINGRESS_TOKEN_CORRUPT: Final = "integrity: the re-ingress work-row holds a corrupt payload"
 
 
-def reingress_token_refusal(error: QueueTagError) -> tuple[str, str]:
-    """The ``last_error`` and the ``dead`` event detail for a re-ingress token whose own payload
-    ``error`` refused (BACKLOG #5982): :data:`REINGRESS_TOKEN_CORRUPT` for a corrupt cell, which is
-    not drift, and :data:`REINGRESS_TOKEN_TAG_FAILED` for every other refusal. Each backend's
-    handoff and the re-ingress worker read it, so the three backends cannot label it apart."""
+class ReingressTokenRefusal(NamedTuple):
+    """How a re-ingress token whose own payload was refused is labelled (BACKLOG #5982)."""
+
+    #: The server backends' fenced-write label, which their H1 fence WARNING names.
+    op: str
+    #: The token's ``last_error``.
+    last_error: str
+    #: The origin's ``dead`` event detail.
+    event_detail: str
+
+
+def reingress_token_refusal(error: QueueTagError) -> ReingressTokenRefusal:
+    """The labels for a re-ingress token whose own payload ``error`` refused (BACKLOG #5982):
+    :data:`REINGRESS_TOKEN_CORRUPT` for a corrupt cell (:attr:`QueueTagError.drift` false), and
+    :data:`REINGRESS_TOKEN_TAG_FAILED` for every other refusal, as before. Each backend's handoff
+    and the re-ingress worker read it, so none can label a corrupt cell apart from the others.
+    Only the labels differ: either is dead-lettered, audited and alerted the same way."""
     if error.drift:
-        return REINGRESS_TOKEN_TAG_FAILED, "re-ingress work-row failed its integrity check"
-    return REINGRESS_TOKEN_CORRUPT, "re-ingress work-row holds a corrupt payload"
+        return ReingressTokenRefusal(
+            "ingress_handoff(tag-failed)",
+            REINGRESS_TOKEN_TAG_FAILED,
+            "re-ingress work-row failed its integrity check",
+        )
+    return ReingressTokenRefusal(
+        "ingress_handoff(corrupt-token)",
+        REINGRESS_TOKEN_CORRUPT,
+        "re-ingress work-row holds a corrupt payload",
+    )
 
 
 #: The ``outcome`` the handoff reports that tag failure with (BACKLOG #5982). It says the handoff
@@ -17281,7 +17302,7 @@ class MessageStore:
             # BACKLOG #5727: each dead-letter on the reference runs after the try, so a failed seal
             # in it chains no raw open error; the handlers only record which one is owed.
             ref_fault: QueueOpenFault | None = None
-            ref_refusal: tuple[str, str] | None = None
+            ref_refusal: ReingressTokenRefusal | None = None
             ref_corrupt = False
             try:
                 ref = await cipher_call(self._cipher, open_queue_cell, self._cipher, wr) or ""
@@ -17306,7 +17327,7 @@ class MessageStore:
                 # cause is fixed. Mirrors the depth-cap branch.
                 ref_corrupt = ref_fault is None
             if ref_refusal is not None:
-                return await _consume_dead(*ref_refusal)
+                return await _consume_dead(ref_refusal.last_error, ref_refusal.event_detail)
             if ref_fault is not None:
                 raise ref_fault
             if ref_corrupt:

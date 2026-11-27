@@ -278,7 +278,6 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.metadata import intake_metadata_json, user_metadata
 from messagefoundry.store.queue_tag import (
-    QUEUE_TAG_CAUSES,
     QueueOpenFault,
     QueueTagError,
     fault_text,
@@ -13485,8 +13484,8 @@ class RegistryRunner:
         # raw open error, whose cause can echo a key service's URL or body. The handlers keep only
         # strings: the error's type name, and the unopenable_log_text the dead-letter records. A
         # cipher's own text is not recorded: it can echo stored text, a key_id (BACKLOG #5982).
-        # The words QUEUE_TAG_CAUSES gives the refusal's cause, and its last_error, never the error.
-        tag_refused: tuple[str, str] | None = None
+        # The refused token's last_error, never the error itself.
+        tag_refused: str | None = None
         unopenable: tuple[str, str] | None = None
         try:
             body = await self.store.response_body_for_work_row(item.id) or ""
@@ -13495,7 +13494,7 @@ class RegistryRunner:
             # store has audited and alerted it; dead-letter it under the error the handoff records
             # for the same failure, not as an undecryptable reply. A corrupt cell is not drift, so
             # it is named corrupt rather than a failed tag.
-            tag_refused = (QUEUE_TAG_CAUSES[err.cause], reingress_token_refusal(err)[0])
+            tag_refused = reingress_token_refusal(err).last_error
         except CipherError as exc:
             # BACKLOG #5727: a key service that gave no verdict says nothing about this reply. It
             # takes the fault arm, which re-pends the token with a backoff and dead-letters
@@ -13524,11 +13523,13 @@ class RegistryRunner:
                 # deliberate hard stop.
                 unopenable = (type(exc).__name__, unopenable_log_text(exc))
         if tag_refused is not None:
-            words, last_error = tag_refused
             log.warning(
-                "response worker %r: work-row %s %s and is dead-lettered", name, item.id, words
+                "response worker %r: work-row %s refused (%s); dead-lettering",
+                name,
+                item.id,
+                tag_refused,
             )
-            await self.store.dead_letter_now(item.id, last_error)
+            await self.store.dead_letter_now(item.id, tag_refused)
             return _ItemOutcome.PROCESSED, None
         if read_fault is not None:
             try:

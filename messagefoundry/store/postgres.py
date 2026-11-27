@@ -313,6 +313,7 @@ from messagefoundry.store.store import (
     PendingFactorAnchor,
     ReingressOriginMissing,
     ReingressOutcome,
+    ReingressTokenRefusal,
     ReplyWaitState,
     ResendKeyConflict,
     ResendKeyRecord,
@@ -6635,7 +6636,7 @@ class PostgresStore(ServerCipherWalk):
                     # BACKLOG #5727: each dead-letter on the reference runs after the try, as on
                     # SQLite.
                     ref_fault: QueueOpenFault | None = None
-                    ref_refusal: tuple[str, str] | None = None
+                    ref_refusal: ReingressTokenRefusal | None = None
                     ref_corrupt = False
                     try:
                         ref = (
@@ -6662,7 +6663,7 @@ class PostgresStore(ServerCipherWalk):
                         # branch.
                         ref_corrupt = ref_fault is None
                     if ref_refusal is not None:
-                        return await _consume_dead("ingress_handoff(tag-failed)", *ref_refusal)
+                        return await _consume_dead(*ref_refusal)
                     if ref_fault is not None:
                         raise ref_fault
                     if ref_corrupt:

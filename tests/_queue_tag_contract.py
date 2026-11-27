@@ -26,6 +26,7 @@ from messagefoundry.store.queue_tag import (
     QUEUE_CORRUPT_ALERT_TABLE,
     QUEUE_TAG_CAUSES,
     QUEUE_TAG_FAILED_ACTION,
+    CorruptQueueCellError,
     QueueTagError,
 )
 from messagefoundry.store.store import (
@@ -49,18 +50,28 @@ _RAW = "MSH|^~\\&|SYNTH|F|R|RF|20260101||ADT^A01|QT1|P|2.5.1\rPID|1||SYNTH-100||
 
 class _Hook:
     """Records each tag-failure alert the store's cipher raises. A corrupt cell alerts under its own
-    table (BACKLOG #5884), every other refusal under ``queue``."""
+    table (BACKLOG #5884), every other refusal under ``queue``. Nothing is asserted in the hook: the
+    cipher swallows a hook's error, so :meth:`misrouted` is asserted by the caller instead."""
 
     def __init__(self) -> None:
         self.reasons: list[str] = []
         self.corrupt: list[str] = []
+        self.alerts: list[tuple[str, str]] = []
 
     def __call__(self, table: str, reason: str) -> None:
-        corrupt = QUEUE_TAG_CAUSES["corrupt"] in reason
-        assert table == (QUEUE_CORRUPT_ALERT_TABLE if corrupt else "queue"), (table, reason)
+        self.alerts.append((table, reason))
         self.reasons.append(reason)
-        if corrupt:
+        if QUEUE_TAG_CAUSES["corrupt"] in reason:
             self.corrupt.append(reason)
+
+    def misrouted(self) -> list[tuple[str, str]]:
+        """Each alert raised under the wrong table for what its reason says."""
+        return [
+            (table, reason)
+            for table, reason in self.alerts
+            if table
+            != (QUEUE_CORRUPT_ALERT_TABLE if QUEUE_TAG_CAUSES["corrupt"] in reason else "queue")
+        ]
 
 
 async def _row_id(fetch: RawFetch, message_id: str, stage: str) -> str:
@@ -93,6 +104,7 @@ async def _assert_refused(
     )
     assert len(audited) == 1, (label, audited)
     assert any(row_id[:12] in reason for reason in hook.reasons), (label, hook.reasons)
+    assert len(hook.alerts) > 0 and len(hook.misrouted()) == 0, (label, hook.misrouted())
 
 
 async def _outbound(store: Any, fetch: RawFetch, lane: str, body: str) -> tuple[str, str]:
@@ -373,6 +385,24 @@ async def _assert_corrupt_response_token(
 ) -> None:
     """BACKLOG #5982 step 2: a token whose payload is corrupt under a key the store holds is
     dead-lettered, audited and alerted as before, and labelled corrupt, never as a failed tag."""
+    # --- at the re-ingress reply read: refused, audited and alerted as corrupt ---------------
+    _, token = await _response_token(store, fetch, "OB_QT_S5", "LB_QT_S5")
+    item = await store.claim_next_fifo("LB_QT_S5", stage=Stage.RESPONSE.value)
+    assert item is not None and item.id == token
+    [cell] = await fetch("SELECT payload FROM queue WHERE id=?", (token,))
+    marker = str(cell["payload"]).rsplit(":", 1)[0]
+    await raw("UPDATE queue SET payload=? WHERE id=?", (f"{marker}:AAAAA", token))  # bad base64
+    corrupt_before = len(hook.corrupt)
+    try:
+        await store.response_body_for_work_row(token)
+    except CorruptQueueCellError:
+        pass
+    else:
+        raise AssertionError("a reply read through a corrupt token was not refused as corrupt")
+    await _assert_reported(fetch, hook, token, REINGRESS_READ_TAG_FAILURE_OUTCOME, "corrupt read")
+    assert len(hook.corrupt) == corrupt_before + 1 and token[:12] in hook.corrupt[-1]
+
+    # --- at the handoff: dead-lettered under the corrupt label, never a failed tag ------------
     mid, token = await _response_token(store, fetch, "OB_QT_S4", "LB_QT_S4")
     item = await store.claim_next_fifo("LB_QT_S4", stage=Stage.RESPONSE.value)
     assert item is not None and item.id == token
