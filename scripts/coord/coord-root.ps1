@@ -332,6 +332,36 @@ function Test-CoordRecordIsHere {
     return (-not $h) -or ($h -ieq (Get-CoordHost))
 }
 
+function Get-CoordSeatEnded {
+    # When the NEWEST seat record in one box's registry directory says its session ended itself
+    # (seat.ps1 -Close writes `closed`, -Close -Handback `handed`): @{ Lifecycle; At }, At a one-line
+    # printable stamp. Otherwise $null, and never a throw. The newest only, as box-activity.ps1's
+    # Get-BoxRecordHost reads it: one that cannot be read may be the current record mid-write, so
+    # nothing older speaks for it. A record is its writer's claim, never proof a session is gone.
+    param([string]$Dir)
+    try {
+        if (-not $Dir -or -not (Test-Path -LiteralPath $Dir -PathType Container)) { return $null }
+        $f = Get-ChildItem -LiteralPath $Dir -Filter *.json -File -Force -EA SilentlyContinue |
+             Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+        if (-not $f) { return $null }
+        $rec = Read-CoordText $f.FullName | ConvertFrom-Json -NoEnumerate -EA Stop
+        if ($rec -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+        $p = $rec.PSObject.Properties['lifecycle']
+        $life = if ($p) { [string]$p.Value } else { '' }
+        if ($life -notin 'closed', 'handed') { return $null }
+        $p = $rec.PSObject.Properties['lifecycleAt']
+        $at = if ($p) { $p.Value } else { $null }
+        $atText = if ($at -is [datetime]) {
+            $at.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', [cultureinfo]::InvariantCulture)
+        } else {
+            # Writer-chosen text, so one printable line, capped.
+            $t = (([string]$at) -replace '[\p{C}]', ' ' -replace '[^\x20-\x7E]', '?' -replace '\s+', ' ').Trim()
+            if (-not $t) { 'an unrecorded time' } elseif ($t.Length -gt 40) { $t.Substring(0, 37) + '...' } else { $t }
+        }
+        return [pscustomobject]@{ Lifecycle = $life.ToLowerInvariant(); At = $atText }
+    } catch { return $null }
+}
+
 function Get-CoordInnerException {
     # PowerShell wraps an exception a .NET method throws in a MethodInvocationException.
     param($Exception)

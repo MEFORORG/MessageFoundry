@@ -368,6 +368,71 @@ def test_a_seat_directory_with_no_readable_record_is_not_a_seat(repo: Path, shar
     assert not (shared / "mail" / "box").exists()
 
 
+def _ended(rec: dict[str, Any], lifecycle: str, at: str) -> dict[str, Any]:
+    return {**rec, "lifecycle": lifecycle, "lifecycleAt": at}
+
+
+@pytest.mark.parametrize("lifecycle", ["closed", "handed"])
+def test_a_send_to_a_seat_that_closed_itself_warns_and_still_queues(
+    repo: Path, shared: Path, lifecycle: str
+) -> None:
+    rec = _record(box=SEAT_ID, session="sess-o", worktree=r"D:\t\autonomy-plan", host=OTHER_HOST)
+    _plant_record(shared / "seats", SEAT_ID, _ended(rec, lifecycle, "2026-11-20T10:00:00Z"))
+    proc = _send(repo, shared, SEAT_ID)
+    assert proc.returncode == 0, proc.stderr
+    warnings = [ln for ln in proc.stderr.splitlines() if "WARNING" in ln]
+    assert len(warnings) == 1, proc.stderr
+    assert f"'{lifecycle}'" in warnings[0] and "2026-11-20T10:00:00Z" in warnings[0]
+    assert "future session" in warnings[0]
+    assert json.loads(proc.stdout)[0]["Status"] == "queued"
+    assert len(list((shared / "mail" / "box" / SEAT_ID / "inbox").glob("*.json"))) == 1
+
+
+def test_a_send_to_an_open_seat_does_not_warn(repo: Path, shared: Path) -> None:
+    _plant_record(
+        shared / "seats",
+        SEAT_ID,
+        _record(box=SEAT_ID, session="sess-o", worktree=r"D:\t\autonomy-plan", host=OTHER_HOST),
+    )
+    proc = _send(repo, shared, SEAT_ID)
+    assert proc.returncode == 0, proc.stderr
+    assert "WARNING" not in proc.stderr
+
+
+def test_a_path_send_reads_the_newest_record_in_the_recipients_box(
+    repo: Path, shared: Path
+) -> None:
+    first = _send(repo, shared, str(repo))
+    assert first.returncode == 0, first.stderr
+    key = json.loads(first.stdout)[0]["Key"]
+    rec = _record(box=key, session="sess-a", worktree=str(repo), host=None)
+    old = _plant_record(shared / "seats", key, _ended(rec, "closed", "2026-11-20T10:00:00Z"))
+    os.utime(old, (time.time() - 3600, time.time() - 3600))
+    closed = _send(repo, shared, str(repo))
+    assert closed.returncode == 0, closed.stderr
+    assert "'closed'" in closed.stderr
+    # A newer session in the same worktree is open, so the box has a reader again.
+    _plant_record(
+        shared / "seats", key, _record(box=key, session="sess-b", worktree=str(repo), host=None)
+    )
+    reopened = _send(repo, shared, str(repo))
+    assert reopened.returncode == 0, reopened.stderr
+    assert "WARNING" not in reopened.stderr
+
+
+def test_an_unreadable_record_in_the_recipients_box_says_nothing(repo: Path, shared: Path) -> None:
+    """The newest record may be mid-write, so an older closed one does not speak for it."""
+    first = _send(repo, shared, str(repo))
+    key = json.loads(first.stdout)[0]["Key"]
+    rec = _record(box=key, session="sess-a", worktree=str(repo), host=None)
+    old = _plant_record(shared / "seats", key, _ended(rec, "closed", "2026-11-20T10:00:00Z"))
+    os.utime(old, (time.time() - 3600, time.time() - 3600))
+    (shared / "seats" / key / "torn.json").write_text("{not json", encoding="utf-8")
+    proc = _send(repo, shared, str(repo))
+    assert proc.returncode == 0, proc.stderr
+    assert "WARNING" not in proc.stderr
+
+
 def test_a_send_refuses_when_the_shared_root_does_not_answer(repo: Path) -> None:
     proc = _send(repo, DEAD_UNC, str(repo))
     assert proc.returncode != 0
