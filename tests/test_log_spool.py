@@ -1845,12 +1845,15 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
         # ``__main__._forward_spool_dir`` and ``_supervisor_forward_spool_dir``: ``engine``,
         # ``shard-<id>`` or ``supervisor`` under ``_forward_spool_root``, which is ``Path(base)``
         # for a non-empty setting and otherwise ``log-spool`` in the resolved store path's parent.
-        # The next test ties only the default: ``log-spool`` in the directory that holds a
-        # ``[store].path`` it builds directly, on SQLite and on a database server, shared by two
-        # stores in one directory. Two facts here are checked by reading the code, not tied by any
-        # test: ``--db`` reaching ``[store].path`` (``_serve`` and ``_supervise`` write it into the
-        # CLI layer), and a relative setting being taken against the working directory
-        # (``_forward_spool_root`` returns ``Path(base)`` unanchored).
+        # The next test ties only the default for an unset setting: ``log-spool`` in the directory
+        # that holds a ``[store].path`` it builds directly, on SQLite and on a database server,
+        # shared by two stores in one directory. At least these facts here are checked by reading
+        # the code, not tied by any test: the subdirectory names and the supervisor's root
+        # (``_forward_spool_dir``, ``_supervisor_forward_spool_dir``), an empty setting read as
+        # unset (``_forward_spool_root`` tests ``if base``), ``--db`` reaching ``[store].path``
+        # (``_serve`` and ``_supervise`` write it into the CLI layer), and a relative setting being
+        # taken against the working directory (``_forward_spool_root`` returns ``Path(base)``
+        # unanchored).
         "A process spools in the subdirectory engine, shard-<engine shard id> or supervisor of a "
         "root. The root is [logging].forward_spool_dir (environment variable "
         "MEFOR_LOGGING_FORWARD_SPOOL_DIR), taken against the working directory when it is a "
