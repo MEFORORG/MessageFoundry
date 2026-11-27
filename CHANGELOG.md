@@ -8,9 +8,11 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [0.5.3] — 2026-11-27 — Early Access
 
-This engine moved the UI seam, so the published web console 0.5.0 wheel refuses it; see the caution
-in [INSTALL-GUIDE.md](https://github.com/MEFORORG/MessageFoundry/blob/v0.5.3/docs/INSTALL-GUIDE.md#launching-the-admin-console-in-a-browser).
-A `BACKLOG #N` number cites the project's private planning ledger, so it has no public page.
+This engine pairs with web console 0.6.0, which is published after it under its own
+`webconsole-v0.6.0` tag. Its UI seam is `2fdef0ec34ace13d`, so with the console on it refuses to
+start beside console 0.5.0 or older. Upgrade the two together, or set
+`[security].serve_web_console = false`. A `BACKLOG #N` number cites the project's private planning
+ledger, so it has no public page.
 
 ### Added
 - **A slow credential-reminder rescan is a named security loosening.** `[cert_monitor]` and

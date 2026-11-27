@@ -20,6 +20,14 @@ engine compatibility range.
 [`messagefoundry_webconsole/__init__.py`](../../messagefoundry_webconsole/__init__.py), not from
 this line.**
 
+## [0.6.0] — 2026-11-27 — Early Access
+
+**Requires engine 0.5.3. Supported engine UI seam: `2fdef0ec34ace13d`**, the value engine 0.5.3
+ships as `messagefoundry.api._ui_seam.ENGINE_UI_SEAM`. With the console on, any other engine refuses
+to start. Console 0.5.0 does not work with engine 0.5.3, and this console does not work with engine
+0.5.2 or older, so upgrade the two together. The entries marked as seam changes below say why the
+digest moved.
+
 ### Added
 
 - **Directory-account enrolment codes (ADR 0207, BACKLOG #2609).** A directory account's user page
@@ -43,6 +51,10 @@ this line.**
 
 ### Changed
 
+- **The package requires `messagefoundry>=0.5.3`.** Console 0.5.0 required `messagefoundry>=0.5.2`.
+  The floor still has no ceiling (`RELEASE.md` step 2), so beside an older engine pip upgrades the
+  engine, and an unpinned upgrade takes the newest release, whose seam may differ. Pin both:
+  `messagefoundry==0.5.3` with `messagefoundry-webconsole==0.6.0`.
 - **The event log's kind filter reads the engine's one connection-event vocabulary.** The console
   no longer keeps its own list; it imports `CONNECTION_EVENT_KIND_ORDER` from the engine module
   `messagefoundry.connection_events`, and the choices and their order are unchanged. Needs an engine
@@ -1135,7 +1147,8 @@ two items sat under Unreleased.
   compat ranges, re-lock, add the release job) — see [`RELEASE.md`](RELEASE.md). It was not wired
   when this entry was written; the `release-webconsole` job published this wheel on 2026-07-29.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/webconsole-v0.5.0...HEAD
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/webconsole-v0.6.0...HEAD
+[0.6.0]: https://github.com/MEFORORG/MessageFoundry/releases/tag/webconsole-v0.6.0
 [0.5.0]: https://github.com/MEFORORG/MessageFoundry/releases/tag/webconsole-v0.5.0
 [0.4.0]: https://github.com/MEFORORG/MessageFoundry/releases/tag/webconsole-v0.4.0
 [0.3.0]: https://github.com/MEFORORG/MessageFoundry/releases/tag/webconsole-v0.3.0

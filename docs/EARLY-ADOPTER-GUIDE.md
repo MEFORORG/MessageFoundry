@@ -179,9 +179,7 @@ pip install "messagefoundry==0.5.3"        # pin the exact engine version (core 
 
 `messagefoundry==0.5.3` pulls only the **core runtime** — what a headless engine needs. Add extras
 (§4.2) for the PySide6 test harness, a server-DB backend, or SFTP; the browser web console installs
-as its own `messagefoundry-webconsole` wheel. **Caution:** the published console 0.5.0 wheel refuses
-engine 0.5.3, which moved the UI seam; see the caution in
-[INSTALL-GUIDE.md, *Launching the admin console*](INSTALL-GUIDE.md#launching-the-admin-console-in-a-browser).
+as its own `messagefoundry-webconsole` wheel.
 
 > **WARNING: Early access.** The current release is an **Early Access** release on public PyPI — feature-complete and
 > test-validated, but the external review + pen test that gate a security-certified **v1.0** land after

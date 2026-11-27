@@ -1411,13 +1411,10 @@ This service is **headless**. Operators watch and run it from the **browser web 
 same-origin at `/ui` (not part of the service runtime — a separate wheel the engine mounts
 in-process). It publishes as its **own** distribution on its own version line. With the console on,
 the engine refuses to start beside a console built for a different UI seam, so match the pair:
-console 0.5.0 for engine 0.5.2. **Caution:** the published console 0.5.0 wheel refuses engine
-0.5.3, which moved the UI seam; see the caution in
-[INSTALL-GUIDE.md, *Launching the admin console*](INSTALL-GUIDE.md#launching-the-admin-console-in-a-browser).
-Install the console into the engine venv:
+console 0.6.0 for engine 0.5.3. Install it into the engine venv:
 
 ```powershell
-pip install "messagefoundry-webconsole==0.5.0"       # into the engine venv (the published wheel; pairs with engine 0.5.2)
+pip install "messagefoundry-webconsole==0.6.0"       # into the engine venv (pairs with engine 0.5.3)
 pip install -e packaging/messagefoundry-webconsole   # or, from a source checkout
 ```
 

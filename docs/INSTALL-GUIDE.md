@@ -425,21 +425,10 @@ It ships as a separate wheel (`messagefoundry-webconsole`) on its **own version 
 *not* lockstep with the engine — that the engine mounts in-process. The pair is checked at startup
 against the engine's UI-seam version and a mismatched pair is **refused**, so install the console
 release built for the engine version you pinned. The console is **on by default**, so on a local
-instance installing a console that matches the engine is all you need.
-
-> **Caution: there is no published console for engine 0.5.3 yet.** Engine 0.5.3 moved the UI seam
-> to `2fdef0ec34ace13d`. The published `messagefoundry-webconsole` 0.5.0 wheel supports only engine
-> 0.5.2's seam, `6d8b36eb7bb94bf0`, so with that wheel installed and the console on, engine 0.5.3
-> refuses to start. Until a console release that supports engine 0.5.3 ships, run engine 0.5.3 with
-> `[security].serve_web_console = false`, or with no console installed, which serves the JSON API
-> only unless `[security].serve_web_console = true` is set explicitly, in which case it refuses to
-> start. A console installed from the `v0.5.3` source checkout
-> (`pip install -e packaging/messagefoundry-webconsole`) also reports version 0.5.0 but supports
-> engine 0.5.3's seam; it is built from source, not the published wheel. The published wheel below
-> pairs with engine 0.5.2.
+instance installing it is all you need:
 
 ```powershell
-pip install "messagefoundry-webconsole==0.5.0"    # the published /ui web console wheel; pairs with engine 0.5.2 (see the caution above), into the same venv
+pip install "messagefoundry-webconsole==0.6.0"    # the /ui web console for engine 0.5.3, into the same venv
 # then (re)start the engine — there is no switch to turn on. To turn the console OFF, set
 # [security].serve_web_console = false (the old [api].serve_ui spelling is refused at config load)
 ```

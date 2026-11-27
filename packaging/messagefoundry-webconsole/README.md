@@ -15,19 +15,10 @@ pure `messagefoundry.parsing` lib — never `pipeline`/`store`/`transports`/`con
 
 ## Install
 
-The published console 0.5.0 wheel pairs with engine 0.5.2. Install the engine and the console into
-one environment.
-
-> **Caution: the published console 0.5.0 wheel refuses engine 0.5.3.** Engine 0.5.3 moved the UI
-> seam (see *Compatibility*), so the line below installs a pair that refuses to start with the
-> console on, until a console release that supports engine 0.5.3 ships and its version replaces
-> `0.5.0` here. The caution in
-> [INSTALL-GUIDE.md, *Launching the admin console*](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/INSTALL-GUIDE.md#launching-the-admin-console-in-a-browser)
-> says what works until then.
+Console 0.6.0 pairs with engine 0.5.3. Install the pair into one environment:
 
 ```
-# refuses to start with the console on until a published console for engine 0.5.3 ships (caution above)
-pip install "messagefoundry==0.5.3" "messagefoundry-webconsole==0.5.0"
+pip install "messagefoundry==0.5.3" "messagefoundry-webconsole==0.6.0"
 # or, for development, beside an engine installed from the same checkout:
 pip install -e packaging/messagefoundry-webconsole
 ```
@@ -46,14 +37,12 @@ absent, it serves the JSON API only and prints a warning at startup. Setting
 
 The console pins itself against the engine's `ENGINE_UI_SEAM` (`SUPPORTED_ENGINE_SEAMS` +
 `assert_engine_seam`) and supports **exactly one** seam — the engine build it was released against
-(BACKLOG #279). The published console 0.5.0 wheel supports seam `6d8b36eb7bb94bf0`, which engine
-0.5.2 provides; the in-tree console, which also reports 0.5.0, tracks the engine's seam. Engine
-0.5.3 provides `2fdef0ec34ace13d`, so the published console 0.5.0 wheel refuses it. With
+(BACKLOG #279). Console 0.6.0 supports seam `2fdef0ec34ace13d`, which engine 0.5.3 provides. With
 the console on, the engine refuses to start beside any other console. The refusal is
 `UiSeamMismatch` when startup reaches the seam check, and an import error when a mismatched pair
 fails before it.
 
-Console 0.5.0 declares `messagefoundry>=0.5.2`, a floor with no ceiling. So pip will not leave it
-beside an engine older than 0.5.2. It upgrades the engine instead, and an unpinned upgrade takes
+Console 0.6.0 declares `messagefoundry>=0.5.3`, a floor with no ceiling. So pip will not leave it
+beside an engine older than 0.5.3. It upgrades the engine instead, and an unpinned upgrade takes
 the newest release, whose seam may differ. The engine refuses that pair at startup. Pin both
-versions, as a pair whose seams match.
+versions, as above.
