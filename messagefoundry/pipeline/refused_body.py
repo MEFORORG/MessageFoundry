@@ -349,7 +349,8 @@ def head_only_resubmit_refusal(message_id: str, metadata: str | None) -> str | N
         if "reingress_of_seq" in parsed and isinstance(parsed.get("correlation_id"), str)
         # BACKLOG #1619 item 6: a held frame's sender waits for no reply and never resends it. An
         # attempt may also have recorded it RECEIVED, so this names only what this row holds.
-        else "its sender never resends it, and this row holds only the frame's head"
+        else "its sender never resends it, and this row holds only the frame's head; an attempt"
+        " that faulted after its commit may have left a whole RECEIVED copy on this inbound"
         if record.get(HELD_FRAME_KEY) is True
         else "have the sender send its own copy again"
     )

@@ -10337,12 +10337,11 @@ class RegistryRunner:
             try:
                 text = decode_body(raw, ic)  # the same decode, and surrogate refusal, as ingress
             except IngressGuardError as exc:
-                # The exception's own text is not logged: it can quote the bytes it refused.
+                # ``reason`` is decode_body's content-free text: a codec, a position, a cause.
                 log.warning(
-                    "held frame on inbound %s did not decode as text (%s), so its ERROR row "
-                    "stores it as received",
+                    "held frame on inbound %s did not decode as text, so it is stored undecoded: %s",
                     ic.name,
-                    type(exc).__name__,
+                    exc.reason,
                 )
                 text = None
         bounded = self._refused_body.bound_uncharged(

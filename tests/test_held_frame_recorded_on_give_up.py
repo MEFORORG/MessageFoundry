@@ -537,8 +537,12 @@ async def test_a_cancel_while_waiting_for_an_mllp_slot_is_recorded_as_a_cancel(
             source._on_client(_ThenEof(frame(_doc_hl7())), _Peer())  # type: ignore[arg-type]
         )
         await asyncio.wait_for(waiting.wait(), timeout=2.0)
-        for _ in range(20):  # let the hold reach the slot wait
+        # A positive control: the retry is waiting on the slot, not in the pause, when cancelled.
+        for _ in range(200):
+            if getattr(source._inflight, "_waiters", None):
+                break
             await asyncio.sleep(0)
+        assert getattr(source._inflight, "_waiters", None), "the retry never waited for a slot"
         client.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(client, timeout=2.0)
@@ -569,4 +573,5 @@ async def test_a_held_frame_that_does_not_decode_logs_a_warning_without_its_body
         if r.name == "messagefoundry.pipeline.wiring_runner" and r.levelno == logging.WARNING
     ]
     assert any("did not decode as text" in m and _INBOUND in m for m in lines), lines
-    assert not any("MRN123" in m or "DOE" in m or "\\xff" in m for m in lines), lines
+    assert not any("MRN123" in m or "DOE" in m for m in lines), lines
+    assert not any("0xff" in m or "\xff" in m or "\xfe" in m for m in lines), lines

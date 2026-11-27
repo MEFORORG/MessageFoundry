@@ -2961,11 +2961,13 @@ class MLLPSource(SourceConnector):
         ``intake`` is the connection's intake context, which :func:`deliver` hands to a handler
         that takes one (vault BACKLOG #2607).
         """
-        slots = self._inflight
-        if slots is None:
+        async with self._slot():
             return await deliver(handler, message, intake)
-        async with slots:
-            return await deliver(handler, message, intake)
+
+    def _slot(self) -> contextlib.AbstractAsyncContextManager[object]:
+        """One of this listener's in-flight slots, or a context that waits for nothing when the
+        bound is off. :meth:`_handle_bounded` and a held frame's retries both take theirs here."""
+        return self._inflight if self._inflight is not None else contextlib.nullcontext()
 
     @property
     def sockport(self) -> int:
@@ -3393,7 +3395,7 @@ class MLLPSource(SourceConnector):
                                             "handler_error", peer_host=peer_host, reason=reason
                                         ),
                                         record_loss=self.record_lost_frame,
-                                        slot=lambda: self._inflight,
+                                        slot=self._slot,
                                     )
                                 except HandlerFaultUnrecovered:
                                     handler_dropped = True  # handler_error is recorded; close
