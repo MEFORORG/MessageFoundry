@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import threading
 import time
 from collections.abc import Callable
@@ -200,24 +201,31 @@ def test_a_refusal_a_password_cannot_clear_is_not_prompted(qapp: Any, error: Api
 
 class _GuardedStepUp:
     """Declines a step-up asked while its own prompt is up, as MonitorPanel._step_up does. While
-    up, it runs ``during`` (the operator's act inside the prompt's nested event loop)."""
+    its first prompt is up, it runs ``during`` (the operator's act inside the prompt's nested
+    event loop); a later prompt just answers. ``answer`` may be a callable, which may raise."""
 
-    def __init__(self, during: Callable[[], None], answer: bool = True) -> None:
-        self._during = during
+    def __init__(
+        self, during: Callable[[], None], answer: bool | Callable[[], bool] = True
+    ) -> None:
+        self._during: Callable[[], None] | None = during
         self._answer = answer
         self._open = False
         self.calls = 0
+        self.actions: list[str | None] = []
 
     def __call__(self, action: str | None) -> bool:
         self.calls += 1
+        self.actions.append(action)
         if self._open:
             return False
         self._open = True
         try:
-            self._during()
+            during, self._during = self._during, None
+            if during is not None:
+                during()
         finally:
             self._open = False
-        return self._answer
+        return self._answer() if callable(self._answer) else self._answer
 
 
 def _pump_until(qapp: Any, done: Callable[[], bool]) -> None:
@@ -228,10 +236,10 @@ def _pump_until(qapp: Any, done: Callable[[], bool]) -> None:
     assert done(), "the nested event loop never reached the awaited state"
 
 
-def test_an_open_superseded_during_the_prompt_reopens_the_new_selection(qapp: Any) -> None:
+def test_an_open_superseded_during_the_prompt_lets_the_newer_open_land(qapp: Any) -> None:
     """The prompt's nested event loop can run a newer load(). That one wins, so the old open is
-    dropped. Its request went out under the old session, so once the prompt re-proves, the new
-    selection is opened again rather than left to come back refused."""
+    dropped. The newer open is still out when the prompt re-proves, so it is left to land rather
+    than opened a second time: each open is an audited PHI read."""
     client = _Client(open_refusals=1)
     box: list[MessageDetailPanel] = []
     step_up = _GuardedStepUp(lambda: box[0].load("m2"))
@@ -239,8 +247,8 @@ def test_an_open_superseded_during_the_prompt_reopens_the_new_selection(qapp: An
     box.append(panel)
     try:
         panel.load("m1")
-        _settle(qapp, lambda: _opened(panel) and client.opens >= 3)
-        assert client.opened == ["m1", "m2", "m2"]
+        _settle(qapp, lambda: _opened(panel))
+        assert client.opened == ["m1", "m2"]
         assert step_up.calls == 1
         assert panel._message_id == "m2"
         assert errors == []
@@ -365,7 +373,7 @@ def test_a_second_body_refusal_is_reported_not_prompted_again(qapp: Any) -> None
 
 def test_a_body_superseded_during_its_prompt_is_not_painted(qapp: Any) -> None:
     """A newer open in the prompt's nested event loop wins: m1's body is neither repeated nor
-    painted under m2, and m2, opened under the old session, is opened again after the proof."""
+    painted under m2, and m2's open, still out when the prompt re-proves, lands once."""
     client = _Client(body_refusals=1)
     box: list[MessageDetailPanel] = []
     panel, errors = _panel(client, _GuardedStepUp(lambda: box[0].load("m2")))
@@ -374,9 +382,9 @@ def test_a_body_superseded_during_its_prompt_is_not_painted(qapp: Any) -> None:
         panel.load("m1")
         _settle(qapp, lambda: _opened(panel))
         panel._on_show_body()
-        _settle(qapp, lambda: panel._message_id == "m2" and client.opens >= 3)
+        _settle(qapp, lambda: panel._message_id == "m2")
         assert client.bodies == 1
-        assert client.opened == ["m1", "m2", "m2"]
+        assert client.opened == ["m1", "m2"]
         assert panel._raw.toPlainText() == ""
         assert errors == []
     finally:
@@ -421,6 +429,178 @@ def test_show_body_stays_disabled_while_its_prompt_is_up(qapp: Any) -> None:
         _settle(qapp, lambda: bool(panel._raw.toPlainText()))
         assert seen == [False]
         assert errors == []
+    finally:
+        panel.stop()
+        box.clear()
+
+
+class _ScriptedClient:
+    """Answers each open, and each body read, by the next entry of its script: ``"ok"`` serves it,
+    any other string refuses it with a step-up naming that string as its action. An exhausted
+    script serves."""
+
+    def __init__(self, *, opens: list[str], bodies: list[str] | None = None) -> None:
+        self._opens = list(opens)
+        self._bodies = list(bodies or [])
+        self.opened: list[str] = []
+        self.bodies = 0
+
+    @staticmethod
+    def _next(script: list[str]) -> None:
+        outcome = script.pop(0) if script else "ok"
+        if outcome != "ok":
+            raise StepUpRequired("step-up required", status=403, action=outcome)
+
+    def get_message(self, message_id: str) -> Any:
+        self.opened.append(message_id)
+        self._next(self._opens)
+        return _detail(message_id)
+
+    def get_message_body(self, message_id: str, *, surface: str) -> Any:
+        self.bodies += 1
+        self._next(self._bodies)
+        return SimpleNamespace(message_id=message_id, raw=_RAW)
+
+
+def _select_m2_and_wait_for_its_refusal(box: list[MessageDetailPanel], qapp: Any) -> None:
+    panel = box[0]
+    panel.load("m2")
+    # Its refusal comes back while the prompt is up; that step-up is declined, so it is reported.
+    _pump_until(qapp, lambda: panel._summary.text() == "The message could not be opened.")
+
+
+def test_a_reopen_after_another_reads_proof_still_prompts_for_its_own_action(qapp: Any) -> None:
+    """The proof was for the body read's action, so it need not cover the reopened open's. A
+    step-up refusal of the reopen is prompted for, not reported as if it were the repeat."""
+    client = _ScriptedClient(opens=["ok", "open", "open"], bodies=["body"])
+    box: list[MessageDetailPanel] = []
+    step_up = _GuardedStepUp(lambda: _select_m2_and_wait_for_its_refusal(box, qapp))
+    panel, errors = _panel(client, step_up)
+    box.append(panel)
+    try:
+        panel.load("m1")
+        _settle(qapp, lambda: _opened(panel))
+        panel._on_show_body()
+        _settle(qapp, lambda: panel._message_id == "m2")
+        # The body prompt; m2's refusal inside it, declined; the reopen's refusal, prompted.
+        assert step_up.actions == ["body", "open", "open"]
+        assert client.opened == ["m1", "m2", "m2", "m2"]
+        assert errors == ["step-up required"]  # only the declined nested step-up
+    finally:
+        panel.stop()
+        box.clear()
+
+
+def test_a_reopen_refused_twice_prompts_once_and_reports(qapp: Any) -> None:
+    client = _ScriptedClient(opens=["ok", "open", "open", "open", "open"], bodies=["body"])
+    box: list[MessageDetailPanel] = []
+    step_up = _GuardedStepUp(lambda: _select_m2_and_wait_for_its_refusal(box, qapp))
+    panel, errors = _panel(client, step_up)
+    box.append(panel)
+    try:
+        panel.load("m1")
+        _settle(qapp, lambda: _opened(panel))
+        panel._on_show_body()
+        _settle(qapp, lambda: len(errors) == 2)
+        assert step_up.actions == ["body", "open", "open"]
+        assert client.opened == ["m1", "m2", "m2", "m2"]  # the reopen and its one repeat
+        assert errors == ["step-up required", "step-up required"]
+        assert not _opened(panel)
+    finally:
+        panel.stop()
+        box.clear()
+
+
+def _refuse_re_proof() -> bool:
+    raise ApiError("re-verification failed", status=401)
+
+
+def test_a_refused_re_proof_of_a_superseded_open_is_still_reported(qapp: Any) -> None:
+    client = _Client(open_refusals=1)
+    box: list[MessageDetailPanel] = []
+    step_up = _GuardedStepUp(lambda: box[0].load("m2"), answer=_refuse_re_proof)
+    panel, errors = _panel(client, step_up)
+    box.append(panel)
+    try:
+        panel.load("m1")
+        _settle(qapp, lambda: _opened(panel))
+        assert errors == ["re-verification failed"]
+        assert panel._message_id == "m2"
+        assert client.opened == ["m1", "m2"]
+    finally:
+        panel.stop()
+        box.clear()
+
+
+def test_a_refused_re_proof_of_a_superseded_body_read_is_still_reported(qapp: Any) -> None:
+    client = _Client(body_refusals=1)
+    box: list[MessageDetailPanel] = []
+    step_up = _GuardedStepUp(lambda: box[0].load("m2"), answer=_refuse_re_proof)
+    panel, errors = _panel(client, step_up)
+    box.append(panel)
+    try:
+        panel.load("m1")
+        _settle(qapp, lambda: _opened(panel))
+        panel._on_show_body()
+        _settle(qapp, lambda: panel._message_id == "m2")
+        assert errors == ["re-verification failed"]
+        assert client.bodies == 1
+        assert panel._raw.toPlainText() == ""
+    finally:
+        panel.stop()
+        box.clear()
+
+
+_FAULT_TEXT = "PID|1||100^^^H^MR||DOE^JANE"  # what a fault's text could quote
+
+
+def _broken_prompt() -> bool:
+    raise RuntimeError(_FAULT_TEXT)
+
+
+def test_a_body_prompt_that_raises_something_else_is_reported_and_logged_without_its_text(
+    qapp: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="harness._console_widgets")
+    client = _Client(body_refusals=1)
+    panel, errors = _panel(client, _StepUp(_broken_prompt))
+    try:
+        panel.load("m1")
+        _settle(qapp, lambda: _opened(panel))
+        panel._on_show_body()
+        _settle(qapp, lambda: bool(errors))
+        assert errors == ["the body could not be read: RuntimeError"]
+        assert panel._show_body.isEnabled()
+        assert panel._raw.toPlainText() == ""
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert [r.getMessage() for r in warnings] == [
+            "message body read for m1 raised RuntimeError"
+        ]
+        assert _FAULT_TEXT not in caplog.text
+    finally:
+        panel.stop()
+
+
+def test_a_superseded_body_prompt_fault_is_still_logged(
+    qapp: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="harness._console_widgets")
+    client = _Client(body_refusals=1)
+    box: list[MessageDetailPanel] = []
+    step_up = _GuardedStepUp(lambda: box[0].load("m2"), answer=_broken_prompt)
+    panel, errors = _panel(client, step_up)
+    box.append(panel)
+    try:
+        panel.load("m1")
+        _settle(qapp, lambda: _opened(panel))
+        panel._on_show_body()
+        _settle(qapp, lambda: panel._message_id == "m2")
+        assert errors == []  # superseded: nothing is said on screen about m1's body
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert [r.getMessage() for r in warnings] == [
+            "message body read for m1 raised RuntimeError"
+        ]
+        assert _FAULT_TEXT not in caplog.text
     finally:
         panel.stop()
         box.clear()

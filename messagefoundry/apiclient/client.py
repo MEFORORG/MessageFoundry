@@ -1349,9 +1349,12 @@ class EngineClient:
         0077), the stashed action rides along as ``purpose`` so the engine mints a grant BOUND to it;
         a plain session-window step-up posts ``{"password": …}`` unchanged.
 
-        ``purpose`` names the action up front instead, for a caller that proves BEFORE the call it
-        is about to make, so the refusal and the retry never happen (vault BACKLOG #2625: a timed
-        reload must not carry a step-up inside its timer). It wins over a stashed action.
+        ``purpose`` names the action explicitly instead, and wins over a stashed action. At least
+        two callers pass it: one that proves BEFORE the call it is about to make, so the refusal
+        and the retry never happen (vault BACKLOG #2625: a timed reload must not carry a step-up
+        inside its timer), and one answering a refusal this client did not stash, such as a
+        worker read through a handler-less polling client, which passes the refused call's
+        :attr:`StepUpRequired.action` and then repeats that call itself (BACKLOG #5945).
 
         Raises :class:`ApiError` with ``status`` None when the 2xx reply carries no usable token
         (BACKLOG #5344). The engine may have rotated the session anyway, so the held token may

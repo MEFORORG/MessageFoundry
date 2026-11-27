@@ -182,6 +182,31 @@ def test_a_refresh_during_the_prompt_neither_searches_nor_prompts_again(qapp: An
         panel.stop()
 
 
+def test_a_prompt_fault_is_reported_and_a_refresh_latched_meanwhile_still_runs(qapp: Any) -> None:
+    # A prompt raising something other than ApiError used to escape the result slot: nothing was
+    # reported, and a refresh latched while the prompt was up was never run.
+    client = _SearchClient(refusals=1)
+    panel_box: list[MessagesPanel] = []
+
+    def latch_a_refresh_then_break(_action: str | None) -> bool:
+        panel_box[0].refresh(autosize=True)
+        raise RuntimeError("the poller would not restart")
+
+    panel, errors = _search(qapp, client, None)
+    panel_box.append(panel)
+    panel._step_up = latch_a_refresh_then_break
+    try:
+        _settle(qapp, panel, client, 2)
+        assert errors == ["the poller would not restart"]
+        assert client.searches == 2  # the latched refresh, run once the fault was reported
+        assert panel._table.rowCount() == 1
+        assert not panel._loading
+        assert panel._pending is None
+    finally:
+        panel.stop()
+        panel_box.clear()
+
+
 def test_an_idp_step_up_is_not_answered_with_a_password_prompt(qapp: Any) -> None:
     client = _SearchClient(refusals=1, error=IdpStepUpRequired("use the web console", status=403))
     step_up = _StepUp(True)

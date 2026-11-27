@@ -231,7 +231,7 @@ def test_an_unexpected_body_failure_is_reported_and_the_button_offered_again(qap
     try:
         _open(panel, "m1")
         panel._show_body.setEnabled(False)  # as _on_show_body leaves it while the fetch runs
-        panel._body_failed(panel._open_seq, RuntimeError("boom"))
+        panel._body_failed("m1", panel._open_seq, RuntimeError("boom"))
         assert errors == ["the body could not be read: RuntimeError"]
         assert panel._show_body.isEnabled()
     finally:
