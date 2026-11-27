@@ -282,6 +282,9 @@ so it leads its own `NullCoordinator`. With `[backup].enabled`, its `BackupRunne
 standby still leads its own coordinator. What changed is that `BackupRunner` starts no scheduled pass
 while the engine reports the box as paused: while it is a passive standby, and during an activation until
 its reload has completed.
+*(BACKLOG #5965, owner ruling 2026-11-26, decision d20261126T095342812-893e1d, widens this on one
+box only: an activated server-DB box with `[dr].restore_token` set starts no pass either, so a later
+re-activation of the same restore still passes the token check. Any other activated box backs up.)*
 
 **What the false premise reaches.**
 

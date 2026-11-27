@@ -174,7 +174,7 @@ async def box(tmp_path: Path) -> AsyncIterator[_Box]:
         config_dir=live,
         config_reload_roots=[str(staging), str(tiered), str(scheduled), str(gated)],
         store_settings=ss,
-        dr_settings=DrSettings(enabled=True, activate=False, seed_archive=archive),
+        dr_settings=DrSettings(enabled=True, seed_archive=archive),
         egress_settings=EgressSettings(deny_by_default=False),
     )
     # The seed holds a row for a destination none of these graphs declares. A started engine

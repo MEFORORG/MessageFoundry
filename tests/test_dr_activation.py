@@ -462,7 +462,7 @@ async def test_no_hook_relies_on_passive_lb(tmp_path: Path) -> None:
 async def test_manual_only_activation(tmp_path: Path) -> None:
     # AC-8: manual is the default and the only built mode; the coordinator activates ONLY on the explicit
     # activate() call (the RBAC-gated POST /dr/activate). There is no background/auto trigger — a freshly
-    # constructed coordinator (activate=false) is NOT active until activate() is invoked.
+    # constructed coordinator is NOT active until activate() is invoked.
     store, archive, ss = await _seed(tmp_path)
     try:
         coord, state = _coord(store, ss, seed_archive=archive)

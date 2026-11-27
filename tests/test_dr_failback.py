@@ -47,7 +47,7 @@ ADT = (
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    # A DR box: dr.enabled so the coordinator builds; activate=false so it starts un-activated (the box
+    # A DR box: dr.enabled so the coordinator builds; it starts un-activated (the box
     # comes up passive, with no listener bound, vault BACKLOG #3140; the test activates it, then fails
     # it back). store_settings present so the cold-seed key seam exists.
     store = await MessageStore.open(tmp_path / "fb.db")
@@ -56,7 +56,7 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
         poll_interval=0.02,
         config_dir=None,
         store_settings=StoreSettings(path=str(tmp_path / "fb.db")),
-        dr_settings=DrSettings(enabled=True, activate=False, seed_archive="seed.mfbak"),
+        dr_settings=DrSettings(enabled=True, seed_archive="seed.mfbak"),
         egress_settings=EgressSettings(deny_by_default=False),
     )
     yield eng
@@ -179,7 +179,7 @@ async def test_an_activation_reports_a_connector_its_reload_could_not_close(
         poll_interval=0.02,
         config_dir=None,
         store_settings=StoreSettings(path=str(tmp_path / "fb.db")),
-        dr_settings=DrSettings(enabled=True, activate=False, seed_archive="seed.mfbak"),
+        dr_settings=DrSettings(enabled=True, seed_archive="seed.mfbak"),
         egress_settings=EgressSettings(deny_by_default=False),
         claim_mode="per_lane",
     )

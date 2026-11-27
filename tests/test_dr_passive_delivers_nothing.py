@@ -181,7 +181,7 @@ async def test_a_passive_standby_delivers_nothing_until_it_is_activated(
 ) -> None:
     """Red before #3262: the passive box delivered every restored row as soon as it started."""
     cfg = await _seeded(tmp_path, sent)
-    passive = DrSettings(enabled=True, activate=False, seed_archive="seed.mfbak")
+    passive = DrSettings(enabled=True, seed_archive="seed.mfbak")
     async with _served(tmp_path, cfg, passive, claim_mode) as engine:
         rr = engine.registry_runner
         assert rr is not None
@@ -231,7 +231,7 @@ async def test_a_release_stops_delivery_again_until_the_next_activation(
     """After ``POST /dr/release`` the box is passive again, so a row that reaches the outbound
     stage waits, across a reload too, and the next activation delivers it once."""
     cfg = await _seeded(tmp_path, sent)
-    passive = DrSettings(enabled=True, activate=False, seed_archive="seed.mfbak")
+    passive = DrSettings(enabled=True, seed_archive="seed.mfbak")
     async with _served(tmp_path, cfg, passive, claim_mode) as engine:
         rr = engine.registry_runner
         assert rr is not None
@@ -269,8 +269,9 @@ async def test_an_active_dr_box_over_the_same_store_delivers_its_critical_rows(
     """The control arm: the recorder sees a delivery, so the empty lists above are not a dead
     probe, and the park is the passive state's and not the seed's."""
     cfg = await _seeded(tmp_path, sent)
-    latched = DrSettings(enabled=True, activate=True, seed_archive="seed.mfbak")
-    async with _served(tmp_path, cfg, latched) as engine:
+    passive = DrSettings(enabled=True, seed_archive="seed.mfbak")
+    async with _served(tmp_path, cfg, passive) as engine:
+        await engine._dr_activate_profile()  # the engine callback POST /dr/activate runs
         await _until_sent(sent, 4)
         await asyncio.sleep(_SETTLE_SECONDS)
         assert sent == [(_OB_CRIT, "S1"), (_OB_CRIT, "S2"), (_OB_CRIT, "S3"), (_OB_CRIT, "S4")]

@@ -1136,6 +1136,7 @@ _ALERT_EVENT_SIDE: Final[Mapping[str, str]] = MappingProxyType(
                 "vault_privilege_warning",
                 "leadership_acquired",
                 "dr_activated",
+                "dr_restarted_passive",
                 "initial_credential_expiring",
                 "log_write_failed",
                 "log_forward_failed",
@@ -12028,7 +12029,23 @@ def create_app(
         optional release hook / the passive LB returns it to the primary), unbinds all inbound listeners, and drains the staged queue
         to completion before returning success (no dual-accept window while the VIP moves). Cross-store
         reconciliation with the recovered primary is operator-verified per the runbook (the engine gives
-        no cross-store loss/duplicate guarantee)."""
+        no cross-store loss/duplicate guarantee). On a box that is already passive but whose identity was
+        last activated, or whose start raised ``dr_restarted_passive`` with no activation recorded
+        since, it is a stay-passive release instead (BACKLOG #5965): it runs the release hook when one
+        is set, writes a ``dr.stay_passive`` audit row and
+        closes the alert, but unbinds no listener and drains nothing, so an inbound an operator started
+        on that box stays bound. It still answers ``action=release``. On a passive box whose own
+        newest activate or release record is not an activation and whose start raised no
+        ``dr_restarted_passive``, it changes nothing: it writes no row and closes no alert, so a
+        ``dr_restarted_passive`` an earlier start left open stays open until an operator resolves it by
+        hand, with ``POST /alerts/{alert_id}/resolve`` or the web console's Resolve on the alert, or a later
+        ``POST /dr/activate`` under the same box label, run only once the operator has confirmed
+        the primary is not serving, closes it. The response does not reliably
+        tell that case from a stay-passive release: both answer ``active=false``, and a call that
+        changed nothing can answer an earlier release's outcome, its drain fields and
+        ``vip_hook_ran`` included. Read the alert list to see whether the alert closed. Only a
+        successful stay-passive release writes a ``dr.stay_passive`` audit row, but an earlier release's row
+        reads the same, so match its host, actor and time to the call."""
         coord = engine.dr_coordinator
         if coord is None:
             raise HTTPException(503, "this deployment is not a DR standby ([dr].enabled is false)")
@@ -13852,8 +13869,8 @@ def create_managed_app(
                 security_enforcement=security_enforcement,
                 update_check_settings=update_check_settings,
                 backup_settings=backup_settings,
-                # [dr] third-tier DR standby run-profile + cold-seed (#61, ADR 0048). When dr.enabled AND
-                # dr.activate, the engine binds only connections at/above dr.priority_threshold this boot.
+                # [dr] third-tier DR standby run-profile + cold-seed (#61, ADR 0048). A DR box starts
+                # passive; after POST /dr/activate it binds only connections at/above dr.priority_threshold.
                 dr_settings=dr_settings,
                 # [backup] DR archive is encrypted under the store DEK (its KEY SOURCE) and bundles the
                 # config dir; pass the resolved store settings (the KeyProvider seam) + version metadata.
