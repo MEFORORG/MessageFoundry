@@ -539,6 +539,54 @@ def test_a_device_path_normpath_would_read_as_another_object_is_not_walked(path:
     assert (chain, cause) == ([], "the path is a device path this check does not read")
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        r"\\?\C:\certs\NUL",
+        r"\\.\C:\certs\NUL",
+        r"\??\C:\certs\nul",
+        r"\\?\C:\certs\COM1.pem",
+        r"\\.\C:\certs\aux.ca.pem",
+        r"\\?\C:\certs\CONOUT$",
+        "\\\\?\\C:\\certs\\LPT\u00b9.pem",
+        r"\\?\C:\NUL\ca.pem",
+        # The other names ntpath.isreserved reports, which Win32 also rewrites once stripped.
+        r"\\?\C:\certs\ca.pem.",
+        r"\\.\C:\certs\ca.pem ",
+        r"\\?\C:\certs\ca.pem:stream",
+    ],
+)
+def test_a_device_path_holding_a_dos_device_name_is_not_walked(path: str) -> None:
+    """Vault BACKLOG #5515 remainder. A device prefix skips Win32's DOS device-name rule, so the
+    open reads a file named ``NUL`` where the walk's stripped ``C:\\certs\\NUL`` opens the device.
+    Measured on Windows 10.0.26300: ``\\\\?\\`` and ``\\\\.\\`` paths ending in ``NUL`` read the
+    file, the stripped path read ``\\Device\\Null`` and the verdict judged the device's DACL. Red
+    under origin/main, which walked each device name as a drive path and refused the last three
+    only later, as a name ending in a space or a dot or as a stream."""
+    chain, cause = windows_chain(path, "C:\\cwd", _probe())
+    assert (chain, cause) == ([], "the path is a device path this check does not read")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [r"\\?\C:\certs\NULL.pem", r"\\?\C:\certs\COM10", r"\\?\C:\console\ca.pem", r"C:\certs\NUL"],
+)
+def test_a_name_that_is_not_a_device_name_or_has_no_prefix_is_still_walked(path: str) -> None:
+    """The must-not-trip twins: a name that only starts like a device name, and a plain path,
+    which the open and the walk both read as the device."""
+    _chain, cause = windows_chain(path, "C:\\cwd", _probe())
+    assert cause is None
+
+
+@pytest.mark.parametrize("target", [r"\??\C:\real\NUL", r"\\?\C:\real\com1.pem"])
+def test_a_link_to_a_verbatim_dos_device_name_is_not_walked(target: str) -> None:
+    """A link target is an NT path the kernel reads as written, so ``\\??\\C:\\real\\NUL`` is the
+    file named ``NUL``, where the splice would have walked the device. Red as above."""
+    links = {"C:\\certs\\lnk": target}
+    _chain, cause = windows_chain("C:\\certs\\lnk", "C:\\cwd", _probe(links))
+    assert cause is not None and cause.kind == "a link points at a path this check does not read"
+
+
 @pytest.mark.parametrize("target", [r"\??\C:\real\..\other", r"\\.\C:\real\..\other"])
 def test_a_link_to_a_device_path_normpath_would_change_is_not_walked(target: str) -> None:
     """A junction or symlink target is an NT path, read as written, so not even a ``\\\\.\\``
@@ -1577,6 +1625,28 @@ def test_windows_default_programdata_placement_passes(programdata_dir: Path) -> 
     anchor.write_bytes(b"x")
     v = ap.anchor_path_verdict(anchor)
     assert v.ok is True, v.findings
+
+
+@_windows_only
+@pytest.mark.parametrize("prefix", ["\\\\?\\", "\\\\.\\"])
+def test_windows_a_prefixed_anchor_named_nul_is_not_judged_as_the_device(
+    programdata_dir: Path, prefix: str
+) -> None:
+    """Vault BACKLOG #5515 remainder, on the real host. The prefixed open reads the file named
+    ``NUL``; the walk, judging ``C:\\...\\NUL``, read ``\\Device\\Null``'s DACL instead. Red under
+    origin/main: no device-path cause, and findings naming the device's Everyone write."""
+    anchor = prefix + str(programdata_dir) + "\\NUL"
+    # Only a verbatim spelling reaches the file: the fixture's plain rmtree would aim at the device
+    # and leave the folder behind.
+    verbatim = Path("\\\\?\\" + str(programdata_dir) + "\\NUL")
+    verbatim.write_bytes(b"x")
+    try:
+        assert Path(anchor).read_bytes() == b"x"  # the open reads the file, not the device
+        v = ap.anchor_path_verdict(anchor)
+    finally:
+        verbatim.unlink()
+    assert v.ok is None
+    assert [f.reason for f in v.findings] == ["the path is a device path this check does not read"]
 
 
 @_windows_only

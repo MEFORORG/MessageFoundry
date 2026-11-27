@@ -468,7 +468,9 @@ def _strip_win_prefix(path: str) -> str | None:
             if rest[:4].upper() == "UNC\\":
                 return "\\\\" + rest[4:]
             if len(rest) >= 2 and rest[1] == ":" and rest[0].isascii() and rest[0].isalpha():
-                return rest
+                # Stripped, a reserved name (``NUL``, ``COM1.pem`` before Windows 11, ``ca.pem.``)
+                # would be read by Win32's rules, not as the file the prefixed open reads.
+                return None if ntpath.isreserved(rest) else rest
             if rest[:7].lower() == "volume{":
                 return "\\\\?\\" + rest
             return None
@@ -659,6 +661,11 @@ def windows_chain(
       after the GUID.
     - A link or ``subst`` target with a device prefix other than an all-backslash ``\\\\?\\`` or
       ``\\??\\``, or a verbatim one the first rule refuses.
+    - A path, link target or ``subst`` target whose device prefix strips to a drive path holding a
+      name ``ntpath.isreserved`` reports, in any folder or its last name: a DOS device name
+      (``NUL``, ``COM1.pem``), a name ending in a space or a dot, or one holding a ``:`` or a
+      wildcard. The prefix skips Win32's rules for those names, so the open reads a file named
+      ``NUL``, where the stripped path the walk reads opens the device.
     - A relative path under a working directory whose first four characters are a device prefix,
       in any slashes: a rooted one (``\\x``); one under a working directory that strips to a bare
       drive, or keeps a ``\\\\?\\`` prefix with nothing after its drive or volume part; and one

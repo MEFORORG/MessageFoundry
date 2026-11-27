@@ -12124,10 +12124,12 @@ def _windows_link_target(text: str) -> str:
     directory, or a path rooted with no drive (``\\x``), which may name the object namespace.
 
     Read through the anchor walk's own reader of a link target (``anchor_path._strip_nt_target``),
-    so a device prefix that walk refuses is refused here too: any prefix but an all-backslash
-    ``\\\\?\\`` or ``\\??\\``, and a verbatim one holding a ``/``, a ``.`` or ``..`` name, or an
-    empty name. Win32 rewrites a ``\\\\.\\`` or forward-slash prefix before the open, so
-    stripping one, as this once did, walked a path the open may not reach (vault BACKLOG #5515)."""
+    so a device prefix that walk refuses is refused here too, by the one list in its
+    ``windows_chain``: at least any prefix but an all-backslash ``\\\\?\\`` or ``\\??\\``, a verbatim
+    one holding a ``/``, a ``.`` or ``..`` name, or an empty name, and one that strips to a name
+    ``ntpath.isreserved`` reports. Win32 rewrites a ``\\\\.\\`` or forward-slash prefix before the
+    open, so stripping one, as this once did, walked a path the open may not reach (vault BACKLOG
+    #5515)."""
     from messagefoundry.auth.anchor_path import _drive_relative, _strip_nt_target
 
     plain = _strip_nt_target(text)
