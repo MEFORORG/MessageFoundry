@@ -124,8 +124,9 @@ jobs:
 
   export:
     # NO SECRET IN THIS JOB (BACKLOG #5477). It runs uv and a repository script on the Dependabot-
-    # changed tree, so it references no secret and no minted token, and its output leaves only as
-    # the artifact below. tests/test_dep1_lock_resync_lockstep.py holds that.
+    # changed tree, so it references no secret and no minted token. It hands its files to the push
+    # job only as the artifact below; its `closure` output and its result also cross (see the
+    # SECURITY MODEL). tests/test_dep1_lock_resync_lockstep.py holds that.
     name: Re-export lock files (no secrets)
     needs: preflight
     if: >-
@@ -197,7 +198,8 @@ jobs:
       # It runs after the exports, so it copies the fresh locks. It may FAIL: a per-platform fork in
       # any lock, which needs a human, or a PR head from before the script existed. Either way the
       # re-exported locks must still be pushed, so a failure here does not fail this job. The push
-      # job's last step reads this step's outcome through the `closure` output and marks THE RUN red.
+      # job's last step reads this step's outcome through the `closure` output and marks THE RUN red,
+      # unless the run its own push fires cancels this one first (the concurrency group below).
       # That red sits on the pre-push commit; on the new head, the signal is the closure test failing
       # in the required test legs.
       - name: Regenerate the runtime-closure inventories from the core, sqlserver, postgres and harness locks
@@ -234,9 +236,11 @@ jobs:
 
   push:
     # THE ONLY JOB THAT HOLDS THE APP KEY OR TOKEN (BACKLOG #5477), and it runs no code from the
-    # Dependabot-changed tree: no uv, no interpreter, no repository script, only git over a checkout
-    # read as data and the files the export job handed over. A fresh runner, so nothing the export
-    # job planted in its own environment or git config is here.
+    # Dependabot-changed tree: no uv, no interpreter, no repository script. Its steps are at least
+    # three actions and run blocks held to a command allowlist (git, cp, find, realpath and shell
+    # builtins; tests/test_dep1_lock_resync_lockstep.py), over a checkout read as data and the files
+    # the export job handed over. A fresh runner, so nothing the export job planted in its own
+    # environment or git config is here.
     name: Push the re-exported lock files to the PR branch
     needs: [preflight, export]
     if: >-
@@ -247,17 +251,6 @@ jobs:
       contents: read
     timeout-minutes: 10
     steps:
-      # MINTED FIRST, before the checkout. No step of this job runs code from the Dependabot-changed
-      # tree, so ordering is belt and braces here; create-github-app-token's post step revokes the
-      # token at job end. The token is handed to the push step alone and written to no .git/config.
-      - name: Mint a scoped GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
-        with:
-          app-id: ${{ secrets.LOCK_RESYNC_APP_ID }}
-          private-key: ${{ secrets.LOCK_RESYNC_APP_PRIVATE_KEY }}
-          permission-contents: write
-
       - name: Check out the PR head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -278,19 +271,26 @@ jobs:
       # untrusted data. Only the fixed list below is copied, only as regular files, and only onto
       # destinations inside this checkout: a destination the tree made a symlink (or put under a
       # symlinked directory) could otherwise point outside it, at a file git or the shell reads later.
-      # Anything else in the artifact fails the step.
+      # Any other file in the artifact fails the step, and so does a failed listing of it.
       - name: Copy the re-exported files into the checkout
         run: |
           set -euo pipefail
           src="${RUNNER_TEMP}/lock-resync-exports"
           files='requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock docker/locks/requirements-postgres.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt security/runtime-closure-postgres.txt security/runtime-closure-harness.txt'
+          entries="${RUNNER_TEMP}/lock-resync-entries"
+          # A plain redirect, not a process substitution, so a failing find fails the step.
+          find "${src}" -mindepth 1 ! -type d -print0 > "${entries}"
           while IFS= read -r -d '' found; do
             rel="${found#"${src}"/}"
-            if [[ " ${files} " != *" ${rel} "* ]]; then
+            known=''
+            for want in ${files}; do
+              if [ "${want}" = "${rel}" ]; then known=1; fi
+            done
+            if [ -z "${known}" ]; then
               echo "::error title=lock-resync artifact::unexpected entry in the artifact: ${rel}"
               exit 1
             fi
-          done < <(find "${src}" -mindepth 1 ! -type d -print0)
+          done < "${entries}"
           root="$(pwd -P)"
           for rel in ${files}; do
             if [ ! -f "${src}/${rel}" ] || [ -L "${src}/${rel}" ]; then
@@ -303,6 +303,18 @@ jobs:
             fi
             cp -- "${src}/${rel}" "${rel}"
           done
+
+      # MINTED LAST, directly before the one step that uses it, so the token does not exist while the
+      # untrusted artifact is fetched and copied, and a refused artifact mints nothing. No step of this
+      # job runs code from the Dependabot-changed tree. create-github-app-token's post step revokes
+      # the token at job end. The token is handed to the push step alone and written to no .git/config.
+      - name: Mint a scoped GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          app-id: ${{ secrets.LOCK_RESYNC_APP_ID }}
+          private-key: ${{ secrets.LOCK_RESYNC_APP_PRIVATE_KEY }}
+          permission-contents: write
 
       - name: Commit and push the resynced locks
         env:

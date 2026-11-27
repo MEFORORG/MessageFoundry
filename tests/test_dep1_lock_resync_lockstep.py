@@ -391,14 +391,17 @@ def _steps_naming(needles: tuple[str, ...]) -> list[tuple[str, str]]:
 
 
 def test_the_resync_job_env_hands_out_no_credential() -> None:
-    """RED when: the workflow's or a job's ``env:`` names the token or the key, which hands it to
-    every step of that scope."""
+    """RED when: the workflow's ``env:`` or any job-level key (``env:``, ``outputs:``, ...) names
+    the token or the key, which hands it to every step of that scope or out of the job."""
     workflow = load_workflow(_RESYNC.name)
-    scopes = [("workflow", workflow.get("env"))]
-    scopes += [(f"{job} job", body.get("env")) for job, body in _jobs().items()]
-    for where, env in scopes:
-        assert not _named(env or {}, _TOKEN_NEEDLES + _KEY_NEEDLES), (
-            f"the resync {where}-level env names the App token or key"
+    scopes = [("workflow env", workflow.get("env"))]
+    scopes += [
+        (f"{job} job", {k: v for k, v in body.items() if k != "steps"})
+        for job, body in _jobs().items()
+    ]
+    for where, value in scopes:
+        assert not _named(value or {}, _TOKEN_NEEDLES + _KEY_NEEDLES), (
+            f"the resync {where} names the App token or key"
         )
 
 
@@ -458,18 +461,20 @@ def test_the_resync_installs_the_uv_the_gate_pins() -> None:
 
 
 def test_the_app_key_is_used_only_by_the_mint_step_of_the_push_job() -> None:
-    """RED when: the mint step, which takes the App's long-lived private key, sits anywhere but the
-    push job ahead of its checkout, or another step is handed the key.
+    """RED when: the mint step, which takes the App's long-lived private key, is not the push job's
+    step directly before the commit, or another step is handed the key.
 
-    The push job runs no code from the Dependabot-changed tree (pinned below), so minting ahead of
-    its checkout is belt and braces there. The key is a secret of the push job only; the export job,
-    which runs uv and the repository script, references no secret at all (pinned below).
+    The push job runs no code from the Dependabot-changed tree (pinned below). Minting directly
+    before the commit means the token does not exist while the untrusted artifact is fetched and
+    copied, and a refused artifact mints nothing. The key is a secret of the push job only; the
+    export job, which runs uv and the repository script, references no secret at all (pinned below).
     """
     steps = _job_steps("push")
     position = {str(s.get("id") or s.get("name")): i for i, s in enumerate(steps)}
-    assert position["app-token"] < position["Check out the PR head"], (
-        "the App private key is used after the push job's checkout"
+    assert position["app-token"] + 1 == position["Commit and push the resynced locks"], (
+        "the App token must be minted directly before the commit step"
     )
+    assert position["app-token"] > position[_COPY_STEP], "the token is minted before the copy"
     key_readers = _steps_naming(_KEY_NEEDLES)
     assert key_readers == [("push", "app-token")], (
         f"steps handed the App private key: {key_readers}"
@@ -478,34 +483,37 @@ def test_the_app_key_is_used_only_by_the_mint_step_of_the_push_job() -> None:
 
 #: The actions a job that holds the App key or token may use. None of them runs code from the checkout.
 _CREDENTIAL_JOB_ACTIONS = ("actions/checkout@", _DOWNLOAD, _MINT)
-#: The commands such a job's run blocks may invoke. An ALLOWLIST, so a command nobody listed fails
-#: closed: none of these runs code it is handed, given the argument rules in ``_disallowed_commands``.
+#: The commands such a job's run blocks may invoke. An ALLOWLIST, so a command nobody listed is
+#: refused; the argument rules in ``_disallowed_commands`` narrow git and cp further.
 _CREDENTIAL_COMMANDS = frozenset(
-    {
-        ":",
-        "[",
-        "[[",
-        "base64",
-        "cp",
-        "echo",
-        "exit",
-        "export",
-        "find",
-        "git",
-        "printf",
-        "pwd",
-        "read",
-    }
-    | {"realpath", "set", "test", "true"}
+    {":", "[", "[[", "base64", "cp", "echo", "exit", "export", "find", "git", "printf", "pwd"}
+    | {"read", "realpath", "set", "test", "true"}
 )
 #: Words that may stand ahead of a command name without being one.
 _SHELL_KEYWORDS = frozenset({"!", "{", "}", "if", "then", "elif", "else", "fi", "while", "until"})
 _SHELL_KEYWORDS |= {"do", "done", "esac"}
-#: Arguments that make an allowed command run another program or load configuration.
-_RUNS_ANOTHER = {
-    "git": ("-c", "--config-env", "--exec-path"),
-    "find": ("-exec", "-execdir", "-ok", "-okdir"),
+#: The git subcommands the push may run, and the git config keys it may set. git reads others as
+#: programs to run (an alias, a submodule foreach, a rebase --exec, core.fsmonitor, diff drivers).
+_GIT_SUBCOMMANDS = frozenset({"add", "commit", "config", "diff", "push"})
+_GIT_CONFIG_SET = frozenset({"user.name", "user.email"})
+#: The git config the push may set through GIT_CONFIG_*, each key with the exact value it must
+#: carry. Any other key, or the same key with another value (core.fsmonitor naming a program), is
+#: refused.
+_GIT_ENV_CONFIG = {
+    "core.hooksPath": "/dev/null",
+    "core.fsmonitor": "false",
+    "http.https://github.com/.extraheader": "AUTHORIZATION: basic ${auth}",
 }
+_GIT_ENV_PAIR = re.compile(
+    r"\bGIT_CONFIG_(?P<kind>KEY|VALUE)_(?P<index>\d+)="
+    r"(?:'(?P<sq>[^']*)'|\"(?P<dq>[^\"]*)\"|(?P<bare>\S*))"
+)
+#: A shell variable a credential job may assign: lower-case script locals, IFS for one read, and the
+#: GIT_CONFIG_* triple. Anything else upper-case can change what the shell or git runs (at least
+#: BASH_ENV, ENV, PATH, LD_PRELOAD, GIT_EXEC_PATH, GIT_EXTERNAL_DIFF, GIT_SSH_COMMAND).
+_ASSIGNABLE = re.compile(r"[a-z_][a-z0-9_]*|IFS|GIT_CONFIG_COUNT|GIT_CONFIG_(?:KEY|VALUE)_\d+")
+_ASSIGNMENT = re.compile(r"(?P<name>[A-Za-z_]\w*)=(?P<value>.*)", re.DOTALL)
+_REDIRECT = re.compile(r"\d*(?:<|>|>>|&>)")
 
 
 def _substitutions(text: str) -> tuple[str, list[str]]:
@@ -529,38 +537,75 @@ def _substitutions(text: str) -> tuple[str, list[str]]:
     return "".join(outer), bodies
 
 
+def _assignment_offence(word: str) -> str | None:
+    match = _ASSIGNMENT.fullmatch(word)
+    assert match
+    name, value = match["name"], match["value"]
+    if not _ASSIGNABLE.fullmatch(name):
+        return f"assigns {name}"
+    if name.startswith("GIT_CONFIG_KEY_") and value not in _GIT_ENV_CONFIG:
+        return f"sets git config {value!r} through the environment"
+    return None
+
+
 def _disallowed_commands(script: str) -> list[str]:
-    """Every simple command in ``script`` that is not on ``_CREDENTIAL_COMMANDS``, and every
-    allowed command given an argument that runs something else. Substitutions are read too; a
-    backtick substitution is refused outright."""
-    from tests.test_ci_venv_pinning import (
-        _COMMAND_PREFIXES,
-        _PREFIX_ASSIGNMENT,
-        _commands,
-        _executed_shell,
-    )
+    """Every simple command in ``script`` that is not on ``_CREDENTIAL_COMMANDS``, every allowed
+    command used in a way that runs or plants something else, and every variable assignment off
+    ``_ASSIGNABLE``. Substitutions are read too; a backtick substitution is refused outright, and so
+    is any mention of $GITHUB_ENV or $GITHUB_PATH, which hand a later step an environment or PATH."""
+    from tests.test_ci_venv_pinning import _commands, _executed_shell
 
     text = _executed_shell(script).replace("\\\n", " ")
     bad = ["a backtick substitution"] if "`" in text else []
+    bad += [f"names {v}" for v in ("GITHUB_ENV", "GITHUB_PATH") if v in text]
     outer, bodies = _substitutions(text)
     for body in bodies:
         bad += _disallowed_commands(body)
+    pairs: dict[str, dict[str, str]] = {}
+    for m in _GIT_ENV_PAIR.finditer(text):
+        value = next(v for v in (m["sq"], m["dq"], m["bare"]) if v is not None)
+        pairs.setdefault(m["index"], {})[m["kind"]] = value
+    for index, pair in sorted(pairs.items()):
+        key, value = pair.get("KEY", ""), pair.get("VALUE")
+        if _GIT_ENV_CONFIG.get(key) != value:
+            bad.append(f"GIT_CONFIG_*_{index} sets {key!r} to {value!r}")
     for line in outer.splitlines():
-        for words in _commands(line):
-            while words and (
-                words[0] in _SHELL_KEYWORDS
-                or words[0] in _COMMAND_PREFIXES
-                or _PREFIX_ASSIGNMENT.fullmatch(words[0])
-                or words[0].endswith(")")  # a case arm's pattern
-            ):
+        for raw in _commands(line):
+            words: list[str] = []
+            skip_target = False
+            for word in raw:
+                if skip_target:
+                    skip_target = False
+                elif _REDIRECT.fullmatch(word):
+                    skip_target = True  # `< file`: the next word is the target, not an argument
+                elif not _REDIRECT.match(word):
+                    words.append(word)
+            while words and (words[0] in _SHELL_KEYWORDS or _ASSIGNMENT.fullmatch(words[0])):
+                if _ASSIGNMENT.fullmatch(words[0]):
+                    offence = _assignment_offence(words[0])
+                    if offence:
+                        bad.append(f"{offence} in {line.strip()!r}")
                 words = words[1:]
-            if not words or words[0] in ("for", "case") or words[0][0] in "<>":
-                continue  # a loop or case header, or a redirection after `done`
-            name = words[0]
+            if not words or words[0] == "for":
+                continue  # a loop header; its body lines are read on their own
+            name, args = words[0], words[1:]
+            shown = line.strip()
             if name not in _CREDENTIAL_COMMANDS:
-                bad.append(f"{name!r} in {line.strip()!r}")
-            elif any(w.startswith(_RUNS_ANOTHER.get(name, ())) for w in words[1:]):
-                bad.append(f"{name} with an argument that runs another program: {line.strip()!r}")
+                bad.append(f"{name!r} in {shown!r}")
+            elif name == "export":
+                for arg in args:
+                    offence = _assignment_offence(arg) if _ASSIGNMENT.fullmatch(arg) else None
+                    if offence or not _ASSIGNMENT.fullmatch(arg):
+                        bad.append(f"export {arg!r} in {shown!r}")
+            elif name == "git":
+                if not args or args[0] not in _GIT_SUBCOMMANDS:
+                    bad.append(f"git {args[:1]} in {shown!r}")
+                elif args[0] == "config" and (len(args) != 3 or args[1] not in _GIT_CONFIG_SET):
+                    bad.append(f"git config {args[1:2]} in {shown!r}")
+            elif name == "find" and any(a.startswith(("-exec", "-ok", "-delete")) for a in args):
+                bad.append(f"find runs or deletes: {shown!r}")
+            elif name == "cp" and (args[:1] != ["--"] or len(args) != 3 or args[2] != "${rel}"):
+                bad.append(f"cp other than `cp -- <src> ${{rel}}`: {shown!r}")
     return bad
 
 
@@ -570,7 +615,15 @@ def _step_offences(step: dict[str, Any]) -> list[str]:
     offences = [f"uses {uses}"] if uses and not uses.startswith(_CREDENTIAL_JOB_ACTIONS) else []
     if "shell" in step:
         offences.append(f"shell: {step['shell']}")
+    for name in step.get("env") or {}:
+        if str(name) not in _CREDENTIAL_STEP_ENV:
+            offences.append(f"env {name}")
     return offences + _disallowed_commands(str(step.get("run") or ""))
+
+
+#: The step env names a credential job may set. Each carries data, and none is a variable the
+#: shell, git or the runner reads as configuration.
+_CREDENTIAL_STEP_ENV = frozenset({"APP_ID", "APP_TOKEN", "HEAD_REF"})
 
 
 def test_the_command_allowlist_refuses_what_it_must() -> None:
@@ -586,23 +639,41 @@ def test_the_command_allowlist_refuses_what_it_must() -> None:
         "if true; then bash x; fi",
         ". ./env.sh",
         "sudo python3 x.py",
+        "sudo cp -- evil ${rel}",
         "time python3 scripts/x.py",
         "echo `python3 x.py`",
         'x="$(echo a | python3 -)"',
+        ">/dev/null python3 evil.py",
+        "</dev/null python3 evil.py",
         "find . -exec python3 {} \\;",
         "git -c alias.x=!sh x",
+        "git submodule foreach python3 evil.py",
+        "git config alias.x '!python3 evil.py'",
+        "git x",
+        "GIT_EXTERNAL_DIFF='python3 evil.py' git diff",
+        "GIT_EXEC_PATH=./tree git push",
+        "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=./evil.sh",
+        "export BASH_ENV=./evil.sh",
+        "PATH=./bin:$PATH git push",
+        'echo "BASH_ENV=${PWD}/evil.sh" >> "$GITHUB_ENV"',
+        'echo "${PWD}/bin" >> "$GITHUB_PATH"',
+        "cp scripts/evil ~/.local/bin/git",
         "awk 1 f",
         "while python3 x.py; do :; done",
     ):
         assert _disallowed_commands(run), run
     assert _step_offences({"uses": "astral-sh/setup-uv@abc"})
     assert _step_offences({"run": "print(1)", "shell": "python {0}"})
+    assert _step_offences({"run": "git push", "env": {"BASH_ENV": "scripts/evil.sh"}})
     for run in (
         "git push origin HEAD",
         'echo "::error::scripts/security/runtime_closure.py failed"',
         'cp -- "${src}/${rel}" "${rel}"',
         "# python3 scripts/x.py",
         'root="$(pwd -P)"',
+        "export GIT_CONFIG_KEY_0='core.hooksPath' GIT_CONFIG_VALUE_0='/dev/null'",
+        "git config user.name 'dependabot[bot]'",
+        "done < __substitution_1__",
     ):
         assert not _disallowed_commands(run), (run, _disallowed_commands(run))
 
@@ -649,7 +720,9 @@ def test_the_credential_jobs_run_no_code_from_the_pr_tree() -> None:
         assert body.get("runs-on") == "ubuntu-latest", (
             f"{job} must run on a fresh GitHub-hosted runner, not one a PR-tree job could have used"
         )
-        assert "defaults" not in body and "container" not in body, f"{job} sets defaults/container"
+        assert not {"defaults", "container", "env", "services"} & set(body), (
+            f"{job} sets a job-level defaults, container, env or services"
+        )
         for step in _job_steps(job):
             label = step.get("name") or step.get("uses")
             offences = _step_offences(step)
@@ -714,6 +787,12 @@ def test_the_lock_files_cross_jobs_as_one_artifact_of_the_staged_set() -> None:
     assert [j for j, _ in uploads] == ["export"], f"expected one upload, in export: {uploads}"
     assert [j for j, _ in downloads] == ["push"], f"expected one download, in push: {downloads}"
     up, down = uploads[0][1]["with"], downloads[0][1]["with"]
+    # Any other input could fetch another run's artifact (run-id, github-token, repository) or
+    # several at once (pattern, merge-multiple), or change what is uploaded.
+    assert set(down) == {"name", "path"}, f"the download step takes {sorted(down)}"
+    assert set(up) <= {"name", "path", "retention-days", "if-no-files-found", "overwrite"}, (
+        f"the upload step takes {sorted(up)}"
+    )
     assert up["name"] == down["name"], "the push job downloads a different artifact"
     assert set(str(up["path"]).split()) == staged, "the uploaded set is not the staged set"
     assert up.get("include-hidden-files") in (None, False)
@@ -803,10 +882,24 @@ def test_the_copy_step_refuses_what_the_artifact_or_tree_could_plant(tmp_path: P
         shutil.rmtree(ws / "ci" / "locks")
         (ws / "ci" / "locks").symlink_to(outside, target_is_directory=True)
 
-    for build in (extra, missing, artifact_link, dest_link, dir_link):
+    def unlisted(ws: Path, art: Path) -> None:
+        # A directory find cannot read: the listing fails, and the step must fail with it rather
+        # than check part of the artifact. (Root reads it anyway, so the case is skipped there.)
+        hidden = art / "hidden"
+        hidden.mkdir()
+        (hidden / "extra").write_text("x", encoding="utf-8")
+        hidden.chmod(0)
+
+    cases = [extra, missing, artifact_link, dest_link, dir_link]
+    if os.geteuid() != 0:
+        cases.append(unlisted)
+    for build in cases:
         result = _run_copy(tmp_path / build.__name__, build, staged, script, bash)
+        if build is unlisted:
+            (tmp_path / build.__name__ / "rt" / "lock-resync-exports" / "hidden").chmod(0o700)
         assert result.returncode != 0, f"{build.__name__}: the copy step accepted it"
-        assert "::error" in result.stdout, f"{build.__name__}: {result.stdout}{result.stderr}"
+        if build is not unlisted:  # find reports its own error; the step prints no annotation
+            assert "::error" in result.stdout, f"{build.__name__}: {result.stdout}{result.stderr}"
         assert victim.read_text(encoding="utf-8") == "victim\n", f"{build.__name__} wrote outside"
         assert sorted(p.name for p in outside.iterdir()) == ["victim"], build.__name__
         landed = tmp_path / build.__name__ / "ws" / "constraints.lock"
