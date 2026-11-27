@@ -308,9 +308,9 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       // reply is drawn, not when the request is sent, so a setting kept again before the reply
       // arrives keeps its default (BACKLOG #8243 items 18 and 20). A reference under another key
       // keeps it, so the original key typed back still finds it.
-      // A key the latest request sent as an env reference keeps it too: a reply to an older request
-      // can be drawn first, and the newer request's reply will draw the reference (item 18).
-      const envRefKeys = new Set(LAST_ASKED ? LAST_ASKED.envKeys : []);
+      // A reply drawn here was built from the latest request's settings (the message handler), so a
+      // reply to an older request cannot prune a default the latest one carries (item 18).
+      const envRefKeys = new Set();
       for (const g of groups) for (const f of g.fields) if (f.envKey !== undefined || f.envDefault !== undefined) envRefKeys.add(f.key);
       for (const k of HELD_DEFAULTS.keys()) if (!envRefKeys.has(k)) HELD_DEFAULTS.delete(k);
       for (const g of groups) {
@@ -336,9 +336,9 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       settingRow('', '', false, '');
     }
 
-    // The latest fields request: its settings in canonical form, and the keys it sent as env
-    // references; null until the first request. The reply carries no request id, so the settings
-    // are how the page tells which request a reply answers (the message handler below).
+    // The settings the latest fields request sent, in canonical form (canon); null until the first
+    // request. The reply carries no request id, so the settings are how the page tells which
+    // request a reply answers (the message handler below).
     let LAST_ASKED = null;
 
     /** Ask the extension to rebuild the descriptors when the transport or direction changes. */
@@ -347,8 +347,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       // A setting this request leaves out (removed, or its env key box empty) loses its held default
       // when the reply is drawn (renderGroups), not here.
       const settings = collectSettings(true);
-      const keys = Object.keys(settings);
-      LAST_ASKED = { settings: canon(settings), envKeys: new Set(keys.filter((k) => isEnvRefValue(settings[k]))) };
+      LAST_ASKED = canon(settings);
       // The request names this page's render, so the host can drop a reply that would reach a
       // newer page: the token current when the host handles it may already be that page's.
       vscode.postMessage({
@@ -709,18 +708,18 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       // Rebuilt descriptors after a transport/direction change. The grouping rules stay in the tested
       // module; the webview only draws what it is handed.
       if (d.command === 'fields') {
-        if (LAST_ASKED) {
+        if (LAST_ASKED !== null) {
           // A reply not built from the latest request's settings answers an older request: drawing
           // it would drop or change a setting the latest request carries, or bring back one it left
           // out. Two requests with the same settings cannot be told apart, so a reply to the older
           // of them is drawn, as every reply was before; a request id the hosts echo would settle it.
-          if (canon(repliedSettings(d.groups)) !== LAST_ASKED.settings) return;
+          if (canon(repliedSettings(d.groups)) !== LAST_ASKED) return;
           // The form changed since the latest request (a setting removed, kept again, emptied,
           // retyped or switched between a literal and env()): drawing its reply would undo that, so
           // ask again with the form as it is now (BACKLOG #8243 items 18 and 20). Each reply sends
           // at most one request, and the form does not change until a reply is drawn, so this stops
           // once the user stops editing. If the host never answers, the form stays as it is.
-          if (canon(collectSettings(true)) !== LAST_ASKED.settings) { requestFields(); return; }
+          if (canon(collectSettings(true)) !== LAST_ASKED) { requestFields(); return; }
         }
         FIELD_GROUPS = d.groups;
         renderGroups(FIELD_GROUPS);
