@@ -227,11 +227,19 @@ class StepUpRequired(ApiError):
     declined, or the retry after it was refused again (BACKLOG #5945).
 
     It lets a caller tell a step-up refusal from a role or scope refusal, which shares the status.
-    For a session-window gate the caller can re-prove the password on its own GUI thread and retry.
-    It carries no ``X-Step-Up-Action``, so for a per-action gate (ADR 0077) a re-proof made from it
-    binds no action, and the retry is refused again. A subclass of
-    :class:`ApiError`, so a caller that catches only that still sees the refusal. A refusal that
-    carries ``X-Step-Up-Via: idp`` raises :class:`IdpStepUpRequired` instead."""
+    The caller can re-prove the password on its own GUI thread and retry. ``action`` is the
+    refusal's ``X-Step-Up-Action``: the action a per-action gate (ADR 0077) binds its proof to, or
+    None for a session-window gate. A re-proof for a per-action gate must pass it to
+    :meth:`EngineClient.reauth` as ``purpose``, or it mints no grant for that action and the retry
+    is refused again. A subclass of :class:`ApiError`, so a caller that catches only that still
+    sees the refusal. A refusal that carries ``X-Step-Up-Via: idp`` raises
+    :class:`IdpStepUpRequired` instead."""
+
+    def __init__(
+        self, message: str, *, status: int | None = None, action: str | None = None
+    ) -> None:
+        super().__init__(message, status=status)
+        self.action = action
 
 
 def _buffer_bounded(streaming: httpx.Response, *, limit: int) -> httpx.Response:
@@ -850,7 +858,8 @@ class EngineClient:
         self._step_up_handler: Callable[[], bool] | None = None
         #: The action a per-action step-up 403 named in ``X-Step-Up-Action`` (ADR 0077), stashed just
         #: before the handler runs so :meth:`reauth` can bind the fresh proof to it. None for a plain
-        #: session-window step-up (no header) — then :meth:`reauth` posts no ``purpose``, unchanged.
+        #: session-window step-up (no header) — then :meth:`reauth` posts no ``purpose`` unless its
+        #: caller passes one.
         self._pending_step_up_action: str | None = None
         #: Invoked when the engine demands a second factor (403 + X-MFA-Required, WP-14); the GUI
         #: prompts for a TOTP / recovery code, calls verify_mfa(), and returns True iff verified.
@@ -1243,16 +1252,24 @@ class EngineClient:
         # X-Step-Up-Required when this session hasn't re-proved its credential recently. Prompt the
         # user (the handler re-authenticates via reauth()) and retry once, so the action goes through
         # transparently instead of surfacing a raw 403.
+        # ADR 0077: a per-action step-up names the action in X-Step-Up-Action; a plain
+        # session-window step-up omits it. An empty header names no action, since as a purpose it
+        # would win over none and be refused.
+        step_up_action = (
+            response.headers.get("X-Step-Up-Action") or None
+            if response.status_code == 403
+            else None
+        )
         if (
             _allow_step_up
             and response.status_code == 403
             and response.headers.get("X-Step-Up-Required")
             and self._step_up_handler is not None
         ):
-            # ADR 0077: a per-action step-up names the action in X-Step-Up-Action; stash it BEFORE the
-            # handler runs so the reauth() it calls binds the fresh proof to that action. A plain
-            # session-window step-up omits the header → None → reauth() posts no purpose (unchanged).
-            self._pending_step_up_action = response.headers.get("X-Step-Up-Action")
+            # Stash the action BEFORE the handler runs so the reauth() it calls binds the fresh proof
+            # to it. None (a session-window step-up) → reauth() posts no purpose unless its caller
+            # passes one.
+            self._pending_step_up_action = step_up_action
             proved = False
             try:
                 proved = self._step_up_handler()
@@ -1272,7 +1289,9 @@ class EngineClient:
                     **kw,
                 )
         if response.status_code == 403 and response.headers.get("X-Step-Up-Required"):
-            raise StepUpRequired(_error_detail(response), status=response.status_code)
+            raise StepUpRequired(
+                _error_detail(response), status=response.status_code, action=step_up_action
+            )
         if response.status_code >= 400:
             raise ApiError(_error_detail(response), status=response.status_code)
         return response
@@ -1328,13 +1347,23 @@ class EngineClient:
         session's step-up window. Raises :class:`ApiError` (status 403) on a wrong password. Does not
         itself trigger the step-up handler (``/me/reauth`` is not a step-up-gated route).
 
-        When the 403 that triggered this reauth named a per-action step-up (``X-Step-Up-Action``, ADR
-        0077), the stashed action rides along as ``purpose`` so the engine mints a grant BOUND to it;
-        a plain session-window step-up posts ``{"password": …}`` unchanged.
+        A ``purpose`` that is not None is posted as the purpose, whatever is stashed. With
+        ``purpose`` None, whatever action is stashed rides along instead, so the engine mints a
+        grant BOUND to it; with neither, it posts ``{"password": …}`` unchanged, as for a
+        session-window step-up. The stash is one slot: the per-action refusal
+        (``X-Step-Up-Action``, ADR 0077) that called the step-up handler fills it, but a second
+        refusal on this client while that handler runs overwrites it, and that refusal's own
+        decline or reauth then empties it. Once past the cleartext refusal, every call empties the
+        stash before it posts, so it binds one reauth at most, and a re-proof the engine refuses
+        uses it up too.
 
-        ``purpose`` names the action up front instead, for a caller that proves BEFORE the call it
-        is about to make, so the refusal and the retry never happen (vault BACKLOG #2625: a timed
-        reload must not carry a step-up inside its timer). It wins over a stashed action.
+        At least two callers pass ``purpose``: one that proves BEFORE the call it is about to
+        make, so the refusal and the retry never happen (vault BACKLOG #2625: a timed reload must
+        not carry a step-up inside its timer), and one answering a refusal this client did not
+        stash, such as a worker read through a handler-less polling client, which passes the
+        refused call's :attr:`StepUpRequired.action` and then repeats that call itself (BACKLOG
+        #5945). For a session-window refusal that action is None, so such a call falls back to
+        whatever this client has stashed, and posts no purpose only when nothing is.
 
         Raises :class:`ApiError` with ``status`` None when the 2xx reply carries no usable token
         (BACKLOG #5344). The engine may have rotated the session anyway, so the held token may

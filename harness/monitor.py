@@ -400,10 +400,18 @@ class MonitorPanel(QWidget):
             return False
         return True
 
-    def _step_up(self) -> bool:
+    def _step_up(self, action: str | None = None) -> bool:
         """Answer a step-up refusal (403 + ``X-Step-Up-Required``): ask for the password, masked,
         and re-prove it. ``EngineClient.reauth`` sends the action the refusal named as ``purpose``
         and adopts the re-keyed session, and the client then retries the call once.
+
+        As the main client's handler it is called with no ``action``, and ``reauth`` takes the
+        action that client stashed from the refusal. A panel whose worker read was refused through
+        the handler-less polling client passes that refusal's ``StepUpRequired.action``, since the
+        main client stashed nothing for that read, and repeats the read itself (BACKLOG #5945). For
+        a session-window refusal that action is None, and ``reauth`` then falls back to the main
+        client's stash, which holds an action only while that client's own prompt is open, when
+        the ``_step_up_open`` check below declines the call.
 
         The re-proof rotates the session, so the poller's copy of the old token is dead: it is
         restarted on the new one. The password is passed straight to ``reauth`` and kept nowhere."""
@@ -433,7 +441,7 @@ class MonitorPanel(QWidget):
             return False
         # A refused re-proof raises out of the action that asked for it, so the action's own error
         # report names the real cause ("re-verification failed") rather than the original 403.
-        client.reauth(password)
+        client.reauth(password, purpose=action)
         self._stop_poller()
         self._start_poller()
         return True
@@ -547,12 +555,15 @@ class MonitorPanel(QWidget):
         # Messages: reuse the console's filter list + detail pane (user-initiated, GUI thread).
         # Their reads run on worker threads, so they get a polling client: it shares the token but
         # carries no step-up handler, so a refusal there can never open a Qt dialog off the GUI
-        # thread (vault BACKLOG #2625 gave the main client one). The step-up gated content search
-        # hands its 403 back to the GUI thread, which answers it with the same re-proof.
+        # thread (vault BACKLOG #2625 gave the main client one). A step-up refusal of the content
+        # search, the open or the body read is handed back to the GUI thread, which answers it with
+        # the same re-proof, bound to the action the refusal named (BACKLOG #5945).
         self._messages = MessagesPanel(
             self._client, poll_client=self._poll_client, step_up=self._step_up
         )
-        self._detail = MessageDetailPanel(self._client, poll_client=self._poll_client)
+        self._detail = MessageDetailPanel(
+            self._client, poll_client=self._poll_client, step_up=self._step_up
+        )
         self._messages.message_selected.connect(self._detail.load)
         self._messages.error.connect(lambda m: self._set_status(m, error=True))
         self._detail.error.connect(lambda m: self._set_status(m, error=True))
