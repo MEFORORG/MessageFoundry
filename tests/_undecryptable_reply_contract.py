@@ -626,6 +626,26 @@ async def worker_read_engine_fault_dead_letters(store: Any, fetch: RawFetch, _ra
     assert await children(fetch) == []
 
 
+async def worker_read_reference_failure_is_worded_for_the_reference(
+    store: Any, fetch: RawFetch, _raw: RawSql
+) -> None:
+    """BACKLOG #5727, the Lander's hold on PR 3155 item 8: a verdict on the token's reference,
+    not a tag failure, at the step's own read is dead-lettered. The read never opened the reply,
+    so the record must not say the reply does not decrypt."""
+    mid, item = await _claimed_head(store)
+    target = await _cell(fetch, "ref", mid)
+    step = runner(store)
+    with faulting_cipher(store) as fault:
+        fault.unheld = target  # a key the store does not hold: no tag failure
+        fault.target, fault.open_error = target, CipherError("synthetic verdict")
+        await step._process_response_item(LOOP, item)
+    assert (await token_of(fetch, mid))["status"] == OutboxStatus.DEAD.value
+    details = [str(e["detail"]) for e in await store.events_for(mid) if e["event"] == "dead"]
+    assert details, details
+    assert all("re-ingress reply:" not in d for d in details), details
+    assert [d for d in details if "token reference or reply" in d], details
+
+
 #: A marker in synthetic origin metadata, to show the decrypted text reaches no log or error.
 META_MARK = "SYNTHETIC-META-MARK"
 
@@ -784,6 +804,7 @@ HANDOFF_CASES: list[ContractCase] = [
     _worker_dead_letter_seal_failure_carries_no_open_error("reply"),
     _worker_dead_letter_seal_failure_carries_no_open_error("ref"),
     worker_read_engine_fault_dead_letters,
+    worker_read_reference_failure_is_worded_for_the_reference,
     _unparseable_origin_dead_letters(f"not json {META_MARK}", "not_json"),
     _unparseable_origin_dead_letters(f'{{"correlation_depth": "{META_MARK}"}}', "word_depth"),
     _unparseable_origin_dead_letters('{"correlation_depth": [1]}', "list_depth"),

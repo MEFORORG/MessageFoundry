@@ -13455,14 +13455,17 @@ class RegistryRunner:
                 del read_fault  # the fault's traceback holds this frame: no cycle through a local
         if unopenable is not None:
             error_type, error_text = unopenable
+            # The read opens the token's reference first, then the reply, and either can fail
+            # here, so the wording names both (the Lander's hold on PR 3155, item 8).
             log.warning(
-                "response worker %r: reply body of %s does not decrypt (%s); dead-lettering",
+                "response worker %r: the reference or the reply of work-row %s does not decrypt"
+                " (%s); dead-lettering",
                 name,
                 item.id,
                 error_type,
             )
             await self.store.dead_letter_now(
-                item.id, f"undecryptable re-ingress reply: {error_text}"
+                item.id, f"undecryptable re-ingress token reference or reply: {error_text}"
             )
             return _ItemOutcome.PROCESSED, None
         unstorable = _unstorable_reply(body)
