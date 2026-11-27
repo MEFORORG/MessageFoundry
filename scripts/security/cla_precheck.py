@@ -86,10 +86,10 @@ TWO CASES BACKLOG #5645 item 1 names:
     refuses nothing (BACKLOG #8335 item 3). The budget of waits is one, shared with the case
     above. A re-read that refuses, or whose commits include the head, is the verdict, even one cut
     short by a fault (a head that moves after its first page included), with that fault and its
-    own beside it; it is not read again. A re-read that still lacks the head replaces the read
-    kept. A re-read that faults with no page kept, is cut short refusing nothing with pages that do
-    not include the head or cannot show that they do, or shows another head on its first page
-    ends the re-reads. Then, or once the waits run out,
+    own beside it; it is not read again. A complete re-read that still lacks the head replaces the
+    read kept. A re-read that faults with no page kept, is cut short refusing nothing with pages
+    that do not include the head or cannot show that they do, or shows another head on its first
+    page ends the re-reads. Then, or once the waits run out,
     the read kept is judged, with its fault and any later one beside the verdict, which warns
     and passes: a list trailing the head for longer than the waits is still not checked past
     what it holds. A verdict that already refuses is not re-read, since the run fails already, so
@@ -292,6 +292,9 @@ class Verdict:
     refusals: tuple[str, ...]
     #: Set when part of the verdict could not be reached. The refusals that WERE reached still stand.
     fault: str | None = None
+    #: The commit id and fault text of each owner ruling W7-R11 fault in ``fault``: an unlinked
+    #: or null author under an error inside the committer, warned on and not refused.
+    unproven: tuple[tuple[str, str], ...] = ()
 
 
 def _person(commit: Mapping[str, Any], role: str) -> Mapping[str, Any] | None:
@@ -583,6 +586,7 @@ def evaluate(
     ``complete`` false (a read cut short by a fault) the count check is skipped.
     """
     faults: list[str] = []
+    unproven: list[tuple[str, str]] = []
     signed_cache: dict[str, frozenset[int] | None] = {}
 
     def has_signed(who: Attribution) -> bool | None:
@@ -643,11 +647,13 @@ def evaluate(
                     if index < read.first_page and commit["author"] is not None
                     else ""
                 )
-                faults.append(
+                text = (
                     f"commit {oid}: GraphQL reported an error inside its committer, and its "
                     f"author reads as unlinked or null, which that failure may have caused; not "
                     f"refused{key}"
                 )
+                faults.append(text)
+                unproven.append((str(oid), text))
                 slots.append(None)
                 continue
             # Judged before the key below, so a commit whose committer cannot be read, other than
@@ -722,7 +728,7 @@ def evaluate(
     refusals = [
         r for pair in itertools.zip_longest(rule_one, rule_two) for r in pair if r is not None
     ]
-    return Verdict(tuple(refusals), "; ".join(faults) or None)
+    return Verdict(tuple(refusals), "; ".join(faults) or None, tuple(unproven))
 
 
 def _escape_command(text: str) -> str:
@@ -887,16 +893,27 @@ def read_judged_head(
             verdict = judge(exc.partial, False)
             if kept is None:
                 return exc.partial, verdict, str(exc)
-            if verdict.refusals or _missing_head(exc.partial, expected_head) is None:
+            holds_head = _missing_head(exc.partial, expected_head) is None
+            if verdict.refusals or holds_head:
                 # A refusal this re-read proves is the verdict, and so is a re-read whose pages
-                # hold the head. Its fault names it as the read judged, and says that the commits
+                # hold the head. Its fault names it as the read judged, and says that any commits
                 # past the cut are unchecked, since a read cut short has no count check; its
                 # verdict keeps its own faults.
-                return (
-                    exc.partial,
-                    verdict,
-                    f"the re-read judged was cut short, so the commits past it are not checked: {exc}",
+                text = (
+                    "the re-read judged was cut short, so any commits past it are not checked: "
+                    f"{exc}"
                 )
+                if holds_head:
+                    # The read kept's W7-R11 warnings on commits past the cut are the only word
+                    # on those commits, so they stay, under the read kept's name. Its other
+                    # faults are about a read that is not the one judged, and are not reported.
+                    seen = {str(c.get("oid", "")) for c in exc.partial.commits}
+                    past = [t for oid, t in kept[1].unproven if oid not in seen]
+                    if past:
+                        text += "; the read kept, past the re-read's cut, showed: " + "; ".join(
+                            past
+                        )
+                return exc.partial, verdict, text
             return _report_kept(kept, f"a re-read was cut short: {exc}")
         verdict = judge(read, True)
         missing = _missing_head(read, expected_head)
