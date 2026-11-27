@@ -265,11 +265,10 @@ stands): the hold stands and the Lander may transfer the PR to the Repair Manage
 30-minute window and no not-live test. It never substitutes for the hold, and it never makes a
 repair-owner marker or a REPAIR turn: the transfer steps in CLAUDE.md section 5 still run. Where
 the PR is REPAIR's already (a repair-owner marker after the hold), it stays REPAIR's, and the
-closed marker is set aside. On a PR whose reply or edit after the hold already reads LANDER, a
-counting marker adds ``author-closed`` beside those flags, as it does beside ``repair-rehold``. A
-marker that does not count in ``classify``, an invalid shape or a minimized one included, is an
-ordinary event, so one after the hold is a reply. A closed marker before the hold does not count:
-a hold posted after the author closed reads AUTHOR until it expires (HOLD_TTL).
+closed marker is set aside. A marker that does not count in ``classify``, an invalid shape or a
+minimized one included, is an ordinary event, so one after the hold is a reply. A closed marker
+before the hold does not count: a hold posted after the author closed reads AUTHOR until it
+expires (HOLD_TTL).
 
 A HOLD ON A QUEUED OR ARMED PR IS THE LANDER'S. A PR in the merge queue, or with auto-merge armed,
 merges without its author moving, so a hold on it reads LANDER with ``held`` kept beside the
@@ -772,8 +771,6 @@ def classify(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str], st
         flags.append("edited")
     if not new_commit:
         flags.append("no-new-commit")
-    if closed:
-        flags.append("author-closed")
     return LANDER, flags, None
 
 

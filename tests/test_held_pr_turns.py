@@ -1696,17 +1696,13 @@ def test_an_author_closed_marker_after_the_hold_is_the_landers_now(
         _held(401, odd),
         # An ack before the marker is history; the marker after it still counts.
         _held(402, _ack("2026-10-28T12:30:00Z", _sha(402)), _closed()),
-        # A reply after the hold still reads replied; the marker adds its flag beside it.
+        # A reply after the hold still reads replied, and the marker adds no flag beside it.
         _held(403, _comment("Manager: answered the finding.", "2026-10-28T12:30:00Z"), _closed()),
     )
     assert _repair_row(rows[400]) == ("LANDER", ["held", "author-closed"], None)
     assert _repair_row(rows[401]) == ("LANDER", ["held", "author-closed"], None)
     assert _repair_row(rows[402]) == ("LANDER", ["held", "acked", "author-closed"], None)
-    assert _repair_row(rows[403]) == (
-        "LANDER",
-        ["replied", "no-new-commit", "author-closed"],
-        None,
-    )
+    assert _repair_row(rows[403]) == ("LANDER", ["replied", "no-new-commit"], None)
 
 
 def test_an_author_closed_marker_within_thirty_minutes_still_reads_lander(
@@ -1833,14 +1829,15 @@ def test_the_author_closed_void_check_edges(
     assert _turn(rows[461]) == ("LANDER", ["replied", "edited", "no-new-commit"])
     assert _turn(rows[462]) == ("LANDER", ["held", "author-closed"])
     assert _turn(rows[463]) == ("LANDER", ["replied", "no-new-commit"])
-    assert _turn(rows[464]) == ("LANDER", ["replied", "no-new-commit", "page-cut"])
+    # A reply already reads LANDER with no ``author-closed`` to void, so a cut page adds nothing.
+    assert _turn(rows[464]) == ("LANDER", ["replied", "no-new-commit"])
 
 
 def test_an_author_closed_marker_beside_other_lander_flags(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Beside an earlier transfer it reads ``repair-rehold`` too; an edit between the hold and the
-    marker keeps it; a cut page replaces it with ``page-cut``."""
+    marker reads LANDER without it; a cut page replaces it with ``page-cut``."""
     rehold = _pr(
         455,
         comments=[
@@ -1863,8 +1860,30 @@ def test_an_author_closed_marker_beside_other_lander_flags(
         ["held", "author-closed", "repair-rehold"],
         OWNER_ID,
     )
-    assert _turn(rows[456]) == ("LANDER", ["replied", "edited", "no-new-commit", "author-closed"])
+    assert _turn(rows[456]) == ("LANDER", ["replied", "edited", "no-new-commit"])
     assert _turn(rows[457]) == ("LANDER", ["held", "page-cut"])
+
+
+def test_an_author_reply_then_an_author_closed_marker_reads_no_author_closed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A reply after the hold may dispute it, so a marker after that reply must not tell the
+    Lander the hold stands and the PR may transfer at once."""
+    disputed = _pr(
+        436,
+        comments=[
+            _hold("2026-10-28T12:00:00Z", _sha(436)),
+            _comment(
+                "Manager: this hold is wrong; the finding does not apply.", "2026-10-28T12:30:00Z"
+            ),
+            _closed("2026-10-28T13:00:00Z"),
+        ],
+    )
+    rows = _engine_rows(tmp_path, capsys, disputed)
+    turn, flags = _turn(rows[436])
+    assert turn == "LANDER"
+    assert "author-closed" not in flags
+    assert flags == ["replied", "no-new-commit"]
 
 
 def test_an_author_closed_marker_on_a_hold_not_naming_the_head_does_not_count(

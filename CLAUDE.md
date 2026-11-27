@@ -512,8 +512,10 @@ older orphaned ask. The paragraph above's repair takes no such test. An author c
 reply hands the turn back to the Lander, and nothing expires then. The author may also hand the PR
 over sooner. The explicit form is a comment whose first line is
 `<!-- author-session-closed session=<id> -->`, posted only by the original author session, `<id>`
-being its own session id; `scripts/coord/held_pr_turns.py` flags `author-closed` only where it
-counts, which the script's header states. A flagged PR is transfer-eligible at once, without the
+being its own session id; `scripts/coord/held_pr_turns.py` flags it `author-closed` where its
+header says it counts. The script cannot tell which session posted the marker, so the Lander
+confirms it against the author's seat record; a flagged PR so confirmed is transfer-eligible at
+once, without the
 30-minute window or the not-live test, and the transfer's other conditions still hold, at least
 the next sentence's and the transfer steps in order (owner approval 2026-11-27, in the Manager's
 chat). The PR must not be queued or carry an armed auto-merge request. The Lander spawns one
