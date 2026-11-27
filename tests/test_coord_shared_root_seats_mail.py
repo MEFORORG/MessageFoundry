@@ -387,9 +387,28 @@ def test_a_send_to_a_seat_that_closed_itself_warns_and_still_queues(
     warnings = [ln for ln in proc.stderr.splitlines() if "WARNING" in ln]
     assert len(warnings) == 1, proc.stderr
     assert f"'{lifecycle}'" in warnings[0] and "2026-11-20T10:00:00Z" in warnings[0]
-    assert "future session" in warnings[0]
+    assert "may sit unread until a session starts" in warnings[0]
     assert json.loads(proc.stdout)[0]["Status"] == "queued"
     assert len(list((shared / "mail" / "box" / SEAT_ID / "inbox").glob("*.json"))) == 1
+
+
+def test_the_closed_seat_warning_does_not_say_only_a_future_session_reads_it(
+    repo: Path, shared: Path
+) -> None:
+    """A session that ran -Close and stays open drains its box on its next turn, idle or not.
+
+    So the WARNING must not tell the sender that only a future session will read the mail: a
+    `-To all` target is one presence has just measured live, and a sender acting on that line
+    would stop counting on a peer that is still there.
+    """
+    rec = _record(box=SEAT_ID, session="sess-o", worktree=r"D:\t\autonomy-plan", host=OTHER_HOST)
+    _plant_record(shared / "seats", SEAT_ID, _ended(rec, "closed", "2026-11-20T10:00:00Z"))
+    proc = _send(repo, shared, SEAT_ID)
+    assert proc.returncode == 0, proc.stderr
+    warnings = [ln for ln in proc.stderr.splitlines() if "WARNING" in ln]
+    assert len(warnings) == 1, proc.stderr
+    assert "read only by a future session" not in warnings[0]
+    assert "finishes another turn" in warnings[0]
 
 
 def test_a_send_to_an_open_seat_does_not_warn(repo: Path, shared: Path) -> None:

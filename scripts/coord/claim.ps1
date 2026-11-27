@@ -498,7 +498,7 @@ function Get-HolderSeatClose([string]$HeldPath) {
         }
         $ended = Get-CoordSeatEnded -Dir (Join-Path $seats (ConvertTo-BoxKey -Path (Resolve-BoxPath -Path $HeldPath)))
         if (-not $ended) { return $null }
-        $script:HolderSeatClose[$pathKey] = "holder's seat record self-declared $($ended.Lifecycle) at $($ended.At)"
+        $script:HolderSeatClose[$pathKey] = "the newest seat record for the holder's worktree reads lifecycle '$($ended.Lifecycle)' at $($ended.At)"
         return $script:HolderSeatClose[$pathKey]
     }
     catch { return $null }

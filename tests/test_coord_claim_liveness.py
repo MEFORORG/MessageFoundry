@@ -934,7 +934,7 @@ def test_a_holder_that_closed_itself_is_reported_and_still_refused(
 ) -> None:
     peer = peer_holding(keyed_repo, tmp_path, "k")
     plant_seat(keyed_repo, peer, "s1", lifecycle)
-    note = f"holder's seat record self-declared {lifecycle} at {CLOSED_AT}"
+    note = f"the newest seat record for the holder's worktree reads lifecycle '{lifecycle}' at {CLOSED_AT}"
 
     take = claim(keyed_repo, "-Take", "k", "-Note", "mine now")
     assert take.returncode == 1
@@ -958,4 +958,4 @@ def test_a_holder_whose_newest_record_is_open_reports_no_close(
     plant_seat(keyed_repo, peer, "s-old", "closed", age_s=3600)
     plant_seat(keyed_repo, peer, "s-new", "open")
     for args in (("-Take", "k", "-Note", "x"), ("-Release", "k"), ("-List",)):
-        assert "self-declared" not in claim(keyed_repo, *args).stdout
+        assert "reads lifecycle" not in claim(keyed_repo, *args).stdout
