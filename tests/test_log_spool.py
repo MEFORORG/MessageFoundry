@@ -1817,11 +1817,11 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
     [in_use] = [r for r in caplog.records if "in use by another process" in r.getMessage()]
     assert in_use.levelno == logging.WARNING
     message = in_use.getMessage()
-    _, prefix, facts = message.partition("off-box log forwarding runs without an on-disk spool")
-    assert prefix, message
+    _, sep, facts = message.partition("off-box log forwarding runs without an on-disk spool")
+    assert sep, message
     assert facts == _SPOOL_IN_USE_FACTS  # the constant the control below looks for
-    # ``_try_lock`` reads any lock fault as contention, so the holder is only the usual cause.
-    assert "Another process usually holds the lock, but a fault taking the lock reads" in facts
+    # ``_try_lock`` reads any lock fault as contention, so a holder is only one possible cause.
+    assert "whether another process holds the lock or taking the lock failed." in facts
     # ``_open_forward_spool`` runs once, at configure time, so only a restart retries the lock.
     assert "runs without an on-disk spool until it restarts with a spool it can lock." in facts
     # The stranding fact, and at least these inputs to the directory ``__main__._forward_spool_dir``
@@ -1840,7 +1840,7 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
         in facts
     )
     assert "the working directory when that setting is a relative path" in facts
-    assert "and the engine shard id." in facts
+    assert "and an engine shard's shard id." in facts
     assert "it also changes with the store path the default directory is derived from." in facts
     assert 'One directory serves one process (ADR 0200, "One process per directory").' in facts
     # No branch of a procedure: each of these was wrong for some deployment.
@@ -1871,7 +1871,7 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
         and "still holds 1 spool segment(s)" in caplog.text
     )
     assert "is not usable" in caplog.text
-    # The positive control: an unusable directory gets none of the in-use facts.
+    # The control: an unusable directory gets none of the in-use facts.
     assert "MEFOR_LOGGING_FORWARD_SPOOL_DIR" not in caplog.text
     assert _SPOOL_IN_USE_FACTS not in caplog.text
 
