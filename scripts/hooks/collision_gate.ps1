@@ -323,9 +323,13 @@ $code = 0
 # this gate and its callee from the same checkout (docs/WORKTREES.md, "which copy runs"), so they move
 # together; a copy that predates the parameter fails the invocation, which lands on the unresolved
 # notice below -- loud and allowing, which is this gate's posture for everything it cannot check.
+#
+# -LiveOnly because every decision and notice below reads only Live rows, so a dormant worktree's row
+# changes nothing this gate does. Walking them anyway outran the harness timeout once worktrees
+# accumulated (overlap.ps1, at the parameter), and a killed gate checks nothing.
 try {
     $raw = & pwsh -NoProfile -NonInteractive -File $OverlapScript `
-        -File $target -Json -TimeBudgetSeconds $OverlapTimeBudgetSeconds 2>$null
+        -File $target -Json -LiveOnly -TimeBudgetSeconds $OverlapTimeBudgetSeconds 2>$null
     $code = $LASTEXITCODE
 } catch {
     Write-Unresolved "overlap-threw" "invoking the overlap script raised: $($_.Exception.Message)"
@@ -372,7 +376,7 @@ try { $rows = @($text | ConvertFrom-Json -ErrorAction Stop) } catch {
 # them to assume it was nearly done -- and on the measured runs it was not.
 if ($partial -and $rows.Count -gt 0 -and $null -ne $rows[0].PSObject.Properties['Total']) {
     $slowDetail = "the overlap walk did not finish within its ${OverlapTimeBudgetSeconds}s budget, " +
-        "covering $(Get-SafeForMessage $rows[0].Walked) of $(Get-SafeForMessage $rows[0].Total) worktrees. " +
+        "covering $(Get-SafeForMessage $rows[0].Walked) of $(Get-SafeForMessage $rows[0].Total) worktrees a live session owns. " +
         "Those were checked; the rest were never looked at"
 }
 

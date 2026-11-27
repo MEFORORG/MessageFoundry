@@ -228,7 +228,9 @@ if ($root) {
                 $inflight = @()
                 # Work that threw must not read as "nobody is building anything", so it says so,
                 # protected. It goes with the other in-flight lines, after the claims.
-                try { $inflight = @(& $overlap -Json | ConvertFrom-Json) } catch {
+                # -LiveOnly: $busy below keeps only Live rows, and a full walk outran SessionStart's
+                # 30s timeout once worktrees accumulated (overlap.ps1, at the parameter).
+                try { $inflight = @(& $overlap -Json -LiveOnly | ConvertFrom-Json) } catch {
                     $inflight = @()
                     $overlapFault = "In-flight work: NOT READ ($(Format-Reason $_.Exception.Message)). Run: scripts\coord\overlap.ps1"
                 }
