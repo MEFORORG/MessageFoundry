@@ -799,8 +799,8 @@ Manager's watch reached the cloud session 29 seconds after its question.
   register text the owner signs, A or B"* and the answer as *"/driver"*, and Manager record
   d20261126T233936172-bb6cdb fits it to the existing rulings). Its companion is korus
   `roles/LANDER.md` *4a-quinquies*. A falsehood in draft register row text must be fixed, or
-  disclosed in the signing guide, before the row is put up for signature. Only a falsehood false
-  only in the safe direction skips the merge hold and blocks the signing instead; under 38a483 as
+  disclosed in the signing guide, before the row is put up for signature. A falsehood false only in
+  the safe direction does not hold the merge and blocks the signing instead; under 38a483 as
   clarified by 98fe64, that is what the Lander chose over *"A as first put, holding every merge on
   it"*. Every other one keeps the route this bullet already gives it, so one false in the unsafe
   direction, a false score or a false anchor goes to the owner and the PR waits, and a prose error
@@ -813,11 +813,13 @@ Manager's watch reached the cloud session 29 seconds after its question.
   it. A PR that edits signed register row text is re-signing: it holds, and goes to the owner in
   person, because the 2026-10-22 ruling above reserves signing and re-signing the register to the
   owner in person (*"Still mine in person"*). Whether to void or correct signed register row text
-  is a question for the owner. A dated marker on a register row stays under the safe-direction
-  exception, except a finding that a marker falsely reads an acceptance as void, fired or in force,
-  which goes to the owner. The Lander never decides whether an acceptance is void. This changes no
-  other route to the owner, at least the live-exposure route section 0 sets, the score route and
-  the anchor route.
+  is a question for the owner. A dated marker on a register row is not register row text here. It
+  stays under the safe-direction exception, except a finding that a marker falsely reads an
+  acceptance as void, fired or in force, which goes to the owner. The Lander never decides whether
+  an acceptance is void. This changes no other route to the owner, at least the one this bullet
+  gives a present-tense live-exposure claim, which section 0 forbids, the score route and the
+  anchor route. **CHANGED 2026-11-26:** until this text, the safe-direction exception also covered
+  register row text, as PR 3345 wrote it that day.
   **Ledger ruling R2 (owner-signed 2026-11-04, in session: *"Sign R1-R9"*) changes how the findings
   are filed, and the Lander reads it as setting when.** A merged PR files at most one row, holding
   its open findings as numbered items. Its deferred scope becomes steps on the row it cites, or is
