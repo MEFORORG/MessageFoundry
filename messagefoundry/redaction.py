@@ -2938,9 +2938,8 @@ def redact_bounded_head(head: str, note: str) -> str:
     note appended after it, follows (BACKLOG #5925), and stripped. ``note`` is ``""`` when nothing
     was cut, and ``head`` is then redacted as :func:`redact` redacts any text.
 
-    One place for what :func:`safe_text` and ``verify_leaf.safe_detail_text`` each do with a head
-    they bound, so the two answer alike (the off-box audit tee does not use it; its
-    ``_bounded_detail`` says why):
+    One place for what :func:`safe_text`, ``verify_leaf.safe_detail_text`` and the off-box audit
+    tee's detail each do with a head they bound, so they answer alike:
     ``_held_back(redact_bounded_head(head, note), limit) + note`` is ``safe_text(text, limit=limit)``
     for ``(head, note) = safe_text_bound(text)``. With a note, the head's trailing whitespace is
     dropped first: a cut can leave it after the head's last value, the answer is stripped anyway,

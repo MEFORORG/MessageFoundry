@@ -370,11 +370,12 @@ def test_the_line_break_rule_after_a_rest_is_pinned() -> None:
     assert redact("<family>Smith</family Li\n") == "<family>[redacted]</family Li\n"
 
 
-def test_the_audit_tee_detail_keeps_one_answer_on_both_paths() -> None:
-    """Round-2 review: telling only the tee's unscrubbed bound about its note made it disagree with
-    the C0-scrubbed path, whose head the handler chain read with no note, so the line shipped the
-    whole detail hidden. Both paths keep main's answer, a named residual (``_bounded_detail``).
-    Red on the round-1 head: the shipped detail was the placeholder and the note alone."""
+def test_the_audit_tee_detail_prints_no_value_the_cut_left_last() -> None:
+    """Both of the tee's detail paths are told the note follows the head (BACKLOG #5925 closing
+    step 5), so neither prints the value the cut left last. The C0-scrubbed path's head was read
+    by the handler chain with no note, so its answer can still show that value; the line check
+    then ships the detail hidden whole, with its note (``_bounded_detail``). Before step 5 this
+    pinned main's answer, the scrubbed detail with ``12345`` in it."""
     import json
 
     from messagefoundry.store import audit_tee
@@ -402,4 +403,5 @@ def test_the_audit_tee_detail_keeps_one_answer_on_both_paths() -> None:
     finally:
         logger.removeHandler(handler)
     shipped = json.loads(lines[-1])["detail"]
-    assert shipped.startswith("\x01 [redacted] "), shipped  # scrubbed, not hidden whole
+    assert "12345" not in shipped, shipped
+    assert shipped.endswith(" [redaction bound: dropped 70_001 more chars unscanned]"), shipped
