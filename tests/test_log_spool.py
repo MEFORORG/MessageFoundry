@@ -1824,48 +1824,38 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
     message = in_use.getMessage()
     _, sep, facts = message.partition("off-box log forwarding runs without an on-disk spool")
     assert sep, message
-    assert facts == _SPOOL_IN_USE_FACTS  # the constant the control below looks for
-    # At least the causes ``_try_lock`` returns False for: ``lock_exclusive`` reports contention by any
-    # handle, this process's own included, and ``_try_lock`` reads any other lock fault as
-    # contention.
-    assert (
-        "This WARNING reads the same for at least these causes: another process holds the lock, "
-        "this process already holds it on another handle, or taking the lock failed." in facts
-    )
-    # ``_open_forward_spool`` runs once per forwarder, at configure time, and returned ``None``
-    # here, so this forwarder has no spool object and reads nothing from that directory. Another
-    # handle in this process may still send, so the sentence is about the forwarder, not the
-    # process.
-    assert (
+    # A literal, never the module constant: comparing the constant with itself passes any rewording.
+    assert facts == (
+        # At least the causes ``_try_lock`` returns False for: ``lock_exclusive`` reports
+        # contention by any handle, this process's own included, and ``_try_lock`` reads any other
+        # lock fault as contention.
+        ". This WARNING reads the same for at least these causes: another process holds the lock, "
+        "this process already holds it on another handle, or taking the lock failed. "
+        # ``_open_forward_spool`` runs once per forwarder, at configure time, and returned ``None``
+        # here, so this forwarder has no spool object and reads nothing from that directory.
+        # Another handle in this process may still send, so the sentence is about the forwarder.
         "Until this process restarts with a spool it can lock, the forwarder this WARNING belongs "
-        "to has no on-disk spool and sends nothing from that directory." in facts
-    )
-    # The stranding fact belongs to the lock holder, never to this forwarder, which holds nothing.
-    assert (
-        "Only the process holding a spool directory's lock sends that directory's segments, so a "
+        "to has no on-disk spool and sends nothing from that directory. "
+        # Stranding belongs to the lock holder; a process without the lock sends none, so moving it
+        # strands none.
+        "Only the process holding a spool directory's lock sends that directory's segments. A "
         "change to that process's spool directory leaves the segments in its old directory unsent "
-        "until a process opens that directory again." in facts
+        "until a process opens that directory again; a change to the spool directory of a process "
+        "that does not hold the lock strands none of them. "
+        # ``__main__._forward_spool_dir`` and ``_supervisor_forward_spool_dir``: ``engine``,
+        # ``shard-<id>`` or ``supervisor`` under ``_forward_spool_root``, which is ``Path(base)``
+        # for a setting (never anchored) and otherwise ``log-spool`` in the resolved store path's
+        # parent, ``--db`` landing in ``[store].path`` on every backend (the next test ties it).
+        "Each process spools in its own subdirectory (engine, shard-<engine shard id>, or "
+        "supervisor) of a root. The root is [logging].forward_spool_dir (environment variable "
+        "MEFOR_LOGGING_FORWARD_SPOOL_DIR), taken against the working directory when it is a "
+        "relative path. With no setting, the root is log-spool in the directory that holds the "
+        "resolved store path (--db, or else [store].path, read even when the store is on a "
+        "database server), so two stores in one directory share it. "
+        'One directory serves one process (ADR 0200, "One process per directory").'
     )
-    assert "any change to a process's spool directory" not in facts
-    # At least these inputs to the directory ``__main__._forward_spool_dir`` derives: the setting
-    # and its variable, the working directory under a relative setting (the root is ``Path(base)``,
-    # never anchored), the engine shard's shard id, and under no setting the directory holding
-    # ``[store].path``, which ``--db`` sets in both ``serve`` and ``supervise``, read on every
-    # backend (the next test ties that one to the code).
-    assert (
-        "[logging].forward_spool_dir (environment variable MEFOR_LOGGING_FORWARD_SPOOL_DIR)"
-        in facts
-    )
-    assert "the working directory when that setting is a relative path" in facts
-    assert "and an engine shard's shard id." in facts
-    assert (
-        "With no setting, it also changes with the directory that holds the resolved store path "
-        "(--db, or else [store].path), which is read even when the store is on a database server."
-        in facts
-    )
-    assert "the store path the default directory is derived from" not in facts
-    assert 'One directory serves one process (ADR 0200, "One process per directory").' in facts
-    # No branch of a procedure: each of these was wrong for some deployment.
+    # No branch of a procedure: each of these was wrong for some deployment, the last four being
+    # reworded commands a review named.
     lowered = facts.lower()
     for imperative in (
         "stop one",
@@ -1876,6 +1866,10 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
         "each of the others",
         "Never change",
         "Leave the process",
+        "Move this process",
+        "Set [logging].forward_spool_dir",
+        "stop the other process",
+        "Kill the process",
     ):
         assert imperative.lower() not in lowered, imperative
 
@@ -1900,11 +1894,20 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
 def test_the_default_spool_directory_follows_the_directory_that_holds_the_store_path(
     tmp_path: Path,
 ) -> None:
-    """The in-use WARNING says the default directory changes with the directory that holds
-    ``[store].path``, not with the path itself, and that the path is read even on a database-server
-    backend: two paths in one directory share a default (BACKLOG #5400)."""
-    from messagefoundry.__main__ import _forward_spool_dir
+    """The in-use WARNING says the default root is ``log-spool`` in the directory that holds the
+    store path, not one keyed by the path itself, and that the path is read even on a
+    database-server backend: two stores in one directory share it (BACKLOG #5400)."""
+    from messagefoundry.__main__ import _forward_spool_dir, _forward_spool_root
     from messagefoundry.config.settings import ServiceSettings, StoreBackend, StoreSettings
+
+    unset = ServiceSettings()
+    assert not unset.logging.forward_spool_dir
+    root = _forward_spool_root(unset, str(tmp_path / "a.db"))
+    assert (
+        root
+        == _forward_spool_root(unset, str(tmp_path / "b.db"))
+        == tmp_path.resolve() / "log-spool"
+    )
 
     def default(store: Path, **server: Any) -> str:
         return _forward_spool_dir(

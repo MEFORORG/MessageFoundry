@@ -2155,13 +2155,15 @@ _SPOOL_IN_USE_FACTS = (
     "process already holds it on another handle, or taking the lock failed. Until this process "
     "restarts with a spool it can lock, the forwarder this WARNING belongs to has no on-disk spool "
     "and sends nothing from that directory. Only the process holding a spool directory's lock "
-    "sends that directory's segments, so a change to that process's spool directory leaves the "
-    "segments in its old directory unsent until a process opens that directory again. The "
-    "directory changes with at least [logging].forward_spool_dir (environment variable "
-    "MEFOR_LOGGING_FORWARD_SPOOL_DIR), the working directory when that setting is a relative path, "
-    "and an engine shard's shard id. With no setting, it also changes with the directory that "
-    "holds the resolved store path (--db, or else [store].path), which is read even when the store "
-    "is on a database server. "
+    "sends that directory's segments. A change to that process's spool directory leaves the "
+    "segments in its old directory unsent until a process opens that directory again; a change to "
+    "the spool directory of a process that does not hold the lock strands none of them. Each "
+    "process spools in its own subdirectory (engine, shard-<engine shard id>, or supervisor) of "
+    "a root. The root is [logging].forward_spool_dir (environment variable "
+    "MEFOR_LOGGING_FORWARD_SPOOL_DIR), taken against the working directory when it is a relative "
+    "path. With no setting, the root is log-spool in the directory that holds the resolved store "
+    "path (--db, or else [store].path, read even when the store is on a database server), so two "
+    "stores in one directory share it. "
     'One directory serves one process (ADR 0200, "One process per directory").'
 )
 
