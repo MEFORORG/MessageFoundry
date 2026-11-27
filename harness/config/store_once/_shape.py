@@ -26,14 +26,15 @@ Knobs (all optional, with safe defaults so ``serve`` works with none set):
 * ``MEFOR_LOAD_ADT_PORT``       — ADT hub inbound MLLP port (default 2600).
 * ``MEFOR_LOAD_RESULTS_PORT``   — results hub inbound MLLP port (default 2601).
 * ``MEFOR_LOAD_OTHER_PORT``     — other hub inbound MLLP port (default 2602).
-* ``MEFOR_LOAD_SHARD_ADT``      — ``supervise`` shard id for the ADT hub (default unset → no tag).
-* ``MEFOR_LOAD_SHARD_RESULTS``  — ``supervise`` shard id for the results hub (default unset → no tag).
-* ``MEFOR_LOAD_SHARD_OTHER``    — ``supervise`` shard id for the other hub (default unset → no tag).
+* ``MEFOR_LOAD_SHARD_ADT``      — ``supervise`` engine shard id for the ADT hub (default unset).
+* ``MEFOR_LOAD_SHARD_RESULTS``  — ``supervise`` engine shard id for the results hub (default unset).
+* ``MEFOR_LOAD_SHARD_OTHER``    — ``supervise`` engine shard id for the other hub (default unset).
 
-Shards (all optional): tagging a hub with ``shard=`` routes it to a named ``messagefoundry supervise``
-subprocess. **Unset (the default) = no tag = a single implicit shard**, so the SAME load graph serves
-both unsharded (default) and sharded (e.g. ``MEFOR_LOAD_SHARD_ADT=a`` / ``_RESULTS=b`` / ``_OTHER=b``
-→ a 2-shard layout) with no other change. The tags never affect routing.
+Engine shards (all optional): tagging a hub with ``shard=`` routes it to a named
+``messagefoundry supervise`` subprocess. **Unset (the default) = no tag = a single implicit engine
+shard**, so the SAME load graph serves both an unsharded engine (default) and engine shards (e.g.
+``MEFOR_LOAD_SHARD_ADT=a`` / ``_RESULTS=b`` / ``_OTHER=b`` → two engine shards) with no other change.
+The tags never affect routing.
 
 The graph is **synthetic and generic** — it models the *shape* of a high-fan-out estate (one big ADT
 hub plus results/orders hubs), never a real site. See ``docs/LOAD-TESTING.md``.

@@ -22,7 +22,7 @@ import pytest
 
 from harness.config.shardcert import _shape as shardcert_shape
 from harness.load.ids import SHARDCERT_IDS
-from messagefoundry.checks import _run_tool
+from messagefoundry.checks import CheckResult, _run_tool
 from messagefoundry.childenv import CHILD_INTERPRETER_FLAGS, outside_engine_namespace
 from tests._ast_sites import named_func, parse_source
 from tests.test_dependency_boundaries import _modules_imported_by
@@ -87,20 +87,43 @@ def test_graph_loads_without_the_harness_package(graph: str, tmp_path: Path) -> 
     assert count >= 1
 
 
+def _advisory_mypy(
+    graph: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, package: bool = False
+) -> CheckResult:
+    """``messagefoundry check``'s advisory mypy on a copy of ``graph`` (BACKLOG #5850).
+
+    It runs ``mypy --config-file= <config dir>``. A directory holding an ``__init__.py`` is a package
+    to mypy, so its ``from _shape import`` is not found there; without one mypy resolves the bare
+    name from the directory, as the loader does. The working directory is the copy's parent, and
+    the caller's mypy cache and search path are dropped, which ``_run_tool`` would pass on, so each
+    run caches under tmp_path and resolves only what the copy holds."""
+    config = tmp_path / graph
+    shutil.copytree(_CONFIG / graph, config, ignore=shutil.ignore_patterns("__pycache__"))
+    if package:
+        (config / "__init__.py").write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MYPY_CACHE_DIR", raising=False)
+    monkeypatch.delenv("MYPYPATH", raising=False)
+    result = _run_tool("mypy", "mypy", ["--config-file=", str(config)])
+    assert not result.skipped, result.detail
+    return result
+
+
 @pytest.mark.parametrize("graph", _GRAPHS)
 def test_checks_advisory_mypy_resolves_the_bare_sibling_import(
     graph: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # `messagefoundry check` runs `mypy --config-file= <config dir>` (BACKLOG #5850). A directory
-    # holding an __init__.py is a package to mypy, so its `from _shape import` is not found there;
-    # without one mypy resolves the bare name from the directory, as the loader does. The run is in a
-    # copy, with the copy as the working directory, so its cache cannot touch the repository's.
-    config = tmp_path / graph
-    shutil.copytree(_CONFIG / graph, config, ignore=shutil.ignore_patterns("__pycache__"))
-    monkeypatch.chdir(tmp_path)
-    result = _run_tool("mypy", "mypy", ["--config-file=", str(config)])
-    assert not result.skipped, result.detail
+    result = _advisory_mypy(graph, tmp_path, monkeypatch)
     assert result.ok, result.detail
+
+
+def test_control_a_package_marker_fails_the_advisory_mypy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # If this starts passing, mypy no longer reports the defect and the test above proves nothing.
+    result = _advisory_mypy("load", tmp_path, monkeypatch, package=True)
+    assert not result.ok
+    assert "import-not-found" in result.detail, result.detail
 
 
 def test_control_the_block_reaches_a_graphs_import(tmp_path: Path) -> None:
@@ -136,10 +159,12 @@ def test_inlined_refusal_decorator_matches_the_original(graph: str) -> None:
 @pytest.mark.parametrize("graph", ["passthrough", "store_once"])
 def test_copied_load_shape_matches_the_load_graphs(graph: str) -> None:
     # Byte for byte, so the copy cannot drift even in a comment: harness/config/load is the one to
-    # edit, and its docstring says so.
-    assert (_CONFIG / graph / "_shape.py").read_bytes() == (
-        _CONFIG / "load" / "_shape.py"
-    ).read_bytes()
+    # edit, and its docstring says so. Line endings are left out, because a checkout may write
+    # either and the repository stores the same blob for both.
+    def lf(path: Path) -> bytes:
+        return path.read_bytes().replace(b"\r\n", b"\n")
+
+    assert lf(_CONFIG / graph / "_shape.py") == lf(_CONFIG / "load" / "_shape.py")
 
 
 def test_inlined_id_parser_matches_harness_load_ids() -> None:
@@ -152,10 +177,14 @@ def test_inlined_id_parser_matches_harness_load_ids() -> None:
         assert inlined.parse(SHARDCERT_IDS.format(seq)) == seq
 
 
-@pytest.mark.parametrize("module", ["_shape.py", "graph.py"])
 @pytest.mark.parametrize("graph", _GRAPHS)
-def test_the_graph_does_not_import_the_harness_package(graph: str, module: str) -> None:
-    # Walks function bodies too: a Router's or Handler's body does not run in the load test above.
-    tree = parse_source((_CONFIG / graph / module).read_text(encoding="utf-8"))
-    imported = _modules_imported_by(tree, f"harness.config.{graph}")
-    assert not [name for name in imported if name.split(".")[0] == "harness"]
+def test_the_graph_does_not_import_the_harness_package(graph: str) -> None:
+    # Every file in the directory, function bodies too: a Router's or Handler's body does not run in
+    # the load test above, and a non-_ module such as connscale's gen_toml.py is loaded as config.
+    modules = sorted((_CONFIG / graph).glob("*.py"))
+    assert {"_shape.py", "graph.py"} <= {path.name for path in modules}
+    found: dict[str, list[str]] = {}
+    for path in modules:
+        imported = _modules_imported_by(parse_source(path.read_text(encoding="utf-8")), path.stem)
+        found[path.name] = [name for name in imported if name.split(".")[0] == "harness"]
+    assert not any(found.values()), found

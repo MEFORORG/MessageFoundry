@@ -275,8 +275,8 @@ must read the whole file against the moving tests. *(Note 2026-11-14, vault BACK
 | File | What it loads | Proposed disposition |
 |---|---|---|
 | `test_harness_config.py` | The `harness/config` coverage graph. | Moves. |
-| `test_passthrough_graph.py` | `harness/config/passthrough`. | Moves with its graph. The graph imports `harness.config.load._shape`, and `tests/test_load_config.py` pairs it with a harness load profile, so it cannot become an engine fixture as it stands. `docs/CONNECTIONS.md` links to it as a runnable example and needs a new target. |
-| `test_store_once_graph.py` | `harness/config/store_once`. | Moves, for the same two reasons. |
+| `test_passthrough_graph.py` | `harness/config/passthrough`. | Moves with its graph. `tests/test_load_config.py` pairs it with a harness load profile, so it cannot become an engine fixture as it stands. **CORRECTED 2026-11-27:** this cell also read *"The graph imports `harness.config.load._shape`"*; since BACKLOG #5853 the graph imports a byte copy of that file kept beside it, and loads with only the engine installed. `docs/CONNECTIONS.md` links to it as a runnable example and needs a new target. |
+| `test_store_once_graph.py` | `harness/config/store_once`. | Moves, for the same reason. **CORRECTED 2026-11-27:** this cell read *"for the same two reasons"*, before the import reason above was corrected. |
 
 **Not measured:** whether the engine has equal tests of pass-through re-ingress and of
 store-once delivery elsewhere. Step 3 must check before those two files leave.
