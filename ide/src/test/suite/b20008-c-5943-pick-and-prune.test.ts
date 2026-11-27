@@ -48,6 +48,8 @@ function edit(name: "path" | "value", value: string, expectSrc: string, projecti
   return msg;
 }
 
+type RebaseOption = NonNullable<Parameters<typeof drainEdits>[5]> & { firstIsPick?: boolean };
+
 /** A fake document plus a fake `lens rewrite` of `msg.set(path, value)` that keeps the stale guard. */
 class FakeEditor {
   text: string;
@@ -93,9 +95,12 @@ class FakeEditor {
     return { before, after };
   };
 
-  /** The drain's rebase option. Built as a variable, so an unknown option compiles against any drain. */
-  options(firstIsPick: boolean): { rebaser: QueuedEditRebaser; readSource: () => string } {
-    const opts = { rebaser: this.rebaser, readSource: (): string => this.text, firstIsPick };
+  /**
+   * The drain's rebase option. Typed as the drain's own option plus `firstIsPick`, so a misspelled key
+   * is a type error, while the file still compiles against a drain that has no such option.
+   */
+  options(firstIsPick: boolean): RebaseOption {
+    const opts: RebaseOption = { rebaser: this.rebaser, readSource: (): string => this.text, firstIsPick };
     return opts;
   }
 }
@@ -198,13 +203,24 @@ suite("b20008 C #5943 item 42 -- a typed edit queued behind a field pick", () =>
     assert.strictEqual(other.expectSrc, rowOf(S1), "another field of the row is still carried");
   });
 
-  test("a pick that meets a busy slot is not queued as a typed edit", async () => {
+  test("a pick that meets a busy slot is not queued as a typed edit, and is reported", async () => {
     const ed = new FakeEditor(S0);
     const guard = new EditLoopGuard();
     assert.ok(guard.beginEdit());
-    await drainEdits(guard, edit("path", "PID-9", rowOf(S0), 1), ed.apply, undefined, undefined, ed.options(true));
+    const errors: unknown[] = [];
+    const pick = edit("path", "PID-9", rowOf(S0), 1);
+    await drainEdits(guard, pick, ed.apply, (err) => errors.push(err), undefined, ed.options(true));
     assert.strictEqual(guard.pendingCount, 0);
     assert.deepStrictEqual(ed.applied, []);
+    assert.strictEqual(errors.length, 1, "the declined pick goes to onError");
+  });
+
+  test("a re-projection of the same buffer while the picker is open keeps the pick's page", async () => {
+    const ed = new FakeEditor(S0);
+    ed.rebaser.project(2, S0); // a save during the modal pick re-projects the unchanged buffer
+    await drainWithQueued(ed, edit("path", "PID-9", rowOf(S0), 1), [edit("value", "NEW", rowOf(S0), 2)]);
+    assert.deepStrictEqual(ed.refused, []);
+    assert.deepStrictEqual(ed.applied, ["path=PID-9", "value=NEW"]);
   });
 
   test("readPickPartMessage and readEditMessage carry a safe-integer projection id, and drop any other", () => {

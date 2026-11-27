@@ -2848,6 +2848,11 @@ export function buildPasteRequest(
   return req;
 }
 
+/** One field of one row: the key edits coalesce by, and the key the rebaser marks writes by. */
+export function editFieldKey(msg: EditMessage): string {
+  return `${msg.handler}\u0000${msg.lineStart}\u0000${msg.lineEnd}\u0000${msg.name}`;
+}
+
 /**
  * One-editor-at-a-time + webview↔document update-loop guard (ADR 0076 §5, the InterSystems guardrail).
  *
@@ -2868,11 +2873,6 @@ export function buildPasteRequest(
  * refresh once the slot frees. The debt is recorded as a single boolean (a re-projection is idempotent —
  * ten suppressed saves owe exactly one refresh), mirroring the queue/take shape of the pending edits.
  */
-/** One field of one row: the key edits coalesce by, and the key the rebaser marks writes by. */
-export function editFieldKey(msg: EditMessage): string {
-  return `${msg.handler}\u0000${msg.lineStart}\u0000${msg.lineEnd}\u0000${msg.name}`;
-}
-
 export class EditLoopGuard {
   private inFlight = false;
   private suppressedChange = false;
@@ -3040,7 +3040,7 @@ export class RerenderDebouncer<H = unknown> {
  * that an UNEXPECTED `apply` rejection never strands a queued edit — is unit-testable node-side.
  *
  * If an edit is already in flight, `first` is queued (coalesced by field) and this returns — the running
- * drain will pick it up. Otherwise it claims the slot and drains `first` then everything `takePending()`
+ * drain will pick it up; a pick is never queued (below). Otherwise it claims the slot and drains `first` then everything `takePending()`
  * yields. `apply` performs the actual `lens rewrite` + `WorkspaceEdit`; its OWN handled outcomes (a CLI
  * refusal) never throw, but an unexpected `WorkspaceEdit` rejection (or a spawn failure) would — that is
  * caught, routed to `onError`, and the loop KEEPS DRAINING so a pending second edit is not wedged until
@@ -3051,9 +3051,9 @@ export class RerenderDebouncer<H = unknown> {
  * With `rebase.firstIsPick`, `first` is a field pick (BACKLOG #5943): it is sent as posted, never
  * carried, and its write is recorded as a pick, so the typed edits drained behind it are still carried
  * over it, except an edit on the picked field from a page projected from a buffer before the pick
- * (no page shows a pick, {@link QueuedEditRebaser}). A pick that meets a busy slot is dropped, never
- * queued as a typed edit, so its caller checks the slot first and tells the user, as `applyPickedEdit`
- * does.
+ * (no page shows a pick, {@link QueuedEditRebaser}). A pick that meets a busy slot is never queued as
+ * a typed edit: it goes to `onError` and is not applied. `applyPickedEdit` checks the slot first, so
+ * it can decline with a gentler message.
  */
 export async function drainEdits(
   guard: EditLoopGuard,
@@ -3071,6 +3071,12 @@ export async function drainEdits(
   if (!guard.beginEdit()) {
     if (rebase?.firstIsPick !== true) {
       guard.queue(first);
+    } else {
+      try {
+        onError?.(new Error("an edit is in progress, so the pick was not applied; try again"), first);
+      } catch {
+        // A throwing handler must not escape the drain, which never throws.
+      }
     }
     return;
   }
@@ -3181,8 +3187,8 @@ export function rowAfterRewrite(msg: EditMessage, write: AppliedRewrite): string
 }
 
 /**
- * Carries an edit's `expectSrc` forward over the typed rewrites applied since the webview it was made
- * on was projected (BACKLOG #5943). The webview's rows keep their projection-time source until the next
+ * Carries an edit's `expectSrc` forward over the typed and picked rewrites applied since the webview
+ * it was made on was projected (BACKLOG #5943). The webview's rows keep their projection-time source until the next
  * re-projection, so an edit on a row whose earlier rewrite has landed, queued behind that rewrite or
  * posted before the re-projection arrives, is sent with the row's old text, and the engine's stale
  * guard (F7) refuses it and the user's edit is reverted.
@@ -3208,7 +3214,8 @@ export function rowAfterRewrite(msg: EditMessage, write: AppliedRewrite): string
  *    applyOne overwrites it with the rewrite's output, as on main, and the write is recorded as clean.
  *
  * The provider owns one for the panel and calls {@link project} each time it replaces the webview. A
- * projection whose buffer is not in the chain ends the chain and keeps only itself. Otherwise the
+ * projection whose buffer is not in the chain ends the chain and keeps only itself, and the previous
+ * projection when that one was projected from the same buffer. Otherwise the
  * rebaser keeps the new projection, and the previous one when its buffer is in the chain. It then
  * deletes only the chain buffers that come before every kept projection's buffer. Chain buffers are
  * ordered by last use, not by projection, so a value retyped back or renders that finish out of order
@@ -3250,15 +3257,18 @@ export class QueuedEditRebaser {
 
   /** The webview now shows projection `id`, projected from `source`. */
   project(id: number, source: string): void {
-    if (!this.chain.has(source)) {
-      this.latch();
-      this.projections = new Map([[id, source]]);
-      return;
-    }
-    const kept = new Map<number, string>();
     const ids = [...this.projections.keys()];
     const prev = ids[ids.length - 1];
     const prevSource = prev === undefined ? undefined : this.projections.get(prev);
+    if (!this.chain.has(source)) {
+      this.latch();
+      // A re-projection of the same buffer (a save during a modal field pick, say) has the same rows,
+      // so the page before it stays usable, and a pick made there can still start a chain.
+      this.projections = new Map(prev !== undefined && prevSource === source ? [[prev, source]] : []);
+      this.projections.set(id, source);
+      return;
+    }
+    const kept = new Map<number, string>();
     if (prev !== undefined && prevSource !== undefined && this.chain.has(prevSource)) {
       kept.set(prev, prevSource);
     }
