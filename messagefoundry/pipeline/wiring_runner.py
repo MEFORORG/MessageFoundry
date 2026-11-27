@@ -278,7 +278,6 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.metadata import intake_metadata_json, user_metadata
 from messagefoundry.store.queue_tag import (
-    PROGRAMMING_ERRORS,
     QueueOpenFault,
     QueueTagError,
     fault_text,
@@ -13415,15 +13414,15 @@ class RegistryRunner:
             # for the same failure, not as an undecryptable reply.
             tag_failed = True
         except CipherError as exc:
-            # BACKLOG #5727: a key service that gave no verdict says nothing about this reply, and
-            # a fault in the engine's own code is not the cell's either. Both take the fault arm,
-            # which re-pends the token with a backoff and dead-letters nothing. A per-lane worker
-            # retries until the service answers; a pooled lane under infra_fault_policy "stop"
-            # goes STOPPED after infra_fault_stop_after such faults, its token left pending.
-            if isinstance(exc, PROGRAMMING_ERRORS):
-                raise
-            # Raised below, outside this handler, so the fault carries no chain to the raw
-            # key-service error, which can echo a URL or a body (BACKLOG #2318).
+            # BACKLOG #5727: a key service that gave no verdict says nothing about this reply. It
+            # takes the fault arm, which re-pends the token with a backoff and dead-letters
+            # nothing. A per-lane worker retries until the service answers; a pooled lane under
+            # infra_fault_policy "stop" goes STOPPED after infra_fault_stop_after such faults, its
+            # token left pending. Raised below, outside this handler, so the fault carries no chain
+            # to the raw key-service error, which can echo a URL or a body (BACKLOG #2318). An
+            # engine fault, such as an AADComponentError, is dead-lettered with every other
+            # verdict, as on main before #5727; held, it would fail on every pass at the lane's
+            # head (the Lander's hold on PR 3155, item 7).
             read_fault = no_verdict_fault(exc)
             if read_fault is None:
                 # BACKLOG #4995: a reply body that fails this way fails again on a retry until its

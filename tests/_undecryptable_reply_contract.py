@@ -606,6 +606,26 @@ def _worker_dead_letter_seal_failure_carries_no_open_error(
     return case
 
 
+async def worker_read_engine_fault_dead_letters(store: Any, fetch: RawFetch, _raw: RawSql) -> None:
+    """BACKLOG #5727, the Lander's hold on PR 3155 item 7: an engine fault on the step's own read
+    of the reply, an AADComponentError, is dead-lettered with its reference kept, as on main before
+    #5727. Held, it would fail on every pass at the head of the lane. CONTROL: the step returns, so
+    nothing raised, and the token's reference is kept for a replay."""
+    mid, item = await _claimed_head(store)
+    before = await token_of(fetch, mid)
+    target = await _cell(fetch, "reply", mid)
+    step = runner(store)
+    with faulting_cipher(store) as fault:
+        fault.target, fault.open_error = target, AADComponentError("synthetic")
+        await step._process_response_item(LOOP, item)
+    after = await token_of(fetch, mid)
+    assert after["status"] == OutboxStatus.DEAD.value
+    assert after["payload"] == before["payload"] and after["payload"] != ""
+    events = await store.events_for(mid)
+    assert [e for e in events if e["event"] == "dead" and "undecryptable" in str(e["detail"])]
+    assert await children(fetch) == []
+
+
 #: A marker in synthetic origin metadata, to show the decrypted text reaches no log or error.
 META_MARK = "SYNTHETIC-META-MARK"
 
@@ -763,6 +783,7 @@ HANDOFF_CASES: list[ContractCase] = [
     ),
     _worker_dead_letter_seal_failure_carries_no_open_error("reply"),
     _worker_dead_letter_seal_failure_carries_no_open_error("ref"),
+    worker_read_engine_fault_dead_letters,
     _unparseable_origin_dead_letters(f"not json {META_MARK}", "not_json"),
     _unparseable_origin_dead_letters(f'{{"correlation_depth": "{META_MARK}"}}', "word_depth"),
     _unparseable_origin_dead_letters('{"correlation_depth": [1]}', "list_depth"),
