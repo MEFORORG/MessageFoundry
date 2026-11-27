@@ -452,6 +452,11 @@ target, no `pickle` import left to mis-suppress:
   >   the first check. So the window this bullet describes narrows by the time the request takes
   >   to encode, to frames queued after that second check and ahead of the call's answer. It is
   >   not closed.
+  >
+  >   *Amended 2026-11-27 (vault BACKLOG #3135 steps 11 and 12):* this bullet says two cases are
+  >   accepted. Two more are now, the forged lookup in this bullet and the desync after a partial
+  >   read; the owner's 2026-11-27 acceptance, after the Manager's 2026-11-10 list below, cites the
+  >   records.
   > - **A length header over the frame cap.** How the engine handles one is new since vault BACKLOG
   >   #3135, not a carried-over rule; the worker's own reader still treats one as a dead peer.
   >   Before vault BACKLOG #3135 the engine read such a header as a dead peer: at least, in the
@@ -549,12 +554,7 @@ target, no `pickle` import left to mis-suppress:
   > last two items in this list (vault BACKLOG #3135 steps 11 and 12), the owner answered *"Accept
   > it (Recommended)"* for each, choosing *"Same scope as owner record d20261110T165507353-b70f7b
   > and its 2026-11-24 carry-over"* (records d20261127T133719996-73a18d for step 11 and
-  > d20261127T133721848-3b2fdf for step 12). The 2026-11-24 note above stays true of that ruling.
-  > *Not the owner's words:* a forged lookup is brokered under the bounds the worker's own lookup
-  > meets, at least the wall cap and the `[egress]` allowlist, and its reply is written to the
-  > request pipe, which the forger can read. The desync fails the next message closed as an
-  > internal error, under the `[delivery] internal_error` policy, and the respawn resyncs. Each
-  > needs a writer that read the request.
+  > d20261127T133721848-3b2fdf for step 12). The answer names no end to either acceptance.
   → `tests/test_sandbox.py::test_a_desynced_or_forged_response_is_rejected`,
   `tests/test_sandbox.py::test_a_frame_staged_between_dispatches_can_never_answer_the_next_one`,
   `tests/test_sandbox.py::test_a_dead_peer_is_not_treated_as_a_forged_frame`,

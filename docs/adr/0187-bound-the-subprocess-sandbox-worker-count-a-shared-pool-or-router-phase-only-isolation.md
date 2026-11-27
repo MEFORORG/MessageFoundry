@@ -428,6 +428,8 @@ argument above stands for every fault that does kill.
   > was changed to pin that. A request outside the codec grammar still raises, and keeps the worker.
   >
   > *Added 2026-11-10, not part of the ruling:* at least two forged frames that carry the request's id can fail to raise: a forged `ok` answer, and at `mode=isolated` a forged lookup. See [ADR 0087](0087-sandbox-subprocess-isolation.md) AC-10's 2026-11-09 amendment and `dispatch` in `messagefoundry/pipeline/sandbox.py`, with `_await_answer` for the lookup. No owner record cited there names this AC. A fix is to be added as a step on vault BACKLOG #3135.
+  >
+  > *Note 2026-11-27, not the owner's words:* vault BACKLOG #3135 step 11, the step for the forged lookup, is met by the owner's acceptance of 2026-11-27, not by a fix; ADR 0087 AC-10's 2026-11-09 amendment cites the record. The acceptance as recorded there names no AC of this ADR.
 
 ## Consequences
 
