@@ -442,3 +442,39 @@ def test_the_console_escapes_the_backend_name() -> None:
     text = _report(db_backend="pg\x1b[2J\n").render_console()
     assert "\x1b" not in text
     assert "pg\\x1b[2J" in text
+
+
+@pytest.mark.parametrize(
+    "before", [None, frozenset({_A})], ids=["no first read", "first read short of the count"]
+)
+def test_final_reads_skip_a_second_list_that_could_not_count(
+    before: frozenset[tuple[str, float]] | None,
+) -> None:
+    node, (_, _, dead_new) = _final([before], _stats_dead(2), frozenset({_A}))
+    assert node.calls == ["copies", "stats"]
+    assert dead_new is None
+
+
+def test_a_store_past_the_cap_is_never_listed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(failover, "_DEAD_COPIES_MAX", 2)
+    node = _CopyNode(frozenset({_A, _B, _C}))
+    got = asyncio.run(failover._opening_dead_copies([node], object(), _stats_dead(3)))  # type: ignore[list-item,arg-type]
+    assert got is None
+    assert node.reads == 0
+
+
+def test_a_lease_whose_recovery_bound_overflows_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Every knob is finite and passes the loader; the bound 2 x 1e308 is not.
+    profile = _profile(leader_lease_ttl_seconds="1e308")
+
+    def started(*_a: object, **_k: object) -> object:
+        raise AssertionError("the run started")
+
+    monkeypatch.setattr(failover, "build_corpus", started)
+    ports = FailoverPorts(
+        api_a=1, api_b=2, inbound_adt=3, inbound_results=4, inbound_other=5, sink=6, sink_count=1
+    )
+    with pytest.raises(FailoverError, match="too large"):
+        asyncio.run(failover.run_failover_load(profile, ports=ports, base_env={}))

@@ -86,8 +86,10 @@ _DEAD_PAGE = 500
 #: The most dead copies the per-copy check reads (BACKLOG #5572). Past it the check stays absolute,
 #: so a store carrying more fails a clean run, as every reused store with dead rows did before. Each
 #: page is a PHI-gated read: it spends the rig account's per-actor PHI-read budget (120 a minute by
-#: default) and writes an exposure audit row. A run reads at most three times, so this cap keeps a
-#: run to 30 pages; raising it, or a lower engine budget, turns pages into refusals.
+#: default) and writes an exposure audit row. A run reads the whole set at most four times (the
+#: opening read, once per node if the first is not whole, and once on each side of the final stats
+#: read), so this cap keeps a run to about 40 pages, plus a re-ask of any page that met an expired
+#: session. Raising it, or a lower engine budget, turns pages into refusals.
 _DEAD_COPIES_MAX = 5_000
 
 #: One dead outbound copy, as ``/dead-letters`` names it: ``(outbox_id, failed_at)``. The time is
@@ -445,7 +447,9 @@ class EngineNode:
         try:
             got = await self._read_dead_copies(client)
         except FailoverError as exc:
-            got = f"the rig session was refused ({type(exc).__name__})"
+            # rigadmin's reason, which names no message data: it tells a rate-limited sign-in from
+            # a refused credential.
+            got = f"the rig session was refused: {escape_for_terminal(str(exc), single_line=True)}"
         if isinstance(got, str):
             log.warning("node %s: dead-letter read not whole: %s", self.node_id, got)
             return None
@@ -1230,8 +1234,8 @@ async def _opening_dead_copies(
     (BACKLOG #5572). ``None`` when there are none, when no node gives a whole read, and when the read
     does not match the opening count, so that every excused copy is one the report counts in
     ``dead_opening``; each way the dead-row check stays absolute. A store with no dead rows is never
-    listed."""
-    if opening.dead == 0:
+    listed, and nor is one past :data:`_DEAD_COPIES_MAX`, which no read could cover."""
+    if opening.dead == 0 or opening.dead > _DEAD_COPIES_MAX:
         return None
     for n in nodes:
         copies = await n.dead_copies(client)
@@ -1249,15 +1253,20 @@ async def _final_reads(
     """The final stats read, the harness counters at that moment, and :func:`_judge_new_dead`'s count.
 
     The dead copies are read on both sides of the stats read, so a copy that dies or leaves between
-    them shows as a moved set and judges nothing. The counters are taken straight after the stats
-    read, before the second dead-copy read, so the sink arrivals they count line up with the
-    ``done`` count beside them, as they did before this check existed."""
+    them shows as a moved set and judges nothing. The second read is skipped wherever its answer
+    could not change that, so it spends no PHI-read budget for nothing.
+
+    The counters are taken straight after the stats read, before the second dead-copy read, so the
+    ``sink_received`` that duplicates are counted from lines up with the ``done`` count beside it.
+    The tracker is read later, in :func:`_build_report`, as it was before this check existed: a
+    late arrival there only records a delivery that really happened, or adds an inversion or a lane."""
     before = await survivor.dead_copies(client) if carried else None
     final = await survivor.stats(client)
     if final is None:
         raise FailoverError("could not read the survivor's final /stats for reconciliation")
     snapshot = counters.snapshot()
-    after = await survivor.dead_copies(client) if carried and final.dead else None
+    worth = before is not None and final.dead > 0 and len(before) == final.dead
+    after = await survivor.dead_copies(client) if worth else None
     return final, snapshot, _judge_new_dead(carried, before, after, final.dead)
 
 
@@ -1288,12 +1297,20 @@ def _refuse_non_finite(fo: Failover) -> None:
     The profile's range checks pass NaN, which fails every comparison, and pass infinity wherever a
     knob has no maximum. At least ``recovery_ttl_multiple`` and ``max_dup_rate`` reach here as NaN,
     and ``max_promotion_seconds`` and ``leader_lease_ttl_seconds`` as infinity. Each lands in the
-    JSON report as a threshold, and ``NaN`` and ``Infinity`` are not JSON. The other profile knobs
-    are the profile loader's to check."""
+    JSON report, and ``NaN`` and ``Infinity`` are not JSON. The recovery bound is checked too: two
+    finite knobs can multiply past the float range, so a lease near ``1e308`` would still print
+    ``Infinity``. The other profile knobs are the profile loader's to check."""
     for f in fields(fo):
         value = getattr(fo, f.name)
         if isinstance(value, float) and not math.isfinite(value):
             raise FailoverError(f"[load.failover] {f.name} must be a finite number, not {value}")
+    # 4 x the lease is the monitor's deadline term, the largest multiple of it the run computes.
+    for derived in (fo.recovery_ttl_multiple, 4.0):
+        if not math.isfinite(derived * fo.leader_lease_ttl_seconds):
+            raise FailoverError(
+                "[load.failover] leader_lease_ttl_seconds is too large: a bound computed from it "
+                "is not a finite number"
+            )
 
 
 async def _await_drain(node: EngineNode, client: httpx.AsyncClient, *, timeout: float) -> None:

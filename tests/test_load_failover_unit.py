@@ -429,6 +429,9 @@ def test_build_report_fails_on_ordering_inversion() -> None:
         96,
     ]:  # 96 arrives AFTER 97 on lane d0 → inversion; all 0..97 delivered
         t.on_delivery("d0", seq)
+    for seq in range(98):  # a second, in-order lane, so only the inversion can fail the check
+        t.on_delivery("d1", seq)
+    assert t.lanes_observed == 2 and t.lane_inversions == 1
     assert t.acked_not_delivered() == 0
     rep = _report(tracker=t)
     assert rep.lane_inversions == 1
