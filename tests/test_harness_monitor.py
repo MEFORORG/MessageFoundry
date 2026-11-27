@@ -241,9 +241,11 @@ class _ReauthClient:
     def __init__(self, refuse: bool = False) -> None:
         self.refuse = refuse
         self.passwords: list[str] = []
+        self.purposes: list[str | None] = []
 
-    def reauth(self, password: str) -> None:
+    def reauth(self, password: str, *, purpose: str | None = None) -> None:
         self.passwords.append(password)
+        self.purposes.append(purpose)
         if self.refuse:
             raise ApiError("re-verification failed", status=403)
 
@@ -284,6 +286,8 @@ def test_the_step_up_handler_re_proves_and_restarts_the_poller(
         else:
             assert panel._step_up() is expected
         assert client.passwords == ([answer[0]] if answer[1] and answer[0] else [])
+        # As the client's handler it names no purpose: reauth takes the action the client stashed.
+        assert client.purposes == [None] * len(client.passwords)
         assert len(started) == restarts
     finally:
         panel._client = None

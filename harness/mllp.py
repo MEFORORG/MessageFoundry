@@ -22,7 +22,7 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -136,6 +136,38 @@ def pause_unless_stopped(stop: threading.Event, seconds: float) -> bool:
     return True
 
 
+def paced[T](items: Iterable[T], stop: threading.Event, rate: float) -> Iterator[T]:
+    """Yield ``items`` with a :func:`pause_unless_stopped` of ``1 / rate`` seconds between two of
+    them (none for a ``rate`` of 0 or less), and end as soon as it sees ``stop`` set. It looks
+    before and after each draw and throughout each pause, but cannot see into the caller's work.
+
+    The pause is a gap after the caller's work on an item, not a schedule, so a slow send makes
+    the batch run below ``rate``. It goes before every item but the first, never after the last:
+    a pause after the last would hold the batch open a whole pause with nothing left to send,
+    10 seconds at the tabs' lowest rate of 0.1 a second (BACKLOG #5855, #5856). The next item is
+    drawn before the pause, because a lazy ``items`` only tells there is none left once it is
+    asked for one; so a stop while that item is drawn, or during the pause, drops it unyielded,
+    as it does every item after it. A stop set before then, during the caller's work, ends the
+    batch before the next item is drawn, so a lazy ``items`` is not asked for one the batch will
+    never send."""
+    delay = 1.0 / rate if rate > 0 else 0.0
+    iterator = iter(items)
+    first = True
+    while not stop.is_set():
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return
+        # Drawing a lazy item can take a while, and there may be no pause after it to see a stop
+        # set meanwhile: none before the first item, and none at all at a rate of 0.
+        if stop.is_set():
+            return
+        if not first and delay and pause_unless_stopped(stop, delay):
+            return
+        first = False
+        yield item
+
+
 def _socket_error(code: int) -> OSError:
     """The OSError for a failed dial's ``code``. On Windows the ``winerror`` argument picks the
     subclass a blocking connect raises, such as ``ConnectionRefusedError`` for 10061, and the text
@@ -208,13 +240,8 @@ class SendWorker(QObject):
         # The items may be generated lazily on this thread, so a generator fault ends the batch
         # here; finished is emitted whatever happens, or the tab would wait on it for good.
         try:
-            delay = 1.0 / self._rate if self._rate > 0 else 0.0
-            for item in self._items:
-                if self._stop.is_set():
-                    break
+            for item in paced(self._items, self._stop, self._rate):
                 self.result.emit(self._send_one(item))
-                if delay and pause_unless_stopped(self._stop, delay):
-                    break
         except Exception as exc:  # noqa: BLE001 -- any fault ends the batch; the tab must hear why
             log.exception("harness send batch ended early")
             self.failure = f"{type(exc).__name__}: {exc}"

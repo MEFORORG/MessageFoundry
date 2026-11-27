@@ -87,3 +87,58 @@ def test_a_declined_step_up_leaves_no_purpose_for_the_next_reauth() -> None:
     finally:
         client.close()
     assert bodies == [{"password": "pw"}], "the declined action rode along as the purpose"
+
+
+@pytest.mark.parametrize(
+    ("headers", "action"),
+    [
+        ({"X-Step-Up-Required": "1", "X-Step-Up-Action": "purge"}, "purge"),
+        ({"X-Step-Up-Required": "1"}, None),
+        ({"X-Step-Up-Required": "1", "X-Step-Up-Action": ""}, None),
+    ],
+    ids=["per-action", "session-window", "empty-action"],
+)
+def test_step_up_required_names_the_action_the_refusal_named(
+    headers: dict[str, str], action: str | None
+) -> None:
+    """A per-action gate (ADR 0077) mints its grant only for a re-proof that names the action, and
+    a handler-less client stashes nothing, so the refusal itself must carry it."""
+    client = _refusing(headers, [])
+    try:
+        with pytest.raises(StepUpRequired) as raised:
+            client.search_messages(content="x")
+    finally:
+        client.close()
+    assert raised.value.action == action
+
+
+def test_an_empty_action_posts_no_purpose_through_the_handler() -> None:
+    """The handler path normalizes an empty X-Step-Up-Action the same way: as a purpose an empty
+    string would win over none and be refused."""
+    bodies: list[dict[str, object]] = []
+    client = _refusing({"X-Step-Up-Required": "1", "X-Step-Up-Action": ""}, bodies)
+
+    def prove() -> bool:
+        client.reauth("pw")
+        return True
+
+    client.set_step_up_handler(prove)
+    try:
+        with pytest.raises(StepUpRequired):  # the fake refuses the retry too
+            client.search_messages(content="x")
+    finally:
+        client.set_step_up_handler(None)
+        client.close()
+    assert bodies == [{"password": "pw"}]
+
+
+def test_a_declined_handler_still_names_the_action() -> None:
+    """The handler declined, so the caller sees the refusal and may re-prove for it later."""
+    client = _refusing({"X-Step-Up-Required": "1", "X-Step-Up-Action": "purge"}, [])
+    client.set_step_up_handler(lambda: False)
+    try:
+        with pytest.raises(StepUpRequired) as raised:
+            client.search_messages(content="x")
+    finally:
+        client.close()
+    assert raised.value.action == "purge"

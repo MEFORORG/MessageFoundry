@@ -10,6 +10,7 @@ the GUI thread and resubmits the search once.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from types import SimpleNamespace
@@ -19,7 +20,11 @@ import pytest
 
 pytest.importorskip("PySide6")
 
-from harness._console_widgets import MessagesPanel  # noqa: E402
+from harness._console_widgets import (  # noqa: E402
+    MessagesPanel,
+    _MessagesSnapshot,
+    _StepUpRefusal,
+)
 from messagefoundry.apiclient import ApiError, IdpStepUpRequired, StepUpRequired  # noqa: E402
 
 
@@ -67,10 +72,12 @@ class _StepUp:
         self.answer = answer
         self.calls = 0
         self.threads: list[threading.Thread] = []
+        self.actions: list[str | None] = []
 
-    def __call__(self) -> bool:
+    def __call__(self, action: str | None) -> bool:
         self.calls += 1
         self.threads.append(threading.current_thread())
+        self.actions.append(action)
         return self.answer
 
 
@@ -112,6 +119,24 @@ def test_a_refused_search_steps_up_on_the_gui_thread_and_resubmits(qapp: Any) ->
         panel.stop()
 
 
+@pytest.mark.parametrize("action", ["message_search", None], ids=["per-action", "session-window"])
+def test_the_step_up_re_proves_for_the_action_the_refusal_named(
+    qapp: Any, action: str | None
+) -> None:
+    """A per-action gate (ADR 0077) mints its grant only for a re-proof naming its action, and the
+    polling client stashed nothing, so the panel passes the refusal's own action on."""
+    client = _SearchClient(refusals=1, error=StepUpRequired("refused", status=403, action=action))
+    step_up = _StepUp(True)
+    panel, errors = _search(qapp, client, step_up)
+    try:
+        _settle(qapp, panel, client, 2)
+        assert step_up.actions == [action]
+        assert client.searches == 2
+        assert errors == []
+    finally:
+        panel.stop()
+
+
 def test_a_second_refusal_is_reported_not_prompted_again(qapp: Any) -> None:
     client = _SearchClient(refusals=5)
     step_up = _StepUp(True)
@@ -145,7 +170,7 @@ def test_a_refresh_during_the_prompt_neither_searches_nor_prompts_again(qapp: An
     panel_box: list[MessagesPanel] = []
     calls: list[int] = []
 
-    def decline_after_a_refresh() -> bool:
+    def decline_after_a_refresh(_action: str | None) -> bool:
         calls.append(client.searches)
         panel_box[0].refresh(autosize=True)
         return False
@@ -158,6 +183,57 @@ def test_a_refresh_during_the_prompt_neither_searches_nor_prompts_again(qapp: An
         assert calls == [1]
         assert client.searches == 1
         assert errors == ["step-up required"]
+    finally:
+        panel.stop()
+
+
+def test_a_prompt_fault_is_reported_and_a_refresh_latched_meanwhile_still_runs(
+    qapp: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A prompt raising something other than ApiError used to escape the result slot: nothing was
+    # reported, and a refresh latched while the prompt was up was never run.
+    caplog.set_level(logging.DEBUG, logger="harness._console_widgets")
+    client = _SearchClient(refusals=1)
+    panel_box: list[MessagesPanel] = []
+
+    def latch_a_refresh_then_break(_action: str | None) -> bool:
+        panel_box[0].refresh(autosize=True)
+        raise RuntimeError("the poller would not restart")
+
+    panel, errors = _search(qapp, client, None)
+    panel_box.append(panel)
+    panel._step_up = latch_a_refresh_then_break
+    try:
+        _settle(qapp, panel, client, 2)
+        assert errors == ["the poller would not restart"]
+        assert client.searches == 2  # the latched refresh, run once the fault was reported
+        assert panel._table.rowCount() == 1
+        assert not panel._loading
+        assert panel._pending is None
+        logged = [r.getMessage() for r in caplog.records if r.name == "harness._console_widgets"]
+        assert logged == ["message search step-up prompt raised RuntimeError"]
+    finally:
+        panel.stop()
+        panel_box.clear()
+
+
+class _Interrupt(BaseException):
+    pass
+
+
+def test_a_prompt_that_raises_a_base_exception_still_clears_the_in_flight_guard(qapp: Any) -> None:
+    # Not reported (it is no Exception, so it propagates), but the panel must not wedge with
+    # _loading set, which would latch every later refresh forever.
+    def interrupted(_action: str | None) -> bool:
+        raise _Interrupt
+
+    panel = MessagesPanel(_SearchClient(refusals=0), step_up=interrupted)  # type: ignore[arg-type]
+    try:
+        panel._loading = True
+        refused = _MessagesSnapshot(None, "", False, "refused", refusal=_StepUpRefusal(None))
+        with pytest.raises(_Interrupt):
+            panel._apply(refused)
+        assert not panel._loading
     finally:
         panel.stop()
 
@@ -190,7 +266,7 @@ def test_a_403_that_is_not_a_step_up_is_not_answered_with_a_password_prompt(qapp
 def test_a_refused_re_proof_reports_its_own_cause(qapp: Any) -> None:
     client = _SearchClient(refusals=1)
 
-    def refuse() -> bool:
+    def refuse(_action: str | None) -> bool:
         raise ApiError("re-verification failed", status=401)
 
     panel, errors = _search(qapp, client, None)
