@@ -475,6 +475,7 @@ from messagefoundry.pipeline.alert_sinks import (
 )
 from messagefoundry.pipeline.alerts import (
     STORE_RESTORED_SUBJECT,
+    UNREACHED_ROLLUP_SOURCE,
     AlertSink,
     LoggingAlertSink,
     administrator_granted_alert,
@@ -12601,6 +12602,9 @@ _SESSION_REAP_FIRST_DELAY = 300.0
 # maximum slew rate is about 300 s an hour). Each pass that runs also purges as of this much before
 # its own reading, so a step under it cannot delete a row the validator would still accept.
 _SESSION_REAP_STEP_TOLERANCE = 600.0
+# How long the step after a purge (the re-proof count drop, BACKLOG #5336) may run before the reaper
+# stops it, so a re-proof holding an account's lock cannot delay the next purge past this.
+_SESSION_REAP_AFTER_PURGE_TIMEOUT = 300.0
 
 
 async def _session_reaper(
@@ -12610,6 +12614,7 @@ async def _session_reaper(
     lineage_seconds: float | None = None,
     wall: Callable[[], float] | None = None,
     mono: Callable[[], float] | None = None,
+    after_purge: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Drop expired session rows, first ``_SESSION_REAP_FIRST_DELAY`` after start and then every
     ``_SESSION_REAP_INTERVAL``, until the task is cancelled. With ``idle_seconds`` given,
@@ -12656,6 +12661,13 @@ async def _session_reaper(
     ``wall`` and ``mono`` default to ``time.time`` and ``time.monotonic``, read at each pass rather
     than bound at import, so a test that patches ``time`` reaches the reaper too.
 
+    ``after_purge``, when given, runs after each purge that committed. The lifespan passes
+    :meth:`AuthService.drop_reaped_reproof_counts`, which drops the re-proof counts of the
+    sessions the store shows as revoked or holds no row for, for each account it reaches; its
+    docstring says which it may not (BACKLOG #5336). It does not run after a skipped or failed
+    pass, and it is stopped after ``_SESSION_REAP_AFTER_PURGE_TIMEOUT``, so the next purge is
+    delayed by at most that much.
+
     A transient store error must not kill the reaper for the process lifetime (it would let the
     sessions table grow unbounded, and its stored exception could later abort lifespan shutdown) —
     log and retry next interval (review M-33)."""
@@ -12692,6 +12704,24 @@ async def _session_reaper(
             raise
         except Exception:
             _log.exception("session reaper: purge failed; will retry next interval")
+            continue
+        if after_purge is None:
+            continue
+        try:
+            async with asyncio.timeout(_SESSION_REAP_AFTER_PURGE_TIMEOUT):
+                await after_purge()
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            _log.warning(
+                "session reaper: the step after the purge ran past %.0fs and was stopped; will "
+                "retry next interval",
+                _SESSION_REAP_AFTER_PURGE_TIMEOUT,
+            )
+        except Exception:
+            _log.exception(
+                "session reaper: the step after the purge failed; will retry next interval"
+            )
 
 
 async def _directory_reconciler(
@@ -12803,15 +12833,27 @@ _UNREACHED_ALERT_TEXT: Final[str] = (
     "probes, faults aside, failed to reach the directory. Check its entry, and any outage, "
     "referral or configuration alert."
 )
+#: The source label prefix of a rollup's instance (BACKLOG #3100 item 14). Each rollup is keyed by
+#: the accounts it covers (``ReconcilePlan.unreached_rollup``), never by one shared label: the
+#: notifier keys its cooldown and an operator's suspend by type and source, so under one label the
+#: last rollup's cooldown, or a suspend of any rollup, silenced every later rollup, and with it each
+#: account entering then, which no other page names. Keyed by the account set, a cooldown or
+#: suspend reaches only a later rollup of exactly those accounts, as a per-account one reaches only
+#: that account, so each rollup is resolved or suspended on its own; the outage page covers a whole
+#: directory. A later rollup of a different set pages, even one holding accounts paged before, such
+#: as those of several rollups re-entering together after a restart, as a per-account page does
+#: after one. An INFO line logs the key with the pass's count. Not under
+#: ``directory-reconciler-unreached:``, where a username could spell the label.
+_UNREACHED_ROLLUP_SOURCE = UNREACHED_ROLLUP_SOURCE
 #: What one page for many such accounts says, on a pass that rolls them up
 #: (``AuthService._record_unreached_accounts`` decides when), so a flapping directory opens one
-#: instance rather than one per signed-in account. It counts only the accounts entering on its
-#: pass, and says so: a later rollup updates the same open instance's text, so a count that read
-#: as a total would be replaced by a smaller one while more accounts stood (BACKLOG #3709). No
-#: process can say how many stand: each counts its own, and the instance is shared. ``probes``
-#: is the fewest failures among those entering, of up to each one's last ``window`` probes (its
-#: window can hold fewer, and a probe fault adds nothing to it, hence "faults aside"), counted in
-#: probes, not passes, which differ under a probe budget smaller than the estate.
+#: instance per set of accounts entering together rather than one per account. It counts only
+#: the accounts entering on its pass, and says so: no process can say how many stand, since each
+#: counts its own, and a later rollup of the same accounts updates the same open instance's text
+#: (BACKLOG #3709). ``probes`` is the fewest failures among those entering, of up to each one's
+#: last ``window`` probes (its window can hold fewer, and a probe fault adds nothing to it, hence
+#: "faults aside"), counted in probes, not passes, which differ under a probe budget smaller than
+#: the estate.
 _UNREACHED_ROLLUP_TEXT: Final[str] = (
     "Accounts newly unreachable: {entering}. Their sessions are not revoked; each failed {probes}+ "
     "of up to its last {window} probes, faults aside. Check the directory. "
@@ -13029,11 +13071,12 @@ def _alert_unreached_accounts(plan: ReconcilePlan, sink: AlertSink) -> None:
     enters). That many of up to its last ``plan.unreached_window`` probes failed to reach the
     directory, so the reconciler has neither struck nor revoked it. Once per entry, like a paging
     refusal, and with no inverse: an operator resolves it. The account name is in the source
-    only, as for a paging refusal. On a rolled-up pass (``plan.unreached_rollup``), one page under
-    the bare source covers those entering, naming none, and counting only them."""
+    only, as for a paging refusal. On a rolled-up pass (``plan.unreached_rollup``), one page covers
+    those entering, naming none and counting only them, under a source keyed by those accounts
+    (:data:`_UNREACHED_ROLLUP_SOURCE` says why)."""
     if plan.unreached_rollup:
         sink.ad_reconcile_aborted(
-            _UNREACHED_ALERT_SOURCE,
+            f"{_UNREACHED_ROLLUP_SOURCE}:{plan.unreached_rollup}",
             reason=UNREACHED_ACCOUNT,
             probed=plan.asked,
             detail=_UNREACHED_ROLLUP_TEXT.format(
@@ -14406,6 +14449,7 @@ def create_managed_app(
                         store,
                         idle_seconds=auth.session_idle_seconds,
                         lineage_seconds=auth.supersession_lineage_seconds,
+                        after_purge=auth.drop_reaped_reproof_counts,
                     )
                 )
                 if _initial_credential_warn_lead(auth) is not None:

@@ -2299,6 +2299,47 @@ def test_windows_an_unknown_drive_type_is_unreadable(monkeypatch: pytest.MonkeyP
 
 
 @windows_only
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "\\\\?\\{real}\\x\\..\\store.key",  # verbatim: the open reads the ``..`` as a name
+        "\\\\.\\{drive}\\..\\UNC\\host\\share\\store.key",  # Win32 climbs out onto a share
+    ],
+)
+def test_windows_a_device_spelling_the_walk_refuses_is_refused_before_abspath(
+    tmp_path: Path, spelling: str
+) -> None:
+    """``os.path.abspath`` collapsed ``..`` before the walk saw the text: a verbatim
+    ``\\\\?\\C:\\x\\..\\k`` was walked as ``C:\\k``, which the open never reads, and
+    ``\\\\.\\C:\\..\\UNC\\h\\s\\k`` as the local ``C:\\UNC\\h\\s``, where Win32 opens the share.
+    The walk's own rule for a device prefix (vault BACKLOG #5515) now reads the text as written.
+    The first spelling's control is the same key named plainly, which passes."""
+    real = tmp_path / "real"
+    real.mkdir()
+    key = real / "store.key"
+    write_restricted_file(key, b"KEY-MATERIAL-STAND-IN")
+    host = _host_judging_only_under(tmp_path)
+    surroundings = restricted_file._windows_surroundings_problem
+    assert surroundings(key, host) is None  # the control
+    path = Path(spelling.format(real=real, drive=tmp_path.drive))
+    problem = surroundings(path, host)
+    assert problem is not None and "device path" in problem
+
+
+@windows_only
+@pytest.mark.parametrize("prefix", ["\\\\?\\", "\\\\.\\"])
+def test_windows_a_plain_device_spelling_is_still_walked(tmp_path: Path, prefix: str) -> None:
+    """The control for the test above: a device prefix naming the same object as its plain
+    spelling is walked as before."""
+    real = tmp_path / "real"
+    real.mkdir()
+    key = real / "store.key"
+    write_restricted_file(key, b"KEY-MATERIAL-STAND-IN")
+    host = _host_judging_only_under(tmp_path)
+    assert restricted_file._windows_surroundings_problem(Path(prefix + str(key)), host) is None
+
+
+@windows_only
 def test_windows_a_volume_the_host_cannot_judge_is_judged_as_before(tmp_path: Path) -> None:
     """The walk asked ``host.volume_cause``, which refuses a volume whose file system is neither
     NTFS nor ReFS, such as CSVFS or FAT, or cannot be read, so a key file on such a volume that the

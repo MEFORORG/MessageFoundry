@@ -5019,6 +5019,13 @@ async def test_alert_generation_bounds_the_resolve_pg(store) -> None:
     await check_fenced_resolve_contract(store)
 
 
+async def test_suspended_until_after_reads_only_open_suspends_pg(store) -> None:
+    """Vault BACKLOG #3100 item 14: the suspend prime's filter, its ``$n`` numbering included."""
+    from tests.test_alert_state import _assert_suspended_until_after_reads_only_open_suspends
+
+    await _assert_suspended_until_after_reads_only_open_suspends(store)
+
+
 async def test_alert_instance_lifecycle_pg(store) -> None:
     from messagefoundry.store.store import AlertSummary
 

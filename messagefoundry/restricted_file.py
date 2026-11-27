@@ -63,6 +63,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final
 
 from messagefoundry.auth.anchor_path import (
+    _DEVICE_PATH,
     _GRANTING_ACE_TYPES,
     _SHARED_SERVICE_SIDS,
     ACCESS_ALLOWED_ACE_TYPE,
@@ -78,6 +79,8 @@ from messagefoundry.auth.anchor_path import (
     WinHost,
     WinSecurity,
     WinTrust,
+    _drive_relative,
+    _strip_win_prefix,
     _win_probe,
     describe_sid,
     evaluate_windows_object,
@@ -837,6 +840,15 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     a link. ``host`` holds the readers."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise OSError("the folders on a Windows path are walked on Windows only")
+    # abspath collapses ``.`` and ``..`` the open may read otherwise: as names after a verbatim
+    # prefix, or, after a ``\\.\`` one, as climbing out of the drive. So a device prefix is judged
+    # as written, by the walk's own rule (vault BACKLOG #5515), before abspath runs. A spelling that
+    # passes is walked as before.
+    text = os.fspath(path)
+    if text[:4].replace("/", "\\") in ("\\\\.\\", "\\\\?\\", "\\??\\"):
+        plain = _strip_win_prefix(text)
+        if plain is None or _drive_relative(plain):
+            return _windows_cause_problem(WalkCause.plain(_DEVICE_PATH))
     try:
         full = Path(os.path.abspath(path))
     except OSError as exc:  # the working directory

@@ -149,6 +149,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.intake_bound import process_alert_subject, shorten_with_checksum
 from messagefoundry.pki import (
+    OWN_CRL_CHAIN_HOPS,
     CrlBlock,
     CrlFacts,
     CrlIssuerKey,
@@ -903,7 +904,7 @@ def _load(
     reloaded = timed = 0
     signatures: dict[frozenset[bytes], CrlSignatureFinding | None] = {}
     # Why the own-CRL rule refuses, if it does, per CA list and per wording (vault BACKLOG #5511).
-    unowned: dict[tuple[frozenset[bytes], bool], str | None] = {}
+    unowned: dict[tuple[frozenset[bytes], str | bool | None], str | None] = {}
     for ctx, held, held_back in ready:
         if held_back is not None:
             # :data:`_RANK` picks the refusal reported, whatever the order: order only breaks a
@@ -934,9 +935,21 @@ def _load(
                 # Vault BACKLOG #5627: the rule a start applies to a hop checking the whole chain,
                 # so a CRL OpenSSL may judge a CA's clients by, and that CA did not sign, never
                 # loads live.
-                key = (anchors, held.setting == OUTBOUND_CRL_SETTING)
+                # Keyed by the wording: a hop in pki.OWN_CRL_CHAIN_HOPS gets its own, and the
+                # rest only outbound or not, so listeners sharing one CA list judge it once.
+                wording = (
+                    held.setting
+                    if held.setting in OWN_CRL_CHAIN_HOPS
+                    else held.setting == OUTBOUND_CRL_SETTING
+                )
+                key = (anchors, wording)
                 if key not in unowned:
-                    unowned[key] = own_crl_reason(anchors, pem, outbound=key[1])
+                    unowned[key] = own_crl_reason(
+                        anchors,
+                        pem,
+                        outbound=held.setting == OUTBOUND_CRL_SETTING,
+                        setting=held.setting,
+                    )
                 if (unowned_why := unowned[key]) is not None:
                     refusals.add(f"{label}: {unowned_why}", FIX)
                     continue

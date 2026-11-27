@@ -178,13 +178,19 @@ def _why(exc: BaseException) -> str:
     # characters are stripped from every one of these texts all the same.
     #
     # A hop refusal keeps its text only when it is exactly the Vault hop's marked one, built from
-    # fixed text (BACKLOG #3471), as `vault_failure_text` reads it. Any other `InsecureHopRefused`
-    # falls through to its type name: the base type promises no fixed text. `_ad_why` gives the
-    # LDAPS guard's a fixed text for the AD probe, read from nothing in it.
+    # fixed text (BACKLOG #3471), as `vault_failure_text` reads it, or when it is also one of the
+    # fail-closed types. Any other `InsecureHopRefused` falls through to its type name: the base
+    # type promises no fixed text.
+    # `_ad_why` gives the LDAPS guard's a fixed text for the AD probe, read from nothing in it.
+    #
+    # Each text is read by `_own_text`, which runs none of the error's code (vault BACKLOG #8163
+    # items 5 and 6): a `__str__` of the class's own could raise out of the probe's handler or
+    # print a byte, and one that holds a codec error would print its byte. Those name the type.
+    name = type(exc).__name__
     fail_closed = (KeyProviderError, SecretProviderError, LdapError)
     if isinstance(exc, fail_closed) or is_vault_hop_refusal(exc):
-        return strip_control_chars(str(exc))
-    name = type(exc).__name__
+        text = _own_text(exc)
+        return name if text is None else text
     if _is_forbidden(exc):
         return f"permission denied ({name})"
     # Exactly ValueError, not a subclass: the probe's own shape refusals and the TLS-suite
@@ -195,8 +201,20 @@ def _why(exc: BaseException) -> str:
     # as int() raises inside engine code, nor engine code that copies a library's text. An
     # exception never raised has no frame, and keeps its type name alone.
     if type(exc) is ValueError and raised_by_the_engine(exc):
-        return f"{name}: {strip_control_chars(str(exc))[:200]}"
+        text = _own_text(exc)
+        return name if text is None else f"{name}: {text[:200]}"
     return name
+
+
+def _own_text(exc: BaseException) -> str | None:
+    """``exc``'s text with control characters stripped, read with
+    :func:`~messagefoundry.redaction.own_message`, or ``None`` where that gives none. A codec
+    error, or an error whose one argument is one, gives none there, since its argument is no
+    ``str``."""
+    from messagefoundry.redaction import own_message
+
+    text = own_message(exc)
+    return None if text is None else strip_control_chars(text)
 
 
 def _ad_why(exc: BaseException) -> str:
@@ -212,18 +230,19 @@ def _ad_why(exc: BaseException) -> str:
     ``InsecureHopRefused``, whatever its subclass.
 
     The test is an ``InsecureHopRefused`` whose traceback passes through
-    ``auth.ldap._refuse_ad_revocation`` (:func:`raised_through`). So it accepts one raised by
-    anything that function calls, the guard and the TLS context factory included, not only the
-    guard's own. Any other ``InsecureHopRefused`` on this probe, at least one from resolving a
-    Vault-held bind password, takes :func:`_why`'s rule, as on the Vault probe (BACKLOG #3471,
-    #4883)."""
-    from messagefoundry.auth.ldap import _refuse_ad_revocation
+    ``auth.ldap._enforce_ad_revocation_guard`` (:func:`raised_through`), the guard's own call,
+    which ``_refuse_ad_revocation`` makes after it has read the TLS context. So it accepts one
+    raised by the guard's capture or its enforcement, or by what they call, and not one from the
+    TLS context factory (vault BACKLOG #8163 item 2). Any other ``InsecureHopRefused`` on this
+    probe, at least one from resolving a Vault-held bind password, takes :func:`_why`'s rule, as on
+    the Vault probe (BACKLOG #3471, #4883)."""
+    from messagefoundry.auth.ldap import _enforce_ad_revocation_guard
     from messagefoundry.config.tls_policy import InsecureHopRefused
 
     if not issubclass(type(exc), InsecureHopRefused):
         return _why(exc)
     try:
-        through_the_guard = raised_through(exc, _refuse_ad_revocation.__code__)
+        through_the_guard = raised_through(exc, _enforce_ad_revocation_guard.__code__)
     except Exception:  # noqa: BLE001 -- a traceback that cannot be read is not the guard's
         logger.warning("AD probe: a hop refusal's traceback could not be read; named by its type")
         return "InsecureHopRefused"

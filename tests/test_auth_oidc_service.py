@@ -349,9 +349,16 @@ async def test_service_threads_enforcement_dial_and_pin_to_the_oidc_anchor(
         pin: str | None = None,
         enforcing: bool = True,
         crl_file: str | None = None,
+        crl_check_chain: bool = False,
     ) -> urllib.request.OpenerDirector:
         calls.append(
-            {"ca": ca_cert_file, "pin": pin, "enforcing": enforcing, "crl": crl_file},
+            {
+                "ca": ca_cert_file,
+                "pin": pin,
+                "enforcing": enforcing,
+                "crl": crl_file,
+                "chain": crl_check_chain,
+            },
         )
         return urllib.request.build_opener()
 
@@ -365,6 +372,7 @@ async def test_service_threads_enforcement_dial_and_pin_to_the_oidc_anchor(
         oidc_tls_ca_cert_file="C:/anchors/idp-ca.pem",
         oidc_tls_ca_cert_pin="ab" * 32,
         oidc_tls_crl_file=str(crl),
+        oidc_tls_crl_check_chain=True,
     )
     for enforcing in (False, True):
         store = await MessageStore.open(":memory:")
@@ -378,6 +386,8 @@ async def test_service_threads_enforcement_dial_and_pin_to_the_oidc_anchor(
     # BACKLOG #299: the CRL path is threaded on the same seam. Asserted here rather than only at
     # build_idp_opener, because a setting that never reaches the builder is a knob that does nothing.
     assert all(c["crl"] == str(crl) for c in calls)
+    # Vault BACKLOG #5511: and so is the opt-in whole-chain check, for the same reason.
+    assert all(c["chain"] is True for c in calls)
 
 
 # --- AC-2: roles come from LDAP, never from a token claim -------------------------------------------

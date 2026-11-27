@@ -13,6 +13,7 @@ import pytest
 
 from messagefoundry.config.settings import AlertRule, AlertsSettings, load_settings
 from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.pipeline import alert_sinks
 from messagefoundry.pipeline.alert_sinks import (
     _DRAIN_CANCEL_GRACE_SECONDS,
     EmailTransport,
@@ -22,6 +23,8 @@ from messagefoundry.pipeline.alert_sinks import (
     notifier_from_settings,
 )
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.store.store import MessageStore
+from tests._store_audit import ALERT_AUDIT
 
 #: The [alerts] revocation guards count no posture as enforcing (ADR 0173 section 12), so an
 #: off-box hop built here to test something else is built on a warn posture.
@@ -775,3 +778,109 @@ def test_webhook_ordinary_url_still_constructs() -> None:
         WebhookTransport("https://hooks.example/x", timeout=5.0, posture=_NOT_ENFORCING).name
         == "webhook"
     )
+
+
+# --- vault BACKLOG #3100 item 14, finding 2 of the Lander's hold on PR 3350 -------------------
+
+#: A rollup's source prefix, spelled out here so a change to the shipped label shows as a red.
+_ROLLUP = "directory-reconciler-unreached-rollup"
+
+
+class _Clock:
+    """Stands in for the sink module's ``time``, so a test steps the cooldown clock by hand."""
+
+    def __init__(self) -> None:
+        self.mono = 1000.0
+        self.wall = 1_800_000_000.0
+
+    def monotonic(self) -> float:
+        return self.mono
+
+    def time(self) -> float:
+        return self.wall
+
+
+def _page(sink: NotifierAlertSink, source: str) -> None:
+    sink.ad_reconcile_aborted(source, reason="account_unreachable", probed=9, detail="synthetic")
+
+
+def _kept(entries: dict[str, Any], prefix: str) -> int:
+    return sum(1 for key in entries if key.startswith(f"ad_reconcile_aborted:{prefix}:"))
+
+
+def test_rollup_state_is_kept_for_the_most_recent_rollups_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #3100 item 14. Each rollup of unreachable accounts is its own instance, keyed
+    by its accounts, and none has an inverse, so on a flapping directory the notifier's cooldown
+    and occurrence entries grew with every distinct set. They are now kept for the most recently
+    emitted rollups only, a fixed number (3 here). Within that number nothing changes: a rollup
+    inside its cooldown is still throttled, and its count still builds across a quiet spell far
+    longer than the cooldown, so its escalation does too. A per-account source keeps its entries
+    as before.
+
+    RED when: the notifier keeps an entry for every rollup it ever paged."""
+    clock = _Clock()
+    monkeypatch.setattr(alert_sinks, "time", clock)
+    monkeypatch.setattr(alert_sinks, "_ROLLUP_KEYS_KEPT", 3, raising=False)
+    sink = NotifierAlertSink([], realert_seconds=300.0)
+    for i in range(50):
+        _page(sink, f"{_ROLLUP}:{i:016x}")
+        clock.mono += 1.0
+    assert _kept(sink._last_sent, _ROLLUP) <= 3, "a cooldown entry was kept for every rollup"
+    assert _kept(sink._occurrences, _ROLLUP) <= 3, "a count was kept for every rollup"
+    # The control: a rollup among those kept is still throttled inside its cooldown, and counted.
+    same = f"{_ROLLUP}:{'a' * 16}"
+    _page(sink, same)
+    queued = sink._queue.qsize()
+    _page(sink, f"{_ROLLUP}:{'b' * 16}")
+    clock.mono += 299.0
+    _page(sink, same)
+    assert sink._queue.qsize() == queued + 1, "a rollup inside its cooldown paged again"
+    clock.mono += 10_000.0  # quiet far past its cooldown: its count still builds
+    _page(sink, same)
+    assert sink._occurrences[f"ad_reconcile_aborted:{same}"] == 3
+    # A per-account source is untouched: each keeps its cooldown and count.
+    unreached = "directory-reconciler-unreached"
+    for i in range(20):
+        _page(sink, f"{unreached}:user{i}")
+        clock.mono += 301.0
+    _page(sink, f"{_ROLLUP}:{'c' * 16}")
+    assert _kept(sink._last_sent, unreached) == 20
+    assert _kept(sink._occurrences, unreached) == 20
+
+
+async def test_a_suspended_rollup_survives_the_suspend_prime_read_cap() -> None:
+    """Vault BACKLOG #3100 item 14. At startup the notifier seeds its suspend cache from the
+    store, and read only the newest 1000 live instances. Rollup instances have no inverse, so on
+    a flapping directory more than 1000 can stand, and an operator's suspend of an older one was
+    not seeded: once the same accounts rolled up again after a restart, the suspended rollup
+    paged. The prime now reads only the live instances whose suspend window is still open.
+
+    RED when: a suspended instance older than 1000 newer live ones is not seeded."""
+    store = await MessageStore.open(":memory:")
+    try:
+        base = time.time() - 10_000
+        await store.upsert_alert_instance(
+            event_type="ad_reconcile_aborted",
+            connection=f"{_ROLLUP}:{'0' * 16}",
+            severity="error",
+            now=base,
+        )
+        [old] = await store.list_active_alert_instances(allowed_channels=None)
+        until = time.time() + 3600
+        assert await store.suspend_alert_instance(old.id, until=until, audit=ALERT_AUDIT)
+        for i in range(1, 1002):
+            await store.upsert_alert_instance(
+                event_type="ad_reconcile_aborted",
+                connection=f"{_ROLLUP}:{i:016x}",
+                severity="error",
+                now=base + i,
+            )
+        sink = NotifierAlertSink([], store=store)
+        await sink.prime_suspensions()
+        key = f"ad_reconcile_aborted:{_ROLLUP}:{'0' * 16}"
+        assert sink._suspended.get(key) == until, "the operator's suspend was lost past the cap"
+        assert len(sink._suspended) == 1
+    finally:
+        await store.close()

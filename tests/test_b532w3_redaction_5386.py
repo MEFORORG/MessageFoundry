@@ -426,6 +426,15 @@ _MEMBER_SHAPES: tuple[tuple[str, Callable[[int], str]], ...] = (
     ("member keys", lambda n: (";pwd=a'b" * n)[:n]),
 )
 
+#: The first member's starts, each run out to a ";" (BACKLOG #5030 added item 4), a key glued after
+#: a non-ASCII letter among them.
+_FIRST_MEMBER_SHAPES: tuple[tuple[str, Callable[[int], str]], ...] = (
+    ("first-member starts", lambda n: ("x pass=1 " * n)[:n] + ";"),
+    ("non-ASCII glued starts", lambda n: ("\u00e9pass=a " * n)[:n] + ";"),
+    ("qualified starts", lambda n: (" secretvalue=" * n)[:n] + ";x="),
+    ("one long key", lambda n: " " + "pass" * (n // 4) + ";"),
+)
+
 
 def test_the_dsn_and_member_patterns_grow_linearly_and_the_control_does_not() -> None:
     """One test, so the control cannot be deselected apart from the shapes it vouches for."""
@@ -439,6 +448,7 @@ def test_the_dsn_and_member_patterns_grow_linearly_and_the_control_does_not() ->
     for pattern, shapes in (
         (scrub_mod._WIDE_DSN_PASSWORD, _SHAPES),
         (scrub_mod._CONNECTION_STRING_MEMBER, _MEMBER_SHAPES),
+        (scrub_mod._CONNECTION_STRING_FIRST_MEMBER, _FIRST_MEMBER_SHAPES),
     ):
         for label, shape in shapes:
             _assert_linear(label, functools.partial(pattern.sub, "x"), shape)

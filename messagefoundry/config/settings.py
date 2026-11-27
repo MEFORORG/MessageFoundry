@@ -837,11 +837,13 @@ class StoreSettings(_Section):
     # + the response/payload bodies; its error/last_error/detail stay plaintext — see sqlserver.py.)
     # Secret — supply via MEFOR_STORE_ENCRYPTION_KEY, never the file.
     # Empty = off (values stored as-is).
-    encryption_key: str | None = None
+    # Out of the repr (vault BACKLOG #8163 item 21): a frame on a store refusal's traceback holds
+    # `settings`, so a renderer that prints locals would print the key. Reads are unchanged.
+    encryption_key: str | None = Field(default=None, repr=False)
     # Comma-separated base64 RETIRED keys, kept available for *decrypt only* during a key rotation
     # (ASVS 11.2.2) until `messagefoundry rotate-key` finishes re-encrypting under the active key.
-    # Secret — env-only (MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). Empty = none.
-    encryption_keys_retired: str = ""
+    # Secret — env-only (MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). Empty = none. Out of the repr too.
+    encryption_keys_retired: str = Field(default="", repr=False)
     # When true, `serve` refuses to start without an encryption key even when the audited opt-out
     # below is set. Off by default. See docs/PHI.md §3.
     require_encryption: bool = False
@@ -3831,6 +3833,11 @@ class AuthSettings(_Section):
     # nextUpdate at start and at every bind. With it unset, an off-box LDAPS bind on an enforcing
     # instance is refused when serve builds the auth service.
     ad_tls_crl_file: str | None = None
+    # Opt-in (vault BACKLOG #5511): check ad_tls_crl_file against every certificate in the domain
+    # controller's chain, not only the leaf, so a revoked intermediate CA refuses the controller. It
+    # needs ad_tls_crl_file and ad_tls_ca_cert_file, and refuses at load without either: on the OS
+    # trust store the start rule could not be met. Default False keeps the leaf check.
+    ad_tls_crl_check_chain: bool = False
     # A plain ldap:// bind is refused at every posture (vault BACKLOG #3533 item 1). The opt-in that once
     # released it at [security].enforcement = warn, ad_allow_insecure_ldap, is a REMOVED key
     # (_REMOVED_KEYS), so a config that still sets it is refused by name rather than ignored.
@@ -4011,6 +4018,11 @@ class AuthSettings(_Section):
     # leg carrying the client secret, the authorization code and the identity assertion. Same
     # fail-closed refusals as every other CRL (absent / unloadable / past nextUpdate refuses at start).
     oidc_tls_crl_file: str | None = None
+    # Opt-in (vault BACKLOG #5511): check oidc_tls_crl_file against every certificate in the IdP's
+    # chain on both legs, not only the leaf, so a revoked intermediate CA refuses the IdP. It needs
+    # oidc_tls_crl_file and oidc_tls_ca_cert_file, and refuses at load without either: on the OS
+    # trust store the start rule could not be met. Default False keeps the leaf check.
+    oidc_tls_crl_check_chain: bool = False
     oidc_redirect_path: str = "/ui/oidc/callback"  # full URI derived from [api].public_origin
     oidc_scopes: list[str] = Field(default_factory=lambda: ["openid", "profile"])
     oidc_signing_algorithms: list[str] = Field(default_factory=lambda: ["RS256"])
@@ -4377,6 +4389,35 @@ class AuthSettings(_Section):
     @classmethod
     def _auth_crl_file_exists(cls, v: str | None, info: ValidationInfo) -> str | None:
         return _refuse_a_missing_crl_file(v, f"[auth].{info.field_name}")
+
+    @model_validator(mode="after")
+    def _check_chain_needs_crl_and_ca(self) -> AuthSettings:
+        # Vault BACKLOG #5511. With no CRL file the flag would read as a control that is on while
+        # nothing is checked. With no CA file the hop trusts the OS store, where the whole-chain
+        # start rule would need a CRL from every root it loads, so the builder would refuse it at
+        # start; refusing here says so at load, even with the hop off.
+        # Each value read as an attribute, so a renamed field fails type checking, not a load.
+        hops = (
+            (
+                "oidc",
+                self.oidc_tls_crl_check_chain,
+                self.oidc_tls_crl_file,
+                self.oidc_tls_ca_cert_file,
+            ),
+            ("ad", self.ad_tls_crl_check_chain, self.ad_tls_crl_file, self.ad_tls_ca_cert_file),
+        )
+        for prefix, chain, crl_file, ca_file in hops:
+            if not chain:
+                continue
+            for needed, value in (("crl_file", crl_file), ("ca_cert_file", ca_file)):
+                if not value:
+                    raise ValueError(
+                        f"[auth].{prefix}_tls_crl_check_chain = true requires "
+                        f"[auth].{prefix}_tls_{needed}: the whole-chain check reads the CRLs in "
+                        f"[auth].{prefix}_tls_crl_file against the CAs in "
+                        f"[auth].{prefix}_tls_ca_cert_file alone"
+                    )
+        return self
 
     @field_validator("kerberos_spn")
     @classmethod

@@ -31,7 +31,10 @@ from __future__ import annotations
 
 import ast
 import builtins
+import decimal
+import dis
 import errno
+import fractions
 import functools
 import hashlib
 import importlib.abc
@@ -40,6 +43,7 @@ import importlib.util
 import inspect
 import io
 import ipaddress
+import itertools
 import json
 import logging
 import math
@@ -360,6 +364,12 @@ class EnvRef:
         # The builtin ``float`` reads a TOML ``true`` as 1.0 the same way.
         elif self.cast is float:
             object.__setattr__(self, "cast", _cast_float)
+        # Some other numeric builtins and number types (``abs``, ``round``, ``decimal.Decimal``) read
+        # a TOML ``true`` as 1 the same way, so those named in _NUMERIC_BUILTIN_FUNCTIONS, and
+        # classes with one of _NUMBER_TYPES in their MRO, get a bool refused ahead of them. Both
+        # lists are partial.
+        elif self.cast is not None and _is_numeric_builtin_cast(self.cast):
+            object.__setattr__(self, "cast", _bool_refusing_cast(self.cast))
         # A default is never cast at resolve time, so ``default="false"`` would reach the connector
         # as text and read True there. Read it strictly here, once, on both routes: ``connections.toml``
         # hands in ``_cast_bool`` itself. ``None`` stays a deliberate None. The value is withheld for
@@ -421,10 +431,15 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     string as True. A ``default=`` with ``cast=bool`` is read the same way when the reference is
     made, and an unreadable one is refused then. ``cast=int`` means a strict whole-number reading
     (vault BACKLOG #1650, :func:`_cast_int`), and ``cast=float`` a strict finite-number reading
-    (:func:`_cast_float`). Any other callable runs as given, a builtin such as ``abs`` or a
-    type such as ``decimal.Decimal`` included, on the environment value as it arrives, a TOML bool
-    included, so ``cast=lambda v: int(v)`` still reads ``true`` as 1; the connector's own check
-    sees only what the cast returned. On a boolean
+    (:func:`_cast_float`). At least ``abs`` and ``round`` among the numeric builtins, and a number
+    type such as ``decimal.Decimal``, refuse a TOML bool read from the environment
+    (:func:`_is_numeric_builtin_cast` says which). A ``default=`` is neither cast nor checked by
+    that refusal, so ``env("p", cast=Decimal, default=True)`` with the key unset returns ``True``,
+    and a number subclass such as ``class Port(int)`` is refused only a bool, so it still cuts
+    ``2575.9`` to 2575. The builtin list is partial, so at least
+    ``math.sqrt`` and ``operator.neg`` still read ``true`` as 1. Any other callable runs as given, on the
+    environment value as it arrives, a TOML bool included, so ``cast=lambda v: int(v)`` still
+    reads ``true`` as 1; the connector's own check sees only what the cast returned. On a boolean
     setting (a factory parameter annotated ``bool``, a composer's ``enabled``, or ``Ftp``'s ``tls``),
     the result is then read the same strict way, so an uncast or ``str``-cast ``env()`` there cannot
     hand the connector the text ``"false"`` (vault BACKLOG #3234). A cast that itself returns a ``bool`` is trusted:
@@ -555,6 +570,67 @@ def _cast_float(raw: Any) -> float:
 
 # Named "float" for the reason ``_cast_bool`` is named "bool".
 _cast_float.__name__ = "float"
+
+
+#: Numeric builtins that read a bool as the number 1 or 0. A number TYPE is matched by
+#: :func:`_is_numeric_builtin_cast` against :data:`_NUMBER_TYPES` instead.
+_NUMERIC_BUILTIN_FUNCTIONS: Final = (
+    abs,
+    round,
+    math.floor,
+    math.ceil,
+    math.trunc,
+    math.fabs,
+    operator.index,
+)
+
+#: Number types that read a bool as the number 1 or 0. A cast class with one of these in its MRO
+#: counts, so ``class Port(int)`` and ``enum.IntEnum`` are refused a bool. ``numbers.Number`` is
+#: here for a class that inherits it; a type only REGISTERED with it, such as ``numpy.int64``, is
+#: not in its MRO and is not matched.
+_NUMBER_TYPES: Final = (int, float, complex, decimal.Decimal, fractions.Fraction, numbers.Number)
+
+#: ``type``'s own MRO reader. A metaclass cannot replace it, and reading it runs no author code.
+_READ_MRO: Final = type.__dict__["__mro__"].__get__
+
+
+def _is_numeric_builtin_cast(cast: Callable[[Any], Any] | None) -> bool:
+    """Whether ``cast`` is a numeric builtin or a number type, other than the ``int``, ``float`` and
+    ``bool`` that :class:`EnvRef` swaps for its own reads. Each reads a TOML ``true`` as 1 (vault
+    BACKLOG #1650).
+
+    No author code runs here and nothing is hashed, since an author's cast need not be hashable.
+    ``type(cast)`` reads the object's own type, never an author ``__class__``, and
+    ``issubclass(..., type)`` against the exact ``type`` compares MROs without a hook. Every
+    comparison is by identity, since an equality test would run a metaclass ``__eq__``. Returns
+    ``bool``, not ``TypeIs``: a False result says nothing about whether ``cast`` is None."""
+    if issubclass(type(cast), type):
+        if any(cast is own for own in (bool, int, float)):
+            return False
+        return any(base is known for base in _READ_MRO(cast) for known in _NUMBER_TYPES)
+    return any(cast is known for known in _NUMERIC_BUILTIN_FUNCTIONS)
+
+
+class _bool_refusing_cast:  # noqa: N801 -- read as the function it stands in for
+    """``cast`` with a bool refused ahead of it, by the rule :func:`_cast_int` holds, value
+    withheld. Equal when the casts are, so two references written with one cast still compare
+    equal; no cache, which would keep a config module's own number class alive past a reload."""
+
+    def __init__(self, cast: Callable[[Any], Any]) -> None:
+        self.cast = cast
+        # Named as the cast the author wrote, for the reason ``_cast_bool`` is named "bool".
+        self.__name__ = _cast_name(cast)
+
+    def __call__(self, raw: Any) -> Any:
+        if isinstance(raw, bool):
+            raise ValueError("a bool is not a number (value withheld)")
+        return self.cast(raw)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _bool_refusing_cast) and other.cast is self.cast
+
+    def __hash__(self) -> int:
+        return id(self.cast)
 
 
 #: Named casts a ``connections.toml`` env-ref may request (ADR 0007). A data file/GUI can't author an
@@ -6061,9 +6137,12 @@ def _accepts_callees(obj: object) -> list[object]:
     function, a ``__wrapped__`` it carries, and a callable instance's ``__call__``. Empty for a plain
     function with no ``__wrapped__``.
 
-    Every read is static, as ``reachability._function_of`` reads (``type()``, ``__dict__`` and
-    ``inspect.getattr_static``), so no author ``__class__``, ``__getattr__`` or
-    ``__getattribute__`` runs at load. A class-based wrapper that calls ``functools.update_wrapper``
+    A callable instance's ``__call__`` and ``__wrapped__`` are looked up with
+    ``inspect.getattr_static``, so no author ``__getattr__`` or ``__getattribute__`` runs for
+    them. Not every read here is free of author code: at least the ``func`` read off a
+    ``functools.partial`` runs a subclass's override, and a function's ``__wrapped__`` is read with
+    ``.get`` on its ``__dict__``, which an author can replace with a ``dict`` subclass whose
+    ``get`` runs. A class-based wrapper that calls ``functools.update_wrapper``
     yields both its own ``__call__`` and the function it wraps, since either may run."""
     kind = type(obj)
     if issubclass(kind, functools.partial):
@@ -6082,6 +6161,45 @@ def _accepts_callees(obj: object) -> list[object]:
     with suppress(AttributeError):
         out.append(inspect.getattr_static(obj, "__wrapped__"))
     return out
+
+
+#: Objects the run-scoped walk always follows, then judges their targets (BACKLOG #5514).
+_ACCEPTS_ALWAYS_FOLLOWED: Final = (functools.partial, MethodType, staticmethod, classmethod)
+
+#: Containers the run-scoped walk reads the items of, by EXACT type: a subclass could run author
+#: code from its ``__iter__`` (BACKLOG #5514, engine PR 2997's left list).
+_ACCEPTS_CONTAINER_TYPES: Final = (tuple, list, dict, set, frozenset)
+
+
+def _is_accepts_container(kind: type) -> bool:
+    """Whether ``kind`` is exactly one of :data:`_ACCEPTS_CONTAINER_TYPES`. By identity: ``kind in``
+    the tuple would test equality and run an author metaclass's ``__eq__`` during the walk."""
+    return any(kind is container for container in _ACCEPTS_CONTAINER_TYPES)
+
+
+#: The instructions that load a local, the first parameter included.
+_LOCAL_LOADS: Final = frozenset({"LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK"})
+
+
+def _first_argument_attributes(code: CodeType) -> set[str]:
+    """The attribute names ``code`` loads straight off its first parameter (``self.getter``), read
+    from the bytecode, where a plain local load of it comes right before the ``LOAD_ATTR``. Empty
+    for code with no parameter. Nested code is not read: there ``self`` is a closure cell, not the
+    first parameter. It misses at least a ``self`` loaded by Python 3.14's combined
+    ``LOAD_FAST_BORROW_LOAD_FAST_BORROW`` (as in ``return x, self.getter``), by ``LOAD_DEREF``
+    (when a nested function also uses ``self``), or with an ``EXTENDED_ARG`` before the
+    ``LOAD_ATTR``."""
+    if not code.co_argcount:
+        return set()
+    first = code.co_varnames[0]
+    return {
+        ins.argval
+        for previous, ins in itertools.pairwise(dis.get_instructions(code))
+        if ins.opname == "LOAD_ATTR"
+        and isinstance(ins.argval, str)
+        and previous.opname in _LOCAL_LOADS
+        and previous.argval == first
+    }
 
 
 def _accepts_walk(start: object, expand: Callable[[object], Iterable[object]]) -> Iterator[object]:
@@ -6130,17 +6248,38 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
     ``def``), names one, as the earlier one-level check did. A function or instance defined
     elsewhere that carries a ``__wrapped__`` chain, such as a ``functools.lru_cache`` or a library
     decorator around a config helper, is judged by the function at the end of the chain
-    (``reachability._function_of``). The walk's own reads are static (:func:`_accepts_callees`), but
-    ``captured_values`` tests a global with ``isinstance``, which can run an object's ``__class__``;
-    :func:`_check_accepts_predicate` refuses a predicate whose walk raises. It does not see at
-    least: a call through ``getattr`` or another computed name, a function in any other module, an
-    object's other methods, or a value the predicate builds while it runs."""
+    (``reachability._function_of``). The walk's attribute lookups by name use
+    ``inspect.getattr_static``, but it is not free of author code: at least the ``func``, ``args``
+    and ``keywords`` it reads off a ``functools.partial`` and the ``__func__`` it reads off a
+    ``staticmethod`` or ``classmethod`` are plain attribute reads, which a subclass can override,
+    a function's ``__wrapped__`` is read off a ``__dict__`` an author can replace (see
+    :func:`_accepts_callees`), and ``captured_values`` tests a global with ``isinstance``, which can run an object's
+    ``__class__``; :func:`_check_accepts_predicate` refuses a predicate whose walk raises.
+
+    Engine PR 2997's left list adds these edges (vault BACKLOG #5514): an attribute a function
+    reads as ``Name.attr`` off a class or an instance, not only off a module; the items of a
+    ``tuple``, ``list``, ``dict`` (keys and values), ``set`` or ``frozenset`` the walk reaches,
+    by exact type; a ``staticmethod`` or ``classmethod``'s function, so ``staticmethod(state_get)``
+    is caught; any wrapper whose ``__wrapped__`` chain ends at the accessor itself; and
+    the attributes a config bound method, or a callable instance's ``__call__``, reads straight off
+    its first parameter (``self.getter``) in the bytecode forms :func:`_first_argument_attributes`
+    reads, looked up on the bound ``__self__`` or the instance, a method found there bound to it in
+    turn, read with ``inspect.getattr_static``. It does not see at least: a call through
+    ``getattr`` or another computed name, a function in any other module, an attribute read off a
+    local or off an attribute (``self.a.b``), a subclass of a container, an object's methods the
+    walk does not reach by name, a value the predicate builds while it runs, a ``self`` load that
+    :func:`_first_argument_attributes` misses (Python 3.14's combined
+    ``LOAD_FAST_BORROW_LOAD_FAST_BORROW``, ``LOAD_DEREF``, an ``EXTENDED_ARG``), the reads off
+    ``self`` of a method reached as ``Name.attr`` off a module-level instance or class
+    (``FILTER.check(msg)``), since that edge is the plain function with no ``self`` to look them up
+    on, and a classmethod's ``cls.getter``."""
     # Lazy: both accessor modules are imported by handler code, not by the loader, and reachability
     # imports this module at its top level.
     from messagefoundry.config.reachability import (
         _function_of,
         _is_config_module,
         captured_values,
+        code_names,
     )
     from messagefoundry.config.response import response_get
     from messagefoundry.config.state import state_get
@@ -6160,27 +6299,83 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
 
     def followed(value: object) -> bool:
         kind = type(value)
-        if id(value) in accessors or issubclass(kind, (functools.partial, MethodType)):
+        if id(value) in accessors or issubclass(kind, _ACCEPTS_ALWAYS_FOLLOWED):
+            return True
+        if _is_accepts_container(kind):  # exact types, so no author __iter__ runs
             return True
         if issubclass(kind, type) or not callable(value):
             return False
         own = cast("FunctionType", value) if issubclass(kind, FunctionType) else None
         if _is_config_module(own.__module__ if own else kind.__module__, home):
             return True
-        # A cache or a library decorator around a config helper: judge the function it wraps.
+        # A cache or a library decorator around a config helper, or a functools.wraps wrapper
+        # around an accessor itself: judge the function it wraps.
         inner = _function_of(value)
-        return inner is not None and _is_config_module(inner.__module__, home)
+        return inner is not None and (
+            id(inner) in accessors or _is_config_module(inner.__module__, home)
+        )
+
+    bound: dict[tuple[int, int], MethodType] = {}
+
+    def attribute(holder: object, name: str) -> object:
+        # Static, so no author __getattr__ runs for this lookup.
+        return inspect.getattr_static(holder, name, None)
+
+    def self_reads(func: object, owner: object) -> list[object]:
+        # What ``func``, a config function, reads off its first parameter, looked up on ``owner``.
+        # A followed plain function found there is bound to ``owner``, so its own reads off
+        # ``self`` are followed too. Engine and library code is not read, as elsewhere here.
+        if not (issubclass(type(func), FunctionType) and followed(func)):
+            return []
+        edges: list[object] = []
+        for name in _first_argument_attributes(cast("FunctionType", func).__code__):
+            value = attribute(owner, name)
+            if not followed(value):
+                continue
+            if issubclass(type(value), FunctionType):
+                # One bound object per pair, kept alive here, so the walk's seen-by-id set ends
+                # a method that reads itself off ``self`` rather than looping on fresh bindings.
+                key = (id(value), id(owner))
+                value = bound.setdefault(key, MethodType(cast("FunctionType", value), owner))
+            edges.append(value)
+        return edges
 
     def expand(obj: object) -> list[object]:
         if id(obj) in accessors:
             return []
+        kind = type(obj)
         edges = [edge for edge in _accepts_callees(obj) if obj is pred or followed(edge)]
-        if issubclass(type(obj), functools.partial):
+        if _is_accepts_container(kind):
+            items = cast("Iterable[object]", obj)
+            if kind is dict:
+                table = cast("dict[object, object]", obj)
+                items = itertools.chain(table.keys(), table.values())
+            edges += [item for item in items if followed(item)]
+        elif issubclass(kind, (staticmethod, classmethod)):
+            inner = cast("staticmethod[..., object]", obj).__func__
+            if followed(inner):
+                edges.append(inner)
+        elif issubclass(kind, functools.partial):
             part = cast("functools.partial[object]", obj)
             edges += [value for value in (*part.args, *part.keywords.values()) if followed(value)]
-        if issubclass(type(obj), FunctionType):
+        elif issubclass(kind, MethodType):
+            method = cast("MethodType", obj)
+            edges += self_reads(method.__func__, method.__self__)
+        elif issubclass(kind, FunctionType):
             func = cast("FunctionType", obj)
             edges += [c.value for c in captured_values(func, home) if followed(c.value)]
+            # ``Global.attr`` off a class or an instance: captured_values reads it off a module only.
+            # A method found here is never bound (a plain function, or a classmethod whose function
+            # is followed unbound), so self_reads does not run on it: ``FILTER.check``'s reads off
+            # ``self`` and a classmethod's reads off ``cls`` are missed.
+            for holder_name, name in code_names(func.__code__)[1]:
+                holder = func.__globals__.get(holder_name)
+                if holder is not None and not issubclass(type(holder), ModuleType):
+                    value = attribute(holder, name)
+                    if followed(value):
+                        edges.append(value)
+        elif callable(obj) and not issubclass(kind, type):
+            edges += self_reads(attribute(kind, "__call__"), obj)
         return edges
 
     found: set[str] = set()
@@ -7405,7 +7600,7 @@ class Registry:
     def encoding_problems(self) -> list[str]:
         """Human-readable messages for declared ``encoding`` values naming no usable text codec.
 
-        Caught statically, naming the connection and the offending string, the way
+        Caught statically, naming the connection and withholding the offending string, the way
         :meth:`port_collisions` catches a duplicate port before it becomes a bare bind ``OSError``
         (see the section comment above for the runtime failure this pre-empts).
 
@@ -7481,10 +7676,12 @@ class Registry:
                 )
                 continue
             if not _is_text_codec(value):
+                # The literal is config-module text, which a load error does not quote (BACKLOG
+                # #3765 item 1): the connection names where to look, and the value is withheld.
                 problems.append(
-                    f"{kind} {name!r}: encoding {value!r} is not a Python text codec — every "
-                    f"message would fail at decode/encode; use a codec name such as 'utf-8', "
-                    f"'latin-1' or 'cp1252'"
+                    f"{kind} {name!r}: encoding is not a Python text codec (value withheld) — "
+                    f"every message would fail at decode/encode; use a codec name such as "
+                    f"'utf-8', 'latin-1' or 'cp1252'"
                 )
         return problems
 
@@ -10092,12 +10289,15 @@ def _with_link_targets(
     with none given it raises ``OSError`` naming the link. The load's check hands it
     :func:`_refuse_unvetted_link`, which the dev/test escape does not downgrade.
 
-    **Not vetted**, at least: the links in between, for a link to a link, the folders holding the
-    links outside the config directory, from which a writer could re-point one, the folders above
-    each target's folder, as the folders above the config directory are not, and on Windows a
-    name-surrogate reparse point that is neither a symbolic link nor a junction, which is not
-    followed (the start check's :func:`_link_chain` refuses one). The start check walks the links
-    of its own files further. A path already listed is not repeated."""
+    Each such link is then walked as the ``serve`` start check walks its own files
+    (:func:`_member_link_chain`): what :func:`_link_chain` names is listed too, the real folder
+    holding each link the walk follows, the folder holding the config directory's own link
+    included, each link itself on Windows, and the object it reaches. A walk that cannot run, that
+    reaches nothing, or that reaches another object than an open of the link, is refused the same way.
+
+    **Not vetted**, at least: the folders above each target's folder and above each folder
+    holding a link, as the folders above the config directory are not. A path already listed is
+    not repeated."""
     out: list[Path] = []
     for path in paths:
         out.append(path)
@@ -10112,7 +10312,36 @@ def _with_link_targets(
         out.append(target)
         if not target.is_dir():
             out.append(target.parent)
+        chain = _member_link_chain(path)
+        if isinstance(chain, str):
+            if refuse is None:
+                raise OSError(errno.EINVAL, chain, str(path))
+            refuse(f"{_CONFIG_SOURCE_LEAD} {path}: {chain}")
+            continue
+        out += chain
     return list(dict.fromkeys(out))
+
+
+def _member_link_chain(path: Path) -> list[Path] | str:
+    """What :func:`_link_chain` names for the trust-list link at ``path``, or the reason as text
+    where the walk cannot vouch for it: the walk could not run, or reached nothing, or reached
+    another object than an open of ``path`` does (``os.path.samefile``, as
+    :func:`_file_and_folder` checks it; vault BACKLOG #2596 step 4).
+
+    The walk names the real folder holding each link it follows, each link itself on Windows, and
+    the object it reaches, so a link in between, the folder holding it outside the config
+    directory, and a Windows reparse point the walk cannot follow are vetted or refused, as the
+    ``serve`` start check vets its own files (:func:`_file_and_folder`)."""
+    try:
+        chain, end = _link_chain(path)
+        same = end is not None and os.path.samefile(path, end)
+    except (OSError, ValueError) as exc:  # ValueError: a link target holding a NUL
+        return f"its link chain could not be walked ({getattr(exc, 'strerror', None) or type(exc).__name__})"
+    if end is None:
+        return "the walk of its link chain reaches nothing where the link resolves to an object"
+    if not same:
+        return "the walk of its link chain reaches another object than the open of the link"
+    return chain
 
 
 def _resolved_link(path: Path) -> Path | str | None:
@@ -10834,6 +11063,13 @@ _WIN_WRITE_MASK = (
     | 0x40000000  # GENERIC_WRITE
 )
 
+# What the config-source check refuses: the write class above, plus FILE_DELETE_CHILD (0x40). On a
+# folder that bit lets its holder delete any file in it whatever that file's own access list says,
+# so a holder on the config directory can drop a module from the graph the engine runs (BACKLOG
+# #5622, #8251 item 13). On a file it means nothing, so it is checked on every path, with no stat to
+# tell the two apart; ``_WIN_WRITE_MASK`` stays equal to ``anchor_path.WIN_FILE_MASK``.
+_WIN_CONFIG_WRITE_MASK = _WIN_WRITE_MASK | 0x00000040  # FILE_DELETE_CHILD
+
 # Broad/low-privilege well-known SIDs that must never hold a write-class right on executed config.
 _WIN_REJECTED_SIDS = frozenset(
     {
@@ -10979,7 +11215,8 @@ def _evaluate_config_dacl(
     (Everyone/Authenticated Users/Users/…) holds such a right. Any other granting entry type
     (compound, object, callback) carrying a write-class right refuses too, because its trustee or
     condition cannot be judged here. A LocalService or NetworkService process user is not
-    self-trusted: other services share that SID (BACKLOG #5622).
+    self-trusted: other services share that SID (BACKLOG #5622). The write class also holds
+    FILE_DELETE_CHILD (:data:`_WIN_CONFIG_WRITE_MASK`).
 
     The **owner** is then vetted in its own right (CONFIG-2), mirroring the POSIX arm's refusal of a
     foreign uid: an owner holds WRITE_DAC implicitly, so a low-privilege owner can rewrite the code
@@ -11014,7 +11251,7 @@ def _evaluate_config_dacl(
     for ace_type, access_mask, trustee_sid in aces:
         if ace_type not in _WIN_GRANTING_ACE_TYPES:
             continue  # DENY ACEs never grant a right
-        if not access_mask & _WIN_WRITE_MASK:
+        if not access_mask & _WIN_CONFIG_WRITE_MASK:
             continue  # read/execute-only ACE (e.g. Users:RX on a repo checkout) is fine
         if ace_type != _WIN_ACCESS_ALLOWED_ACE_TYPE:
             unsure = unsure or (
@@ -11884,12 +12121,18 @@ def _windows_link_target(text: str) -> str:
     """A Windows link's target, as :func:`_link_chain` joins it: its ``\\\\?\\`` prefix dropped.
     Raises ``OSError`` for a target the walk could not follow to the folder the open reaches: a
     device path, a drive with no separator after it (``D:x``), read from that drive's own working
-    directory, or a path rooted with no drive (``\\x``), which may name the object namespace."""
-    from messagefoundry.auth.anchor_path import _drive_relative, _strip_win_prefix
+    directory, or a path rooted with no drive (``\\x``), which may name the object namespace.
 
-    plain = _strip_win_prefix(text)
+    Read through the anchor walk's own reader of a link target (``anchor_path._strip_nt_target``),
+    so a device prefix that walk refuses is refused here too: any prefix but an all-backslash
+    ``\\\\?\\`` or ``\\??\\``, and a verbatim one holding a ``/``, a ``.`` or ``..`` name, or an
+    empty name. Win32 rewrites a ``\\\\.\\`` or forward-slash prefix before the open, so
+    stripping one, as this once did, walked a path the open may not reach (vault BACKLOG #5515)."""
+    from messagefoundry.auth.anchor_path import _drive_relative, _strip_nt_target
+
+    plain = _strip_nt_target(text)
     if plain is None:
-        raise OSError(errno.EINVAL, "a link leads to a device path")
+        raise OSError(errno.EINVAL, "a link leads to a device path this check does not read")
     if _drive_relative(plain):
         raise OSError(errno.EINVAL, "a link leads to a drive with no separator after it")
     if not ntpath.splitdrive(plain)[0] and plain[:1] in ("\\", "/"):
@@ -11966,8 +12209,10 @@ def _file_and_folder(
             chain, end = _link_chain(path)
             # The kernel's own answer, against the walk's, for any gap left in the walk's model:
             # a final link naming a file with a trailing separator, for one, which the open
-            # refuses (ENOTDIR) and the walk's split drops, or a ``\\?\`` target the walk normalizes and the open takes
-            # literally. Where they disagree the walk vetted another route than the open takes.
+            # refuses (ENOTDIR) and the walk's split drops. A device-prefixed link target the walk
+            # would read as another path than the open is refused before this, by
+            # _windows_link_target. Where they disagree the walk vetted another route than the
+            # open takes.
             if mode is not None and end is None:
                 raise OSError(
                     errno.EINVAL, "the open reaches an object where the walk reaches none"

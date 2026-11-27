@@ -1041,7 +1041,7 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     the loader reads, and
     **refuses** to load when a broad/low-privilege principal (Everyone, Authenticated Users,
     `BUILTIN\Users`, INTERACTIVE, …) or any non-owner/non-admin principal holds a write-class right
-    (write/append/delete/`WRITE_DAC`/`WRITE_OWNER`/generic-write). The principals that may hold one
+    (write/append/delete/`WRITE_DAC`/`WRITE_OWNER`/generic-write/delete-child). The principals that may hold one
     are SYSTEM, `BUILTIN\Administrators`, TrustedInstaller, the owner, the run-as account (never
     LocalService or NetworkService, which other services share) and a Domain, Schema or Enterprise
     Admins group the local Administrators lookup resolves. A grant to any other account is refused,
@@ -1127,11 +1127,12 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     code-set table link among them, leads to nothing it can read at check time or cannot be
     resolved (vault BACKLOG #2596), and the dev/test escape does not downgrade that refusal. For
     a linked folder the folder holding its target is not
-    checked. That
-    resolution is not checked against what the load's open then reaches. It does not check the
-    links in between, for a link to a link, a folder outside the config directory that holds a
-    link, from which a writer could re-point it, or on Windows a reparse point other than a
-    symbolic link or a junction, which it does not follow. So the layout also depends on at least these, which it
+    checked. It then walks each such link as the `serve` start check walks its own files
+    (`_link_chain`), so it also checks the real folder holding each link the walk follows, the
+    links in between for a link to a link, and on Windows each link itself, and it refuses the
+    load where that walk cannot run, reaches nothing, or reaches another object than an open of
+    the link does, a Windows reparse point other than a symbolic link or a junction among them
+    (vault BACKLOG #2596 step 4). So the layout also depends on at least these, which it
     does not check: every directory above the config directory, and above each folder a link
     leads to, is writable only by root; no link leads through a folder another account can write;
     and the file system reports real owners and modes (a network mount may synthesize them).
@@ -1153,9 +1154,8 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
       take this walk either, but it does walk the links an open of each file passes through, as
       it models the open, and vets the folders holding them, as the value-file paragraph in
       [SECURITY.md](SECURITY.md#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
-      states. The config load's trust list does not take that walk: it checks what each link
-      resolves to, as the bullet above says, so the two checks still answer a linked file
-      differently.
+      states. The config load's trust list takes that link walk too, for each member that is a
+      link, as the bullet above says.
     - **The exposure that leaves is a known limit, not a safe layout.** An account that can write
       any directory above the config directory can rename that directory and put a link or another
       directory in its place. A substitute put there after the check runs unchecked, and one put
