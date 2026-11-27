@@ -2103,6 +2103,12 @@ def _build_record(
     )
 
 
+#: Appended to the stranding-budget and ``no_sends`` text when the engine arms were not judged, where
+#: either makes the step INCONCLUSIVE rather than LOSS (BACKLOG #5574 item 9). The estate copy keeps
+#: the same text, and tests/test_b20006_c_threshold_verdicts.py holds the two to it.
+_UNJUDGED_THRESHOLD = " — a threshold, not proof of a loss, while the engine arms were not judged"
+
+
 @dataclass(frozen=True)
 class _Excusal:
     """How many unconfirmed sends the intake bound forgives this step, and whether that broke."""
@@ -2357,7 +2363,12 @@ def _reconcile_judged(
     # it rather than LOSS (BACKLOG #5574).
     write_lost = write_short > 0 and drained
     engine_lost = read_short > 0 or floor_short > 0 or deliver_short > 0 or write_lost
-    lost = (engine_judged and engine_lost) or over_budget or not_back or no_sends or no_reply
+    # The stranding budget and `no_sends` are thresholds, not proof (BACKLOG #5574 item 9). With
+    # the engine metrics missing or reset, no arm can say whether the sends they name were lost, so
+    # they make the step INCONCLUSIVE there rather than LOSS. It still fails: `unproven` below
+    # always names the missing metrics or the reset.
+    threshold_lost = engine_judged and (over_budget or no_sends)
+    lost = (engine_judged and engine_lost) or threshold_lost or not_back or no_reply
     # Reasons the step cannot CLEAR itself although no arm proved a loss (BACKLOG #5574), as in
     # harness/load/report.py's copy: every arm above is an inequality that an empty, unsettled or
     # undelivering step satisfies trivially.
@@ -2435,6 +2446,7 @@ def _reconcile_judged(
         parts.append(
             f"nothing was sent after the reload probe, so intake after the reload was not "
             f"measured and the {stranded} send(s) it stranded cannot be excused on trust"
+            + ("" if engine_judged else _UNJUDGED_THRESHOLD)
         )
     if no_reply and reload is not None:
         parts.append(_no_reply_detail(reload, sent_after))
@@ -2448,6 +2460,7 @@ def _reconcile_judged(
             f"{unconfirmed} unconfirmed sends exceed the stranding budget "
             f"({budget} = max(connections, {of_run})) — systemic no-ACK fault "
             f"(possible accepted-and-dropped); nothing excused"
+            + ("" if engine_judged else _UNJUDGED_THRESHOLD)
         )
     elif unconfirmed > 0 and not engine_judged:
         # No intake reading to compare them with: a reset clamps `read` and missing metrics zero

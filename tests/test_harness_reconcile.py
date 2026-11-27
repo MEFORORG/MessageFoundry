@@ -1497,10 +1497,12 @@ def test_inconclusive_reaches_the_json_and_the_console() -> None:
     assert estate_report._noloss_cell(replace(est, ok=True, inconclusive=False)) == "ok"
 
 
-def test_rig_reconciles_a_client_counter_loss_stays_loss_across_a_counter_reset() -> None:
-    # The stranding budget reads only client counters, so a reset that voids the engine deltas does
-    # not void it: 36 of 36 sends unanswered is a systemic no-ACK fault either way. The control is
-    # the same reset with every send answered, which is INCONCLUSIVE.
+def test_rig_reconciles_a_stranding_flood_fails_inconclusive_across_a_counter_reset() -> None:
+    # 36 of 36 sends unanswered is a systemic no-ACK fault either way, but the stranding budget is a
+    # threshold, not proof of a loss: with a reset voiding the engine deltas, nothing says whether
+    # those sends reached the engine, so the step fails INCONCLUSIVE rather than LOSS (BACKLOG #5574
+    # item 9; it was LOSS here until then). The control is the same reset with every send answered,
+    # which is INCONCLUSIVE too and does not name the fault.
     base = _sample(read=100, written=100)
     final = _sample(read=30, written=30)
     flood = Counters(sent=36, acked=0, timeouts=36)
@@ -1508,8 +1510,9 @@ def test_rig_reconciles_a_client_counter_loss_stays_loss_across_a_counter_reset(
         connscale_reconcile(flood, base, final, unconfirmed_budget=_BUDGET, counter_reset=_RESET),
         estate_reconcile(flood, base, final, unconfirmed_budget=_BUDGET, counter_reset=_RESET),
     ):
-        assert not result.ok and not result.inconclusive, result.detail
+        assert not result.ok and result.inconclusive, result.detail
         assert "systemic no-ACK fault" in result.detail
+        assert "a threshold, not proof of a loss" in result.detail
         assert "restarted mid-run" in result.detail
     control = connscale_reconcile(
         _RIG_CLEAN, base, final, unconfirmed_budget=_BUDGET, counter_reset=_RESET
@@ -1532,17 +1535,19 @@ def test_connscale_reconcile_a_reload_guard_stays_loss_across_a_counter_reset() 
     assert "4 connection(s) never came back" in result.detail
 
 
-def test_rig_reconciles_a_client_counter_loss_stays_loss_without_engine_metrics() -> None:
-    # Missing engine metrics used to return INCONCLUSIVE before any arm ran, so a systemic no-ACK
-    # fault the client counters prove on their own was reported as unproven. The control is the
-    # same missing metrics with every send answered, which stays INCONCLUSIVE.
+def test_rig_reconciles_a_stranding_flood_fails_inconclusive_without_engine_metrics() -> None:
+    # Missing engine metrics used to return INCONCLUSIVE before any arm ran, so the no-ACK fault
+    # went unnamed; the arm now runs and names it. It is a threshold, not proof of a loss, so the
+    # step fails INCONCLUSIVE rather than LOSS (BACKLOG #5574 item 9). The control is the same
+    # missing metrics with every send answered, which stays INCONCLUSIVE.
     flood = Counters(sent=36, acked=0, timeouts=36)
     for result in (
         connscale_reconcile(flood, None, None, unconfirmed_budget=_BUDGET),
         estate_reconcile(flood, None, None, unconfirmed_budget=_BUDGET),
     ):
-        assert not result.ok and not result.inconclusive, result.detail
+        assert not result.ok and result.inconclusive, result.detail
         assert "systemic no-ACK fault" in result.detail
+        assert "a threshold, not proof of a loss" in result.detail
         assert "engine metrics unavailable" in result.detail
         assert (result.engine_read, result.engine_written, result.backlog) == (0, 0, -1)
         assert "not drained" not in result.detail
@@ -1723,10 +1728,15 @@ def test_batchbox_aggregate_keeps_a_stranding_loss_whether_or_not_the_band_read_
     # Budget here: max(4 connections, 3 * 10 // 4 = 7) = 7, so 8 timeouts is over it.
     needle = "band at engine index 3: 8 unconfirmed sends exceed its stranding budget (7)"
     for flood in (_remote_band(8), _remote_band(8, counter_reset=_RESET)):
-        # The band's own verdict agrees with what it published: the arm is the same arithmetic.
+        # The band's own verdict rests on the arm it published: the arm is the same arithmetic. It
+        # is LOSS where the band read the engine, and INCONCLUSIVE (still failing) across a reset,
+        # where the band no longer counts a threshold as proof (BACKLOG #5574 item 9). The cell
+        # below keeps the published arm as a loss either way.
         no_loss = flood["no_loss"]
         assert isinstance(no_loss, dict)
-        assert no_loss["ok"] is False and no_loss["inconclusive"] is False, no_loss["detail"]
+        assert no_loss["ok"] is False, no_loss["detail"]
+        reset = no_loss["counter_reset"] is not None
+        assert no_loss["inconclusive"] is reset, no_loss["detail"]
         assert "systemic no-ACK fault" in str(no_loss["detail"])
         rec = bb.aggregate_cell_record(_cell(), [flood, _pair()])
         assert not rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail

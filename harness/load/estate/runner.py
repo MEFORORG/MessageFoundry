@@ -76,6 +76,9 @@ _CPU_FLAT_GAP_SPAN_S = 5.0
 # trying at most `_TOP_UP_ATTEMPTS` times, one poll interval apart.
 _MIN_IN_HOLD_SAMPLES = 2
 _TOP_UP_ATTEMPTS = 3
+#: The connscale copy's text, kept the same: appended to the stranding-budget detail when the
+#: engine arms were not judged and the budget made the step INCONCLUSIVE (BACKLOG #5574 item 9).
+_UNJUDGED_THRESHOLD = " — a threshold, not proof of a loss, while the engine arms were not judged"
 _PROC_BY_SAMPLE: dict[int, ProcSample] = {}
 
 
@@ -571,7 +574,10 @@ def _reconcile(
     # leaves this, `out_dead` and `errored` all unmoved: no `/stats` or `/connections` field
     # counts dead-letters monotonically, so that offset is not seen (BACKLOG #5436).
     store_dead_lost = not metrics_missing and store_dead > 0
-    lost = (engine_judged and engine_lost) or store_dead_lost or over_budget
+    # The stranding budget is a threshold, not proof (BACKLOG #5574 item 9): with the engine
+    # metrics missing or reset it makes the step INCONCLUSIVE rather than LOSS, as in the connscale
+    # copy. It still fails, since `unproven` below names the missing metrics or the reset.
+    lost = (engine_judged and (engine_lost or over_budget)) or store_dead_lost
     # Reasons the step cannot CLEAR itself although no arm proved a loss (BACKLOG #5574), as in
     # harness/load/report.py's copy: every arm above is an inequality that an empty, unsettled or
     # undelivering step satisfies trivially.
@@ -648,6 +654,7 @@ def _reconcile(
             f"{unconfirmed} unconfirmed sends exceed the stranding budget "
             f"({budget} = max(connections, three quarters of the run)) — systemic no-ACK fault "
             f"(possible accepted-and-dropped); nothing excused"
+            + ("" if engine_judged else _UNJUDGED_THRESHOLD)
         )
     elif unconfirmed > 0 and not engine_judged:
         # No intake reading to compare them with: a reset clamps `read` and missing metrics zero
