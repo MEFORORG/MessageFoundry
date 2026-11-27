@@ -7,8 +7,13 @@
 // engine IO. It names only what aiPolicy.ts exported before the per-engine key was added
 // (`resolveAiPolicy`, `assistantState`, the `AiPolicyIo` and `AiPolicyWire` types), so it runs
 // against that earlier source too, where it fails on the behaviour rather than on a missing symbol.
-// The Extension Host twins are T17 and T18 in ai-policy.test.ts, which `test:unit` ignores; this file
-// runs node-side, on every ide leg, and skips in the Extension Host, which resolves the real `vscode`.
+// The Extension Host twins are T17 and T18 in ai-policy.test.ts, which `test:unit` ignores and which
+// cannot compile against that earlier source (it imports `aiPolicyCacheKey`); this file runs
+// node-side, on every ide leg, and skips in the Extension Host, which resolves the real `vscode`.
+//
+// What each test pins on main: K-A1 pins the per-engine key alone. K-B1 and K-B2 pass on main
+// through either the per-engine key or the deny carrier, so a change that shared only the cache
+// would leave them green; against the single unscoped key before both, they fail.
 import * as assert from "assert";
 import * as path from "node:path";
 
@@ -16,7 +21,7 @@ import type * as vscode from "vscode";
 
 import type { AiPolicyIo, AiPolicyWire } from "../../aiPolicy";
 
-/** Two engines on loopback, so SEC-005 lets the bearer go to either over http. */
+/** Two engines, told apart only by port. */
 const ENGINE_A = "http://127.0.0.1:8765";
 const ENGINE_B = "http://127.0.0.1:9876";
 /** A fixed clock, so a cached permit is never too old to stand and the age bound decides nothing. */
@@ -116,7 +121,8 @@ function wire(w: Partial<AiPolicyWire>): AiPolicyWire {
 
 /**
  * The engine at `url` answers `answer`, or is unreachable when `answer` is undefined. The local CLI
- * has no answer, so an offline result is the cache's or the fail-closed policy, never the CLI's.
+ * has no answer, so an offline result is never the CLI's: it is the cache's, a deny the carrier holds
+ * (on main), or the fail-closed policy.
  */
 function engine(url: string, answer: AiPolicyWire | undefined): AiPolicyIo {
   return {
@@ -149,6 +155,7 @@ keySuite("resolveAiPolicy keys its cache by engine (BACKLOG #5564)", () => {
       false,
       `engine A's permit was carried to engine B: B resolved to ${JSON.stringify(offB)}`,
     );
+    assert.strictEqual(offB.mode, "unverified", "B has no answer of its own, so it fails closed");
   });
 
   test("K-B1: engine B's central off is not missed after engine A answers a permit", async () => {

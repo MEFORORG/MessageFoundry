@@ -3,15 +3,26 @@
 // assistantState enables assistance only for the modes it names, and a retained ai:assist deny holds
 // under managed_endpoint too (BACKLOG #5882; the allow-list is BACKLOG #5406).
 //
-// The sibling ai-policy-model.test.ts built nearly every policy as mode `byo`, so a gate that
-// enabled a missing or unrecognized mode, or managed_endpoint with a retained deny, could pass. These
-// cases build each of those shapes. They name only what aiPolicyModel.ts exported before the
-// allow-list (`assistantState`, `mergeAuthoritativePolicy`, `cachedPolicyOffline`), so they run
-// against that earlier source too, where they fail on the behaviour rather than on a missing symbol.
+// G1-G4 in ai-policy-model.test.ts, added with the allow-list, already cover most unrecognized and
+// non-string modes. This file exists because that one cannot compile against the source before the
+// allow-list (it imports `narrowMode` and later symbols), so no run of it there can fail as an
+// assertion. These cases name only what aiPolicyModel.ts exported before the allow-list
+// (`assistantState`, `mergeAuthoritativePolicy`, `cachedPolicyOffline`), so they run against that
+// earlier source too. They add an absent `mode` key, near-miss spellings, more non-string values, and
+// managed_endpoint with a retained ai:assist deny, which no earlier test built.
 // Zero-import model, so this runs node-side on every ide leg.
 import * as assert from "assert";
 
-import { assistantState, cachedPolicyOffline, mergeAuthoritativePolicy, type AiPolicy } from "../../aiPolicyModel";
+import {
+  CACHED_PERMIT_MAX_AGE_MS,
+  assistantState,
+  cachedPolicyOffline,
+  mergeAuthoritativePolicy,
+  type AiPolicy,
+} from "../../aiPolicyModel";
+
+/** When a cached answer was stamped; any fixed epoch works, as cachedPolicyOffline reads only the age. */
+const CACHED_AT = 1_800_000_000_000;
 
 function policy(p: Partial<AiPolicy>): AiPolicy {
   return { mode: "byo", dataScope: "code_only", environment: null, assistPermitted: null, reason: null, ...p };
@@ -73,9 +84,10 @@ suite("assistantState: a mode outside the allow-list disables assistance (BACKLO
   });
 
   test("M-unknown offline: a cached answer in an unknown mode disables, fresh or old", () => {
-    for (const cachedAt of [1_000, 0]) {
-      const cached = { ...withMode("managed_future", true), cachedAt };
-      assert.strictEqual(assistantState(cachedPolicyOffline(cached, 1_000)).enabled, false, `cachedAt=${cachedAt}`);
+    // Fresh is an age of 0 ms; old is ten times the bound, so both branches of cachedPolicyOffline run.
+    for (const now of [CACHED_AT, CACHED_AT + 10 * CACHED_PERMIT_MAX_AGE_MS]) {
+      const cached = { ...withMode("managed_future", true), cachedAt: CACHED_AT };
+      assert.strictEqual(assistantState(cachedPolicyOffline(cached, now)).enabled, false, `now=${now}`);
     }
   });
 
@@ -84,6 +96,10 @@ suite("assistantState: a mode outside the allow-list disables assistance (BACKLO
     for (const mode of ["byo", "managed_endpoint"]) {
       for (const ap of PERMITTING) {
         assert.strictEqual(assistantState(policy({ mode, assistPermitted: ap })).enabled, true, `${mode} permitted=${ap}`);
+        // And offline: a fresh cached permit in either mode still stands, so a cachedPolicyOffline
+        // that failed closed on everything would not pass the offline cases here.
+        const cached = { ...policy({ mode, assistPermitted: ap }), cachedAt: CACHED_AT };
+        assert.strictEqual(assistantState(cachedPolicyOffline(cached, CACHED_AT)).enabled, true, `${mode} offline`);
       }
     }
   });
