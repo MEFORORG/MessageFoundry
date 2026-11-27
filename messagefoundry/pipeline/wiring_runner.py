@@ -287,9 +287,9 @@ from messagefoundry.store.queue_tag import (
 from messagefoundry.store.sealed_cache import point_in_time
 from messagefoundry.store.store import (
     REINGRESS_PEEK_FAILED,
-    REINGRESS_TOKEN_TAG_FAILED,
     ConnectionEventWrite,
     OwnedLanes,
+    reingress_token_refusal,
 )
 from messagefoundry.store.transit_attestation import utf16_units
 from messagefoundry.threadhop import to_thread_or_loop
@@ -13484,15 +13484,17 @@ class RegistryRunner:
         # raw open error, whose cause can echo a key service's URL or body. The handlers keep only
         # strings: the error's type name, and the unopenable_log_text the dead-letter records. A
         # cipher's own text is not recorded: it can echo stored text, a key_id (BACKLOG #5982).
-        tag_failed = False
+        # The refused token's last_error, never the error itself.
+        tag_refused: str | None = None
         unopenable: tuple[str, str] | None = None
         try:
             body = await self.store.response_body_for_work_row(item.id) or ""
-        except QueueTagError:
-            # BACKLOG #5982: the token's own payload failed its tag after the claim opened it. The
+        except QueueTagError as err:
+            # BACKLOG #5982: the token's own payload was refused after the claim opened it. The
             # store has audited and alerted it; dead-letter it under the error the handoff records
-            # for the same failure, not as an undecryptable reply.
-            tag_failed = True
+            # for the same failure, not as an undecryptable reply. A corrupt cell is not drift, so
+            # it is named corrupt rather than a failed tag.
+            tag_refused = reingress_token_refusal(err).last_error
         except CipherError as exc:
             # BACKLOG #5727: a key service that gave no verdict says nothing about this reply. It
             # takes the fault arm, which re-pends the token with a backoff and dead-letters
@@ -13520,13 +13522,14 @@ class RegistryRunner:
                 # as a QueueOpenFault too; its invocation ceiling, a plain CipherError, is a
                 # deliberate hard stop.
                 unopenable = (type(exc).__name__, unopenable_log_text(exc))
-        if tag_failed:
+        if tag_refused is not None:
             log.warning(
-                "response worker %r: work-row %s failed its integrity tag; dead-lettering",
+                "response worker %r: work-row %s refused (%s); dead-lettering",
                 name,
                 item.id,
+                tag_refused,
             )
-            await self.store.dead_letter_now(item.id, REINGRESS_TOKEN_TAG_FAILED)
+            await self.store.dead_letter_now(item.id, tag_refused)
             return _ItemOutcome.PROCESSED, None
         if read_fault is not None:
             try:

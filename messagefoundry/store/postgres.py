@@ -258,7 +258,6 @@ from messagefoundry.store.store import (
     REINGRESS_READ_TAG_FAILURE_OUTCOME,
     REINGRESS_TAG_FAILURE_OUTCOME,
     REINGRESS_TARGET_PREFIX,
-    REINGRESS_TOKEN_TAG_FAILED,
     SESSION_MINT_ATTEMPTS,
     SESSION_MINT_EPOCH_RAISED,
     TRANSIT_ATTESTATION_COLUMNS,
@@ -314,6 +313,7 @@ from messagefoundry.store.store import (
     PendingFactorAnchor,
     ReingressOriginMissing,
     ReingressOutcome,
+    ReingressTokenRefusal,
     ReplyWaitState,
     ResendKeyConflict,
     ResendKeyRecord,
@@ -408,6 +408,7 @@ from messagefoundry.store.store import (
     read_transit_bound_attestation_rows,
     reauth_stamp,
     recovery_code_spend,
+    reingress_token_refusal,
     removal_keeps_way_past,
     report_approval_reseal,
     report_refused_ad_role_map,
@@ -6635,7 +6636,8 @@ class PostgresStore(ServerCipherWalk):
                     # BACKLOG #5727: each dead-letter on the reference runs after the try, as on
                     # SQLite.
                     ref_fault: QueueOpenFault | None = None
-                    ref_tag_failed = ref_corrupt = False
+                    ref_refusal: ReingressTokenRefusal | None = None
+                    ref_corrupt = False
                     try:
                         ref = (
                             await cipher_call(self._cipher, open_queue_cell, self._cipher, wr)
@@ -6648,7 +6650,7 @@ class PostgresStore(ServerCipherWalk):
                         # first, so a dead-letter write that fails is still reported.
                         # Without its traceback, so the queued error holds no frame of this transaction.
                         queue_tag_rows.append((wr, err.with_traceback(None)))
-                        ref_tag_failed = True
+                        ref_refusal = reingress_token_refusal(err)  # a corrupt cell is not drift
                     except Exception as exc:  # noqa: BLE001 - dead-letters unless transient
                         # BACKLOG #5727: no verdict on the cell. Raised below, outside this handler,
                         # so the fault carries no chain to the raw key-service error. Not
@@ -6660,11 +6662,9 @@ class PostgresStore(ServerCipherWalk):
                         # re-ingressed as it stands. Mirrors the SQLite branch and the depth-cap
                         # branch.
                         ref_corrupt = ref_fault is None
-                    if ref_tag_failed:
+                    if ref_refusal is not None:
                         return await _consume_dead(
-                            "ingress_handoff(tag-failed)",
-                            REINGRESS_TOKEN_TAG_FAILED,
-                            "re-ingress work-row failed its integrity check",
+                            ref_refusal.op, ref_refusal.last_error, ref_refusal.event_detail
                         )
                     if ref_fault is not None:
                         raise ref_fault
