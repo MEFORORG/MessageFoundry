@@ -29,12 +29,11 @@ import pytest
 import messagefoundry.checks as checks
 from messagefoundry.checks import run_checks
 
-SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
-
-#: One variable per class the child must not see. The test reads names only, so each value is a
-#: plain placeholder rather than a secret-shaped string.
+#: At least one variable per class the child must not see, the lower-case engine prefix included.
+#: The test reads names only, so each value is a plain placeholder, not a secret-shaped string.
 _SECRETS = {
     "MEFOR_STORE_ENCRYPTION_KEY": "placeholder",
+    "mefor_lower_b20009": "placeholder",
     "VAULT_TOKEN": "placeholder",
     "PGPASSWORD": "placeholder",
     "CI_DEPLOY_TOKEN_B20009": "placeholder",
@@ -63,7 +62,11 @@ def test_run_checks_lint_children_start_by_absolute_path_with_no_engine_secret(
     def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         tool = _lint_tool(list(cmd))
         assert tool is not None, f"unexpected child: {cmd}"
-        calls.setdefault(tool, []).append((list(cmd), dict(kwargs.get("env") or {})))
+        # A program named through executable= or a shell is located by the OS, not by argv[0];
+        # a child with no env= inherits the caller's whole environment.
+        assert kwargs.get("executable") is None and not kwargs.get("shell"), cmd
+        assert kwargs.get("env") is not None, f"{cmd} inherits the whole environment"
+        calls.setdefault(tool, []).append((list(cmd), dict(kwargs["env"])))
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -76,15 +79,18 @@ def test_run_checks_lint_children_start_by_absolute_path_with_no_engine_secret(
     monkeypatch.setattr(checks, "_tool_installed", lambda _module: True, raising=fixed)
     monkeypatch.setattr(shutil, "which", lambda name, *_a, **_k: name)
 
-    report = run_checks(SAMPLES_CONFIG, messages_dir=None, run_lint=True)
+    # An empty config directory: the lint legs start the same way, without the sample graph.
+    config_dir = tmp_path / "cfg"
+    config_dir.mkdir()
+    report = run_checks(config_dir, messages_dir=None, run_lint=True)
 
     by_name = {r.name: r for r in report.results}
+    started = {tool: [cmd for cmd, _env in found] for tool, found in calls.items()}
     for tool in ("ruff", "mypy", "ruff-security"):
         assert by_name[tool].skipped is False, by_name[tool].detail
-        assert len(calls.get(tool, [])) == 1, calls
-    assert set(calls) == {"ruff", "mypy", "ruff-security"}
+        assert len(started.get(tool, [])) == 1, started  # commands only, never env values
 
-    config = str(SAMPLES_CONFIG)
+    config = str(config_dir)
     ruff_cmd = calls["ruff"][0][0]
     assert ruff_cmd == [program, "check", config]
     security_cmd = calls["ruff-security"][0][0]
@@ -94,7 +100,7 @@ def test_run_checks_lint_children_start_by_absolute_path_with_no_engine_secret(
     assert "-P" in mypy_cmd
     assert mypy_cmd[-4:] == ["-m", "mypy", "--config-file=", config]
 
-    for (cmd, env), *_ in calls.values():
+    for [(cmd, env)] in calls.values():
         upper = {name.upper() for name in env}
         assert not any(name.startswith("MEFOR_") for name in upper), cmd
         assert {name.upper() for name in _SECRETS}.isdisjoint(upper), cmd
