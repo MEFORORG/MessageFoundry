@@ -718,7 +718,7 @@ def withhold_refused_cell(cipher: Cipher, table: str, exc: CipherError, stored: 
     )
 
 
-def open_listed_cell(cipher: Cipher, stored: str | None, aad: bytes, *, table: str) -> str | None:
+def open_listed_cell(cipher: Cipher, stored: object, aad: bytes, *, table: str) -> str | None:
     """Open one cell of a table this module does not tag, for a list-shaped read, or ``None`` when
     the cipher refuses it only because it does not hold the key the cell names: in-process, a key
     not supplied, a retired key version or an unknown one; under Transit, a retired or unknown key
@@ -732,9 +732,15 @@ def open_listed_cell(cipher: Cipher, stored: str | None, aad: bytes, *, table: s
     audit row or ``integrity_drift`` alert, so the failed read is the only signal, and withholding
     it would hide the tamper. A substituted cell whose marker was also rewritten to name a key the
     store does not hold cannot be told from a key genuinely not held, so it is withheld
-    (:func:`refused_for_key` names the cases)."""
+    (:func:`refused_for_key` names the cases).
+
+    A value that is not text, a planted BLOB say, raises :class:`CipherError` on a keyed and a
+    keyless store alike, failing the read, rather than a ``TypeError`` out of the cipher or a
+    non-text value back to the caller (BACKLOG #5650). The store writes these cells as text only."""
     if stored is None:
         return None
+    if not isinstance(stored, str):
+        raise CipherError(f"a {table} cell is not text, which the store never writes")
     try:
         return cipher.decrypt(stored, aad=aad)
     except CipherError as exc:
