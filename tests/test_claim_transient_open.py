@@ -431,7 +431,7 @@ async def test_a_corrupt_cell_under_a_held_key_is_dead_lettered_and_reported(
             db, f"SELECT last_error, id FROM queue WHERE rowid={head}", (_DEST,)
         )
         last_error = cipher.decrypt(sealed_error, aad=cell_aad("queue", "last_error", row_id))
-        assert "is corrupt" in last_error and "(CipherError)" in last_error, last_error
+        assert "is corrupt" in last_error and "(CipherError, bad_base64)" in last_error, last_error
         assert "malformed ciphertext" not in last_error and "key_id=" not in last_error, last_error
         warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
         assert not any("malformed ciphertext" in m or "key_id=" in m for m in warnings), warnings

@@ -100,9 +100,13 @@ def test_a_corrupt_payload_under_a_held_key_is_corrupt_not_drift() -> None:
         open_queue_cell(cipher, {**row, "channel_id": "IB_B", "payload": sealed})
     assert type(moved.value) is QueueTagError and moved.value.drift
     # BACKLOG #5982: the cipher's error is named by class, never chained, so no traceback prints it.
-    assert "(UnauthenticatedCipherError)" in str(moved.value) and "key_id" not in str(moved.value)
+    assert "(UnauthenticatedCipherError, tag_mismatch)" in str(moved.value) and "key_id" not in str(
+        moved.value
+    )
     assert moved.value.__cause__ is None and moved.value.__context__ is None
 
+    # BACKLOG #5982: each reason survives as a fixed code in place of the cipher's text.
+    codes = {"bad base64": "bad_base64", "too short": "too_short", "not valid UTF-8": "not_utf8"}
     for cause, payload in _corrupt_payloads(cipher, key_b64, sealed).items():
         assert cipher.holds_key_for(payload)  # the marker still names a held key
         with pytest.raises(CipherError, match=cause):  # control: the cipher's own reason
@@ -111,7 +115,8 @@ def test_a_corrupt_payload_under_a_held_key_is_corrupt_not_drift() -> None:
             open_queue_cell(cipher, {**row, "payload": payload})
         assert not corrupt.value.drift
         assert isinstance(corrupt.value, QueueTagError)  # still contained as one
-        assert cause not in str(corrupt.value)
+        assert cause not in str(corrupt.value) and "key_id" not in str(corrupt.value)
+        assert f"(CipherError, {codes[cause]})" in str(corrupt.value), str(corrupt.value)
         assert corrupt.value.__cause__ is None and corrupt.value.__context__ is None
 
 
