@@ -6,8 +6,9 @@
   pre-fix ``_run_remote_proc`` did not take, so they fail there on a TypeError, not on the defect.
   The two here call the runner with only the arguments its signature names, so each runs against
   the pre-fix source too and fails there on an assertion.
-* #5857 item 1: S26-22, a layout no cell could run is refused before any engine starts; S26-23,
-  a cell's engine is stopped when its start-up raises an OSError or the walk is cancelled.
+* #5857 item 1: S26-22, a layout any cell could not run is refused before any engine starts,
+  through the same checks the engine's config loader and connscale-remote run; S26-23, a cell's
+  engine is stopped when its start-up raises an OSError or the walk is cancelled.
 
 Every engine collaborator is faked; no engine or connscale-remote process starts, and the only
 children spawned are one-line ``python -c`` scripts.
@@ -30,7 +31,12 @@ import pytest
 import harness.load.connscale.batchbox as bb
 from harness.load.connscale.profile import load_connscale_profile_text
 from harness.load.connscale.runner import ConnScaleError
-from harness.load.coord import BATCH_CELL_DONE, BATCH_CELL_READY, FileDropCoord
+from harness.load.coord import (
+    BATCH_CELL_DONE,
+    BATCH_CELL_READY,
+    CoordMessageRefused,
+    FileDropCoord,
+)
 
 _BATCH = """\
 [connscale]
@@ -53,12 +59,14 @@ _AUTH_ENV = (
     "MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL",
     "MEFOR_AUTH_LOGIN_RATE_LIMIT_ENABLED",
     "MEFOR_AUTH_LOGIN_RATE_LIMIT_WINDOW_SECONDS",
+    # The engines inherit it, and the layout check refuses a prefix the loader would.
+    "MEFOR_CONNSCALE_NAME_PREFIX",
 )
 
 
 @pytest.fixture(autouse=True)
 def _no_auth_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    # No sign-in limit inherited from the calling shell can refuse the fleet first.
+    # No sign-in limit or name prefix inherited from the calling shell can refuse the fleet first.
     for name in _AUTH_ENV:
         monkeypatch.delenv(name, raising=False)
 
@@ -191,19 +199,38 @@ async def _engine_alone(
     [
         ({"sink_procs": 0}, "sink_procs must be >= 1, got 0"),
         # The CLI's --inbound-base is not bounded by the profile's own base_port check.
-        ({"inbound_base": 65530}, "the inbound ports 65530..65537 run outside 1..65535"),
+        (
+            {"inbound_base": 65530},
+            "count 8: the engine's connscale config refuses the shape: base_port 65530 + count 8 "
+            "runs past port 65535",
+        ),
         ({"api_base": 0}, "the API ports 0..0 run outside 1..65535"),
-        ({"sink_base": 65533}, "the sink ports 65533..65538 run outside 1..65535"),
+        # The loader bounds only the first sink port; connscale-remote refuses band 3's 65536.
+        (
+            {"sink_base": 65533},
+            "count 8: connscale-remote refuses driver band 3: sink port 65536 runs past 65535",
+        ),
         ({"api_base": 2603}, "API port 2603 falls in its inbound ports 2600..2607"),
-        # Two driver bands of four: band 1 binds inbound 2604..2607 beside its sink port 2605,
-        # which connscale-remote's check_remote_bands refuses on the driver box.
+        # Two driver bands of four: the sink ports 2604..2605 fall in the inbound block, which the
+        # engine's config loader refuses.
         (
             {"sink_procs": 2, "sink_base": 2604},
-            "driver band 1's sink port 2605 falls in its inbound ports 2604..2607",
+            "inbound port block [2600, 2607] overlaps the sink port range [2604, 2605]",
+        ),
+        # The loader refuses ANY overlap of the whole inbound block and the whole sink range. A
+        # check per driver band alone passes these, since no band's own sink port falls in its own
+        # inbound sub-range, and then every engine fails at config load.
+        (
+            {"sink_base": 2595},
+            "inbound port block [2600, 2607] overlaps the sink port range [2595, 2600]",
+        ),
+        (
+            {"sink_procs": 2, "sink_base": 2607},
+            "inbound port block [2600, 2607] overlaps the sink port range [2607, 2608]",
         ),
     ],
 )
-async def test_a_layout_no_cell_could_run_starts_no_engine(
+async def test_a_layout_a_cell_could_not_run_starts_no_engine(
     monkeypatch: pytest.MonkeyPatch, layout: dict[str, Any], said: str
 ) -> None:
     """S26-22: each of these used to start the cell's engine and fail it later, if at all. Now no
@@ -258,14 +285,127 @@ async def test_a_claim_mode_the_engine_does_not_read_builds_no_cell(
     assert rec.built == []
 
 
+def test_a_claim_mode_refusal_echoes_the_value_bounded_and_escaped() -> None:
+    profile = load_connscale_profile_text(_BATCH)
+    with pytest.raises(ConnScaleError) as caught:
+        bb.iter_batch_cells(profile, claim_mode="x" * 10_000 + "\x1b[2J")
+    said = str(caught.value)
+    # Before, the whole 10,004-character value, escape sequence included, was echoed.
+    assert len(said) < 300 and "(10004 characters)" in said, said
+    with pytest.raises(ConnScaleError) as caught:
+        bb.iter_batch_cells(profile, claim_mode="per\x1b[2Jlane")
+    assert "\x1b" not in str(caught.value) and "per\\x1b[2Jlane" in str(caught.value)
+
+
+#: A layout well clear of every collision, for a test that varies one other knob.
+_FAR: dict[str, Any] = {
+    "inbound_base": 2600,
+    "api_base": 9000,
+    "sink_base": 40000,
+    "sink_host": "127.0.0.1",
+}
+
+
+def _cells(*counts: int) -> list[bb.BatchCell]:
+    listed = ", ".join(str(n) for n in counts)
+    profile = load_connscale_profile_text(_BATCH.replace("counts = [8]", f"counts = [{listed}]"))
+    return bb.iter_batch_cells(profile, claim_mode="pooled")
+
+
+@pytest.mark.parametrize(
+    ("counts", "sink_procs", "said"),
+    [
+        # The engine's config loader caps the count at 5000 and its sink ports at 4096. A port
+        # check alone passes both, and every engine of that count then fails at config load.
+        ((5001,), 6, "count (MEFOR_CONNSCALE_COUNT) must be <= 5000, got 5001"),
+        ((4097,), 4097, "sink ports (MEFOR_CONNSCALE_SINK_PORTS) must be <= 4096, got 4097"),
+    ],
+)
+def test_the_layout_check_refuses_past_the_engine_loaders_caps(
+    counts: tuple[int, ...], sink_procs: int, said: str
+) -> None:
+    with pytest.raises(ConnScaleError, match=r"refuses the shape: ") as caught:
+        bb.check_engine_layout(_cells(*counts), sink_procs=sink_procs, **_FAR)
+    assert said in str(caught.value)
+    # CONTROL: one below each cap is admitted.
+    bb.check_engine_layout(_cells(*(n - 1 for n in counts)), sink_procs=sink_procs - 1, **_FAR)
+
+
+async def test_one_cell_past_a_cap_refuses_the_whole_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Count 8 could run on its own; the 5001 cell beside it refuses the matrix before any starts.
+    rec = _install_engine_fakes(monkeypatch)
+    report, readies = await _engine_alone(
+        _BATCH.replace("counts = [8]", "counts = [8, 5001]"), sink_procs=6
+    )
+    assert rec.built == []
+    assert [c.count for c in report.cells] == [8, 5001]
+    assert all(c.error and "must be <= 5000" in c.error for c in report.cells)
+    assert len(readies) == 2 and all("must be <= 5000" in r.get("error", "") for r in readies)
+
+
 def test_the_layout_check_admits_the_edges_of_the_port_space() -> None:
     cells = bb.iter_batch_cells(load_connscale_profile_text(_BATCH), claim_mode="per_lane")
-    bb.check_engine_layout(cells, sink_procs=1, inbound_base=1, api_base=65535, sink_base=65535)
-    bb.check_engine_layout(cells, sink_procs=6, inbound_base=65528, api_base=9, sink_base=1)
+    off_box = {"sink_host": "10.0.0.2"}
+    bb.check_engine_layout(
+        cells, sink_procs=1, inbound_base=1, api_base=65535, sink_base=65535, **off_box
+    )
+    bb.check_engine_layout(
+        cells, sink_procs=6, inbound_base=65528, api_base=9, sink_base=1, sink_host="localhost"
+    )
     # API blocks that end just below, or start just above, the inbound block 2600..2607.
-    bb.check_engine_layout(cells, sink_procs=6, inbound_base=2600, api_base=2599, sink_base=40000)
-    bb.check_engine_layout(cells, sink_procs=6, inbound_base=2600, api_base=2608, sink_base=40000)
-    bb.check_engine_layout([], sink_procs=0, inbound_base=0, api_base=0, sink_base=0)
+    bb.check_engine_layout(cells, sink_procs=6, **{**_FAR, "api_base": 2599})
+    bb.check_engine_layout(cells, sink_procs=6, **{**_FAR, "api_base": 2608})
+    # ... and just below, or just above, a loopback sink range 40000..40005.
+    bb.check_engine_layout(cells, sink_procs=6, **{**_FAR, "api_base": 39999})
+    bb.check_engine_layout(cells, sink_procs=6, **{**_FAR, "api_base": 40006})
+    bb.check_engine_layout(
+        [], sink_procs=0, inbound_base=0, api_base=0, sink_base=0, sink_host="127.0.0.1"
+    )
+
+
+@pytest.mark.parametrize(
+    "sink_host",
+    # An empty host is the loader's 127.0.0.1; a dial to the unspecified address stays local.
+    ["127.0.0.1", "localhost", "::1", "127.0.0.2", "", "  ", "0.0.0.0", "::"],
+)
+def test_an_api_port_in_a_loopback_sink_range_is_refused(sink_host: str) -> None:
+    # The sinks bind on this box, so cell 0's API port 40002 would take band 2's sink port.
+    with pytest.raises(ConnScaleError, match="API port 40002 falls in its sink ports 40000..40005"):
+        bb.check_engine_layout(
+            _cells(8), sink_procs=6, **{**_FAR, "api_base": 40002, "sink_host": sink_host}
+        )
+    # CONTROL: sinks on another box share no port with the engine's API.
+    bb.check_engine_layout(
+        _cells(8), sink_procs=6, **{**_FAR, "api_base": 40002, "sink_host": "10.0.0.2"}
+    )
+
+
+async def test_a_name_prefix_the_engine_loader_refuses_starts_no_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The engines inherit MEFOR_CONNSCALE_NAME_PREFIX from the calling shell; the loader refuses a
+    # prefix outside [A-Za-z0-9_], so every engine would fail at config load.
+    rec = _install_engine_fakes(monkeypatch)
+    monkeypatch.setenv("MEFOR_CONNSCALE_NAME_PREFIX", "E-0")
+    report, readies = await _engine_alone(sink_procs=6)
+    assert rec.built == []
+    assert all(c.error and "name prefix" in c.error for c in report.cells)
+    assert readies and all("name prefix" in r.get("error", "") for r in readies)
+    # CONTROL: a prefix the loader admits runs.
+    monkeypatch.setenv("MEFOR_CONNSCALE_NAME_PREFIX", " E0 ")
+    report, _ = await _engine_alone(sink_procs=6)
+    assert report.ok, report.notes
+
+
+def test_a_loader_refusal_echoes_an_inherited_value_bounded_and_escaped() -> None:
+    hostile = "\x1b[2J" + "-" * 10_000
+    with pytest.raises(ConnScaleError) as caught:
+        bb.check_engine_layout(_cells(8), sink_procs=6, name_prefix=hostile, **_FAR)
+    said = str(caught.value)
+    assert "name prefix (MEFOR_CONNSCALE_NAME_PREFIX)" in said
+    assert "\x1b" not in said and len(said) < 600 and "characters)" in said, said[:200]
 
 
 async def test_the_default_layout_still_runs(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -313,6 +453,35 @@ async def test_an_engine_that_cannot_be_built_fails_the_cell(
     assert [c.error for c in report.cells] == [said]
     assert [r.get("error") for r in readies] == [said]
     assert rec.started == rec.stopped == []
+
+
+@pytest.mark.parametrize(
+    ("exc", "said"),
+    [
+        # The text resume_into_job raises when it cannot resume the started process.
+        (
+            OSError("node batch-x: could not resume the started process (status 0xc0000022)"),
+            "OSError: node batch-x: could not resume the started process (status 0xc0000022)",
+        ),
+        (TimeoutError("health wait ran out"), "TimeoutError: health wait ran out"),
+        # Cut short and made terminal-safe, so a long or hostile message cannot run on.
+        (OSError("\x1b[2J" + "y" * 500), "OSError: \\x1b[2J" + "y" * 116 + "... (504 characters)"),
+        # No text to keep: the type alone.
+        (OSError(), "OSError"),
+        (OSError(5), "OSError"),
+    ],
+)
+async def test_a_one_argument_oserror_keeps_its_message(
+    monkeypatch: pytest.MonkeyPatch, exc: OSError, said: str
+) -> None:
+    """Before, an OSError with no OS reason was named by its type alone, which dropped the one
+    line saying why the engine did not start."""
+    rec = _install_engine_fakes(monkeypatch)
+    monkeypatch.setattr(bb, "_await_node_healthy", _raiser(exc))
+    report, readies = await _engine_alone(sink_procs=6)
+    assert [c.error for c in report.cells] == [f"engine did not start: {said}"]
+    assert [r.get("error") for r in readies] == [f"engine did not start: {said}"]
+    assert rec.started and rec.stopped == rec.started
 
 
 async def test_a_failed_error_ready_post_still_stops_the_engine(
@@ -388,3 +557,24 @@ async def test_a_cancelled_done_wait_after_a_failed_start_stops_the_engine(
     monkeypatch.setattr(FileDropCoord, "await_message", _raiser(asyncio.CancelledError()))
     await _walk_is_cancelled()
     assert rec.started and rec.stopped == rec.started
+
+
+async def test_a_refused_done_after_a_failed_start_stops_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused coord message stops the run with its own reason, as it does after a cell that
+    started; before, the failed-start path noted its type and walked on to the next cell."""
+    rec = _install_engine_fakes(monkeypatch)
+    monkeypatch.setattr(bb, "_await_node_healthy", _raiser(ConnScaleError("not healthy")))
+    refused = CoordMessageRefused("the DONE file is not a regular file")
+    monkeypatch.setattr(FileDropCoord, "await_message", _raiser(refused))
+    two_cells = load_connscale_profile_text(_BATCH.replace("counts = [8]", "counts = [3, 8]"))
+    with tempfile.TemporaryDirectory() as tmp, pytest.raises(CoordMessageRefused):
+        await bb.run_batch_engine(
+            profile=two_cells,
+            coord=FileDropCoord(tmp, run_id="batch_ab"),
+            store_env={},
+            sink_procs=6,
+            cell_timeout=10.0,
+        )
+    assert len(rec.started) == 1 and rec.stopped == rec.started

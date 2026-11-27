@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import json
 import logging
 import math
@@ -43,8 +44,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from harness.config.connscale._shape import CHEAP, make_connscale_shape
 from harness.load.connscale.compare import build_batch_comparison
 from harness.load.connscale.profile import CLAIM_MODES, FUSE_OFF, SANDBOX_OFF, ConnScaleProfile
+from harness.load.connscale.remote import check_remote_bands
 from harness.load.connscale.report import (
     EXIT_OK,
     EXIT_SLO_VIOLATION,
@@ -64,7 +67,12 @@ from harness.load.connscale.runner import (
     _node_env,
     _reset_server_store,
 )
-from harness.load.coord import BATCH_CELL_DONE, BATCH_CELL_READY, FileDropCoord
+from harness.load.coord import (
+    BATCH_CELL_DONE,
+    BATCH_CELL_READY,
+    CoordMessageRefused,
+    FileDropCoord,
+)
 from harness.load.failover import EngineNode, FailoverError, _await_port
 from messagefoundry.terminal_text import escape_for_terminal
 
@@ -212,39 +220,109 @@ def check_operator_sign_in_limits(procs: int, environ: Mapping[str, str]) -> Non
 
 
 _PORT_MAX = 65535
+_SHOWN_MAX = 120  # characters of an outside value a refusal or a cell error echoes
+
+
+_LOADER_SHOWN_MAX = 400  # a loader refusal names the knob and the fix, so it gets more room
+
+
+def _shown(text: str, limit: int = _SHOWN_MAX) -> str:
+    """``text`` as a refusal or a cell error may echo it: one terminal-safe line cut to ``limit``
+    characters before escaping, so an outside value can neither run on nor steer the terminal that
+    prints it."""
+    shown = escape_for_terminal(text[:limit], single_line=True)
+    return f"{shown}... ({len(text)} characters)" if len(text) > limit else shown
+
+
+def _is_this_box(host: str) -> bool:
+    """Whether a sink dialled at ``host`` binds on this box, so it shares this box's ports: a
+    loopback address, ``localhost``, or the unspecified address, which a dial reaches locally."""
+    text = host.strip().lower()
+    if text == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_unspecified
 
 
 def check_engine_layout(
-    cells: list[BatchCell], *, sink_procs: int, inbound_base: int, api_base: int, sink_base: int
+    cells: list[BatchCell],
+    *,
+    sink_procs: int,
+    inbound_base: int,
+    api_base: int,
+    sink_base: int,
+    sink_host: str,
+    transform: str = CHEAP,
+    name_prefix: str = "",
 ) -> None:
-    """Refuse an engine-box layout no cell could run, before any engine starts (BACKLOG #5857).
+    """Refuse an engine-box layout that any cell could not run, before any engine starts (BACKLOG
+    #5857). One cell's fault refuses the whole matrix, the cells that could run included.
 
-    Raises :class:`ConnScaleError` naming the first fault: a sink-process count below 1, a port
-    block that runs outside 1..65535 (the largest cell's inbound block, the API ports the cells
-    step through, or the agreed sink band), a cell whose API port falls in its own inbound block,
-    or a driver band whose sink port falls in that band's inbound sub-range, which
-    connscale-remote's ``check_remote_bands`` refuses. Each of these used to start the cells'
-    engines and fail them later, at a port bind, a health wait, or the driver's band plan, one cell
-    at a time. An empty cell list has no layout to refuse. The claim mode is
-    :func:`iter_batch_cells`'s to refuse, since the cell ids carry it.
+    Raises :class:`ConnScaleError` naming the first fault. The shape each distinct count gives the
+    engine goes through the engine's own config loader, :func:`make_connscale_shape`, so this
+    refuses what every engine of that count would refuse at config load: at least a count or a
+    sink-port count past its cap, an inbound block outside the port space, an inbound block that
+    overlaps the sink range, whatever host the sinks are on, and a connection-name prefix the
+    loader does not admit. Each driver band of that count goes through connscale-remote's own
+    :func:`check_remote_bands`, which also refuses a sink port past 65535. Beside those, a
+    sink-process count below 1, API ports the cells step through that run outside 1..65535, and a
+    cell whose API port falls in its own inbound block are refused, or in its own sink range when
+    the engine dials its sinks on this box (:func:`_is_this_box`, after the loader's default for
+    an empty ``sink_host``), so they share the engine's ports. Each of these used to start
+    the cells' engines and fail them later, at config load, a port bind, a health wait, or the
+    driver's band plan, one cell at a time. An empty cell list has no layout to refuse. The claim
+    mode is :func:`iter_batch_cells`'s to refuse, since the cell ids carry it.
 
     Only ports one cell binds at once are compared: a later cell may bind a port an earlier
-    cell's engine bound and released. A sink band on the engine's own box is not compared with
-    the engine's ports, since nothing here says the boxes are one."""
+    cell's engine bound and released. With any other ``sink_host`` the sink range is not compared
+    with the API ports, since the sinks are then taken to be on another box. A loopback spelling
+    :mod:`ipaddress` does not read, such as ``127.1``, is taken that way too."""
     if not cells:
         return
     if sink_procs < 1:
         raise ConnScaleError(f"sink_procs must be >= 1, got {sink_procs}")
-    top_count = max(c.count for c in cells)
-    blocks = (
-        ("inbound", inbound_base, top_count),
-        ("API", api_base, len(cells)),
-        ("sink", sink_base, min(sink_procs, top_count)),
-    )
-    for what, first, span in blocks:
-        last = first + span - 1
-        if first < 1 or last > _PORT_MAX:
-            raise ConnScaleError(f"the {what} ports {first}..{last} run outside 1..{_PORT_MAX}")
+    api_last = api_base + len(cells) - 1
+    if api_base < 1 or api_last > _PORT_MAX:
+        raise ConnScaleError(f"the API ports {api_base}..{api_last} run outside 1..{_PORT_MAX}")
+    sinks_here = False
+    for count in sorted({c.count for c in cells}):
+        try:
+            shape = make_connscale_shape(
+                count=count,
+                base_port=inbound_base,
+                sink_host=sink_host.strip(),  # stripped as the engine's env route strips it
+                sink_port=sink_base,
+                sink_ports=min(sink_procs, count),  # the delivery ports run_batch_engine sets
+                transform=transform,
+                name_prefix=name_prefix,
+            )
+        except ValueError as exc:
+            # Bounded: the loader echoes the value it refused, and a name prefix comes from the
+            # calling shell's environment.
+            raise ConnScaleError(
+                f"count {count}: the engine's connscale config refuses the shape: "
+                f"{_shown(str(exc), _LOADER_SHOWN_MAX)}"
+            ) from exc
+        # The host the engine dials, after the loader's own default for an empty one.
+        sinks_here = _is_this_box(shape.sink_host)
+        bands = plan_driver_bands(
+            inbound_base=inbound_base, count=count, sink_base=sink_base, sink_procs=sink_procs
+        )
+        for band in bands:
+            try:
+                check_remote_bands(
+                    [band.inbound_base],
+                    [band.sink_base],
+                    count=band.conn_count,
+                    sink_ports=band.sink_ports,
+                )
+            except ConnScaleError as exc:
+                raise ConnScaleError(
+                    f"count {count}: connscale-remote refuses driver band {band.index}: {exc}"
+                ) from exc
     for step, cell in enumerate(cells):
         api_port = api_base + step
         if inbound_base <= api_port < inbound_base + cell.count:
@@ -252,16 +330,12 @@ def check_engine_layout(
                 f"cell {cell.cell_id}: API port {api_port} falls in its inbound ports "
                 f"{inbound_base}..{inbound_base + cell.count - 1}"
             )
-        bands = plan_driver_bands(
-            inbound_base=inbound_base, count=cell.count, sink_base=sink_base, sink_procs=sink_procs
-        )
-        for band in bands:
-            band_last = band.inbound_base + band.conn_count - 1
-            if band.inbound_base <= band.sink_base <= band_last:
-                raise ConnScaleError(
-                    f"cell {cell.cell_id}: driver band {band.index}'s sink port {band.sink_base} "
-                    f"falls in its inbound ports {band.inbound_base}..{band_last}"
-                )
+        sink_last = sink_base + min(sink_procs, cell.count) - 1
+        if sinks_here and sink_base <= api_port <= sink_last:
+            raise ConnScaleError(
+                f"cell {cell.cell_id}: API port {api_port} falls in its sink ports "
+                f"{sink_base}..{sink_last}, which bind on this box"
+            )
 
 
 def _refusal_before_any_cell(
@@ -271,11 +345,14 @@ def _refusal_before_any_cell(
     inbound_base: int,
     api_base: int,
     sink_base: int,
+    sink_host: str,
+    transform: str,
     environ: Mapping[str, str],
 ) -> tuple[str, ConnScaleError] | None:
     """The first check that refuses the whole matrix, as ``(label, error)``, or None. The sign-in
     limits are sized to the largest cell's fleet: it grows with the count, so the largest covers
-    every smaller one."""
+    every smaller one. The connection-name prefix is the one the engines inherit from ``environ``,
+    since :func:`_node_env` sets none, read the way the engine's env route reads it."""
     if not cells:
         return None
     try:
@@ -285,6 +362,9 @@ def _refusal_before_any_cell(
             inbound_base=inbound_base,
             api_base=api_base,
             sink_base=sink_base,
+            sink_host=sink_host,
+            transform=transform,
+            name_prefix=environ.get("MEFOR_CONNSCALE_NAME_PREFIX", "").strip(),
         )
     except ConnScaleError as exc:
         return "ENGINE LAYOUT REFUSED", exc
@@ -341,7 +421,9 @@ def iter_batch_cells(profile: ConnScaleProfile, *, claim_mode: str) -> list[Batc
     A claim mode the engine does not read is refused too (BACKLOG #5857), before any cell id is
     built from it: a cell id names the coord files both halves write."""
     if claim_mode not in CLAIM_MODES:
-        raise ConnScaleError(f"claim mode {claim_mode!r} is not one of {sorted(CLAIM_MODES)}")
+        raise ConnScaleError(
+            f"claim mode '{_shown(claim_mode)}' is not one of {sorted(CLAIM_MODES)}"
+        )
     if profile.sandbox_modes != (SANDBOX_OFF,) or profile.warmup_timeout_s > 0.0:
         raise ConnScaleError(
             f"the batch box runs no sandbox arm and no warm-up; profile {profile.name!r} names "
@@ -1000,16 +1082,18 @@ async def run_batch_engine(
     inbound = profile.base_port if inbound_base is None else inbound_base
     cells = iter_batch_cells(profile, claim_mode=claim_mode)
     report = BatchEngineReport(profile=profile.name, claim_mode=claim_mode)
-    # Refuse a layout no cell could run and an operator sign-in limit too small for the largest
-    # cell's fleet, before any engine starts. Each cell then fails the way an engine that did not
-    # start fails, so the driver box reads an error READY for every cell instead of waiting on one
-    # that never comes, or on a stale one.
+    # Refuse a layout any cell could not run and an operator sign-in limit too small for the
+    # largest cell's fleet, before any engine starts: one cell's fault refuses the whole matrix.
+    # Each cell then fails the way an engine that did not start fails, so the driver box reads an
+    # error READY for every cell instead of waiting on one that never comes, or on a stale one.
     refusal = _refusal_before_any_cell(
         cells,
         sink_procs=sink_procs,
         inbound_base=inbound,
         api_base=api_base,
         sink_base=sink_base,
+        sink_host=sink_host,
+        transform=profile.transform,
         environ=base_env,
     )
     if refusal is not None:
@@ -1120,6 +1204,8 @@ async def run_batch_engine(
                 cell_coord.post(BATCH_CELL_READY, {"cell_id": cell.cell_id, "error": info.error})
                 try:
                     await cell_coord.await_message(BATCH_CELL_DONE, timeout=cell_timeout)
+                except CoordMessageRefused:
+                    raise  # it stops the run with its own reason, as on the success path
                 except Exception as wait_exc:
                     kind = type(wait_exc).__name__
                     log.warning("batch cell %s: wait for DONE failed: %s", cell.cell_id, kind)
@@ -1192,10 +1278,16 @@ async def _stop_cell_node(node: EngineNode, cell_id: str, report: BatchEngineRep
 
 def _start_fault(exc: BaseException) -> str:
     """Why a cell's engine did not start, for its error, its READY and the notes. An OSError is
-    named by type and its OS reason only: its full text carries the file paths it failed on, and
-    a bare one has no text at all."""
+    named by type and a reason only, cut short and made terminal-safe by :func:`_shown`. The
+    reason is its OS reason where it has one, since its full text carries the file paths it failed
+    on, or else the message of a one-argument OSError, a TimeoutError included, such as the status
+    ``resume_into_job`` raises. A bare one, or one whose only argument is not text, has no
+    reason."""
     if isinstance(exc, OSError):
-        return f"{type(exc).__name__}: {exc.strerror}" if exc.strerror else type(exc).__name__
+        reason = exc.strerror if isinstance(exc.strerror, str) else None
+        if not reason and len(exc.args) == 1 and isinstance(exc.args[0], str):
+            reason = exc.args[0]
+        return f"{type(exc).__name__}: {_shown(reason)}" if reason else type(exc).__name__
     return str(exc)
 
 
