@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import re
+import threading
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -721,6 +722,63 @@ def test_read_log_file_does_not_block_on_a_fifo_swapped_in_after_the_listing(
     os.mkfifo(log)
     with pytest.raises(bundle_mod._LogFileRefused):
         bundle_mod._read_log_file(log, listed)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are POSIX only")
+def test_log_tail_does_not_hang_on_a_fifo_put_at_the_listed_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same race, driven through :func:`build_bundle` as the CLI drives it, so it names no
+    helper of the bundle's own: the listing saw a regular file, and a FIFO is at the name by the
+    open. A plain open then waits for a writer and the bundle never finishes (BACKLOG #5383).
+    The listing's view is stood in for by answering ``os.stat`` and ``os.lstat`` for that one name
+    with a regular file's stat, so the test does rest on the listing checking the file through one
+    of those two calls; the count below fails it by name if neither is reached. A FIFO cannot be
+    made on Windows, so this runs on POSIX only."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    fifo = log_dir / "engine.log"
+    os.mkfifo(fifo)
+    fifo_name = os.fspath(fifo)
+    decoy = tmp_path / "decoy.log"
+    decoy.write_text("x\n", encoding="utf-8")
+    seen_as_regular = os.lstat(decoy)
+    forged = [0]
+
+    def as_listed(real: Any) -> Any:
+        def fake(path: Any, *args: Any, **kwargs: Any) -> Any:
+            if not isinstance(path, int) and os.fspath(path) == fifo_name:
+                forged[0] += 1
+                return seen_as_regular
+            return real(path, *args, **kwargs)
+
+        return fake
+
+    monkeypatch.setattr(os, "stat", as_listed(os.stat))
+    monkeypatch.setattr(os, "lstat", as_listed(os.lstat))
+
+    result: list[str | None] = []
+    failed: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            result.append(_tail_member(tmp_path, log_dir))
+        except BaseException as exc:  # noqa: BLE001 -- reported by the assertion below
+            failed.append(exc)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(10)
+    hung = worker.is_alive()
+    if hung:
+        # Release the open still waiting on the FIFO: a writer arriving lets it return, and the
+        # close gives it end of file, so no thread outlives the test.
+        os.close(os.open(fifo_name, os.O_WRONLY | os.O_NONBLOCK))
+        worker.join(10)
+    assert not hung, "build_bundle was still waiting on the FIFO after 10 seconds"
+    assert not failed, failed
+    assert forged[0] >= 1, "neither os.stat nor os.lstat was asked about the log file"
+    assert result == ["MF-BUNDLE-LOG-002 _LogFileRefused"]
 
 
 def test_read_log_file_refuses_a_file_swapped_in_after_the_listing(tmp_path: Path) -> None:
