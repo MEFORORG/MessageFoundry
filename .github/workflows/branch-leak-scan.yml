@@ -149,10 +149,20 @@ jobs:
             # Exactly 40: a short hex value would resolve as an abbreviated id.
             if [ "${#sha}" -ne 40 ]; then echo "::error::push SHA '$sha' is not 40 hex characters." >&2; exit 2; fi
           done
-          # Step 2's inputs, written before anything below can exit, so step 2 always has them.
+          # STEP 2'S INPUT, THE EARLIER RANGE. It is listed to a .tmp file, moved into place whole, and
+          # then a .done marker holding its line count is written LAST, so step 2 can tell a complete
+          # list from a missing or partial one: a step 1 that dies mid `rev-list` leaves no marker, and
+          # step 2 fails closed rather than reading what it finds as an empty range.
           earlier_file="$RUNNER_TEMP/branch-leak-scan-earlier.txt"
-          : > "$earlier_file"
+          rm -f "$earlier_file" "$earlier_file.tmp" "$earlier_file.done" "$earlier_file.done.tmp"
+          record_earlier() {
+            mv "$earlier_file.tmp" "$earlier_file"
+            wc -l < "$earlier_file" | tr -d ' ' > "$earlier_file.done.tmp"
+            mv "$earlier_file.done.tmp" "$earlier_file.done"
+          }
           if [ "$PUSH_AFTER" = "$zero" ]; then
+            : > "$earlier_file.tmp"
+            record_earlier
             echo "branch deleted: no pushed commits to scan; scanning the checked-out tree only."
             python scripts/security/scan_forbidden.py --path .
             exit 0
@@ -161,10 +171,13 @@ jobs:
           rm -rf "$snap"
           mkdir -p "$snap"
           # Writes each commit in $1 (one id per line) to its own root under $snap, every file that
-          # commit added or changed, and sets roots and files for the scan that follows.
+          # commit added or changed, and sets roots and files for the scan that follows. A refusal found
+          # on the walk is recorded in walk_rc (2 for an unsafe path, else 1) and the walk goes on, so
+          # one run reports every commit that carries one; the caller fails on walk_rc after its scan.
           snapshot() {
             roots=()
             files=0
+            walk_rc=0
             while read -r sha; do
               [ -n "$sha" ] || continue
               root="$snap/$sha"
@@ -186,16 +199,19 @@ jobs:
                 case "$newmode" in 100644|100755|120000) ;; *) continue ;; esac
                 case "/$path/" in
                   //*|*/../*|*/./*|*/.git/*)
+                    # The path is not printed: it is pushed text, and could carry a workflow command.
                     echo "::error::branch commit $sha names an unsafe path; refusing to write it." >&2
-                    exit 2
+                    walk_rc=2
+                    continue
                     ;;
                 esac
                 # The scanner skips this path so a working-tree scan on the owner's machine does not
                 # trip on the git-ignored real token list. Inside a COMMIT it is committed by
-                # definition, so its presence is the leak.
+                # definition, so its presence is the leak. It is never written out for the scanner.
                 if [ "$path" = "scripts/security/scan-tokens.local.txt" ]; then
                   echo "::error::branch commit $sha commits scripts/security/scan-tokens.local.txt, the real token list." >&2
-                  exit 1
+                  if [ "$walk_rc" -lt 1 ]; then walk_rc=1; fi
+                  continue
                 fi
                 case "$path" in
                   */*) mkdir -p "$root/${path%/*}" ;;
@@ -218,18 +234,24 @@ jobs:
           this_push=(--not refs/remotes/origin/main)
           if [ "$PUSH_BEFORE" != "$zero" ] && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
             this_push+=("$PUSH_BEFORE")
-            git rev-list "$PUSH_BEFORE" --not refs/remotes/origin/main > "$earlier_file"
+            git rev-list "$PUSH_BEFORE" --not refs/remotes/origin/main > "$earlier_file.tmp"
           else
             echo "no usable 'before' (new branch, or a force-push whose old head is not here): step 1 scans everything not on origin/main."
+            : > "$earlier_file.tmp"
           fi
+          record_earlier
           commits="$(git rev-list "$PUSH_AFTER" "${this_push[@]}")"
           snapshot "$commits"
           echo "step 1, this push: $(count "$commits") commit(s) walked, $files added or changed file(s) under ${#roots[@]} commit root(s)."
           # ONE scan of the tip tree and every commit root. Each commit is its own root, so a path
           # detector keyed on `docs/security/` still sees the repository-relative path, and the tip
           # always has files, so the scanner's zero-files refusal cannot fire on a push whose only
-          # files sit under a directory the scanner skips.
-          python scripts/security/scan_forbidden.py --path . "${roots[@]}"
+          # files sit under a directory the scanner skips. It runs even after a refusal on the walk, so
+          # the run reports every hit, and the step then fails on whichever code is higher.
+          rc=0
+          python scripts/security/scan_forbidden.py --path . "${roots[@]}" || rc=$?
+          if [ "$walk_rc" -gt "$rc" ]; then rc=$walk_rc; fi
+          exit "$rc"
       - name: Rescan the commits earlier pushes added
         # STEP 2 (BACKLOG #8244 item 63): what `before` reaches off main, which is disjoint from step
         # 1's commits. On a force-push whose old head is still here it also holds the commits the push
@@ -248,10 +270,21 @@ jobs:
           export MEFOR_MIN_DETECTORS=names=8,estate=14,site_prefixes=2
           set -euo pipefail
           earlier_file="$RUNNER_TEMP/branch-leak-scan-earlier.txt"
-          if [ ! -f "$earlier_file" ]; then
-            # Step 1 writes this before any exit but its input checks, so it is missing only when
-            # step 1 refused its inputs or never ran. Not a clean range.
-            echo "::error::step 1 recorded no earlier range ($earlier_file); the earlier pushes were not rescanned." >&2
+          # A missing, partial or unfinished record is not a clean range: step 1 writes the .done
+          # marker only after the whole list is in place, so it is missing when step 1 refused its
+          # inputs, never ran, or died while listing (BACKLOG #5595).
+          if [ ! -f "$earlier_file" ] || [ ! -f "$earlier_file.done" ]; then
+            echo "::error::step 1 recorded no earlier range ($earlier_file), or did not finish recording it; the earlier pushes were not rescanned." >&2
+            exit 2
+          fi
+          expected="$(cat "$earlier_file.done")"
+          actual="$(wc -l < "$earlier_file" | tr -d ' ')"
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::step 1's earlier range holds $actual line(s), not the $expected it recorded; the earlier pushes were not rescanned." >&2
+            exit 2
+          fi
+          if grep -qvE '^[0-9a-f]{40}$' "$earlier_file"; then
+            echo "::error::step 1's earlier range holds a line that is not a commit id; the earlier pushes were not rescanned." >&2
             exit 2
           fi
           earlier="$(cat "$earlier_file")"
@@ -264,10 +297,27 @@ jobs:
           . "$RUNNER_TEMP/branch-leak-scan-snapshot.sh"
           snapshot "$earlier"
           echo "step 2, earlier pushes: $(count "$earlier") commit(s) walked, $files added or changed file(s) under ${#roots[@]} commit root(s)."
-          if [ "${#roots[@]}" -eq 0 ]; then exit 0; fi
+          if [ "${#roots[@]}" -eq 0 ]; then exit "$walk_rc"; fi
           # This workflow file is text and is always checked out, since GitHub runs it from the pushed
           # commit, so a range of binary files alone cannot trip the zero-files refusal.
-          python scripts/security/scan_forbidden.py --path .github/workflows/branch-leak-scan.yml "${roots[@]}"
+          sentinel=.github/workflows/branch-leak-scan.yml
+          rc=0
+          python scripts/security/scan_forbidden.py --path "$sentinel" "${roots[@]}" || rc=$?
+          if [ "$rc" -eq 1 ]; then
+            # The scanner names a hit by its path inside a commit root, which drops the commit. After
+            # a hit, each root is scanned again on its own, so each hit is named with its commit SHA.
+            # Reasons only, as above: never the matched content.
+            for root in "${roots[@]}"; do
+              one=0
+              python scripts/security/scan_forbidden.py --path "$sentinel" "$root" > "$snap/attribution.txt" 2>&1 || one=$?
+              if [ "$one" -ne 0 ]; then
+                echo "::error::earlier-push commit ${root##*/} carries the hit(s) below; each path is inside that commit." >&2
+                cat "$snap/attribution.txt" >&2
+              fi
+            done
+          fi
+          if [ "$walk_rc" -gt "$rc" ]; then rc=$walk_rc; fi
+          exit "$rc"
       - name: Say what a failure here does and does not mean
         if: failure()
         run: |

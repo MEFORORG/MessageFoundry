@@ -16,7 +16,9 @@ out what to scan, never the scanner's detectors.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -35,10 +37,12 @@ _MARKER = "SYNTHETIC-LEAK-MARKER"
 
 #: Reports each scanned file holding the marker, by its path relative to the scan root it came from,
 #: and exits 1 on any hit. Every call's arguments are logged so a row can tell the tip scan from the
-#: range scan. A named root that does not exist exits 2, as the real scanner's unreadable path does.
+#: range scan, and the detector floor it ran under goes to a second log. A named root that does not
+#: exist exits 2, as the real scanner's unreadable path does.
 _STUB = f"""#!/usr/bin/env bash
 shift
 echo "$*" >> "$SCAN_LOG"
+echo "${{MEFOR_REQUIRE_TOKENS:-unset}} ${{MEFOR_MIN_DETECTORS:-unset}}" >> "$SCAN_LOG.env"
 [ "$1" = "--path" ] || exit 9
 shift
 hit=0
@@ -49,6 +53,17 @@ for root in "$@"; do
   done < <(find "$root" -path "$root/.git" -prune -o -type f -print0)
 done
 exit $hit
+"""
+
+#: Stands in for git so a row can kill step 1 partway through listing the earlier range: the
+#: ``rev-list`` whose first argument is ``$FAIL_REVLIST`` prints only its first line, then exits 128,
+#: as a git that died mid-walk does. Every other call goes to the real git.
+_GIT_SHIM = """#!/usr/bin/env bash
+if [ "${1:-}" = rev-list ] && [ "${2:-}" = "$FAIL_REVLIST" ]; then
+  "$REAL_GIT" "$@" | head -n 1
+  exit 128
+fi
+exec "$REAL_GIT" "$@"
 """
 
 
@@ -112,9 +127,21 @@ def bash(tmp_path_factory: pytest.TempPathFactory) -> str:
 
 
 def _run_steps(
-    bash: str, repo: Path, tmp_path: Path, before: str, after: str, *, steps: tuple[str, ...] = ()
+    bash: str,
+    repo: Path,
+    tmp_path: Path,
+    before: str,
+    after: str,
+    *,
+    steps: tuple[str, ...] = (),
+    fail_revlist: str | None = None,
+    between: Callable[[Path], None] | None = None,
+    tokens: str = "synthetic",
 ) -> tuple[list[int], str, list[str]]:
-    """Run step 1 then step 2, as the job does: step 2 runs whatever step 1 returned."""
+    """Run step 1 then step 2, as the job does: step 2 runs whatever step 1 returned.
+
+    ``fail_revlist`` puts ``_GIT_SHIM`` in front of git; ``between`` is called with ``$RUNNER_TEMP``
+    after the first step, to damage what it recorded."""
     stub_dir = tmp_path / "stub"
     stub_dir.mkdir(exist_ok=True)
     stub = stub_dir / "python"
@@ -125,16 +152,34 @@ def _run_steps(
     runner_temp = tmp_path / "runner-temp"
     runner_temp.mkdir(exist_ok=True)
     env = probe_env(Path(bash), dict(os.environ))
+    prefix = stub_dir.as_posix()
+    if fail_revlist is not None:
+        real_git = subprocess.run(
+            [bash, "-c", "command -v git"], capture_output=True, text=True, timeout=60, env=env
+        ).stdout.strip()
+        assert real_git, "no git on the bash PATH"
+        shim_dir = tmp_path / "gitshim"
+        shim_dir.mkdir(exist_ok=True)
+        shim = shim_dir / "git"
+        shim.write_text(_GIT_SHIM, encoding="utf-8", newline="\n")
+        shim.chmod(0o755)
+        prefix = f"{shim_dir.as_posix()}{os.pathsep}{prefix}"
+        env.update({"REAL_GIT": real_git, "FAIL_REVLIST": fail_revlist})
     env.update(
         {
-            "MEFOR_FORBIDDEN_TOKENS": "synthetic",
+            "MEFOR_FORBIDDEN_TOKENS": tokens,
             "PUSH_BEFORE": before,
             "PUSH_AFTER": after,
             "RUNNER_TEMP": runner_temp.as_posix(),
             "SCAN_LOG": log.as_posix(),
-            "PATH": f"{stub_dir.as_posix()}{os.pathsep}{env.get('PATH', '')}",
+            "PATH": f"{prefix}{os.pathsep}{env.get('PATH', '')}",
         }
     )
+    if fail_revlist is not None:
+        which_git = subprocess.run(
+            [bash, "-c", "command -v git"], capture_output=True, text=True, timeout=60, env=env
+        ).stdout.strip()
+        assert "gitshim" in which_git.replace("\\", "/"), f"the git shim lost to {which_git!r}"
     # The stub must WIN, not merely be first on PATH: Git for Windows' bash can reorder PATH, and a
     # real python here would run a real scanner against nothing (BACKLOG #1216).
     which = subprocess.run(
@@ -156,6 +201,8 @@ def _run_steps(
         )
         rcs.append(proc.returncode)
         out += proc.stdout + proc.stderr
+        if i == 0 and between is not None:
+            between(runner_temp)
     calls = log.read_text(encoding="utf-8").splitlines()
     return rcs, out, calls
 
@@ -214,9 +261,10 @@ def test_a_later_push_rescans_an_earlier_push_whose_run_never_finished(
     rc, out, calls = _run(bash, repo.path, tmp_path, leaked, removed)
     assert rc == 1, f"rc={rc}; the earlier push's commit was not rescanned\n{out}"
     assert "HIT docs/security/note.md" in out, out
-    assert len(calls) == 2, calls
+    assert len(calls) == 3, f"tip, earlier range, then the hit's own commit: {calls}"
     assert calls[0] == "--path .", f"step 1 adds nothing but the tip: {calls}"
     assert calls[1].startswith(f"--path {_SENTINEL} ") and leaked in calls[1], calls
+    assert f"earlier-push commit {leaked} carries the hit(s) below" in out, out
 
 
 def test_each_step_reports_its_own_range(bash: str, tmp_path: Path) -> None:
@@ -226,7 +274,7 @@ def test_each_step_reports_its_own_range(bash: str, tmp_path: Path) -> None:
     after = _commit(repo.path, "again", {"b.txt": f"{_MARKER}\n"})
     rcs, out, calls = _run_steps(bash, repo.path, tmp_path, removed, after)
     assert rcs == [1, 1], f"rcs={rcs}\n{out}"
-    assert len(calls) == 2 and after in calls[0] and leaked in calls[1], calls
+    assert len(calls) == 3 and after in calls[0] and leaked in calls[1], calls
     assert "HIT b.txt" in out and "HIT docs/security/note.md" in out, out
 
 
@@ -278,7 +326,7 @@ def test_a_force_push_with_a_known_before_rescans_the_dropped_commits(
     after = _commit(repo.path, "rewritten", {"a.txt": "x\n"})
     rc, out, calls = _run(bash, repo.path, tmp_path, old, after)
     assert rc == 1 and "HIT docs/security/note.md" in out, f"rc={rc}\n{out}"
-    assert len(calls) == 2 and after in calls[0] and old in calls[1], calls
+    assert len(calls) == 3 and after in calls[0] and old in calls[1], calls
 
 
 def test_a_clean_push_passes_and_scans_its_commits(bash: str, tmp_path: Path) -> None:
@@ -368,3 +416,142 @@ def test_a_committed_real_token_list_is_a_hit(bash: str, tmp_path: Path) -> None
 def test_checkout_fetches_full_history() -> None:
     checkout = next(s for s in _steps() if str(s.get("uses", "")).startswith("actions/checkout@"))
     assert checkout["with"].get("fetch-depth") == 0, checkout
+
+
+def _floor_env(tmp_path: Path) -> list[str]:
+    return (tmp_path / "scan.log.env").read_text(encoding="utf-8").splitlines()
+
+
+def test_step_two_fails_closed_when_step_one_dies_listing_the_earlier_range(
+    bash: str, tmp_path: Path
+) -> None:
+    """MEASURED fail-open on 682bde146: step 1 died mid ``rev-list`` (exit 128) and step 2 read the
+    partial list it left as the whole earlier range, rescanned only that, and passed. A partial list
+    is not a clean range. The leak is in the OLDER earlier commit, so only the full list reaches it."""
+    repo = _Repo(tmp_path)
+    leaked = _commit(repo.path, "leak", {"docs/security/note.md": f"{_MARKER}\n"})
+    before = _commit(repo.path, "remove", {"docs/security/note.md": None, "a.txt": "x\n"})
+    after = _commit(repo.path, "more", {"b.txt": "y\n"})
+    rcs, out, calls = _run_steps(bash, repo.path, tmp_path, before, after, fail_revlist=before)
+    assert rcs[0] == 128, f"rcs={rcs}; the shim did not kill step 1\n{out}"
+    assert rcs[1] == 2, f"rcs={rcs}; step 2 read a partial earlier range as complete\n{out}"
+    assert "did not finish recording it" in out, out
+    assert not any(leaked in c for c in calls), calls
+
+
+@pytest.mark.parametrize("damage", ["truncate", "not-a-sha"])
+def test_step_two_fails_closed_on_a_damaged_earlier_range(
+    damage: str, bash: str, tmp_path: Path
+) -> None:
+    """The marker records the list's length, so a list cut short after step 1 finished is refused,
+    and so is a line that is not a commit id."""
+    repo = _Repo(tmp_path)
+    first = _commit(repo.path, "one", {"a.txt": "x\n"})
+    before = _commit(repo.path, "two", {"b.txt": "y\n"})
+    after = _commit(repo.path, "three", {"c.txt": "z\n"})
+
+    def harm(runner_temp: Path) -> None:
+        listing = runner_temp / "branch-leak-scan-earlier.txt"
+        lines = listing.read_text(encoding="utf-8").splitlines()
+        assert lines == [before, first], lines
+        kept = lines[:1] if damage == "truncate" else [lines[0], "HEAD"]
+        listing.write_text("".join(f"{line}\n" for line in kept), encoding="utf-8", newline="\n")
+
+    rcs, out, _ = _run_steps(bash, repo.path, tmp_path, before, after, between=harm)
+    assert rcs == [0, 2], f"rcs={rcs}\n{out}"
+
+
+def test_both_steps_scan_under_security_yml_s_detector_floor(bash: str, tmp_path: Path) -> None:
+    """The floor is duplicated into step 2, so it is pinned there by EXECUTION: every scanner call,
+    step 1's and step 2's, runs with tokens required and the same per-section minimums as
+    security.yml's forbidden-content job. A step 2 that lost its exports would scan under no floor."""
+    floors = set(
+        re.findall(
+            r"export MEFOR_MIN_DETECTORS=(\S+)",
+            (_REPO / ".github" / "workflows" / "security.yml").read_text(encoding="utf-8"),
+        )
+    )
+    assert len(floors) == 1, f"security.yml carries more than one floor: {floors}"
+    repo = _Repo(tmp_path)
+    first = _commit(repo.path, "one", {"a.txt": "x\n"})
+    after = _commit(repo.path, "two", {"b.txt": "y\n"})
+    rcs, out, calls = _run_steps(bash, repo.path, tmp_path, first, after)
+    assert rcs == [0, 0] and len(calls) == 2, f"rcs={rcs}, calls={calls}\n{out}"
+    assert _floor_env(tmp_path) == [f"1 {floors.pop()}"] * 2, _floor_env(tmp_path)
+
+
+def test_step_two_without_the_token_secret_fails_closed(bash: str, tmp_path: Path) -> None:
+    repo = _Repo(tmp_path)
+    first = _commit(repo.path, "one", {"a.txt": "x\n"})
+    after = _commit(repo.path, "two", {"b.txt": "y\n"})
+    rcs, out, calls = _run_steps(bash, repo.path, tmp_path, first, after, tokens="")
+    assert rcs == [2, 2] and not calls, f"rcs={rcs}, calls={calls}\n{out}"
+
+
+def test_an_earlier_push_hit_names_its_commit(bash: str, tmp_path: Path) -> None:
+    """The scanner names a hit by its path inside a commit root, which on its own drops the commit,
+    so a responder could not tell which public SHA to assess. Only the commit that carries the hit is
+    named; a clean commit in the same range is not."""
+    repo = _Repo(tmp_path)
+    clean = _commit(repo.path, "clean", {"a.txt": "x\n"})
+    leaked = _commit(repo.path, "leak", {"docs/security/note.md": f"{_MARKER}\n"})
+    removed = _commit(repo.path, "remove", {"docs/security/note.md": None})
+    rcs, out, _ = _run_steps(bash, repo.path, tmp_path, removed, removed)
+    assert rcs == [0, 1], f"rcs={rcs}\n{out}"
+    assert f"earlier-push commit {leaked} carries the hit(s) below" in out, out
+    assert f"earlier-push commit {clean}" not in out, out
+    named = out.index(f"earlier-push commit {leaked}")
+    assert "HIT docs/security/note.md" in out[named:], out
+    assert _MARKER not in out, "a hit report printed the matched content"
+
+
+def test_the_walk_reports_every_refusal_before_it_fails(bash: str, tmp_path: Path) -> None:
+    """The first committed token list used to end the walk, so a second one, and every content hit
+    behind it, went unreported until that one was fixed and the branch pushed again."""
+    repo = _Repo(tmp_path)
+    token = "scripts/security/scan-tokens.local.txt"
+    one = _commit(repo.path, "oops", {token: "x\n"})
+    _commit(repo.path, "undo", {token: None})
+    two = _commit(repo.path, "oops again", {token: "y\n", "docs/security/note.md": f"{_MARKER}\n"})
+    after = _commit(repo.path, "undo again", {token: None, "docs/security/note.md": None})
+    rcs, out, calls = _run_steps(bash, repo.path, tmp_path, repo.main, after)
+    assert rcs[0] == 1, f"rcs={rcs}\n{out}"
+    assert f"branch commit {one} commits {token}" in out, out
+    assert f"branch commit {two} commits {token}" in out, out
+    assert "HIT docs/security/note.md" in out, f"the walk stopped before the scan\n{out}"
+    assert len(calls) == 1, calls
+
+
+def test_an_unsafe_path_is_refused_and_the_walk_goes_on(bash: str, tmp_path: Path) -> None:
+    """A tree entry named ``.git`` cannot come through the index, but a hand-built tree carries one,
+    and a push delivers it. It is never written out, the step fails 2, and the walk still reaches the
+    content hit in the same push."""
+    repo = _Repo(tmp_path)
+    _leak_then_remove(repo)
+
+    def plumb(*args: str, stdin: str) -> str:
+        # Bytes, not text: text mode on Windows writes CRLF, and each name would gain a CR.
+        out = subprocess.run(
+            ["git", "-C", str(repo.path), *args],
+            input=stdin.encode("utf-8"),
+            capture_output=True,
+            check=True,
+            timeout=60,
+        ).stdout
+        return out.decode("utf-8").strip()
+
+    def mktree(entries: str) -> str:
+        return plumb("mktree", stdin=entries)
+
+    blob = plumb("hash-object", "-w", "--stdin", stdin="x\n")
+    inner = mktree(f"100644 blob {blob}\thooks-config\n")
+    dotgit = mktree(f"040000 tree {inner}\t.git\n")
+    head_tree = _git(repo.path, "rev-parse", "HEAD^{tree}")
+    listing = _git(repo.path, "ls-tree", head_tree)
+    tree = mktree(f"{listing}\n040000 tree {dotgit}\tsub\n")
+    bad = _git(repo.path, "commit-tree", tree, "-p", "HEAD", "-m", "unsafe")
+    _git(repo.path, "update-ref", "HEAD", bad)
+    rcs, out, _ = _run_steps(bash, repo.path, tmp_path, repo.main, bad)
+    assert rcs[0] == 2, f"rcs={rcs}\n{out}"
+    assert f"branch commit {bad} names an unsafe path" in out, out
+    assert "HIT docs/security/note.md" in out, f"the walk stopped at the unsafe path\n{out}"
