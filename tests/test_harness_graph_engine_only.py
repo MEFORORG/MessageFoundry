@@ -22,6 +22,7 @@ import pytest
 
 from harness.config.shardcert import _shape as shardcert_shape
 from harness.load.ids import SHARDCERT_IDS
+from messagefoundry.checks import _run_tool
 from messagefoundry.childenv import CHILD_INTERPRETER_FLAGS, outside_engine_namespace
 from tests._ast_sites import named_func, parse_source
 from tests.test_dependency_boundaries import _modules_imported_by
@@ -84,6 +85,22 @@ def test_graph_loads_without_the_harness_package(graph: str, tmp_path: Path) -> 
     assert done.returncode == 0, done.stderr
     count = int(done.stdout.split("inbounds", 1)[1].split()[0])
     assert count >= 1
+
+
+@pytest.mark.parametrize("graph", _GRAPHS)
+def test_checks_advisory_mypy_resolves_the_bare_sibling_import(
+    graph: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `messagefoundry check` runs `mypy --config-file= <config dir>` (BACKLOG #5850). A directory
+    # holding an __init__.py is a package to mypy, so its `from _shape import` is not found there;
+    # without one mypy resolves the bare name from the directory, as the loader does. The run is in a
+    # copy, with the copy as the working directory, so its cache cannot touch the repository's.
+    config = tmp_path / graph
+    shutil.copytree(_CONFIG / graph, config, ignore=shutil.ignore_patterns("__pycache__"))
+    monkeypatch.chdir(tmp_path)
+    result = _run_tool("mypy", "mypy", ["--config-file=", str(config)])
+    assert not result.skipped, result.detail
+    assert result.ok, result.detail
 
 
 def test_control_the_block_reaches_a_graphs_import(tmp_path: Path) -> None:
