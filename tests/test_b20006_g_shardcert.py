@@ -499,8 +499,10 @@ async def test_colocated_kill_that_did_not_take_effect_fails_the_run(
 async def test_colocated_kill_of_an_engine_shard_that_had_already_exited_fails_the_run(
     fleet: types.SimpleNamespace,
 ) -> None:
-    """BACKLOG #5440: an engine shard that crashed on its own before the kill made kill() a no-op, and the
-    run certified a recovery from a crash the rig never caused."""
+    """BACKLOG #5440: an engine shard whose own crash was reaped before the kill was killed with no root
+    left running, and the run certified a recovery from a crash the rig never caused. The run now fails
+    for such a shard. One that exited in the reap window, or under a live Windows launcher, still passes;
+    ``ShardCertNode.killed_while_running`` names both."""
     fleet.already_exited.update({"a", "b"})
     with pytest.raises(RuntimeError, match="had already exited"):
         await sc.run_shardcert(**_sizes(kill=True, kill_at_fraction=0.3))

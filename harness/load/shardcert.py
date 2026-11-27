@@ -1241,7 +1241,8 @@ class ShardCertReport:
             # v7 (BACKLOG #5440, S27-57) — `correctness.engine_dead` MEANING CHANGED: it is the store's count,
             # where a v6 value was that count summed over every engine shard (N times it). Zero is zero in both,
             # so the PASS bar is unchanged. `recovery_seconds`, reported and not gated, still runs from the kill,
-            # but the kill now lands at the kill deadline rather than at the first tick past it, and the span
+            # but each tick's sleep is now capped at the kill deadline, so the loop asks to wake then rather
+            # than at its next tick; timer granularity or a stalled loop can still wake it later. The span
             # now includes the wait for the killed process to exit and its node's stop(); see the field.
             "schema_version": 7,
             "kind": "shardcert",
@@ -1973,9 +1974,11 @@ async def run_shardcert(
                 pause = min(pause, (kill_deadline or 0) - time.monotonic())
             await asyncio.sleep(max(0.0, pause))
         if kill and not did_kill:
-            # BACKLOG #5440 (S27-55): the loop overslept the kill instant AND the end of the hold (a stalled
-            # event loop, or a hold of 0). No kill happened under load, so there is no kill leg to certify:
-            # fail the run rather than kill now and report a recovery from a crash with no load behind it.
+            # BACKLOG #5440 (S27-55): the loop overslept the kill instant AND the end of the hold, for example
+            # on a stalled event loop (`require_kill_leg` already refused a hold of 0). The kill never fired,
+            # so there is no kill leg to certify: fail the run rather than kill now, after the load, and
+            # report a recovery from it. A kill that did fire is not thereby shown to have been under load
+            # (`require_kill_leg`).
             # The teardown below stops the fleet; the restart is never reached.
             raise RuntimeError(
                 f"kill leg never fired: the hold ended before the kill instant of engine shard {killed}"
@@ -3303,16 +3306,21 @@ async def _restart_killed(
     silently (:meth:`ShardCertNode.wait_exited`), and ``stop()`` would then end the live process
     gracefully, so a recovery timed after it would certify a graceful stop as crash recovery. A process
     still running :data:`_KILL_EXIT_TIMEOUT` seconds on fails the run; it stays in ``nodes``, so the
-    caller's teardown stops it. So does a process that had already exited when it was killed: the rig
-    caused no crash then.
+    caller's teardown stops it. So does a node that :attr:`ShardCertNode.killed_while_running` reads as
+    already exited when it was killed: the rig caused no crash then. That read misses at least the reap
+    window and the Windows launcher case the attribute names, so a node that had exited in either passes
+    this check, and its own exit is taken for a crash the rig caused.
 
     The caller's ``recovery_seconds`` runs from the kill instant to the restart's health, so it includes
     this wait for the exit, the old node's ``stop()`` (on a process already gone, the log close and the job
     teardown) and the restart's start, besides what the caller itself spends before calling this."""
     old = nodes[killed]
     if not old.killed_while_running:
-        # It exited on its own before the kill (an engine crash the rig did not cause), so kill() was a
-        # no-op and a recovery timed from it would be credited to a crash the rig never made.
+        # Its root's exit was reaped before the kill (an engine crash the rig did not cause), so the kill
+        # ended no running root: it ended only what was left in the node's job, where there is one (on
+        # Windows), and otherwise did nothing. A recovery timed from it would be credited to a crash the
+        # rig never made. An exit not yet reaped, or under a live Windows launcher, does not reach here;
+        # see ShardCertNode.killed_while_running.
         raise RuntimeError(
             f"engine shard {killed} had already exited when the kill leg killed it, so the rig caused no "
             "crash and no crash recovery can be certified"
