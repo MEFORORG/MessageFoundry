@@ -1734,30 +1734,33 @@ def _records_worker_death(worker: str) -> Callable[[_ItemBody], _ItemBody]:
 
 
 def _reply_step_fault(exc: Exception) -> Exception:
-    """What leaves the re-ingress step in place of ``exc`` (BACKLOG #5727): a key service that
-    gave no verdict becomes a :class:`QueueOpenFault`; anything else becomes a
-    :class:`_ReplyStepFault` named by :func:`fault_text` and its frames, never its text or chain.
-    Both are fresh, with no cause, context or traceback."""
-    fault = no_verdict_fault(exc)
-    if fault is not None:
-        return fault
+    """What leaves the re-ingress step in place of ``exc`` (BACKLOG #5727), always fresh, with no
+    cause, context or traceback. A :class:`QueueOpenFault` keeps its own text. A key service that
+    gave no verdict becomes a :class:`QueueOpenFault`, and anything else a
+    :class:`_ReplyStepFault`. Each of those two is named by :func:`fault_text`: the type, and a
+    cipher error's own text, which never holds a value, never a driver's text or a chain. Each
+    also lists the file, line and function of every frame ``exc`` passed through, never a local."""
+    if isinstance(exc, QueueOpenFault):
+        return QueueOpenFault(*exc.args)
     frames = "".join(
         f"\n  {frame.f_code.co_filename}:{lineno} in {frame.f_code.co_name}"
         for frame, lineno in traceback.walk_tb(exc.__traceback__)
     )
+    if no_verdict_fault(exc) is not None:
+        return QueueOpenFault(f"{fault_text(exc)}{frames}")
     return _ReplyStepFault(f"{fault_text(exc)}{frames}")
 
 
 def _reply_step_boundary(body: _ItemBody) -> _ItemBody:
     """Wrap the re-ingress step so whatever escapes it leaves only as a :class:`QueueOpenFault`
-    or as a type name (BACKLOG #5727; the Lander's hold on PR 3155). The step's store calls seal
-    and open cells, and a raw cipher error can chain a key service's URL or body, a driver error
-    its statement, and a traceback the frames that hold the reply. The fault arm that catches it
-    logs it with its traceback. A :class:`QueueOpenFault` the step raised itself passes as it is:
-    the step builds it with no chain and drops the frames that hold the reply. Every other
-    ``Exception`` is replaced by :func:`_reply_step_fault`, raised here, outside the handler, so it
-    carries no chain and its traceback starts in this frame. The outcome does not change: both
-    claim modes re-pend on any ``Exception``. A ``BaseException`` that is not one passes."""
+    or a :class:`_ReplyStepFault`, each named as :func:`_reply_step_fault` says (BACKLOG #5727;
+    the Lander's hold on PR 3155). The step's store calls seal and open cells, and a raw cipher
+    error can chain a key service's URL or body, a driver error its statement, and a traceback
+    the frames that hold the reply. The fault arm that catches it logs it with its traceback.
+    Every ``Exception``, a :class:`QueueOpenFault` included, is replaced by a fresh one, raised
+    here, outside the handler, so it carries no chain and its traceback starts in this frame. The
+    outcome does not change: both claim modes re-pend on any ``Exception``. A ``BaseException``
+    that is not one passes."""
 
     @functools.wraps(body)
     async def bounded(
@@ -1765,8 +1768,6 @@ def _reply_step_boundary(body: _ItemBody) -> _ItemBody:
     ) -> tuple[_ItemOutcome, float | None]:
         try:
             return await body(self, name, item)
-        except QueueOpenFault:
-            raise
         except Exception as exc:  # noqa: BLE001 -- replaced, never swallowed; see the docstring
             fault = _reply_step_fault(exc)
         try:
@@ -13435,10 +13436,10 @@ class RegistryRunner:
                 # cell, dead-letters on a token reference, and on origin metadata dead-letters where
                 # the cipher reads it as a corrupt cell and propagates otherwise. The read above
                 # opens the same reference first: an engine fault it does not read as a tag failure
-                # re-raises there, so that token re-pends and never reaches the handoff. A key
-                # service with no verdict on one of the handoff's encrypts leaves it as a
-                # QueueOpenFault too; its invocation ceiling, a plain CipherError, is a deliberate
-                # hard stop.
+                # is dead-lettered here, with every other verdict, so that token never reaches the
+                # handoff. A key service with no verdict on one of the handoff's encrypts leaves it
+                # as a QueueOpenFault too; its invocation ceiling, a plain CipherError, is a
+                # deliberate hard stop.
                 unopenable = (type(exc).__name__, safe_exc(exc))
         if tag_failed:
             log.warning(
@@ -15365,10 +15366,11 @@ class _RedactedFault(Exception):
     ``last_error`` built from it carries no raw driver text, which can quote a cell (section 9)."""
 
 
-class _ReplyStepFault(_RedactedFault):
-    """An error that left the re-ingress step, named by its type and its frames alone
-    (:func:`_reply_step_boundary`, BACKLOG #5727). A cipher error also keeps its own text, which
-    never holds a value."""
+class _ReplyStepFault(Exception):
+    """An error that left the re-ingress step (:func:`_reply_step_boundary`, BACKLOG #5727), named
+    by its type and its frames' file, line and function. A cipher error also keeps its own text,
+    which never holds a value. Not a :class:`_RedactedFault`: that text is not passed through
+    :func:`safe_exc`."""
 
 
 def _as_content_fault(exc: Exception | SystemExit) -> Exception:

@@ -6643,7 +6643,8 @@ class PostgresStore(ServerCipherWalk):
                         ref_tag_failed = True
                     except Exception as exc:  # noqa: BLE001 - dead-letters unless transient
                         # BACKLOG #5727: no verdict on the cell. Raised below, outside this handler,
-                        # so the fault carries no chain to the raw key-service error.
+                        # so the fault carries no chain to the raw key-service error. Not
+                        # no_verdict_fault, which never retries an engine fault: as on SQLite.
                         ref_fault = (
                             queue_open_fault(exc) if is_transient_open_failure(exc) else None
                         )

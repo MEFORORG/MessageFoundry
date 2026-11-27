@@ -29,6 +29,7 @@ from messagefoundry.store.crypto import (
 from messagefoundry.store.queue_tag import QueueOpenFault
 from tests import _undecryptable_reply_contract as contract
 from tests._erased_reply_contract import LOOP, children
+from tests._queue_tag_contract import RawFetch
 
 #: A marker the reply carries, to show no frame of the escaping fault holds it.
 REPLY_MARK = "SYNTHETIC-REPLY-MARK"
@@ -61,7 +62,10 @@ def _assert_clean(fault: BaseException, outage: bool) -> None:
     rendered = logging.Formatter().formatException((type(fault), fault, fault.__traceback__))
     assert contract.KEY_SERVICE_TEXT not in rendered and REPLY_MARK not in rendered
     walked, holding = contract._engine_frames_holding(fault, (REPLY_MARK,))
-    assert walked and holding == [], (walked, holding)
+    assert holding == [], holding
+    # The traceback starts at the boundary, so the step's frame, which holds the reply, is not on
+    # it. This module's own frame is walked too, so name the boundary's.
+    assert "bounded" in walked and "_process_response_item" not in walked, walked
 
 
 async def _head(store: MessageStore) -> tuple[str, Any]:
@@ -143,7 +147,7 @@ async def test_a_verdict_seal_in_the_handoff_leaves_clean(store: MessageStore) -
     assert len(await children(_fetch(store))) == 1
 
 
-def _fetch(store: MessageStore) -> contract.RawFetch:
+def _fetch(store: MessageStore) -> RawFetch:
     async def fetch(sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
         cur = await store._db.execute(sql, params)
         return [dict(r) for r in await cur.fetchall()]

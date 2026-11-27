@@ -17186,8 +17186,8 @@ class MessageStore:
             # is retried as a QueueOpenFault, raised below, outside this handler, so it carries no
             # chain to the raw key-service error. Aimed at the transaction's seals, it also takes any
             # other cipher call no inner arm contains, the finalizer's opens among them. The
-            # invocation ceiling stays a verdict, re-raised here; the response step names it by type
-            # alone before it reaches a log.
+            # invocation ceiling stays a verdict, re-raised here; the response step replaces it with
+            # a fault named by its type and own text, with no chain, before it reaches a log.
             seal_fault = no_verdict_fault(exc)
             if seal_fault is None:
                 raise
@@ -17276,6 +17276,8 @@ class MessageStore:
             except Exception as exc:  # noqa: BLE001 - dead-letters unless transient
                 # BACKLOG #5727: no verdict on the cell. Raised below, outside this handler, so the
                 # fault carries no chain to the raw key-service error.
+                # Not no_verdict_fault, which never retries an engine fault: this arm retries any
+                # failure the no-verdict rule reads as transient, as it did before #5727.
                 ref_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
                 # Otherwise a corrupt/undecryptable work-row reference (DB corruption, a key the
                 # store lacks) cannot be re-ingressed as it stands; a replay can retry it once the

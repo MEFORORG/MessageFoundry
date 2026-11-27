@@ -1007,7 +1007,8 @@ class QueueStore(StoreLifecycle, Protocol):
         the cause is fixed. A token reference that does not open, or fails its tag, is dead-lettered
         the same way. Any other cipher error is raised as it is, at least the encrypt's invocation
         ceiling and an engine fault on the reply cell such as an ``AADComponentError``; the
-        re-ingress step names what escapes by type before it reaches a log."""
+        re-ingress step replaces what escapes with a fault that has no chain, named by its type and
+        a cipher error's own text, before it reaches a log."""
         ...
 
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:

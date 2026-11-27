@@ -62,6 +62,8 @@ __all__ = [
     "QUEUE_TAG_FAILED_ACTION",
     "TRANSIENT_OPEN_BACKOFF_SECONDS",
     "QueueOpenFault",
+    "fault_text",
+    "no_verdict_fault",
     "queue_open_fault",
     "release_unreturned",
     "set_aside_deadline",

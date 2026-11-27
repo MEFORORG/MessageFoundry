@@ -9986,6 +9986,7 @@ class SqlServerStore(ServerCipherWalk):
                 except Exception as exc:  # noqa: BLE001 - dead-letters unless transient
                     # BACKLOG #5727: no verdict on the cell. Raised below, outside this handler, so
                     # the fault carries no chain to the raw key-service error.
+                    # Not no_verdict_fault, which never retries an engine fault: as on SQLite.
                     ref_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
                     ref_corrupt = ref_fault is None
                 if ref_tag_failed:

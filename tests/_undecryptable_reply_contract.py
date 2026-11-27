@@ -447,7 +447,10 @@ def _fault_reaches_no_reply(which: str, *, reply: str = PEEKED_REPLY) -> Contrac
                 del store.ingress_handoff
             assert caught.value.__cause__ is None and caught.value.__context__ is None
             walked, holding = _engine_frames_holding(caught.value, needles)
-            assert "_process_response_item" in walked  # the frame that read the reply was walked
+            # The step boundary raised a fresh fault: its traceback starts there, so the frame that
+            # read the reply is not on it (BACKLOG #5727, the Lander's hold on PR 3155).
+            assert walked and walked[-1] == "bounded", walked
+            assert "_process_response_item" not in walked, walked
             assert holding == []
             await _assert_token_live(store, fetch, mid)
             # CONTROL: the same token re-ingresses once the fault clears.
@@ -485,7 +488,8 @@ async def seal_outage_reaches_no_reply(store: Any, fetch: RawFetch, _raw: RawSql
             del store.ingress_handoff
         assert caught.value.__cause__ is None and caught.value.__context__ is None
         walked, holding = _engine_frames_holding(caught.value, needles)
-        assert "_process_response_item" in walked
+        assert walked and walked[-1] == "bounded", walked
+        assert "_process_response_item" not in walked, walked
         assert holding == []
         await _assert_token_live(store, fetch, mid)
         # CONTROL: the same token re-ingresses once the fault clears.
@@ -663,8 +667,12 @@ def _unparseable_origin_dead_letters(metadata: str, name: str) -> ContractCase:
         )
         await raw("UPDATE messages SET metadata=? WHERE id=?", (sealed, mid))
         records: list[logging.LogRecord] = []
-        handler = logging.Handler()
-        handler.emit = records.append  # type: ignore[method-assign]
+
+        class _Collect(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = _Collect()
         root = logging.getLogger()
         root.addHandler(handler)
         try:
@@ -675,8 +683,10 @@ def _unparseable_origin_dead_letters(metadata: str, name: str) -> ContractCase:
         events = await store.events_for(mid)
         assert [e for e in events if e["event"] == "dead" and "unparseable" in str(e["detail"])]
         assert await children(fetch) == []
-        assert records  # CONTROL: the handler saw the dead-letter's own warning
-        assert not [r for r in records if META_MARK in r.getMessage()]
+        # CONTROL: the handler saw the dead-letter's own warning, so a clean read is not a miss.
+        assert [r for r in records if "is unparseable" in r.getMessage()], records
+        rendered = logging.Formatter()
+        assert not [r for r in records if META_MARK in rendered.format(r)]
 
     case.__name__ = f"unparseable_origin_{name}_dead_letters"
     return case
