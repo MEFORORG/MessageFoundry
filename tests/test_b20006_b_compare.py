@@ -97,9 +97,9 @@ def _reset(recs: list[ConnScaleRecord]) -> list[ConnScaleRecord]:
 
 
 def _drowned(recs: list[ConnScaleRecord]) -> list[ConnScaleRecord]:
-    """The same trials as a timed-out drain leaves them: no drain time, INCONCLUSIVE."""
+    """The same trials as a timed-out drain leaves them: no drain time, 40 rows left, INCONCLUSIVE."""
     return [
-        replace(r, drain_seconds=None)
+        replace(r, drain_seconds=None, no_loss=replace(r.no_loss, backlog=40))
         for r in _inconclusive(recs, "backlog 40 not drained (in_pipeline 40 not done)")
     ]
 
@@ -205,6 +205,22 @@ def test_the_lift_bar_label_names_the_bar_applied() -> None:
     assert "< 12.5% --" in cmp.rows[0].reason
     assert "lift >= 12.5% AND" in cmp.render_table()
 
+    # The delivered/offered floor too: 0.983 under a 0.985 floor read "0.983 < 0.98".
+    behind = _arm(True, "fuse", [130.0, 131.0, 129.0], sink_received=983)
+    floor = build_fuse_comparison(
+        _arm(False, "fuse", [100.0, 101.0, 99.0]) + behind,
+        (False, True),
+        min_delivered_offered=0.985,
+    )
+    assert floor is not None
+    assert "delivered/offered 0.983 < 0.985 --" in floor.rows[0].reason
+    assert "delivered/offered >= 0.985 |" in floor.render_table()
+
+    # A bar :.15g would round reads back as the same float.
+    near = build_fuse_comparison(recs, (False, True), min_lift_pct=0.1 + 0.2)
+    assert near is not None
+    assert f"lift >= {0.1 + 0.2!r}% AND" in near.render_table()
+
 
 # --------------------------------------------------------------------------- #
 # BACKLOG #5574 item 8: a B1 whose reconcile was INCONCLUSIVE is not graded on its lift
@@ -245,6 +261,7 @@ def test_an_inconclusive_b1_still_meets_the_definite_no_gos_first() -> None:
     assert cmp is not None
     assert cmp.rows[0].verdict == FUSE_NO_GO
     assert "did not fully drain" in cmp.rows[0].reason
+    assert "rows stranded" in cmp.rows[0].reason
 
     behind = _reset(_arm(True, "fuse", [130.0, 131.0, 129.0], sink_received=500))
     cmp = build_fuse_comparison(_arm(False, "fuse", [100.0, 101.0, 99.0]) + behind, (False, True))
@@ -272,6 +289,8 @@ def test_a_drained_inconclusive_b0_trial_is_no_reference_for_a_go() -> None:
         assert row.verdict == FUSE_INCONCLUSIVE, row.reason
         assert "1 B0 trial(s) drained but could not clear zero-loss" in row.reason
         assert cmp.overall_verdict == FUSE_INCONCLUSIVE
+        guards = cmp.to_json_dict()["rows"][0]["guards"]  # type: ignore[index]
+        assert guards["b0_drained_inconclusive"] == 1 and guards["b0_unsent_trials"] == 0
 
 
 def test_a_drowned_or_lossy_b0_is_still_a_reference() -> None:

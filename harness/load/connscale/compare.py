@@ -884,8 +884,9 @@ _BATCH_WORDS = _AxisWords(
 
 def _num(value: float) -> str:
     """A guard value as given: ``10`` and ``2`` for the defaults, ``12.5`` or ``2.5`` otherwise,
-    so a label never rounds to a different bar from the one applied (BACKLOG #5430)."""
-    return format(value, ".15g")
+    so a label never rounds to a different bar from the one applied (BACKLOG #5430). ``repr`` is
+    the shortest text that reads back as the same float."""
+    return str(int(value)) if value.is_integer() else repr(value)
 
 
 def _sigma_label(multiple: float) -> str:
@@ -941,11 +942,16 @@ class _FuseArm:
     #: Trials that recorded no traffic, a failed cell's placeholder among them. Their 0.0 rate is no
     #: measurement, so an arm with any is no reference for a lift (BACKLOG #5574).
     unsent_trials: int
-    #: Trials that recorded traffic and drained, yet whose reconcile was INCONCLUSIVE. Among the
-    #: causes are engine counters it could not judge (at least a reset, or an unreadable
-    #: ``/stats``), and the intake rate is read from those same counters. So on B0 such a trial is
-    #: no reference for a lift (BACKLOG #5574 item 5). A drowned trial (no drain time) is not
-    #: counted here: its rate is taken as a measurement (see the gap `_fuse_verdict` names).
+    #: Trials that recorded traffic and drained, yet whose reconcile was INCONCLUSIVE (BACKLOG
+    #: #5574 items 5 and 8). THE ONE STATEMENT OF WHY `_fuse_verdict` distrusts such a rate: among
+    #: the causes are engine counters the reconcile could not judge (at least a mid-step reset, or
+    #: an unreadable ``/stats``), and the intake rate is read from those same counters, a reset's
+    #: negative delta clamped to 0. NoLoss names no cause, so this is a proxy, and it errs both
+    #: ways. Too broad: an INCONCLUSIVE trial whose rate was sound (for example one that delivered
+    #: nothing) is distrusted too, which only ever turns a GO or NO-GO into INCONCLUSIVE. Too
+    #: narrow (KNOWN GAP): a drowned trial (no drain time), or one that proved a loss on client
+    #: counters alone, whose counters ALSO reset is taken as a measurement. Closing both needs the
+    #: reset carried on NoLoss.
     drained_inconclusive: int
     delivered_offered: float | None  # mean sink_received/sent across trials (None if no sent)
     zero_loss_ok: bool  # every trial held the at-least-once reconcile
@@ -1186,7 +1192,7 @@ class FuseModeComparison:
         lines.append(
             f"guards ({self.guards_ref}): lift >= {_num(self.min_lift_pct)}% AND > "
             f"{_sigma_label(self.sigma_multiple)} | in_pipeline flat-or-lower | delivered/offered "
-            f">= {self.min_delivered_offered:.2f}"
+            f">= {_num(self.min_delivered_offered)}"
             f" | zero-loss held  (SQL Server is the valid leg; SQLite is NOT a throughput proxy)"
         )
         lines.append(_sandbox_line(self.sandbox_arms))
@@ -1592,17 +1598,17 @@ def _fuse_verdict(
     if not delivered_offered_ok:
         shown = "n/a" if cand.delivered_offered is None else f"{cand.delivered_offered:.3f}"
         return FUSE_NO_GO, (
-            f"delivered/offered {shown} < {min_delivered_offered:.2f} -- B1 is not keeping up end-to-end"
+            f"delivered/offered {shown} < {_num(min_delivered_offered)} -- B1 is not keeping up "
+            "end-to-end"
         )
     if candidate_lost:
-        # INCONCLUSIVE, after the drain and keeping-up guards, which read the drain gauge and the
-        # client and sink counts, so their NO-GO still reads as one. Before the lift bar: a B1 that
-        # drained and kept up yet could not clear zero-loss may have had engine counters the
-        # reconcile could not judge (at least a reset, or an unreadable /stats), and its intake
-        # rate comes from those same counters (a reset's negative delta clamped to 0), so a lift
-        # under the bar may be no measurement (BACKLOG #5574 item 8). NoLoss does not say which
-        # cause it was, so every INCONCLUSIVE B1 takes this branch; a cause that left the
-        # counters sound then reads INCONCLUSIVE where it read NO-GO. Either fails the row.
+        # INCONCLUSIVE, after the drain and keeping-up guards. The keeping-up guard reads client
+        # and sink counts. The drain guard reads a gauge, which a counter reset does not corrupt;
+        # an unreadable /stats can still time the drain out, and that NO-GO's reason already says
+        # no strand is asserted. Before the lift bar, because the rate the bar reads may be no
+        # measurement here: `_FuseArm.drained_inconclusive` says why and what the proxy misses
+        # (BACKLOG #5574 item 8). Every INCONCLUSIVE B1 takes this branch, so one whose counters
+        # were sound reads INCONCLUSIVE where it read NO-GO; either fails the row.
         # Still a hard fail (the row's `ok` reads `candidate_lost`), but nothing proved a message
         # dropped, so it is not called a breach.
         return FUSE_INCONCLUSIVE, (
@@ -1623,13 +1629,10 @@ def _fuse_verdict(
             "or a step that sent nothing) -- B0's intake and drain are no sound reference for a lift"
         )
     if base.drained_inconclusive:
-        # A B0 trial that drained yet could not clear zero-loss may have had engine counters the
-        # reconcile could not judge (at least a reset, or an unreadable /stats), and its intake
-        # rate, read from them (a reset's negative delta clamped to 0), can drag B0's mean down
-        # into a lift B1 never made (BACKLOG #5574 item 5). A B0 that drowned (no drain time) is
-        # still taken as a measurement, the drowning-baseline case, and so is one that proved a
-        # loss. KNOWN GAP: NoLoss carries no cause, so a drowned trial, or one that proved a loss
-        # on client counters alone, whose engine counters ALSO reset is not told apart here.
+        # Such a trial's rate may be no measurement (`_FuseArm.drained_inconclusive` says why and
+        # names the gap), and a clamped rate drags B0's mean down into a lift B1 never made
+        # (BACKLOG #5574 item 5). A B0 that drowned (no drain time) is still taken as a
+        # measurement, the drowning-baseline case, and so is one that proved a loss.
         return FUSE_INCONCLUSIVE, (
             f"{base.drained_inconclusive} B0 trial(s) drained but could not clear zero-loss (their "
             "reconcile was INCONCLUSIVE, for example the engine counters reset or could not be "
@@ -1651,7 +1654,7 @@ def _fuse_verdict(
         )
     return FUSE_GO, (
         f"lift {lift_pct:+.1f}% >= {bar_pct}% and > {sigma_label}, in_pipeline "
-        f"flat-or-lower, delivered/offered >= {min_delivered_offered:.2f}, zero-loss held"
+        f"flat-or-lower, delivered/offered >= {_num(min_delivered_offered)}, zero-loss held"
     )
 
 
@@ -1743,6 +1746,10 @@ def _fuse_row_json(row: FuseComparisonRow) -> dict[str, object]:
             "b1_zero_loss_inconclusive": (
                 None if row.candidate is None else row.candidate.zero_loss_inconclusive
             ),
+            # B0 trials that are no reference for a lift (BACKLOG #5574 item 5): either above 0
+            # makes a would-be GO INCONCLUSIVE.
+            "b0_unsent_trials": row.baseline.unsent_trials,
+            "b0_drained_inconclusive": row.baseline.drained_inconclusive,
         },
         # INFORMATIONAL latency signal (ADR 0075 distance insurance) — NOT a gate: the GO/NO-GO verdict
         # above is unchanged. ``*_delta_pct`` is (B1 - B0) / B0 * 100, so a NEGATIVE value means B1 is
