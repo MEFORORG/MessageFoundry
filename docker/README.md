@@ -204,7 +204,8 @@ against one case that matters, described under
   start until you export it or put it in a `.env` beside `compose.yaml` (an `env_file:` does not
   feed substitution, and passing `--env-file` reads the named file instead of that `.env`, so keep
   every substituted value, at least this one and the Postgres password, in the file substitution
-  reads; the `ha` engines still read their own store password from `secrets.env`). The
+  reads; the `ha` engines read the same `MEFOR_STORE_PASSWORD` substitution the Postgres service
+  does, so a `secrets.env` line feeds only the default `engine`). The
   `revocation-attestation-check` service refuses a value that does not read as true, such as `0`.
   `docker compose up` and `docker compose --profile ha up` run that check before they start the
   default `engine`, and `docker compose logs revocation-attestation-check` shows why it refused. The
@@ -245,7 +246,8 @@ certificate (A) and its revocation attestation, or it **refuses to start** — b
   spool*, is the inventory row.
 - **Secrets** (`MEFOR_STORE_ENCRYPTION_KEY`, `MEFOR_API_TLS_KEY_PASSWORD`, `MEFOR_STORE_PASSWORD`, …):
   the engine reads these from **env vars**. On k8s inject via `secretKeyRef` (clean). On Docker use
-  `env_file` (gitignored) — note plain env is visible in `docker inspect`; prefer a secrets manager for
+  `env_file` (gitignored), except the `ha` engines' `MEFOR_STORE_PASSWORD`, which `compose.yaml`
+  sets by substitution so it matches the Postgres service's (the Topology A note above) — note plain env is visible in `docker inspect`; prefer a secrets manager for
   production. At least the engine's own secret settings other than the store key, and every
   `MEFOR_VALUE_*` value, can instead come from a **secrets directory**, one file per setting,
   mounted read-only and named by `MEFOR_SECRETS_DIRECTORY`, which `docker inspect` shows as a path
