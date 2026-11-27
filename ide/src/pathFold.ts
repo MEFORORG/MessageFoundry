@@ -113,19 +113,34 @@ export function nonAsciiCaseVariant(
   return { head: path.win32.join(t.root, ...t.segments.slice(0, t.depth)), rest: t.segments.slice(t.depth) };
 }
 
+/** `p`'s real path. The native call fails with EISDIR on some Windows volumes (RAM disks, some
+ *  virtual drives), where the JS implementation still answers, as workspaceContainment.ts's does. */
+function realpathOf(p: string): string {
+  try {
+    return fs.realpathSync.native(p);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") {
+      throw e;
+    }
+    return fs.realpathSync(p);
+  }
+}
+
 /** Whether `a` and `b` name one folder on disk: by real path, or, where the real path keeps the
- *  spelling's case (the fallback some volumes take), by device and file id. A path that does not
- *  exist or cannot be read gives false, which every caller reads as "outside". */
+ *  spelling's case (the JS fallback), by device and a non-zero file id; a volume that reports file
+ *  id 0 cannot tell two folders apart. A path that does not exist or cannot be read gives false,
+ *  which every caller reads as "outside". */
 function sameFolderOnDisk(a: string, b: string, win32: boolean): boolean {
   try {
-    if (isSamePath(fs.realpathSync.native(a), fs.realpathSync.native(b), win32)) {
+    if (isSamePath(realpathOf(a), realpathOf(b), win32)) {
       return true;
     }
     const x = fs.statSync(a, { bigint: true });
     const y = fs.statSync(b, { bigint: true });
-    return x.dev === y.dev && x.ino === y.ino;
+    return x.ino !== 0n && x.dev === y.dev && x.ino === y.ino;
   } catch {
-    // ENOENT is the usual case: a U+212A spelling names no folder NTFS would fold onto root.
+    // ENOENT is the usual case: a U+212A spelling names no folder NTFS would fold onto root. Any
+    // other read failure also reads as outside, which only switches a convenience off.
     return false;
   }
 }

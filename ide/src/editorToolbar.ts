@@ -19,7 +19,8 @@ import { segmentsBelowOnDisk } from "./pathFold";
  * is folded, not with path.relative's toLowerCase(), which reads a directory spelled with U+212A
  * KELVIN SIGN as the config dir's "k" one (pathFold.ts, BACKLOG #5832); a path that differs from the
  * config dir by another case outside A-Z is asked of the file system, so e-acute against E-acute,
- * which NTFS folds, is still inside (pathFold.segmentsBelowOnDisk).
+ * which NTFS folds, is still inside when the config dir exists and can be read; when it cannot, the
+ * file reads as outside and gets no toolbar (pathFold.segmentsBelowOnDisk).
  */
 export function isConfigFile(
   fileFsPath: string,

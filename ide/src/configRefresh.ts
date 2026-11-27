@@ -70,7 +70,9 @@ export class RefreshCoalescer {
 /**
  * The absolute directory a config-dir FileSystemWatcher should watch, or undefined when no watcher
  * can be created: no workspace folder, or a configDir that resolves OUTSIDE the workspace folder
- * (an absolute path elsewhere, or a relative one that escapes via `..`). Outside-the-workspace
+ * (an absolute path elsewhere, or a relative one that escapes via `..`). A configDir spelling the
+ * workspace with another case outside A-Z is asked of the file system, so it is inside only when
+ * that folder exists and reads as the workspace (pathFold.segmentsBelowOnDisk). Outside-the-workspace
  * stays unwatched by design — the graceful degradation is "manual refresh still works", never a
  * crash or a watcher over an unrelated part of the filesystem.
  */

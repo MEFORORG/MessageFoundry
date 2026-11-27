@@ -7,8 +7,10 @@
 // the two apart, so on Windows a different directory or file read as the config dir's own.
 //
 // configRefresh and editorToolbar take the host's path rules, so their U+212A cases bite only on a
-// Windows runner; on posix the two spellings differ under the exact compare, before and after.
-// editorToolbar.ts imports vscode, so it is loaded against a stub here (as promote-target-gate does),
+// Windows runner; on posix the two spellings differ under the exact compare, before and after. On
+// Windows the fixed code asks the file system about a U+212A spelling, and ROOT names no folder, so
+// the spelling-only cases below read as outside without one; the "on disk" suite pins the case where
+// both folders exist. editorToolbar.ts imports vscode, so it is loaded against a stub here (as promote-target-gate does),
 // which keeps this case in the node-side unit suite rather than the Extension Host's editor-toolbar.
 import * as assert from "assert";
 import * as fs from "node:fs";
@@ -116,15 +118,30 @@ diskSuite("on disk: a non-ASCII case NTFS folds is inside, U+212A is not (BACKLO
   const LOWER = "caf\u00E9";
   const UPPER = "CAF\u00C9";
   let root: string;
+  // What this volume does, so a temp directory that folds otherwise skips rather than goes red.
+  let foldsAcute = false;
+  let keepsKelvinApart = false;
   setup(() => {
     root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "mf-b20008g-")));
     fs.mkdirSync(path.join(root, LOWER, "cfg"), { recursive: true });
+    foldsAcute = fs.existsSync(path.join(root, UPPER));
     fs.mkdirSync(path.join(root, "kits"));
-    fs.mkdirSync(path.join(root, `${KELVIN}its`));
+    try {
+      fs.mkdirSync(path.join(root, `${KELVIN}its`));
+      keepsKelvinApart = true;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw e;
+      }
+      keepsKelvinApart = false; // this volume folds U+212A onto k, so the two are one folder here
+    }
   });
   teardown(() => fs.rmSync(root, { recursive: true, force: true }));
 
-  test("E-acute spelling of the config dir is the same folder; the toolbar and the watcher keep it", () => {
+  test("E-acute spelling of the config dir is the same folder; the toolbar and the watcher keep it", function () {
+    if (!foldsAcute) {
+      this.skip(); // a case-sensitive or non-folding temp volume: no folded spelling to read
+    }
     const t = toolbar as Toolbar;
     const dir = path.join(root, LOWER);
     assert.strictEqual(t.isConfigFile(path.join(root, UPPER, "a.py"), dir, "."), true);
@@ -137,10 +154,45 @@ diskSuite("on disk: a non-ASCII case NTFS folds is inside, U+212A is not (BACKLO
     assert.strictEqual(watchableConfigDir(missing, path.join(root, "NA\u00CFVE", "cfg")), undefined);
   });
 
-  test("a U+212A folder beside the k one is another folder, by the file system too", () => {
+  test("where the native real path fails with EISDIR, the JS one and the file id still settle it", function () {
+    if (!foldsAcute) {
+      this.skip();
+    }
+    const t = toolbar as Toolbar;
+    const native = fs.realpathSync.native;
+    fs.realpathSync.native = ((): never => {
+      throw Object.assign(new Error("EISDIR: illegal operation on a directory"), { code: "EISDIR" });
+    }) as unknown as typeof native;
+    try {
+      assert.strictEqual(t.isConfigFile(path.join(root, UPPER, "a.py"), path.join(root, LOWER), "."), true);
+    } finally {
+      fs.realpathSync.native = native;
+    }
+  });
+
+  test("a U+212A folder beside the k one is another folder, by the file system too", function () {
+    if (!keepsKelvinApart) {
+      this.skip();
+    }
     const t = toolbar as Toolbar;
     assert.strictEqual(t.isConfigFile(path.join(root, `${KELVIN}its`, "a.py"), path.join(root, "kits"), "."), false);
     assert.strictEqual(watchableConfigDir(path.join(root, "kits"), path.join(root, `${KELVIN}its`)), undefined);
+  });
+
+  test("a volume that reports file id 0 for both folders does not make them one", function () {
+    if (!keepsKelvinApart) {
+      this.skip();
+    }
+    const t = toolbar as Toolbar;
+    // The module object itself: the `import * as fs` binding is read-only, and pathFold reads through it.
+    const nodeFs = require("node:fs") as { statSync: unknown };
+    const stat = nodeFs.statSync;
+    nodeFs.statSync = (): { dev: bigint; ino: bigint } => ({ dev: 0n, ino: 0n });
+    try {
+      assert.strictEqual(t.isConfigFile(path.join(root, `${KELVIN}its`, "a.py"), path.join(root, "kits"), "."), false);
+    } finally {
+      nodeFs.statSync = stat;
+    }
   });
 });
 
