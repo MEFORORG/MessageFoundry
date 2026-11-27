@@ -474,8 +474,7 @@ def read_cipher_cells(
     allow (:meth:`~messagefoundry.store.crypto_transit.TransitCipher.decrypt_many`)."""
     if chunk_rows < 1:
         raise ValueError(f"chunk_rows must be at least 1, not {chunk_rows}")
-    keyless = not cipher.encrypts
-    unmarked = unmarked and not keyless
+    unmarked = unmarked and cipher.encrypts
     version = _schema_version(conn)
     tables = store_tables(conn)
     for spec in cells:
@@ -507,17 +506,8 @@ def read_cipher_cells(
             for rowid, sealed, *row in cursor:
                 count, last = count + 1, int(rowid)
                 where, key, stored = tuple(row[:width]), row[width:-1], row[-1]
-                if not sealed:
-                    opening.note(CellReading(spec, unsealed_kind, where))
-                elif not isinstance(stored, str):
-                    # Only a BLOB is sealed and not text; see `_sealed_test` for why it fails.
-                    opening.note(CellReading(spec, "blob", where))
-                elif keyless:
-                    # The sealed test ignores case; the marker does not. A keyless store's plaintext
-                    # that only resembles it is not a sealed cell.
-                    if cipher.is_encrypted(stored):
-                        opening.note(CellReading(spec, "keyless", where))
-                elif opening.add(stored, key, where):
+                # Only a BLOB is sealed and not text; see `_sealed_test` for why it fails.
+                if opening.read(sealed, stored, key, where, unsealed_kind):
                     break  # the key service failed; see _open_queued
             cursor.close()  # ends the chunk's read transaction even when the loop broke early
             readings = _opened(opening)
@@ -565,10 +555,36 @@ class _Opening:
         self.limit = BATCH_MAX_ITEMS if isinstance(cipher, BatchCipher) else 1
         #: Whether a value failed because the key service did (:func:`_is_outage`).
         self.outage = False
+        self.keyless = not cipher.encrypts
 
     def note(self, reading: CellReading) -> None:
         """Place a reading that needed no decrypt at the next place."""
         self.readings.append(reading)
+
+    def read(
+        self,
+        sealed: bool,
+        stored: object,
+        key: list[object],
+        where: tuple[object, ...],
+        unsealed_kind: ReadingKind,
+    ) -> bool:
+        """Classify one row's value, by the one rule :func:`read_cipher_cells` and
+        :func:`read_server_cipher_cells` share, and queue it when it is to be opened. ``sealed``
+        is the backend's own sealed test, true for a value that is not text. True when the queue
+        met an outage (:meth:`add`)."""
+        if not sealed:
+            self.note(CellReading(self.spec, unsealed_kind, where))
+        elif not isinstance(stored, str):
+            self.note(CellReading(self.spec, "blob", where))
+        elif self.keyless:
+            # The sealed test ignores case; the marker does not. A keyless store's plaintext that
+            # only resembles it is not a sealed cell.
+            if self.cipher.is_encrypted(stored):
+                self.note(CellReading(self.spec, "keyless", where))
+        else:
+            return self.add(stored, key, where)
+        return False
 
     def add(self, stored: str, key: list[object], where: tuple[object, ...]) -> bool:
         """Queue one value at the next place, opening the queue first when this value would take
@@ -888,30 +904,22 @@ def _read_server_chunk(
     readings, the position of the last row read, and whether a key-service outage stopped it. Run
     in a worker thread: under ``vault_transit`` each batch of decrypts is a Transit request."""
     index = {c: i for i, c in enumerate(_server_select(spec))}
-    keyless = not cipher.encrypts
     opening = _Opening(spec, cipher)
     for row in rows:
         position += 1
         stored = row[-1]
         where = tuple(position if c == POSITION else row[index[c]] for c in spec.locator)
-        if not isinstance(stored, str):
-            # Every server cipher column is text, so a driver handing back anything else is a
-            # damaged row, failed as SQLite fails a BLOB.
-            opening.note(CellReading(spec, "blob", where))
-            continue
-        if stored == "":
-            continue  # every purge path writes '' (see read_cipher_cells)
-        if not _is_sealed_text(stored):
-            if unmarked:
-                opening.note(CellReading(spec, unsealed_kind, where))
-            continue
-        if keyless:
-            # The sealed test ignores case; the marker does not (see read_cipher_cells).
-            if cipher.is_encrypted(stored):
-                opening.note(CellReading(spec, "keyless", where))
-            continue
+        # Every server cipher column is text, so a driver handing back anything else is a damaged
+        # row, read as sealed so that it fails as SQLite fails a BLOB.
+        sealed = True
+        if isinstance(stored, str):
+            if stored == "":
+                continue  # every purge path writes '' (see read_cipher_cells)
+            sealed = _is_sealed_text(stored)
+            if not sealed and not unmarked:
+                continue  # not sealed, and this walk does not count unmarked values
         key = [row[index[c]] for c in spec.aad_columns]
-        if opening.add(stored, key, where):
+        if opening.read(sealed, stored, key, where, unsealed_kind):
             break
     # After an outage the walk ends, so the position returned with it is never read.
     return _opened(opening), position, opening.outage
