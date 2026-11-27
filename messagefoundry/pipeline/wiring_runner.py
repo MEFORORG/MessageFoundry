@@ -13223,6 +13223,7 @@ class RegistryRunner:
         Mirrors :meth:`_router_worker`'s claim / missing-inbound / backoff supervision. Re-ingress is an
         internal stage with no source of its own (``LoopbackSource`` is inert); under active-passive HA
         the whole graph (and thus this worker) runs on the leader ONLY, so a single node drains it."""
+        last_buildup_check = 0.0
         woken = False  # B11: previous wait was a wake (herd) vs poll-interval timeout (idle)?
         # B12 (ADR 0061): wait on THIS loopback's RESPONSE lane Event when per-lane wake is on; else the
         # shared singleton (byte-identical). Resolved once.
@@ -13254,6 +13255,13 @@ class RegistryRunner:
                 if outcome[0] is _ItemOutcome.STOPPED:
                     return
                 claimed.clear()  # #1844: resolved, before anything else in the pass can raise
+                # Off the hot path (rate-limited), as the router and transform workers check theirs.
+                now = time.time()
+                if now - last_buildup_check >= _BUILDUP_CHECK_INTERVAL:
+                    last_buildup_check = now
+                    await self._maybe_alert_buildup(
+                        name, stage=Stage.RESPONSE.value, threshold=self._buildup_default
+                    )
                 faults.healthy()
             except asyncio.CancelledError:
                 raise
@@ -13268,8 +13276,26 @@ class RegistryRunner:
                 if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start
                 claimed.clear()
+                # BACKLOG #5727: a token held by repeated no-verdict faults takes this arm on every
+                # pass, never the success path, and is re-pended between claims, so the in-flight
+                # watch never sees it held. Checked here too, after the re-pend so the token counts.
+                now = time.time()
+                if now - last_buildup_check >= _BUILDUP_CHECK_INTERVAL:
+                    last_buildup_check = now
+                    await self._response_fault_buildup_check(name)
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
+
+    async def _response_fault_buildup_check(self, name: str) -> None:
+        """The response worker's build-up check from its fault arm (BACKLOG #5727). A diagnostic: a
+        store read that fails here is logged by its type alone, since a driver's text can quote a
+        cell, and never escapes, which would end the worker outside its own backoff."""
+        try:
+            await self._maybe_alert_buildup(
+                name, stage=Stage.RESPONSE.value, threshold=self._buildup_default
+            )
+        except Exception as exc:  # noqa: BLE001 -- a diagnostic; see the docstring
+            log.warning("response worker %r: build-up check failed (%s)", name, type(exc).__name__)
 
     @_records_worker_death("response")
     async def _process_response_item(

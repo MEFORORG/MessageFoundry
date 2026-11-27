@@ -11,12 +11,15 @@ arm handed the token back, and the next claim took the same head again.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import pathlib
 import threading
 from typing import Any
 
 import pytest
 
+from messagefoundry.config.models import BuildupThreshold
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.store.crypto import CipherUnavailableError, generate_key, make_cipher
 from tests import _undecryptable_reply_contract as contract
@@ -140,6 +143,46 @@ async def test_an_outage_stalls_the_loop_on_no_retry_of_the_running_worker(
                 await asyncio.wait_for(task, timeout=5.0)
         assert fault.loop_cost(loop_thread, gaps) == (0, 0), (fault.blocks, gaps)
     assert not [e for e in await store.events_for(head) if e["event"] == "dead"]
+
+
+class _BuildupSink(LoggingAlertSink):
+    def __init__(self) -> None:
+        self.buildup: list[tuple[str, int]] = []
+
+    def queue_buildup(self, name: str, *, depth: int, oldest_age_seconds: float) -> None:
+        self.buildup.append((name, depth))
+
+
+async def test_a_reply_lane_held_by_no_verdict_faults_raises_the_buildup_alert(
+    store: MessageStore,
+) -> None:
+    """BACKLOG #5727: a key-service outage holds the reply lane on fault after fault, so the
+    response worker never reaches its success path, and the token is re-pended between claims, so
+    the in-flight watch never sees it held. The fault arm's build-up check is what pages it. The
+    token was captured at epoch 1.0, so it is past the 60 s age on the first pass."""
+    fetch = _fetch(store)
+    head = await contract.captured(store, control="UR-B-HEAD", now=1.0)
+    [reply] = await fetch("SELECT body FROM response WHERE message_id=?", (head,))
+    runner = contract.runner(store)
+    sink = _BuildupSink()
+    runner._alert_sink = sink
+    runner._buildup_default = BuildupThreshold(max_oldest_seconds=60.0)
+    with contract.faulting_cipher(store) as fault:
+        fault.target, fault.open_error = reply["body"], CipherUnavailableError("synthetic")
+        task = asyncio.ensure_future(runner._response_worker(LOOP))
+        try:
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(4.0):
+                    while not sink.buildup:
+                        await asyncio.sleep(0.02)
+        finally:
+            runner._stop.set()
+            runner._response_work.set()
+            await asyncio.wait_for(task, timeout=5.0)
+    # CONTROL: the lane really was held by the fault, with nothing dead-lettered.
+    assert (await contract.token_of(fetch, head))["status"] == OutboxStatus.PENDING.value
+    assert not [e for e in await store.events_for(head) if e["event"] == "dead"]
+    assert sink.buildup == [(LOOP, 1)], "no queue_buildup alert for the held reply lane"
 
 
 @pytest.mark.parametrize("spoil", contract.SPOILS, ids=lambda s: s.__name__)
