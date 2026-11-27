@@ -430,8 +430,8 @@ suite("Steps edit -- the provider wires the rebase (BACKLOG #5943)", () => {
     assert.ok(/readSource: \(\) => document\.getText\(\)/.test(src.slice(src.indexOf("const applyEdit = (msg"))));
   });
 
-  test("both edit posts in the page echo the projection id", () => {
+  test("both edit posts and both pick posts in the page echo the projection id", () => {
     const js = read("media", "stepsWebview.js");
-    assert.strictEqual((js.match(/projection: projectionId\(\)/g) ?? []).length, 2);
+    assert.strictEqual((js.match(/projection: projectionId\(\)/g) ?? []).length, 4);
   });
 });

@@ -288,6 +288,8 @@
           value: inp ? inp.value : '',
           expectSrc: b.dataset.expectSrc,
           mode: b.dataset.mode,
+          // The pick's write is recorded against the projection it was made on (BACKLOG #5943).
+          projection: projectionId(),
         });
       });
     }
@@ -356,7 +358,7 @@
           if (!fieldsReady(parts, index)) { setHint(box, true); return; }
           setHint(box, false);
           box.dataset.pickParts = JSON.stringify(parts);
-          vscode.postMessage(Object.assign({ command: 'pickPart' }, coords(box), { parts: parts, index: index }));
+          vscode.postMessage(Object.assign({ command: 'pickPart' }, coords(box), { parts: parts, index: index, projection: projectionId() }));
         }
         // A new, empty chip of `kind`: a clone of the renderer's own blank chip, so its markup has one
         // source, placed before the Add buttons.

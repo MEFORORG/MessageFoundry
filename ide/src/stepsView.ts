@@ -75,6 +75,7 @@ import {
   pickPartSeed,
   readEditMessage,
   readPickPartMessage,
+  readProjection,
   releaseEdit,
   renderHandlersHtml,
   renderStepsContextMenuHtml,
@@ -594,23 +595,30 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     // claims the single edit slot around the pick + drain, then ALWAYS re-projects — a picked value has no
     // optimistic DOM value to rely on (unlike a typed edit). The F7 `expect_src` stale guard rides through
     // `applyOne` unchanged: a coordinate shifted by a raced edit is REFUSED, not mis-spliced.
+    // The drain is `drainEdits` with `firstIsPick` (BACKLOG #5943): the pick is sent as posted, and the
+    // typed edits drained behind it are carried over the rewrites before them, the pick's included,
+    // except one on the picked field. `drainEdits` releases the slot through releaseEdit (#1759).
     const applyPickedEdit = async (msg: EditMessage): Promise<void> => {
-      if (!guard.beginEdit()) {
+      // Checked here, not left to drainEdits: a busy slot declines a pick rather than queuing it as a
+      // typed edit. Nothing awaits between this check and drainEdits claiming the slot.
+      if (guard.isEditing) {
         void vscode.window.showInformationMessage(
           "MessageFoundry: an edit is in progress — try again in a moment.",
         );
         return;
       }
-      try {
-        let current: EditMessage | undefined = msg;
-        while (current) {
-          await applyOne(current); // applyOne handles its own error + revert-render
-          current = guard.takePending(); // drain a raced typed edit (F5) — NEVER clearPending (that drops it)
-        }
-      } finally {
-        // releaseEdit, never a bare endEdit — a save suppressed during the pick is deferred (#1759).
-        releaseEdit(guard, scheduleRerender);
-      }
+      await drainEdits(
+        guard,
+        msg,
+        applyOne, // applyOne handles its own refusal + revert-render
+        (err) => {
+          void vscode.window.showErrorMessage(
+            `MessageFoundry: could not apply the edit — ${errorText(err)}`,
+          );
+        },
+        scheduleRerender, // a save suppressed during the pick is deferred (#1759)
+        { rebaser, readSource: () => document.getText(), log: (text) => console.warn(text), firstIsPick: true },
+      );
       if (disposed) {
         return;
       }
@@ -718,6 +726,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         mode?: string;
         appended?: boolean; // ADR 0104 fan-out "＋ dest" — the anchor send's flags (for isReturnRow)
         scaffold?: string;
+        projection?: unknown; // a pickPath's projection id (BACKLOG #5943), read through readProjection
       }) => {
         if (m?.command === "test") {
           // Reuse the existing Test Bench (dry-run this workspace's config — no engine, no sending).
@@ -787,13 +796,18 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           typeof m.expectSrc === "string"
         ) {
           // ADR 0104 §2.3: the picked path is written as the argument's literal.
-          const coords = {
+          const coords: Omit<EditMessage, "command" | "value"> = {
             handler: m.handler,
             lineStart: m.lineStart,
             lineEnd: m.lineEnd,
             name: m.name,
             expectSrc: m.expectSrc,
           };
+          // The projection the pick was made on, so the rebaser can record its write (BACKLOG #5943).
+          const projection = readProjection(m);
+          if (projection !== undefined) {
+            coords.projection = projection;
+          }
           const seed = typeof m.value === "string" ? m.value : "";
           void pickThenApply(coords, m.mode === "segment" ? "segment" : "path", seed, (picked) => picked);
         } else if (
