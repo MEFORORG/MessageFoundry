@@ -381,9 +381,11 @@ jobs:
         if: ${{ !cancelled() && steps.failover_db.outcome == 'success' }}
         # ITS OWN DATABASE, created above. The reference step keys the database it opens, and a keyed
         # audit chain refuses a later keyless append; these nodes run keyless on purpose
-        # (harness/load/failover.py). And its no-loss check reads ABSOLUTE counts
-        # (`final.in_pipeline == 0 and final.dead == 0`), so rows the reference run left undrained
-        # would be reported as failover's loss. A separate database keeps both out.
+        # (harness/load/failover.py). And its no-loss check reads ABSOLUTE counts for the pipeline
+        # (`final.in_pipeline == 0`), so rows the reference run left undrained would be reported as
+        # failover's loss. Dead rows already in the store are excused copy by copy only when the rig
+        # can read them whole from /dead-letters (BACKLOG #5572); otherwise `final.dead == 0` holds.
+        # A separate database keeps both out.
         env:
           MEFOR_STORE_DATABASE: messagefoundry_failover
         run: |

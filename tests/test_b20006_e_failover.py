@@ -12,6 +12,8 @@ three new ones, and a carried-over copy that is replayed and dies again.
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import math
 from types import SimpleNamespace
 from typing import Any
@@ -136,22 +138,22 @@ def test_a_carried_copy_that_died_again_is_new() -> None:
 
 
 @pytest.mark.parametrize(
-    ("opening", "before", "after", "final_dead"),
+    ("opening", "first", "second", "final_dead"),
     [
         (None, frozenset({_A}), frozenset({_A}), 1),  # no opening reading
-        (frozenset({_A}), None, frozenset({_A}), 1),  # no reading before the final stats
-        (frozenset({_A}), frozenset({_A}), None, 1),  # no reading after it
+        (frozenset({_A}), None, frozenset({_A}), 1),  # no first reading after the final stats
+        (frozenset({_A}), frozenset({_A}), None, 1),  # no second reading
         (frozenset({_A}), frozenset({_A}), frozenset({_A, _B}), 2),  # the set moved across them
         (frozenset({_A, _B}), frozenset({_A}), frozenset({_A}), 2),  # stats sees a copy they miss
     ],
 )
 def test_an_inconclusive_reading_judges_nothing(
     opening: frozenset[tuple[str, float]] | None,
-    before: frozenset[tuple[str, float]] | None,
-    after: frozenset[tuple[str, float]] | None,
+    first: frozenset[tuple[str, float]] | None,
+    second: frozenset[tuple[str, float]] | None,
     final_dead: int,
 ) -> None:
-    assert _judge_new_dead(opening, before, after, final_dead) is None
+    assert _judge_new_dead(opening, first, second, final_dead) is None
 
 
 def test_carried_over_dead_rows_do_not_fail_a_clean_run() -> None:
@@ -185,18 +187,30 @@ def _row(oid: str, at: float) -> dict[str, object]:
     return {"outbox_id": oid, "failed_at": at, "summary": "SYNTHETIC"}
 
 
+#: A scripted page: a JSON object answered 200, ``None`` for a node that did not answer, or a bare
+#: status: a refusal with a detail body, or 200 with no JSON object.
+_Page = dict[str, Any] | int | None
+_REFUSAL_DETAIL = "SYNTHETIC-REFUSAL-DETAIL"
+
+
 def _node_answering(
-    monkeypatch: pytest.MonkeyPatch, pages: list[dict[str, Any] | None]
+    monkeypatch: pytest.MonkeyPatch, pages: list[_Page]
 ) -> tuple[failover.EngineNode, list[str]]:
     node = failover.EngineNode.__new__(failover.EngineNode)
     node.node_id = "fo-x"
     paths: list[str] = []
 
-    async def answer(_client: object, path: str) -> dict[str, Any] | None:
+    async def answer(_client: object, path: str) -> tuple[int | None, dict[str, Any] | None]:
         paths.append(path)
-        return pages[min(len(paths) - 1, len(pages) - 1)]
+        page = pages[min(len(paths) - 1, len(pages) - 1)]
+        if page is None:
+            return None, None
+        if isinstance(page, int):
+            # A refusal carries the engine's own detail text, which must never reach a log.
+            return page, ({"detail": _REFUSAL_DETAIL} if page != 200 else None)
+        return 200, page
 
-    monkeypatch.setattr(node, "_signed_in_json", answer)
+    monkeypatch.setattr(node, "_signed_in_reply", answer)
     return node, paths
 
 
@@ -234,7 +248,7 @@ def test_dead_copies_reads_every_page(monkeypatch: pytest.MonkeyPatch) -> None:
     ],
 )
 def test_dead_copies_is_none_unless_whole(
-    pages: list[dict[str, Any] | None], monkeypatch: pytest.MonkeyPatch
+    pages: list[_Page], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(failover, "_DEAD_PAGE", 2)
     node, _ = _node_answering(monkeypatch, pages)
@@ -307,72 +321,140 @@ def test_per_lane_ordering_fails_on_an_inversion_over_two_lanes() -> None:
 # --- the final reads, in order ---------------------------------------------------
 
 
-def _stats_dead(dead: int) -> NodeStats:
-    return NodeStats(done=0, dead=dead, pending=0, inflight=0, in_pipeline=0)
+def _stats_dead(dead: int, in_pipeline: int = 0) -> NodeStats:
+    return NodeStats(done=0, dead=dead, pending=0, inflight=0, in_pipeline=in_pipeline)
 
 
 class _FinalNode:
-    """The survivor's final reads, from a script, logging their order. Each dead-copy read returns
-    the next scripted set, and each one also lands a late sink arrival on ``counters``, so a test can
-    see which side of the reads the counters were taken on."""
+    """The survivor's final reads, from a script, logging their order. Each stats read returns the
+    next scripted reading (the last one repeats), and each dead-copy read returns the next scripted
+    set. A dead-copy read also lands a late sink arrival on ``counters`` and a late delivery of seq 0
+    on ``tracker``, so a test can see which side of the reads the counters and tracker were taken
+    on."""
 
     def __init__(
         self,
         copies: list[frozenset[tuple[str, float]] | None],
-        stats: NodeStats | None,
+        stats: list[NodeStats | None],
         counters: Counters,
+        tracker: FailoverTracker,
     ) -> None:
         self._copies = copies
         self._stats = stats
         self._counters = counters
+        self._tracker = tracker
         self.calls: list[str] = []
 
     async def dead_copies(self, client: object) -> frozenset[tuple[str, float]] | None:
         self.calls.append("copies")
         self._counters.sink_received += 1
+        self._tracker.on_delivery("d0", 0)
         return self._copies.pop(0)
 
     async def stats(self, client: object) -> NodeStats | None:
         self.calls.append("stats")
-        return self._stats
+        return self._stats.pop(0) if len(self._stats) > 1 else self._stats[0]
 
 
 def _final(
     copies: list[frozenset[tuple[str, float]] | None],
-    stats: NodeStats | None,
+    stats: NodeStats | None | list[NodeStats | None],
     carried: frozenset[tuple[str, float]] | None,
-) -> tuple[_FinalNode, tuple[NodeStats, Counters, int | None]]:
+    tracker: FailoverTracker | None = None,
+) -> tuple[_FinalNode, tuple[NodeStats, Counters, FailoverTracker, int | None]]:
     counters = Counters(sink_received=10)
-    node = _FinalNode(copies, stats, counters)
-    got = asyncio.run(failover._final_reads(node, object(), carried, counters))  # type: ignore[arg-type]
+    tracker = tracker or FailoverTracker()
+    script = stats if isinstance(stats, list) else [stats]
+    node = _FinalNode(copies, script, counters, tracker)
+    got = asyncio.run(failover._final_reads(node, object(), carried, counters, tracker))  # type: ignore[arg-type]
     return node, got
 
 
-def test_final_reads_bracket_the_stats_read() -> None:
+def test_final_reads_take_the_stats_first_then_bracket_a_second_one() -> None:
     carried = frozenset({_A, _B})
-    node, (final, snapshot, dead_new) = _final([carried, carried], _stats_dead(2), carried)
-    assert node.calls == ["copies", "stats", "copies"]
+    node, (final, snapshot, _, dead_new) = _final([carried, carried], _stats_dead(2), carried)
+    assert node.calls == ["stats", "copies", "stats", "copies"]
     assert (final.dead, dead_new) == (2, 0)
-    # The first read's arrival is in, the second's is not: taken straight after the stats read.
-    assert snapshot.sink_received == 11
+    # Taken straight after the first stats read: no dead-copy read's arrival is in.
+    assert snapshot.sink_received == 10
+
+
+def test_a_drain_that_finishes_during_the_dead_copy_reads_still_fails() -> None:
+    """BACKLOG #5572: the final stats read must see the moment ``main`` saw, straight after the
+    drain. Here the pipeline empties only once the rig starts reading dead copies; the verdict reads
+    the stranded rows, so the run fails as it would on a fresh store."""
+    carried = frozenset({_A})
+    stranded, drained = _stats_dead(1, in_pipeline=4), _stats_dead(1)
+
+    class _DrainsDuringTheRead(_FinalNode):
+        async def stats(self, client: object) -> NodeStats | None:
+            self.calls.append("stats")
+            return drained if "copies" in self.calls else stranded
+
+    counters = Counters(sent=100, acked=98, sink_received=196, timeouts=2)
+    tracker = _tracker()
+    node = _DrainsDuringTheRead([carried, carried], [], counters, tracker)
+    final, snapshot, held, dead_new = asyncio.run(
+        failover._final_reads(node, object(), carried, counters, tracker)  # type: ignore[arg-type]
+    )
+    assert final.in_pipeline == 4
+    # The second stats read no longer matches the first, so nothing is excused either.
+    assert dead_new is None
+    profile = _profile()
+    rep = _build_report(
+        profile,
+        "postgres",
+        snapshot,
+        held,
+        _outcome(),
+        final,
+        done_at_start=0,
+        fo=profile.failover,
+        notes=[],
+        dead_opening=1,
+        dead_new=dead_new,
+    )
+    assert rep.result_ok is False
+    assert any(s.name == "no_acknowledged_loss" and not s.ok for s in rep.slos)
+
+
+def test_a_delivery_during_the_dead_copy_reads_counts_for_nothing() -> None:
+    # Seq 0 was acked and had not reached the sink at the final stats read. The dead-copy reads
+    # deliver it; the report still counts it as not delivered, as it would have on main.
+    carried = frozenset({_A})
+    tracker = FailoverTracker()
+    tracker.on_ack(0)
+    _, (_, _, held, _) = _final([carried, carried], _stats_dead(1), carried, tracker=tracker)
+    assert tracker.acked_not_delivered() == 0
+    assert held.acked_not_delivered() == 1
+
+
+def test_final_reads_judge_nothing_when_the_second_stats_read_moved() -> None:
+    carried = frozenset({_A, _B})
+    moved = NodeStats(done=1, dead=2, pending=0, inflight=0, in_pipeline=0)
+    node, (final, _, _, dead_new) = _final([carried], [_stats_dead(2), moved], carried)
+    assert node.calls == ["stats", "copies", "stats"]
+    assert final == _stats_dead(2)
+    assert dead_new is None
 
 
 def test_final_reads_judge_nothing_when_the_set_moved() -> None:
     carried = frozenset({_A, _B})
-    _, (_, _, dead_new) = _final([carried, frozenset({_A, ("ox", 9.0)})], _stats_dead(2), carried)
+    _, (_, _, _, dead_new) = _final(
+        [carried, frozenset({_A, ("ox", 9.0)})], _stats_dead(2), carried
+    )
     assert dead_new is None
 
 
-def test_final_reads_skip_both_lists_with_nothing_carried() -> None:
-    node, (_, _, dead_new) = _final([], _stats_dead(4), None)
+def test_final_reads_skip_every_list_with_nothing_carried() -> None:
+    node, (_, _, _, dead_new) = _final([], _stats_dead(4), None)
     assert node.calls == ["stats"]
     assert dead_new is None
 
 
-def test_final_reads_skip_the_second_list_when_nothing_is_dead() -> None:
-    carried = frozenset({_A})
-    node, _ = _final([carried], _stats_dead(0), carried)
-    assert node.calls == ["copies", "stats"]
+def test_final_reads_skip_every_list_when_nothing_is_dead() -> None:
+    node, _ = _final([], _stats_dead(0), frozenset({_A}))
+    assert node.calls == ["stats"]
 
 
 def test_final_reads_refuse_a_missing_final_stats_read() -> None:
@@ -390,10 +472,10 @@ def test_a_refused_session_is_a_partial_dead_copy_read(monkeypatch: pytest.Monke
     node = failover.EngineNode.__new__(failover.EngineNode)
     node.node_id = "fo-x"
 
-    async def refuse(_client: object, _path: str) -> dict[str, Any]:
+    async def refuse(_client: object, _path: str) -> tuple[int, dict[str, Any]]:
         raise FailoverError("node fo-x: sign-in refused")
 
-    monkeypatch.setattr(node, "_signed_in_json", refuse)
+    monkeypatch.setattr(node, "_signed_in_reply", refuse)
     assert asyncio.run(node.dead_copies(object())) is None  # type: ignore[arg-type]
 
 
@@ -450,8 +532,8 @@ def test_the_console_escapes_the_backend_name() -> None:
 def test_final_reads_skip_a_second_list_that_could_not_count(
     before: frozenset[tuple[str, float]] | None,
 ) -> None:
-    node, (_, _, dead_new) = _final([before], _stats_dead(2), frozenset({_A}))
-    assert node.calls == ["copies", "stats"]
+    node, (_, _, _, dead_new) = _final([before], _stats_dead(2), frozenset({_A}))
+    assert node.calls == ["stats", "copies"]
     assert dead_new is None
 
 
@@ -478,3 +560,100 @@ def test_a_lease_whose_recovery_bound_overflows_is_refused(
     )
     with pytest.raises(FailoverError, match="too large"):
         asyncio.run(failover.run_failover_load(profile, ports=ports, base_env={}))
+
+
+# --- what a refused page logs, and what the rig keeps of a row ---------------------
+
+
+@pytest.mark.parametrize(
+    ("page", "reason"),
+    [
+        (None, "no answer at offset 0"),
+        (429, "HTTP 429 at offset 0"),
+        (403, "HTTP 403 at offset 0"),
+        (422, "HTTP 422 at offset 0"),
+        (200, "an answer that is not a JSON object at offset 0"),
+    ],
+)
+def test_a_refused_page_is_logged_by_status_never_by_body(
+    page: _Page, reason: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    node, _ = _node_answering(monkeypatch, [page])
+    with caplog.at_level(logging.DEBUG):
+        assert asyncio.run(node.dead_copies(object())) is None  # type: ignore[arg-type]
+    assert reason in caplog.text
+    assert _REFUSAL_DETAIL not in caplog.text
+
+
+_SENTINEL = "SYNTHETIC-PHI-SENTINEL"
+
+
+def _full_row(oid: str, at: float) -> dict[str, object]:
+    """A row with every field ``/dead-letters`` returns, each non-id field carrying the sentinel."""
+    return {
+        "outbox_id": oid,
+        "failed_at": at,
+        "message_id": f"{_SENTINEL}-mid",
+        "channel_id": f"{_SENTINEL}-in",
+        "destination_name": f"{_SENTINEL}-out",
+        "attempts": 3,
+        "last_error": f"{_SENTINEL}-error",
+        "control_id": f"{_SENTINEL}-ctl",
+        "message_type": f"{_SENTINEL}-type",
+        "received_at": 1.0,
+        "summary": f"{_SENTINEL}-summary",
+    }
+
+
+def test_a_whole_read_keeps_only_the_outbox_id_and_failure_time(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    node, _ = _node_answering(
+        monkeypatch, [{"total": 2, "dead_letters": [_full_row("o1", 1.0), _full_row("o2", 2.0)]}]
+    )
+    with caplog.at_level(logging.DEBUG):
+        got = asyncio.run(node.dead_copies(object()))  # type: ignore[arg-type]
+    assert got == frozenset({("o1", 1.0), ("o2", 2.0)})
+    assert _SENTINEL not in repr(got)
+    assert _SENTINEL not in caplog.text
+
+
+def test_a_partial_read_logs_no_row_field(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(failover, "_DEAD_PAGE", 1)
+    node, _ = _node_answering(
+        monkeypatch,
+        [
+            {"total": 2, "dead_letters": [_full_row("o1", 1.0)]},
+            {"total": 2, "dead_letters": [_full_row("o1", 1.0)]},  # seen twice
+        ],
+    )
+    with caplog.at_level(logging.DEBUG):
+        assert asyncio.run(node.dead_copies(object())) is None  # type: ignore[arg-type]
+    assert "seen twice" in caplog.text
+    assert _SENTINEL not in caplog.text
+    assert "o1" not in caplog.text
+
+
+def test_the_report_carries_counts_never_a_dead_copy_id() -> None:
+    carried = frozenset({("SYNTHETIC-OID-1", 1.0)})
+    grown = carried | {("SYNTHETIC-OID-2", 2.0)}
+    _, (final, snapshot, held, dead_new) = _final([grown, grown], _stats_dead(2), carried)
+    assert dead_new == 1
+    profile = _profile()
+    rep = _build_report(
+        profile,
+        "postgres",
+        snapshot,
+        held,
+        _outcome(),
+        final,
+        done_at_start=0,
+        fo=profile.failover,
+        notes=[],
+        dead_opening=1,
+        dead_new=dead_new,
+    )
+    text = json.dumps(rep.to_json_dict()) + rep.render_console() + "".join(rep.notes)
+    assert "SYNTHETIC-OID" not in text

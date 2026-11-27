@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import logging
 import math
@@ -87,8 +88,8 @@ _DEAD_PAGE = 500
 #: so a store carrying more fails a clean run, as every reused store with dead rows did before. Each
 #: page is a PHI-gated read: it spends the rig account's per-actor PHI-read budget (120 a minute by
 #: default) and writes an exposure audit row. A run reads the whole set at most four times (the
-#: opening read, once per node if the first is not whole, and once on each side of the final stats
-#: read), so this cap keeps a run to about 40 pages, plus a re-ask of any page that met an expired
+#: opening read, once per node if the first is not whole, and twice after the final stats read),
+#: so this cap keeps a run to about 40 pages, plus a re-ask of any page that met an expired
 #: session. Raising it, or a lower engine budget, turns pages into refusals.
 _DEAD_COPIES_MAX = 5_000
 
@@ -391,6 +392,14 @@ class EngineNode:
         A node that refuses the session (401) is asked again once with a renewed one. A sign-in the
         engine REFUSES is not "unreachable" and is not swallowed: it raises ``FailoverError``, the
         setup failure every runner over this class already reports, with the reason."""
+        status, body = await self._signed_in_reply(client, path)
+        return body if status == 200 else None
+
+    async def _signed_in_reply(
+        self, client: httpx.AsyncClient, path: str
+    ) -> tuple[int | None, dict[str, Any] | None]:
+        """:meth:`_signed_in_json`'s read, as :func:`_get_status_json`'s ``(status, JSON object)``,
+        so a caller can tell a refusal from a node that did not answer."""
         url = f"{self.url}{path}"
         try:
             token = await asyncio.to_thread(rigadmin.session_token, self.url, cacert=self.cacert)
@@ -401,10 +410,10 @@ class EngineNode:
                 )
                 status, body = await _get_status_json(client, url, token)
         except rigadmin.RigUnreachable:
-            return None
+            return None, None
         except rigadmin.RigSignInRefused as exc:
             raise FailoverError(f"node {self.node_id}: {exc}") from exc
-        return body if status == 200 else None
+        return status, body
 
     async def role(self, client: httpx.AsyncClient) -> str | None:
         """``"primary"`` / ``"standby"`` / ``"single-node"`` from ``/cluster/status``; ``None`` if the
@@ -460,11 +469,16 @@ class EngineNode:
         copies: dict[str, float] = {}
         total: int | None = None
         while True:
-            data = await self._signed_in_json(
+            status, data = await self._signed_in_reply(
                 client, f"/dead-letters?limit={_DEAD_PAGE}&offset={len(copies)}"
             )
-            if data is None:
+            # The status alone, never the body: a refusal's detail is the engine's own text.
+            if status is None:
                 return f"no answer at offset {len(copies)}"
+            if status != 200:
+                return f"HTTP {status} at offset {len(copies)}"
+            if data is None:
+                return f"an answer that is not a JSON object at offset {len(copies)}"
             page_total, rows = data.get("total"), data.get("dead_letters")
             if type(page_total) is not int or not isinstance(rows, list):
                 return "a page with no total or no rows"
@@ -835,14 +849,14 @@ async def run_failover_load(
             outcome = (
                 await monitor
             )  # recovery was observed during the phase/drain (or hit the deadline)
-            final, counters, dead_new = await _final_reads(
-                survivor, client, carried, metrics.counters
+            final, counters, held, dead_new = await _final_reads(
+                survivor, client, carried, metrics.counters, tracker
             )
             return _build_report(
                 profile,
                 db_backend,
                 counters,
-                tracker,
+                held,
                 outcome,
                 final,
                 opening.done,
@@ -1006,8 +1020,10 @@ def _build_report(
         notes.append(f"{final.dead} dead-lettered outbound row(s) at the end; {why}")
     if tracker.lanes_observed < 2:
         notes.append(
-            f"per-lane ordering observed {tracker.lanes_observed} lane(s); it needs two to compare "
-            "anything, so zero inversions proves nothing and the check fails"
+            f"per-lane ordering observed {tracker.lanes_observed} lane(s); the failover graph fans "
+            "out to MEFOR_LOAD_FANOUT destinations, 3 by default, so fewer than two means "
+            "deliveries reached too few of them or the lane key collapsed onto one label, and the "
+            "check fails rather than certify order across the destinations from it"
         )
     no_loss_ok = acked_not_delivered == 0 and final.in_pipeline == 0 and dead_ok
     recovery_bound = fo.recovery_ttl_multiple * fo.leader_lease_ttl_seconds
@@ -1035,8 +1051,10 @@ def _build_report(
             outcome.leader_samples > 0 and outcome.max_concurrent_leaders <= 1,
         ),
         SloCheck("no_acknowledged_loss", 0, acked_not_delivered, no_loss_ok),
-        # Non-vacuous like single_leader: with fewer than two lanes observed there is no ordering to
-        # compare, so zero inversions proves nothing and the check FAILS (S26-62).
+        # Non-vacuous like single_leader (S26-62). One lane is still checked for FIFO, but the graph
+        # fans out to several destinations, so fewer than two lanes means a lane key that collapsed
+        # (MSH-6 not stamped, every destination on one label) or too few destinations reached. Zero
+        # inversions then does not show per-destination order, so the check FAILS.
         SloCheck(
             "per_lane_ordering",
             0,
@@ -1249,46 +1267,60 @@ async def _final_reads(
     client: httpx.AsyncClient,
     carried: frozenset[DeadCopy] | None,
     counters: Counters,
-) -> tuple[NodeStats, Counters, int | None]:
-    """The final stats read, the harness counters at that moment, and :func:`_judge_new_dead`'s count.
+    tracker: FailoverTracker,
+) -> tuple[NodeStats, Counters, FailoverTracker, int | None]:
+    """The final stats read, the harness counters and tracker at that moment, and
+    :func:`_judge_new_dead`'s count.
 
-    The dead copies are read on both sides of the stats read, so a copy that dies or leaves between
-    them shows as a moved set and judges nothing. The second read is skipped wherever its answer
-    could not change that, so it spends no PHI-read budget for nothing.
+    The stats read comes first, straight after the drain and the monitor, as it did before the
+    per-copy check existed, and the counters and the tracker are copied straight after it, with no
+    await between. So every verdict the report draws from them sees the same moment it did then: a
+    drain that had not finished by then still fails, and a delivery the sink records during the
+    dead-copy reads below counts for nothing (BACKLOG #5572).
 
-    The counters are taken straight after the stats read, before the second dead-copy read, so the
-    ``sink_received`` that duplicates are counted from lines up with the ``done`` count beside it.
-    The tracker is read later, in :func:`_build_report`, as it was before this check existed: a
-    late arrival there only records a delivery that really happened, or adds an inversion or a lane."""
-    before = await survivor.dead_copies(client) if carried else None
+    Only then are the dead copies read, and only when there is something to excuse: a reused store
+    whose opening copies were read whole, with dead rows at the end. The copies are read twice, on
+    both sides of a second stats read, and judged only when the two reads are the same set, its size
+    is the dead count, and the second stats read matches the first in every count. Each later read
+    is skipped wherever its answer could not change that, so it spends no PHI-read budget for
+    nothing."""
     final = await survivor.stats(client)
     if final is None:
         raise FailoverError("could not read the survivor's final /stats for reconciliation")
     snapshot = counters.snapshot()
-    worth = before is not None and final.dead > 0 and len(before) == final.dead
-    after = await survivor.dead_copies(client) if worth else None
-    return final, snapshot, _judge_new_dead(carried, before, after, final.dead)
+    held = copy.deepcopy(tracker)
+    if not carried or final.dead == 0:
+        return final, snapshot, held, None
+    first = await survivor.dead_copies(client)
+    if first is None or len(first) != final.dead:
+        return final, snapshot, held, None
+    if await survivor.stats(client) != final:
+        return final, snapshot, held, None
+    second = await survivor.dead_copies(client)
+    return final, snapshot, held, _judge_new_dead(carried, first, second, final.dead)
 
 
 def _judge_new_dead(
     opening: frozenset[DeadCopy] | None,
-    before: frozenset[DeadCopy] | None,
-    after: frozenset[DeadCopy] | None,
+    first: frozenset[DeadCopy] | None,
+    second: frozenset[DeadCopy] | None,
     final_dead: int,
 ) -> int | None:
-    """How many of the run's final dead copies were not dead, unchanged, at the opening read.
+    """How many of the dead copies at the final stats read were not dead, unchanged, at the opening
+    read.
 
-    ``before`` and ``after`` are whole reads taken on either side of the final stats read that gave
-    ``final_dead``. The count is given only when the two are the same set and its size is that dead
-    count; otherwise ``None``, which judges nothing and leaves the check absolute. A new copy cannot
-    hide in a set that held still across the stats read and matched its count: it would need a
-    copy that left before that read to be back in ``after`` with its own ``failed_at``, and a copy
-    that is dead-lettered again takes a new one."""
-    if opening is None or before is None or after is None:
+    ``first`` and ``second`` are whole reads taken after that stats read, on either side of a second
+    stats read whose counts all match it. The count is given only when the two are the same set and
+    its size is ``final_dead``; otherwise ``None``, which judges nothing and leaves the check absolute.
+    A new copy dead at the final stats read cannot hide: for it to be gone from the set read later,
+    another copy must have taken its place, since the count held, and a copy that becomes dead after
+    the final read is new too, because a carried-over copy that is dead-lettered again takes a new
+    ``failed_at``. So a set with no new copy is the set the final stats read counted."""
+    if opening is None or first is None or second is None:
         return None
-    if before != after or len(after) != final_dead:
+    if first != second or len(second) != final_dead:
         return None
-    return len(after - opening)
+    return len(second - opening)
 
 
 def _refuse_non_finite(fo: Failover) -> None:
