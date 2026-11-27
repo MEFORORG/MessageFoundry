@@ -153,15 +153,17 @@ class _BuildupSink(LoggingAlertSink):
         self.buildup.append((name, depth))
 
 
+@pytest.mark.parametrize("leader", [True, False], ids=["leader", "not_leader"])
 async def test_a_reply_lane_held_by_no_verdict_faults_raises_the_buildup_alert(
-    store: MessageStore,
+    store: MessageStore, leader: bool
 ) -> None:
     """BACKLOG #5727: the key service gives no verdict on the step's read of the reply, pass after
     pass, while the claim's open of the token still works, so the response worker never reaches
     its success path, and the token is re-pended between claims, so the in-flight watch never sees
     it held. The fault arm's build-up check is what pages it. The token was captured at epoch 1.0,
     so it is past the 60 s age on the first pass. An outage that also fails the claim's open sets
-    the token aside at the claim, which this check does not reach."""
+    the token aside at the claim, which this check does not reach. A node that does not lead pages
+    nothing, since a successor may own the lane."""
     fetch = _fetch(store)
     head = await contract.captured(store, control="UR-B-HEAD", now=1.0)
     [reply] = await fetch("SELECT body FROM response WHERE message_id=?", (head,))
@@ -169,6 +171,8 @@ async def test_a_reply_lane_held_by_no_verdict_faults_raises_the_buildup_alert(
     sink = _BuildupSink()
     runner._alert_sink = sink
     runner._buildup_default = BuildupThreshold(max_oldest_seconds=60.0)
+    if not leader:
+        runner._coordinator.is_leader = lambda: False  # type: ignore[method-assign]
     with contract.faulting_cipher(store) as fault:
         fault.target, fault.open_error = reply["body"], CipherUnavailableError("synthetic")
         task = asyncio.ensure_future(runner._response_worker(LOOP))
@@ -184,7 +188,7 @@ async def test_a_reply_lane_held_by_no_verdict_faults_raises_the_buildup_alert(
     # CONTROL: the lane really was held by the fault, with nothing dead-lettered.
     assert (await contract.token_of(fetch, head))["status"] == OutboxStatus.PENDING.value
     assert not [e for e in await store.events_for(head) if e["event"] == "dead"]
-    assert sink.buildup == [(LOOP, 1)], "no queue_buildup alert for the held reply lane"
+    assert sink.buildup == ([(LOOP, 1)] if leader else []), sink.buildup
 
 
 @pytest.mark.parametrize("leader", [True, False], ids=["leader", "not_leader"])
@@ -230,12 +234,13 @@ async def test_a_whole_outage_set_aside_at_the_claim_raises_the_buildup_alert(
     assert sink.buildup == ([(LOOP, 1)] if leader else []), sink.buildup
 
 
+@pytest.mark.parametrize("leader", [True, False], ids=["leader", "not_leader"])
 async def test_a_reply_lane_backlog_raises_the_buildup_alert_from_the_success_path(
-    store: MessageStore,
+    store: MessageStore, leader: bool
 ) -> None:
     """BACKLOG #5727: the response worker checks its lane after a handed-off token, as the router
-    and transform workers check theirs. Two tokens captured at epoch 1.0: after the first hands
-    off, the second is pending past the 60 s age."""
+    and transform workers check theirs, on the leader only. Two tokens captured at epoch 1.0:
+    after the first hands off, the second is pending past the 60 s age."""
     fetch = _fetch(store)
     await contract.captured(store, control="UR-S-ONE", now=1.0)
     await contract.captured(store, control="UR-S-TWO", now=2.0)
@@ -243,6 +248,8 @@ async def test_a_reply_lane_backlog_raises_the_buildup_alert_from_the_success_pa
     sink = _BuildupSink()
     runner._alert_sink = sink
     runner._buildup_default = BuildupThreshold(max_oldest_seconds=60.0)
+    if not leader:
+        runner._coordinator.is_leader = lambda: False  # type: ignore[method-assign]
     task = asyncio.ensure_future(runner._response_worker(LOOP))
     try:
         async with asyncio.timeout(5.0):
@@ -252,7 +259,7 @@ async def test_a_reply_lane_backlog_raises_the_buildup_alert_from_the_success_pa
         runner._stop.set()
         runner._response_work.set()
         await asyncio.wait_for(task, timeout=5.0)
-    assert sink.buildup == [(LOOP, 1)], "no queue_buildup alert from the success path"
+    assert sink.buildup == ([(LOOP, 1)] if leader else []), sink.buildup
 
 
 @pytest.mark.parametrize("spoil", contract.SPOILS, ids=lambda s: s.__name__)

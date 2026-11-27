@@ -13313,8 +13313,12 @@ class RegistryRunner:
                     return
                 claimed.clear()  # #1844: resolved, before anything else in the pass can raise
                 # Off the hot path (rate-limited), as the router and transform workers check theirs.
+                # On the leader only, as on the empty-claim branch (BACKLOG #5727).
                 now = time.time()
-                if now - last_buildup_check >= _BUILDUP_CHECK_INTERVAL:
+                if (
+                    now - last_buildup_check >= _BUILDUP_CHECK_INTERVAL
+                    and self._coordinator.is_leader()
+                ):
                     last_buildup_check = now
                     await self._response_buildup_check(name)
                 faults.healthy()
@@ -13339,6 +13343,7 @@ class RegistryRunner:
                 if (
                     held is HoldResult.LANDED
                     and now - last_buildup_check >= _BUILDUP_CHECK_INTERVAL
+                    and self._coordinator.is_leader()
                 ):
                     last_buildup_check = now
                     await self._response_buildup_check(name)
@@ -15058,7 +15063,10 @@ class RegistryRunner:
         # driver's raw text (BACKLOG #5727).
         key = f"{Stage.RESPONSE.value}:{lane}"
         now = time.time()
-        if now - self._pooled_buildup_at.get(key, 0.0) >= _BUILDUP_CHECK_INTERVAL:
+        if (
+            now - self._pooled_buildup_at.get(key, 0.0) >= _BUILDUP_CHECK_INTERVAL
+            and self._coordinator.is_leader()
+        ):
             self._pooled_buildup_at[key] = now
             await self._response_buildup_check(lane)
         return result

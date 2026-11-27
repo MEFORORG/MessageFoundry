@@ -169,3 +169,27 @@ async def test_a_failed_pooled_reply_buildup_check_logs_no_driver_text(
     failed = [r for r in caplog.records if "build-up check failed" in r.getMessage()]
     assert failed, [r.getMessage() for r in caplog.records]  # CONTROL: the check ran and failed
     assert REPLY_MARK not in caplog.text
+
+
+async def test_a_pooled_reply_buildup_check_runs_on_the_leader_only(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 6: a node that does not lead runs no build-up check on the pooled reply lane, as the
+    per-lane worker's paths do not, since a successor may own the lane."""
+    _, item = await _head(store)
+    step = contract.runner(store)
+    step._coordinator.is_leader = lambda: False  # type: ignore[method-assign]
+    reads: list[str] = []
+
+    async def _depth(name: str, *, stage: str = "") -> tuple[int, float | None]:
+        reads.append(name)
+        return 0, None
+
+    monkeypatch.setattr(store, "pending_depth", _depth)
+    await step._dispatch_response(LOOP, item)
+    assert reads == []
+    # CONTROL: the leader does run it.
+    step._coordinator.is_leader = lambda: True  # type: ignore[method-assign]
+    step._pooled_buildup_at.clear()
+    await step._dispatch_response(LOOP, item)  # an already-consumed token: a no-op handoff
+    assert reads == [LOOP]
