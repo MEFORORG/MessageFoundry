@@ -660,8 +660,9 @@ HANDLER_FAULT_REPORT_AFTER = 4
 #: grace for its client tasks.
 _HOLD_STOP_POLL_SECONDS = 0.25
 
-#: The bound on the ``handler_error`` report a cancelled hold still makes. The store may be what is
-#: hung, and stop() waits for the task it cancelled, so the report must not hold stop() open.
+#: The bound on the ``handler_error`` report a cancelled hold still makes, and, separately, on its
+#: write of the held frame's ``ERROR`` row (BACKLOG #1619 item 6). The store may be what is hung,
+#: and stop() waits for the task it cancelled, so neither may hold stop() open.
 _CANCELLED_REPORT_SECONDS = 1.0
 
 
@@ -784,7 +785,7 @@ async def hold_and_retry(
     frames behind it are still lost: the listener never handed them to the handler. The reason it
     is given is fixed text and the scrubbed fault, never a byte of the frame. It is best-effort: a
     write that raises logs a WARNING, and the ERROR line then still says the frame is not recorded.
-    After a cancel it is bounded by :data:`_CANCELLED_REPORT_SECONDS`, like the report. A cancel
+    After a cancel it is bounded by :data:`_CANCELLED_REPORT_SECONDS`, as the report is. A cancel
     inside an attempt records it too, and its reason says the cut-off attempt may also have
     recorded it, since a second row is a lesser fault than a frame that may be lost uncounted. It
     is called only once the hold has ended, so the hold itself still has no attempt cap.
@@ -851,17 +852,90 @@ async def hold_and_retry(
                 )
             return reply
     except asyncio.CancelledError:
-        cancelled = "the listener task was cancelled"
-        mid = await _record_held_frame(
-            record_loss,
+        await _end_hold(
             frame,
-            _held_loss_reason(failed, reason, cut_off=in_attempt),
+            reason,
+            failed=failed,
+            why="the listener task was cancelled",
+            cut_off=in_attempt,
+            bound=_CANCELLED_REPORT_SECONDS,
+            reported=reported,
             transport=transport,
             peer=peer,
             log=log,
-            timeout=_CANCELLED_REPORT_SECONDS,
+            report=report,
+            record_loss=record_loss,
         )
-        if in_attempt:
+        raise
+    await _end_hold(
+        frame,
+        reason,
+        failed=failed,
+        why="the listener is stopping",
+        cut_off=False,
+        bound=None,
+        reported=reported,
+        transport=transport,
+        peer=peer,
+        log=log,
+        report=report,
+        record_loss=record_loss,
+    )
+    raise HandlerFaultUnrecovered
+
+
+async def _end_hold(
+    frame: bytes,
+    reason: str,
+    *,
+    failed: int,
+    why: str,
+    cut_off: bool,
+    bound: float | None,
+    reported: bool,
+    transport: str,
+    peer: object,
+    log: logging.Logger,
+    report: Callable[[str], Awaitable[None]],
+    record_loss: HeldFrameRecorder | None,
+) -> None:
+    """End a hold without its frame: report it unless already reported, hand the frame to
+    ``record_loss``, then log one ERROR line saying what became of it. ``cut_off`` says a cancel cut
+    off an attempt inside the handler. ``bound``, after a cancel, bounds the report and the write
+    each, since stop() waits for the task it cancelled.
+
+    The report goes first because it is a non-blocking enqueue, and the write may be what hangs.
+    The ERROR line is written in a ``finally``, so a further cancel during either still logs it."""
+    mid: str | None = None
+    writing = False
+    try:
+        if not reported:
+            if bound is None:
+                await report(reason)
+            else:
+                try:
+                    await asyncio.wait_for(report(reason), bound)
+                except TimeoutError:
+                    log.warning(
+                        "%s handler_error event for %s not written within %.1fs of the cancel",
+                        transport,
+                        peer,
+                        bound,
+                    )
+        if record_loss is not None:
+            writing = True
+            mid = await _record_held_frame(
+                record_loss,
+                frame,
+                _held_loss_reason(failed, reason, cut_off=cut_off),
+                transport=transport,
+                peer=peer,
+                log=log,
+                bound=bound,
+            )
+            writing = False
+    finally:
+        if cut_off:
             log.error(
                 "%s message from %s may or may not be recorded: the listener task was cancelled "
                 "inside attempt %d, after %d failed with: %s. No frame behind it on this connection "
@@ -880,42 +954,18 @@ async def hold_and_retry(
                     peer,
                     mid,
                 )
-        elif mid is None:
-            _log_hold_loss(log, transport, peer, failed, reason, cancelled)
+        elif mid is not None:
+            _log_hold_recorded(log, transport, peer, failed, reason, why, mid)
         else:
-            _log_hold_recorded(log, transport, peer, failed, reason, cancelled, mid)
-        if not reported:
-            try:
-                await asyncio.wait_for(report(reason), _CANCELLED_REPORT_SECONDS)
-            except TimeoutError:
-                log.warning(
-                    "%s handler_error event for %s not written within %.1fs of the cancel",
-                    transport,
-                    peer,
-                    _CANCELLED_REPORT_SECONDS,
-                )
-        raise
-    stopping = "the listener is stopping"
-    recorded: str | None = None
-    try:
-        recorded = await _record_held_frame(
-            record_loss,
-            frame,
-            _held_loss_reason(failed, reason, cut_off=False),
-            transport=transport,
-            peer=peer,
-            log=log,
-            timeout=None,
-        )
-    finally:
-        # A cancel during the write still logs the loss, then propagates.
-        if recorded is None:
-            _log_hold_loss(log, transport, peer, failed, reason, stopping)
-        else:
-            _log_hold_recorded(log, transport, peer, failed, reason, stopping, recorded)
-    if not reported:
-        await report(reason)
-    raise HandlerFaultUnrecovered
+            _log_hold_loss(log, transport, peer, failed, reason, why)
+        if writing:
+            # A cancel landed during the ERROR write, which may have committed before it.
+            log.warning(
+                "%s ERROR row for the held message from %s may or may not be written: the write "
+                "was cancelled",
+                transport,
+                peer,
+            )
 
 
 def _held_loss_reason(failed: int, reason: str, *, cut_off: bool) -> str:
@@ -930,38 +980,37 @@ def _held_loss_reason(failed: int, reason: str, *, cut_off: bool) -> str:
 
 
 async def _record_held_frame(
-    record_loss: HeldFrameRecorder | None,
+    record_loss: HeldFrameRecorder,
     frame: bytes,
     reason: str,
     *,
     transport: str,
     peer: object,
     log: logging.Logger,
-    timeout: float | None,
+    bound: float | None,
 ) -> str | None:
     """Hand the held frame to ``record_loss`` and return the ``ERROR`` row's message id, or ``None``
-    when there is no recorder or its write failed. A failure is logged, never raised: the caller's
-    loss line is the record then. ``CancelledError`` is not a write failure and propagates."""
-    if record_loss is None:
-        return None
+    when its write failed. A failure is logged, never raised: the caller's loss line is the record
+    then. ``CancelledError`` is not a write failure and propagates."""
     try:
-        if timeout is None:
+        if bound is None:
             return await record_loss(frame, reason)
-        return await asyncio.wait_for(record_loss(frame, reason), timeout)
-    except TimeoutError:
-        log.warning(
-            "%s ERROR row for the held message from %s not written within %.1fs of the cancel",
-            transport,
-            peer,
-            timeout,
-        )
+        return await asyncio.wait_for(record_loss(frame, reason), bound)
     except Exception as exc:  # noqa: BLE001 -- best effort: the caller's loss line records the frame
-        log.warning(
-            "%s ERROR row for the held message from %s not written: %s",
-            transport,
-            peer,
-            safe_exc(exc),
-        )
+        if isinstance(exc, TimeoutError) and bound is not None:
+            log.warning(
+                "%s ERROR row for the held message from %s not written within %.1fs of the cancel",
+                transport,
+                peer,
+                bound,
+            )
+        else:
+            log.warning(
+                "%s ERROR row for the held message from %s not written: %s",
+                transport,
+                peer,
+                safe_exc(exc),
+            )
     return None
 
 

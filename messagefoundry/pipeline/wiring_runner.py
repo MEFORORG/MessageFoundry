@@ -10330,10 +10330,18 @@ class RegistryRunner:
         would otherwise drain the allowance for every refused body on the inbound. A body larger
         than a head stores only its head, as a refusal past the allowance does, so a body over the
         detach threshold never lands whole in the message row; its length and keyed digest are
-        recorded either way. The body is stored as received, never decoded or parsed, so the row
+        recorded either way. A text body is stored decoded in the inbound's charset where that
+        decodes it to text the store can write, else as received; it is never parsed, so the row
         carries no header fields. A failed write propagates to the listener, which logs it."""
+        text: str | None = None
+        if not ic.content_type.is_binary:
+            try:
+                text = raw.decode(ingress_encoding(ic))
+                text.encode("utf-8")  # a lone surrogate (UTF-7) would fail the write itself
+            except (UnicodeError, LookupError):
+                text = None
         bounded = self._refused_body.bound_uncharged(
-            raw, ic.content_type.value, reason, cipher=self.store.cipher()
+            raw, text, ic.content_type.value, reason, cipher=self.store.cipher()
         )
         return await self.store.record_received(
             channel_id=ic.name,

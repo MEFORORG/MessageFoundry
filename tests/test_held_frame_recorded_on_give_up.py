@@ -18,6 +18,7 @@ Synthetic HL7 only, never real PHI.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import sqlite3
@@ -32,26 +33,34 @@ import messagefoundry.transports.tcp as tcp_mod
 from messagefoundry.config.models import AckMode, ConnectorType, ContentType
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
+from messagefoundry.parsing.binary import MARKER as CARRIAGE_MARKER
 from messagefoundry.pipeline.refused_body import (
+    HELD_FRAME_KEY,
     METADATA_KEY,
     RefusedBodyAllowance,
     RefusedBodyPolicy,
+    head_only_resubmit_refusal,
 )
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore
+from messagefoundry.store.crypto import make_cipher
 from messagefoundry.transports.base import SourceConnector
 from messagefoundry.transports.mllp import MLLPSource, frame
 from messagefoundry.transports.tcp import TcpSource
+from messagefoundry.transports.x12 import X12Source
 from tests.test_detach_attachment_write_fault import _doc_hl7
 from tests.test_mllp_handler_failure import _drive as _drive_mllp
 from tests.test_mllp_handler_failure import _no_reply as _mllp_no_reply
-from tests.test_tcp_x12_handler_failure import _ThenEof
+from tests.test_tcp_x12_handler_failure import LISTENERS, _ThenEof
+from tests.test_tcp_x12_handler_failure import _no_reply as _no_reply_listener
 from tests.test_x12_connection_events import _drive as _drive_tcp
 from tests.test_x12_connection_events import _kinds, _Peer, _tcp
 
 #: A small head, so the synthetic document (about 2.8 KB) is larger than it.
 _POLICY = RefusedBodyPolicy(allowance_bytes=100_000, window_seconds=60.0, head_bytes=64)
 _INBOUND = "IB_STREAM"
+#: A store cipher with no key: the bound's own tests do not need a digest.
+_KEYLESS = make_cipher(None)
 
 
 @pytest.fixture
@@ -287,3 +296,153 @@ async def test_the_runner_injects_the_recorder_at_start(store: MessageStore) -> 
 def test_a_direct_build_records_nothing() -> None:
     assert _tcp_source().record_lost_frame is None
     assert _mllp_source().record_lost_frame is None
+
+
+# --- the seam itself, on every listener that holds a frame -----------------------------------------
+
+
+class _Recorder:
+    """A ``record_lost_frame`` fake: keeps what it is handed, then returns an id, raises, or hangs."""
+
+    def __init__(self, *, fault: Exception | None = None, hang: bool = False) -> None:
+        self.calls: list[tuple[bytes, str]] = []
+        self.entered = asyncio.Event()
+        self._fault = fault
+        self._hang = hang
+
+    async def __call__(self, frame_bytes: bytes, reason: str) -> str:
+        self.calls.append((frame_bytes, reason))
+        self.entered.set()
+        if self._hang:
+            await asyncio.Event().wait()
+        if self._fault is not None:
+            raise self._fault
+        return "mid-1"
+
+
+def _stops_on_second(source: X12Source | TcpSource) -> Any:
+    calls = 0
+
+    async def handler(_raw: bytes) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            source._admission.stopping = True
+        raise RuntimeError("synthetic store outage")
+
+    return handler
+
+
+@pytest.mark.parametrize(("transport", "build", "wire", "body"), LISTENERS)
+async def test_every_holding_listener_hands_the_frame_to_the_recorder(
+    caplog: pytest.LogCaptureFixture, transport: str, build: Any, wire: bytes, body: bytes
+) -> None:
+    source = _no_reply_listener(build)
+    recorder = _Recorder()
+    source.record_lost_frame = recorder
+    with caplog.at_level(logging.ERROR):
+        events = await _drive_tcp(source, _ThenEof(wire), _Peer(), handler=_stops_on_second(source))
+    assert [f for f, _ in recorder.calls] == [body]
+    assert recorder.calls[0][1].startswith("held until the listener stopped; the inbound handler")
+    assert "handler_error" in _kinds(events)
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1 and "is recorded as ERROR message mid-1" in errors[0], errors
+
+
+@pytest.mark.parametrize(("transport", "build", "wire", "body"), LISTENERS)
+async def test_a_recorder_timeout_on_the_stopping_path_is_logged_not_raised(
+    caplog: pytest.LogCaptureFixture, transport: str, build: Any, wire: bytes, body: bytes
+) -> None:
+    # A store can raise its own TimeoutError, as an OS ETIMEDOUT; the stopping path has no bound.
+    source = _no_reply_listener(build)
+    source.record_lost_frame = _Recorder(fault=TimeoutError("timed out"))
+    with caplog.at_level(logging.WARNING):
+        await _drive_tcp(source, _ThenEof(wire), _Peer(), handler=_stops_on_second(source))
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("ERROR row for the held message" in m and "not written: " in m for m in messages)
+    assert any("is not recorded, nor is any frame behind it" in m for m in messages)
+
+
+async def test_a_second_cancel_during_the_write_still_logs_the_loss(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # stop() cancels a hold, then the cancel is repeated while the ERROR write hangs: the loss line
+    # is still written, since it is logged in a finally, and the report was made before the write.
+    recorder = _Recorder(hang=True)
+    reports: list[str] = []
+    calls = 0
+
+    async def handler(_raw: bytes) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("synthetic store outage")
+        await asyncio.Event().wait()
+
+    async def report(reason: str) -> None:
+        reports.append(reason)
+
+    with caplog.at_level(logging.WARNING):
+        task = asyncio.create_task(
+            base_mod.hold_and_retry(
+                handler,
+                b"frame",
+                "RuntimeError: synthetic store outage",
+                transport="TCP",
+                peer="peer",
+                log=logging.getLogger("messagefoundry.transports.tcp"),
+                stopped=lambda: False,
+                report=report,
+                record_loss=recorder,
+            )
+        )
+        while calls < 2:
+            await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.wait_for(recorder.entered.wait(), timeout=2.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    messages = [r.getMessage() for r in caplog.records]
+    assert reports, "the report is made before the write"
+    assert any("may or may not be recorded" in m for m in messages), messages
+    assert any("may or may not be written: the write was cancelled" in m for m in messages)
+
+
+def test_a_frame_that_fits_in_a_head_is_stored_whole_and_charges_nothing() -> None:
+    allowance = RefusedBodyAllowance(_POLICY, clock=lambda: 0.0)
+    wire = b"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|X|P|2.5\r"
+    bounded = allowance.bound_uncharged(wire, None, "hl7v2", "held", cipher=_KEYLESS)
+    assert bounded.raw == wire.decode("ascii")
+    assert bounded.record["stored"] == "whole" and bounded.record[HELD_FRAME_KEY] is True
+    assert allowance.try_charge(_INBOUND, _POLICY.allowance_bytes)
+
+
+def test_a_decoded_text_head_is_kept_readable() -> None:
+    allowance = RefusedBodyAllowance(_POLICY, clock=lambda: 0.0)
+    text = "PID|1||MRN||MÜLLER^ANNA\r" * 10
+    bounded = allowance.bound_uncharged(
+        text.encode("utf-8"), text, "hl7v2", "held", cipher=_KEYLESS
+    )
+    assert text.startswith(bounded.raw) and "Ü" in bounded.raw
+    assert len(bounded.raw.encode("utf-8")) <= _POLICY.head_bytes
+
+
+@pytest.mark.parametrize("wire", [b"\x89PNG\x01\x02", b"\x89" * 500], ids=["whole", "head"])
+def test_a_binary_held_frame_is_stored_as_carriage(wire: bytes) -> None:
+    allowance = RefusedBodyAllowance(_POLICY, clock=lambda: 0.0)
+    bounded = allowance.bound_uncharged(wire, None, "binary", "held", cipher=_KEYLESS)
+    assert bounded.raw.startswith(CARRIAGE_MARKER), bounded.raw[:20]
+    kept = base64.b64decode(bounded.raw[len(CARRIAGE_MARKER) :])
+    assert kept and wire.startswith(kept)
+    assert len(bounded.raw) <= max(_POLICY.head_bytes, len(CARRIAGE_MARKER) + 8)
+
+
+def test_the_resubmit_refusal_does_not_promise_a_resend_for_a_held_frame() -> None:
+    allowance = RefusedBodyAllowance(_POLICY, clock=lambda: 0.0)
+    held = allowance.bound_uncharged(
+        _doc_hl7().encode("utf-8"), None, "hl7v2", "held", cipher=_KEYLESS
+    )
+    refusal = head_only_resubmit_refusal("m1", held.metadata)
+    assert refusal is not None and "never resends" in refusal
+    assert "send its own copy again" not in refusal
