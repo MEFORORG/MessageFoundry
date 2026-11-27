@@ -4372,6 +4372,12 @@ def test_a_pair_minted_for_a_127_bind_fails_verification_at_a_name_it_lacks(
         # Off loopback, nothing is kept: the CLI defaults cannot reach this bind anyway. A re-mint
         # carries only the fixed loopback set, as origin/main's does, so the old names are dropped.
         ("127.0.0.1", "myhost.example", ["myhost.example"]),
+        # Hostname verification keeps a trailing dot, so a name with one and the same name without
+        # are two names a client dials (#8291 item 1). localhost. is not a loopback spelling
+        # is_loopback lists, so it keeps the loopback names, as LOCALHOST does.
+        ("localhost", "localhost.", ["localhost.", "127.0.0.1", "::1"]),
+        ("localhost.", "localhost", ["localhost", "127.0.0.1", "::1"]),
+        ("myhost.example", "myhost.example.", ["myhost.example."]),
     ],
 )
 def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
@@ -4420,6 +4426,54 @@ def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
 
 
 @pytest.mark.parametrize(
+    ("old_names", "then"),
+    [
+        # Every name the bind check requires for ``then``, less only the dot.
+        (["localhost", "127.0.0.1", "::1"], "localhost."),
+        (["localhost.", "127.0.0.1", "::1"], "localhost"),
+        (["myhost.example"], "myhost.example."),
+    ],
+)
+def test_a_bind_move_across_a_trailing_dot_serves_a_pair_that_verifies_at_the_new_bind(
+    old_names: list[str], then: str, tmp_path: Path
+) -> None:
+    """#8291 item 1, under BACKLOG #5973. A client dials ``then`` as written, and its hostname
+    check keeps the trailing dot, so the pair the engine serves for that bind must name ``then``
+    with the dot or without it as ``then`` has it. The planted pair is one the engine minted, and
+    names everything the bind check requires except that. Before the fix the check ignored the
+    dot, reused the pair, and the pinned client refused it.
+
+    The control is the planted pair itself: the same handshake at ``then`` refuses it, so the pass
+    after the start is the re-mint's doing, not a hostname check that went away."""
+    from messagefoundry import pki
+
+    old_cert, old_key = _generated_pair(tmp_path)
+    cert_pem, key_pem = pki.make_self_signed(old_names[0], old_names[1:], 365)
+    old_cert.write_bytes(cert_pem)
+    write_restricted_file(old_key, key_pem)
+    old_server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    old_server.load_cert_chain(old_cert, old_key)
+    with pytest.raises(ssl.SSLCertVerificationError):
+        _handshake(
+            old_server,
+            ssl.create_default_context(cafile=str(old_cert)),
+            client_cert=None,
+            server_hostname=then,
+        )
+
+    events: list[GeneratedPairReplaced] = []
+    cert, key = ensure_api_tls_material(
+        ApiSettings(host=then), state_dir=tmp_path, replacements=events
+    )
+    assert [e.reason for e in events] == ["bind_changed"]
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.load_cert_chain(cert, key)
+    client_ctx = ssl.create_default_context(cafile=cert)
+    assert client_ctx.check_hostname
+    assert _handshake(server_ctx, client_ctx, client_cert=None, server_hostname=then)
+
+
+@pytest.mark.parametrize(
     ("first", "then", "renew"),
     [
         # The old certificate already names every name the new bind requires. A pair minted for
@@ -4436,6 +4490,7 @@ def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
         ("127.0.0.1", "[::1]", True),
         # Hostname matching ignores case, and a SAN cannot carry an IPv6 zone.
         ("myhost", "MYHOST", True),
+        ("myhost.", "MYHOST.", True),
         ("fe80::1%12", "fe80::1%12", True),
         # A bracketed host is minted and checked without its brackets, as the address.
         ("[::1]", "[::1]", True),
