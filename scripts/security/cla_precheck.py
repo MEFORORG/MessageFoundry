@@ -80,10 +80,13 @@ TWO CASES BACKLOG #5645 item 1 names:
   * A head that lags the push event. When ``CLA_HEAD_SHA`` is set and the first page's
     ``headRefOid`` is another commit, the read stops there and is repeated after each wait in
     ``HEAD_RETRY_DELAYS``. If every first page shows another head, the run is a fault and nothing
-    is judged: a read of another head proves nothing about this one. Only that case is re-read. A
-    read whose ``headRefOid`` is ``CLA_HEAD_SHA`` is judged; if it is complete and its commits do
-    not include that head, or cannot show that they do, a fault is added beside the verdict, so a
-    pass is not silent. A read cut short carries its own fault and is not checked for the head. A
+    is judged: a read of another head proves nothing about this one. A read whose ``headRefOid``
+    is ``CLA_HEAD_SHA`` is judged; if it is complete and its commits do not include that head, or
+    cannot show that they do, it is read again on the same waits while its verdict refuses nothing
+    (BACKLOG #8335 item 3), and once they run out the last read is judged with a fault beside the
+    verdict, so a pass is not silent. A verdict that already refuses is not re-read, since a
+    re-read could only drop that refusal. A read cut short carries its own fault and is not
+    checked for the head. A
     head that moves after the first page is not re-read: the pages before the move, which are of
     ``CLA_HEAD_SHA``, are judged, with a fault. Without ``CLA_HEAD_SHA`` (a comment event) nothing
     is re-read.
@@ -121,8 +124,8 @@ pass for an author who never signed.
 UNMEASURED: whether GitHub's GraphQL ``headRefOid`` or commit list trails the push event, and by
 how long. The waits in ``HEAD_RETRY_DELAYS`` are a guess. A ``headRefOid`` that still shows another
 head after them leaves the run a fault that warns and passes. A commit list that trails a current
-``headRefOid`` is not waited for: it is judged, so after a force-push it can
-refuse a commit the pull request no longer holds.
+``headRefOid`` is waited for on the same delays only while it refuses nothing; one that refuses is
+judged at once, so after a force-push it can refuse a commit the pull request no longer holds.
 
 UNMEASURED: that every field a partial error nulled lies on the ``path`` of an error naming its
 commit node. The GraphQL specification implies it: an error's path names the field that raised it,
@@ -142,8 +145,8 @@ so a workflow step can pass event data through ``env:`` (zizmor's template-injec
   CLA_PR_NUMBER       the pull request number
   CLA_ALLOWLIST       the same comma-separated list cla.yml passes the action
   CLA_HEAD_SHA        optional; the head commit the run judges. A first page showing another
-                      head is re-read, then a fault; a head that moves on a later page is not
-                      re-read.
+                      head is re-read, then a fault; so is a list of that head lacking it while
+                      it refuses nothing; a head that moves on a later page is not re-read.
   GITHUB_GRAPHQL_URL  optional; defaults to https://api.github.com/graphql
   GITHUB_API_URL      optional; defaults to https://api.github.com
   CLA_SIGNATURES_PATH the action's ``path-to-signatures``
@@ -834,13 +837,19 @@ def read_judged_head(
     number: int,
     expected_head: str,
     sleep: Callable[[float], None],
-) -> tuple[PullRequestRead, bool, str | None]:
-    """Read the pull request, re-reading while its first page shows another head.
+    judge: Callable[[PullRequestRead, bool], Verdict],
+) -> tuple[PullRequestRead, Verdict, str | None]:
+    """Read and judge the pull request, re-reading while the read is not yet of its head.
 
-    Returns the read, whether it is complete, and a fault to report beside its verdict, if any.
-    With ``expected_head`` set, a first page of another head is read again after each wait in
-    ``HEAD_RETRY_DELAYS``, and is a fault that judges nothing once the waits run out. A complete
-    read of that head whose commits do not include it is judged, with a fault.
+    Returns the read, ``judge``'s verdict on it (called with whether the read is complete), and a
+    fault to report beside that verdict, if any. With ``expected_head`` set, a first page of
+    another head is read again after each wait in ``HEAD_RETRY_DELAYS``, and is a fault that
+    judges nothing once the waits run out. A complete read of that head whose commits do not
+    include it, or cannot show that they do, is read again on the same waits while its verdict
+    refuses nothing (BACKLOG #5645 item 1, #8335 item 3), so a commit list that trails a current
+    ``headRefOid`` cannot pass on the commits it lacks. A verdict that already refuses is kept
+    without a re-read, because a re-read could only drop a refusal. Once the waits run out, the
+    last read is judged, with a fault.
     """
     delays = iter(HEAD_RETRY_DELAYS)
     while True:
@@ -858,23 +867,32 @@ def read_judged_head(
             # A page failed after whole pages were kept. Those pages still prove what they prove.
             if exc.partial is None:
                 raise
-            return exc.partial, False, str(exc)
-        if expected_head and not any(c.get("oid") == expected_head for c in read.commits):
-            # A commit whose id GraphQL nulled, or that came back in another form, may be the head.
-            unreadable = sum(1 for c in read.commits if not _SHA.fullmatch(str(c.get("oid") or "")))
-            if unreadable:
-                return (
-                    read,
-                    True,
-                    (
-                        "the commit ids this read could resolve do not include CLA_HEAD_SHA, and "
-                        f"{unreadable} commit(s) carry no 40-character lowercase id, so whether the "
-                        "pull request's commits include it is unknown"
-                    ),
-                )
-            # The read may have stopped short of the head, so this names what it returned.
-            return read, True, "the commits this read returned do not include CLA_HEAD_SHA"
-        return read, True, None
+            return exc.partial, judge(exc.partial, False), str(exc)
+        verdict = judge(read, True)
+        missing = _missing_head(read, expected_head)
+        if missing is None or verdict.refusals:
+            return read, verdict, missing
+        delay = next(delays, None)
+        if delay is None:
+            return read, verdict, missing
+        sleep(delay)
+
+
+def _missing_head(read: PullRequestRead, expected_head: str) -> str | None:
+    """Why ``read``'s commits cannot be shown to include ``expected_head``, or None if they do
+    or no head is expected."""
+    if not expected_head or any(c.get("oid") == expected_head for c in read.commits):
+        return None
+    # A commit whose id GraphQL nulled, or that came back in another form, may be the head.
+    unreadable = sum(1 for c in read.commits if not _SHA.fullmatch(str(c.get("oid") or "")))
+    if unreadable:
+        return (
+            "the commit ids this read could resolve do not include CLA_HEAD_SHA, and "
+            f"{unreadable} commit(s) carry no 40-character lowercase id, so whether the "
+            "pull request's commits include it is unknown"
+        )
+    # The read may have stopped short of the head, so this names what it returned.
+    return "the commits this read returned do not include CLA_HEAD_SHA"
 
 
 def run(
@@ -921,10 +939,15 @@ def run(
                     raise PrecheckFault("CLA_SIGNATURES_PATH or CLA_SIGNATURES_BRANCH is not set")
                 api = _https_url(env, "GITHUB_API_URL", DEFAULT_API_URL)
                 signatures = rest_signatures(api, token, owner, name, path, branch)
-        read, complete, read_fault = read_judged_head(
-            transport, owner, name, number, expected_head, sleep or time.sleep
+        read, verdict, read_fault = read_judged_head(
+            transport,
+            owner,
+            name,
+            number,
+            expected_head,
+            sleep or time.sleep,
+            lambda r, complete: evaluate(r, allowlist, signatures, complete=complete),
         )
-        verdict = evaluate(read, allowlist, signatures, complete=complete)
     except PrecheckFault as exc:
         print(f"::warning title=CLA pre-check fault::{_escape_command(str(exc))}")
         return EXIT_FAULT

@@ -1070,20 +1070,82 @@ def test_a_head_that_lags_the_push_event_is_re_read(capsys: pytest.CaptureFixtur
 def test_a_commit_list_without_its_head_is_judged_with_a_fault(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """headRefOid is CLA_HEAD_SHA but the commits do not include it: judged at once, as before,
-    so a refusal it proves stands, with a fault added so that a pass is not silent."""
+    """headRefOid is CLA_HEAD_SHA but the commits do not include it. A read that refuses nothing
+    is read again on every wait (BACKLOG #8335 item 3); once the waits run out it is judged with a
+    fault, so that a pass is not silent. A refusal it proves stands at once, with no wait."""
     env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    tries = len(cla_precheck.HEAD_RETRY_DELAYS) + 1
     linked = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 1, False)
-    assert _run(env, _serve([linked])) == EXIT_FAULT
+    waits: list[float] = []
+    assert run(env, _serve([linked] * tries), _no_signatures, waits.append) == EXIT_FAULT
+    assert waits == list(cla_precheck.HEAD_RETRY_DELAYS)
     assert "the commits this read returned do not include CLA_HEAD_SHA" in capsys.readouterr().out
     # A complete read short of totalCount may have stopped before the head, so the fault names the
     # commits it returned, never the pull request's.
     short = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 5, False)
-    assert _run(env, _serve([short])) == EXIT_FAULT
+    assert run(env, _serve([short] * tries), _no_signatures, lambda _s: None) == EXIT_FAULT
     out = capsys.readouterr().out
     assert "the commits this read returned do not include CLA_HEAD_SHA" in out
     assert "the pull request's commits do not include" not in out
     assert _run(env, _serve([_page([_commit(1, "wshallwshall")], 1, False)])) == EXIT_REFUSED
+
+
+def test_a_commit_list_that_trails_its_head_is_re_read_and_a_refusal_there_stands(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #5645 item 1, #8335 item 3: headRefOid is already CLA_HEAD_SHA but the commit list
+    still lacks the head. On main that read was judged at once and warned and passed, so an
+    unlinked author in the pushed commits went unchecked. It is read again, and the unlinked
+    author the caught-up list holds is refused."""
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    trailing = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 1, False)
+    caught_up = _page(
+        [_commit(1, "Octo", "octo-contributor", 90000001), _commit(_HEAD, "wshallwshall")],
+        2,
+        False,
+    )
+    replies = [trailing, caught_up]
+    waits: list[float] = []
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, waits.append) == EXIT_REFUSED
+    assert waits == [cla_precheck.HEAD_RETRY_DELAYS[0]] and replies == []
+    out = capsys.readouterr().out
+    assert "refused::" in out
+    assert "do not include CLA_HEAD_SHA" not in out
+
+
+def test_a_commit_list_that_catches_up_to_its_head_passes_without_a_fault(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    replies = [
+        _page([octo], 1, False),
+        _page([octo], 1, False),
+        _page([octo, _commit(_HEAD, "Octo", "octo-contributor", 90000001)], 2, False),
+    ]
+    waits: list[float] = []
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, waits.append) == EXIT_PASS
+    assert waits == list(cla_precheck.HEAD_RETRY_DELAYS) and replies == []
+    assert "fault" not in capsys.readouterr().out
+
+
+def test_a_trailing_list_that_already_refuses_is_not_re_read() -> None:
+    """A re-read could only drop a refusal the trailing read proved, so none is made."""
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    assert _run(env, _serve([_page([_commit(1, "Anon")], 1, False)])) == EXIT_REFUSED
+
+
+def test_a_trailing_list_whose_re_read_moves_to_a_newer_head_is_a_fault() -> None:
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    trailing = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 1, False)
+    newer = _page([_commit(2, "Anon")], 1, False, head="cd" * 20)
+    replies = [trailing, newer, newer]
+    waits: list[float] = []
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, waits.append) == EXIT_FAULT
+    assert waits == list(cla_precheck.HEAD_RETRY_DELAYS) and replies == []
 
 
 def test_a_head_whose_id_graphql_nulled_is_not_said_to_be_missing(
@@ -1095,7 +1157,8 @@ def test_a_head_whose_id_graphql_nulled_is_not_said_to_be_missing(
     page = _page([_commit(1, "Octo", "octo-contributor", 90000001), _commit(2, "x")], 2, False)
     page["data"]["repository"]["pullRequest"]["commits"]["nodes"][1] = None
     page = {**page, "errors": [_node_error(1, "commit", "oid")]}
-    assert _run(env, _serve([page])) == EXIT_FAULT
+    tries = len(cla_precheck.HEAD_RETRY_DELAYS) + 1
+    assert run(env, _serve([page] * tries), _no_signatures, lambda _s: None) == EXIT_FAULT
     out = capsys.readouterr().out
     assert "the pull request's commits do not include CLA_HEAD_SHA" not in out
     assert (
