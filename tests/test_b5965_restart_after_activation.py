@@ -34,7 +34,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.config.wiring import MLLP, Registry, build_inbound_connection
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alert_sinks import AlertRuleSet, NotifierAlertSink
-from messagefoundry.pipeline.alerts import LoggingAlertSink
+from messagefoundry.pipeline.alerts import DR_RESTART_CLOSE_GUIDANCE, LoggingAlertSink
 from messagefoundry.pipeline.dr import DrActivationError, DrCoordinator
 from messagefoundry.pipeline.dr_backup import BackupRunner, _day_key
 from messagefoundry.store import MessageStore
@@ -251,11 +251,11 @@ async def test_a_store_rebuilt_from_an_activated_snapshot_alerts_without_claimin
                 # The activate advice is conditional: in these cases the primary may be serving.
                 assert "confirmed the primary is not serving" in line
                 # The ERROR line prints under every sink, so it carries the close guidance too.
-                assert "POST /dr/release on this start runs the release_hook when one" in line
-                assert "records that it stays passive" in line
-                assert "where [alerts] keeps alert instances; there, if you leave" in line
-                assert "a later start raises none, resolve it by hand" in line
-                assert "POST /alerts/{alert_id}/resolve" in line
+                assert DR_RESTART_CLOSE_GUIDANCE in line
+                # Only the close is conditional; the hand route holds whatever the release did.
+                assert "records that the box stays passive and, where [alerts] keeps" in line
+                assert "If the release is refused, or the alert is still open" in line
+                assert "resolve it by hand (POST /alerts/{alert_id}/resolve" in line
                 # An operator-started inbound still binds on a passive box.
                 assert "serves nothing" not in line and "holds no DR role" in line
             # The starting process wrote no record, so the line names the identity's record.
@@ -329,10 +329,10 @@ def test_the_restart_alert_line_says_how_to_close_it(caplog: pytest.LogCaptureFi
     with caplog.at_level(logging.CRITICAL, logger="messagefoundry.pipeline.alerts"):
         LoggingAlertSink().dr_restarted_passive("dr-box")
     (line,) = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
-    assert "POST /dr/release on this start runs the release_hook when one is set" in line
-    assert "records that it stays passive" in line
-    assert "closes this alert where [alerts] keeps alert instances; there, if you leave" in line
-    assert "a later start raises none, resolve it by hand" in line
+    assert DR_RESTART_CLOSE_GUIDANCE in line
+    assert "a POST /dr/release on this start runs the release_hook when one is set" in line
+    assert "where [alerts] keeps alert instances, closes the dr_restarted_passive alert" in line
+    assert "If the release is refused, or the alert is still open afterwards" in line
     assert "POST /alerts/{alert_id}/resolve" in line and "Resolve in the web console" in line
     assert "serves nothing" not in line and "an operator starts on it still binds" in line
 
@@ -386,9 +386,11 @@ async def test_an_unreadable_store_at_start_fails_loud(
         # activate, how to leave the box passive, and how the alert closes.
         (line,) = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
         assert "could not read the activation audit rows" in line
-        assert "confirmed the primary is not serving" in line and "holds no DR role" in line
-        assert "POST /dr/release on this start runs the release_hook when one" in line
-        assert "POST /alerts/{alert_id}/resolve" in line
+        assert "only once the primary is confirmed not serving" in line
+        assert "holds no DR role" in line
+        # Nobody can tell whether this box was ever activated, so the line implies no earlier run.
+        assert "re-run" not in line and "feeds again" not in line
+        assert DR_RESTART_CLOSE_GUIDANCE in line
         # The release still settles the alert it raised, though the box was never activated.
         monkeypatch.setattr(store, "recent_audit_of", real)
         await coord.release(actor="bob")

@@ -68,6 +68,17 @@ UNREACHED_ROLLUP_SOURCE = "directory-reconciler-unreached-rollup"
 #: throttles some reminders, by that operator's choice.
 REMINDER_SECONDS = 300.0
 
+#: How an operator closes ``dr_restarted_passive``. Both restart ERROR lines in ``dr`` and this
+#: sink's CRITICAL line carry it, one spelling (BACKLOG #5965). A refused release records nothing
+#: and the close is best effort, so only the close is conditional and the hand route is not.
+DR_RESTART_CLOSE_GUIDANCE = (
+    "To leave it passive instead, a POST /dr/release on this start runs the release_hook when one "
+    "is set, records that the box stays passive and, where [alerts] keeps alert instances, closes "
+    "the dr_restarted_passive alert. If the release is refused, or the alert is still open "
+    "afterwards, resolve it by hand (POST /alerts/{alert_id}/resolve, or Resolve in the web "
+    "console)."
+)
+
 
 def intake_pause_detail(*, reason: str, value: int, limit: int, store_kind: str) -> str:
     """The one-line, PHI-free description of an intake pause both sinks show. It must stay true on a
@@ -1060,7 +1071,7 @@ class AlertSink(Protocol):
         serving, the operator re-runs ``POST /dr/activate``. Also raised when the start could not
         read whether the box was activated. Page-worthy, and CRITICAL unless a matching rule names
         its own severity. It closes the open ``dr_activated`` instance for ``node``, which no
-        longer describes a box that serves; the next ``dr_activated`` or ``dr_released`` for
+        longer describes this passive box; the next ``dr_activated`` or ``dr_released`` for
         ``node`` closes this one. On a passive box, ``POST /dr/release`` raises ``dr_released``
         only when its start raised this alert or the box's newest own activate or release record
         is an activation. So an instance an earlier start left open, on a start that raised none,
@@ -1684,12 +1695,8 @@ class LoggingAlertSink:
             "ALERT dr_restarted_passive: DR box %r started PASSIVE and may have been serving when "
             "it went down -- the ERROR line before this says what its store shows. It holds no "
             "DR role until POST /dr/activate, to be run only once you have confirmed the "
-            "primary is not serving; an inbound an operator starts on it still binds. To leave "
-            "it passive instead, POST /dr/release on this start runs the release_hook when one "
-            "is set, records that it stays passive and closes this alert where [alerts] keeps "
-            "alert instances; there, if you leave the alert open and a later start raises none, "
-            "resolve it by hand, with POST /alerts/{alert_id}/resolve or Resolve in the web "
-            "console",
+            "primary is not serving; an inbound an operator starts on it still binds. "
+            + DR_RESTART_CLOSE_GUIDANCE,
             node,
         )
 
