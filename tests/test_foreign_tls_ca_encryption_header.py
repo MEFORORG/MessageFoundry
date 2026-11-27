@@ -170,10 +170,12 @@ def test_a_plain_sslca_file_still_builds(tmp_path: Path) -> None:
     assert f"SSLCA={ca};" in _build(SSLCA=ca)
 
 
-#: BACKLOG #3745: a key block with no encryption header, PKCS#8 encrypted and plain.
+#: BACKLOG #3745: a key block with no encryption header, one for each label step 2 names.
 _KEY_SHAPES = [
     pytest.param("ENCRYPTED PRIVATE" + " KEY", id="PKCS#8 encrypted"),
     pytest.param("PRIVATE" + " KEY", id="plain"),
+    pytest.param("RSA PRIVATE" + " KEY", id="RSA"),
+    pytest.param("EC PRIVATE" + " KEY", id="EC"),
 ]
 
 

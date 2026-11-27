@@ -3351,10 +3351,11 @@ async def test_a_postgres_ssl_root_cert_holding_a_private_key_refuses(
     """Vault BACKLOG #4203: a private key in the PostgreSQL store CA refuses the start or reload
     check, with a ``pem_refused`` row and a refusal that names the setting and never the key's
     body. It runs once for each label vault BACKLOG #3745 step 2 names (:data:`_KEY_LABELS`). Red
-    under: the PostgreSQL spec left out of :func:`collect_anchor_specs`, where nothing is
-    refused; and, for the ``RSA`` and ``EC`` cases alone, the private-key refusal of a CA read by
-    path (:func:`_refuse_by_path_content`, past the server-pin arm) narrowed to the plain and
-    PKCS#8 labels. The control: the certificate alone passes."""
+    under: the PostgreSQL spec left out of :func:`collect_anchor_specs`, at the control, since an
+    empty preflight returns no result; and, for the ``RSA`` and ``EC`` cases alone, the
+    private-key refusal of a CA read by path (``ta._refuse_by_path_content``, past the
+    server-pin arm) narrowed to the ``PRIVATE KEY`` and ``ENCRYPTED PRIVATE KEY`` labels. The
+    control: the certificate alone passes."""
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     ca = _sqlserver_pin(tmp_path)
@@ -3682,10 +3683,11 @@ async def test_a_private_key_past_the_pin_cap_refuses_the_store_pin(
 ) -> None:
     """Round 1 finding 1: the SQL Server pin's private-key scan reads the whole file, as main did,
     so a key block past ``PIN_FILE_MAX_BYTES`` refuses with its ``pem_refused`` row. Red on
-    8fa101c637, whose read stopped at the cap, so the key went unseen and the pin only warned.
-    It runs once for each label vault BACKLOG #3745 step 2 names (:data:`_KEY_LABELS`), and the
-    ``RSA`` and ``EC`` cases alone go red with the server-pin arm's private-key refusal
-    (:func:`_refuse_by_path_content`) narrowed to the plain and PKCS#8 labels.
+    8fa101c637, whose read stopped at the cap, so the key went unseen and the pin only warned;
+    that red was measured for the ``PRIVATE KEY`` and ``ENCRYPTED PRIVATE KEY`` cases. It runs
+    once for each label vault BACKLOG #3745 step 2 names (:data:`_KEY_LABELS`), and the ``RSA``
+    and ``EC`` cases alone go red with the server-pin arm's private-key refusal
+    (``ta._refuse_by_path_content``) narrowed to those two labels.
     The control: the same padding with no key warns about the size and does not refuse."""
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
