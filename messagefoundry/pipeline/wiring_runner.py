@@ -13246,9 +13246,14 @@ class RegistryRunner:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3 (loopback lane)
                     # BACKLOG #5727: a claim whose open of the token's payload gets no verdict sets
                     # the token aside and returns None, so a full key-service outage reaches only
-                    # this branch. The set-aside token is pending, so the check counts it.
+                    # this branch. The set-aside token is pending, so the check counts it. A fenced
+                    # claim on a node that no longer leads also returns None, so only the leader
+                    # checks here, as only the leader pages from the in-flight watch.
                     now = time.time()
-                    if now - last_buildup_check >= _BUILDUP_CHECK_INTERVAL:
+                    if (
+                        now - last_buildup_check >= _BUILDUP_CHECK_INTERVAL
+                        and self._coordinator.is_leader()
+                    ):
                         last_buildup_check = now
                         await self._response_buildup_check(name)
                     woken = await self._wait_for_work(wait_ev)
