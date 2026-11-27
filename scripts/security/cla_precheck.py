@@ -84,9 +84,10 @@ TWO CASES BACKLOG #5645 item 1 names:
     ``headRefOid`` is ``CLA_HEAD_SHA`` is judged; if it is complete and its commits do not include
     that head, or cannot show that they do, it is read again on the same waits while its verdict
     refuses nothing (BACKLOG #8335 item 3). The budget of waits is one, shared with the case
-    above. A re-read that refuses, or whose commits include the head, is the verdict. A re-read
-    that still lacks the head replaces the read kept. A re-read that faults, is cut short
-    refusing nothing, or shows another head ends the re-reads. Then, or once the waits run out,
+    above. A re-read that refuses, or whose commits include the head, is the verdict, even one cut
+    short by a fault, with that fault and its own beside it. A re-read that still lacks the head
+    replaces the read kept. A re-read that faults, is cut short refusing nothing before its pages
+    reach the head, or shows another head ends the re-reads. Then, or once the waits run out,
     the read kept is judged, with its fault and any later one beside the verdict, which warns
     and passes: a list trailing the head for longer than the waits is still not checked past
     what it holds. A verdict that already refuses is not re-read, since the run fails already, so
@@ -884,8 +885,9 @@ def read_judged_head(
             verdict = judge(exc.partial, False)
             if kept is None:
                 return exc.partial, verdict, str(exc)
-            if verdict.refusals:
-                # A refusal this re-read proves is the verdict; its fault names it as a re-read.
+            if verdict.refusals or _missing_head(exc.partial, expected_head) is None:
+                # A refusal this re-read proves is the verdict, and so is a re-read whose pages
+                # hold the head; its fault names it as a re-read, and its verdict keeps its own.
                 return exc.partial, verdict, f"a re-read was cut short: {exc}"
             return _report_kept(kept, f"a re-read was cut short: {exc}")
         verdict = judge(read, True)

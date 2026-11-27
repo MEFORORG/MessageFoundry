@@ -1467,3 +1467,35 @@ def test_each_fault_of_a_trailing_list_names_the_read_it_belongs_to(
         "not include CLA_HEAD_SHA; read 1 distinct commits where the pull request has 2; the "
         "unread commits are not checked; then a re-read faulted: GraphQL returned an error"
     ]
+
+
+def test_a_trailing_re_read_cut_short_that_holds_the_head_is_the_judged_read(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A re-read cut short whose whole pages include CLA_HEAD_SHA is the judged read, as the module
+    docstring says of a re-read whose commits include the head, and its own verdict faults are
+    reported beside its cut-short fault. The kept read, which lacked the head, is not reported. A
+    fault is still a fault: the exit code is EXIT_FAULT, as it was when the kept read was judged."""
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    head = _commit(_HEAD, "Octo", "octo-contributor", 90000001)
+    errored = {
+        **_page([octo, _commit(2, "Octo Contributor"), head], 4, True),
+        "errors": [_node_error(1, "commit", "author", "user")],
+    }
+    replies = [_page([octo], 2, False), errored, {"errors": [{}]}]
+    waits: list[float] = []
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, waits.append) == EXIT_FAULT
+    assert waits == [cla_precheck.HEAD_RETRY_DELAYS[0]] and replies == []
+    out = capsys.readouterr().out
+    assert "refused::" not in out
+    warnings = [line for line in out.splitlines() if "fault::" in line]
+    assert len(warnings) == 1
+    assert warnings[0].startswith(
+        "::warning title=CLA pre-check fault::a re-read was cut short: GraphQL returned an error"
+    )
+    # The re-read's own verdict fault, for the commit GraphQL errored inside, is kept.
+    assert "GraphQL reported an error inside it; not judged" in warnings[0]
+    assert "the read judged" not in out
+    assert "do not include CLA_HEAD_SHA" not in out
