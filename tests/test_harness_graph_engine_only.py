@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The harness graphs load without the ``harness`` package (BACKLOG #5850, #5852, #5853, #5854),
-and what they inline or copy to do so stays equal to what it was copied from.
+"""The harness graphs in ``_GRAPHS`` load without the ``harness`` package (BACKLOG #5850, #5852,
+#5853, #5854), and what they inline or copy to do so stays equal to what it was copied from. The
+other directories under ``harness/config`` are not covered here.
 
 A plain ``python -P`` subprocess cannot show the defect in a development environment, because the
 editable install's ``.pth`` makes ``harness`` importable anyway. So the child installs a
@@ -22,7 +23,7 @@ import pytest
 
 from harness.config.shardcert import _shape as shardcert_shape
 from harness.load.ids import SHARDCERT_IDS
-from messagefoundry.checks import CheckResult, _run_tool
+from messagefoundry.checks import CheckResult, run_checks
 from messagefoundry.childenv import CHILD_INTERPRETER_FLAGS, outside_engine_namespace
 from tests._ast_sites import named_func, parse_source
 from tests.test_dependency_boundaries import _modules_imported_by
@@ -90,13 +91,16 @@ def test_graph_loads_without_the_harness_package(graph: str, tmp_path: Path) -> 
 def _advisory_mypy(
     graph: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, package: bool = False
 ) -> CheckResult:
-    """``messagefoundry check``'s advisory mypy on a copy of ``graph`` (BACKLOG #5850).
+    """``messagefoundry check``'s advisory mypy result on a copy of ``graph`` (BACKLOG #5850).
 
-    It runs ``mypy --config-file= <config dir>``. A directory holding an ``__init__.py`` is a package
-    to mypy, so its ``from _shape import`` is not found there; without one mypy resolves the bare
-    name from the directory, as the loader does. The working directory is the copy's parent, and
-    the caller's mypy cache and search path are dropped, which ``_run_tool`` would pass on, so each
-    run caches under tmp_path and resolves only what the copy holds."""
+    It is read from ``run_checks``, so the test follows whatever command check builds. Today that is
+    ``mypy --config-file= <config dir>``. A directory holding an ``__init__.py`` is a package to mypy,
+    so its ``from _shape import`` is not found there; without one mypy resolves the bare name from
+    the directory, as the loader does. The working directory is the copy's parent, and the caller's
+    ``MYPY_CACHE_DIR`` and ``MYPYPATH``, which check passes on, are dropped, so each run caches under
+    tmp_path. mypy still finds whatever the interpreter can import, the editable ``harness`` among
+    it, so this is not an engine-only type check; the AST test below is the one that refuses a
+    ``harness`` import."""
     config = tmp_path / graph
     shutil.copytree(_CONFIG / graph, config, ignore=shutil.ignore_patterns("__pycache__"))
     if package:
@@ -104,7 +108,7 @@ def _advisory_mypy(
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MYPY_CACHE_DIR", raising=False)
     monkeypatch.delenv("MYPYPATH", raising=False)
-    result = _run_tool("mypy", "mypy", ["--config-file=", str(config)])
+    [result] = [r for r in run_checks(config, run_lint=True).results if r.name == "mypy"]
     assert not result.skipped, result.detail
     return result
 
@@ -185,6 +189,8 @@ def test_the_graph_does_not_import_the_harness_package(graph: str) -> None:
     assert {"_shape.py", "graph.py"} <= {path.name for path in modules}
     found: dict[str, list[str]] = {}
     for path in modules:
-        imported = _modules_imported_by(parse_source(path.read_text(encoding="utf-8")), path.stem)
+        # The module's own package, so a relative import resolves to the harness name it reaches.
+        tree = parse_source(path.read_text(encoding="utf-8"))
+        imported = _modules_imported_by(tree, f"harness.config.{graph}")
         found[path.name] = [name for name in imported if name.split(".")[0] == "harness"]
     assert not any(found.values()), found

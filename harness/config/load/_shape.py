@@ -121,7 +121,7 @@ def _env_float(name: str, default: float, *, minimum: float, maximum: float) -> 
 
 
 def _env_shard(name: str) -> str | None:
-    """A shard id from the environment, or ``None`` when unset/blank (= no shard tag)."""
+    """An engine shard id from the environment, or ``None`` when unset/blank (= no tag)."""
     raw = os.environ.get(name)
     raw = raw.strip() if raw else ""
     return raw or None
