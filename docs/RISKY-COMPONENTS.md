@@ -61,8 +61,9 @@ one. The harness wheel declares none of them, so they are not in its closure and
 for it. `pyodbc` is assessed in the `sqlserver` section and `asyncpg` in the `postgres` section,
 both for the engine.
 
-An install that enables any other extra (`sftp`, `dicom`, `fhir`, `xml`, `x12`, `webauthn`,
-`otel`, `vault`) carries dependencies **outside** the four assessed sets. Those are not assessed
+An install that enables any other extra, at least `sftp`, `dicom`, `fhir`, `xml`, `x12`,
+`webauthn`, `otel`, `vault` and `fuzz` (`atheris`), carries dependencies **outside** the four
+assessed sets. Those are not assessed
 here, and that is a gap rather than an assertion of safety.
 
 ## The criterion
@@ -221,7 +222,9 @@ So the defect to track is the driver's, which is one more reason to keep the dri
 The PostgreSQL store backend reaches its database through `asyncpg`, the one name the extra adds to
 the core closure. `messagefoundry/store/postgres.py` imports it when the store opens and opens one
 connection pool through it. The HA coordinator in `messagefoundry/pipeline/cluster.py` runs its
-lease and node statements on that same pool. Elsewhere in the engine it is imported at least by
+lease and node statements on that same pool. `messagefoundry store provision-schema` and the
+store's privilege probe open a second, one-connection pool through the same function, with the same
+credential and TLS context. Elsewhere in the engine it is imported at least by
 `messagefoundry/store/base.py`, to name its error classes, and by `messagefoundry verify`, to read
 whether its `create_pool` takes a `connect` hook. The same criterion applies.
 
@@ -730,6 +733,12 @@ The survey is made by hand, and no script repeats it. It is dated to the pins th
 a version bump alone does not turn the test red. A re-read that moves a pin does: the script then
 names each wheel whose survey answer is behind, and the test fails until that wheel is surveyed
 again. The record's `method` says how each answer was reached.
+
+One version bump does turn the test red on its own: `asyncpg`'s. The `postgres` section's TLS
+reading names the pin it was read on, and the test holds that pin to the closure. So every `asyncpg`
+bump, a Dependabot one included, stays red until someone reads the new `connect_utils.py` again and
+moves the version the section names. That is meant: the no-plaintext-fallback reading rests on
+that file.
 
 The test does not go red when the re-read date passes, because a date alone would then fail every
 unrelated pull request. Keeping the re-read date is a maintainer task. Run

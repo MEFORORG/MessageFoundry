@@ -1928,14 +1928,15 @@ def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:
     else:
         # The DEFAULT path, closed under BACKLOG #300. It used to return `True`, which left asyncpg to
         # build the context, so the engine had nothing to narrow and nowhere to load a CRL. This is the
-        # same call asyncpg makes for `ssl=True` (asyncpg 0.31.0, connect_utils.py:811-813):
+        # same call asyncpg makes for `ssl=True` (asyncpg 0.32.0, connect_utils.py:820-824):
         # create_default_context() with no arguments, so CERT_REQUIRED, check_hostname and the system
         # trust store are unchanged, and the lines below only remove suites and add a CRL.
         #
-        # asyncpg labels an SSLContext `sslmode=disable` where it labels `True` `verify-full`
-        # (:814-815). The label is read only against `allow` and `prefer` (the retry pair, the
-        # advisory flag and the cancel path), and both labels fall in "any other sslmode": one
-        # attempt, no plaintext fallback, TLS upgrade with server_hostname. So the wire is the same.
+        # asyncpg 0.32.0 labels an SSLContext `sslmode=require` where it labels `True` `verify-full`
+        # (:824-826); 0.31.0 labelled it `disable`. The label is read only against `allow` and
+        # `prefer` (the retry pair, the advisory flag and the cancel path), and all three labels fall
+        # in "any other sslmode": one attempt, no plaintext fallback, TLS upgrade with
+        # server_hostname. So the wire is the same.
         ctx = ssl.create_default_context()
         connector = "Postgres store (system trust)"
     narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
