@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from harness.load.connscale.compare import build_batch_comparison
-from harness.load.connscale.profile import FUSE_OFF, SANDBOX_OFF, ConnScaleProfile
+from harness.load.connscale.profile import CLAIM_MODES, FUSE_OFF, SANDBOX_OFF, ConnScaleProfile
 from harness.load.connscale.report import (
     EXIT_OK,
     EXIT_SLO_VIOLATION,
@@ -208,6 +208,48 @@ def check_operator_sign_in_limits(procs: int, environ: Mapping[str, str]) -> Non
                 f"{name}={held.strip()} in the environment is below the {procs} driver processes "
                 "that each sign in at the start of a cell, so the engine would refuse one with "
                 f"HTTP 429. Unset it, set it to at least {size}, or set it to 0 for no limit"
+            )
+
+
+_PORT_MAX = 65535
+
+
+def check_engine_layout(
+    cells: list[BatchCell],
+    *,
+    claim_mode: str,
+    sink_procs: int,
+    inbound_base: int,
+    api_base: int,
+    sink_base: int,
+) -> None:
+    """Refuse an engine-box layout no cell could run, before any engine starts (BACKLOG #5857).
+
+    Raises :class:`ConnScaleError` naming the first fault: a claim mode the engine does not read, a
+    sink-process count below 1, a port block that runs outside 1..65535 (a cell's inbound block, the
+    API ports the cells step through, or the agreed sink band), or a cell whose API port falls in
+    its own inbound block. Each of these used to start every cell's engine and fail it later, at a
+    port bind, a health wait, or the driver's band plan, one cell at a time."""
+    if claim_mode not in CLAIM_MODES:
+        raise ConnScaleError(f"claim mode {claim_mode!r} is not one of {sorted(CLAIM_MODES)}")
+    if sink_procs < 1:
+        raise ConnScaleError(f"sink_procs must be >= 1, got {sink_procs}")
+    top_count = max(c.count for c in cells)
+    blocks = (
+        ("inbound", inbound_base, top_count),
+        ("API", api_base, len(cells)),
+        ("sink", sink_base, min(sink_procs, top_count)),
+    )
+    for what, first, span in blocks:
+        last = first + span - 1
+        if first < 1 or last > _PORT_MAX:
+            raise ConnScaleError(f"the {what} ports {first}..{last} run outside 1..{_PORT_MAX}")
+    for step, cell in enumerate(cells):
+        api_port = api_base + step
+        if inbound_base <= api_port < inbound_base + cell.count:
+            raise ConnScaleError(
+                f"cell {cell.cell_id}: API port {api_port} falls in its inbound ports "
+                f"{inbound_base}..{inbound_base + cell.count - 1}"
             )
 
 
@@ -911,15 +953,26 @@ async def run_batch_engine(
     inbound = profile.base_port if inbound_base is None else inbound_base
     cells = iter_batch_cells(profile, claim_mode=claim_mode)
     report = BatchEngineReport(profile=profile.name, claim_mode=claim_mode)
-    # Refuse an operator sign-in limit too small for the largest cell's fleet before any engine
-    # starts; the cell fleet grows with the count, so the largest covers every smaller one. Each
-    # cell then fails the way an engine that did not start fails, so the driver box reads an error
-    # READY for every cell instead of waiting on one that never comes, or on a stale one.
+    # Refuse a layout no cell could run and an operator sign-in limit too small for the largest
+    # cell's fleet, before any engine starts; the cell fleet grows with the count, so the largest
+    # covers every smaller one. Each cell then fails the way an engine that did not start fails, so
+    # the driver box reads an error READY for every cell instead of waiting on one that never comes,
+    # or on a stale one.
+    label = "ENGINE LAYOUT REFUSED"
     try:
         if cells:
+            check_engine_layout(
+                cells,
+                claim_mode=claim_mode,
+                sink_procs=sink_procs,
+                inbound_base=inbound,
+                api_base=api_base,
+                sink_base=sink_base,
+            )
+            label = "SIGN-IN LIMIT REFUSED"
             check_operator_sign_in_limits(min(sink_procs, max(c.count for c in cells)), base_env)
     except ConnScaleError as exc:
-        report.notes.append(f"SIGN-IN LIMIT REFUSED, NO CELL RAN: {exc}")
+        report.notes.append(f"{label}, NO CELL RAN: {exc}")
         for step, cell in enumerate(cells):
             error = f"engine not started: {exc}"
             report.cells.append(
@@ -992,7 +1045,9 @@ async def run_batch_engine(
             # the DRIVER separately proves off-box reachability from its side.
             await _await_port("127.0.0.1", inbound, timeout=_PORTS_READY_TIMEOUT)
             await _await_port("127.0.0.1", inbound + cell.count - 1, timeout=_PORTS_READY_TIMEOUT)
-        except (ConnScaleError, FailoverError) as exc:
+        # An OSError is a failed start too: a spawn or a TLS context the process could not make
+        # (BACKLOG #5857). It used to end the walk with the cell's engine still running.
+        except (ConnScaleError, FailoverError, OSError) as exc:
             info = BatchCellEngineInfo(
                 cell_id=cell.cell_id,
                 node_id=node.node_id,
@@ -1018,8 +1073,14 @@ async def run_batch_engine(
                     f"CELL {cell.cell_id}: wait for the driver's DONE failed ({kind}) after the "
                     "cell's startup failed; moving to the next cell"
                 )
-            await _stop_cell_node(node, cell.cell_id, report)
+            finally:
+                await _stop_cell_node(node, cell.cell_id, report)
             continue
+        except BaseException:
+            # Anything else, a cancellation included, ends the walk, and the engine this cell may
+            # already have started goes with it rather than outliving the run (BACKLOG #5857).
+            await _stop_cell_node(node, cell.cell_id, report)
+            raise
 
         pid = getattr(node, "pid", None)
         info = BatchCellEngineInfo(
