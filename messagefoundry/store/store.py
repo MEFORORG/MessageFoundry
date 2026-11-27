@@ -17317,19 +17317,22 @@ class MessageStore:
             # dead-letter the token instead: whether an AADComponentError there reads as a corrupt
             # cell depends on the cipher.
             # Only the decrypts are wrapped: the encrypt's invocation ceiling stays a hard stop.
-            async def _dead_unopenable(exc: CipherError, what: str) -> bool:
+            # The dead-letter runs after the handler, so a failure in it chains no raw decrypt error,
+            # whose cause can echo the key service's URL or body; only the error's type name is kept.
+            async def _dead_unopenable(error_type: str, what: str) -> bool:
                 log.warning(
                     "ingress_handoff: %s of work-row %s does not decrypt (%s); dead-lettering",
                     what,
                     response_row_id,
-                    type(exc).__name__,
+                    error_type,
                 )
                 return await _consume_dead(
-                    f"re-ingress {what} does not decrypt ({type(exc).__name__})",
+                    f"re-ingress {what} does not decrypt ({error_type})",
                     f"re-ingress {what} undecryptable",
                 )
 
             open_fault: QueueOpenFault | None = None
+            unopenable: str | None = None
             try:
                 body = (
                     await self._adec(
@@ -17342,9 +17345,11 @@ class MessageStore:
                     raise
                 open_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
                 if open_fault is None:
-                    return await _dead_unopenable(exc, "reply")
+                    unopenable = type(exc).__name__
             if open_fault is not None:
                 raise open_fault
+            if unopenable is not None:
+                return await _dead_unopenable(unopenable, "reply")
             # 3. The origin's correlation lineage (absent keys → depth 0, origin is its own root).
             cur = await self._db.execute(
                 "SELECT channel_id, metadata FROM messages WHERE id=?", (origin_id,)
@@ -17377,9 +17382,11 @@ class MessageStore:
                     raise
                 open_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
                 if open_fault is None:
-                    return await _dead_unopenable(exc, "origin metadata")
+                    unopenable = type(exc).__name__
             if open_fault is not None:
                 raise open_fault
+            if unopenable is not None:
+                return await _dead_unopenable(unopenable, "origin metadata")
             if meta_json:
                 loaded = json.loads(meta_json)
                 if isinstance(loaded, dict):

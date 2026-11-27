@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import logging
 import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
@@ -168,9 +169,15 @@ class FaultingCipher:
         self.target: str | None = None
         self.open_error: Exception | None = None
         self.seal_error: Exception | None = None
+        #: A value this cipher reports it holds no key for, while the real cipher names its keys.
+        self.unheld: str | None = None
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._real, name)
+        attr = getattr(self._real, name)
+        unheld = self.__dict__.get("unheld")
+        if name == "holds_key_for" and unheld is not None:
+            return lambda stored: stored != unheld and attr(stored)
+        return attr
 
     def decrypt(self, stored: Any, *args: Any, **kwargs: Any) -> Any:
         if self.open_error is not None and stored == self.target:
@@ -184,6 +191,7 @@ class FaultingCipher:
 
     def heal(self) -> None:
         self.open_error = self.seal_error = None
+        self.unheld = None
 
 
 #: How long :class:`BlockingFaultingCipher` holds each open of its target, as a key service that
@@ -482,6 +490,50 @@ async def seal_outage_reaches_no_reply(store: Any, fetch: RawFetch, _raw: RawSql
     assert len(await children(fetch)) == 1
 
 
+#: A key-service error's own text, as a Vault client's can carry: a URL and a request body.
+KEY_SERVICE_TEXT = "https://vault.example.test/v1/transit/decrypt/mefor body=SYNTHETIC-BODY"
+
+
+def _dead_letter_seal_failure_carries_no_open_error(which: str) -> ContractCase:
+    """BACKLOG #5727: a verdict on the ``which`` cell dead-letters the token, and a dead-letter
+    whose seal then fails must not chain the raw decrypt error, whose cause can echo the key
+    service's URL and body, into the error that leaves."""
+
+    async def case(store: Any, fetch: RawFetch, raw: RawSql) -> None:
+        mid, item = await _claimed_head(store)
+        if which == "metadata":
+            await _plant_metadata(store._cipher, raw, mid)
+        target = await _cell(fetch, which, mid)
+        with faulting_cipher(store) as fault:
+            if which == "metadata":
+                # A key the store does not hold, so the open reaches the CipherError arm. Under a
+                # held key a plain CipherError reads as a corrupt cell, the CellTagError arm.
+                fault.unheld = target
+            open_error = CipherError("synthetic verdict")
+            open_error.__cause__ = ValueError(KEY_SERVICE_TEXT)
+            fault.target, fault.open_error = target, open_error
+            fault.seal_error = CipherError("synthetic invocation ceiling")
+            with pytest.raises(CipherError, match="invocation ceiling") as caught:
+                await _handoff(store, item.id, LOOP)
+            rendered = logging.Formatter().formatException(
+                (type(caught.value), caught.value, caught.value.__traceback__)
+            )
+            # CONTROL: the formatter renders the chain it is given, so a clean read is not a miss.
+            assert KEY_SERVICE_TEXT in logging.Formatter().formatException(
+                (type(open_error), open_error, None)
+            )
+            assert KEY_SERVICE_TEXT not in rendered and REPLY not in rendered
+            assert caught.value.__context__ is None
+            await _assert_token_live(store, fetch, mid)
+            # CONTROL: the same token hands off once the fault clears.
+            fault.heal()
+            assert await _handoff(store, item.id, LOOP) is True
+        assert len(await children(fetch)) == 1
+
+    case.__name__ = f"dead_letter_seal_failure_at_{which}_carries_no_open_error"
+    return case
+
+
 #: Retries of the same token under one outage, each of which opens the faulting cell again.
 OUTAGE_RETRIES = 3
 
@@ -592,6 +644,8 @@ HANDOFF_CASES: list[ContractCase] = [
     _fault_reaches_no_reply("reply", reply=REFUSED_REPLY),
     _fault_reaches_no_reply("metadata", reply=REFUSED_REPLY),
     seal_outage_reaches_no_reply,
+    _dead_letter_seal_failure_carries_no_open_error("reply"),
+    _dead_letter_seal_failure_carries_no_open_error("metadata"),
     _outage_open_leaves_the_loop("worker_ref"),
     _outage_open_leaves_the_loop("worker_reply"),
     _outage_open_leaves_the_loop("ref"),

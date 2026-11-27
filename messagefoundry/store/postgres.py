@@ -6694,21 +6694,24 @@ class PostgresStore(ServerCipherWalk):
                     # token reference or origin metadata it can dead-letter the token instead:
                     # whether an AADComponentError there reads as a corrupt cell depends on the
                     # cipher.
-                    async def _dead_unopenable(exc: CipherError, what: str, label: str) -> bool:
+                    # The dead-letter runs after the handler, so a failure in it chains no raw
+                    # decrypt error; only the error's type name is kept, as on SQLite.
+                    async def _dead_unopenable(error_type: str, what: str, label: str) -> bool:
                         log.warning(
                             "ingress_handoff: %s of work-row %s does not decrypt (%s);"
                             " dead-lettering",
                             what,
                             response_row_id,
-                            type(exc).__name__,
+                            error_type,
                         )
                         return await _consume_dead(
                             label,
-                            f"re-ingress {what} does not decrypt ({type(exc).__name__})",
+                            f"re-ingress {what} does not decrypt ({error_type})",
                             f"re-ingress {what} undecryptable",
                         )
 
                     open_fault: QueueOpenFault | None = None
+                    unopenable: str | None = None
                     try:
                         body = (
                             await self._adec(
@@ -6723,11 +6726,13 @@ class PostgresStore(ServerCipherWalk):
                             queue_open_fault(exc) if is_transient_open_failure(exc) else None
                         )
                         if open_fault is None:
-                            return await _dead_unopenable(
-                                exc, "reply", "ingress_handoff(reply-unopenable)"
-                            )
+                            unopenable = type(exc).__name__
                     if open_fault is not None:
                         raise open_fault
+                    if unopenable is not None:
+                        return await _dead_unopenable(
+                            unopenable, "reply", "ingress_handoff(reply-unopenable)"
+                        )
                     mrow = await conn.fetchrow(
                         "SELECT channel_id, metadata FROM messages WHERE id=$1", origin_id
                     )
@@ -6764,11 +6769,13 @@ class PostgresStore(ServerCipherWalk):
                             queue_open_fault(exc) if is_transient_open_failure(exc) else None
                         )
                         if open_fault is None:
-                            return await _dead_unopenable(
-                                exc, "origin metadata", "ingress_handoff(origin-unopenable)"
-                            )
+                            unopenable = type(exc).__name__
                     if open_fault is not None:
                         raise open_fault
+                    if unopenable is not None:
+                        return await _dead_unopenable(
+                            unopenable, "origin metadata", "ingress_handoff(origin-unopenable)"
+                        )
                     refusal: str | None = None
                     if meta_json:
                         loaded, refusal = json_loads_or_refusal(meta_json)
