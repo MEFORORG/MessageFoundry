@@ -6931,8 +6931,9 @@ class PostgresStore(ServerCipherWalk):
             await self._after_fenced_write(exc)
             return False
         except CipherError as exc:
-            # BACKLOG #5727: a seal the key service gave no verdict on is retried as a
-            # QueueOpenFault, raised below, outside this handler, as on SQLite.
+            # BACKLOG #5727: a seal, or any other cipher call no inner arm contains, that the key
+            # service gave no verdict on is retried as a QueueOpenFault, raised below, outside this
+            # handler, as on SQLite.
             if isinstance(exc, PROGRAMMING_ERRORS) or not is_transient_open_failure(exc):
                 raise
             seal_fault = queue_open_fault(exc)

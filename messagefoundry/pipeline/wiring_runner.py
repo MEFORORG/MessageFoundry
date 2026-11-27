@@ -8945,8 +8945,8 @@ class RegistryRunner:
         # broadcast above cannot lift it (BACKLOG #5704).
 
     async def _pooled_maybe_buildup(self, lane: str, stage: str) -> None:
-        """Pooled INGRESS/ROUTED buildup-alert hook (ADR 0066 D1). The per_lane buildup depth check lives
-        in the router/transform worker LOOPS (dropped in pooled mode), so the pooled per-stage adapter
+        """Pooled INGRESS/ROUTED/RESPONSE buildup-alert hook (ADR 0066 D1; RESPONSE since BACKLOG
+        #5727). The per_lane buildup depth check lives in the router/transform/response worker LOOPS (dropped in pooled mode), so the pooled per-stage adapter
         calls this after each processed item — rate-limited per (stage, lane) to ``_BUILDUP_CHECK_INTERVAL``
         so it never runs a COUNT+MIN per claimed item. ``_maybe_alert_buildup`` additionally self-throttles
         the actual alert emit via ``_next_buildup_alert`` (300 s)."""
@@ -13259,9 +13259,7 @@ class RegistryRunner:
                 now = time.time()
                 if now - last_buildup_check >= _BUILDUP_CHECK_INTERVAL:
                     last_buildup_check = now
-                    await self._maybe_alert_buildup(
-                        name, stage=Stage.RESPONSE.value, threshold=self._buildup_default
-                    )
+                    await self._response_buildup_check(name)
                 faults.healthy()
             except asyncio.CancelledError:
                 raise
@@ -13276,26 +13274,43 @@ class RegistryRunner:
                 if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start
                 claimed.clear()
-                # BACKLOG #5727: a token held by repeated no-verdict faults takes this arm on every
-                # pass, never the success path, and is re-pended between claims, so the in-flight
-                # watch never sees it held. Checked here too, after the re-pend so the token counts.
+                # BACKLOG #5727: a token whose step faults with no verdict on every pass takes this
+                # arm, never the success path, and is re-pended between claims, so the in-flight
+                # watch never sees it held. Checked here too, only once the re-pend landed, so the
+                # token counts as pending and this node still owns the lane.
                 now = time.time()
-                if now - last_buildup_check >= _BUILDUP_CHECK_INTERVAL:
+                if (
+                    held is HoldResult.LANDED
+                    and now - last_buildup_check >= _BUILDUP_CHECK_INTERVAL
+                ):
                     last_buildup_check = now
-                    await self._response_fault_buildup_check(name)
+                    await self._response_buildup_check(name)
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
 
-    async def _response_fault_buildup_check(self, name: str) -> None:
-        """The response worker's build-up check from its fault arm (BACKLOG #5727). A diagnostic: a
-        store read that fails here is logged by its type alone, since a driver's text can quote a
-        cell, and never escapes, which would end the worker outside its own backoff."""
+    async def _response_buildup_check(self, name: str) -> None:
+        """The response worker's build-up check (BACKLOG #5727). A diagnostic: a store read that
+        fails here never escapes, which would count it as a worker fault, and is logged as a
+        redacted stand-in through a per-lane :class:`~messagefoundry.log_backoff.FailureRun`, as
+        :meth:`_delivery_failure_alert_checks` logs its checks, since the driver's text can quote
+        a cell and the fault arm runs it about once a second while the store is down."""
+        key = f"response-buildup:{name}"
         try:
             await self._maybe_alert_buildup(
                 name, stage=Stage.RESPONSE.value, threshold=self._buildup_default
             )
         except Exception as exc:  # noqa: BLE001 -- a diagnostic; see the docstring
-            log.warning("response worker %r: build-up check failed (%s)", name, type(exc).__name__)
+            stand_in = _RedactedFault(safe_exc(exc)).with_traceback(exc.__traceback__)
+            failures = self._delivery_alert_check_runs.get(key, FailureRun())
+            self._delivery_alert_check_runs[key] = failures.record(
+                log, stand_in, "response build-up check failed for loopback %r", name
+            )
+        else:
+            open_run = self._delivery_alert_check_runs.pop(key, None)
+            if open_run is not None:
+                open_run.clear(
+                    log, "response build-up check for loopback %r", name, level=logging.WARNING
+                )
 
     @_records_worker_death("response")
     async def _process_response_item(
@@ -13359,9 +13374,10 @@ class RegistryRunner:
                 # cell, dead-letters on a token reference, and on origin metadata dead-letters where
                 # the cipher reads it as a corrupt cell and propagates otherwise. The read above
                 # opens the same reference first: an engine fault it does not read as a tag failure
-                # re-raises there, so that token re-pends and never reaches the handoff. The
-                # handoff's encrypt is not contained: its invocation ceiling is a deliberate hard
-                # stop.
+                # re-raises there, so that token re-pends and never reaches the handoff. A key
+                # service with no verdict on one of the handoff's encrypts leaves it as a
+                # QueueOpenFault too; its invocation ceiling, a plain CipherError, is a deliberate
+                # hard stop.
                 log.warning(
                     "response worker %r: reply body of %s does not decrypt (%s); dead-lettering",
                     name,
@@ -14968,7 +14984,9 @@ class RegistryRunner:
     async def _dispatch_response(self, lane: str, item: OutboxItem) -> LaneItemResult:
         if self._inbound_log_halted(lane):  # #122 claim gate, pooled half (BACKLOG #5704)
             return await self._refuse_log_halted(item)
-        return _to_lane_result(await self._process_response_item(lane, item))
+        result = _to_lane_result(await self._process_response_item(lane, item))
+        await self._pooled_maybe_buildup(lane, Stage.RESPONSE.value)  # D1 (see _dispatch_ingress)
+        return result
 
     async def _wait_for_work(self, event: asyncio.Event) -> bool:
         """Wait up to the idle backstop for ``event`` (this worker class's wake event), then clear it.

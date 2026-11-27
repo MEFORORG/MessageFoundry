@@ -17181,9 +17181,11 @@ class MessageStore:
                 queue_tag_rows=queue_tag_rows,
             )
         except CipherError as exc:
-            # BACKLOG #5727: a key service that gave no verdict during a seal says nothing about the
-            # token, so it is retried as a QueueOpenFault, raised below, outside this handler, so it
-            # carries no chain to the raw key-service error. The invocation ceiling stays a verdict.
+            # BACKLOG #5727: a key service that gave no verdict says nothing about the token, so it
+            # is retried as a QueueOpenFault, raised below, outside this handler, so it carries no
+            # chain to the raw key-service error. Aimed at the transaction's seals, it also takes any
+            # other cipher call no inner arm contains, the finalizer's opens among them. The
+            # invocation ceiling stays a verdict.
             if isinstance(exc, PROGRAMMING_ERRORS) or not is_transient_open_failure(exc):
                 raise
             seal_fault: QueueOpenFault = queue_open_fault(exc)
@@ -17316,7 +17318,8 @@ class MessageStore:
             # propagates from the reply cell. On a token reference or origin metadata it can
             # dead-letter the token instead: whether an AADComponentError there reads as a corrupt
             # cell depends on the cipher.
-            # Only the decrypts are wrapped: the encrypt's invocation ceiling stays a hard stop.
+            # The encrypts are contained only in ingress_handoff, and only where the key service
+            # gave no verdict: the invocation ceiling stays a hard stop.
             # The dead-letter runs after the handler, so a failure in it chains no raw decrypt error,
             # whose cause can echo the key service's URL or body; only the error's type name is kept.
             async def _dead_unopenable(error_type: str, what: str) -> bool:

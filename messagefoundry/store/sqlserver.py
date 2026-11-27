@@ -9877,8 +9877,9 @@ class SqlServerStore(ServerCipherWalk):
                 queue_tag_rows=queue_tag_rows,
             )
         except CipherError as exc:
-            # BACKLOG #5727: a seal the key service gave no verdict on is retried as a
-            # QueueOpenFault, raised below, outside this handler, as on SQLite.
+            # BACKLOG #5727: a seal, or any other cipher call no inner arm contains, that the key
+            # service gave no verdict on is retried as a QueueOpenFault, raised below, outside this
+            # handler, as on SQLite.
             if isinstance(exc, PROGRAMMING_ERRORS) or not is_transient_open_failure(exc):
                 raise
             seal_fault: QueueOpenFault = queue_open_fault(exc)
@@ -10028,8 +10029,9 @@ class SqlServerStore(ServerCipherWalk):
                 # outside the handler so it carries no chain to the raw key-service error, and the
                 # token is retried. An engine fault propagates from the reply cell. On a token
                 # reference or origin metadata it can dead-letter the token instead: whether an
-                # AADComponentError there reads as a corrupt cell depends on the cipher. Only the
-                # decrypts are wrapped: the encrypt's invocation ceiling stays a hard stop.
+                # AADComponentError there reads as a corrupt cell depends on the cipher. The
+                # encrypts are contained only in ingress_handoff, and only where the key service
+                # gave no verdict: the invocation ceiling stays a hard stop.
                 # The dead-letter runs after the handler, so a failure in it chains no raw decrypt
                 # error; only the error's type name is kept, as on SQLite.
                 async def _dead_unopenable(error_type: str, what: str, label: str) -> bool:
