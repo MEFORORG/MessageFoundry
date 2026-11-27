@@ -6404,8 +6404,10 @@ if ($coordMatch) {
            What = "the collision gate's unresolved-notice throttle"
            Fix  = 'let scripts\hooks\collision_gate.ps1 stamp it; writing one HIDES its warning' }
         @{ Name = "overlap-cache"
-           What = "the collision gate's peer-overlap input (one cache file per querying worktree)"
-           Fix  = 'pwsh -NoProfile -File scripts\coord\overlap.ps1 -Refresh' }
+           # -LiveOnly, because that is the walk collision_gate.ps1 runs and <key>.live.json is the file
+           # it reads; a bare -Refresh rewrites only <key>.json, which the gate never reads.
+           What = "the collision gate's peer-overlap input (two cache files per querying worktree: <key>.live.json, which the gate reads, and <key>.json, from a full walk)"
+           Fix  = 'pwsh -NoProfile -File scripts\coord\overlap.ps1 -Refresh -LiveOnly' }
         @{ Name = "announce/off"
            What = "the REPO-WIDE announce kill switch"
            Fix  = 'ask the user -- silencing announcements for every session is their decision, not yours' }

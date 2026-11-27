@@ -522,6 +522,37 @@ def test_machine_read_coordination_state_is_denied(
     assert "AUTHORITY" in reason or "machine-read coordination state" in reason
 
 
+COLLISION_GATE = GATE.parent / "collision_gate.ps1"
+
+
+@pytest.mark.parametrize(
+    "rest", ["overlap-cache/0a1b2c3d.json", "overlap-cache/0a1b2c3d.live.json"]
+)
+def test_the_overlap_cache_remedy_refreshes_the_file_the_collision_gate_reads(
+    primary: Path, repos_file: Path, rest: str
+) -> None:
+    """The refusal's remedy must rewrite the cache file collision_gate.ps1 actually reads.
+
+    overlap.ps1 keeps one whole-map cache per querying root, plus ``<key>.live.json`` for a
+    ``-LiveOnly`` walk, and the collision gate calls it with ``-LiveOnly``. A remedy of a bare
+    ``-Refresh`` rewrote only ``<key>.json``, so for up to the cache window the gate kept answering
+    from the untouched live map. The flag set is read from the gate's own invocation, not restated.
+    """
+    gate_src = COLLISION_GATE.read_text(encoding="utf-8")
+    call = re.search(r"-File \$target -Json[^\r\n]*", gate_src)
+    assert call is not None, "collision_gate.ps1's overlap.ps1 invocation was not found"
+    gate_reads_live = "-LiveOnly" in call.group(0).split()
+
+    worktree = primary / ".claude" / "worktrees" / "wt-1"
+    reason = assert_denied(run_gate(edit(_coord(primary, rest), cwd=worktree), repos_file))
+    remedy = reason.split("Do this instead:", 1)[1].strip().splitlines()[0].split()
+    assert "overlap.ps1" in " ".join(remedy) and "-Refresh" in remedy, remedy
+    assert ("-LiveOnly" in remedy) == gate_reads_live, (remedy, call.group(0))
+    # The What text names both cache files, and no longer claims one per querying worktree.
+    assert "one cache file per querying worktree" not in reason
+    assert ".live.json" in reason
+
+
 @pytest.mark.parametrize(
     "rest",
     [
