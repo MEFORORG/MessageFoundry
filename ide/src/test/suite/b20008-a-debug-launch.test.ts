@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-// Batch 20008 Builder A (BACKLOG #5409 added item 1, the failing-test half): the Test Bench Debug
-// launch hands debugpy the interpreter options the CLI bridge launches with, `-P` among them.
-// `-P` alone does not keep the workspace off the import path: debugpy builds before 1.8.22 add the
-// working directory for a MODULE launch whatever `-P` says, which is why the launch names a written
-// program (item 2), and a PYTHONPATH from the debuggee's environment stays open
-// (TEST_BENCH_DEBUG_PROGRAM's docblock in testBenchDebugProgram.ts says which builds and what).
-// b532w3-ide-debugpy.test.ts pins this wiring by reading testBench.ts's source; neither of its tests
-// drives the launch. This drives the real TestBench.debugRow, a method present before and after the
-// fix, with `vscode` stubbed, and asserts on the configuration it hands
-// `vscode.debug.startDebugging`. With testBench.ts at cc1b376f15^ (before engine PR 3127) the
-// configuration carries no `pythonArgs`, so the first test fails as an assertion; with testBench.ts
-// on main both pass.
+// Batch 20008 Builder A (BACKLOG #5409 added item 1, the failing-test half).
+// The Test Bench Debug launch hands debugpy the CLI bridge's interpreter options, `-P` among them.
+// `-P` alone is not the whole control. TEST_BENCH_DEBUG_PROGRAM's docblock in
+// testBenchDebugProgram.ts says which debugpy builds need the written program, and what stays open.
+// b532w3-ide-debugpy.test.ts pins this wiring by reading testBench.ts's source.
+// None of its tests drives debugRow. This file drives the real TestBench.debugRow, with `vscode`
+// stubbed. That method exists before and after the fix. The tests assert on what it hands
+// `vscode.debug.startDebugging`. With testBench.ts at cc1b376f15^ (before engine PR 3127), the
+// configuration has no `pythonArgs`, so the item 1 test fails as an assertion. On main all pass.
 import * as assert from "assert";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -22,6 +19,8 @@ import { TEST_BENCH_DEBUG_PROGRAM, debugProgramFileName } from "../../testBenchD
 
 /** Every configuration the stubbed `vscode.debug.startDebugging` received. */
 let launched: { folder: unknown; config: Record<string, unknown> }[] = [];
+/** Every error notice debugRow showed. */
+let errors: string[] = [];
 let workspace = "";
 
 const vscodeStub = {
@@ -38,7 +37,8 @@ const vscodeStub = {
   },
   window: {
     showErrorMessage: (m: string): Promise<undefined> => {
-      throw new Error(`debugRow showed an error: ${m}`);
+      errors.push(m);
+      return Promise.resolve(undefined);
     },
     showWarningMessage: (): Promise<undefined> => Promise.resolve(undefined),
     createOutputChannel: () => ({ appendLine: (): void => {}, show: (): void => {}, dispose: (): void => {} }),
@@ -118,6 +118,7 @@ launchSuite("b20008-a: the Test Bench Debug launch carries -P (BACKLOG #5409 add
     workspace = path.join(base, "ws");
     fs.mkdirSync(workspace);
     launched = [];
+    errors = [];
   });
 
   teardown(() => {
@@ -127,18 +128,24 @@ launchSuite("b20008-a: the Test Bench Debug launch carries -P (BACKLOG #5409 add
   /** The global storage folder the stubbed context hands debugRow. */
   const storageDir = (): string => path.join(base, "storage");
 
-  /** A TestBench with one loaded row, its debugRow driven for that row; returns what was launched. */
-  async function debugOneRow(): Promise<Record<string, unknown>> {
+  /** A TestBench with one loaded row whose global storage has `scheme`, its debugRow driven. */
+  async function driveDebugRow(scheme: string): Promise<void> {
     const storage = storageDir();
     const context = {
       subscriptions: [],
-      globalStorageUri: { scheme: "file", fsPath: storage, with: () => ({ fsPath: storage }) },
+      globalStorageUri: { scheme, fsPath: storage, with: () => ({ fsPath: storage }) },
     };
     const bench = new testBenchModule.TestBench(context as unknown as import("vscode").ExtensionContext);
     const internals = bench as unknown as TestBenchInternals;
     internals.rows = [{ source: "adt_a01.hl7", path: path.join(workspace, "adt_a01.hl7") }];
     await internals.debugRow(0);
+  }
+
+  /** debugRow driven with local storage; returns the one configuration it launched. */
+  async function debugOneRow(): Promise<Record<string, unknown>> {
+    await driveDebugRow("file");
     // THE CONTROL: the launch was reached and captured, so an assertion below is about its content.
+    assert.deepStrictEqual(errors, []);
     assert.strictEqual(launched.length, 1, "debugRow did not call startDebugging exactly once");
     const { config } = launched[0];
     assert.strictEqual(config.type, "debugpy");
@@ -153,13 +160,21 @@ launchSuite("b20008-a: the Test Bench Debug launch carries -P (BACKLOG #5409 add
     assert.deepStrictEqual(args, [...INTERPRETER_OPTIONS], JSON.stringify(config));
   });
 
+  // The two item 2 tests are not this row's failing-test half; item 2 closed on its own evidence.
+  // They pin, by driving the launch, the form that the docblock the header names says -P needs.
   test("item 2: the launch names the program writeDebugProgram wrote, never the module", async () => {
-    // Not this row's failing-test half (item 2 closed on its own evidence): it pins, by driving the
-    // launch, the form -P needs on the debugpy builds the header names.
     const config = await debugOneRow();
     assert.strictEqual(config.module, undefined, JSON.stringify(config));
     const program = path.join(storageDir(), TEST_BENCH_DEBUG_PROGRAM.folder, debugProgramFileName(TEST_BENCH_DEBUG_PROGRAM.source));
     assert.strictEqual(config.program, program, JSON.stringify(config));
     assert.strictEqual(fs.readFileSync(program, "utf8"), TEST_BENCH_DEBUG_PROGRAM.source);
+  });
+
+  test("item 2: a program that cannot be written refuses the launch, never falling back to the module", async () => {
+    // A remote window's storage has no local path, so writeDebugProgram refuses it.
+    await driveDebugRow("vscode-remote");
+    assert.deepStrictEqual(launched, [], "debugRow launched though the program was not written");
+    assert.strictEqual(errors.length, 1, JSON.stringify(errors));
+    assert.ok(errors[0].startsWith("MessageFoundry: Debug did not start: "), errors[0]);
   });
 });
