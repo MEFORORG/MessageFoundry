@@ -104,8 +104,8 @@ async def test_a_failure_to_build_the_replacement_leaves_a_fixed_text_fault(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The last loop's item 1: if building the replacement raises, its error would carry the raw
-    seal error, and its key-service chain, as context. The boundary raises a fixed-text
-    QueueOpenFault from None instead."""
+    seal error, and its key-service chain, as context. The boundary drops it and raises a
+    fixed-text QueueOpenFault outside the handler instead, so the fault has no chain."""
     import messagefoundry.pipeline.wiring_runner as wiring_runner
 
     def _broken(exc: Exception) -> Exception:

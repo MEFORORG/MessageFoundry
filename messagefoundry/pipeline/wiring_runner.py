@@ -1778,7 +1778,8 @@ def _reply_step_boundary(body: _ItemBody) -> _ItemBody:
                 # 3155, the last loop).
                 fault = None
         if fault is None:
-            raise QueueOpenFault("re-ingress step fault could not be named") from None
+            # Raised outside the handler, so it carries no context and needs no ``from None``.
+            raise QueueOpenFault("re-ingress step fault could not be named")
         try:
             raise fault
         finally:
