@@ -145,10 +145,10 @@ jobs:
           # that cannot be computed is not a clean range. The EXIT trap makes any exit other than 0
           # or 2 a refusal (2), whatever ended the step: a failed git call, mkdir or redirect under
           # -e, or an unset variable under -u. An internal failure is never a leak verdict (1) and
-          # never a pass. A 1 stands only when a leak was found first: a committed token list on the
-          # walk, or a scanner report.
+          # never a pass. A 1 stands only from a verdict the step reached (`finished`), or after a
+          # leak was found: a committed token list on the walk, or a scanner report.
           set -euo pipefail
-          trap 'st=$?; if [ "$st" -eq 0 ] || [ "$st" -eq 2 ]; then exit "$st"; fi; if [ "${walk_rc:-0}" -eq 1 ] || [ "${rc:-0}" -eq 1 ]; then [ "$st" -eq 1 ] || echo "::error::the scan failed internally (exit $st) after it had found the leak reported above." >&2; exit 1; fi; echo "::error::the scan failed internally (exit $st) and did not finish; this is a refusal, not a leak verdict." >&2; exit 2' EXIT
+          trap 'st=$?; if [ "$st" -eq 0 ] || [ "$st" -eq 2 ] || { [ "$st" -eq 1 ] && [ "${finished:-0}" -eq 1 ]; }; then exit "$st"; fi; if [ "${walk_rc:-0}" -eq 1 ] || [ "${rc:-0}" -eq 1 ]; then echo "::error::the scan failed internally (exit $st) after it had found the leak reported above, and did not finish." >&2; exit 1; fi; echo "::error::the scan failed internally (exit $st) and did not finish; this is a refusal, not a leak verdict." >&2; exit 2' EXIT
           zero=0000000000000000000000000000000000000000
           for sha in "$PUSH_BEFORE" "$PUSH_AFTER"; do
             case "$sha" in
@@ -164,15 +164,21 @@ jobs:
           rm -f "$earlier_file" "$earlier_file.tmp"
           # Shows stdin with every `::` and `##[` broken up, looping until none is left, so a line the
           # scanner echoes from a pushed path cannot start a workflow command such as ::stop-commands::.
-          defang() { sed -e ':a' -e 's/::/: :/' -e 'ta' -e 's/##\[/# #[/' -e 'ta'; }
+          # -u: sed otherwise holds piped output in its buffer, and a scan killed at a limit would
+          # show none of it.
+          defang() { sed -u -e ':a' -e 's/::/: :/' -e 'ta' -e 's/##\[/# #[/' -e 'ta'; }
           # The scanner's exit code ($1) with its output ($2): a 1 is a leak only beside a FORBIDDEN
-          # CONTENT report. An uncaught Python exception also exits 1, and a crash is a refusal (2).
+          # CONTENT report. An uncaught Python exception also exits 1, and a crash is judged 2. A
+          # copy that cannot be read (grep 2) leaves the 1 standing: the scanner's own word is kept.
           judge() {
-            if [ "$1" -eq 1 ] && ! grep -q '^FORBIDDEN CONTENT' "$2"; then
-              echo "::error::the scanner exited 1 without a FORBIDDEN CONTENT report, so it failed rather than found a leak; this is a refusal." >&2
+            if [ "$1" -ne 1 ]; then echo "$1"; return 0; fi
+            g=0
+            grep -q '^FORBIDDEN CONTENT' "$2" || g=$?
+            if [ "$g" -eq 1 ]; then
+              echo "::error::the scanner exited 1 without a FORBIDDEN CONTENT report, so it failed rather than found a leak." >&2
               echo 2
             else
-              echo "$1"
+              echo 1
             fi
           }
           # Runs the scanner on "$@" and sets rc to its judged exit code. Its output streams through
@@ -189,14 +195,16 @@ jobs:
                 echo "::error::the scanner's output could not be kept or shown (tee ${codes[1]}, sed ${codes[2]})." >&2
                 if [ "$rc" -eq 0 ]; then rc=2; fi
               fi
+              # Judged only from a whole copy: a partial one could hide the report the scanner printed.
+              if [ "${codes[1]}" -eq 0 ]; then rc="$(judge "$rc" "$out")"; fi
             fi
-            rc="$(judge "$rc" "$out")"
           }
           if [ "$PUSH_AFTER" = "$zero" ]; then
             : > "$earlier_file.tmp"
             mv "$earlier_file.tmp" "$earlier_file"
             echo "branch deleted: no pushed commits to scan, and the earlier range is not listed (see this workflow's header); scanning the checked-out tree only."
             scan --path .
+            finished=1
             exit "$rc"
           fi
           snap="$RUNNER_TEMP/branch-leak-scan-commits"
@@ -230,10 +238,8 @@ jobs:
                 # A gitlink has no blob here. A symlink's blob is its target text, written as a regular
                 # file so the scanner reads that text and never follows the link.
                 case "$newmode" in 100644|100755|120000) ;; *) continue ;; esac
-                # A control character is refused too: bash's own error for a failed write prints the
-                # path raw, and a newline in it would start a line the runner reads as a command.
                 case "/$path/" in
-                  //*|*/../*|*/./*|*/.git/*|*[[:cntrl:]]*)
+                  //*|*/../*|*/./*|*/.git/*)
                     # The path is not printed: it is pushed text, and could carry a workflow command.
                     echo "::error::branch commit $sha names an unsafe path; refusing to write it." >&2
                     if [ "$walk_rc" -ne 1 ]; then walk_rc=2; fi
@@ -248,11 +254,14 @@ jobs:
                   walk_rc=1
                   continue
                 fi
+                # stderr is closed off BEFORE the write: a failed mkdir, or bash's own error for a
+                # failed redirect, prints the pushed path raw, and a newline, `::` or `##[` in it could
+                # start a workflow command. The step then fails through the EXIT trap, which names no path.
                 case "$path" in
-                  */*) mkdir -p "$root/${path%/*}" ;;
-                  *) mkdir -p "$root" ;;
+                  */*) mkdir -p "$root/${path%/*}" 2>/dev/null ;;
+                  *) mkdir -p "$root" 2>/dev/null ;;
                 esac
-                git cat-file blob "$blob" > "$root/$path"
+                git cat-file blob "$blob" 2>/dev/null > "$root/$path"
                 n=$((n + 1))
               done < "$raw"
               if [ "$n" -gt 0 ]; then
@@ -294,6 +303,7 @@ jobs:
           # the run reports every hit.
           scan --path . "${roots[@]}"
           if [ "$rc" -eq 1 ]; then record_hit_roots this-push; fi
+          finished=1
           exit "$(verdict "$rc" "$walk_rc")"
       - name: Rescan the commits earlier pushes added
         # STEP 2 (BACKLOG #8244 item 63): what `before` reaches off main, which is disjoint from step
@@ -314,7 +324,7 @@ jobs:
           # As in step 1: any exit other than 0 or 2 is a refusal (2), never a leak verdict or a pass,
           # unless a leak was found first.
           set -euo pipefail
-          trap 'st=$?; if [ "$st" -eq 0 ] || [ "$st" -eq 2 ]; then exit "$st"; fi; if [ "${walk_rc:-0}" -eq 1 ] || [ "${rc:-0}" -eq 1 ]; then [ "$st" -eq 1 ] || echo "::error::the rescan failed internally (exit $st) after it had found the leak reported above." >&2; exit 1; fi; echo "::error::the rescan failed internally (exit $st) and did not finish; this is a refusal, not a leak verdict." >&2; exit 2' EXIT
+          trap 'st=$?; if [ "$st" -eq 0 ] || [ "$st" -eq 2 ] || { [ "$st" -eq 1 ] && [ "${finished:-0}" -eq 1 ]; }; then exit "$st"; fi; if [ "${walk_rc:-0}" -eq 1 ] || [ "${rc:-0}" -eq 1 ]; then echo "::error::the rescan failed internally (exit $st) after it had found the leak reported above, and did not finish." >&2; exit 1; fi; echo "::error::the rescan failed internally (exit $st) and did not finish; this is a refusal, not a leak verdict." >&2; exit 2' EXIT
           earlier_file="$RUNNER_TEMP/branch-leak-scan-earlier.txt"
           # A missing or unfinished record is not a clean range (BACKLOG #5595). Step 1 renames the
           # list into place only once it is whole, so it is missing when step 1 refused its inputs,
@@ -341,13 +351,14 @@ jobs:
           . "$RUNNER_TEMP/branch-leak-scan-snapshot.sh"
           snapshot "$earlier"
           echo "step 2, earlier pushes: $(count "$earlier") commit(s) walked, $files added or changed file(s) under ${#roots[@]} commit root(s)."
-          if [ "${#roots[@]}" -eq 0 ]; then exit "$walk_rc"; fi
+          if [ "${#roots[@]}" -eq 0 ]; then finished=1; exit "$walk_rc"; fi
           # This workflow file is text and is always checked out, since GitHub runs it from the pushed
           # commit, so a range of binary files alone cannot trip the zero-files refusal. Step 1 scans it
           # too, as part of the tip, so a hit in it reds both steps. That double report is kept: step 1
           # can fail before its scan, and then this is the run's only scan of the file.
           scan --path .github/workflows/branch-leak-scan.yml "${roots[@]}"
           if [ "$rc" -eq 1 ]; then record_hit_roots earlier; fi
+          finished=1
           exit "$(verdict "$rc" "$walk_rc")"
       - name: Name the commit behind each scan hit
         # The scanner names a CONTENT hit by its path inside the commit root it came from, which drops
@@ -383,8 +394,8 @@ jobs:
               printf 'clean\n' > "$clean"
               one=0
               python scripts/security/scan_forbidden.py --path "$clean" "$root" > "$snap/attribution.txt" 2>&1 || one=$?
-              one="$(judge "$one" "$snap/attribution.txt")"
-              if [ "$one" -eq 1 ]; then
+              judged="$(judge "$one" "$snap/attribution.txt")"
+              if [ "$judged" -eq 1 ]; then
                 echo "::error::$label commit ${root##*/} carries the hit(s) below; each path is inside that commit."
                 # The scanner's output for this root. Each hit line names a path inside the commit
                 # and a reason, as the scan step's own output already did for the same root. The
@@ -392,7 +403,7 @@ jobs:
                 # never printed, but a name hit's path is itself the matched text. A pushed path can
                 # carry a newline, so the output goes through defang and cannot start a command.
                 defang < "$snap/attribution.txt"
-              elif [ "$one" -ne 0 ]; then
+              elif [ "$judged" -ne 0 ]; then
                 echo "::warning::$label commit ${root##*/} could not be rescanned on its own (scanner exit $one)."
               fi
             done < "$list"
