@@ -16,7 +16,7 @@
     that needs cooperation to work does not work.
 
     ONLY LIVE SESSIONS BLOCK. A dormant worktree with changes cannot be racing you -- its owner is not
-    typing -- so it is reported and allowed. Blocking on dormant worktrees would deny edits to every
+    typing -- so it is allowed, and not even walked (-LiveOnly). Blocking on dormant worktrees would deny edits to every
     file any abandoned branch ever touched, and a gate that cries wolf gets uninstalled.
 
     FAILS OPEN, DELIBERATELY. Any error -- unparseable payload, no git, no registry, a broken overlap
@@ -34,8 +34,8 @@
     would otherwise inject a notice into EVERY Edit and Write. If the throttle state cannot be read or
     written the notice is emitted anyway -- silence is the defect being fixed, so the fallback is noise.
 
-    Wired on Edit|Write|MultiEdit|NotebookEdit. The overlap map is cached, so the common case is a
-    cache read, not a git walk across every worktree.
+    Wired on Edit|Write|MultiEdit|NotebookEdit. It asks overlap.ps1 for the worktrees a live session
+    owns (-LiveOnly), and that map is cached, so the common case is a cache read, not a git walk.
 
     IT CHECKS FROM THE WORKTREE THE EDITED FILE SITS IN, NOT THE ONE IT RUNS IN. The desktop app starts a
     worktree session's CLI with `--project-config-root <primary checkout>`. Measured 2026-10-12, a

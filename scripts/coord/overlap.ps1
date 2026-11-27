@@ -176,9 +176,9 @@ param(
     # harness killed it on every Edit and Write. SessionStart's 30s timeout killed session-context.ps1
     # the same way.
     #
-    # The whole-map cache is neither read nor written in this mode. A map holding only Live rows
-    # would under-report to a bare run reading the same file. The term memo is still read and written,
-    # and still pruned against every worktree, live or not.
+    # The mode has its own whole-map cache file, <key>.live.json, and never reads or writes the full
+    # one: a map holding only Live rows would under-report to a bare run reading the same file. The
+    # term memo is shared, and still pruned against every worktree, live or not.
     [switch]$LiveOnly
 )
 
@@ -321,7 +321,7 @@ if ($myHead) {
 $cacheSha = [System.Security.Cryptography.SHA256]::Create()
 $cacheKey = -join ($cacheSha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($myRootNorm))[0..3] | ForEach-Object { $_.ToString('x2') })
 $cacheSha.Dispose()
-$cacheFile = Join-Path $common "mefor-coord/overlap-cache/$cacheKey.json"
+$cacheFile = Join-Path $common "mefor-coord/overlap-cache/$cacheKey$(if ($LiveOnly) { '.live' }).json"
 $termCacheFile = Join-Path $common "mefor-coord/overlap-terms.json"
 
 # THE ANCHOR EVERY COMMITTED-HALF TERM IS MEASURED AGAINST, resolved once so it can go in the memo key.
@@ -359,11 +359,12 @@ try {
 # Empty Head is tolerated (an unborn checkout, or a git too old to print the line). It disables the
 # memo for that worktree and the terms are computed the long way, which is slow and correct.
 function Get-WorktreeList {
-    $out = @(); $cur = $null
+    # A list, not `+=`, for the reason given at $jobs.
+    $out = [System.Collections.Generic.List[object]]::new(); $cur = $null
     foreach ($line in (& git @gitArgs worktree list --porcelain 2>$null)) {
         if ($line -like "worktree *") {
             $cur = [pscustomobject]@{ Path = $line.Substring(9).Trim(); Branch = ""; Head = "" }
-            $out += $cur
+            $out.Add($cur)
         }
         elseif ($line -like "HEAD *" -and $cur) { $cur.Head = $line.Substring(5).Trim() }
         elseif ($line -like "branch *" -and $cur) { $cur.Branch = ($line.Substring(7).Trim() -replace '^refs/heads/', '') }
@@ -564,10 +565,11 @@ function Build-Map {
     # Longest prefix wins is the only rule that survives nesting: a session in .../worktrees/foo matches
     # both the primary and foo, and foo is the one it is actually sitting in.
     $ownerByWorktree = @{}
+    # Normalised once, not once per session: this loop is sessions times worktrees.
+    $worktreeNorms = @(foreach ($w in $worktrees) { ConvertTo-Norm $w.Path })
     foreach ($k in @($sessionsByCwd.Keys | Sort-Object)) {
         $best = $null
-        foreach ($w in $worktrees) {
-            $wn = ConvertTo-Norm $w.Path
+        foreach ($wn in $worktreeNorms) {
             if ($k -eq $wn -or $k.StartsWith("$wn/")) {
                 if ($null -eq $best -or $wn.Length -gt $best.Length) { $best = $wn }
             }
@@ -977,7 +979,7 @@ function Build-Map {
 
 # --- cache -------------------------------------------------------------------------------------
 $map = $null
-if (-not $Refresh -and -not $LiveOnly -and (Test-Path -LiteralPath $cacheFile)) {
+if (-not $Refresh -and (Test-Path -LiteralPath $cacheFile)) {
     # A cache that is missing, locked or not JSON is a silent miss: that is ordinary churn. -LiteralPath,
     # as on the write: a `[` in the path is a wildcard class to a positional Get-Content, which would
     # make every read a silent miss while the writes kept succeeding.
@@ -1031,8 +1033,9 @@ if ($null -eq $map) {
     # zero-rows guard below still fires -- but it serializes into the cache as `"rows": null`, and the
     # next run reads that back as `@($null)`, a ONE-element array holding $null. Count is then 1, the
     # guard does not fire, and the table prints a phantom occupant. The hook arms this constantly:
-    # collision_gate.ps1 runs `overlap.ps1 -File ... -Json` on every gated edit and the cache is written
-    # before the -File early exit, so any bare `overlap.ps1` inside $CacheSeconds inherits it.
+    # collision_gate.ps1 runs `overlap.ps1 -File ... -Json -LiveOnly` on every gated edit and the cache
+    # is written before the -File early exit, so any -LiveOnly run inside $CacheSeconds inherits it,
+    # and any bare run inherits a full walk's file the same way.
     $map = @(Build-Map)
     $script:MapPartial = [bool]$script:WalkAbandoned
     # OVERRAN THE BUDGET: keep the rows, stamp every one of them, exit 3, and DO NOT CACHE. The rows are
@@ -1046,8 +1049,7 @@ if ($null -eq $map) {
             $r | Add-Member -NotePropertyName Total -NotePropertyValue $script:WorktreeCount -Force
         }
     }
-    # -LiveOnly: never cached. See the parameter.
-    elseif (-not $LiveOnly) {
+    else {
         try {
             New-Item -ItemType Directory -Force -Path (Split-Path $cacheFile) | Out-Null
             # Last-write-wins on purpose: a duplicate walk is the only cost of a race, and a lock on the
@@ -1091,9 +1093,11 @@ function Exit-Overlap { if ($script:MapPartial) { exit 3 }; exit 0 }
 function Write-PartialBanner {
     if (-not $script:MapPartial) { return }
     Write-Host ""
-    Write-Host "PARTIAL MAP -- walked $($script:WalkedCount) of $($script:WorktreeCount) worktrees before running out of time."
+    $scope = if ($LiveOnly) { "worktrees a live session owns" } else { "worktrees" }
+    Write-Host "PARTIAL MAP -- walked $($script:WalkedCount) of $($script:WorktreeCount) $scope before running out of time."
     Write-Host "The rest were NOT checked. Nothing below is an all-clear: a peer in an unwalked worktree"
-    Write-Host "cannot appear here at all. Re-run with -TimeBudgetSeconds 0 for the complete answer."
+    if ($LiveOnly) { Write-Host "cannot appear here at all. Re-run with -TimeBudgetSeconds 0, without -LiveOnly, for the complete answer." }
+    else { Write-Host "cannot appear here at all. Re-run with -TimeBudgetSeconds 0 for the complete answer." }
 }
 
 # --- single-file query (the hook's fast path) ----------------------------------------------------

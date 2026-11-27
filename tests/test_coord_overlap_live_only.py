@@ -8,8 +8,9 @@ a killed hook checks nothing. So the mode must:
 
 * still return the live peer's row, dirty file and all, so the gate can still deny on it;
 * drop the dormant peer's row, which neither caller reads;
-* neither read nor write the whole-map cache, because a live-only map read back by a bare run would
-  under-report every dormant worktree.
+* keep its whole-map cache in its own file, because a live-only map read back by a bare run would
+  under-report every dormant worktree;
+* leave the shared term memo's dormant entries in place for the next full walk.
 
 Driven against real throwaway repos, because the question is what the script walks and writes.
 """
@@ -47,13 +48,17 @@ def _git(repo: Path, *args: str) -> str:
     return proc.stdout
 
 
-def _cache_path(repo: Path) -> Path:
+def _common(repo: Path) -> Path:
+    return Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+
+
+def _cache_path(repo: Path, *, live: bool) -> Path:
     """The whole-map cache file for this querying root, named as overlap.ps1 names it."""
-    common = _git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
     top = _git(repo, "rev-parse", "--path-format=absolute", "--show-toplevel").strip()
     norm = top.replace("\\", "/").rstrip("/").lower()
     key = hashlib.sha256(norm.encode("utf-8")).hexdigest()[:8]
-    return Path(common) / "mefor-coord" / "overlap-cache" / f"{key}.json"
+    name = f"{key}.live.json" if live else f"{key}.json"
+    return _common(repo) / "mefor-coord" / "overlap-cache" / name
 
 
 @pytest.fixture
@@ -95,26 +100,28 @@ def fleet(tmp_path: Path) -> Iterator[dict[str, Any]]:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    (config_root / "sessions" / "1.json").write_text(
-        json.dumps(
-            {
-                "pid": stand_in.pid,
-                "sessionId": str(uuid.uuid4()),
-                "cwd": str(live),
-                "startedAt": int(time.time() * 1000),
-                "entrypoint": "claude-code",
-            }
-        ),
-        encoding="utf-8",
-    )
-    yield {"primary": primary, "config_root": config_root, "tmp": tmp_path}
-
-    stand_in.terminate()
+    # Reaped however setup ends, so a failed write cannot orphan the sleeper.
     try:
-        stand_in.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        stand_in.kill()
-        stand_in.wait(timeout=10)
+        (config_root / "sessions" / "1.json").write_text(
+            json.dumps(
+                {
+                    "pid": stand_in.pid,
+                    "sessionId": str(uuid.uuid4()),
+                    "cwd": str(live),
+                    "startedAt": int(time.time() * 1000),
+                    "entrypoint": "claude-code",
+                }
+            ),
+            encoding="utf-8",
+        )
+        yield {"primary": primary, "config_root": config_root, "tmp": tmp_path}
+    finally:
+        stand_in.terminate()
+        try:
+            stand_in.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            stand_in.kill()
+            stand_in.wait(timeout=10)
 
 
 def _overlap(fleet: dict[str, Any], *args: str) -> subprocess.CompletedProcess[str]:
@@ -167,21 +174,47 @@ def test_live_only_answers_the_single_file_query_the_gate_denies_on(fleet: dict[
     assert rows[0]["MatchedDirty"] is True, rows[0]
 
 
-def test_live_only_neither_writes_nor_reads_the_whole_map_cache(fleet: dict[str, Any]) -> None:
-    cache = _cache_path(fleet["primary"])
-    assert not cache.exists()
-    _overlap(fleet, "-LiveOnly")
-    assert not cache.exists(), "a live-only map was cached, so a bare run would under-report"
-
-    # A planted cache holding only a fabricated row: a run that read it would return that row.
-    _overlap(fleet)
-    assert cache.exists(), "the control: a full walk does write the cache"
+def _plant(cache: Path, branch: str) -> None:
+    """Replace a cache file's rows with one fabricated row, so a run that reads it returns it."""
     planted = json.loads(cache.read_text(encoding="utf-8-sig"))
-    planted["rows"] = [
-        {"Worktree": "ghost", "Branch": "ghost-branch", "Live": True, "Files": ["alpha.txt"]}
-    ]
+    planted["rows"] = [{"Worktree": branch, "Branch": branch, "Live": True, "Files": ["alpha.txt"]}]
     cache.write_text(json.dumps(planted), encoding="utf-8")
-    assert [r["Branch"] for r in _rows(_overlap(fleet))] == ["ghost-branch"], (
-        "the control: a full run within the window does read the planted cache"
+
+
+def _branches(fleet: dict[str, Any], *args: str) -> list[str]:
+    # A long window, so a slow runner cannot turn a cache hit into a re-walk between launches.
+    return [r["Branch"] for r in _rows(_overlap(fleet, "-CacheSeconds", "3600", *args))]
+
+
+def test_live_only_and_full_walks_never_share_a_whole_map_cache(fleet: dict[str, Any]) -> None:
+    full = _cache_path(fleet["primary"], live=False)
+    live = _cache_path(fleet["primary"], live=True)
+
+    _overlap(fleet, "-LiveOnly")
+    assert live.exists(), "a -LiveOnly walk writes its own cache file"
+    assert not full.exists(), "a live-only map reached the full cache, so a bare run under-reports"
+    _overlap(fleet)
+    assert full.exists(), "the control: a full walk writes the full cache"
+
+    # Each kind reads its own file and only its own: the controls show a planted file is read.
+    _plant(full, "ghost-full")
+    _plant(live, "ghost-live")
+    assert _branches(fleet) == ["ghost-full"]
+    assert _branches(fleet, "-LiveOnly") == ["ghost-live"]
+
+
+def test_live_only_keeps_the_dormant_peers_memo_entry(fleet: dict[str, Any]) -> None:
+    memo = _common(fleet["primary"]) / "mefor-coord" / "overlap-terms.json"
+    # The dormant peer needs a committed, unlanded change for the walk to memoise anything about it.
+    dormant = fleet["tmp"] / "dormant-wt"
+    _git(dormant, "commit", "-qam", "dormant commit")
+    _overlap(fleet, "-Refresh")
+    before = set(json.loads(memo.read_text(encoding="utf-8-sig")))
+    dormant_head = _git(dormant, "rev-parse", "HEAD").strip()
+    assert any(f"|{dormant_head}|" in k for k in before), (
+        f"the control: a full walk memoises the dormant peer's head {dormant_head}: {before}"
     )
-    assert [r["Branch"] for r in _rows(_overlap(fleet, "-LiveOnly"))] == ["live-branch"]
+
+    _overlap(fleet, "-Refresh", "-LiveOnly")
+    after = set(json.loads(memo.read_text(encoding="utf-8-sig")))
+    assert before <= after, f"a -LiveOnly walk pruned entries a full walk needs: {before - after}"
