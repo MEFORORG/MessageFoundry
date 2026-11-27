@@ -461,7 +461,7 @@ def test_the_arm_reader_follows_a_repointed_workflows_dir(
     (tmp_path / "ci-paths").mkdir()
     (tmp_path / "ci-paths" / "docker.txt").write_bytes(f"{planted}\n".encode())
     monkeypatch.setattr(workflow_contexts, "WORKFLOWS", workflows)
-    assert changes_arm_pattern("docker", "dockerignore") == planted != real
+    assert changes_arm_pattern("docker", "dockerignore") == f"(?:{planted})" != real
 
 
 def test_a_parsed_workflow_is_a_fresh_copy_each_call() -> None:

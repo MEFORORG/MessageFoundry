@@ -19,5 +19,5 @@
 ^\.pre-commit-config\.yaml
 ^constraints\.lock
 ^requirements\.lock
-^tests/(conftest\.py|_tooling_manifest\.py|tooling_manifest\.txt|test_tooling_partition\.py)
+^tests/(conftest\.py|_ci_paths\.py|_tooling_manifest\.py|tooling_manifest\.txt|test_tooling_partition\.py)
 ^\.github/ci-paths/

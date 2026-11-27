@@ -3321,13 +3321,14 @@ jobs:
           changed=$(git diff --name-only --no-renames "$BASE_SHA...HEAD")
           # Each path arm below reads its list from .github/ci-paths/<arm>.txt, one ERE per line,
           # anchored as the inline form was (BACKLOG #5472: this file sits at GitHub's size limit).
-          # A list that is missing, empty, or holds a blank or CR line, or a grep that errors, FAILS
-          # the job: grep reads a missing list as "no match" and a blank line as "match everything".
+          # A list that is missing, empty, matches the empty line (a blank line, `^x|`, `^.*`) or
+          # holds a CR, or a grep that errors, FAILS the job: grep reads a missing list as "no
+          # match" and a match-everything line as true for every PR.
           paths_match() {
             local list=".github/ci-paths/$1.txt" rc=0
             # -U: Git Bash's grep drops a CR before matching without it.
-            if [ ! -s "$list" ] || grep -qxE '' "$list" || grep -qUF $'\r' "$list"; then
-              echo "::error::$list is missing, empty, or holds a blank or CR line"
+            if [ ! -s "$list" ] || printf '\n' | grep -qEf "$list" || grep -qUF $'\r' "$list"; then
+              echo "::error::$list is missing, empty, matches everything, or holds a CR"
               exit 1
             fi
             echo "$changed" | grep -qEf "$list" || rc=$?
@@ -3337,7 +3338,7 @@ jobs:
             fi
             return "$rc"
           }
-          # NB: the tests/test_(...) alternation MUST list every file the sqlserver-store /
+          # NB: the tests/test_(...) line of .github/ci-paths/serverdb.txt MUST list every file the sqlserver-store /
           # postgres-store pytest steps below run (the ADR 0057/0058/0060/0066 throughput levers AND
           # the ADR 0013/0016 RTE capture/re-ingress case); those suites are MEFOR_TEST_SQLSERVER-gated
           # and run ONLY on the server-DB legs, so a file not matched here edits with NO real SS/PG
@@ -3443,7 +3444,7 @@ jobs:
           # routes the smoke never takes. An engine start change outside this list is still first run
           # by the nightly. A red here stops no merge either: the job is not a required context and
           # not in ci-gate's needs (see the note above ci-gate). The merge_group and push arms are
-          # unchanged (#1830). tests/test_ci_docker_gate.py pins this alternation, and the measured
+          # unchanged (#1830). tests/test_ci_docker_gate.py pins this arm's list, and the measured
           # run rate is in that file's docstring.
           if paths_match docker; then
             echo "docker=true" >> "$GITHUB_OUTPUT"

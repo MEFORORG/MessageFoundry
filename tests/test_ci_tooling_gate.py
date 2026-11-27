@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _bash_resolver import explain_returncode, probe_env, require_bash  # noqa: E402
 
 from tests import _tooling_manifest as tooling_manifest  # noqa: E402
-from tests._ci_paths import CI_PATHS, plant_lists  # noqa: E402
+from tests._ci_paths import CI_PATHS, ci_path_list, plant_lists  # noqa: E402
 from tests._workflow_contexts import changes_arm_pattern  # noqa: E402
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -115,6 +115,7 @@ _CASES = [
         True,
         "a changes-job path list: editing one must run the gate tests that read it (BACKLOG #5472)",
     ),
+    (["tests/_ci_paths.py"], True, "the one reader of those lists, which this tier's tests share"),
     # The four rows below pin the arm widened on 2026-08-18, and they are the only thing that does.
     # tests/test_lint_scope_parity.py is a manifest entry whose subject is a three-way agreement: the
     # ruff `rev:` pinned in .pre-commit-config.yaml, the `ruff==` constraints.lock installs, and the
@@ -193,7 +194,7 @@ def test_every_path_list_trips_the_tier_on_a_line_of_its_own() -> None:
     assert len(lists) >= 5, f"expected the five path lists, found {[p.name for p in lists]}"
     missed = [p.name for p in lists if not gate([f".github/ci-paths/{p.name}"])]
     assert not missed, f"editing these path lists does not run the tooling tier: {missed}"
-    assert r"^\.github/ci-paths/" in _gate_regex().split("|"), (
+    assert r"^\.github/ci-paths/" in ci_path_list("tooling"), (
         "the tooling list no longer names the path lists on a line of their own"
     )
 

@@ -24,3 +24,4 @@
 ^ci/python-version
 ^scripts/ci/(db-tls-cert|retry-native-crash)\.sh
 ^\.github/workflows/ci\.yml
+^\.github/ci-paths/serverdb\.txt$

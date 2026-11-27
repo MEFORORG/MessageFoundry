@@ -5,8 +5,9 @@
 ci.yml sits at GitHub's workflow file size limit (tests/test_ci_engine_suite_shards.py holds it
 under 512,000 bytes), and its five path arms -- ``serverdb``, ``docker``, ``packaging``, ``ide`` and
 ``tooling`` -- were written inline as one ``grep -qE '^(...)'`` each, several thousand bytes of
-it. They moved, owner-approved in chat on 2026-11-27, to ``.github/ci-paths/<arm>.txt``, one ERE per
-line, which the step reads with ``grep -qEf`` through its ``paths_match`` function.
+it. They moved to ``.github/ci-paths/<arm>.txt``, owner-approved in chat (the batch 20002 brief
+dates the approval 2026-11-27), one ERE per line, which the step reads with ``grep -qEf`` through
+its ``paths_match`` function.
 
 THE MOVE MUST NOT CHANGE A DECISION. ``_INLINE_AT_60EB058`` below is each inline regex exactly as
 ci.yml held it at commit 60eb058c1b3, the head the move started from, and the equivalence test runs
@@ -15,13 +16,22 @@ in the gate tests, and near-misses built from both. Python's ``re`` is a differe
 grep's ERE, so a Python-only comparison would prove the two Python readings agree, not that the
 step decides as before; the Python reading is compared too, because every other gate test uses it.
 
-THIS IS A PIN, AND IT IS MEANT TO RED ON A DELIBERATE EDIT. A change to a list that alters what it
-admits fails here until ``_INLINE_AT_60EB058`` is moved with it. Rename the constant and its source
-commit then, and say in the commit why the arm's coverage moved.
+The only paths allowed to differ are ``_ADMITTED_SINCE_THE_PIN``: what the move itself added. An
+edit to ci.yml ran every arm, because ci.yml was where the arms lived; each list now admits its own
+file, so an edit to a list still runs the arm it governs. The tooling list admits tests/_ci_paths.py,
+the reader its tests share.
 
-``paths_match`` itself is run under bash for the shapes a list can fail in: missing, empty, a blank
-line (``grep -f`` reads it as match-everything), a CR, a pattern grep refuses. Each fails the step.
-The inline form had no such failure: a missing list read as "no match", and the arm went false.
+THIS IS A PIN, AND IT REDS ON A DELIBERATE EDIT. A later change that widens an arm adds its paths
+to ``_ADMITTED_SINCE_THE_PIN`` and says why in the commit; ``_INLINE_AT_60EB058`` and
+``_SOURCE_SHA`` stay as they are, because they record where the move started. A change that narrows
+an arm, or adds one, is the point at which this pin has done its job: retire the equivalence tests
+rather than invent an inline arm that never existed. The gate tests beside this file pin what each
+arm must admit; this file pins only that the move did not change it.
+
+``paths_match`` itself is run under bash for the shapes a list can fail in: missing, empty, a line
+that matches the empty line (a blank line, ``^x|``, ``^.*``, which ``grep -f`` reads as
+match-everything), a CR, a pattern grep refuses. Each fails the step. The inline form had no such
+failure: a missing list read as "no match", and the arm went false.
 """
 
 from __future__ import annotations
@@ -36,7 +46,7 @@ from pathlib import Path
 import pytest
 
 from tests._bash_resolver import probe_env, require_bash
-from tests._ci_paths import CI_PATHS, arm_list_name, ci_path_list, joined
+from tests._ci_paths import CI_PATHS, PATHS_MATCH, arm_list_name, ci_path_list, joined
 from tests._workflow_contexts import changes_arm_pattern, jobs_of
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -277,29 +287,43 @@ def _grep(
     return proc.stdout.decode("utf-8").splitlines()
 
 
-def _inline_vs_list(bash: str, inline: str, listed: Path, corpus: Path) -> tuple[list[str], int]:
-    """The paths the inline regex and the list decide differently, and how many the inline admits."""
-    old = _grep(bash, corpus, inline=inline)
-    new = _grep(bash, corpus, listed=listed)
-    return sorted(set(old) ^ set(new)), len(old)
-
-
 # --------------------------------------------------------------------------------------------------
 # THE EQUIVALENCE, through real grep.
 # --------------------------------------------------------------------------------------------------
+
+
+#: What each list admits that its inline arm did not: what the move itself added (module
+#: docstring), as the path that must be newly admitted and the shape every newly admitted path must
+#: have. Each list admits its own file, as every arm admitted ci.yml, where it used to live. The
+#: tooling list's new line is unanchored at the end like its siblings, so `_ci_paths.pyx` rides too.
+_ADMITTED_SINCE_THE_PIN: dict[str, tuple[str, str]] = {
+    "serverdb": (".github/ci-paths/serverdb.txt", r"^\.github/ci-paths/serverdb\.txt$"),
+    "docker": (".github/ci-paths/docker.txt", r"^\.github/ci-paths/docker\.txt$"),
+    "packaging": (".github/ci-paths/packaging.txt", r"^\.github/ci-paths/packaging\.txt$"),
+    "ide": (".github/ci-paths/ide.txt", r"^\.github/ci-paths/ide\.txt$"),
+    "tooling": ("tests/_ci_paths.py", r"^tests/_ci_paths\.py"),
+}
+
+
+def _added_as_expected(arm: str, added: set[str]) -> bool:
+    must, shape = _ADMITTED_SINCE_THE_PIN[arm]
+    return must in added and all(re.search(shape, path) for path in added)
 
 
 @pytest.mark.parametrize("arm", sorted(_INLINE_AT_60EB058))
 def test_each_list_admits_exactly_what_its_inline_regex_admitted(
     arm: str, bash: str, corpus_file: Path
 ) -> None:
-    diff, admitted = _inline_vs_list(
-        bash, _INLINE_AT_60EB058[arm], CI_PATHS / f"{arm}.txt", corpus_file
+    old = set(_grep(bash, corpus_file, inline=_INLINE_AT_60EB058[arm]))
+    new = set(_grep(bash, corpus_file, listed=CI_PATHS / f"{arm}.txt"))
+    assert old, f"the {arm} inline regex admits nothing in the corpus; the corpus is wrong"
+    assert not old - new, (
+        f"the {arm} list no longer admits {len(old - new)} path(s) ci.yml's inline arm at "
+        f"{_SOURCE_SHA[:11]} admitted: {sorted(old - new)[:20]}"
     )
-    assert admitted, f"the {arm} inline regex admits nothing in the corpus; the corpus is wrong"
-    assert not diff, (
-        f"{len(diff)} path(s) the {arm} list decides differently from ci.yml's inline arm at "
-        f"{_SOURCE_SHA[:11]}: {diff[:20]}"
+    assert _added_as_expected(arm, new - old), (
+        f"the {arm} list admits {sorted(new - old)[:20]} beyond the inline arm; the move added only "
+        f"{_ADMITTED_SINCE_THE_PIN[arm]}"
     )
 
 
@@ -308,8 +332,9 @@ def test_the_python_reading_agrees_with_the_inline_regex(arm: str) -> None:
     """Every other gate test reads the list through ``changes_arm_pattern`` and Python's ``re``."""
     old = re.compile(_INLINE_AT_60EB058[arm])
     new = re.compile(changes_arm_pattern(arm, _SANITY[arm]))
-    differ = [p for p in _corpus() if bool(old.search(p)) != bool(new.search(p))]
-    assert not differ, f"the {arm} list's Python reading differs on: {differ[:20]}"
+    differ = {p for p in _corpus() if bool(old.search(p)) != bool(new.search(p))}
+    assert all(new.search(p) for p in differ), f"the {arm} Python reading lost: {differ}"
+    assert _added_as_expected(arm, differ), f"the {arm} Python reading differs on: {differ}"
 
 
 @pytest.mark.parametrize("arm", sorted(_INLINE_AT_60EB058))
@@ -326,14 +351,17 @@ def test_the_comparison_reds_on_a_damaged_list(
         lines = [lines[0].removeprefix("^"), *lines[1:]]
     damaged = tmp_path / f"{arm}.txt"
     damaged.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
-    diff, _ = _inline_vs_list(bash, _INLINE_AT_60EB058[arm], damaged, corpus_file)
-    assert diff, f"{damage} in the {arm} list went unseen; the equivalence test is blind to it"
+    old = set(_grep(bash, corpus_file, inline=_INLINE_AT_60EB058[arm]))
+    new = set(_grep(bash, corpus_file, listed=damaged))
+    assert old - new or not _added_as_expected(arm, new - old), (
+        f"{damage} in the {arm} list went unseen; the equivalence test is blind to it"
+    )
 
 
 def test_the_pinned_regexes_are_the_ones_ci_yml_held(tmp_path: Path) -> None:
     """Provenance of the pin: read each inline arm out of ci.yml at the source commit, the way the
     pre-move reader did, and compare. That commit leaves the history once the branch squash-merges,
-    so this skips where it is gone; it ran on the branch that made the move."""
+    so this skips where it is gone; it ran, and passed, on the branch that made the move."""
     if _git("cat-file", "-e", f"{_SOURCE_SHA}^{{commit}}").returncode != 0:
         pytest.skip(f"{_SOURCE_SHA[:11]} is not in this clone's history")
     shown = _git("show", f"{_SOURCE_SHA}:.github/workflows/ci.yml")
@@ -359,29 +387,85 @@ def _step_run() -> str:
     return found[0]
 
 
+#: An inline path arm: a grep of the changed paths whose -flags include E and whose pattern is a
+#: quoted literal starting `^`, in either quote. The code classifier's `grep -qE "$alwayscode"`
+#: is a variable, and the manifest arm's `grep -vE '^...'` reads the manifest, not the paths.
+_INLINE_ARM = re.compile(
+    r"""echo\s+"\$changed"\s*\|\s*grep\s+-[A-Za-z]*E[A-Za-z]*\s+(?:-e\s+)?['"]\^"""
+)
+
+
+def _code_lines(script: str) -> str:
+    return "\n".join(line for line in script.splitlines() if not line.lstrip().startswith("#"))
+
+
 def test_each_output_is_decided_by_its_own_list() -> None:
     text = _CI.read_text(encoding="utf-8")
     for arm in _INLINE_AT_60EB058:
         assert arm_list_name(text, arm) == arm, f"`{arm}` is decided by another arm's list"
 
 
-def test_every_list_is_read_by_exactly_one_arm_and_no_inline_arm_is_left() -> None:
-    code = "\n".join(line for line in _step_run().splitlines() if not line.lstrip().startswith("#"))
-    named = re.findall(r"\bpaths_match ([a-z_]+)\b", code)
+def test_every_list_is_read_by_one_arm_and_no_inline_arm_is_left() -> None:
+    code = _code_lines(_step_run())
+    named = [m.group(1) for m in PATHS_MATCH.finditer(code)]
     on_disk = sorted(p.stem for p in CI_PATHS.glob("*.txt"))
-    assert sorted(named) == on_disk == sorted(_INLINE_AT_60EB058), (named, on_disk)
-    assert "grep -qE '^(" not in code, "an inline path arm is back in the changes step"
+    assert sorted(named) == on_disk, f"arms {sorted(named)} against lists {on_disk}"
+    assert set(_INLINE_AT_60EB058) <= set(named), "a pinned arm no longer reads its list"
+    assert not _INLINE_ARM.search(code), "an inline path arm is back in the changes step"
+
+
+@pytest.mark.parametrize(
+    ("line", "inline"),
+    [
+        ("if echo \"$changed\" | grep -qE '^(docs/)'; then", True),
+        ("if echo \"$changed\" | grep -Eq '^docs/'; then", True),
+        ('if echo "$changed" | grep -qE "^(docs/)"; then', True),
+        ("if echo \"$changed\" | grep -E -e '^docs/' >/dev/null; then", True),
+        ('elif echo "$changed" | grep -qE "$alwayscode"; then', False),
+        ("grep -qxFf <(grep -vE '^[[:space:]]*(#|$)' tests/tooling_manifest.txt)", False),
+        ("if paths_match docs; then", False),
+    ],
+)
+def test_the_inline_arm_detector_on_planted_lines(line: str, inline: bool) -> None:
+    """NEGATIVE CONTROL for the guard above: it must see each inline shape, and not the arms that
+    are not inline. At least these shapes; a pattern spelt through a variable is not seen."""
+    assert bool(_INLINE_ARM.search(line)) is inline
 
 
 def test_each_list_is_well_formed() -> None:
-    """What ``ci_path_list`` and the step both refuse, plus: every line anchored, every line an
-    expression Python compiles (grep's own refusal is the bash test below)."""
+    """What ``ci_path_list`` and the step both refuse, plus: every line anchored, no line twice."""
     for arm in _INLINE_AT_60EB058:
         lines = ci_path_list(arm)
         unanchored = [line for line in lines if not line.startswith("^")]
         assert not unanchored, f"{arm} list lines without `^`: {unanchored}"
         assert len(set(lines)) == len(lines), f"the {arm} list repeats a line"
-        re.compile(joined(lines))
+
+
+@pytest.mark.parametrize(
+    ("content", "why"),
+    [
+        (b"^a(\n^b)\n", "two lines grep refuses that join into one valid regex"),
+        (b"^docs/|\n", "a trailing `|`, which matches every path"),
+        (b"^.*\n", "a line that matches every path"),
+        (b"^docs/\n\n", "a blank line"),
+        (b"^docs/\r\n", "a CR"),
+        (b"", "an empty list"),
+    ],
+)
+def test_the_python_reader_refuses_what_the_step_refuses(
+    tmp_path: Path, content: bytes, why: str
+) -> None:
+    (tmp_path / "probe.txt").write_bytes(content)
+    with pytest.raises(AssertionError):
+        ci_path_list("probe", tmp_path)
+    assert why
+
+
+def test_the_python_reader_joins_lines_so_one_cannot_reach_into_the_next() -> None:
+    """A ``|`` in one line must not widen the line beside it once joined."""
+    pattern = re.compile(joined(["^a/(x|y)", "^b/"]))
+    assert pattern.search("a/x") and pattern.search("b/c")
+    assert not pattern.search("y") and not pattern.search("c/b/")
 
 
 # --------------------------------------------------------------------------------------------------
@@ -458,6 +542,8 @@ def test_a_good_list_matches_as_grep_does(
         (b"^docs/\n\n^src/\n", "a blank line, which grep -f reads as match-everything"),
         (b"^docs/\r\n^src/\r\n", "a CR, which grep -f would carry into every pattern"),
         (b"^docs/(\n", "a pattern grep refuses"),
+        (b"^docs/|\n^src/\n", "a trailing `|`, which matches the empty line, so every path"),
+        (b"^.*\n", "a line that matches every path"),
     ],
 )
 def test_a_bad_list_fails_the_step(

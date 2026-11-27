@@ -10,3 +10,4 @@
 ^scripts/ci/make_syslog_ca_crl\.py$
 ^tests/_phi_gate_provisions\.py$
 ^\.github/workflows/ci\.yml
+^\.github/ci-paths/docker\.txt$
