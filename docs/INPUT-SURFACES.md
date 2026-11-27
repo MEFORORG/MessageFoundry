@@ -177,10 +177,11 @@ already text, and check 8 does not run. A reply a check refuses is recorded with
 with at least these exceptions. A reply whose read fails because a key service gave no verdict is
 not dead-lettered: the token is re-pended with a backoff and holds its FIFO lane, and a pooled lane
 under `infra_fault_policy = stop` can go `STOPPED` with the token left pending. A reply that fails
-to decrypt for any other reason, a fault in the engine's own code such as an `AADComponentError`
-included, or that holds a lone
-surrogate (`_unstorable_reply`), is dead-lettered by `dead_letter_now` before the size ceiling, and
-no `ERROR` child is stored for it. The handoff's own decrypt failures dead-letter the token through
+to decrypt for any other reason, or that holds a lone surrogate (`_unstorable_reply`), is
+dead-lettered by `dead_letter_now` before the size ceiling, and no `ERROR` child is stored for it.
+A CipherError on the step's read that is an engine fault, such as an AADComponentError, is
+dead-lettered with its reference kept. Any other exception in the step re-pends and holds the lane.
+The handoff's own decrypt failures dead-letter the token through
 `_consume_dead`, except at least a key service with no verdict, which re-pends it the same way.
 A refused reply on a token the handoff stores no child for, such as
 a depth-capped token, gets no `ERROR` child either.
