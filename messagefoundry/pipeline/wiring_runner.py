@@ -13244,6 +13244,13 @@ class RegistryRunner:
                 if item is None:
                     faults.healthy()
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3 (loopback lane)
+                    # BACKLOG #5727: a claim whose open of the token's payload gets no verdict sets
+                    # the token aside and returns None, so a full key-service outage reaches only
+                    # this branch. The set-aside token is pending, so the check counts it.
+                    now = time.time()
+                    if now - last_buildup_check >= _BUILDUP_CHECK_INTERVAL:
+                        last_buildup_check = now
+                        await self._response_buildup_check(name)
                     woken = await self._wait_for_work(wait_ev)
                     continue
                 gate = await self._log_gate_after_claim("response", name, claimed, faults, fence)

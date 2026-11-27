@@ -171,6 +171,8 @@ class FaultingCipher:
         self.seal_error: Exception | None = None
         #: A value this cipher reports it holds no key for, while the real cipher names its keys.
         self.unheld: str | None = None
+        #: Whether ``open_error`` fails every open, not only ``target``'s: a whole outage.
+        self.every = False
 
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self._real, name)
@@ -180,7 +182,7 @@ class FaultingCipher:
         return attr
 
     def decrypt(self, stored: Any, *args: Any, **kwargs: Any) -> Any:
-        if self.open_error is not None and stored == self.target:
+        if self.open_error is not None and (self.every or stored == self.target):
             raise self.open_error
         return self._real.decrypt(stored, *args, **kwargs)
 
@@ -192,6 +194,7 @@ class FaultingCipher:
     def heal(self) -> None:
         self.open_error = self.seal_error = None
         self.unheld = None
+        self.every = False
 
 
 #: How long :class:`BlockingFaultingCipher` holds each open of its target, as a key service that

@@ -187,6 +187,45 @@ async def test_a_reply_lane_held_by_no_verdict_faults_raises_the_buildup_alert(
     assert sink.buildup == [(LOOP, 1)], "no queue_buildup alert for the held reply lane"
 
 
+async def test_a_whole_outage_set_aside_at_the_claim_raises_the_buildup_alert(
+    store: MessageStore,
+) -> None:
+    """BACKLOG #5727: when every open fails, the claim's own open of the token's payload gets no
+    verdict, so the claim sets the token aside and returns None. The worker reaches only its
+    empty-claim branch, and that branch's build-up check is what pages it."""
+    fetch = _fetch(store)
+    head = await contract.captured(store, control="UR-W-OUTAGE", now=1.0)
+    runner = contract.runner(store)
+    sink = _BuildupSink()
+    runner._alert_sink = sink
+    runner._buildup_default = BuildupThreshold(max_oldest_seconds=60.0)
+    reached: list[str] = []
+    real_step = runner._process_response_item
+
+    async def step(name: str, item: Any) -> Any:
+        reached.append(item.id)
+        return await real_step(name, item)
+
+    runner._process_response_item = step  # type: ignore[method-assign]
+    with contract.faulting_cipher(store) as fault:
+        fault.every, fault.open_error = True, CipherUnavailableError("synthetic")
+        task = asyncio.ensure_future(runner._response_worker(LOOP))
+        try:
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(4.0):
+                    while not sink.buildup:
+                        await asyncio.sleep(0.02)
+        finally:
+            runner._stop.set()
+            runner._response_work.set()
+            await asyncio.wait_for(task, timeout=5.0)
+    # CONTROL: the claim set the token aside, so the step never ran and nothing was dead-lettered.
+    assert reached == []
+    assert (await contract.token_of(fetch, head))["status"] == OutboxStatus.PENDING.value
+    assert not [e for e in await store.events_for(head) if e["event"] == "dead"]
+    assert sink.buildup == [(LOOP, 1)], "no queue_buildup alert for a lane set aside at the claim"
+
+
 async def test_a_reply_lane_backlog_raises_the_buildup_alert_from_the_success_path(
     store: MessageStore,
 ) -> None:
