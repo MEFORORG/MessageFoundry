@@ -244,12 +244,22 @@ jobs:
 
           eligible=true
           saw_any=false
-          # `read` drops ONE trailing empty field, so `a,` would read as `a` alone. That is an empty
-          # member like `a,,b`, and it denies the same way (BACKLOG #5474).
+          # Before the split, two shapes `read` would lose (BACKLOG #5474). It stops at a newline, so a
+          # member after one is never checked: admit only the characters a dependency name and
+          # fetch-metadata's `, ` join carry (ASCII letters and digits, `@/._-`, comma, space), and
+          # hold anything else, a control character or non-ASCII whitespace included, without
+          # echoing it. And it drops ONE trailing empty field, so `a,` would read as `a` alone: that
+          # is an empty member like `a,,b`, and it holds the same way.
           case "$DEP_NAMES" in
+            *[!A-Za-z0-9@/._,\ -]*)
+              echo "::notice::the dependency list carries a character no dependency name has — routing the WHOLE PR to manual review."
+              echo "eligible=false" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
             *,)
               echo "::notice::the dependency list ends in a comma, so a member has no name — routing the WHOLE PR to manual review."
-              eligible=false
+              echo "eligible=false" >> "$GITHUB_OUTPUT"
+              exit 0
               ;;
           esac
           IFS=',' read -ra names <<< "$DEP_NAMES"

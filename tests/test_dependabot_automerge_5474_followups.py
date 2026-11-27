@@ -29,10 +29,16 @@ from tests import test_dependabot_automerge_guardrails as g
         # Controls: fetch-metadata's own `, ` join, and padding at either end, still pass.
         ("actions/checkout, github/codeql-action/init", "true"),
         (" actions/checkout ", "true"),
-        ("actions/checkout,\tactions/setup-python", "true"),
         # THE REGRESSION ROWS, each `eligible=true` before the fix. `read` drops one trailing empty
         # field, so a trailing comma read as a list with no empty member.
         ("actions/checkout,", "false"),
+        # `read` stops at a newline, so a member after one was never checked.
+        ("actions/checkout\nevil/x", "false"),
+        ("actions/checkout,\n", "false"),
+        # A character no name or join carries holds, a tab, a CR and non-ASCII space included.
+        ("actions/checkout,\tactions/setup-python", "false"),
+        ("actions/x\r::stop-commands::tok", "false"),
+        ("\u00a0actions/checkout", "false"),
         # Interior whitespace was stripped, rewriting the name into one the row admits.
         ("actions/ checkout", "false"),
         ("actions/check out", "false"),
@@ -50,6 +56,9 @@ def test_allowset_denies_a_trailing_comma_and_whitespace_inside_a_name(
     )
     assert run.rc == 0, f"the allowset body aborted (rc={run.rc}){g._diagnostic(run)}"
     assert run.outputs.get("eligible") == expected, f"{names!r}{g._diagnostic(run)}"
+    # A held list is never echoed back into a workflow command.
+    if "\r" in names:
+        assert "stop-commands" not in run.stdout, run.stdout
 
 
 # --------------------------------------------------------------------------------------------------
@@ -63,7 +72,9 @@ def _unquoted(body: str) -> str:
 
 
 def _version_routes(body: str) -> tuple[int, int]:
-    """How many times the body assigns the version track, and emits its output, in any quoting."""
+    """How many times the body assigns the version track, and emits its output, through double
+    and single quotes. Not through a backslash escape, `$'...'` quoting or `printf -v`, which a
+    review reads."""
     flat = _unquoted(body)
     return (
         # A shell assignment takes no spaces round `=`, and `$track` is a read, not an assignment.
@@ -74,7 +85,7 @@ def _version_routes(body: str) -> tuple[int, int]:
 
 def test_a_quoted_second_version_track_route_cannot_hide_from_the_pin() -> None:
     """The existing pin counts the literal ``track=version``, so a second arm spelled
-    ``track="version"`` would sit beside it unread. This count reads through the quoting."""
+    ``track="version"`` would sit beside it unread. This count reads through those quotes."""
     body = str(g._step("ghsa")["run"])
     assert _version_routes(body) == (1, 1), _version_routes(body)
     # The instrument check: each quoted second route must move the count.
@@ -91,8 +102,9 @@ def test_a_quoted_second_version_track_route_cannot_hide_from_the_pin() -> None:
 
 
 def _journaling_curl(tmp_path: Path, stub_dir: Path, payload: str) -> Path:
-    """Replace ``stub_dir``'s curl with one that records its argv OUTSIDE the stub directory."""
-    journal = tmp_path / "curl5474.calls"
+    """Replace ``stub_dir``'s curl with one that records its argv where the guardrail file's
+    ``_assert_the_fixture_answered`` reads it, OUTSIDE the stub directory."""
+    journal = g._curl_journal(tmp_path)
     record = "printf '%s\\n' \"$*\" >> '" + journal.as_posix() + "'\n"
     stub = stub_dir / "curl"
     stub.write_text(
@@ -118,8 +130,10 @@ _NAMELESS_AGE_ROWS = [
 
 
 def _assert_the_age_rows(deps_json: str, expected: str, tmp_path: Path, real_jq: bool) -> None:
-    """The aged row must have been answered by the curl stub, and a nameless row denies before
-    asking about itself: every recorded call names the one named dependency."""
+    """The aged row must have asked the curl stub, and a nameless row denies before asking about
+    itself: every recorded call names the one named dependency. With stubbed jq the curl answer is
+    not what dates the row (the jq stub prints the date), so only the real-jq arm also checks the
+    computed age against the fixture."""
     aged = g._iso(24 * 30)
     if real_jq:
         stub_dir = g._stub_dir(tmp_path, [], jq=False)
@@ -127,9 +141,8 @@ def _assert_the_age_rows(deps_json: str, expected: str, tmp_path: Path, real_jq:
         # The jq stub prints these rows as real jq's `@tsv` would print this DEPS_JSON.
         rows = [(d.get("dependencyName"), d.get("newVersion")) for d in json.loads(deps_json)]
         stub_dir = g._stub_dir(tmp_path, rows, published=aged)
-    journal = _journaling_curl(
-        tmp_path, stub_dir, f'{{"urls":[{{"upload_time_iso_8601":"{aged}"}}]}}'
-    )
+    payload = f'{{"urls":[{{"upload_time_iso_8601":"{aged}"}}]}}'
+    journal = _journaling_curl(tmp_path, stub_dir, payload)
     run = g._run_step_body(
         "age",
         {"SECURITY_TRACK": "true", "DEP_ECOSYSTEM": "uv", "DEPS_JSON": deps_json},
@@ -141,7 +154,9 @@ def _assert_the_age_rows(deps_json: str, expected: str, tmp_path: Path, real_jq:
     calls = _calls(journal)
     assert all("requests/2.32.3/json" in c for c in calls), f"a nameless row was asked: {calls}"
     if expected == "true":
-        assert calls, f"the curl stub never answered the aged row{g._diagnostic(run)}"
+        g._assert_the_fixture_answered(tmp_path, run, "requests/2.32.3/json")
+        if real_jq:
+            g._assert_the_age_is_the_fixtures(run, payload)
 
 
 @pytest.mark.parametrize(("deps_json", "expected"), _NAMELESS_AGE_ROWS)
@@ -173,7 +188,9 @@ _ALLOWSET_GATE = "steps.allowset.outputs.eligible == 'true'"
 
 
 def _is_exactly_the_allowset_gate(cond: object) -> bool:
-    return " ".join(str(cond).split()) == _ALLOWSET_GATE
+    text = " ".join(str(cond).split())
+    wrapped = re.fullmatch(r"\$\{\{\s*(.*?)\s*\}\}", text)
+    return (wrapped.group(1) if wrapped else text) == _ALLOWSET_GATE
 
 
 @pytest.mark.parametrize("step_id", ["age", "authors"])
@@ -189,10 +206,12 @@ def test_the_gated_steps_run_on_the_allow_set_conjunct_and_nothing_else(step_id:
     ):
         assert _ALLOWSET_GATE in loosened  # the old substring check would have passed it
         assert not _is_exactly_the_allowset_gate(loosened), loosened
+    # And the equivalent `${{ }}` spelling is not a false accusation.
+    assert _is_exactly_the_allowset_gate(f"${{{{ {_ALLOWSET_GATE} }}}}")
 
 
 # --------------------------------------------------------------------------------------------------
-# Item 16: an end-to-end run of the hold for an actions PR outside dependabot.yml's groups
+# Item 16: the hold for an actions PR outside dependabot.yml's groups, through three step bodies
 # --------------------------------------------------------------------------------------------------
 
 
@@ -206,11 +225,12 @@ def test_the_gated_steps_run_on_the_allow_set_conjunct_and_nothing_else(step_id:
         ("actions-new", False),
     ],
 )
-def test_an_actions_pr_outside_the_groups_holds_end_to_end(
+def test_an_actions_pr_outside_the_groups_holds_through_the_step_bodies(
     group: str, arms: bool, tmp_path: Path
 ) -> None:
     """The allow-set, ghsa and age bodies run in order on one actions PR, each fed the previous
-    steps' real outputs, and the shipped merge ``if`` decides on them."""
+    steps' real outputs, and the shipped merge ``if`` decides on them. The authors step and the
+    metadata are NOT run: they are fixed at their arming values, so only these three steps decide."""
     for sub in ("a", "g", "s"):
         (tmp_path / sub).mkdir()
     eco = "github_actions"
@@ -225,7 +245,10 @@ def test_an_actions_pr_outside_the_groups_holds_end_to_end(
         tmp_path / "g",
     )
     assert ghsa.rc == 0, g._diagnostic(ghsa)
-    # The age step's own `if` is the allow-set conjunct, which passed above, so it runs.
+    age_runs = g._evaluate_expression(
+        str(g._step("age").get("if", "")), {"steps.allowset.outputs.eligible": "true"}
+    )
+    assert age_runs is True, "the age step would be skipped on an eligible PR"
     age = g._run_step_body(
         "age",
         {
@@ -261,13 +284,15 @@ def _unrestricted_star(group: dict) -> bool:
 
 
 def test_the_actions_groups_cover_every_action() -> None:
-    """The workflow header says every github-actions update lands in ``actions-deps`` or
-    ``actions-security``, so the unknown-group hold is reached only by a PR Dependabot opens outside
-    them. That rests on both groups matching ``*`` unrestricted; this pins it."""
+    """The workflow header says the unknown-group hold is reached at least by an actions PR
+    Dependabot opens outside ``actions-deps`` and ``actions-security``. That such a PR is rare rests
+    on both groups matching ``*`` unrestricted and on no ``multi-ecosystem-group`` routing actions
+    elsewhere; this pins both. It cannot rule out an ungrouped PR Dependabot opens anyway."""
     actions = [
         u for u in g._load_dependabot()["updates"] if u["package-ecosystem"] == "github-actions"
     ]
     assert len(actions) == 1, actions
+    assert "multi-ecosystem-group" not in actions[0], actions[0]
     groups = actions[0].get("groups") or {}
     version = [
         n for n, v in groups.items() if v.get("applies-to", "version-updates") == "version-updates"
