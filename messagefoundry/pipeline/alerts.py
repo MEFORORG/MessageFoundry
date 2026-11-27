@@ -32,6 +32,7 @@ __all__ = [
     "INTAKE_DISK_REASON",
     "REMINDER_SECONDS",
     "STORE_RESTORED_SUBJECT",
+    "UNREACHED_ROLLUP_SOURCE",
     "AlertSink",
     "HELD_COPY_NOTE",
     "LoggingAlertSink",
@@ -53,6 +54,12 @@ log = logging.getLogger(__name__)
 #: ``DEPTH_REASON`` and ``DISK_REASON``.
 INTAKE_DEPTH_REASON = "staged_depth"
 INTAKE_DISK_REASON = "disk_floor"
+
+#: The source label prefix of a rollup of unreachable directory accounts' ``ad_reconcile_aborted``
+#: instance, ``<this>:<key>`` (vault BACKLOG #3100 item 14). The API raises it; why each rollup is
+#: keyed by its accounts is said there, at ``_UNREACHED_ROLLUP_SOURCE``. Defined here so the
+#: notifier, which bounds its in-memory state for these instances, shares the one spelling.
+UNREACHED_ROLLUP_SOURCE = "directory-reconciler-unreached-rollup"
 
 #: How often an emitter raises a condition that persists again: ``queue_buildup``, ``message_stall``
 #: and ``saturation`` in ``wiring_runner``, and ``intake_paused`` in ``intake_bound``. One value, so
@@ -792,9 +799,10 @@ class AlertSink(Protocol):
         for a probe fault, ``"directory-reconciler-misconfigured"`` for a configuration refusal,
         ``"directory-reconciler-paging:<username>"`` for a paging refusal,
         ``"directory-reconciler-outage"`` for a lasting outage, and
-        ``"directory-reconciler-unreached:<username>"`` for an unreached account, or the bare
-        ``"directory-reconciler-unreached"`` for a rollup of those entering on one pass
-        (``AuthService._record_unreached_accounts`` decides when), so each
+        ``"directory-reconciler-unreached:<username>"`` for an unreached account, or
+        ``"directory-reconciler-unreached-rollup:<key>"`` for a rollup of those entering on one
+        pass, keyed by those accounts (``AuthService._record_unreached_accounts`` decides when,
+        and the API's ``_UNREACHED_ROLLUP_SOURCE`` says why), so each
         is its own instance and throttle. ``reason`` is one of those eight closed-set slugs.
         ``probed`` is, for
         the breaker, how many principals the pass judged, its denominator, and a paging refusal

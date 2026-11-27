@@ -352,6 +352,7 @@ INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #3772: hashlib for the SHA-256 that bounds over-long client-address text in the
     # new-address signal's dedupe keys and rows. A dedupe key over caller text, not a secret. And
     # (BACKLOG #3770) the keyed digest of the past-cap log line, prefixed with a per-process secret.
+    # And (BACKLOG #3100 item 14) a rollup alert's instance key over user ids, not a secret.
     "messagefoundry/auth/service.py": frozenset(
         {"hashlib", "messagefoundry.config.tls_policy", "messagefoundry.store.crypto", "secrets"}
     ),
@@ -1296,6 +1297,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # BACKLOG #3770: _address_log_field, a SHA-256 over a per-process secret prefix
             # (_ADDRESS_LOG_KEY, from secrets.token_urlsafe) and the text, a keyed digest that keeps
             # an unparsed address out of the log; a reading aid, not an authenticator.
+            # BACKLOG #3100 item 14: _unreached_rollup_key, a SHA-256 over the sorted user ids of
+            # the accounts a rollup pages for, the key its alert instance's source carries.
             "hash:hashlib.sha256",
             # BACKLOG #2592: the passkey set is checked against the digest the account's integrity
             # seal covers (store.passkey_digest, a SHA-256 the seal authenticates).

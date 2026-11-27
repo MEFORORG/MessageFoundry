@@ -873,12 +873,23 @@ _FORFEIT_NOBODY_ELSE: Final[str] = (
     ", because a restarted process does not resolve one it finds open, and a [cluster] node or "
     "an engine of more than one engine shard resolves none itself"
 )
-#: Where those whose row this pass wrote, plus the accounts latched as paged unreachable that still
-#: hold a live session and a directory key and whose window has not since held only answers, are
-#: more than this, those entering page as one (BACKLOG #3100 closing step 2, #3709;
-#: `AuthService._record_unreached_accounts`). A fixed number, not a setting, so tuning the
-#: mass-revoke breaker does not change how these page.
+#: Where those whose row this pass wrote are more than this, they page as one (BACKLOG #3100
+#: closing step 2, #3709, item 14; `AuthService._record_unreached_accounts`), so no pass pages more
+#: than this many accounts by name. A fixed number, not a setting, so tuning the mass-revoke
+#: breaker does not change how these page.
 _UNREACHED_ROLLUP_ABOVE: Final[int] = 5
+
+
+def _unreached_rollup_key(user_ids: Iterable[str]) -> str:
+    """The key a rollup's page carries in its source, ``ReconcilePlan.unreached_rollup``: 16 hex
+    characters of a SHA-256 over the sorted user ids of the accounts entering (BACKLOG #3100 item
+    14). An alert-instance key, not a secret and not a pseudonym: anyone who can list user ids can
+    recompute it. The ids, not the names, so the source carries no username and a rename keeps the
+    key; sorted, so the order a pass probed them in does not change it."""
+    ids = "\n".join(sorted(user_ids))
+    return hashlib.sha256(ids.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+
 #: What a forfeited standing logs when a new condition of its kind opens (BACKLOG #3083).
 _FORFEITED_EPISODE_WARNINGS: Final[dict[_EpisodeKind, str]] = {
     "breaker": (
@@ -10334,9 +10345,10 @@ class AuthService:
         whose window holds no failure keeps no window, which reads the same as one of answers
         only, since an answer adds nothing to the count.
 
-        **A flapping directory must not page every account.** Whether the lifespan task pages
+        **No pass pages more than a few accounts by name.** Whether the lifespan task pages
         once for those entering (``unreached_rollup``) is decided by
-        :meth:`_record_unreached_accounts`, on the rows it wrote; each account whose row was
+        :meth:`_record_unreached_accounts`, on the rows this pass wrote alone, so accounts that
+        enter a few at a time on successive passes each page by name; each account whose row was
         written has that row, and one whose row was refused gets no row, page or latch on that
         pass.
 
@@ -10391,10 +10403,11 @@ class AuthService:
         account unpaged and unlatched, so a later failing probe of it can write the row and page.
 
         Then it decides the rollup (``unreached_rollup``, BACKLOG #3709), once and on the rows
-        written: whether the accounts already paged and those just written are more than
-        :data:`_UNREACHED_ROLLUP_ABOVE`. Nothing is latched before the pass ends, so the paged set
-        holds only earlier passes' accounts. Decided on the entries instead, a pass whose refusals
-        left five or fewer standing paged its written ones under the bare source, naming none, and
+        this pass wrote alone: whether they are more than :data:`_UNREACHED_ROLLUP_ABOVE`. The
+        accounts latched by earlier passes do not count (BACKLOG #3100 item 14): counted, one
+        account entering after five or more were latched paged in a rollup of one, naming
+        nobody; a latched account pages no more either way. Decided on the entries instead, a
+        pass whose refusals left five or fewer written paged them in a rollup, naming none, and
         one whose every row was refused carried a rollup with nothing in it.
 
         It logs one WARNING naming each account whose row was written, or one WARNING with the
@@ -10440,12 +10453,7 @@ class AuthService:
         finally:
             if pending is not None:
                 warn(pending[1], pending[2])
-            # A rollup only with something written: one with nothing would page nothing, and the
-            # lifespan task reads the run's length off the entries (final-round finding 1).
-            rollup = (
-                bool(written)
-                and len(self._reconcile_unreached_paged) + len(written) > _UNREACHED_ROLLUP_ABOVE
-            )
+            rollup = len(written) > _UNREACHED_ROLLUP_ABOVE
             if rollup:
                 _log.warning(
                     "directory reconcile: %d accounts entered the unreachable state, so "
@@ -10456,7 +10464,13 @@ class AuthService:
             else:
                 for _user_id, username, probes in written:
                     warn(username, probes)
-        return replace(plan, unreached=tuple(written), unreached_rollup=rollup)
+        key = _unreached_rollup_key(uid for uid, _n, _p in written) if rollup else None
+        if key is not None:
+            # So an operator can match an open rollup instance to this pass's rows by its key
+            # (BACKLOG #3100 item 14). Outside the finally, so a raise out of a row write logs no
+            # key; a raise later in the pass can still leave the key with no page.
+            _log.info("directory reconcile: those %d accounts roll up as %s", len(written), key)
+        return replace(plan, unreached=tuple(written), unreached_rollup=key)
 
     def _latch_unreached_accounts(self, plan: reconcile.ReconcilePlan) -> None:
         """Record that each entry's page is raised, last in the pass, as the outage's is

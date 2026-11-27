@@ -475,6 +475,7 @@ from messagefoundry.pipeline.alert_sinks import (
 )
 from messagefoundry.pipeline.alerts import (
     STORE_RESTORED_SUBJECT,
+    UNREACHED_ROLLUP_SOURCE,
     AlertSink,
     LoggingAlertSink,
     administrator_granted_alert,
@@ -12817,15 +12818,27 @@ _UNREACHED_ALERT_TEXT: Final[str] = (
     "probes, faults aside, failed to reach the directory. Check its entry, and any outage, "
     "referral or configuration alert."
 )
+#: The source label prefix of a rollup's instance (BACKLOG #3100 item 14). Each rollup is keyed by
+#: the accounts it covers (``ReconcilePlan.unreached_rollup``), never by one shared label: the
+#: notifier keys its cooldown and an operator's suspend by type and source, so under one label the
+#: last rollup's cooldown, or a suspend of any rollup, silenced every later rollup, and with it each
+#: account entering then, which no other page names. Keyed by the account set, a cooldown or
+#: suspend reaches only a later rollup of exactly those accounts, as a per-account one reaches only
+#: that account, so each rollup is resolved or suspended on its own; the outage page covers a whole
+#: directory. A later rollup of a different set pages, even one holding accounts paged before, such
+#: as those of several rollups re-entering together after a restart, as a per-account page does
+#: after one. An INFO line logs the key with the pass's count. Not under
+#: ``directory-reconciler-unreached:``, where a username could spell the label.
+_UNREACHED_ROLLUP_SOURCE = UNREACHED_ROLLUP_SOURCE
 #: What one page for many such accounts says, on a pass that rolls them up
 #: (``AuthService._record_unreached_accounts`` decides when), so a flapping directory opens one
-#: instance rather than one per signed-in account. It counts only the accounts entering on its
-#: pass, and says so: a later rollup updates the same open instance's text, so a count that read
-#: as a total would be replaced by a smaller one while more accounts stood (BACKLOG #3709). No
-#: process can say how many stand: each counts its own, and the instance is shared. ``probes``
-#: is the fewest failures among those entering, of up to each one's last ``window`` probes (its
-#: window can hold fewer, and a probe fault adds nothing to it, hence "faults aside"), counted in
-#: probes, not passes, which differ under a probe budget smaller than the estate.
+#: instance per set of accounts entering together rather than one per account. It counts only
+#: the accounts entering on its pass, and says so: no process can say how many stand, since each
+#: counts its own, and a later rollup of the same accounts updates the same open instance's text
+#: (BACKLOG #3709). ``probes`` is the fewest failures among those entering, of up to each one's
+#: last ``window`` probes (its window can hold fewer, and a probe fault adds nothing to it, hence
+#: "faults aside"), counted in probes, not passes, which differ under a probe budget smaller than
+#: the estate.
 _UNREACHED_ROLLUP_TEXT: Final[str] = (
     "Accounts newly unreachable: {entering}. Their sessions are not revoked; each failed {probes}+ "
     "of up to its last {window} probes, faults aside. Check the directory. "
@@ -13043,11 +13056,12 @@ def _alert_unreached_accounts(plan: ReconcilePlan, sink: AlertSink) -> None:
     enters). That many of up to its last ``plan.unreached_window`` probes failed to reach the
     directory, so the reconciler has neither struck nor revoked it. Once per entry, like a paging
     refusal, and with no inverse: an operator resolves it. The account name is in the source
-    only, as for a paging refusal. On a rolled-up pass (``plan.unreached_rollup``), one page under
-    the bare source covers those entering, naming none, and counting only them."""
+    only, as for a paging refusal. On a rolled-up pass (``plan.unreached_rollup``), one page covers
+    those entering, naming none and counting only them, under a source keyed by those accounts
+    (:data:`_UNREACHED_ROLLUP_SOURCE` says why)."""
     if plan.unreached_rollup:
         sink.ad_reconcile_aborted(
-            _UNREACHED_ALERT_SOURCE,
+            f"{_UNREACHED_ROLLUP_SOURCE}:{plan.unreached_rollup}",
             reason=UNREACHED_ACCOUNT,
             probed=plan.asked,
             detail=_UNREACHED_ROLLUP_TEXT.format(
