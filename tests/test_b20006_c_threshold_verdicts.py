@@ -132,6 +132,7 @@ def test_no_sends_after_the_reload_without_engine_metrics_fails_inconclusive() -
     )
     assert not result.ok and result.inconclusive, result.detail
     assert "nothing was sent after the reload probe" in result.detail
+    assert _SUFFIX in result.detail
 
 
 def test_no_sends_after_the_reload_with_the_engine_read_stays_loss() -> None:

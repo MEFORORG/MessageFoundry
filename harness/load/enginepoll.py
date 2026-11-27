@@ -122,8 +122,10 @@ def _pool_wait_attr(status: Any, name: str) -> float | None:
 @dataclass(frozen=True)
 class EngineSample:
     """One engine-side observation. ``read``/``written``/``done``/``dead`` are cumulative since engine
-    start, so run totals are last − first. Under a multi-shard cluster every field is the **sum**
-    across all polled shards."""
+    start, so run totals are last − first. Under a multi-engine-shard cluster most fields are the
+    **sum** across all polled engine shards, store-wide gauges included (BACKLOG #5950). At least
+    the per-process executor gauges (the busiest engine shard's), the pool snapshot and the uptime
+    are not; :meth:`EnginePoller._sample_sync` names the rule per field."""
 
     elapsed_s: float
     pending: int  # outbound stage, status=pending
@@ -145,7 +147,8 @@ class EngineSample:
     uptime_s: float
     # B11 connection-scale instrumentation (read-only, additive; default 0/None so an OLDER engine
     # without these fields deserializes to zeros — the established back-compat pattern). Summed across
-    # shards where summable; pool gauges take the first server-store shard reporting one.
+    # engine shards where summable; executor gauges take the busiest engine shard, and the legacy
+    # pool gauges the first server-store engine shard reporting one.
     empty_claims: int = 0  # Σ cumulative empty claims (wall #3)
     empty_claims_idle_poll: int = 0  # the idle-poll re-SELECT share
     empty_claims_wake_fanout: int = 0  # the per-commit wake-fanout (thundering-herd) share

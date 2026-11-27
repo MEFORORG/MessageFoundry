@@ -175,6 +175,17 @@ def test_the_store_dead_text_is_not_repeated_beside_the_same_outbound_count() ->
     assert "the store holds" not in result.detail
 
 
+def test_a_real_outbound_dead_letter_moves_all_three_counts_and_is_one_loss() -> None:
+    # The shape the engine produces: a dead outbound row raises `out_dead` and the store's dead
+    # rows, and the finalizer gives its message an ERROR disposition.
+    c = Counters(sent=36, acked=36, sink_received=33)
+    result = _judge(c, _sample(read=36, written=33, dead=3, out_dead=3, in_errored=3))
+    assert not result.ok and not result.inconclusive, result.detail
+    assert "3 outbound row(s) dead-lettered" in result.detail
+    assert "the store holds" not in result.detail
+    assert "3 message(s) took an ERROR disposition" in result.detail
+
+
 def test_a_store_dead_count_that_fell_is_inconclusive() -> None:
     c = Counters(sent=36, acked=36, sink_received=36)
     base = _sample(read=0, written=0, dead=6)

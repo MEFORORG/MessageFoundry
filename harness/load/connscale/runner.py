@@ -2148,7 +2148,7 @@ def _excusal(c: Counters, *, unconfirmed_budget: int, reload_stranded: int = 0) 
     # then treats every other send as confirmed. So an over-budget detail can also print
     # "lost K on intake", where K is `population - read`: unconfirmed sends that never reached
     # intake, plus any real loss. Read the budget clause first; with the engine arms judged it is the
-    # verdict (BACKLOG #1866), and without them it makes the step INCONCLUSIVE (BACKLOG #5574 item 9).
+    # verdict (BACKLOG #1866), and without them it is no loss on its own (BACKLOG #5574 item 9).
     # The load copy in report.py no longer fails on the budget.
     budget = max(unconfirmed_budget, 3 * population // 4)
     over_budget = unconfirmed > budget
@@ -2259,7 +2259,7 @@ def _reconcile_judged(
     # Missing engine metrics leave every engine-delta arm unjudged, exactly as a reset does below,
     # and must not skip the arms that read only client counters: the reload guards `not_back` and
     # `no_reply` still prove a loss without the engine, and the stranding budget and `no_sends`
-    # still run, as thresholds that make the step INCONCLUSIVE (BACKLOG #5574 item 9). The stand-ins
+    # still run, as thresholds that are no loss on their own (BACKLOG #5574 item 9). The stand-ins
     # 0/0/-1 are what a band report carries for "no reading" (the batch-box aggregate reads the -1).
     metrics_missing = base is None or final is None
     if base is None or final is None:
@@ -2272,8 +2272,8 @@ def _reconcile_judged(
     # A restart, a stats reset or a purge makes final - baseline no run total, so no arm that reads
     # the engine deltas may rest on it; the load copy's reasoning is the source of record. Of the
     # arms that read only client counters, the reload guards `not_back` and `no_reply` still prove a
-    # loss across it; the stranding budget and `no_sends` are thresholds there and make the step
-    # INCONCLUSIVE (BACKLOG #5574 item 9). A negative delta is not published.
+    # loss across it; the stranding budget and `no_sends` are thresholds there and no loss on their
+    # own (BACKLOG #5574 item 9). A negative delta is not published.
     engine_judged = counter_reset is None and not metrics_missing
     if not engine_judged:
         read, written = max(0, read), max(0, written)
@@ -2370,8 +2370,8 @@ def _reconcile_judged(
     engine_lost = read_short > 0 or floor_short > 0 or deliver_short > 0 or write_lost
     # The stranding budget and `no_sends` are thresholds, not proof (BACKLOG #5574 item 9). With
     # the engine metrics missing or reset, no arm can say whether the sends they name were lost, so
-    # they make the step INCONCLUSIVE there rather than LOSS. It still fails: `unproven` below
-    # always names the missing metrics or the reset.
+    # they are no loss there, and a step no other arm proves lost is INCONCLUSIVE rather than LOSS.
+    # It still fails: `unproven` below always names the missing metrics or the reset.
     threshold_lost = engine_judged and (over_budget or no_sends)
     lost = (engine_judged and engine_lost) or threshold_lost or not_back or no_reply
     # Reasons the step cannot CLEAR itself although no arm proved a loss (BACKLOG #5574), as in

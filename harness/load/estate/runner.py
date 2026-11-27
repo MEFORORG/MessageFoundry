@@ -644,12 +644,13 @@ def _reconcile(
             f"send(s) can account for — a dead-letter at some stage (ingress, routed or outbound)"
         )
     elif engine_judged and errored > 0:
-        # Not judged, but not silent either: the NAKs and unconfirmed sends may account for these,
-        # and a dead-letter beside them is not seen here.
+        # Not judged, but not silent either, as the unconfirmed-send note below is not: the NAKs and
+        # unconfirmed sends may account for these, and a dead-letter beside them is not seen here.
         parts.append(
             f"{errored} message(s) took an ERROR disposition during the step, no more than the "
-            f"{c.nak} NAKed and {c.timeouts} unconfirmed send(s) — not judged, since whether a "
-            f"NAK is a loss is undecided, so a dead-letter among them is not seen"
+            f"{c.nak} NAKed and {c.timeouts} unconfirmed send(s) — not judged, since each may be "
+            f"a refused frame whose NAK the client saw or missed, so a dead-letter among them is "
+            f"not seen"
         )
     if not drained and final is not None:
         parts.append(
