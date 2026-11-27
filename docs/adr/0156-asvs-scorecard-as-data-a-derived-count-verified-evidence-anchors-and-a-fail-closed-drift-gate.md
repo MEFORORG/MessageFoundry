@@ -1,6 +1,6 @@
 # ADR 0156 — ASVS scorecard as data: a derived count, verified evidence anchors, and a fail-closed drift gate
 
-**Status:** **Accepted (2026-08-01)** — built and merged the same day; §7 amended at ratification, see below
+**Status:** **Accepted (2026-08-01)** — built and merged the same day; §7 amended at ratification, see below; the title is qualified for the vault's pre-commit hook by the hook note dated 2026-11-27 under Amendment 2
 **Date:** 2026-08-01
 **Supersedes:** —
 **Related:** ADR 0155 (DAST) · BACKLOG #205 (risk-acceptance register) · ASVS cell 15.1.3
@@ -176,19 +176,21 @@ That last row is the fix for **15.1.3**: the guards stop being inspection-only t
 > *(2026-09-21, in the vault's copy, and brought into this copy on 2026-11-27: the vault's
 > `scripts/asvs/register_check.py` no longer stays advisory. The owner chose the enforcing form
 > under BACKLOG #353, so that script is no longer an instance of the hazard. The hazard itself, and
-> this paragraph's point about the hook, stand unchanged.)*
+> this paragraph's point about the hook, stand unchanged. Since vault PR 3065 that point about the
+> hook no longer holds: see the next note.)*
 >
 > *(2026-11-27: this amendment's table, and the two paragraphs between it and the 2026-09-21 note,
 > describe the vault's `asvs-scorecard` hook, its installation and its remedy as they stood on
-> 2026-08-17. Do not act on them. Vault PR 3065, merged 2026-11-26, replaced the hook's entry, and
-> this copy does not restate what the hook now does. Its source of record is the docstring of the
-> vault's `scripts/asvs/precommit_scorecard.py`. Amendment 2's 2026-11-25 note in the vault's copy
-> of this ADR summarises it, cites the owner ruling behind it, and says what still holds for the
-> verifier and how the hook's shim is installed. The hook has at least one path on which it passes
-> without verifying, which qualifies this ADR's title and section 6 for the pre-commit hook alone,
-> and it no longer refuses every FAIL the verifier reports. Never run `pre-commit install` in the
-> vault, whatever the remedy above says: the header of the vault's
-> `scripts/coord/install-git-hooks.ps1` forbids it.)*
+> 2026-08-17. Do not act on what they say about the hook. Vault PR 3065, merged 2026-11-26,
+> replaced the hook's entry, and this copy does not restate the hook's behaviour beyond two
+> consequences for this ADR. The hook's source of record is the docstring of the vault's
+> `scripts/asvs/precommit_scorecard.py`. Amendment 2's 2026-11-25 note in the vault's copy of this
+> ADR summarises it, cites the owner ruling behind it, and says what still holds for the verifier
+> and how the hook's shim is installed. The two consequences: the hook has at least one path on
+> which it passes without verifying, which qualifies this ADR's title and section 6 at least for
+> the pre-commit hook, and it no longer refuses every FAIL the verifier reports. The remedy above,
+> `pre-commit install`, is one the header of the vault's `scripts/coord/install-git-hooks.ps1`
+> forbids.)*
 >
 > **WHY THIS IS RECORDED RATHER THAN QUIETLY FIXED.** The claim is load-bearing in a security record:
 > it tells a reader that authoring-time enforcement is in place, and a reader who believes it will not
