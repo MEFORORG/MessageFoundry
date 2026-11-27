@@ -1064,7 +1064,7 @@ class AlertSink(Protocol):
         ``node`` closes this one. On a passive box, ``POST /dr/release`` raises ``dr_released``
         only when its start raised this alert or the box's newest own activate or release record
         is an activation. So an instance an earlier start left open, on a start that raised none,
-        stays open until an operator resolves it by hand, with ``POST /alerts/{id}/resolve`` or
+        stays open until an operator resolves it by hand, with ``POST /alerts/{alert_id}/resolve`` or
         the web console's Resolve on the alert, or a later ``POST /dr/activate`` under the same
         ``node``, run only once the operator has confirmed the primary is not serving, closes it;
         a release there changes nothing and does not close it.
@@ -1682,12 +1682,13 @@ class LoggingAlertSink:
     def dr_restarted_passive(self, node: str) -> None:
         log.critical(
             "ALERT dr_restarted_passive: DR box %r started PASSIVE and may have been serving when "
-            "it went down -- the ERROR line before this says what its store shows. It serves "
-            "nothing until POST /dr/activate, to be run only once you have confirmed the "
-            "primary is not serving. POST /dr/release on this start records that it stays "
-            "passive, which closes the alert where [alerts] keeps alert instances; there, if "
-            "a later start raises none, an alert left open is resolved by hand, with POST "
-            "/alerts/{alert_id}/resolve or Resolve in the web console",
+            "it went down -- the ERROR line before this says what its store shows. It holds no "
+            "DR role until POST /dr/activate, to be run only once you have confirmed the "
+            "primary is not serving; an inbound an operator starts on it still binds. To leave "
+            "it passive instead, POST /dr/release on this start records that it stays passive "
+            "and closes this alert where [alerts] keeps alert instances; an alert an earlier "
+            "start left open is resolved by hand, with POST /alerts/{alert_id}/resolve or "
+            "Resolve in the web console",
             node,
         )
 

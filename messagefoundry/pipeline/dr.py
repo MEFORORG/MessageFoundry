@@ -369,8 +369,9 @@ class DrCoordinator:
         have been serving. ``POST /dr/release`` on the passive box records that the operator
         leaves it passive, and closes the open alert (:meth:`_record_stay_passive`). On a start
         that raised none, a release closes nothing, so an alert an earlier start left open stays
-        open until an operator resolves it by hand, or a later activation under the same label
-        closes it. Returns whether it alerted.
+        open until an operator resolves it by hand, or a later activation under the same label,
+        run only once the operator has confirmed the primary is not serving, closes it. Returns
+        whether it alerted.
 
         It misses at least: an activation whose ``dr.activate`` row was never written (the owed
         row is held in memory only); a box whose host name changed between the activation and
@@ -399,9 +400,13 @@ class DrCoordinator:
                 "restored from a snapshot taken while it was activated, a release whose record "
                 "was never written, and an earlier start that already came back passive read "
                 "the same way, and in at least the first two the primary may be serving again. It has "
-                "started PASSIVE, serves nothing and does not re-activate itself; once you have "
+                "started PASSIVE, holds no DR role and does not re-activate itself; once you have "
                 "confirmed the primary is not serving, re-run POST /dr/activate to serve the "
-                "priority feeds again, or POST /dr/release to record that it stays passive",
+                "priority feeds again. To leave it passive instead, POST /dr/release on this "
+                "start records that it stays passive and closes the dr_restarted_passive alert "
+                "where [alerts] keeps "
+                "alert instances; an alert an earlier start left open is resolved by hand, with "
+                "POST /alerts/{alert_id}/resolve or Resolve in the web console",
                 self._label(),
             )
         self._restart_alerted = True
@@ -419,7 +424,7 @@ class DrCoordinator:
         box delivers nothing already, so any row left undelivered on it stays queued for the
         operator to reconcile, as after a release. ``None`` when there is nothing to record: then
         it writes no row and closes no alert, so a ``dr_restarted_passive`` an earlier start left
-        open stays open until an operator resolves it by hand (``POST /alerts/{id}/resolve``), or
+        open stays open until an operator resolves it by hand (``POST /alerts/{alert_id}/resolve``), or
         a later activation under the same label, run only once the operator has confirmed the
         primary is not serving, closes it. A write error refuses the release."""
         try:
@@ -757,7 +762,7 @@ class DrCoordinator:
         other case, as on a box never activated or one whose activation aborted after a hand-back,
         the release writes no row and closes no alert. So a ``dr_restarted_passive`` an earlier
         start left open, on a start that raised none, stays open until an operator resolves it by
-        hand, with ``POST /alerts/{id}/resolve`` or the web console's Resolve on the alert, or a
+        hand, with ``POST /alerts/{alert_id}/resolve`` or the web console's Resolve on the alert, or a
         later activation under the same label, run only once the operator has confirmed the
         primary is not serving, closes it.
         **Within the DR store** at-least-once + idempotency are preserved on drain;

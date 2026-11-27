@@ -250,6 +250,12 @@ async def test_a_store_rebuilt_from_an_activated_snapshot_alerts_without_claimin
                 assert "went down while serving" not in line
                 # The activate advice is conditional: in these cases the primary may be serving.
                 assert "confirmed the primary is not serving" in line
+                # The ERROR line prints under every sink, so it carries the close guidance too.
+                assert "POST /dr/release on this start records that it stays passive" in line
+                assert "where [alerts] keeps alert instances" in line
+                assert "POST /alerts/{alert_id}/resolve" in line
+                # An operator-started inbound still binds on a passive box.
+                assert "serves nothing" not in line and "holds no DR role" in line
             # The starting process wrote no record, so the line names the identity's record.
             assert "for this identity" in records[0].getMessage()
             assert "this process" not in records[0].getMessage()
@@ -322,9 +328,10 @@ def test_the_restart_alert_line_says_how_to_close_it(caplog: pytest.LogCaptureFi
         LoggingAlertSink().dr_restarted_passive("dr-box")
     (line,) = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
     assert "POST /dr/release on this start records that it stays passive" in line
-    assert "closes the alert where [alerts] keeps alert instances" in line
-    assert "if a later start raises none, an alert left open is resolved by hand" in line
+    assert "closes this alert where [alerts] keeps alert instances" in line
+    assert "an alert an earlier start left open is resolved by hand" in line
     assert "POST /alerts/{alert_id}/resolve" in line and "Resolve in the web console" in line
+    assert "serves nothing" not in line and "an operator starts on it still binds" in line
 
 
 async def test_a_never_activated_box_writes_no_release_row(tmp_path: Path) -> None:
