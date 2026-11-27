@@ -453,3 +453,62 @@ def test_a_never_declared_record_still_reads_none(repo: Path) -> None:
     rec = read_record(repo)
     assert rec["seatCanonical"] is None
     assert rec["seatRosterVerdict"] == "none"
+
+
+# --- A declaration reopens an ended record --------------------------------------------------------
+
+
+@pytest.mark.parametrize("handback", [False, True])
+@pytest.mark.parametrize("session", ["record-facts-probe", None])
+def test_a_declaration_after_a_close_reopens_the_record(
+    repo: Path, handback: bool, session: str | None
+) -> None:
+    """A resumed session declares again; announce-session.ps1 hides any record not `open`."""
+    seat(repo, "-Declare", "-Seat", "builder", "-Goal", "first episode", session=session)
+    start = episode_start(read_record(repo))
+    seat(repo, "-Close", *(["-Handback"] if handback else []), session=session)
+    close_at = start + timedelta(hours=1)
+    rewrite_record(repo, lifecycleAt=close_at.isoformat())
+    ended = read_record(repo)
+    assert ended["lifecycle"] == ("handed" if handback else "closed")
+    for key, minutes in (("9401", 10), ("9402", 120)):
+        put_json(
+            coord_dir(repo) / "claims" / f"{key}.json",
+            {
+                "worktree": ended["worktree"],
+                "claimed": (start + timedelta(minutes=minutes)).isoformat(),
+            },
+        )
+    seat(repo, "-Declare", "-Seat", "builder", "-Goal", "resumed", session=session)
+    after = read_record(repo)
+    assert after["lifecycle"] == "open"
+    assert datetime.fromisoformat(str(after["lifecycleAt"])) > start
+    # The new episode starts at the close: before it is the last episode's, after it the reopener's.
+    assert datetime.fromisoformat(str(after["episodeStart"])) == close_at
+    by_key = {c["key"]: c["attribution"] for c in after["claims"]}
+    assert by_key == {"9401": "worktree-inherited", "9402": "this-episode"}
+    # A later hook pass carries the reopened state forward.
+    seat(repo, "-Record", session=session)
+    carried = read_record(repo)
+    assert (carried["lifecycle"], carried["episodeStart"]) == ("open", after["episodeStart"])
+
+
+def test_a_plain_pass_on_a_closed_record_leaves_it_closed(repo: Path) -> None:
+    """The Stop hook fires on a closing session's last turn; that pass must not reopen it."""
+    declare(repo)
+    seat(repo, "-Close")
+    closed = read_record(repo)
+    plain_record(repo)
+    after = read_record(repo)
+    assert (after["lifecycle"], after["lifecycleAt"]) == ("closed", closed["lifecycleAt"])
+
+
+def test_a_reopen_whose_close_stamp_names_no_instant_starts_at_the_declaration(
+    repo: Path,
+) -> None:
+    declare(repo)
+    seat(repo, "-Close")
+    rewrite_record(repo, lifecycleAt="not a stamp")
+    after = declare(repo)
+    assert after["lifecycle"] == "open"
+    assert after["episodeStart"] == after["lifecycleAt"]

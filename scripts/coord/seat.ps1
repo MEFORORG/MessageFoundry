@@ -25,7 +25,7 @@
         seat.ps1 -Record                      # the hook path: derive everything, write, exit 0
         seat.ps1 -Declare -Seat builder3 -Goal "..." -Done "..." -OutOfScope "..."
         seat.ps1 -Declare -Handoff <path>     # point at the document a replacement should read
-        seat.ps1 -Close [-Handback]
+        seat.ps1 -Close [-Handback]           # lifecycle closed (handed); a later -Declare reopens it
         seat.ps1 -BumpEpoch                   # mark an account switch; see POOL EPOCH below
         seat.ps1 -ClearHandoff -Box <boxKey> -SessionId <sessionKey>
                                               # clear ANOTHER, dead session's pointer to a deleted file
@@ -1401,6 +1401,17 @@ try {
                     elseif ($null -ne $priorStart) { $priorStart }
                     elseif ($priorEnded) { $null }
                     else { $lifecycleAt }
+    # A DECLARATION ON AN ENDED RECORD REOPENS IT. Before this only -Close ever moved lifecycle, so a
+    # session resumed after its own -Close kept reading closed, and announce-session.ps1 hid it from
+    # every peer while it worked. The new episode starts at the old one's close: everything after
+    # the close is the reopener's, and that is the same boundary the nosid case above already draws.
+    # A close stamp that names no instant cannot be that boundary, so the declaration itself is.
+    # -Record never reopens: the Stop hook fires on a closed session's last turn too.
+    if ($Declare -and $priorEnded) {
+        $episodeStart = if ($null -ne (ConvertTo-StampInstant $lifecycleAt)) { $lifecycleAt } else { $now }
+        $lifecycle = 'open'
+        $lifecycleAt = $now
+    }
     if ($Close) {
         $lifecycle = if ($Handback) { 'handed' } else { 'closed' }
         $lifecycleAt = $now
