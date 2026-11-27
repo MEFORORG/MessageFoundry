@@ -19,12 +19,10 @@ from harness.load.shardcert_ladder import (
     LadderRung,
     RungOutcome,
     RungVerdict,
-    build_consolidated_report,
     build_rung_outcome,
 )
 from tests.test_shardcert_failclosed_verdicts import (
     _ABORTED_GATE,
-    _DESTS,
     _clean_gate,
     _consolidated,
     _drive,
@@ -96,20 +94,7 @@ def test_soak_break_on_an_engine_aborted_soak_stays_setup_degraded() -> None:
 
 def test_soak_break_under_a_drive_side_soak_abort_stays_setup_degraded() -> None:
     soak = _underdriven_soak(inversions=2)
-    rep = build_consolidated_report(
-        shards=("a", "b"),
-        dests=_DESTS,
-        handlers=_DESTS,
-        delivering=_DESTS,
-        routing="broadcast",
-        lanes_per_shard=1,
-        driver_count=2,
-        sink_count=_DESTS,
-        climb=[_sustained(0, 20.0)],
-        soak=soak,
-        climb_aborted=False,
-        soak_aborted=True,
-    )
+    rep = _consolidated([_sustained(0, 20.0)], soak=soak, soak_aborted=True)
     assert rep.exit_code == 2
 
 

@@ -101,6 +101,7 @@ from harness.load.shardcert import (
     run_shardcert_engine,
     rung_fidelity,
 )
+from messagefoundry.pipeline.phase_timing import LANE_EPISODE_TIMING_ENV
 from messagefoundry.terminal_text import escape_for_terminal
 
 log = logging.getLogger(__name__)
@@ -607,10 +608,7 @@ class EpisodeTiming:
 
     def render(self) -> str:
         if self.is_empty:
-            return (
-                "lane episode (S_lane): (none captured — MEFOR_PIPELINE_LANE_EPISODE_TIMING off or no "
-                "episodes)"
-            )
+            return f"lane episode (S_lane): (none captured — {LANE_EPISODE_TIMING_ENV} off or no episodes)"
         return (
             f"lane episode (S_lane): episodes={self.episodes} windows={self.windows} | "
             f"S_lane mean/max={self.episode_mean_ms:.2f}/{self.episode_max_ms:.2f}ms | "
@@ -2669,12 +2667,10 @@ class ConsolidatedLadderReport:
         after a teardown can read as a duplicate. The lanes term is not a hard break and does not outrank."""
         if self.ok or self.climb_aborted or self.store_truth_unconfirmed:
             return False
-        if self._climb_broken:
-            return True
-        if self.soak_aborted:
-            return False
         soak_broke = self.soak is not None and self.soak.verdict is RungVerdict.CORRECTNESS_FAIL
-        return soak_broke or not self.soak_drive_shortfall
+        return self._climb_broken or (
+            not self.soak_aborted and (soak_broke or not self.soak_drive_shortfall)
+        )
 
     @property
     def result_label(self) -> str:
@@ -3534,14 +3530,6 @@ def _attach_rung_timings(payload: dict[str, object], rung_logs: Sequence[Path]) 
     payload["episode_timing"] = aggregate_episode_timing(rung_logs).to_json_dict()
 
 
-async def _attach_rung_timings_off_loop(
-    payload: dict[str, object], keep_dir: Path, shards: Sequence[str]
-) -> None:
-    """:func:`_attach_rung_timings` on a worker thread: it reads every shard's node log, which can be large,
-    and the engine ladder runs on the event loop."""
-    await asyncio.to_thread(_attach_rung_timings, payload, _rung_log_paths(keep_dir, shards))
-
-
 async def run_engine_ladder(
     *,
     rates: Sequence[float],
@@ -3683,7 +3671,10 @@ async def run_engine_ladder(
                 )
             break
         payload = _engine_rung_payload(report)
-        await _attach_rung_timings_off_loop(payload, keep_dir, report.shards)
+        # Every shard's node log is read here, so off the loop the ladder awaits its coord on.
+        await asyncio.to_thread(
+            _attach_rung_timings, payload, _rung_log_paths(keep_dir, report.shards)
+        )
         rung_coord.post(ENGINE_RUNG_REPORT, payload)
         result.rungs_armed.append(rung.run_suffix)
         if report.aborted:
@@ -3782,7 +3773,7 @@ async def run_engine_ladder(
         result.notes.append("soak: no DRIVE_START from the drive")
         return result
     payload = _engine_rung_payload(report)
-    await _attach_rung_timings_off_loop(payload, keep_dir, report.shards)
+    await asyncio.to_thread(_attach_rung_timings, payload, _rung_log_paths(keep_dir, report.shards))
     soak_coord.post(ENGINE_RUNG_REPORT, payload)
     result.rungs_armed.append("soak")
     return result
