@@ -1254,7 +1254,11 @@ class EngineClient:
         # ADR 0077: a per-action step-up names the action in X-Step-Up-Action; a plain
         # session-window step-up omits it. An empty header names no action, since as a purpose it
         # would win over none and be refused.
-        step_up_action = response.headers.get("X-Step-Up-Action") or None
+        step_up_action = (
+            response.headers.get("X-Step-Up-Action") or None
+            if response.status_code == 403
+            else None
+        )
         if (
             _allow_step_up
             and response.status_code == 403

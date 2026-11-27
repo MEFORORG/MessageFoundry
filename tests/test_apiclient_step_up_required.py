@@ -112,6 +112,26 @@ def test_step_up_required_names_the_action_the_refusal_named(
     assert raised.value.action == action
 
 
+def test_an_empty_action_posts_no_purpose_through_the_handler() -> None:
+    """The handler path normalizes an empty X-Step-Up-Action the same way: as a purpose an empty
+    string would win over none and be refused."""
+    bodies: list[dict[str, object]] = []
+    client = _refusing({"X-Step-Up-Required": "1", "X-Step-Up-Action": ""}, bodies)
+
+    def prove() -> bool:
+        client.reauth("pw")
+        return True
+
+    client.set_step_up_handler(prove)
+    try:
+        with pytest.raises(StepUpRequired):  # the fake refuses the retry too
+            client.search_messages(content="x")
+    finally:
+        client.set_step_up_handler(None)
+        client.close()
+    assert bodies == [{"password": "pw"}]
+
+
 def test_a_declined_handler_still_names_the_action() -> None:
     """The handler declined, so the caller sees the refusal and may re-prove for it later."""
     client = _refusing({"X-Step-Up-Required": "1", "X-Step-Up-Action": "purge"}, [])

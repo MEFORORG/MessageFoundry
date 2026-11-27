@@ -67,10 +67,12 @@ class _Client:
         self._body_refusals = body_refusals
         self._error = error or StepUpRequired("step-up required", status=403, action="act")
         self.opens = 0
+        self.opened: list[str] = []
         self.bodies = 0
 
     def get_message(self, message_id: str) -> Any:
         self.opens += 1
+        self.opened.append(message_id)
         if self.opens <= self._open_refusals:
             raise copy.copy(self._error)  # fresh: a shared one keeps every traceback
         return _detail(message_id)
@@ -196,27 +198,115 @@ def test_a_refusal_a_password_cannot_clear_is_not_prompted(qapp: Any, error: Api
         panel.stop()
 
 
-def test_an_open_superseded_during_the_prompt_is_dropped(qapp: Any) -> None:
+class _GuardedStepUp:
+    """Declines a step-up asked while its own prompt is up, as MonitorPanel._step_up does. While
+    up, it runs ``during`` (the operator's act inside the prompt's nested event loop)."""
+
+    def __init__(self, during: Callable[[], None], answer: bool = True) -> None:
+        self._during = during
+        self._answer = answer
+        self._open = False
+        self.calls = 0
+
+    def __call__(self, action: str | None) -> bool:
+        self.calls += 1
+        if self._open:
+            return False
+        self._open = True
+        try:
+            self._during()
+        finally:
+            self._open = False
+        return self._answer
+
+
+def _pump_until(qapp: Any, done: Callable[[], bool]) -> None:
+    deadline = time.time() + 10
+    while time.time() < deadline and not done():
+        qapp.processEvents()
+        time.sleep(0.01)
+    assert done(), "the nested event loop never reached the awaited state"
+
+
+def test_an_open_superseded_during_the_prompt_reopens_the_new_selection(qapp: Any) -> None:
     """The prompt's nested event loop can run a newer load(). That one wins, so the old open is
-    neither repeated nor reported, even though the prompt re-proved."""
+    dropped. Its request went out under the old session, so once the prompt re-proves, the new
+    selection is opened again rather than left to come back refused."""
     client = _Client(open_refusals=1)
     box: list[MessageDetailPanel] = []
-
-    def select_another_row() -> bool:
-        box[0].load("m2")
-        return True
-
-    panel, errors = _panel(client, _StepUp(select_another_row))
+    step_up = _GuardedStepUp(lambda: box[0].load("m2"))
+    panel, errors = _panel(client, step_up)
     box.append(panel)
     try:
         panel.load("m1")
-        _settle(qapp, lambda: _opened(panel))
-        assert client.opens == 2  # the refused m1 open, then m2's; m1 was not repeated
+        _settle(qapp, lambda: _opened(panel) and client.opens >= 3)
+        assert client.opened == ["m1", "m2", "m2"]
+        assert step_up.calls == 1
         assert panel._message_id == "m2"
         assert errors == []
     finally:
         panel.stop()
         box.clear()  # panel -> step-up -> box -> panel
+
+
+def test_a_new_selection_refused_during_the_prompt_is_reopened_after_the_proof(qapp: Any) -> None:
+    """The newer open comes back refused while the prompt is up. That step-up is declined (one
+    prompt at a time) and reported, and the proof the open prompt then makes opens it again."""
+    client = _Client(open_refusals=2)
+    box: list[MessageDetailPanel] = []
+
+    def select_and_wait_for_its_refusal() -> None:
+        box[0].load("m2")
+        _pump_until(qapp, lambda: step_up.calls == 2)
+
+    step_up = _GuardedStepUp(select_and_wait_for_its_refusal)
+    panel, errors = _panel(client, step_up)
+    box.append(panel)
+    try:
+        panel.load("m1")
+        _settle(qapp, lambda: _opened(panel))
+        assert client.opened == ["m1", "m2", "m2"]
+        assert panel._message_id == "m2"
+        assert errors == ["step-up required"]  # the declined nested step-up, reported
+    finally:
+        panel.stop()
+        box.clear()
+
+
+def test_a_new_selection_that_landed_during_the_prompt_is_not_reopened(qapp: Any) -> None:
+    client = _Client(open_refusals=1)
+    box: list[MessageDetailPanel] = []
+
+    def select_and_wait_for_it() -> None:
+        box[0].load("m2")
+        _pump_until(qapp, lambda: box[0]._message_id == "m2")
+
+    panel, errors = _panel(client, _GuardedStepUp(select_and_wait_for_it))
+    box.append(panel)
+    try:
+        panel.load("m1")
+        _settle(qapp, lambda: _opened(panel))
+        assert client.opened == ["m1", "m2"]  # no second, audited open of m2
+        assert errors == []
+    finally:
+        panel.stop()
+        box.clear()
+
+
+def test_a_prompt_that_raises_something_else_is_reported_not_wedged(qapp: Any) -> None:
+    client = _Client(open_refusals=1)
+
+    def broken() -> bool:
+        raise RuntimeError("the poller would not restart")
+
+    panel, errors = _panel(client, _StepUp(broken))
+    try:
+        panel.load("m1")
+        _settle(qapp, lambda: bool(errors))
+        assert errors == ["the message could not be opened: RuntimeError"]
+        assert panel._summary.text() == "The message could not be opened."
+    finally:
+        panel.stop()
 
 
 def test_a_refused_body_read_steps_up_and_repeats_once(qapp: Any) -> None:
@@ -271,6 +361,69 @@ def test_a_second_body_refusal_is_reported_not_prompted_again(qapp: Any) -> None
         assert panel._show_body.isEnabled()
     finally:
         panel.stop()
+
+
+def test_a_body_superseded_during_its_prompt_is_not_painted(qapp: Any) -> None:
+    """A newer open in the prompt's nested event loop wins: m1's body is neither repeated nor
+    painted under m2, and m2, opened under the old session, is opened again after the proof."""
+    client = _Client(body_refusals=1)
+    box: list[MessageDetailPanel] = []
+    panel, errors = _panel(client, _GuardedStepUp(lambda: box[0].load("m2")))
+    box.append(panel)
+    try:
+        panel.load("m1")
+        _settle(qapp, lambda: _opened(panel))
+        panel._on_show_body()
+        _settle(qapp, lambda: panel._message_id == "m2" and client.opens >= 3)
+        assert client.bodies == 1
+        assert client.opened == ["m1", "m2", "m2"]
+        assert panel._raw.toPlainText() == ""
+        assert errors == []
+    finally:
+        panel.stop()
+        box.clear()
+
+
+def test_a_refused_body_re_proof_reports_its_own_cause(qapp: Any) -> None:
+    client = _Client(body_refusals=1)
+
+    def refuse() -> bool:
+        raise ApiError("re-verification failed", status=401)
+
+    panel, errors = _panel(client, _StepUp(refuse))
+    try:
+        panel.load("m1")
+        _settle(qapp, lambda: _opened(panel))
+        panel._on_show_body()
+        _settle(qapp, lambda: bool(errors))
+        assert client.bodies == 1
+        assert errors == ["re-verification failed"]
+        assert panel._show_body.isEnabled()
+    finally:
+        panel.stop()
+
+
+def test_show_body_stays_disabled_while_its_prompt_is_up(qapp: Any) -> None:
+    client = _Client(body_refusals=1)
+    box: list[MessageDetailPanel] = []
+    seen: list[bool] = []
+
+    def record_the_button() -> bool:
+        seen.append(box[0]._show_body.isEnabled())
+        return True
+
+    panel, errors = _panel(client, _StepUp(record_the_button))
+    box.append(panel)
+    try:
+        panel.load("m1")
+        _settle(qapp, lambda: _opened(panel))
+        panel._on_show_body()
+        _settle(qapp, lambda: bool(panel._raw.toPlainText()))
+        assert seen == [False]
+        assert errors == []
+    finally:
+        panel.stop()
+        box.clear()
 
 
 def test_the_monitor_re_proves_a_polling_refusal_for_its_action(

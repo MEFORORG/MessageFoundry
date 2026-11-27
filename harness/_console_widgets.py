@@ -333,6 +333,9 @@ class MessageDetailPanel(QWidget):
         self._events.setRowCount(0)
 
     def load(self, message_id: str) -> None:
+        self._open(message_id, retried=False)
+
+    def _open(self, message_id: str, *, retried: bool) -> None:
         # Read the message OFF the main thread; apply on the main thread. A newer load() supersedes
         # an in-flight one (rapid row clicks / replay), so a stale result is dropped in _apply.
         self._open_seq += 1
@@ -340,7 +343,16 @@ class MessageDetailPanel(QWidget):
         # Nothing is open until this open lands. The previous message leaves the screen now, and
         # Show body or Replay pressed meanwhile would act on it, so both go too (BACKLOG #5848).
         self._reset("Opening the message...")
-        self._submit_open(message_id, self._open_seq, retried=False)
+        self._submit_open(message_id, self._open_seq, retried=retried)
+
+    def _reopen_after_proof(self) -> None:
+        """A prompt re-proved after its nested event loop started a newer open, which went out
+        under the old session. That open may come back refused, or already has and was reported,
+        since a refusal arriving while a prompt is up is declined. So the current selection is
+        opened again, as the one repeat after a step-up, unless it has already landed."""
+        message_id = self._pending_id
+        if message_id is not None and message_id != self._message_id:
+            self._open(message_id, retried=True)
 
     def _submit_open(self, message_id: str, open_seq: int, *, retried: bool) -> None:
         self._runner.submit(
@@ -397,10 +409,16 @@ class MessageDetailPanel(QWidget):
         the one repeat after a step-up, so a refusal of it is reported, never prompted again."""
         if snap.open_seq != self._open_seq or snap.message_id != self._pending_id:
             return  # a newer load() (or a clear()) superseded this result
-        answer = self._answer_step_up(snap.refusal, retried)
+        try:
+            answer = self._answer_step_up(snap.refusal, retried)
+        except Exception as exc:  # noqa: BLE001 -- as the runner's on_error: report, never wedge
+            self._open_raised(snap.message_id, snap.open_seq, exc)
+            return
         if snap.open_seq != self._open_seq or snap.message_id != self._pending_id:
-            # The prompt's nested event loop ran a newer load() or a clear(). That one wins and
-            # reports its own result, so this one is dropped whatever the prompt answered.
+            # The prompt's nested event loop ran a newer load() or a clear(). That one wins, so
+            # this one is dropped whatever the prompt answered.
+            if answer is True:
+                self._reopen_after_proof()
             return
         if answer is True:
             # The polling client reads the rotated token through the shared cell, so the repeat
@@ -502,9 +520,16 @@ class MessageDetailPanel(QWidget):
             return
         # Show body stays disabled while the prompt is up, so a press in its nested event loop
         # cannot start a second read and a second prompt.
-        answer = self._answer_step_up(snap.refusal, retried)
+        try:
+            answer = self._answer_step_up(snap.refusal, retried)
+        except Exception as exc:  # noqa: BLE001 -- as the runner's on_error: report, never wedge
+            self._body_failed(snap.open_seq, exc)
+            return
         if snap.open_seq != self._open_seq or snap.message_id != self._message_id:
-            return  # the prompt's nested event loop opened another message, or cleared this one
+            # The prompt's nested event loop opened another message, or cleared this one.
+            if answer is True:
+                self._reopen_after_proof()
+            return
         if answer is True:
             self._submit_body(snap.message_id, snap.open_seq, retried=True)
             return
