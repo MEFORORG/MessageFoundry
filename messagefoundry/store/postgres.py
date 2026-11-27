@@ -6059,8 +6059,8 @@ class PostgresStore(ServerCipherWalk):
         if is_transient_open_failure(exc):
             return queue_open_fault(exc)
         # A string, never the error: a record keeps its args, and the error's traceback holds the
-        # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884). For a
-        # queue-tag refusal it is the class and cause, not the text (`unopenable_log_text`, #5982).
+        # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884). It names a
+        # queue-tag refusal by class and cause, any other error by class (`unopenable_log_text`).
         log.warning(
             "dead-lettering undecryptable queue row %s: %s", row["id"], unopenable_log_text(exc)
         )

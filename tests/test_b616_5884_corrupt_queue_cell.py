@@ -28,7 +28,7 @@ from messagefoundry.pipeline.alerts import (
 )
 from messagefoundry.store.crypto import (
     AesGcmCipher,
-    UnauthenticatedCipherError,
+    CipherError,
     generate_key,
     make_cipher,
 )
@@ -99,15 +99,19 @@ def test_a_corrupt_payload_under_a_held_key_is_corrupt_not_drift() -> None:
     with pytest.raises(QueueTagError) as moved:
         open_queue_cell(cipher, {**row, "channel_id": "IB_B", "payload": sealed})
     assert type(moved.value) is QueueTagError and moved.value.drift
-    assert isinstance(moved.value.__cause__, UnauthenticatedCipherError)
+    # BACKLOG #5982: the cipher's error is named by class, never chained, so no traceback prints it.
+    assert "(UnauthenticatedCipherError)" in str(moved.value) and "key_id" not in str(moved.value)
+    assert moved.value.__cause__ is None and moved.value.__context__ is None
 
     for cause, payload in _corrupt_payloads(cipher, key_b64, sealed).items():
         assert cipher.holds_key_for(payload)  # the marker still names a held key
+        with pytest.raises(CipherError, match=cause):  # control: the cipher's own reason
+            cipher.decrypt(payload, aad=queue_row_aad(row))
         with pytest.raises(CorruptQueueCellError, match="is corrupt") as corrupt:
             open_queue_cell(cipher, {**row, "payload": payload})
         assert not corrupt.value.drift
         assert isinstance(corrupt.value, QueueTagError)  # still contained as one
-        assert cause in str(corrupt.value.__cause__)
+        assert cause not in str(corrupt.value) and corrupt.value.__cause__ is None
 
 
 def test_a_corrupt_payload_keeps_its_audit_and_alert_naming_no_payload(
