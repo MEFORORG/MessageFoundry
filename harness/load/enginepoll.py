@@ -539,9 +539,10 @@ def _min_not_none(values: Iterable[int | None]) -> int | None:
     return min(seen) if seen else None
 
 
-def _max_not_none(values: Iterable[float | None]) -> float | None:
+def _max_not_none[N: (int, float)](values: Iterable[N | None]) -> N | None:
     """The MAX over the non-``None`` values (``None`` if all are ``None``). Used for the pool WAIT
-    percentiles: the fleet is bound if ANY shard's pool is bound, so the worst shard is the reading."""
+    percentiles and the executor gauges: the fleet is bound if ANY engine shard is bound, so the
+    worst engine shard is the reading."""
     seen = [v for v in values if v is not None]
     return max(seen) if seen else None
 
@@ -1056,7 +1057,8 @@ class EnginePoller:
             # B11: empty-claim counts SUM across shards (each shard runs its own workers). Executor
             # gauges + the pool snapshot are per-process; take the MAX queue depth/busy and the first
             # shard reporting a pool (in practice the connscale harness runs a single engine, so this
-            # is exactly that one engine's reading).
+            # is exactly that one engine's reading). The executor pair read the first shard until
+            # BACKLOG #5950 item 1, which hid a saturated executor on any later engine shard.
             empty_claims=sum(s.empty_claims for s in shard_samples),
             empty_claims_idle_poll=sum(s.empty_claims_idle_poll for s in shard_samples),
             empty_claims_wake_fanout=sum(s.empty_claims_wake_fanout for s in shard_samples),
@@ -1073,8 +1075,8 @@ class EnginePoller:
                 if (_wait_n := sum(s.pool_acquire_wait_count for s in shard_samples))
                 else 0.0
             ),
-            executor_queue_depth=_first_not_none(s.executor_queue_depth for s in shard_samples),
-            executor_busy=_first_not_none(s.executor_busy for s in shard_samples),
+            executor_queue_depth=_max_not_none(s.executor_queue_depth for s in shard_samples),
+            executor_busy=_max_not_none(s.executor_busy for s in shard_samples),
             pool_size=_first_not_none(s.pool_size for s in shard_samples),
             pool_idle=_first_not_none(s.pool_idle for s in shard_samples),
             pool_wait_p50_ms=_first_not_none(s.pool_wait_p50_ms for s in shard_samples),
