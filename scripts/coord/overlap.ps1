@@ -95,7 +95,8 @@
     The WHOLE-MAP cache is a plain last-write-wins file: a stale-by-seconds view of who is editing what
     is fine, and two sessions refreshing at once cost a duplicate walk, not corruption. It is keyed on
     the querying worktree's root AND HEAD, because Files depends on both. There is ONE FILE PER ROOT,
-    mefor-coord/overlap-cache/<first 8 hex of sha256(root)>.json. It was one shared file until
+    mefor-coord/overlap-cache/<first 8 hex of sha256(root)>.json, and one more, <same>.live.json, for
+    -LiveOnly walks (see that parameter). It was one shared file until
     2026-10-13, when collision_gate.ps1 began running this script from each session's own worktree
     rather than from the primary checkout. A shared file then held one root at a time, so every
     session's edit evicted the last one's map and each gated edit paid a full walk. The term memo beside it is
@@ -590,18 +591,20 @@ function Build-Map {
     # caller's HEAD, the inheritor set, the memo -- is resolved into a flat job list here, so the body
     # below can run in a runspace that shares none of it.
     #
-    # A list, not `+=`: that copies the array on every append, so it costs n squared over 1481
-    # worktrees.
+    # A list, not `+=`: that copies the array on every append, so it costs n squared in the worktree
+    # count.
     $jobs = [System.Collections.Generic.List[object]]::new()
-    # Every memo key this walk could still use, walked or not. The prune below keeps exactly these.
+    # Every memo key this walk could still use, walked or not, and in both modes the same set for the
+    # same caller. The prune below keeps exactly these. Every key embeds the caller's HEAD, so another
+    # caller's prune still drops them; this only stops -LiveOnly dropping more than a full walk does.
     $memoKeys = [System.Collections.Generic.List[string]]::new()
-    foreach ($w in $worktrees) {
-        $norm = ConvertTo-Norm $w.Path
+    for ($i = 0; $i -lt $worktrees.Count; $i++) {
+        $w = $worktrees[$i]
+        $norm = $worktreeNorms[$i]
         if ($norm -eq $myRootNorm) { continue }   # not a collision with yourself
-        # -LiveOnly: no live session owns this worktree, so its row would be dormant. Its memo key is
-        # still kept below, so a -LiveOnly walk does not prune what a full walk still needs.
+        # -LiveOnly: no live session owns this worktree, so its row would be dormant and it is not
+        # walked. Test-Path waits until after the key, so both modes keep the same keys.
         $skipWalk = $LiveOnly -and -not $ownerByWorktree.ContainsKey($norm)
-        if (-not $skipWalk -and -not (Test-Path -LiteralPath $w.Path)) { continue }
 
         # $inheritors GATES THE SPAWN, not the answer. A peer holding none of my unlanded commits
         # cannot be narrowed by the third term below, so running that diff for it buys a guaranteed
@@ -623,6 +626,7 @@ function Build-Map {
         }
         if ($key) { $memoKeys.Add($key) }
         if ($skipWalk) { continue }
+        if (-not (Test-Path -LiteralPath $w.Path)) { continue }
         $jobs.Add([pscustomobject]@{
             Path = $w.Path; Branch = $w.Branch; Norm = $norm; Key = $key
             Memo = $(if ($key -and $termCache.ContainsKey($key)) { @($termCache[$key]) } else { $null })

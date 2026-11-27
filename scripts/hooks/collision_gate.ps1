@@ -354,7 +354,7 @@ if ($code -ne 0 -and -not $partial) {
 # EMPTY OUTPUT IS NOT AN ANSWER. Under -Json a resolved "nobody else is in this file" is the two bytes
 # `[]`; nothing at all is a script that never produced a verdict. Folding those together is precisely
 # how this gate came to report all-clear while checking nothing.
-$slowDetail = "the overlap walk did not finish within its ${OverlapTimeBudgetSeconds}s budget, so the map below covers only the worktrees it reached and the rest were never looked at"
+$slowDetail = "the overlap walk did not finish within its ${OverlapTimeBudgetSeconds}s budget, so the map below covers only the worktrees a live session owns that it reached, and the rest were never looked at"
 
 $text = (@($raw) -join "`n").Trim()
 if (-not $text) {

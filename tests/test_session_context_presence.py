@@ -553,8 +553,13 @@ def fake_overlap(repo: Path, count: int) -> None:
         for i in range(count)
     ]
     payload = json.dumps(rows).replace("'", "''")
+    # Binds like the real script, and refuses a call without -LiveOnly: the full walk outran
+    # SessionStart's timeout (overlap.ps1, at the parameter).
     (repo / "scripts" / "coord" / "overlap.ps1").write_text(
-        f"Write-Output '{payload}'\n", encoding="utf-8"
+        "[CmdletBinding()] param([switch]$Json, [switch]$LiveOnly)\n"
+        "if (-not $LiveOnly) { throw 'session-context did not pass -LiveOnly' }\n"
+        f"Write-Output '{payload}'\n",
+        encoding="utf-8",
     )
 
 

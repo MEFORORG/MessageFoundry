@@ -3,8 +3,8 @@
 """``overlap.ps1 -LiveOnly`` walks only the worktrees a live session owns.
 
 The collision gate and session-context.ps1 read only Live rows. Walking every dormant worktree as
-well outran both hooks' harness timeouts once worktrees accumulated (1481 measured 2026-11-27), and
-a killed hook checks nothing. So the mode must:
+well outran both hooks' harness timeouts once worktrees accumulated (measured at the parameter in
+overlap.ps1), and a killed hook checks nothing. So the mode must:
 
 * still return the live peer's row, dirty file and all, so the gate can still deny on it;
 * drop the dormant peer's row, which neither caller reads;
@@ -205,7 +205,8 @@ def test_live_only_and_full_walks_never_share_a_whole_map_cache(fleet: dict[str,
 
 def test_live_only_keeps_the_dormant_peers_memo_entry(fleet: dict[str, Any]) -> None:
     memo = _common(fleet["primary"]) / "mefor-coord" / "overlap-terms.json"
-    # The dormant peer needs a committed, unlanded change for the walk to memoise anything about it.
+    # The commit gives the dormant peer a HEAD of its own. Without it both peers sit at origin/main,
+    # share one memo key, and the live peer's job keeps that key, so the check would pass vacuously.
     dormant = fleet["tmp"] / "dormant-wt"
     _git(dormant, "commit", "-qam", "dormant commit")
     _overlap(fleet, "-Refresh")
