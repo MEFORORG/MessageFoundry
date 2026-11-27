@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The load, estate and shardcert graphs load without the ``harness`` package (BACKLOG #5850,
-#5852, #5854), and what they inline to do so stays equal to what it was copied from.
+"""The harness graphs load without the ``harness`` package (BACKLOG #5850, #5852, #5853, #5854),
+and what they inline or copy to do so stays equal to what it was copied from.
 
 A plain ``python -P`` subprocess cannot show the defect in a development environment, because the
 editable install's ``.pth`` makes ``harness`` importable anyway. So the child installs a
@@ -28,7 +28,7 @@ from tests.test_dependency_boundaries import _modules_imported_by
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _CONFIG = _REPO_ROOT / "harness" / "config"
-_GRAPHS = ["load", "estate", "shardcert", "connscale"]
+_GRAPHS = ["load", "estate", "shardcert", "connscale", "passthrough", "store_once"]
 
 # Only the finder below raises with this text, so a control can tell its refusal from any other
 # missing module.
@@ -114,6 +114,15 @@ def test_inlined_refusal_decorator_matches_the_original(graph: str) -> None:
     assert _parsed_def(_CONFIG / graph / "_shape.py", "prints_its_refusal") == _parsed_def(
         _CONFIG / "_refusal.py", "prints_its_refusal"
     )
+
+
+@pytest.mark.parametrize("graph", ["passthrough", "store_once"])
+def test_copied_load_shape_matches_the_load_graphs(graph: str) -> None:
+    # Byte for byte, so the copy cannot drift even in a comment: harness/config/load is the one to
+    # edit, and its docstring says so.
+    assert (_CONFIG / graph / "_shape.py").read_bytes() == (
+        _CONFIG / "load" / "_shape.py"
+    ).read_bytes()
 
 
 def test_inlined_id_parser_matches_harness_load_ids() -> None:

@@ -6,6 +6,13 @@ Loader skips ``_*`` modules, so this file is *imported* by :mod:`graph` rather t
 It centralizes the env-tunable knobs (fan-out factor, transform cost, sink endpoint) so the graph
 reads them in one place — no copy-paste across the registered modules (CLAUDE.md §4).
 
+The same bytes sit in ``harness/config/load``, ``harness/config/passthrough`` and
+``harness/config/store_once``. Each graph imports this file as the bare sibling helper ``_shape``,
+and the config loader serves a bare import only from the graph's own directory, so each directory
+holds its own copy and loads with only the engine installed (BACKLOG #5853). Edit the one in
+``harness/config/load`` and copy it over the other two; ``tests/test_harness_graph_engine_only.py``
+fails while they differ.
+
 Knobs (all optional, with safe defaults so ``serve`` works with none set):
 
 * ``MEFOR_LOAD_FANOUT``         — sink destinations per ADT message (default 20).
