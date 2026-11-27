@@ -149,8 +149,12 @@ providerSuite("CodeSetCustomEditorProvider: a save of the opened file passes --n
     );
     try {
       await settle();
-      // Control: the guard took the file as the config dir's own, so the form rendered from the CLI.
-      assert.ok(webview.html.includes("<!DOCTYPE html>"), "the grid did not render");
+      // Control: the guard took the file as the config dir's own, so the grid rendered from the CLI's
+      // read of it. The guard's refusal paints a notice page and never runs `codeset show`.
+      assert.ok(
+        calls.some((a) => a[0] === "codeset" && a[1] === "show" && a.includes(STEM)),
+        `the grid never read the code set; posted ${JSON.stringify(posted)}`,
+      );
       assert.ok(onMessage !== undefined, "the provider registered no message handler");
       await onMessage({ command: "save", detail: DETAIL });
       const upsert = calls.find((a) => a[0] === "codeset" && a[1] === "upsert");

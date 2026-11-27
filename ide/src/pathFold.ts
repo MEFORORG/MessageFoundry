@@ -12,6 +12,9 @@
 // ASCII fold still reads as one path at least two names a case-sensitive directory keeps apart
 // (fsutil setCaseSensitiveInfo, or one WSL created) that differ in ASCII case. A leaf module, so
 // every caller can import it without a cycle; it is vscode-free for the unit suite.
+// {@link segmentsBelowOnDisk} is the one helper here that reads the file system, for a caller whose
+// outside answer only switches a convenience off.
+import * as fs from "node:fs";
 import * as path from "node:path";
 
 /** `s` with ASCII A-Z lower-cased and every other character, non-ASCII letters included, unchanged. */
@@ -108,4 +111,44 @@ export function nonAsciiCaseVariant(
     return undefined;
   }
   return { head: path.win32.join(t.root, ...t.segments.slice(0, t.depth)), rest: t.segments.slice(t.depth) };
+}
+
+/** Whether `a` and `b` name one folder on disk: by real path, or, where the real path keeps the
+ *  spelling's case (the fallback some volumes take), by device and file id. A path that does not
+ *  exist or cannot be read gives false, which every caller reads as "outside". */
+function sameFolderOnDisk(a: string, b: string, win32: boolean): boolean {
+  try {
+    if (isSamePath(fs.realpathSync.native(a), fs.realpathSync.native(b), win32)) {
+      return true;
+    }
+    const x = fs.statSync(a, { bigint: true });
+    const y = fs.statSync(b, { bigint: true });
+    return x.dev === y.dev && x.ino === y.ino;
+  } catch {
+    // ENOENT is the usual case: a U+212A spelling names no folder NTFS would fold onto root.
+    return false;
+  }
+}
+
+/**
+ * {@link segmentsBelow}, except where `target` is outside only by a case difference outside A-Z
+ * ({@link nonAsciiCaseVariant}): then the file system is asked whether the folder `target` names at
+ * `root`'s depth is `root` itself, and when it is, the segments below it are returned. So e-acute
+ * against E-acute, which NTFS folds, reads as inside, and U+212A KELVIN SIGN against "k", which it
+ * does not, reads as outside. A folder that does not exist or cannot be read reads as outside too,
+ * so this suits only a caller for which outside switches a convenience off (the editor toolbar, the
+ * config-dir watcher), never one that skips a check for a path outside. It makes no file-system call
+ * unless such a variant exists, so none off Windows.
+ */
+export function segmentsBelowOnDisk(
+  root: string,
+  target: string,
+  win32: boolean = path.sep === "\\",
+): string[] | undefined {
+  const below = segmentsBelow(root, target, win32);
+  if (below !== undefined) {
+    return below;
+  }
+  const variant = nonAsciiCaseVariant(root, target, win32);
+  return variant !== undefined && sameFolderOnDisk(root, variant.head, win32) ? [...variant.rest] : undefined;
 }

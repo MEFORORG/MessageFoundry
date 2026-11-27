@@ -11,6 +11,8 @@
 // editorToolbar.ts imports vscode, so it is loaded against a stub here (as promote-target-gate does),
 // which keeps this case in the node-side unit suite rather than the Extension Host's editor-toolbar.
 import * as assert from "assert";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import { watchableConfigDir } from "../../configRefresh";
@@ -102,6 +104,43 @@ stubSuite("editorToolbar.isConfigFile folds ASCII case only (BACKLOG #5832)", ()
     assert.strictEqual(t.isConfigFile(path.join(ROOT, "KITS", "a.py"), ROOT, "kits"), WIN);
     assert.strictEqual(t.isConfigFile(path.join(ROOT, "kits"), ROOT, "kits"), false); // the dir itself
     assert.strictEqual(t.isConfigFile(path.join(ROOT, "kits-other", "a.py"), ROOT, "kits"), false);
+  });
+});
+
+// On disk, on Windows only: a case difference outside A-Z is settled by the file system, so the fix
+// does not lose a folder NTFS folds (e-acute against E-acute), while a U+212A spelling, which NTFS
+// keeps apart from "k", stays outside even where both folders exist.
+const diskSuite = WIN && toolbar !== undefined ? suite : suite.skip;
+
+diskSuite("on disk: a non-ASCII case NTFS folds is inside, U+212A is not (BACKLOG #5832)", () => {
+  const LOWER = "caf\u00E9";
+  const UPPER = "CAF\u00C9";
+  let root: string;
+  setup(() => {
+    root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "mf-b20008g-")));
+    fs.mkdirSync(path.join(root, LOWER, "cfg"), { recursive: true });
+    fs.mkdirSync(path.join(root, "kits"));
+    fs.mkdirSync(path.join(root, `${KELVIN}its`));
+  });
+  teardown(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  test("E-acute spelling of the config dir is the same folder; the toolbar and the watcher keep it", () => {
+    const t = toolbar as Toolbar;
+    const dir = path.join(root, LOWER);
+    assert.strictEqual(t.isConfigFile(path.join(root, UPPER, "a.py"), dir, "."), true);
+    const upper = path.join(root, UPPER, "cfg");
+    assert.strictEqual(watchableConfigDir(dir, upper), upper);
+    assert.strictEqual(watchableConfigDir(dir, path.join(root, UPPER)), dir);
+    // A case variant of a config dir that does not exist cannot be read, so it reads as outside.
+    const missing = path.join(root, "na\u00EFve");
+    assert.strictEqual(t.isConfigFile(path.join(root, "NA\u00CFVE", "a.py"), missing, "."), false);
+    assert.strictEqual(watchableConfigDir(missing, path.join(root, "NA\u00CFVE", "cfg")), undefined);
+  });
+
+  test("a U+212A folder beside the k one is another folder, by the file system too", () => {
+    const t = toolbar as Toolbar;
+    assert.strictEqual(t.isConfigFile(path.join(root, `${KELVIN}its`, "a.py"), path.join(root, "kits"), "."), false);
+    assert.strictEqual(watchableConfigDir(path.join(root, "kits"), path.join(root, `${KELVIN}its`)), undefined);
   });
 });
 
