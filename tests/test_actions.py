@@ -486,19 +486,30 @@ def test_convert_case_title_reads_case_across_an_escape() -> None:
     [
         # BACKLOG #5928 step 1's own case: upper case leaves the hex escape, so the letter it
         # carries keeps the case the sender sent.
-        ("jos\\XE9\\", "PID-5", "upper", "JOS\\XE9\\"),
         ("jos\\XE9\\", "PID-5.1", "upper", "JOS\\XE9\\"),
         ("jos\\XE9\\", "PID-5.1.1", "upper", "JOS\\XE9\\"),
-        # Literal text after the escape is still cased, and a whole field keeps its components.
-        ("jos\\XE9\\ab^x", "PID-5", "upper", "JOS\\XE9\\AB^X"),
-        # A UTF-8 letter is two bytes. The decoder reads each byte as its own character, so
-        # casing that text byte by byte would write different bytes ("\xc3" lower-cased is
-        # "\xe3"). Kept as sent, the bytes stay intact in every mode.
-        ("ren\\XC3A9\\", "PID-5", "upper", "REN\\XC3A9\\"),
+        # On a whole field, lower-case hex digits tell "kept as sent" from casing the wire text.
+        # Literal text after the escape is still cased, and the field keeps its components.
+        ("jos\\Xe9\\", "PID-5", "upper", "JOS\\Xe9\\"),
+        ("jos\\Xe9\\ab^x", "PID-5", "upper", "JOS\\Xe9\\AB^X"),
+        # e-acute is two bytes in UTF-8 (C3 A9). The decoder reads each byte as its own
+        # character, so casing that text byte by byte would write different bytes ("\xc3"
+        # lower-cased is "\xe3"). Kept as sent, the bytes stay intact.
+        ("ren\\XC3A9\\", "PID-5.1", "upper", "REN\\XC3A9\\"),
         ("JOS\\XC389\\", "PID-5", "lower", "jos\\XC389\\"),
         ("JOS\\XC389\\", "PID-5.1", "lower", "jos\\XC389\\"),
         ("JOS\\XC389\\", "PID-5", "title", "Jos\\XC389\\"),
         ("JOS\\XC389\\", "PID-5.1", "title", "Jos\\XC389\\"),
+        # Title case still reads the per-byte decode to decide whether the next letter starts a
+        # word, and the last byte of a UTF-8 letter decodes to an uncased character, so the "e"
+        # after it is capitalized mid-word. A known defect on main, not fixed here.
+        pytest.param(
+            "ren\\XC3A9\\e",
+            "PID-5.1",
+            "title",
+            "Ren\\XC3A9\\e",
+            marks=pytest.mark.xfail(strict=True, reason="title case reads a per-byte hex decode"),
+        ),
     ],
 )
 def test_convert_case_keeps_a_hex_escape_as_the_bytes_sent(
@@ -506,10 +517,11 @@ def test_convert_case_keeps_a_hex_escape_as_the_bytes_sent(
 ) -> None:
     # Pins the "escapes kept as sent" rule (engine PR 2936) that BACKLOG #5928 step 1 questions.
     # A hex escape carries bytes in the message's character set, and the decoder maps each byte
-    # to one character without reading that set, so it cannot tell a Latin-1 letter from part of
-    # a UTF-8 one. Keeping the escape as sent writes no byte the sender did not send.
+    # to one character without reading MSH-18, so it cannot tell a Latin-1 letter from part of a
+    # UTF-8 one. While that holds, keeping the escape as sent writes no byte the sender did not
+    # send. A decoder that reads MSH-18 could case the letter instead and change these rows.
     # NEGATIVE CONTROL: on 17f42069782^, which cased the wire text or wrote a decoded value back,
-    # every component-path case and the whole-field lower and title cases fail.
+    # every passing row here fails.
     m = _with_pid(sent)
     convert_case(m, path, mode)
     assert m["PID-5"] == expected
