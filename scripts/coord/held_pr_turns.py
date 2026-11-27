@@ -251,6 +251,9 @@ when ALL of these hold:
 * no qualifying repair-owner marker falls strictly between the hold and the newest such marker:
   a closed marker after a transfer already standing is an ordinary reply, as it was before this
   contract;
+* no reply and no edit, as the ``replied`` and ``edited`` flags read them, falls after the hold
+  and before the marker's second, since a reply may dispute the hold (a marker after one is set
+  aside, and the row reads as it would with no marker, never ``author-closed``);
 * the PR is not in the merge queue and has no armed auto-merge request, and neither comment nor
   review page was cut (``_row`` drops the flag on such a PR, keeping ``in-queue``, ``auto-armed``
   or ``page-cut``, and the row otherwise reads as it would with the marker counted).
@@ -266,9 +269,9 @@ stands): the hold stands and the Lander may transfer the PR to the Repair Manage
 repair-owner marker or a REPAIR turn: the transfer steps in CLAUDE.md section 5 still run. Where
 the PR is REPAIR's already (a repair-owner marker after the hold), it stays REPAIR's, and the
 closed marker is set aside. A marker that does not count in ``classify``, an invalid shape or a
-minimized one included, is an ordinary event, so one after the hold is a reply. A closed marker
-before the hold does not count: a hold posted after the author closed reads AUTHOR until it
-expires (HOLD_TTL).
+minimized one included, is an ordinary event, so one after the hold is a reply, except one that
+fails only the reply-or-edit condition, which is set aside. A closed marker before the hold does
+not count: a hold posted after the author closed reads AUTHOR until it expires (HOLD_TTL).
 
 A HOLD ON A QUEUED OR ARMED PR IS THE LANDER'S. A PR in the merge queue, or with auto-merge armed,
 merges without its author moving, so a hold on it reads LANDER with ``held`` kept beside the
