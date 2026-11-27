@@ -1664,3 +1664,171 @@ def test_age_text() -> None:
     assert hpt.age_text(45 * 60) == "45m"
     assert hpt.age_text(3 * 3600 + 12 * 60) == "3h12m"
     assert hpt.age_text(-5) == "0m"
+
+
+# ---- the author-closed contract ------------------------------------------------------------------
+
+CLOSED_ID = "local_Cd34ef56-0000-4000-8000-000000000000"
+
+
+def _closed_body(session: str = CLOSED_ID) -> str:
+    """The wrapup skill's closing post: the marker line, then the author's own words."""
+    return (
+        f"<!-- author-session-closed session={session} -->\n"
+        "The author session closed; repairs go to the Repair Manager, the merge stays the Lander's."
+    )
+
+
+def _closed(at: str = "2026-10-28T13:00:00Z", session: str = CLOSED_ID) -> dict[str, Any]:
+    return _comment(_closed_body(session), at)
+
+
+def test_an_author_closed_marker_after_the_hold_is_the_landers_now(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The Lander's turn, transfer-eligible at once: no 30-minute window and no not-live test, and
+    never a repair-owner marker or a REPAIR turn."""
+    odd = _comment(_closed_body().replace(" -->\n", " --> \r\n", 1), "2026-10-28T13:00:00Z")
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        _held(400, _closed()),
+        _held(401, odd),
+        # An ack before the marker is history; the marker after it still counts.
+        _held(402, _ack("2026-10-28T12:30:00Z", _sha(402)), _closed()),
+        # A reply after the hold still reads replied; the marker adds its flag beside it.
+        _held(403, _comment("Manager: answered the finding.", "2026-10-28T12:30:00Z"), _closed()),
+    )
+    assert _repair_row(rows[400]) == ("LANDER", ["held", "author-closed"], None)
+    assert _repair_row(rows[401]) == ("LANDER", ["held", "author-closed"], None)
+    assert _repair_row(rows[402]) == ("LANDER", ["held", "acked", "author-closed"], None)
+    assert _repair_row(rows[403]) == (
+        "LANDER",
+        ["replied", "no-new-commit", "author-closed"],
+        None,
+    )
+
+
+def test_an_author_closed_marker_within_thirty_minutes_still_reads_lander(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], real_hold_ttl: None
+) -> None:
+    """No 30-minute window: a hold five minutes old with the marker after it is the Lander's."""
+    fresh = _pr(
+        407,
+        comments=[_hold("2026-10-28T17:55:00Z", _sha(407)), _closed("2026-10-28T17:56:00Z")],
+    )
+    rows = _engine_rows(tmp_path, capsys, fresh)
+    assert _turn(rows[407]) == ("LANDER", ["held", "author-closed"])
+
+
+def test_an_author_closed_marker_never_replaces_a_repair_transfer(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rows = _engine_rows(tmp_path, capsys, _held(405, _closed(), _repair("2026-10-28T14:00:00Z")))
+    assert _repair_row(rows[405]) == ("REPAIR", ["held", "repair"], OWNER_ID)
+
+
+def test_an_author_closed_marker_before_the_hold_does_not_count(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    before = _pr(
+        410, comments=[_closed("2026-10-28T11:00:00Z"), _hold("2026-10-28T12:00:00Z", _sha(410))]
+    )
+    # A same-second marker is not provably after the hold, so it is a reply.
+    tied = _held(411, _closed("2026-10-28T12:00:00Z"))
+    rows = _engine_rows(tmp_path, capsys, before, tied)
+    assert _turn(rows[410]) == ("AUTHOR", ["held"])
+    assert _turn(rows[411]) == ("LANDER", ["replied", "no-new-commit"])
+
+
+def test_a_minimized_author_closed_marker_does_not_count(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rows = _engine_rows(tmp_path, capsys, _held(415, _minimized(_closed())))
+    assert _turn(rows[415]) == ("LANDER", ["replied", "no-new-commit"])
+
+
+@pytest.mark.parametrize("session", ["", "a" * 65, "local_x.y", "local x", "local_xé"])
+def test_an_author_closed_marker_with_a_bad_session_id_does_not_count(
+    session: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert hpt.closed_session(_closed_body(session)) is None
+    rows = _engine_rows(tmp_path, capsys, _held(420, _closed(session=session)))
+    assert _turn(rows[420]) == ("LANDER", ["replied", "no-new-commit"])
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Closing.\n" + _closed_body(),
+        "\n" + _closed_body(),
+        " " + _closed_body(),
+        "> " + _closed_body(),
+        _closed_body().replace(" -->\n", " --> trailing\n", 1),
+        _closed_body().replace(" -->\n", " --> \n", 1),
+    ],
+)
+def test_an_author_closed_marker_off_line_one_does_not_count(
+    body: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert hpt.closed_session(body) is None
+    rows = _engine_rows(tmp_path, capsys, _held(425, _comment(body, "2026-10-28T13:00:00Z")))
+    assert _turn(rows[425]) == ("LANDER", ["replied", "no-new-commit"])
+
+
+def test_an_author_commit_after_the_marker_means_the_author_is_not_gone(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The head no longer starts with the hold's SHA, which is how the script reads a commit."""
+    pushed = _held(430, _closed(), head=_sha(431))
+    pushed["commits"]["nodes"][0]["commit"]["committedDate"] = "2026-10-28T14:00:00Z"
+    rows = _engine_rows(tmp_path, capsys, pushed)
+    assert _turn(rows[430]) == ("LANDER", ["new-commit", "replied"])
+
+
+def test_an_author_closed_marker_on_a_hold_not_naming_the_head_does_not_count(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stale = _pr(435, comments=[_hold("2026-10-28T12:00:00Z", _sha(1)), _closed()])
+    rows = _engine_rows(tmp_path, capsys, stale)
+    assert _turn(rows[435]) == ("LANDER", ["new-commit", "replied"])
+
+
+def test_an_ack_after_the_author_closed_marker_voids_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rows = _engine_rows(
+        tmp_path, capsys, _held(440, _closed(), _ack("2026-10-28T14:00:00Z", _sha(440)))
+    )
+    assert _turn(rows[440]) == ("LANDER", ["replied", "no-new-commit"])
+
+
+def test_an_author_closed_marker_on_a_queued_or_armed_pr_is_not_transfer_eligible(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    queued = _held(445, _closed())
+    queued["mergeQueueEntry"] = {"state": "QUEUED"}
+    armed = _held(446, _closed())
+    armed["autoMergeRequest"] = {"enabledAt": "2026-10-28T10:00:00Z"}
+    rows = _engine_rows(tmp_path, capsys, queued, armed)
+    assert _turn(rows[445]) == ("LANDER", ["held", "in-queue"])
+    assert _turn(rows[446]) == ("LANDER", ["held", "auto-armed"])
+
+
+def test_an_author_closed_marker_is_gated_like_an_ack() -> None:
+    body = _closed_body()
+    assert hpt.Event(NOW, body, bot=False, trusted=True).closed_by == CLOSED_ID
+    for gated in (
+        hpt.Event(NOW, body, bot=False, trusted=False),
+        hpt.Event(NOW, body, bot=False, trusted=True, dismissed=True),
+        hpt.Event(NOW, body, bot=False, trusted=True, review=True),
+    ):
+        assert gated.closed_by is None
+    # A bot's marker is no event for the turn at all.
+    assert hpt.classify(
+        _sha(1),
+        [
+            hpt.Event(datetime(2026, 10, 28, 12, tzinfo=UTC), _marker_body(_sha(1)), False, True),
+            hpt.Event(datetime(2026, 10, 28, 13, tzinfo=UTC), body, bot=True, trusted=True),
+        ],
+    ) == ("AUTHOR", ["held"], None)

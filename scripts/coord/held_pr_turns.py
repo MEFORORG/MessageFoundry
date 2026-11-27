@@ -226,6 +226,37 @@ bool is an ERROR row too, never skipped as a draft. Inline review-thread comment
 read. Only the latest ``COMMENT_PAGE`` issue comments and ``REVIEW_PAGE`` reviews are fetched;
 A CUT PAGE IS THE LANDER'S (THE REPAIR CONTRACT) says what a cut page does.
 
+THE AUTHOR-CLOSED CONTRACT. An author session that closes with a hold still standing on its PR
+may hand the PR over at once, ONLY by this shape, as an issue comment::
+
+    <!-- author-session-closed session=<session id> -->
+    The author session closed; repairs go to the Repair Manager, and the merge stays the Lander's.
+
+The first line is read exactly as the ack marker's is (a full match, only trailing spaces, tabs and
+carriage returns stripped, the same association, minimized, dismissed and bot gates, and never a
+review), and ``<id>`` is 1 to 64 of ``[0-9A-Za-z_-]``, as the repair-owner marker's. No signature
+is required on the second line: the author, not the Lander, posts it. A closed marker COUNTS only
+when ALL of these hold:
+
+* it was posted strictly after the hold's second (the newest Lander event is a marker hold, read
+  as AUTHOR's turn reads it; a same-second marker is not provably after the hold);
+* the PR's ``headRefOid`` starts with the hold's SHA, which is how "no author commit after the
+  marker" is read, and is stricter, since it also catches a push between the hold and the marker;
+* no ack naming the head is at or after the newest such marker's second: an ack after it says
+  the author is still working, so the author is not gone;
+* the PR is not in the merge queue and has no armed auto-merge request (``_row`` drops the flag
+  there, keeping ``in-queue`` or ``auto-armed``).
+
+A counting closed marker is set aside as neither a reply nor a Lander event, as an ack is. The PR
+then reads LANDER, flagged ``author-closed`` after ``held`` (and ``acked`` when an earlier ack
+stands): the hold stands and the Lander may transfer the PR to the Repair Manager now, with no
+30-minute window and no not-live test. It never substitutes for the hold, and it never makes a
+repair-owner marker or a REPAIR turn: the transfer steps in CLAUDE.md section 5 still run. Where
+the PR is REPAIR's already (a repair-owner marker after the hold), it stays REPAIR's, and the
+closed marker is set aside. On a PR whose reply or edit after the hold already reads LANDER, a
+counting marker adds ``author-closed`` beside those flags. A marker that does not count, an
+invalid shape or a minimized one included, is an ordinary event, so one after the hold is a reply.
+
 A HOLD ON A QUEUED OR ARMED PR IS THE LANDER'S. A PR in the merge queue, or with auto-merge armed,
 merges without its author moving, so a hold on it reads LANDER with ``held`` kept beside the
 ``in-queue`` or ``auto-armed`` flag: dequeuing or disarming it is the Lander's move. A REPAIR turn
@@ -256,6 +287,8 @@ AUTHOR, but the newest ack is over 30 minutes old, so it is the Lander's; AN ACK
 over 30 minutes old and unacknowledged, so it is the Lander's; AN UNACKNOWLEDGED HOLD EXPIRES);
 ``page-cut`` (beside ``held``: the row would read AUTHOR or REPAIR, but a comment or review page
 was cut, so it is the Lander's; THE REPAIR CONTRACT);
+``author-closed`` (a counting author-session-closed marker stands after the hold: the Lander's
+turn, transfer-eligible now; THE AUTHOR-CLOSED CONTRACT);
 ``in-queue`` / ``auto-armed`` (the PR is already in the merge queue or has auto-merge armed).
 
 Stdlib only.
@@ -317,6 +350,9 @@ _ACK_MARKER = re.compile(r"<!-- hold-ack head=([0-9a-fA-F]{7,40}) -->")
 #: The Lander's repair-owner marker, matched the same way as the hold marker. The session id keeps
 #: its case; one bounded repeat, so it cannot backtrack catastrophically.
 _REPAIR_MARKER = re.compile(r"<!-- repair-owner session=([0-9A-Za-z_-]{1,64}) -->")
+#: An author session's closing hand-over, matched the same way as the ack marker. The session id
+#: keeps its case; one bounded repeat, so it cannot backtrack catastrophically.
+_CLOSED_MARKER = re.compile(r"<!-- author-session-closed session=([0-9A-Za-z_-]{1,64}) -->")
 #: What may trail the marker on its line. Only these: a Unicode space is not stripped.
 _TRAILING = " \t\r"
 
@@ -408,10 +444,9 @@ class RepoRead:
     required_error: str | None = None
 
 
-def _first_line_sha(pattern: re.Pattern[str], first_line: str) -> str | None:
-    """The SHA ``pattern`` captures from the whole of ``first_line``, lower-cased, else ``None``."""
-    marker = pattern.fullmatch(first_line.rstrip(_TRAILING))
-    return marker.group(1).lower() if marker else None
+def _first_line_marker(pattern: re.Pattern[str], body: str) -> re.Match[str] | None:
+    """``pattern`` matched against the whole of ``body``'s first line, else ``None``."""
+    return pattern.fullmatch(body.split("\n", 1)[0].rstrip(_TRAILING))
 
 
 def _signed_marker(pattern: re.Pattern[str], body: str) -> re.Match[str] | None:
@@ -436,7 +471,8 @@ def ack_head(body: str) -> str | None:
 
     The shape only, as ``hold_head``. The gates are ``Event``'s.
     """
-    return _first_line_sha(_ACK_MARKER, body.split("\n", 1)[0])
+    marker = _first_line_marker(_ACK_MARKER, body)
+    return marker.group(1).lower() if marker else None
 
 
 def repair_owner(body: str) -> str | None:
@@ -446,6 +482,15 @@ def repair_owner(body: str) -> str | None:
     second. The gates are ``Event``'s.
     """
     marker = _signed_marker(_REPAIR_MARKER, body)
+    return marker.group(1) if marker else None
+
+
+def closed_session(body: str) -> str | None:
+    """The session an author-session-closed marker names; ``None`` when ``body`` is not one.
+
+    The shape only, as ``ack_head``. The gates are ``Event``'s.
+    """
+    marker = _first_line_marker(_CLOSED_MARKER, body)
     return marker.group(1) if marker else None
 
 
@@ -508,6 +553,14 @@ class Event:
         if not self.trusted or self.dismissed or self.review:
             return None
         return repair_owner(self.body)
+
+    @cached_property
+    def closed_by(self) -> str | None:
+        """The session an author-session-closed marker comment names, else ``None``. Never a
+        review."""
+        if not self.trusted or self.dismissed or self.review:
+            return None
+        return closed_session(self.body)
 
 
 _nodes = pr_state._nodes
@@ -658,6 +711,13 @@ def classify(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str], st
     after = [e for e in turn_events if e.latest >= when and not e.lander and not e.cancelled]
     # An ack naming the head says "still my move", not a reply; any other event after it is one.
     acks = [e for e in after if (a := e.acked_at) is not None and head.startswith(a)]
+    # An author's closing hand-over strictly after the hold, on the hold's head, with no ack from
+    # its second on, is neither a reply nor a Lander event (THE AUTHOR-CLOSED CONTRACT).
+    closed = [] if new_commit else [e for e in after if e.when > when and e.closed_by is not None]
+    newest_closed = max((e.when for e in closed), default=None)
+    if newest_closed is not None and any(e.latest >= newest_closed for e in acks):
+        closed = []
+    after = [e for e in after if not any(e is c for c in closed)]
     replied = len(acks) < len(after)
     # Every seat posts under one login, so who edited cannot be told: any edit from the hold's
     # second on, of the hold itself or of an older Lander comment too, hands the turn back.
@@ -668,12 +728,15 @@ def classify(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str], st
             return repair
         if not replied:
             flags = ["held", "acked"] if acks else ["held"]
+            if closed:
+                flags.append("author-closed")
             transferred = _earlier_transfer(turn_events, when)
             if transferred is not None:
                 # A marker before this hold and none after it: an author was told to stand down,
                 # so parking it on them is the unsafe direction. The Lander re-posts a marker.
                 return LANDER, [*flags, "repair-rehold"], transferred[0]
-            return AUTHOR, flags, None
+            # A closed author session leaves the turn with the Lander, transfer-eligible now.
+            return (LANDER if closed else AUTHOR), flags, None
     flags = ["new-commit"] if new_commit else []
     if replied:
         flags.append("replied")
@@ -681,6 +744,8 @@ def classify(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str], st
         flags.append("edited")
     if not new_commit:
         flags.append("no-new-commit")
+    if closed:
+        flags.append("author-closed")
     return LANDER, flags, None
 
 
@@ -754,9 +819,13 @@ def _row(repo: str, pr: dict[str, Any], read: RepoRead, now: datetime) -> dict[s
         flags.append("in-queue")
     if pr.get("autoMergeRequest"):
         flags.append("auto-armed")
-    if turn in (AUTHOR, REPAIR) and ("in-queue" in flags or "auto-armed" in flags):
-        # Queued or armed, a held PR merges with no move from its author or its repair owner.
-        turn = LANDER
+    if "in-queue" in flags or "auto-armed" in flags:
+        if "author-closed" in flags:
+            # A queued or armed PR is not transfer-eligible: the Lander dequeues or disarms first.
+            flags.remove("author-closed")
+        if turn in (AUTHOR, REPAIR):
+            # Queued or armed, a held PR merges with no move from its author or its repair owner.
+            turn = LANDER
     green, verdict = _required_green(pr, head, read)
     stamps = [e.latest for e in events] + ([committed] if committed else [])
     newest = max(stamps) if stamps else None
