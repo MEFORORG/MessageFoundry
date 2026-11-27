@@ -302,6 +302,47 @@ def test_every_required_substitution_names_the_same_sources() -> None:
             assert phrase in msg, f"{var}'s message omits {phrase!r}"
 
 
+# Finding 23: under --profile ha the engines read MEFOR_STORE_PASSWORD from secrets.env, and the
+# local postgres reads it by substitution, which that env_file does not feed. The example's note
+# named only the SQL Server image, so a reader who filled in secrets.env alone was refused at load.
+_SECRETS_EXAMPLE = _COMPOSE.parent / "secrets.env.example"
+_STORE_PASSWORD = "MEFOR_STORE_PASSWORD"
+
+
+@functools.cache
+def _store_password_note() -> str:
+    """The comment block directly above the example's ``MEFOR_STORE_PASSWORD`` entry."""
+    lines = _SECRETS_EXAMPLE.read_text(encoding="utf-8").splitlines()
+    [at] = [
+        n for n, line in enumerate(lines) if line.lstrip("# ").startswith(f"{_STORE_PASSWORD}=")
+    ]
+    block: list[str] = []
+    for line in reversed(lines[:at]):
+        if not line.startswith("#"):
+            break
+        block.insert(0, line.lstrip("#").strip())
+    assert block, f"no comment above {_STORE_PASSWORD}= in {_SECRETS_EXAMPLE.name}"
+    return " ".join(block)
+
+
+def test_the_ha_profile_reads_the_store_password_from_two_sources() -> None:
+    # The premise the note states. A change to one source edits the note and this test together.
+    services = _all_services()
+    m = _SUBSTITUTION.fullmatch(str(_env(services["postgres"])["POSTGRES_PASSWORD"]))
+    assert m and m["var"] == _STORE_PASSWORD
+    for engine in ("engine-ha", "engine-standby"):
+        paths = {str(e["path"]) for e in services[engine].get("env_file") or []}
+        assert "./secrets.env" in paths, engine
+
+
+def test_the_store_password_note_names_the_ha_image_and_the_substitution_sources() -> None:
+    note = _store_password_note()
+    image = str(_all_services()["engine-ha"]["image"])
+    assert image in note, f"the {_STORE_PASSWORD} note does not name {image}, the ha engines' image"
+    for phrase in ("SUBSTITUTION", "does NOT feed", ".env beside compose.yaml", "--env-file"):
+        assert phrase in note, f"the {_STORE_PASSWORD} note omits {phrase!r}"
+
+
 # --- the k8s manifests (BACKLOG #5400 item 1) ----------------------------------------------------
 
 _K8S = _COMPOSE.parent / "k8s"
