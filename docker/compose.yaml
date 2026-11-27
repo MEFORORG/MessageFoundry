@@ -123,9 +123,11 @@ x-ha-engine-env: &ha-engine-env
   # key; `docker compose run -e MEFOR_STORE_PASSWORD=...`; and changing the value after
   # Postgres first initializes the mefor-pg volume, since it reads POSTGRES_PASSWORD only then,
   # until that volume is recreated or the role's password is changed to match. A deployment
-  # that gives the engines their own row-only role (the DEV-ONLY note below) replaces this
-  # alias with ANOTHER required `${...:?...}` substitution with no default, never a literal
-  # password in this file (BACKLOG #1091).
+  # that gives the engines their own row-only role (the DEV-ONLY note below) sets
+  # MEFOR_STORE_PASSWORD on engine-ha and engine-standby only, not in this anchor, since
+  # schema-provision merges it too and keeps the DDL-capable role's password, and sets it to
+  # ANOTHER required `${...:?...}` substitution with no default, never a literal password in
+  # this file (BACKLOG #1091).
   MEFOR_STORE_PASSWORD: *store-password
   MEFOR_STORE_POOL_SIZE: "40"         # default (ADR 0062); >= 2 required under [cluster]
   MEFOR_CLUSTER_ENABLED: "true"

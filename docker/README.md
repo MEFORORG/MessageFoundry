@@ -253,11 +253,13 @@ certificate (A) and its revocation attestation, or it **refuses to start** — b
   production. At least the engine's own secret settings other than the store key, and every
   `MEFOR_VALUE_*` value, can instead come from a **secrets directory**, one file per setting,
   mounted read-only and named by `MEFOR_SECRETS_DIRECTORY`, which `docker inspect` shows as a path
-  only. The store password is the exception on the `ha` profile: the `ha` engines and the
-  `postgres` service always carry it in `environment:`, so `docker inspect` shows it on them
-  whatever secrets source you use. Which settings it supplies, and which it does not, are listed in
+  only. Which settings it supplies, and which it does not, are listed in
   [CONFIGURATION.md](../docs/CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory).
   `compose.yaml` carries it commented out, with the ownership and modes the engine requires.
+  On the `ha` profile, `engine-ha`, `engine-standby`, `schema-provision` and `postgres` always
+  carry the store password in `environment:`, so `docker inspect` shows it on them whatever
+  secrets source you use; a secrets-directory file of that name still wins over the variable
+  inside an engine.
 - **TLS cert/key:** mount **read-only**; never bake into an image layer. The API key may be
   passphrase-encrypted (`MEFOR_API_TLS_KEY_PASSWORD`). Under the default `enforce` the engine
   refuses a group-readable key file ([PHI.md](../docs/PHI.md) §2, *Key files*, which also says what

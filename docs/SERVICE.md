@@ -981,8 +981,10 @@ NSSM environment.
   to the `x-ha-engine` anchor's `volumes:` list and the `x-ha-engine-env` anchor, which both
   services merge (so does `schema-provision`), not to a service: a service-level `volumes:`
   replaces the anchor's list rather than adding to it.
-  A `MEFOR_STORE_PASSWORD` file in that directory overrides the substitution the local `postgres`
-  service reads, so it must hold the same value, or the `ha` engines fail at store login.
+  A `MEFOR_STORE_PASSWORD` file in that directory wins over the `MEFOR_STORE_PASSWORD` variable
+  that `compose.yaml` sets in those services from the substitution the local `postgres` service
+  reads. Postgres never reads the directory, so the file must hold the store role's current
+  password, or the `ha` engines fail at store login.
   Where each platform's directory goes, a systemd unit's included, and what the engine refuses
   there are in [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory).
   Linux, on a host or in a container, is not a supported v1 deployment target
