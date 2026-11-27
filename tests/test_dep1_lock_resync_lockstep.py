@@ -144,15 +144,13 @@ def test_every_exported_lock_is_verified_and_staged() -> None:
     # The staging step's list is checked against the same set in
     # test_the_lock_files_cross_jobs_as_one_artifact_of_the_staged_set. A `git add` after it would
     # stage the PR head's working-tree bytes back over the staged content.
-    from tests.test_ci_venv_pinning import _executed_shell
-
     porcelain = re.compile(r"\bgit\s+(?:add|stage|commit)(?![\w-])")
     assert porcelain.search("git commit -a -m x") and porcelain.search("git stage x")
     assert not porcelain.search('git commit-tree "${tree}"')
     adders = [
         (job, step.get("name"))
         for job, step in _all_steps()
-        if porcelain.search(_executed_shell(str(step.get("run") or "")))
+        if porcelain.search(_executed_run(step))
     ]
     assert not adders, f"the resync stages or commits from the working tree: {adders}"
 
@@ -197,7 +195,7 @@ def test_the_resync_regenerates_the_closure_file() -> None:
     step = steps[regen]
     # With no arguments the script rewrites every closure pair. Naming one would silently leave the
     # others stale on every Dependabot PR (BACKLOG #1955).
-    calls = [ln.strip() for ln in str(step["run"]).splitlines() if "runtime_closure.py" in ln]
+    calls = [ln.strip() for ln in _executed_run(step).splitlines() if "runtime_closure.py" in ln]
     assert calls == [_REGENERATOR], f"the resync must run {_REGENERATOR!r} bare, found {calls}"
     assert step.get("continue-on-error") is True, (
         "the closure rewrite must not block the commit step, or its failure strands the locks"
@@ -208,12 +206,14 @@ def test_the_resync_regenerates_the_closure_file() -> None:
     output = [k for k, v in outputs.items() if str(v) == f"${{{{ steps.{step_id}.outcome }}}}"]
     assert len(output) == 1, f"the export job must output the closure step's outcome: {outputs}"
     push = _job_steps("push")
-    commit = index_of("git commit", push)
+    commits = [i for i, s in enumerate(push) if _COMMITS.search(_executed_run(s))]
+    assert len(commits) == 1, f"expected one push job step that commits, found {commits}"
+    commit = commits[0]
     failing = [
         s
         for s in push[commit + 1 :]
         if str(s.get("if", "")).strip() == f"needs.export.outputs.{output[0]} == 'failure'"
-        and "exit 1" in str(s.get("run", ""))
+        and re.search(r"^\s*exit 1\s*$", _executed_run(s), re.MULTILINE)
     ]
     assert failing, "no step after the commit fails the run when the closure rewrite fails"
     script = _ROOT / _REGENERATOR.split()[1]
@@ -398,29 +398,36 @@ def test_the_step_locators_read_only_executed_lines() -> None:
     assert located == ["Commit and push the resynced locks"], located
 
 
-#: An action reference pinned to a full commit SHA: ``owner/repo@<40 lower-case hex>``. A tag or a
-#: branch can be moved to other code after review; a commit SHA cannot.
-_PINNED_USES = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}")
+#: An action reference in the one form this workflow allows: ``owner/repo@<40 lower-case hex>``.
+#: A tag or a branch can be moved to other code after review; a commit SHA cannot. The owner is
+#: letters, digits and hyphens, as a GitHub account name is, so ``./dir@<sha>`` (a local action
+#: from the PR tree) does not match.
+_PINNED_USES = re.compile(r"[A-Za-z0-9-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}")
 #: The same, as the line spells it, with an optional trailing ``# <version>`` comment.
 _PINNED_USES_LINE = re.compile(
-    r"\s*(?:-\s+)?uses:\s+(?P<ref>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40})(?:\s+#\s*\S.*)?"
+    rf"\s*(?:-\s+)?uses:\s+(?P<ref>{_PINNED_USES.pattern})(?:\s+#\s*\S.*?)?\s*"
 )
+#: Any line with a ``uses`` key, bare or quoted.
+_USES_LINE = re.compile(r"""\s*(?:-\s+)?["']?uses["']?\s*:""")
 
 
 def _unpinned_uses(text: str) -> list[str]:
-    """Every ``uses:`` in the workflow ``text`` that is not pinned to a full commit SHA, read both
-    from the parsed steps and from the lines that spell them."""
+    """Every ``uses:`` in the workflow ``text``, a step's or a job's (a reusable-workflow call),
+    that is not ``owner/repo@<40-hex SHA>``, read both from the parsed workflow and from the lines
+    that spell a ``uses`` key."""
     import yaml
 
     parsed = yaml.safe_load(text)
-    refs = [
-        str(step.get("uses"))
-        for body in (parsed.get("jobs") or {}).values()
-        for step in (body or {}).get("steps") or []
-        if "uses" in step
+    refs: list[str] = []
+    for body in (parsed.get("jobs") or {}).values():
+        body = body or {}
+        if "uses" in body:
+            refs.append(str(body["uses"]))
+        refs += [str(step["uses"]) for step in body.get("steps") or [] if "uses" in step]
+    bad = [
+        f"{ref} is not owner/repo@<40-hex SHA>" for ref in refs if not _PINNED_USES.fullmatch(ref)
     ]
-    bad = [ref for ref in refs if not _PINNED_USES.fullmatch(ref)]
-    lines = [ln for ln in text.splitlines() if re.match(r"\s*(?:-\s+)?uses\s*:", ln)]
+    lines = [ln for ln in text.splitlines() if _USES_LINE.match(ln)]
     bad += [f"line {ln.strip()!r}" for ln in lines if not _PINNED_USES_LINE.fullmatch(ln)]
     if len(lines) != len(refs):
         bad.append(f"{len(refs)} parsed uses: but {len(lines)} lines spell one")
@@ -441,6 +448,7 @@ def test_every_action_is_pinned_to_a_full_commit_sha() -> None:
     good = f"jobs:\n  j:\n    steps:\n      - uses: actions/checkout@{sha} # v7.0.1\n"
     assert not _unpinned_uses(good), _unpinned_uses(good)
     assert not _unpinned_uses(good.replace(" # v7.0.1", "")), "a SHA without a comment is pinned"
+    assert not _unpinned_uses(good.replace(" # v7.0.1", " # v7.0.1   ")), "trailing space refused"
     for ref in (
         "actions/checkout@main",
         "actions/checkout@v7",
@@ -449,6 +457,9 @@ def test_every_action_is_pinned_to_a_full_commit_sha() -> None:
         f"actions/checkout@{sha.upper()}",
         f"actions/checkout@{sha}0",
         "./.github/actions/local",
+        f"./tools@{sha}",
+        f"../x@{sha}",
+        f"./.github@{sha}",
         "docker://alpine:3",
         f"actions/checkout/sub@{sha}",
     ):
@@ -456,6 +467,8 @@ def test_every_action_is_pinned_to_a_full_commit_sha() -> None:
         assert _unpinned_uses(mutated), ref
     hidden = good.replace(f"actions/checkout@{sha} # v7.0.1", f'"actions/checkout@main" # {sha}')
     assert _unpinned_uses(hidden), "a quoted mutable ref with a SHA in its comment passed"
+    called = good + '  k:\n    "uses": ./.github/workflows/evil.yml\n'
+    assert _unpinned_uses(called), "a quoted job-level reusable-workflow call passed"
 
 
 # What hands a step the minted token or the App key, in any spelling a step could use: the dotted or
@@ -940,7 +953,7 @@ _PINNED_CREDENTIAL_JOBS: dict[str, list[tuple[str, str]]] = {
         ),
         (
             "Commit and push the resynced locks",
-            "68da54d7a9f8ac156bc775c34ebae73ddeafd6cbf4d0ad43652be4a551b2896d",
+            "ebf46e375b47d858b943f9d83e49bcf593ee43fce2b82b12463c59a07a8a213e",
         ),
         (
             "Fail if the closure inventory could not be regenerated",
@@ -952,8 +965,10 @@ _PINNED_CREDENTIAL_JOBS: dict[str, list[tuple[str, str]]] = {
 
 #: The workflow's ``on:``, ``permissions:`` and ``concurrency:``, by the sha256 of their parsed
 #: content. RE-PIN ONLY AFTER A REVIEW OF THE EDIT: the triggers decide which events run the jobs
-#: that hold the App key, the permissions bound every job's GITHUB_TOKEN that a job does not
-#: narrow, and the concurrency group decides which run cancels which (BACKLOG #5477).
+#: that hold the App key, the permissions are the GITHUB_TOKEN default for a job that sets no
+#: ``permissions:`` of its own (each job here sets its own, which replaces it, so this holds the
+#: default a job added later would get), and the concurrency group decides which run cancels which
+#: (BACKLOG #5477).
 _PINNED_WORKFLOW_SETTINGS = "8cbb320284637a3c46e5f357ba14871b55e073544f8bb4474f931b7c84805c29"
 #: The top-level keys the workflow may carry. Any other (``env``, ``defaults``, ``run-name``, ...)
 #: is refused rather than left unpinned.
@@ -981,9 +996,17 @@ def test_the_workflow_triggers_permissions_and_concurrency_are_pinned_by_content
     failure prints the new pin to paste in.
     """
     workflow = load_workflow(_RESYNC.name)
-    keys = {"on" if k is True else str(k) for k in workflow}
-    assert keys <= _WORKFLOW_KEYS, f"the resync has top-level keys {sorted(keys - _WORKFLOW_KEYS)}"
-    assert {"on", "permissions", "concurrency"} <= keys, f"the resync's top-level keys: {keys}"
+
+    def off_list(parsed: dict[Any, Any]) -> list[str]:
+        keys = {"on" if k is True else str(k) for k in parsed}
+        return sorted(keys - _WORKFLOW_KEYS)
+
+    assert not off_list(workflow), f"the resync has top-level keys {off_list(workflow)}"
+    for extra in ("run-name", "env", "defaults"):
+        assert off_list({**workflow, extra: {}}) == [extra], f"the key gate let {extra} through"
+    assert {"on", "permissions", "concurrency"} <= {
+        "on" if k is True else str(k) for k in workflow
+    }, "the resync lost on:, permissions: or concurrency:"
     actual = _workflow_key_pin(workflow)
     assert actual == _PINNED_WORKFLOW_SETTINGS, (
         f"the resync's on:, permissions: or concurrency: changed; review the edit, then re-pin "
@@ -1111,7 +1134,7 @@ def test_the_lock_files_cross_jobs_as_one_artifact_of_the_staged_set() -> None:
     assert up["name"] == down["name"], "the push job downloads a different artifact"
     assert set(str(up["path"]).split()) == staged, "the uploaded set is not the staged set"
     assert up.get("include-hidden-files") in (None, False)
-    assert f'src="{_artifact_dir()}"' in str(_copy_step()["run"]), (
+    assert f'src="{_artifact_dir()}"' in _executed_run(_copy_step()), (
         "the staging step reads a directory other than the one the download step writes"
     )
     copy = _COPY_LIST_RE.findall(str(_copy_step()["run"]))
@@ -1327,7 +1350,9 @@ def test_the_commit_step_fails_when_git_cannot_compare(tmp_path: Path, code: int
     pushed = _git(tmp_path / "origin.git", "for-each-ref", "--format=%(objectname)", ref).strip()
     assert not pushed, f"the commit step pushed after git diff exited {code}: {result.stdout}"
     assert result.returncode != 0, f"the commit step passed after git diff exited {code}"
-    assert "::error" in result.stdout, result.stdout + result.stderr
+    assert f"lock-resync compare::git diff --cached --quiet exited {code}" in result.stdout, (
+        result.stdout + result.stderr
+    )
 
 
 def _commit_step() -> dict[str, Any]:
