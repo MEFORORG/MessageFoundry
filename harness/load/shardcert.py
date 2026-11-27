@@ -1968,9 +1968,10 @@ async def run_shardcert(
             pause = min(next_due - loop.time(), _MAX_TICK_SLEEP)
             if kill and not did_kill:
                 # BACKLOG #5440 (S27-55): cap each tick's sleep at the kill instant, so the loop asks to wake
-                # then; timer granularity or a stalled loop can still wake it later (handled below). It does
-                # not mean a message was sent before the kill: a small enough kill fraction still kills
-                # before the first tick sends (`require_kill_leg`).
+                # then; timer granularity or a stalled loop can still wake it later. A wake past the end of
+                # the hold fails the run below; a late wake inside the hold kills late, at the next check,
+                # and nothing detects it. It does not mean a message was sent before the kill: a small
+                # enough kill fraction still kills before the first tick sends (`require_kill_leg`).
                 pause = min(pause, (kill_deadline or 0) - time.monotonic())
             await asyncio.sleep(max(0.0, pause))
         if kill and not did_kill:
@@ -1981,7 +1982,8 @@ async def run_shardcert(
             # from it.
             # The teardown below stops the fleet; the restart is never reached.
             raise RuntimeError(
-                f"kill leg never fired: the hold ended before the kill instant of engine shard {killed}"
+                f"kill leg never fired: the drive loop did not run between the kill instant and the end "
+                f"of the hold, so engine shard {killed} was never killed"
             )
 
         # HOLD OVER — FREEZE the second half HERE, before anything post-hold can land in it. Everything

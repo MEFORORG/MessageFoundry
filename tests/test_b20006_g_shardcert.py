@@ -404,8 +404,8 @@ async def test_colocated_kill_fires_inside_the_hold_when_ticks_are_far_apart(
 ) -> None:
     """S27-55 (1), the in-range case: ticks further apart than the hold's remainder. The first tick is
     before the deadline and the next is past the hold, so before the fix the loop ended unkilled, the
-    restart started over the live engine shard, and the report still named it killed. The tick now wakes at
-    the kill instant."""
+    restart started over the live engine shard, and the report still named it killed. The tick's sleep is
+    now capped at the kill instant."""
     monkeypatch.setattr(sc, "_MAX_TICK_SLEEP", 1.5)
     rep = await sc.run_shardcert(
         **_sizes(aggregate_rate=1.0, hold_seconds=1.0, kill=True, kill_at_fraction=0.1)
