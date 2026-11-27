@@ -1349,7 +1349,7 @@ class EngineClient:
 
         A ``purpose`` that is not None is posted as the purpose, whatever is stashed. With
         ``purpose`` None, whatever action is stashed rides along instead, so the engine mints a
-        grant BOUND to it; with neither, it posts ``{"password": …}`` unchanged, as for a
+        grant BOUND to it; with neither, it posts ``{"password": …}`` alone, as for a
         session-window step-up. The stash is one slot: the per-action refusal
         (``X-Step-Up-Action``, ADR 0077) that called the step-up handler fills it, but a second
         refusal on this client while that handler runs overwrites it, and that refusal's own
