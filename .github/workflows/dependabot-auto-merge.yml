@@ -85,9 +85,11 @@ name: Dependabot auto-merge
 #      MIN_RELEASE_AGE_HOURS ago and that neither the version nor any of its files is yanked,
 #      because the security updates on that track are the ones the upstream cooldown cannot age.
 #      FAILS CLOSED identically to #2: an API error, an empty or unreadable file list, any file
-#      whose upload time is missing or unparseable, a yanked version or file, a package
-#      name/version that does not match its expected shape, or an ecosystem with no publish-date
-#      source wired all route to manual review.
+#      whose upload time is missing, is not a plain UTC timestamp or does not parse as a date, a
+#      yanked version or file, a package name/version that does not match its expected shape, or
+#      an ecosystem with no publish-date source wired all route to manual review. A release
+#      yanked before the step reads PyPI is refused whatever its age. The step reads PyPI once per
+#      run, so a yank made after that read is not seen by that run.
 #      CORRECTED 2026-11-27 (#5474 item 14): was 'because that track is the one the upstream
 #      cooldown cannot age'.
 #      CORRECTED 2026-11-27 (#5474): was 'requires every candidate version to have been published
@@ -509,14 +511,9 @@ jobs:
       # Guardrail #4: Dependabot's SECURITY updates bypass dependabot.yml's `cooldown` by design,
       # and they arrive on the security track (defined at #2 in the header), so the release-age
       # gate runs HERE for that track. When this step runs, a security-track uv/pip PR gets
-      # age_ok=true only when, for every candidate version, PyPI lists at least one file, every
-      # file carries a well-formed upload time, the NEWEST of those times is at least
-      # MIN_RELEASE_AGE_HOURS ago, and neither the version nor any file is yanked. A file added to
-      # an old release therefore restarts its clock, and a release yanked inside the window is
-      # refused. A security-track PR of any other ecosystem gets age_ok=false outright, as no
-      # publish-date source is wired for it. This holds a release that is published and yanked
-      # inside the window, the axios-1.14.1 pattern, only while the yank is visible at the time the
-      # step runs: it reads PyPI once, so a yank after that read is not seen. It costs
+      # age_ok=true only when every candidate version meets #4 in the header, which states the
+      # conditions once: dated by its NEWEST file, and not yanked. A security-track PR of any other
+      # ecosystem gets age_ok=false outright, as no publish-date source is wired for it. It costs
       # unattended-merge LATENCY only: a held PR stays open and a human can still merge a genuine
       # CVE fix immediately.
       # CORRECTED 2026-11-27 (#5474): was 'age_ok=true only when every candidate version was
@@ -635,40 +632,51 @@ jobs:
               age_ok=false
               break
             fi
-            # The release is dated by its NEWEST file, so a file uploaded late to an old version
-            # restarts the clock (BACKLOG #5474). Every file's time must be well formed before the
-            # max is taken: a fixed-width UTC shape makes the string max the chronological one, and
-            # one unreadable time voids the whole read rather than being skipped. `YANKED` is
-            # printed for a yanked version or any yanked file; an empty or non-array file list, or
-            # any bad time, prints nothing. A jq error (a non-object file, say) is ERR. All three
-            # fail closed below.
+            # How #4 in the header is read (BACKLOG #5474). jq prints `YANKED`, or every file's
+            # upload time one per line, or nothing: nothing for an `info` that is neither an object
+            # nor absent, an empty or non-array file list, a file that is not an object, or a time
+            # that is not a plain UTC timestamp. Each time is then parsed by `date`, and the release
+            # is dated by the largest epoch, so a file uploaded late restarts the clock.
             published="$(printf '%s' "$body" | jq -r '
               def stamp_ok: type == "string"
                 and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?Z$");
-              if ((.info // {}).yanked // false) != false
-                 or any(.urls[]?; (.yanked // false) != false) then "YANKED"
+              if .info != null and (.info | type) != "object" then empty
+              elif (.info.yanked // false) != false then "YANKED"
               elif (.urls | type) != "array" or (.urls | length) == 0 then empty
+              elif any(.urls[]; type != "object") then empty
+              elif any(.urls[]; (.yanked // false) != false) then "YANKED"
               elif all(.urls[]; .upload_time_iso_8601 | stamp_ok)
-                then [.urls[].upload_time_iso_8601] | max
+                then .urls[].upload_time_iso_8601
               else empty end' 2>/dev/null)" || published="ERR"
             if [ "$published" = "YANKED" ]; then
               echo "::warning::'${name}==${ver}' is yanked on PyPI, or has a yanked file — failing closed (manual review)."
               age_ok=false
               break
             fi
-            if [ "$published" = "ERR" ] || [ -z "$published" ] || [ "$published" = "null" ]; then
+            if [ "$published" = "ERR" ] || [ -z "$published" ]; then
               echo "::warning::no file list, or a file with no readable upload time, for '${name}==${ver}' — failing closed (manual review)."
               age_ok=false
               break
             fi
-            published_epoch="$(date -u -d "$published" +%s 2>/dev/null)" || published_epoch="ERR"
-            case "$published_epoch" in
-              ""|*[!0-9]*)
-                echo "::warning::unparseable upload timestamp '$published' for '${name}==${ver}' — failing closed."
-                age_ok=false
-                break
-                ;;
-            esac
+            # Every time must parse: one unparseable time voids the read rather than being skipped.
+            published_epoch=""
+            bad_stamp=""
+            while IFS= read -r stamp; do
+              # `date -d ''` reads as midnight today, so an empty line must not reach it.
+              if [ -z "$stamp" ]; then bad_stamp="<empty>"; break; fi
+              stamp_epoch="$(date -u -d "$stamp" +%s 2>/dev/null)" || stamp_epoch="ERR"
+              case "$stamp_epoch" in
+                ""|*[!0-9]*) bad_stamp="$stamp"; break ;;
+              esac
+              if [ -z "$published_epoch" ] || [ "$stamp_epoch" -gt "$published_epoch" ]; then
+                published_epoch="$stamp_epoch"
+              fi
+            done <<< "$published"
+            if [ -n "$bad_stamp" ] || [ -z "$published_epoch" ]; then
+              echo "::warning::unparseable upload timestamp '${bad_stamp}' for '${name}==${ver}' — failing closed."
+              age_ok=false
+              break
+            fi
             age_hours=$(( (now - published_epoch) / 3600 ))
             if [ "$age_hours" -lt 0 ]; then
               echo "::warning::'${name}==${ver}' reports a FUTURE upload time (clock skew?) — failing closed."

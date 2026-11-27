@@ -1119,14 +1119,15 @@ def _fixture_age_hours(payload: str | None) -> int | None:
     """The age the step must compute from ``payload``, or None when the fixture dates nothing.
 
     Derived FROM the payload rather than passed in beside it, so the expected age and the fixture
-    cannot drift apart. ``min()`` mirrors the step's own ``sort | .[0]``.
+    cannot drift apart. ``max()`` mirrors the step, which dates a release by its NEWEST file
+    (BACKLOG #5474; this read ``min()`` while the step took the oldest).
     """
     if payload is None:
         return None
     stamps = re.findall(r'"upload_time_iso_8601"\s*:\s*"([^"]+)"', payload)
     if not stamps:
         return None
-    when = dt.datetime.strptime(min(stamps), "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=dt.UTC)
+    when = max(dt.datetime.fromisoformat(stamp) for stamp in stamps)
     return int((dt.datetime.now(dt.UTC) - when).total_seconds() // 3600)
 
 
