@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import math
-from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -43,12 +42,7 @@ types = ["ADT"]
 [load.mix]
 "ADT^A01" = 1.0
 [load.failover]
-kill_at_fraction = 0.5
-heartbeat_seconds = 2.0
-leader_fence_timeout_seconds = 4.0
-leader_lease_ttl_seconds = 6.0
-recovery_ttl_multiple = 2.0
-max_dup_rate = 0.1
+{failover}
 [[load.phase]]
 name = "sustained"
 kind = "sustained"
@@ -57,9 +51,20 @@ rate_start = 20.0
 duration_s = 2.0
 """
 
+_FAILOVER = {
+    "kill_at_fraction": "0.5",
+    "heartbeat_seconds": "2.0",
+    "leader_fence_timeout_seconds": "4.0",
+    "leader_lease_ttl_seconds": "6.0",
+    "recovery_ttl_multiple": "2.0",
+    "max_dup_rate": "0.1",
+}
 
-def _profile() -> Any:
-    return load_profile_text(_PROFILE, where="<test>")
+
+def _profile(**knobs: str) -> Any:
+    """The profile, with ``knobs`` written into its ``[load.failover]`` table as TOML values."""
+    table = "\n".join(f"{k} = {v}" for k, v in {**_FAILOVER, **knobs}.items())
+    return load_profile_text(_PROFILE.format(failover=table), where="<test>")
 
 
 def _outcome() -> _KillOutcome:
@@ -184,6 +189,7 @@ def _node_answering(
     monkeypatch: pytest.MonkeyPatch, pages: list[dict[str, Any] | None]
 ) -> tuple[failover.EngineNode, list[str]]:
     node = failover.EngineNode.__new__(failover.EngineNode)
+    node.node_id = "fo-x"
     paths: list[str] = []
 
     async def answer(_client: object, path: str) -> dict[str, Any] | None:
@@ -280,6 +286,122 @@ def test_per_lane_ordering_fails_on_one_lane() -> None:
 def test_per_lane_ordering_passes_on_two_lanes() -> None:
     rep = _report()
     assert any(s.name == "per_lane_ordering" and s.ok for s in rep.slos)
+    assert not any("lane(s)" in n for n in rep.notes)
+
+
+def test_per_lane_ordering_names_why_one_lane_fails() -> None:
+    rep = _report(tracker=_tracker(lanes=("d0",)))
+    assert any("observed 1 lane(s)" in n for n in rep.notes)
+
+
+def test_per_lane_ordering_fails_on_an_inversion_over_two_lanes() -> None:
+    # With two lanes the lane count passes, so only the inversion can fail the check.
+    t = _tracker(lanes=("d1",))
+    for seq in (*range(96), 97, 96):  # 96 arrives after 97 on lane d0
+        t.on_delivery("d0", seq)
+    assert t.lanes_observed == 2 and t.lane_inversions == 1
+    rep = _report(tracker=t)
+    assert any(s.name == "per_lane_ordering" and not s.ok for s in rep.slos)
+
+
+# --- the final reads, in order ---------------------------------------------------
+
+
+def _stats_dead(dead: int) -> NodeStats:
+    return NodeStats(done=0, dead=dead, pending=0, inflight=0, in_pipeline=0)
+
+
+class _FinalNode:
+    """The survivor's final reads, from a script, logging their order. Each dead-copy read returns
+    the next scripted set, and each one also lands a late sink arrival on ``counters``, so a test can
+    see which side of the reads the counters were taken on."""
+
+    def __init__(
+        self,
+        copies: list[frozenset[tuple[str, float]] | None],
+        stats: NodeStats | None,
+        counters: Counters,
+    ) -> None:
+        self._copies = copies
+        self._stats = stats
+        self._counters = counters
+        self.calls: list[str] = []
+
+    async def dead_copies(self, client: object) -> frozenset[tuple[str, float]] | None:
+        self.calls.append("copies")
+        self._counters.sink_received += 1
+        return self._copies.pop(0)
+
+    async def stats(self, client: object) -> NodeStats | None:
+        self.calls.append("stats")
+        return self._stats
+
+
+def _final(
+    copies: list[frozenset[tuple[str, float]] | None],
+    stats: NodeStats | None,
+    carried: frozenset[tuple[str, float]] | None,
+) -> tuple[_FinalNode, tuple[NodeStats, Counters, int | None]]:
+    counters = Counters(sink_received=10)
+    node = _FinalNode(copies, stats, counters)
+    got = asyncio.run(failover._final_reads(node, object(), carried, counters))  # type: ignore[arg-type]
+    return node, got
+
+
+def test_final_reads_bracket_the_stats_read() -> None:
+    carried = frozenset({_A, _B})
+    node, (final, snapshot, dead_new) = _final([carried, carried], _stats_dead(2), carried)
+    assert node.calls == ["copies", "stats", "copies"]
+    assert (final.dead, dead_new) == (2, 0)
+    # The first read's arrival is in, the second's is not: taken straight after the stats read.
+    assert snapshot.sink_received == 11
+
+
+def test_final_reads_judge_nothing_when_the_set_moved() -> None:
+    carried = frozenset({_A, _B})
+    _, (_, _, dead_new) = _final([carried, frozenset({_A, ("ox", 9.0)})], _stats_dead(2), carried)
+    assert dead_new is None
+
+
+def test_final_reads_skip_both_lists_with_nothing_carried() -> None:
+    node, (_, _, dead_new) = _final([], _stats_dead(4), None)
+    assert node.calls == ["stats"]
+    assert dead_new is None
+
+
+def test_final_reads_skip_the_second_list_when_nothing_is_dead() -> None:
+    carried = frozenset({_A})
+    node, _ = _final([carried], _stats_dead(0), carried)
+    assert node.calls == ["copies", "stats"]
+
+
+def test_final_reads_refuse_a_missing_final_stats_read() -> None:
+    with pytest.raises(FailoverError, match="final /stats"):
+        _final([None], None, frozenset({_A}))
+
+
+def test_an_opening_read_that_does_not_match_the_opening_count_excuses_nothing() -> None:
+    node = _CopyNode(frozenset({_A, _B, _C}))
+    got = asyncio.run(failover._opening_dead_copies([node], object(), _stats_dead(2)))  # type: ignore[list-item,arg-type]
+    assert got is None
+
+
+def test_a_refused_session_is_a_partial_dead_copy_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    node = failover.EngineNode.__new__(failover.EngineNode)
+    node.node_id = "fo-x"
+
+    async def refuse(_client: object, _path: str) -> dict[str, Any]:
+        raise FailoverError("node fo-x: sign-in refused")
+
+    monkeypatch.setattr(node, "_signed_in_json", refuse)
+    assert asyncio.run(node.dead_copies(object())) is None  # type: ignore[arg-type]
+
+
+def test_a_failure_time_too_large_for_a_float_is_a_partial_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    node, _ = _node_answering(monkeypatch, [{"total": 1, "dead_letters": [_row("a", 10**400)]}])
+    assert asyncio.run(node.dead_copies(object())) is None  # type: ignore[arg-type]
 
 
 def test_no_accepted_load_is_a_named_violation() -> None:
@@ -289,12 +411,20 @@ def test_no_accepted_load_is_a_named_violation() -> None:
     assert "(0 violated)" not in rep.render_console()
 
 
-@pytest.mark.parametrize("value", [math.nan, math.inf])
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("max_dup_rate", "nan"),
+        ("recovery_ttl_multiple", "nan"),
+        ("max_promotion_seconds", "inf"),
+        ("leader_lease_ttl_seconds", "inf"),
+    ],
+)
 def test_a_non_finite_failover_knob_is_refused_before_any_start(
-    value: float, monkeypatch: pytest.MonkeyPatch
+    key: str, value: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    profile = _profile()
-    profile = replace(profile, failover=replace(profile.failover, max_dup_rate=value))
+    # Through the profile loader, which lets each of these through, so the guard is what stops it.
+    profile = _profile(**{key: value})
 
     def boom(*_a: object, **_k: object) -> object:
         raise AssertionError("the run started")
@@ -304,7 +434,7 @@ def test_a_non_finite_failover_knob_is_refused_before_any_start(
     ports = FailoverPorts(
         api_a=1, api_b=2, inbound_adt=3, inbound_results=4, inbound_other=5, sink=6, sink_count=1
     )
-    with pytest.raises(FailoverError, match="max_dup_rate"):
+    with pytest.raises(FailoverError, match=f"{key} must be a finite number"):
         asyncio.run(failover.run_failover_load(profile, ports=ports, base_env={}))
 
 

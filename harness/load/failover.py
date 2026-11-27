@@ -79,21 +79,27 @@ _STOP_GRACE = 5.0
 _SETTLE = 0.5  # let the final ACKs/arrivals settle before the truly-final engine sample
 _OPENING_STATS_ATTEMPTS = 5
 _OPENING_STATS_RETRY_S = 0.5
-#: One ``/dead-letters`` page: the route's own ceiling (``limit <= 500``).
+#: One ``/dead-letters`` page. It copies that route's ``limit`` ceiling (``le=500``) and nothing pins
+#: the two: if the route lowers it, every page is refused, the read logs the refusal, and the dead-row
+#: check stays absolute.
 _DEAD_PAGE = 500
 #: The most dead copies the per-copy check reads (BACKLOG #5572). Past it the check stays absolute,
-#: so a store carrying more fails a clean run, as every reused store with dead rows did before.
-_DEAD_COPIES_MAX = 10_000
+#: so a store carrying more fails a clean run, as every reused store with dead rows did before. Each
+#: page is a PHI-gated read: it spends the rig account's per-actor PHI-read budget (120 a minute by
+#: default) and writes an exposure audit row. A run reads at most three times, so this cap keeps a
+#: run to 30 pages; raising it, or a lower engine budget, turns pages into refusals.
+_DEAD_COPIES_MAX = 5_000
 
 #: One dead outbound copy, as ``/dead-letters`` names it: ``(outbox_id, failed_at)``. The time is
 #: part of the identity, so a carried-over row that is replayed and dead-lettered again reads as new.
 DeadCopy = tuple[str, float]
 
-#: The most bytes the rig reads of one ``/health``, ``/cluster/status`` or ``/stats`` answer, the
-#: only API routes it polls over ``httpx`` (ASVS 5.1.1, BACKLOG #1127). Each is a role or a few
-#: counters, well under a KiB, so 1 MiB leaves room and still stops a node that streams without end.
-#: A ``/dead-letters`` page is read under the same cap; one past it is no answer, so the dead-row
-#: check stays absolute (BACKLOG #5572).
+#: The most bytes the rig reads of one engine API answer (ASVS 5.1.1, BACKLOG #1127). The routes
+#: it polls, ``/health``, ``/cluster/status`` and ``/stats``, answer a role or a few counters, well
+#: under a KiB, so 1 MiB leaves room and still stops a node that streams without end. It also reads
+#: ``/dead-letters`` pages, which are larger: 500 rows, each with the engine's error text and
+#: summary. A page past the cap is no answer, which leaves the dead-row check absolute (BACKLOG
+#: #5572), so a smaller cap would quietly switch that check off.
 MAX_STATUS_REPLY_BYTES = 1 << 20
 
 
@@ -431,43 +437,65 @@ class EngineNode:
         read add up to that total. A row the paging skipped or saw twice breaks one of those, and so
         does a dead row whose message row is gone, which the count sees and the list does not. Only
         the copy identities are kept, in memory: the summary and error text the route also returns
-        are dropped here and never reach the report (PHI rule)."""
-        copies: set[DeadCopy] = set()
-        seen: set[str] = set()
+        are dropped here and never reach the report (PHI rule).
+
+        The read is optional, so nothing it meets ends the run: a refused sign-in, which every other
+        read raises as :class:`FailoverError`, is a partial read here too. Why a read was not whole
+        is logged, by reason only."""
+        try:
+            got = await self._read_dead_copies(client)
+        except FailoverError as exc:
+            got = f"the rig session was refused ({type(exc).__name__})"
+        if isinstance(got, str):
+            log.warning("node %s: dead-letter read not whole: %s", self.node_id, got)
+            return None
+        return got
+
+    async def _read_dead_copies(self, client: httpx.AsyncClient) -> frozenset[DeadCopy] | str:
+        """:meth:`dead_copies`' pages, or why they are not whole."""
+        copies: dict[str, float] = {}
         total: int | None = None
         while True:
             data = await self._signed_in_json(
                 client, f"/dead-letters?limit={_DEAD_PAGE}&offset={len(copies)}"
             )
             if data is None:
-                return None
+                return f"no answer at offset {len(copies)}"
             page_total, rows = data.get("total"), data.get("dead_letters")
             if type(page_total) is not int or not isinstance(rows, list):
-                return None
+                return "a page with no total or no rows"
             if total is None:
                 total = page_total
-            if page_total != total or total > _DEAD_COPIES_MAX:
-                return None
+            if page_total != total:
+                return "the total changed between pages"
+            if total > _DEAD_COPIES_MAX:
+                return f"{total} dead rows, past the {_DEAD_COPIES_MAX} the check reads"
             for row in rows:
                 if not isinstance(row, dict):
-                    return None
+                    return "a row that is not an object"
                 oid, at = row.get("outbox_id"), row.get("failed_at")
                 # bool is an int, so it is refused by name; NaN never equals itself, so a NaN time
-                # could not match its own opening copy.
+                # could not match its own opening copy; an int too large for a float overflows.
                 if (
                     not isinstance(oid, str)
                     or not isinstance(at, (int, float))
                     or isinstance(at, bool)
                 ):
-                    return None
-                failed_at = float(at)
-                if not math.isfinite(failed_at) or oid in seen:
-                    return None
-                seen.add(oid)
-                copies.add((oid, failed_at))
+                    return "a row with no outbox id or failure time"
+                try:
+                    failed_at = float(at)
+                except OverflowError:
+                    return "a failure time out of range"
+                if not math.isfinite(failed_at):
+                    return "a failure time out of range"
+                if oid in copies:
+                    return "a row seen twice: the set moved under the paging"
+                copies[oid] = failed_at
             if not rows or len(copies) >= total:
                 break
-        return frozenset(copies) if len(copies) == total else None
+        if len(copies) != total:
+            return f"{len(copies)} rows read of {total}"
+        return frozenset(copies.items())
 
 
 async def _get_json(client: httpx.AsyncClient, url: str) -> dict[str, Any] | None:
@@ -803,17 +831,13 @@ async def run_failover_load(
             outcome = (
                 await monitor
             )  # recovery was observed during the phase/drain (or hit the deadline)
-            # The dead copies are read on both sides of the final stats read, so a copy that dies or
-            # leaves between the reads shows as a moved set and judges nothing (_judge_new_dead).
-            before = await survivor.dead_copies(client) if carried else None
-            final = await survivor.stats(client)
-            if final is None:
-                raise FailoverError("could not read the survivor's final /stats for reconciliation")
-            after = await survivor.dead_copies(client) if carried and final.dead else None
+            final, counters, dead_new = await _final_reads(
+                survivor, client, carried, metrics.counters
+            )
             return _build_report(
                 profile,
                 db_backend,
-                metrics.counters,
+                counters,
                 tracker,
                 outcome,
                 final,
@@ -821,7 +845,7 @@ async def run_failover_load(
                 fo,
                 notes,
                 dead_opening=opening.dead,
-                dead_new=_judge_new_dead(carried, before, after, final.dead),
+                dead_new=dead_new,
             )
         finally:
             for task in (phase_task, monitor):
@@ -966,16 +990,20 @@ def _build_report(
         dead_new = 0
     dead_ok = dead_new == 0
     if not dead_ok:
-        notes.append(
-            f"{final.dead} dead-lettered outbound row(s) at the end; "
-            + (
-                f"{dead_new} of them new this run"
-                if dead_new is not None
-                else f"the store held {dead_opening} at the opening read and the run could not tell "
+        if dead_new is not None:
+            why = f"{dead_new} of them new this run"
+        elif dead_opening:
+            why = (
+                f"the store held {dead_opening} at the opening read and the run could not tell "
                 "carried-over rows from new ones, so every one counts"
-                if dead_opening
-                else "the store held none at the opening read"
             )
+        else:
+            why = "the store held none at the opening read"
+        notes.append(f"{final.dead} dead-lettered outbound row(s) at the end; {why}")
+    if tracker.lanes_observed < 2:
+        notes.append(
+            f"per-lane ordering observed {tracker.lanes_observed} lane(s); it needs two to compare "
+            "anything, so zero inversions proves nothing and the check fails"
         )
     no_loss_ok = acked_not_delivered == 0 and final.in_pipeline == 0 and dead_ok
     recovery_bound = fo.recovery_ttl_multiple * fo.leader_lease_ttl_seconds
@@ -1199,15 +1227,38 @@ async def _opening_dead_copies(
     nodes: list[EngineNode], client: httpx.AsyncClient, opening: NodeStats
 ) -> frozenset[DeadCopy] | None:
     """The dead copies the store already held before any load: the only rows the run may excuse
-    (BACKLOG #5572). ``None`` when there are none, and when no node gives a whole read; either way the
-    dead-row check stays absolute. A store with no dead rows is never listed."""
+    (BACKLOG #5572). ``None`` when there are none, when no node gives a whole read, and when the read
+    does not match the opening count, so that every excused copy is one the report counts in
+    ``dead_opening``; each way the dead-row check stays absolute. A store with no dead rows is never
+    listed."""
     if opening.dead == 0:
         return None
     for n in nodes:
         copies = await n.dead_copies(client)
         if copies is not None:
-            return copies or None
+            return copies if len(copies) == opening.dead else None
     return None
+
+
+async def _final_reads(
+    survivor: EngineNode,
+    client: httpx.AsyncClient,
+    carried: frozenset[DeadCopy] | None,
+    counters: Counters,
+) -> tuple[NodeStats, Counters, int | None]:
+    """The final stats read, the harness counters at that moment, and :func:`_judge_new_dead`'s count.
+
+    The dead copies are read on both sides of the stats read, so a copy that dies or leaves between
+    them shows as a moved set and judges nothing. The counters are taken straight after the stats
+    read, before the second dead-copy read, so the sink arrivals they count line up with the
+    ``done`` count beside them, as they did before this check existed."""
+    before = await survivor.dead_copies(client) if carried else None
+    final = await survivor.stats(client)
+    if final is None:
+        raise FailoverError("could not read the survivor's final /stats for reconciliation")
+    snapshot = counters.snapshot()
+    after = await survivor.dead_copies(client) if carried and final.dead else None
+    return final, snapshot, _judge_new_dead(carried, before, after, final.dead)
 
 
 def _judge_new_dead(
@@ -1232,9 +1283,13 @@ def _judge_new_dead(
 
 
 def _refuse_non_finite(fo: Failover) -> None:
-    """Refuse a ``[load.failover]`` knob that is NaN or infinite. The profile's range checks let
-    both through (NaN fails every comparison), and either would print as a threshold the JSON report
-    cannot carry: ``NaN`` and ``Infinity`` are not JSON (S26-62)."""
+    """Refuse a ``[load.failover]`` knob that is NaN or infinite, before anything starts (S26-62).
+
+    The profile's range checks pass NaN, which fails every comparison, and pass infinity wherever a
+    knob has no maximum. At least ``recovery_ttl_multiple`` and ``max_dup_rate`` reach here as NaN,
+    and ``max_promotion_seconds`` and ``leader_lease_ttl_seconds`` as infinity. Each lands in the
+    JSON report as a threshold, and ``NaN`` and ``Infinity`` are not JSON. The other profile knobs
+    are the profile loader's to check."""
     for f in fields(fo):
         value = getattr(fo, f.name)
         if isinstance(value, float) and not math.isfinite(value):
