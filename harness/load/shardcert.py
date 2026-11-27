@@ -1407,6 +1407,22 @@ async def _reset_store_or_signal(coord: FileDropCoord, node_env: Mapping[str, st
         raise
 
 
+def _check_store_pool_or_signal(
+    coord: FileDropCoord, pool_size: int, shard_count: int, *, force: bool
+) -> None:
+    """The ENGINE half's :func:`check_store_pool_size` (BACKLOG #5953, S27-74), telling a waiting drive
+    half at once when it refuses, as :func:`_reset_store_or_signal` does. Best-effort post, fixed reason."""
+    try:
+        check_store_pool_size(pool_size, shard_count, force=force)
+    except StorePoolOverCliff:
+        with contextlib.suppress(OSError):
+            coord.post(
+                ENGINE_SETUP_FAILED,
+                {"reason": "store pool at/over the ADR 0062 cliff (see the engine box's stderr)"},
+            )
+        raise
+
+
 async def _open_rig_store(env: Mapping[str, str]) -> SqlServerStore:
     """Open the rig's SQL Server store from ``env``, at a warn posture. The caller closes it.
 
@@ -1678,6 +1694,7 @@ async def run_shardcert(
     sink_port: int | None = None,
     capture_peak: bool = False,
     store_pool_size: int | None = None,
+    force_store_pool_size: bool = False,
     strict_bands: bool = False,
 ) -> ShardCertReport:
     """Run the 4-shard certification bench once. ``store_env`` must point every serve process at the
@@ -1772,6 +1789,8 @@ async def run_shardcert(
     # MEFOR_STORE_POOL_SIZE exactly as the old setdefault did, so an operator's out-of-band pin is unchanged
     # — what changed is the DEFAULT (8 -> 40, the product's) and the fact that the value is now RECORDED.
     pool_size = resolve_store_pool_size(store_env, store_pool_size)
+    # BACKLOG #5953 (S27-74): refuse a pool at/over the ADR 0062 cliff before the store is touched.
+    check_store_pool_size(pool_size, n, force=force_store_pool_size)
     store_env["MEFOR_STORE_POOL_SIZE"] = str(pool_size)
     announce_store_pool(pool_size, n)
     node_env = {**os.environ, **store_env, **shape_env, **escapes}
@@ -2869,6 +2888,7 @@ async def _run_ladder_step(
     sink_host: str,
     sink_port: int | None,
     store_pool_size: int | None = None,
+    force_store_pool_size: bool = False,
     strict_bands: bool = False,
 ) -> ShardCertStepRecord:
     """Drive ONE ladder hold step at ``rate`` (a full fresh-fleet ``run_shardcert``, no kill, peak
@@ -2888,6 +2908,7 @@ async def _run_ladder_step(
         sink_port=sink_port,
         capture_peak=True,
         store_pool_size=store_pool_size,
+        force_store_pool_size=force_store_pool_size,
         strict_bands=strict_bands,
     )
     return ShardCertStepRecord.from_report(rate, report, hold_seconds=hold_seconds)
@@ -2906,6 +2927,7 @@ async def run_shardcert_ladder(
     sink_host: str = "127.0.0.1",
     sink_port: int | None = None,
     store_pool_size: int | None = None,
+    force_store_pool_size: bool = False,
     strict_bands: bool = False,
 ) -> ShardCertLadderReport:
     """Run the ascending rate-ladder ceiling hunt: for each aggregate rate (sorted ascending), drive one
@@ -2934,6 +2956,7 @@ async def run_shardcert_ladder(
                 sink_host=sink_host,
                 sink_port=sink_port,
                 store_pool_size=store_pool_size,
+                force_store_pool_size=force_store_pool_size,
                 strict_bands=strict_bands,
             )
         except StoreResetFailed as exc:
@@ -3509,6 +3532,7 @@ async def run_shardcert_engine(
     sample_in_pipeline: bool = False,
     sample_interval: float = 2.0,
     store_pool_size: int | None = None,
+    force_store_pool_size: bool = False,
     strict_bands: bool = False,
 ) -> ShardCertEngineReport:
     """The ENGINE-box half (WS-C option #2). Brings the ``serve --shard`` fleet up against the ONE
@@ -3577,6 +3601,7 @@ async def run_shardcert_engine(
     # default 40) and ASSIGNED, so its value is CHOSEN in one place and RECORDED in the rung's report; it
     # used to be `setdefault`-pinned at 8 (1/5 of product, 32 connections fleet-wide) and recorded nowhere.
     pool_size = resolve_store_pool_size(store_env, store_pool_size)
+    _check_store_pool_or_signal(coord, pool_size, n, force=force_store_pool_size)
     store_env["MEFOR_STORE_POOL_SIZE"] = str(pool_size)
     announce_store_pool(pool_size, n)
     node_env = {**os.environ, **store_env, **shape_env, **escapes}

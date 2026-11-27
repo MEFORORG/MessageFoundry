@@ -1060,6 +1060,13 @@ def _add_bench_truth_args(parser: argparse.ArgumentParser) -> None:
         f"value is recorded in the report JSON",
     )
     parser.add_argument(
+        "--force-store-pool-size",
+        action="store_true",
+        help="RUN a --store-pool-size at/over the ADR 0062 collapse cliff (POOL_SIZE_CLIFF per process) "
+        "instead of refusing it. Past the cliff the pool itself thrashes the shared store, so the measured "
+        "wall is the pool's, not the engine's",
+    )
+    parser.add_argument(
         "--strict-inbound-bands",
         action="store_true",
         help="REFUSE to run when the inbound band count G (= shards x --lanes-per-shard) is below the "
@@ -1164,6 +1171,7 @@ def _run_shardcert(argv: list[str]) -> int:
 
     from harness.load.shardcert import (
         InboundBandTooNarrow,
+        StorePoolOverCliff,
         StoreResetFailed,
         parse_rate_ladder,
         run_shardcert,
@@ -1189,6 +1197,7 @@ def _run_shardcert(argv: list[str]) -> int:
                     sink_port=args.sink_port,
                     store_env=store_env,
                     store_pool_size=args.store_pool_size,
+                    force_store_pool_size=args.force_store_pool_size,
                     strict_bands=args.strict_inbound_bands,
                 )
             )
@@ -1212,6 +1221,7 @@ def _run_shardcert(argv: list[str]) -> int:
                 store_env=store_env,
                 capture_peak=True,
                 store_pool_size=args.store_pool_size,
+                force_store_pool_size=args.force_store_pool_size,
                 strict_bands=args.strict_inbound_bands,
             )
         )
@@ -1223,6 +1233,10 @@ def _run_shardcert(argv: list[str]) -> int:
     except StoreResetFailed as exc:
         # BACKLOG #5576: the store could not be emptied, so nothing measured would be clean. Setup, not a
         # bench result.
+        print(f"refusing to run: {exc}", file=sys.stderr)
+        return 2
+    except StorePoolOverCliff as exc:
+        # BACKLOG #5953 (S27-74): the ADR 0062 cliff without --force-store-pool-size. Setup.
         print(f"refusing to run: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
@@ -1473,6 +1487,9 @@ def _run_shardcert_engine(argv: list[str]) -> int:
 
     coord = _coord_from_args(args)
     assert isinstance(coord, FileDropCoord)
+    # Apart from the block above, which BACKLOG #5440 (KillLegError) also edits on its own branch.
+    from harness.load.shardcert import StorePoolOverCliff
+
     coord.clear()  # the engine is the first mover — clear any stale prior-run handshake files
 
     try:
@@ -1494,10 +1511,15 @@ def _run_shardcert_engine(argv: list[str]) -> int:
                 sink_host=args.sink_host,
                 claim_mode=args.claim_mode,
                 store_pool_size=args.store_pool_size,
+                force_store_pool_size=args.force_store_pool_size,
                 strict_bands=args.strict_inbound_bands,
             )
         )
     except (InboundBandTooNarrow, StoreResetFailed) as exc:
+        print(f"refusing to run: {exc}", file=sys.stderr)
+        return 2
+    except StorePoolOverCliff as exc:
+        # BACKLOG #5953 (S27-74): the ADR 0062 cliff without --force-store-pool-size. Setup.
         print(f"refusing to run: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
@@ -2030,7 +2052,12 @@ def _run_shardcert_engine_ladder(argv: list[str]) -> int:
         return 2
 
     from harness.load.coord import FileDropCoord
-    from harness.load.shardcert import InboundBandTooNarrow, StoreResetFailed, parse_rate_ladder
+    from harness.load.shardcert import (
+        InboundBandTooNarrow,
+        StorePoolOverCliff,
+        StoreResetFailed,
+        parse_rate_ladder,
+    )
     from harness.load.shardcert_ladder import run_engine_ladder
 
     try:
@@ -2095,10 +2122,15 @@ def _run_shardcert_engine_ladder(argv: list[str]) -> int:
                 climb_drive_start_timeout=args.drive_start_timeout,
                 soak_timeout=args.soak_timeout,
                 store_pool_size=args.store_pool_size,
+                force_store_pool_size=args.force_store_pool_size,
                 strict_bands=args.strict_inbound_bands,
             )
         )
     except (InboundBandTooNarrow, StoreResetFailed) as exc:
+        print(f"refusing to run: {exc}", file=sys.stderr)
+        return 2
+    except StorePoolOverCliff as exc:
+        # BACKLOG #5953 (S27-74): the ADR 0062 cliff without --force-store-pool-size. Setup.
         print(f"refusing to run: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:

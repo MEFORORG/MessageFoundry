@@ -15,7 +15,9 @@
 >    the drive box's disk). It would have commissioned an engine rewrite against a harness artifact.
 >    * The pool is now an **explicit, recorded, sweepable** variable: **`--store-pool-size N`** (defaults to
 >      the product 40; an ambient `MEFOR_STORE_POOL_SIZE` still wins over the default, as the old
->      `setdefault` did).
+>      `setdefault` did). A size at or over ADR 0062's collapse cliff (`POOL_SIZE_CLIFF`, per process) is
+>      **refused** before the store reset, exit 2, unless **`--force-store-pool-size`** is passed (BACKLOG
+>      #5953); the engine half tells a waiting drive half at once.
 >    * The **effective** value is printed to **stderr at fleet launch** and recorded in the report JSON at
 >      **`store_pool.requested_pool_size`** — beside the engine's own **`engine_max_size`** (`/status`), so a
 >      requested-vs-observed mismatch is a finding rather than a silent 8.

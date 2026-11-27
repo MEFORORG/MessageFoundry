@@ -3590,6 +3590,8 @@ async def run_engine_ladder(
     #: ARTIFACT 2: the EFFECTIVE MEFOR_STORE_POOL_SIZE for every shard PROCESS. None ⇒ resolve from the
     #: ambient env, else the PRODUCT default (40) — never the old hardcoded 8.
     store_pool_size: int | None = None,
+    #: BACKLOG #5953 (S27-74): run a pool at/over the ADR 0062 cliff anyway (``--force-store-pool-size``).
+    force_store_pool_size: bool = False,
     #: ARTIFACT 5: refuse (rather than warn) to arm a rung whose inbound band count G is below the outbound
     #: lane count L. Off by default because G < L is TRUE at the shipped defaults.
     strict_bands: bool = False,
@@ -3683,6 +3685,7 @@ async def run_engine_ladder(
                 # rung visible on the only path STEP 4 actually runs.
                 sample_in_pipeline=True,
                 store_pool_size=store_pool_size,
+                force_store_pool_size=force_store_pool_size,
                 strict_bands=strict_bands,
             )
         except CoordTimeout:
@@ -3799,6 +3802,7 @@ async def run_engine_ladder(
             # The soak must run on the SAME pool + band shape as the climb it was pinned from, or the soak
             # is testing a different fleet than the ceiling it is soaking (ARTIFACTS 2/5).
             store_pool_size=store_pool_size,
+            force_store_pool_size=force_store_pool_size,
             strict_bands=strict_bands,
         )
     except CoordTimeout:
