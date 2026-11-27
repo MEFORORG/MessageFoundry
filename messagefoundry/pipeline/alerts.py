@@ -1053,8 +1053,14 @@ class AlertSink(Protocol):
         read whether the box was activated. Page-worthy, and CRITICAL unless a matching rule names
         its own severity. It closes the open ``dr_activated`` instance for ``node``, which no
         longer describes a box that serves; the next ``dr_activated`` or ``dr_released`` for
-        ``node`` closes this one. ``node`` is the label the coordinator's ``dr_activated``
-        carries: the host, and on an engine shard the shard too. No PHI."""
+        ``node`` closes this one. On a passive box, ``POST /dr/release`` raises ``dr_released``
+        only when its start raised this alert or the box's newest own activate or release record
+        is an activation. So an instance an earlier start raised, on a box whose newest own record is
+        not an activation, stays open until an operator resolves it by hand, with
+        ``POST /alerts/{id}/resolve`` or the web console's Resolve on the alert, or a later
+        ``POST /dr/activate`` closes it; a release there changes nothing and does not close it.
+        ``node`` is the label the coordinator's ``dr_activated`` carries: the host, and on an
+        engine shard the engine shard identity too. No PHI."""
         ...
 
     # --- vault BACKLOG #2613: the security-signal rule layer -----------------------------------
@@ -1660,8 +1666,8 @@ class LoggingAlertSink:
         # The inverse (auto-resolve) event, logged at INFO, no page. Raised by a fail-back and by a
         # release that leaves a restarted box passive (BACKLOG #5965), so the line claims no hand-back.
         log.info(
-            "ALERT dr_released: DR box %r released: it no longer serves under the DR run-profile, "
-            "and serving is left to the %s",
+            "ALERT dr_released: DR box %r released: this box is not activated as DR; serving is "
+            "left to the %s",
             node,
             role,
         )
@@ -1671,7 +1677,10 @@ class LoggingAlertSink:
             "ALERT dr_restarted_passive: DR box %r started PASSIVE and may have been serving when "
             "it went down -- the ERROR line before this says what its store shows. It serves "
             "nothing until POST /dr/activate, to be run only once you have confirmed the "
-            "primary is not serving; POST /dr/release records that it stays passive",
+            "primary is not serving; POST /dr/release records that it stays passive and closes "
+            "this alert. An instance an earlier start raised is not closed by a release on a "
+            "box whose newest own record is not an activation: resolve it by hand with "
+            "POST /alerts/{id}/resolve or the web console's Resolve",
             node,
         )
 

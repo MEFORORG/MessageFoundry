@@ -12033,7 +12033,15 @@ def create_app(
         since, it is a stay-passive release instead (BACKLOG #5965): it runs the release hook when one
         is set, writes a ``dr.stay_passive`` audit row and
         closes the alert, but unbinds no listener and drains nothing, so an inbound an operator started
-        on that box stays bound. It still answers ``action=release``."""
+        on that box stays bound. It still answers ``action=release``. On a passive box whose own
+        newest activate or release record is not an activation and whose start raised no
+        ``dr_restarted_passive``, it changes nothing: it writes no row and closes no alert, so a
+        ``dr_restarted_passive`` an earlier start raised stays open until an operator resolves it by
+        hand, with ``POST /alerts/{id}/resolve`` or the web console's Resolve on the alert, or a later
+        ``POST /dr/activate`` closes it. The response does not reliably tell that case from a
+        stay-passive release: both answer ``active=false`` with no drain fields, and with no release
+        hook set both answer ``vip_hook_ran=false``. Read the alert list to see whether the alert
+        closed."""
         coord = engine.dr_coordinator
         if coord is None:
             raise HTTPException(503, "this deployment is not a DR standby ([dr].enabled is false)")

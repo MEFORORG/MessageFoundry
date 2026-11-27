@@ -306,7 +306,7 @@ async def test_the_stay_passive_line_claims_no_hand_back(
         ]
         assert len(lines) == 1
         assert "handed back" not in lines[0]
-        assert "it no longer serves under the DR run-profile" in lines[0]
+        assert "this box is not activated as DR; serving is left to the primary" in lines[0]
         assert await store.list_audit(action="dr.stay_passive", limit=5) != []
     finally:
         await store.close()

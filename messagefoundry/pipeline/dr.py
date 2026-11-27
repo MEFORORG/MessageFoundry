@@ -282,8 +282,8 @@ class DrCoordinator:
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
         # #145: the DR box's host, the first part of the label the dr_activated, dr_released and
         # dr_restarted_passive alerts carry (also the throttle / auto-resolve key); _label() adds
-        # the process. Stable across an activate/release pair (same box), so the fail-back
-        # resolves the promotion instance. PHI-free (a host label only).
+        # the engine shard identity where there is one. Stable across an activate/release pair
+        # (same box), so the fail-back resolves the promotion instance. PHI-free (a host label only).
         self._host = socket.gethostname()
         self._clock = clock
         # ADR 0073: the engine's ownership scope for the activation recovery reset. On a SHARDED DR
@@ -338,15 +338,15 @@ class DrCoordinator:
         return self._instance() if self._instance is not None else None
 
     def _label(self) -> str:
-        """The DR alerts' label: the host, and the process identity where it has one, so each
+        """The DR alerts' label: the host, and the engine shard identity where it has one, so each
         engine shard of a box raises and resolves its own instance (BACKLOG #5965)."""
         identity = self._identity()
         return f"{self._host} {identity}" if identity else self._host
 
     def _whose(self) -> dict[str, object]:
         """The fields a transition row carries so a later start can tell whether this identity
-        wrote it: the host, and the process identity (BACKLOG #5965). The host keeps a row
-        restored from another box's store from reading as this box's own."""
+        wrote it: the host, and the engine shard identity, or none (BACKLOG #5965). The host keeps
+        a row restored from another box's store from reading as this box's own."""
         return {"host": self._host, "instance": self._identity()}
 
     async def _own_last_transition(self) -> str | None:
@@ -367,8 +367,9 @@ class DrCoordinator:
         ``dr_activated`` for the same label. Each engine shard reads only the rows its own identity wrote, so each
         alerts on its own. A store that cannot be read is the same loud outcome, since the box may
         have been serving. ``POST /dr/release`` on the passive box records that the operator
-        leaves it passive, and closes the alert (:meth:`_record_stay_passive`). Returns whether
-        it alerted.
+        leaves it passive, and closes the alert this start raised (:meth:`_record_stay_passive`);
+        an alert an earlier start raised is closed only by hand or by a later activation. Returns
+        whether it alerted.
 
         It misses at least: an activation whose ``dr.activate`` row was never written (the owed
         row is held in memory only); a box whose host name changed between the activation and
@@ -415,8 +416,10 @@ class DrCoordinator:
         starts stop alerting, and close the alert (BACKLOG #5965). The release hook runs when
         one is set, since the takeover hook may have moved the address here. Nothing drains: the
         box delivers nothing already, so any row left undelivered on it stays queued for the
-        operator to reconcile, as after a release. ``None`` when there is nothing
-        to record. A write error refuses the release."""
+        operator to reconcile, as after a release. ``None`` when there is nothing to record: then
+        it writes no row and closes no alert, so a ``dr_restarted_passive`` an earlier start
+        raised stays open until an operator resolves it by hand (``POST /alerts/{id}/resolve``)
+        or a later activation closes it. A write error refuses the release."""
         try:
             last = await self._own_last_transition()
         except Exception:
@@ -742,11 +745,17 @@ class DrCoordinator:
         optional ``release_hook`` / let the passive LB return it to the primary), then the engine unbinds
         all inbound listeners while the workers drain the staged queue to completion. Returns success only
         once the VIP is off the DR box and intake is unbound, so there is **no dual-accept window** while
-        the VIP moves. **The exception is a box already passive** whose identity was last activated, or
-        whose start raised ``dr_restarted_passive`` with no activation recorded since: that release
-        only runs the release hook when one is set, writes a
-        ``dr.stay_passive`` row and closes the alert (:meth:`_record_stay_passive`). It unbinds no
-        listener and drains nothing, so an inbound an operator started on that box stays bound.
+        the VIP moves. **A box already passive is an exception** in at least these cases, and none of
+        them unbinds a listener or drains, so an inbound an operator started on that box stays bound.
+        Where its identity was last activated, or its start raised ``dr_restarted_passive`` with no
+        activation recorded since, the release only runs the release hook when one is set, writes a
+        ``dr.stay_passive`` row and closes that alert (:meth:`_record_stay_passive`). Where its own
+        newest activate or release record is not an activation, as on a box never activated or one
+        whose activation aborted after a hand-back, and this start raised no restart alert, the
+        release writes no row and closes no alert. So a ``dr_restarted_passive`` an earlier start
+        raised stays open until an operator resolves it by hand, with ``POST /alerts/{id}/resolve``
+        or the web console's Resolve on the alert, or a later activation closes it. A retry after a completed hand-back answers with that release's
+        outcome, and a hand-back whose ``dr.release`` row is still owed writes that row first.
         **Within the DR store** at-least-once + idempotency are preserved on drain;
         **cross-store** reconciliation with the recovered primary is operator-verified per the runbook
         (the engine gives no cross-store loss/duplicate guarantee — documented, not an engine AC)."""
