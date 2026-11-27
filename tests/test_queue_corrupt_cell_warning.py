@@ -302,6 +302,7 @@ async def test_an_unhandled_read_refusal_logs_no_cipher_text_under_uvicorn(
     refusal = _REFUSALS[kind][0]
     raised = re.compile(rf"(?m)^{re.escape(f'{refusal.__module__}.{refusal.__qualname__}')}:")
     assert any("Traceback" in p and raised.search(p) for p in printed), printed
+    assert len(printed) >= 1  # the absence search below walks a non-empty capture
     leaked = [p for p in printed if any(word in p for word in _CIPHER_WORDS)]
     assert leaked == [], leaked
     assert not any("SYNTH-BODY" in p for p in printed)
