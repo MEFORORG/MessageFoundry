@@ -1825,12 +1825,12 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
     _, sep, facts = message.partition("off-box log forwarding runs without an on-disk spool")
     assert sep, message
     assert facts == _SPOOL_IN_USE_FACTS  # the constant the control below looks for
-    # Every cause ``_try_lock`` returns False for: ``lock_exclusive`` reports contention by any
+    # At least the causes ``_try_lock`` returns False for: ``lock_exclusive`` reports contention by any
     # handle, this process's own included, and ``_try_lock`` reads any other lock fault as
     # contention.
     assert (
-        "This WARNING reads the same whether another process holds the lock, this process already "
-        "holds it on another handle, or taking the lock failed." in facts
+        "This WARNING reads the same for at least these causes: another process holds the lock, "
+        "this process already holds it on another handle, or taking the lock failed." in facts
     )
     # ``_open_forward_spool`` runs once per forwarder, at configure time, and returned ``None``
     # here, so this forwarder has no spool object and reads nothing from that directory. Another
@@ -1840,7 +1840,7 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
         "Until this process restarts with a spool it can lock, the forwarder this WARNING belongs "
         "to has no on-disk spool and sends nothing from that directory." in facts
     )
-    # The stranding fact belongs to the lock holder, never to this process, which holds nothing.
+    # The stranding fact belongs to the lock holder, never to this forwarder, which holds nothing.
     assert (
         "Only the process holding a spool directory's lock sends that directory's segments, so a "
         "change to that process's spool directory leaves the segments in its old directory unsent "
@@ -1850,7 +1850,8 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
     # At least these inputs to the directory ``__main__._forward_spool_dir`` derives: the setting
     # and its variable, the working directory under a relative setting (the root is ``Path(base)``,
     # never anchored), the engine shard's shard id, and under no setting the directory holding
-    # ``[store].path``, read on every backend (the next test ties that one to the code).
+    # ``[store].path``, which ``--db`` sets in both ``serve`` and ``supervise``, read on every
+    # backend (the next test ties that one to the code).
     assert (
         "[logging].forward_spool_dir (environment variable MEFOR_LOGGING_FORWARD_SPOOL_DIR)"
         in facts
@@ -1858,8 +1859,9 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
     assert "the working directory when that setting is a relative path" in facts
     assert "and an engine shard's shard id." in facts
     assert (
-        "With no setting, it also changes with the directory that holds the resolved [store].path, "
-        "which is read even when the store is on a database server." in facts
+        "With no setting, it also changes with the directory that holds the resolved store path "
+        "(--db, or else [store].path), which is read even when the store is on a database server."
+        in facts
     )
     assert "the store path the default directory is derived from" not in facts
     assert 'One directory serves one process (ADR 0200, "One process per directory").' in facts
