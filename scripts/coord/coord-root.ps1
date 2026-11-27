@@ -340,9 +340,11 @@ function Get-CoordSeatEnded {
     #
     # NEWEST BY WHAT THE RECORD SAYS, never by file time, as seat.ps1 picks its prior: -ClearHandoff
     # rewrites a dead session's record without moving its asOf, and a copy moves the file time too.
-    # Any record that cannot be read may be the current one mid-write, so then nothing older speaks
-    # for the box (box-activity.ps1, Get-BoxRecordHost, reads the same way). A record whose asOf
-    # names no instant sorts oldest; between equal stamps the later file time wins.
+    # The NEWEST FILE that cannot be read may be the current record mid-write, so then nothing older
+    # speaks for the box (box-activity.ps1, Get-BoxRecordHost, reads the same way). An unreadable
+    # file older than a readable one is a leftover and is skipped, or one stray file would silence
+    # the box for good. A record whose asOf names no instant sorts oldest; between equal stamps the
+    # later file time wins.
     param([string]$Dir)
     try {
         if (-not $Dir -or -not (Test-Path -LiteralPath $Dir -PathType Container)) { return $null }
@@ -350,8 +352,12 @@ function Get-CoordSeatEnded {
         $best = [DateTimeOffset]::MinValue
         foreach ($f in @(Get-ChildItem -LiteralPath $Dir -Filter *.json -File -Force -EA SilentlyContinue |
                 Sort-Object LastWriteTimeUtc -Descending)) {
-            $one = Read-CoordText $f.FullName | ConvertFrom-Json -NoEnumerate -EA Stop
-            if ($one -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+            $one = $null
+            try { $one = Read-CoordText $f.FullName | ConvertFrom-Json -NoEnumerate -EA Stop } catch { }
+            if ($one -isnot [System.Management.Automation.PSCustomObject]) {
+                if ($null -eq $rec) { return $null }
+                continue
+            }
             $p = $one.PSObject.Properties['asOf']
             $v = if ($p) { $p.Value } else { $null }
             $at = [DateTimeOffset]::MinValue
@@ -359,7 +365,9 @@ function Get-CoordSeatEnded {
                 if ($v.Kind -ne [DateTimeKind]::Unspecified) { $at = [DateTimeOffset]::new($v.ToUniversalTime()) }
             } elseif ($null -ne $v) {
                 $parsed = [DateTimeOffset]::MinValue
-                if ("$v" -match '(Z|[+-]\d{2}:?\d{2})\s*\z' -and
+                # Anchored to a time, as seat.ps1's ConvertTo-StampInstant is, or the year of a date
+                # like 11-22-2026 would read as a -20:26 offset.
+                if ("$v" -match 'T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})\s*\z' -and
                     [DateTimeOffset]::TryParse("$v", [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) { $at = $parsed }
             }
             if ($null -eq $rec -or $at -gt $best) { $rec = $one; $best = $at }

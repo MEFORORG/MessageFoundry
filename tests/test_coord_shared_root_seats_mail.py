@@ -424,6 +424,37 @@ def test_a_path_send_reads_the_newest_record_in_the_recipients_box(
     assert "WARNING" not in reopened.stderr
 
 
+def test_an_old_unreadable_file_does_not_silence_the_box(repo: Path, shared: Path) -> None:
+    rec = _record(box=SEAT_ID, session="sess-o", worktree=r"D:\t\autonomy-plan", host=OTHER_HOST)
+    _plant_record(shared / "seats", SEAT_ID, _ended(rec, "closed", "2026-11-20T10:00:00Z"))
+    stray = shared / "seats" / SEAT_ID / "stray.json"
+    stray.write_text("[]", encoding="utf-8")
+    os.utime(stray, (time.time() - 86400 * 30, time.time() - 86400 * 30))
+    proc = _send(repo, shared, SEAT_ID)
+    assert proc.returncode == 0, proc.stderr
+    assert "'closed'" in proc.stderr
+
+
+def test_mail_to_one_session_is_not_judged_by_the_box(repo: Path, shared: Path) -> None:
+    rec = _record(box=SEAT_ID, session="sess-o", worktree=r"D:\t\autonomy-plan", host=OTHER_HOST)
+    _plant_record(shared / "seats", SEAT_ID, _ended(rec, "closed", "2026-11-20T10:00:00Z"))
+    proc = _ps(
+        COORD / "mail.ps1",
+        repo,
+        "-Send",
+        "-To",
+        SEAT_ID,
+        "-ToSessionId",
+        "12345678-1234-1234-1234-123456789abc",
+        "-Body",
+        "hello",
+        "-Json",
+        env=_env(shared),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "WARNING" not in proc.stderr
+
+
 def test_newest_is_what_the_record_says_not_its_file_time(repo: Path, shared: Path) -> None:
     """seat.ps1 -ClearHandoff rewrites a dead session's record and leaves its asOf alone."""
     first = _send(repo, shared, str(repo))

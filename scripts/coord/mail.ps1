@@ -692,14 +692,16 @@ if ($Send) {
 
     # On stderr, so -Json output stays parseable. Get-MailRoot above already refused an unresolved
     # shared root, so a throw here is only a read failure, and it says nothing.
+    # The records read are the ones under the box the mail went to, which is where the live session
+    # writes now; a legacy seat id's own directory is frozen and shared across PCs. Mail addressed
+    # to one session is not judged by the box's newest record of any session, so it gets none.
     $seatsDir = $null
-    try { $seatsDir = Get-SeatsDirForMail -MailRootUsed $root -Override $MailRoot } catch { }
+    if (-not $ToSessionId) {
+        try { $seatsDir = Get-SeatsDirForMail -MailRootUsed $root -Override $MailRoot } catch { }
+    }
     if ($seatsDir) {
         foreach ($w in @($written | Where-Object { $_.Status -eq 'queued' })) {
-            # A seat id names the directory its record was read from. For a legacy id that is not
-            # the box key the mail went to, so read the record where the resolver found it.
-            $recKey = if ($seatTargets.Count -gt 0) { $To } else { $w.Key }
-            $warn = Get-EndedSeatWarning -SeatsDir $seatsDir -Key $recKey -Label $w.To
+            $warn = Get-EndedSeatWarning -SeatsDir $seatsDir -Key $w.Key -Label $w.To
             if ($warn) { [Console]::Error.WriteLine("mail.ps1: $warn") }
         }
     }
