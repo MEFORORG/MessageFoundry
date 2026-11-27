@@ -195,7 +195,15 @@ async def test_dr_released_auto_resolves_activated() -> None:
     sink.dr_activated("dr-box", role="dr_standby")
     sink.dr_released("dr-box", role="primary")
     await _drain(sink)
-    assert store.resolves == [{"event_type": "dr_activated", "connection": "dr-box"}]
+    # BACKLOG #5965: the activation and the release each close any open dr_restarted_passive.
+    assert sorted(store.resolves, key=str) == sorted(
+        [
+            {"event_type": "dr_restarted_passive", "connection": "dr-box"},
+            {"event_type": "dr_restarted_passive", "connection": "dr-box"},
+            {"event_type": "dr_activated", "connection": "dr-box"},
+        ],
+        key=str,
+    )
 
 
 # --- DbCoordinator emits at leadership transitions ---------------------------

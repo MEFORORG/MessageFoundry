@@ -488,7 +488,7 @@ def test_engine_timestamps_survive_redaction() -> None:
 def test_the_tables_the_scan_cannot_see_survive_redaction() -> None:
     """Text the lexical scan cannot see that a refusal, alert or log line renders verbatim."""
     from messagefoundry.auth import anchor_path
-    from messagefoundry.pipeline import secret_rotation
+    from messagefoundry.pipeline import alerts, secret_rotation
     from messagefoundry.store import keyprovider_vault, privilege, sqlserver, store
     from messagefoundry.transports import http_auth, smart
 
@@ -503,6 +503,7 @@ def test_the_tables_the_scan_cannot_see_survive_redaction() -> None:
         sqlserver._rcsi_remedy("mefor_test"),
         sqlserver._options_remedy("mefor_test", [name for name, _ in sqlserver._DATABASE_OPTIONS]),
         store.AUDIT_CHAIN_KEYLESS_ROWS,
+        alerts.DR_RESTART_CLOSE_GUIDANCE,
     ]
     # An audit-table grant is built by a helper and joined into a refusal later, out of the scan.
     texts += [

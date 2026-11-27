@@ -71,7 +71,7 @@ def test_file_drop_generates_on_the_worker_and_stops_inside_a_pause(
 ) -> None:
     panel = file_panel.FilePanel()
     panel._count.setValue(1_000_000)
-    panel._rate.setValue(0.1)  # a ten-second pause after each file
+    panel._rate.setValue(0.1)  # a ten-second pause between two files
     panel._drop_dir.setText(str(tmp_path))
     try:
         started = time.monotonic()

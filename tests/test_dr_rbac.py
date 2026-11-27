@@ -66,7 +66,6 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
         store_settings=StoreSettings(path=str(tmp_path / "rbac.db")),
         dr_settings=DrSettings(
             enabled=True,
-            activate=False,
             seed_archive="seed.mfbak",
             priority_threshold=Priority.CRITICAL,
         ),

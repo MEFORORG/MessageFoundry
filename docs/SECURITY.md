@@ -4272,7 +4272,28 @@ The complete set, as enumerated in the [route map](#route--permission-map-engine
 - **Cluster control** -- `POST /cluster/stepdown` (BACKLOG #1494).
 - **Disaster recovery** -- `POST /dr/activate` and `POST /dr/release` (vault BACKLOG #2581). A promotion
   runs the operator's takeover hook and binds the priority listeners; a release runs the release
-  hook and unbinds every inbound. Each asks for the same fresh proof as the planned failover above.
+  hook and unbinds every inbound. A release on a box already passive never unbinds a listener
+  or drains (BACKLOG #5965). A hand-back whose `dr.release` row is still owed writes that row
+  and runs no hook, and a retry after a release that completed on this start runs no hook and
+  writes no row.
+  Otherwise, where its own newest activate or release record is an activation, or its start
+  raised the `dr_restarted_passive` alert with no activation recorded since, it is a stay-passive
+  release: it runs the release hook when one is set, writes a `dr.stay_passive` audit row and
+  asks the alert to close, which is best effort, so read the alert list afterwards. A refused
+  release, for example one whose audit write fails, writes no such row. In every other case, as on a box never activated or one whose activation aborted
+  after a hand-back, the release changes nothing: it writes no row and closes no alert. So a
+  `dr_restarted_passive` alert an earlier start left open, on a start that raised none, stays
+  open until an operator resolves it by hand, with `POST /alerts/{alert_id}/resolve` or the web
+  console's Resolve on the alert, or a later `POST /dr/activate` under the same box label, run
+  only once the operator has confirmed the primary is not serving, closes it. The release's
+  response does not reliably tell a stay-passive release from one that changed nothing, so read
+  the alert list, or the audit log for a `dr.stay_passive` row matching the call's host, actor
+  and time; only a stay-passive release writes one, but an earlier release's row reads the same.
+  The two DR routes this bullet names, `POST /dr/activate` and `POST /dr/release`, each ask for the same fresh proof as the planned failover above.
+  Under `serve` a DR box starts passive and no setting promotes it: `[dr].activate` is a removed
+  key (BACKLOG #5965; the `[dr]` `activate` row of [CONFIGURATION.md](CONFIGURATION.md) says why).
+  So `POST /dr/activate` is the only promotion, and a restart of an activated box needs it again, once
+  the operator has confirmed the primary is not serving.
 - **Dual control** -- `POST /approvals/{id}/resolve` (BACKLOG #1562). Approve and reject are not
   step-up gated; this one is, because it closes an approval record on the resolver's word alone.
   So is `POST /approvals/{id}/interrupt`, the step before a resolve for a release stranded in

@@ -10,7 +10,8 @@ The denominator is ``security/runtime-closure-core.txt``: the core runtime closu
 toolchain. It is a copy of the pin lines in a DEP-1 lock; its own header says which one, and how to
 regenerate it. Tests below hold the copy to that lock in name and version (BACKLOG #1812).
 
-The page also assesses two extras, each in its own section: ``sqlserver`` (BACKLOG #1955) and
+The page also assesses three extras, each in its own section: ``sqlserver`` (BACKLOG #1955),
+``postgres``, which the container image's ``runtime-postgres`` variant installs (BACKLOG #5933), and
 ``harness``, which the harness wheel installs and which the ASVS assessment scope took in by owner
 ruling R1 of 2026-10-02. Each section's denominator is its ``security/runtime-closure-<extra>.txt``,
 built and held the same way, and it classifies only the names that closure adds to the core one.
@@ -66,8 +67,7 @@ _CORE_LOCK = _ROOT / "docker" / "locks" / "requirements-core.lock"
 _SQLSERVER_CLOSURE = _ROOT / "security" / "runtime-closure-sqlserver.txt"
 _SQLSERVER_LOCK = _ROOT / "docker" / "locks" / "requirements-sqlserver.lock"
 #: The ``postgres`` extra's closure and the lock it copies (BACKLOG #5933). The runtime-postgres
-#: image installs that lock. The page records the closure and does not yet assess the extra, so it
-#: is a pair here and not in ``_EXTRAS``.
+#: image installs that lock.
 _POSTGRES_CLOSURE = _ROOT / "security" / "runtime-closure-postgres.txt"
 _POSTGRES_LOCK = _ROOT / "docker" / "locks" / "requirements-postgres.lock"
 #: The ``harness`` extra's closure and the lock it copies. No image installs that lock.
@@ -86,12 +86,14 @@ _READINGS = _ROOT / "security" / "risky-component-readings.json"
 _SURVEY = _ROOT / "security" / "bundled-code-survey.json"
 
 #: The headings that bound the page's classified regions. The core tables run from the tier 1
-#: heading to the sqlserver heading, the sqlserver tables from there to the harness heading, and
-#: the harness tables from there to the ASVS reading.
+#: heading to the sqlserver heading, the sqlserver tables from there to the postgres heading, the
+#: postgres tables from there to the harness heading, and the harness tables from there to the ASVS
+#: reading.
 _CORE_START = "## Tier 1 — hostile input"
 _CORE_SPLIT = "## Assessed and NOT designated"
 _SQLSERVER_START = "## The `sqlserver` extra"
 _EXTRA_SPLIT = "### Assessed and NOT designated"
+_POSTGRES_START = "## The `postgres` extra"
 _HARNESS_START = "## The `harness` extra"
 #: The ASVS-example reading (BACKLOG #1189, ground 2) runs from here to the closing sections.
 _ASVS_START = "## Risky by ASVS's own examples, read from public data"
@@ -211,20 +213,21 @@ def _designated_and_excluded() -> tuple[set[str], set[str]]:
     return _classified(_CORE_START, _CORE_SPLIT, _SQLSERVER_START)
 
 
-def _sqlserver_designated_and_excluded() -> tuple[set[str], set[str]]:
-    """The names the ``sqlserver`` section classifies, split at its not-designated heading."""
-    return _classified(_SQLSERVER_START, _EXTRA_SPLIT, _HARNESS_START)
+def _extra_designated_and_excluded(extra: str) -> tuple[set[str], set[str]]:
+    """The names an extra's section classifies, split at its not-designated heading.
 
-
-def _harness_designated_and_excluded() -> tuple[set[str], set[str]]:
-    """The names the ``harness`` section classifies, split at its not-designated heading."""
-    return _classified(_HARNESS_START, _EXTRA_SPLIT, _ASVS_START)
+    The section's bounds are the ones ``_EXTRAS`` records, so the section tests and the designation
+    guard read the same region of the page.
+    """
+    _, start, end, _ = _EXTRAS[extra]
+    return _classified(start, _EXTRA_SPLIT, end)
 
 
 #: Each assessed extra: its closure file, its section's start and end headings, and one name the
 #: extra must add, so an empty difference cannot pass the section's tests vacuously.
 _EXTRAS: dict[str, tuple[Path, str, str, str]] = {
-    "sqlserver": (_SQLSERVER_CLOSURE, _SQLSERVER_START, _HARNESS_START, "pyodbc"),
+    "sqlserver": (_SQLSERVER_CLOSURE, _SQLSERVER_START, _POSTGRES_START, "pyodbc"),
+    "postgres": (_POSTGRES_CLOSURE, _POSTGRES_START, _HARNESS_START, "asyncpg"),
     "harness": (_HARNESS_CLOSURE, _HARNESS_START, _ASVS_START, "pyside6-essentials"),
 }
 
@@ -344,25 +347,6 @@ def test_an_extra_closure_is_the_core_closure_plus_the_extra(extra: str) -> None
     )
 
 
-def test_the_postgres_closure_is_the_core_closure_plus_asyncpg() -> None:
-    """RED when: the ``postgres`` closure stops being the core one plus ``asyncpg`` alone.
-
-    The page's scope section says the extra adds one name, ``asyncpg``. A lock move that adds a
-    second name, or drops ``asyncpg``, makes that sentence false, and the extra is not in
-    ``_EXTRAS``, so no section test would see it (BACKLOG #5933).
-    """
-    core = _closure_pins()
-    pins = _closure_pins(_POSTGRES_CLOSURE)
-    assert len(core) >= 20, f"the core closure parsed to {len(core)} names, too few to be real"
-    moved = sorted(n for n in core if pins.get(n) != core[n])
-    assert not moved, (
-        f"core packages missing or at another version in the postgres closure: {moved}"
-    )
-    assert _additions(_POSTGRES_CLOSURE) == {"asyncpg"}
-    scope = " ".join(_region("## Scope, and the denominator", "## The criterion").split())
-    assert "It adds one name to the core closure, `asyncpg`." in scope
-
-
 @pytest.mark.parametrize("extra", sorted(_EXTRAS))
 def test_an_extra_section_classifies_exactly_what_the_extra_adds(extra: str) -> None:
     """RED when: an extra gains a package nobody classified, or its section names a stray one.
@@ -370,9 +354,8 @@ def test_an_extra_section_classifies_exactly_what_the_extra_adds(extra: str) -> 
     The core tests above cannot see this: they read only the core closure, and a package the extra
     alone brings is outside it. Names the core tables already classify are not repeated here.
     """
-    path, start, end, _ = _EXTRAS[extra]
-    additions = _additions(path)
-    designated, excluded = _classified(start, _EXTRA_SPLIT, end)
+    additions = _additions(_EXTRAS[extra][0])
+    designated, excluded = _extra_designated_and_excluded(extra)
     classified = designated | excluded
     missing = sorted(additions - classified)
     assert not missing, (
@@ -396,7 +379,7 @@ def test_an_extra_section_counts_printed_on_the_page_are_the_real_ones(extra: st
     scope section above the tiers. So a stray copy elsewhere on the page cannot satisfy it.
     """
     path, start, end, _ = _EXTRAS[extra]
-    designated, excluded = _classified(start, _EXTRA_SPLIT, end)
+    designated, excluded = _extra_designated_and_excluded(extra)
     added = len(designated) + len(excluded)
     assert added == len(_additions(path)), f"the {extra} tables do not sum to the additions"
     core = len(_closure())
@@ -416,15 +399,47 @@ def test_an_extra_section_counts_printed_on_the_page_are_the_real_ones(extra: st
         assert fact in scope, f"the scope section does not say {fact!r}"
 
 
-def test_the_harness_extra_is_not_listed_as_unassessed() -> None:
-    """RED when: the scope section's list of unassessed extras names ``harness`` again.
+def test_the_postgres_prose_names_what_the_extra_adds_and_the_pin_it_read() -> None:
+    """RED when: the ``postgres`` closure stops adding ``asyncpg`` alone, or its pin moves.
 
-    The harness section assesses it, so a list calling it unassessed contradicts the page.
+    The scope section says the extra adds one name, ``asyncpg``, and the section's TLS reading names
+    the pin it was read on. The section tests above hold the tables and the arithmetic, not those
+    sentences, so a second name, or an ``asyncpg`` bump nobody re-read, would leave them false
+    (BACKLOG #5933).
+    """
+    assert _additions(_POSTGRES_CLOSURE) == {"asyncpg"}
+    scope = " ".join(_region("## Scope, and the denominator", "## The criterion").split())
+    assert "It adds one name to the core closure, `asyncpg`," in scope
+    pin = _closure_pins(_POSTGRES_CLOSURE)["asyncpg"]
+    _, start, end, _ = _EXTRAS["postgres"]
+    section = " ".join(_region(start, end).split())
+    assert f"On the pinned {pin}, read for this section," in section, (
+        f"the postgres section's TLS reading does not name asyncpg {pin}; read the new "
+        "connect_utils.py again before changing the version it names"
+    )
+    # The section points at the rendered subsection for its results, as the harness one does.
+    assert f"*{component_readings.EXTRAS_HEADING.removeprefix('### ')}*" in section
+
+
+def test_the_scope_section_counts_the_assessed_extras() -> None:
+    """RED when: an extra is assessed or dropped and the scope section's counts stay behind."""
+    assert len(_EXTRAS) + 1 < len(_NUMBER_WORDS), "extend _NUMBER_WORDS to count the extras"
+    scope = " ".join(_region("## Scope, and the denominator", "## The criterion").split())
+    assert f"{_NUMBER_WORDS[len(_EXTRAS)].capitalize()} extras are assessed as well." in scope
+    assert f"the {_NUMBER_WORDS[len(_EXTRAS) + 1]} assessed sets" in scope
+
+
+@pytest.mark.parametrize("extra", sorted(_EXTRAS))
+def test_an_assessed_extra_is_not_listed_as_unassessed(extra: str) -> None:
+    """RED when: the scope section's list of unassessed extras names an assessed extra again.
+
+    Each extra in ``_EXTRAS`` has its own section, so a list calling it unassessed contradicts the
+    page. ``harness``, and later ``postgres`` (BACKLOG #5933), were taken off that list.
     """
     scope = _region("## Scope, and the denominator", "## The criterion")
     unassessed = scope.partition("An install that enables any other extra")[2].partition("\n\n")[0]
-    assert "`postgres`" in unassessed, "the list of unassessed extras moved; re-read this test"
-    assert "`harness`" not in unassessed, "the scope section still lists `harness` as unassessed"
+    assert "`sftp`" in unassessed, "the list of unassessed extras moved; re-read this test"
+    assert f"`{extra}`" not in unassessed, f"the scope section still lists `{extra}` as unassessed"
 
 
 def test_the_generator_reads_every_extra_the_page_assesses() -> None:
@@ -981,10 +996,8 @@ def _readings(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 def _designated() -> set[str]:
     """Every name the tiers designate: the core tables' and each extra section's."""
-    return (
-        _designated_and_excluded()[0]
-        | _sqlserver_designated_and_excluded()[0]
-        | _harness_designated_and_excluded()[0]
+    return _designated_and_excluded()[0].union(
+        *(_extra_designated_and_excluded(extra)[0] for extra in _EXTRAS)
     )
 
 
@@ -1274,8 +1287,8 @@ def test_the_generator_reads_the_same_designation_as_this_guard() -> None:
     for heading, following in zip(tiers, [*tiers[1:], _CORE_SPLIT], strict=True):
         tier = f"tier {heading.split()[2]}"
         expected |= dict.fromkeys(_table_names(_region(heading, following)), tier)
-    expected |= dict.fromkeys(_sqlserver_designated_and_excluded()[0], "the `sqlserver` extra")
-    expected |= dict.fromkeys(_harness_designated_and_excluded()[0], "the `harness` extra")
+    for extra in _EXTRAS:
+        expected |= dict.fromkeys(_extra_designated_and_excluded(extra)[0], f"the `{extra}` extra")
     assert set(expected) == _designated()
     assert component_readings.designation_labels(page) == expected
 

@@ -43,6 +43,7 @@ from messagefoundry.store.crypto import (
     CipherError,
     CipherUnavailableError,
     UnauthenticatedCipherError,
+    UnmarkedCipherError,
     cell_aad,
 )
 from messagefoundry.store.row_seal import seal_bytes
@@ -78,6 +79,7 @@ __all__ = [
     "queue_row_aad",
     "report_queue_tag_failure",
     "reseal_unless_tag_failure",
+    "unopenable_log_text",
 ]
 
 _log = logging.getLogger(__name__)
@@ -168,8 +170,13 @@ def fault_text(exc: BaseException) -> str:
 
 
 def queue_open_fault(exc: BaseException) -> QueueOpenFault:
-    """:class:`QueueOpenFault` named by :func:`fault_text`. The T17 path logs this fault at
-    ERROR, which is why a driver's text is left out."""
+    """:class:`QueueOpenFault` naming ``exc`` by its type, and by its own text only where ``exc``
+    is a :class:`CipherError`, whose text is the cipher's own wording and names no row's body. It is
+    not value-free: a cipher's text can echo a field cut from the stored value (``crypto._echo``),
+    and a Transit outage's can name its key with the cause's class or a fixed refusal text. Any
+    other error, a failed store read or dead-letter write, is named by its type alone: a driver's
+    text can echo a statement, a key or a truncated value, and the T17 path logs this fault at
+    ERROR."""
     return QueueOpenFault(fault_text(exc))
 
 
@@ -283,8 +290,11 @@ class QueueTagError(CipherError):
     must be, a ``shared_body`` key that differs from the row's ``body_ref``, and a store-once row on
     a backend that does not deliver one. A subclass of
     :class:`CipherError`, so every claim path that already dead-letters an undecryptable row
-    dead-letters this one the same way. Carries no row value. Its :attr:`cause` names which case it
-    was, from :data:`QUEUE_TAG_CAUSES`."""
+    dead-letters this one the same way. Carries no row value. One :func:`open_queue_cell` raises
+    for a cipher's refusal carries none of the cipher's text either: its message names the cipher
+    error's class and a fixed code, and the cipher's error is neither its cause nor its context
+    (BACKLOG #5982, :func:`_queue_cell_refusal`). Its :attr:`cause` names which case it was, from
+    :data:`QUEUE_TAG_CAUSES`."""
 
     #: Whether the refusal is drift rather than a corrupt cell, :class:`CorruptQueueCellError`. A
     #: claim audits and alerts both; a read alerts both and writes no audit row.
@@ -512,18 +522,70 @@ def reseal_unless_tag_failure(cipher: Cipher, stored: str, aad: bytes) -> str | 
     return cipher.encrypt(plaintext, aad=aad)
 
 
-def _names_tag_failure(cipher: Cipher, stored: str, exc: CipherError) -> bool:
-    """Whether ``exc``, raised opening the marked value ``stored``, says the cell failed its tag.
+#: How the local cipher's own refusals begin, each with the code a refusal names in its place
+#: (BACKLOG #5982). The prefixes are the engine's fixed wording in ``AesGcmCipher``, never a
+#: value, and they decide only that diagnostic code, never what a caller does with the error.
+_REFUSAL_CODES: Final = (
+    ("malformed ciphertext (bad base64", "bad_base64"),
+    ("malformed ciphertext (too short", "too_short"),
+    ("decrypted value is not valid UTF-8", "not_utf8"),
+    ("unknown at-rest marker version", "unparseable_marker"),
+    ("unknown/unsupported at-rest cipher algorithm", "unparseable_marker"),
+)
 
-    A key service that gave no verdict (:func:`is_transient_open_failure`, BACKLOG #5765) says
-    nothing about the cell, so it is never a tag failure. Otherwise :func:`is_tag_failure` decides,
-    so under Vault Transit, which cannot name its keys, every other refusal of a marked value is
-    refused as a :class:`QueueTagError`. Its cause is ``tag`` only for an AEAD failure, and
-    ``unknown`` for any other refusal (:data:`QUEUE_TAG_CAUSES`). That is deliberately louder than
+
+def _refusal_code(exc: CipherError, otherwise: str) -> str:
+    """The :data:`_REFUSAL_CODES` code ``exc``'s text begins with, else ``otherwise``."""
+    text = str(exc)
+    return next((code for prefix, code in _REFUSAL_CODES if text.startswith(prefix)), otherwise)
+
+
+def _queue_cell_refusal(cipher: Cipher, stored: str, exc: CipherError) -> CipherError:
+    """What :func:`open_queue_cell` raises for ``exc``, the cipher's refusal of the marked value
+    ``stored``, which is neither a key service's silence (:func:`is_transient_open_failure`) nor
+    an unmarked value's refusal.
+
+    A :class:`QueueTagError` where :func:`is_tag_failure` names the cell. So under Vault Transit,
+    which cannot name its keys, every such refusal of a marked value is a :class:`QueueTagError`,
+    whose cause is ``tag`` only for an AEAD failure and ``unknown`` for any other refusal
+    (:data:`QUEUE_TAG_CAUSES`). That is deliberately louder than
     :func:`~messagefoundry.store.cell_tag.open_tagged_cell`, which keeps a non-AEAD Transit refusal
     as the cipher's own error: narrowing this control would rest on matching Vault's error text, and
-    that change is not this fix's to make."""
-    return not is_transient_open_failure(exc) and is_tag_failure(cipher, stored)
+    that change is not this fix's to make. Under a key a cipher that names its keys holds, any
+    refusal but a failed AEAD check is a :class:`CorruptQueueCellError`. Any other refusal, at
+    least a cell under a key the store does not hold and a marker this build cannot parse, is
+    rebuilt in ``exc``'s own class, so a caller that contains, dead-letters, audits or alerts on
+    it by class does so as before.
+
+    **Its message names ``exc``'s class and a fixed code, and nothing of the cipher's text
+    (BACKLOG #5982).** The local cipher's text echoes at least a ``key_id`` cut from the stored
+    value. A Vault Transit refusal's text names at least the Transit key, and the hvac error, whose
+    text is Vault's, is chained to it as its cause. The rebuilt error carries no cause. A claim
+    still dead-letters it rather than setting it aside: it is no :class:`CipherUnavailableError`,
+    the one class :func:`is_transient_open_failure` names with no cause, since ``exc`` was not one.
+    A traceback printer that prints frames' locals still prints ``open_queue_cell``'s
+    ``payload``, the stored value itself."""
+    named = type(exc).__name__
+    aead = isinstance(exc, UnauthenticatedCipherError)
+    if is_tag_failure(cipher, stored):
+        if not aead and _names_its_keys(cipher):
+            # Under a key this process holds, only a failed AEAD check means the cell was sealed
+            # for another row. Any other refusal is the cell itself being unreadable.
+            return CorruptQueueCellError(
+                "the queue row's payload is corrupt and cannot be read under the key it names"
+                f" ({named}, {_refusal_code(exc, 'corrupt')})"
+            )
+        # Only a failed AEAD check says the tag failed; any other refusal here is from a cipher
+        # that cannot name its keys, which cannot say whether the cell is corrupt or moved.
+        return QueueTagError(
+            "integrity: the queue row's payload does not open under its own tag"
+            f" ({named}, {'tag_mismatch' if aead else 'refused'})",
+            cause="tag" if aead else "unknown",
+        )
+    # A failed AEAD check under keys none of which the marker names is a key not supplied, a
+    # legacy key id among them. Otherwise the cipher's own wording says why, where it is known.
+    code = "unknown_key" if aead else _refusal_code(exc, "refused")
+    return type(exc)(f"the queue row's payload cannot be opened ({named}, {code})")
 
 
 def open_queue_cell(cipher: Cipher, row: Any) -> str:
@@ -531,17 +593,27 @@ def open_queue_cell(cipher: Cipher, row: Any) -> str:
     ``shared_body`` key for a ``ref`` row.
 
     Raises :class:`QueueTagError`, which is drift, when the cell does not open under the row's
-    tag (see :func:`_names_tag_failure`), when a keyed store's row (or any ``ref`` row) holds a
+    tag (see :func:`_queue_cell_refusal`), when a keyed store's row (or any ``ref`` row) holds a
     blank ``payload``, or when a ``ref`` row's opened key differs from its ``body_ref`` column. Any
-    other key or format problem raises the cipher's own error, and so does a key service that gave
-    no verdict (:func:`is_transient_open_failure`). That includes at least a cell whose marker the
-    cipher cannot read, which then gets no queue-tag audit row and no alert: docs/PHI.md section 1,
+    other key or format problem raises the cipher's own class, and a key service that gave no
+    verdict (:func:`is_transient_open_failure`) the cipher's own error. That includes at least a
+    cell whose marker the cipher cannot read, which then gets no queue-tag audit row and no alert:
+    docs/PHI.md section 1,
     *A database writer is refused only where a seal or a tag covers the row*, states that gap.
     Raises its subclass
     :class:`CorruptQueueCellError`, which is not drift, only when a cipher that names its keys
     refuses a cell under a key it holds for a reason other than a failed AEAD check. A keyless
     store writes plaintext and has no tag to check, so there only the reference comparison binds
-    anything. :data:`QUEUE_TAG_CAUSES` names each case's ``cause``."""
+    anything. :data:`QUEUE_TAG_CAUSES` names each case's ``cause``.
+
+    **What it raises for a refused marked cell carries none of the cipher's text (BACKLOG #5982).**
+    :func:`_queue_cell_refusal` builds it, outside the cipher's handler, so the cipher's error is
+    neither its cause nor its context, nor that of anything the build raises. It is raised from no
+    local: the error's traceback holds this frame, so a local holding either error would make a
+    cycle keeping every caller's frame, and other rows' opened bodies in it, alive until the
+    cyclic collector ran. A key service's silence is raised as the cipher gave it, since a claim
+    reads its cause to set the row aside, and so is an unmarked value's
+    :class:`UnmarkedCipherError`, whose text names a column and a remedy and no value."""
     payload = row["payload"]
     body_ref = row["body_ref"]
     if payload == "" and (cipher.encrypts or body_ref is not None):
@@ -551,30 +623,45 @@ def open_queue_cell(cipher: Cipher, row: Any) -> str:
         # reaches this line on a keyed store is an erasure, a plant, or an empty body from a keyless
         # run of an already keyed store. Nothing tells those apart, so all three are refused.
         raise QueueTagError("integrity: the queue row holds no sealed payload", cause="blank")
+    failure: CipherError | None = None
     try:
         opened = cipher.decrypt(payload, aad=queue_row_aad(row))
     except CipherError as exc:
-        if not _names_tag_failure(cipher, payload, exc):
-            raise  # a key, format or key-service problem, which the cipher's own error names
-        if not isinstance(exc, UnauthenticatedCipherError) and _names_its_keys(cipher):
-            # Under a key this process holds, only a failed AEAD check means the cell was sealed
-            # for another row. Any other refusal is the cell itself being unreadable. A cipher that
-            # cannot name its keys has every refusal refused below, as cause tag or unknown.
-            raise CorruptQueueCellError(
-                f"the queue row's payload is corrupt and cannot be read under the key it names ({exc})"
-            ) from exc
-        # Only a failed AEAD check says the tag failed; any other refusal here is from a cipher that
-        # cannot name its keys, which cannot say whether the cell is corrupt or sealed elsewhere.
-        raise QueueTagError(
-            f"integrity: the queue row's payload does not open under its own tag ({exc})",
-            cause="tag" if isinstance(exc, UnauthenticatedCipherError) else "unknown",
-        ) from exc
+        if isinstance(exc, UnmarkedCipherError) or is_transient_open_failure(exc):
+            raise  # text that names no value, or a cause the claim reads to set the row aside
+        failure = exc
+    if failure is not None:
+        # Outside the handler, so the cipher's error is neither the refusal's cause nor its
+        # context (#5982), and the local is dropped as the raise leaves this frame, so no cycle
+        # holds either error.
+        try:
+            raise _queue_cell_refusal(cipher, payload, failure)
+        finally:
+            del failure
     if body_ref is not None and opened != body_ref:
         raise QueueTagError(
             "integrity: the queue row's sealed reference differs from its body_ref",
             cause="ref" if cipher.encrypts else "ref-unsealed",
         )
     return opened
+
+
+def unopenable_log_text(exc: BaseException) -> str:
+    """What a WARNING may say about ``exc``, the error that refused a row's payload (BACKLOG #5982).
+
+    A :class:`QueueTagError`, drift or a corrupt cell (:class:`CorruptQueueCellError`), is named
+    by its class and its :attr:`~QueueTagError.cause`, the :data:`QUEUE_TAG_CAUSES` key rather
+    than the words that table maps it to. Any other error is named by its class alone: a driver's
+    text is not this function's to vouch for, nor is a cipher error that did not come through
+    :func:`open_queue_cell`.
+
+    The errors :func:`open_queue_cell` raises for a refused marked cell hold no cipher text, so the
+    ``last_error`` and ``message_events`` ``dead`` detail a claim builds from one hold none either.
+    A key service's silence keeps its text in at least the :class:`QueueOpenFault` a claim builds
+    for it, which the T17 path logs at ERROR."""
+    if isinstance(exc, QueueTagError):
+        return f"{type(exc).__name__} (cause {exc.cause})"
+    return type(exc).__name__
 
 
 class _AuditSink(Protocol):
@@ -646,16 +733,12 @@ def alert_queue_tag_failure(
     so. Names the row by its stage and a short id prefix, never a row value. The reason says what
     ``error.cause`` says, in :data:`QUEUE_TAG_CAUSES`'s words (BACKLOG #5884). A corrupt cell
     (:class:`CorruptQueueCellError`) alerts under its own subject
-    (:data:`QUEUE_CORRUPT_ALERT_TABLE`), and its WARNING also carries the cipher's reason. Unlike
-    the tagged-cell path's WARNING, none of these is rate-limited. Never raises."""
+    (:data:`QUEUE_CORRUPT_ALERT_TABLE`). The WARNING and the alert carry none of the error's
+    text: the row's stage, a short id prefix, the cause's words and ``outcome``. Unlike the
+    tagged-cell path's WARNING, none of these is rate-limited. Never raises."""
     ref = str(row["id"])[:_ROW_REF_LEN]
     reason = f"a {row['stage']} queue row {QUEUE_TAG_CAUSES[error.cause]} and {outcome} (row {ref})"
-    if error.drift:
-        _log.warning("%s", reason)
-    else:
-        # The text, not the error: a record keeps its args, and the error's traceback holds the
-        # claim frame's locals, which can include other rows' opened bodies.
-        _log.warning("%s: %s", reason, str(error))
+    _log.warning("%s", reason)
     report = getattr(cipher, "report_tag_failure", None)
     if callable(report):
         report("queue" if error.drift else QUEUE_CORRUPT_ALERT_TABLE, reason)

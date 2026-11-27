@@ -26,7 +26,7 @@ from PySide6.QtCore import QFileSystemWatcher, QObject, QTimer, Signal
 
 from harness.bounded_file import read_capped
 from harness.drivers.file import drop_atomic, drop_name
-from harness.mllp import Received, SendItem, pause_unless_stopped
+from harness.mllp import Received, SendItem, paced
 from messagefoundry.parsing import HL7PeekError, Peek, normalize
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 
@@ -78,21 +78,14 @@ class FileDropWorker(QObject):
             self.finished.emit()
 
     def _drop_all(self) -> None:
-        delay = 1.0 / self._rate if self._rate > 0 else 0.0
         try:
             Path(self._directory).mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            for item in self._items:
-                if self._stop.is_set():
-                    break
+            for item in paced(self._items, self._stop, 0.0):
                 self.result.emit(DropResult(item, "", str(exc)))
             return
-        for item in self._items:
-            if self._stop.is_set():
-                break
+        for item in paced(self._items, self._stop, self._rate):
             self.result.emit(self._write_one(item))
-            if delay and pause_unless_stopped(self._stop, delay):
-                break
 
     def _write_one(self, item: SendItem) -> DropResult:
         try:

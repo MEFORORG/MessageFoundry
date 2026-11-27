@@ -1070,20 +1070,145 @@ def test_a_head_that_lags_the_push_event_is_re_read(capsys: pytest.CaptureFixtur
 def test_a_commit_list_without_its_head_is_judged_with_a_fault(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """headRefOid is CLA_HEAD_SHA but the commits do not include it: judged at once, as before,
-    so a refusal it proves stands, with a fault added so that a pass is not silent."""
+    """headRefOid is CLA_HEAD_SHA but the commits do not include it. A read that refuses nothing
+    is read again on every wait (BACKLOG #8335 item 3); once the waits run out it is judged with a
+    fault, so that a pass is not silent. A refusal it proves stands at once, with no wait."""
     env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    tries = len(cla_precheck.HEAD_RETRY_DELAYS) + 1
     linked = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 1, False)
-    assert _run(env, _serve([linked])) == EXIT_FAULT
+    waits: list[float] = []
+    assert run(env, _serve([linked] * tries), _no_signatures, waits.append) == EXIT_FAULT
+    assert waits == list(cla_precheck.HEAD_RETRY_DELAYS)
     assert "the commits this read returned do not include CLA_HEAD_SHA" in capsys.readouterr().out
     # A complete read short of totalCount may have stopped before the head, so the fault names the
     # commits it returned, never the pull request's.
     short = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 5, False)
-    assert _run(env, _serve([short])) == EXIT_FAULT
+    waits = []
+    replies = [short] * tries
+    assert run(env, lambda _q, _v: replies.pop(0), _no_signatures, waits.append) == EXIT_FAULT
+    # A complete read short of totalCount is re-read like any other that lacks the head.
+    assert waits == list(cla_precheck.HEAD_RETRY_DELAYS) and replies == []
     out = capsys.readouterr().out
     assert "the commits this read returned do not include CLA_HEAD_SHA" in out
     assert "the pull request's commits do not include" not in out
     assert _run(env, _serve([_page([_commit(1, "wshallwshall")], 1, False)])) == EXIT_REFUSED
+
+
+def test_a_commit_list_that_trails_its_head_is_re_read_and_a_refusal_there_stands(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #5645 item 1, #8335 item 3: headRefOid is already CLA_HEAD_SHA but the commit list
+    still lacks the head. On main that read was judged at once and warned and passed, so an
+    unlinked author in the pushed commits went unchecked. It is read again, and the unlinked
+    author the caught-up list holds is refused."""
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    trailing = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 1, False)
+    caught_up = _page(
+        [_commit(1, "Octo", "octo-contributor", 90000001), _commit(_HEAD, "wshallwshall")],
+        2,
+        False,
+    )
+    replies = [trailing, caught_up]
+    waits: list[float] = []
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, waits.append) == EXIT_REFUSED
+    assert waits == [cla_precheck.HEAD_RETRY_DELAYS[0]] and replies == []
+    out = capsys.readouterr().out
+    assert "refused::" in out
+    assert "do not include CLA_HEAD_SHA" not in out
+
+
+def test_a_commit_list_that_catches_up_to_its_head_passes_without_a_fault(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    replies = [
+        _page([octo], 1, False),
+        _page([octo], 1, False),
+        _page([octo, _commit(_HEAD, "Octo", "octo-contributor", 90000001)], 2, False),
+    ]
+    waits: list[float] = []
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, waits.append) == EXIT_PASS
+    assert waits == list(cla_precheck.HEAD_RETRY_DELAYS) and replies == []
+    assert "fault" not in capsys.readouterr().out
+
+
+def test_a_trailing_list_that_already_refuses_is_not_re_read() -> None:
+    """A re-read could only drop a refusal the trailing read proved, so none is made."""
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    assert _run(env, _serve([_page([_commit(1, "Anon")], 1, False)])) == EXIT_REFUSED
+
+
+def test_a_trailing_list_whose_re_read_moves_to_a_newer_head_is_a_fault(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    trailing = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 1, False)
+    newer = _page([_commit(2, "Anon")], 1, False, head="cd" * 20)
+    replies = [trailing, newer]
+    waits: list[float] = []
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, waits.append) == EXIT_FAULT
+    # GitHub moved past this head, so the re-reads end there rather than wait again.
+    assert waits == [cla_precheck.HEAD_RETRY_DELAYS[0]] and replies == []
+    # The judged read of CLA_HEAD_SHA is still the one reported, beside the stale re-reads.
+    out = capsys.readouterr().out
+    assert "the commits this read returned do not include CLA_HEAD_SHA" in out
+    assert "a re-read showed another head than CLA_HEAD_SHA" in out
+
+
+def test_a_trailing_re_read_that_now_refuses_stops_there() -> None:
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    replies = [_page([octo], 1, False), _page([octo, _commit(2, "Anon")], 2, False)]
+    waits: list[float] = []
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, waits.append) == EXIT_REFUSED
+    assert waits == [cla_precheck.HEAD_RETRY_DELAYS[0]] and replies == []
+
+
+def test_a_stale_head_and_a_trailing_list_share_one_budget_of_waits() -> None:
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    stale = _page([octo], 1, False, head="cd" * 20)
+    trailing = _page([octo], 1, False)
+    replies = [stale, trailing, trailing]
+    waits: list[float] = []
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, waits.append) == EXIT_FAULT
+    assert waits == list(cla_precheck.HEAD_RETRY_DELAYS) and replies == []
+
+
+def test_a_trailing_re_read_that_faults_outright_reports_the_judged_read(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    replies = [_page([octo], 1, False), {"errors": [{}]}]
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, lambda _s: None) == EXIT_FAULT
+    out = capsys.readouterr().out
+    assert "the commits this read returned do not include CLA_HEAD_SHA" in out
+    assert "then a re-read faulted" in out
+
+
+def test_the_signature_file_is_read_once_across_re_reads() -> None:
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    page_one = [_commit(i, "Octo", "octo-contributor", 90000001) for i in range(1, 3)]
+    late = _commit(3, "Late", "late-contributor", 90000002)
+    trailing = _page(page_one, 3, True)
+    rest = _page([late], 3, False)
+    replies = [trailing, rest] * (len(cla_precheck.HEAD_RETRY_DELAYS) + 1)
+    reads: list[int] = []
+
+    def signatures() -> frozenset[int]:
+        reads.append(1)
+        return frozenset({90000002})
+
+    assert run(env, lambda _q, _v: replies.pop(0), signatures, lambda _s: None) == EXIT_FAULT
+    assert replies == [] and reads == [1]
 
 
 def test_a_head_whose_id_graphql_nulled_is_not_said_to_be_missing(
@@ -1095,7 +1220,8 @@ def test_a_head_whose_id_graphql_nulled_is_not_said_to_be_missing(
     page = _page([_commit(1, "Octo", "octo-contributor", 90000001), _commit(2, "x")], 2, False)
     page["data"]["repository"]["pullRequest"]["commits"]["nodes"][1] = None
     page = {**page, "errors": [_node_error(1, "commit", "oid")]}
-    assert _run(env, _serve([page])) == EXIT_FAULT
+    tries = len(cla_precheck.HEAD_RETRY_DELAYS) + 1
+    assert run(env, _serve([page] * tries), _no_signatures, lambda _s: None) == EXIT_FAULT
     out = capsys.readouterr().out
     assert "the pull request's commits do not include CLA_HEAD_SHA" not in out
     assert (
@@ -1260,3 +1386,218 @@ def test_the_script_reads_event_data_from_the_environment_only() -> None:
     source = Path(cla_precheck.__file__).read_text(encoding="utf-8")
     for reader in ("argv", "argparse", "getopt", "optparse", "fileinput"):
         assert reader not in source, f"cla_precheck.py names {reader!r}"
+
+
+def test_a_trailing_re_read_cut_short_reports_the_judged_read(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    replies = [_page([octo], 2, False), _page([octo], 2, True), {"errors": [{}]}]
+    waits: list[float] = []
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, waits.append) == EXIT_FAULT
+    assert waits == [cla_precheck.HEAD_RETRY_DELAYS[0]] and replies == []
+    out = capsys.readouterr().out
+    assert "the commits this read returned do not include CLA_HEAD_SHA" in out
+    assert "then a re-read was cut short" in out
+
+
+def test_a_signature_fault_is_read_again_on_a_re_read() -> None:
+    """functools.cache keeps no exception, so a re-read after a faulted signature read reads it
+    again, and the unsigned author past the first page is refused there."""
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    page_one = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 2, True)
+    late = _page([_commit(2, "Late", "late-contributor", 90000002)], 2, False)
+    caught_up = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 3, True)
+    rest = _page(
+        [
+            _commit(2, "Late", "late-contributor", 90000002),
+            _commit(_HEAD, "Octo", "octo-contributor", 90000001),
+        ],
+        3,
+        False,
+    )
+    replies = [page_one, late, caught_up, rest]
+    answers: list[object] = [PrecheckFault("the signature file could not be read"), frozenset()]
+
+    def signatures() -> frozenset[int]:
+        answer = answers.pop(0)
+        if isinstance(answer, PrecheckFault):
+            raise answer
+        assert isinstance(answer, frozenset)
+        return answer
+
+    assert run(env, lambda _q, _v: replies.pop(0), signatures, lambda _s: None) == EXIT_REFUSED
+    assert replies == [] and answers == []
+
+
+def test_a_trailing_re_read_cut_short_that_refuses_is_the_verdict(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A re-read cut short whose whole pages refuse is the verdict: a refusal it proves stands. If
+    the kept read, which refused nothing, were judged instead, the run would warn and pass."""
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    replies = [_page([octo], 2, False), _page([_commit(2, "Anon")], 2, True), {"errors": [{}]}]
+    waits: list[float] = []
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, waits.append) == EXIT_REFUSED
+    assert waits == [cla_precheck.HEAD_RETRY_DELAYS[0]] and replies == []
+    out = capsys.readouterr().out
+    assert "refused::" in out
+    assert "the read judged" not in out
+    # The fault is the re-read's, and says so.
+    assert (
+        "fault::the re-read judged was cut short, so any commits past it are not checked: "
+        "GraphQL returned an error" in out
+    )
+
+
+def test_each_fault_of_a_trailing_list_names_the_read_it_belongs_to(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The kept read's count fault comes before the re-read's, under the kept read's name, so it
+    does not read as the re-read's."""
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    replies = [_page([octo], 2, False), {"errors": [{}]}]
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, lambda _s: None) == EXIT_FAULT
+    warnings = [line for line in capsys.readouterr().out.splitlines() if "fault::" in line]
+    assert warnings == [
+        "::warning title=CLA pre-check fault::the read judged: the commits this read returned do "
+        "not include CLA_HEAD_SHA; read 1 distinct commits where the pull request has 2; the "
+        "unread commits are not checked; then a re-read faulted: GraphQL returned an error"
+    ]
+
+
+def test_a_trailing_re_read_cut_short_that_holds_the_head_is_the_judged_read(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A re-read cut short whose whole pages include CLA_HEAD_SHA is the judged read, as the module
+    docstring says of a re-read whose commits include the head, and its own verdict faults are
+    reported beside its cut-short fault. The kept read, which lacked the head, is not reported. A
+    fault is still a fault: the exit code is EXIT_FAULT, as it was when the kept read was judged."""
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    head = _commit(_HEAD, "Octo", "octo-contributor", 90000001)
+    errored = {
+        **_page([octo, _commit(2, "Octo Contributor"), head], 4, True),
+        "errors": [_node_error(1, "commit", "author", "user")],
+    }
+    replies = [_page([octo], 2, False), errored, {"errors": [{}]}]
+    waits: list[float] = []
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, waits.append) == EXIT_FAULT
+    assert waits == [cla_precheck.HEAD_RETRY_DELAYS[0]] and replies == []
+    out = capsys.readouterr().out
+    assert "refused::" not in out
+    warnings = [line for line in out.splitlines() if "fault::" in line]
+    assert len(warnings) == 1
+    assert warnings[0].startswith(
+        "::warning title=CLA pre-check fault::the re-read judged was cut short, so any commits "
+        "past it are not checked: GraphQL returned an error; "
+    )
+    # The re-read's own verdict fault, for the commit GraphQL errored inside, is kept.
+    assert "GraphQL reported an error inside it; not judged" in warnings[0]
+    assert "the read judged" not in out
+    assert "do not include CLA_HEAD_SHA" not in out
+
+
+def test_a_re_read_cut_short_holding_the_head_keeps_the_kept_reads_w7_r11_faults_past_its_cut(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Lander hold on engine PR 3355, finding 1: a re-read cut short that holds CLA_HEAD_SHA is
+    the read judged, but the read kept saw a commit past the re-read's cut whose unlinked author
+    is an owner ruling W7-R11 fault. That warning is the only word on that commit, so it stays,
+    under the read kept's name. The read kept's other faults (its missing head, its count) are
+    not reported under the re-read's name (finding 3)."""
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    errored = {"oid": f"{2:040x}", "author": _UNLINKED, "committer": _OCTO}
+    kept_two = {
+        **_page(
+            [_committer_errored(errored, "user"), _commit(3, "Octo", "octo-contributor", 90000001)],
+            4,
+            False,
+        ),
+        "errors": [_node_error(0, "commit", "committer", "user")],
+    }
+    head = _commit(_HEAD, "Octo", "octo-contributor", 90000001)
+    replies = [_page([octo], 4, True), kept_two, _page([octo, head], 4, True), {"errors": [{}]}]
+    waits: list[float] = []
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, waits.append) == EXIT_FAULT
+    assert waits == [cla_precheck.HEAD_RETRY_DELAYS[0]] and replies == []
+    out = capsys.readouterr().out
+    assert "refused::" not in out
+    warnings = [line for line in out.splitlines() if "fault::" in line]
+    assert warnings == [
+        "::warning title=CLA pre-check fault::the re-read judged was cut short, so any commits "
+        "past it are not checked: GraphQL returned an error; the earlier read's W7-R11 warnings "
+        f"for commits the re-read does not list: commit {2:040x}: GraphQL reported an error "
+        "inside its committer, and its author reads as unlinked or null, which that failure may "
+        "have caused; not refused"
+    ]
+    assert "do not include CLA_HEAD_SHA" not in out
+    assert "distinct commits" not in out
+
+
+def test_a_re_read_cut_short_labels_its_own_faults_after_the_earlier_reads_warnings(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Lander hold on engine PR 3355 at 97da6d21: when the earlier read's W7-R11 warnings and the
+    judged re-read's own verdict fault are both reported, the re-read's fault comes after
+    "the re-read showed: ", so it does not read as the earlier read's."""
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    errored = {"oid": f"{2:040x}", "author": _UNLINKED, "committer": _OCTO}
+    kept_two = {
+        **_page(
+            [_committer_errored(errored, "user"), _commit(3, "Octo", "octo-contributor", 90000001)],
+            4,
+            False,
+        ),
+        "errors": [_node_error(0, "commit", "committer", "user")],
+    }
+    head = _commit(_HEAD, "Octo", "octo-contributor", 90000001)
+    re_read = {
+        **_page([octo, _commit(5, "Octo Contributor"), head], 4, True),
+        "errors": [_node_error(1, "commit", "author", "user")],
+    }
+    replies = [_page([octo], 4, True), kept_two, re_read, {"errors": [{}]}]
+    waits: list[float] = []
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, waits.append) == EXIT_FAULT
+    assert waits == [cla_precheck.HEAD_RETRY_DELAYS[0]] and replies == []
+    out = capsys.readouterr().out
+    warnings = [line for line in out.splitlines() if "fault::" in line]
+    assert warnings == [
+        "::warning title=CLA pre-check fault::the re-read judged was cut short, so any commits "
+        "past it are not checked: GraphQL returned an error; the earlier read's W7-R11 warnings "
+        f"for commits the re-read does not list: commit {2:040x}: GraphQL reported an error "
+        "inside its committer, and its author reads as unlinked or null, which that failure may "
+        "have caused; not refused; the re-read showed: "
+        f"commit {5:040x}: GraphQL reported an error inside it; not judged"
+    ]
+
+
+def test_a_trailing_re_read_cut_short_that_cannot_show_the_head_reports_the_kept_read(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The boundary of the case above: a re-read cut short whose pages hold a commit whose id
+    GraphQL nulled cannot show that it holds the head, so the kept read is still the one judged."""
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    nulled = _page([octo, _commit(2, "Octo", "octo-contributor", 90000001)], 4, True)
+    nulled["data"]["repository"]["pullRequest"]["commits"]["nodes"][1] = None
+    nulled = {**nulled, "errors": [_node_error(1, "commit", "oid")]}
+    replies = [_page([octo], 2, False), nulled, {"errors": [{}]}]
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, lambda _s: None) == EXIT_FAULT
+    assert replies == []
+    out = capsys.readouterr().out
+    assert "the read judged: the commits this read returned do not include CLA_HEAD_SHA" in out
+    assert "then a re-read was cut short" in out
+    assert "the re-read judged" not in out

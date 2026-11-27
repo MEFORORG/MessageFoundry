@@ -491,7 +491,7 @@ def test_the_line_annotator_agrees_with_the_toml_fence_extractor() -> None:
 
 # THE MEASURED BASELINE, AND WHY THIS IS A RATCHET RATHER THAN A CLEAN GATE.
 #
-# 23 documents carry 54 of these citations -- the row count and the sum of the table below, pinned
+# 22 documents carry 53 of these citations -- the row count and the sum of the table below, pinned
 # by test_the_header_count_matches_the_table, because two drafts of this line have already drifted
 # from the dict they describe: one said 58 against a sum of 59, and the document count read 27
 # against 26 rows. BACKLOG #1383's agreed scope is docs/SECURITY.md ONLY -- the ASVS tracker
@@ -576,7 +576,6 @@ _BASELINE: dict[str, int] = {
     # the retirement; rewriting the decision in place would erase what was decided.
     "docs/adr/0066-pooled-stage-claimers.md": 1,
     "docs/adr/0027-per-connection-retention.md": 1,
-    "docs/adr/0096-cluster-leader-preference-and-non-promotable-standby.md": 1,
     # #1279: was 2. Dotted spelling, PR #1364 review: was 5, the added one is the
     # `# was [ai].data_class = "phi"` migration note. Fence + section: was 6, and the two that went
     # are the `[security]`-block case -- correct replacement config, reported as a defect.
@@ -700,8 +699,8 @@ def test_the_header_count_matches_the_table() -> None:
     # `_SCAN_GENERATION == _SCAN_GENERATION` would pass whatever it said, which is the vacuous shape
     # this file keeps pairing controls against. Change the constant and this literal together.
     assert (len(_BASELINE), sum(_BASELINE.values()), _SCAN_GENERATION) == (
-        23,
-        54,
+        22,
+        53,
         "fence-aware + section-aware, 2026-09-20",
     )
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -153,7 +154,6 @@ async def seeded(tmp_path: Path) -> AsyncIterator[tuple[Engine, str]]:
         store_settings=ss,
         dr_settings=DrSettings(
             enabled=True,
-            activate=False,
             seed_archive=archive,
             takeover_hook=_OK_HOOK,
             priority_threshold=Priority.CRITICAL,
@@ -315,6 +315,9 @@ async def test_a_release_whose_drain_gives_up_inside_the_deadline_answers_with_t
             "depth_left": depth,
             "drained": False,
             "held_on_parked_outbounds": 0,
+            # BACKLOG #5965: the host and process identity, read back at the next start.
+            "host": socket.gethostname(),
+            "instance": None,
             "vip_hook_ran": False,
         }
     ]

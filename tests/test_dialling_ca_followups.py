@@ -135,7 +135,7 @@ async def dr_engine(tmp_path: Path) -> AsyncIterator[Engine]:
         poll_interval=0.02,
         config_dir=None,
         store_settings=ss,
-        dr_settings=DrSettings(enabled=True, activate=False, seed_archive=archive),
+        dr_settings=DrSettings(enabled=True, seed_archive=archive),
         egress_settings=EgressSettings(deny_by_default=False),
         registry_preflight=ta.make_registry_anchor_preflight(store, enforcing=True),
         lane_anchor_check=ta.make_lane_anchor_check(store, enforcing=True),

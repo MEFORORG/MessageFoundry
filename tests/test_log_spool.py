@@ -397,7 +397,7 @@ def test_a_segment_number_is_never_reused(spool_dir: Path) -> None:
 
 def _simulate_cpython_3149_syslog_init(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make ``SysLogHandler.__init__`` swallow a ``socket.gaierror`` from ``createSocket``, as
-    CPython 3.14.9 does (see ``_retry_a_swallowed_lookup``), whatever Python runs the test."""
+    CPython 3.14.9 does (see ``_TimeoutSysLogHandler.__init__``), whatever Python runs the test."""
     real_init = logging.handlers.SysLogHandler.__init__
 
     def _init(self: logging.handlers.SysLogHandler, *args: Any, **kwargs: Any) -> None:
@@ -479,22 +479,33 @@ def test_a_permanent_connect_failure_is_reported_at_error_and_not_deferred(
     again.close()
 
 
+@pytest.mark.parametrize("spool", [False, True], ids=["no-spool", "spool"])
 @pytest.mark.parametrize("protocol", ["udp", "tcp", "tls"])
 def test_a_name_that_does_not_resolve_fails_permanently_under_the_real_create_socket(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], protocol: str
+    spool_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    protocol: str,
+    spool: bool,
 ) -> None:
     """The stdlib ``createSocket`` runs for real here and only the lookup is faked, so every arm,
-    UDP included, is held to the simulated 3.14.9 behavior as well."""
+    UDP included, is held to the simulated 3.14.9 behavior as well, with a spool behind it or not
+    (BACKLOG #4063: a spool must not turn the name into "not reachable yet")."""
 
     def _no_such_name(*args: Any, **kwargs: Any) -> Any:
-        raise socket.gaierror(11001, "getaddrinfo failed")
+        raise socket.gaierror(socket.EAI_NONAME, "getaddrinfo failed")
 
     _simulate_cpython_3149_syslog_init(monkeypatch)
     monkeypatch.setattr(socket, "getaddrinfo", _no_such_name)
+    spooling: dict[str, Any] = (
+        {"spool_dir": str(spool_dir), "spool_max_bytes": 1_000_000}
+        if spool
+        else {"spool_max_bytes": 0}
+    )
     installed = configure_logging(
         "INFO",
         forward=SyslogForward(
-            host="siem.example.org", port=514, protocol=protocol, tls_verify=False
+            host="siem.example.org", port=514, protocol=protocol, tls_verify=False, **spooling
         ),
     )
     out = capsys.readouterr().out
@@ -511,7 +522,7 @@ def _assert_reads_not_installed_permanently() -> None:
     assert status.state == "not_installed"
 
 
-@pytest.mark.parametrize("protocol", ["tcp", "udp"])
+@pytest.mark.parametrize("protocol", ["tcp", "tls", "udp"])
 def test_a_transient_lookup_failure_is_still_deferred_on_cpython_3149(
     spool_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -532,6 +543,7 @@ def test_a_transient_lookup_failure_is_still_deferred_on_cpython_3149(
             host="siem.example.org",
             port=6514,
             protocol=protocol,
+            tls_verify=False,
             spool_dir=str(spool_dir),
             spool_max_bytes=1_000_000,
         ),
@@ -563,11 +575,10 @@ def test_a_transient_connect_failure_is_still_deferred(
     assert "not reachable yet" in capsys.readouterr().out
 
 
-def _first_lookup_of_the_collector_fails(
-    monkeypatch: pytest.MonkeyPatch, answer: list[Any]
-) -> list[object]:
-    """Fail the first lookup of ``siem.example.org`` with a transient ``gaierror``, answer later
-    ones with ``answer``, and pass any other host to the real lookup. Returns that host's lookups."""
+def _collector_lookups(monkeypatch: pytest.MonkeyPatch, answers: list[Any]) -> list[object]:
+    """Answer the lookups of ``siem.example.org`` in turn from ``answers``: an exception is raised,
+    anything else returned, and the last answer repeats. Any other host goes to the real lookup.
+    Returns that host's lookups."""
     real_getaddrinfo = socket.getaddrinfo
     lookups: list[object] = []
 
@@ -575,104 +586,165 @@ def _first_lookup_of_the_collector_fails(
         if host != "siem.example.org":
             return real_getaddrinfo(host, *args, **kwargs)  # type: ignore[arg-type]
         lookups.append(host)
-        if len(lookups) == 1:
-            raise socket.gaierror(socket.EAI_AGAIN, "temporary failure in name resolution")
+        answer = answers[min(len(lookups), len(answers)) - 1]
+        if isinstance(answer, BaseException):
+            raise answer
         return answer
 
     monkeypatch.setattr(socket, "getaddrinfo", _getaddrinfo)
     return lookups
 
 
-@pytest.mark.parametrize("tls", [False, True], ids=["tcp", "tls"])
-def test_a_lookup_that_answers_on_the_retry_connects_through_our_create_socket(
-    monkeypatch: pytest.MonkeyPatch, tls: bool
+def _try_again() -> socket.gaierror:
+    return socket.gaierror(socket.EAI_AGAIN, "temporary failure in name resolution")
+
+
+def _loopback(socktype: int, port: int) -> list[Any]:
+    proto = socket.IPPROTO_UDP if socktype == socket.SOCK_DGRAM else socket.IPPROTO_TCP
+    return [(socket.AF_INET, socktype, proto, "", ("127.0.0.1", port))]
+
+
+class _Wrapped:
+    """What :class:`_RecordingContext` hands back, so the handler is seen to keep it."""
+
+    def __init__(self, sock: Any) -> None:
+        self.sock = sock
+
+    def gettimeout(self) -> float | None:
+        return float(self.sock.gettimeout())
+
+    def close(self) -> None:
+        self.sock.close()
+
+
+class _RecordingContext:
+    """A stand-in TLS context: records each wrap and does no handshake."""
+
+    def __init__(self) -> None:
+        self.wrapped: list[tuple[Any, str]] = []
+
+    def wrap_socket(self, sock: Any, server_hostname: str) -> Any:
+        self.wrapped.append((sock, server_hostname))
+        return _Wrapped(sock)
+
+
+def _handler(
+    monkeypatch: pytest.MonkeyPatch, protocol: str, port: int, *, defer_connect: bool
+) -> _TimeoutSysLogHandler:
+    """The forwarder arm :func:`_build_syslog_handler` builds for ``siem.example.org``, with a
+    stand-in TLS context so no handshake runs."""
+    monkeypatch.setattr(logging_setup, "_build_tls_context", lambda forward: _RecordingContext())
+    handler = _build_syslog_handler(
+        SyslogForward(host="siem.example.org", port=port, protocol=protocol),
+        defer_connect=defer_connect,
+    )
+    assert isinstance(handler, _TimeoutSysLogHandler)
+    return handler
+
+
+def _assert_wrapped_for_the_collector(handler: _TimeoutSysLogHandler) -> None:
+    """The TLS override wrapped the socket for the configured server name, and the handler kept
+    the wrapped socket."""
+    assert isinstance(handler, _TlsSysLogHandler)
+    assert isinstance(handler.socket, _Wrapped)
+    context = handler._ssl_context
+    assert isinstance(context, _RecordingContext)
+    assert context.wrapped == [(handler.socket.sock, "siem.example.org")]
+
+
+@pytest.mark.parametrize("defer", [False, True], ids=["no-spool", "spool"])
+@pytest.mark.parametrize("protocol", ["udp", "tcp", "tls"])
+def test_a_swallowed_lookup_error_is_the_one_raised_with_no_second_lookup(
+    monkeypatch: pytest.MonkeyPatch, protocol: str, defer: bool
 ) -> None:
-    """On CPython 3.14.9 the stdlib constructor swallows the first lookup, and our constructor's
-    retry looks the name up again, through the class's own ``createSocket``. The spy on
-    ``_TimeoutSysLogHandler.createSocket`` shows the retry ran that override; for TLS, the wrap
-    record shows the TLS override ran and wrapped the socket for the configured server name, and
-    that the handler kept the wrapped socket. The socket's timeout is checked as an outcome only:
-    the stdlib's ``createSocket`` applies the same value. The retry's lookup answers with a
-    loopback listener, so no name is resolved."""
+    """BACKLOG #4063: on CPython 3.14.9 the constructor raises the lookup error the stdlib
+    swallowed, and looks the name up only once. A second lookup would pay a resolver stall twice,
+    and here, where the second lookup would answer, it would hide the failure altogether."""
     _simulate_cpython_3149_syslog_init(monkeypatch)
-    real_create = _TimeoutSysLogHandler.createSocket
+    socktype = socket.SOCK_DGRAM if protocol == "udp" else socket.SOCK_STREAM
+    with socket.create_server(("127.0.0.1", 0)) as server:
+        port = server.getsockname()[1]
+        lookups = _collector_lookups(monkeypatch, [_try_again(), _loopback(socktype, port)])
+        if defer:
+            handler = _handler(monkeypatch, protocol, port, defer_connect=True)
+            try:
+                assert isinstance(handler.startup_error, socket.gaierror)
+                assert handler.startup_error.errno == socket.EAI_AGAIN
+                assert handler.socket is None
+            finally:
+                handler.close()
+        else:
+            with pytest.raises(socket.gaierror) as raised:
+                _handler(monkeypatch, protocol, port, defer_connect=False)
+            assert raised.value.errno == socket.EAI_AGAIN
+    assert len(lookups) == 1
+
+
+@pytest.mark.parametrize("protocol", ["udp", "tcp", "tls"])
+def test_a_flapping_resolver_cannot_turn_a_missing_name_into_a_deferral(
+    spool_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    protocol: str,
+) -> None:
+    """BACKLOG #4063 (Lander finding 1): the first lookup says the name does not exist and a second
+    would say "try again". The permanent reading is the first lookup's, so a spool does not defer a
+    misconfigured name as "not reachable yet"."""
+    _simulate_cpython_3149_syslog_init(monkeypatch)
+    _collector_lookups(
+        monkeypatch, [socket.gaierror(socket.EAI_NONAME, "name not known"), _try_again()]
+    )
+    installed = configure_logging(
+        "INFO",
+        forward=SyslogForward(
+            host="siem.example.org",
+            port=6514,
+            protocol=protocol,
+            tls_verify=False,
+            spool_dir=str(spool_dir),
+            spool_max_bytes=1_000_000,
+        ),
+    )
+    out = capsys.readouterr().out
+    assert installed is False
+    assert "failed permanently" in out
+    assert "not reachable yet" not in out
+
+
+@pytest.mark.parametrize("cpython_3149", [False, True], ids=["native", "simulated-3.14.9"])
+@pytest.mark.parametrize("protocol", ["udp", "tcp", "tls"])
+def test_a_construction_that_connects_creates_one_socket(
+    monkeypatch: pytest.MonkeyPatch, protocol: str, cpython_3149: bool
+) -> None:
+    """BACKLOG #4063 (Lander finding 5): a lookup that answers at once costs one lookup and one
+    stdlib ``createSocket``. A broken ``socket is None`` guard would connect a second socket and
+    leak the first."""
+    if cpython_3149:
+        _simulate_cpython_3149_syslog_init(monkeypatch)
+    real_create = logging.handlers.SysLogHandler.createSocket
     creates: list[object] = []
 
-    def _counting_create(self: _TimeoutSysLogHandler) -> None:
+    def _counting_create(self: logging.handlers.SysLogHandler) -> None:
         creates.append(self)
         real_create(self)
 
-    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _counting_create)
+    monkeypatch.setattr(logging.handlers.SysLogHandler, "createSocket", _counting_create)
+    socktype = socket.SOCK_DGRAM if protocol == "udp" else socket.SOCK_STREAM
     with socket.create_server(("127.0.0.1", 0)) as server:
         port = server.getsockname()[1]
-        lookups = _first_lookup_of_the_collector_fails(
-            monkeypatch,
-            [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", port))],
-        )
-        wrapped: list[tuple[Any, str]] = []
-
-        class _Wrapped:
-            """What the fake context hands back, so the handler is seen to keep it."""
-
-            def __init__(self, sock: Any) -> None:
-                self.sock = sock
-
-            def gettimeout(self) -> float | None:
-                return float(self.sock.gettimeout())
-
-            def close(self) -> None:
-                self.sock.close()
-
-        class _RecordingContext:
-            def wrap_socket(self, sock: Any, server_hostname: str) -> Any:
-                wrapped.append((sock, server_hostname))
-                return _Wrapped(sock)
-
-        common: dict[str, Any] = {
-            "address": ("siem.example.org", port),
-            "socktype": socket.SOCK_STREAM,
-            "timeout": 1.0,
-            "defer_connect": True,
-        }
-        handler = (
-            _TlsSysLogHandler(
-                **common,
-                ssl_context=_RecordingContext(),  # type: ignore[arg-type]
-                server_hostname="collector.example.org",  # not the address host
-            )
-            if tls
-            else _TimeoutSysLogHandler(**common)
-        )
+        lookups = _collector_lookups(monkeypatch, [_loopback(socktype, port)])
+        handler = _handler(monkeypatch, protocol, port, defer_connect=True)
         try:
-            assert len(lookups) == 2  # the swallowed lookup, then the retry
-            assert creates == [handler, handler]  # both through our override, the retry included
+            assert len(lookups) == 1
+            assert creates == [handler]
             assert handler.startup_error is None
             assert handler.socket is not None
-            assert handler.socket.gettimeout() == 1.0
-            if tls:
-                assert isinstance(handler.socket, _Wrapped)
-                assert wrapped == [(handler.socket.sock, "collector.example.org")]
+            if protocol != "udp":
+                assert handler.socket.gettimeout() == logging_setup._FORWARD_TCP_TIMEOUT
+            if protocol == "tls":
+                _assert_wrapped_for_the_collector(handler)
         finally:
             handler.close()
-
-
-def test_a_udp_lookup_that_answers_on_the_retry_returns_a_handler_with_a_socket(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The UDP arm retries the lookup in ``_TimeoutSysLogHandler.__init__`` (BACKLOG #5923). A retry
-    that answers must hand back that handler, open, with its socket."""
-    _simulate_cpython_3149_syslog_init(monkeypatch)
-    lookups = _first_lookup_of_the_collector_fails(
-        monkeypatch,
-        [(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP, "", ("127.0.0.1", 514))],
-    )
-    handler = _build_syslog_handler(SyslogForward(host="siem.example.org", port=514))
-    try:
-        assert len(lookups) == 2  # the swallowed lookup, then the retry
-        assert getattr(handler, "socket", None) is not None
-        assert handler.socktype == socket.SOCK_DGRAM
-    finally:
-        handler.close()
 
 
 def test_a_send_error_that_is_not_a_network_error_is_never_counted_as_sent(
@@ -714,12 +786,26 @@ def _not_yet_valid() -> ssl.SSLCertVerificationError:
         (socket.gaierror(11001, "host not found"), True),
         # The platform's own EAI_NONAME: -2 on Linux, where a bare 11001 exercises nothing.
         (socket.gaierror(socket.EAI_NONAME, "name or service not known"), True),
+        # BACKLOG #4063: "no address record", Linux EAI_NODATA (-5) and Windows WSANO_DATA
+        # (11004), stays transient, since a resolver not yet up can return either; the reason is
+        # at _EAI_NO_SUCH_NAME. Literals, so each runs on every platform.
+        (socket.gaierror(-5, "no address associated with hostname"), False),
+        (socket.gaierror(11004, "valid name, no data record"), False),
         (socket.gaierror(getattr(socket, "EAI_AGAIN", -3), "temporary failure"), False),
         (ssl.SSLCertVerificationError("certificate verify failed"), True),
         (_not_yet_valid(), False),
         (ConnectionRefusedError("refused"), False),
     ],
-    ids=["no-such-name", "eai-noname", "dns-try-again", "bad-cert", "clock-not-synced", "refused"],
+    ids=[
+        "no-such-name",
+        "eai-noname",
+        "eai-nodata",
+        "wsano-data",
+        "dns-try-again",
+        "bad-cert",
+        "clock-not-synced",
+        "refused",
+    ],
 )
 def test_only_a_missing_name_or_a_bad_certificate_is_permanent(
     error: OSError, permanent: bool

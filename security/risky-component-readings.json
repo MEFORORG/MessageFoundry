@@ -1,11 +1,12 @@
 {
   "subject": "Public-metadata readings of each runtime component on ASVS 5.0.0 V15.1's risky-component examples (BACKLOG #1189, ASVS 15.1.4)",
-  "snapshot_date": "2026-10-08",
-  "reread_by": "2027-01-06",
+  "snapshot_date": "2026-11-27",
+  "reread_by": "2027-02-25",
   "population": {
     "core": "security/runtime-closure-core.txt",
     "extras": {
       "sqlserver": "security/runtime-closure-sqlserver.txt",
+      "postgres": "security/runtime-closure-postgres.txt",
       "harness": "security/runtime-closure-harness.txt"
     }
   },
@@ -82,15 +83,15 @@
       "name": "annotated-doc",
       "pinned": "0.0.5",
       "added_by": [],
-      "latest_version": "0.0.5",
-      "newest_upload": "2026-07-28",
-      "releases_in_maintenance_window": 4,
+      "latest_version": "0.0.7",
+      "newest_upload": "2026-11-18",
+      "releases_in_maintenance_window": 6,
       "development_status": [
         "Development Status :: 4 - Beta"
       ],
       "project_status": "active",
       "pinned_yanked": false,
-      "requires_python_latest": ">=3.9",
+      "requires_python_latest": ">=3.11",
       "advisories": [],
       "advisories_dropped": [],
       "advisories_unresolved": [],
@@ -128,9 +129,9 @@
       "name": "anyio",
       "pinned": "4.15.1",
       "added_by": [],
-      "latest_version": "4.15.1",
-      "newest_upload": "2026-09-05",
-      "releases_in_maintenance_window": 17,
+      "latest_version": "4.16.0",
+      "newest_upload": "2026-11-01",
+      "releases_in_maintenance_window": 14,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],
@@ -193,9 +194,9 @@
       "name": "argon2-cffi-bindings",
       "pinned": "26.1.0",
       "added_by": [],
-      "latest_version": "26.1.0",
-      "newest_upload": "2026-08-20",
-      "releases_in_maintenance_window": 2,
+      "latest_version": "26.2.0",
+      "newest_upload": "2026-11-13",
+      "releases_in_maintenance_window": 3,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],
@@ -213,12 +214,44 @@
       }
     },
     {
+      "name": "asyncpg",
+      "pinned": "0.32.0",
+      "added_by": [
+        "postgres"
+      ],
+      "latest_version": "0.32.0",
+      "newest_upload": "2026-10-06",
+      "releases_in_maintenance_window": 2,
+      "development_status": [
+        "Development Status :: 5 - Production/Stable"
+      ],
+      "project_status": "active",
+      "pinned_yanked": false,
+      "requires_python_latest": ">=3.9.0",
+      "advisories": [
+        {
+          "id": "GHSA-2xpj-f5g2-8p7m",
+          "severity": "CRITICAL",
+          "rated_by": "github",
+          "published": "2020-08-12"
+        }
+      ],
+      "advisories_dropped": [],
+      "advisories_unresolved": [],
+      "advisories_affecting_pin": [],
+      "risky": {
+        "maintenance": false,
+        "support": false,
+        "advisory_history": false
+      }
+    },
+    {
       "name": "certifi",
-      "pinned": "2026.7.22",
+      "pinned": "2026.10.23",
       "added_by": [],
-      "latest_version": "2026.7.22",
-      "newest_upload": "2026-07-22",
-      "releases_in_maintenance_window": 15,
+      "latest_version": "2026.11.20",
+      "newest_upload": "2026-11-20",
+      "releases_in_maintenance_window": 19,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],
@@ -237,6 +270,12 @@
           "severity": "MODERATE",
           "rated_by": "github",
           "published": "2022-12-07"
+        },
+        {
+          "id": "GHSA-6q48-6c7w-9gw2",
+          "severity": "CRITICAL",
+          "rated_by": "github",
+          "published": "2026-10-20"
         },
         {
           "id": "GHSA-xqr8-7jwr-rhp7",
@@ -279,9 +318,9 @@
       "name": "click",
       "pinned": "8.5.0",
       "added_by": [],
-      "latest_version": "8.5.0",
-      "newest_upload": "2026-08-26",
-      "releases_in_maintenance_window": 11,
+      "latest_version": "8.5.1",
+      "newest_upload": "2026-11-06",
+      "releases_in_maintenance_window": 12,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],
@@ -304,7 +343,7 @@
       "added_by": [],
       "latest_version": "50.0.2",
       "newest_upload": "2026-09-30",
-      "releases_in_maintenance_window": 27,
+      "releases_in_maintenance_window": 26,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],
@@ -468,17 +507,17 @@
     },
     {
       "name": "fastapi",
-      "pinned": "0.142.2",
+      "pinned": "0.165.0",
       "added_by": [],
-      "latest_version": "0.142.4",
-      "newest_upload": "2026-10-07",
-      "releases_in_maintenance_window": 113,
+      "latest_version": "0.165.0",
+      "newest_upload": "2026-11-18",
+      "releases_in_maintenance_window": 157,
       "development_status": [
         "Development Status :: 4 - Beta"
       ],
       "project_status": "active",
       "pinned_yanked": false,
-      "requires_python_latest": ">=3.10",
+      "requires_python_latest": ">=3.11",
       "advisories": [
         {
           "id": "GHSA-8h2j-cgx8-6xv7",
@@ -536,8 +575,8 @@
       "pinned": "1.3.5",
       "added_by": [],
       "latest_version": "1.3.5",
-      "newest_upload": "2024-03-13",
-      "releases_in_maintenance_window": 0,
+      "newest_upload": "2026-10-26",
+      "releases_in_maintenance_window": 1,
       "development_status": [],
       "project_status": "active",
       "pinned_yanked": false,
@@ -547,7 +586,7 @@
       "advisories_unresolved": [],
       "advisories_affecting_pin": [],
       "risky": {
-        "maintenance": true,
+        "maintenance": false,
         "support": false,
         "advisory_history": false
       }
@@ -558,7 +597,7 @@
       "added_by": [],
       "latest_version": "1.0.9",
       "newest_upload": "2025-04-24",
-      "releases_in_maintenance_window": 3,
+      "releases_in_maintenance_window": 2,
       "development_status": [
         "Development Status :: 3 - Alpha"
       ],
@@ -579,9 +618,9 @@
       "name": "httptools",
       "pinned": "0.8.0",
       "added_by": [],
-      "latest_version": "0.8.0",
-      "newest_upload": "2026-05-25",
-      "releases_in_maintenance_window": 5,
+      "latest_version": "0.9.0",
+      "newest_upload": "2026-10-09",
+      "releases_in_maintenance_window": 3,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],
@@ -602,15 +641,15 @@
       "name": "httpx",
       "pinned": "0.28.1",
       "added_by": [],
-      "latest_version": "0.28.1",
-      "newest_upload": "2026-08-31",
-      "releases_in_maintenance_window": 8,
+      "latest_version": "0.29.0",
+      "newest_upload": "2026-11-26",
+      "releases_in_maintenance_window": 9,
       "development_status": [
         "Development Status :: 4 - Beta"
       ],
       "project_status": "active",
       "pinned_yanked": false,
-      "requires_python_latest": ">=3.8",
+      "requires_python_latest": ">=3.10",
       "advisories": [
         {
           "id": "GHSA-h8pj-cxx2-jfg2",
@@ -689,18 +728,31 @@
     },
     {
       "name": "opentelemetry-api",
-      "pinned": "1.45.0",
+      "pinned": "1.45.2",
       "added_by": [],
-      "latest_version": "1.45.1",
-      "newest_upload": "2026-10-06",
-      "releases_in_maintenance_window": 28,
+      "latest_version": "1.45.2",
+      "newest_upload": "2026-10-29",
+      "releases_in_maintenance_window": 26,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],
       "project_status": "active",
       "pinned_yanked": false,
       "requires_python_latest": ">=3.10",
-      "advisories": [],
+      "advisories": [
+        {
+          "id": "GHSA-mf5v-w3w3-f6cg",
+          "severity": "MODERATE",
+          "rated_by": "github",
+          "published": "2026-11-13"
+        },
+        {
+          "id": "GHSA-xcq7-p3pf-p88h",
+          "severity": "MODERATE",
+          "rated_by": "github",
+          "published": "2026-10-22"
+        }
+      ],
       "advisories_dropped": [],
       "advisories_unresolved": [],
       "advisories_affecting_pin": [],
@@ -716,7 +768,7 @@
       "added_by": [],
       "latest_version": "7.2.2",
       "newest_upload": "2026-01-28",
-      "releases_in_maintenance_window": 10,
+      "releases_in_maintenance_window": 9,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],
@@ -742,11 +794,11 @@
     },
     {
       "name": "pyasn1",
-      "pinned": "0.6.4",
+      "pinned": "0.6.5",
       "added_by": [],
-      "latest_version": "0.6.4",
-      "newest_upload": "2026-07-09",
-      "releases_in_maintenance_window": 3,
+      "latest_version": "0.6.5",
+      "newest_upload": "2026-10-27",
+      "releases_in_maintenance_window": 4,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],
@@ -754,6 +806,12 @@
       "pinned_yanked": false,
       "requires_python_latest": ">=3.8",
       "advisories": [
+        {
+          "id": "GHSA-2qm8-x737-gmw5",
+          "severity": "HIGH",
+          "rated_by": "github",
+          "published": "2026-10-30"
+        },
         {
           "id": "GHSA-63vm-454h-vhhq",
           "severity": "HIGH",
@@ -765,6 +823,18 @@
           "severity": "HIGH",
           "rated_by": "github",
           "published": "2026-07-14"
+        },
+        {
+          "id": "GHSA-9m75-vc3g-4x39",
+          "severity": "HIGH",
+          "rated_by": "github",
+          "published": "2026-10-30"
+        },
+        {
+          "id": "GHSA-fm9c-5rcf-2q5p",
+          "severity": "HIGH",
+          "rated_by": "github",
+          "published": "2026-10-30"
         },
         {
           "id": "GHSA-hm4w-wwcw-mr6r",
@@ -783,6 +853,12 @@
           "severity": "HIGH",
           "rated_by": "github",
           "published": "2026-07-14"
+        },
+        {
+          "id": "GHSA-mm57-4v3p-rchx",
+          "severity": "HIGH",
+          "rated_by": "github",
+          "published": "2026-10-30"
         }
       ],
       "advisories_dropped": [],
@@ -798,15 +874,15 @@
       "name": "pycparser",
       "pinned": "3.0",
       "added_by": [],
-      "latest_version": "3.0",
-      "newest_upload": "2026-01-21",
-      "releases_in_maintenance_window": 2,
+      "latest_version": "3.12",
+      "newest_upload": "2026-10-22",
+      "releases_in_maintenance_window": 5,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],
       "project_status": "active",
       "pinned_yanked": false,
-      "requires_python_latest": ">=3.10",
+      "requires_python_latest": ">=3.11",
       "advisories": [],
       "advisories_dropped": [],
       "advisories_unresolved": [],
@@ -819,17 +895,17 @@
     },
     {
       "name": "pydantic",
-      "pinned": "2.13.5",
+      "pinned": "2.14.3",
       "added_by": [],
-      "latest_version": "2.13.5",
-      "newest_upload": "2026-09-09",
+      "latest_version": "2.14.4",
+      "newest_upload": "2026-11-19",
       "releases_in_maintenance_window": 51,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],
       "project_status": "active",
       "pinned_yanked": false,
-      "requires_python_latest": ">=3.9",
+      "requires_python_latest": ">=3.10",
       "advisories": [
         {
           "id": "GHSA-5jqp-qgf6-3pvh",
@@ -855,11 +931,11 @@
     },
     {
       "name": "pydantic-core",
-      "pinned": "2.46.5",
+      "pinned": "2.50.4",
       "added_by": [],
-      "latest_version": "2.49.0",
-      "newest_upload": "2026-09-09",
-      "releases_in_maintenance_window": 46,
+      "latest_version": "2.50.5",
+      "newest_upload": "2026-11-19",
+      "releases_in_maintenance_window": 45,
       "development_status": [
         "Development Status :: 3 - Alpha"
       ],
@@ -882,15 +958,15 @@
       "added_by": [
         "sqlserver"
       ],
-      "latest_version": "5.3.0",
-      "newest_upload": "2025-10-17",
-      "releases_in_maintenance_window": 2,
+      "latest_version": "5.5.0",
+      "newest_upload": "2026-11-08",
+      "releases_in_maintenance_window": 3,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],
       "project_status": "active",
       "pinned_yanked": false,
-      "requires_python_latest": ">=3.9",
+      "requires_python_latest": ">=3.11",
       "advisories": [],
       "advisories_dropped": [],
       "advisories_unresolved": [],
@@ -903,19 +979,19 @@
     },
     {
       "name": "pyside6",
-      "pinned": "6.11.2",
+      "pinned": "6.11.3",
       "added_by": [
         "harness"
       ],
-      "latest_version": "6.11.2",
-      "newest_upload": "2026-08-18",
-      "releases_in_maintenance_window": 19,
+      "latest_version": "6.12.0",
+      "newest_upload": "2026-10-26",
+      "releases_in_maintenance_window": 18,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],
       "project_status": "active",
       "pinned_yanked": false,
-      "requires_python_latest": "<3.15,>=3.10",
+      "requires_python_latest": "<3.16,>=3.10",
       "advisories": [],
       "advisories_dropped": [],
       "advisories_unresolved": [],
@@ -928,19 +1004,19 @@
     },
     {
       "name": "pyside6-addons",
-      "pinned": "6.11.2",
+      "pinned": "6.11.3",
       "added_by": [
         "harness"
       ],
-      "latest_version": "6.11.2",
-      "newest_upload": "2026-08-18",
-      "releases_in_maintenance_window": 19,
+      "latest_version": "6.12.0",
+      "newest_upload": "2026-10-26",
+      "releases_in_maintenance_window": 18,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],
       "project_status": "active",
       "pinned_yanked": false,
-      "requires_python_latest": "<3.15,>=3.10",
+      "requires_python_latest": "<3.16,>=3.10",
       "advisories": [],
       "advisories_dropped": [],
       "advisories_unresolved": [],
@@ -953,19 +1029,19 @@
     },
     {
       "name": "pyside6-essentials",
-      "pinned": "6.11.2",
+      "pinned": "6.11.3",
       "added_by": [
         "harness"
       ],
-      "latest_version": "6.11.2",
-      "newest_upload": "2026-08-18",
-      "releases_in_maintenance_window": 19,
+      "latest_version": "6.12.0",
+      "newest_upload": "2026-10-26",
+      "releases_in_maintenance_window": 18,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],
       "project_status": "active",
       "pinned_yanked": false,
-      "requires_python_latest": "<3.15,>=3.10",
+      "requires_python_latest": "<3.16,>=3.10",
       "advisories": [],
       "advisories_dropped": [],
       "advisories_unresolved": [],
@@ -978,11 +1054,11 @@
     },
     {
       "name": "pyspnego",
-      "pinned": "0.12.3",
+      "pinned": "0.12.4",
       "added_by": [],
       "latest_version": "0.12.4",
       "newest_upload": "2026-10-06",
-      "releases_in_maintenance_window": 6,
+      "releases_in_maintenance_window": 5,
       "development_status": [
         "Development Status :: 4 - Beta"
       ],
@@ -1001,19 +1077,19 @@
     },
     {
       "name": "shiboken6",
-      "pinned": "6.11.2",
+      "pinned": "6.11.3",
       "added_by": [
         "harness"
       ],
-      "latest_version": "6.11.2",
-      "newest_upload": "2026-08-18",
-      "releases_in_maintenance_window": 19,
+      "latest_version": "6.12.0",
+      "newest_upload": "2026-10-26",
+      "releases_in_maintenance_window": 18,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],
       "project_status": "active",
       "pinned_yanked": false,
-      "requires_python_latest": "<3.15,>=3.10",
+      "requires_python_latest": "<3.16,>=3.10",
       "advisories": [],
       "advisories_dropped": [],
       "advisories_unresolved": [],
@@ -1049,17 +1125,17 @@
     },
     {
       "name": "starlette",
-      "pinned": "1.7.0",
+      "pinned": "1.10.0",
       "added_by": [],
-      "latest_version": "1.7.0",
-      "newest_upload": "2026-09-23",
-      "releases_in_maintenance_window": 41,
+      "latest_version": "1.10.0",
+      "newest_upload": "2026-10-24",
+      "releases_in_maintenance_window": 40,
       "development_status": [
         "Development Status :: 3 - Alpha"
       ],
       "project_status": "active",
       "pinned_yanked": false,
-      "requires_python_latest": ">=3.10",
+      "requires_python_latest": ">=3.11",
       "advisories": [
         {
           "id": "GHSA-2c2j-9gv5-cj73",
@@ -1133,11 +1209,11 @@
     },
     {
       "name": "tomlkit",
-      "pinned": "0.15.1",
+      "pinned": "0.15.2",
       "added_by": [],
-      "latest_version": "0.15.1",
-      "newest_upload": "2026-07-17",
-      "releases_in_maintenance_window": 4,
+      "latest_version": "0.15.3",
+      "newest_upload": "2026-11-24",
+      "releases_in_maintenance_window": 6,
       "development_status": [],
       "project_status": "active",
       "pinned_yanked": false,
@@ -1154,10 +1230,10 @@
     },
     {
       "name": "truststore",
-      "pinned": "0.10.4",
+      "pinned": "0.10.5",
       "added_by": [],
-      "latest_version": "0.10.4",
-      "newest_upload": "2025-08-12",
+      "latest_version": "0.10.5",
+      "newest_upload": "2026-10-12",
       "releases_in_maintenance_window": 4,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
@@ -1202,9 +1278,9 @@
       "name": "typing-inspection",
       "pinned": "0.4.4",
       "added_by": [],
-      "latest_version": "0.4.4",
-      "newest_upload": "2026-08-12",
-      "releases_in_maintenance_window": 10,
+      "latest_version": "0.4.5",
+      "newest_upload": "2026-11-04",
+      "releases_in_maintenance_window": 11,
       "development_status": [
         "Development Status :: 3 - Alpha"
       ],
@@ -1223,11 +1299,11 @@
     },
     {
       "name": "tzdata",
-      "pinned": "2026.4",
+      "pinned": "2026.6",
       "added_by": [],
-      "latest_version": "2026.5",
-      "newest_upload": "2026-10-03",
-      "releases_in_maintenance_window": 8,
+      "latest_version": "2026.6",
+      "newest_upload": "2026-10-28",
+      "releases_in_maintenance_window": 9,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],
@@ -1246,11 +1322,11 @@
     },
     {
       "name": "uvicorn",
-      "pinned": "0.49.0",
+      "pinned": "0.54.0",
       "added_by": [],
       "latest_version": "0.54.0",
       "newest_upload": "2026-09-25",
-      "releases_in_maintenance_window": 35,
+      "releases_in_maintenance_window": 32,
       "development_status": [
         "Development Status :: 4 - Beta"
       ],
@@ -1286,7 +1362,7 @@
       "added_by": [],
       "latest_version": "0.23.0",
       "newest_upload": "2026-10-01",
-      "releases_in_maintenance_window": 3,
+      "releases_in_maintenance_window": 2,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],
@@ -1305,10 +1381,10 @@
     },
     {
       "name": "websockets",
-      "pinned": "17.1",
+      "pinned": "17.2",
       "added_by": [],
-      "latest_version": "17.2",
-      "newest_upload": "2026-10-03",
+      "latest_version": "17.4",
+      "newest_upload": "2026-10-30",
       "releases_in_maintenance_window": 12,
       "development_status": [
         "Development Status :: 5 - Production/Stable"

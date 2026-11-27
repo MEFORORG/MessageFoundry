@@ -1321,12 +1321,34 @@ _ASK_WITH_CONTEXT = (
 )
 _FAILED_NOTICE = "at least one shell guard FAILED OPEN on this call"
 
+# A KEPT DECISION BESIDE A GUARD THAT THREW, WITH NO OTHER GUARD'S CONTEXT (BACKLOG #5606: commit
+# 414957d5d4 of branch b482/l-guards-tests, squash-merged as 56dda19b138, PR 2982). That path writes the kept decision and exits 0, so without the notice the failed guard
+# is invisible to the session. The `ask` stub carries its own context, which the dispatcher keeps
+# apart from other guards' contexts, so `ask` beside a throw already takes this path and its check
+# already refuses the gate as it was before that commit. This stub carries no context at all, so a
+# dispatcher that adds the notice only to a decision that already has context is refused too.
+_ASK_BARE = (
+    "$null = [Console]::In.ReadToEnd()\n"
+    "[Console]::Out.Write((@{hookSpecificOutput=@{hookEventName='PreToolUse';"
+    "permissionDecision='ask';permissionDecisionReason='asked'}} | ConvertTo-Json -Compress))"
+)
+# The gate on the context block as that commit wrote it, and as it stood before.
+_KEPT_NOTICE_GATE = (
+    "if ($ShellGuardContexts.Count -or ($ShellGuardFailed -and $null -ne $ShellGuardKept)) {"
+)
+_KEPT_NOTICE_GATE_BEFORE = "if ($ShellGuardContexts.Count) {"
+_KEPT_NOTICE_GATE_CONTEXT_ONLY = _KEPT_NOTICE_GATE.replace(
+    "$null -ne $ShellGuardKept)",
+    "$null -ne $ShellGuardKept -and $ShellGuardKept -match 'additionalContext')",
+)
+
 
 def _context_guards(tmp_path: Path) -> dict[str, Path]:
     return {
         "a": _guard(tmp_path, "ctx_a.ps1", _CONTEXT % "context A"),
         "b": _guard(tmp_path, "ctx_b.ps1", _CONTEXT % "context B"),
         "ask": _guard(tmp_path, "ask_own.ps1", _ASK_WITH_CONTEXT % "own context"),
+        "ask_bare": _guard(tmp_path, "ask_bare.ps1", _ASK_BARE),
         "throws": _guard(tmp_path, "throws.ps1", "throw 'broken guard'"),
         "silent": _guard(tmp_path, "silent.ps1", "$null = [Console]::In.ReadToEnd()"),
         "deny": _guard(tmp_path, "deny.ps1", "$null = [Console]::In.ReadToEnd()\n" + _DENY % "no"),
@@ -1391,6 +1413,20 @@ def _context_checks(dispatcher: Path, g: dict[str, Path]) -> list[str]:
     ):
         failed.append(f"a kept decision hid a failed guard: {asked}")
 
+    # A kept decision with no context at all, beside a throw and no other context:
+    # that path writes the decision and exits 0, so only the notice shows the failed guard.
+    for order in (("ask_bare", "throws"), ("throws", "ask_bare")):
+        bare = run(*order)
+        if (
+            bare.returncode != 0
+            or hso(bare).get("permissionDecision") != "ask"
+            or hso(bare).get("permissionDecisionReason") != "asked"
+            or _FAILED_NOTICE not in str(hso(bare).get("additionalContext"))
+        ):
+            failed.append(
+                f"a bare kept decision hid a failed guard ({' then '.join(order)}): {bare}"
+            )
+
     silent_fail = run("silent", "throws")
     if (silent_fail.returncode, silent_fail.stdout) != (1, ""):
         failed.append(f"a failed guard beside a silent allow did not exit 1: {silent_fail}")
@@ -1411,10 +1447,20 @@ _NOTICE_ADD = "if ($ShellGuardFailed) {\n        $ShellGuardContexts.Add("
 
 
 @pytest.mark.parametrize(
-    ("label", "old", "new"),
+    ("label", "old", "new", "expect"),
     [
-        ("contexts dropped", _COLLECT, "$null = $ShellGuardContext"),
-        ("joined with one newline", _JOIN, _JOIN.replace('"`n`n"', '"`n"')),
+        (
+            "contexts dropped",
+            _COLLECT,
+            "$null = $ShellGuardContext",
+            "a lone context was not passed through",
+        ),
+        (
+            "joined with one newline",
+            _JOIN,
+            _JOIN.replace('"`n`n"', '"`n"'),
+            "two contexts were not joined in guard order",
+        ),
         (
             "own context last",
             _JOIN,
@@ -1422,13 +1468,43 @@ _NOTICE_ADD = "if ($ShellGuardFailed) {\n        $ShellGuardContexts.Add("
                 "@(@($ShellGuardOwn) + $ShellGuardContexts",
                 "@(@($ShellGuardContexts) + $ShellGuardOwn",
             ),
+            "the kept decision did not carry its own context first",
         ),
-        ("failure exits 0", _FAIL_EXIT, "exit 0\nexit 0"),
-        ("failure notice dropped", _NOTICE_ADD, "if ($false) {\n        $ShellGuardContexts.Add("),
+        (
+            "failure exits 0",
+            _FAIL_EXIT,
+            "exit 0\nexit 0",
+            "a failed guard beside a silent allow did not exit 1",
+        ),
+        (
+            "failure notice dropped",
+            _NOTICE_ADD,
+            "if ($false) {\n        $ShellGuardContexts.Add(",
+            "a context hid a failed guard",
+        ),
+        (
+            "notice gate as before PR 2982",
+            _KEPT_NOTICE_GATE,
+            _KEPT_NOTICE_GATE_BEFORE,
+            "a kept decision hid a failed guard:",
+        ),
+        (
+            "notice only beside a decision that has context",
+            _KEPT_NOTICE_GATE,
+            _KEPT_NOTICE_GATE_CONTEXT_ONLY,
+            "a bare kept decision hid a failed guard",
+        ),
     ],
 )
 @pytest.mark.timeout(300)
-def test_each_context_mistake_is_caught(tmp_path: Path, label: str, old: str, new: str) -> None:
-    """The control for the test above: a dispatcher carrying each mistake fails at least one check."""
+def test_each_context_mistake_is_caught(
+    tmp_path: Path, label: str, old: str, new: str, expect: str
+) -> None:
+    """The control for the test above: a dispatcher carrying each named mistake fails the check
+    that names it, not only some other check. At least the context-only, deny and lost-context
+    checks have no mutant here."""
     mutated = _dispatcher_copy(tmp_path / "dispatch_mutated.ps1", (old, new))
-    assert _context_checks(mutated, _context_guards(tmp_path)), f"{label} went unnoticed"
+    failed = _context_checks(mutated, _context_guards(tmp_path))
+    assert any(f.startswith(expect) for f in failed), (
+        f"{label} went unnoticed by its check: {failed}"
+    )

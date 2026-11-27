@@ -79,11 +79,22 @@ TWO CASES BACKLOG #5645 item 1 names:
     page, keeping the pages read before it.
   * A head that lags the push event. When ``CLA_HEAD_SHA`` is set and the first page's
     ``headRefOid`` is another commit, the read stops there and is repeated after each wait in
-    ``HEAD_RETRY_DELAYS``. If every first page shows another head, the run is a fault and nothing
-    is judged: a read of another head proves nothing about this one. Only that case is re-read. A
-    read whose ``headRefOid`` is ``CLA_HEAD_SHA`` is judged; if it is complete and its commits do
-    not include that head, or cannot show that they do, a fault is added beside the verdict, so a
-    pass is not silent. A read cut short carries its own fault and is not checked for the head. A
+    ``HEAD_RETRY_DELAYS``. If no read of ``CLA_HEAD_SHA`` is ever judged, the run is a fault and
+    nothing is judged: a read of another head proves nothing about this one. A read whose
+    ``headRefOid`` is ``CLA_HEAD_SHA`` is judged; if it is complete and its commits do not include
+    that head, or cannot show that they do, it is read again on the same waits while its verdict
+    refuses nothing (BACKLOG #8335 item 3). The budget of waits is one, shared with the case
+    above. A re-read that refuses, or whose commits include the head, is the verdict, even one cut
+    short by a fault (a head that moves after its first page included), with that fault and its
+    own beside it; it is not read again. A complete re-read that still lacks the head replaces the
+    read kept. A re-read that faults with no page kept, is cut short refusing nothing with pages
+    that do not include the head or cannot show that they do, or shows another head on its first
+    page ends the re-reads. Then, or once the waits run out,
+    the read kept is judged, with its fault and any later one beside the verdict, which warns
+    and passes: a list trailing the head for longer than the waits is still not checked past
+    what it holds. A verdict that already refuses is not re-read, since the run fails already, so
+    the refusals it reports may not be all a caught-up list would show. A first read cut short
+    by a fault carries its own fault and is not checked for the head. A
     head that moves after the first page is not re-read: the pages before the move, which are of
     ``CLA_HEAD_SHA``, are judged, with a fault. Without ``CLA_HEAD_SHA`` (a comment event) nothing
     is re-read.
@@ -121,8 +132,9 @@ pass for an author who never signed.
 UNMEASURED: whether GitHub's GraphQL ``headRefOid`` or commit list trails the push event, and by
 how long. The waits in ``HEAD_RETRY_DELAYS`` are a guess. A ``headRefOid`` that still shows another
 head after them leaves the run a fault that warns and passes. A commit list that trails a current
-``headRefOid`` is not waited for: it is judged, so after a force-push it can
-refuse a commit the pull request no longer holds.
+``headRefOid`` is re-read as the paragraph on a head that lags the push event says; one that
+refuses is judged at once, so after a force-push it can refuse a commit the pull request no longer
+holds.
 
 UNMEASURED: that every field a partial error nulled lies on the ``path`` of an error naming its
 commit node. The GraphQL specification implies it: an error's path names the field that raised it,
@@ -142,8 +154,9 @@ so a workflow step can pass event data through ``env:`` (zizmor's template-injec
   CLA_PR_NUMBER       the pull request number
   CLA_ALLOWLIST       the same comma-separated list cla.yml passes the action
   CLA_HEAD_SHA        optional; the head commit the run judges. A first page showing another
-                      head is re-read, then a fault; a head that moves on a later page is not
-                      re-read.
+                      head is re-read, and so is a complete read of CLA_HEAD_SHA whose
+                      commits lack it, while it refuses nothing; see the paragraph on a head
+                      that lags the push event.
   GITHUB_GRAPHQL_URL  optional; defaults to https://api.github.com/graphql
   GITHUB_API_URL      optional; defaults to https://api.github.com
   CLA_SIGNATURES_PATH the action's ``path-to-signatures``
@@ -162,6 +175,7 @@ apart by the annotation, not the code alone.
 
 from __future__ import annotations
 
+import functools
 import http.client
 import io
 import itertools
@@ -174,7 +188,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 EXIT_PASS = 0
@@ -190,8 +204,9 @@ ACTIONS_BOT_ID = 41898282
 DEFAULT_GRAPHQL_URL = "https://api.github.com/graphql"
 DEFAULT_API_URL = "https://api.github.com"
 
-# Seconds to wait before each re-read when the head read is not the head the run judges. That
-# GitHub's GraphQL view trails the push event, and by how much, is unmeasured (module docstring).
+# Seconds to wait before each re-read for the head the run judges; when, is the module docstring's
+# paragraph on a head that lags the push event. That GitHub's GraphQL view trails the push event,
+# and by how much, is unmeasured.
 HEAD_RETRY_DELAYS = (5.0, 10.0)
 
 # Where a commit node sits in the reply, as a GraphQL error ``path`` names it.
@@ -277,6 +292,9 @@ class Verdict:
     refusals: tuple[str, ...]
     #: Set when part of the verdict could not be reached. The refusals that WERE reached still stand.
     fault: str | None = None
+    #: The commit id and fault text of each owner ruling W7-R11 fault in ``fault``: an unlinked
+    #: or null author under an error inside the committer, warned on and not refused.
+    unproven: tuple[tuple[str, str], ...] = ()
 
 
 def _person(commit: Mapping[str, Any], role: str) -> Mapping[str, Any] | None:
@@ -568,6 +586,7 @@ def evaluate(
     ``complete`` false (a read cut short by a fault) the count check is skipped.
     """
     faults: list[str] = []
+    unproven: list[tuple[str, str]] = []
     signed_cache: dict[str, frozenset[int] | None] = {}
 
     def has_signed(who: Attribution) -> bool | None:
@@ -628,11 +647,13 @@ def evaluate(
                     if index < read.first_page and commit["author"] is not None
                     else ""
                 )
-                faults.append(
+                text = (
                     f"commit {oid}: GraphQL reported an error inside its committer, and its "
                     f"author reads as unlinked or null, which that failure may have caused; not "
                     f"refused{key}"
                 )
+                faults.append(text)
+                unproven.append((str(oid), text))
                 slots.append(None)
                 continue
             # Judged before the key below, so a commit whose committer cannot be read, other than
@@ -707,7 +728,7 @@ def evaluate(
     refusals = [
         r for pair in itertools.zip_longest(rule_one, rule_two) for r in pair if r is not None
     ]
-    return Verdict(tuple(refusals), "; ".join(faults) or None)
+    return Verdict(tuple(refusals), "; ".join(faults) or None, tuple(unproven))
 
 
 def _escape_command(text: str) -> str:
@@ -834,19 +855,29 @@ def read_judged_head(
     number: int,
     expected_head: str,
     sleep: Callable[[float], None],
-) -> tuple[PullRequestRead, bool, str | None]:
-    """Read the pull request, re-reading while its first page shows another head.
+    judge: Callable[[PullRequestRead, bool], Verdict],
+) -> tuple[PullRequestRead, Verdict, str | None]:
+    """Read and judge the pull request, re-reading while the read is not yet of its head.
 
-    Returns the read, whether it is complete, and a fault to report beside its verdict, if any.
-    With ``expected_head`` set, a first page of another head is read again after each wait in
-    ``HEAD_RETRY_DELAYS``, and is a fault that judges nothing once the waits run out. A complete
-    read of that head whose commits do not include it is judged, with a fault.
+    Returns the read, ``judge``'s verdict on it (called with whether the read is complete), and a
+    fault to report beside that verdict, if any. Where the read kept is returned, the verdict's
+    own fault is moved into that third element (``_report_kept``) and the verdict carries none;
+    so it is where a re-read cut short is judged, labelled as the re-read's.
+    When it re-reads, and what it reports then, is stated once, in the module docstring's
+    paragraph on a head that lags the push event.
     """
     delays = iter(HEAD_RETRY_DELAYS)
+    # The last judged read of the head that refused nothing, with why it lacks the head.
+    kept: tuple[PullRequestRead, Verdict, str] | None = None
     while True:
         try:
             read = fetch_commits(transport, owner, name, number, expected_head)
         except _StaleHead as exc:
+            if kept is not None:
+                # A re-read of another head than CLA_HEAD_SHA ends the re-reads.
+                return _report_kept(kept, "a re-read showed another head than CLA_HEAD_SHA")
+            # With no read kept, every read before this one was stale, so each wait spent
+            # was spent on a re-read of another head.
             delay = next(delays, None)
             if delay is None:
                 raise PrecheckFault(
@@ -855,26 +886,80 @@ def read_judged_head(
             sleep(delay)
             continue
         except PrecheckFault as exc:
-            # A page failed after whole pages were kept. Those pages still prove what they prove.
             if exc.partial is None:
-                raise
-            return exc.partial, False, str(exc)
-        if expected_head and not any(c.get("oid") == expected_head for c in read.commits):
-            # A commit whose id GraphQL nulled, or that came back in another form, may be the head.
-            unreadable = sum(1 for c in read.commits if not _SHA.fullmatch(str(c.get("oid") or "")))
-            if unreadable:
-                return (
-                    read,
-                    True,
-                    (
-                        "the commit ids this read could resolve do not include CLA_HEAD_SHA, and "
-                        f"{unreadable} commit(s) carry no 40-character lowercase id, so whether the "
-                        "pull request's commits include it is unknown"
-                    ),
+                if kept is None:
+                    raise
+                return _report_kept(kept, f"a re-read faulted: {exc}")
+            # A page failed after whole pages were kept. Those pages still prove what they prove.
+            verdict = judge(exc.partial, False)
+            if kept is None:
+                return exc.partial, verdict, str(exc)
+            holds_head = _missing_head(exc.partial, expected_head) is None
+            if verdict.refusals or holds_head:
+                # A refusal this re-read proves is the verdict, and so is a re-read whose pages
+                # hold the head. Its fault names it as the read judged, and says that any commits
+                # past the cut are unchecked, since a read cut short has no count check; its
+                # verdict keeps its own faults.
+                text = (
+                    "the re-read judged was cut short, so any commits past it are not checked: "
+                    f"{exc}"
                 )
-            # The read may have stopped short of the head, so this names what it returned.
-            return read, True, "the commits this read returned do not include CLA_HEAD_SHA"
-        return read, True, None
+                if holds_head:
+                    # The read kept's W7-R11 warnings on commits past the cut are the only word
+                    # on those commits, so they stay, under the read kept's name. Its other
+                    # faults are about a read that is not the one judged, and are not reported.
+                    seen = {str(c.get("oid", "")) for c in exc.partial.commits}
+                    past = [t for oid, t in kept[1].unproven if oid not in seen]
+                    if past:
+                        text += (
+                            "; the earlier read's W7-R11 warnings for commits the re-read does "
+                            "not list: " + "; ".join(past)
+                        )
+                # The re-read's own faults are labelled, so they do not read as the earlier
+                # read's; they move into this text, so ``run`` does not print them again.
+                if verdict.fault:
+                    text += "; the re-read showed: " + verdict.fault
+                return exc.partial, replace(verdict, fault=None), text
+            return _report_kept(kept, f"a re-read was cut short: {exc}")
+        verdict = judge(read, True)
+        missing = _missing_head(read, expected_head)
+        if missing is None or verdict.refusals:
+            return read, verdict, missing
+        kept = (read, verdict, missing)
+        delay = next(delays, None)
+        if delay is None:
+            return _report_kept(kept, None)
+        sleep(delay)
+
+
+def _report_kept(
+    kept: tuple[PullRequestRead, Verdict, str], later: str | None
+) -> tuple[PullRequestRead, Verdict, str]:
+    """The read kept, its verdict, and one fault naming the read each part belongs to: the kept
+    read's own faults first, its verdict's included, then the fault of the re-read that ended the
+    re-reads, if one did. The verdict's fault moves into that text, so ``run`` does not print it
+    after the re-read's."""
+    read, verdict, missing = kept
+    fault = "; ".join(f for f in (missing, verdict.fault) if f)
+    text = f"the read judged: {fault}" + (f"; then {later}" if later else "")
+    return read, replace(verdict, fault=None), text
+
+
+def _missing_head(read: PullRequestRead, expected_head: str) -> str | None:
+    """Why ``read``'s commits cannot be shown to include ``expected_head``, or None if they do
+    or no head is expected."""
+    if not expected_head or any(c.get("oid") == expected_head for c in read.commits):
+        return None
+    # A commit whose id GraphQL nulled, or that came back in another form, may be the head.
+    unreadable = sum(1 for c in read.commits if not _SHA.fullmatch(str(c.get("oid") or "")))
+    if unreadable:
+        return (
+            "the commit ids this read could resolve do not include CLA_HEAD_SHA, and "
+            f"{unreadable} commit(s) carry no 40-character lowercase id, so whether the "
+            "pull request's commits include it is unknown"
+        )
+    # The read may have stopped short of the head, so this names what it returned.
+    return "the commits this read returned do not include CLA_HEAD_SHA"
 
 
 def run(
@@ -921,10 +1006,18 @@ def run(
                     raise PrecheckFault("CLA_SIGNATURES_PATH or CLA_SIGNATURES_BRANCH is not set")
                 api = _https_url(env, "GITHUB_API_URL", DEFAULT_API_URL)
                 signatures = rest_signatures(api, token, owner, name, path, branch)
-        read, complete, read_fault = read_judged_head(
-            transport, owner, name, number, expected_head, sleep or time.sleep
+        # Read at most once successfully across re-reads; functools.cache keeps no exception,
+        # so a judgement after a faulted read tries again.
+        signatures = functools.cache(signatures)
+        read, verdict, read_fault = read_judged_head(
+            transport,
+            owner,
+            name,
+            number,
+            expected_head,
+            sleep or time.sleep,
+            lambda r, complete: evaluate(r, allowlist, signatures, complete=complete),
         )
-        verdict = evaluate(read, allowlist, signatures, complete=complete)
     except PrecheckFault as exc:
         print(f"::warning title=CLA pre-check fault::{_escape_command(str(exc))}")
         return EXIT_FAULT

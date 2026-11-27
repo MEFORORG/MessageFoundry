@@ -2050,30 +2050,18 @@ def test_vip_enabled_warns_that_nothing_moves_the_address(
     assert any("[cluster.vip]" in r.getMessage() for r in caplog.records)
 
 
-# --- [dr].activate + [cluster] mutual-exclusion guard (ADR 0096 rider) ------
-
-
-def test_dr_activate_with_cluster_is_rejected(tmp_path: Path) -> None:
-    # A DR box coming up under the DR run-profile must not also contend for the cluster lease (it could
-    # win leadership and drive the primary store cross-WAN). Refused at config load, naming the key.
-    cfg = _write(
-        tmp_path / "messagefoundry.toml",
-        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
-        "[cluster]\nenabled = true\n[dr]\nenabled = true\nactivate = true\n"
-        "seed_archive = 'seed.mfbak'\n",
-    )
-    with pytest.raises(ValidationError, match=r"\[dr\]\.activate cannot be combined"):
-        load_settings(config_path=cfg, environ={})
+# --- [dr] + [cluster] mutual-exclusion guard (ADR 0096 rider) ------
 
 
 def test_dr_enabled_but_not_activated_with_cluster_is_rejected(tmp_path: Path) -> None:
-    # vault BACKLOG #3263. This loaded before. A provisioned DR box that is not activated is passive
-    # (ADR 0048): it binds no listener and delivers nothing. As a cluster member it could win the
-    # lease and serve nothing, and POST /dr/activate would make it the box the test above refuses.
+    # vault BACKLOG #3263. This loaded before. A DR box starts passive (ADR 0048, BACKLOG #5965):
+    # it binds no listener and delivers nothing. As a cluster member it could win the lease and
+    # serve nothing, and POST /dr/activate would make it a lease-contending DR box that could drive
+    # the primary store cross-WAN.
     cfg = _write(
         tmp_path / "messagefoundry.toml",
         '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
-        "[cluster]\nenabled = true\n[dr]\nenabled = true\nactivate = false\n"
+        "[cluster]\nenabled = true\n[dr]\nenabled = true\n"
         "seed_archive = 'seed.mfbak'\n",
     )
     with pytest.raises(ValidationError, match=r"\[dr\]\.enabled cannot be combined"):
@@ -2081,7 +2069,7 @@ def test_dr_enabled_but_not_activated_with_cluster_is_rejected(tmp_path: Path) -
 
 
 def test_a_cluster_member_with_dr_off_loads(tmp_path: Path) -> None:
-    # The control for the two refusals above: the same file with [dr] off loads.
+    # The control for the refusal above: the same file with [dr] off loads.
     cfg = _write(
         tmp_path / "messagefoundry.toml",
         '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
@@ -2091,15 +2079,15 @@ def test_a_cluster_member_with_dr_off_loads(tmp_path: Path) -> None:
     assert s.cluster.enabled is True and s.dr.enabled is False
 
 
-def test_dr_activate_without_cluster_is_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # The classic DR posture: activate the DR profile with [cluster] disabled — must load fine.
+def test_dr_box_without_cluster_is_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The classic DR posture: a DR box with [cluster] disabled — must load fine.
     monkeypatch.chdir(tmp_path)
     cfg = _write(
         tmp_path / "messagefoundry.toml",
-        "[dr]\nenabled = true\nactivate = true\nseed_archive = 'seed.mfbak'\n",
+        "[dr]\nenabled = true\nseed_archive = 'seed.mfbak'\n",
     )
     s = load_settings(config_path=cfg, environ={})
-    assert s.dr.activate is True and s.cluster.enabled is False
+    assert s.dr.enabled is True and s.cluster.enabled is False
 
 
 # --- [integrity] startup self-attestation (ADR 0041 D3) + dual-control config_reload (D2) ----
@@ -2222,19 +2210,19 @@ def test_delivery_priority_default_and_dr_section(tmp_path: Path) -> None:
     # [delivery].priority + [dr] load and default as decided (ADR 0048, #61).
     s = load_settings(config_path=_write(tmp_path / "g.toml", ""), environ={})
     assert s.delivery.priority.value == "normal"  # global default
-    assert s.dr.enabled is False and s.dr.activate is False  # opt-in, no-op by default
+    assert s.dr.enabled is False  # opt-in, no-op by default
     assert s.dr.priority_threshold.value == "critical"  # owner-locked default
     assert s.dr.activation_mode.value == "manual"  # only mode built this slice
 
     cfg = _write(
         tmp_path / "h.toml",
         "[delivery]\npriority = 'critical'\n"
-        "[dr]\nenabled = true\nactivate = true\npriority_threshold = 'normal'\n"
+        "[dr]\nenabled = true\npriority_threshold = 'normal'\n"
         "seed_archive = 'seed.mfbak'\ntakeover_hook = 'echo ok'\ntakeover_timeout_seconds = 5\n",
     )
     s = load_settings(config_path=cfg, environ={})
     assert s.delivery.priority.value == "critical"
-    assert s.dr.enabled and s.dr.activate and s.dr.priority_threshold.value == "normal"
+    assert s.dr.enabled and s.dr.priority_threshold.value == "normal"
     assert s.dr.takeover_hook == "echo ok"
 
 

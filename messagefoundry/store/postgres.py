@@ -208,6 +208,7 @@ from messagefoundry.store.queue_tag import (
     report_queue_tag_failure,
     reseal_unless_tag_failure,
     set_aside_deadline,
+    unopenable_log_text,
 )
 from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
@@ -1928,15 +1929,20 @@ def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:
         connector = "Postgres store (pinned CA)"
     else:
         # The DEFAULT path, closed under BACKLOG #300. It used to return `True`, which left asyncpg to
-        # build the context, so the engine had nothing to narrow and nowhere to load a CRL. This is the
-        # same call asyncpg makes for `ssl=True` (asyncpg 0.31.0, connect_utils.py:811-813):
-        # create_default_context() with no arguments, so CERT_REQUIRED, check_hostname and the system
-        # trust store are unchanged, and the lines below only remove suites and add a CRL.
+        # build the context, so the engine had nothing to narrow and nowhere to load a CRL. For
+        # `ssl=True`, asyncpg 0.32.0 (connect_utils.py:820-824) calls create_default_context() with
+        # no arguments, as this does, so CERT_REQUIRED, check_hostname and the system trust store are
+        # the same. It then also sets ALPN to `postgresql` where the ssl module has ALPN (:822-823).
+        # This context sets no ALPN, and asyncpg adds none to a context passed in, so the two differ
+        # there as well as in the suites and the CRL the lines below change.
         #
-        # asyncpg labels an SSLContext `sslmode=disable` where it labels `True` `verify-full`
-        # (:814-815). The label is read only against `allow` and `prefer` (the retry pair, the
-        # advisory flag and the cancel path), and both labels fall in "any other sslmode": one
-        # attempt, no plaintext fallback, TLS upgrade with server_hostname. So the wire is the same.
+        # asyncpg 0.32.0 labels a passed SSLContext `sslmode=require` and `True` `verify-full`
+        # (:824-826); 0.31.0 labelled a passed context `disable`. The label is read against `allow`
+        # and `prefer` (the retry pair, the advisory flag and the cancel path), where both labels
+        # mean one attempt with no plaintext fallback. It is also read by the direct-TLS gate at
+        # :830, which refuses direct TLS below `require`: both labels pass it, so with direct TLS
+        # selected (PGSSLNEGOTIATION=direct, since the engine passes no direct_tls) the handshake is
+        # direct, and this context carries no ALPN into it.
         ctx = ssl.create_default_context()
         connector = "Postgres store (system trust)"
     narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
@@ -6058,9 +6064,11 @@ class PostgresStore(ServerCipherWalk):
         the caller does with it."""
         if is_transient_open_failure(exc):
             return queue_open_fault(exc)
-        # The text, not the error: a record keeps its args, and the error's traceback holds the
+        # A string, never the error: a record keeps its args, and the error's traceback holds the
         # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884).
-        log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], str(exc))
+        log.warning(
+            "dead-lettering undecryptable queue row %s: %s", row["id"], unopenable_log_text(exc)
+        )
         try:
             await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
         except PROGRAMMING_ERRORS:

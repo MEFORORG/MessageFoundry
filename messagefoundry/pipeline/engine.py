@@ -44,6 +44,7 @@ from messagefoundry.config.settings import (
     SecretRotationSettings,
     SecurityEnforcement,
     ShadowSettings,
+    StoreBackend,
     StoreSettings,
     UpdateCheckSettings,
     engine_owned_dirs,
@@ -893,29 +894,29 @@ class Engine:
         self._intake_monitor: IntakeBoundMonitor | None = None
         # DR run-profile (#61, ADR 0048). The global [delivery].priority default a connection inherits
         # when it declares no priority= (every runner inherits it). The DR run-profile THRESHOLD is
-        # active only when this box is a DR standby that has been activated for THIS boot (dr.enabled
-        # AND dr.activate): then the runner binds only connections whose resolved tier rank >=
-        # dr.priority_threshold. A non-DR deployment (the default) passes dr_threshold=None to the runner
-        # → no filtering, byte-identical to before. Held so reload re-applies the same threshold.
-        # A DR box that is not activated passes dr_standby instead, and binds no inbound listener
-        # until it is (vault BACKLOG #3140).
+        # active only once POST /dr/activate has promoted this DR box: then the runner binds only
+        # connections whose resolved tier rank >= dr.priority_threshold. A non-DR deployment (the
+        # default) passes dr_threshold=None to the runner → no filtering, byte-identical to before.
+        # Held so reload re-applies the same threshold. A DR box that is not activated passes
+        # dr_standby instead, and binds no inbound listener until it is (vault BACKLOG #3140).
         self._priority_default = priority_default
         self._dr_settings = dr_settings or DrSettings()
         if self._dr_settings.enabled and (
             self._dr_settings.takeover_hook or self._dr_settings.release_hook
         ):
-            # At start, not only when a hook runs, which on a DR box is during the disaster: the
-            # coordinator that runs hooks is built only at the first activate or release.
+            # At construction, not only when a hook runs, which on a DR box is during the disaster.
             warn_unset_pass_environment(self._dr_settings.pass_environment)
-        # Whether THIS boot runs under the DR run-profile (#61, ADR 0048). Latched from
-        # [dr].enabled AND [dr].activate at construction; flipped True by the DR coordinator on a
-        # successful POST /dr/activate (which then reloads the graph so the run-profile filter applies)
-        # and back False on POST /dr/release. A runner takes dr_threshold from _dr_run_threshold() when
-        # it is built, and _set_dr_active hands a running one the new value on each flip (#3067).
-        self._dr_active = bool(self._dr_settings.enabled and self._dr_settings.activate)
+        # Whether the engine runs under the DR run-profile (#61, ADR 0048). Always False at
+        # construction: no configuration brings a box up active, so every activation runs the
+        # seed verification, takeover hook and audit row of POST /dr/activate (BACKLOG #5965).
+        # Flipped True by the DR coordinator on a successful POST /dr/activate (which then reloads
+        # the graph so the run-profile filter applies) and back False on POST /dr/release. A runner
+        # takes dr_threshold from _dr_run_threshold() when it is built, and _set_dr_active hands a
+        # running one the new value on each flip (#3067).
+        self._dr_active = False
         # Whether an activation's reload has completed, so the run-profile is applied and not only
-        # latched; :meth:`_dr_backup_paused` reads it. A boot latched active needs no reload.
-        self._dr_profile_applied = self._dr_active
+        # latched; :meth:`_dr_backup_paused` reads it (vault BACKLOG #5712).
+        self._dr_profile_applied = False
         # This instance's environment values (DEV/PROD), shared with every runner the engine builds —
         # so env() references in a reloaded graph resolve against THIS environment (and a missing
         # value is refused here, on this engine, not on the box the graph was authored on). The
@@ -1180,7 +1181,7 @@ class Engine:
 
     def _dr_run_threshold(self) -> Priority | None:
         """The DR run-profile threshold for the runner (#61, ADR 0048): ``[dr].priority_threshold`` when
-        this boot is running under the DR profile (``_dr_active``), else ``None`` (no DR filtering — a
+        the engine is running under the DR profile (``_dr_active``), else ``None`` (no DR filtering — a
         normal deployment is byte-identical). Read at every runner construction (start + reload) so the
         threshold is consistently applied across reloads."""
         return self._dr_settings.priority_threshold if self._dr_active else None
@@ -1198,14 +1199,29 @@ class Engine:
 
     def _dr_backup_paused(self) -> bool:
         """Whether the backup runner must skip its pass (vault BACKLOG #5712; the reason is at
-        :class:`~messagefoundry.pipeline.dr_backup.BackupRunner`'s ``dr_paused``): on a
-        passive DR standby, and during an activation until its reload has completed. Applied
-        implies latched, since every flip of the latch to False clears it."""
-        return self._dr_settings.enabled and not self._dr_profile_applied
+        :class:`~messagefoundry.pipeline.dr_backup.BackupRunner`'s ``dr_paused``): on a passive DR
+        standby, and during an activation until its reload has completed. Once applied, only
+        where :meth:`_dr_activated_backup_paused` says so. Applied implies latched, since every
+        flip of the latch to False clears it."""
+        if not self._dr_settings.enabled:
+            return False
+        return not self._dr_profile_applied or self._dr_activated_backup_paused()
+
+    def _dr_activated_backup_paused(self) -> bool:
+        """Whether an activated DR box still runs no backup pass: only a server-DB box with
+        ``[dr].restore_token`` set (BACKLOG #5965; owner ruling 2026-11-26, decision
+        d20261126T095342812-893e1d). Its own ``dr_backup`` row would become the latest anchor the
+        restore-token check compares, so a later re-activation of the same restore would be
+        refused as a stale vintage. No other box runs that check, so it keeps backing up."""
+        return bool(self._dr_settings.restore_token) and self.store.backend in (
+            StoreBackend.POSTGRES,
+            StoreBackend.SQLSERVER,
+        )
 
     @property
     def dr_active(self) -> bool:
-        """Whether the engine is running under the DR run-profile this boot (#61, ADR 0048)."""
+        """Whether the engine is running under the DR run-profile, which only ``POST /dr/activate``
+        turns on (#61, ADR 0048; BACKLOG #5965)."""
         return self._dr_active
 
     @property
@@ -1237,6 +1253,9 @@ class Engine:
                 self.store,
                 self._dr_settings,
                 store_settings=self._store_settings,
+                # BACKLOG #5965: each engine shard's dr.activate, dr.release and dr.stay_passive
+                # rows name it.
+                instance=lambda: self.instance_identity,
                 activate_profile=self._dr_activate_profile,
                 deactivate_profile=self._dr_release_drain,
                 profile_provenance=self._dr_config_drift,
@@ -1376,6 +1395,23 @@ class Engine:
         # Only now may a backup pass run: the latch flipped before the reload, which can still
         # fail and roll it back (vault BACKLOG #5712).
         self._dr_profile_applied = True
+        runner = self._backup_runner
+        if (
+            runner is not None
+            and runner.enabled
+            and runner.scheduled
+            and self._dr_activated_backup_paused()
+        ):
+            # Once per activation (BACKLOG #5965): the runner itself skips each pass silently.
+            log.warning(
+                "DR backup: scheduled passes are paused while this server-DB box is activated, "
+                "because [dr].restore_token is set and this box's own backup row would become "
+                "the newest anchor that token check compares, refusing a later re-activation of "
+                "the same restore. "
+                "No config-only archive of this box is written meanwhile, and the database "
+                "itself stays the DBA's to back up; the `messagefoundry backup` command still "
+                "writes one, and its row then becomes the token check's newest anchor"
+            )
         if not close_failures:
             return {}
         failure = _outbound_close_failure(close_failures)
@@ -2473,6 +2509,12 @@ class Engine:
                 dr_paused=self._dr_backup_paused,
             )
             self._backup_runner.start()
+        # BACKLOG #5965 (owner ruling 2026-11-25): a box this identity last activated comes back up
+        # passive and stays so, and says so loudly. Never an activation: POST /dr/activate is the
+        # only one. Not leader-gated: each engine shard reads its own rows and alerts on its own.
+        dr = self.dr_coordinator
+        if dr is not None:
+            await dr.check_restarted_passive()
         # [cert_monitor] TLS-cert expiry monitor (Q5c) — a maintenance task like retention, independent
         # of the message graph and surviving reloads; a no-op when warn_days=0. NOT leader-gated: certs
         # are node-local files, so each node alerts on its own (the per-cert realert throttle bounds
