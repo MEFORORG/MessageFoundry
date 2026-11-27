@@ -10,6 +10,7 @@ the GUI thread and resubmits the search once.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from types import SimpleNamespace
@@ -19,7 +20,11 @@ import pytest
 
 pytest.importorskip("PySide6")
 
-from harness._console_widgets import MessagesPanel  # noqa: E402
+from harness._console_widgets import (  # noqa: E402
+    MessagesPanel,
+    _MessagesSnapshot,
+    _StepUpRefusal,
+)
 from messagefoundry.apiclient import ApiError, IdpStepUpRequired, StepUpRequired  # noqa: E402
 
 
@@ -182,9 +187,12 @@ def test_a_refresh_during_the_prompt_neither_searches_nor_prompts_again(qapp: An
         panel.stop()
 
 
-def test_a_prompt_fault_is_reported_and_a_refresh_latched_meanwhile_still_runs(qapp: Any) -> None:
+def test_a_prompt_fault_is_reported_and_a_refresh_latched_meanwhile_still_runs(
+    qapp: Any, caplog: pytest.LogCaptureFixture
+) -> None:
     # A prompt raising something other than ApiError used to escape the result slot: nothing was
     # reported, and a refresh latched while the prompt was up was never run.
+    caplog.set_level(logging.DEBUG, logger="harness._console_widgets")
     client = _SearchClient(refusals=1)
     panel_box: list[MessagesPanel] = []
 
@@ -202,9 +210,32 @@ def test_a_prompt_fault_is_reported_and_a_refresh_latched_meanwhile_still_runs(q
         assert panel._table.rowCount() == 1
         assert not panel._loading
         assert panel._pending is None
+        logged = [r.getMessage() for r in caplog.records if r.name == "harness._console_widgets"]
+        assert logged == ["message search step-up prompt raised RuntimeError"]
     finally:
         panel.stop()
         panel_box.clear()
+
+
+class _Interrupt(BaseException):
+    pass
+
+
+def test_a_prompt_that_raises_a_base_exception_still_clears_the_in_flight_guard(qapp: Any) -> None:
+    # Not reported (it is no Exception, so it propagates), but the panel must not wedge with
+    # _loading set, which would latch every later refresh forever.
+    def interrupted(_action: str | None) -> bool:
+        raise _Interrupt
+
+    panel = MessagesPanel(_SearchClient(refusals=0), step_up=interrupted)  # type: ignore[arg-type]
+    try:
+        panel._loading = True
+        refused = _MessagesSnapshot(None, "", False, "refused", refusal=_StepUpRefusal(None))
+        with pytest.raises(_Interrupt):
+            panel._apply(refused)
+        assert not panel._loading
+    finally:
+        panel.stop()
 
 
 def test_an_idp_step_up_is_not_answered_with_a_password_prompt(qapp: Any) -> None:

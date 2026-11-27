@@ -436,8 +436,8 @@ def test_show_body_stays_disabled_while_its_prompt_is_up(qapp: Any) -> None:
 
 class _ScriptedClient:
     """Answers each open, and each body read, by the next entry of its script: ``"ok"`` serves it,
-    any other string refuses it with a step-up naming that string as its action. An exhausted
-    script serves."""
+    ``"401"`` and ``"429"`` fail it with that status, and any other string refuses it with a
+    step-up naming that string as its action. An exhausted script serves."""
 
     def __init__(self, *, opens: list[str], bodies: list[str] | None = None) -> None:
         self._opens = list(opens)
@@ -448,6 +448,8 @@ class _ScriptedClient:
     @staticmethod
     def _next(script: list[str]) -> None:
         outcome = script.pop(0) if script else "ok"
+        if outcome in ("401", "429"):
+            raise ApiError(f"failed with {outcome}", status=int(outcome))
         if outcome != "ok":
             raise StepUpRequired("step-up required", status=403, action=outcome)
 
@@ -511,6 +513,54 @@ def test_a_reopen_refused_twice_prompts_once_and_reports(qapp: Any) -> None:
         box.clear()
 
 
+@pytest.mark.parametrize("refused", ["open", "401"], ids=["step-up", "rotation-race-401"])
+def test_a_newer_open_refused_for_the_session_before_the_proof_is_sent_again_unprompted(
+    qapp: Any, refused: str
+) -> None:
+    """The newer open is still out when the prompt re-proves, and comes back refused for the old
+    session. It is sent again under the new one, not prompted for a password just typed, and not
+    reported as a dead end."""
+    client = _ScriptedClient(opens=["open", refused])
+    box: list[MessageDetailPanel] = []
+    step_up = _GuardedStepUp(lambda: box[0].load("m2"))
+    panel, errors = _panel(client, step_up)
+    box.append(panel)
+    try:
+        panel.load("m1")
+        _settle(qapp, lambda: _opened(panel))
+        assert step_up.calls == 1
+        assert client.opened == ["m1", "m2", "m2"]
+        assert panel._message_id == "m2"
+        assert errors == []
+    finally:
+        panel.stop()
+        box.clear()
+
+
+def test_a_newer_open_that_failed_for_another_cause_is_not_reopened(qapp: Any) -> None:
+    """A 429 from the PHI-read pacing is no refusal a proof clears, so it is reported once and the
+    proof does not read the message again."""
+    client = _ScriptedClient(opens=["open", "429"])
+    box: list[MessageDetailPanel] = []
+
+    def select_and_wait_for_its_failure() -> None:
+        box[0].load("m2")
+        _pump_until(qapp, lambda: bool(errors))
+
+    step_up = _GuardedStepUp(select_and_wait_for_its_failure)
+    panel, errors = _panel(client, step_up)
+    box.append(panel)
+    try:
+        panel.load("m1")
+        _settle(qapp, lambda: step_up.calls == 1 and not panel._runner._calls)
+        assert client.opened == ["m1", "m2"]
+        assert errors == ["failed with 429"]
+        assert not _opened(panel)
+    finally:
+        panel.stop()
+        box.clear()
+
+
 def _refuse_re_proof() -> bool:
     raise ApiError("re-verification failed", status=401)
 
@@ -558,6 +608,15 @@ def _broken_prompt() -> bool:
     raise RuntimeError(_FAULT_TEXT)
 
 
+def _panel_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """The panel module's own WARNING records, so an unrelated one cannot fail the test."""
+    return [
+        r
+        for r in caplog.records
+        if r.name == "harness._console_widgets" and r.levelno == logging.WARNING
+    ]
+
+
 def test_a_body_prompt_that_raises_something_else_is_reported_and_logged_without_its_text(
     qapp: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -572,7 +631,7 @@ def test_a_body_prompt_that_raises_something_else_is_reported_and_logged_without
         assert errors == ["the body could not be read: RuntimeError"]
         assert panel._show_body.isEnabled()
         assert panel._raw.toPlainText() == ""
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        warnings = _panel_warnings(caplog)
         assert [r.getMessage() for r in warnings] == [
             "message body read for m1 raised RuntimeError"
         ]
@@ -596,7 +655,7 @@ def test_a_superseded_body_prompt_fault_is_still_logged(
         panel._on_show_body()
         _settle(qapp, lambda: panel._message_id == "m2")
         assert errors == []  # superseded: nothing is said on screen about m1's body
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        warnings = _panel_warnings(caplog)
         assert [r.getMessage() for r in warnings] == [
             "message body read for m1 raised RuntimeError"
         ]

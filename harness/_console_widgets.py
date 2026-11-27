@@ -230,6 +230,13 @@ class _DetailSnapshot:
     # The open was refused for want of a fresh step-up, which the handler-less polling client
     # cannot prompt for; the panel answers it on the GUI thread (BACKLOG #5945).
     refusal: _StepUpRefusal | None = None
+    status: int | None = None  # the failed read's HTTP status, where it had one
+
+    @property
+    def session_refused(self) -> bool:
+        """Refused for the session it went out under: a step-up, or a 401, which a read racing a
+        step-up's rotation of the session can get. A fresh proof may clear either."""
+        return self.refusal is not None or self.status == 401
 
 
 @dataclass(frozen=True)
@@ -278,10 +285,13 @@ class MessageDetailPanel(QWidget):
         # Bumped by every load() and clear(). A body fetch carries the value it started under, and
         # _apply_body drops it once the number has moved on (BACKLOG #2346).
         self._open_seq = 0
-        # The open_seq of the open whose result has not come back yet, if any. A proof made while a
-        # newer open is still out leaves that open to land, rather than charging a second audited
-        # read for the same selection (BACKLOG #5945).
-        self._in_flight_seq: int | None = None
+        # Bumped by every proof this panel's prompts make. Each open carries the value it went out
+        # under, so one refused for an older session is sent again rather than prompted for, and
+        # one that is served is not opened twice (BACKLOG #5945).
+        self._proofs = 0
+        # The open_seq of an open reported refused for its session, as one refused while a prompt
+        # was up is: a later proof opens the selection again.
+        self._session_refused_seq: int | None = None
 
         self._summary = QLabel("Select a message")
         self._summary.setWordWrap(True)
@@ -351,26 +361,24 @@ class MessageDetailPanel(QWidget):
 
     def _reopen_after_proof(self) -> None:
         """A prompt re-proved after its nested event loop started a newer open, which went out
-        under the old session. If that open came back refused while the prompt was up, its
-        step-up was declined (one prompt at a time) and reported, so the current selection is
-        opened again. Not when it has landed, nor while it is still out: it lands on its own then,
-        and a refusal of it is answered as any other, so one selection is not two audited opens.
+        under the old session. If that open came back refused for its session while the prompt
+        was up, its step-up was declined (one prompt at a time) and reported, so the current
+        selection is opened again. Not when it landed, failed for another cause, or is still out:
+        an open still out is sent again by _apply only if it comes back refused, so one selection
+        is not two audited opens.
 
         The reopen is a fresh open, not the repeat after a step-up: the proof was for the action
         the earlier read was refused for, which need not be this open's, so a step-up refusal of it
         still prompts. Once at most, since the repeat after that prompt is never prompted again."""
         message_id = self._pending_id
-        if message_id is None or message_id == self._message_id:
-            return
-        if self._in_flight_seq == self._open_seq:
-            return
-        self._open(message_id, retried=False)
+        if message_id is not None and self._session_refused_seq == self._open_seq:
+            self._open(message_id, retried=False)
 
     def _submit_open(self, message_id: str, open_seq: int, *, retried: bool) -> None:
-        self._in_flight_seq = open_seq
+        sent_under = self._proofs
         self._runner.submit(
             lambda: self._fetch(message_id, open_seq),
-            on_done=lambda snap: self._apply(snap, retried=retried),
+            on_done=lambda snap: self._apply(snap, retried=retried, sent_under=sent_under),
             on_error=lambda exc: self._open_raised(message_id, open_seq, exc),
         )
 
@@ -406,7 +414,7 @@ class MessageDetailPanel(QWidget):
             # or second-factor refusal, which a password would not clear.
             return _DetailSnapshot(message_id, open_seq, None, str(exc), _StepUpRefusal(exc.action))
         except ApiError as exc:
-            return _DetailSnapshot(message_id, open_seq, None, str(exc))
+            return _DetailSnapshot(message_id, open_seq, None, str(exc), status=exc.status)
         return _DetailSnapshot(message_id, open_seq, detail, None)
 
     def _answer_step_up(self, refusal: _StepUpRefusal | None, retried: bool) -> bool | str:
@@ -415,7 +423,10 @@ class MessageDetailPanel(QWidget):
         :func:`_ask_step_up`'s answer."""
         if refusal is None or retried or self._step_up is None:
             return False
-        return _ask_step_up(self._step_up, refusal)
+        answer = _ask_step_up(self._step_up, refusal)
+        if answer is True:
+            self._proofs += 1
+        return answer
 
     def _after_superseded_prompt(self, answer: bool | str) -> None:
         """A read's prompt answered after a newer open or a clear() superseded the read, which is
@@ -426,13 +437,20 @@ class MessageDetailPanel(QWidget):
         elif isinstance(answer, str):
             self.error.emit(answer)
 
-    def _apply(self, snap: _DetailSnapshot, *, retried: bool = False) -> None:
+    def _apply(
+        self, snap: _DetailSnapshot, *, retried: bool = False, sent_under: int | None = None
+    ) -> None:
         """Runs on the main thread (result slot) — safe to touch widgets. ``retried``: this read is
-        the one repeat after a step-up, so a refusal of it is reported, never prompted again."""
-        if snap.open_seq == self._in_flight_seq:
-            self._in_flight_seq = None  # it has come back, whatever is done with it
+        the one repeat after a step-up, so a refusal of it is reported, never prompted again.
+        ``sent_under``: the proof count the open went out under, None where it is not known."""
         if snap.open_seq != self._open_seq or snap.message_id != self._pending_id:
             return  # a newer load() (or a clear()) superseded this result
+        if snap.session_refused and sent_under is not None and sent_under != self._proofs:
+            # It went out before a proof this panel has made since, so its refusal is the old
+            # session's: send it again under the new one, as a fresh open, rather than prompt for
+            # a password just typed. Bounded: the resend carries the current count.
+            self._submit_open(snap.message_id, snap.open_seq, retried=False)
+            return
         try:
             answer = self._answer_step_up(snap.refusal, retried)
         except Exception as exc:  # noqa: BLE001 -- as the runner's on_error: report, never wedge
@@ -451,6 +469,7 @@ class MessageDetailPanel(QWidget):
         if isinstance(answer, str):
             snap = replace(snap, error=answer)
         if snap.error is not None:
+            self._session_refused_seq = snap.open_seq if snap.session_refused else None
             self.error.emit(snap.error)
             # Never leave the previous message's metadata and body under the newly selected row.
             self._reset("The message could not be opened.")
@@ -790,13 +809,20 @@ class MessagesPanel(QWidget):
         if snap.refusal is not None and not retried and self._step_up is not None:
             # _loading stays set while the prompt is up: its nested event loop may deliver a
             # refresh, which must latch rather than start a second search and a second prompt.
+            fault: Exception | None = None
+            answer: bool | str = False
             try:
                 answer = _ask_step_up(self._step_up, snap.refusal)
             except Exception as exc:  # noqa: BLE001 -- as the runner's on_error: report, never wedge
-                # It clears _loading, reports, and runs a refresh latched while the prompt was up.
-                self._on_error(exc)
+                fault = exc
+            finally:
+                self._loading = False
+            if fault is not None:
+                # Its text is not logged: a fault can quote what it was handed.
+                _log.warning("message search step-up prompt raised %s", type(fault).__name__)
+                # It reports the fault and runs a refresh latched while the prompt was up.
+                self._on_error(fault)
                 return
-            self._loading = False
             if answer is True:
                 # Re-proved on the GUI thread; the polling client reads the rotated token through
                 # the shared cell, so the resubmitted search carries the fresh grant. One retry
