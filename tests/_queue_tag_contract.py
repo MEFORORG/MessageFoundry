@@ -22,10 +22,16 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from messagefoundry.store.crypto import cell_aad
-from messagefoundry.store.queue_tag import QUEUE_TAG_CAUSES, QUEUE_TAG_FAILED_ACTION, QueueTagError
+from messagefoundry.store.queue_tag import (
+    QUEUE_CORRUPT_ALERT_TABLE,
+    QUEUE_TAG_CAUSES,
+    QUEUE_TAG_FAILED_ACTION,
+    QueueTagError,
+)
 from messagefoundry.store.store import (
     REINGRESS_READ_TAG_FAILURE_OUTCOME,
     REINGRESS_TAG_FAILURE_OUTCOME,
+    REINGRESS_TOKEN_CORRUPT,
     REINGRESS_TOKEN_TAG_FAILED,
     MessageStatus,
     OutboxStatus,
@@ -42,14 +48,19 @@ _RAW = "MSH|^~\\&|SYNTH|F|R|RF|20260101||ADT^A01|QT1|P|2.5.1\rPID|1||SYNTH-100||
 
 
 class _Hook:
-    """Records each tag-failure alert the store's cipher raises."""
+    """Records each tag-failure alert the store's cipher raises. A corrupt cell alerts under its own
+    table (BACKLOG #5884), every other refusal under ``queue``."""
 
     def __init__(self) -> None:
         self.reasons: list[str] = []
+        self.corrupt: list[str] = []
 
     def __call__(self, table: str, reason: str) -> None:
-        assert table == "queue"
+        corrupt = QUEUE_TAG_CAUSES["corrupt"] in reason
+        assert table == (QUEUE_CORRUPT_ALERT_TABLE if corrupt else "queue"), (table, reason)
         self.reasons.append(reason)
+        if corrupt:
+            self.corrupt.append(reason)
 
 
 async def _row_id(fetch: RawFetch, message_id: str, stage: str) -> str:
@@ -352,6 +363,45 @@ async def _assert_response_stage(store: Any, raw: RawSql, fetch: RawFetch, hook:
         REINGRESS_TOKEN_TAG_FAILED
     ), sealed_error
     children = await fetch("SELECT id FROM messages WHERE channel_id=?", ("LB_QT_S3",))
+    assert children == [], children
+
+    await _assert_corrupt_response_token(store, raw, fetch, hook)
+
+
+async def _assert_corrupt_response_token(
+    store: Any, raw: RawSql, fetch: RawFetch, hook: _Hook
+) -> None:
+    """BACKLOG #5982 step 2: a token whose payload is corrupt under a key the store holds is
+    dead-lettered, audited and alerted as before, and labelled corrupt, never as a failed tag."""
+    mid, token = await _response_token(store, fetch, "OB_QT_S4", "LB_QT_S4")
+    item = await store.claim_next_fifo("LB_QT_S4", stage=Stage.RESPONSE.value)
+    assert item is not None and item.id == token
+    assert await store.response_body_for_work_row(token) == _RAW  # control: read before the change
+    [cell] = await fetch("SELECT payload FROM queue WHERE id=?", (token,))
+    marker = str(cell["payload"]).rsplit(":", 1)[0]
+    assert store.cipher().holds_key_for(f"{marker}:AAAAA")  # the marker still names a held key
+    await raw("UPDATE queue SET payload=? WHERE id=?", (f"{marker}:AAAAA", token))  # bad base64
+    corrupt_before = len(hook.corrupt)
+    assert await _handoff(store, token, "LB_QT_S4") is True  # consumed as dead, no child
+    await _assert_refused(store, fetch, hook, message_id=mid, row_id=token, label="corrupt")
+    audited = await fetch(
+        "SELECT detail FROM audit_log WHERE action=? AND detail LIKE ?",
+        (QUEUE_TAG_FAILED_ACTION, f"%{token[:12]}%"),
+    )
+    assert len(audited) == 1, audited
+    assert json.loads(audited[0]["detail"])["cause"] == "corrupt", audited
+    assert len(hook.corrupt) == corrupt_before + 1, hook.corrupt
+    assert token[:12] in hook.corrupt[-1] and REINGRESS_TAG_FAILURE_OUTCOME in hook.corrupt[-1]
+    rows = await fetch("SELECT last_error FROM queue WHERE id=?", (token,))
+    last_error = store.cipher().decrypt(
+        rows[0]["last_error"], aad=cell_aad("queue", "last_error", token)
+    )
+    assert last_error == REINGRESS_TOKEN_CORRUPT and "corrupt" in last_error, last_error
+    assert last_error != REINGRESS_TOKEN_TAG_FAILED
+    events = [e for e in await store.events_for(mid) if e["event"] == "dead"]
+    assert len(events) == 1, events
+    assert "corrupt" in events[0]["detail"] and "integrity check" not in events[0]["detail"], events
+    children = await fetch("SELECT id FROM messages WHERE channel_id=?", ("LB_QT_S4",))
     assert children == [], children
 
 

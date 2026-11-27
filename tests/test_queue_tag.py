@@ -11,6 +11,8 @@ legs run the same contract from ``tests/test_postgres_store.py`` and ``tests/tes
 from __future__ import annotations
 
 import ast
+import json
+import logging
 import pathlib
 import sqlite3
 from typing import Any
@@ -477,6 +479,78 @@ async def test_the_response_worker_dead_letters_a_token_whose_tag_fails_after_it
             "SELECT detail FROM audit_log WHERE action=?", (QUEUE_TAG_FAILED_ACTION,)
         )
         assert len(audited) == 1 and item.id[:12] in audited[0]["detail"], audited
+        assert await children(fetch) == []
+    finally:
+        await store.close()
+
+
+async def test_the_response_worker_labels_a_corrupt_token_corrupt_not_tag_drift(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5982 step 2: a token whose payload turns corrupt after its claim, under a key the
+    store holds, is dead-lettered, audited and alerted as before, and named corrupt rather than a
+    failed tag, in its ``last_error`` and in the worker's WARNING."""
+    from messagefoundry.pipeline.wiring_runner import _ItemOutcome  # noqa: PLC0415
+    from messagefoundry.store.queue_tag import (  # noqa: PLC0415
+        QUEUE_CORRUPT_ALERT_TABLE,
+        QUEUE_TAG_FAILED_ACTION,
+    )
+    from messagefoundry.store.store import (  # noqa: PLC0415
+        REINGRESS_TOKEN_TAG_FAILED,
+        MessageStatus,
+        OutboxStatus,
+        Stage,
+    )
+    from tests import _undecryptable_reply_contract as reply  # noqa: PLC0415
+    from tests._erased_reply_contract import LOOP, children, status_of  # noqa: PLC0415
+
+    caplog.set_level(logging.WARNING, logger="messagefoundry.pipeline.wiring_runner")
+    from messagefoundry.store.crypto import AesGcmCipher  # noqa: PLC0415
+
+    cipher = make_cipher(generate_key(), write_v2=True)
+    assert isinstance(cipher, AesGcmCipher)
+    alerts: list[tuple[str, str]] = []
+    cipher.set_tag_failure_hook(lambda table, reason: alerts.append((table, reason)))
+    store = await MessageStore.open(tmp_path / "worker.db", cipher=cipher)
+    try:
+
+        async def fetch(sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
+            cur = await store._db.execute(sql, params)
+            return [dict(r) for r in await cur.fetchall()]
+
+        mid = await reply.captured(store, control="QT-C", now=1.0)
+        item = await store.claim_next_fifo(LOOP, stage=Stage.RESPONSE.value)
+        assert item is not None
+        [cell] = await fetch("SELECT payload FROM queue WHERE id=?", (item.id,))
+        corrupt = str(cell["payload"]).rsplit(":", 1)[0] + ":AAAAA"  # bad base64, held key
+        assert cipher.holds_key_for(corrupt)
+        await store._db.execute("UPDATE queue SET payload=? WHERE id=?", (corrupt, item.id))
+        await store._db.commit()
+
+        outcome = await reply.runner(store)._process_response_item(LOOP, item)
+
+        assert outcome[0] is _ItemOutcome.PROCESSED
+        assert (await reply.token_of(fetch, mid))["status"] == OutboxStatus.DEAD.value
+        [row] = await fetch("SELECT last_error FROM queue WHERE id=?", (item.id,))
+        last_error = store.cipher().decrypt(
+            row["last_error"], aad=cell_aad("queue", "last_error", item.id)
+        )
+        assert last_error != REINGRESS_TOKEN_TAG_FAILED
+        assert "corrupt" in last_error and "queue tag" not in last_error, last_error
+        assert await status_of(store, mid) == MessageStatus.ERROR.value
+        audited = await fetch(
+            "SELECT detail FROM audit_log WHERE action=?", (QUEUE_TAG_FAILED_ACTION,)
+        )
+        assert len(audited) == 1 and item.id[:12] in audited[0]["detail"], audited
+        assert json.loads(audited[0]["detail"])["cause"] == "corrupt", audited
+        assert len(alerts) == 1 and alerts[0][0] == QUEUE_CORRUPT_ALERT_TABLE, alerts
+        worker = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "messagefoundry.pipeline.wiring_runner" and item.id in r.getMessage()
+        ]
+        assert len(worker) == 1, worker
+        assert "corrupt" in worker[0] and "integrity tag" not in worker[0], worker
         assert await children(fetch) == []
     finally:
         await store.close()

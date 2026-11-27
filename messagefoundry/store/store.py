@@ -1171,6 +1171,23 @@ REINGRESS_ARTIFACT_MISSING: Final = "re-ingress reply row is missing"
 #: from a corrupt reference or an undecryptable reply, because it is audited and alerted as a tag
 #: failure. The server backends and the re-ingress worker import it.
 REINGRESS_TOKEN_TAG_FAILED: Final = "integrity: the re-ingress work-row failed its queue tag"
+#: The ``last_error`` of a re-ingress token whose own ``payload`` is a corrupt cell under a key the
+#: store holds (:class:`~messagefoundry.store.queue_tag.CorruptQueueCellError`), at the reply read or
+#: at the handoff. It is handled as :data:`REINGRESS_TOKEN_TAG_FAILED` is, dead-lettered, audited and
+#: alerted, but a corrupt cell is not tag drift, so it is not named as one (BACKLOG #5982).
+REINGRESS_TOKEN_CORRUPT: Final = "integrity: the re-ingress work-row holds a corrupt payload"
+
+
+def reingress_token_refusal(error: QueueTagError) -> tuple[str, str]:
+    """The ``last_error`` and the ``dead`` event detail for a re-ingress token whose own payload
+    ``error`` refused (BACKLOG #5982): :data:`REINGRESS_TOKEN_CORRUPT` for a corrupt cell, which is
+    not drift, and :data:`REINGRESS_TOKEN_TAG_FAILED` for every other refusal. Each backend's
+    handoff and the re-ingress worker read it, so the three backends cannot label it apart."""
+    if error.drift:
+        return REINGRESS_TOKEN_TAG_FAILED, "re-ingress work-row failed its integrity check"
+    return REINGRESS_TOKEN_CORRUPT, "re-ingress work-row holds a corrupt payload"
+
+
 #: The ``outcome`` the handoff reports that tag failure with (BACKLOG #5982). It says the handoff
 #: refused the token rather than that the token is dead. Each backend's handoff queues the report
 #: before its dead-letter write, so it is sent even when that write or its commit fails, or is
@@ -17161,7 +17178,8 @@ class MessageStore:
         An origin whose metadata cell fails its row tag (BACKLOG #2593) makes the token unrecoverable:
         it is dead-lettered and consumed like a corrupt reference, and the failure is audited. So is a
         token whose own ``payload`` fails its queue tag (:data:`REINGRESS_TOKEN_TAG_FAILED`, BACKLOG
-        #5982), which is also alerted, as a claim reports a tag failure. A token
+        #5982), or is corrupt (:data:`REINGRESS_TOKEN_CORRUPT`), which is also alerted, as a claim
+        reports a tag failure. A token
         whose reply retention erased is dead-lettered, consumed and blanked (BACKLOG #1560), so it
         produces no child and cannot be replayed. One whose ``response`` row is missing is damage: it
         is dead-lettered under :data:`REINGRESS_ARTIFACT_MISSING` and keeps its reference as the
@@ -17263,7 +17281,8 @@ class MessageStore:
             # BACKLOG #5727: each dead-letter on the reference runs after the try, so a failed seal
             # in it chains no raw open error; the handlers only record which one is owed.
             ref_fault: QueueOpenFault | None = None
-            ref_tag_failed = ref_corrupt = False
+            ref_refusal: tuple[str, str] | None = None
+            ref_corrupt = False
             try:
                 ref = await cipher_call(self._cipher, open_queue_cell, self._cipher, wr) or ""
                 origin_msg_id, dest, seq_s = ref.split("\x1f")
@@ -17275,7 +17294,7 @@ class MessageStore:
                 # that fails is still reported.
                 # Without its traceback, so the queued error holds no frame of this transaction.
                 queue_tag_rows.append((wr, err.with_traceback(None)))
-                ref_tag_failed = True
+                ref_refusal = reingress_token_refusal(err)  # a corrupt cell is not drift
             except Exception as exc:  # noqa: BLE001 - dead-letters unless transient
                 # BACKLOG #5727: no verdict on the cell. Raised below, outside this handler, so the
                 # fault carries no chain to the raw key-service error.
@@ -17286,10 +17305,8 @@ class MessageStore:
                 # store lacks) cannot be re-ingressed as it stands; a replay can retry it once the
                 # cause is fixed. Mirrors the depth-cap branch.
                 ref_corrupt = ref_fault is None
-            if ref_tag_failed:
-                return await _consume_dead(
-                    REINGRESS_TOKEN_TAG_FAILED, "re-ingress work-row failed its integrity check"
-                )
+            if ref_refusal is not None:
+                return await _consume_dead(*ref_refusal)
             if ref_fault is not None:
                 raise ref_fault
             if ref_corrupt:

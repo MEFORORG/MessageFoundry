@@ -262,7 +262,6 @@ from messagefoundry.store.store import (
     REINGRESS_READ_TAG_FAILURE_OUTCOME,
     REINGRESS_TAG_FAILURE_OUTCOME,
     REINGRESS_TARGET_PREFIX,
-    REINGRESS_TOKEN_TAG_FAILED,
     SESSION_MINT_ATTEMPTS,
     SESSION_MINT_EPOCH_RAISED,
     TRANSIT_ATTESTATION_COLUMNS,
@@ -420,6 +419,7 @@ from messagefoundry.store.store import (
     read_transit_bound_attestation_rows,
     reauth_stamp,
     recovery_code_spend,
+    reingress_token_refusal,
     removal_keeps_way_past,
     report_approval_reseal,
     report_refused_ad_role_map,
@@ -9857,7 +9857,8 @@ class SqlServerStore(ServerCipherWalk):
         child. An origin whose metadata cell fails its row tag (BACKLOG #2593) is consumed like a
         corrupt ref, and the failure is audited once the transaction has closed; so is a work-row
         whose own ``payload`` fails its queue tag (:data:`REINGRESS_TOKEN_TAG_FAILED`, BACKLOG
-        #5982), which is also alerted. A ``peek_failed``
+        #5982), or is corrupt (:data:`REINGRESS_TOKEN_CORRUPT`), which is also alerted. A
+        ``peek_failed``
         child stores ``refused_raw`` and ``refused_metadata`` as :meth:`QueueStore.ingress_handoff`
         says (vault BACKLOG #4796)."""
         tag_failures: list[CellTagError] = []
@@ -9970,7 +9971,8 @@ class SqlServerStore(ServerCipherWalk):
                 # token is retried; any other failure consumes and dead-letters it.
                 # BACKLOG #5727: each dead-letter on the reference runs after the try, as on SQLite.
                 ref_fault: QueueOpenFault | None = None
-                ref_tag_failed = ref_corrupt = False
+                ref_refusal: tuple[str, str] | None = None
+                ref_corrupt = False
                 try:
                     ref = (
                         await cipher_call(self._cipher, open_queue_cell, self._cipher, work_row)
@@ -9983,19 +9985,15 @@ class SqlServerStore(ServerCipherWalk):
                     # first, so a dead-letter write that fails is still reported.
                     # Without its traceback, so the queued error holds no frame of this transaction.
                     queue_tag_rows.append((work_row, err.with_traceback(None)))
-                    ref_tag_failed = True
+                    ref_refusal = reingress_token_refusal(err)  # a corrupt cell is not drift
                 except Exception as exc:  # noqa: BLE001 - dead-letters unless transient
                     # BACKLOG #5727: no verdict on the cell. Raised below, outside this handler, so
                     # the fault carries no chain to the raw key-service error.
                     # Not no_verdict_fault, which never retries an engine fault: as on SQLite.
                     ref_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
                     ref_corrupt = ref_fault is None
-                if ref_tag_failed:
-                    return await _consume_dead(
-                        "ingress_handoff(tag-failed)",
-                        REINGRESS_TOKEN_TAG_FAILED,
-                        "re-ingress work-row failed its integrity check",
-                    )
+                if ref_refusal is not None:
+                    return await _consume_dead("ingress_handoff(tag-failed)", *ref_refusal)
                 if ref_fault is not None:
                     raise ref_fault
                 if ref_corrupt:
