@@ -3049,7 +3049,9 @@ export class RerenderDebouncer<H = unknown> {
  *
  * With `rebase.firstIsPick`, `first` is a field pick (BACKLOG #5943): it is sent as posted, never
  * carried, and its write is recorded as a pick, so the typed edits drained behind it are still carried
- * over it, except an edit on the picked field itself ({@link QueuedEditRebaser.record}).
+ * over it, except an edit on the picked field itself ({@link QueuedEditRebaser.record}). The caller
+ * declines a pick while the slot is busy, as `applyPickedEdit` does: a busy drain would queue it as a
+ * typed edit.
  */
 export async function drainEdits(
   guard: EditLoopGuard,
@@ -3196,7 +3198,7 @@ export function rowAfterRewrite(msg: EditMessage, write: AppliedRewrite): string
  *  - it is not on a field a recorded pick wrote after that projection was made (below);
  *  - its `expectSrc` is that buffer's text at the edit's line range;
  *  - the live buffer, read just before the edit is sent, is exactly the chain's last output. A change
- *    made between recorded writes (an undo, a structural op, a pick, another panel, split-view typing)
+ *    made between recorded writes (an undo, a structural op, another panel, split-view typing)
  *    leaves the edit unrebased. Split-view typing made while a rewrite is in flight is not covered:
  *    applyOne overwrites it with the rewrite's output, as on main, and the write is recorded as clean.
  *

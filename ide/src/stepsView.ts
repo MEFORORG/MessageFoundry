@@ -306,9 +306,9 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     // What THIS panel's last render projected (BACKLOG #5843): read by the picker scope and the Router
     // role check, so a second open Steps editor can never answer for this one.
     const panelState = new StepsPanelProjection();
-    // The typed rewrites applied since the webview was last projected, so an edit on one of their rows
-    // is sent with the row's current source rather than refused as stale (BACKLOG #5943). render()
-    // tells it which buffer each new webview was projected from.
+    // The typed and picked rewrites applied since the webview was last projected, so an edit on one of
+    // their rows is sent with the row's current source rather than refused as stale (BACKLOG #5943).
+    // render() tells it which buffer each new webview was projected from.
     const rebaser = new QueuedEditRebaser();
     let projectionId = 0;
 
