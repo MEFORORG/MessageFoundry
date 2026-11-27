@@ -26,16 +26,25 @@ That is **35 distributions**, recorded in
 | Names in `pyproject.toml`, core plus every extra | 45 | Still direct-only, and mixes in extras nobody enabled. |
 | **Core runtime closure** | **35** | **Used for the tiers below.** What a default install actually executes. |
 | **`sqlserver` runtime closure** | **37** | **Used for the `sqlserver` section only.** The core closure plus what that extra adds. |
+| **`postgres` runtime closure** | **36** | **Used for the `postgres` section only.** The core closure plus what that extra adds. |
 | **`harness` runtime closure** | **39** | **Used for the `harness` section only.** The core closure plus what that extra adds. |
 | `requirements.lock` | A superset | Exported with `--all-extras`, so it carries the dev toolchain. Designating packages no production install has weakens the signal for the ones it does. |
 
-Two extras are assessed as well. The `sqlserver` runtime closure is **37 distributions**, recorded in
+Three extras are assessed as well. The `sqlserver` runtime closure is **37 distributions**, recorded in
 [`security/runtime-closure-sqlserver.txt`](../security/runtime-closure-sqlserver.txt). It has its
 own section below, which classifies only the names the extra adds to the core closure.
 
 It is assessed because the SQL Server store is the deployment the project's security assessment
 names. This page chose its own scope; covering the extra here does not decide what that assessment
 grades.
+
+The `postgres` runtime closure is **36 distributions**, recorded in
+[`security/runtime-closure-postgres.txt`](../security/runtime-closure-postgres.txt). It adds one name
+to the core closure, `asyncpg`, and has its own section below, which classifies only that name.
+
+It is assessed because the container image's `runtime-postgres` variant installs it, and the `ha`
+compose profile and `docker/k8s/ha-postgres.yaml` run the Postgres store on that variant (BACKLOG
+#5933).
 
 The `harness` runtime closure is **39 distributions**, recorded in
 [`security/runtime-closure-harness.txt`](../security/runtime-closure-harness.txt). Installing the
@@ -49,17 +58,12 @@ by owner ruling R1 of 2026-10-02, which
 [`ASVS-ASSESSMENT-METHOD.md`](ASVS-ASSESSMENT-METHOD.md) section 2 records. The harness also imports
 at least `paramiko`, `pydicom`, `pynetdicom`, `openpyxl`, `pyodbc` and `asyncpg` when a feature needs
 one. The harness wheel declares none of them, so they are not in its closure and not assessed here
-for it. `pyodbc` is assessed in the `sqlserver` section, for the engine.
+for it. `pyodbc` is assessed in the `sqlserver` section and `asyncpg` in the `postgres` section,
+both for the engine.
 
-An install that enables any other extra (`postgres`, `sftp`, `dicom`, `fhir`, `xml`, `x12`,
-`webauthn`, `otel`, `vault`) carries dependencies **outside** the three assessed sets. Those are not assessed
+An install that enables any other extra (`sftp`, `dicom`, `fhir`, `xml`, `x12`, `webauthn`,
+`otel`, `vault`) carries dependencies **outside** the four assessed sets. Those are not assessed
 here, and that is a gap rather than an assertion of safety.
-
-The `postgres` extra's closure is recorded, in
-[`security/runtime-closure-postgres.txt`](../security/runtime-closure-postgres.txt), because the
-container image's `runtime-postgres` variant installs it (BACKLOG #5933). It adds one name to the
-core closure, `asyncpg`. It is still not assessed: an assessed extra needs its own section here and
-a reading in the public-data snapshot below, and that snapshot is re-read whole, on one date.
 
 ## The criterion
 
@@ -198,7 +202,8 @@ reaches an operator through Microsoft and the operating system's package manager
 
 The `DATABASE` connector's `generic` dialect can instead load any ODBC driver the operator has
 installed, such as one for PostgreSQL or Oracle. Those drivers are chosen per site and are not
-assessed here.
+assessed here. The `postgres` extra does not change that: the connector reaches PostgreSQL through
+ODBC, not through `asyncpg`.
 
 ### A pyodbc crash report that the driver turned out to cause
 
@@ -210,6 +215,57 @@ regression in an 18.6 release of ODBC Driver 18, not in `pyodbc`. It says Micros
 
 So the defect to track is the driver's, which is one more reason to keep the driver current.
 `pyodbc` 5.3.0 was still its newest release on that date.
+
+## The `postgres` extra
+
+The PostgreSQL store backend reaches its database through `asyncpg`, the one name the extra adds to
+the core closure. `messagefoundry/store/postgres.py` imports it when the store opens and opens one
+connection pool through it. The HA coordinator in `messagefoundry/pipeline/cluster.py` runs its
+lease and node statements on that same pool. Elsewhere in the engine, `messagefoundry/store/base.py`
+imports it only to name its error classes, and `messagefoundry verify` only to read whether its
+`create_pool` takes a `connect` hook. The same criterion applies.
+
+Unlike the `sqlserver` extra, no driver sits beneath it. `asyncpg` implements the PostgreSQL wire
+protocol itself, in compiled Cython, so everything the `sqlserver` section puts on the ODBC driver
+falls on this one distribution.
+
+### Designated
+
+| Component | Tier | Why | Native |
+|---|---|---|---|
+| `asyncpg` | 1, 2 and 3 | the store's whole path to PostgreSQL. It encodes every value the store writes into binary statement parameters, the raw inbound message among them, and decodes every row and every server message that comes back, so bytes a sending system chose pass through its codecs both ways. It holds the store credential and answers the server's password challenge, computing the SCRAM-SHA-256 exchange in its own code. It starts TLS on each connection with the context the engine builds for it, and speaks the PostgreSQL protocol to every server the store dials | **yes** |
+
+### Assessed and NOT designated
+
+None. The one name the extra adds is designated.
+
+So 1 plus 0 is 1, and 35 plus 1 is 36.
+
+### Why it meets each tier
+
+1. **Hostile input.** The rows the store reads back were written by the engine, but they carry what
+   a sending system chose: the raw message and the values parsed from it. `asyncpg`'s codecs decode
+   them, and its protocol code parses every message the server sends, error and notice text
+   included.
+2. **Secrets and trust.** It is handed the store's user name and password, and keeps them for the
+   pool's lifetime, so it can open new connections, as `aioodbc` keeps the connection string. It
+   runs the SCRAM-SHA-256 exchange in its own code, `asyncpg/protocol/scram.pyx`, on the standard
+   library's `hashlib` and `hmac`, and checks the server's signature there too. It also answers a
+   cleartext or MD5 password request, if the server makes one. Whether the server's certificate is
+   trusted is decided by the context the engine passes and by the standard library's `ssl`, not by
+   `asyncpg`. It still decides when TLS starts. On the pinned 0.32.0, read for this section, a
+   context passed in is taken as TLS required: a server that refuses TLS gets an error, not a
+   plaintext connection.
+3. **Protocol termination.** It speaks the PostgreSQL frontend and backend protocol, framing and
+   startup included, to every server the store dials.
+
+Its extension modules bundle no library. On the wheels read, they name only the C library and the
+maths and thread libraries on Linux, and the C runtime and Python itself on Windows. So a fault in
+its protocol or codec code is a memory-safety event in the engine's process, not a Python exception.
+
+The ASVS reading further down reads `asyncpg` with every other component on this page. Its results
+are in *The names the assessed extras add*, and what its wheels carry is in *What each wheel
+carries inside it*. Neither is copied here.
 
 ## The `harness` extra
 
@@ -317,7 +373,7 @@ vulnerabilities". This section reads every component on those examples.
 
 <!-- BEGIN component-readings: rendered by scripts/security/component_readings.py from security/risky-component-readings.json. Do not edit by hand. -->
 
-> **Snapshot date: 2026-10-08. Re-read by: 2027-01-06.** Every reading below comes from public data
+> **Snapshot date: 2026-11-27. Re-read by: 2027-02-25.** Every reading below comes from public data
 > on the snapshot date: PyPI, the Python Package Index, and OSV, the Open Source Vulnerabilities
 > database. It covers the versions the closure files pinned that day. Support status and advisory
 > history go stale. After the re-read date, treat this section as out of date until
@@ -328,10 +384,11 @@ The readings, their sources and their windows are recorded in
 
 ### What is read, and the test for each example
 
-All 41 distributions this page assesses are read: the 35 in the core closure and the 6 that the
-assessed extras add to it. The `sqlserver` extra adds 2: `aioodbc` and `pyodbc`. The `harness` extra
-adds 4: `pyside6`, `pyside6-addons`, `pyside6-essentials` and `shiboken6`. That is not only the
-designated part. A library can be risky on these examples even where the tiers did not designate it.
+All 42 distributions this page assesses are read: the 35 in the core closure and the 7 that the
+assessed extras add to it. The `sqlserver` extra adds 2: `aioodbc` and `pyodbc`. The `postgres`
+extra adds 1: `asyncpg`. The `harness` extra adds 4: `pyside6`, `pyside6-addons`,
+`pyside6-essentials` and `shiboken6`. That is not only the designated part. A library can be risky
+on these examples even where the tiers did not designate it.
 
 | Example | A component is risky on it when | Source |
 |---|---|---|
@@ -357,15 +414,14 @@ says which wheels carry another project in any of those forms, and what this pag
 These tests are mechanical. A small library that is finished can trip the first one without being
 neglected. The reading says where to look; it does not say the library is broken.
 
-**Risky on at least one example: 9 of 41. On maintenance: 2. On support: 0. On vulnerability
-history: 7. Not risky on any: 32. 9 plus 32 is 41.**
+**Risky on at least one example: 8 of 42. On maintenance: 1. On support: 0. On vulnerability
+history: 7. Not risky on any: 34. 8 plus 34 is 42.**
 
 ### Poorly maintained
 
 | Component | Newest release | Designated above |
 |---|---|---|
 | `aioodbc` | 2023-10-28 | yes, the `sqlserver` extra |
-| `hl7apy` | 2024-03-13 | yes, tier 1 |
 
 ### Unsupported or end of life
 
@@ -376,14 +432,14 @@ None on the snapshot date.
 | Component | Significant in the window | Newest of those | Designated above |
 |---|---|---|---|
 | `anyio` | 2 | 2026-09-18 | no |
-| `certifi` | 1 | 2023-07-25 | yes, tier 2 |
+| `certifi` | 2 | 2026-10-20 | yes, tier 2 |
 | `cryptography` | 8 | 2026-08-03 | yes, tier 2 |
 | `h11` | 1 | 2025-04-24 | yes, tier 3 |
 | `httpx` | 1 | 2022-04-28 | yes, tier 3 |
-| `pyasn1` | 5 | 2026-07-14 | yes, tier 2 |
+| `pyasn1` | 9 | 2026-10-30 | yes, tier 2 |
 | `starlette` | 5 | 2026-06-15 | yes, tier 3 |
 
-On the snapshot date OSV listed no advisory against any pinned version, in any of the 41. The table
+On the snapshot date OSV listed no advisory against any pinned version, in any of the 42. The table
 above counts past advisories only.
 
 Every advisory in the window carries a rating from one of the two sources.
@@ -395,7 +451,7 @@ Every advisory in the window carries a rating from one of the two sources.
 
 | Components | Designated above |
 |---|---|
-| `argon2-cffi`, `argon2-cffi-bindings`, `cffi`, `fastapi`, `httpcore`, `httptools`, `idna`, `ldap3`, `pycparser`, `pydantic`, `pydantic-core`, `pyodbc`, `pyside6-essentials`, `pyspnego`, `shiboken6`, `sspilib`, `truststore`, `uvicorn`, `websockets` | yes |
+| `argon2-cffi`, `argon2-cffi-bindings`, `asyncpg`, `cffi`, `fastapi`, `hl7apy`, `httpcore`, `httptools`, `idna`, `ldap3`, `pycparser`, `pydantic`, `pydantic-core`, `pyodbc`, `pyside6-essentials`, `pyspnego`, `shiboken6`, `sspilib`, `truststore`, `uvicorn`, `websockets` | yes |
 | `aiosqlite`, `annotated-doc`, `annotated-types`, `click`, `opentelemetry-api`, `psutil`, `pyside6`, `pyside6-addons`, `tomlkit`, `typing-extensions`, `typing-inspection`, `tzdata`, `uvloop` | no |
 
 Not risky here means that none of the three tests fired. It is not a clean result beyond them: the
@@ -406,7 +462,7 @@ vulnerability-history test reads advisories by PyPI name only, as stated with th
 The tiers stay the designation. This reading does not move a component into or out of them. Where
 the two agree is where to look first.
 
-8 designated components are also risky on an ASVS example:
+7 designated components are also risky on an ASVS example:
 
 | Component | Designated above | Risky on |
 |---|---|---|
@@ -414,7 +470,6 @@ the two agree is where to look first.
 | `certifi` | tier 2 | vulnerability history |
 | `cryptography` | tier 2 | vulnerability history |
 | `h11` | tier 3 | vulnerability history |
-| `hl7apy` | tier 1 | maintenance |
 | `httpx` | tier 3 | vulnerability history |
 | `pyasn1` | tier 2 | vulnerability history |
 | `starlette` | tier 3 | vulnerability history |
@@ -426,9 +481,9 @@ and a reviewer can revisit it.
 ### What each wheel carries inside it
 
 The vulnerability-history test reads advisories by PyPI name. This survey asks what that test
-cannot: whether each of the 41 pinned wheels carries a bundled copy of another separately
+cannot: whether each of the 42 pinned wheels carries a bundled copy of another separately
 distributed project, and in what form. The compiled-code answers were made by hand between
-2026-10-04 and 2026-10-07, and the source and data answers between 2026-10-05 and 2026-10-07,
+2026-10-04 and 2026-11-27, and the source and data answers between 2026-10-05 and 2026-11-27,
 against the pins the snapshot reads. The evidence, the files read and their hashes are recorded in
 [`security/bundled-code-survey.json`](../security/bundled-code-survey.json). A run of the script
 does not repeat it.
@@ -448,14 +503,14 @@ compiled or source, and data, but not tables kept as generated Python modules. T
 as data. That part is this page's choice, and a reader can draw it elsewhere. A wheel whose answer
 is not established, for any form, is treated as carrying code.
 
-**Another project's compiled code: found in 9 of 41. Not found in 32. Not established: 0. 9 plus 32
-plus 0 is 41.**
+**Another project's compiled code: found in 9 of 42. Not found in 33. Not established: 0. 9 plus 33
+plus 0 is 42.**
 
-**Another project's source code: found in 0 of 41. Not found in 39. Not established: 2. 0 plus 39
-plus 2 is 41.**
+**Another project's source code: found in 0 of 42. Not found in 40. Not established: 2. 0 plus 40
+plus 2 is 42.**
 
-**Another project's data: found in 5 of 41. Not found in 34. Not established: 2. 5 plus 34 plus 2 is
-41.**
+**Another project's data: found in 6 of 42. Not found in 34. Not established: 2. 6 plus 34 plus 2 is
+42.**
 
 Each count is what the search described below found, and not a statement of what a wheel holds. The
 search reads names, sizes and marked text. It can miss a copy that has no marker, so a wheel counted
@@ -466,22 +521,23 @@ The table has one row for each wheel and form where the answer is not a plain no
 | Component | Pinned | Form | Carries | Evidence | Route |
 |---|---|---|---|---|---|
 | `argon2-cffi-bindings` | 26.1.0 | compiled code | Argon2 reference implementation (phc-winner-argon2), version not established | wheel file list and source tree | designated, tier 2 |
-| `certifi` | 2026.7.22 | data | Mozilla's list of trusted root certificates, version not established | wheel file list and files opened | designated, tier 2 |
+| `asyncpg` | 0.32.0 | data | PostgreSQL's error codes and built-in type identifiers, generated from its `errcodes.txt` and `pg_catalog.pg_type`, version not established | wheel file list and files opened | designated, the `postgres` extra |
+| `certifi` | 2026.10.23 | data | Mozilla's list of trusted root certificates, version not established | wheel file list and files opened | designated, tier 2 |
 | `cffi` | 2.1.1 | compiled code | libffi, version not established | wheel file list and source tree | designated, tier 2 |
 | `cryptography` | 50.0.2 | compiled code | OpenSSL 4.0.3; Rust crates, the 40 entries of the source distribution's `Cargo.lock` | wheel file list and source tree | designated, tier 2 |
 | `hl7apy` | 1.3.5 | data | HL7 v2 definitions of messages, segments, fields and data types, the twelve versions from 2.1 to 2.8.2 | wheel file list and files opened | designated, tier 1 |
 | `httptools` | 0.8.0 | compiled code | llhttp 9.4.1; http-parser 2.9.4 | wheel file list and source tree | designated, tier 3 |
 | `idna` | 3.20 | data | IDNA and UTS 46 mapping tables, Unicode 18.0.0 | wheel file list and files opened | designated, tier 3 |
 | `ldap3` | 2.9.1 | data | Directory server schemas: Active Directory 2012 R2, 389 Directory Server, eDirectory 8.8.8 and 9.1.4, OpenLDAP slapd 2.4, versions as the file names give them | wheel file list and files opened | designated, tier 2 |
-| `pydantic-core` | 2.46.5 | compiled code | Rust crates, the 104 entries of the source distribution's `Cargo.lock` | wheel file list and source tree | designated, tier 1 |
-| `pyside6-addons` | 6.11.2 | compiled code | Qt, version not established | project metadata | highlighted below |
-| `pyside6-addons` | 6.11.2 | source code | not established | wheel not fetched | highlighted below |
-| `pyside6-addons` | 6.11.2 | data | not established | wheel not fetched | highlighted below |
-| `pyside6-essentials` | 6.11.2 | compiled code | Qt, version not established | project metadata | designated, the `harness` extra |
-| `pyside6-essentials` | 6.11.2 | source code | not established | wheel not fetched | designated, the `harness` extra |
-| `pyside6-essentials` | 6.11.2 | data | not established | wheel not fetched | designated, the `harness` extra |
-| `shiboken6` | 6.11.2 | compiled code | Microsoft Visual C++ runtime libraries (Windows wheel) 14.44.35211.0, with two files at 14.24.28127.4 | wheel file list | designated, the `harness` extra |
-| `tzdata` | 2026.4 | data | IANA Time Zone Database 2026d | wheel file list and files opened | none owed: data only |
+| `pydantic-core` | 2.50.4 | compiled code | Rust crates, the 102 entries of the source distribution's `Cargo.lock` | wheel file list and source tree | designated, tier 1 |
+| `pyside6-addons` | 6.11.3 | compiled code | Qt, version not established | project metadata | highlighted below |
+| `pyside6-addons` | 6.11.3 | source code | not established | wheel not fetched | highlighted below |
+| `pyside6-addons` | 6.11.3 | data | not established | wheel not fetched | highlighted below |
+| `pyside6-essentials` | 6.11.3 | compiled code | Qt, version not established | project metadata | designated, the `harness` extra |
+| `pyside6-essentials` | 6.11.3 | source code | not established | wheel not fetched | designated, the `harness` extra |
+| `pyside6-essentials` | 6.11.3 | data | not established | wheel not fetched | designated, the `harness` extra |
+| `shiboken6` | 6.11.3 | compiled code | Microsoft Visual C++ runtime libraries (Windows wheel) 14.44.35211.0, with two files at 14.24.28127.4 | wheel file list | designated, the `harness` extra |
+| `tzdata` | 2026.6 | data | IANA Time Zone Database 2026f | wheel file list and files opened | none owed: data only |
 | `uvloop` | 0.23.0 | compiled code | libuv 1.52.1 | wheel file list and source tree | highlighted below |
 
 27 wheels were found to carry no compiled code, on the evidence of the wheel tag and file list:
@@ -490,16 +546,16 @@ The table has one row for each wheel and form where the answer is not a plain no
 `pyasn1`, `pycparser`, `pydantic`, `pyspnego`, `starlette`, `tomlkit`, `truststore`,
 `typing-extensions`, `typing-inspection`, `tzdata`, `uvicorn`.
 
-4 wheels were found to carry no compiled code, on the evidence of the wheel file list and source
-tree: `psutil`, `pyodbc`, `sspilib`, `websockets`.
+5 wheels were found to carry no compiled code, on the evidence of the wheel file list and source
+tree: `asyncpg`, `psutil`, `pyodbc`, `sspilib`, `websockets`.
 
 1 wheel was found to carry no compiled code, on the evidence of the wheel file list: `pyside6`.
 
 27 wheels have no row in the table: the search found no package, library tree or data set of another
 project in them, in any form.
 
-The word search ran over the 39 wheels that were fetched. It hit 90 files. Counted in files: 7 hold
-a single module adapted from another project, 24 hold lines copied into a wheel's own module, and 59
+The word search ran over the 40 wheels that were fetched. It hit 91 files. Counted in files: 7 hold
+a single module adapted from another project, 25 hold lines copied into a wheel's own module, and 59
 hold prose that marks no copy, such as a project's own licence header. The record lists each hit
 under its wheel. Each hit was sorted into its kind by hand. No test runs the search again: the
 wheels are not kept in this repository, so the counts of files hit are not checked against them.
@@ -522,15 +578,15 @@ route. The list is what the word search found, and it is not a full list: a modu
 another project that does not say so in one of the listed words is not in it.
 
 `pydantic` also holds a second release line of its own project: `pydantic/v1`, 27 files, version
-1.10.26. That is the same project, so it is not counted as another project's source. An advisory
+1.10.27. That is the same project, so it is not counted as another project's source. An advisory
 against that line would name `pydantic`, at that line's own version numbers. The reading above asks
 OSV for every advisory recorded under that name, at any version, and for the ones that affect the
 pinned version. An advisory OSV records against that line would be among the first. Nothing was
-asked at version 1.10.26, so the reading does not say which advisories affect that line.
+asked at version 1.10.27, so the reading does not say which advisories affect that line.
 
-5 wheels carry another project's data and none of its code: `certifi`, `hl7apy`, `idna`, `ldap3`,
-`tzdata`. Not designated among them: `tzdata`. Under the criterion above, that owes no route. No
-notice about any of that data was read.
+6 wheels carry another project's data and none of its code: `asyncpg`, `certifi`, `hl7apy`, `idna`,
+`ldap3`, `tzdata`. Not designated among them: `tzdata`. Under the criterion above, that owes no
+route. No notice about any of that data was read.
 
 Each answer rests on the evidence the record names. A wheel tagged `none-any` had its file list read
 as well as its tag. For any other wheel that was fetched, one Linux x86_64 wheel and the Windows
@@ -592,11 +648,12 @@ stated there: a 0 is about the name, not about the code inside the wheel.
 | Component | Added by | Pinned | Newest release | Advisories counted under the name | Risky on |
 |---|---|---|---|---|---|
 | `aioodbc` | `sqlserver` | 0.5.0 | 2023-10-28 | 0 | maintenance |
-| `pyodbc` | `sqlserver` | 5.3.0 | 2025-10-17 | 0 | none |
-| `pyside6` | `harness` | 6.11.2 | 2026-08-18 | 0 | none |
-| `pyside6-addons` | `harness` | 6.11.2 | 2026-08-18 | 0 | none |
-| `pyside6-essentials` | `harness` | 6.11.2 | 2026-08-18 | 0 | none |
-| `shiboken6` | `harness` | 6.11.2 | 2026-08-18 | 0 | none |
+| `asyncpg` | `postgres` | 0.32.0 | 2026-10-06 | 1 | none |
+| `pyodbc` | `sqlserver` | 5.3.0 | 2026-11-08 | 0 | none |
+| `pyside6` | `harness` | 6.11.3 | 2026-10-26 | 0 | none |
+| `pyside6-addons` | `harness` | 6.11.3 | 2026-10-26 | 0 | none |
+| `pyside6-essentials` | `harness` | 6.11.3 | 2026-10-26 | 0 | none |
+| `shiboken6` | `harness` | 6.11.3 | 2026-10-26 | 0 | none |
 
 <!-- END component-readings -->
 
@@ -612,19 +669,16 @@ against these components are handled through the process in
 **It is not the consolidated threat-model table.** That document is withheld from public checkouts
 by policy. This page is derived independently and stands on its own.
 
-**It does not cover the extras other than `sqlserver` and `harness`.** See the scope note above.
+**It does not cover the extras other than `sqlserver`, `postgres` and `harness`.** See the scope note above.
 
 ## Keeping it true
 
 `tests/test_risky_component_designation.py` fails when this page and
 [`security/runtime-closure-core.txt`](../security/runtime-closure-core.txt) disagree: a dependency
 that enters the closure without being classified here, or a name here that is not in the closure,
-turns it red. It holds the `sqlserver` section to
-[`security/runtime-closure-sqlserver.txt`](../security/runtime-closure-sqlserver.txt) the same way,
-over the names that file adds to the core, and the `harness` section to
-[`security/runtime-closure-harness.txt`](../security/runtime-closure-harness.txt), over the names
-that one adds. The test is the reason the arithmetic above can be
-trusted after the next dependency bump.
+turns it red. It holds each assessed extra's section to that extra's closure file, named in the
+scope section, the same way, over the names that file adds to the core. The test is the reason the
+arithmetic above can be trusted after the next dependency bump.
 
 The same test holds each closure file to the lock it copies, in every name and version (BACKLOG
 #1812, #1955). Each file's header names its lock and the command that regenerates both.

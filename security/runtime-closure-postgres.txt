@@ -1,10 +1,10 @@
 # The POSTGRES runtime closure: every distribution an engine install with the `postgres` extra
 # carries, transitive dependencies included, with NO other extra and NO development toolchain.
 #
-# It is the core closure in security/runtime-closure-core.txt plus what the extra adds, and the
-# Dockerfile's runtime-postgres image installs the same lock (BACKLOG #5933). docs/RISKY-COMPONENTS.md
-# records this file and does NOT yet assess the extra: the name it adds, asyncpg, is classified
-# nowhere on that page. This file is the denominator a `postgres` section would classify.
+# This file is the denominator for the `postgres` section of docs/RISKY-COMPONENTS.md (BACKLOG
+# #5933). It is the core closure in security/runtime-closure-core.txt plus what the extra adds, and
+# the page classifies only those additions; the core closure's own names are classified above them.
+# The Dockerfile's runtime-postgres image installs the same lock.
 #
 # Each line below is a copy of a pin line in docker/locks/requirements-postgres.lock. That file is
 # `uv export --no-emit-project --no-dev --extra postgres` of uv.lock, and the DEP-1 gate in
